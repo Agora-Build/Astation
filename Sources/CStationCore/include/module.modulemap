@@ -1,0 +1,6 @@
+module CStationCore {
+    header "astation_rtc.h"
+    header "astation_core.h"
+    link "astation_core"
+    export *
+}

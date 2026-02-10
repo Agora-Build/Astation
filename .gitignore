@@ -1,0 +1,30 @@
+# Build artifacts
+/build/
+/output/
+/.build/
+/target/
+/server/target/
+
+# Swift Package Manager
+.swiftpm/
+Package.resolved
+
+# macOS
+.DS_Store
+
+# Editor settings
+.vscode/
+.idea/
+
+# Local environment
+.env
+.env.local
+
+# Claude state
+.claude/
+
+# Vendor SDKs (downloaded separately)
+/third_party/
+
+# Logs
+*.log
