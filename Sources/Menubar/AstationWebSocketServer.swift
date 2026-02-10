@@ -1,6 +1,8 @@
 import Foundation
 import WebSocketKit
 import NIO
+import NIOHTTP1
+import NIOWebSocket
 
 class AstationWebSocketServer {
     private var eventLoopGroup: EventLoopGroup!
