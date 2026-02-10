@@ -33,7 +33,7 @@ enum AstationMessage: Codable {
 
     // Mark task routing (Chisel → Astation → Atem)
     case markTaskNotify(taskId: String, status: String, description: String)
-    case markTaskAssignment(taskId: String)
+    case markTaskAssignment(taskId: String, receivedAtMs: UInt64)
     case markTaskResult(taskId: String, success: Bool, message: String)
     
     // Custom encoding/decoding to handle the enum cases
@@ -192,10 +192,11 @@ enum AstationMessage: Codable {
             try dataContainer.encode(status, forKey: .status)
             try dataContainer.encode(description, forKey: .description)
 
-        case .markTaskAssignment(let taskId):
+        case .markTaskAssignment(let taskId, let receivedAtMs):
             try container.encode(MessageType.markTaskAssignment, forKey: .type)
             var dataContainer = container.nestedContainer(keyedBy: MarkTaskAssignmentKeys.self, forKey: .data)
             try dataContainer.encode(taskId, forKey: .taskId)
+            try dataContainer.encode(receivedAtMs, forKey: .receivedAtMs)
 
         case .markTaskResult(let taskId, let success, let message):
             try container.encode(MessageType.markTaskResult, forKey: .type)
@@ -340,7 +341,8 @@ enum AstationMessage: Codable {
         case .markTaskAssignment:
             let dataContainer = try container.nestedContainer(keyedBy: MarkTaskAssignmentKeys.self, forKey: .data)
             let taskId = try dataContainer.decode(String.self, forKey: .taskId)
-            self = .markTaskAssignment(taskId: taskId)
+            let receivedAtMs = try dataContainer.decodeIfPresent(UInt64.self, forKey: .receivedAtMs) ?? 0
+            self = .markTaskAssignment(taskId: taskId, receivedAtMs: receivedAtMs)
 
         case .markTaskResult:
             let dataContainer = try container.nestedContainer(keyedBy: MarkTaskResultKeys.self, forKey: .data)
@@ -420,7 +422,7 @@ private enum MarkTaskNotifyKeys: String, CodingKey {
 }
 
 private enum MarkTaskAssignmentKeys: String, CodingKey {
-    case taskId
+    case taskId, receivedAtMs
 }
 
 private enum MarkTaskResultKeys: String, CodingKey {

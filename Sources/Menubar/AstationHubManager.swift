@@ -406,20 +406,25 @@ class AstationHubManager: ObservableObject {
         return connectedClients.first(where: { $0.isFocused })
     }
 
+    /// Pick the target Atem for routing: focused client, or first connected.
+    /// Returns the client ID, or nil if no Atem is connected.
+    func routeToFocusedAtem() -> String? {
+        return (focusedClient() ?? connectedClients.first)?.id
+    }
+
     // MARK: - Voice Command Routing
 
     /// Send a voice command to the focused Atem instance.
     /// Called by the transcription pipeline when speech-to-text produces text.
     func sendVoiceCommand(text: String, isFinal: Bool) {
-        let target = focusedClient() ?? connectedClients.first
-        guard let client = target else {
+        guard let clientId = routeToFocusedAtem() else {
             print("🎤 No Atem connected — voice command dropped: \(text)")
             return
         }
 
         let message = AstationMessage.voiceCommand(text: text, isFinal: isFinal)
-        sendHandler?(message, client.id)
-        print("🎤 Voice command → \(client.id): \(text)\(isFinal ? " [final]" : "")")
+        sendHandler?(message, clientId)
+        print("🎤 Voice command → \(clientId): \(text)\(isFinal ? " [final]" : "")")
     }
 
     // MARK: - Mark Task Routing
@@ -443,23 +448,29 @@ class AstationHubManager: ObservableObject {
     }
 
     private func routeMarkTask(taskId: String) {
-        // Pick a target Atem: focused client first, then first available
-        let target = focusedClient() ?? connectedClients.first
-        guard let client = target else {
+        guard let clientId = routeToFocusedAtem() else {
             print("📌 No Atem connected — mark task \(taskId) stays pending")
             return
         }
 
-        let assignment = AstationMessage.markTaskAssignment(taskId: taskId)
-        sendHandler?(assignment, client.id)
+        // Derive receivedAtMs from the stored MarkTask.receivedAt
+        let receivedAtMs: UInt64
+        if let index = markTasks.firstIndex(where: { $0.taskId == taskId }) {
+            receivedAtMs = UInt64(markTasks[index].receivedAt.timeIntervalSince1970 * 1000)
+        } else {
+            receivedAtMs = UInt64(Date().timeIntervalSince1970 * 1000)
+        }
+
+        let assignment = AstationMessage.markTaskAssignment(taskId: taskId, receivedAtMs: receivedAtMs)
+        sendHandler?(assignment, clientId)
 
         DispatchQueue.main.async {
             if let index = self.markTasks.firstIndex(where: { $0.taskId == taskId }) {
                 self.markTasks[index].status = "assigned"
-                self.markTasks[index].assignedTo = client.id
+                self.markTasks[index].assignedTo = clientId
             }
         }
-        print("📌 Mark task \(taskId) assigned to \(client.id)")
+        print("📌 Mark task \(taskId) assigned to \(clientId)")
     }
 
     private func handleUserCommand(_ command: String, context: [String: String]) {
