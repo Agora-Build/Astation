@@ -1,0 +1,136 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-core:
+    name: Build C++ Core Library
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build astation_core static library
+        run: |
+          mkdir -p build && cd build
+          cmake .. -DBUILD_TESTING=ON
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: Run core tests
+        run: cd build && ctest --output-on-failure
+
+      - name: Upload core library
+        uses: actions/upload-artifact@v4
+        with:
+          name: libastation_core
+          path: build/libastation_core.a
+
+  build-app:
+    name: Build macOS App
+    needs: build-core
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download core library
+        uses: actions/download-artifact@v4
+        with:
+          name: libastation_core
+          path: build/
+
+      - name: Build Swift package
+        run: swift build -c release
+
+      - name: Create app bundle
+        run: |
+          APP_DIR="Astation.app/Contents"
+          mkdir -p "$APP_DIR/MacOS"
+          mkdir -p "$APP_DIR/Resources"
+
+          cp .build/release/astation "$APP_DIR/MacOS/Astation"
+
+          cat > "$APP_DIR/Info.plist" << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>Astation</string>
+            <key>CFBundleIdentifier</key>
+            <string>build.agora.astation</string>
+            <key>CFBundleName</key>
+            <string>Astation</string>
+            <key>CFBundleVersion</key>
+            <string>${{ github.ref_name }}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${{ github.ref_name }}</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>13.0</string>
+            <key>LSUIElement</key>
+            <true/>
+            <key>CFBundleURLTypes</key>
+            <array>
+              <dict>
+                <key>CFBundleURLName</key>
+                <string>build.agora.astation</string>
+                <key>CFBundleURLSchemes</key>
+                <array>
+                  <string>astation</string>
+                </array>
+              </dict>
+            </array>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Create .pkg installer
+        run: |
+          mkdir -p pkg-root/Applications
+          cp -R Astation.app pkg-root/Applications/
+
+          pkgbuild \
+            --root pkg-root \
+            --identifier build.agora.astation \
+            --version "${{ github.ref_name }}" \
+            --install-location / \
+            Astation-${{ github.ref_name }}-mac-arm64.pkg
+
+      - name: Compress app bundle
+        run: |
+          tar -czf Astation-${{ github.ref_name }}-mac-arm64.tar.gz Astation.app
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: astation-mac-arm64
+          path: |
+            Astation-${{ github.ref_name }}-mac-arm64.pkg
+            Astation-${{ github.ref_name }}-mac-arm64.tar.gz
+
+  release:
+    name: Create GitHub Release
+    needs: build-app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: astation-mac-arm64
+          path: dist/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/Astation-${{ github.ref_name }}-mac-arm64.pkg
+            dist/Astation-${{ github.ref_name }}-mac-arm64.tar.gz
