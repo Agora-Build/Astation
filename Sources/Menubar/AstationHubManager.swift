@@ -406,6 +406,22 @@ class AstationHubManager: ObservableObject {
         return connectedClients.first(where: { $0.isFocused })
     }
 
+    // MARK: - Voice Command Routing
+
+    /// Send a voice command to the focused Atem instance.
+    /// Called by the transcription pipeline when speech-to-text produces text.
+    func sendVoiceCommand(text: String, isFinal: Bool) {
+        let target = focusedClient() ?? connectedClients.first
+        guard let client = target else {
+            print("🎤 No Atem connected — voice command dropped: \(text)")
+            return
+        }
+
+        let message = AstationMessage.voiceCommand(text: text, isFinal: isFinal)
+        sendHandler?(message, client.id)
+        print("🎤 Voice command → \(client.id): \(text)\(isFinal ? " [final]" : "")")
+    }
+
     // MARK: - Mark Task Routing
 
     private func handleMarkTaskNotify(taskId: String, status: String, description: String) {

@@ -28,6 +28,9 @@ enum AstationMessage: Codable {
     case heartbeat(timestamp: Date)
     case pong(timestamp: Date)
 
+    // Voice command routing (Astation → Atem)
+    case voiceCommand(text: String, isFinal: Bool)
+
     // Mark task routing (Chisel → Astation → Atem)
     case markTaskNotify(taskId: String, status: String, description: String)
     case markTaskAssignment(taskId: String)
@@ -59,6 +62,7 @@ enum AstationMessage: Codable {
         case atemInstanceList = "atem_instance_list"
         case heartbeat
         case pong
+        case voiceCommand
         case markTaskNotify
         case markTaskAssignment
         case markTaskResult
@@ -174,6 +178,12 @@ enum AstationMessage: Codable {
         case .pong(let timestamp):
             try container.encode(MessageType.pong, forKey: .type)
             try container.encode(timestamp, forKey: .timestamp)
+
+        case .voiceCommand(let text, let isFinal):
+            try container.encode(MessageType.voiceCommand, forKey: .type)
+            var dataContainer = container.nestedContainer(keyedBy: VoiceCommandKeys.self, forKey: .data)
+            try dataContainer.encode(text, forKey: .text)
+            try dataContainer.encode(isFinal, forKey: .isFinal)
 
         case .markTaskNotify(let taskId, let status, let description):
             try container.encode(MessageType.markTaskNotify, forKey: .type)
@@ -314,6 +324,12 @@ enum AstationMessage: Codable {
             let timestamp = try container.decode(Date.self, forKey: .timestamp)
             self = .pong(timestamp: timestamp)
 
+        case .voiceCommand:
+            let dataContainer = try container.nestedContainer(keyedBy: VoiceCommandKeys.self, forKey: .data)
+            let text = try dataContainer.decode(String.self, forKey: .text)
+            let isFinal = try dataContainer.decodeIfPresent(Bool.self, forKey: .isFinal) ?? false
+            self = .voiceCommand(text: text, isFinal: isFinal)
+
         case .markTaskNotify:
             let dataContainer = try container.nestedContainer(keyedBy: MarkTaskNotifyKeys.self, forKey: .data)
             let taskId = try dataContainer.decode(String.self, forKey: .taskId)
@@ -392,6 +408,11 @@ private enum VideoToggleKeys: String, CodingKey {
 
 private enum AtemInstanceListKeys: String, CodingKey {
     case instances
+}
+
+private enum VoiceCommandKeys: String, CodingKey {
+    case text
+    case isFinal = "is_final"
 }
 
 private enum MarkTaskNotifyKeys: String, CodingKey {
