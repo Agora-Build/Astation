@@ -18,8 +18,8 @@ class AstationWebSocketServer {
         eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         
         let upgrader = NIOWebSocketServerUpgrader(
-            shouldUpgrade: { _, _ in
-                return HTTPHeaders()
+            shouldUpgrade: { channel, _ in
+                return channel.eventLoop.makeSucceededFuture(HTTPHeaders())
             },
             upgradePipelineHandler: { channel, _ in
                 return WebSocket.server(on: channel) { ws in
@@ -148,7 +148,7 @@ class AstationWebSocketServer {
 }
 
 // Simple HTTP handler for WebSocket upgrade
-private class HTTPHandler: ChannelInboundHandler {
+private class HTTPHandler: ChannelInboundHandler, RemovableChannelHandler {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
     
