@@ -1,3 +1,4 @@
+import CStationCore
 import Foundation
 
 // Hub Manager - Contains all business logic for Agora projects, tokens, etc.
@@ -19,6 +20,9 @@ class AstationHubManager: ObservableObject {
     lazy var sessionLinkManager = SessionLinkManager(hubManager: self)
     @Published var projectLoadError: String?
 
+    /// Opaque handle to the C core engine (VAD + signaling pipeline).
+    private var coreHandle: OpaquePointer?
+
     /// Station relay URL. Priority: AGORA_STATION_RELAY_URL env var > UserDefaults > default.
     var stationRelayUrl: String {
         SettingsWindowController.currentStationURL
@@ -34,22 +38,64 @@ class AstationHubManager: ObservableObject {
 
     init() {
         Log.info("Initializing Astation Hub Manager")
+        setupCore()
         setupRTCManager()
         checkCredentialStatus()
         loadProjects()
+    }
+
+    deinit {
+        if let core = coreHandle {
+            astation_core_destroy(core)
+            coreHandle = nil
+        }
+    }
+
+    // MARK: - Core Pipeline Setup
+
+    private func setupCore() {
+        var config = AStationCoreConfig()
+        // Defaults for VAD: 16 kHz, 20 ms frames, 600 ms silence, 30 s inactivity
+        config.vad_sample_rate = 16000
+        config.vad_frame_duration_ms = 20
+        config.vad_silence_duration_ms = 600
+        config.inactivity_timeout_ms = 30000
+
+        var callbacks = AStationCoreCallbacks()
+        callbacks.on_log = { level, message, _ in
+            guard let msg = message.map({ String(cString: $0) }) else { return }
+            switch level {
+            case ASTATION_LOG_ERROR: Log.error("[Core] \(msg)")
+            case ASTATION_LOG_WARN:  Log.warn("[Core] \(msg)")
+            case ASTATION_LOG_INFO:  Log.info("[Core] \(msg)")
+            default:                 Log.debug("[Core] \(msg)")
+            }
+        }
+
+        callbacks.on_transcription = { _, text, _, _ in
+            guard let text = text.map({ String(cString: $0) }) else { return }
+            Log.info("[Core] Transcription: \(text)")
+        }
+
+        // No signaling adapter for now — voice commands are routed via WebSocket
+        coreHandle = astation_core_create(&config, &callbacks, nil)
+        if coreHandle != nil {
+            Log.info("Core engine initialized (VAD pipeline ready)")
+        } else {
+            Log.warn("Core engine creation returned nil — audio pipeline disabled")
+        }
     }
 
     // MARK: - RTC Setup
 
     private func setupRTCManager() {
         // Wire RTC audio frames into the VAD/ASR pipeline.
-        // When the real Agora RTC SDK delivers audio, on_audio_frame fires and
-        // the samples can be forwarded to astation_core_feed_audio_frame().
+        // The Agora RTC SDK delivers mic audio via on_audio_frame; forward to the core.
         rtcManager.onAudioFrame = { [weak self] data, samples, channels, sampleRate in
-            guard self != nil else { return }
-            // TODO: Forward PCM to astation_core_feed_audio_frame() once core is wired in Swift.
-            // For now the stub RTC engine does not produce real audio frames.
-            _ = (data, samples, channels, sampleRate)
+            guard let self = self, let core = self.coreHandle else { return }
+            // Feed PCM16 audio into the VAD pipeline
+            astation_core_feed_audio_frame(core, data, samples, UInt32(sampleRate))
+            _ = channels // channels is implicit in sample interleaving
         }
 
         rtcManager.onJoinSuccess = { channel, uid in

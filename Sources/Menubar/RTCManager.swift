@@ -80,7 +80,7 @@ class RTCManager {
 
         var config = AStationRtcConfig()
         // We need to keep the C strings alive for the duration of the create call.
-        // The stub copies them internally, so temporaries from withCString are fine.
+        // The SDK copies them internally, so temporaries from withCString are fine.
         let newEngine: OpaquePointer? = appId.withCString { appIdPtr in
             config.app_id = appIdPtr
             config.token = nil

@@ -52,8 +52,21 @@ jobs:
           APP_DIR="Astation.app/Contents"
           mkdir -p "$APP_DIR/MacOS"
           mkdir -p "$APP_DIR/Resources"
+          mkdir -p "$APP_DIR/Frameworks"
 
           cp .build/release/astation "$APP_DIR/MacOS/Astation"
+
+          # Bundle Agora RTC SDK frameworks into the app
+          AGORA_LIBS="third_party/agora/rtc_mac/libs"
+          PLATFORM="macos-arm64_x86_64"
+          for xcfw in "$AGORA_LIBS"/*.xcframework; do
+            FW_NAME=$(basename "$xcfw" .xcframework)
+            FW_PATH="$xcfw/$PLATFORM/$FW_NAME.framework"
+            if [ -d "$FW_PATH" ]; then
+              cp -R "$FW_PATH" "$APP_DIR/Frameworks/"
+              echo "Bundled: $FW_NAME.framework"
+            fi
+          done
 
           cat > "$APP_DIR/Info.plist" << 'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>

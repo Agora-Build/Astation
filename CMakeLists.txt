@@ -13,6 +13,43 @@ target_include_directories(astation_core
         $<INSTALL_INTERFACE:include>
 )
 
+# Locate Agora RTC SDK headers per platform.
+# SDK layout:
+#   macOS:   third_party/agora/rtc_mac/libs/AgoraRtcKit.xcframework/.../Headers/
+#   Linux:   third_party/agora/rtc_linux/include/
+#   Windows: third_party/agora/rtc_win/include/
+set(AGORA_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/agora")
+
+if(APPLE)
+    set(AGORA_HEADERS "${AGORA_SDK_DIR}/rtc_mac/libs/AgoraRtcKit.xcframework/macos-arm64_x86_64/AgoraRtcKit.framework/Versions/A/Headers")
+elseif(UNIX)
+    set(AGORA_HEADERS "${AGORA_SDK_DIR}/rtc_linux/include")
+elseif(WIN32)
+    set(AGORA_HEADERS "${AGORA_SDK_DIR}/rtc_win/include")
+endif()
+
+if(EXISTS "${AGORA_HEADERS}")
+    target_include_directories(astation_core PRIVATE "${AGORA_HEADERS}")
+    message(STATUS "Agora RTC SDK headers: ${AGORA_HEADERS}")
+else()
+    message(FATAL_ERROR
+        "Agora RTC SDK not found at: ${AGORA_HEADERS}\n"
+        "Download the Agora RTC Native SDK for your platform and extract to third_party/agora/")
+endif()
+
+# On Linux, also add library search path for linking
+if(UNIX AND NOT APPLE)
+    set(AGORA_LIBS_DIR "${AGORA_SDK_DIR}/rtc_linux/libs")
+    if(EXISTS "${AGORA_LIBS_DIR}")
+        target_link_directories(astation_core PUBLIC "${AGORA_LIBS_DIR}")
+    endif()
+elseif(WIN32)
+    set(AGORA_LIBS_DIR "${AGORA_SDK_DIR}/rtc_win/libs")
+    if(EXISTS "${AGORA_LIBS_DIR}")
+        target_link_directories(astation_core PUBLIC "${AGORA_LIBS_DIR}")
+    endif()
+endif()
+
 target_compile_features(astation_core PUBLIC cxx_std_17)
 
 if(MSVC)
