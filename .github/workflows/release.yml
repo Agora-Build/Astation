@@ -38,7 +38,7 @@ jobs:
 
       - name: Build astation_core static library
         run: |
-          make -j$(sysctl -n hw.ncpu)
+          cmake --build build --parallel $(sysctl -n hw.ncpu)
 
       - name: Run core tests
         run: cd build && ctest --output-on-failure
