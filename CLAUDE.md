@@ -108,6 +108,11 @@ Message types:
 - **Rust Server**: Axum, Tokio, Serde (auth web fallback)
 - **Agora SDKs**: RTC + RTM macOS frameworks (vendored in `third_party/`, gitignored)
 
+## Offline / pre-downloaded SDK
+
+- Skip auto-download and use a local SDK root:
+  `cmake -S . -B build -DAGORA_SKIP_DOWNLOAD=ON -DAGORA_SDK_DIR=/path/to/sdk`
+
 ## Mark Task Routing
 
 ```

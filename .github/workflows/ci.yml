@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-macos:
+    name: Build macOS
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Agora SDK
+        uses: actions/cache@v4
+        with:
+          path: third_party/agora
+          key: agora-sdk-macos-4.6.2
+          restore-keys: agora-sdk-macos-
+
+      - name: Configure C++ core (download SDK if needed)
+        run: |
+          SDK_DIR="third_party/agora"
+          if [ -d "$SDK_DIR/rtc_mac" ]; then
+            cmake -S . -B build -DBUILD_TESTING=ON -DAGORA_SKIP_DOWNLOAD=ON -DAGORA_SDK_DIR="$SDK_DIR"
+          else
+            if [ "${AGORA_SKIP_DOWNLOAD:-}" = "1" ]; then
+              echo "AGORA_SKIP_DOWNLOAD=1 but SDK missing at $SDK_DIR" >&2
+              exit 1
+            fi
+            cmake -S . -B build -DBUILD_TESTING=ON
+          fi
+
+      - name: Build C++ core
+        run: |
+          cmake --build build --parallel $(sysctl -n hw.ncpu)
+
+      - name: Run core tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Build Swift package
+        run: swift build -c release

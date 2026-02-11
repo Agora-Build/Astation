@@ -16,7 +16,8 @@ target_include_directories(astation_core
 # Locate Agora RTC SDK headers per platform.
 # On macOS: Download from Agora's SPM distribution (individual xcframework zips)
 # On Linux/Windows: Look for manually extracted SDK
-set(AGORA_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/agora")
+option(AGORA_SKIP_DOWNLOAD "Skip auto-download of Agora SDK (use local AGORA_SDK_DIR)" OFF)
+set(AGORA_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/agora" CACHE PATH "Path to Agora SDK root (contains rtc_mac/rtc_linux/rtc_win)")
 set(AGORA_VERSION "4.6.2")
 
 if(APPLE)
@@ -28,7 +29,7 @@ elseif(WIN32)
 endif()
 
 # Auto-download SDK if missing (macOS only, uses SPM distribution URLs)
-if(APPLE AND NOT EXISTS "${AGORA_HEADERS}")
+if(APPLE AND NOT EXISTS "${AGORA_HEADERS}" AND NOT AGORA_SKIP_DOWNLOAD)
     message(STATUS "Agora RTC SDK not found, downloading from SPM distribution...")
 
     set(BASE_URL "https://download.agora.io/swiftpm/AgoraRtcEngine_macOS/${AGORA_VERSION}")
@@ -76,7 +77,42 @@ if(APPLE AND NOT EXISTS "${AGORA_HEADERS}")
     message(STATUS "Agora RTC SDK installed to ${AGORA_SDK_DIR}/rtc_mac/")
 endif()
 
-if(EXISTS "${AGORA_HEADERS}")
+if(APPLE)
+    if(AGORA_SKIP_DOWNLOAD AND NOT EXISTS "${AGORA_HEADERS}")
+        message(FATAL_ERROR
+            "Agora RTC SDK not found at: ${AGORA_HEADERS}\n"
+            "AGORA_SKIP_DOWNLOAD is ON. Provide a local SDK via -DAGORA_SDK_DIR=/path/to/sdk\n"
+            "Expected structure: ${AGORA_SDK_DIR}/rtc_mac/<Framework>.xcframework/...")
+    endif()
+    # Fail fast if any expected framework headers are missing.
+    set(AGORA_EXPECTED_HEADER_DIRS "")
+    foreach(FW ${FRAMEWORKS})
+        list(APPEND AGORA_EXPECTED_HEADER_DIRS
+            "${AGORA_SDK_DIR}/rtc_mac/${FW}.xcframework/macos-arm64_x86_64/${FW}.framework/Headers"
+        )
+    endforeach()
+    foreach(HDR_DIR IN LISTS AGORA_EXPECTED_HEADER_DIRS)
+        if(NOT EXISTS "${HDR_DIR}")
+            message(FATAL_ERROR "Missing Agora framework headers at: ${HDR_DIR}")
+        endif()
+    endforeach()
+
+    file(GLOB AGORA_XCFRAMEWORK_HEADERS
+        "${AGORA_SDK_DIR}/rtc_mac/*.xcframework/macos-arm64_x86_64/*.framework/Headers"
+    )
+    if(AGORA_XCFRAMEWORK_HEADERS)
+        list(REMOVE_DUPLICATES AGORA_XCFRAMEWORK_HEADERS)
+        target_include_directories(astation_core PRIVATE ${AGORA_XCFRAMEWORK_HEADERS})
+        message(STATUS "Agora RTC SDK headers:")
+        foreach(HDR_DIR IN LISTS AGORA_XCFRAMEWORK_HEADERS)
+            message(STATUS "  ${HDR_DIR}")
+        endforeach()
+    else()
+        message(FATAL_ERROR
+            "Agora RTC SDK headers not found under: ${AGORA_SDK_DIR}/rtc_mac\n"
+            "macOS: Run cmake again to auto-download")
+    endif()
+elseif(EXISTS "${AGORA_HEADERS}")
     target_include_directories(astation_core PRIVATE "${AGORA_HEADERS}")
     message(STATUS "Agora RTC SDK headers: ${AGORA_HEADERS}")
 else()

@@ -36,6 +36,12 @@ swift build -c release
 - If SPM fails: Try `swift package resolve --force-resolution`
 - Clean build: `rm -rf build third_party/agora .build && swift build`
 
+**Offline / pre-downloaded SDK**
+- Skip auto-download and use a local SDK root:
+  `cmake -S . -B build -DAGORA_SKIP_DOWNLOAD=ON -DAGORA_SDK_DIR=/path/to/sdk`
+- Expected layout:
+  `/path/to/sdk/rtc_mac/<Framework>.xcframework/...`
+
 **Linux/Windows builds:**
 - C++ core only (no Swift app on these platforms)
 - CMake does NOT auto-download on Linux/Windows

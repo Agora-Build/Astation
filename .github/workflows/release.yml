@@ -16,10 +16,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache Agora SDK
+        uses: actions/cache@v4
+        with:
+          path: third_party/agora
+          key: agora-sdk-macos-4.6.2
+          restore-keys: agora-sdk-macos-
+
+      - name: Configure astation_core (download SDK if needed)
+        run: |
+          SDK_DIR="third_party/agora"
+          if [ -d "$SDK_DIR/rtc_mac" ]; then
+            cmake -S . -B build -DBUILD_TESTING=ON -DAGORA_SKIP_DOWNLOAD=ON -DAGORA_SDK_DIR="$SDK_DIR"
+          else
+            if [ "${AGORA_SKIP_DOWNLOAD:-}" = "1" ]; then
+              echo "AGORA_SKIP_DOWNLOAD=1 but SDK missing at $SDK_DIR" >&2
+              exit 1
+            fi
+            cmake -S . -B build -DBUILD_TESTING=ON
+          fi
+
       - name: Build astation_core static library
         run: |
-          mkdir -p build && cd build
-          cmake .. -DBUILD_TESTING=ON
           make -j$(sysctl -n hw.ncpu)
 
       - name: Run core tests
@@ -43,6 +61,26 @@ jobs:
         with:
           name: libastation_core
           path: build/
+
+      - name: Cache Agora SDK
+        uses: actions/cache@v4
+        with:
+          path: third_party/agora
+          key: agora-sdk-macos-4.6.2
+          restore-keys: agora-sdk-macos-
+
+      - name: Download Agora SDK for bundling (if needed)
+        run: |
+          SDK_DIR="third_party/agora"
+          if [ -d "$SDK_DIR/rtc_mac" ]; then
+            cmake -S . -B build-sdk -DBUILD_TESTING=OFF -DAGORA_SKIP_DOWNLOAD=ON -DAGORA_SDK_DIR="$SDK_DIR"
+          else
+            if [ "${AGORA_SKIP_DOWNLOAD:-}" = "1" ]; then
+              echo "AGORA_SKIP_DOWNLOAD=1 but SDK missing at $SDK_DIR" >&2
+              exit 1
+            fi
+            cmake -S . -B build-sdk -DBUILD_TESTING=OFF
+          fi
 
       - name: Build Swift package
         run: swift build -c release
