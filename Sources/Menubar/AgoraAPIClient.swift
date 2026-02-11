@@ -7,7 +7,7 @@ struct AgoraAPIResponse: Codable {
 
 /// Raw project as returned by `GET https://api.agora.io/dev/v1/projects`
 struct AgoraAPIProject: Codable {
-    let id: Int
+    let id: String
     let name: String
     let vendor_key: String   // app_id
     let sign_key: String     // app_certificate
@@ -61,7 +61,7 @@ class AgoraAPIClient {
             throw AgoraAPIError.httpError(0)
         }
 
-        guard httpResponse.statusCode == 200 else {
+        guard (200...201).contains(httpResponse.statusCode) else {
             throw AgoraAPIError.httpError(httpResponse.statusCode)
         }
 
@@ -69,6 +69,8 @@ class AgoraAPIClient {
         do {
             apiResponse = try JSONDecoder().decode(AgoraAPIResponse.self, from: data)
         } catch {
+            let preview = String(data: data.prefix(500), encoding: .utf8) ?? "(binary)"
+            print("[AgoraAPI] Decode failed. Raw response: \(preview)")
             throw AgoraAPIError.decodingError(error.localizedDescription)
         }
 

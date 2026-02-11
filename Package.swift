@@ -35,6 +35,11 @@ let package = Package(
                 .linkedLibrary("astation_core"),
                 .linkedLibrary("c++")
             ]
+        ),
+        .testTarget(
+            name: "AstationTests",
+            dependencies: ["Menubar"],
+            path: "Tests/AstationTests"
         )
     ]
 )
