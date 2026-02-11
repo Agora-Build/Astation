@@ -14,17 +14,34 @@ Prerequisites: macOS 13+, Xcode Command Line Tools, CMake.
 git clone git@github.com:Agora-Build/Astation.git
 cd Astation
 
-# 1. Build the C++ core library
+# 1. Build the C++ core library (CMake auto-downloads Agora SDK from SPM distribution)
 mkdir -p build && cd build
 cmake .. -DBUILD_TESTING=ON
 make -j$(sysctl -n hw.ncpu)
 cd ..
 
-# 2. Build the Swift app
+# 2. Build the Swift app (SPM auto-downloads Agora frameworks)
 swift build -c release
 
 # Binary at .build/release/astation
 ```
+
+**What happens during build:**
+- CMake detects missing Agora SDK and downloads 7 xcframeworks from `https://download.agora.io/swiftpm/AgoraRtcEngine_macOS/4.6.2/`
+- Swift Package Manager resolves `AgoraRtcEngine_macOS` dependency automatically
+- No manual SDK downloads needed!
+
+**Troubleshooting:**
+- If CMake fails with "SDK not found": Run `cmake ..` again to retry download
+- If SPM fails: Try `swift package resolve --force-resolution`
+- Clean build: `rm -rf build third_party/agora .build && swift build`
+
+**Linux/Windows builds:**
+- C++ core only (no Swift app on these platforms)
+- CMake does NOT auto-download on Linux/Windows
+- Download SDK manually:
+  - Linux: https://docs.agora.io/en/sdks?platform=linux → extract to `third_party/agora/rtc_linux/`
+  - Windows: https://docs.agora.io/en/sdks?platform=windows → extract to `third_party/agora/rtc_win/`
 
 ## How It Works
 
@@ -105,8 +122,8 @@ server/
 
 ### Dependencies
 
-- **Swift Package Manager**: WebSocketKit, SwiftNIO
-- **C++ Core**: CMake, Agora RTC SDK (vendored separately in `third_party/`)
+- **Swift Package Manager**: WebSocketKit, SwiftNIO, AgoraRtcEngine_macOS (auto-downloaded)
+- **C++ Core**: CMake, Agora RTC SDK (auto-downloaded from SPM distribution on macOS)
 - **Rust Server**: Axum, Tokio
 
 ## Configuration
