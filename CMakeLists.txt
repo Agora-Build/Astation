@@ -84,18 +84,23 @@ if(APPLE)
             "AGORA_SKIP_DOWNLOAD is ON. Provide a local SDK via -DAGORA_SDK_DIR=/path/to/sdk\n"
             "Expected structure: ${AGORA_SDK_DIR}/rtc_mac/<Framework>.xcframework/...")
     endif()
-    # Fail fast if any expected framework headers are missing.
-    set(AGORA_EXPECTED_HEADER_DIRS "")
+    # Fail fast if any expected framework bundles are missing.
+    set(AGORA_EXPECTED_FRAMEWORK_DIRS "")
     foreach(FW ${FRAMEWORKS})
-        list(APPEND AGORA_EXPECTED_HEADER_DIRS
-            "${AGORA_SDK_DIR}/rtc_mac/${FW}.xcframework/macos-arm64_x86_64/${FW}.framework/Headers"
+        list(APPEND AGORA_EXPECTED_FRAMEWORK_DIRS
+            "${AGORA_SDK_DIR}/rtc_mac/${FW}.xcframework/macos-arm64_x86_64/${FW}.framework"
         )
     endforeach()
-    foreach(HDR_DIR IN LISTS AGORA_EXPECTED_HEADER_DIRS)
-        if(NOT EXISTS "${HDR_DIR}")
-            message(FATAL_ERROR "Missing Agora framework headers at: ${HDR_DIR}")
+    foreach(FW_DIR IN LISTS AGORA_EXPECTED_FRAMEWORK_DIRS)
+        if(NOT EXISTS "${FW_DIR}")
+            message(FATAL_ERROR "Missing Agora framework bundle at: ${FW_DIR}")
         endif()
     endforeach()
+
+    # AgoraRtcKit must provide headers for the core build.
+    if(NOT EXISTS "${AGORA_HEADERS}")
+        message(FATAL_ERROR "Missing AgoraRtcKit headers at: ${AGORA_HEADERS}")
+    endif()
 
     file(GLOB AGORA_XCFRAMEWORK_HEADERS
         "${AGORA_SDK_DIR}/rtc_mac/*.xcframework/macos-arm64_x86_64/*.framework/Headers"
