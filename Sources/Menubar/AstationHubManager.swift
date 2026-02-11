@@ -16,6 +16,7 @@ class AstationHubManager: ObservableObject {
     let rtcManager = RTCManager()
     let authGrantController = AuthGrantController()
     let timeSync = TimeSync()
+    lazy var sessionLinkManager = SessionLinkManager(hubManager: self)
     @Published var projectLoadError: String?
 
     /// Station relay URL. Priority: AGORA_STATION_RELAY_URL env var > UserDefaults > default.
@@ -90,8 +91,9 @@ class AstationHubManager: ObservableObject {
         }
     }
 
-    /// Leave the current RTC channel.
+    /// Leave the current RTC channel and revoke all share links.
     func leaveRTCChannel() {
+        Task { await sessionLinkManager.revokeAll() }
         rtcManager.leaveChannel()
     }
     

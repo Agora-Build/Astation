@@ -211,6 +211,67 @@ class StatusBarController {
                 startShareItem.target = self
                 statusMenu.addItem(startShareItem)
             }
+
+            // Share Session Section
+            let linkManager = hubManager.sessionLinkManager
+            let linkCount = linkManager.activeLinks.count
+            let shareHeader = NSMenuItem(
+                title: "Share Links (\(linkCount)/\(linkManager.maxLinks))",
+                action: nil,
+                keyEquivalent: ""
+            )
+            shareHeader.isEnabled = false
+            statusMenu.addItem(shareHeader)
+
+            if linkManager.canCreateMore {
+                let createLinkItem = NSMenuItem(
+                    title: "Create Share Link",
+                    action: #selector(createShareLink),
+                    keyEquivalent: "s"
+                )
+                createLinkItem.target = self
+                statusMenu.addItem(createLinkItem)
+            }
+
+            for link in linkManager.activeLinks {
+                let linkSubmenu = NSMenu()
+
+                let copyItem = NSMenuItem(
+                    title: "Copy URL",
+                    action: #selector(copyShareLinkURL(_:)),
+                    keyEquivalent: ""
+                )
+                copyItem.target = self
+                copyItem.representedObject = link.url
+                linkSubmenu.addItem(copyItem)
+
+                let revokeItem = NSMenuItem(
+                    title: "Revoke",
+                    action: #selector(revokeShareLink(_:)),
+                    keyEquivalent: ""
+                )
+                revokeItem.target = self
+                revokeItem.representedObject = link.id
+                linkSubmenu.addItem(revokeItem)
+
+                let linkItem = NSMenuItem(
+                    title: "  \(link.id.prefix(8))...",
+                    action: nil,
+                    keyEquivalent: ""
+                )
+                linkItem.submenu = linkSubmenu
+                statusMenu.addItem(linkItem)
+            }
+
+            if !linkManager.activeLinks.isEmpty {
+                let revokeAllItem = NSMenuItem(
+                    title: "Revoke All Links",
+                    action: #selector(revokeAllShareLinks),
+                    keyEquivalent: ""
+                )
+                revokeAllItem.target = self
+                statusMenu.addItem(revokeAllItem)
+            }
         } else {
             let joinItem = NSMenuItem(
                 title: "Join Channel...",
@@ -383,6 +444,57 @@ class StatusBarController {
     @objc private func stopScreenShare() {
         hubManager.rtcManager.stopScreenShare()
         setupMenu()
+    }
+
+    @objc private func createShareLink() {
+        Task {
+            do {
+                let link = try await hubManager.sessionLinkManager.createLink()
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString(link.url, forType: .string)
+
+                await MainActor.run {
+                    let alert = NSAlert()
+                    alert.messageText = "Share Link Created"
+                    alert.informativeText = "Link copied to clipboard:\n\(link.url)"
+                    alert.alertStyle = .informational
+                    alert.runModal()
+                    setupMenu()
+                }
+            } catch {
+                await MainActor.run {
+                    let alert = NSAlert()
+                    alert.messageText = "Failed to Create Link"
+                    alert.informativeText = error.localizedDescription
+                    alert.alertStyle = .warning
+                    alert.runModal()
+                }
+            }
+        }
+    }
+
+    @objc private func copyShareLinkURL(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? String else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url, forType: .string)
+    }
+
+    @objc private func revokeShareLink(_ sender: NSMenuItem) {
+        guard let linkId = sender.representedObject as? String else { return }
+        guard let link = hubManager.sessionLinkManager.activeLinks.first(where: { $0.id == linkId }) else { return }
+        Task {
+            await hubManager.sessionLinkManager.revokeLink(link)
+            await MainActor.run { setupMenu() }
+        }
+    }
+
+    @objc private func revokeAllShareLinks() {
+        Task {
+            await hubManager.sessionLinkManager.revokeAll()
+            await MainActor.run { setupMenu() }
+        }
     }
 
     @objc private func toggleVoiceHotkey() {

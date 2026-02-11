@@ -1,0 +1,12 @@
+services:
+  webapp:
+    build: .
+    ports:
+      - "8080:80"
+    depends_on:
+      - api-server
+  api-server:
+    build: ../api-server
+    environment:
+      - RUST_LOG=info
+      - PORT=3000

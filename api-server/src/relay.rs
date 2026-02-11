@@ -477,6 +477,7 @@ mod tests {
         let state = crate::AppState {
             sessions: crate::session_store::SessionStore::new(),
             relay: RelayHub::new(),
+            rtc_sessions: crate::rtc_session::RtcSessionStore::new(),
         };
         Router::new()
             .route("/api/pair", axum::routing::post(create_pair_handler))

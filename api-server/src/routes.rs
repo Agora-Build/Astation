@@ -240,6 +240,7 @@ mod tests {
     use super::*;
     use crate::auth::create_session;
     use crate::relay::RelayHub;
+    use crate::rtc_session::RtcSessionStore;
     use crate::session_store::SessionStore;
     use axum::{
         body::Body,
@@ -253,6 +254,7 @@ mod tests {
         let state = AppState {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
         };
         Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -312,6 +314,7 @@ mod tests {
         let state = AppState {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -409,6 +412,7 @@ mod tests {
         let state = AppState {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -476,6 +480,7 @@ mod tests {
         let state = AppState {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -561,6 +566,7 @@ mod tests {
         let state = AppState {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
         };
         let session = create_session("my-machine");
         let session_id = session.id.clone();
@@ -611,6 +617,7 @@ mod tests {
         let state = AppState {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))

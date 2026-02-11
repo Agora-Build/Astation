@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Astation Session</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <!-- Loading State -->
+    <div id="loading" class="loading-container">
+        <div class="spinner"></div>
+        <p>Loading session...</p>
+    </div>
+
+    <!-- Error State -->
+    <div id="error" class="error-container" style="display: none;">
+        <div class="error-card">
+            <h1>Session Not Found</h1>
+            <p id="error-message">This session does not exist or has expired.</p>
+            <a href="/" class="btn">Go Home</a>
+        </div>
+    </div>
+
+    <!-- Name Input Dialog -->
+    <div id="name-dialog" class="dialog-overlay" style="display: none;">
+        <div class="dialog-card">
+            <h2>Join Session</h2>
+            <p id="session-info"></p>
+            <div class="form-group">
+                <label for="name-input">Your Name</label>
+                <input type="text" id="name-input" placeholder="Enter your name" maxlength="32" autocomplete="off">
+            </div>
+            <button id="join-btn" class="btn btn-primary" onclick="handleJoin()">Join</button>
+        </div>
+    </div>
+
+    <!-- Main App -->
+    <div id="app" class="app-container" style="display: none;">
+        <!-- Video Area -->
+        <div class="video-area" id="video-area">
+            <div id="video-main" class="video-main">
+                <div class="video-placeholder">
+                    <p>Waiting for screen share...</p>
+                </div>
+            </div>
+            <div id="video-grid" class="video-grid" style="display: none;"></div>
+        </div>
+
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <h3>Participants</h3>
+                <span id="participant-count" class="badge">0</span>
+            </div>
+            <ul id="user-list" class="user-list"></ul>
+        </div>
+
+        <!-- Bottom Bar -->
+        <div class="bottom-bar">
+            <div class="bottom-left">
+                <span id="display-name" class="display-name"></span>
+            </div>
+            <div class="bottom-center">
+                <button id="mic-btn" class="btn-icon" onclick="toggleMic()" title="Toggle Microphone">
+                    <svg id="mic-on-icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                        <line x1="12" y1="19" x2="12" y2="23"/>
+                        <line x1="8" y1="23" x2="16" y2="23"/>
+                    </svg>
+                    <svg id="mic-off-icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display: none;">
+                        <line x1="1" y1="1" x2="23" y2="23"/>
+                        <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/>
+                        <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2c0 .76-.13 1.49-.36 2.18"/>
+                        <line x1="12" y1="19" x2="12" y2="23"/>
+                        <line x1="8" y1="23" x2="16" y2="23"/>
+                    </svg>
+                </button>
+                <button class="btn-icon btn-leave" onclick="leave()" title="Leave Session">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+                        <polyline points="16 17 21 12 16 7"/>
+                        <line x1="21" y1="12" x2="9" y2="12"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="bottom-right">
+                <span id="channel-name" class="channel-name"></span>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://download.agora.io/sdk/release/AgoraRTC_N.js"></script>
+    <script src="/js/app.js"></script>
+</body>
+</html>

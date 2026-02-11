@@ -116,7 +116,7 @@ jobs:
             Astation-${{ github.ref_name }}-mac-arm64.tar.gz
 
   check-server-changes:
-    name: Check for server/ changes
+    name: Check for api-server/ changes
     runs-on: ubuntu-latest
     outputs:
       server_changed: ${{ steps.check.outputs.changed }}
@@ -125,7 +125,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check if server/ changed since last tag
+      - name: Check if api-server/ changed since last tag
         id: check
         run: |
           # Find the previous tag before the current one
@@ -133,15 +133,15 @@ jobs:
           PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${CURRENT_TAG}$" | head -1)
 
           if [ -z "$PREV_TAG" ]; then
-            echo "No previous tag found — treating server as changed"
+            echo "No previous tag found — treating api-server as changed"
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
-            CHANGED=$(git diff --name-only "$PREV_TAG" "$CURRENT_TAG" -- server/ | wc -l)
+            CHANGED=$(git diff --name-only "$PREV_TAG" "$CURRENT_TAG" -- api-server/ | wc -l)
             if [ "$CHANGED" -gt 0 ]; then
-              echo "server/ has $CHANGED changed files since $PREV_TAG"
+              echo "api-server/ has $CHANGED changed files since $PREV_TAG"
               echo "changed=true" >> "$GITHUB_OUTPUT"
             else
-              echo "No changes in server/ since $PREV_TAG — skipping Docker build"
+              echo "No changes in api-server/ since $PREV_TAG — skipping Docker build"
               echo "changed=false" >> "$GITHUB_OUTPUT"
             fi
           fi
@@ -177,13 +177,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run server tests
-        working-directory: server
+        working-directory: api-server
         run: cargo test
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
-          context: server
+          context: api-server
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
@@ -192,9 +192,74 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  check-webapp-changes:
+    name: Check for webapp/ changes
+    runs-on: ubuntu-latest
+    outputs:
+      webapp_changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if webapp/ changed since last tag
+        id: check
+        run: |
+          CURRENT_TAG="${GITHUB_REF_NAME}"
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${CURRENT_TAG}$" | head -1)
+
+          if [ -z "$PREV_TAG" ]; then
+            echo "No previous tag found — treating webapp as changed"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            CHANGED=$(git diff --name-only "$PREV_TAG" "$CURRENT_TAG" -- webapp/ | wc -l)
+            if [ "$CHANGED" -gt 0 ]; then
+              echo "webapp/ has $CHANGED changed files since $PREV_TAG"
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "No changes in webapp/ since $PREV_TAG — skipping Docker build"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+  build-webapp-docker:
+    name: Build Session Web App Docker Image
+    needs: check-webapp-changes
+    if: needs.check-webapp-changes.outputs.webapp_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version and lowercase owner
+        id: version
+        run: |
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: webapp
+          push: true
+          tags: |
+            ghcr.io/${{ steps.version.outputs.owner }}/station-webapp:${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.version.outputs.owner }}/station-webapp:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   release:
     name: Create GitHub Release
-    needs: [build-app, check-server-changes]
+    needs: [build-app, check-server-changes, check-webapp-changes]
     if: always() && needs.build-app.result == 'success'
     runs-on: ubuntu-latest
     steps:

@@ -30,6 +30,8 @@ class RTCManager {
     private var _isMicMuted: Bool = false
     private var _isScreenSharing: Bool = false
     private var _isInChannel: Bool = false
+    private var _currentChannel: String?
+    private var _currentUid: UInt32 = 0
 
     /// Called when an audio frame is received from the RTC engine.
     /// Parameters: (samples, sampleCount, channels, sampleRate)
@@ -53,6 +55,8 @@ class RTCManager {
     var isMicMuted: Bool { return _isMicMuted }
     var isScreenSharing: Bool { return _isScreenSharing }
     var isInChannel: Bool { return _isInChannel }
+    var currentChannel: String? { return _currentChannel }
+    var currentUid: UInt32 { return _currentUid }
 
     deinit {
         if engine != nil {
@@ -98,6 +102,8 @@ class RTCManager {
                 let channelStr = channel.map { String(cString: $0) } ?? ""
                 DispatchQueue.main.async {
                     mgr._isInChannel = true
+                    mgr._currentChannel = channelStr
+                    mgr._currentUid = uid
                     mgr.onJoinSuccess?(channelStr, uid)
                 }
             }
@@ -107,6 +113,8 @@ class RTCManager {
                 DispatchQueue.main.async {
                     mgr._isInChannel = false
                     mgr._isScreenSharing = false
+                    mgr._currentChannel = nil
+                    mgr._currentUid = 0
                     mgr.onLeave?()
                 }
             }
