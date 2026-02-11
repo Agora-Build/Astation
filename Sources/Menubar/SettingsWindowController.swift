@@ -15,9 +15,9 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     /// Returns the persisted Station relay URL.
-    /// Env var AGORA_STATION_URL takes priority over UserDefaults.
+    /// Env var AGORA_STATION_RELAY_URL takes priority over UserDefaults.
     static var currentStationURL: String {
-        if let envUrl = ProcessInfo.processInfo.environment["AGORA_STATION_URL"], !envUrl.isEmpty {
+        if let envUrl = ProcessInfo.processInfo.environment["AGORA_STATION_RELAY_URL"], !envUrl.isEmpty {
             return envUrl
         }
         let saved = UserDefaults.standard.string(forKey: stationURLKey) ?? ""
@@ -93,8 +93,8 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         stationUrlField.placeholderString = SettingsWindowController.defaultStationURL
         let savedStation = UserDefaults.standard.string(forKey: SettingsWindowController.stationURLKey) ?? ""
         stationUrlField.stringValue = savedStation
-        if ProcessInfo.processInfo.environment["AGORA_STATION_URL"] != nil {
-            stationUrlField.placeholderString = "Overridden by AGORA_STATION_URL env var"
+        if ProcessInfo.processInfo.environment["AGORA_STATION_RELAY_URL"] != nil {
+            stationUrlField.placeholderString = "Overridden by AGORA_STATION_RELAY_URL env var"
         }
         contentView.addSubview(stationUrlField)
 

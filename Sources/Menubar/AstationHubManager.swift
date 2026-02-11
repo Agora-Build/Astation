@@ -17,8 +17,8 @@ class AstationHubManager: ObservableObject {
     let authGrantController = AuthGrantController()
     @Published var projectLoadError: String?
 
-    /// Station relay URL. Priority: AGORA_STATION_URL env var > UserDefaults > default.
-    var stationUrl: String {
+    /// Station relay URL. Priority: AGORA_STATION_RELAY_URL env var > UserDefaults > default.
+    var stationRelayUrl: String {
         SettingsWindowController.currentStationURL
     }
 
@@ -501,10 +501,10 @@ class AstationHubManager: ObservableObject {
     /// Connect to a remote Atem via the relay service using a pairing code.
     func connectToRelay(code: String) {
         let wsScheme: String
-        if stationUrl.hasPrefix("https://") {
-            wsScheme = stationUrl.replacingOccurrences(of: "https://", with: "wss://")
+        if stationRelayUrl.hasPrefix("https://") {
+            wsScheme = stationRelayUrl.replacingOccurrences(of: "https://", with: "wss://")
         } else {
-            wsScheme = stationUrl.replacingOccurrences(of: "http://", with: "ws://")
+            wsScheme = stationRelayUrl.replacingOccurrences(of: "http://", with: "ws://")
         }
         let wsUrl = "\(wsScheme)/ws?role=astation&code=\(code)"
 
