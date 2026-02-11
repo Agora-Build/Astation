@@ -134,9 +134,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version from tag
+      - name: Extract version and lowercase owner
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -152,8 +154,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/astation-server:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/astation-server:latest
+            ghcr.io/${{ steps.version.outputs.owner }}/astation-server:${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.version.outputs.owner }}/astation-server:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
