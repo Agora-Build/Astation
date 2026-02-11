@@ -16,17 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download Agora RTC SDK
-        run: |
-          curl -L -o agora_sdk.zip "https://download.agora.io/sdk/release/Agora_Native_SDK_for_Mac_FULL.zip"
-          unzip -q agora_sdk.zip
-          mkdir -p third_party/agora/rtc_mac/libs
-          # Find the extracted folder (version may vary)
-          SDK_DIR=$(find . -maxdepth 1 -type d -name "Agora_Native_SDK_for_Mac_*" | head -1)
-          mv "$SDK_DIR"/libs/*.xcframework third_party/agora/rtc_mac/libs/
-          ls -la third_party/agora/rtc_mac/libs/
-          echo "Agora RTC SDK downloaded and extracted"
-
       - name: Build astation_core static library
         run: |
           mkdir -p build && cd build
@@ -68,7 +57,7 @@ jobs:
           cp .build/release/astation "$APP_DIR/MacOS/Astation"
 
           # Bundle Agora RTC SDK frameworks into the app
-          AGORA_LIBS="third_party/agora/rtc_mac/libs"
+          AGORA_LIBS="third_party/agora/rtc_mac"
           PLATFORM="macos-arm64_x86_64"
           for xcfw in "$AGORA_LIBS"/*.xcframework; do
             FW_NAME=$(basename "$xcfw" .xcframework)
