@@ -73,8 +73,8 @@ struct AStationRtcEngineImpl
                 media_engine->registerAudioFrameObserver(nullptr);
                 media_engine = nullptr;
             }
-            // sync release — blocks until SDK is fully torn down
-            rtc_engine->release(true);
+            // Release engine (newer SDK uses callback instead of sync bool)
+            rtc_engine->release(nullptr);
             rtc_engine = nullptr;
         }
     }
@@ -93,14 +93,14 @@ struct AStationRtcEngineImpl
         agora::rtc::RtcEngineContext ctx;
         ctx.appId = app_id.c_str();
         ctx.eventHandler = this;
-        ctx.channelProfile = agora::CHANNEL_PROFILE_LIVE_BROADCASTING;
-        ctx.audioScenario = agora::AUDIO_SCENARIO_DEFAULT;
+        ctx.channelProfile = agora::rtc::CHANNEL_PROFILE_LIVE_BROADCASTING;
+        ctx.audioScenario = agora::rtc::AUDIO_SCENARIO_DEFAULT;
 
         int ret = rtc_engine->initialize(ctx);
         if (ret != 0) {
             std::fprintf(stderr,
                 "[AStationRtc] initialize() failed: %d\n", ret);
-            rtc_engine->release(true);
+            rtc_engine->release(nullptr);
             rtc_engine = nullptr;
             return false;
         }
@@ -111,7 +111,7 @@ struct AStationRtcEngineImpl
         }
 
         // Set role to broadcaster so we can publish mic/screen
-        rtc_engine->setClientRole(agora::CLIENT_ROLE_BROADCASTER);
+        rtc_engine->setClientRole(agora::rtc::CLIENT_ROLE_BROADCASTER);
 
         // Obtain the media engine for audio frame observation (feeds VAD pipeline)
         void* media_ptr = nullptr;
