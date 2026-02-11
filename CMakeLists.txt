@@ -14,87 +14,80 @@ target_include_directories(astation_core
 )
 
 # Locate Agora RTC SDK headers per platform.
-# SDK layout:
-#   macOS:   third_party/agora/rtc_mac/libs/AgoraRtcKit.xcframework/.../Headers/
-#   Linux:   third_party/agora/rtc_linux/include/
-#   Windows: third_party/agora/rtc_win/include/
+# On macOS: Download from Agora's SPM distribution (individual xcframework zips)
+# On Linux/Windows: Look for manually extracted SDK
 set(AGORA_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/agora")
+set(AGORA_VERSION "4.6.2")
 
 if(APPLE)
-    set(AGORA_HEADERS "${AGORA_SDK_DIR}/rtc_mac/libs/AgoraRtcKit.xcframework/macos-arm64_x86_64/AgoraRtcKit.framework/Versions/A/Headers")
+    set(AGORA_HEADERS "${AGORA_SDK_DIR}/rtc_mac/AgoraRtcKit.xcframework/macos-arm64_x86_64/AgoraRtcKit.framework/Headers")
 elseif(UNIX)
     set(AGORA_HEADERS "${AGORA_SDK_DIR}/rtc_linux/include")
 elseif(WIN32)
     set(AGORA_HEADERS "${AGORA_SDK_DIR}/rtc_win/include")
 endif()
 
-if(NOT EXISTS "${AGORA_HEADERS}")
-    message(STATUS "Agora RTC SDK not found at: ${AGORA_HEADERS}")
-    message(STATUS "Attempting to download Agora RTC SDK...")
+# Auto-download SDK if missing (macOS only, uses SPM distribution URLs)
+if(APPLE AND NOT EXISTS "${AGORA_HEADERS}")
+    message(STATUS "Agora RTC SDK not found, downloading from SPM distribution...")
 
-    if(APPLE)
-        set(SDK_URL "https://download.agora.io/sdk/release/Agora_Native_SDK_for_Mac_FULL.zip")
-        set(SDK_ZIP "${CMAKE_CURRENT_BINARY_DIR}/agora_sdk.zip")
+    set(BASE_URL "https://download.agora.io/swiftpm/AgoraRtcEngine_macOS/${AGORA_VERSION}")
+    set(FRAMEWORKS
+        "AgoraRtcKit"
+        "Agorafdkaac"
+        "Agoraffmpeg"
+        "AgoraSoundTouch"
+        "video_dec"
+        "AgoraScreenCaptureExtension"
+        "AgoraAiNoiseSuppressionExtension"
+    )
 
-        # Download SDK
-        file(DOWNLOAD "${SDK_URL}" "${SDK_ZIP}"
+    file(MAKE_DIRECTORY "${AGORA_SDK_DIR}/rtc_mac")
+
+    foreach(FW ${FRAMEWORKS})
+        set(ZIP_FILE "${CMAKE_CURRENT_BINARY_DIR}/${FW}.xcframework.zip")
+        set(ZIP_URL "${BASE_URL}/${FW}.xcframework.zip")
+
+        message(STATUS "Downloading ${FW}.xcframework...")
+        file(DOWNLOAD "${ZIP_URL}" "${ZIP_FILE}"
              SHOW_PROGRESS
              STATUS DOWNLOAD_STATUS)
 
         list(GET DOWNLOAD_STATUS 0 DOWNLOAD_ERROR)
         if(NOT DOWNLOAD_ERROR EQUAL 0)
-            message(FATAL_ERROR "Failed to download Agora RTC SDK from ${SDK_URL}")
+            message(FATAL_ERROR "Failed to download ${FW} from ${ZIP_URL}")
         endif()
 
-        # Extract SDK
-        message(STATUS "Extracting Agora RTC SDK...")
+        message(STATUS "Extracting ${FW}.xcframework...")
         execute_process(
-            COMMAND ${CMAKE_COMMAND} -E tar xzf "${SDK_ZIP}"
-            WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+            COMMAND ${CMAKE_COMMAND} -E tar xzf "${ZIP_FILE}"
+            WORKING_DIRECTORY "${AGORA_SDK_DIR}/rtc_mac"
             RESULT_VARIABLE EXTRACT_RESULT
         )
 
         if(NOT EXTRACT_RESULT EQUAL 0)
-            message(FATAL_ERROR "Failed to extract Agora RTC SDK")
+            message(FATAL_ERROR "Failed to extract ${FW}.xcframework")
         endif()
 
-        # Find extracted directory
-        file(GLOB SDK_EXTRACTED_DIRS "${CMAKE_CURRENT_BINARY_DIR}/Agora_Native_SDK_for_Mac_*")
-        list(GET SDK_EXTRACTED_DIRS 0 SDK_EXTRACTED_DIR)
+        file(REMOVE "${ZIP_FILE}")
+        message(STATUS "Installed: ${FW}.xcframework")
+    endforeach()
 
-        # Move xcframeworks to expected location
-        file(MAKE_DIRECTORY "${AGORA_SDK_DIR}/rtc_mac/libs")
-        file(GLOB XCFRAMEWORKS "${SDK_EXTRACTED_DIR}/libs/*.xcframework")
-        foreach(XCFW ${XCFRAMEWORKS})
-            get_filename_component(XCFW_NAME ${XCFW} NAME)
-            file(COPY ${XCFW} DESTINATION "${AGORA_SDK_DIR}/rtc_mac/libs/")
-            message(STATUS "Installed: ${XCFW_NAME}")
-        endforeach()
-
-        # Clean up
-        file(REMOVE "${SDK_ZIP}")
-        file(REMOVE_RECURSE "${SDK_EXTRACTED_DIR}")
-
-        message(STATUS "Agora RTC SDK installed to ${AGORA_SDK_DIR}/rtc_mac/libs/")
-    elseif(UNIX)
-        message(FATAL_ERROR
-            "Agora RTC SDK not found at: ${AGORA_HEADERS}\n"
-            "Download from https://docs.agora.io/en/sdks?platform=linux and extract to third_party/agora/rtc_linux/")
-    elseif(WIN32)
-        message(FATAL_ERROR
-            "Agora RTC SDK not found at: ${AGORA_HEADERS}\n"
-            "Download from https://docs.agora.io/en/sdks?platform=windows and extract to third_party/agora/rtc_win/")
-    endif()
+    message(STATUS "Agora RTC SDK installed to ${AGORA_SDK_DIR}/rtc_mac/")
 endif()
 
 if(EXISTS "${AGORA_HEADERS}")
     target_include_directories(astation_core PRIVATE "${AGORA_HEADERS}")
     message(STATUS "Agora RTC SDK headers: ${AGORA_HEADERS}")
 else()
-    message(FATAL_ERROR "Agora RTC SDK installation failed")
+    message(FATAL_ERROR
+        "Agora RTC SDK not found at: ${AGORA_HEADERS}\n"
+        "macOS: Run cmake again to auto-download\n"
+        "Linux: Download from https://docs.agora.io/en/sdks?platform=linux\n"
+        "Windows: Download from https://docs.agora.io/en/sdks?platform=windows")
 endif()
 
-# On Linux, also add library search path for linking
+# On Linux/Windows, add library search paths
 if(UNIX AND NOT APPLE)
     set(AGORA_LIBS_DIR "${AGORA_SDK_DIR}/rtc_linux/libs")
     if(EXISTS "${AGORA_LIBS_DIR}")
