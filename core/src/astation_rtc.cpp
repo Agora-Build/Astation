@@ -93,7 +93,7 @@ struct AStationRtcEngineImpl
         agora::rtc::RtcEngineContext ctx;
         ctx.appId = app_id.c_str();
         ctx.eventHandler = this;
-        ctx.channelProfile = agora::rtc::CHANNEL_PROFILE_LIVE_BROADCASTING;
+        ctx.channelProfile = agora::CHANNEL_PROFILE_LIVE_BROADCASTING;
         ctx.audioScenario = agora::rtc::AUDIO_SCENARIO_DEFAULT;
 
         int ret = rtc_engine->initialize(ctx);
