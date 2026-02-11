@@ -159,4 +159,18 @@ int astation_rtc_set_token(AStationRtcEngine* engine, const char* token) {
     return 0;
 }
 
+int astation_rtc_set_channel(AStationRtcEngine* engine, const char* channel, uint32_t uid) {
+    if (!engine) {
+        return -1;
+    }
+    auto* impl = reinterpret_cast<AStationRtcEngineImpl*>(engine);
+    impl->channel = (channel ? channel : "");
+    impl->uid = uid;
+    std::fprintf(stderr,
+        "[AStationRtc] Channel set to %s uid=%u (stub)\n",
+        impl->channel.c_str(),
+        impl->uid);
+    return 0;
+}
+
 } // extern "C"

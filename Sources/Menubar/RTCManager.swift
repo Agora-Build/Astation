@@ -148,7 +148,7 @@ class RTCManager {
             throw RTCError.engineCreationFailed
         }
         engine = created
-        print("[RTCManager] Engine initialized with appId=\(appId)")
+        Log.info("[RTCManager] Engine initialized with appId=\(appId)")
     }
 
     // MARK: - Channel
@@ -156,28 +156,31 @@ class RTCManager {
     /// Join an RTC channel with the given token, channel name, and uid.
     func joinChannel(token: String, channel: String, uid: UInt32) {
         guard let engine = engine else {
-            print("[RTCManager] Cannot join: engine not initialized")
+            Log.info("[RTCManager] Cannot join: engine not initialized")
             return
         }
-        // Update token and channel config before joining
+        // Update channel, uid, and token on the engine before joining
+        channel.withCString { channelPtr in
+            _ = astation_rtc_set_channel(engine, channelPtr, uid)
+        }
         token.withCString { tokenPtr in
             _ = astation_rtc_set_token(engine, tokenPtr)
         }
         let result = astation_rtc_join(engine)
         if result != 0 {
-            print("[RTCManager] Join failed with code \(result)")
+            Log.info("[RTCManager] Join failed with code \(result)")
         }
     }
 
     /// Leave the current RTC channel.
     func leaveChannel() {
         guard let engine = engine else {
-            print("[RTCManager] Cannot leave: engine not initialized")
+            Log.info("[RTCManager] Cannot leave: engine not initialized")
             return
         }
         let result = astation_rtc_leave(engine)
         if result != 0 {
-            print("[RTCManager] Leave failed with code \(result)")
+            Log.info("[RTCManager] Leave failed with code \(result)")
         }
     }
 
@@ -186,7 +189,7 @@ class RTCManager {
     /// Mute or unmute the local microphone.
     func muteMic(_ mute: Bool) {
         guard let engine = engine else {
-            print("[RTCManager] Cannot mute: engine not initialized")
+            Log.info("[RTCManager] Cannot mute: engine not initialized")
             return
         }
         let result = astation_rtc_mute_mic(engine, mute ? 1 : 0)
@@ -200,7 +203,7 @@ class RTCManager {
     /// Start screen sharing on the given display.
     func startScreenShare(displayId: UInt32) {
         guard let engine = engine else {
-            print("[RTCManager] Cannot screen share: engine not initialized")
+            Log.info("[RTCManager] Cannot screen share: engine not initialized")
             return
         }
         let result = astation_rtc_enable_screen_share(engine, Int32(displayId))
@@ -212,7 +215,7 @@ class RTCManager {
     /// Stop screen sharing.
     func stopScreenShare() {
         guard let engine = engine else {
-            print("[RTCManager] Cannot stop screen share: engine not initialized")
+            Log.info("[RTCManager] Cannot stop screen share: engine not initialized")
             return
         }
         let result = astation_rtc_stop_screen_share(engine)

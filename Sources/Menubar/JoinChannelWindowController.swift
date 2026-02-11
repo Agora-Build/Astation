@@ -153,7 +153,7 @@ class JoinChannelWindowController: NSObject, NSWindowDelegate {
         statusLabel.textColor = .systemBlue
         joinButton.isEnabled = false
 
-        print("[JoinChannel] Joining channel=\(channel) uid=\(uid) project=\(project.name)")
+        Log.info("[JoinChannel] Joining channel=\(channel) uid=\(uid) project=\(project.name)")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             self?.window?.close()

@@ -34,7 +34,7 @@ class StatusBarController {
         setupMenu()
         statusItem.menu = statusMenu
         
-        print("📊 Status bar controller initialized")
+        Log.info(" Status bar controller initialized")
     }
     
     private func setupMenu() {
@@ -356,12 +356,12 @@ class StatusBarController {
     }
     
     @objc private func showProjects() {
-        print("📋 Show projects requested from status bar")
+        Log.info(" Show projects requested from status bar")
         projectsWindowController.showWindow()
     }
     
     @objc private func showConnections() {
-        print("🔌 Show connections requested from status bar")
+        Log.info(" Show connections requested from status bar")
         let clientCount = webSocketServer.getConnectedClientsCount()
         let clients = hubManager.connectedClients
         
@@ -385,7 +385,7 @@ class StatusBarController {
         pasteboard.clearContents()
         pasteboard.setString(url, forType: .string)
 
-        print("📋 WebSocket URL copied to clipboard: \(url)")
+        Log.info(" WebSocket URL copied to clipboard: \(url)")
 
         let alert = NSAlert()
         alert.messageText = "URL Copied"
@@ -400,7 +400,7 @@ class StatusBarController {
         pasteboard.clearContents()
         pasteboard.setString(url, forType: .string)
 
-        print("📋 Station URL copied to clipboard: \(url)")
+        Log.info(" Station URL copied to clipboard: \(url)")
 
         let alert = NSAlert()
         alert.messageText = "URL Copied"
@@ -517,7 +517,7 @@ class StatusBarController {
 
         if headerTapCount >= 5 {
             headerTapCount = 0
-            print("[StatusBar] Dev Console activated via 5-tap")
+            Log.info("[StatusBar] Dev Console activated via 5-tap")
             devConsoleController.showWindow()
         }
     }
@@ -527,12 +527,12 @@ class StatusBarController {
     }
 
     @objc private func quitApplication() {
-        print("🛑 Quit requested from status bar")
+        Log.info(" Quit requested from status bar")
         NSApp.terminate(nil)
     }
     
     func showStatus() {
-        print("📊 Status bar menu opened")
+        Log.info(" Status bar menu opened")
         setupMenu() // Refresh menu with current data
     }
     

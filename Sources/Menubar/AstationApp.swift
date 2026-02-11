@@ -9,7 +9,7 @@ class AstationApp: NSObject, NSApplicationDelegate {
     private var hotkeyManager: HotkeyManager?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
-        print("🔧 Initializing Astation components...")
+        Log.info("Initializing Astation components...")
 
         // Set up a main menu with Edit submenu so Cmd+C/V/X work in text fields.
         // Accessory apps don't get a default menu bar, so we create one manually.
@@ -53,9 +53,9 @@ class AstationApp: NSObject, NSApplicationDelegate {
         // Start WebSocket server
         do {
             try webSocketServer.start(host: "127.0.0.1", port: 8080)
-            print("🌐 WebSocket server started on ws://127.0.0.1:8080")
+            Log.info("WebSocket server started on ws://127.0.0.1:8080")
         } catch {
-            print("❌ Failed to start WebSocket server: \(error)")
+            Log.error("Failed to start WebSocket server: \(error)")
             NSApp.terminate(nil)
             return
         }
@@ -82,16 +82,17 @@ class AstationApp: NSObject, NSApplicationDelegate {
         }
         hotkeyManager?.registerHotkeys()
 
-        print("🎉 Astation fully operational!")
-        print("📡 Ready for Atem connections on ws://127.0.0.1:8080")
-        print("⌨️  Global hotkeys: Ctrl+V (voice), Ctrl+Shift+V (video)")
+        Log.info("Astation fully operational!")
+        Log.info("Ready for Atem connections on ws://127.0.0.1:8080")
+        Log.info("Global hotkeys: Ctrl+V (voice), Ctrl+Shift+V (video)")
+        Log.info("Log file: \(Log.logFile.path)")
     }
     
     func applicationWillTerminate(_ notification: Notification) {
-        print("🛑 Shutting down Astation...")
+        Log.info("Shutting down Astation...")
         hotkeyManager?.unregisterAll()
         webSocketServer?.stop()
-        print("👋 Astation terminated")
+        Log.info("Astation terminated")
     }
     
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -104,11 +105,11 @@ class AstationApp: NSObject, NSApplicationDelegate {
     @objc func handleURLEvent(_ event: NSAppleEventDescriptor, withReply replyEvent: NSAppleEventDescriptor) {
         guard let urlString = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue,
               let url = URL(string: urlString) else {
-            print("❌ Invalid URL event received")
+            Log.error(" Invalid URL event received")
             return
         }
 
-        print("🔗 Received URL: \(urlString)")
+        Log.info(" Received URL: \(urlString)")
         handleDeepLink(url)
     }
 
@@ -119,7 +120,7 @@ class AstationApp: NSObject, NSApplicationDelegate {
         case "auth":
             handleAuthDeepLink(url)
         default:
-            print("⚠️ Unknown deep link path: \(url.host ?? "nil")")
+            Log.warn(" Unknown deep link path: \(url.host ?? "nil")")
         }
     }
 
@@ -131,7 +132,7 @@ class AstationApp: NSObject, NSApplicationDelegate {
 
         guard let sessionId = params["id"],
               let hostname = params["tag"] else {
-            print("❌ Auth deep link missing required parameters (id, tag)")
+            Log.error(" Auth deep link missing required parameters (id, tag)")
             return
         }
 

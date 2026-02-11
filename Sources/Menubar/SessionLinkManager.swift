@@ -87,7 +87,7 @@ class SessionLinkManager {
         )
 
         activeLinks.append(link)
-        print("[SessionLinkManager] Created link: \(linkUrl)")
+        Log.info("[SessionLinkManager] Created link: \(linkUrl)")
         return link
     }
 
@@ -102,11 +102,11 @@ class SessionLinkManager {
         do {
             let _ = try await URLSession.shared.data(for: request)
         } catch {
-            print("[SessionLinkManager] Failed to revoke link \(link.id): \(error)")
+            Log.info("[SessionLinkManager] Failed to revoke link \(link.id): \(error)")
         }
 
         activeLinks.removeAll { $0.id == link.id }
-        print("[SessionLinkManager] Revoked link: \(link.id)")
+        Log.info("[SessionLinkManager] Revoked link: \(link.id)")
     }
 
     /// Revoke all active session links.

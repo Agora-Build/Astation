@@ -34,6 +34,7 @@ int astation_rtc_mute_mic(AStationRtcEngine* engine, int mute);
 int astation_rtc_enable_screen_share(AStationRtcEngine* engine, int display_id);
 int astation_rtc_stop_screen_share(AStationRtcEngine* engine);
 int astation_rtc_set_token(AStationRtcEngine* engine, const char* token);
+int astation_rtc_set_channel(AStationRtcEngine* engine, const char* channel, uint32_t uid);
 
 #ifdef __cplusplus
 }

@@ -33,7 +33,7 @@ class AstationHubManager: ObservableObject {
     var sendHandler: ((AstationMessage, String) -> Void)?
 
     init() {
-        print("[AstationHub] Initializing Astation Hub Manager")
+        Log.info("Initializing Astation Hub Manager")
         setupRTCManager()
         checkCredentialStatus()
         loadProjects()
@@ -53,23 +53,23 @@ class AstationHubManager: ObservableObject {
         }
 
         rtcManager.onJoinSuccess = { channel, uid in
-            print("[AstationHub] RTC joined channel=\(channel) uid=\(uid)")
+            Log.info("RTC joined channel=\(channel) uid=\(uid)")
         }
 
         rtcManager.onLeave = {
-            print("[AstationHub] RTC left channel")
+            Log.info("RTC left channel")
         }
 
         rtcManager.onError = { code, message in
-            print("[AstationHub] RTC error \(code): \(message)")
+            Log.error("RTC error \(code): \(message)")
         }
 
         rtcManager.onUserJoined = { uid in
-            print("[AstationHub] Remote user joined: \(uid)")
+            Log.info("Remote user joined: \(uid)")
         }
 
         rtcManager.onUserLeft = { uid in
-            print("[AstationHub] Remote user left: \(uid)")
+            Log.info("Remote user left: \(uid)")
         }
     }
 
@@ -77,9 +77,9 @@ class AstationHubManager: ObservableObject {
     func initializeRTC(appId: String) {
         do {
             try rtcManager.initialize(appId: appId)
-            print("[AstationHub] RTC engine initialized")
+            Log.info("RTC engine initialized")
         } catch {
-            print("[AstationHub] Failed to initialize RTC: \(error)")
+            Log.error("Failed to initialize RTC: \(error)")
         }
     }
 
@@ -105,9 +105,9 @@ class AstationHubManager: ObservableObject {
     
     func checkCredentialStatus() {
         if credentialManager.hasCredentials {
-            print("[AstationHub] Credentials found in encrypted storage")
+            Log.info("[AstationHub] Credentials found in encrypted storage")
         } else {
-            print("[AstationHub] No credentials configured. Open Settings to add Agora credentials.")
+            Log.info("[AstationHub] No credentials configured. Open Settings to add Agora credentials.")
         }
     }
 
@@ -121,7 +121,7 @@ class AstationHubManager: ObservableObject {
     /// Load projects: try real API first, fall back to empty list with error message.
     private func loadProjects() {
         guard let credentials = credentialManager.load() else {
-            print("[AstationHub] No credentials — cannot fetch projects. Open Settings to configure.")
+            Log.info("[AstationHub] No credentials — cannot fetch projects. Open Settings to configure.")
             DispatchQueue.main.async {
                 self.projects = []
                 self.projectLoadError = "No credentials configured"
@@ -135,13 +135,13 @@ class AstationHubManager: ObservableObject {
                 await MainActor.run {
                     self.projects = fetched
                     self.projectLoadError = nil
-                    print("📋 Loaded \(fetched.count) projects from Agora Console API")
+                    Log.info(" Loaded \(fetched.count) projects from Agora Console API")
                 }
             } catch {
                 await MainActor.run {
                     self.projects = []
                     self.projectLoadError = error.localizedDescription
-                    print("❌ Failed to fetch projects: \(error)")
+                    Log.error(" Failed to fetch projects: \(error)")
                 }
             }
         }
@@ -168,7 +168,7 @@ class AstationHubManager: ObservableObject {
         }
 
         guard let project = project, !project.signKey.isEmpty else {
-            print("⚠️ No project with certificate found — returning empty token")
+            Log.warn(" No project with certificate found — returning empty token")
             return TokenResponse(token: "", channel: channel, uid: uid, expiresIn: "0")
         }
 
@@ -183,7 +183,7 @@ class AstationHubManager: ObservableObject {
             issuedAt: issuedAt
         )
 
-        print("🔑 Generated RTC token for channel '\(channel)', uid '\(uid)' (issued_at=\(issuedAt))")
+        Log.info(" Generated RTC token for channel '\(channel)', uid '\(uid)' (issued_at=\(issuedAt))")
 
         return TokenResponse(
             token: token,
@@ -198,7 +198,7 @@ class AstationHubManager: ObservableObject {
     func addClient(_ client: ConnectedClient) {
         DispatchQueue.main.async {
             self.connectedClients.append(client)
-            print("👥 Client connected: \(client.id) (\(client.clientType))")
+            Log.info(" Client connected: \(client.id) (\(client.clientType))")
             self.broadcastInstanceList()
         }
     }
@@ -206,7 +206,7 @@ class AstationHubManager: ObservableObject {
     func removeClient(withId clientId: String) {
         DispatchQueue.main.async {
             self.connectedClients.removeAll { $0.id == clientId }
-            print("👋 Client disconnected: \(clientId)")
+            Log.info(" Client disconnected: \(clientId)")
             self.broadcastInstanceList()
         }
     }
@@ -218,7 +218,7 @@ class AstationHubManager: ObservableObject {
     // MARK: - Claude Code Integration
     
     func launchClaudeCode(withContext context: String? = nil) -> Bool {
-        print("🤖 Launching Claude Code...")
+        Log.info(" Launching Claude Code...")
         
         let task = Process()
         task.launchPath = "/usr/bin/env"
@@ -233,10 +233,10 @@ class AstationHubManager: ObservableObject {
             DispatchQueue.main.async {
                 self.isClaudeRunning = true
             }
-            print("✅ Claude Code launched successfully")
+            Log.info(" Claude Code launched successfully")
             return true
         } catch {
-            print("❌ Failed to launch Claude Code: \(error)")
+            Log.error(" Failed to launch Claude Code: \(error)")
             return false
         }
     }
@@ -259,11 +259,11 @@ class AstationHubManager: ObservableObject {
     func handleMessage(_ message: AstationMessage, from clientId: String) -> AstationMessage? {
         switch message {
         case .projectListRequest:
-            print("📋 Project list requested by client: \(clientId)")
+            Log.info(" Project list requested by client: \(clientId)")
             return .projectListResponse(projects: getProjects(), timestamp: Date())
             
         case .tokenRequest(let channel, let uid, let projectId):
-            print("🔑 Token requested by client: \(clientId) for \(channel)/\(uid)")
+            Log.info(" Token requested by client: \(clientId) for \(channel)/\(uid)")
             Task {
                 let tokenResponse = await generateRTCToken(channel: channel, uid: uid, projectId: projectId)
                 let response = AstationMessage.tokenResponse(
@@ -274,12 +274,12 @@ class AstationHubManager: ObservableObject {
             return nil
             
         case .userCommand(let command, let context):
-            print("💻 User command from \(clientId): \(command)")
+            Log.info(" User command from \(clientId): \(command)")
             handleUserCommand(command, context: context)
             return nil
             
         case .statusUpdate(let status, let data):
-            print("📊 Status update from \(clientId): \(status)")
+            Log.info(" Status update from \(clientId): \(status)")
             // Capture hostname/tag from the status update to track this Atem instance
             updateClientActivity(
                 clientId: clientId,
@@ -289,7 +289,7 @@ class AstationHubManager: ObservableObject {
             return nil
 
         case .authRequest(let sessionId, let hostname, let otp, let timestamp):
-            print("🔐 Auth request from \(clientId): session=\(sessionId), host=\(hostname)")
+            Log.info(" Auth request from \(clientId): session=\(sessionId), host=\(hostname)")
             let request = AuthRequest(sessionId: sessionId, hostname: hostname, otp: otp, timestamp: timestamp)
             DispatchQueue.main.async {
                 let session = self.authGrantController.handleAuthRequest(request)
@@ -298,17 +298,17 @@ class AstationHubManager: ObservableObject {
             return nil  // Response sent asynchronously via notification
 
         case .markTaskNotify(let taskId, let status, let description):
-            print("📌 Mark task notify: \(taskId) — \(description)")
+            Log.info(" Mark task notify: \(taskId) — \(description)")
             handleMarkTaskNotify(taskId: taskId, status: status, description: description)
             return nil
 
         case .markTaskResult(let taskId, let success, let message):
-            print("📌 Mark task result: \(taskId) success=\(success) — \(message)")
+            Log.info(" Mark task result: \(taskId) success=\(success) — \(message)")
             handleMarkTaskResult(taskId: taskId, success: success, message: message)
             return nil
 
         default:
-            print("ℹ️ Unhandled message type from client: \(clientId)")
+            Log.debug(" Unhandled message type from client: \(clientId)")
             return nil
         }
     }
@@ -317,12 +317,12 @@ class AstationHubManager: ObservableObject {
 
     func handleAuthResult(_ session: AuthSession) {
         guard let granted = session.granted else {
-            print("[AstationHub] Auth session \(session.request.sessionId) still pending")
+            Log.info("[AstationHub] Auth session \(session.request.sessionId) still pending")
             return
         }
 
         if granted {
-            print("✅ Auth granted for \(session.request.hostname), token: \(session.sessionToken?.prefix(8) ?? "nil")...")
+            Log.info(" Auth granted for \(session.request.hostname), token: \(session.sessionToken?.prefix(8) ?? "nil")...")
 
             let response = AstationMessage.authResponse(
                 sessionId: session.request.sessionId,
@@ -332,7 +332,7 @@ class AstationHubManager: ObservableObject {
             )
             broadcastAuthResponse(response, sessionId: session.request.sessionId)
         } else {
-            print("❌ Auth denied for \(session.request.hostname)")
+            Log.error(" Auth denied for \(session.request.hostname)")
 
             let response = AstationMessage.authResponse(
                 sessionId: session.request.sessionId,
@@ -367,7 +367,7 @@ class AstationHubManager: ObservableObject {
 
         let message = AstationMessage.voiceToggle(active: voiceActive)
         broadcastHandler?(message)
-        print("[AstationHub] Voice toggled: \(voiceActive ? "active" : "muted")")
+        Log.info("[AstationHub] Voice toggled: \(voiceActive ? "active" : "muted")")
     }
 
     /// Toggle video (screen share) and broadcast state to all connected Atems.
@@ -384,7 +384,7 @@ class AstationHubManager: ObservableObject {
 
         let message = AstationMessage.videoToggle(active: videoActive)
         broadcastHandler?(message)
-        print("[AstationHub] Video toggled: \(videoActive ? "sharing" : "off")")
+        Log.info("[AstationHub] Video toggled: \(videoActive ? "sharing" : "off")")
     }
 
     // MARK: - Atem Instance Management
@@ -446,13 +446,13 @@ class AstationHubManager: ObservableObject {
     /// Called by the transcription pipeline when speech-to-text produces text.
     func sendVoiceCommand(text: String, isFinal: Bool) {
         guard let clientId = routeToFocusedAtem() else {
-            print("🎤 No Atem connected — voice command dropped: \(text)")
+            Log.info(" No Atem connected — voice command dropped: \(text)")
             return
         }
 
         let message = AstationMessage.voiceCommand(text: text, isFinal: isFinal)
         sendHandler?(message, clientId)
-        print("🎤 Voice command → \(clientId): \(text)\(isFinal ? " [final]" : "")")
+        Log.info(" Voice command → \(clientId): \(text)\(isFinal ? " [final]" : "")")
     }
 
     // MARK: - Mark Task Routing
@@ -472,12 +472,12 @@ class AstationHubManager: ObservableObject {
                 self.markTasks[index].resultMessage = message
             }
         }
-        print("📌 Mark task \(taskId) finished: \(success ? "completed" : "failed") — \(message)")
+        Log.info(" Mark task \(taskId) finished: \(success ? "completed" : "failed") — \(message)")
     }
 
     private func routeMarkTask(taskId: String) {
         guard let clientId = routeToFocusedAtem() else {
-            print("📌 No Atem connected — mark task \(taskId) stays pending")
+            Log.info(" No Atem connected — mark task \(taskId) stays pending")
             return
         }
 
@@ -498,7 +498,7 @@ class AstationHubManager: ObservableObject {
                 self.markTasks[index].assignedTo = clientId
             }
         }
-        print("📌 Mark task \(taskId) assigned to \(clientId)")
+        Log.info(" Mark task \(taskId) assigned to \(clientId)")
     }
 
     private func handleUserCommand(_ command: String, context: [String: String]) {
@@ -516,7 +516,7 @@ class AstationHubManager: ObservableObject {
         let context = ["action": action]
         let message = AstationMessage.userCommand(command: command, context: context)
         sendHandler?(message, clientId)
-        print("[AstationHub] Sent command [\(action)] to \(clientId.prefix(8))...: \(command.prefix(80))")
+        Log.info("[AstationHub] Sent command [\(action)] to \(clientId.prefix(8))...: \(command.prefix(80))")
     }
 
     // MARK: - Relay Pairing
@@ -531,11 +531,11 @@ class AstationHubManager: ObservableObject {
         }
         let wsUrl = "\(wsScheme)/ws?role=astation&code=\(code)"
 
-        print("[AstationHub] Connecting to relay: \(wsUrl)")
+        Log.info("[AstationHub] Connecting to relay: \(wsUrl)")
 
         // Open a WebSocket to the relay and bridge messages
         guard let url = URL(string: wsUrl) else {
-            print("[AstationHub] Invalid relay URL: \(wsUrl)")
+            Log.info("[AstationHub] Invalid relay URL: \(wsUrl)")
             return
         }
 
@@ -566,7 +566,7 @@ class AstationHubManager: ObservableObject {
                    let jsonString = String(data: jsonData, encoding: .utf8) {
                     task?.send(.string(jsonString)) { error in
                         if let error = error {
-                            print("[AstationHub] Relay send error: \(error)")
+                            Log.info("[AstationHub] Relay send error: \(error)")
                         }
                     }
                 }
@@ -602,7 +602,7 @@ class AstationHubManager: ObservableObject {
                 self?.readRelayMessages(task: task, clientId: clientId)
 
             case .failure(let error):
-                print("[AstationHub] Relay connection closed: \(error)")
+                Log.info("[AstationHub] Relay connection closed: \(error)")
                 DispatchQueue.main.async {
                     self?.removeClient(withId: clientId)
                 }
