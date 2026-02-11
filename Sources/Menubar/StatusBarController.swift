@@ -8,6 +8,8 @@ class StatusBarController {
     private var statusMenu: NSMenu!
     private lazy var settingsWindowController = SettingsWindowController(credentialManager: hubManager.credentialManager)
     private lazy var devConsoleController = DevConsoleController(hubManager: hubManager)
+    private lazy var projectsWindowController = ProjectsWindowController(hubManager: hubManager)
+    private lazy var joinChannelWindowController = JoinChannelWindowController(hubManager: hubManager)
     private var headerTapCount = 0
     private var lastHeaderTapTime: Date?
 
@@ -294,26 +296,7 @@ class StatusBarController {
     
     @objc private func showProjects() {
         print("📋 Show projects requested from status bar")
-        let projects = hubManager.getProjects()
-
-        let alert = NSAlert()
-        alert.messageText = "Agora Projects (\(projects.count))"
-
-        if let error = hubManager.projectLoadError {
-            alert.informativeText = "Failed to load projects: \(error)\n\nCheck your credentials in Settings."
-            alert.alertStyle = .warning
-        } else if projects.isEmpty {
-            alert.informativeText = "No projects found. Configure credentials in Settings."
-            alert.alertStyle = .informational
-        } else {
-            let projectList = projects.map { project in
-                "• \(project.name) (\(project.status))\n  App ID: \(project.vendorKey)"
-            }.joined(separator: "\n\n")
-            alert.informativeText = projectList
-            alert.alertStyle = .informational
-        }
-
-        alert.runModal()
+        projectsWindowController.showWindow()
     }
     
     @objc private func showConnections() {
@@ -369,7 +352,7 @@ class StatusBarController {
 
     @objc private func joinRTCChannel() {
         let projects = hubManager.getProjects()
-        guard let project = projects.first else {
+        guard !projects.isEmpty else {
             let alert = NSAlert()
             alert.messageText = "No Projects"
             alert.informativeText = "No Agora projects available. Configure credentials in Settings and ensure you have at least one project."
@@ -378,12 +361,7 @@ class StatusBarController {
             return
         }
 
-        // Initialize RTC engine if needed, then join a default channel
-        hubManager.initializeRTC(appId: project.vendorKey)
-        let uid = UInt32.random(in: 1000...9999)
-        hubManager.joinRTCChannel(channel: "astation-default", uid: uid)
-
-        setupMenu()
+        joinChannelWindowController.showWindow()
     }
 
     @objc private func leaveRTCChannel() {

@@ -15,6 +15,7 @@ class AstationHubManager: ObservableObject {
     let apiClient = AgoraAPIClient()
     let rtcManager = RTCManager()
     let authGrantController = AuthGrantController()
+    let timeSync = TimeSync()
     @Published var projectLoadError: String?
 
     /// Station relay URL. Priority: AGORA_STATION_RELAY_URL env var > UserDefaults > default.
@@ -81,10 +82,12 @@ class AstationHubManager: ObservableObject {
         }
     }
 
-    /// Join an RTC channel (generates a token and joins).
+    /// Join an RTC channel (generates a real token and joins).
     func joinRTCChannel(channel: String, uid: UInt32, projectId: String? = nil) {
-        let tokenResponse = generateRTCToken(channel: channel, uid: String(uid), projectId: projectId)
-        rtcManager.joinChannel(token: tokenResponse.token, channel: channel, uid: uid)
+        Task {
+            let tokenResponse = await generateRTCToken(channel: channel, uid: String(uid), projectId: projectId)
+            rtcManager.joinChannel(token: tokenResponse.token, channel: channel, uid: uid)
+        }
     }
 
     /// Leave the current RTC channel.
@@ -153,21 +156,33 @@ class AstationHubManager: ObservableObject {
     
     // MARK: - Token Management
     
-    func generateRTCToken(channel: String, uid: String, projectId: String? = nil) -> TokenResponse {
-        let tokenPayload: [String: Any] = [
-            "uid": uid,
-            "channel": channel,
-            "exp": Int(Date().timeIntervalSince1970) + 3600, // 1 hour from now
-            "iat": Int(Date().timeIntervalSince1970),
-            "uuid": UUID().uuidString
-        ]
-        
-        // Create fake base64 token (in production, use real Agora token generation)
-        let jsonData = try! JSONSerialization.data(withJSONObject: tokenPayload)
-        let token = jsonData.base64EncodedString()
-        
-        print("🔑 Generated RTC token for channel '\(channel)', uid '\(uid)'")
-        
+    func generateRTCToken(channel: String, uid: String, projectId: String? = nil) async -> TokenResponse {
+        // Find the project to get appId + appCertificate
+        let project: AgoraProject?
+        if let projectId = projectId {
+            project = projects.first(where: { $0.id == projectId || $0.vendorKey == projectId })
+        } else {
+            project = projects.first
+        }
+
+        guard let project = project, !project.signKey.isEmpty else {
+            print("⚠️ No project with certificate found — returning empty token")
+            return TokenResponse(token: "", channel: channel, uid: uid, expiresIn: "0")
+        }
+
+        let issuedAt = await timeSync.now()
+        let token = AccessToken2.buildTokenRTC(
+            appId: project.vendorKey,
+            appCertificate: project.signKey,
+            channel: channel,
+            uid: uid,
+            role: .publisher,
+            expireSecs: 3600,
+            issuedAt: issuedAt
+        )
+
+        print("🔑 Generated RTC token for channel '\(channel)', uid '\(uid)' (issued_at=\(issuedAt))")
+
         return TokenResponse(
             token: token,
             channel: channel,
@@ -247,8 +262,14 @@ class AstationHubManager: ObservableObject {
             
         case .tokenRequest(let channel, let uid, let projectId):
             print("🔑 Token requested by client: \(clientId) for \(channel)/\(uid)")
-            let tokenResponse = generateRTCToken(channel: channel, uid: uid, projectId: projectId)
-            return .tokenResponse(token: tokenResponse.token, channel: tokenResponse.channel, uid: tokenResponse.uid, expiresIn: tokenResponse.expiresIn, timestamp: Date())
+            Task {
+                let tokenResponse = await generateRTCToken(channel: channel, uid: uid, projectId: projectId)
+                let response = AstationMessage.tokenResponse(
+                    token: tokenResponse.token, channel: tokenResponse.channel,
+                    uid: tokenResponse.uid, expiresIn: tokenResponse.expiresIn, timestamp: Date())
+                self.sendHandler?(response, clientId)
+            }
+            return nil
             
         case .userCommand(let command, let context):
             print("💻 User command from \(clientId): \(command)")
