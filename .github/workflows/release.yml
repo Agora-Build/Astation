@@ -115,8 +115,41 @@ jobs:
             Astation-${{ github.ref_name }}-mac-arm64.pkg
             Astation-${{ github.ref_name }}-mac-arm64.tar.gz
 
+  check-server-changes:
+    name: Check for server/ changes
+    runs-on: ubuntu-latest
+    outputs:
+      server_changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if server/ changed since last tag
+        id: check
+        run: |
+          # Find the previous tag before the current one
+          CURRENT_TAG="${GITHUB_REF_NAME}"
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${CURRENT_TAG}$" | head -1)
+
+          if [ -z "$PREV_TAG" ]; then
+            echo "No previous tag found — treating server as changed"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            CHANGED=$(git diff --name-only "$PREV_TAG" "$CURRENT_TAG" -- server/ | wc -l)
+            if [ "$CHANGED" -gt 0 ]; then
+              echo "server/ has $CHANGED changed files since $PREV_TAG"
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "No changes in server/ since $PREV_TAG — skipping Docker build"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
   build-server-docker:
-    name: Build Station Server Docker Image
+    name: Build Station Relay Server Docker Image
+    needs: check-server-changes
+    if: needs.check-server-changes.outputs.server_changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -154,14 +187,15 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/${{ steps.version.outputs.owner }}/astation-server:${{ steps.version.outputs.version }}
-            ghcr.io/${{ steps.version.outputs.owner }}/astation-server:latest
+            ghcr.io/${{ steps.version.outputs.owner }}/station-relay-server:${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.version.outputs.owner }}/station-relay-server:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
   release:
     name: Create GitHub Release
-    needs: [build-app, build-server-docker]
+    needs: [build-app, check-server-changes]
+    if: always() && needs.build-app.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

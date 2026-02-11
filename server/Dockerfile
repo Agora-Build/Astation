@@ -10,10 +10,10 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/astation-server /usr/local/bin/astation-server
+COPY --from=builder /app/target/release/station-relay-server /usr/local/bin/station-relay-server
 
 EXPOSE 3000
 
 ENV RUST_LOG=info
 
-CMD ["astation-server"]
+CMD ["station-relay-server"]
