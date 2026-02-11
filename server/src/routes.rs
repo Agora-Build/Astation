@@ -6,8 +6,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, SessionStatus};
-use crate::session_store::SessionStore;
 use crate::web::auth_page;
+use crate::AppState;
 
 // --- Request / Response types ---
 
@@ -55,7 +55,7 @@ pub struct AuthPageQuery {
 /// POST /api/sessions
 /// Creates a new auth session for the given hostname.
 pub async fn create_session_handler(
-    State(store): State<SessionStore>,
+    State(state): State<AppState>,
     Json(body): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
     let session = auth::create_session(&body.hostname);
@@ -67,17 +67,17 @@ pub async fn create_session_handler(
         created_at: session.created_at,
         expires_at: session.expires_at,
     };
-    store.create(session).await;
+    state.sessions.create(session).await;
     (StatusCode::CREATED, Json(response))
 }
 
 /// GET /api/sessions/:id/status
 /// Returns the current status of a session. Includes token if granted.
 pub async fn get_session_status_handler(
-    State(store): State<SessionStore>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match store.get(&id).await {
+    match state.sessions.get(&id).await {
         Some(session) => {
             // Check if session has expired
             let status = if session.status == SessionStatus::Pending
@@ -112,11 +112,11 @@ pub async fn get_session_status_handler(
 /// POST /api/sessions/:id/grant
 /// Validates the OTP, sets status to Granted, and generates a session token.
 pub async fn grant_session_handler(
-    State(store): State<SessionStore>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<GrantRequest>,
 ) -> impl IntoResponse {
-    match store.get(&id).await {
+    match state.sessions.get(&id).await {
         Some(mut session) => {
             // Check if already processed
             if session.status != SessionStatus::Pending {
@@ -159,7 +159,7 @@ pub async fn grant_session_handler(
                 status: session.status.clone(),
                 token: session.token.clone(),
             };
-            store.update(&id, session).await;
+            state.sessions.update(&id, session).await;
 
             Ok(Json(response))
         }
@@ -175,10 +175,10 @@ pub async fn grant_session_handler(
 /// POST /api/sessions/:id/deny
 /// Sets the session status to Denied.
 pub async fn deny_session_handler(
-    State(store): State<SessionStore>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match store.get(&id).await {
+    match state.sessions.get(&id).await {
         Some(mut session) => {
             if session.status != SessionStatus::Pending {
                 return Err((
@@ -200,7 +200,7 @@ pub async fn deny_session_handler(
                 status: session.status.clone(),
                 token: None,
             };
-            store.update(&id, session).await;
+            state.sessions.update(&id, session).await;
 
             Ok(Json(response))
         }
@@ -216,10 +216,10 @@ pub async fn deny_session_handler(
 /// GET /auth?id=...&tag=...
 /// Returns the HTML fallback auth page.
 pub async fn auth_page_handler(
-    State(store): State<SessionStore>,
+    State(state): State<AppState>,
     Query(params): Query<AuthPageQuery>,
 ) -> impl IntoResponse {
-    match store.get(&params.id).await {
+    match state.sessions.get(&params.id).await {
         Some(session) => Ok(Html(auth_page::render_auth_page(
             &session.id,
             &params.tag,
@@ -239,6 +239,7 @@ pub async fn auth_page_handler(
 mod tests {
     use super::*;
     use crate::auth::create_session;
+    use crate::relay::RelayHub;
     use crate::session_store::SessionStore;
     use axum::{
         body::Body,
@@ -249,14 +250,17 @@ mod tests {
     use tower::ServiceExt;
 
     fn create_app() -> Router {
-        let store = SessionStore::new();
+        let state = AppState {
+            sessions: SessionStore::new(),
+            relay: RelayHub::new(),
+        };
         Router::new()
             .route("/api/sessions", post(create_session_handler))
             .route("/api/sessions/:id/status", get(get_session_status_handler))
             .route("/api/sessions/:id/grant", post(grant_session_handler))
             .route("/api/sessions/:id/deny", post(deny_session_handler))
             .route("/auth", get(auth_page_handler))
-            .with_state(store)
+            .with_state(state)
     }
 
     #[tokio::test]
@@ -305,12 +309,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_grant_lifecycle() {
-        let store = SessionStore::new();
+        let state = AppState {
+            sessions: SessionStore::new(),
+            relay: RelayHub::new(),
+        };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
             .route("/api/sessions/:id/status", get(get_session_status_handler))
             .route("/api/sessions/:id/grant", post(grant_session_handler))
-            .with_state(store.clone());
+            .with_state(state);
 
         // Step 1: Create session
         let response = app
@@ -399,12 +406,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_deny_lifecycle() {
-        let store = SessionStore::new();
+        let state = AppState {
+            sessions: SessionStore::new(),
+            relay: RelayHub::new(),
+        };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
             .route("/api/sessions/:id/status", get(get_session_status_handler))
             .route("/api/sessions/:id/deny", post(deny_session_handler))
-            .with_state(store.clone());
+            .with_state(state);
 
         // Step 1: Create session
         let response = app
@@ -463,11 +473,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_grant_with_wrong_otp() {
-        let store = SessionStore::new();
+        let state = AppState {
+            sessions: SessionStore::new(),
+            relay: RelayHub::new(),
+        };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
             .route("/api/sessions/:id/grant", post(grant_session_handler))
-            .with_state(store.clone());
+            .with_state(state);
 
         // Create session
         let response = app
@@ -545,14 +558,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_page_handler() {
-        let store = SessionStore::new();
+        let state = AppState {
+            sessions: SessionStore::new(),
+            relay: RelayHub::new(),
+        };
         let session = create_session("my-machine");
         let session_id = session.id.clone();
-        store.create(session).await;
+        state.sessions.create(session).await;
 
         let app = Router::new()
             .route("/auth", get(auth_page_handler))
-            .with_state(store);
+            .with_state(state);
 
         let response = app
             .oneshot(
@@ -592,11 +608,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_double_grant_returns_conflict() {
-        let store = SessionStore::new();
+        let state = AppState {
+            sessions: SessionStore::new(),
+            relay: RelayHub::new(),
+        };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
             .route("/api/sessions/:id/grant", post(grant_session_handler))
-            .with_state(store.clone());
+            .with_state(state);
 
         // Create session
         let response = app

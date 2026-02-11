@@ -7,7 +7,10 @@ class StatusBarController {
     private let webSocketServer: AstationWebSocketServer
     private var statusMenu: NSMenu!
     private lazy var settingsWindowController = SettingsWindowController(credentialManager: hubManager.credentialManager)
-    
+    private lazy var devConsoleController = DevConsoleController(hubManager: hubManager)
+    private var headerTapCount = 0
+    private var lastHeaderTapTime: Date?
+
     init(hubManager: AstationHubManager, webSocketServer: AstationWebSocketServer) {
         self.hubManager = hubManager
         self.webSocketServer = webSocketServer
@@ -35,9 +38,9 @@ class StatusBarController {
     private func setupMenu() {
         statusMenu.removeAllItems()
         
-        // Header
-        let headerItem = NSMenuItem(title: "🚀 Astation Hub", action: nil, keyEquivalent: "")
-        headerItem.isEnabled = false
+        // Header (clickable — 5 taps opens Dev Console)
+        let headerItem = NSMenuItem(title: "🚀 Astation Hub", action: #selector(handleHeaderTap), keyEquivalent: "")
+        headerItem.target = self
         statusMenu.addItem(headerItem)
         
         statusMenu.addItem(NSMenuItem.separator())
@@ -426,10 +429,25 @@ class StatusBarController {
         setupMenu()
     }
 
+    @objc private func handleHeaderTap() {
+        let now = Date()
+        if let lastTap = lastHeaderTapTime, now.timeIntervalSince(lastTap) > 2.0 {
+            headerTapCount = 0
+        }
+        headerTapCount += 1
+        lastHeaderTapTime = now
+
+        if headerTapCount >= 5 {
+            headerTapCount = 0
+            print("[StatusBar] Dev Console activated via 5-tap")
+            devConsoleController.showWindow()
+        }
+    }
+
     @objc private func openSettings() {
         settingsWindowController.showWindow()
     }
-    
+
     @objc private func quitApplication() {
         print("🛑 Quit requested from status bar")
         NSApp.terminate(nil)

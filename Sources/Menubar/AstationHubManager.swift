@@ -17,6 +17,12 @@ class AstationHubManager: ObservableObject {
     let authGrantController = AuthGrantController()
     @Published var projectLoadError: String?
 
+    /// Station relay URL. Default: https://station.agora.build.
+    /// Override with AGORA_STATION_URL env var.
+    var stationUrl: String {
+        ProcessInfo.processInfo.environment["AGORA_STATION_URL"] ?? "https://station.agora.build"
+    }
+
     /// Callback for broadcasting messages to all connected Atem clients.
     /// Set by AstationApp after wiring up the WebSocket server.
     var broadcastHandler: ((AstationMessage) -> Void)?
@@ -478,6 +484,107 @@ class AstationHubManager: ObservableObject {
         if command.lowercased().contains("claude") || command.lowercased().contains("help") {
             let contextString = context.isEmpty ? command : "\(command) with context: \(context)"
             _ = launchClaudeCode(withContext: contextString)
+        }
+    }
+
+    // MARK: - Dev Console Command Dispatch
+
+    /// Send a userCommand to a specific Atem instance.
+    func sendCommandToClient(_ command: String, action: String, clientId: String) {
+        let context = ["action": action]
+        let message = AstationMessage.userCommand(command: command, context: context)
+        sendHandler?(message, clientId)
+        print("[AstationHub] Sent command [\(action)] to \(clientId.prefix(8))...: \(command.prefix(80))")
+    }
+
+    // MARK: - Relay Pairing
+
+    /// Connect to a remote Atem via the relay service using a pairing code.
+    func connectToRelay(code: String) {
+        let wsScheme: String
+        if stationUrl.hasPrefix("https://") {
+            wsScheme = stationUrl.replacingOccurrences(of: "https://", with: "wss://")
+        } else {
+            wsScheme = stationUrl.replacingOccurrences(of: "http://", with: "ws://")
+        }
+        let wsUrl = "\(wsScheme)/ws?role=astation&code=\(code)"
+
+        print("[AstationHub] Connecting to relay: \(wsUrl)")
+
+        // Open a WebSocket to the relay and bridge messages
+        guard let url = URL(string: wsUrl) else {
+            print("[AstationHub] Invalid relay URL: \(wsUrl)")
+            return
+        }
+
+        let task = URLSession.shared.webSocketTask(with: url)
+        task.resume()
+
+        // Generate a synthetic client ID for this relay connection
+        let relayClientId = "relay-\(code)"
+
+        // Add as connected client
+        let client = ConnectedClient(
+            id: relayClientId,
+            clientType: "Atem",
+            connectedAt: Date(),
+            hostname: "relay:\(code)"
+        )
+        addClient(client)
+
+        // Start reading messages from the relay
+        readRelayMessages(task: task, clientId: relayClientId)
+
+        // Wire send handler to also forward to relay
+        let originalSend = sendHandler
+        sendHandler = { [weak self, weak task] message, targetId in
+            if targetId == relayClientId {
+                // Send to relay WebSocket
+                if let jsonData = try? JSONEncoder().encode(message),
+                   let jsonString = String(data: jsonData, encoding: .utf8) {
+                    task?.send(.string(jsonString)) { error in
+                        if let error = error {
+                            print("[AstationHub] Relay send error: \(error)")
+                        }
+                    }
+                }
+            } else {
+                // Forward to original handler (local WebSocket)
+                originalSend?(message, targetId)
+            }
+        }
+    }
+
+    private func readRelayMessages(task: URLSessionWebSocketTask, clientId: String) {
+        task.receive { [weak self] result in
+            switch result {
+            case .success(let message):
+                switch message {
+                case .string(let text):
+                    if let data = text.data(using: .utf8),
+                       let msg = try? JSONDecoder().decode(AstationMessage.self, from: data) {
+                        DispatchQueue.main.async {
+                            let response = self?.handleMessage(msg, from: clientId)
+                            // If there's a response, send it back via relay
+                            if let response = response,
+                               let jsonData = try? JSONEncoder().encode(response),
+                               let jsonString = String(data: jsonData, encoding: .utf8) {
+                                task.send(.string(jsonString)) { _ in }
+                            }
+                        }
+                    }
+                default:
+                    break
+                }
+                // Continue reading
+                self?.readRelayMessages(task: task, clientId: clientId)
+
+            case .failure(let error):
+                print("[AstationHub] Relay connection closed: \(error)")
+                DispatchQueue.main.async {
+                    self?.removeClient(withId: clientId)
+                }
+            }
         }
     }
 }
