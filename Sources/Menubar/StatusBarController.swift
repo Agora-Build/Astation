@@ -42,6 +42,11 @@ class StatusBarController: NSObject, NSMenuDelegate {
     // MARK: - NSMenuDelegate
 
     func menuWillOpen(_ menu: NSMenu) {
+        Log.info("Menu opening — isInChannel=\(hubManager.rtcManager.isInChannel), channel=\(hubManager.rtcManager.currentChannel ?? "nil"), uid=\(hubManager.rtcManager.currentUid)")
+        setupMenu()
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
         setupMenu()
     }
 
