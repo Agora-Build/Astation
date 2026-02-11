@@ -1,7 +1,7 @@
 import Cocoa
 import Foundation
 
-class StatusBarController {
+class StatusBarController: NSObject, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let hubManager: AstationHubManager
     private let webSocketServer: AstationWebSocketServer
@@ -16,6 +16,7 @@ class StatusBarController {
     init(hubManager: AstationHubManager, webSocketServer: AstationWebSocketServer) {
         self.hubManager = hubManager
         self.webSocketServer = webSocketServer
+        super.init()
         setupStatusBar()
     }
     
@@ -29,14 +30,21 @@ class StatusBarController {
             button.toolTip = "Astation - AI Work Suite Hub"
         }
         
-        // Create menu
+        // Create menu (rebuilt on every open via NSMenuDelegate)
         statusMenu = NSMenu()
+        statusMenu.delegate = self
         setupMenu()
         statusItem.menu = statusMenu
         
         Log.info(" Status bar controller initialized")
     }
     
+    // MARK: - NSMenuDelegate
+
+    func menuWillOpen(_ menu: NSMenu) {
+        setupMenu()
+    }
+
     private func setupMenu() {
         statusMenu.removeAllItems()
         
