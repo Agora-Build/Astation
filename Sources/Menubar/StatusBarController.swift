@@ -55,14 +55,6 @@ class StatusBarController {
         statusItem.isEnabled = false
         statusMenu.addItem(statusItem)
         
-        let claudeStatusItem = NSMenuItem(
-            title: "🤖 Claude: \(systemStatus.claudeRunning ? "Running" : "Idle")",
-            action: nil,
-            keyEquivalent: ""
-        )
-        claudeStatusItem.isEnabled = false
-        statusMenu.addItem(claudeStatusItem)
-        
         let projectsItem = NSMenuItem(
             title: "📋 Projects: \(systemStatus.projects) loaded",
             action: nil,
@@ -234,15 +226,6 @@ class StatusBarController {
         actionsHeader.isEnabled = false
         statusMenu.addItem(actionsHeader)
 
-        // Launch Claude Code
-        let launchClaudeItem = NSMenuItem(
-            title: "Launch Claude Code",
-            action: #selector(launchClaudeCode),
-            keyEquivalent: "c"
-        )
-        launchClaudeItem.target = self
-        statusMenu.addItem(launchClaudeItem)
-        
         // Show Projects
         let showProjectsItem = NSMenuItem(
             title: "📋 Show Projects",
@@ -267,14 +250,24 @@ class StatusBarController {
         let serverHeader = NSMenuItem(title: "Server Info", action: nil, keyEquivalent: "")
         serverHeader.isEnabled = false
         statusMenu.addItem(serverHeader)
-        
+
+        let wsUrl = SettingsWindowController.currentWebSocketURL
         let wsServerItem = NSMenuItem(
-            title: "🌐 WebSocket: ws://127.0.0.1:8080/ws",
+            title: "🌐 WebSocket: \(wsUrl)",
             action: #selector(copyWebSocketURL),
             keyEquivalent: ""
         )
         wsServerItem.target = self
         statusMenu.addItem(wsServerItem)
+
+        let stationUrl = SettingsWindowController.currentStationURL
+        let stationItem = NSMenuItem(
+            title: "📡 Station: \(stationUrl)",
+            action: #selector(copyStationURL),
+            keyEquivalent: ""
+        )
+        stationItem.target = self
+        statusMenu.addItem(stationItem)
         
         statusMenu.addItem(NSMenuItem.separator())
         
@@ -297,26 +290,6 @@ class StatusBarController {
         )
         quitItem.target = self
         statusMenu.addItem(quitItem)
-    }
-    
-    @objc private func launchClaudeCode() {
-        print("🤖 Launch Claude Code requested from status bar")
-        let success = hubManager.launchClaudeCode()
-        
-        let alert = NSAlert()
-        if success {
-            alert.messageText = "Claude Code Launched"
-            alert.informativeText = "Claude Code has been launched successfully."
-            alert.alertStyle = .informational
-        } else {
-            alert.messageText = "Launch Failed"
-            alert.informativeText = "Failed to launch Claude Code. Please check if it's installed."
-            alert.alertStyle = .warning
-        }
-        alert.runModal()
-        
-        // Refresh menu to update status
-        setupMenu()
     }
     
     @objc private func showProjects() {
@@ -363,16 +336,31 @@ class StatusBarController {
     }
     
     @objc private func copyWebSocketURL() {
-        let url = "ws://127.0.0.1:8080/ws"
+        let url = SettingsWindowController.currentWebSocketURL
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(url, forType: .string)
-        
+
         print("📋 WebSocket URL copied to clipboard: \(url)")
-        
+
         let alert = NSAlert()
         alert.messageText = "URL Copied"
         alert.informativeText = "WebSocket URL has been copied to clipboard:\n\(url)"
+        alert.alertStyle = .informational
+        alert.runModal()
+    }
+
+    @objc private func copyStationURL() {
+        let url = SettingsWindowController.currentStationURL
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url, forType: .string)
+
+        print("📋 Station URL copied to clipboard: \(url)")
+
+        let alert = NSAlert()
+        alert.messageText = "URL Copied"
+        alert.informativeText = "Station relay URL has been copied to clipboard:\n\(url)"
         alert.alertStyle = .informational
         alert.runModal()
     }

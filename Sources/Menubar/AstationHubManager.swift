@@ -17,10 +17,9 @@ class AstationHubManager: ObservableObject {
     let authGrantController = AuthGrantController()
     @Published var projectLoadError: String?
 
-    /// Station relay URL. Default: https://station.agora.build.
-    /// Override with AGORA_STATION_URL env var.
+    /// Station relay URL. Priority: AGORA_STATION_URL env var > UserDefaults > default.
     var stationUrl: String {
-        ProcessInfo.processInfo.environment["AGORA_STATION_URL"] ?? "https://station.agora.build"
+        SettingsWindowController.currentStationURL
     }
 
     /// Callback for broadcasting messages to all connected Atem clients.
