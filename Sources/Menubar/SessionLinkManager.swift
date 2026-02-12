@@ -30,12 +30,12 @@ class SessionLinkManager {
             throw SessionLinkError.notInChannel
         }
 
-        let hostUid = hubManager.rtcManager.currentUid
+        let hostUid = Int(hubManager.rtcManager.currentUid)
 
         // Generate a uid=0 wildcard publisher token
         let tokenResponse = await hubManager.generateRTCToken(
             channel: channel,
-            uid: "0"
+            uid: 0
         )
 
         guard !tokenResponse.token.isEmpty else {

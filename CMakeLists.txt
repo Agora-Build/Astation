@@ -181,4 +181,19 @@ if(BUILD_TESTING)
         target_compile_options(astation_core_tests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
     add_test(NAME astation_core_tests COMMAND astation_core_tests)
+
+    add_executable(astation_core_token_tests
+        core/tests/token_builder_test.cpp
+    )
+    target_link_libraries(astation_core_token_tests PRIVATE astation_core)
+    target_include_directories(astation_core_token_tests PRIVATE
+        core/include
+        core/third_party/agora_token_builder
+    )
+    if(MSVC)
+        target_compile_options(astation_core_token_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(astation_core_token_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME astation_core_token_tests COMMAND astation_core_token_tests)
 endif()

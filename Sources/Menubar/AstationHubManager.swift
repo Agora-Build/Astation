@@ -130,10 +130,15 @@ class AstationHubManager: ObservableObject {
     }
 
     /// Join an RTC channel (generates a real token and joins).
-    func joinRTCChannel(channel: String, uid: UInt32, projectId: String? = nil) {
+    func joinRTCChannel(channel: String, uid: Int, projectId: String? = nil) {
+        guard uid >= 0, uid <= Int(UInt32.max) else {
+            Log.warn(" Invalid UID for RTC join: '\(uid)'")
+            return
+        }
+        let uidNum = UInt32(uid)
         Task {
-            let tokenResponse = await generateRTCToken(channel: channel, uid: String(uid), projectId: projectId)
-            rtcManager.joinChannel(token: tokenResponse.token, channel: channel, uid: uid)
+            let tokenResponse = await generateRTCToken(channel: channel, uid: uid, projectId: projectId)
+            rtcManager.joinChannel(token: tokenResponse.token, channel: channel, uid: uidNum)
         }
     }
 
@@ -205,6 +210,14 @@ class AstationHubManager: ObservableObject {
     // MARK: - Token Management
     
     func generateRTCToken(channel: String, uid: String, projectId: String? = nil) async -> TokenResponse {
+        guard let uidInt = Int(uid) else {
+            Log.warn(" Invalid UID for RTC token generation: '\(uid)'")
+            return TokenResponse(token: "", channel: channel, uid: uid, expiresIn: "0")
+        }
+        return await generateRTCToken(channel: channel, uid: uidInt, projectId: projectId)
+    }
+
+    func generateRTCToken(channel: String, uid: Int, projectId: String? = nil) async -> TokenResponse {
         // Find the project to get appId + appCertificate
         let project: AgoraProject?
         if let projectId = projectId {
@@ -215,13 +228,14 @@ class AstationHubManager: ObservableObject {
 
         guard let project = project, !project.signKey.isEmpty else {
             Log.warn(" No project with certificate found — returning empty token")
-            return TokenResponse(token: "", channel: channel, uid: uid, expiresIn: "0")
+            return TokenResponse(token: "", channel: channel, uid: String(uid), expiresIn: "0")
         }
 
-        guard let uidNum = UInt32(uid) else {
+        guard uid >= 0, uid <= Int(UInt32.max) else {
             Log.warn(" Invalid UID for RTC token generation: '\(uid)'")
-            return TokenResponse(token: "", channel: channel, uid: uid, expiresIn: "0")
+            return TokenResponse(token: "", channel: channel, uid: String(uid), expiresIn: "0")
         }
+        let uidNum = UInt32(uid)
 
         let tokenExpireSeconds: UInt32 = 3600
         let privilegeExpireSeconds: UInt32 = 3600
@@ -253,7 +267,7 @@ class AstationHubManager: ObservableObject {
         return TokenResponse(
             token: token,
             channel: channel,
-            uid: uid,
+            uid: String(uid),
             expiresIn: "\(tokenExpireSeconds)s"
         )
     }
@@ -601,8 +615,11 @@ class AstationHubManager: ObservableObject {
                 return "RTC: usage /rtc join <channel> <uid> [project]"
             }
             let channel = parts[2]
-            guard let uid = UInt32(parts[3]) else {
+            guard let uid = Int(parts[3]) else {
                 return "RTC: uid must be numeric"
+            }
+            guard uid >= 0 else {
+                return "RTC: uid must be non-negative"
             }
             let projects = getProjects()
             guard !projects.isEmpty else {

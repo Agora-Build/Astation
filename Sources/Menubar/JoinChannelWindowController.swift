@@ -139,9 +139,9 @@ class JoinChannelWindowController: NSObject, NSWindowDelegate {
             return
         }
 
-        guard let uid = UInt32(uidField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
-        else {
-            statusLabel.stringValue = "UID must be a number"
+        let uidText = uidField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let uid = Int(uidText), uid >= 0, uid <= Int(UInt32.max) else {
+            statusLabel.stringValue = "UID must be a non-negative number"
             statusLabel.textColor = .systemRed
             return
         }
