@@ -320,7 +320,7 @@ int astation_rtc_join(AStationRtcEngine* engine) {
         impl->channel.c_str(),
         impl->uid,
         [&]() {
-            agora::rtc::ChannelMediaOptions options;
+            agora::rtc::ChannelMediaOptions options{};
             options.publishMicrophoneTrack = (impl->enable_audio != 0);
             options.publishCameraTrack = false;
             options.publishScreenTrack = impl->screen_sharing;
@@ -330,8 +330,10 @@ int astation_rtc_join(AStationRtcEngine* engine) {
         }());
 
     if (ret != 0) {
+        const char* desc = impl->rtc_engine->getErrorDescription(ret);
         std::fprintf(stderr,
-            "[AStationRtc] joinChannel() failed: %d\n", ret);
+            "[AStationRtc] joinChannel() failed: %d (%s)\n",
+            ret, desc ? desc : "unknown");
     }
     return ret;
 }
@@ -442,24 +444,26 @@ int astation_rtc_enable_screen_share(AStationRtcEngine* engine,
     if (ret == 0) {
         impl->screen_sharing = true;
         if (impl->joined) {
-            agora::rtc::ChannelMediaOptions options;
+            agora::rtc::ChannelMediaOptions options{};
             options.publishScreenTrack = true;
             options.publishCameraTrack = false;
             options.publishMicrophoneTrack = (impl->enable_audio != 0);
             int opt_ret = impl->rtc_engine->updateChannelMediaOptions(options);
             if (opt_ret != 0) {
+                const char* desc = impl->rtc_engine->getErrorDescription(opt_ret);
                 std::fprintf(stderr,
-                    "[AStationRtc] updateChannelMediaOptions(publishScreenTrack) failed: %d\n",
-                    opt_ret);
+                    "[AStationRtc] updateChannelMediaOptions(publishScreenTrack) failed: %d (%s)\n",
+                    opt_ret, desc ? desc : "unknown");
             }
         }
         std::fprintf(stderr,
             "[AStationRtc] Screen sharing started on display %d\n",
             display_id);
     } else {
+        const char* desc = impl->rtc_engine->getErrorDescription(ret);
         std::fprintf(stderr,
-            "[AStationRtc] startScreenCaptureByDisplayId() failed: %d\n",
-            ret);
+            "[AStationRtc] startScreenCaptureByDisplayId() failed: %d (%s)\n",
+            ret, desc ? desc : "unknown");
     }
     return ret;
 #else
@@ -485,19 +489,22 @@ int astation_rtc_stop_screen_share(AStationRtcEngine* engine) {
     if (ret == 0) {
         impl->screen_sharing = false;
         if (impl->joined) {
-            agora::rtc::ChannelMediaOptions options;
+            agora::rtc::ChannelMediaOptions options{};
             options.publishScreenTrack = false;
             int opt_ret = impl->rtc_engine->updateChannelMediaOptions(options);
             if (opt_ret != 0) {
+                const char* desc = impl->rtc_engine->getErrorDescription(opt_ret);
                 std::fprintf(stderr,
-                    "[AStationRtc] updateChannelMediaOptions(stopScreenTrack) failed: %d\n",
-                    opt_ret);
+                    "[AStationRtc] updateChannelMediaOptions(stopScreenTrack) failed: %d (%s)\n",
+                    opt_ret, desc ? desc : "unknown");
             }
         }
         std::fprintf(stderr, "[AStationRtc] Screen sharing stopped\n");
     } else {
+        const char* desc = impl->rtc_engine->getErrorDescription(ret);
         std::fprintf(stderr,
-            "[AStationRtc] stopScreenCapture() failed: %d\n", ret);
+            "[AStationRtc] stopScreenCapture() failed: %d (%s)\n",
+            ret, desc ? desc : "unknown");
     }
     return ret;
 #else
