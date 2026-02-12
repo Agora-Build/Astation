@@ -68,6 +68,3 @@ final class SessionLinkManagerTests: XCTestCase {
         }
     }
 }
-
-// Allow equatable comparison for test assertions
-extension SessionLinkError: Equatable {}

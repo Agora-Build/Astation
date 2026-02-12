@@ -1,4 +1,6 @@
+import CStationCore
 import XCTest
+import zlib
 
 @testable import Menubar
 
@@ -17,7 +19,112 @@ private struct DecodedToken {
 
 private struct DecodedService {
     let serviceType: UInt16
+    let channel: String?
+    let uid: String?
+    let userId: String?
     let privileges: [(key: UInt16, value: UInt32)]
+}
+
+private enum RtcRole: Int32 {
+    case publisher = 1
+    case subscriber = 2
+}
+
+private let testAppId = "0123456789abcdef0123456789abcdef"
+private let testAppCert = "abcdef0123456789abcdef0123456789"
+private let testAppIdAlt = "00112233445566778899aabbccddeeff"
+private let testAppCertAlt = "ffeeddccbbaa99887766554433221100"
+
+private func buildRtcToken(
+    appId: String = testAppId,
+    appCertificate: String = testAppCert,
+    channel: String,
+    uid: UInt32,
+    role: RtcRole,
+    tokenExpireSeconds: UInt32,
+    privilegeExpireSeconds: UInt32
+) -> String {
+    appId.withCString { appIdC in
+        appCertificate.withCString { certC in
+            channel.withCString { channelC in
+                guard let tokenPtr = astation_rtc_build_token(
+                    appIdC,
+                    certC,
+                    channelC,
+                    uid,
+                    role.rawValue,
+                    tokenExpireSeconds,
+                    privilegeExpireSeconds
+                ) else {
+                    return ""
+                }
+                let token = String(cString: tokenPtr)
+                astation_token_free(tokenPtr)
+                return token
+            }
+        }
+    }
+}
+
+private func buildRtmToken(
+    appId: String = testAppId,
+    appCertificate: String = testAppCert,
+    userId: String,
+    tokenExpireSeconds: UInt32
+) -> String {
+    appId.withCString { appIdC in
+        appCertificate.withCString { certC in
+            userId.withCString { userIdC in
+                guard let tokenPtr = astation_rtm_build_token(
+                    appIdC,
+                    certC,
+                    userIdC,
+                    tokenExpireSeconds
+                ) else {
+                    return ""
+                }
+                let token = String(cString: tokenPtr)
+                astation_token_free(tokenPtr)
+                return token
+            }
+        }
+    }
+}
+
+private func zlibDecompress(_ data: Data) throws -> Data {
+    if data.isEmpty {
+        return Data()
+    }
+    var capacity = max(1024, data.count * 8)
+
+    while true {
+        var output = Data(count: capacity)
+        var destLen = uLongf(capacity)
+
+        let result = output.withUnsafeMutableBytes { dstBuffer in
+            data.withUnsafeBytes { srcBuffer in
+                guard
+                    let dstBase = dstBuffer.bindMemory(to: Bytef.self).baseAddress,
+                    let srcBase = srcBuffer.bindMemory(to: Bytef.self).baseAddress
+                else {
+                    return Z_MEM_ERROR
+                }
+                return uncompress(dstBase, &destLen, srcBase, uLong(data.count))
+            }
+        }
+
+        if result == Z_OK {
+            output.count = Int(destLen)
+            return output
+        }
+
+        if result == Z_BUF_ERROR {
+            capacity *= 2
+            continue
+        }
+
+        throw NSError(domain: "Token", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to decompress zlib payload"])
+    }
 }
 
 private func decodeToken(_ token: String) throws -> DecodedToken {
@@ -26,9 +133,10 @@ private func decodeToken(_ token: String) throws -> DecodedToken {
     }
 
     let encoded = String(token.dropFirst(3))
-    guard let data = Data(base64Encoded: encoded) else {
+    guard let compressed = Data(base64Encoded: encoded) else {
         throw NSError(domain: "Token", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid base64"])
     }
+    let data = try zlibDecompress(compressed)
 
     var offset = 0
 
@@ -86,13 +194,28 @@ private func decodeToken(_ token: String) throws -> DecodedToken {
     for _ in 0..<serviceCount {
         let serviceType = try readUInt16()
         let privCount = try readUInt16()
+        var channel: String? = nil
+        var uid: String? = nil
+        var userId: String? = nil
         var privileges: [(key: UInt16, value: UInt32)] = []
         for _ in 0..<privCount {
             let k = try readUInt16()
             let v = try readUInt32()
             privileges.append((key: k, value: v))
         }
-        services.append(DecodedService(serviceType: serviceType, privileges: privileges))
+        if serviceType == 1 {
+            channel = try readString()
+            uid = try readString()
+        } else if serviceType == 2 {
+            userId = try readString()
+        }
+        services.append(DecodedService(
+            serviceType: serviceType,
+            channel: channel,
+            uid: uid,
+            userId: userId,
+            privileges: privileges
+        ))
     }
 
     // Verify we consumed all bytes
@@ -110,49 +233,68 @@ final class AccessToken2Tests: XCTestCase {
     // MARK: - Empty certificate → empty token
 
     func testEmptyCertificateReturnsEmptyRTCToken() {
-        let token = AccessToken2.buildTokenRTC(
-            appId: "appid", appCertificate: "", channel: "chan", uid: "uid",
-            role: .publisher, expireSecs: 3600, issuedAt: 1_000_000)
+        let token = buildRtcToken(
+            appId: testAppId,
+            appCertificate: "",
+            channel: "chan",
+            uid: 1234,
+            role: .publisher,
+            tokenExpireSeconds: 3600,
+            privilegeExpireSeconds: 3600
+        )
         XCTAssertTrue(token.isEmpty)
     }
 
     func testEmptyCertificateReturnsEmptyRTMToken() {
-        let token = AccessToken2.buildTokenRTM(
-            appId: "appid", appCertificate: "", userId: "user",
-            expireSecs: 3600, issuedAt: 1_000_000)
+        let token = buildRtmToken(
+            appId: testAppId,
+            appCertificate: "",
+            userId: "user",
+            tokenExpireSeconds: 3600
+        )
         XCTAssertTrue(token.isEmpty)
     }
 
     // MARK: - Version prefix
 
     func testRTCTokenStartsWith007() {
-        let token = AccessToken2.buildTokenRTC(
-            appId: "appid123", appCertificate: "cert456", channel: "chan", uid: "uid",
-            role: .publisher, expireSecs: 3600, issuedAt: 1_000_000)
+        let token = buildRtcToken(
+            channel: "chan",
+            uid: 1,
+            role: .publisher,
+            tokenExpireSeconds: 3600,
+            privilegeExpireSeconds: 3600
+        )
         XCTAssertTrue(token.hasPrefix("007"))
     }
 
     func testRTMTokenStartsWith007() {
-        let token = AccessToken2.buildTokenRTM(
-            appId: "appid123", appCertificate: "cert456", userId: "user",
-            expireSecs: 3600, issuedAt: 1_000_000)
+        let token = buildRtmToken(
+            userId: "user",
+            tokenExpireSeconds: 3600
+        )
         XCTAssertTrue(token.hasPrefix("007"))
     }
 
     // MARK: - Base64 validity
 
     func testRTCTokenIsValidBase64After007() {
-        let token = AccessToken2.buildTokenRTC(
-            appId: "test_app_id", appCertificate: "test_cert", channel: "chan1", uid: "uid1",
-            role: .publisher, expireSecs: 3600, issuedAt: 1_700_000_000)
+        let token = buildRtcToken(
+            channel: "chan1",
+            uid: 42,
+            role: .publisher,
+            tokenExpireSeconds: 3600,
+            privilegeExpireSeconds: 3600
+        )
         let encoded = String(token.dropFirst(3))
         XCTAssertNotNil(Data(base64Encoded: encoded), "Content after '007' should be valid base64")
     }
 
     func testRTMTokenIsValidBase64After007() {
-        let token = AccessToken2.buildTokenRTM(
-            appId: "test_app_id", appCertificate: "test_cert", userId: "alice",
-            expireSecs: 7200, issuedAt: 1_700_000_000)
+        let token = buildRtmToken(
+            userId: "alice",
+            tokenExpireSeconds: 7200
+        )
         let encoded = String(token.dropFirst(3))
         XCTAssertNotNil(Data(base64Encoded: encoded), "Content after '007' should be valid base64")
     }
@@ -160,12 +302,20 @@ final class AccessToken2Tests: XCTestCase {
     // MARK: - Publisher vs Subscriber
 
     func testPublisherTokenLongerThanSubscriber() {
-        let pubToken = AccessToken2.buildTokenRTC(
-            appId: "appid", appCertificate: "cert", channel: "chan", uid: "uid",
-            role: .publisher, expireSecs: 3600, issuedAt: 1_000_000)
-        let subToken = AccessToken2.buildTokenRTC(
-            appId: "appid", appCertificate: "cert", channel: "chan", uid: "uid",
-            role: .subscriber, expireSecs: 3600, issuedAt: 1_000_000)
+        let pubToken = buildRtcToken(
+            channel: "chan",
+            uid: 7,
+            role: .publisher,
+            tokenExpireSeconds: 3600,
+            privilegeExpireSeconds: 3600
+        )
+        let subToken = buildRtcToken(
+            channel: "chan",
+            uid: 7,
+            role: .subscriber,
+            tokenExpireSeconds: 3600,
+            privilegeExpireSeconds: 3600
+        )
         XCTAssertGreaterThan(
             pubToken.count, subToken.count,
             "Publisher token should be longer (4 privileges vs 1)")
@@ -236,19 +386,29 @@ final class AccessToken2Tests: XCTestCase {
     // MARK: - Roundtrip: RTC token generate → decode
 
     func testRTCPublisherRoundtrip() throws {
-        let appId = "test_app_id_32chars_exactly_here"
-        let token = AccessToken2.buildTokenRTC(
-            appId: appId, appCertificate: "test_cert", channel: "chan1", uid: "uid1",
-            role: .publisher, expireSecs: 3600, issuedAt: 1_700_000_000)
+        let channel = "chan1"
+        let uid: UInt32 = 1234
+        let now = UInt32(Date().timeIntervalSince1970)
+        let tokenExpireSeconds: UInt32 = 3600
+        let privilegeExpireSeconds: UInt32 = 3600
+        let token = buildRtcToken(
+            channel: channel,
+            uid: uid,
+            role: .publisher,
+            tokenExpireSeconds: tokenExpireSeconds,
+            privilegeExpireSeconds: privilegeExpireSeconds
+        )
 
         let decoded = try decodeToken(token)
 
-        XCTAssertEqual(decoded.appId, appId)
-        XCTAssertEqual(decoded.issueTs, 1_700_000_000)
-        XCTAssertEqual(decoded.expire, 3600)
+        XCTAssertEqual(decoded.appId, testAppId)
+        XCTAssertLessThanOrEqual(abs(Int(decoded.issueTs) - Int(now)), 10)
+        XCTAssertEqual(decoded.expire, tokenExpireSeconds)
         XCTAssertEqual(decoded.signature.count, 32, "HMAC-SHA256 signature should be 32 bytes")
         XCTAssertEqual(decoded.services.count, 1)
         XCTAssertEqual(decoded.services[0].serviceType, 1, "Service type should be RTC (1)")
+        XCTAssertEqual(decoded.services[0].channel, channel)
+        XCTAssertEqual(decoded.services[0].uid, String(uid))
         XCTAssertEqual(decoded.services[0].privileges.count, 4, "Publisher should have 4 privileges")
 
         // Verify all privilege types are present
@@ -259,70 +419,100 @@ final class AccessToken2Tests: XCTestCase {
         XCTAssertTrue(privKeys.contains(4), "Should have publishData privilege")
 
         // All privileges should expire at issuedAt + expireSecs
-        let expectedExpireAt: UInt32 = 1_700_000_000 + 3600
+        let expectedExpireAt: UInt32 = privilegeExpireSeconds
         for priv in decoded.services[0].privileges {
             XCTAssertEqual(priv.value, expectedExpireAt, "Privilege \(priv.key) should expire at \(expectedExpireAt)")
         }
     }
 
     func testRTCSubscriberRoundtrip() throws {
-        let appId = "subscriber_app"
-        let token = AccessToken2.buildTokenRTC(
-            appId: appId, appCertificate: "cert_sub", channel: "ch", uid: "u",
-            role: .subscriber, expireSecs: 7200, issuedAt: 1_700_000_000)
+        let channel = "ch"
+        let uid: UInt32 = 9
+        let now = UInt32(Date().timeIntervalSince1970)
+        let tokenExpireSeconds: UInt32 = 7200
+        let privilegeExpireSeconds: UInt32 = 7200
+        let token = buildRtcToken(
+            channel: channel,
+            uid: uid,
+            role: .subscriber,
+            tokenExpireSeconds: tokenExpireSeconds,
+            privilegeExpireSeconds: privilegeExpireSeconds
+        )
 
         let decoded = try decodeToken(token)
 
-        XCTAssertEqual(decoded.appId, appId)
-        XCTAssertEqual(decoded.issueTs, 1_700_000_000)
-        XCTAssertEqual(decoded.expire, 7200)
+        XCTAssertEqual(decoded.appId, testAppId)
+        XCTAssertLessThanOrEqual(abs(Int(decoded.issueTs) - Int(now)), 10)
+        XCTAssertEqual(decoded.expire, tokenExpireSeconds)
         XCTAssertEqual(decoded.services.count, 1)
         XCTAssertEqual(decoded.services[0].serviceType, 1)
+        XCTAssertEqual(decoded.services[0].channel, channel)
+        XCTAssertEqual(decoded.services[0].uid, String(uid))
         XCTAssertEqual(decoded.services[0].privileges.count, 1, "Subscriber should have 1 privilege")
         XCTAssertEqual(decoded.services[0].privileges[0].key, 1, "Should only have joinChannel")
-        XCTAssertEqual(decoded.services[0].privileges[0].value, 1_700_000_000 + 7200)
+        XCTAssertEqual(decoded.services[0].privileges[0].value, privilegeExpireSeconds)
     }
 
     // MARK: - Roundtrip: RTM token generate → decode
 
     func testRTMRoundtrip() throws {
-        let appId = "rtm_test_app"
-        let token = AccessToken2.buildTokenRTM(
-            appId: appId, appCertificate: "rtm_cert", userId: "alice",
-            expireSecs: 86400, issuedAt: 1_700_000_000)
+        let userId = "alice"
+        let now = UInt32(Date().timeIntervalSince1970)
+        let tokenExpireSeconds: UInt32 = 86400
+        let token = buildRtmToken(
+            userId: userId,
+            tokenExpireSeconds: tokenExpireSeconds
+        )
 
         let decoded = try decodeToken(token)
 
-        XCTAssertEqual(decoded.appId, appId)
-        XCTAssertEqual(decoded.issueTs, 1_700_000_000)
-        XCTAssertEqual(decoded.expire, 86400)
+        XCTAssertEqual(decoded.appId, testAppId)
+        XCTAssertLessThanOrEqual(abs(Int(decoded.issueTs) - Int(now)), 10)
+        XCTAssertEqual(decoded.expire, tokenExpireSeconds)
         XCTAssertEqual(decoded.signature.count, 32)
         XCTAssertEqual(decoded.services.count, 1)
         XCTAssertEqual(decoded.services[0].serviceType, 2, "Service type should be RTM (2)")
+        XCTAssertEqual(decoded.services[0].userId, userId)
         XCTAssertEqual(decoded.services[0].privileges.count, 1, "RTM should have 1 privilege (login)")
         XCTAssertEqual(decoded.services[0].privileges[0].key, 1, "Should have login privilege")
-        XCTAssertEqual(decoded.services[0].privileges[0].value, 1_700_000_000 + 86400)
+        XCTAssertEqual(decoded.services[0].privileges[0].value, tokenExpireSeconds)
     }
 
     // MARK: - Randomness (salt)
 
     func testTwoTokensAreDifferent() {
-        let token1 = AccessToken2.buildTokenRTC(
-            appId: "app", appCertificate: "cert", channel: "ch", uid: "u",
-            role: .publisher, expireSecs: 3600, issuedAt: 1_000_000)
-        let token2 = AccessToken2.buildTokenRTC(
-            appId: "app", appCertificate: "cert", channel: "ch", uid: "u",
-            role: .publisher, expireSecs: 3600, issuedAt: 1_000_000)
+        let token1 = buildRtcToken(
+            channel: "ch",
+            uid: 1,
+            role: .publisher,
+            tokenExpireSeconds: 3600,
+            privilegeExpireSeconds: 3600
+        )
+        let token2 = buildRtcToken(
+            channel: "ch",
+            uid: 1,
+            role: .publisher,
+            tokenExpireSeconds: 3600,
+            privilegeExpireSeconds: 3600
+        )
         XCTAssertNotEqual(token1, token2, "Random salt should produce different tokens each time")
     }
 
     func testTwoTokensHaveDifferentSalts() throws {
-        let token1 = AccessToken2.buildTokenRTC(
-            appId: "app", appCertificate: "cert", channel: "ch", uid: "u",
-            role: .publisher, expireSecs: 3600, issuedAt: 1_000_000)
-        let token2 = AccessToken2.buildTokenRTC(
-            appId: "app", appCertificate: "cert", channel: "ch", uid: "u",
-            role: .publisher, expireSecs: 3600, issuedAt: 1_000_000)
+        let token1 = buildRtcToken(
+            channel: "ch",
+            uid: 1,
+            role: .publisher,
+            tokenExpireSeconds: 3600,
+            privilegeExpireSeconds: 3600
+        )
+        let token2 = buildRtcToken(
+            channel: "ch",
+            uid: 1,
+            role: .publisher,
+            tokenExpireSeconds: 3600,
+            privilegeExpireSeconds: 3600
+        )
         let d1 = try decodeToken(token1)
         let d2 = try decodeToken(token2)
         XCTAssertNotEqual(d1.salt, d2.salt, "Salts should differ between invocations")
@@ -331,39 +521,57 @@ final class AccessToken2Tests: XCTestCase {
     // MARK: - Edge cases
 
     func testZeroExpiry() throws {
-        let token = AccessToken2.buildTokenRTC(
-            appId: "app", appCertificate: "cert", channel: "ch", uid: "u",
-            role: .publisher, expireSecs: 0, issuedAt: 1_700_000_000)
+        let token = buildRtcToken(
+            channel: "ch",
+            uid: 1,
+            role: .publisher,
+            tokenExpireSeconds: 0,
+            privilegeExpireSeconds: 0
+        )
         let decoded = try decodeToken(token)
         XCTAssertEqual(decoded.expire, 0)
         // Privileges should expire at issuedAt + 0 = issuedAt
         for priv in decoded.services[0].privileges {
-            XCTAssertEqual(priv.value, 1_700_000_000)
+            XCTAssertEqual(priv.value, 0)
         }
     }
 
-    func testLargeAppId() throws {
+    func testInvalidAppIdReturnsEmptyToken() {
         let appId = String(repeating: "a", count: 200)
-        let token = AccessToken2.buildTokenRTC(
-            appId: appId, appCertificate: "cert", channel: "ch", uid: "u",
-            role: .publisher, expireSecs: 3600, issuedAt: 1_000_000)
-        let decoded = try decodeToken(token)
-        XCTAssertEqual(decoded.appId, appId)
+        let token = buildRtcToken(
+            appId: appId,
+            appCertificate: testAppCert,
+            channel: "ch",
+            uid: 1,
+            role: .publisher,
+            tokenExpireSeconds: 3600,
+            privilegeExpireSeconds: 3600
+        )
+        XCTAssertTrue(token.isEmpty)
     }
 
-    func testUnicodeAppId() throws {
+    func testUnicodeAppIdReturnsEmptyToken() {
         let appId = "app_\u{1F600}_test"  // emoji in app ID
-        let token = AccessToken2.buildTokenRTC(
-            appId: appId, appCertificate: "cert", channel: "ch", uid: "u",
-            role: .publisher, expireSecs: 3600, issuedAt: 1_000_000)
-        let decoded = try decodeToken(token)
-        XCTAssertEqual(decoded.appId, appId)
+        let token = buildRtcToken(
+            appId: appId,
+            appCertificate: testAppCert,
+            channel: "ch",
+            uid: 1,
+            role: .publisher,
+            tokenExpireSeconds: 3600,
+            privilegeExpireSeconds: 3600
+        )
+        XCTAssertTrue(token.isEmpty)
     }
 
     func testTokenNonEmptyWithValidCert() {
-        let token = AccessToken2.buildTokenRTC(
-            appId: "a", appCertificate: "c", channel: "", uid: "",
-            role: .subscriber, expireSecs: 1, issuedAt: 1)
+        let token = buildRtcToken(
+            channel: "",
+            uid: 0,
+            role: .subscriber,
+            tokenExpireSeconds: 1,
+            privilegeExpireSeconds: 1
+        )
         XCTAssertFalse(token.isEmpty)
         XCTAssertTrue(token.hasPrefix("007"))
     }
@@ -371,12 +579,22 @@ final class AccessToken2Tests: XCTestCase {
     // MARK: - Different inputs → different tokens
 
     func testDifferentAppIdProducesDifferentToken() throws {
-        let token1 = AccessToken2.buildTokenRTC(
-            appId: "app1", appCertificate: "cert", channel: "ch", uid: "u",
-            role: .publisher, expireSecs: 3600, issuedAt: 1_000_000)
-        let token2 = AccessToken2.buildTokenRTC(
-            appId: "app2", appCertificate: "cert", channel: "ch", uid: "u",
-            role: .publisher, expireSecs: 3600, issuedAt: 1_000_000)
+        let token1 = buildRtcToken(
+            appId: testAppId,
+            channel: "ch",
+            uid: 1,
+            role: .publisher,
+            tokenExpireSeconds: 3600,
+            privilegeExpireSeconds: 3600
+        )
+        let token2 = buildRtcToken(
+            appId: testAppIdAlt,
+            channel: "ch",
+            uid: 1,
+            role: .publisher,
+            tokenExpireSeconds: 3600,
+            privilegeExpireSeconds: 3600
+        )
         // Even ignoring random salt, different appId means different content
         let d1 = try decodeToken(token1)
         let d2 = try decodeToken(token2)
@@ -385,12 +603,24 @@ final class AccessToken2Tests: XCTestCase {
 
     func testDifferentCertProducesDifferentSignature() throws {
         // Generate many pairs and check signatures differ
-        let token1 = AccessToken2.buildTokenRTC(
-            appId: "app", appCertificate: "cert_A", channel: "ch", uid: "u",
-            role: .publisher, expireSecs: 3600, issuedAt: 1_000_000)
-        let token2 = AccessToken2.buildTokenRTC(
-            appId: "app", appCertificate: "cert_B", channel: "ch", uid: "u",
-            role: .publisher, expireSecs: 3600, issuedAt: 1_000_000)
+        let token1 = buildRtcToken(
+            appId: testAppId,
+            appCertificate: testAppCert,
+            channel: "ch",
+            uid: 1,
+            role: .publisher,
+            tokenExpireSeconds: 3600,
+            privilegeExpireSeconds: 3600
+        )
+        let token2 = buildRtcToken(
+            appId: testAppId,
+            appCertificate: testAppCertAlt,
+            channel: "ch",
+            uid: 1,
+            role: .publisher,
+            tokenExpireSeconds: 3600,
+            privilegeExpireSeconds: 3600
+        )
         // Tokens will differ (different cert → different signing key → different signature)
         XCTAssertNotEqual(token1, token2)
     }
@@ -398,9 +628,13 @@ final class AccessToken2Tests: XCTestCase {
     // MARK: - Signature is 32 bytes (HMAC-SHA256)
 
     func testSignatureLength() throws {
-        let token = AccessToken2.buildTokenRTC(
-            appId: "app", appCertificate: "cert", channel: "ch", uid: "u",
-            role: .publisher, expireSecs: 3600, issuedAt: 1_000_000)
+        let token = buildRtcToken(
+            channel: "ch",
+            uid: 1,
+            role: .publisher,
+            tokenExpireSeconds: 3600,
+            privilegeExpireSeconds: 3600
+        )
         let decoded = try decodeToken(token)
         XCTAssertEqual(decoded.signature.count, 32, "HMAC-SHA256 produces 32-byte signatures")
     }

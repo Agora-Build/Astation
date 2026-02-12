@@ -27,7 +27,7 @@ enum AccessToken2 {
         appId: String,
         appCertificate: String,
         channel: String,
-        uid: String,
+        uid: UInt32,
         role: RTCRole,
         expireSecs: UInt32,
         issuedAt: UInt32
@@ -58,6 +58,8 @@ enum AccessToken2 {
             packUInt16(&content, key)
             packUInt32(&content, value)
         }
+        packString(&content, channel)
+        packString(&content, String(uid))
 
         // Derive signing key
         let signingKey = deriveSigningKey(
@@ -103,6 +105,7 @@ enum AccessToken2 {
             packUInt16(&content, key)
             packUInt32(&content, value)
         }
+        packString(&content, userId)
 
         let signingKey = deriveSigningKey(
             appCertificate: appCertificate, issuedAt: issuedAt, salt: salt)

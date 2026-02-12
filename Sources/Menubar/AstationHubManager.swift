@@ -218,24 +218,43 @@ class AstationHubManager: ObservableObject {
             return TokenResponse(token: "", channel: channel, uid: uid, expiresIn: "0")
         }
 
-        let issuedAt = await timeSync.now()
-        let token = AccessToken2.buildTokenRTC(
-            appId: project.vendorKey,
-            appCertificate: project.signKey,
-            channel: channel,
-            uid: uid,
-            role: .publisher,
-            expireSecs: 3600,
-            issuedAt: issuedAt
-        )
+        guard let uidNum = UInt32(uid) else {
+            Log.warn(" Invalid UID for RTC token generation: '\(uid)'")
+            return TokenResponse(token: "", channel: channel, uid: uid, expiresIn: "0")
+        }
 
-        Log.info(" Generated RTC token for channel '\(channel)', uid '\(uid)' (issued_at=\(issuedAt))")
+        let tokenExpireSeconds: UInt32 = 3600
+        let privilegeExpireSeconds: UInt32 = 3600
+        let role: Int32 = 1 // publisher
+
+        let token: String
+        let tokenPtr = astation_rtc_build_token(
+            project.vendorKey,
+            project.signKey,
+            channel,
+            uidNum,
+            role,
+            tokenExpireSeconds,
+            privilegeExpireSeconds
+        )
+        if let tokenPtr {
+            token = String(cString: tokenPtr)
+            astation_token_free(tokenPtr)
+        } else {
+            token = ""
+        }
+
+        if token.isEmpty {
+            Log.warn(" RTC token generation failed for channel '\(channel)', uid '\(uid)'")
+        } else {
+            Log.info(" Generated RTC token for channel '\(channel)', uid '\(uid)'")
+        }
 
         return TokenResponse(
             token: token,
             channel: channel,
             uid: uid,
-            expiresIn: "1 hour"
+            expiresIn: "\(tokenExpireSeconds)s"
         )
     }
     
@@ -552,6 +571,89 @@ class AstationHubManager: ObservableObject {
         if command.lowercased().contains("claude") || command.lowercased().contains("help") {
             let contextString = context.isEmpty ? command : "\(command) with context: \(context)"
             _ = launchClaudeCode(withContext: contextString)
+        }
+    }
+
+    // MARK: - Local RTC Dev Commands
+
+    /// Handle local dev console commands for RTC testing.
+    /// Supported:
+    ///   /rtc status
+    ///   /rtc join <channel> <uid> [project name]
+    ///   /rtc leave
+    ///   /rtc mic on|off|toggle
+    ///   /rtc screen on|off [displayId]
+    func handleLocalRtcCommand(_ command: String) -> String {
+        let parts = command.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard parts.count >= 2 else {
+            return "RTC: invalid command. Try: /rtc help"
+        }
+
+        let action = parts[1].lowercased()
+        switch action {
+        case "help":
+            return "RTC: /rtc status | /rtc join <channel> <uid> [project] | /rtc leave | /rtc mic on|off|toggle | /rtc screen on|off [displayId]"
+        case "status":
+            let channel = rtcManager.currentChannel ?? "none"
+            return "RTC: inChannel=\(rtcManager.isInChannel) channel=\(channel) uid=\(rtcManager.currentUid) micMuted=\(rtcManager.isMicMuted) screenSharing=\(rtcManager.isScreenSharing)"
+        case "join":
+            guard parts.count >= 4 else {
+                return "RTC: usage /rtc join <channel> <uid> [project]"
+            }
+            let channel = parts[2]
+            guard let uid = UInt32(parts[3]) else {
+                return "RTC: uid must be numeric"
+            }
+            let projects = getProjects()
+            guard !projects.isEmpty else {
+                return "RTC: no projects loaded. Add credentials in Settings."
+            }
+            let projectName = parts.count >= 5 ? parts[4...].joined(separator: " ") : nil
+            let project = projectName.flatMap { name in
+                projects.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+            } ?? projects[0]
+            initializeRTC(appId: project.vendorKey)
+            joinRTCChannel(channel: channel, uid: uid, projectId: project.id)
+            return "RTC: joining channel=\(channel) uid=\(uid) project=\(project.name)"
+        case "leave":
+            leaveRTCChannel()
+            return "RTC: leaving channel"
+        case "mic":
+            guard parts.count >= 3 else {
+                return "RTC: usage /rtc mic on|off|toggle"
+            }
+            let mode = parts[2].lowercased()
+            switch mode {
+            case "on":
+                rtcManager.muteMic(false)
+                return "RTC: mic unmuted"
+            case "off":
+                rtcManager.muteMic(true)
+                return "RTC: mic muted"
+            case "toggle":
+                rtcManager.muteMic(!rtcManager.isMicMuted)
+                return "RTC: mic \(rtcManager.isMicMuted ? "muted" : "unmuted")"
+            default:
+                return "RTC: usage /rtc mic on|off|toggle"
+            }
+        case "screen":
+            guard parts.count >= 3 else {
+                return "RTC: usage /rtc screen on|off [displayId]"
+            }
+            let mode = parts[2].lowercased()
+            switch mode {
+            case "on":
+                let displayId = parts.count >= 4 ? UInt32(parts[3]) ?? 0 : 0
+                rtcManager.startScreenShare(displayId: displayId)
+                return "RTC: screen share started (displayId=\(displayId))"
+            case "off":
+                rtcManager.stopScreenShare()
+                return "RTC: screen share stopped"
+            default:
+                return "RTC: usage /rtc screen on|off [displayId]"
+            }
+        default:
+            return "RTC: unknown command. Try: /rtc help"
         }
     }
 

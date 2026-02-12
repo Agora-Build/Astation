@@ -37,6 +37,7 @@ let package = Package(
             linkerSettings: [
                 .unsafeFlags(["-L", "build"]),
                 .linkedLibrary("astation_core"),
+                .linkedLibrary("z"),
                 .linkedLibrary("c++"),
             ]
         ),

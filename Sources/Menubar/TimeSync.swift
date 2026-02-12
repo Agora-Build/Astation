@@ -12,6 +12,7 @@ class TimeSync {
         do {
             var request = URLRequest(url: URL(string: "https://api.agora.io")!)
             request.httpMethod = "HEAD"
+            request.timeoutInterval = 5
 
             let (_, response) = try await URLSession.shared.data(for: request)
 

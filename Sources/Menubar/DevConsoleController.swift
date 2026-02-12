@@ -173,6 +173,7 @@ class DevConsoleController: NSObject, NSWindowDelegate {
 
         // Refresh the Atem list
         refreshAtemList()
+        appendLog("Tip: use /rtc help for local RTC commands")
     }
 
     // MARK: - Actions
@@ -210,6 +211,13 @@ class DevConsoleController: NSObject, NSWindowDelegate {
         let command = messageInput.string.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !command.isEmpty else {
             appendLog("Error: Enter a command")
+            return
+        }
+
+        if command.hasPrefix("/rtc") {
+            let response = hubManager.handleLocalRtcCommand(command)
+            appendLog(response)
+            messageInput.string = ""
             return
         }
 

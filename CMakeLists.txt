@@ -9,12 +9,16 @@ endif()
 add_library(astation_core STATIC
     core/src/astation_core.cpp
     core/src/astation_rtc.cpp
+    core/src/astation_token.cpp
 )
 
 target_include_directories(astation_core
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/core/include>
         $<INSTALL_INTERFACE:include>
+)
+target_include_directories(astation_core PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/third_party/agora_token_builder
 )
 
 # Locate Agora RTC SDK headers per platform.
@@ -146,6 +150,14 @@ elseif(WIN32)
 endif()
 
 target_compile_features(astation_core PUBLIC cxx_std_17)
+
+find_package(ZLIB REQUIRED)
+target_link_libraries(astation_core PRIVATE ZLIB::ZLIB)
+
+if(NOT APPLE)
+    find_package(OpenSSL REQUIRED)
+    target_link_libraries(astation_core PRIVATE OpenSSL::Crypto)
+endif()
 
 if(MSVC)
     target_compile_options(astation_core PRIVATE /W4 /permissive-)
