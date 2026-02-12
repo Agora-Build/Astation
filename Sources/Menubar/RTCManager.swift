@@ -1,5 +1,6 @@
 import Foundation
 #if os(macOS)
+import AppKit
 import CoreGraphics
 #endif
 import CStationCore
@@ -202,6 +203,24 @@ class RTCManager {
     }
 
     // MARK: - Screen Share
+#if os(macOS)
+    private func ensureScreenSharePermission() -> Bool {
+        if CGPreflightScreenCaptureAccess() {
+            return true
+        }
+        Log.info("[RTCManager] Screen recording permission not granted. Requesting access...")
+        let granted = CGRequestScreenCaptureAccess()
+        if !granted {
+            let alert = NSAlert()
+            alert.messageText = "Screen Recording Permission Required"
+            alert.informativeText =
+                "Enable Screen Recording for Astation in System Settings > Privacy & Security > Screen Recording, then relaunch."
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
+        return granted
+    }
+#endif
 
     /// Start screen sharing on the given display.
     func startScreenShare(displayId: UInt32) {
@@ -210,6 +229,10 @@ class RTCManager {
             return
         }
         #if os(macOS)
+        guard ensureScreenSharePermission() else {
+            Log.info("[RTCManager] Screen recording permission denied")
+            return
+        }
         let resolvedDisplayId = displayId == 0 ? UInt32(CGMainDisplayID()) : displayId
         #else
         let resolvedDisplayId = displayId
