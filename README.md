@@ -8,7 +8,7 @@ Download the `.pkg` installer from [Releases](https://github.com/Agora-Build/Ast
 
 ### Build from source
 
-Prerequisites: macOS 13+, Xcode Command Line Tools, CMake.
+Prerequisites: macOS 14+, Xcode Command Line Tools, CMake.
 
 ```bash
 git clone git@github.com:Agora-Build/Astation.git

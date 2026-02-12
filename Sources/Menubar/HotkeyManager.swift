@@ -48,7 +48,7 @@ class HotkeyManager {
         )
 
         // Ctrl+V → voice toggle
-        var voiceKeyID = EventHotKeyID(
+        let voiceKeyID = EventHotKeyID(
             signature: HotkeyManager.hotkeySignature,
             id: HotkeyManager.voiceHotkeyID
         )
@@ -65,7 +65,7 @@ class HotkeyManager {
         }
 
         // Ctrl+Shift+V → video toggle
-        var videoKeyID = EventHotKeyID(
+        let videoKeyID = EventHotKeyID(
             signature: HotkeyManager.hotkeySignature,
             id: HotkeyManager.videoHotkeyID
         )

@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "Astation",
     platforms: [
-        .macOS(.v13)
+        .macOS(.v14)
     ],
     products: [
         .executable(

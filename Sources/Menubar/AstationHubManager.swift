@@ -605,7 +605,7 @@ class AstationHubManager: ObservableObject {
 
         // Wire send handler to also forward to relay
         let originalSend = sendHandler
-        sendHandler = { [weak self, weak task] message, targetId in
+        sendHandler = { [weak task] message, targetId in
             if targetId == relayClientId {
                 // Send to relay WebSocket
                 if let jsonData = try? JSONEncoder().encode(message),

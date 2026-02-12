@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.16)
 
 project(AstationCore LANGUAGES C CXX)
 
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum macOS deployment target")
+endif()
+
 add_library(astation_core STATIC
     core/src/astation_core.cpp
     core/src/astation_rtc.cpp
@@ -107,7 +111,7 @@ if(APPLE)
     )
     if(AGORA_XCFRAMEWORK_HEADERS)
         list(REMOVE_DUPLICATES AGORA_XCFRAMEWORK_HEADERS)
-        target_include_directories(astation_core PRIVATE ${AGORA_XCFRAMEWORK_HEADERS})
+        target_include_directories(astation_core SYSTEM PRIVATE ${AGORA_XCFRAMEWORK_HEADERS})
         message(STATUS "Agora RTC SDK headers:")
         foreach(HDR_DIR IN LISTS AGORA_XCFRAMEWORK_HEADERS)
             message(STATUS "  ${HDR_DIR}")
@@ -118,7 +122,7 @@ if(APPLE)
             "macOS: Run cmake again to auto-download")
     endif()
 elseif(EXISTS "${AGORA_HEADERS}")
-    target_include_directories(astation_core PRIVATE "${AGORA_HEADERS}")
+    target_include_directories(astation_core SYSTEM PRIVATE "${AGORA_HEADERS}")
     message(STATUS "Agora RTC SDK headers: ${AGORA_HEADERS}")
 else()
     message(FATAL_ERROR

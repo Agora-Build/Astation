@@ -148,7 +148,7 @@ class AstationWebSocketServer {
 }
 
 // Simple HTTP handler for WebSocket upgrade
-private class HTTPHandler: ChannelInboundHandler, RemovableChannelHandler {
+private final class HTTPHandler: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
     
