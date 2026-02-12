@@ -44,3 +44,24 @@ jobs:
 
       - name: Build Swift package
         run: swift build -c release
+
+  test-webapp:
+    name: Webapp Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Run webapp tests
+        run: node webapp/tests/codec.test.js
+
+  test-api-server:
+    name: API Server Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run api-server tests
+        working-directory: api-server
+        run: cargo test
