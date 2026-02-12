@@ -211,12 +211,14 @@ class RTCManager {
         Log.info("[RTCManager] Screen recording permission not granted. Requesting access...")
         let granted = CGRequestScreenCaptureAccess()
         if !granted {
-            let alert = NSAlert()
-            alert.messageText = "Screen Recording Permission Required"
-            alert.informativeText =
-                "Enable Screen Recording for Astation in System Settings > Privacy & Security > Screen Recording, then relaunch."
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
+            for _ in 0..<2 {
+                let alert = NSAlert()
+                alert.messageText = "Screen Recording Permission Required"
+                alert.informativeText =
+                    "Enable Screen Recording for Astation in System Settings > Privacy & Security > Screen Recording, then relaunch."
+                alert.addButton(withTitle: "Grant Permission First")
+                alert.runModal()
+            }
         }
         return granted
     }
