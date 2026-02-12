@@ -416,6 +416,10 @@ int astation_rtc_enable_screen_share(AStationRtcEngine* engine,
     params.bitrate = agora::rtc::STANDARD_BITRATE;
     params.captureMouseCursor = true;
 
+    std::fprintf(stderr,
+        "[AStationRtc] Screen share config: codec=AV1 resolution=1920x1080 fps=%d\n",
+        params.frameRate);
+
     int ret = impl->rtc_engine->startScreenCaptureByDisplayId(
         static_cast<int64_t>(display_id), region, params);
 
