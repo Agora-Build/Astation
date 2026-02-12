@@ -395,6 +395,12 @@ int astation_rtc_enable_screen_share(AStationRtcEngine* engine,
     }
 
 #if (defined(__APPLE__) && TARGET_OS_MAC && !TARGET_OS_IPHONE) || defined(_WIN32)
+    if (impl->screen_sharing) {
+        std::fprintf(stderr,
+            "[AStationRtc] Screen sharing already active\n");
+        return 0;
+    }
+
     // Ensure video is enabled and configure encoder for AV1 @ 1080p.
     impl->rtc_engine->enableVideo();
     agora::rtc::VideoEncoderConfiguration encoder_config;
@@ -407,6 +413,16 @@ int astation_rtc_enable_screen_share(AStationRtcEngine* engine,
         std::fprintf(stderr,
             "[AStationRtc] setVideoEncoderConfiguration(AV1) failed: %d\n",
             enc_ret);
+        encoder_config.codecType = agora::rtc::VIDEO_CODEC_H264;
+        int fallback_ret = impl->rtc_engine->setVideoEncoderConfiguration(encoder_config);
+        if (fallback_ret != 0) {
+            std::fprintf(stderr,
+                "[AStationRtc] setVideoEncoderConfiguration(H264) failed: %d\n",
+                fallback_ret);
+        } else {
+            std::fprintf(stderr,
+                "[AStationRtc] Falling back to H264 for screen share\n");
+        }
     }
 
     agora::rtc::Rectangle region = {0, 0, 0, 0}; // full display

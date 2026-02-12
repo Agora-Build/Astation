@@ -1,4 +1,7 @@
 import Foundation
+#if os(macOS)
+import CoreGraphics
+#endif
 import CStationCore
 
 // MARK: - RTC Error
@@ -206,7 +209,12 @@ class RTCManager {
             Log.info("[RTCManager] Cannot screen share: engine not initialized")
             return
         }
-        let result = astation_rtc_enable_screen_share(engine, Int32(displayId))
+        #if os(macOS)
+        let resolvedDisplayId = displayId == 0 ? UInt32(CGMainDisplayID()) : displayId
+        #else
+        let resolvedDisplayId = displayId
+        #endif
+        let result = astation_rtc_enable_screen_share(engine, Int32(resolvedDisplayId))
         if result == 0 {
             _isScreenSharing = true
         }
