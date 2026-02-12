@@ -6,8 +6,8 @@ import zlib
 
 // MARK: - Token Decoder (for roundtrip verification)
 
-/// Minimal AccessToken2 decoder — mirrors Atem/src/token.rs decode_token().
-/// Used only in tests to verify the Swift encoder produces valid tokens.
+/// Minimal AccessToken2 decoder — mirrors Agora's AccessToken2 format.
+/// Used only in tests to verify the C++ token builder produces valid tokens.
 private struct DecodedToken {
     let signature: Data
     let appId: String
@@ -321,68 +321,6 @@ final class AccessToken2Tests: XCTestCase {
             "Publisher token should be longer (4 privileges vs 1)")
     }
 
-    // MARK: - Binary packing helpers
-
-    func testPackUInt16() {
-        var buf = Data()
-        AccessToken2.packUInt16(&buf, 0x0102)
-        XCTAssertEqual(buf, Data([0x02, 0x01]))
-    }
-
-    func testPackUInt32() {
-        var buf = Data()
-        AccessToken2.packUInt32(&buf, 0x01020304)
-        XCTAssertEqual(buf, Data([0x04, 0x03, 0x02, 0x01]))
-    }
-
-    func testPackUInt16Zero() {
-        var buf = Data()
-        AccessToken2.packUInt16(&buf, 0)
-        XCTAssertEqual(buf, Data([0x00, 0x00]))
-    }
-
-    func testPackUInt32Zero() {
-        var buf = Data()
-        AccessToken2.packUInt32(&buf, 0)
-        XCTAssertEqual(buf, Data([0x00, 0x00, 0x00, 0x00]))
-    }
-
-    func testPackUInt16Max() {
-        var buf = Data()
-        AccessToken2.packUInt16(&buf, UInt16.max)
-        XCTAssertEqual(buf, Data([0xFF, 0xFF]))
-    }
-
-    func testPackUInt32Max() {
-        var buf = Data()
-        AccessToken2.packUInt32(&buf, UInt32.max)
-        XCTAssertEqual(buf, Data([0xFF, 0xFF, 0xFF, 0xFF]))
-    }
-
-    func testPackString() {
-        var buf = Data()
-        AccessToken2.packString(&buf, "AB")
-        XCTAssertEqual(buf, Data([0x02, 0x00, 0x41, 0x42]))
-    }
-
-    func testPackStringEmpty() {
-        var buf = Data()
-        AccessToken2.packString(&buf, "")
-        XCTAssertEqual(buf, Data([0x00, 0x00]))
-    }
-
-    func testPackBytes() {
-        var buf = Data()
-        AccessToken2.packBytes(&buf, Data([0xFF, 0xAA]))
-        XCTAssertEqual(buf, Data([0x02, 0x00, 0xFF, 0xAA]))
-    }
-
-    func testPackBytesEmpty() {
-        var buf = Data()
-        AccessToken2.packBytes(&buf, Data())
-        XCTAssertEqual(buf, Data([0x00, 0x00]))
-    }
-
     // MARK: - Roundtrip: RTC token generate → decode
 
     func testRTCPublisherRoundtrip() throws {
@@ -639,18 +577,4 @@ final class AccessToken2Tests: XCTestCase {
         XCTAssertEqual(decoded.signature.count, 32, "HMAC-SHA256 produces 32-byte signatures")
     }
 
-    // MARK: - Service type constants
-
-    func testServiceTypeConstants() {
-        XCTAssertEqual(AccessToken2.serviceTypeRTC, 1)
-        XCTAssertEqual(AccessToken2.serviceTypeRTM, 2)
-    }
-
-    func testPrivilegeConstants() {
-        XCTAssertEqual(AccessToken2.privilegeJoinChannel, 1)
-        XCTAssertEqual(AccessToken2.privilegePublishAudio, 2)
-        XCTAssertEqual(AccessToken2.privilegePublishVideo, 3)
-        XCTAssertEqual(AccessToken2.privilegePublishData, 4)
-        XCTAssertEqual(AccessToken2.privilegeLogin, 1)
-    }
 }
