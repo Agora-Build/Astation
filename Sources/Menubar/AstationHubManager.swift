@@ -36,12 +36,14 @@ class AstationHubManager: ObservableObject {
     /// Set by AstationApp after wiring up the WebSocket server.
     var sendHandler: ((AstationMessage, String) -> Void)?
 
-    init() {
+    init(skipProjectLoad: Bool = false) {
         Log.info("Initializing Astation Hub Manager")
         setupCore()
         setupRTCManager()
         checkCredentialStatus()
-        loadProjects()
+        if !skipProjectLoad {
+            loadProjects()
+        }
     }
 
     deinit {

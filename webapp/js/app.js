@@ -161,8 +161,8 @@ async function handleJoin() {
 // --- Agora SDK ---
 
 async function joinChannel(appId, channel, token, uid) {
-    const preferredCodec = "av1";
-    const fallbackCodec = "vp8";
+    const preferredCodec = (window.AstationCodec && window.AstationCodec.preferredCodec) || "av1";
+    const fallbackCodec = (window.AstationCodec && window.AstationCodec.fallbackCodec) || "vp8";
 
     const createClientWithCodec = async (codec) => {
         const newClient = AgoraRTC.createClient({ mode: "rtc", codec });

@@ -145,6 +145,47 @@ void test_rtm_token() {
     assert(service->privileges_.at(agora::tools::ServiceRtm::kPrivilegeLogin) == token_expire);
 }
 
+void test_invalid_app_id() {
+    const std::string channel = "invalid-app";
+    char* token = astation_rtc_build_token(
+        "not-a-uuid",
+        kAppCert,
+        channel.c_str(),
+        1,
+        1,
+        60,
+        60);
+    assert(token != nullptr);
+    assert(std::string(token).empty());
+    astation_token_free(token);
+}
+
+void test_invalid_app_cert() {
+    const std::string channel = "invalid-cert";
+    char* token = astation_rtc_build_token(
+        kAppId,
+        "not-a-uuid",
+        channel.c_str(),
+        1,
+        1,
+        60,
+        60);
+    assert(token != nullptr);
+    assert(std::string(token).empty());
+    astation_token_free(token);
+}
+
+void test_rtm_invalid_cert() {
+    char* token = astation_rtm_build_token(
+        kAppId,
+        "not-a-uuid",
+        "user",
+        60);
+    assert(token != nullptr);
+    assert(std::string(token).empty());
+    astation_token_free(token);
+}
+
 } // namespace
 
 int main() {
@@ -152,6 +193,9 @@ int main() {
     test_rtc_subscriber();
     test_rtc_uid_zero();
     test_rtm_token();
+    test_invalid_app_id();
+    test_invalid_app_cert();
+    test_rtm_invalid_cert();
 
     std::cout << "token_builder_test: ok\n";
     return 0;
