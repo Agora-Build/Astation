@@ -110,6 +110,9 @@ struct AStationRtcEngineImpl
             rtc_engine->enableAudio();
         }
 
+        // Enable video subsystem so screen sharing can publish video.
+        rtc_engine->enableVideo();
+
         // Set role to broadcaster so we can publish mic/screen
         rtc_engine->setClientRole(agora::rtc::CLIENT_ROLE_BROADCASTER);
 
@@ -315,8 +318,16 @@ int astation_rtc_join(AStationRtcEngine* engine) {
     int ret = impl->rtc_engine->joinChannel(
         impl->token.empty() ? nullptr : impl->token.c_str(),
         impl->channel.c_str(),
-        nullptr, // info
-        impl->uid);
+        impl->uid,
+        [&]() {
+            agora::rtc::ChannelMediaOptions options;
+            options.publishMicrophoneTrack = (impl->enable_audio != 0);
+            options.publishCameraTrack = false;
+            options.publishScreenTrack = impl->screen_sharing;
+            options.autoSubscribeAudio = true;
+            options.autoSubscribeVideo = true;
+            return options;
+        }());
 
     if (ret != 0) {
         std::fprintf(stderr,
@@ -384,10 +395,25 @@ int astation_rtc_enable_screen_share(AStationRtcEngine* engine,
     }
 
 #if (defined(__APPLE__) && TARGET_OS_MAC && !TARGET_OS_IPHONE) || defined(_WIN32)
+    // Ensure video is enabled and configure encoder for AV1 @ 1080p.
+    impl->rtc_engine->enableVideo();
+    agora::rtc::VideoEncoderConfiguration encoder_config;
+    encoder_config.dimensions = agora::rtc::VideoDimensions(1920, 1080);
+    encoder_config.frameRate = 15;
+    encoder_config.bitrate = agora::rtc::STANDARD_BITRATE;
+    encoder_config.codecType = agora::rtc::VIDEO_CODEC_AV1;
+    int enc_ret = impl->rtc_engine->setVideoEncoderConfiguration(encoder_config);
+    if (enc_ret != 0) {
+        std::fprintf(stderr,
+            "[AStationRtc] setVideoEncoderConfiguration(AV1) failed: %d\n",
+            enc_ret);
+    }
+
     agora::rtc::Rectangle region = {0, 0, 0, 0}; // full display
     agora::rtc::ScreenCaptureParameters params;
     params.dimensions = {1920, 1080};
     params.frameRate = 15;
+    params.bitrate = agora::rtc::STANDARD_BITRATE;
     params.captureMouseCursor = true;
 
     int ret = impl->rtc_engine->startScreenCaptureByDisplayId(
@@ -395,6 +421,18 @@ int astation_rtc_enable_screen_share(AStationRtcEngine* engine,
 
     if (ret == 0) {
         impl->screen_sharing = true;
+        if (impl->joined) {
+            agora::rtc::ChannelMediaOptions options;
+            options.publishScreenTrack = true;
+            options.publishCameraTrack = false;
+            options.publishMicrophoneTrack = (impl->enable_audio != 0);
+            int opt_ret = impl->rtc_engine->updateChannelMediaOptions(options);
+            if (opt_ret != 0) {
+                std::fprintf(stderr,
+                    "[AStationRtc] updateChannelMediaOptions(publishScreenTrack) failed: %d\n",
+                    opt_ret);
+            }
+        }
         std::fprintf(stderr,
             "[AStationRtc] Screen sharing started on display %d\n",
             display_id);
@@ -426,6 +464,16 @@ int astation_rtc_stop_screen_share(AStationRtcEngine* engine) {
     int ret = impl->rtc_engine->stopScreenCapture();
     if (ret == 0) {
         impl->screen_sharing = false;
+        if (impl->joined) {
+            agora::rtc::ChannelMediaOptions options;
+            options.publishScreenTrack = false;
+            int opt_ret = impl->rtc_engine->updateChannelMediaOptions(options);
+            if (opt_ret != 0) {
+                std::fprintf(stderr,
+                    "[AStationRtc] updateChannelMediaOptions(stopScreenTrack) failed: %d\n",
+                    opt_ret);
+            }
+        }
         std::fprintf(stderr, "[AStationRtc] Screen sharing stopped\n");
     } else {
         std::fprintf(stderr,

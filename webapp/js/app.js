@@ -161,15 +161,27 @@ async function handleJoin() {
 // --- Agora SDK ---
 
 async function joinChannel(appId, channel, token, uid) {
-    client = AgoraRTC.createClient({ mode: "rtc", codec: "vp8" });
+    const preferredCodec = "av1";
+    const fallbackCodec = "vp8";
 
-    // Set up event handlers before joining
-    client.on("user-published", handleUserPublished);
-    client.on("user-unpublished", handleUserUnpublished);
-    client.on("user-joined", handleUserJoined);
-    client.on("user-left", handleUserLeft);
+    const createClientWithCodec = async (codec) => {
+        const newClient = AgoraRTC.createClient({ mode: "rtc", codec });
 
-    await client.join(appId, channel, token, uid);
+        newClient.on("user-published", handleUserPublished);
+        newClient.on("user-unpublished", handleUserUnpublished);
+        newClient.on("user-joined", handleUserJoined);
+        newClient.on("user-left", handleUserLeft);
+
+        await newClient.join(appId, channel, token, uid);
+        return newClient;
+    };
+
+    try {
+        client = await createClientWithCodec(preferredCodec);
+    } catch (err) {
+        console.warn(`AV1 join failed, falling back to ${fallbackCodec}:`, err);
+        client = await createClientWithCodec(fallbackCodec);
+    }
 
     // Create and publish local mic track
     try {
