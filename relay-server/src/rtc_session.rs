@@ -105,7 +105,7 @@ pub struct JoinRtcSessionResponse {
     pub name: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct RtcSessionError {
     pub error: String,
 }
@@ -870,5 +870,161 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_join_session_full_handler() {
+        let state = AppState {
+            sessions: SessionStore::new(),
+            relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
+        };
+        state
+            .rtc_sessions
+            .create("full-h".into(), "app1".into(), "room1".into(), "tok1".into(), 42)
+            .await;
+
+        // Fill session to capacity (8 participants)
+        for i in 0..8 {
+            state.rtc_sessions.join("full-h", format!("User{}", i)).await.unwrap();
+        }
+
+        let app = Router::new()
+            .route(
+                "/api/rtc-sessions/:id/join",
+                post(join_rtc_session_handler),
+            )
+            .with_state(state);
+
+        // 9th person should get 409 Conflict
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/rtc-sessions/full-h/join")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"name":"User9"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: RtcSessionError = serde_json::from_slice(&body).unwrap();
+        assert!(error.error.contains("full"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_cleanup_and_join() {
+        let store = RtcSessionStore::new();
+        store
+            .create("race-test".into(), "a".into(), "c".into(), "t".into(), 1)
+            .await;
+
+        // Spawn concurrent operations: cleanup and join
+        let store1 = store.clone();
+        let cleanup_task = tokio::spawn(async move {
+            store1.cleanup_expired().await;
+        });
+
+        let store2 = store.clone();
+        let join_task = tokio::spawn(async move {
+            store2.join("race-test", "RaceUser".into()).await
+        });
+
+        let _ = tokio::join!(cleanup_task, join_task);
+
+        // Session should still exist and have at least one participant
+        let session = store.get("race-test").await;
+        assert!(session.is_some(), "Session should not be cleaned up while active");
+    }
+
+    #[tokio::test]
+    async fn test_session_url_format() {
+        let app = create_test_app();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/rtc-sessions")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"app_id":"app1","channel":"room","token":"tok","host_uid":5678}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let resp: CreateRtcSessionResponse = serde_json::from_slice(&body).unwrap();
+
+        assert!(resp.url.starts_with("https://station.agora.build/session/"));
+        assert!(resp.url.contains(&resp.id));
+        assert!(uuid::Uuid::parse_str(&resp.id).is_ok(), "Session ID should be valid UUID");
+    }
+
+    #[tokio::test]
+    async fn test_participant_names_persistence() {
+        let store = RtcSessionStore::new();
+        store
+            .create("name-test".into(), "app".into(), "ch".into(), "tok".into(), 1)
+            .await;
+
+        // Join multiple users
+        store.join("name-test", "Alice".into()).await.unwrap();
+        store.join("name-test", "Bob".into()).await.unwrap();
+        store.join("name-test", "Charlie".into()).await.unwrap();
+
+        let session = store.get("name-test").await.unwrap();
+        assert_eq!(session.participants.len(), 3);
+
+        let names: Vec<String> = session.participants.iter()
+            .filter_map(|p| p.display_name.clone())
+            .collect();
+        assert_eq!(names, vec!["Alice", "Bob", "Charlie"]);
+    }
+
+    #[tokio::test]
+    async fn test_delete_session_with_participants() {
+        let store = RtcSessionStore::new();
+        store
+            .create("del-part".into(), "app".into(), "ch".into(), "tok".into(), 1)
+            .await;
+
+        // Add participants
+        store.join("del-part", "User1".into()).await.unwrap();
+        store.join("del-part", "User2".into()).await.unwrap();
+
+        // Delete should succeed even with participants
+        assert!(store.delete("del-part").await);
+        assert!(store.get("del-part").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_does_not_remove_active_sessions_with_participants() {
+        let store = RtcSessionStore::new();
+
+        // Create session (not expired)
+        store
+            .create("active-with-parts".into(), "a".into(), "c".into(), "t".into(), 1)
+            .await;
+
+        // Add participants
+        store.join("active-with-parts", "User1".into()).await.unwrap();
+        store.join("active-with-parts", "User2".into()).await.unwrap();
+
+        store.cleanup_expired().await;
+
+        // Should still exist
+        let session = store.get("active-with-parts").await;
+        assert!(session.is_some());
+        assert_eq!(session.unwrap().participants.len(), 2);
     }
 }

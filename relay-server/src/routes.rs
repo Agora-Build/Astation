@@ -674,4 +674,321 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }
+
+    #[tokio::test]
+    async fn test_double_deny_returns_conflict() {
+        let state = AppState {
+            sessions: SessionStore::new(),
+            relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
+        };
+        let app = Router::new()
+            .route("/api/sessions", post(create_session_handler))
+            .route("/api/sessions/:id/deny", post(deny_session_handler))
+            .with_state(state);
+
+        // Create session
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"hostname": "test-machine"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: CreateSessionResponse = serde_json::from_slice(&body).unwrap();
+        let session_id = created.id;
+
+        // First deny
+        app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{}/deny", session_id))
+                    .header("Content-Type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Second deny should return conflict
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{}/deny", session_id))
+                    .header("Content-Type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_grant_after_deny_returns_conflict() {
+        let state = AppState {
+            sessions: SessionStore::new(),
+            relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
+        };
+        let app = Router::new()
+            .route("/api/sessions", post(create_session_handler))
+            .route("/api/sessions/:id/grant", post(grant_session_handler))
+            .route("/api/sessions/:id/deny", post(deny_session_handler))
+            .with_state(state);
+
+        // Create session
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"hostname": "test-machine"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: CreateSessionResponse = serde_json::from_slice(&body).unwrap();
+        let session_id = created.id;
+        let otp = created.otp;
+
+        // Deny first
+        app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{}/deny", session_id))
+                    .header("Content-Type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Try to grant after deny should return conflict
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{}/grant", session_id))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(format!(r#"{{"otp": "{}"}}"#, otp)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_create_session_invalid_json() {
+        let app = create_app();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"invalid": json}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Should reject invalid JSON
+        assert!(
+            response.status() == StatusCode::BAD_REQUEST ||
+            response.status() == StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_session_missing_hostname() {
+        let app = create_app();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn test_session_token_uniqueness() {
+        let state = AppState {
+            sessions: SessionStore::new(),
+            relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
+        };
+        let app = Router::new()
+            .route("/api/sessions", post(create_session_handler))
+            .route("/api/sessions/:id/grant", post(grant_session_handler))
+            .with_state(state);
+
+        let mut tokens = std::collections::HashSet::new();
+
+        for i in 0..10 {
+            // Create session
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/sessions")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(format!(r#"{{"hostname": "host-{}"}}"#, i)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let created: CreateSessionResponse = serde_json::from_slice(&body).unwrap();
+
+            // Grant session
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/sessions/{}/grant", created.id))
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(format!(r#"{{"otp": "{}"}}"#, created.otp)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let grant_resp: SessionStatusResponse = serde_json::from_slice(&body).unwrap();
+
+            if let Some(token) = grant_resp.token {
+                tokens.insert(token);
+            }
+        }
+
+        assert_eq!(tokens.len(), 10, "All session tokens should be unique");
+    }
+
+    #[tokio::test]
+    async fn test_status_returns_expired_for_old_pending_session() {
+        use chrono::{Duration, Utc};
+
+        let state = AppState {
+            sessions: SessionStore::new(),
+            relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
+        };
+
+        // Create an expired session manually
+        let now = Utc::now();
+        let expired_session = crate::auth::Session {
+            id: uuid::Uuid::new_v4().to_string(),
+            otp: "12345678".to_string(),
+            hostname: "expired-host".to_string(),
+            status: crate::auth::SessionStatus::Pending,
+            token: None,
+            created_at: now - Duration::minutes(10),
+            expires_at: now - Duration::minutes(5),
+        };
+        let session_id = expired_session.id.clone();
+        state.sessions.create(expired_session).await;
+
+        let app = Router::new()
+            .route("/api/sessions/:id/status", get(get_session_status_handler))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{}/status", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status_resp: SessionStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status_resp.status, crate::auth::SessionStatus::Expired);
+    }
+
+    #[tokio::test]
+    async fn test_hostname_with_special_characters() {
+        let app = create_app();
+
+        let test_hostnames = vec![
+            "host-with-dashes",
+            "host_with_underscores",
+            "host.with.dots",
+            "192.168.1.1",
+            "host123",
+            "UPPERCASE-HOST",
+        ];
+
+        for hostname in test_hostnames {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/sessions")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(format!(r#"{{"hostname": "{}"}}"#, hostname)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::CREATED,
+                "Should accept hostname: {}",
+                hostname
+            );
+
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let resp: CreateSessionResponse = serde_json::from_slice(&body).unwrap();
+            assert_eq!(resp.hostname, hostname);
+        }
+    }
 }

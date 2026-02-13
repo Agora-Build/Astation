@@ -290,7 +290,25 @@ pub async fn pair_page_handler(
     }
 }
 
+/// HTML-escape a string to prevent XSS attacks
+fn html_escape(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '&' => "&amp;".to_string(),
+            '<' => "&lt;".to_string(),
+            '>' => "&gt;".to_string(),
+            '"' => "&quot;".to_string(),
+            '\'' => "&#x27;".to_string(),
+            '/' => "&#x2F;".to_string(),
+            _ => c.to_string(),
+        })
+        .collect()
+}
+
 fn render_pair_page(code: &str, hostname: &str) -> String {
+    let code_escaped = html_escape(code);
+    let hostname_escaped = html_escape(hostname);
+
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -317,15 +335,16 @@ fn render_pair_page(code: &str, hostname: &str) -> String {
     <p>Enter this code in Astation to connect</p>
     <div class="code">{code}</div>
     <div class="hostname">Host: {hostname}</div>
-    <a class="btn" href="astation://pair?code={code}">Open in Astation</a>
+    <a class="btn" href="astation://pair?code={code_url}">Open in Astation</a>
     <div class="download">
       <p>Don't have Astation? <a href="https://github.com/AgoraIO-Community/astation/releases">Download</a></p>
     </div>
   </div>
 </body>
 </html>"#,
-        code = code,
-        hostname = hostname,
+        code = code_escaped,
+        hostname = hostname_escaped,
+        code_url = urlencoding::encode(code),
     )
 }
 
@@ -787,5 +806,180 @@ mod tests {
             10,
             "All 10 pairing codes should be unique"
         );
+    }
+
+    #[tokio::test]
+    async fn test_pairing_code_entropy() {
+        // Generate many codes to verify randomness distribution
+        let mut first_chars = std::collections::HashMap::new();
+        for _ in 0..100 {
+            let code = generate_pairing_code();
+            let first_char = code.chars().next().unwrap();
+            *first_chars.entry(first_char).or_insert(0) += 1;
+        }
+
+        // Should have reasonable distribution (at least 5 different first characters out of 100 samples)
+        assert!(
+            first_chars.len() >= 5,
+            "Pairing codes should have good entropy, got {} unique first chars",
+            first_chars.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pair_page_xss_protection() {
+        // Test that hostname with HTML/JS is safely escaped
+        let html = render_pair_page("TEST-CODE", "<script>alert('xss')</script>");
+        // If properly escaped, the literal string should appear, not executed
+        assert!(!html.contains("<script>alert"), "Script tags should be escaped or removed");
+
+        // Test with other XSS vectors
+        let html2 = render_pair_page("CODE-123", "' onload='alert(1)'");
+        assert!(!html2.contains("onload='alert"), "Event handlers should be escaped");
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_keeps_recently_paired() {
+        let hub = RelayHub::new();
+
+        // Create an old room but with atem connected (not astation)
+        let (tx_atem, _rx) = mpsc::unbounded_channel::<String>();
+        let room = PairRoom {
+            code: "OLD-ATEM".to_string(),
+            hostname: "old-host".to_string(),
+            atem_tx: Some(tx_atem),
+            astation_tx: None,
+            created_at: Instant::now() - std::time::Duration::from_secs(ROOM_EXPIRY_SECS + 10),
+        };
+        hub.rooms.write().await.insert("OLD-ATEM".to_string(), room);
+
+        hub.cleanup_expired().await;
+
+        let rooms = hub.rooms.read().await;
+        // Should be removed (only astation_tx prevents cleanup)
+        assert!(!rooms.contains_key("OLD-ATEM"), "Room with only atem connected should be cleaned up");
+    }
+
+    #[tokio::test]
+    async fn test_pair_status_shows_unpaired_then_paired() {
+        let state = crate::AppState {
+            sessions: crate::session_store::SessionStore::new(),
+            relay: RelayHub::new(),
+            rtc_sessions: crate::rtc_session::RtcSessionStore::new(),
+        };
+
+        // Create pair
+        let code = generate_pairing_code();
+        let room = PairRoom {
+            code: code.clone(),
+            hostname: "test-host".to_string(),
+            atem_tx: None,
+            astation_tx: None,
+            created_at: Instant::now(),
+        };
+        state.relay.rooms.write().await.insert(code.clone(), room);
+
+        let app = Router::new()
+            .route("/api/pair/:code", axum::routing::get(pair_status_handler))
+            .with_state(state.clone());
+
+        // Check status before pairing
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/pair/{}", code))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let status: PairStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!status.paired, "Should not be paired initially");
+
+        // Simulate astation connection
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        {
+            let mut rooms = state.relay.rooms.write().await;
+            if let Some(room) = rooms.get_mut(&code) {
+                room.astation_tx = Some(tx);
+            }
+        }
+
+        // Check status after pairing
+        let app2 = Router::new()
+            .route("/api/pair/:code", axum::routing::get(pair_status_handler))
+            .with_state(state);
+
+        let response = app2
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/pair/{}", code))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let status: PairStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert!(status.paired, "Should be paired after astation connects");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_pair_creation() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let app = Arc::new(Mutex::new(create_relay_app()));
+        let mut handles = Vec::new();
+
+        for i in 0..10 {
+            let app_clone = app.clone();
+            handles.push(tokio::spawn(async move {
+                let app = app_clone.lock().await;
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/pair")
+                            .header("Content-Type", "application/json")
+                            .body(Body::from(format!(r#"{{"hostname": "host-{}"}}"#, i)))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<CreatePairResponse>(&body)
+                    .ok()
+                    .map(|r| r.code)
+            }));
+        }
+
+        let mut codes = std::collections::HashSet::new();
+        for handle in handles {
+            if let Some(code) = handle.await.unwrap() {
+                codes.insert(code);
+            }
+        }
+
+        assert_eq!(codes.len(), 10, "All concurrent pairs should have unique codes");
+    }
+
+    #[test]
+    fn test_code_chars_does_not_contain_ambiguous() {
+        let chars_str = String::from_utf8_lossy(CODE_CHARS);
+        assert!(!chars_str.contains('0'), "CODE_CHARS should not contain 0");
+        assert!(!chars_str.contains('O'), "CODE_CHARS should not contain O");
+        assert!(!chars_str.contains('1'), "CODE_CHARS should not contain 1");
+        assert!(!chars_str.contains('I'), "CODE_CHARS should not contain I");
+        assert!(!chars_str.contains('L'), "CODE_CHARS should not contain L");
     }
 }
