@@ -216,13 +216,21 @@ class StatusBarController: NSObject, NSMenuDelegate {
                 stopShareItem.target = self
                 statusMenu.addItem(stopShareItem)
             } else {
-                let startShareItem = NSMenuItem(
-                    title: "Start Screen Share",
-                    action: #selector(startScreenShare),
+                let startDisplayItem = NSMenuItem(
+                    title: "Start Screen Share (Display…)",
+                    action: #selector(startScreenShareDisplay),
                     keyEquivalent: ""
                 )
-                startShareItem.target = self
-                statusMenu.addItem(startShareItem)
+                startDisplayItem.target = self
+                statusMenu.addItem(startDisplayItem)
+
+                let startRegionItem = NSMenuItem(
+                    title: "Start Screen Share (Region…)",
+                    action: #selector(startScreenShareRegion),
+                    keyEquivalent: ""
+                )
+                startRegionItem.target = self
+                statusMenu.addItem(startRegionItem)
             }
 
             // Share Session Section
@@ -449,14 +457,93 @@ class StatusBarController: NSObject, NSMenuDelegate {
         setupMenu()
     }
 
-    @objc private func startScreenShare() {
-        hubManager.rtcManager.startScreenShare(displayId: 0)
-        setupMenu()
+    @objc private func startScreenShareDisplay() {
+        promptForScreenSource(title: "Select Display") { [weak self] source in
+            self?.hubManager.rtcManager.startScreenShare(displayId: source.id)
+            self?.setupMenu()
+        }
+    }
+
+    @objc private func startScreenShareRegion() {
+        promptForScreenSource(title: "Select Display for Region") { [weak self] source in
+            guard let self = self else { return }
+            guard let screen = self.matchNSScreen(for: source) else {
+                let alert = NSAlert()
+                alert.messageText = "Display Not Found"
+                alert.informativeText = "Unable to match the selected display. Try again."
+                alert.alertStyle = .warning
+                alert.runModal()
+                return
+            }
+            ScreenRegionSelector.selectRegion(on: screen) { regionPixels in
+                guard let regionPixels else { return }
+                self.hubManager.rtcManager.startScreenShare(displayId: source.id, regionPixels: regionPixels)
+                self.setupMenu()
+            }
+        }
     }
 
     @objc private func stopScreenShare() {
         hubManager.rtcManager.stopScreenShare()
         setupMenu()
+    }
+
+    private func promptForScreenSource(title: String, completion: @escaping (ScreenShareSource) -> Void) {
+        let sources = hubManager.rtcManager.screenSources()
+        guard !sources.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "No Displays Available"
+            alert.informativeText = "Unable to fetch screen capture sources. Ensure the app has Screen Recording permission."
+            alert.alertStyle = .warning
+            alert.runModal()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = "Choose which display to share."
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        let primaryIndex = sources.firstIndex { $0.isPrimary } ?? 0
+        for (index, source) in sources.enumerated() {
+            var label = "Display \(index + 1)"
+            if source.isPrimary {
+                label += " (Primary)"
+            }
+            if source.rectPixels.width > 0 && source.rectPixels.height > 0 {
+                label += " — \(Int(source.rectPixels.width))x\(Int(source.rectPixels.height))"
+            }
+            popup.addItem(withTitle: label)
+        }
+        popup.selectItem(at: primaryIndex)
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "Select")
+        alert.addButton(withTitle: "Cancel")
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            completion(sources[popup.indexOfSelectedItem])
+        }
+    }
+
+    private func matchNSScreen(for source: ScreenShareSource) -> NSScreen? {
+        let target = source.rectPixels
+        for screen in NSScreen.screens {
+            let scale = screen.backingScaleFactor
+            let frame = screen.frame
+            let pixelRect = CGRect(
+                x: frame.origin.x * scale,
+                y: frame.origin.y * scale,
+                width: frame.size.width * scale,
+                height: frame.size.height * scale
+            )
+            let deltaX = abs(pixelRect.origin.x - target.origin.x)
+            let deltaY = abs(pixelRect.origin.y - target.origin.y)
+            let deltaW = abs(pixelRect.size.width - target.size.width)
+            let deltaH = abs(pixelRect.size.height - target.size.height)
+            if deltaX < 2 && deltaY < 2 && deltaW < 2 && deltaH < 2 {
+                return screen
+            }
+        }
+        return NSScreen.main
     }
 
     @objc private func createShareLink() {

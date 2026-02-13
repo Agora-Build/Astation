@@ -8,8 +8,8 @@ int main() {
     {
         // Requested display id wins when provided.
         AstationScreenSource sources[] = {
-            {123, 1, 0},
-            {456, 1, 1},
+            {123, 1, 0, 0, 0, 0, 0},
+            {456, 1, 1, 0, 0, 0, 0},
         };
         int64_t resolved = astation_select_screen_source(sources, 2, 999);
         assert(resolved == 999);
@@ -24,8 +24,8 @@ int main() {
     {
         // First screen is selected if no primary is marked.
         std::vector<AstationScreenSource> sources = {
-            {101, 1, 0},
-            {202, 1, 0},
+            {101, 1, 0, 0, 0, 0, 0},
+            {202, 1, 0, 0, 0, 0, 0},
         };
         int64_t resolved = astation_select_screen_source(sources.data(), sources.size(), 0);
         assert(resolved == 101);
@@ -34,9 +34,9 @@ int main() {
     {
         // Primary screen should be selected even if not first.
         std::vector<AstationScreenSource> sources = {
-            {101, 1, 0},
-            {202, 1, 1},
-            {303, 1, 0},
+            {101, 1, 0, 0, 0, 0, 0},
+            {202, 1, 1, 0, 0, 0, 0},
+            {303, 1, 0, 0, 0, 0, 0},
         };
         int64_t resolved = astation_select_screen_source(sources.data(), sources.size(), 0);
         assert(resolved == 202);
@@ -45,8 +45,8 @@ int main() {
     {
         // Ignore non-screen sources.
         std::vector<AstationScreenSource> sources = {
-            {101, 0, 0},
-            {202, 1, 0},
+            {101, 0, 0, 0, 0, 0, 0},
+            {202, 1, 0, 0, 0, 0, 0},
         };
         int64_t resolved = astation_select_screen_source(sources.data(), sources.size(), 0);
         assert(resolved == 202);

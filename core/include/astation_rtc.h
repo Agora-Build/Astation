@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 
+#include "astation_screen_capture.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -32,7 +34,16 @@ int astation_rtc_join(AStationRtcEngine* engine);
 int astation_rtc_leave(AStationRtcEngine* engine);
 int astation_rtc_mute_mic(AStationRtcEngine* engine, int mute);
 int astation_rtc_enable_screen_share(AStationRtcEngine* engine, int display_id);
+int astation_rtc_enable_screen_share_region(AStationRtcEngine* engine,
+                                            int display_id,
+                                            int x,
+                                            int y,
+                                            int width,
+                                            int height);
 int astation_rtc_stop_screen_share(AStationRtcEngine* engine);
+int astation_rtc_get_screen_sources(AStationRtcEngine* engine,
+                                    AstationScreenSource* out_sources,
+                                    int max_count);
 int astation_rtc_set_token(AStationRtcEngine* engine, const char* token);
 int astation_rtc_set_channel(AStationRtcEngine* engine, const char* channel, uint32_t uid);
 

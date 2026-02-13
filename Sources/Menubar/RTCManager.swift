@@ -24,6 +24,12 @@ enum RTCError: Error, LocalizedError {
     }
 }
 
+struct ScreenShareSource {
+    let id: Int64
+    let isPrimary: Bool
+    let rectPixels: CGRect
+}
+
 // MARK: - RTC Manager
 
 /// Swift wrapper around the C FFI RTC engine (astation_rtc.h).
@@ -224,8 +230,55 @@ class RTCManager {
     }
 #endif
 
+    func screenSources() -> [ScreenShareSource] {
+        guard let engine = engine else {
+            Log.info("[RTCManager] Cannot list screens: engine not initialized")
+            return []
+        }
+        let count = Int(astation_rtc_get_screen_sources(engine, nil, 0))
+        if count <= 0 {
+            return []
+        }
+        var sources = Array(
+            repeating: AstationScreenSource(
+                source_id: 0,
+                is_screen: 0,
+                is_primary: 0,
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0
+            ),
+            count: count
+        )
+        let filled = sources.withUnsafeMutableBufferPointer { buf -> Int in
+            guard let base = buf.baseAddress else { return 0 }
+            return Int(astation_rtc_get_screen_sources(engine, base, Int32(buf.count)))
+        }
+        if filled <= 0 {
+            return []
+        }
+        return sources.prefix(filled).map { source in
+            ScreenShareSource(
+                id: source.source_id,
+                isPrimary: source.is_primary != 0,
+                rectPixels: CGRect(
+                    x: CGFloat(source.x),
+                    y: CGFloat(source.y),
+                    width: CGFloat(source.width),
+                    height: CGFloat(source.height)
+                )
+            )
+        }
+    }
+
     /// Start screen sharing on the given display.
-    func startScreenShare(displayId: UInt32) {
+    func startScreenShare(displayId: Int64) {
+        startScreenShare(displayId: displayId, regionPixels: nil)
+    }
+
+    /// Start screen sharing on a display with an optional capture region (pixels).
+    func startScreenShare(displayId: Int64, regionPixels: CGRect?) {
         guard let engine = engine else {
             Log.info("[RTCManager] Cannot screen share: engine not initialized")
             return
@@ -235,11 +288,19 @@ class RTCManager {
             Log.info("[RTCManager] Screen recording permission denied")
             return
         }
-        let resolvedDisplayId = displayId == 0 ? UInt32(CGMainDisplayID()) : displayId
         #else
-        let resolvedDisplayId = displayId
+        let _ = displayId
         #endif
-        let result = astation_rtc_enable_screen_share(engine, Int32(resolvedDisplayId))
+        let result: Int32
+        if let region = regionPixels {
+            let x = Int32(region.origin.x)
+            let y = Int32(region.origin.y)
+            let w = Int32(region.size.width)
+            let h = Int32(region.size.height)
+            result = astation_rtc_enable_screen_share_region(engine, Int32(displayId), x, y, w, h)
+        } else {
+            result = astation_rtc_enable_screen_share(engine, Int32(displayId))
+        }
         if result == 0 {
             _isScreenSharing = true
         }

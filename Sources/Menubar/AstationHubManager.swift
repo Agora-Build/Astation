@@ -662,7 +662,7 @@ class AstationHubManager: ObservableObject {
             let mode = parts[2].lowercased()
             switch mode {
             case "on":
-                let displayId = parts.count >= 4 ? UInt32(parts[3]) ?? 0 : 0
+                let displayId = parts.count >= 4 ? Int64(parts[3]) ?? 0 : 0
                 rtcManager.startScreenShare(displayId: displayId)
                 return "RTC: screen share started (displayId=\(displayId))"
             case "off":
