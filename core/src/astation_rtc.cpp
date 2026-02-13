@@ -436,6 +436,14 @@ int astation_rtc_enable_screen_share(AStationRtcEngine* engine,
 
     // Ensure video is enabled and configure encoder for AV1 @ 1080p.
     impl->rtc_engine->enableVideo();
+    int scenario_ret = impl->rtc_engine->setScreenCaptureScenario(
+        agora::rtc::SCREEN_SCENARIO_DOCUMENT);
+    if (scenario_ret != 0) {
+        const char* desc = impl->rtc_engine->getErrorDescription(scenario_ret);
+        std::fprintf(stderr,
+            "[AStationRtc] setScreenCaptureScenario() failed: %d (%s)\n",
+            scenario_ret, desc ? desc : "unknown");
+    }
     agora::rtc::VideoEncoderConfiguration encoder_config;
     encoder_config.dimensions = agora::rtc::VideoDimensions(1920, 1080);
     encoder_config.frameRate = 15;

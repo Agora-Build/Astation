@@ -30,6 +30,7 @@ let package = Package(
                 .product(name: "WebSocketKit", package: "websocket-kit"),
                 .product(name: "NIO", package: "swift-nio"),
                 .product(name: "RtcBasic", package: "AgoraRtcEngine_macOS"),
+                .product(name: "ScreenCapture", package: "AgoraRtcEngine_macOS"),
                 .product(name: "AINS", package: "AgoraRtcEngine_macOS"),
             ],
             path: "Sources/Menubar",
