@@ -46,45 +46,75 @@ Built with Rust, Axum, and Tokio for high performance and security.
 
 ## Quick Start
 
-### Run Locally (Development)
+### Development Mode
+
+**Option 1: Local (Cargo)**
 ```bash
-# Set CORS to allow all origins (development only)
+# Set CORS to allow all origins
 export CORS_ORIGIN=*
 
-# Run server
+# Run with debug logging
+export RUST_LOG=debug
 cargo run
 
 # Server starts at http://localhost:3000
 ```
 
-### Run with Docker
+**Option 2: Docker Compose (Dev)**
 ```bash
-# Build image
-docker build -t station-relay-server .
+# Uses docker-compose.dev.yml
+docker compose -f docker-compose.dev.yml up
 
-# Run container
-docker run -d \
-  -p 3000:3000 \
-  -e CORS_ORIGIN=https://station.agora.build \
-  -e RUST_LOG=info \
-  station-relay-server
+# With hot reload (requires cargo-watch):
+# Uncomment command in docker-compose.dev.yml
 ```
 
-### Deploy with Cloudflare Tunnel
+### Production Deployment
+
+**Option 1: Docker Compose** ✅ Recommended
 ```bash
-# Install cloudflared
-brew install cloudflare/cloudflare/cloudflared
+# Create .env file
+cp .env.example .env
+# Edit .env with your settings
 
-# Create and configure tunnel
-cloudflared tunnel create station-relay
-cloudflared tunnel route dns station-relay station.agora.build
+# Deploy
+docker compose up -d
 
-# Run tunnel + server
+# Check status
+docker compose ps
+docker compose logs -f
+```
+
+**Option 2: Coolify** ✅ Self-Hosted
+```bash
+# Deploy to your Coolify instance
+# See COOLIFY.md for complete guide
+
+1. Add new Docker Compose service
+2. Point to GitHub repo
+3. Configure environment (CORS_ORIGIN)
+4. Deploy with one click
+```
+
+**Option 3: Cloudflare Tunnel** ✅ Secure
+```bash
+# For enhanced security with zero exposed ports
+# See DEPLOY.md for complete guide
+
 docker compose up -d
 cloudflared tunnel run station-relay
 ```
 
-See `DEPLOY.md` for detailed deployment guide.
+**Choose Your Deployment:**
+- **Docker Compose:** Simple, VPS/dedicated server
+- **Coolify:** Self-hosted PaaS, auto-deploy from GitHub
+- **Cloudflare Tunnel:** Maximum security, zero-trust networking
+
+See detailed guides:
+- `docker-compose.yml` - Production config
+- `docker-compose.dev.yml` - Development config
+- `DEPLOY.md` - Full deployment guide
+- `COOLIFY.md` - Coolify-specific instructions
 
 ---
 

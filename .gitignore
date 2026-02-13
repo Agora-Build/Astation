@@ -19,6 +19,9 @@ Package.resolved
 # Local environment
 .env
 .env.local
+relay-server/.env
+relay-server/.env.local
+relay-server/.env.production
 
 # Claude state
 .claude/

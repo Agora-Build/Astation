@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  station-relay-server-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: station-relay-server:dev
+    container_name: station-relay-server-dev
+    restart: "no"  # Don't restart in dev mode
+
+    environment:
+      # Allow all origins in development
+      - CORS_ORIGIN=*
+
+      # Port
+      - PORT=3000
+
+      # Debug logging
+      - RUST_LOG=debug
+
+    ports:
+      # Expose on all interfaces for easy access
+      - "3000:3000"
+
+    # Mount source code for hot reload (if using cargo-watch)
+    volumes:
+      - .:/app
+      - /app/target  # Exclude target directory
+
+    # No resource limits in dev
+    # No security restrictions in dev
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/pair"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+    # Override command for development
+    # Uncomment to use cargo-watch for auto-reload:
+    # command: cargo watch -x run
+
+# Development helper services (optional)
+
+# Uncomment to add a development database if needed in the future
+# postgres:
+#   image: postgres:15-alpine
+#   container_name: station-relay-db-dev
+#   environment:
+#     - POSTGRES_USER=station
+#     - POSTGRES_PASSWORD=dev_password
+#     - POSTGRES_DB=station_relay
+#   ports:
+#     - "5432:5432"
+#   volumes:
+#     - postgres_data:/var/lib/postgresql/data
+
+# Uncomment to add Redis for caching/rate limiting if needed
+# redis:
+#   image: redis:7-alpine
+#   container_name: station-relay-cache-dev
+#   ports:
+#     - "6379:6379"
+#   volumes:
+#     - redis_data:/data
+
+# volumes:
+#   postgres_data:
+#   redis_data:
