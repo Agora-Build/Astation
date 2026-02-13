@@ -493,7 +493,10 @@ class StatusBarController: NSObject, NSMenuDelegate {
         alert.messageText = "Start Screen Share"
         alert.informativeText = "Choose a display and optionally share a region."
 
-        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        let accessoryWidth: CGFloat = 320
+        let accessoryHeight: CGFloat = 54
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: accessoryHeight - 24, width: accessoryWidth, height: 24))
+        popup.controlSize = .regular
         let primaryIndex = sources.firstIndex { $0.isPrimary } ?? 0
         for (index, source) in sources.enumerated() {
             var label = "Display \(index + 1)"
@@ -509,13 +512,15 @@ class StatusBarController: NSObject, NSMenuDelegate {
 
         let checkbox = NSButton(checkboxWithTitle: "Share region only", target: nil, action: nil)
         checkbox.state = .off
+        checkbox.frame = NSRect(x: 0, y: 0, width: accessoryWidth, height: 18)
 
-        let stack = NSStackView(views: [popup, checkbox])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 8
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: accessoryWidth, height: accessoryHeight))
+        popup.autoresizingMask = [.width]
+        checkbox.autoresizingMask = [.width]
+        container.addSubview(popup)
+        container.addSubview(checkbox)
 
-        alert.accessoryView = stack
+        alert.accessoryView = container
         alert.addButton(withTitle: "Start")
         alert.addButton(withTitle: "Cancel")
 
