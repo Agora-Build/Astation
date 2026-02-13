@@ -5,7 +5,7 @@ mod rtc_session;
 mod session_store;
 mod web;
 
-use axum::http::{HeaderValue, Method};
+use axum::http::{header, HeaderValue, Method};
 use axum::routing::{get, post};
 use axum::Router;
 use relay::RelayHub;
@@ -91,7 +91,7 @@ async fn main() {
         CorsLayer::new()
             .allow_origin(allowed_origin.parse::<HeaderValue>().expect("Invalid CORS_ORIGIN"))
             .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
-            .allow_headers(tower_http::cors::Any)
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
             .allow_credentials(true)
     };
 

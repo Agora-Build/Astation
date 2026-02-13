@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   station-relay-server:
     build: .
