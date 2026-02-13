@@ -165,13 +165,15 @@ class AstationApp: NSObject, NSApplicationDelegate {
         let env = ProcessInfo.processInfo.environment
         guard env["ASTATION_AUTORUN"] == "1" else { return }
 
-        let channel = (env["ASTATION_RTC_CHANNEL"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let uidString = (env["ASTATION_RTC_UID"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let appId = (env["ASTATION_APP_ID"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let channel = (env["ASTATION_RTC_CHANNEL"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let token = (env["ASTATION_RTC_TOKEN"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let projectId = (env["ASTATION_PROJECT_ID"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let projectName = (env["ASTATION_PROJECT_NAME"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let uidString = (env["ASTATION_RTC_UID"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
 
+        guard !appId.isEmpty else {
+            Log.warn("[AutoRTC] Missing ASTATION_APP_ID")
+            return
+        }
         guard !channel.isEmpty else {
             Log.warn("[AutoRTC] Missing ASTATION_RTC_CHANNEL")
             return
@@ -180,61 +182,15 @@ class AstationApp: NSObject, NSApplicationDelegate {
             Log.warn("[AutoRTC] Invalid ASTATION_RTC_UID: '\(uidString)'")
             return
         }
-
-        if !appId.isEmpty && !token.isEmpty {
-            Log.info("[AutoRTC] Initializing RTC and joining channel=\(channel) uid=\(uid)")
-            hubManager.initializeRTC(appId: appId)
-            hubManager.rtcManager.joinChannel(token: token, channel: channel, uid: uid)
-            startAutoScreenShareIfNeeded(env: env)
+        guard !token.isEmpty else {
+            Log.warn("[AutoRTC] Missing ASTATION_RTC_TOKEN")
             return
         }
 
-        Task { @MainActor in
-            Log.info("[AutoRTC] Resolving project from stored credentials...")
-            let timeoutMs = Int(env["ASTATION_PROJECT_WAIT_MS"] ?? "6000") ?? 6000
-            let projects = await waitForProjects(timeoutMs: timeoutMs)
-            guard !projects.isEmpty else {
-                let err = hubManager.projectLoadError ?? "no projects loaded"
-                Log.warn("[AutoRTC] Cannot resolve project: \(err)")
-                return
-            }
+        Log.info("[AutoRTC] Initializing RTC and joining channel=\(channel) uid=\(uid)")
+        hubManager.initializeRTC(appId: appId)
+        hubManager.rtcManager.joinChannel(token: token, channel: channel, uid: uid)
 
-            let selected: AgoraProject
-            if !projectId.isEmpty,
-               let match = projects.first(where: { $0.id == projectId || $0.vendorKey == projectId }) {
-                selected = match
-            } else if !projectName.isEmpty,
-                      let match = projects.first(where: { $0.name.caseInsensitiveCompare(projectName) == .orderedSame }) {
-                selected = match
-            } else if !appId.isEmpty,
-                      let match = projects.first(where: { $0.vendorKey == appId }) {
-                selected = match
-            } else {
-                selected = projects[0]
-            }
-
-            guard !selected.vendorKey.isEmpty else {
-                Log.warn("[AutoRTC] Selected project missing App ID")
-                return
-            }
-            guard !selected.signKey.isEmpty else {
-                Log.warn("[AutoRTC] Selected project missing App Certificate")
-                return
-            }
-
-            Log.info("[AutoRTC] Using project '\(selected.name)' (appId=\(selected.vendorKey))")
-            hubManager.initializeRTC(appId: selected.vendorKey)
-            let tokenResponse = await hubManager.generateRTCToken(channel: channel, uid: Int(uid), projectId: selected.id)
-            guard !tokenResponse.token.isEmpty else {
-                Log.warn("[AutoRTC] Failed to generate RTC token")
-                return
-            }
-            hubManager.rtcManager.joinChannel(token: tokenResponse.token, channel: channel, uid: uid)
-            startAutoScreenShareIfNeeded(env: env)
-        }
-    }
-
-    private func startAutoScreenShareIfNeeded(env: [String: String]) {
         if env["ASTATION_SCREEN_SHARE"] == "1" {
             let displayId = UInt32(env["ASTATION_SCREEN_SHARE_DISPLAY_ID"] ?? "0") ?? 0
             let delayMs = Int(env["ASTATION_SCREEN_SHARE_DELAY_MS"] ?? "1500") ?? 1500
@@ -243,20 +199,5 @@ class AstationApp: NSObject, NSApplicationDelegate {
                 self?.hubManager.rtcManager.startScreenShare(displayId: displayId)
             }
         }
-    }
-
-    @MainActor
-    private func waitForProjects(timeoutMs: Int) async -> [AgoraProject] {
-        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
-        while Date() < deadline {
-            if !hubManager.projects.isEmpty {
-                return hubManager.projects
-            }
-            if hubManager.projectLoadError != nil {
-                break
-            }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
-        return hubManager.projects
     }
 }
