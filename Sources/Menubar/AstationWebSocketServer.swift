@@ -50,13 +50,13 @@ class AstationWebSocketServer {
         let serverChannel = try bootstrap.bind(host: host, port: port).wait()
         self.channel = serverChannel
         
-        print("🌐 WebSocket server bound to \(host):\(port)")
+        Log.info("WebSocket server bound to \(host):\(port)")
     }
     
     func stop() {
         channel?.close(promise: nil)
         try? eventLoopGroup?.syncShutdownGracefully()
-        print("🛑 WebSocket server stopped")
+        Log.info("WebSocket server stopped")
     }
     
     private func handleWebSocketConnection(_ ws: WebSocket) {
@@ -71,7 +71,7 @@ class AstationWebSocketServer {
         )
         hubManager.addClient(client)
         
-        print("🔌 New WebSocket connection: \(clientId)")
+        Log.info("New WebSocket connection: \(clientId)")
         
         // Handle incoming messages
         ws.onText { ws, text in
@@ -80,14 +80,14 @@ class AstationWebSocketServer {
         
         ws.onBinary { ws, buffer in
             // Handle binary messages if needed
-            print("📦 Binary message received from \(clientId)")
+            NetworkDebugLogger.logWebSocketBinary(direction: "recv", context: "local \(clientId)", size: buffer.readableBytes)
         }
         
         // Handle connection close
         ws.onClose.whenComplete { _ in
             self.connectedClients.removeValue(forKey: clientId)
             self.hubManager.removeClient(withId: clientId)
-            print("🔌 WebSocket connection closed: \(clientId)")
+            Log.info("WebSocket connection closed: \(clientId)")
         }
         
         // Send welcome message
@@ -99,13 +99,13 @@ class AstationWebSocketServer {
     }
     
     private func handleIncomingMessage(_ text: String, from clientId: String, ws: WebSocket) {
+        NetworkDebugLogger.logWebSocket(direction: "recv", context: "local \(clientId)", message: text)
         guard let data = text.data(using: .utf8),
               let message = try? JSONDecoder().decode(AstationMessage.self, from: data) else {
-            print("❌ Failed to decode message from \(clientId): \(text)")
+            Log.error("Failed to decode message from \(clientId): \(text)")
             return
         }
-        
-        print("📨 Received message from \(clientId): \(message)")
+        Log.debug("Received message from \(clientId): \(message)")
         
         // Process message through hub manager
         if let response = hubManager.handleMessage(message, from: clientId) {
@@ -117,12 +117,12 @@ class AstationWebSocketServer {
         guard let ws = connectedClients[clientId],
               let data = try? JSONEncoder().encode(message),
               let text = String(data: data, encoding: .utf8) else {
-            print("❌ Failed to send message to \(clientId)")
+            Log.error("Failed to send message to \(clientId)")
             return
         }
-        
+
         ws.send(text)
-        print("📤 Sent message to \(clientId): \(message)")
+        NetworkDebugLogger.logWebSocket(direction: "send", context: "local \(clientId)", message: text)
     }
     
     func sendMessageToClient(_ message: AstationMessage, clientId: String) {
@@ -132,13 +132,13 @@ class AstationWebSocketServer {
     func broadcastMessage(_ message: AstationMessage) {
         guard let data = try? JSONEncoder().encode(message),
               let text = String(data: data, encoding: .utf8) else {
-            print("❌ Failed to encode broadcast message")
+            Log.error("Failed to encode broadcast message")
             return
         }
         
         for (clientId, ws) in connectedClients {
             ws.send(text)
-            print("📢 Broadcast message to \(clientId)")
+            NetworkDebugLogger.logWebSocket(direction: "send", context: "local \(clientId)", message: text)
         }
     }
     

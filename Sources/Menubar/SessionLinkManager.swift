@@ -66,7 +66,9 @@ class SessionLinkManager {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
+        NetworkDebugLogger.logRequest(request, label: "SessionLink")
         let (data, response) = try await URLSession.shared.data(for: request)
+        NetworkDebugLogger.logResponse(response, data: data, label: "SessionLink")
 
         guard let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode == 201 else {
@@ -100,8 +102,11 @@ class SessionLinkManager {
         request.httpMethod = "DELETE"
 
         do {
-            let _ = try await URLSession.shared.data(for: request)
+            NetworkDebugLogger.logRequest(request, label: "SessionLink")
+            let (data, response) = try await URLSession.shared.data(for: request)
+            NetworkDebugLogger.logResponse(response, data: data, label: "SessionLink")
         } catch {
+            NetworkDebugLogger.logError(error, label: "SessionLink")
             Log.info("[SessionLinkManager] Failed to revoke link \(link.id): \(error)")
         }
 

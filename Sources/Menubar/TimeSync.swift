@@ -14,7 +14,9 @@ class TimeSync {
             request.httpMethod = "HEAD"
             request.timeoutInterval = 5
 
-            let (_, response) = try await URLSession.shared.data(for: request)
+            NetworkDebugLogger.logRequest(request, label: "TimeSync")
+            let (data, response) = try await URLSession.shared.data(for: request)
+            NetworkDebugLogger.logResponse(response, data: data, label: "TimeSync")
 
             if let httpResponse = response as? HTTPURLResponse,
                 let dateString = httpResponse.value(forHTTPHeaderField: "Date")
@@ -37,6 +39,7 @@ class TimeSync {
                 }
             }
         } catch {
+            NetworkDebugLogger.logError(error, label: "TimeSync")
             print("[TimeSync] Sync failed (\(error)), using local clock")
         }
     }

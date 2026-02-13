@@ -55,35 +55,42 @@ class AgoraAPIClient {
         let base64Auth = authData.base64EncodedString()
         request.setValue("Basic \(base64Auth)", forHTTPHeaderField: "Authorization")
 
-        let (data, response) = try await session.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw AgoraAPIError.httpError(0)
-        }
-
-        guard (200...201).contains(httpResponse.statusCode) else {
-            throw AgoraAPIError.httpError(httpResponse.statusCode)
-        }
-
-        let apiResponse: AgoraAPIResponse
+        NetworkDebugLogger.logRequest(request, label: "AgoraAPI")
         do {
-            apiResponse = try JSONDecoder().decode(AgoraAPIResponse.self, from: data)
-        } catch {
-            let preview = String(data: data.prefix(500), encoding: .utf8) ?? "(binary)"
-            print("[AgoraAPI] Decode failed. Raw response: \(preview)")
-            throw AgoraAPIError.decodingError(error.localizedDescription)
-        }
+            let (data, response) = try await session.data(for: request)
+            NetworkDebugLogger.logResponse(response, data: data, label: "AgoraAPI")
 
-        // Map API projects to our AgoraProject model
-        return apiResponse.projects.map { raw in
-            AgoraProject(
-                id: raw.vendor_key,  // Use app_id as the project identifier
-                name: raw.name,
-                vendorKey: raw.vendor_key,
-                signKey: raw.sign_key,
-                status: raw.status == 1 ? "active" : "disabled",
-                created: raw.created
-            )
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw AgoraAPIError.httpError(0)
+            }
+
+            guard (200...201).contains(httpResponse.statusCode) else {
+                throw AgoraAPIError.httpError(httpResponse.statusCode)
+            }
+
+            let apiResponse: AgoraAPIResponse
+            do {
+                apiResponse = try JSONDecoder().decode(AgoraAPIResponse.self, from: data)
+            } catch {
+                let preview = String(data: data.prefix(500), encoding: .utf8) ?? "(binary)"
+                Log.error("[AgoraAPI] Decode failed. Raw response: \(preview)")
+                throw AgoraAPIError.decodingError(error.localizedDescription)
+            }
+
+            // Map API projects to our AgoraProject model
+            return apiResponse.projects.map { raw in
+                AgoraProject(
+                    id: raw.vendor_key,  // Use app_id as the project identifier
+                    name: raw.name,
+                    vendorKey: raw.vendor_key,
+                    signKey: raw.sign_key,
+                    status: raw.status == 1 ? "active" : "disabled",
+                    created: raw.created
+                )
+            }
+        } catch {
+            NetworkDebugLogger.logError(error, label: "AgoraAPI")
+            throw error
         }
     }
 }

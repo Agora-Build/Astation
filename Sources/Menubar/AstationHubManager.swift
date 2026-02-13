@@ -731,6 +731,7 @@ class AstationHubManager: ObservableObject {
                 // Send to relay WebSocket
                 if let jsonData = try? JSONEncoder().encode(message),
                    let jsonString = String(data: jsonData, encoding: .utf8) {
+                    NetworkDebugLogger.logWebSocket(direction: "send", context: "relay \(relayClientId)", message: jsonString)
                     task?.send(.string(jsonString)) { error in
                         if let error = error {
                             Log.info("[AstationHub] Relay send error: \(error)")
@@ -750,6 +751,7 @@ class AstationHubManager: ObservableObject {
             case .success(let message):
                 switch message {
                 case .string(let text):
+                    NetworkDebugLogger.logWebSocket(direction: "recv", context: "relay \(clientId)", message: text)
                     if let data = text.data(using: .utf8),
                        let msg = try? JSONDecoder().decode(AstationMessage.self, from: data) {
                         DispatchQueue.main.async {
@@ -758,6 +760,7 @@ class AstationHubManager: ObservableObject {
                             if let response = response,
                                let jsonData = try? JSONEncoder().encode(response),
                                let jsonString = String(data: jsonData, encoding: .utf8) {
+                                NetworkDebugLogger.logWebSocket(direction: "send", context: "relay \(clientId)", message: jsonString)
                                 task.send(.string(jsonString)) { _ in }
                             }
                         }
