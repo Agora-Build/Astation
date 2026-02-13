@@ -159,8 +159,12 @@ impl RtcSessionStore {
         if let Some(inner_arc) = sessions.get(id) {
             let mut inner = inner_arc.write().await;
 
+            let current_count = inner.participants.len();
+            tracing::info!("Join request for session {}: current participants = {}, name = {}", id, current_count, name);
+
             // Enforce 8-person limit (including host)
-            if inner.participants.len() >= 8 {
+            if current_count >= 8 {
+                tracing::warn!("Session {} is full ({} participants)", id, current_count);
                 return Err("Session is full (maximum 8 participants)".to_string());
             }
 
@@ -170,6 +174,10 @@ impl RtcSessionStore {
                 display_name: Some(name.clone()),
                 joined_at: Utc::now(),
             });
+
+            tracing::info!("User {} joined session {} with UID {} (total participants: {})",
+                name, id, uid, inner.participants.len());
+
             Ok(JoinRtcSessionResponse {
                 app_id: inner.app_id.clone(),
                 channel: inner.channel.clone(),

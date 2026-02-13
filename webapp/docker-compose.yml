@@ -1,12 +1,14 @@
 services:
-  webapp:
+  station-webapp:
     build: .
+    container_name: station-webapp
     ports:
       - "8080:80"
     depends_on:
-      - api-server
-  api-server:
+      - station-api-server
+  station-api-server:
     build: ../api-server
+    container_name: station-api-server
     environment:
       - RUST_LOG=info
       - PORT=3000
