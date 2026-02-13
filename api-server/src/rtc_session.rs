@@ -96,7 +96,7 @@ pub struct JoinRtcSessionRequest {
     pub name: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JoinRtcSessionResponse {
     pub app_id: String,
     pub channel: String,
@@ -154,17 +154,23 @@ impl RtcSessionStore {
         }
     }
 
-    pub async fn join(&self, id: &str, name: String) -> Option<JoinRtcSessionResponse> {
+    pub async fn join(&self, id: &str, name: String) -> Result<JoinRtcSessionResponse, String> {
         let sessions = self.sessions.read().await;
         if let Some(inner_arc) = sessions.get(id) {
             let mut inner = inner_arc.write().await;
+
+            // Enforce 8-person limit (including host)
+            if inner.participants.len() >= 8 {
+                return Err("Session is full (maximum 8 participants)".to_string());
+            }
+
             let uid = inner.uid_counter.fetch_add(1, Ordering::SeqCst);
             inner.participants.push(Participant {
                 uid,
                 display_name: Some(name.clone()),
                 joined_at: Utc::now(),
             });
-            Some(JoinRtcSessionResponse {
+            Ok(JoinRtcSessionResponse {
                 app_id: inner.app_id.clone(),
                 channel: inner.channel.clone(),
                 token: inner.token.clone(),
@@ -172,7 +178,7 @@ impl RtcSessionStore {
                 name,
             })
         } else {
-            None
+            Err("Session not found".to_string())
         }
     }
 
@@ -254,13 +260,17 @@ pub async fn join_rtc_session_handler(
     Json(body): Json<JoinRtcSessionRequest>,
 ) -> impl IntoResponse {
     match state.rtc_sessions.join(&id, body.name).await {
-        Some(response) => Ok(Json(response)),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(RtcSessionError {
-                error: "Session not found".to_string(),
-            }),
-        )),
+        Ok(response) => Ok(Json(response)),
+        Err(error) => {
+            let status = if error.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else if error.contains("full") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Err((status, Json(RtcSessionError { error })))
+        }
     }
 }
 
@@ -376,7 +386,7 @@ mod tests {
     #[tokio::test]
     async fn test_join_nonexistent() {
         let store = RtcSessionStore::new();
-        assert!(store.join("nope", "Alice".into()).await.is_none());
+        assert!(store.join("nope", "Alice".into()).await.is_err());
     }
 
     #[tokio::test]
@@ -480,21 +490,42 @@ mod tests {
                 store
                     .join("concurrent", format!("User{}", i))
                     .await
-                    .unwrap()
-                    .uid
+                    .ok()
+                    .map(|r| r.uid)
             }));
         }
 
         let mut uids = Vec::new();
         for handle in handles {
-            uids.push(handle.await.unwrap());
+            if let Some(uid) = handle.await.unwrap() {
+                uids.push(uid);
+            }
         }
 
         uids.sort();
         uids.dedup();
-        assert_eq!(uids.len(), 10, "All 10 UIDs should be unique");
+        assert_eq!(uids.len(), 8, "Should allow maximum 8 participants");
         assert_eq!(*uids.first().unwrap(), 1000);
-        assert_eq!(*uids.last().unwrap(), 1009);
+        assert_eq!(*uids.last().unwrap(), 1007);
+    }
+
+    #[tokio::test]
+    async fn test_max_participants_enforced() {
+        let store = RtcSessionStore::new();
+        store
+            .create("full-test".into(), "a".into(), "c".into(), "t".into(), 1)
+            .await;
+
+        // Join 8 people successfully
+        for i in 0..8 {
+            let result = store.join("full-test", format!("User{}", i)).await;
+            assert!(result.is_ok(), "User {} should join successfully", i);
+        }
+
+        // 9th person should fail
+        let result = store.join("full-test", "User9".into()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("full"));
     }
 
     // --- Handler Tests ---

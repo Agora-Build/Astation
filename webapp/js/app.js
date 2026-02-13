@@ -197,25 +197,35 @@ async function joinChannel(appId, channel, token, uid) {
 }
 
 async function handleUserPublished(user, mediaType) {
-    await client.subscribe(user, mediaType);
+    try {
+        await client.subscribe(user, mediaType);
 
-    if (mediaType === "video") {
-        const videoMain = document.getElementById("video-main");
-        videoMain.innerHTML = "";
-        user.videoTrack.play(videoMain);
+        if (mediaType === "video") {
+            const videoMain = document.getElementById("video-main");
+            videoMain.innerHTML = "";
 
-        // Track the video
-        if (remoteUsers.has(user.uid)) {
-            remoteUsers.get(user.uid).videoTrack = user.videoTrack;
+            // Get codec info for logging
+            const codecType = user.videoTrack?._videoTrack?.getCodecType?.() || "unknown";
+            console.log(`Receiving video from UID ${user.uid} with codec: ${codecType}`);
+
+            user.videoTrack.play(videoMain);
+
+            // Track the video
+            if (remoteUsers.has(user.uid)) {
+                remoteUsers.get(user.uid).videoTrack = user.videoTrack;
+            }
         }
-    }
 
-    if (mediaType === "audio") {
-        user.audioTrack.play();
+        if (mediaType === "audio") {
+            user.audioTrack.play();
 
-        if (remoteUsers.has(user.uid)) {
-            remoteUsers.get(user.uid).audioTrack = user.audioTrack;
+            if (remoteUsers.has(user.uid)) {
+                remoteUsers.get(user.uid).audioTrack = user.audioTrack;
+            }
         }
+    } catch (err) {
+        console.error(`Failed to subscribe to ${mediaType} from UID ${user.uid}:`, err);
+        // Try to continue - SDK will handle codec mismatches internally
     }
 }
 
