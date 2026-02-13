@@ -2,12 +2,19 @@ import AppKit
 
 final class ScreenRegionSelector {
     private static var activeWindow: ScreenRegionSelectionWindow?
+    private static let defaults = UserDefaults.standard
+    private static let defaultsPrefix = "screenShare.region"
 
-    static func selectRegion(on screen: NSScreen, completion: @escaping (CGRect?) -> Void) {
+    static func selectRegion(on screen: NSScreen,
+                             displayId: Int64,
+                             completion: @escaping (CGRect?) -> Void) {
         DispatchQueue.main.async {
             activeWindow?.close()
+            let initialRect = loadStoredRect(for: screen, displayId: displayId)
+                ?? defaultRect(for: screen)
             let window = ScreenRegionSelectionWindow(screen: screen) { rectPoints in
                 if let rectPoints {
+                    saveStoredRect(rectPoints, for: screen, displayId: displayId)
                     let scale = screen.backingScaleFactor
                     let pixelRect = CGRect(
                         x: rectPoints.origin.x * scale,
@@ -19,12 +26,57 @@ final class ScreenRegionSelector {
                 } else {
                     completion(nil)
                 }
-                activeWindow = nil
+                DispatchQueue.main.async {
+                    activeWindow = nil
+                }
             }
+            window.setInitialSelection(initialRect)
             activeWindow = window
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
         }
+    }
+
+    private static func defaultRect(for screen: NSScreen) -> CGRect {
+        let size = screen.frame.size
+        return CGRect(
+            x: size.width * 0.25,
+            y: size.height * 0.25,
+            width: size.width * 0.5,
+            height: size.height * 0.5
+        )
+    }
+
+    private static func loadStoredRect(for screen: NSScreen, displayId: Int64) -> CGRect? {
+        let key = "\(defaultsPrefix).\(displayId)"
+        guard let dict = defaults.dictionary(forKey: key),
+              let x = dict["x"] as? Double,
+              let y = dict["y"] as? Double,
+              let w = dict["w"] as? Double,
+              let h = dict["h"] as? Double else {
+            return nil
+        }
+        let size = screen.frame.size
+        guard size.width > 0, size.height > 0 else { return nil }
+        return CGRect(
+            x: CGFloat(x) * size.width,
+            y: CGFloat(y) * size.height,
+            width: CGFloat(w) * size.width,
+            height: CGFloat(h) * size.height
+        )
+    }
+
+    private static func saveStoredRect(_ rect: CGRect, for screen: NSScreen, displayId: Int64) {
+        let size = screen.frame.size
+        guard size.width > 0, size.height > 0 else { return }
+        let dict: [String: Double] = [
+            "x": Double(rect.origin.x / size.width),
+            "y": Double(rect.origin.y / size.height),
+            "w": Double(rect.size.width / size.width),
+            "h": Double(rect.size.height / size.height)
+        ]
+        let key = "\(defaultsPrefix).\(displayId)"
+        defaults.set(dict, forKey: key)
     }
 }
 
@@ -47,7 +99,7 @@ private final class ScreenRegionSelectionWindow: NSWindow {
         level = .floating
         hasShadow = false
         ignoresMouseEvents = false
-        isMovableByWindowBackground = true
+        isMovableByWindowBackground = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         let overlay = ScreenRegionSelectionView(frame: NSRect(origin: .zero, size: screen.frame.size))
@@ -68,8 +120,14 @@ private final class ScreenRegionSelectionWindow: NSWindow {
         DispatchQueue.main.async { [weak self] in
             guard let self = self, !self.didComplete else { return }
             self.didComplete = true
-            self.close()
+            self.orderOut(nil)
             self.onComplete(rect)
+        }
+    }
+
+    func setInitialSelection(_ rect: CGRect) {
+        if let view = contentView as? ScreenRegionSelectionView {
+            view.setSelection(rect)
         }
     }
 }
@@ -199,9 +257,9 @@ private final class ScreenRegionSelectionView: NSView {
         NSColor.clear.setFill()
         NSBezierPath(rect: rect).fill()
 
-        NSColor.white.setStroke()
+        NSColor.systemGreen.setStroke()
         let path = NSBezierPath(rect: rect)
-        path.lineWidth = 2
+        path.lineWidth = 6
         path.stroke()
     }
 
@@ -279,5 +337,10 @@ private final class ScreenRegionSelectionView: NSView {
             r.size.width -= dx
         }
         return r
+    }
+
+    func setSelection(_ rect: CGRect) {
+        selectionRect = clamp(rect: rect)
+        needsDisplay = true
     }
 }

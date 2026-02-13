@@ -461,7 +461,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
                     alert.runModal()
                     return
                 }
-                ScreenRegionSelector.selectRegion(on: screen) { regionPixels in
+                ScreenRegionSelector.selectRegion(on: screen, displayId: source.id) { regionPixels in
                     guard let regionPixels else { return }
                     self.hubManager.rtcManager.startScreenShare(displayId: source.id, regionPixels: regionPixels)
                     self.setupMenu()
