@@ -56,12 +56,12 @@ jobs:
       - name: Run webapp tests
         run: node webapp/tests/codec.test.js
 
-  test-api-server:
-    name: API Server Tests
+  test-relay-server:
+    name: Relay Server Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run api-server tests
-        working-directory: api-server
+      - name: Run relay server tests
+        working-directory: relay-server
         run: cargo test
