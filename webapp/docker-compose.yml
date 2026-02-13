@@ -1,6 +1,7 @@
 services:
   station-webapp:
     build: .
+    image: station-webapp
     container_name: station-webapp
     ports:
       - "8080:80"
@@ -8,6 +9,7 @@ services:
       - station-api-server
   station-api-server:
     build: ../api-server
+    image: station-relay-server
     container_name: station-api-server
     environment:
       - RUST_LOG=info
