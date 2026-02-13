@@ -308,6 +308,38 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  deploy-relay-server:
+    name: Deploy Relay Server to Coolify
+    needs: build-server-docker
+    if: needs.build-server-docker.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Coolify deployment
+        run: |
+          curl -X POST "${{ secrets.COOLIFY_RELAY_SERVER_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "tag": "${{ github.ref_name }}",
+              "service": "station-relay-server"
+            }'
+        continue-on-error: true
+
+  deploy-webapp:
+    name: Deploy Web App to Coolify
+    needs: build-webapp-docker
+    if: needs.build-webapp-docker.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Coolify deployment
+        run: |
+          curl -X POST "${{ secrets.COOLIFY_WEBAPP_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "tag": "${{ github.ref_name }}",
+              "service": "station-webapp"
+            }'
+        continue-on-error: true
+
   release:
     name: Create GitHub Release
     needs: [build-app, check-server-changes, check-webapp-changes]
