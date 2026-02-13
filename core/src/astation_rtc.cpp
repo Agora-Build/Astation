@@ -7,63 +7,20 @@
 #include "IAgoraMediaEngine.h"
 #include "AgoraBase.h"
 #include "AgoraMediaBase.h"
+#include "astation_screen_capture.h"
 
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <new>
 #include <string>
+#include <vector>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif
 
 namespace {
-
-int64_t resolve_screen_capture_display_id(agora::rtc::IRtcEngine* engine,
-                                          int64_t requested_id) {
-    if (!engine || requested_id > 0) {
-        return requested_id;
-    }
-    agora::rtc::SIZE thumb_size(0, 0);
-    agora::rtc::SIZE icon_size(0, 0);
-    auto* sources = engine->getScreenCaptureSources(thumb_size, icon_size, true);
-    if (!sources) {
-        return requested_id;
-    }
-
-    int64_t first_screen_id = requested_id;
-    bool has_screen = false;
-    bool has_primary = false;
-    int64_t primary_id = requested_id;
-
-    const unsigned int count = sources->getCount();
-    for (unsigned int i = 0; i < count; ++i) {
-        const auto info = sources->getSourceInfo(i);
-        if (info.type != agora::rtc::ScreenCaptureSourceType_Screen) {
-            continue;
-        }
-        if (!has_screen) {
-            first_screen_id = info.sourceId;
-            has_screen = true;
-        }
-        if (info.primaryMonitor) {
-            primary_id = info.sourceId;
-            has_primary = true;
-            break;
-        }
-    }
-    sources->release();
-
-    if (has_primary) {
-        return primary_id;
-    }
-    if (has_screen) {
-        return first_screen_id;
-    }
-    return requested_id;
-}
-
 // ---------------------------------------------------------------------------
 // AStationRtcEngineImpl — wraps a real agora::rtc::IRtcEngine and forwards
 // SDK callbacks back through the C AStationRtcCallbacks interface.
@@ -455,8 +412,27 @@ int astation_rtc_enable_screen_share(AStationRtcEngine* engine,
     impl->rtc_engine->stopScreenCapture();
 
     const int64_t requested_display_id = static_cast<int64_t>(display_id);
-    const int64_t resolved_display_id =
-        resolve_screen_capture_display_id(impl->rtc_engine, requested_display_id);
+    int64_t resolved_display_id = requested_display_id;
+    if (impl->rtc_engine && requested_display_id <= 0) {
+        agora::rtc::SIZE thumb_size(0, 0);
+        agora::rtc::SIZE icon_size(0, 0);
+        auto* sources = impl->rtc_engine->getScreenCaptureSources(thumb_size, icon_size, true);
+        if (sources) {
+            std::vector<AstationScreenSource> entries;
+            entries.reserve(sources->getCount());
+            for (unsigned int i = 0; i < sources->getCount(); ++i) {
+                const auto info = sources->getSourceInfo(i);
+                AstationScreenSource entry{};
+                entry.source_id = info.sourceId;
+                entry.is_screen = (info.type == agora::rtc::ScreenCaptureSourceType_Screen) ? 1 : 0;
+                entry.is_primary = info.primaryMonitor ? 1 : 0;
+                entries.push_back(entry);
+            }
+            sources->release();
+            resolved_display_id = astation_select_screen_source(
+                entries.data(), entries.size(), requested_display_id);
+        }
+    }
 
     // Ensure video is enabled and configure encoder for AV1 @ 1080p.
     impl->rtc_engine->enableVideo();

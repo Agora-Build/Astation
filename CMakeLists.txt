@@ -9,6 +9,7 @@ endif()
 add_library(astation_core STATIC
     core/src/astation_core.cpp
     core/src/astation_rtc.cpp
+    core/src/astation_screen_capture.cpp
     core/src/astation_token.cpp
 )
 
@@ -196,4 +197,16 @@ if(BUILD_TESTING)
         target_compile_options(astation_core_token_tests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
     add_test(NAME astation_core_token_tests COMMAND astation_core_token_tests)
+
+    add_executable(astation_core_screen_capture_tests
+        core/tests/screen_capture_selection_test.cpp
+    )
+    target_link_libraries(astation_core_screen_capture_tests PRIVATE astation_core)
+    target_include_directories(astation_core_screen_capture_tests PRIVATE core/include)
+    if(MSVC)
+        target_compile_options(astation_core_screen_capture_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(astation_core_screen_capture_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME astation_core_screen_capture_tests COMMAND astation_core_screen_capture_tests)
 endif()
