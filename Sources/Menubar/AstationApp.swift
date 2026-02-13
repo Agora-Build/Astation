@@ -86,8 +86,6 @@ class AstationApp: NSObject, NSApplicationDelegate {
         Log.info("Ready for Atem connections on ws://127.0.0.1:8080")
         Log.info("Global hotkeys: Ctrl+V (voice), Ctrl+Shift+V (video)")
         Log.info("Log file: \(Log.logFile.path)")
-
-        handleAutoRTC()
     }
     
     func applicationWillTerminate(_ notification: Notification) {
@@ -156,48 +154,6 @@ class AstationApp: NSObject, NSApplicationDelegate {
 
             // Notify hub manager of the auth result
             self.hubManager?.handleAuthResult(session)
-        }
-    }
-
-    // MARK: - Auto RTC (diagnostics)
-
-    private func handleAutoRTC() {
-        let env = ProcessInfo.processInfo.environment
-        guard env["ASTATION_AUTORUN"] == "1" else { return }
-
-        let appId = (env["ASTATION_APP_ID"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let channel = (env["ASTATION_RTC_CHANNEL"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let token = (env["ASTATION_RTC_TOKEN"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        let uidString = (env["ASTATION_RTC_UID"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard !appId.isEmpty else {
-            Log.warn("[AutoRTC] Missing ASTATION_APP_ID")
-            return
-        }
-        guard !channel.isEmpty else {
-            Log.warn("[AutoRTC] Missing ASTATION_RTC_CHANNEL")
-            return
-        }
-        guard let uid = UInt32(uidString) else {
-            Log.warn("[AutoRTC] Invalid ASTATION_RTC_UID: '\(uidString)'")
-            return
-        }
-        guard !token.isEmpty else {
-            Log.warn("[AutoRTC] Missing ASTATION_RTC_TOKEN")
-            return
-        }
-
-        Log.info("[AutoRTC] Initializing RTC and joining channel=\(channel) uid=\(uid)")
-        hubManager.initializeRTC(appId: appId)
-        hubManager.rtcManager.joinChannel(token: token, channel: channel, uid: uid)
-
-        if env["ASTATION_SCREEN_SHARE"] == "1" {
-            let displayId = UInt32(env["ASTATION_SCREEN_SHARE_DISPLAY_ID"] ?? "0") ?? 0
-            let delayMs = Int(env["ASTATION_SCREEN_SHARE_DELAY_MS"] ?? "1500") ?? 1500
-            Log.info("[AutoRTC] Will start screen share displayId=\(displayId) in \(delayMs)ms")
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs)) { [weak self] in
-                self?.hubManager.rtcManager.startScreenShare(displayId: displayId)
-            }
         }
     }
 }
