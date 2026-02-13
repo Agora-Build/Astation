@@ -438,7 +438,7 @@ int astation_rtc_enable_screen_share(AStationRtcEngine* engine,
     impl->rtc_engine->enableVideo();
     agora::rtc::VideoEncoderConfiguration encoder_config;
     encoder_config.dimensions = agora::rtc::VideoDimensions(1920, 1080);
-    encoder_config.frameRate = 30;
+    encoder_config.frameRate = 15;
     encoder_config.bitrate = agora::rtc::STANDARD_BITRATE;
     encoder_config.codecType = agora::rtc::VIDEO_CODEC_AV1;
     int enc_ret = impl->rtc_engine->setVideoEncoderConfiguration(encoder_config);
@@ -461,7 +461,7 @@ int astation_rtc_enable_screen_share(AStationRtcEngine* engine,
     agora::rtc::Rectangle region = {0, 0, 0, 0}; // full display
     agora::rtc::ScreenCaptureParameters params;
     params.dimensions = {1920, 1080};
-    params.frameRate = 30;
+    params.frameRate = 15;
     params.bitrate = agora::rtc::STANDARD_BITRATE;
     params.captureMouseCursor = true;
 
