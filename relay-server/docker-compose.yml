@@ -2,22 +2,15 @@ services:
   station-relay-server:
     build: .
     image: station-relay-server:latest
-    container_name: station-relay-server
     restart: unless-stopped
 
     environment:
-      # CORS origin (required for production)
       - CORS_ORIGIN=${CORS_ORIGIN:-https://station.agora.build}
-
-      # Port (default: 3000)
       - PORT=${PORT:-3000}
-
-      # Log level (info for production)
       - RUST_LOG=${RUST_LOG:-info}
 
     ports:
-      # Only bind to localhost for security (use reverse proxy)
-      - "127.0.0.1:3000:3000"
+      - "3000:3000"
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/api/pair"]
@@ -25,45 +18,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
-
-    # Resource limits (adjust based on your needs)
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: 512M
-        reservations:
-          cpus: '0.25'
-          memory: 128M
-
-    # Security options
-    security_opt:
-      - no-new-privileges:true
-
-    # Read-only root filesystem (production hardening)
-    read_only: true
-    tmpfs:
-      - /tmp
-
-    # Drop unnecessary capabilities
-    cap_drop:
-      - ALL
-    cap_add:
-      - NET_BIND_SERVICE
-
-# For production with webapp (optional)
-# Uncomment to deploy both services together
-#
-# webapp:
-#   image: station-webapp:latest
-#   container_name: station-webapp
-#   restart: unless-stopped
-#   ports:
-#     - "127.0.0.1:8080:80"
-#   depends_on:
-#     - station-relay-server
-#   healthcheck:
-#     test: ["CMD", "curl", "-f", "http://localhost/"]
-#     interval: 30s
-#     timeout: 10s
-#     retries: 3
