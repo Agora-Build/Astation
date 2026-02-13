@@ -418,7 +418,7 @@ mod tests {
             .create("part-test".into(), "app".into(), "ch".into(), "tok".into(), 1)
             .await;
 
-        store.join("part-test", "Alice".into()).await;
+        let _ = store.join("part-test", "Alice".into()).await;
 
         let session = store.get("part-test").await.unwrap();
         assert_eq!(session.participants.len(), 1);
