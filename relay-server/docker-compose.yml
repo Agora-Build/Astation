@@ -1,6 +1,8 @@
 services:
-  station-relay:
+  station-relay-server:
     build: .
+    image: station-relay-server
+    container_name: station-relay-server
     ports:
       - "3000:3000"
     environment:

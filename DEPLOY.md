@@ -32,9 +32,9 @@ Create `docker-compose.yml`:
 version: '3.8'
 
 services:
-  relay-server:
+  station-relay-server:
     image: ghcr.io/agora-build/station-relay-server:latest
-    container_name: astation-api
+    container_name: station-relay-server
     restart: unless-stopped
     environment:
       - RUST_LOG=info
@@ -47,14 +47,14 @@ services:
       timeout: 10s
       retries: 3
 
-  webapp:
+  station-webapp:
     image: ghcr.io/agora-build/station-webapp:latest
-    container_name: astation-webapp
+    container_name: station-webapp
     restart: unless-stopped
     ports:
       - "80:80"
     depends_on:
-      - relay-server
+      - station-relay-server
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost/"]
       interval: 30s
@@ -400,8 +400,8 @@ curl -X POST http://localhost:3000/api/rtc-sessions \
 
 **Docker Compose:**
 ```bash
-docker compose logs -f relay-server
-docker compose logs -f webapp
+docker compose logs -f station-relay-server
+docker compose logs -f station-webapp
 ```
 
 **Kubernetes:**
@@ -422,7 +422,7 @@ sudo tail -f /var/log/nginx/access.log
 
 **Docker Compose:**
 ```bash
-docker compose up -d --scale relay-server=3 --scale webapp=3
+docker compose up -d --scale station-relay-server=3 --scale station-webapp=3
 ```
 
 **Kubernetes:**
