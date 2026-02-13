@@ -30,6 +30,7 @@ final class ScreenRegionSelector {
 
 private final class ScreenRegionSelectionWindow: NSWindow {
     private let onComplete: (CGRect?) -> Void
+    private var didComplete = false
 
     init(screen: NSScreen, onComplete: @escaping (CGRect?) -> Void) {
         self.onComplete = onComplete
@@ -51,15 +52,24 @@ private final class ScreenRegionSelectionWindow: NSWindow {
         let overlay = ScreenRegionSelectionView(frame: NSRect(origin: .zero, size: screen.frame.size))
         overlay.autoresizingMask = [.width, .height]
         overlay.onSelection = { [weak self] rect in
-            self?.close()
-            self?.onComplete(rect)
+            self?.complete(rect)
         }
         overlay.onCancel = { [weak self] in
-            self?.close()
-            self?.onComplete(nil)
+            self?.complete(nil)
         }
         contentView = overlay
         makeFirstResponder(overlay)
+    }
+
+    override var canBecomeKey: Bool { true }
+
+    private func complete(_ rect: CGRect?) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, !self.didComplete else { return }
+            self.didComplete = true
+            self.close()
+            self.onComplete(rect)
+        }
     }
 }
 
@@ -69,6 +79,7 @@ private final class ScreenRegionSelectionView: NSView {
 
     private var startPoint: CGPoint?
     private var currentPoint: CGPoint?
+    private var didFinish = false
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -94,19 +105,25 @@ private final class ScreenRegionSelectionView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if didFinish { return }
         guard let rect = selectionRect else {
+            didFinish = true
             onCancel?()
             return
         }
         if rect.width < 10 || rect.height < 10 {
+            didFinish = true
             onCancel?()
             return
         }
+        didFinish = true
         onSelection?(rect)
     }
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { // ESC
+            if didFinish { return }
+            didFinish = true
             onCancel?()
         }
     }
