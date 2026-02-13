@@ -8,7 +8,7 @@ services:
     depends_on:
       - station-relay-server
   station-relay-server:
-    build: ../api-server
+    build: ../relay-server
     image: station-relay-server
     container_name: station-relay-server
     environment:

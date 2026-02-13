@@ -78,7 +78,7 @@ When the host (Astation) starts screen sharing:
 Web Browser
   ↓ GET /session/abc-123
 Nginx (port 80)
-  ↓ /api/* → proxy to api-server:3000
+  ↓ /api/* → proxy to relay-server:3000
   ↓ /session/* → serve index.html (SPA)
 API Server (port 3000)
   ↓ Rust Axum + RTC Session Store
@@ -131,8 +131,8 @@ services:
     ports:
       - "80:80"
     depends_on:
-      - api-server
-  api-server:
+      - relay-server
+  relay-server:
     image: ghcr.io/agora-build/station-relay-server:latest
     environment:
       - RUST_LOG=info

@@ -167,7 +167,7 @@ jobs:
             Astation-${{ github.ref_name }}-mac-arm64.tar.gz
 
   check-server-changes:
-    name: Check for api-server/ changes
+    name: Check for relay-server/ changes
     runs-on: ubuntu-latest
     outputs:
       server_changed: ${{ steps.check.outputs.changed }}
@@ -176,7 +176,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check if api-server/ changed since last tag
+      - name: Check if relay-server/ changed since last tag
         id: check
         run: |
           # Find the previous tag before the current one
@@ -184,15 +184,15 @@ jobs:
           PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${CURRENT_TAG}$" | head -1)
 
           if [ -z "$PREV_TAG" ]; then
-            echo "No previous tag found — treating api-server as changed"
+            echo "No previous tag found — treating relay-server as changed"
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
-            CHANGED=$(git diff --name-only "$PREV_TAG" "$CURRENT_TAG" -- api-server/ | wc -l)
+            CHANGED=$(git diff --name-only "$PREV_TAG" "$CURRENT_TAG" -- relay-server/ | wc -l)
             if [ "$CHANGED" -gt 0 ]; then
-              echo "api-server/ has $CHANGED changed files since $PREV_TAG"
+              echo "relay-server/ has $CHANGED changed files since $PREV_TAG"
               echo "changed=true" >> "$GITHUB_OUTPUT"
             else
-              echo "No changes in api-server/ since $PREV_TAG — skipping Docker build"
+              echo "No changes in relay-server/ since $PREV_TAG — skipping Docker build"
               echo "changed=false" >> "$GITHUB_OUTPUT"
             fi
           fi
@@ -228,13 +228,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run server tests
-        working-directory: api-server
+        working-directory: relay-server
         run: cargo test
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
-          context: api-server
+          context: relay-server
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |

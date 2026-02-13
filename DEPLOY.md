@@ -32,7 +32,7 @@ Create `docker-compose.yml`:
 version: '3.8'
 
 services:
-  api-server:
+  relay-server:
     image: ghcr.io/agora-build/station-relay-server:latest
     container_name: astation-api
     restart: unless-stopped
@@ -54,7 +54,7 @@ services:
     ports:
       - "80:80"
     depends_on:
-      - api-server
+      - relay-server
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost/"]
       interval: 30s
@@ -96,20 +96,20 @@ metadata:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: api-server
+  name: relay-server
   namespace: astation
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: api-server
+      app: relay-server
   template:
     metadata:
       labels:
-        app: api-server
+        app: relay-server
     spec:
       containers:
-      - name: api-server
+      - name: relay-server
         image: ghcr.io/agora-build/station-relay-server:latest
         ports:
         - containerPort: 3000
@@ -136,11 +136,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: api-server
+  name: relay-server
   namespace: astation
 spec:
   selector:
-    app: api-server
+    app: relay-server
   ports:
   - port: 3000
     targetPort: 3000
@@ -234,7 +234,7 @@ kubectl get services -n astation
 kubectl get ingress -n astation
 
 # View logs
-kubectl logs -n astation deployment/api-server -f
+kubectl logs -n astation deployment/relay-server -f
 kubectl logs -n astation deployment/webapp -f
 ```
 
@@ -400,13 +400,13 @@ curl -X POST http://localhost:3000/api/rtc-sessions \
 
 **Docker Compose:**
 ```bash
-docker compose logs -f api-server
+docker compose logs -f relay-server
 docker compose logs -f webapp
 ```
 
 **Kubernetes:**
 ```bash
-kubectl logs -n astation -l app=api-server -f
+kubectl logs -n astation -l app=relay-server -f
 kubectl logs -n astation -l app=webapp -f
 ```
 
@@ -422,12 +422,12 @@ sudo tail -f /var/log/nginx/access.log
 
 **Docker Compose:**
 ```bash
-docker compose up -d --scale api-server=3 --scale webapp=3
+docker compose up -d --scale relay-server=3 --scale webapp=3
 ```
 
 **Kubernetes:**
 ```bash
-kubectl scale deployment api-server --replicas=5 -n astation
+kubectl scale deployment relay-server --replicas=5 -n astation
 kubectl scale deployment webapp --replicas=10 -n astation
 ```
 
