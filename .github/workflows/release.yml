@@ -227,7 +227,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run server tests
+      - name: Run relay server tests
         working-directory: relay-server
         run: cargo test
 
