@@ -508,6 +508,14 @@ int astation_rtc_leave(AStationRtcEngine* engine) {
     std::fprintf(stderr,
         "[AStationRtc] Leaving channel=%s\n", impl->channel.c_str());
 
+    if (impl->screen_sharing) {
+        agora::rtc::ChannelMediaOptions options{};
+        options.publishScreenTrack = false;
+        impl->rtc_engine->updateChannelMediaOptions(options);
+        impl->rtc_engine->stopScreenCapture();
+        impl->screen_sharing = false;
+    }
+
     int ret = impl->rtc_engine->leaveChannel();
     if (ret != 0) {
         std::fprintf(stderr,
@@ -608,27 +616,27 @@ int astation_rtc_stop_screen_share(AStationRtcEngine* engine) {
     }
 
 #if (defined(__APPLE__) && TARGET_OS_MAC && !TARGET_OS_IPHONE) || defined(_WIN32)
-    int ret = impl->rtc_engine->stopScreenCapture();
-    if (ret == 0) {
-        impl->screen_sharing = false;
-        if (impl->joined) {
-            agora::rtc::ChannelMediaOptions options{};
-            options.publishScreenTrack = false;
-            int opt_ret = impl->rtc_engine->updateChannelMediaOptions(options);
-            if (opt_ret != 0) {
-                const char* desc = impl->rtc_engine->getErrorDescription(opt_ret);
-                std::fprintf(stderr,
-                    "[AStationRtc] updateChannelMediaOptions(stopScreenTrack) failed: %d (%s)\n",
-                    opt_ret, desc ? desc : "unknown");
-            }
+    if (impl->joined) {
+        agora::rtc::ChannelMediaOptions options{};
+        options.publishScreenTrack = false;
+        int opt_ret = impl->rtc_engine->updateChannelMediaOptions(options);
+        if (opt_ret != 0) {
+            const char* desc = impl->rtc_engine->getErrorDescription(opt_ret);
+            std::fprintf(stderr,
+                "[AStationRtc] updateChannelMediaOptions(stopScreenTrack) failed: %d (%s)\n",
+                opt_ret, desc ? desc : "unknown");
         }
-        std::fprintf(stderr, "[AStationRtc] Screen sharing stopped\n");
-    } else {
+    }
+    int ret = impl->rtc_engine->stopScreenCapture();
+    if (ret != 0) {
         const char* desc = impl->rtc_engine->getErrorDescription(ret);
         std::fprintf(stderr,
             "[AStationRtc] stopScreenCapture() failed: %d (%s)\n",
             ret, desc ? desc : "unknown");
+    } else {
+        std::fprintf(stderr, "[AStationRtc] Screen sharing stopped\n");
     }
+    impl->screen_sharing = false;
     return ret;
 #else
     std::fprintf(stderr,

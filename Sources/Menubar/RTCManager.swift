@@ -313,8 +313,9 @@ class RTCManager {
             return
         }
         let result = astation_rtc_stop_screen_share(engine)
-        if result == 0 {
-            _isScreenSharing = false
+        _isScreenSharing = false
+        if result != 0 {
+            Log.info("[RTCManager] Stop screen share failed with code \(result)")
         }
     }
 }
