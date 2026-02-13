@@ -63,24 +63,23 @@ Returns `400 Bad Request` with error details if validation fails.
 
 ## 🔒 Deployment Architecture
 
-### Recommended Setup (with Cloudflare Tunnel)
+### Recommended Setup
 
 ```
 Internet
     ↓
-Cloudflare (DDoS protection, HTTPS termination, caching)
+Reverse Proxy (Nginx/Caddy/Cloudflare)
+    ↓ HTTPS, Rate Limiting, DDoS Protection
     ↓
-Cloudflare Tunnel (secure tunnel, no exposed ports)
-    ↓
-Relay Server (localhost:3000, rate limiting, input validation)
+Relay Server (localhost:3000)
+    ↓ Application-level rate limiting, input validation
 ```
 
-**Advantages:**
-- ✅ HTTPS automatically managed by Cloudflare
-- ✅ DDoS protection included
-- ✅ No exposed ports (Tunnel only)
-- ✅ Zero-trust network access
-- ✅ Free tier available
+**Requirements:**
+- ✅ HTTPS via reverse proxy (Nginx, Caddy, or Cloudflare)
+- ✅ DDoS protection (Cloudflare recommended)
+- ✅ Relay server binds to localhost only
+- ✅ All traffic goes through reverse proxy
 
 ### Environment Variables
 
@@ -216,69 +215,59 @@ Web User → Opens https://station.agora.build/session/{id}
 
 ## 🚀 Deployment Steps
 
-### 1. Build Docker Image
+### Production (Docker Compose)
+
 ```bash
+# 1. Create environment file
 cd relay-server
-docker build -t station-relay-server .
-```
+cp .env.example .env
+# Edit: CORS_ORIGIN=https://station.agora.build
 
-### 2. Run with Docker Compose
-```bash
-# docker-compose.yml
-services:
-  relay-server:
-    image: station-relay-server
-    environment:
-      - RUST_LOG=info
-      - PORT=3000
-      - CORS_ORIGIN=https://station.agora.build
-    ports:
-      - "127.0.0.1:3000:3000"  # Only localhost access
-    restart: unless-stopped
-```
-
-### 3. Configure Cloudflare Tunnel
-```bash
-# Install cloudflared
-brew install cloudflare/cloudflare/cloudflared
-
-# Authenticate
-cloudflared tunnel login
-
-# Create tunnel
-cloudflared tunnel create station-relay
-
-# Configure tunnel
-cat > ~/.cloudflared/config.yml <<EOF
-tunnel: <TUNNEL_ID>
-credentials-file: ~/.cloudflared/<TUNNEL_ID>.json
-
-ingress:
-  - hostname: station.agora.build
-    service: http://localhost:3000
-  - service: http_status:404
-EOF
-
-# Run tunnel
-cloudflared tunnel run station-relay
-```
-
-### 4. Start Services
-```bash
+# 2. Deploy
 docker compose up -d
-cloudflared tunnel run station-relay
+
+# 3. Verify
+curl http://localhost:3000/api/pair
+# Expected: 400 Bad Request (server running)
 ```
 
-### 5. Verify
-```bash
-# Check health
-curl https://station.agora.build/api/pair
+### Staging (Coolify)
 
-# Test rate limiting
-for i in {1..70}; do
-  curl -X POST https://station.agora.build/api/sessions/test/grant -d '{"otp":"12345678"}'
-done
-# Should see 429 Too Many Requests after 60 requests
+```bash
+# See STAGING-SETUP.md for complete guide
+
+1. Coolify → New Docker Compose service
+2. GitHub: Agora-Build/Astation, path: relay-server
+3. Environment: CORS_ORIGIN=https://station.staging.agora.build
+4. Domain: station.staging.agora.build
+5. Deploy
+```
+
+### Configure Reverse Proxy
+
+**Option 1: Cloudflare (Recommended)**
+- Point DNS to your server
+- Enable proxying in Cloudflare
+- SSL/TLS mode: Full
+
+**Option 2: Nginx**
+```nginx
+server {
+    listen 443 ssl;
+    server_name station.agora.build;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+    }
+}
+```
+
+**Option 3: Caddy**
+```
+station.agora.build {
+    reverse_proxy localhost:3000
+}
 ```
 
 ---
