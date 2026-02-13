@@ -6,11 +6,11 @@ services:
     ports:
       - "8080:80"
     depends_on:
-      - station-api-server
-  station-api-server:
+      - station-relay-server
+  station-relay-server:
     build: ../api-server
     image: station-relay-server
-    container_name: station-api-server
+    container_name: station-relay-server
     environment:
       - RUST_LOG=info
       - PORT=3000
