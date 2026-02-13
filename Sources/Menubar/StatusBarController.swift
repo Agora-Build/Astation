@@ -216,21 +216,13 @@ class StatusBarController: NSObject, NSMenuDelegate {
                 stopShareItem.target = self
                 statusMenu.addItem(stopShareItem)
             } else {
-                let startDisplayItem = NSMenuItem(
-                    title: "Start Screen Share (Display…)",
-                    action: #selector(startScreenShareDisplay),
+                let startShareItem = NSMenuItem(
+                    title: "Start Screen Share…",
+                    action: #selector(startScreenShare),
                     keyEquivalent: ""
                 )
-                startDisplayItem.target = self
-                statusMenu.addItem(startDisplayItem)
-
-                let startRegionItem = NSMenuItem(
-                    title: "Start Screen Share (Region…)",
-                    action: #selector(startScreenShareRegion),
-                    keyEquivalent: ""
-                )
-                startRegionItem.target = self
-                statusMenu.addItem(startRegionItem)
+                startShareItem.target = self
+                statusMenu.addItem(startShareItem)
             }
 
             // Share Session Section
@@ -457,27 +449,25 @@ class StatusBarController: NSObject, NSMenuDelegate {
         setupMenu()
     }
 
-    @objc private func startScreenShareDisplay() {
-        promptForScreenSource(title: "Select Display") { [weak self] source in
-            self?.hubManager.rtcManager.startScreenShare(displayId: source.id)
-            self?.setupMenu()
-        }
-    }
-
-    @objc private func startScreenShareRegion() {
-        promptForScreenSource(title: "Select Display for Region") { [weak self] source in
+    @objc private func startScreenShare() {
+        promptForScreenShareOptions { [weak self] source, useRegion in
             guard let self = self else { return }
-            guard let screen = self.matchNSScreen(for: source) else {
-                let alert = NSAlert()
-                alert.messageText = "Display Not Found"
-                alert.informativeText = "Unable to match the selected display. Try again."
-                alert.alertStyle = .warning
-                alert.runModal()
-                return
-            }
-            ScreenRegionSelector.selectRegion(on: screen) { regionPixels in
-                guard let regionPixels else { return }
-                self.hubManager.rtcManager.startScreenShare(displayId: source.id, regionPixels: regionPixels)
+            if useRegion {
+                guard let screen = self.matchNSScreen(for: source) else {
+                    let alert = NSAlert()
+                    alert.messageText = "Display Not Found"
+                    alert.informativeText = "Unable to match the selected display. Try again."
+                    alert.alertStyle = .warning
+                    alert.runModal()
+                    return
+                }
+                ScreenRegionSelector.selectRegion(on: screen) { regionPixels in
+                    guard let regionPixels else { return }
+                    self.hubManager.rtcManager.startScreenShare(displayId: source.id, regionPixels: regionPixels)
+                    self.setupMenu()
+                }
+            } else {
+                self.hubManager.rtcManager.startScreenShare(displayId: source.id)
                 self.setupMenu()
             }
         }
@@ -488,7 +478,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
         setupMenu()
     }
 
-    private func promptForScreenSource(title: String, completion: @escaping (ScreenShareSource) -> Void) {
+    private func promptForScreenShareOptions(completion: @escaping (ScreenShareSource, Bool) -> Void) {
         let sources = hubManager.rtcManager.screenSources()
         guard !sources.isEmpty else {
             let alert = NSAlert()
@@ -500,8 +490,9 @@ class StatusBarController: NSObject, NSMenuDelegate {
         }
 
         let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = "Choose which display to share."
+        alert.messageText = "Start Screen Share"
+        alert.informativeText = "Choose a display and optionally share a region."
+
         let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
         let primaryIndex = sources.firstIndex { $0.isPrimary } ?? 0
         for (index, source) in sources.enumerated() {
@@ -515,12 +506,21 @@ class StatusBarController: NSObject, NSMenuDelegate {
             popup.addItem(withTitle: label)
         }
         popup.selectItem(at: primaryIndex)
-        alert.accessoryView = popup
-        alert.addButton(withTitle: "Select")
+
+        let checkbox = NSButton(checkboxWithTitle: "Share region only", target: nil, action: nil)
+        checkbox.state = .off
+
+        let stack = NSStackView(views: [popup, checkbox])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+
+        alert.accessoryView = stack
+        alert.addButton(withTitle: "Start")
         alert.addButton(withTitle: "Cancel")
 
         if alert.runModal() == .alertFirstButtonReturn {
-            completion(sources[popup.indexOfSelectedItem])
+            completion(sources[popup.indexOfSelectedItem], checkbox.state == .on)
         }
     }
 

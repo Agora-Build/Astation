@@ -4,24 +4,27 @@ final class ScreenRegionSelector {
     private static var activeWindow: ScreenRegionSelectionWindow?
 
     static func selectRegion(on screen: NSScreen, completion: @escaping (CGRect?) -> Void) {
-        let window = ScreenRegionSelectionWindow(screen: screen) { rectPoints in
-            if let rectPoints {
-                let scale = screen.backingScaleFactor
-                let pixelRect = CGRect(
-                    x: rectPoints.origin.x * scale,
-                    y: rectPoints.origin.y * scale,
-                    width: rectPoints.size.width * scale,
-                    height: rectPoints.size.height * scale
-                )
-                completion(pixelRect)
-            } else {
-                completion(nil)
+        DispatchQueue.main.async {
+            activeWindow?.close()
+            let window = ScreenRegionSelectionWindow(screen: screen) { rectPoints in
+                if let rectPoints {
+                    let scale = screen.backingScaleFactor
+                    let pixelRect = CGRect(
+                        x: rectPoints.origin.x * scale,
+                        y: rectPoints.origin.y * scale,
+                        width: rectPoints.size.width * scale,
+                        height: rectPoints.size.height * scale
+                    )
+                    completion(pixelRect)
+                } else {
+                    completion(nil)
+                }
+                activeWindow = nil
             }
-            activeWindow = nil
+            activeWindow = window
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
         }
-        activeWindow = window
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
     }
 }
 
@@ -30,16 +33,17 @@ private final class ScreenRegionSelectionWindow: NSWindow {
 
     init(screen: NSScreen, onComplete: @escaping (CGRect?) -> Void) {
         self.onComplete = onComplete
+        let screenSize = screen.frame.size
         super.init(
-            contentRect: screen.frame,
+            contentRect: NSRect(origin: .zero, size: screenSize),
             styleMask: [.borderless],
             backing: .buffered,
-            defer: false,
-            screen: screen
+            defer: false
         )
+        setFrame(screen.frame, display: true)
         isOpaque = false
         backgroundColor = .clear
-        level = .screenSaver
+        level = .floating
         hasShadow = false
         ignoresMouseEvents = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -78,6 +82,10 @@ private final class ScreenRegionSelectionView: NSView {
         startPoint = point
         currentPoint = point
         needsDisplay = true
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
     }
 
     override func mouseDragged(with event: NSEvent) {
