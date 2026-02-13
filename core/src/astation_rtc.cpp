@@ -20,6 +20,50 @@
 
 namespace {
 
+int64_t resolve_screen_capture_display_id(agora::rtc::IRtcEngine* engine,
+                                          int64_t requested_id) {
+    if (!engine || requested_id > 0) {
+        return requested_id;
+    }
+    agora::rtc::SIZE thumb_size(0, 0);
+    agora::rtc::SIZE icon_size(0, 0);
+    auto* sources = engine->getScreenCaptureSources(thumb_size, icon_size, true);
+    if (!sources) {
+        return requested_id;
+    }
+
+    int64_t first_screen_id = requested_id;
+    bool has_screen = false;
+    bool has_primary = false;
+    int64_t primary_id = requested_id;
+
+    const unsigned int count = sources->getCount();
+    for (unsigned int i = 0; i < count; ++i) {
+        const auto info = sources->getSourceInfo(i);
+        if (info.type != agora::rtc::ScreenCaptureSourceType_Screen) {
+            continue;
+        }
+        if (!has_screen) {
+            first_screen_id = info.sourceId;
+            has_screen = true;
+        }
+        if (info.primaryMonitor) {
+            primary_id = info.sourceId;
+            has_primary = true;
+            break;
+        }
+    }
+    sources->release();
+
+    if (has_primary) {
+        return primary_id;
+    }
+    if (has_screen) {
+        return first_screen_id;
+    }
+    return requested_id;
+}
+
 // ---------------------------------------------------------------------------
 // AStationRtcEngineImpl — wraps a real agora::rtc::IRtcEngine and forwards
 // SDK callbacks back through the C AStationRtcCallbacks interface.
@@ -403,6 +447,17 @@ int astation_rtc_enable_screen_share(AStationRtcEngine* engine,
         return 0;
     }
 
+    if (impl->joined) {
+        agora::rtc::ChannelMediaOptions options{};
+        options.publishScreenTrack = false;
+        impl->rtc_engine->updateChannelMediaOptions(options);
+    }
+    impl->rtc_engine->stopScreenCapture();
+
+    const int64_t requested_display_id = static_cast<int64_t>(display_id);
+    const int64_t resolved_display_id =
+        resolve_screen_capture_display_id(impl->rtc_engine, requested_display_id);
+
     // Ensure video is enabled and configure encoder for AV1 @ 1080p.
     impl->rtc_engine->enableVideo();
     agora::rtc::VideoEncoderConfiguration encoder_config;
@@ -435,11 +490,13 @@ int astation_rtc_enable_screen_share(AStationRtcEngine* engine,
     params.captureMouseCursor = true;
 
     std::fprintf(stderr,
-        "[AStationRtc] Screen share config: codec=AV1 resolution=1920x1080 fps=%d\n",
+        "[AStationRtc] Screen share config: displayId=%lld resolvedDisplayId=%lld codec=AV1 resolution=1920x1080 fps=%d\n",
+        static_cast<long long>(requested_display_id),
+        static_cast<long long>(resolved_display_id),
         params.frameRate);
 
     int ret = impl->rtc_engine->startScreenCaptureByDisplayId(
-        static_cast<int64_t>(display_id), region, params);
+        resolved_display_id, region, params);
 
     if (ret == 0) {
         impl->screen_sharing = true;
@@ -458,12 +515,46 @@ int astation_rtc_enable_screen_share(AStationRtcEngine* engine,
         }
         std::fprintf(stderr,
             "[AStationRtc] Screen sharing started on display %d\n",
-            display_id);
+            static_cast<int>(resolved_display_id));
     } else {
         const char* desc = impl->rtc_engine->getErrorDescription(ret);
         std::fprintf(stderr,
             "[AStationRtc] startScreenCaptureByDisplayId() failed: %d (%s)\n",
             ret, desc ? desc : "unknown");
+        if (params.frameRate > 15) {
+            params.frameRate = 15;
+            std::fprintf(stderr,
+                "[AStationRtc] Retrying screen share with fps=%d\n",
+                params.frameRate);
+            impl->rtc_engine->stopScreenCapture();
+            ret = impl->rtc_engine->startScreenCaptureByDisplayId(
+                resolved_display_id, region, params);
+            if (ret == 0) {
+                impl->screen_sharing = true;
+                if (impl->joined) {
+                    agora::rtc::ChannelMediaOptions options{};
+                    options.publishScreenTrack = true;
+                    options.publishCameraTrack = false;
+                    options.publishMicrophoneTrack = (impl->enable_audio != 0);
+                    int opt_ret = impl->rtc_engine->updateChannelMediaOptions(options);
+                    if (opt_ret != 0) {
+                        const char* retry_desc = impl->rtc_engine->getErrorDescription(opt_ret);
+                        std::fprintf(stderr,
+                            "[AStationRtc] updateChannelMediaOptions(publishScreenTrack) failed: %d (%s)\n",
+                            opt_ret, retry_desc ? retry_desc : "unknown");
+                    }
+                }
+                std::fprintf(stderr,
+                    "[AStationRtc] Screen sharing started on display %d (fps=%d)\n",
+                    static_cast<int>(resolved_display_id),
+                    params.frameRate);
+            } else {
+                const char* retry_desc = impl->rtc_engine->getErrorDescription(ret);
+                std::fprintf(stderr,
+                    "[AStationRtc] startScreenCaptureByDisplayId() retry failed: %d (%s)\n",
+                    ret, retry_desc ? retry_desc : "unknown");
+            }
+        }
     }
     return ret;
 #else
