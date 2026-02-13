@@ -5,12 +5,15 @@ mod rtc_session;
 mod session_store;
 mod web;
 
+use axum::http::{HeaderValue, Method};
 use axum::routing::{get, post};
 use axum::Router;
 use relay::RelayHub;
 use rtc_session::RtcSessionStore;
 use session_store::SessionStore;
-use tower_http::cors::{Any, CorsLayer};
+use std::sync::Arc;
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use tower_http::cors::CorsLayer;
 
 /// Shared state accessible by all route handlers.
 #[derive(Clone)]
@@ -74,23 +77,61 @@ async fn main() {
         rtc_sessions,
     };
 
-    // Configure CORS
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    // Configure CORS - Allow specific origin or default to localhost for development
+    let allowed_origin = std::env::var("CORS_ORIGIN")
+        .unwrap_or_else(|_| "https://station.agora.build".to_string());
 
-    // Build the router
-    let app = Router::new()
+    let cors = if allowed_origin == "*" {
+        // Development mode: allow all origins
+        tracing::warn!("CORS configured to allow ALL origins - only use in development!");
+        CorsLayer::permissive()
+    } else {
+        // Production mode: whitelist specific domain
+        tracing::info!("CORS configured to allow origin: {}", allowed_origin);
+        CorsLayer::new()
+            .allow_origin(allowed_origin.parse::<HeaderValue>().expect("Invalid CORS_ORIGIN"))
+            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+            .allow_headers(tower_http::cors::Any)
+            .allow_credentials(true)
+    };
+
+    // Configure rate limiting
+    // OTP/grant endpoints: 60 requests per minute per IP (strict)
+    // General endpoints: 600 requests per minute per IP
+    let governor_conf_strict = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(1)  // 60 per minute
+            .burst_size(10)
+            .finish()
+            .unwrap(),
+    );
+
+    let governor_conf_general = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(10)  // 600 per minute
+            .burst_size(20)
+            .finish()
+            .unwrap(),
+    );
+
+    // Build the router with rate limiting on sensitive endpoints
+    // Strict rate limiting for OTP validation (brute force protection)
+    let auth_routes = Router::new()
+        .route(
+            "/api/sessions/:id/grant",
+            post(routes::grant_session_handler),
+        )
+        .layer(GovernorLayer {
+            config: governor_conf_strict,
+        });
+
+    // General rate limiting for other API endpoints
+    let general_routes = Router::new()
         // Auth API routes
         .route("/api/sessions", post(routes::create_session_handler))
         .route(
             "/api/sessions/:id/status",
             get(routes::get_session_status_handler),
-        )
-        .route(
-            "/api/sessions/:id/grant",
-            post(routes::grant_session_handler),
         )
         .route(
             "/api/sessions/:id/deny",
@@ -113,12 +154,23 @@ async fn main() {
         // Relay API routes
         .route("/api/pair", post(relay::create_pair_handler))
         .route("/api/pair/:code", get(relay::pair_status_handler))
+        .layer(GovernorLayer {
+            config: governor_conf_general,
+        });
+
+    // Combine all routes
+    let app = Router::new()
+        .merge(auth_routes)
+        .merge(general_routes)
         .route("/ws", get(relay::ws_handler))
         .route("/pair", get(relay::pair_page_handler))
-        // Web page routes
         .route("/auth", get(routes::auth_page_handler))
         .layer(cors)
         .with_state(state);
+
+    tracing::info!("Rate limiting configured:");
+    tracing::info!("  - OTP validation: 60 requests/min per IP (burst: 10)");
+    tracing::info!("  - General API: 600 requests/min per IP (burst: 20)");
 
     // Read port from PORT env var (default 3000)
     let port: u16 = std::env::var("PORT")

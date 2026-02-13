@@ -4,6 +4,7 @@ use axum::{
     response::{Html, IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
+use validator::Validate;
 
 use crate::auth::{self, SessionStatus};
 use crate::web::auth_page;
@@ -11,8 +12,9 @@ use crate::AppState;
 
 // --- Request / Response types ---
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Validate)]
 pub struct CreateSessionRequest {
+    #[validate(length(min = 1, max = 255))]
     pub hostname: String,
 }
 
@@ -58,6 +60,17 @@ pub async fn create_session_handler(
     State(state): State<AppState>,
     Json(body): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
+    // Validate input
+    if let Err(e) = body.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Validation error: {}", e),
+            }),
+        )
+            .into_response();
+    }
+
     let session = auth::create_session(&body.hostname);
     let response = CreateSessionResponse {
         id: session.id.clone(),
@@ -68,7 +81,7 @@ pub async fn create_session_handler(
         expires_at: session.expires_at,
     };
     state.sessions.create(session).await;
-    (StatusCode::CREATED, Json(response))
+    (StatusCode::CREATED, Json(response)).into_response()
 }
 
 /// GET /api/sessions/:id/status

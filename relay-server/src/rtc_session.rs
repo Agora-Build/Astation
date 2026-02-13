@@ -12,6 +12,7 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use validator::Validate;
 
 use crate::AppState;
 
@@ -69,10 +70,13 @@ impl RtcSessionInner {
 
 // --- Request / Response types ---
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Validate)]
 pub struct CreateRtcSessionRequest {
+    #[validate(length(min = 1, max = 255))]
     pub app_id: String,
+    #[validate(length(min = 1, max = 64))]
     pub channel: String,
+    #[validate(length(min = 1, max = 4096))]
     pub token: String,
     pub host_uid: u32,
 }
@@ -91,8 +95,9 @@ pub struct GetRtcSessionResponse {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Validate)]
 pub struct JoinRtcSessionRequest {
+    #[validate(length(min = 1, max = 100))]
     pub name: String,
 }
 
@@ -226,6 +231,18 @@ pub async fn create_rtc_session_handler(
     State(state): State<AppState>,
     Json(body): Json<CreateRtcSessionRequest>,
 ) -> impl IntoResponse {
+    // Validate input
+    if let Err(e) = body.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(CreateRtcSessionResponse {
+                id: String::new(),
+                url: format!("Validation error: {}", e),
+            }),
+        )
+            .into_response();
+    }
+
     let id = Uuid::new_v4().to_string();
     let url = format!("{}/{}", SESSION_BASE_URL, id);
 
@@ -238,6 +255,7 @@ pub async fn create_rtc_session_handler(
         StatusCode::CREATED,
         Json(CreateRtcSessionResponse { id, url }),
     )
+        .into_response()
 }
 
 /// GET /api/rtc-sessions/:id
@@ -267,6 +285,16 @@ pub async fn join_rtc_session_handler(
     Path(id): Path<String>,
     Json(body): Json<JoinRtcSessionRequest>,
 ) -> impl IntoResponse {
+    // Validate input
+    if let Err(e) = body.validate() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(RtcSessionError {
+                error: format!("Validation error: {}", e),
+            }),
+        ));
+    }
+
     match state.rtc_sessions.join(&id, body.name).await {
         Ok(response) => Ok(Json(response)),
         Err(error) => {

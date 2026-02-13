@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::Instant;
+use validator::Validate;
 
 use crate::AppState;
 
@@ -72,8 +73,9 @@ fn generate_pairing_code() -> String {
 
 // --- Request / Response types ---
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Validate)]
 pub struct CreatePairRequest {
+    #[validate(length(min = 1, max = 255))]
     pub hostname: String,
 }
 
@@ -106,6 +108,15 @@ pub async fn create_pair_handler(
     State(state): State<AppState>,
     Json(body): Json<CreatePairRequest>,
 ) -> impl IntoResponse {
+    // Validate input
+    if let Err(e) = body.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Validation error: {}", e)})),
+        )
+            .into_response();
+    }
+
     let hub = &state.relay;
     let code = generate_pairing_code();
     let room = PairRoom {
@@ -121,7 +132,7 @@ pub async fn create_pair_handler(
     drop(rooms);
 
     tracing::info!("Pair room created: {}", code);
-    (StatusCode::CREATED, Json(CreatePairResponse { code }))
+    (StatusCode::CREATED, Json(CreatePairResponse { code })).into_response()
 }
 
 /// GET /api/pair/:code — Check pairing status.
