@@ -609,6 +609,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/rtc-sessions")
                     .header("Content-Type", "application/json")
+                    .header("Host", "station.agora.build")
                     .body(Body::from(
                         r#"{"app_id":"app1","channel":"room","token":"tok","host_uid":5678}"#,
                     ))
@@ -1013,6 +1014,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/rtc-sessions")
                     .header("Content-Type", "application/json")
+                    .header("Host", "station.agora.build")
                     .body(Body::from(
                         r#"{"app_id":"app1","channel":"room","token":"tok","host_uid":5678}"#,
                     ))
