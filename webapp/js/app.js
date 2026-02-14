@@ -63,9 +63,10 @@ function checkSavedUser() {
     }
 }
 
-function saveUser(name) {
+function saveUser(name, micEnabled) {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
         name: name,
+        micEnabled: micEnabled,
         lastUsed: Date.now()
     }));
 }
@@ -99,6 +100,9 @@ function showNameDialog(sessionData) {
     const saved = checkSavedUser();
     if (saved) {
         document.getElementById("name-input").value = saved.name;
+        // Restore saved mic state (default to true if not saved)
+        const micEnabled = saved.micEnabled !== undefined ? saved.micEnabled : true;
+        document.getElementById("mic-enabled-input").checked = micEnabled;
     }
 
     // Focus input
@@ -126,6 +130,9 @@ async function handleJoin() {
         return;
     }
 
+    const micEnabledInput = document.getElementById("mic-enabled-input");
+    const micEnabled = micEnabledInput.checked;
+
     const joinBtn = document.getElementById("join-btn");
     joinBtn.disabled = true;
     joinBtn.textContent = "Joining...";
@@ -146,13 +153,13 @@ async function handleJoin() {
         currentUid = data.uid;
         currentName = data.name;
 
-        saveUser(name);
+        saveUser(name, micEnabled);
         showApp();
 
         document.getElementById("display-name").textContent = currentName;
         document.getElementById("channel-name").textContent = data.channel;
 
-        await joinChannel(data.app_id, data.channel, data.token, data.uid);
+        await joinChannel(data.app_id, data.channel, data.token, data.uid, micEnabled);
     } catch (err) {
         showError("Connection failed: " + err.message);
     }
@@ -160,7 +167,7 @@ async function handleJoin() {
 
 // --- Agora SDK ---
 
-async function joinChannel(appId, channel, token, uid) {
+async function joinChannel(appId, channel, token, uid, micEnabled = true) {
     const preferredCodec = (window.AstationCodec && window.AstationCodec.preferredCodec) || "av1";
     const fallbackCodec = (window.AstationCodec && window.AstationCodec.fallbackCodec) || "vp8";
 
@@ -183,13 +190,21 @@ async function joinChannel(appId, channel, token, uid) {
         client = await createClientWithCodec(fallbackCodec);
     }
 
-    // Create and publish local mic track
-    try {
-        localAudioTrack = await AgoraRTC.createMicrophoneAudioTrack();
-        await client.publish([localAudioTrack]);
-    } catch (err) {
-        console.warn("Microphone access denied:", err);
+    // Create and publish local mic track if enabled
+    if (micEnabled) {
+        try {
+            localAudioTrack = await AgoraRTC.createMicrophoneAudioTrack();
+            await client.publish([localAudioTrack]);
+            isMicMuted = false;
+        } catch (err) {
+            console.warn("Microphone access denied:", err);
+        }
+    } else {
+        isMicMuted = true;
     }
+
+    // Update mic button UI
+    updateMicButton();
 
     // Add self to user list
     addUserToList(uid, currentName, true);
@@ -200,6 +215,11 @@ async function handleUserPublished(user, mediaType) {
     try {
         await client.subscribe(user, mediaType);
 
+        // Set high quality stream for video
+        if (mediaType === "video") {
+            await client.setRemoteVideoStreamType(user.uid, 0); // 0 = high quality
+        }
+
         if (mediaType === "video") {
             const videoMain = document.getElementById("video-main");
             videoMain.innerHTML = "";
@@ -208,7 +228,8 @@ async function handleUserPublished(user, mediaType) {
             const codecType = user.videoTrack?._videoTrack?.getCodecType?.() || "unknown";
             console.log(`Receiving video from UID ${user.uid} with codec: ${codecType}`);
 
-            user.videoTrack.play(videoMain);
+            // Play with fit mode to maintain aspect ratio and quality
+            user.videoTrack.play(videoMain, { fit: "contain" });
 
             // Track the video
             if (remoteUsers.has(user.uid)) {
@@ -300,17 +321,12 @@ function updateParticipantCount() {
 
 // --- Controls ---
 
-function toggleMic() {
-    if (!localAudioTrack) return;
-
-    isMicMuted = !isMicMuted;
-    localAudioTrack.setEnabled(!isMicMuted);
-
+function updateMicButton() {
     const btn = document.getElementById("mic-btn");
     const onIcon = document.getElementById("mic-on-icon");
     const offIcon = document.getElementById("mic-off-icon");
 
-    if (isMicMuted) {
+    if (isMicMuted || !localAudioTrack) {
         btn.classList.add("mic-muted");
         onIcon.style.display = "none";
         offIcon.style.display = "block";
@@ -319,6 +335,25 @@ function toggleMic() {
         onIcon.style.display = "block";
         offIcon.style.display = "none";
     }
+}
+
+async function toggleMic() {
+    // If no track exists, create it
+    if (!localAudioTrack) {
+        try {
+            localAudioTrack = await AgoraRTC.createMicrophoneAudioTrack();
+            await client.publish([localAudioTrack]);
+            isMicMuted = false;
+        } catch (err) {
+            console.error("Failed to create microphone track:", err);
+            return;
+        }
+    } else {
+        isMicMuted = !isMicMuted;
+        localAudioTrack.setEnabled(!isMicMuted);
+    }
+
+    updateMicButton();
 
     // Update own mic indicator
     const selfItem = document.getElementById(`user-${currentUid}`);
@@ -341,6 +376,19 @@ async function leave() {
     }
 
     window.location.href = "/";
+}
+
+function toggleSidebar() {
+    const sidebar = document.getElementById("sidebar");
+    const showBtn = document.getElementById("sidebar-show-btn");
+
+    if (sidebar.classList.contains("hidden")) {
+        sidebar.classList.remove("hidden");
+        showBtn.style.display = "none";
+    } else {
+        sidebar.classList.add("hidden");
+        showBtn.style.display = "flex";
+    }
 }
 
 // --- Utilities ---

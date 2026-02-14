@@ -5,7 +5,7 @@ use tokio::sync::RwLock;
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -224,11 +224,10 @@ impl Default for RtcSessionStore {
 
 // --- Route Handlers ---
 
-const SESSION_BASE_URL: &str = "https://station.agora.build/session";
-
 /// POST /api/rtc-sessions
 pub async fn create_rtc_session_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CreateRtcSessionRequest>,
 ) -> impl IntoResponse {
     // Validate input
@@ -244,7 +243,41 @@ pub async fn create_rtc_session_handler(
     }
 
     let id = Uuid::new_v4().to_string();
-    let url = format!("{}/{}", SESSION_BASE_URL, id);
+
+    // Log all relevant headers for debugging
+    let host_header = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or("(none)");
+    let x_fwd_host = headers.get("x-forwarded-host").and_then(|h| h.to_str().ok()).unwrap_or("(none)");
+    let x_fwd_port = headers.get("x-forwarded-port").and_then(|h| h.to_str().ok()).unwrap_or("(none)");
+    let x_fwd_proto = headers.get("x-forwarded-proto").and_then(|h| h.to_str().ok()).unwrap_or("(none)");
+
+    tracing::info!(
+        "Creating RTC session - Headers: Host={}, X-Forwarded-Host={}, X-Forwarded-Port={}, X-Forwarded-Proto={}",
+        host_header, x_fwd_host, x_fwd_port, x_fwd_proto
+    );
+
+    // Construct URL from Host header (which includes the port the client connected to)
+    let host = headers
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("localhost:8080")
+        .to_string();
+
+    // Check X-Forwarded-Proto for protocol, or infer from host
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|h| h.to_str().ok());
+
+    let protocol = if let Some(proto) = forwarded_proto {
+        proto
+    } else if host.contains("localhost") || host.starts_with("127.0.0.1") || host.starts_with("192.168.") || host.starts_with("10.") {
+        "http"
+    } else {
+        "https"
+    };
+
+    let url = format!("{}://{}/session/{}", protocol, host, id);
+
+    tracing::info!("Generated session URL: {}", url);
 
     state
         .rtc_sessions

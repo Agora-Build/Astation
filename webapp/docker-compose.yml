@@ -1,4 +1,12 @@
 services:
+  station-relay-server:
+    build: ../relay-server
+    image: station-relay-server
+    container_name: station-relay-server
+    environment:
+      - CORS_ORIGIN=*
+      - RUST_LOG=debug
+      - PORT=3000
   station-webapp:
     build: .
     image: station-webapp
@@ -7,10 +15,3 @@ services:
       - "8080:80"
     depends_on:
       - station-relay-server
-  station-relay-server:
-    build: ../relay-server
-    image: station-relay-server
-    container_name: station-relay-server
-    environment:
-      - RUST_LOG=info
-      - PORT=3000

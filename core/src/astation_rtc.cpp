@@ -301,10 +301,10 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
         }
     }
 
-    // Ensure video is enabled and configure encoder for AV1 @ 1080p.
+    // Ensure video is enabled and configure encoder for AV1 @ 1080p30.
     impl->rtc_engine->enableVideo();
     int scenario_ret = impl->rtc_engine->setScreenCaptureScenario(
-        agora::rtc::SCREEN_SCENARIO_DOCUMENT);
+        agora::rtc::SCREEN_SCENARIO_RDC);
     if (scenario_ret != 0) {
         const char* desc = impl->rtc_engine->getErrorDescription(scenario_ret);
         std::fprintf(stderr,
@@ -313,8 +313,8 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
     }
     agora::rtc::VideoEncoderConfiguration encoder_config;
     encoder_config.dimensions = agora::rtc::VideoDimensions(1920, 1080);
-    encoder_config.frameRate = 15;
-    encoder_config.bitrate = agora::rtc::STANDARD_BITRATE;
+    encoder_config.frameRate = 30;
+    encoder_config.bitrate = 2500;
     encoder_config.codecType = agora::rtc::VIDEO_CODEC_AV1;
     int enc_ret = impl->rtc_engine->setVideoEncoderConfiguration(encoder_config);
     if (enc_ret != 0) {
@@ -335,19 +335,20 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
 
     agora::rtc::ScreenCaptureParameters params;
     params.dimensions = {1920, 1080};
-    params.frameRate = 15;
-    params.bitrate = agora::rtc::STANDARD_BITRATE;
+    params.frameRate = 30;
+    params.bitrate = 2500;
     params.captureMouseCursor = true;
 
     std::fprintf(stderr,
-        "[AStationRtc] Screen share config: displayId=%lld resolvedDisplayId=%lld region=%d,%d %dx%d codec=AV1 resolution=1920x1080 fps=%d\n",
+        "[AStationRtc] Screen share config: displayId=%lld resolvedDisplayId=%lld region=%d,%d %dx%d codec=AV1 resolution=1920x1080 fps=%d bitrate=%d kbps\n",
         static_cast<long long>(requested_display_id),
         static_cast<long long>(resolved_display_id),
         region.x,
         region.y,
         region.width,
         region.height,
-        params.frameRate);
+        params.frameRate,
+        params.bitrate);
 
     int ret = impl->rtc_engine->startScreenCaptureByDisplayId(
         resolved_display_id, region, params);
@@ -375,8 +376,8 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
         std::fprintf(stderr,
             "[AStationRtc] startScreenCaptureByDisplayId() failed: %d (%s)\n",
             ret, desc ? desc : "unknown");
-        if (params.frameRate > 15) {
-            params.frameRate = 15;
+        if (params.frameRate > 24) {
+            params.frameRate = 24;
             std::fprintf(stderr,
                 "[AStationRtc] Retrying screen share with fps=%d\n",
                 params.frameRate);

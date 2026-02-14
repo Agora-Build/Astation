@@ -5,15 +5,18 @@ mod rtc_session;
 mod session_store;
 mod web;
 
+use axum::extract::Request;
 use axum::http::{header, HeaderValue, Method};
 use axum::routing::{get, post};
 use axum::Router;
 use relay::RelayHub;
 use rtc_session::RtcSessionStore;
 use session_store::SessionStore;
+use std::net::IpAddr;
 use std::sync::Arc;
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::cors::CorsLayer;
+
 
 /// Shared state accessible by all route handlers.
 #[derive(Clone)]
@@ -120,10 +123,11 @@ async fn main() {
         .route(
             "/api/sessions/:id/grant",
             post(routes::grant_session_handler),
-        )
-        .layer(GovernorLayer {
-            config: governor_conf_strict,
-        });
+        );
+        // Rate limiting temporarily disabled for local testing with nginx proxy
+        // .layer(GovernorLayer {
+        //     config: governor_conf_strict.clone(),
+        // });
 
     // General rate limiting for other API endpoints
     let general_routes = Router::new()
@@ -153,10 +157,11 @@ async fn main() {
         )
         // Relay API routes
         .route("/api/pair", post(relay::create_pair_handler))
-        .route("/api/pair/:code", get(relay::pair_status_handler))
-        .layer(GovernorLayer {
-            config: governor_conf_general,
-        });
+        .route("/api/pair/:code", get(relay::pair_status_handler));
+        // Rate limiting temporarily disabled for local testing with nginx proxy
+        // .layer(GovernorLayer {
+        //     config: governor_conf_general.clone(),
+        // });
 
     // Combine all routes
     let app = Router::new()
