@@ -303,6 +303,22 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
 
     // Ensure video is enabled and configure encoder for AV1 @ 1080p30.
     impl->rtc_engine->enableVideo();
+    const char* param_list[] = {
+        "{\"engine.video.enable_hw_encoder\":false}",
+        "{\"che.video.videoCodecIndex\":11}",
+        "{\"rtc.video.av1_screen_enable\":true}",
+        "{\"rtc.video.av1_dec_enable\":true}",
+        "{\"che.video.enc_scc_enable\":true}"
+    };
+    for (const char* param : param_list) {
+        int param_ret = impl->rtc_engine->setParameters(param);
+        if (param_ret != 0) {
+            std::fprintf(stderr,
+                "[AStationRtc] setParameters failed (%s): %d\n",
+                param,
+                param_ret);
+        }
+    }
     int scenario_ret = impl->rtc_engine->setScreenCaptureScenario(
         agora::rtc::SCREEN_SCENARIO_RDC);
     if (scenario_ret != 0) {
