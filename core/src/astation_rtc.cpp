@@ -320,7 +320,7 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
         }
     }
     int scenario_ret = impl->rtc_engine->setScreenCaptureScenario(
-        agora::rtc::SCREEN_SCENARIO_RDC);
+        agora::rtc::SCREEN_SCENARIO_DOCUMENT);
     if (scenario_ret != 0) {
         const char* desc = impl->rtc_engine->getErrorDescription(scenario_ret);
         std::fprintf(stderr,
