@@ -301,7 +301,7 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
         }
     }
 
-    // Ensure video is enabled and configure encoder for AV1 @ 1080p30.
+    // Ensure video is enabled and configure screen-share encoding (AV1 preferred via parameters).
     impl->rtc_engine->enableVideo();
     const char* param_list[] = {
         "{\"engine.video.enable_hw_encoder\":false}",
@@ -331,11 +331,10 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
     encoder_config.dimensions = agora::rtc::VideoDimensions(1920, 1080);
     encoder_config.frameRate = 30;
     encoder_config.bitrate = 2500;
-    encoder_config.codecType = agora::rtc::VIDEO_CODEC_AV1;
     int enc_ret = impl->rtc_engine->setVideoEncoderConfiguration(encoder_config);
     if (enc_ret != 0) {
         std::fprintf(stderr,
-            "[AStationRtc] setVideoEncoderConfiguration(AV1) failed: %d\n",
+            "[AStationRtc] setVideoEncoderConfiguration failed: %d\n",
             enc_ret);
         encoder_config.codecType = agora::rtc::VIDEO_CODEC_H264;
         int fallback_ret = impl->rtc_engine->setVideoEncoderConfiguration(encoder_config);
@@ -345,7 +344,7 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
                 fallback_ret);
         } else {
             std::fprintf(stderr,
-                "[AStationRtc] Falling back to H264 for screen share\n");
+                "[AStationRtc] Retrying with H264 for screen share\n");
         }
     }
 
@@ -356,7 +355,7 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
     params.captureMouseCursor = true;
 
     std::fprintf(stderr,
-        "[AStationRtc] Screen share config: displayId=%lld resolvedDisplayId=%lld region=%d,%d %dx%d codec=AV1 resolution=1920x1080 fps=%d bitrate=%d kbps\n",
+        "[AStationRtc] Screen share config: displayId=%lld resolvedDisplayId=%lld region=%d,%d %dx%d codec=AV1(params) resolution=1920x1080 fps=%d bitrate=%d kbps\n",
         static_cast<long long>(requested_display_id),
         static_cast<long long>(resolved_display_id),
         region.x,
