@@ -11,6 +11,13 @@ class AstationHubManager: ObservableObject {
     @Published var videoActive = false
     @Published var markTasks: [MarkTask] = []
 
+    /// Agents reported by each Atem, keyed by clientId.
+    @Published var agentsByClientId: [String: [AtemAgentInfo]] = [:]
+    /// Atem instances that disconnected recently (shown as offline in the UI).
+    @Published var offlineClients: [OfflineClient] = []
+    /// User-pinned active client ID. Overrides focus-based routing when set.
+    @Published var pinnedClientId: String?
+
     private var hubStartTime = Date()
     let credentialManager = CredentialManager()
     let apiClient = AgoraAPIClient()
@@ -286,7 +293,26 @@ class AstationHubManager: ObservableObject {
 
     func removeClient(withId clientId: String) {
         DispatchQueue.main.async {
+            // Move to offline list before removing
+            if let client = self.connectedClients.first(where: { $0.id == clientId }) {
+                let offline = OfflineClient(
+                    id: client.id,
+                    hostname: client.hostname,
+                    tag: client.tag,
+                    disconnectedAt: Date()
+                )
+                // Remove any existing offline entry for same hostname to avoid duplicates
+                if !client.hostname.isEmpty && client.hostname != "unknown" {
+                    self.offlineClients.removeAll { $0.hostname == client.hostname }
+                }
+                self.offlineClients.append(offline)
+            }
             self.connectedClients.removeAll { $0.id == clientId }
+            self.agentsByClientId.removeValue(forKey: clientId)
+            // If the pinned client disconnected, clear the pin
+            if self.pinnedClientId == clientId {
+                self.pinnedClientId = nil
+            }
             Log.info(" Client disconnected: \(clientId)")
             self.broadcastInstanceList()
         }
@@ -388,6 +414,13 @@ class AstationHubManager: ObservableObject {
             handleMarkTaskResult(taskId: taskId, success: success, message: message)
             return nil
 
+        case .agentListResponse(let agents):
+            Log.info("[AstationHub] Agent list from \(clientId.prefix(8))…: \(agents.count) agent(s)")
+            DispatchQueue.main.async {
+                self.agentsByClientId[clientId] = agents
+            }
+            return nil
+
         default:
             Log.debug(" Unhandled message type from client: \(clientId)")
             return nil
@@ -477,6 +510,8 @@ class AstationHubManager: ObservableObject {
 
             if let hostname = hostname {
                 self.connectedClients[index].hostname = hostname
+                // If a client with this hostname was offline, it's back online — clear it.
+                self.offlineClients.removeAll { $0.hostname == hostname }
             }
             if let tag = tag {
                 self.connectedClients[index].tag = tag
@@ -486,6 +521,9 @@ class AstationHubManager: ObservableObject {
             // Focus follows most-recent activity
             self.updateFocus(activeClientId: clientId)
         }
+
+        // Ask this Atem to send its current agent list.
+        sendHandler?(AstationMessage.agentListRequest, clientId)
     }
 
     /// Mark the most-recently-active client as focused, unfocus others.
@@ -515,10 +553,39 @@ class AstationHubManager: ObservableObject {
         return connectedClients.first(where: { $0.isFocused })
     }
 
-    /// Pick the target Atem for routing: focused client, or first connected.
+    /// Pick the target Atem for routing: pinned → focused → first connected.
     /// Returns the client ID, or nil if no Atem is connected.
     func routeToFocusedAtem() -> String? {
+        if let pinned = pinnedClientId,
+           connectedClients.contains(where: { $0.id == pinned }) {
+            return pinned
+        }
         return (focusedClient() ?? connectedClients.first)?.id
+    }
+
+    // MARK: - Client & Agent Management
+
+    /// Explicitly pin a client as the active routing target.
+    func pinClient(id: String) {
+        DispatchQueue.main.async { self.pinnedClientId = id }
+    }
+
+    /// Clear the pin, reverting to focus-based routing.
+    func unpinClient() {
+        DispatchQueue.main.async { self.pinnedClientId = nil }
+    }
+
+    /// Remove a disconnected client from the offline list.
+    func removeOfflineClient(id: String) {
+        DispatchQueue.main.async {
+            self.offlineClients.removeAll { $0.id == id }
+        }
+    }
+
+    /// Ask a specific Atem to push its current agent list.
+    func requestAgentList(from clientId: String) {
+        sendHandler?(AstationMessage.agentListRequest, clientId)
+        Log.info("[AstationHub] Requested agent list from \(clientId.prefix(8))…")
     }
 
     // MARK: - Voice Command Routing
@@ -791,6 +858,13 @@ struct ConnectedClient: Identifiable {
     var tag: String = ""
     var lastActivity: Date = Date()
     var isFocused: Bool = false
+}
+
+struct OfflineClient: Identifiable {
+    let id: String
+    var hostname: String
+    var tag: String
+    let disconnectedAt: Date
 }
 
 struct MarkTask {

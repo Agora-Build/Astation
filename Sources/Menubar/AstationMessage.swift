@@ -35,6 +35,10 @@ enum AstationMessage: Codable {
     case markTaskNotify(taskId: String, status: String, description: String)
     case markTaskAssignment(taskId: String, receivedAtMs: UInt64)
     case markTaskResult(taskId: String, success: Bool, message: String)
+
+    // Agent hub (Astation ↔ Atem)
+    case agentListRequest
+    case agentListResponse(agents: [AtemAgentInfo])
     
     // Custom encoding/decoding to handle the enum cases
     private enum CodingKeys: String, CodingKey {
@@ -66,6 +70,8 @@ enum AstationMessage: Codable {
         case markTaskNotify
         case markTaskAssignment
         case markTaskResult
+        case agentListRequest
+        case agentListResponse
     }
     
     func encode(to encoder: Encoder) throws {
@@ -204,6 +210,14 @@ enum AstationMessage: Codable {
             try dataContainer.encode(taskId, forKey: .taskId)
             try dataContainer.encode(success, forKey: .success)
             try dataContainer.encode(message, forKey: .message)
+
+        case .agentListRequest:
+            try container.encode(MessageType.agentListRequest, forKey: .type)
+
+        case .agentListResponse(let agents):
+            try container.encode(MessageType.agentListResponse, forKey: .type)
+            var dataContainer = container.nestedContainer(keyedBy: AgentListKeys.self, forKey: .data)
+            try dataContainer.encode(agents, forKey: .agents)
         }
     }
     
@@ -350,6 +364,14 @@ enum AstationMessage: Codable {
             let success = try dataContainer.decode(Bool.self, forKey: .success)
             let message = try dataContainer.decode(String.self, forKey: .message)
             self = .markTaskResult(taskId: taskId, success: success, message: message)
+
+        case .agentListRequest:
+            self = .agentListRequest
+
+        case .agentListResponse:
+            let dataContainer = try container.nestedContainer(keyedBy: AgentListKeys.self, forKey: .data)
+            let agents = try dataContainer.decode([AtemAgentInfo].self, forKey: .agents)
+            self = .agentListResponse(agents: agents)
         }
     }
 }
@@ -429,6 +451,10 @@ private enum MarkTaskResultKeys: String, CodingKey {
     case taskId, success, message
 }
 
+private enum AgentListKeys: String, CodingKey {
+    case agents
+}
+
 /// Information about a connected Atem instance, broadcast to all clients.
 struct AtemInstanceInfo: Codable {
     let id: String
@@ -439,5 +465,63 @@ struct AtemInstanceInfo: Codable {
     enum CodingKeys: String, CodingKey {
         case id, hostname, tag
         case isFocused = "is_focused"
+    }
+}
+
+/// Snapshot of an agent registered in an Atem instance's AgentRegistry.
+/// Mirrors Rust's `agent_client::AgentInfo` serialization.
+struct AtemAgentInfo: Codable, Identifiable {
+    let id: String
+    let name: String
+    /// Human-readable kind: "Claude Code", "Codex", or raw unknown string.
+    let kind: String
+    /// Protocol string from Rust: "Acp" or "Pty".
+    let agentProtocol: String
+    /// Status string from Rust: "Idle", "Thinking", "WaitingForInput", "Disconnected".
+    let status: String
+    let sessionIds: [String]
+    let acpUrl: String?
+    let ptyPid: UInt32?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, kind, status
+        case agentProtocol = "protocol"
+        case sessionIds = "session_ids"
+        case acpUrl = "acp_url"
+        case ptyPid = "pty_pid"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        // Rust's AgentKind serializes as a plain string for unit variants
+        // ("ClaudeCode", "Codex") or as {"Unknown": "..."} for the tuple variant.
+        if let raw = try? c.decode(String.self, forKey: .kind) {
+            switch raw {
+            case "ClaudeCode": kind = "Claude Code"
+            case "Codex":      kind = "Codex"
+            default:           kind = raw
+            }
+        } else {
+            kind = "Unknown"
+        }
+        agentProtocol = (try? c.decode(String.self, forKey: .agentProtocol)) ?? "Pty"
+        status = (try? c.decode(String.self, forKey: .status)) ?? "Idle"
+        sessionIds = (try? c.decode([String].self, forKey: .sessionIds)) ?? []
+        acpUrl = try? c.decodeIfPresent(String.self, forKey: .acpUrl)
+        ptyPid = try? c.decodeIfPresent(UInt32.self, forKey: .ptyPid)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(kind, forKey: .kind)
+        try c.encode(agentProtocol, forKey: .agentProtocol)
+        try c.encode(status, forKey: .status)
+        try c.encode(sessionIds, forKey: .sessionIds)
+        try c.encodeIfPresent(acpUrl, forKey: .acpUrl)
+        try c.encodeIfPresent(ptyPid, forKey: .ptyPid)
     }
 }

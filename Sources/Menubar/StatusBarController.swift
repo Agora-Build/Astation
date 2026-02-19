@@ -10,6 +10,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
     private lazy var devConsoleController = DevConsoleController(hubManager: hubManager)
     private lazy var projectsWindowController = ProjectsWindowController(hubManager: hubManager)
     private lazy var joinChannelWindowController = JoinChannelWindowController(hubManager: hubManager)
+    private lazy var connectionsWindowController = ConnectionsWindowController(hubManager: hubManager)
     private var headerTapCount = 0
     private var lastHeaderTapTime: Date?
 
@@ -131,21 +132,35 @@ class StatusBarController: NSObject, NSMenuDelegate {
             statusMenu.addItem(noneItem)
         } else {
             for client in atemClients {
-                let focusIndicator = client.isFocused ? "[active]" : "[idle]"
-                let displayName = client.hostname == "unknown" ? client.id.prefix(8) + "..." : client.hostname
+                let isPinned = hubManager.pinnedClientId == client.id
+                let isActive = isPinned || (hubManager.pinnedClientId == nil && client.isFocused)
+                let indicator = isPinned ? "★" : (isActive ? "●" : "○")
+                let displayName = client.hostname == "unknown"
+                    ? String(client.id.prefix(8)) + "..."
+                    : client.hostname
                 let instanceItem = NSMenuItem(
-                    title: "  \(focusIndicator) \(displayName)",
-                    action: nil,
+                    title: "  \(indicator) \(displayName)",
+                    action: #selector(showClientsAndAgents),
                     keyEquivalent: ""
                 )
-                instanceItem.isEnabled = false
-                if client.isFocused {
+                instanceItem.target = self
+                if isActive {
                     instanceItem.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "Active")
                 } else {
                     instanceItem.image = NSImage(systemSymbolName: "circle", accessibilityDescription: "Idle")
                 }
                 statusMenu.addItem(instanceItem)
             }
+        }
+        // Show offline count if any
+        if !hubManager.offlineClients.isEmpty {
+            let offlineItem = NSMenuItem(
+                title: "  ⊘ \(hubManager.offlineClients.count) offline",
+                action: #selector(showClientsAndAgents),
+                keyEquivalent: ""
+            )
+            offlineItem.target = self
+            statusMenu.addItem(offlineItem)
         }
 
         statusMenu.addItem(NSMenuItem.separator())
@@ -310,8 +325,21 @@ class StatusBarController: NSObject, NSMenuDelegate {
         )
         showProjectsItem.target = self
         statusMenu.addItem(showProjectsItem)
-        
-        // Show Connections
+
+        // Show Clients & Agents
+        let onlineCount = hubManager.connectedClients.filter { $0.clientType == "Atem" }.count
+        let clientsTitle = onlineCount > 0
+            ? "🔌 Clients & Agents (\(onlineCount) online)"
+            : "🔌 Clients & Agents"
+        let showClientsItem = NSMenuItem(
+            title: clientsTitle,
+            action: #selector(showClientsAndAgents),
+            keyEquivalent: "k"
+        )
+        showClientsItem.target = self
+        statusMenu.addItem(showClientsItem)
+
+        // Show Connections (legacy developer panel)
         let showConnectionsItem = NSMenuItem(
             title: "🔌 Show Connections",
             action: #selector(showConnections),
@@ -371,6 +399,11 @@ class StatusBarController: NSObject, NSMenuDelegate {
     @objc private func showProjects() {
         Log.info(" Show projects requested from status bar")
         projectsWindowController.showWindow()
+    }
+
+    @objc private func showClientsAndAgents() {
+        Log.info(" Show clients & agents requested from status bar")
+        connectionsWindowController.showAndFocus()
     }
     
     @objc private func showConnections() {
