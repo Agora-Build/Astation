@@ -1,10 +1,21 @@
 FROM rust:1.85-slim AS builder
 
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
-COPY src/ src/
 
-RUN cargo build --release
+# Cache dependency compilation separately from source changes.
+# Copy only manifest files first and build a dummy binary so that
+# cargo fetches + compiles all dependencies. This layer is cached
+# as long as Cargo.toml / Cargo.lock don't change.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs \
+    && cargo build --release \
+    && rm -rf src
+
+# Now copy the real source and do the final build. Only changed
+# source files are recompiled; all dependencies stay cached.
+COPY src/ src/
+# Touch main.rs so cargo knows it changed (avoids "nothing to compile").
+RUN touch src/main.rs && cargo build --release
 
 FROM debian:bookworm-slim
 
