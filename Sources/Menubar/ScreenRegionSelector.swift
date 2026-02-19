@@ -232,10 +232,10 @@ private final class ScreenShareOverlayView: NSView {
         NSColor.clear.setFill()
         NSBezierPath(rect: rect).fill()
 
-        NSColor.systemGreen.setStroke()
+        NSColor(calibratedRed: 0.45, green: 0.90, blue: 0.60, alpha: 0.7).setStroke()
 
-        let cornerLength: CGFloat = 18
-        let cornerWidth: CGFloat = 4
+        let cornerLength: CGFloat = 14
+        let cornerWidth: CGFloat = 3
         let corners = [
             CGPoint(x: rect.minX, y: rect.minY),
             CGPoint(x: rect.maxX, y: rect.minY),
