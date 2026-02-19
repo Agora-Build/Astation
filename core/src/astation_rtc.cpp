@@ -327,7 +327,6 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
             "[AStationRtc] setScreenCaptureScenario() failed: %d (%s)\n",
             scenario_ret, desc ? desc : "unknown");
     }
-    const int target_bitrate_kbps = 6000;
     int capture_width = 1920;
     int capture_height = 1080;
     if (region.width > 0 && region.height > 0) {
