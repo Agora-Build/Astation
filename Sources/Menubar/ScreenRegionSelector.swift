@@ -162,12 +162,10 @@ private final class ScreenRegionSelectionView: NSView {
     private var selectionRect: CGRect?
     private var dragMode: DragMode = .none
     private var didFinish = false
-    private var pendingStart: DispatchWorkItem?
-
     private let minSize: CGFloat = 20
     private let handleSize: CGFloat = 8
     private let instructions =
-        "Drag to select. Drag inside to move, edges to resize. Release to start (auto), or Enter/double-click. Esc to cancel."
+        "Drag to select. Drag inside to move, edges to resize. Release to start, or Enter/double-click. Esc to cancel."
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -182,8 +180,6 @@ private final class ScreenRegionSelectionView: NSView {
             onSelection?(rect)
             return
         }
-        pendingStart?.cancel()
-        pendingStart = nil
         let point = convert(event.locationInWindow, from: nil)
         startPoint = point
 
@@ -211,8 +207,6 @@ private final class ScreenRegionSelectionView: NSView {
 
     override func mouseDragged(with event: NSEvent) {
         guard !didFinish else { return }
-        pendingStart?.cancel()
-        pendingStart = nil
         let point = convert(event.locationInWindow, from: nil)
         switch dragMode {
         case .creating:
@@ -241,10 +235,11 @@ private final class ScreenRegionSelectionView: NSView {
         }
         dragMode = .none
         if let rect = selectionRect, rect.width >= minSize, rect.height >= minSize {
-            scheduleAutoStart(for: rect)
-            return
+            didFinish = true
+            onSelection?(rect)
+        } else {
+            selectionRect = nil
         }
-        selectionRect = nil
     }
 
     override func keyDown(with event: NSEvent) {
@@ -355,21 +350,6 @@ private final class ScreenRegionSelectionView: NSView {
     func setSelection(_ rect: CGRect) {
         selectionRect = clamp(rect: rect)
         needsDisplay = true
-    }
-
-    private func scheduleAutoStart(for rect: CGRect) {
-        pendingStart?.cancel()
-        let pending = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            guard !self.didFinish else { return }
-            guard let current = self.selectionRect else { return }
-            if current.equalTo(rect) {
-                self.didFinish = true
-                self.onSelection?(current)
-            }
-        }
-        pendingStart = pending
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: pending)
     }
 
     private func drawInstructions() {

@@ -327,10 +327,11 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
             "[AStationRtc] setScreenCaptureScenario() failed: %d (%s)\n",
             scenario_ret, desc ? desc : "unknown");
     }
+    const int target_bitrate_kbps = 6000;
     agora::rtc::VideoEncoderConfiguration encoder_config;
     encoder_config.dimensions = agora::rtc::VideoDimensions(1920, 1080);
     encoder_config.frameRate = 30;
-    encoder_config.bitrate = 2500;
+    encoder_config.bitrate = target_bitrate_kbps;
     int enc_ret = impl->rtc_engine->setVideoEncoderConfiguration(encoder_config);
     if (enc_ret != 0) {
         std::fprintf(stderr,
@@ -351,7 +352,7 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
     agora::rtc::ScreenCaptureParameters params;
     params.dimensions = {1920, 1080};
     params.frameRate = 30;
-    params.bitrate = 2500;
+    params.bitrate = target_bitrate_kbps;
     params.captureMouseCursor = true;
 
     std::fprintf(stderr,
