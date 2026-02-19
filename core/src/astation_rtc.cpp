@@ -328,9 +328,54 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
             scenario_ret, desc ? desc : "unknown");
     }
     const int target_bitrate_kbps = 6000;
+    int capture_width = 1920;
+    int capture_height = 1080;
+    if (region.width > 0 && region.height > 0) {
+        capture_width = region.width;
+        capture_height = region.height;
+    } else if (impl->rtc_engine) {
+        agora::rtc::SIZE thumb_size(0, 0);
+        agora::rtc::SIZE icon_size(0, 0);
+        auto* sources = impl->rtc_engine->getScreenCaptureSources(thumb_size, icon_size, true);
+        if (sources) {
+            const unsigned int count = sources->getCount();
+            for (unsigned int i = 0; i < count; ++i) {
+                const auto info = sources->getSourceInfo(i);
+                if (info.type != agora::rtc::ScreenCaptureSourceType_Screen) {
+                    continue;
+                }
+                if (info.sourceId == resolved_display_id &&
+                    info.position.width > 0 &&
+                    info.position.height > 0) {
+                    capture_width = info.position.width;
+                    capture_height = info.position.height;
+                    break;
+                }
+            }
+            sources->release();
+        }
+    }
+    if (capture_width <= 0 || capture_height <= 0) {
+        capture_width = 1920;
+        capture_height = 1080;
+    }
+
+    auto calc_bitrate_kbps = [](int width, int height, int fps) -> int {
+        const double bpp = 0.1; // target bits-per-pixel for high-quality screen share
+        double kbps = (static_cast<double>(width) *
+                          static_cast<double>(height) *
+                          static_cast<double>(fps) * bpp) / 1000.0;
+        if (kbps < 4000.0) kbps = 4000.0;
+        if (kbps > 20000.0) kbps = 20000.0;
+        return static_cast<int>(kbps);
+    };
+
+    const int preferred_fps = 60;
+    int target_bitrate_kbps = calc_bitrate_kbps(capture_width, capture_height, preferred_fps);
+
     agora::rtc::VideoEncoderConfiguration encoder_config;
-    encoder_config.dimensions = agora::rtc::VideoDimensions(1920, 1080);
-    encoder_config.frameRate = 30;
+    encoder_config.dimensions = agora::rtc::VideoDimensions(capture_width, capture_height);
+    encoder_config.frameRate = preferred_fps;
     encoder_config.bitrate = target_bitrate_kbps;
     int enc_ret = impl->rtc_engine->setVideoEncoderConfiguration(encoder_config);
     if (enc_ret != 0) {
@@ -350,19 +395,21 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
     }
 
     agora::rtc::ScreenCaptureParameters params;
-    params.dimensions = {1920, 1080};
-    params.frameRate = 30;
+    params.dimensions = {capture_width, capture_height};
+    params.frameRate = preferred_fps;
     params.bitrate = target_bitrate_kbps;
     params.captureMouseCursor = true;
 
     std::fprintf(stderr,
-        "[AStationRtc] Screen share config: displayId=%lld resolvedDisplayId=%lld region=%d,%d %dx%d codec=AV1(params) resolution=1920x1080 fps=%d bitrate=%d kbps\n",
+        "[AStationRtc] Screen share config: displayId=%lld resolvedDisplayId=%lld region=%d,%d %dx%d codec=AV1(params) resolution=%dx%d fps=%d bitrate=%d kbps\n",
         static_cast<long long>(requested_display_id),
         static_cast<long long>(resolved_display_id),
         region.x,
         region.y,
         region.width,
         region.height,
+        params.dimensions.width,
+        params.dimensions.height,
         params.frameRate,
         params.bitrate);
 
@@ -392,11 +439,20 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
         std::fprintf(stderr,
             "[AStationRtc] startScreenCaptureByDisplayId() failed: %d (%s)\n",
             ret, desc ? desc : "unknown");
-        if (params.frameRate > 24) {
-            params.frameRate = 24;
-            std::fprintf(stderr,
-                "[AStationRtc] Retrying screen share with fps=%d\n",
+        const int fallback_fps[] = {30, 24};
+        for (int fallback : fallback_fps) {
+            if (fallback >= params.frameRate) {
+                continue;
+            }
+            params.frameRate = fallback;
+            params.bitrate = calc_bitrate_kbps(
+                params.dimensions.width,
+                params.dimensions.height,
                 params.frameRate);
+            std::fprintf(stderr,
+                "[AStationRtc] Retrying screen share with fps=%d bitrate=%d kbps\n",
+                params.frameRate,
+                params.bitrate);
             impl->rtc_engine->stopScreenCapture();
             ret = impl->rtc_engine->startScreenCaptureByDisplayId(
                 resolved_display_id, region, params);
@@ -419,10 +475,47 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
                     "[AStationRtc] Screen sharing started on display %d (fps=%d)\n",
                     static_cast<int>(resolved_display_id),
                     params.frameRate);
+                return ret;
+            }
+        }
+
+        if (capture_width > 1920 || capture_height > 1080) {
+            params.dimensions = {1920, 1080};
+            params.frameRate = 30;
+            params.bitrate = calc_bitrate_kbps(
+                params.dimensions.width,
+                params.dimensions.height,
+                params.frameRate);
+            std::fprintf(stderr,
+                "[AStationRtc] Retrying screen share at 1920x1080 fps=%d bitrate=%d kbps\n",
+                params.frameRate,
+                params.bitrate);
+            impl->rtc_engine->stopScreenCapture();
+            ret = impl->rtc_engine->startScreenCaptureByDisplayId(
+                resolved_display_id, region, params);
+            if (ret == 0) {
+                impl->screen_sharing = true;
+                if (impl->joined) {
+                    agora::rtc::ChannelMediaOptions options{};
+                    options.publishScreenTrack = true;
+                    options.publishCameraTrack = false;
+                    options.publishMicrophoneTrack = (impl->enable_audio != 0);
+                    int opt_ret = impl->rtc_engine->updateChannelMediaOptions(options);
+                    if (opt_ret != 0) {
+                        const char* retry_desc = impl->rtc_engine->getErrorDescription(opt_ret);
+                        std::fprintf(stderr,
+                            "[AStationRtc] updateChannelMediaOptions(publishScreenTrack) failed: %d (%s)\n",
+                            opt_ret, retry_desc ? retry_desc : "unknown");
+                    }
+                }
+                std::fprintf(stderr,
+                    "[AStationRtc] Screen sharing started on display %d (fallback 1080p)\n",
+                    static_cast<int>(resolved_display_id));
+                return ret;
             } else {
                 const char* retry_desc = impl->rtc_engine->getErrorDescription(ret);
                 std::fprintf(stderr,
-                    "[AStationRtc] startScreenCaptureByDisplayId() retry failed: %d (%s)\n",
+                    "[AStationRtc] startScreenCaptureByDisplayId() fallback 1080p failed: %d (%s)\n",
                     ret, retry_desc ? retry_desc : "unknown");
             }
         }
