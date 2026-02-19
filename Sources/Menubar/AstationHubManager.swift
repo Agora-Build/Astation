@@ -30,9 +30,12 @@ class AstationHubManager: ObservableObject {
     /// Opaque handle to the C core engine (VAD + signaling pipeline).
     private var coreHandle: OpaquePointer?
 
-    /// Station relay URL. Priority: ASTATION_RELAY_URL env var > UserDefaults (AstationRelayUrl) > default.
+    /// Used by tests to inject a mock relay URL without touching UserDefaults.
+    var _testRelayUrlOverride: String? = nil
+
+    /// Station relay URL. Priority: test override > ASTATION_RELAY_URL env var > UserDefaults > default.
     var stationRelayUrl: String {
-        SettingsWindowController.currentAstationRelayUrl
+        _testRelayUrlOverride ?? SettingsWindowController.currentAstationRelayUrl
     }
 
     /// Callback for broadcasting messages to all connected Atem clients.
@@ -438,6 +441,9 @@ class AstationHubManager: ObservableObject {
         if granted {
             Log.info(" Auth granted for \(session.request.hostname), token: \(session.sessionToken?.prefix(8) ?? "nil")...")
 
+            // Notify the relay server so atem login polling receives "granted".
+            postGrantToRelayServer(sessionId: session.request.sessionId, otp: session.request.otp)
+
             let response = AstationMessage.authResponse(
                 sessionId: session.request.sessionId,
                 success: true,
@@ -448,6 +454,9 @@ class AstationHubManager: ObservableObject {
         } else {
             Log.error(" Auth denied for \(session.request.hostname)")
 
+            // Notify the relay server so atem login polling receives "denied".
+            postDenyToRelayServer(sessionId: session.request.sessionId)
+
             let response = AstationMessage.authResponse(
                 sessionId: session.request.sessionId,
                 success: false,
@@ -456,6 +465,53 @@ class AstationHubManager: ObservableObject {
             )
             broadcastAuthResponse(response, sessionId: session.request.sessionId)
         }
+    }
+
+    /// POST /api/sessions/{id}/grant to the relay server so the polling atem login
+    /// receives the granted status and session token.
+    func postGrantToRelayServer(sessionId: String, otp: String) {
+        let urlString = "\(stationRelayUrl)/api/sessions/\(sessionId)/grant"
+        guard let url = URL(string: urlString) else {
+            Log.error("[AstationHub] Invalid grant URL: \(urlString)")
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["otp": otp])
+
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            if let error = error {
+                Log.error("[AstationHub] Grant POST failed: \(error)")
+                return
+            }
+            if let http = response as? HTTPURLResponse {
+                Log.info("[AstationHub] Grant POST status: \(http.statusCode)")
+            }
+        }.resume()
+    }
+
+    /// POST /api/sessions/{id}/deny to the relay server so the polling atem login
+    /// receives the denied status.
+    func postDenyToRelayServer(sessionId: String) {
+        let urlString = "\(stationRelayUrl)/api/sessions/\(sessionId)/deny"
+        guard let url = URL(string: urlString) else {
+            Log.error("[AstationHub] Invalid deny URL: \(urlString)")
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            if let error = error {
+                Log.error("[AstationHub] Deny POST failed: \(error)")
+                return
+            }
+            if let http = response as? HTTPURLResponse {
+                Log.info("[AstationHub] Deny POST status: \(http.statusCode)")
+            }
+        }.resume()
     }
 
     private func broadcastAuthResponse(_ message: AstationMessage, sessionId: String) {
