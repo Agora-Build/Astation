@@ -30,9 +30,9 @@ class AstationHubManager: ObservableObject {
     /// Opaque handle to the C core engine (VAD + signaling pipeline).
     private var coreHandle: OpaquePointer?
 
-    /// Station relay URL. Priority: ASTATION_RELAY_URL env var > UserDefaults > default.
+    /// Station relay URL. Priority: ASTATION_RELAY_URL env var > UserDefaults (AstationRelayUrl) > default.
     var stationRelayUrl: String {
-        SettingsWindowController.currentStationURL
+        SettingsWindowController.currentAstationRelayUrl
     }
 
     /// Callback for broadcasting messages to all connected Atem clients.

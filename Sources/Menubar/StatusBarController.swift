@@ -355,7 +355,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
         serverHeader.isEnabled = false
         statusMenu.addItem(serverHeader)
 
-        let wsUrl = SettingsWindowController.currentWebSocketURL
+        let wsUrl = SettingsWindowController.currentAstationWs
         let wsServerItem = NSMenuItem(
             title: "🌐 WebSocket: \(wsUrl)",
             action: #selector(copyWebSocketURL),
@@ -364,7 +364,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
         wsServerItem.target = self
         statusMenu.addItem(wsServerItem)
 
-        let stationUrl = SettingsWindowController.currentStationURL
+        let stationUrl = SettingsWindowController.currentAstationRelayUrl
         let stationItem = NSMenuItem(
             title: "📡 Station: \(stationUrl)",
             action: #selector(copyStationURL),
@@ -426,7 +426,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
     }
     
     @objc private func copyWebSocketURL() {
-        let url = SettingsWindowController.currentWebSocketURL
+        let url = SettingsWindowController.currentAstationWs
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(url, forType: .string)
@@ -441,7 +441,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func copyStationURL() {
-        let url = SettingsWindowController.currentStationURL
+        let url = SettingsWindowController.currentAstationRelayUrl
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(url, forType: .string)

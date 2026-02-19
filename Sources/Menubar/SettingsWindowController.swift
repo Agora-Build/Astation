@@ -2,25 +2,25 @@ import Cocoa
 import Foundation
 
 class SettingsWindowController: NSObject, NSWindowDelegate {
-    static let websocketURLKey = "AstationWebSocketURL"
-    static let stationURLKey = "AstationStationURL"
+    static let astationWsKey = "AstationWs"
+    static let astationRelayUrlKey = "AstationRelayUrl"
 
     static let defaultWebSocketURL = "ws://127.0.0.1:8080/ws"
     static let defaultStationURL = "https://station.agora.build"
 
     /// Returns the persisted local WebSocket URL, or the default.
-    static var currentWebSocketURL: String {
-        let saved = UserDefaults.standard.string(forKey: websocketURLKey) ?? ""
+    static var currentAstationWs: String {
+        let saved = UserDefaults.standard.string(forKey: astationWsKey) ?? ""
         return saved.isEmpty ? defaultWebSocketURL : saved
     }
 
     /// Returns the persisted Station relay URL.
     /// Env var ASTATION_RELAY_URL takes priority over UserDefaults.
-    static var currentStationURL: String {
+    static var currentAstationRelayUrl: String {
         if let envUrl = ProcessInfo.processInfo.environment["ASTATION_RELAY_URL"], !envUrl.isEmpty {
             return envUrl
         }
-        let saved = UserDefaults.standard.string(forKey: stationURLKey) ?? ""
+        let saved = UserDefaults.standard.string(forKey: astationRelayUrlKey) ?? ""
         return saved.isEmpty ? defaultStationURL : saved
     }
 
@@ -80,7 +80,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
 
         wsUrlField = NSTextField(frame: NSRect(x: 145, y: 325, width: 280, height: 22))
         wsUrlField.placeholderString = SettingsWindowController.defaultWebSocketURL
-        let savedWs = UserDefaults.standard.string(forKey: SettingsWindowController.websocketURLKey) ?? ""
+        let savedWs = UserDefaults.standard.string(forKey: SettingsWindowController.astationWsKey) ?? ""
         wsUrlField.stringValue = savedWs
         contentView.addSubview(wsUrlField)
 
@@ -91,7 +91,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
 
         stationUrlField = NSTextField(frame: NSRect(x: 145, y: 290, width: 280, height: 22))
         stationUrlField.placeholderString = SettingsWindowController.defaultStationURL
-        let savedStation = UserDefaults.standard.string(forKey: SettingsWindowController.stationURLKey) ?? ""
+        let savedStation = UserDefaults.standard.string(forKey: SettingsWindowController.astationRelayUrlKey) ?? ""
         stationUrlField.stringValue = savedStation
         if ProcessInfo.processInfo.environment["ASTATION_RELAY_URL"] != nil {
             stationUrlField.placeholderString = "Overridden by ASTATION_RELAY_URL env var"
@@ -224,8 +224,8 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         let wsUrl = wsUrlField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let stationUrl = stationUrlField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        UserDefaults.standard.set(wsUrl, forKey: SettingsWindowController.websocketURLKey)
-        UserDefaults.standard.set(stationUrl, forKey: SettingsWindowController.stationURLKey)
+        UserDefaults.standard.set(wsUrl, forKey: SettingsWindowController.astationWsKey)
+        UserDefaults.standard.set(stationUrl, forKey: SettingsWindowController.astationRelayUrlKey)
 
         serverStatusLabel.stringValue = "Server info saved"
         serverStatusLabel.textColor = .systemGreen
