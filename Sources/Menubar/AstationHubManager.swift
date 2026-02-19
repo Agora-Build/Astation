@@ -30,7 +30,7 @@ class AstationHubManager: ObservableObject {
     /// Opaque handle to the C core engine (VAD + signaling pipeline).
     private var coreHandle: OpaquePointer?
 
-    /// Station relay URL. Priority: AGORA_STATION_RELAY_URL env var > UserDefaults > default.
+    /// Station relay URL. Priority: ASTATION_RELAY_URL env var > UserDefaults > default.
     var stationRelayUrl: String {
         SettingsWindowController.currentStationURL
     }
