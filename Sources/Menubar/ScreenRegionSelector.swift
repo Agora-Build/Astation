@@ -167,6 +167,7 @@ private final class ScreenRegionSelectionView: NSView {
     private var dragMode: DragMode = .none
     private var didFinish = false
     private var didDrag = false
+    private var hadSelectionAtMouseDown = false
     private let minSize: CGFloat = 20
     private let handleSize: CGFloat = 8
     private let instructions =
@@ -186,6 +187,7 @@ private final class ScreenRegionSelectionView: NSView {
             return
         }
         didDrag = false
+        hadSelectionAtMouseDown = (selectionRect != nil)
         let point = convert(event.locationInWindow, from: nil)
         startPoint = point
 
@@ -236,6 +238,11 @@ private final class ScreenRegionSelectionView: NSView {
 
     override func mouseUp(with event: NSEvent) {
         if didFinish { return }
+        if event.clickCount == 2, let rect = selectionRect {
+            didFinish = true
+            onSelection?(rect)
+            return
+        }
         if case .creating = dragMode {
             let point = convert(event.locationInWindow, from: nil)
             selectionRect = rectFrom(start: startPoint, end: point)
@@ -244,7 +251,7 @@ private final class ScreenRegionSelectionView: NSView {
         if didDrag, let rect = selectionRect, rect.width >= minSize, rect.height >= minSize {
             didFinish = true
             onSelection?(rect)
-        } else {
+        } else if !hadSelectionAtMouseDown {
             selectionRect = nil
         }
     }
