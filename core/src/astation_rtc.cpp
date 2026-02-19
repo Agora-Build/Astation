@@ -53,7 +53,7 @@ struct AStationRtcEngineImpl
     bool joined{false};
     bool mic_muted{false};
     bool screen_sharing{false};
-    std::vector<view_t> screen_exclude_windows;
+    std::vector<agora::view_t> screen_exclude_windows;
 
     explicit AStationRtcEngineImpl(
         const AStationRtcConfig& config,
@@ -728,7 +728,7 @@ int astation_rtc_set_screen_share_exclude_window(AStationRtcEngine* engine,
     impl->screen_exclude_windows.clear();
     if (window_id > 0) {
         impl->screen_exclude_windows.push_back(
-            reinterpret_cast<view_t>(static_cast<intptr_t>(window_id)));
+            reinterpret_cast<agora::view_t>(static_cast<intptr_t>(window_id)));
     }
     return 0;
 }
