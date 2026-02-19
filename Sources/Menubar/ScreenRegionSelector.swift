@@ -49,6 +49,20 @@ final class ScreenRegionSelector {
     static func showOverlay(on screen: NSScreen,
                             displayId: Int64,
                             rectPoints: CGRect) -> Int64? {
+        if let existing = activeOverlay {
+            if Thread.isMainThread {
+                existing.updateRect(rectPoints)
+                existing.setVisible(true)
+                return Int64(existing.windowNumber)
+            }
+            var windowId: Int64?
+            DispatchQueue.main.sync {
+                existing.updateRect(rectPoints)
+                existing.setVisible(true)
+                windowId = Int64(existing.windowNumber)
+            }
+            return windowId
+        }
         if Thread.isMainThread {
             let overlay = ScreenShareOverlayWindow(
                 screen: screen,
@@ -80,8 +94,7 @@ final class ScreenRegionSelector {
 
     static func hideOverlay() {
         DispatchQueue.main.async {
-            activeOverlay?.close()
-            activeOverlay = nil
+            activeOverlay?.setVisible(false)
         }
     }
 
@@ -210,6 +223,7 @@ private final class ScreenShareOverlayWindow: NSWindow {
         hasShadow = false
         ignoresMouseEvents = true
         sharingType = .none
+        isReleasedWhenClosed = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         let overlay = ScreenShareOverlayView(frame: NSRect(origin: .zero, size: screen.frame.size))
@@ -223,6 +237,16 @@ private final class ScreenShareOverlayWindow: NSWindow {
         if let view = contentView as? ScreenShareOverlayView {
             view.selectionRect = rect
             view.needsDisplay = true
+        }
+    }
+
+    func setVisible(_ visible: Bool) {
+        if visible {
+            alphaValue = 1.0
+            orderFrontRegardless()
+        } else {
+            alphaValue = 0.0
+            orderOut(nil)
         }
     }
 }
