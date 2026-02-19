@@ -461,7 +461,12 @@ class StatusBarController: NSObject, NSMenuDelegate {
                     alert.runModal()
                     return
                 }
-                ScreenRegionSelector.selectRegion(on: screen, displayId: source.id) { regionPixels in
+                let scale = self.screenPixelScale(for: screen, source: source)
+                ScreenRegionSelector.selectRegion(
+                    on: screen,
+                    displayId: source.id,
+                    pixelsPerPoint: scale
+                ) { regionPixels in
                     guard let regionPixels else { return }
                     self.hubManager.rtcManager.startScreenShare(displayId: source.id, regionPixels: regionPixels)
                     self.setupMenu()
@@ -541,6 +546,22 @@ class StatusBarController: NSObject, NSMenuDelegate {
             return source.rectPixels.size
         }
         return nil
+    }
+
+    private func screenPixelScale(for screen: NSScreen, source: ScreenShareSource) -> CGSize {
+        let pointsSize = screen.frame.size
+        if pointsSize.width > 0,
+           pointsSize.height > 0,
+           source.rectPixels.width > 0,
+           source.rectPixels.height > 0 {
+            let scaleX = source.rectPixels.width / pointsSize.width
+            let scaleY = source.rectPixels.height / pointsSize.height
+            if scaleX > 0.5, scaleY > 0.5 {
+                return CGSize(width: scaleX, height: scaleY)
+            }
+        }
+        let scale = screen.backingScaleFactor
+        return CGSize(width: scale, height: scale)
     }
 
     private func screenForDisplayId(_ displayId: Int64) -> NSScreen? {

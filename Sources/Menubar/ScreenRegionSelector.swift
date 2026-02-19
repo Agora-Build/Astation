@@ -7,23 +7,27 @@ final class ScreenRegionSelector {
 
     static func selectRegion(on screen: NSScreen,
                              displayId: Int64,
+                             pixelsPerPoint: CGSize? = nil,
                              completion: @escaping (CGRect?) -> Void) {
         DispatchQueue.main.async {
             activeWindow?.close()
             let initialRect = loadStoredRect(for: screen, displayId: displayId)
                 ?? defaultRect(for: screen)
+            let scale = pixelsPerPoint ?? CGSize(
+                width: screen.backingScaleFactor,
+                height: screen.backingScaleFactor
+            )
             let window = ScreenRegionSelectionWindow(screen: screen) { rectPoints in
                 if let rectPoints {
                     saveStoredRect(rectPoints, for: screen, displayId: displayId)
-                    let scale = screen.backingScaleFactor
                     // Agora expects region coordinates relative to the top-left corner.
                     let screenHeight = screen.frame.size.height
                     let flippedY = screenHeight - rectPoints.origin.y - rectPoints.size.height
                     let pixelRect = CGRect(
-                        x: rectPoints.origin.x * scale,
-                        y: flippedY * scale,
-                        width: rectPoints.size.width * scale,
-                        height: rectPoints.size.height * scale
+                        x: rectPoints.origin.x * scale.width,
+                        y: flippedY * scale.height,
+                        width: rectPoints.size.width * scale.width,
+                        height: rectPoints.size.height * scale.height
                     )
                     completion(pixelRect)
                 } else {
@@ -162,6 +166,7 @@ private final class ScreenRegionSelectionView: NSView {
     private var selectionRect: CGRect?
     private var dragMode: DragMode = .none
     private var didFinish = false
+    private var didDrag = false
     private let minSize: CGFloat = 20
     private let handleSize: CGFloat = 8
     private let instructions =
@@ -180,6 +185,7 @@ private final class ScreenRegionSelectionView: NSView {
             onSelection?(rect)
             return
         }
+        didDrag = false
         let point = convert(event.locationInWindow, from: nil)
         startPoint = point
 
@@ -207,6 +213,7 @@ private final class ScreenRegionSelectionView: NSView {
 
     override func mouseDragged(with event: NSEvent) {
         guard !didFinish else { return }
+        didDrag = true
         let point = convert(event.locationInWindow, from: nil)
         switch dragMode {
         case .creating:
@@ -234,7 +241,7 @@ private final class ScreenRegionSelectionView: NSView {
             selectionRect = rectFrom(start: startPoint, end: point)
         }
         dragMode = .none
-        if let rect = selectionRect, rect.width >= minSize, rect.height >= minSize {
+        if didDrag, let rect = selectionRect, rect.width >= minSize, rect.height >= minSize {
             didFinish = true
             onSelection?(rect)
         } else {
