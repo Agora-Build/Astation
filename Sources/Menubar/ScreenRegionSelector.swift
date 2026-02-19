@@ -248,10 +248,7 @@ private final class ScreenRegionSelectionView: NSView {
             selectionRect = rectFrom(start: startPoint, end: point)
         }
         dragMode = .none
-        if didDrag, let rect = selectionRect, rect.width >= minSize, rect.height >= minSize {
-            didFinish = true
-            onSelection?(rect)
-        } else if let rect = selectionRect, rect.width < minSize || rect.height < minSize {
+        if let rect = selectionRect, rect.width < minSize || rect.height < minSize {
             selectionRect = nil
         }
     }
