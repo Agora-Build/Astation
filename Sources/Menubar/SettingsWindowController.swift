@@ -213,6 +213,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
             statusLabel.textColor = .systemGreen
             updateStatus()
             print("[Settings] Credentials saved successfully")
+            NotificationCenter.default.post(name: .credentialsChanged, object: nil)
         } catch {
             statusLabel.stringValue = "Failed to save: \(error.localizedDescription)"
             statusLabel.textColor = .systemRed
@@ -264,4 +265,5 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
 
 extension Notification.Name {
     static let serverInfoChanged = Notification.Name("AstationServerInfoChanged")
+    static let credentialsChanged = Notification.Name("AstationCredentialsChanged")
 }

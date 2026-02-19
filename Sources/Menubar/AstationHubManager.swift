@@ -54,6 +54,16 @@ class AstationHubManager: ObservableObject {
         if !skipProjectLoad {
             loadProjects()
         }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleCredentialsChanged),
+            name: .credentialsChanged,
+            object: nil
+        )
+    }
+
+    @objc private func handleCredentialsChanged() {
+        broadcastCredentials()
     }
 
     deinit {
@@ -177,6 +187,29 @@ class AstationHubManager: ObservableObject {
     func reloadCredentials() {
         checkCredentialStatus()
         refreshProjects()
+        broadcastCredentials()
+    }
+
+    /// Send current credentials to all connected Atem instances.
+    func broadcastCredentials() {
+        guard let credentials = credentialManager.load() else { return }
+        let msg = AstationMessage.credentialSync(
+            customerId: credentials.customerId,
+            customerSecret: credentials.customerSecret
+        )
+        broadcastHandler?(msg)
+        Log.info("[AstationHub] Broadcast credentialSync to all connected Atems")
+    }
+
+    /// Send current credentials to a specific Atem client.
+    func sendCredentials(toClientId clientId: String) {
+        guard let credentials = credentialManager.load() else { return }
+        let msg = AstationMessage.credentialSync(
+            customerId: credentials.customerId,
+            customerSecret: credentials.customerSecret
+        )
+        sendHandler?(msg, clientId)
+        Log.info("[AstationHub] Sent credentialSync to client \(clientId.prefix(8))…")
     }
     
     // MARK: - Projects Management
@@ -580,6 +613,9 @@ class AstationHubManager: ObservableObject {
 
         // Ask this Atem to send its current agent list.
         sendHandler?(AstationMessage.agentListRequest, clientId)
+
+        // Push credentials to the newly connected Atem.
+        sendCredentials(toClientId: clientId)
     }
 
     /// Mark the most-recently-active client as focused, unfocus others.

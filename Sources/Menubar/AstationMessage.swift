@@ -39,6 +39,7 @@ enum AstationMessage: Codable {
     // Agent hub (Astation ↔ Atem)
     case agentListRequest
     case agentListResponse(agents: [AtemAgentInfo])
+    case credentialSync(customerId: String, customerSecret: String)
     
     // Custom encoding/decoding to handle the enum cases
     private enum CodingKeys: String, CodingKey {
@@ -72,6 +73,7 @@ enum AstationMessage: Codable {
         case markTaskResult
         case agentListRequest
         case agentListResponse
+        case credentialSync
     }
     
     func encode(to encoder: Encoder) throws {
@@ -218,7 +220,18 @@ enum AstationMessage: Codable {
             try container.encode(MessageType.agentListResponse, forKey: .type)
             var dataContainer = container.nestedContainer(keyedBy: AgentListKeys.self, forKey: .data)
             try dataContainer.encode(agents, forKey: .agents)
+
+        case .credentialSync(let customerId, let customerSecret):
+            try container.encode(MessageType.credentialSync, forKey: .type)
+            var dataContainer = container.nestedContainer(keyedBy: CredentialSyncKeys.self, forKey: .data)
+            try dataContainer.encode(customerId, forKey: .customerId)
+            try dataContainer.encode(customerSecret, forKey: .customerSecret)
         }
+    }
+
+    private enum CredentialSyncKeys: String, CodingKey {
+        case customerId = "customer_id"
+        case customerSecret = "customer_secret"
     }
     
     init(from decoder: Decoder) throws {
@@ -372,6 +385,12 @@ enum AstationMessage: Codable {
             let dataContainer = try container.nestedContainer(keyedBy: AgentListKeys.self, forKey: .data)
             let agents = try dataContainer.decode([AtemAgentInfo].self, forKey: .agents)
             self = .agentListResponse(agents: agents)
+
+        case .credentialSync:
+            let dataContainer = try container.nestedContainer(keyedBy: CredentialSyncKeys.self, forKey: .data)
+            let customerId = try dataContainer.decode(String.self, forKey: .customerId)
+            let customerSecret = try dataContainer.decode(String.self, forKey: .customerSecret)
+            self = .credentialSync(customerId: customerId, customerSecret: customerSecret)
         }
     }
 }

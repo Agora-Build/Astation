@@ -121,6 +121,24 @@ pub fn render_auth_page(session_id: &str, hostname: &str, otp: &str) -> String {
             background: #4a4a00;
             color: #fff9c4;
         }}
+        .btn-close {{
+            display: none;
+            margin-top: 20px;
+            width: 100%;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            background: #333;
+            color: #ccc;
+            transition: background 0.2s;
+        }}
+        .btn-close:hover {{
+            background: #444;
+            color: #fff;
+        }}
         .download-link {{
             margin-top: 32px;
             padding-top: 24px;
@@ -156,6 +174,8 @@ pub fn render_auth_page(session_id: &str, hostname: &str, otp: &str) -> String {
         <div class="status" id="status-box">
             <span id="status-text"></span>
         </div>
+
+        <button class="btn-close" id="close-btn" onclick="closePage()">Close this page</button>
 
         <div class="download-link">
             <p>For a better experience, <a href="https://station.agora.build/download">download the Astation macOS app</a>.</p>
@@ -223,6 +243,18 @@ pub fn render_auth_page(session_id: &str, hostname: &str, otp: &str) -> String {
             text.textContent = message;
             text.style.display = 'inline';
             document.getElementById('buttons').style.display = 'none';
+            document.getElementById('close-btn').style.display = 'block';
+        }}
+
+        function closePage() {{
+            // window.close() only works if the page was opened via script;
+            // for pages opened directly (e.g. from terminal), we show a fallback.
+            window.close();
+            // If close didn't work, update button to tell user it's safe to close manually.
+            setTimeout(function() {{
+                const btn = document.getElementById('close-btn');
+                if (btn) btn.textContent = 'You may now close this tab.';
+            }}, 300);
         }}
 
         // Auto-refresh: poll session status every 2 seconds
@@ -310,5 +342,13 @@ mod tests {
         let html = render_auth_page("test-session-id", "my-machine", "12345678");
         assert!(html.starts_with("<!DOCTYPE html>"));
         assert!(html.contains("</html>"));
+    }
+
+    #[test]
+    fn test_render_auth_page_contains_close_button() {
+        let html = render_auth_page("test-session-id", "my-machine", "12345678");
+        assert!(html.contains("close-btn"));
+        assert!(html.contains("Close this page"));
+        assert!(html.contains("closePage()"));
     }
 }
