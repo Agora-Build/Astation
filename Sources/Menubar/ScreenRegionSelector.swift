@@ -405,7 +405,7 @@ private final class ScreenRegionSelectionView: NSView {
         NSColor.clear.setFill()
         NSBezierPath(rect: rect).fill()
 
-        NSColor.systemGreen.setStroke()
+        NSColor.systemBlue.setStroke()
         let path = NSBezierPath(rect: rect)
         path.lineWidth = 6
         path.stroke()
