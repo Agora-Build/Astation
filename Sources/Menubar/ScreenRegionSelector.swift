@@ -2,13 +2,14 @@ import AppKit
 
 final class ScreenRegionSelector {
     private static var activeWindow: ScreenRegionSelectionWindow?
+    private static var activeOverlay: ScreenShareOverlayWindow?
     private static let defaults = UserDefaults.standard
     private static let defaultsPrefix = "screenShare.region"
 
     static func selectRegion(on screen: NSScreen,
                              displayId: Int64,
                              pixelsPerPoint: CGSize? = nil,
-                             completion: @escaping (CGRect?) -> Void) {
+                             completion: @escaping (CGRect?, CGRect?) -> Void) {
         DispatchQueue.main.async {
             activeWindow?.close()
             let initialRect = loadStoredRect(for: screen, displayId: displayId)
@@ -29,9 +30,9 @@ final class ScreenRegionSelector {
                         width: rectPoints.size.width * scale.width,
                         height: rectPoints.size.height * scale.height
                     )
-                    completion(pixelRect)
+                    completion(pixelRect, rectPoints)
                 } else {
-                    completion(nil)
+                    completion(nil, nil)
                 }
                 DispatchQueue.main.async {
                     activeWindow = nil
@@ -41,6 +42,42 @@ final class ScreenRegionSelector {
             activeWindow = window
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    @discardableResult
+    static func showOverlay(on screen: NSScreen,
+                            displayId: Int64,
+                            rectPoints: CGRect) -> Int64? {
+        if Thread.isMainThread {
+            let overlay = ScreenShareOverlayWindow(
+                screen: screen,
+                displayId: displayId,
+                rectPoints: rectPoints
+            )
+            activeOverlay = overlay
+            overlay.orderFrontRegardless()
+            return Int64(overlay.windowNumber)
+        }
+
+        var windowId: Int64?
+        DispatchQueue.main.sync {
+            let overlay = ScreenShareOverlayWindow(
+                screen: screen,
+                displayId: displayId,
+                rectPoints: rectPoints
+            )
+            activeOverlay = overlay
+            overlay.orderFrontRegardless()
+            windowId = Int64(overlay.windowNumber)
+        }
+        return windowId
+    }
+
+    static func hideOverlay() {
+        DispatchQueue.main.async {
+            activeOverlay?.close()
+            activeOverlay = nil
         }
     }
 
@@ -137,6 +174,98 @@ private final class ScreenRegionSelectionWindow: NSWindow {
             view.setSelection(rect)
         }
     }
+
+    func setOverlayVisible(_ visible: Bool) {
+        if visible {
+            alphaValue = 1.0
+            ignoresMouseEvents = false
+            orderFront(nil)
+        } else {
+            alphaValue = 0.0
+            ignoresMouseEvents = true
+            orderOut(nil)
+        }
+    }
+}
+
+private final class ScreenShareOverlayWindow: NSWindow {
+    private var rectPoints: CGRect
+
+    init(screen: NSScreen, displayId: Int64, rectPoints: CGRect) {
+        self.rectPoints = rectPoints
+        super.init(
+            contentRect: screen.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        setFrame(screen.frame, display: true)
+        isOpaque = false
+        backgroundColor = .clear
+        level = .floating
+        hasShadow = false
+        ignoresMouseEvents = true
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        let overlay = ScreenShareOverlayView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        overlay.autoresizingMask = [.width, .height]
+        overlay.selectionRect = rectPoints
+        contentView = overlay
+    }
+
+    func updateRect(_ rect: CGRect) {
+        rectPoints = rect
+        if let view = contentView as? ScreenShareOverlayView {
+            view.selectionRect = rect
+            view.needsDisplay = true
+        }
+    }
+}
+
+private final class ScreenShareOverlayView: NSView {
+    var selectionRect: CGRect? {
+        didSet { needsDisplay = true }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let rect = selectionRect else { return }
+        NSColor.clear.setFill()
+        NSBezierPath(rect: rect).fill()
+
+        NSColor.systemGreen.setStroke()
+
+        let cornerLength: CGFloat = 18
+        let cornerWidth: CGFloat = 4
+        let corners = [
+            CGPoint(x: rect.minX, y: rect.minY),
+            CGPoint(x: rect.maxX, y: rect.minY),
+            CGPoint(x: rect.minX, y: rect.maxY),
+            CGPoint(x: rect.maxX, y: rect.maxY)
+        ]
+
+        for corner in corners {
+            let horizontalEnd = CGPoint(
+                x: corner.x + (corner.x == rect.minX ? cornerLength : -cornerLength),
+                y: corner.y
+            )
+            let verticalEnd = CGPoint(
+                x: corner.x,
+                y: corner.y + (corner.y == rect.minY ? cornerLength : -cornerLength)
+            )
+
+            let hPath = NSBezierPath()
+            hPath.move(to: corner)
+            hPath.line(to: horizontalEnd)
+            hPath.lineWidth = cornerWidth
+            hPath.stroke()
+
+            let vPath = NSBezierPath()
+            vPath.move(to: corner)
+            vPath.line(to: verticalEnd)
+            vPath.lineWidth = cornerWidth
+            vPath.stroke()
+        }
+    }
 }
 
 private final class ScreenRegionSelectionView: NSView {
@@ -171,7 +300,7 @@ private final class ScreenRegionSelectionView: NSView {
     private let minSize: CGFloat = 20
     private let handleSize: CGFloat = 8
     private let instructions =
-        "Drag to select. Drag inside to move, edges to resize. Release to start, or Enter/double-click. Esc to cancel."
+        "Drag to select. Drag inside to move, edges to resize. Double-click or Enter to start. Esc to cancel."
 
     override var acceptsFirstResponder: Bool { true }
 

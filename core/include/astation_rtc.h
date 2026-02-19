@@ -40,6 +40,8 @@ int astation_rtc_enable_screen_share_region(AStationRtcEngine* engine,
                                             int y,
                                             int width,
                                             int height);
+int astation_rtc_set_screen_share_exclude_window(AStationRtcEngine* engine,
+                                                 int64_t window_id);
 int astation_rtc_stop_screen_share(AStationRtcEngine* engine);
 int astation_rtc_get_screen_sources(AStationRtcEngine* engine,
                                     AstationScreenSource* out_sources,

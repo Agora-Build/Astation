@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 #include <mutex>
 #include <new>
 #include <string>
@@ -52,6 +53,7 @@ struct AStationRtcEngineImpl
     bool joined{false};
     bool mic_muted{false};
     bool screen_sharing{false};
+    std::vector<view_t> screen_exclude_windows;
 
     explicit AStationRtcEngineImpl(
         const AStationRtcConfig& config,
@@ -398,6 +400,11 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
     params.frameRate = preferred_fps;
     params.bitrate = target_bitrate_kbps;
     params.captureMouseCursor = true;
+    if (!impl->screen_exclude_windows.empty()) {
+        params.excludeWindowList = impl->screen_exclude_windows.data();
+        params.excludeWindowCount =
+            static_cast<int>(impl->screen_exclude_windows.size());
+    }
 
     std::fprintf(stderr,
         "[AStationRtc] Screen share config: displayId=%lld resolvedDisplayId=%lld region=%d,%d %dx%d codec=AV1(params) resolution=%dx%d fps=%d bitrate=%d kbps\n",
@@ -712,6 +719,18 @@ int astation_rtc_enable_screen_share_region(AStationRtcEngine* engine,
         "[AStationRtc] Screen sharing not available on this platform\n");
     return -1;
 #endif
+}
+
+int astation_rtc_set_screen_share_exclude_window(AStationRtcEngine* engine,
+                                                 int64_t window_id) {
+    if (!engine) return -1;
+    auto* impl = reinterpret_cast<AStationRtcEngineImpl*>(engine);
+    impl->screen_exclude_windows.clear();
+    if (window_id > 0) {
+        impl->screen_exclude_windows.push_back(
+            reinterpret_cast<view_t>(static_cast<intptr_t>(window_id)));
+    }
+    return 0;
 }
 
 int astation_rtc_stop_screen_share(AStationRtcEngine* engine) {

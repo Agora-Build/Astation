@@ -466,12 +466,26 @@ class StatusBarController: NSObject, NSMenuDelegate {
                     on: screen,
                     displayId: source.id,
                     pixelsPerPoint: scale
-                ) { regionPixels in
-                    guard let regionPixels else { return }
-                    self.hubManager.rtcManager.startScreenShare(displayId: source.id, regionPixels: regionPixels)
+                ) { regionPixels, regionPoints in
+                    guard let regionPixels, let regionPoints else { return }
+                    let overlayId = ScreenRegionSelector.showOverlay(
+                        on: screen,
+                        displayId: source.id,
+                        rectPoints: regionPoints
+                    )
+                    self.hubManager.rtcManager.setScreenShareExcludedWindow(windowId: overlayId)
+                    let started = self.hubManager.rtcManager.startScreenShare(
+                        displayId: source.id,
+                        regionPixels: regionPixels
+                    )
+                    if !started {
+                        self.hubManager.rtcManager.setScreenShareExcludedWindow(windowId: nil)
+                        ScreenRegionSelector.hideOverlay()
+                    }
                     self.setupMenu()
                 }
             } else {
+                self.hubManager.rtcManager.setScreenShareExcludedWindow(windowId: nil)
                 self.hubManager.rtcManager.startScreenShare(displayId: source.id)
                 self.setupMenu()
             }
