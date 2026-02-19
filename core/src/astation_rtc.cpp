@@ -726,9 +726,11 @@ int astation_rtc_set_screen_share_exclude_window(AStationRtcEngine* engine,
     if (!engine) return -1;
     auto* impl = reinterpret_cast<AStationRtcEngineImpl*>(engine);
     impl->screen_exclude_windows.clear();
-    if (window_id > 0) {
+    if (window_id != 0) {
+        const uintptr_t handle =
+            static_cast<uintptr_t>(static_cast<uint64_t>(window_id));
         impl->screen_exclude_windows.push_back(
-            reinterpret_cast<agora::view_t>(static_cast<intptr_t>(window_id)));
+            reinterpret_cast<agora::view_t>(handle));
     }
     return 0;
 }

@@ -57,7 +57,9 @@ final class ScreenRegionSelector {
             )
             activeOverlay = overlay
             overlay.orderFrontRegardless()
-            return Int64(overlay.windowNumber)
+            let target: AnyObject = overlay.contentView ?? overlay
+            let ptr = Unmanaged.passUnretained(target).toOpaque()
+            return Int64(bitPattern: UInt64(UInt(bitPattern: ptr)))
         }
 
         var windowId: Int64?
@@ -69,7 +71,9 @@ final class ScreenRegionSelector {
             )
             activeOverlay = overlay
             overlay.orderFrontRegardless()
-            windowId = Int64(overlay.windowNumber)
+            let target: AnyObject = overlay.contentView ?? overlay
+            let ptr = Unmanaged.passUnretained(target).toOpaque()
+            windowId = Int64(bitPattern: UInt64(UInt(bitPattern: ptr)))
         }
         return windowId
     }
