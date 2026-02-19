@@ -364,10 +364,10 @@ private struct AgentRow: View {
     private var endpointLabel: String {
         if let url = agent.acpUrl {
             // Show just host:port to keep it compact
-            return URL(string: url).flatMap {
-                $0.host.map { h in
-                    let port = $0.port.map { ":\($0)" } ?? ""
-                    return h + port
+            return URL(string: url).flatMap { parsed in
+                parsed.host.map { host in
+                    let port = parsed.port.map { ":\($0)" } ?? ""
+                    return host + port
                 }
             } ?? url
         }
