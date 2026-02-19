@@ -257,8 +257,16 @@ private final class ScreenRegionSelectionView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        // Keep the selection visible; key presses should not dismiss the overlay.
-        return
+        if event.keyCode == 53 { // ESC
+            if didFinish { return }
+            didFinish = true
+            onCancel?()
+        } else if event.keyCode == 36 || event.keyCode == 76 { // Return / Enter
+            guard let rect = selectionRect else { return }
+            if didFinish { return }
+            didFinish = true
+            onSelection?(rect)
+        }
     }
 
     override func draw(_ dirtyRect: NSRect) {
