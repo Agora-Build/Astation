@@ -503,8 +503,8 @@ class StatusBarController: NSObject, NSMenuDelegate {
             if source.isPrimary {
                 label += " (Primary)"
             }
-            if source.rectPixels.width > 0 && source.rectPixels.height > 0 {
-                label += " — \(Int(source.rectPixels.width))x\(Int(source.rectPixels.height))"
+            if let size = displayPixelSize(for: source) {
+                label += " — \(Int(size.width))x\(Int(size.height))"
             }
             popup.addItem(withTitle: label)
         }
@@ -529,8 +529,39 @@ class StatusBarController: NSObject, NSMenuDelegate {
         }
     }
 
+    private func displayPixelSize(for source: ScreenShareSource) -> CGSize? {
+        if let screen = screenForDisplayId(source.id) {
+            let scale = screen.backingScaleFactor
+            return CGSize(
+                width: screen.frame.size.width * scale,
+                height: screen.frame.size.height * scale
+            )
+        }
+        if source.rectPixels.width > 0 && source.rectPixels.height > 0 {
+            return source.rectPixels.size
+        }
+        return nil
+    }
+
+    private func screenForDisplayId(_ displayId: Int64) -> NSScreen? {
+        for screen in NSScreen.screens {
+            if let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber {
+                if number.int64Value == displayId {
+                    return screen
+                }
+            }
+        }
+        return nil
+    }
+
     private func matchNSScreen(for source: ScreenShareSource) -> NSScreen? {
+        if let screen = screenForDisplayId(source.id) {
+            return screen
+        }
         let target = source.rectPixels
+        if target.width <= 0 || target.height <= 0 {
+            return NSScreen.main
+        }
         for screen in NSScreen.screens {
             let scale = screen.backingScaleFactor
             let frame = screen.frame

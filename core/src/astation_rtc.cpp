@@ -289,10 +289,10 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
                 entry.source_id = info.sourceId;
                 entry.is_screen = (info.type == agora::rtc::ScreenCaptureSourceType_Screen) ? 1 : 0;
                 entry.is_primary = info.primaryMonitor ? 1 : 0;
-                entry.x = 0;
-                entry.y = 0;
-                entry.width = 0;
-                entry.height = 0;
+                entry.x = info.position.x;
+                entry.y = info.position.y;
+                entry.width = info.position.width;
+                entry.height = info.position.height;
                 entries.push_back(entry);
             }
             sources->release();
