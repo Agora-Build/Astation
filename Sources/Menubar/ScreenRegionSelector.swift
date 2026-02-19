@@ -16,9 +16,12 @@ final class ScreenRegionSelector {
                 if let rectPoints {
                     saveStoredRect(rectPoints, for: screen, displayId: displayId)
                     let scale = screen.backingScaleFactor
+                    // Agora expects region coordinates relative to the top-left corner.
+                    let screenHeight = screen.frame.size.height
+                    let flippedY = screenHeight - rectPoints.origin.y - rectPoints.size.height
                     let pixelRect = CGRect(
                         x: rectPoints.origin.x * scale,
-                        y: rectPoints.origin.y * scale,
+                        y: flippedY * scale,
                         width: rectPoints.size.width * scale,
                         height: rectPoints.size.height * scale
                     )
