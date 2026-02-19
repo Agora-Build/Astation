@@ -190,7 +190,6 @@ class RTCManager {
         }
         let result = astation_rtc_leave(engine)
         _isScreenSharing = false
-        setScreenShareExcludedWindow(windowId: nil)
         ScreenRegionSelector.hideOverlay()
         if result != 0 {
             Log.info("[RTCManager] Leave failed with code \(result)")
@@ -232,18 +231,6 @@ class RTCManager {
         return granted
     }
 #endif
-
-    func setScreenShareExcludedWindow(windowId: Int64?) {
-        guard let engine = engine else {
-            Log.info("[RTCManager] Cannot set excluded window: engine not initialized")
-            return
-        }
-        let value = windowId ?? 0
-        let result = astation_rtc_set_screen_share_exclude_window(engine, value)
-        if result != 0 {
-            Log.info("[RTCManager] Failed to set screen share excluded window: \(result)")
-        }
-    }
 
     func screenSources() -> [ScreenShareSource] {
         guard let engine = engine else {
@@ -333,7 +320,6 @@ class RTCManager {
         }
         let result = astation_rtc_stop_screen_share(engine)
         _isScreenSharing = false
-        setScreenShareExcludedWindow(windowId: nil)
         ScreenRegionSelector.hideOverlay()
         if result != 0 {
             Log.info("[RTCManager] Stop screen share failed with code \(result)")

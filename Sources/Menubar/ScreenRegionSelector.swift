@@ -209,6 +209,7 @@ private final class ScreenShareOverlayWindow: NSWindow {
         level = .floating
         hasShadow = false
         ignoresMouseEvents = true
+        sharingType = .none
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         let overlay = ScreenShareOverlayView(frame: NSRect(origin: .zero, size: screen.frame.size))
