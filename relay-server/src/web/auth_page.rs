@@ -158,7 +158,7 @@ pub fn render_auth_page(session_id: &str, hostname: &str, otp: &str) -> String {
         </div>
 
         <div class="download-link">
-            <p>For a better experience, <a href="https://astation.agora.build/download">download the Astation macOS app</a>.</p>
+            <p>For a better experience, <a href="https://station.agora.build/download">download the Astation macOS app</a>.</p>
         </div>
     </div>
 
