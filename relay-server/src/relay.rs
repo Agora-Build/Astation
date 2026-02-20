@@ -92,8 +92,11 @@ pub struct PairStatusResponse {
 
 #[derive(Deserialize)]
 pub struct WsQuery {
-    pub role: String,
-    pub code: String,
+    // Pairing-based auth (traditional)
+    pub role: Option<String>,
+    pub code: Option<String>,
+    // Session-based auth (after HTTP auth)
+    pub session: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -156,15 +159,62 @@ pub async fn pair_status_handler(
     }
 }
 
-/// GET /ws?role=atem|astation&code=XXXX — WebSocket upgrade for relay.
+/// GET /ws — WebSocket upgrade for relay.
+/// Auth methods:
+///   1. Pairing: ?role=atem|astation&code=XXXX (short-lived, explicit approval)
+///   2. Session: ?session=<session_id> (after HTTP auth, longer-lived)
 pub async fn ws_handler(
     State(state): State<AppState>,
     Query(params): Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     let hub = state.relay.clone();
-    let code = params.code.clone();
-    let role = params.role.clone();
+
+    // Session-based auth (hybrid flow)
+    if let Some(session_id) = params.session.clone() {
+        // Validate session
+        let session = state.sessions.get(&session_id).await;
+        match session {
+            Some(s) if s.status == crate::auth::SessionStatus::Granted => {
+                // Valid session - use session_id as room code, role defaults to "atem"
+                let code = format!("session-{}", session_id);
+                let role = params.role.clone().unwrap_or_else(|| "atem".to_string());
+
+                // Create room if it doesn't exist
+                {
+                    let mut rooms = hub.rooms.write().await;
+                    if !rooms.contains_key(&code) {
+                        rooms.insert(
+                            code.clone(),
+                            PairRoom {
+                                code: code.clone(),
+                                hostname: s.hostname.clone(),
+                                atem_tx: None,
+                                astation_tx: None,
+                                created_at: Instant::now(),
+                            },
+                        );
+                    }
+                }
+
+                return ws.on_upgrade(move |socket| handle_ws(hub, code, role, socket))
+                    .into_response();
+            }
+            _ => {
+                return (StatusCode::UNAUTHORIZED, "Invalid or expired session").into_response();
+            }
+        }
+    }
+
+    // Pairing-based auth (traditional flow)
+    let code = match params.code.clone() {
+        Some(c) => c,
+        None => return (StatusCode::BAD_REQUEST, "Missing code or session parameter").into_response(),
+    };
+    let role = match params.role.clone() {
+        Some(r) => r,
+        None => return (StatusCode::BAD_REQUEST, "Missing role parameter").into_response(),
+    };
 
     // Verify room exists
     {
