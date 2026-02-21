@@ -235,7 +235,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
 
     private func updateServerStatus() {
         let localIP = getLocalNetworkIP() ?? "127.0.0.1"
-        serverStatusLabel.stringValue = "Listening on: ws://127.0.0.1:8080/ws, ws://\(localIP):8080/ws"
+        serverStatusLabel.stringValue = "ws://127.0.0.1:8080/ws, ws://\(localIP):8080/ws"
         serverStatusLabel.textColor = .secondaryLabelColor
     }
 
