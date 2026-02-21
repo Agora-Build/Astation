@@ -79,18 +79,18 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         contentView.addSubview(serverTitle)
 
         let localIP = getLocalNetworkIP() ?? "127.0.0.1"
-        let serverInfo = NSTextField(wrappingLabelWithString: "Astation listens on all interfaces (0.0.0.0:8080). Detected IPs: ws://127.0.0.1:8080/ws (local), ws://\(localIP):8080/ws (LAN). For VPN connections (Netbird, Tailscale), configure the VPN IP in Atem's config.")
+        let serverInfo = NSTextField(wrappingLabelWithString: "Astation automatically listens on ALL network interfaces (0.0.0.0:8080). No configuration needed on Astation side.\n\nAvailable at:\n• ws://127.0.0.1:8080/ws (localhost)\n• ws://\(localIP):8080/ws (LAN)\n\nConfigure these URLs in Atem's config (~/.config/atem/config.toml).")
         serverInfo.font = NSFont.systemFont(ofSize: 11)
         serverInfo.textColor = .secondaryLabelColor
-        serverInfo.frame = NSRect(x: 20, y: 325, width: 410, height: 65)
+        serverInfo.frame = NSRect(x: 20, y: 305, width: 410, height: 85)
         contentView.addSubview(serverInfo)
 
         // Station Relay URL (for remote connections)
         let stationLabel = NSTextField(labelWithString: "Relay URL:")
-        stationLabel.frame = NSRect(x: 20, y: 290, width: 80, height: 22)
+        stationLabel.frame = NSRect(x: 20, y: 270, width: 80, height: 22)
         contentView.addSubview(stationLabel)
 
-        stationUrlField = NSTextField(frame: NSRect(x: 105, y: 290, width: 320, height: 22))
+        stationUrlField = NSTextField(frame: NSRect(x: 105, y: 270, width: 320, height: 22))
         stationUrlField.placeholderString = SettingsWindowController.defaultStationURL
         let savedStation = UserDefaults.standard.string(forKey: SettingsWindowController.astationRelayUrlKey) ?? ""
         stationUrlField.stringValue = savedStation
@@ -99,11 +99,18 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         }
         contentView.addSubview(stationUrlField)
 
+        // Relay URL help text
+        let relayHelp = NSTextField(wrappingLabelWithString: "Optional: For Astation relay client to connect to remote relay server (future feature).")
+        relayHelp.font = NSFont.systemFont(ofSize: 10)
+        relayHelp.textColor = .tertiaryLabelColor
+        relayHelp.frame = NSRect(x: 105, y: 245, width: 320, height: 20)
+        contentView.addSubview(relayHelp)
+
         // Server status label (shows current network IP)
         serverStatusLabel = NSTextField(labelWithString: "")
         serverStatusLabel.font = NSFont.systemFont(ofSize: 11)
         serverStatusLabel.textColor = .secondaryLabelColor
-        serverStatusLabel.frame = NSRect(x: 20, y: 260, width: 405, height: 18)
+        serverStatusLabel.frame = NSRect(x: 20, y: 240, width: 405, height: 18)
         contentView.addSubview(serverStatusLabel)
 
         // Update status immediately
