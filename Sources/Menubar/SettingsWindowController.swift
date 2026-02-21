@@ -33,6 +33,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
     private var deleteButton: NSButton!
     private var stationUrlField: NSTextField!
     private var serverStatusLabel: NSTextField!
+    private var serverInfoLabel: NSTextField!
 
     init(credentialManager: CredentialManager) {
         self.credentialManager = credentialManager
@@ -78,12 +79,11 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         serverTitle.frame = NSRect(x: 20, y: 395, width: 410, height: 24)
         contentView.addSubview(serverTitle)
 
-        let localIP = getLocalNetworkIP() ?? "127.0.0.1"
-        let serverInfo = NSTextField(wrappingLabelWithString: "Astation automatically listens on ALL network interfaces (0.0.0.0:8080). No configuration needed on Astation side.\n\nAvailable at:\n• ws://127.0.0.1:8080/ws (localhost)\n• ws://\(localIP):8080/ws (LAN)\n\nConfigure these URLs in Atem's config (~/.config/atem/config.toml).")
-        serverInfo.font = NSFont.systemFont(ofSize: 11)
-        serverInfo.textColor = .secondaryLabelColor
-        serverInfo.frame = NSRect(x: 20, y: 305, width: 410, height: 85)
-        contentView.addSubview(serverInfo)
+        serverInfoLabel = NSTextField(wrappingLabelWithString: "")
+        serverInfoLabel.font = NSFont.systemFont(ofSize: 11)
+        serverInfoLabel.textColor = .secondaryLabelColor
+        serverInfoLabel.frame = NSRect(x: 20, y: 315, width: 410, height: 70)
+        contentView.addSubview(serverInfoLabel)
 
         // Station Relay URL (for remote connections)
         let stationLabel = NSTextField(labelWithString: "Relay URL:")
@@ -235,7 +235,8 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
 
     private func updateServerStatus() {
         let localIP = getLocalNetworkIP() ?? "127.0.0.1"
-        serverStatusLabel.stringValue = "ws://127.0.0.1:8080/ws, ws://\(localIP):8080/ws"
+        serverInfoLabel.stringValue = "WebSocket:\n• Local: ws://127.0.0.1:8080/ws\n• LAN: ws://\(localIP):8080/ws\n• VPN: ws://<vpn-ip>:8080/ws"
+        serverStatusLabel.stringValue = ""
         serverStatusLabel.textColor = .secondaryLabelColor
     }
 
