@@ -90,7 +90,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         stationLabel.frame = NSRect(x: 20, y: 270, width: 80, height: 22)
         contentView.addSubview(stationLabel)
 
-        stationUrlField = NSTextField(frame: NSRect(x: 105, y: 270, width: 320, height: 22))
+        stationUrlField = NSTextField(frame: NSRect(x: 105, y: 270, width: 235, height: 22))
         stationUrlField.placeholderString = SettingsWindowController.defaultStationURL
         let savedStation = UserDefaults.standard.string(forKey: SettingsWindowController.astationRelayUrlKey) ?? ""
         stationUrlField.stringValue = savedStation
@@ -99,18 +99,11 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         }
         contentView.addSubview(stationUrlField)
 
-        // Relay URL help text
-        let relayHelp = NSTextField(wrappingLabelWithString: "Optional: For Astation relay client to connect to remote relay server (future feature).")
-        relayHelp.font = NSFont.systemFont(ofSize: 10)
-        relayHelp.textColor = .tertiaryLabelColor
-        relayHelp.frame = NSRect(x: 105, y: 245, width: 320, height: 20)
-        contentView.addSubview(relayHelp)
-
         // Server status label (shows current network IP)
         serverStatusLabel = NSTextField(labelWithString: "")
         serverStatusLabel.font = NSFont.systemFont(ofSize: 11)
         serverStatusLabel.textColor = .secondaryLabelColor
-        serverStatusLabel.frame = NSRect(x: 20, y: 240, width: 405, height: 18)
+        serverStatusLabel.frame = NSRect(x: 20, y: 245, width: 405, height: 18)
         contentView.addSubview(serverStatusLabel)
 
         // Update status immediately
@@ -119,49 +112,49 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         // Save server button
         let saveServerButton = NSButton(title: "Save", target: self, action: #selector(saveServerInfo))
         saveServerButton.bezelStyle = .rounded
-        saveServerButton.frame = NSRect(x: 350, y: 255, width: 75, height: 28)
+        saveServerButton.frame = NSRect(x: 350, y: 268, width: 75, height: 24)
         contentView.addSubview(saveServerButton)
 
         // Separator
-        let separator = NSBox(frame: NSRect(x: 20, y: 245, width: 410, height: 1))
+        let separator = NSBox(frame: NSRect(x: 20, y: 235, width: 410, height: 1))
         separator.boxType = .separator
         contentView.addSubview(separator)
 
         // === Credentials Section ===
         let titleLabel = NSTextField(labelWithString: "Agora Console Credentials")
         titleLabel.font = NSFont.boldSystemFont(ofSize: 14)
-        titleLabel.frame = NSRect(x: 20, y: 215, width: 410, height: 24)
+        titleLabel.frame = NSRect(x: 20, y: 200, width: 410, height: 24)
         contentView.addSubview(titleLabel)
 
         // Info label
         let infoLabel = NSTextField(wrappingLabelWithString: "Enter your Customer ID and Customer Secret from console.agora.io > RESTful API. Credentials are encrypted and stored locally.")
         infoLabel.font = NSFont.systemFont(ofSize: 11)
         infoLabel.textColor = .secondaryLabelColor
-        infoLabel.frame = NSRect(x: 20, y: 175, width: 410, height: 36)
+        infoLabel.frame = NSRect(x: 20, y: 160, width: 410, height: 36)
         contentView.addSubview(infoLabel)
 
         // Customer ID label + field
         let idLabel = NSTextField(labelWithString: "Customer ID:")
-        idLabel.frame = NSRect(x: 20, y: 140, width: 120, height: 22)
+        idLabel.frame = NSRect(x: 20, y: 125, width: 120, height: 22)
         contentView.addSubview(idLabel)
 
-        customerIdField = NSTextField(frame: NSRect(x: 145, y: 140, width: 280, height: 22))
+        customerIdField = NSTextField(frame: NSRect(x: 145, y: 125, width: 280, height: 22))
         customerIdField.placeholderString = "Enter Customer ID"
         contentView.addSubview(customerIdField)
 
         // Customer Secret label + field
         let secretLabel = NSTextField(labelWithString: "Customer Secret:")
-        secretLabel.frame = NSRect(x: 20, y: 105, width: 120, height: 22)
+        secretLabel.frame = NSRect(x: 20, y: 90, width: 120, height: 22)
         contentView.addSubview(secretLabel)
 
-        customerSecretField = NSSecureTextField(frame: NSRect(x: 145, y: 105, width: 280, height: 22))
+        customerSecretField = NSSecureTextField(frame: NSRect(x: 145, y: 90, width: 280, height: 22))
         customerSecretField.placeholderString = "Enter Customer Secret"
         contentView.addSubview(customerSecretField)
 
         // Status label
         statusLabel = NSTextField(labelWithString: "")
         statusLabel.font = NSFont.systemFont(ofSize: 11)
-        statusLabel.frame = NSRect(x: 20, y: 70, width: 410, height: 22)
+        statusLabel.frame = NSRect(x: 20, y: 55, width: 410, height: 22)
         contentView.addSubview(statusLabel)
 
         // Update status based on current credential state
