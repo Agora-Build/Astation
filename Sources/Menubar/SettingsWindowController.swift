@@ -31,7 +31,6 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
     private var statusLabel: NSTextField!
     private var saveButton: NSButton!
     private var deleteButton: NSButton!
-    private var wsUrlField: NSTextField!
     private var stationUrlField: NSTextField!
     private var serverStatusLabel: NSTextField!
 
@@ -67,29 +66,19 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         serverTitle.frame = NSRect(x: 20, y: 395, width: 410, height: 24)
         contentView.addSubview(serverTitle)
 
-        let serverInfo = NSTextField(wrappingLabelWithString: "Local WebSocket URL for Atem connections, and Station relay URL for remote pairing. Leave blank to use defaults.")
+        let localIP = getLocalNetworkIP() ?? "127.0.0.1"
+        let serverInfo = NSTextField(wrappingLabelWithString: "Astation listens on all interfaces (0.0.0.0:8080). Detected IPs: ws://127.0.0.1:8080/ws (local), ws://\(localIP):8080/ws (LAN). For VPN connections (Netbird, Tailscale), configure the VPN IP in Atem's config.")
         serverInfo.font = NSFont.systemFont(ofSize: 11)
         serverInfo.textColor = .secondaryLabelColor
-        serverInfo.frame = NSRect(x: 20, y: 355, width: 410, height: 36)
+        serverInfo.frame = NSRect(x: 20, y: 325, width: 410, height: 65)
         contentView.addSubview(serverInfo)
 
-        // WebSocket URL
-        let wsLabel = NSTextField(labelWithString: "WebSocket URL:")
-        wsLabel.frame = NSRect(x: 20, y: 325, width: 120, height: 22)
-        contentView.addSubview(wsLabel)
-
-        wsUrlField = NSTextField(frame: NSRect(x: 145, y: 325, width: 280, height: 22))
-        wsUrlField.placeholderString = SettingsWindowController.defaultWebSocketURL
-        let savedWs = UserDefaults.standard.string(forKey: SettingsWindowController.astationWsKey) ?? ""
-        wsUrlField.stringValue = savedWs
-        contentView.addSubview(wsUrlField)
-
-        // Station URL
-        let stationLabel = NSTextField(labelWithString: "Station URL:")
-        stationLabel.frame = NSRect(x: 20, y: 290, width: 120, height: 22)
+        // Station Relay URL (for remote connections)
+        let stationLabel = NSTextField(labelWithString: "Relay URL:")
+        stationLabel.frame = NSRect(x: 20, y: 290, width: 80, height: 22)
         contentView.addSubview(stationLabel)
 
-        stationUrlField = NSTextField(frame: NSRect(x: 145, y: 290, width: 280, height: 22))
+        stationUrlField = NSTextField(frame: NSRect(x: 105, y: 290, width: 320, height: 22))
         stationUrlField.placeholderString = SettingsWindowController.defaultStationURL
         let savedStation = UserDefaults.standard.string(forKey: SettingsWindowController.astationRelayUrlKey) ?? ""
         stationUrlField.stringValue = savedStation
@@ -98,16 +87,20 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         }
         contentView.addSubview(stationUrlField)
 
-        // Server status label
+        // Server status label (shows current network IP)
         serverStatusLabel = NSTextField(labelWithString: "")
         serverStatusLabel.font = NSFont.systemFont(ofSize: 11)
-        serverStatusLabel.frame = NSRect(x: 145, y: 265, width: 280, height: 18)
+        serverStatusLabel.textColor = .secondaryLabelColor
+        serverStatusLabel.frame = NSRect(x: 20, y: 260, width: 405, height: 18)
         contentView.addSubview(serverStatusLabel)
 
+        // Update status immediately
+        updateServerStatus()
+
         // Save server button
-        let saveServerButton = NSButton(title: "Save Server Info", target: self, action: #selector(saveServerInfo))
+        let saveServerButton = NSButton(title: "Save", target: self, action: #selector(saveServerInfo))
         saveServerButton.bezelStyle = .rounded
-        saveServerButton.frame = NSRect(x: 310, y: 260, width: 115, height: 28)
+        saveServerButton.frame = NSRect(x: 350, y: 255, width: 75, height: 28)
         contentView.addSubview(saveServerButton)
 
         // Separator
@@ -221,18 +214,27 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         }
     }
 
+    private func updateServerStatus() {
+        let localIP = getLocalNetworkIP() ?? "127.0.0.1"
+        serverStatusLabel.stringValue = "Listening on: ws://127.0.0.1:8080/ws, ws://\(localIP):8080/ws"
+        serverStatusLabel.textColor = .secondaryLabelColor
+    }
+
     @objc private func saveServerInfo() {
-        let wsUrl = wsUrlField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let stationUrl = stationUrlField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        UserDefaults.standard.set(wsUrl, forKey: SettingsWindowController.astationWsKey)
         UserDefaults.standard.set(stationUrl, forKey: SettingsWindowController.astationRelayUrlKey)
 
-        serverStatusLabel.stringValue = "Server info saved"
+        serverStatusLabel.stringValue = "Relay URL saved"
         serverStatusLabel.textColor = .systemGreen
-        print("[Settings] Server info saved — WS: \(wsUrl.isEmpty ? "(default)" : wsUrl), Station: \(stationUrl.isEmpty ? "(default)" : stationUrl)")
+        print("[Settings] Station relay URL saved: \(stationUrl.isEmpty ? "(default)" : stationUrl)")
 
         NotificationCenter.default.post(name: .serverInfoChanged, object: nil)
+
+        // Restore status after 2 seconds
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            self?.updateServerStatus()
+        }
     }
 
     @objc private func deleteCredentials() {
@@ -254,6 +256,48 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
                 print("[Settings] Failed to delete credentials: \(error)")
             }
         }
+    }
+
+    // MARK: - Helper Methods
+
+    /// Get the local network IP address (e.g., 192.168.1.5) for LAN connections.
+    private func getLocalNetworkIP() -> String? {
+        var address: String?
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else {
+            return nil
+        }
+
+        defer { freeifaddrs(ifaddr) }
+
+        for ifptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
+            let interface = ifptr.pointee
+            let addrFamily = interface.ifa_addr.pointee.sa_family
+
+            // Check for IPv4
+            if addrFamily == UInt8(AF_INET) {
+                let name = String(cString: interface.ifa_name)
+
+                // Look for en0 (WiFi) or en1 (Ethernet) - skip loopback
+                if name == "en0" || name == "en1" {
+                    var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                    getnameinfo(
+                        interface.ifa_addr,
+                        socklen_t(interface.ifa_addr.pointee.sa_len),
+                        &hostname,
+                        socklen_t(hostname.count),
+                        nil,
+                        socklen_t(0),
+                        NI_NUMERICHOST
+                    )
+                    address = String(cString: hostname)
+                    break
+                }
+            }
+        }
+
+        return address
     }
 
     // MARK: - NSWindowDelegate

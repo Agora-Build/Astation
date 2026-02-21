@@ -474,6 +474,20 @@ private enum AgentListKeys: String, CodingKey {
     case agents
 }
 
+// MARK: - Convenience constructors
+
+extension AstationMessage {
+    /// Create an auth message (uses statusUpdate internally for simplicity)
+    static func auth(info: [String: String]) -> AstationMessage {
+        return .statusUpdate(status: "auth", data: info)
+    }
+
+    /// Create an error message
+    static func error(message: String) -> AstationMessage {
+        return .statusUpdate(status: "error", data: ["message": message])
+    }
+}
+
 /// Information about a connected Atem instance, broadcast to all clients.
 struct AtemInstanceInfo: Codable {
     let id: String
