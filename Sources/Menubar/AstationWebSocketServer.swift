@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import WebSocketKit
 import NIO
 import NIOHTTP1
