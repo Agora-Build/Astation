@@ -355,7 +355,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
         serverHeader.isEnabled = false
         statusMenu.addItem(serverHeader)
 
-        let wsUrl = SettingsWindowController.currentAstationWs
+        let wsUrl = "ws://127.0.0.1:8080/ws"
         let wsServerItem = NSMenuItem(
             title: "🌐 WebSocket: \(wsUrl)",
             action: #selector(copyWebSocketURL),
@@ -426,7 +426,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
     }
     
     @objc private func copyWebSocketURL() {
-        let url = SettingsWindowController.currentAstationWs
+        let url = "ws://127.0.0.1:8080/ws"
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(url, forType: .string)

@@ -2,17 +2,9 @@ import Cocoa
 import Foundation
 
 class SettingsWindowController: NSObject, NSWindowDelegate {
-    static let astationWsKey = "AstationWs"
     static let astationRelayUrlKey = "AstationRelayUrl"
 
-    static let defaultWebSocketURL = "ws://127.0.0.1:8080/ws"
     static let defaultStationURL = "https://station.agora.build"
-
-    /// Returns the persisted local WebSocket URL, or the default.
-    static var currentAstationWs: String {
-        let saved = UserDefaults.standard.string(forKey: astationWsKey) ?? ""
-        return saved.isEmpty ? defaultWebSocketURL : saved
-    }
 
     /// Returns the persisted Station relay URL.
     /// Env var ASTATION_RELAY_URL takes priority over UserDefaults.
