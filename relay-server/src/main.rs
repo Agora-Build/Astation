@@ -3,6 +3,7 @@ mod relay;
 mod routes;
 mod rtc_session;
 mod session_store;
+mod session_verify;
 mod web;
 
 use axum::extract::Request;
@@ -12,6 +13,7 @@ use axum::Router;
 use relay::RelayHub;
 use rtc_session::RtcSessionStore;
 use session_store::SessionStore;
+use session_verify::SessionVerifyCache;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
@@ -24,6 +26,7 @@ pub struct AppState {
     pub sessions: SessionStore,
     pub relay: RelayHub,
     pub rtc_sessions: RtcSessionStore,
+    pub session_verify_cache: SessionVerifyCache,
 }
 
 #[tokio::main]
@@ -40,6 +43,7 @@ async fn main() {
     let sessions = SessionStore::new();
     let relay = RelayHub::new();
     let rtc_sessions = RtcSessionStore::new();
+    let session_verify_cache = SessionVerifyCache::new();
 
     // Spawn background cleanup for expired sessions
     let cleanup_sessions = sessions.clone();
@@ -74,10 +78,21 @@ async fn main() {
         }
     });
 
+    // Spawn background cleanup for session verify cache
+    let cleanup_verify = session_verify_cache.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // 5 minutes
+        loop {
+            interval.tick().await;
+            cleanup_verify.cleanup_expired().await;
+        }
+    });
+
     let state = AppState {
         sessions,
         relay,
         rtc_sessions,
+        session_verify_cache,
     };
 
     // Configure CORS - Allow specific origin or default to localhost for development

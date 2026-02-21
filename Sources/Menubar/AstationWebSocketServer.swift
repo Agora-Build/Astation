@@ -104,6 +104,12 @@ class AstationWebSocketServer {
             return
         }
 
+        // Handle session verification requests (from relay server)
+        if case .statusUpdate(let status, let messageData) = message, status == "session_verify_request" {
+            handleSessionVerifyRequest(messageData, from: clientId)
+            return
+        }
+
         // Check if client is authenticated
         if !authenticatedClients.contains(clientId) {
             // Client not authenticated - check if this is an auth message
@@ -112,8 +118,8 @@ class AstationWebSocketServer {
         }
 
         // Client is authenticated - refresh session activity
-        if case .statusUpdate(let status, let data) = message {
-            if status == "auth", let sessionId = data["session_id"] {
+        if case .statusUpdate(let status, let messageData) = message {
+            if status == "auth", let sessionId = messageData["session_id"] {
                 sessionStore.refresh(sessionId: sessionId)
             }
         }
@@ -189,6 +195,47 @@ class AstationWebSocketServer {
     private func authenticateClient(_ clientId: String, sessionId: String) {
         authenticatedClients.insert(clientId)
         sessionStore.refresh(sessionId: sessionId)
+    }
+
+    private func handleSessionVerifyRequest(_ data: [String: String], from clientId: String) {
+        guard let sessionId = data["session_id"],
+              let requestId = data["request_id"] else {
+            Log.warn("⚠️  Session verify request missing required fields")
+            return
+        }
+
+        Log.info("🔍 Session verification request from \(clientId.prefix(8)): session=\(sessionId.prefix(12))")
+
+        // Check if session is valid in our SessionStore
+        let isValid = sessionStore.validate(sessionId: sessionId)
+
+        // Get astation_id if session is valid
+        var astationId: String? = nil
+        if isValid, let sessionInfo = sessionStore.get(sessionId: sessionId) {
+            astationId = AstationIdentity.shared.id
+            // Refresh the session since it's being used
+            sessionStore.refresh(sessionId: sessionId)
+        }
+
+        // Send verification response back to relay
+        var responseData: [String: String] = [
+            "session_id": sessionId,
+            "request_id": requestId,
+            "valid": isValid ? "true" : "false"
+        ]
+
+        if let astationId = astationId {
+            responseData["astation_id"] = astationId
+        }
+
+        let response = AstationMessage.statusUpdate(
+            status: "session_verify_response",
+            data: responseData
+        )
+
+        sendMessage(response, to: clientId)
+
+        Log.info("✅ Session verification response sent: valid=\(isValid)")
     }
 
     private func showPairingDialog(code: String, hostname: String, clientId: String) {
