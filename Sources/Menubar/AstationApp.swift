@@ -73,6 +73,9 @@ class AstationApp: NSObject, NSApplicationDelegate {
             webSocketServer?.sendMessageToClient(message, clientId: clientId)
         }
 
+        // Start network monitoring to detect IP changes
+        NetworkMonitor.shared.startMonitoring()
+
         // Initialize global hotkeys (Ctrl+V voice, Ctrl+Shift+V video)
         hotkeyManager = HotkeyManager()
         hotkeyManager?.onVoiceToggle = { [weak self] in

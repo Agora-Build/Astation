@@ -37,6 +37,18 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
     init(credentialManager: CredentialManager) {
         self.credentialManager = credentialManager
         super.init()
+
+        // Listen for network changes
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(networkChanged),
+            name: .networkChanged,
+            object: nil
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     func showWindow() {
@@ -218,6 +230,12 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         let localIP = getLocalNetworkIP() ?? "127.0.0.1"
         serverStatusLabel.stringValue = "Listening on: ws://127.0.0.1:8080/ws, ws://\(localIP):8080/ws"
         serverStatusLabel.textColor = .secondaryLabelColor
+    }
+
+    @objc private func networkChanged() {
+        // Update displayed IP when network changes
+        updateServerStatus()
+        Log.info("Network changed - IP updated in settings UI")
     }
 
     @objc private func saveServerInfo() {
