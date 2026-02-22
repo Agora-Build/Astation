@@ -321,6 +321,10 @@ class AstationHubManager: ObservableObject {
         DispatchQueue.main.async {
             self.connectedClients.append(client)
             Log.info(" Client connected: \(client.id) (\(client.clientType))")
+
+            // Send credentials immediately after connection
+            self.sendCredentials(toClientId: client.id)
+
             self.broadcastInstanceList()
         }
     }
