@@ -412,6 +412,7 @@ fn render_pair_page(code: &str, hostname: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_verify::SessionVerifyCache;
 
     #[test]
     fn pairing_code_format() {
@@ -558,6 +559,7 @@ mod tests {
             sessions: crate::session_store::SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: crate::rtc_session::RtcSessionStore::new(),
+            session_verify_cache: SessionVerifyCache::new(),
         };
         Router::new()
             .route("/api/pair", axum::routing::post(create_pair_handler))
@@ -927,6 +929,7 @@ mod tests {
             sessions: crate::session_store::SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: crate::rtc_session::RtcSessionStore::new(),
+            session_verify_cache: SessionVerifyCache::new(),
         };
 
         // Create pair

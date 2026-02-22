@@ -6,7 +6,6 @@ mod session_store;
 mod session_verify;
 mod web;
 
-use axum::extract::Request;
 use axum::http::{header, HeaderValue, Method};
 use axum::routing::{get, post};
 use axum::Router;
@@ -14,9 +13,8 @@ use relay::RelayHub;
 use rtc_session::RtcSessionStore;
 use session_store::SessionStore;
 use session_verify::SessionVerifyCache;
-use std::net::IpAddr;
 use std::sync::Arc;
-use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use tower_governor::governor::GovernorConfigBuilder;
 use tower_http::cors::CorsLayer;
 
 
@@ -116,7 +114,7 @@ async fn main() {
     // Configure rate limiting
     // OTP/grant endpoints: 60 requests per minute per IP (strict)
     // General endpoints: 600 requests per minute per IP
-    let governor_conf_strict = Arc::new(
+    let _governor_conf_strict = Arc::new(
         GovernorConfigBuilder::default()
             .per_second(1)  // 60 per minute
             .burst_size(10)
@@ -124,7 +122,7 @@ async fn main() {
             .unwrap(),
     );
 
-    let governor_conf_general = Arc::new(
+    let _governor_conf_general = Arc::new(
         GovernorConfigBuilder::default()
             .per_second(10)  // 600 per minute
             .burst_size(20)
