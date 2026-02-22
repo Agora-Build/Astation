@@ -445,6 +445,18 @@ class AstationHubManager: ObservableObject {
             }
             return nil
 
+        case .commandResponse(let output, let success, _):
+            Log.info("[AstationHub] Command response from \(clientId.prefix(8))…: success=\(success)")
+            // Post notification so Dev Console can display the response
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(
+                    name: NSNotification.Name("CommandResponseReceived"),
+                    object: nil,
+                    userInfo: ["clientId": clientId, "output": output, "success": success]
+                )
+            }
+            return nil
+
         default:
             Log.debug(" Unhandled message type from client: \(clientId)")
             return nil

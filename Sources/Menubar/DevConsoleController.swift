@@ -19,6 +19,18 @@ class DevConsoleController: NSObject, NSWindowDelegate {
     init(hubManager: AstationHubManager) {
         self.hubManager = hubManager
         super.init()
+
+        // Listen for command responses from Atem
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleCommandResponse(_:)),
+            name: NSNotification.Name("CommandResponseReceived"),
+            object: nil
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     func showWindow() {
@@ -243,6 +255,25 @@ class DevConsoleController: NSObject, NSWindowDelegate {
 
         // Clear input
         messageInput.string = ""
+    }
+
+    @objc private func handleCommandResponse(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let clientId = userInfo["clientId"] as? String,
+              let output = userInfo["output"] as? String,
+              let success = userInfo["success"] as? Bool else {
+            return
+        }
+
+        let status = success ? "✓" : "✗"
+        let preview = output.prefix(200).replacingOccurrences(of: "\n", with: " ")
+        appendLog("\(status) Response from \(clientId.prefix(8))...: \(preview)")
+
+        // If output is long, show it in full
+        if output.count > 200 {
+            appendLog("  Full output (\(output.count) chars):")
+            appendLog(output)
+        }
     }
 
     // MARK: - Helpers
