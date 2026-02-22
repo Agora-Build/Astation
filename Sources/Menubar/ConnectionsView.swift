@@ -56,7 +56,7 @@ private struct ClientListPanel: View {
             Divider()
 
             // ── Body ──────────────────────────────────────────────────────
-            if onlineAtems.isEmpty && hubManager.offlineClients.isEmpty {
+            if onlineAtems.isEmpty {
                 emptyState
             } else {
                 ScrollView {
@@ -79,29 +79,6 @@ private struct ClientListPanel: View {
                                     hubManager.requestAgentList(from: client.id)
                                 }
                             )
-                        }
-
-                        // Offline section
-                        if !hubManager.offlineClients.isEmpty {
-                            HStack {
-                                Text("Offline")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                                    .textCase(.uppercase)
-                                Rectangle()
-                                    .fill(Color.secondary.opacity(0.3))
-                                    .frame(height: 1)
-                            }
-                            .padding(.horizontal, 14)
-                            .padding(.top, 10)
-                            .padding(.bottom, 2)
-
-                            ForEach(hubManager.offlineClients) { offline in
-                                OfflineClientRow(
-                                    client: offline,
-                                    onRemove: { hubManager.removeOfflineClient(id: offline.id) }
-                                )
-                            }
                         }
                     }
                     .padding(.vertical, 4)
@@ -202,47 +179,6 @@ private struct OnlineClientRow: View {
             Button(isPinned ? "Unpin as Active" : "Pin as Active", action: onTogglePin)
             Button("Refresh Agents", action: onRefreshAgents)
         }
-    }
-}
-
-// MARK: - Offline client row
-
-private struct OfflineClientRow: View {
-    let client: OfflineClient
-    let onRemove: () -> Void
-
-    private var displayName: String {
-        client.hostname.isEmpty || client.hostname == "unknown"
-            ? String(client.id.prefix(8)) + "…"
-            : client.hostname
-    }
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Circle()
-                .fill(Color.red.opacity(0.7))
-                .frame(width: 8, height: 8)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(displayName)
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-                Text("offline · last seen \(relativeTime(from: client.disconnectedAt))")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-
-            Spacer()
-
-            Button(action: onRemove) {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundColor(Color(NSColor.tertiaryLabelColor))
-            }
-            .buttonStyle(.plain)
-            .help("Remove from list")
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 6)
     }
 }
 

@@ -152,16 +152,6 @@ class StatusBarController: NSObject, NSMenuDelegate {
                 statusMenu.addItem(instanceItem)
             }
         }
-        // Show offline count if any
-        if !hubManager.offlineClients.isEmpty {
-            let offlineItem = NSMenuItem(
-                title: "  ⊘ \(hubManager.offlineClients.count) offline",
-                action: #selector(showClientsAndAgents),
-                keyEquivalent: ""
-            )
-            offlineItem.target = self
-            statusMenu.addItem(offlineItem)
-        }
 
         statusMenu.addItem(NSMenuItem.separator())
 

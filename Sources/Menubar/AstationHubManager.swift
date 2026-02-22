@@ -13,8 +13,6 @@ class AstationHubManager: ObservableObject {
 
     /// Agents reported by each Atem, keyed by clientId.
     @Published var agentsByClientId: [String: [AtemAgentInfo]] = [:]
-    /// Atem instances that disconnected recently (shown as offline in the UI).
-    @Published var offlineClients: [OfflineClient] = []
     /// User-pinned active client ID. Overrides focus-based routing when set.
     @Published var pinnedClientId: String?
 
@@ -329,27 +327,13 @@ class AstationHubManager: ObservableObject {
 
     func removeClient(withId clientId: String) {
         DispatchQueue.main.async {
-            // Move to offline list before removing
-            if let client = self.connectedClients.first(where: { $0.id == clientId }) {
-                let offline = OfflineClient(
-                    id: client.id,
-                    hostname: client.hostname,
-                    tag: client.tag,
-                    disconnectedAt: Date()
-                )
-                // Remove any existing offline entry for same hostname to avoid duplicates
-                if !client.hostname.isEmpty && client.hostname != "unknown" {
-                    self.offlineClients.removeAll { $0.hostname == client.hostname }
-                }
-                self.offlineClients.append(offline)
-            }
             self.connectedClients.removeAll { $0.id == clientId }
             self.agentsByClientId.removeValue(forKey: clientId)
             // If the pinned client disconnected, clear the pin
             if self.pinnedClientId == clientId {
                 self.pinnedClientId = nil
             }
-            Log.info(" Client disconnected: \(clientId)")
+            Log.info("🔌 Client disconnected and removed: \(clientId.prefix(8))")
             self.broadcastInstanceList()
         }
     }
@@ -599,8 +583,6 @@ class AstationHubManager: ObservableObject {
 
             if let hostname = hostname {
                 self.connectedClients[index].hostname = hostname
-                // If a client with this hostname was offline, it's back online — clear it.
-                self.offlineClients.removeAll { $0.hostname == hostname }
             }
             if let tag = tag {
                 self.connectedClients[index].tag = tag
@@ -667,12 +649,6 @@ class AstationHubManager: ObservableObject {
         DispatchQueue.main.async { self.pinnedClientId = nil }
     }
 
-    /// Remove a disconnected client from the offline list.
-    func removeOfflineClient(id: String) {
-        DispatchQueue.main.async {
-            self.offlineClients.removeAll { $0.id == id }
-        }
-    }
 
     /// Ask a specific Atem to push its current agent list.
     func requestAgentList(from clientId: String) {
@@ -952,12 +928,6 @@ struct ConnectedClient: Identifiable {
     var isFocused: Bool = false
 }
 
-struct OfflineClient: Identifiable {
-    let id: String
-    var hostname: String
-    var tag: String
-    let disconnectedAt: Date
-}
 
 struct MarkTask {
     let taskId: String
