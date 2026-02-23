@@ -369,6 +369,7 @@ mod tests {
     use crate::relay::RelayHub;
     use crate::session_store::SessionStore;
     use crate::session_verify::SessionVerifyCache;
+    use crate::voice_session::VoiceSessionStore;
     use tower::ServiceExt;
 
     fn create_test_app() -> Router {
@@ -377,6 +378,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
         Router::new()
             .route("/api/rtc-sessions", post(create_rtc_session_handler))
@@ -655,6 +657,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
         state
             .rtc_sessions
@@ -709,6 +712,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
         state
             .rtc_sessions
@@ -772,6 +776,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
         state
             .rtc_sessions
@@ -824,6 +829,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
         let app = Router::new()
             .route("/api/rtc-sessions", post(create_rtc_session_handler))
@@ -947,6 +953,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
         state
             .rtc_sessions

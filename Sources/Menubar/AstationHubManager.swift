@@ -318,6 +318,14 @@ class AstationHubManager: ObservableObject {
         )
     }
     
+    // MARK: - ConvoAI Agent Support
+
+    /// Generate an RTC token for the ConvoAI agent (UID 1001) in the given channel.
+    func generateTokenForConvoAIAgent(channel: String) async -> String? {
+        let response = await generateRTCToken(channel: channel, uid: "1001")
+        return response.token.isEmpty ? nil : response.token
+    }
+
     // MARK: - Client Management
     
     func addClient(_ client: ConnectedClient) {

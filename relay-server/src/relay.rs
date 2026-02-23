@@ -411,6 +411,7 @@ fn render_pair_page(code: &str, hostname: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::voice_session::VoiceSessionStore;
     use super::*;
     use crate::session_verify::SessionVerifyCache;
 
@@ -560,6 +561,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: crate::rtc_session::RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
         Router::new()
             .route("/api/pair", axum::routing::post(create_pair_handler))
@@ -930,6 +932,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: crate::rtc_session::RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
 
         // Create pair

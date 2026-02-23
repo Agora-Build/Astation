@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -22,6 +22,12 @@ pub struct ChatCompletionRequest {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+}
+
+/// Query parameters for /api/llm/chat (ConvoAI passes session_id via URL)
+#[derive(Debug, Deserialize)]
+pub struct LlmChatQuery {
+    pub session_id: Option<String>,
 }
 
 /// OpenAI-compatible chat completion response format
@@ -54,11 +60,13 @@ pub struct Choice {
 /// 3. Fallback: IP + time-window heuristic (last session from this IP within 5 minutes)
 pub async fn llm_chat_handler(
     State(state): State<AppState>,
+    Query(query): Query<LlmChatQuery>,
     headers: axum::http::HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
-    // Extract session ID from headers or heuristics
-    let session_id = extract_session_id(&headers, &state).await;
+    // Extract session ID: query param first, then headers
+    let session_id = query.session_id
+        .or_else(|| extract_session_id_from_headers(&headers));
 
     let session_id = match session_id {
         Some(id) => id,
@@ -150,13 +158,13 @@ pub async fn llm_chat_handler(
     }
 }
 
-/// Extract session ID from headers or heuristics
+/// Extract session ID from HTTP headers.
 ///
 /// Priority:
 /// 1. X-Voice-Session-ID header (set by Astation when creating session)
 /// 2. X-Session-ID header (if Agora provides it)
 /// 3. X-Forwarded-For IP + recent session lookup (last session from IP within 5 min)
-async fn extract_session_id(headers: &axum::http::HeaderMap, _state: &AppState) -> Option<String> {
+fn extract_session_id_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
     // Try X-Voice-Session-ID (custom header)
     if let Some(session_id) = headers.get("x-voice-session-id") {
         if let Ok(id) = session_id.to_str() {
@@ -227,8 +235,7 @@ mod tests {
     use crate::session_store::SessionStore;
     use crate::rtc_session::RtcSessionStore;
     use crate::session_verify::SessionVerifyCache;
-    use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
+    use axum::http::StatusCode;
 
     fn create_test_state() -> AppState {
         AppState {
@@ -263,6 +270,7 @@ mod tests {
 
         let response = llm_chat_handler(
             State(state.clone()),
+            Query(LlmChatQuery { session_id: None }),
             headers,
             Json(req),
         ).await;
@@ -311,6 +319,7 @@ mod tests {
 
         let response = llm_chat_handler(
             State(state.clone()),
+            Query(LlmChatQuery { session_id: None }),
             headers,
             Json(req),
         ).await;
@@ -336,6 +345,7 @@ mod tests {
 
         let response = llm_chat_handler(
             State(state),
+            Query(LlmChatQuery { session_id: None }),
             headers,
             Json(req),
         ).await;
@@ -362,6 +372,7 @@ mod tests {
 
         let response = llm_chat_handler(
             State(state),
+            Query(LlmChatQuery { session_id: None }),
             headers,
             Json(req),
         ).await;
@@ -399,6 +410,7 @@ mod tests {
 
         let response = llm_chat_handler(
             State(state.clone()),
+            Query(LlmChatQuery { session_id: None }),
             headers,
             Json(req),
         ).await;
@@ -433,6 +445,7 @@ mod tests {
 
         let response = llm_chat_handler(
             State(state.clone()),
+            Query(LlmChatQuery { session_id: None }),
             headers,
             Json(req),
         ).await;
@@ -469,10 +482,91 @@ mod tests {
 
         let response = llm_chat_handler(
             State(state),
+            Query(LlmChatQuery { session_id: None }),
             headers,
             Json(req),
         ).await;
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_session_id_from_query_param() {
+        let state = create_test_state();
+        state.voice_sessions.create(
+            "query-sess".to_string(),
+            "atem-1".to_string(),
+            "channel-1".to_string(),
+        ).await;
+
+        let req = ChatCompletionRequest {
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "Hello via query param".to_string(),
+            }],
+            stream: false,
+            session_id: None,
+        };
+
+        // No header — session ID comes from query param
+        let headers = axum::http::HeaderMap::new();
+
+        let response = llm_chat_handler(
+            State(state.clone()),
+            Query(LlmChatQuery { session_id: Some("query-sess".to_string()) }),
+            headers,
+            Json(req),
+        ).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify transcription was buffered in the correct session
+        let session = state.voice_sessions.get("query-sess").await.unwrap();
+        assert!(session.get_accumulated_text().contains("Hello via query param"));
+    }
+
+    #[tokio::test]
+    async fn test_query_param_overrides_header() {
+        let state = create_test_state();
+        // Create two sessions
+        state.voice_sessions.create(
+            "from-query".to_string(),
+            "atem-1".to_string(),
+            "channel-1".to_string(),
+        ).await;
+        state.voice_sessions.create(
+            "from-header".to_string(),
+            "atem-1".to_string(),
+            "channel-1".to_string(),
+        ).await;
+
+        let req = ChatCompletionRequest {
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "Which session?".to_string(),
+            }],
+            stream: false,
+            session_id: None,
+        };
+
+        // Both query param and header set — query param should win
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-voice-session-id", "from-header".parse().unwrap());
+
+        let response = llm_chat_handler(
+            State(state.clone()),
+            Query(LlmChatQuery { session_id: Some("from-query".to_string()) }),
+            headers,
+            Json(req),
+        ).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify text went to the query param session, not the header session
+        let query_session = state.voice_sessions.get("from-query").await.unwrap();
+        assert!(query_session.get_accumulated_text().contains("Which session?"));
+
+        let header_session = state.voice_sessions.get("from-header").await.unwrap();
+        assert!(header_session.get_accumulated_text().is_empty());
     }
 }

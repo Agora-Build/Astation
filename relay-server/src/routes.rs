@@ -256,6 +256,7 @@ mod tests {
     use crate::rtc_session::RtcSessionStore;
     use crate::session_store::SessionStore;
     use crate::session_verify::SessionVerifyCache;
+    use crate::voice_session::VoiceSessionStore;
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -270,6 +271,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
         Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -331,6 +333,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -430,6 +433,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -499,6 +503,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -586,6 +591,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
         let session = create_session("my-machine");
         let session_id = session.id.clone();
@@ -638,6 +644,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -702,6 +709,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -765,6 +773,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -872,6 +881,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -936,6 +946,7 @@ mod tests {
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
         };
 
         // Create an expired session manually

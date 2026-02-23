@@ -4,6 +4,9 @@ mod routes;
 mod rtc_session;
 mod session_store;
 mod session_verify;
+mod voice_session;
+mod voice_routes;
+mod llm_proxy;
 mod web;
 
 use axum::http::{header, HeaderValue, Method};
@@ -13,6 +16,7 @@ use relay::RelayHub;
 use rtc_session::RtcSessionStore;
 use session_store::SessionStore;
 use session_verify::SessionVerifyCache;
+use voice_session::VoiceSessionStore;
 use std::sync::Arc;
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_http::cors::CorsLayer;
@@ -25,6 +29,7 @@ pub struct AppState {
     pub relay: RelayHub,
     pub rtc_sessions: RtcSessionStore,
     pub session_verify_cache: SessionVerifyCache,
+    pub voice_sessions: VoiceSessionStore,
 }
 
 #[tokio::main]
@@ -42,6 +47,7 @@ async fn main() {
     let relay = RelayHub::new();
     let rtc_sessions = RtcSessionStore::new();
     let session_verify_cache = SessionVerifyCache::new();
+    let voice_sessions = VoiceSessionStore::new();
 
     // Spawn background cleanup for expired sessions
     let cleanup_sessions = sessions.clone();
@@ -86,11 +92,23 @@ async fn main() {
         }
     });
 
+    // Spawn background cleanup for expired voice sessions
+    let cleanup_voice = voice_sessions.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            cleanup_voice.cleanup_expired().await;
+            tracing::debug!("Cleaned up expired voice sessions");
+        }
+    });
+
     let state = AppState {
         sessions,
         relay,
         rtc_sessions,
         session_verify_cache,
+        voice_sessions,
     };
 
     // Configure CORS - Allow specific origin or default to localhost for development
@@ -167,6 +185,30 @@ async fn main() {
         .route(
             "/api/rtc-sessions/:id/join",
             post(rtc_session::join_rtc_session_handler),
+        )
+        // Voice Session API routes
+        .route(
+            "/api/voice-sessions",
+            post(voice_routes::create_voice_session_handler)
+                .get(voice_routes::list_voice_sessions_handler),
+        )
+        .route(
+            "/api/voice-sessions/:id",
+            get(voice_routes::get_voice_session_handler)
+                .delete(voice_routes::delete_voice_session_handler),
+        )
+        .route(
+            "/api/voice-sessions/:id/trigger",
+            post(voice_routes::trigger_voice_session_handler),
+        )
+        .route(
+            "/api/voice-sessions/response",
+            post(voice_routes::atem_response_handler),
+        )
+        // LLM Proxy (for Agora ConvoAI)
+        .route(
+            "/api/llm/chat",
+            post(llm_proxy::llm_chat_handler),
         )
         // Relay API routes
         .route("/api/pair", post(relay::create_pair_handler))
