@@ -91,22 +91,64 @@ class StatusBarController: NSObject, NSMenuDelegate {
         
         statusMenu.addItem(NSMenuItem.separator())
 
-        // Hotkey State Section
-        let hotkeyHeader = NSMenuItem(title: "Hotkeys", action: nil, keyEquivalent: "")
-        hotkeyHeader.isEnabled = false
-        statusMenu.addItem(hotkeyHeader)
+        // Voice Coding Section
+        let vcm = hubManager.voiceCodingManager
+        let voiceCodingHeader = NSMenuItem(title: "Voice Coding", action: nil, keyEquivalent: "")
+        voiceCodingHeader.isEnabled = false
+        statusMenu.addItem(voiceCodingHeader)
 
-        let voiceState = hubManager.voiceActive ? "Active" : "Muted"
-        let voiceIcon = hubManager.voiceActive ? "mic.fill" : "mic.slash"
-        let voiceItem = NSMenuItem(
-            title: "Voice (Ctrl+V): \(voiceState)",
-            action: #selector(toggleVoiceHotkey),
-            keyEquivalent: ""
-        )
-        voiceItem.image = NSImage(systemSymbolName: voiceIcon, accessibilityDescription: "Voice")
-        voiceItem.target = self
-        statusMenu.addItem(voiceItem)
+        switch vcm.mode {
+        case .off:
+            let voiceOffItem = NSMenuItem(
+                title: "Voice (Ctrl+V): Off",
+                action: nil,
+                keyEquivalent: ""
+            )
+            voiceOffItem.image = NSImage(systemSymbolName: "mic.slash", accessibilityDescription: "Voice Off")
+            voiceOffItem.isEnabled = false
+            statusMenu.addItem(voiceOffItem)
 
+            if hubManager.rtcManager.isInChannel {
+                let handsFreeItem = NSMenuItem(
+                    title: "Start Hands-Free Mode",
+                    action: #selector(startHandsFreeMode),
+                    keyEquivalent: ""
+                )
+                handsFreeItem.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Hands-Free")
+                handsFreeItem.target = self
+                statusMenu.addItem(handsFreeItem)
+            }
+
+        case .ptt:
+            let pttItem = NSMenuItem(
+                title: vcm.isWaitingForResponse ? "Voice (PTT): Waiting for Claude..." : "Voice (PTT): Active",
+                action: nil,
+                keyEquivalent: ""
+            )
+            pttItem.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "PTT Active")
+            pttItem.isEnabled = false
+            statusMenu.addItem(pttItem)
+
+        case .handsFree:
+            let hfItem = NSMenuItem(
+                title: vcm.isWaitingForResponse ? "Voice (Hands-Free): Waiting for Claude..." : "Voice (Hands-Free): Active",
+                action: nil,
+                keyEquivalent: ""
+            )
+            hfItem.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Hands-Free Active")
+            hfItem.isEnabled = false
+            statusMenu.addItem(hfItem)
+
+            let stopItem = NSMenuItem(
+                title: "Stop Hands-Free Mode",
+                action: #selector(stopHandsFreeMode),
+                keyEquivalent: ""
+            )
+            stopItem.target = self
+            statusMenu.addItem(stopItem)
+        }
+
+        // Video hotkey
         let videoState = hubManager.videoActive ? "Sharing" : "Off"
         let videoIcon = hubManager.videoActive ? "video.fill" : "video.slash"
         let videoItem = NSMenuItem(
@@ -688,8 +730,13 @@ class StatusBarController: NSObject, NSMenuDelegate {
         }
     }
 
-    @objc private func toggleVoiceHotkey() {
-        hubManager.toggleVoice()
+    @objc private func startHandsFreeMode() {
+        hubManager.voiceCodingManager.startHandsFree()
+        setupMenu()
+    }
+
+    @objc private func stopHandsFreeMode() {
+        hubManager.voiceCodingManager.stopHandsFree()
         setupMenu()
     }
 

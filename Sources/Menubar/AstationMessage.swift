@@ -31,6 +31,10 @@ enum AstationMessage: Codable {
     // Voice command routing (Astation → Atem)
     case voiceCommand(text: String, isFinal: Bool)
 
+    // Voice coding (relay-based: Astation → Atem → relay server)
+    case voiceRequest(sessionId: String, accumulatedText: String, relayUrl: String)
+    case voiceResponse(sessionId: String, success: Bool, message: String)
+
     // Mark task routing (Chisel → Astation → Atem)
     case markTaskNotify(taskId: String, status: String, description: String)
     case markTaskAssignment(taskId: String, receivedAtMs: UInt64)
@@ -68,6 +72,8 @@ enum AstationMessage: Codable {
         case heartbeat
         case pong
         case voiceCommand
+        case voiceRequest
+        case voiceResponse
         case markTaskNotify
         case markTaskAssignment
         case markTaskResult
@@ -192,6 +198,20 @@ enum AstationMessage: Codable {
             var dataContainer = container.nestedContainer(keyedBy: VoiceCommandKeys.self, forKey: .data)
             try dataContainer.encode(text, forKey: .text)
             try dataContainer.encode(isFinal, forKey: .isFinal)
+
+        case .voiceRequest(let sessionId, let accumulatedText, let relayUrl):
+            try container.encode(MessageType.voiceRequest, forKey: .type)
+            var dataContainer = container.nestedContainer(keyedBy: VoiceRequestKeys.self, forKey: .data)
+            try dataContainer.encode(sessionId, forKey: .sessionId)
+            try dataContainer.encode(accumulatedText, forKey: .accumulatedText)
+            try dataContainer.encode(relayUrl, forKey: .relayUrl)
+
+        case .voiceResponse(let sessionId, let success, let message):
+            try container.encode(MessageType.voiceResponse, forKey: .type)
+            var dataContainer = container.nestedContainer(keyedBy: VoiceResponseKeys.self, forKey: .data)
+            try dataContainer.encode(sessionId, forKey: .sessionId)
+            try dataContainer.encode(success, forKey: .success)
+            try dataContainer.encode(message, forKey: .message)
 
         case .markTaskNotify(let taskId, let status, let description):
             try container.encode(MessageType.markTaskNotify, forKey: .type)
@@ -358,6 +378,20 @@ enum AstationMessage: Codable {
             let isFinal = try dataContainer.decodeIfPresent(Bool.self, forKey: .isFinal) ?? false
             self = .voiceCommand(text: text, isFinal: isFinal)
 
+        case .voiceRequest:
+            let dataContainer = try container.nestedContainer(keyedBy: VoiceRequestKeys.self, forKey: .data)
+            let sessionId = try dataContainer.decode(String.self, forKey: .sessionId)
+            let accumulatedText = try dataContainer.decode(String.self, forKey: .accumulatedText)
+            let relayUrl = try dataContainer.decode(String.self, forKey: .relayUrl)
+            self = .voiceRequest(sessionId: sessionId, accumulatedText: accumulatedText, relayUrl: relayUrl)
+
+        case .voiceResponse:
+            let dataContainer = try container.nestedContainer(keyedBy: VoiceResponseKeys.self, forKey: .data)
+            let sessionId = try dataContainer.decode(String.self, forKey: .sessionId)
+            let success = try dataContainer.decode(Bool.self, forKey: .success)
+            let message = try dataContainer.decode(String.self, forKey: .message)
+            self = .voiceResponse(sessionId: sessionId, success: success, message: message)
+
         case .markTaskNotify:
             let dataContainer = try container.nestedContainer(keyedBy: MarkTaskNotifyKeys.self, forKey: .data)
             let taskId = try dataContainer.decode(String.self, forKey: .taskId)
@@ -456,6 +490,17 @@ private enum AtemInstanceListKeys: String, CodingKey {
 private enum VoiceCommandKeys: String, CodingKey {
     case text
     case isFinal = "is_final"
+}
+
+private enum VoiceRequestKeys: String, CodingKey {
+    case sessionId = "session_id"
+    case accumulatedText = "accumulated_text"
+    case relayUrl = "relay_url"
+}
+
+private enum VoiceResponseKeys: String, CodingKey {
+    case sessionId = "session_id"
+    case success, message
 }
 
 private enum MarkTaskNotifyKeys: String, CodingKey {

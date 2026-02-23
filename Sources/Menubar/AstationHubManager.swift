@@ -23,6 +23,7 @@ class AstationHubManager: ObservableObject {
     let authGrantController = AuthGrantController()
     let timeSync = TimeSync()
     lazy var sessionLinkManager = SessionLinkManager(hubManager: self)
+    lazy var voiceCodingManager = VoiceCodingManager(hubManager: self)
     @Published var projectLoadError: String?
 
     /// Opaque handle to the C core engine (VAD + signaling pipeline).
@@ -116,6 +117,8 @@ class AstationHubManager: ObservableObject {
             // Feed PCM16 audio into the VAD pipeline
             astation_core_feed_audio_frame(core, data, samples, UInt32(sampleRate))
             _ = channels // channels is implicit in sample interleaving
+            // Notify voice coding manager of speech activity (for hands-free silence detection)
+            self.voiceCodingManager.notifySpeechActivity()
         }
 
         rtcManager.onJoinSuccess = { channel, uid in
@@ -455,6 +458,11 @@ class AstationHubManager: ObservableObject {
                     userInfo: ["clientId": clientId, "output": output, "success": success]
                 )
             }
+            return nil
+
+        case .voiceResponse(let sessionId, let success, let message):
+            Log.info("[AstationHub] Voice response from \(clientId.prefix(8))…: session=\(sessionId) success=\(success)")
+            voiceCodingManager.handleVoiceResponse(sessionId: sessionId, success: success, message: message)
             return nil
 
         default:
@@ -1030,4 +1038,5 @@ struct SystemStatus {
 
 extension Notification.Name {
     static let authResponseReady = Notification.Name("authResponseReady")
+    static let voiceCodingResponseReceived = Notification.Name("VoiceCodingResponseReceived")
 }

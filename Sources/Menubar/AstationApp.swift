@@ -76,10 +76,20 @@ class AstationApp: NSObject, NSApplicationDelegate {
         // Start network monitoring to detect IP changes
         NetworkMonitor.shared.startMonitoring()
 
-        // Initialize global hotkeys (Ctrl+V voice, Ctrl+Shift+V video)
+        // Initialize global hotkeys (Ctrl+V PTT, Ctrl+Shift+V video)
         hotkeyManager = HotkeyManager()
-        hotkeyManager?.onVoiceToggle = { [weak self] in
-            self?.hubManager.toggleVoice()
+        hotkeyManager?.onVoiceKeyDown = { [weak self] in
+            let vcm = self?.hubManager.voiceCodingManager
+            if vcm?.mode == .off {
+                vcm?.startPTT()
+            }
+            self?.statusBarController.showStatus()
+        }
+        hotkeyManager?.onVoiceKeyUp = { [weak self] in
+            let vcm = self?.hubManager.voiceCodingManager
+            if vcm?.mode == .ptt {
+                vcm?.stopPTT()
+            }
             self?.statusBarController.showStatus()
         }
         hotkeyManager?.onVideoToggle = { [weak self] in
@@ -89,7 +99,7 @@ class AstationApp: NSObject, NSApplicationDelegate {
         hotkeyManager?.registerHotkeys()
 
         Log.info("Astation fully operational!")
-        Log.info("Global hotkeys: Ctrl+V (voice), Ctrl+Shift+V (video)")
+        Log.info("Global hotkeys: Ctrl+V (PTT voice coding), Ctrl+Shift+V (video)")
         Log.info("Log file: \(Log.logFile.path)")
     }
 

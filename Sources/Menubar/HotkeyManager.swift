@@ -7,8 +7,11 @@ class HotkeyManager {
     private var voiceHotkeyRef: EventHotKeyRef?
     private var videoHotkeyRef: EventHotKeyRef?
 
-    /// Called when Ctrl+V is pressed (voice toggle).
-    var onVoiceToggle: (() -> Void)?
+    /// Called when Ctrl+V is pressed (PTT key-down).
+    var onVoiceKeyDown: (() -> Void)?
+
+    /// Called when Ctrl+V is released (PTT key-up).
+    var onVoiceKeyUp: (() -> Void)?
 
     /// Called when Ctrl+Shift+V is pressed (video toggle).
     var onVideoToggle: (() -> Void)?
@@ -30,19 +33,25 @@ class HotkeyManager {
 
     /// Register global hotkeys. Call once after init.
     func registerHotkeys() {
-        // Install the Carbon event handler for kEventHotKeyPressed
-        var eventType = EventTypeSpec(
-            eventClass: OSType(kEventClassKeyboard),
-            eventKind: UInt32(kEventHotKeyPressed)
-        )
+        // Install the Carbon event handler for both kEventHotKeyPressed and kEventHotKeyReleased
+        var eventTypes = [
+            EventTypeSpec(
+                eventClass: OSType(kEventClassKeyboard),
+                eventKind: UInt32(kEventHotKeyPressed)
+            ),
+            EventTypeSpec(
+                eventClass: OSType(kEventClassKeyboard),
+                eventKind: UInt32(kEventHotKeyReleased)
+            )
+        ]
 
         InstallEventHandler(
             GetApplicationEventTarget(),
             { (_, event, _) -> OSStatus in
                 return HotkeyManager.handleHotKeyEvent(event)
             },
-            1,
-            &eventType,
+            2,
+            &eventTypes,
             nil,
             nil
         )
@@ -115,15 +124,25 @@ class HotkeyManager {
 
         guard err == noErr else { return err }
 
+        let eventKind = GetEventKind(event)
+        let isPressed = (eventKind == UInt32(kEventHotKeyPressed))
+
         switch hotkeyID.id {
         case voiceHotkeyID:
             DispatchQueue.main.async {
-                shared?.onVoiceToggle?()
+                if isPressed {
+                    shared?.onVoiceKeyDown?()
+                } else {
+                    shared?.onVoiceKeyUp?()
+                }
             }
             return noErr
         case videoHotkeyID:
-            DispatchQueue.main.async {
-                shared?.onVideoToggle?()
+            // Video hotkey: press-only (toggle)
+            if isPressed {
+                DispatchQueue.main.async {
+                    shared?.onVideoToggle?()
+                }
             }
             return noErr
         default:
