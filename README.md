@@ -151,7 +151,7 @@ swift run astation
 
 ## Related Projects
 
-- [Atem](https://github.com/Agora-Build/Atem) -- AI development terminal that connects people, Agora platform, and AI agents
+- [Atem](https://github.com/Agora-Build/Atem) -- A terminal that connects people, Agora platform, and AI agents
 - [Chisel](https://github.com/Agora-Build/chisel) -- Dev panel for visual annotation and UI editing by anyone, including AI agents
 - [Vox](https://github.com/Agora-Build/Vox) -- AI latency evaluation platform
 
