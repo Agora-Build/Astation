@@ -21,6 +21,10 @@ class VoiceCodingManager: NSObject {
     private var targetAtemId: String?
     private var handsFreeTimer: Timer?
     private var lastSpeechActivity: Date?
+    private var pendingRtcJoinCompletions: [((Bool) -> Void)] = []
+    private var rtcJoinObserver: NSObjectProtocol?
+    private var rtcJoinTimeout: Timer?
+    private var isPreparing: Bool = false
     private let silenceTimeoutSeconds: TimeInterval = 5.0
 
     // ConvoAI agent lifecycle
@@ -34,7 +38,69 @@ class VoiceCodingManager: NSObject {
         super.init()
     }
 
-    // MARK: - PTT (Push-to-Talk)
+    private func updateStage(_ text: String, autoHideAfter: TimeInterval? = nil) {
+        VoiceCodingHUD.shared.show(text, autoHideAfter: autoHideAfter)
+    }
+
+    private func ensureRTCJoined(completion: @escaping (Bool) -> Void) {
+        if hubManager.rtcManager.isInChannel {
+            completion(true)
+            return
+        }
+
+        pendingRtcJoinCompletions.append(completion)
+        if rtcJoinObserver != nil {
+            return
+        }
+
+        let projects = hubManager.getProjects()
+        guard let project = projects.first else {
+            updateStage("Voice: No projects configured", autoHideAfter: 2.0)
+            finishRtcJoin(success: false)
+            return
+        }
+
+        let channel = "astation-default"
+        let uid = Int.random(in: 1000...9999)
+        updateStage("Voice: Joining RTC…")
+        hubManager.initializeRTC(appId: project.vendorKey)
+        hubManager.joinRTCChannel(channel: channel, uid: uid, projectId: project.id)
+
+        rtcJoinObserver = NotificationCenter.default.addObserver(
+            forName: .rtcJoinSuccess,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.finishRtcJoin(success: true)
+        }
+
+        rtcJoinTimeout = Timer.scheduledTimer(withTimeInterval: 8.0, repeats: false) { [weak self] _ in
+            self?.finishRtcJoin(success: false)
+        }
+    }
+
+    private func finishRtcJoin(success: Bool) {
+        if let observer = rtcJoinObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        rtcJoinObserver = nil
+        rtcJoinTimeout?.invalidate()
+        rtcJoinTimeout = nil
+
+        if !success {
+            updateStage("Voice: RTC join failed", autoHideAfter: 2.0)
+        } else {
+            updateStage("Voice: RTC joined")
+        }
+
+        let completions = pendingRtcJoinCompletions
+        pendingRtcJoinCompletions.removeAll()
+        for completion in completions {
+            completion(success)
+        }
+    }
+
+// MARK: - PTT (Push-to-Talk)
 
     /// Called on Ctrl+V key-down. Creates a relay session and unmutes mic.
     func startPTT() {
@@ -43,11 +109,26 @@ class VoiceCodingManager: NSObject {
             return
         }
         mode = .ptt
+        isPreparing = true
+        updateStage("Voice: Starting PTT…")
         Log.info("[VoiceCoding] PTT started")
 
+        ensureRTCJoined { [weak self] joined in
+            guard let self = self else { return }
+            guard joined else {
+                self.cleanup()
+                return
+            }
+            self.beginPTTWorkflow()
+        }
+    }
+
+    private func beginPTTWorkflow() {
+        updateStage("Voice: Creating session…")
         createRelaySession { [weak self] sessionId in
             guard let self = self, let sessionId = sessionId else {
                 Log.error("[VoiceCoding] Failed to create relay session for PTT")
+                self?.updateStage("Voice: Session failed", autoHideAfter: 2.0)
                 self?.cleanup()
                 return
             }
@@ -61,6 +142,7 @@ class VoiceCodingManager: NSObject {
             }
 
             // Create ConvoAI agent for ASR/TTS
+            self.updateStage("Voice: Starting agent…")
             self.createConvoAIAgent(sessionId: sessionId)
         }
     }
@@ -72,6 +154,12 @@ class VoiceCodingManager: NSObject {
             return
         }
 
+        if isPreparing {
+            Log.info("[VoiceCoding] stopPTT deferred — still preparing")
+            deferredStopPTT = true
+            return
+        }
+
         // If the ConvoAI agent isn't ready yet, defer the stop until it is
         guard isAgentReady else {
             Log.info("[VoiceCoding] stopPTT deferred — agent not ready yet")
@@ -80,6 +168,7 @@ class VoiceCodingManager: NSObject {
         }
 
         Log.info("[VoiceCoding] PTT stopped")
+        updateStage("Voice: Processing…")
 
         // Mute mic immediately
         if hubManager.rtcManager.isInChannel {
@@ -88,11 +177,13 @@ class VoiceCodingManager: NSObject {
 
         guard let sessionId = activeSessionId else {
             Log.warn("[VoiceCoding] stopPTT but no active session")
+            updateStage("Voice: No active session", autoHideAfter: 1.5)
             cleanup()
             return
         }
 
         isWaitingForResponse = true
+        updateStage("Voice: Waiting for response…")
 
         triggerRelaySession(sessionId: sessionId) { [weak self] accumulatedText in
             guard let self = self else { return }
@@ -114,11 +205,26 @@ class VoiceCodingManager: NSObject {
             return
         }
         mode = .handsFree
+        isPreparing = true
+        updateStage("Voice: Starting Hands-Free…")
         Log.info("[VoiceCoding] Hands-Free started")
 
+        ensureRTCJoined { [weak self] joined in
+            guard let self = self else { return }
+            guard joined else {
+                self.cleanup()
+                return
+            }
+            self.beginHandsFreeWorkflow()
+        }
+    }
+
+    private func beginHandsFreeWorkflow() {
+        updateStage("Voice: Creating session…")
         createRelaySession { [weak self] sessionId in
             guard let self = self, let sessionId = sessionId else {
                 Log.error("[VoiceCoding] Failed to create relay session for Hands-Free")
+                self?.updateStage("Voice: Session failed", autoHideAfter: 2.0)
                 self?.cleanup()
                 return
             }
@@ -133,6 +239,7 @@ class VoiceCodingManager: NSObject {
             }
 
             // Create ConvoAI agent for ASR/TTS (persists across session recycling)
+            self.updateStage("Voice: Starting agent…")
             self.createConvoAIAgent(sessionId: sessionId)
 
             // Start silence-check timer on main thread
@@ -152,6 +259,7 @@ class VoiceCodingManager: NSObject {
     func stopHandsFree() {
         guard mode == .handsFree else { return }
         Log.info("[VoiceCoding] Hands-Free stopped by user")
+        updateStage("Voice: Stopping…", autoHideAfter: 1.0)
         if hubManager.rtcManager.isInChannel {
             hubManager.rtcManager.muteMic(true)
         }
@@ -165,9 +273,11 @@ class VoiceCodingManager: NSObject {
         let elapsed = Date().timeIntervalSince(lastActivity)
         if elapsed >= silenceTimeoutSeconds {
             Log.info("[VoiceCoding] Silence timeout (\(silenceTimeoutSeconds)s) — triggering")
+            updateStage("Voice: Processing…")
             guard let sessionId = activeSessionId else { return }
 
             isWaitingForResponse = true
+        updateStage("Voice: Waiting for response…")
             triggerRelaySession(sessionId: sessionId) { [weak self] accumulatedText in
                 guard let self = self else { return }
                 guard let text = accumulatedText, !text.isEmpty else {
@@ -190,6 +300,7 @@ class VoiceCodingManager: NSObject {
     func handleVoiceResponse(sessionId: String, success: Bool, message: String) {
         Log.info("[VoiceCoding] Response for \(sessionId): success=\(success) — \(message)")
         isWaitingForResponse = false
+        updateStage(success ? "Voice: Done" : "Voice: Failed", autoHideAfter: 1.5)
 
         // Post notification for UI updates
         DispatchQueue.main.async {
@@ -308,6 +419,8 @@ class VoiceCodingManager: NSObject {
               let appId = hubManager.projects.first?.vendorKey,
               let channel = hubManager.rtcManager.currentChannel else {
             Log.warn("[VoiceCoding] Missing credentials/appId/channel — skipping ConvoAI agent")
+            updateStage("Voice: Missing credentials", autoHideAfter: 2.0)
+            cleanup()
             return
         }
 
@@ -331,7 +444,9 @@ class VoiceCodingManager: NSObject {
                 )
                 self.activeAgentId = agentResp.agentId
                 self.isAgentReady = true
+                self.isPreparing = false
                 Log.info("[VoiceCoding] ConvoAI agent created: \(agentResp.agentId)")
+                self.updateStage(self.mode == .handsFree ? "Voice: Listening…" : "Voice: Listening…")
 
                 if self.deferredStopPTT {
                     Log.info("[VoiceCoding] Executing deferred stopPTT")
@@ -339,6 +454,7 @@ class VoiceCodingManager: NSObject {
                 }
             } catch {
                 Log.error("[VoiceCoding] ConvoAI agent creation failed: \(error)")
+                self.updateStage("Voice: Agent failed", autoHideAfter: 2.0)
                 self.cleanup()
             }
         }
@@ -366,6 +482,7 @@ class VoiceCodingManager: NSObject {
     private func sendVoiceRequestToAtem(sessionId: String, accumulatedText: String) {
         guard let atemId = targetAtemId ?? hubManager.routeToFocusedAtem() else {
             Log.warn("[VoiceCoding] No Atem available — dropping voice request")
+            updateStage("Voice: No target device", autoHideAfter: 2.0)
             cleanup()
             return
         }
@@ -389,11 +506,13 @@ class VoiceCodingManager: NSObject {
             guard let self = self, self.mode == .handsFree else { return }
             guard let sessionId = sessionId else {
                 Log.error("[VoiceCoding] Failed to recycle hands-free session")
+                self.updateStage("Voice: Session failed", autoHideAfter: 2.0)
                 self.cleanup()
                 return
             }
             self.activeSessionId = sessionId
             self.lastSpeechActivity = Date()
+            self.updateStage("Voice: Listening…")
             Log.info("[VoiceCoding] Hands-Free session recycled: \(sessionId)")
         }
     }
@@ -415,6 +534,7 @@ class VoiceCodingManager: NSObject {
         activeAgentId = nil
         isAgentReady = false
         deferredStopPTT = false
+        isPreparing = false
         mode = .off
         Log.info("[VoiceCoding] Cleaned up — mode is off")
     }

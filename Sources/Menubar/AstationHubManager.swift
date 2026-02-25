@@ -123,6 +123,11 @@ class AstationHubManager: ObservableObject {
 
         rtcManager.onJoinSuccess = { channel, uid in
             Log.info("RTC joined channel=\(channel) uid=\(uid)")
+            NotificationCenter.default.post(
+                name: .rtcJoinSuccess,
+                object: nil,
+                userInfo: ["channel": channel, "uid": uid]
+            )
         }
 
         rtcManager.onLeave = {
@@ -1047,4 +1052,5 @@ struct SystemStatus {
 extension Notification.Name {
     static let authResponseReady = Notification.Name("authResponseReady")
     static let voiceCodingResponseReceived = Notification.Name("VoiceCodingResponseReceived")
+    static let rtcJoinSuccess = Notification.Name("RtcJoinSuccess")
 }
