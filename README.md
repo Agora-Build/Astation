@@ -1,6 +1,6 @@
 # Astation
 
-macOS menubar hub for routing tasks between [Chisel](https://github.com/Agora-Build/chisel), [Atem](https://github.com/Agora-Build/Atem), and Claude Code. Acts as a central coordinator -- receives annotation tasks from the browser, picks the right Atem instance, and tracks task status.
+macOS menubar hub that coordinates between [Chisel](https://github.com/Agora-Build/chisel), [Atem](https://github.com/Agora-Build/Atem), and AI agents. Receives annotation tasks from the browser, routes them to the right Atem instance, tracks task status, and relays voice-coding sessions -- talk to your coding agent from anywhere.
 
 ## Install
 
@@ -151,8 +151,8 @@ swift run astation
 
 ## Related Projects
 
-- [Atem](https://github.com/Agora-Build/Atem) -- AI development terminal (receives tasks from Astation)
-- [Chisel](https://github.com/Agora-Build/chisel) -- Dev panel for visual annotation and CSS editing
+- [Atem](https://github.com/Agora-Build/Atem) -- AI development terminal that connects people, Agora platform, and AI agents
+- [Chisel](https://github.com/Agora-Build/chisel) -- Dev panel for visual annotation and UI editing by anyone, including AI agents
 - [Vox](https://github.com/Agora-Build/Vox) -- AI latency evaluation platform
 
 ## License
