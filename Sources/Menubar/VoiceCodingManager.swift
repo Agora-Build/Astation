@@ -42,6 +42,22 @@ class VoiceCodingManager: NSObject {
         VoiceCodingHUD.shared.show(text, autoHideAfter: autoHideAfter)
     }
 
+    private func resolveVoiceContext() -> (atemId: String, channel: String)? {
+        guard let channel = hubManager.rtcManager.currentChannel else {
+            Log.warn("[VoiceCoding] Missing RTC channel")
+            updateStage("Voice: Missing RTC channel", autoHideAfter: 2.0)
+            return nil
+        }
+        let atemId = targetAtemId ?? hubManager.routeToFocusedAtem()
+        guard let atemId = atemId else {
+            Log.warn("[VoiceCoding] No Atem available")
+            updateStage("Voice: No target device", autoHideAfter: 2.0)
+            return nil
+        }
+        targetAtemId = atemId
+        return (atemId, channel)
+    }
+
     private func ensureRTCJoined(completion: @escaping (Bool) -> Void) {
         if hubManager.rtcManager.isInChannel {
             completion(true)
@@ -124,8 +140,12 @@ class VoiceCodingManager: NSObject {
     }
 
     private func beginPTTWorkflow() {
+        guard let context = resolveVoiceContext() else {
+            cleanup()
+            return
+        }
         updateStage("Voice: Creating session…")
-        createRelaySession { [weak self] sessionId in
+        createRelaySession(atemId: context.atemId, channel: context.channel) { [weak self] sessionId in
             guard let self = self, let sessionId = sessionId else {
                 Log.error("[VoiceCoding] Failed to create relay session for PTT")
                 self?.updateStage("Voice: Session failed", autoHideAfter: 2.0)
@@ -133,7 +153,7 @@ class VoiceCodingManager: NSObject {
                 return
             }
             self.activeSessionId = sessionId
-            self.targetAtemId = self.hubManager.routeToFocusedAtem()
+            self.targetAtemId = context.atemId
             Log.info("[VoiceCoding] PTT session created: \(sessionId)")
 
             // Unmute mic
@@ -220,8 +240,12 @@ class VoiceCodingManager: NSObject {
     }
 
     private func beginHandsFreeWorkflow() {
+        guard let context = resolveVoiceContext() else {
+            cleanup()
+            return
+        }
         updateStage("Voice: Creating session…")
-        createRelaySession { [weak self] sessionId in
+        createRelaySession(atemId: context.atemId, channel: context.channel) { [weak self] sessionId in
             guard let self = self, let sessionId = sessionId else {
                 Log.error("[VoiceCoding] Failed to create relay session for Hands-Free")
                 self?.updateStage("Voice: Session failed", autoHideAfter: 2.0)
@@ -229,7 +253,7 @@ class VoiceCodingManager: NSObject {
                 return
             }
             self.activeSessionId = sessionId
-            self.targetAtemId = self.hubManager.routeToFocusedAtem()
+            self.targetAtemId = context.atemId
             self.lastSpeechActivity = Date()
             Log.info("[VoiceCoding] Hands-Free session created: \(sessionId)")
 
@@ -328,7 +352,7 @@ class VoiceCodingManager: NSObject {
 
     // MARK: - Relay HTTP
 
-    private func createRelaySession(completion: @escaping (String?) -> Void) {
+    private func createRelaySession(atemId: String, channel: String, completion: @escaping (String?) -> Void) {
         let urlString = "\(hubManager.stationRelayUrl)/api/voice-sessions"
         guard let url = URL(string: urlString) else {
             Log.error("[VoiceCoding] Invalid create URL: \(urlString)")
@@ -339,7 +363,12 @@ class VoiceCodingManager: NSObject {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: [:])
+
+        let payload: [String: Any] = [
+            "atem_id": atemId,
+            "channel": channel
+        ]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
 
         URLSession.shared.dataTask(with: request) { data, response, error in
             if let error = error {
@@ -347,11 +376,22 @@ class VoiceCodingManager: NSObject {
                 completion(nil)
                 return
             }
-            guard let http = response as? HTTPURLResponse, http.statusCode == 201 || http.statusCode == 200,
-                  let data = data,
+            guard let http = response as? HTTPURLResponse else {
+                Log.error("[VoiceCoding] Create session: no HTTP response")
+                completion(nil)
+                return
+            }
+            guard http.statusCode == 201 || http.statusCode == 200 else {
+                let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                Log.error("[VoiceCoding] Create session: HTTP \(http.statusCode) \(body)")
+                completion(nil)
+                return
+            }
+            guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let sessionId = json["session_id"] as? String else {
-                Log.error("[VoiceCoding] Create session: unexpected response")
+                let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                Log.error("[VoiceCoding] Create session: unexpected response \(body)")
                 completion(nil)
                 return
             }
@@ -502,7 +542,11 @@ class VoiceCodingManager: NSObject {
         activeSessionId = nil
 
         // Create a fresh session for the next utterance
-        createRelaySession { [weak self] sessionId in
+        guard let context = resolveVoiceContext() else {
+            cleanup()
+            return
+        }
+        createRelaySession(atemId: context.atemId, channel: context.channel) { [weak self] sessionId in
             guard let self = self, self.mode == .handsFree else { return }
             guard let sessionId = sessionId else {
                 Log.error("[VoiceCoding] Failed to recycle hands-free session")
