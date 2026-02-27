@@ -48,8 +48,25 @@ final class SessionLinkManagerTests: XCTestCase {
         XCTAssertNotNil(SessionLinkError.tokenGenerationFailed.errorDescription)
         XCTAssertNotNil(SessionLinkError.noProject.errorDescription)
         XCTAssertNotNil(SessionLinkError.invalidServerURL.errorDescription)
-        XCTAssertNotNil(SessionLinkError.serverError.errorDescription)
+        XCTAssertNotNil(SessionLinkError.networkError(urlString: "http://127.0.0.1:3000", detail: "timed out").errorDescription)
+        XCTAssertNotNil(SessionLinkError.httpError(statusCode: 401, body: "Unauthenticated.").errorDescription)
         XCTAssertNotNil(SessionLinkError.invalidResponse.errorDescription)
+    }
+
+    func testNetworkErrorDescriptionContainsURL() {
+        let description = SessionLinkError
+            .networkError(urlString: "https://station.staging.agora.build/api/rtc-sessions", detail: "timed out")
+            .errorDescription ?? ""
+        XCTAssertTrue(description.contains("https://station.staging.agora.build/api/rtc-sessions"))
+        XCTAssertTrue(description.contains("timed out"))
+    }
+
+    func testHttpErrorDescriptionIncludesBody() {
+        let description = SessionLinkError
+            .httpError(statusCode: 401, body: "Unauthenticated.")
+            .errorDescription ?? ""
+        XCTAssertTrue(description.contains("HTTP 401"))
+        XCTAssertTrue(description.contains("Unauthenticated."))
     }
 
     // MARK: - createLink requires channel
@@ -62,7 +79,11 @@ final class SessionLinkManagerTests: XCTestCase {
             _ = try await manager.createLink()
             XCTFail("Expected notInChannel error")
         } catch let error as SessionLinkError {
-            XCTAssertEqual(error, .notInChannel)
+            if case .notInChannel = error {
+                // expected
+            } else {
+                XCTFail("Expected notInChannel, got \(error)")
+            }
         } catch {
             XCTFail("Unexpected error type: \(error)")
         }

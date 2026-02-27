@@ -1,5 +1,6 @@
 import Cocoa
 import Foundation
+import AVFoundation
 
 class JoinChannelWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
@@ -108,6 +109,41 @@ class JoinChannelWindowController: NSObject, NSWindowDelegate {
         refreshProjectPicker()
     }
 
+    private func ensureMicrophonePermission(completion: @escaping (Bool) -> Void) {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            completion(true)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                DispatchQueue.main.async {
+                    if !granted {
+                        self.showMicrophonePermissionAlert()
+                    }
+                    completion(granted)
+                }
+            }
+        case .denied, .restricted:
+            showMicrophonePermissionAlert()
+            completion(false)
+        @unknown default:
+            completion(false)
+        }
+    }
+
+    private func showMicrophonePermissionAlert() {
+        let alert = NSAlert()
+        alert.messageText = "Microphone Permission Needed"
+        alert.informativeText = "Astation needs Microphone access to publish voice audio. Enable it in System Settings > Privacy & Security > Microphone."
+        alert.addButton(withTitle: "Open Settings")
+        alert.addButton(withTitle: "Continue Without Mic")
+        alert.alertStyle = .warning
+
+        if alert.runModal() == .alertFirstButtonReturn,
+           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     private func refreshProjectPicker() {
         projectPicker?.removeAllItems()
         let projects = hubManager.getProjects()
@@ -146,17 +182,24 @@ class JoinChannelWindowController: NSObject, NSWindowDelegate {
             return
         }
 
-        hubManager.initializeRTC(appId: project.vendorKey)
-        hubManager.joinRTCChannel(channel: channel, uid: uid, projectId: project.id)
-
-        statusLabel.stringValue = "Joining \(channel)..."
+        statusLabel.stringValue = "Checking microphone permission..."
         statusLabel.textColor = .systemBlue
         joinButton.isEnabled = false
 
-        Log.info("[JoinChannel] Joining channel=\(channel) uid=\(uid) project=\(project.name)")
+        ensureMicrophonePermission { [weak self] micGranted in
+            guard let self = self else { return }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            self?.window?.close()
+            self.hubManager.initializeRTC(appId: project.vendorKey)
+            self.hubManager.joinRTCChannel(channel: channel, uid: uid, projectId: project.id)
+
+            self.statusLabel.stringValue = micGranted ? "Joining \(channel)..." : "Joining \(channel) (no mic permission)..."
+            self.statusLabel.textColor = micGranted ? .systemBlue : .systemOrange
+
+            Log.info("[JoinChannel] Joining channel=\(channel) uid=\(uid) project=\(project.name) micPermission=\(micGranted)")
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                self?.window?.close()
+            }
         }
     }
 

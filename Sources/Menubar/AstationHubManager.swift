@@ -524,21 +524,18 @@ class AstationHubManager: ObservableObject {
     /// POST /api/sessions/{id}/grant to the relay server so the polling atem login
     /// receives the granted status and session token.
     func postGrantToRelayServer(sessionId: String, otp: String) {
-        let urlString = "\(stationRelayUrl)/api/sessions/\(sessionId)/grant"
-        guard let url = URL(string: urlString) else {
-            Log.error("[AstationHub] Invalid grant URL: \(urlString)")
+        guard let request = makeGrantRequest(sessionId: sessionId, otp: otp) else {
             return
         }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["otp": otp])
 
-        URLSession.shared.dataTask(with: request) { _, response, error in
+        NetworkDebugLogger.logRequest(request, label: "RelayGrant")
+        URLSession.shared.dataTask(with: request) { data, response, error in
             if let error = error {
+                NetworkDebugLogger.logError(error, label: "RelayGrant")
                 Log.error("[AstationHub] Grant POST failed: \(error)")
                 return
             }
+            NetworkDebugLogger.logResponse(response, data: data, label: "RelayGrant")
             if let http = response as? HTTPURLResponse {
                 Log.info("[AstationHub] Grant POST status: \(http.statusCode)")
             }
@@ -548,24 +545,47 @@ class AstationHubManager: ObservableObject {
     /// POST /api/sessions/{id}/deny to the relay server so the polling atem login
     /// receives the denied status.
     func postDenyToRelayServer(sessionId: String) {
-        let urlString = "\(stationRelayUrl)/api/sessions/\(sessionId)/deny"
-        guard let url = URL(string: urlString) else {
-            Log.error("[AstationHub] Invalid deny URL: \(urlString)")
+        guard let request = makeDenyRequest(sessionId: sessionId) else {
             return
         }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        URLSession.shared.dataTask(with: request) { _, response, error in
+        NetworkDebugLogger.logRequest(request, label: "RelayDeny")
+        URLSession.shared.dataTask(with: request) { data, response, error in
             if let error = error {
+                NetworkDebugLogger.logError(error, label: "RelayDeny")
                 Log.error("[AstationHub] Deny POST failed: \(error)")
                 return
             }
+            NetworkDebugLogger.logResponse(response, data: data, label: "RelayDeny")
             if let http = response as? HTTPURLResponse {
                 Log.info("[AstationHub] Deny POST status: \(http.statusCode)")
             }
         }.resume()
+    }
+
+    func makeGrantRequest(sessionId: String, otp: String) -> URLRequest? {
+        let urlString = "\(stationRelayUrl)/api/sessions/\(sessionId)/grant"
+        guard let url = URL(string: urlString) else {
+            Log.error("[AstationHub] Invalid grant URL: \(urlString)")
+            return nil
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["otp": otp])
+        return request
+    }
+
+    func makeDenyRequest(sessionId: String) -> URLRequest? {
+        let urlString = "\(stationRelayUrl)/api/sessions/\(sessionId)/deny"
+        guard let url = URL(string: urlString) else {
+            Log.error("[AstationHub] Invalid deny URL: \(urlString)")
+            return nil
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        return request
     }
 
     private func broadcastAuthResponse(_ message: AstationMessage, sessionId: String) {

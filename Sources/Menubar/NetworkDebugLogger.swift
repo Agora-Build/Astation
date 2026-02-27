@@ -1,10 +1,20 @@
 import Foundation
 
 enum NetworkDebugLogger {
-#if DEBUG
     private static let maxPayloadLength = 4000
 
+    // Always on in Debug. In Release, enable with ASTATION_NETWORK_DEBUG=1/true.
+    private static let isEnabled: Bool = {
+        #if DEBUG
+        return true
+        #else
+        let value = ProcessInfo.processInfo.environment["ASTATION_NETWORK_DEBUG"]?.lowercased() ?? ""
+        return value == "1" || value == "true" || value == "yes"
+        #endif
+    }()
+
     static func logRequest(_ request: URLRequest, bodyOverride: Data? = nil, label: String? = nil) {
+        guard isEnabled else { return }
         let method = request.httpMethod ?? "GET"
         let url = request.url?.absoluteString ?? "(nil)"
         let headers = sanitizeHeaders(request.allHTTPHeaderFields ?? [:])
@@ -14,6 +24,7 @@ enum NetworkDebugLogger {
     }
 
     static func logResponse(_ response: URLResponse?, data: Data?, label: String? = nil) {
+        guard isEnabled else { return }
         guard let response else {
             Log.debug("[Net] \(labelPrefix(label))Response <nil>")
             return
@@ -28,14 +39,17 @@ enum NetworkDebugLogger {
     }
 
     static func logError(_ error: Error, label: String? = nil) {
+        guard isEnabled else { return }
         Log.debug("[Net] \(labelPrefix(label))Error \(error)")
     }
 
     static func logWebSocket(direction: String, context: String, message: String) {
+        guard isEnabled else { return }
         Log.debug("[WS] \(direction) \(context): \(truncate(message))")
     }
 
     static func logWebSocketBinary(direction: String, context: String, size: Int) {
+        guard isEnabled else { return }
         Log.debug("[WS] \(direction) \(context): <binary \(size) bytes>")
     }
 
@@ -58,9 +72,7 @@ enum NetworkDebugLogger {
     private static func sanitizeHeaders(_ headers: [AnyHashable: Any]) -> [String: String] {
         var out: [String: String] = [:]
         for (k, v) in headers {
-            let key = String(describing: k)
-            let value = String(describing: v)
-            out[key] = value
+            out[String(describing: k)] = String(describing: v)
         }
         return sanitizeHeaders(out)
     }
@@ -80,11 +92,4 @@ enum NetworkDebugLogger {
         let remaining = text.count - maxPayloadLength
         return "\(prefix)…<truncated \(remaining) chars>"
     }
-#else
-    static func logRequest(_ request: URLRequest, bodyOverride: Data? = nil, label: String? = nil) {}
-    static func logResponse(_ response: URLResponse?, data: Data?, label: String? = nil) {}
-    static func logError(_ error: Error, label: String? = nil) {}
-    static func logWebSocket(direction: String, context: String, message: String) {}
-    static func logWebSocketBinary(direction: String, context: String, size: Int) {}
-#endif
 }
