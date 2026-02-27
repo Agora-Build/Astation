@@ -306,13 +306,20 @@ jobs:
     steps:
       - name: Trigger Coolify deployment
         run: |
-          curl -X POST "${{ secrets.COOLIFY_RELAY_SERVER_WEBHOOK_URL }}" \
+          set -euo pipefail
+          body_file=$(mktemp)
+          status_code=$(curl -sS -o "$body_file" -w "%{http_code}" -X POST "${{ secrets.COOLIFY_RELAY_SERVER_WEBHOOK_URL }}" \
             -H "Content-Type: application/json" \
             -d '{
               "tag": "${{ github.ref_name }}",
               "service": "station-relay-server"
-            }'
-        continue-on-error: true
+            }')
+          echo "Coolify relay deploy webhook HTTP status: $status_code"
+          if [[ "$status_code" -lt 200 || "$status_code" -ge 300 ]]; then
+            echo "Relay deployment webhook failed"
+            cat "$body_file"
+            exit 1
+          fi
 
   deploy-webapp:
     name: Deploy Web App to Coolify
@@ -322,13 +329,20 @@ jobs:
     steps:
       - name: Trigger Coolify deployment
         run: |
-          curl -X POST "${{ secrets.COOLIFY_WEBAPP_WEBHOOK_URL }}" \
+          set -euo pipefail
+          body_file=$(mktemp)
+          status_code=$(curl -sS -o "$body_file" -w "%{http_code}" -X POST "${{ secrets.COOLIFY_WEBAPP_WEBHOOK_URL }}" \
             -H "Content-Type: application/json" \
             -d '{
               "tag": "${{ github.ref_name }}",
               "service": "station-webapp"
-            }'
-        continue-on-error: true
+            }')
+          echo "Coolify webapp deploy webhook HTTP status: $status_code"
+          if [[ "$status_code" -lt 200 || "$status_code" -ge 300 ]]; then
+            echo "Webapp deployment webhook failed"
+            cat "$body_file"
+            exit 1
+          fi
 
   release:
     name: Create GitHub Release
