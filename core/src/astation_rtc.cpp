@@ -9,6 +9,7 @@
 #include "AgoraMediaBase.h"
 #include "astation_screen_capture.h"
 
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
@@ -67,6 +68,104 @@ struct AStationRtcEngineImpl
           callbacks(cb),
           callback_ctx(ctx) {}
 
+    bool refresh_recording_device(const char* reason) {
+        if (!rtc_engine) {
+            return false;
+        }
+
+        agora::rtc::AAudioDeviceManager audio_mgr(rtc_engine);
+        if (!audio_mgr) {
+            std::fprintf(stderr,
+                "[AStationRtc] No audio device manager (reason=%s)\n",
+                reason ? reason : "unknown");
+            return false;
+        }
+
+        auto* devices = audio_mgr->enumerateRecordingDevices();
+        if (!devices) {
+            std::fprintf(stderr,
+                "[AStationRtc] Failed to enumerate recording devices (reason=%s)\n",
+                reason ? reason : "unknown");
+            return false;
+        }
+
+        const int count = devices->getCount();
+        if (count <= 0) {
+            std::fprintf(stderr,
+                "[AStationRtc] No recording device found (reason=%s)\n",
+                reason ? reason : "unknown");
+            devices->release();
+            return false;
+        }
+
+        std::array<char, agora::rtc::MAX_DEVICE_ID_LENGTH> selected_name{};
+        std::array<char, agora::rtc::MAX_DEVICE_ID_LENGTH> selected_id{};
+
+        int default_ret = devices->getDefaultDevice(selected_name.data(), selected_id.data());
+        if (default_ret != 0 || selected_id[0] == '\0') {
+            std::array<char, agora::rtc::MAX_DEVICE_ID_LENGTH> fallback_name{};
+            std::array<char, agora::rtc::MAX_DEVICE_ID_LENGTH> fallback_id{};
+            if (devices->getDevice(0, fallback_name.data(), fallback_id.data()) == 0 &&
+                fallback_id[0] != '\0') {
+                selected_name = fallback_name;
+                selected_id = fallback_id;
+            }
+        }
+
+        std::fprintf(stderr,
+            "[AStationRtc] Recording devices detected=%d (reason=%s)\n",
+            count,
+            reason ? reason : "unknown");
+
+        for (int i = 0; i < count; ++i) {
+            std::array<char, agora::rtc::MAX_DEVICE_ID_LENGTH> name{};
+            std::array<char, agora::rtc::MAX_DEVICE_ID_LENGTH> id{};
+            if (devices->getDevice(i, name.data(), id.data()) == 0) {
+                std::fprintf(stderr,
+                    "[AStationRtc]   device[%d]: name=%s id=%s\n",
+                    i,
+                    name.data(),
+                    id.data());
+            }
+        }
+
+        devices->release();
+
+        if (selected_id[0] == '\0') {
+            std::fprintf(stderr,
+                "[AStationRtc] Failed to pick a recording device (reason=%s)\n",
+                reason ? reason : "unknown");
+            return false;
+        }
+
+        std::array<char, agora::rtc::MAX_DEVICE_ID_LENGTH> current_id{};
+        if (audio_mgr->getRecordingDevice(current_id.data()) == 0 &&
+            std::strcmp(current_id.data(), selected_id.data()) == 0) {
+            std::fprintf(stderr,
+                "[AStationRtc] Recording device already active: %s (reason=%s)\n",
+                selected_name.data(),
+                reason ? reason : "unknown");
+            return true;
+        }
+
+        int set_ret = audio_mgr->setRecordingDevice(selected_id.data());
+        if (set_ret != 0) {
+            std::fprintf(stderr,
+                "[AStationRtc] setRecordingDevice failed: %d (reason=%s, id=%s)\n",
+                set_ret,
+                reason ? reason : "unknown",
+                selected_id.data());
+            return false;
+        }
+
+        std::fprintf(stderr,
+            "[AStationRtc] Recording device selected: %s (id=%s, reason=%s)\n",
+            selected_name.data(),
+            selected_id.data(),
+            reason ? reason : "unknown");
+        return true;
+    }
+
     ~AStationRtcEngineImpl() {
         if (rtc_engine) {
             // Unregister audio observer before releasing
@@ -109,6 +208,7 @@ struct AStationRtcEngineImpl
         // Enable audio subsystem
         if (enable_audio) {
             rtc_engine->enableAudio();
+            refresh_recording_device("engine_init");
         }
 
         // Enable video subsystem so screen sharing can publish video.
@@ -578,6 +678,10 @@ int astation_rtc_join(AStationRtcEngine* engine) {
         impl->uid,
         impl->token.empty() ? "(none)" : "(set)");
 
+    if (impl->enable_audio) {
+        impl->refresh_recording_device("join_channel");
+    }
+
     int ret = impl->rtc_engine->joinChannel(
         impl->token.empty() ? nullptr : impl->token.c_str(),
         impl->channel.c_str(),
@@ -641,6 +745,10 @@ int astation_rtc_mute_mic(AStationRtcEngine* engine, int mute) {
     if (!impl->rtc_engine) {
         std::fprintf(stderr, "[AStationRtc] Cannot mute: engine not initialized\n");
         return -1;
+    }
+
+    if (impl->enable_audio && mute == 0) {
+        impl->refresh_recording_device("unmute_mic");
     }
 
     int ret = impl->rtc_engine->muteLocalAudioStream(mute != 0);
