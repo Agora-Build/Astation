@@ -66,13 +66,24 @@ class SessionLinkManager {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        NetworkDebugLogger.logRequest(request, label: "SessionLink")
-        let (data, response) = try await URLSession.shared.data(for: request)
-        NetworkDebugLogger.logResponse(response, data: data, label: "SessionLink")
+        let data: Data
+        let response: URLResponse
+        do {
+            NetworkDebugLogger.logRequest(request, label: "SessionLink")
+            (data, response) = try await URLSession.shared.data(for: request)
+            NetworkDebugLogger.logResponse(response, data: data, label: "SessionLink")
+        } catch {
+            NetworkDebugLogger.logError(error, label: "SessionLink")
+            throw SessionLinkError.networkError(urlString: urlString, detail: error.localizedDescription)
+        }
 
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 201 else {
-            throw SessionLinkError.serverError
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw SessionLinkError.networkError(urlString: urlString, detail: "No HTTP response")
+        }
+
+        guard httpResponse.statusCode == 201 else {
+            let bodyText = String(data: data, encoding: .utf8) ?? ""
+            throw SessionLinkError.httpError(statusCode: httpResponse.statusCode, body: bodyText)
         }
 
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -131,18 +142,31 @@ enum SessionLinkError: Error, LocalizedError {
     case tokenGenerationFailed
     case noProject
     case invalidServerURL
-    case serverError
+    case networkError(urlString: String, detail: String)
+    case httpError(statusCode: Int, body: String)
     case invalidResponse
 
     var errorDescription: String? {
         switch self {
-        case .maxLinksReached: return "Maximum number of share links reached"
-        case .notInChannel: return "Not currently in an RTC channel"
-        case .tokenGenerationFailed: return "Failed to generate token"
-        case .noProject: return "No Agora project available"
-        case .invalidServerURL: return "Invalid server URL"
-        case .serverError: return "Server returned an error"
-        case .invalidResponse: return "Invalid server response"
+        case .maxLinksReached:
+            return "Maximum number of share links reached"
+        case .notInChannel:
+            return "Not currently in an RTC channel"
+        case .tokenGenerationFailed:
+            return "Failed to generate token"
+        case .noProject:
+            return "No Agora project available"
+        case .invalidServerURL:
+            return "Invalid server URL"
+        case .networkError(let urlString, let detail):
+            return "Could not connect to the server (\(urlString)): \(detail)"
+        case .httpError(let statusCode, let body):
+            if body.isEmpty {
+                return "Server returned HTTP \(statusCode)"
+            }
+            return "Server returned HTTP \(statusCode): \(body)"
+        case .invalidResponse:
+            return "Invalid server response"
         }
     }
 }

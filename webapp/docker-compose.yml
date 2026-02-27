@@ -11,6 +11,8 @@ services:
     build: .
     image: station-webapp
     container_name: station-webapp
+    environment:
+      - STATION_RELAY_UPSTREAM=station-relay-server:3000
     ports:
       - "8080:80"
     depends_on:

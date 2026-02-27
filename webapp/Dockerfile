@@ -1,4 +1,9 @@
 FROM nginx:alpine
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+ENV STATION_RELAY_UPSTREAM=station-relay-server:3000
+
+# nginx official entrypoint renders templates from /etc/nginx/templates/*.template
+COPY nginx.conf /etc/nginx/templates/default.conf.template
 COPY . /usr/share/nginx/html
+
 EXPOSE 80

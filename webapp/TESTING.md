@@ -78,7 +78,7 @@ When the host (Astation) starts screen sharing:
 Web Browser
   ↓ GET /session/abc-123
 Nginx (port 80)
-  ↓ /api/* → proxy to relay-server:3000
+  ↓ /api/* → proxy to ${STATION_RELAY_UPSTREAM}
   ↓ /session/* → serve index.html (SPA)
 API Server (port 3000)
   ↓ Rust Axum + RTC Session Store
@@ -117,11 +117,17 @@ Agora Web SDK 4.x
 - API server has CORS enabled for all origins
 - Nginx proxies /api/* to avoid CORS issues
 
+**Could not connect to server (Astation create link):**
+- Ensure webapp can reach relay via `STATION_RELAY_UPSTREAM`.
+- For separate containers in Coolify, set e.g. `STATION_RELAY_UPSTREAM=10.0.0.1:3000`.
+- Validate from webapp container: `wget -qO- http://$STATION_RELAY_UPSTREAM/api/rtc-sessions` (should return 405/404, not DNS/connect error).
+
 ## Production Deployment
 
 **Environment variables:**
 - `PORT=3000` (API server)
 - `RUST_LOG=info` (API server logging)
+- `STATION_RELAY_UPSTREAM=<relay-host>:3000` (webapp nginx upstream)
 
 **Docker compose production:**
 ```yaml
@@ -130,6 +136,8 @@ services:
     image: ghcr.io/agora-build/station-webapp:latest
     ports:
       - "80:80"
+    environment:
+      - STATION_RELAY_UPSTREAM=relay-server:3000
     depends_on:
       - relay-server
   relay-server:
