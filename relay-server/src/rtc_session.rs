@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -15,6 +16,157 @@ use uuid::Uuid;
 use validator::Validate;
 
 use crate::AppState;
+
+const PUBLIC_BASE_URL_ENV_KEYS: [&str; 2] = ["PUBLIC_BASE_URL", "STATION_PUBLIC_BASE_URL"];
+static PUBLIC_BASE_URL_CACHE: OnceLock<Option<String>> = OnceLock::new();
+
+fn first_csv_header_value(headers: &HeaderMap, key: &str) -> Option<String> {
+    headers
+        .get(key)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn normalize_public_base_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return None;
+    }
+    if trimmed.contains('?') || trimmed.contains('#') {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn configured_public_base_url() -> Option<String> {
+    PUBLIC_BASE_URL_CACHE
+        .get_or_init(|| {
+            for key in PUBLIC_BASE_URL_ENV_KEYS {
+                if let Ok(raw_value) = std::env::var(key) {
+                    if raw_value.trim().is_empty() {
+                        continue;
+                    }
+                    if let Some(normalized) = normalize_public_base_url(&raw_value) {
+                        return Some(normalized);
+                    }
+                    tracing::warn!(
+                        "Ignoring invalid {} value (must include http(s):// and no query/fragment): {}",
+                        key,
+                        raw_value
+                    );
+                }
+            }
+            None
+        })
+        .clone()
+}
+
+fn parse_forwarded_header(headers: &HeaderMap) -> (Option<String>, Option<String>) {
+    let Some(forwarded) = first_csv_header_value(headers, "forwarded") else {
+        return (None, None);
+    };
+
+    let mut proto: Option<String> = None;
+    let mut host: Option<String> = None;
+    for part in forwarded.split(';') {
+        let mut kv = part.splitn(2, '=');
+        let key = kv
+            .next()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let value = kv
+            .next()
+            .map(str::trim)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string();
+        if value.is_empty() {
+            continue;
+        }
+        match key.as_str() {
+            "proto" => proto = Some(value),
+            "host" => host = Some(value),
+            _ => {}
+        }
+    }
+    (proto, host)
+}
+
+fn host_has_port(host: &str) -> bool {
+    if host.starts_with('[') {
+        host.contains("]:")
+    } else {
+        host.matches(':').count() == 1
+    }
+}
+
+fn local_hostname(host: &str) -> bool {
+    let host_only = if host.starts_with('[') {
+        host.trim_start_matches('[')
+            .split(']')
+            .next()
+            .unwrap_or(host)
+            .to_string()
+    } else {
+        host.split(':').next().unwrap_or(host).to_string()
+    };
+
+    host_only == "localhost"
+        || host_only == "127.0.0.1"
+        || host_only == "::1"
+        || host_only.starts_with("10.")
+        || host_only.starts_with("192.168.")
+        || host_only
+            .strip_prefix("172.")
+            .and_then(|tail| tail.split('.').next())
+            .and_then(|segment| segment.parse::<u8>().ok())
+            .map(|second_octet| (16..=31).contains(&second_octet))
+            .unwrap_or(false)
+}
+
+fn normalize_proto(proto: &str) -> Option<&'static str> {
+    match proto.trim().to_ascii_lowercase().as_str() {
+        "http" => Some("http"),
+        "https" => Some("https"),
+        _ => None,
+    }
+}
+
+fn derive_session_base_url(headers: &HeaderMap, configured_base: Option<&str>) -> String {
+    if let Some(base) = configured_base.and_then(normalize_public_base_url) {
+        return base;
+    }
+
+    let (forwarded_proto, forwarded_host) = parse_forwarded_header(headers);
+
+    let mut host = forwarded_host
+        .or_else(|| first_csv_header_value(headers, "x-forwarded-host"))
+        .or_else(|| first_csv_header_value(headers, "host"))
+        .unwrap_or_else(|| "localhost:8080".to_string());
+
+    if !host_has_port(&host) {
+        if let Some(port) = first_csv_header_value(headers, "x-forwarded-port") {
+            if !port.is_empty() {
+                host = format!("{}:{}", host, port);
+            }
+        }
+    }
+
+    let inferred_proto = if local_hostname(&host) { "http" } else { "https" };
+    let proto = forwarded_proto
+        .or_else(|| first_csv_header_value(headers, "x-forwarded-proto"))
+        .and_then(|value| normalize_proto(&value).map(str::to_string))
+        .unwrap_or_else(|| inferred_proto.to_string());
+
+    format!("{}://{}", proto, host)
+}
 
 // --- Data Models ---
 
@@ -255,27 +407,12 @@ pub async fn create_rtc_session_handler(
         host_header, x_fwd_host, x_fwd_port, x_fwd_proto
     );
 
-    // Construct URL from Host header (which includes the port the client connected to)
-    let host = headers
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost:8080")
-        .to_string();
-
-    // Check X-Forwarded-Proto for protocol, or infer from host
-    let forwarded_proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|h| h.to_str().ok());
-
-    let protocol = if let Some(proto) = forwarded_proto {
-        proto
-    } else if host.contains("localhost") || host.starts_with("127.0.0.1") || host.starts_with("192.168.") || host.starts_with("10.") {
-        "http"
-    } else {
-        "https"
-    };
-
-    let url = format!("{}://{}/session/{}", protocol, host, id);
+    let configured_public_base = configured_public_base_url();
+    if let Some(base) = configured_public_base.as_deref() {
+        tracing::info!("Using configured public base URL for sessions: {}", base);
+    }
+    let base_url = derive_session_base_url(&headers, configured_public_base.as_deref());
+    let url = format!("{}/session/{}", base_url, id);
 
     tracing::info!("Generated session URL: {}", url);
 
@@ -362,7 +499,7 @@ mod tests {
     use super::*;
     use axum::{
         body::Body,
-        http::{Request, StatusCode},
+        http::{HeaderMap, HeaderValue, Request, StatusCode},
         routing::{delete, get, post},
         Router,
     };
@@ -601,6 +738,42 @@ mod tests {
         assert!(result.unwrap_err().contains("full"));
     }
 
+    #[test]
+    fn test_derive_session_base_url_prefers_configured_public_base() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("internal:3000"));
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("station-staging.agora.build"),
+        );
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+
+        let base = derive_session_base_url(&headers, Some("https://station-staging.agora.build/"));
+        assert_eq!(base, "https://station-staging.agora.build");
+    }
+
+    #[test]
+    fn test_derive_session_base_url_uses_forwarded_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "forwarded",
+            HeaderValue::from_static("for=1.1.1.1;proto=https;host=station-staging.agora.build"),
+        );
+        headers.insert("host", HeaderValue::from_static("internal:3000"));
+
+        let base = derive_session_base_url(&headers, None);
+        assert_eq!(base, "https://station-staging.agora.build");
+    }
+
+    #[test]
+    fn test_derive_session_base_url_infers_http_for_localhost() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("127.0.0.1:3000"));
+
+        let base = derive_session_base_url(&headers, None);
+        assert_eq!(base, "http://127.0.0.1:3000");
+    }
+
     // --- Handler Tests ---
 
     #[tokio::test]
@@ -628,7 +801,8 @@ mod tests {
             .unwrap();
         let resp: CreateRtcSessionResponse = serde_json::from_slice(&body).unwrap();
         assert!(!resp.id.is_empty());
-        assert!(resp.url.starts_with("https://station.agora.build/session/"));
+        assert!(resp.url.contains("/session/"));
+        assert!(resp.url.contains(&resp.id));
     }
 
     #[tokio::test]
@@ -1042,7 +1216,7 @@ mod tests {
             .unwrap();
         let resp: CreateRtcSessionResponse = serde_json::from_slice(&body).unwrap();
 
-        assert!(resp.url.starts_with("https://station.agora.build/session/"));
+        assert!(resp.url.contains("/session/"));
         assert!(resp.url.contains(&resp.id));
         assert!(uuid::Uuid::parse_str(&resp.id).is_ok(), "Session ID should be valid UUID");
     }

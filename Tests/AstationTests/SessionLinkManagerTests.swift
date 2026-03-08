@@ -55,9 +55,9 @@ final class SessionLinkManagerTests: XCTestCase {
 
     func testNetworkErrorDescriptionContainsURL() {
         let description = SessionLinkError
-            .networkError(urlString: "https://station.staging.agora.build/api/rtc-sessions", detail: "timed out")
+            .networkError(urlString: "https://station-staging.agora.build/api/rtc-sessions", detail: "timed out")
             .errorDescription ?? ""
-        XCTAssertTrue(description.contains("https://station.staging.agora.build/api/rtc-sessions"))
+        XCTAssertTrue(description.contains("https://station-staging.agora.build/api/rtc-sessions"))
         XCTAssertTrue(description.contains("timed out"))
     }
 

@@ -6,6 +6,7 @@ services:
 
     environment:
       - CORS_ORIGIN=${CORS_ORIGIN:-https://station.agora.build}
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-https://station.agora.build}
       - PORT=${PORT:-3000}
       - RUST_LOG=${RUST_LOG:-info}
 

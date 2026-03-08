@@ -87,6 +87,9 @@ Relay Server (localhost:3000)
 # CORS origin (required for production)
 CORS_ORIGIN=https://station.agora.build
 
+# Public base URL used for generated share links (recommended)
+PUBLIC_BASE_URL=https://station.agora.build
+
 # Port (default: 3000)
 PORT=3000
 
@@ -221,7 +224,9 @@ Web User → Opens https://station.agora.build/session/{id}
 # 1. Create environment file
 cd relay-server
 cp .env.example .env
-# Edit: CORS_ORIGIN=https://station.agora.build
+# Edit:
+#   CORS_ORIGIN=https://station.agora.build
+#   PUBLIC_BASE_URL=https://station.agora.build
 
 # 2. Deploy
 docker compose up -d
@@ -238,8 +243,10 @@ curl http://localhost:3000/api/pair
 
 1. Coolify → New Docker Compose service
 2. GitHub: Agora-Build/Astation, path: relay-server
-3. Environment: CORS_ORIGIN=https://station.staging.agora.build
-4. Domain: station.staging.agora.build
+3. Environment:
+   CORS_ORIGIN=https://station-staging.agora.build
+   PUBLIC_BASE_URL=https://station-staging.agora.build
+4. Domain: station-staging.agora.build
 5. Deploy
 ```
 

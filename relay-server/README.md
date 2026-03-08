@@ -25,6 +25,7 @@ docker compose -f docker-compose.dev.yml up
 # 1. Configure
 cp .env.example .env
 # Edit: CORS_ORIGIN=https://station.agora.build
+#       PUBLIC_BASE_URL=https://station.agora.build
 
 # 2. Deploy
 docker compose up -d
@@ -35,14 +36,16 @@ docker compose up -d
 # Coolify UI:
 # 1. New Docker Compose service
 # 2. GitHub: Agora-Build/Astation, path: relay-server
-# 3. Environment: CORS_ORIGIN=https://station.staging.agora.build
-# 4. Domain: station.staging.agora.build
+# 3. Environment:
+#    CORS_ORIGIN=https://station-staging.agora.build
+#    PUBLIC_BASE_URL=https://station-staging.agora.build
+# 4. Domain: station-staging.agora.build
 # 5. Deploy
 ```
 
 **URLs:**
 - Production: `https://station.agora.build`
-- Staging: `https://station.staging.agora.build`
+- Staging: `https://station-staging.agora.build`
 - Dev: `http://localhost:3000`
 
 ---
@@ -85,12 +88,14 @@ Config: Set `relay_url` and `ws_url` in `.atem/config.toml`
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CORS_ORIGIN` | `https://station.agora.build` | Allowed origin for CORS (set to `*` for dev) |
+| `PUBLIC_BASE_URL` | _(unset)_ | Public base URL used for generated session links (recommended in production) |
 | `PORT` | `3000` | Server port |
 | `RUST_LOG` | `info` | Log level (error, warn, info, debug, trace) |
 
 **Production:**
 ```bash
 CORS_ORIGIN=https://station.agora.build
+PUBLIC_BASE_URL=https://station.agora.build
 PORT=3000
 RUST_LOG=info
 ```
