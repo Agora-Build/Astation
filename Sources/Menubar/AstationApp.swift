@@ -174,6 +174,8 @@ class AstationApp: NSObject, NSApplicationDelegate {
         switch url.host {
         case "auth":
             handleAuthDeepLink(url)
+        case "pair":
+            handlePairDeepLink(url)
         default:
             Log.warn(" Unknown deep link path: \(url.host ?? "nil")")
         }
@@ -210,5 +212,20 @@ class AstationApp: NSObject, NSApplicationDelegate {
             // Notify hub manager of the auth result
             self.hubManager?.handleAuthResult(session)
         }
+    }
+
+    private func handlePairDeepLink(_ url: URL) {
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let params = components?.queryItems?.reduce(into: [String: String]()) { dict, item in
+            dict[item.name] = item.value
+        } ?? [:]
+
+        guard let code = params["code"], !code.isEmpty else {
+            Log.error(" Pair deep link missing required 'code' parameter")
+            return
+        }
+
+        Log.info(" Pair deep link received with code: \(code)")
+        hubManager?.connectToRelay(code: code)
     }
 }
