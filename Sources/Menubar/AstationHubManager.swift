@@ -201,7 +201,8 @@ class AstationHubManager: ObservableObject {
         guard let credentials = credentialManager.load() else { return }
         let msg = AstationMessage.credentialSync(
             customerId: credentials.customerId,
-            customerSecret: credentials.customerSecret
+            customerSecret: credentials.customerSecret,
+            astationId: AstationIdentity.shared.id
         )
         broadcastHandler?(msg)
         Log.info("[AstationHub] Broadcast credentialSync to all connected Atems")
@@ -212,7 +213,8 @@ class AstationHubManager: ObservableObject {
         guard let credentials = credentialManager.load() else { return }
         let msg = AstationMessage.credentialSync(
             customerId: credentials.customerId,
-            customerSecret: credentials.customerSecret
+            customerSecret: credentials.customerSecret,
+            astationId: AstationIdentity.shared.id
         )
         sendHandler?(msg, clientId)
         Log.info("[AstationHub] Sent credentialSync to client \(clientId.prefix(8))…")
@@ -969,6 +971,102 @@ class AstationHubManager: ObservableObject {
                     self?.removeClient(withId: clientId)
                 }
             }
+        }
+    }
+
+    // MARK: - Identity Relay (persistent background relay for TUI auto-reconnect)
+
+    /// Connect to the relay using this Astation's own identity as the room code.
+    /// Atem stores the identity after first pairing and uses it for TUI auto-connect.
+    func startIdentityRelay() {
+        let identityCode = AstationIdentity.shared.id
+        let wsScheme: String
+        if stationRelayUrl.hasPrefix("https://") {
+            wsScheme = stationRelayUrl.replacingOccurrences(of: "https://", with: "wss://")
+        } else {
+            wsScheme = stationRelayUrl.replacingOccurrences(of: "http://", with: "ws://")
+        }
+        let wsUrl = "\(wsScheme)/ws?role=astation&code=\(identityCode)"
+
+        guard let url = URL(string: wsUrl) else {
+            Log.error("[AstationHub] Invalid identity relay URL: \(wsUrl)")
+            return
+        }
+
+        let task = URLSession.shared.webSocketTask(with: url)
+        task.resume()
+
+        let relayClientId = "identity-relay"
+
+        // Wire sendHandler so hub can route messages to this relay client
+        let originalSend = sendHandler
+        sendHandler = { [weak task] message, targetId in
+            if targetId == relayClientId {
+                if let jsonData = try? JSONEncoder().encode(message),
+                   let jsonString = String(data: jsonData, encoding: .utf8) {
+                    NetworkDebugLogger.logWebSocket(direction: "send", context: "identity-relay", message: jsonString)
+                    task?.send(.string(jsonString)) { _ in }
+                }
+            } else {
+                originalSend?(message, targetId)
+            }
+        }
+
+        Log.info("[AstationHub] Identity relay connecting: \(wsUrl)")
+        readIdentityRelayMessages(task: task, clientId: relayClientId)
+    }
+
+    private func readIdentityRelayMessages(task: URLSessionWebSocketTask, clientId: String) {
+        task.receive { [weak self] result in
+            switch result {
+            case .success(let message):
+                switch message {
+                case .string(let text):
+                    NetworkDebugLogger.logWebSocket(direction: "recv", context: "identity-relay", message: text)
+                    if let data = text.data(using: .utf8),
+                       let msg = try? JSONDecoder().decode(AstationMessage.self, from: data) {
+                        DispatchQueue.main.async {
+                            self?.handleIdentityRelayMessage(msg, task: task, clientId: clientId)
+                        }
+                    }
+                default:
+                    break
+                }
+                self?.readIdentityRelayMessages(task: task, clientId: clientId)
+
+            case .failure(let error):
+                Log.info("[AstationHub] Identity relay disconnected: \(error) — reconnecting in 10s")
+                DispatchQueue.main.async {
+                    self?.removeClient(withId: clientId)
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) {
+                    self?.startIdentityRelay()
+                }
+            }
+        }
+    }
+
+    private func handleIdentityRelayMessage(_ msg: AstationMessage, task: URLSessionWebSocketTask, clientId: String) {
+        // When Atem connects to the identity relay room, it sends a "hello" to announce itself.
+        // We respond by registering it as a connected client (which sends credentials).
+        if case .statusUpdate(let status, let data) = msg, status == "hello" {
+            let hostname = data["hostname"] ?? "unknown"
+            Log.info("[AstationHub] Atem connected via identity relay from: \(hostname)")
+
+            let client = ConnectedClient(
+                id: clientId,
+                clientType: "Atem",
+                connectedAt: Date(),
+                hostname: "relay:\(hostname)"
+            )
+            // addClient calls sendCredentials(toClientId: clientId) via sendHandler
+            addClient(client)
+            return
+        }
+
+        // Forward all other messages through the hub and send any response back
+        if let response = handleMessage(msg, from: clientId) {
+            sendHandler?(response, clientId)
         }
     }
 }

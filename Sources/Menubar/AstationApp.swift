@@ -98,6 +98,10 @@ class AstationApp: NSObject, NSApplicationDelegate {
         }
         hotkeyManager?.registerHotkeys()
 
+        // Connect to relay using this Astation's identity, so Atem TUI can auto-reconnect
+        // after the first `atem pair` without needing to pair again.
+        hubManager.startIdentityRelay()
+
         Log.info("Astation fully operational!")
         Log.info("Global hotkeys: Ctrl+V (PTT voice coding), Ctrl+Shift+V (video)")
         Log.info("Log file: \(Log.logFile.path)")

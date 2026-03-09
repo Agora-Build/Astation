@@ -43,7 +43,7 @@ enum AstationMessage: Codable {
     // Agent hub (Astation ↔ Atem)
     case agentListRequest
     case agentListResponse(agents: [AtemAgentInfo])
-    case credentialSync(customerId: String, customerSecret: String)
+    case credentialSync(customerId: String, customerSecret: String, astationId: String)
     
     // Custom encoding/decoding to handle the enum cases
     private enum CodingKeys: String, CodingKey {
@@ -241,17 +241,19 @@ enum AstationMessage: Codable {
             var dataContainer = container.nestedContainer(keyedBy: AgentListKeys.self, forKey: .data)
             try dataContainer.encode(agents, forKey: .agents)
 
-        case .credentialSync(let customerId, let customerSecret):
+        case .credentialSync(let customerId, let customerSecret, let astationId):
             try container.encode(MessageType.credentialSync, forKey: .type)
             var dataContainer = container.nestedContainer(keyedBy: CredentialSyncKeys.self, forKey: .data)
             try dataContainer.encode(customerId, forKey: .customerId)
             try dataContainer.encode(customerSecret, forKey: .customerSecret)
+            try dataContainer.encode(astationId, forKey: .astationId)
         }
     }
 
     private enum CredentialSyncKeys: String, CodingKey {
         case customerId = "customer_id"
         case customerSecret = "customer_secret"
+        case astationId = "astation_id"
     }
     
     init(from decoder: Decoder) throws {
@@ -424,7 +426,8 @@ enum AstationMessage: Codable {
             let dataContainer = try container.nestedContainer(keyedBy: CredentialSyncKeys.self, forKey: .data)
             let customerId = try dataContainer.decode(String.self, forKey: .customerId)
             let customerSecret = try dataContainer.decode(String.self, forKey: .customerSecret)
-            self = .credentialSync(customerId: customerId, customerSecret: customerSecret)
+            let astationId = try dataContainer.decodeIfPresent(String.self, forKey: .astationId) ?? AstationIdentity.shared.id
+            self = .credentialSync(customerId: customerId, customerSecret: customerSecret, astationId: astationId)
         }
     }
 }

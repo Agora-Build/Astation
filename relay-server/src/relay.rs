@@ -216,15 +216,24 @@ pub async fn ws_handler(
         None => return (StatusCode::BAD_REQUEST, "Missing role parameter").into_response(),
     };
 
-    // Verify room exists
-    {
+    // For astation: auto-create identity room if it doesn't exist (allows persistent relay rooms).
+    // For atem/other: verify the room exists (atem can only join, not create).
+    if role == "astation" {
+        let mut rooms = hub.rooms.write().await;
+        rooms.entry(code.clone()).or_insert_with(|| {
+            tracing::info!("Auto-creating identity room for code={}", &code[..code.len().min(16)]);
+            PairRoom {
+                code: code.clone(),
+                hostname: "identity".to_string(),
+                atem_tx: None,
+                astation_tx: None,
+                created_at: Instant::now(),
+            }
+        });
+    } else {
         let rooms = hub.rooms.read().await;
         if !rooms.contains_key(&code) {
-            return (
-                StatusCode::NOT_FOUND,
-                "Room not found",
-            )
-                .into_response();
+            return (StatusCode::NOT_FOUND, "Room not found").into_response();
         }
     }
 
