@@ -212,7 +212,7 @@ async fn main() {
         )
         // Relay API routes
         .route("/api/pair", post(relay::create_pair_handler))
-        .route("/api/pair/:code", get(relay::pair_status_handler));
+        .route("/api/pair/:code", get(relay::pair_status_handler).delete(relay::delete_pair_handler));
         // Rate limiting temporarily disabled for local testing with nginx proxy
         // .layer(GovernorLayer {
         //     config: governor_conf_general.clone(),

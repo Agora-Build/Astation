@@ -88,6 +88,14 @@ pub struct CreatePairResponse {
 pub struct PairStatusResponse {
     pub paired: bool,
     pub hostname: String,
+    pub atem_connected: bool,
+    pub astation_connected: bool,
+    pub expired: bool,
+}
+
+#[derive(Serialize)]
+pub struct DeletePairResponse {
+    pub closed: bool,
 }
 
 #[derive(Deserialize)]
@@ -146,16 +154,38 @@ pub async fn pair_status_handler(
     let rooms = state.relay.rooms.read().await;
     match rooms.get(&code) {
         Some(room) => {
-            let paired = room.astation_tx.is_some();
+            let atem_connected = room.atem_tx.is_some();
+            let astation_connected = room.astation_tx.is_some();
+            let paired = atem_connected && astation_connected;
+            let age = Instant::now().duration_since(room.created_at).as_secs();
+            let expired = !astation_connected && age >= ROOM_EXPIRY_SECS;
             Ok(Json(PairStatusResponse {
                 paired,
                 hostname: room.hostname.clone(),
+                atem_connected,
+                astation_connected,
+                expired,
             }))
         }
         None => Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Room not found"})),
         )),
+    }
+}
+
+/// DELETE /api/pair/:code — Close a pairing room.
+/// Removes the room, disconnecting both sides.
+pub async fn delete_pair_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(code): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let mut rooms = state.relay.rooms.write().await;
+    if rooms.remove(&code).is_some() {
+        tracing::info!("Pair room closed by client: {}", code);
+        (StatusCode::OK, Json(DeletePairResponse { closed: true })).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Room not found"}))).into_response()
     }
 }
 
@@ -217,7 +247,7 @@ pub async fn ws_handler(
     };
 
     // For astation: auto-create identity room if it doesn't exist (allows persistent relay rooms).
-    // For atem/other: verify the room exists (atem can only join, not create).
+    // For atem/other: verify the room exists and has not expired.
     if role == "astation" {
         let mut rooms = hub.rooms.write().await;
         rooms.entry(code.clone()).or_insert_with(|| {
@@ -232,8 +262,17 @@ pub async fn ws_handler(
         });
     } else {
         let rooms = hub.rooms.read().await;
-        if !rooms.contains_key(&code) {
-            return (StatusCode::NOT_FOUND, "Room not found").into_response();
+        match rooms.get(&code) {
+            None => return (StatusCode::NOT_FOUND, "Room not found").into_response(),
+            Some(room) => {
+                // If room is expired (no astation and older than limit), reject with 410 Gone
+                if room.astation_tx.is_none() {
+                    let age = Instant::now().duration_since(room.created_at).as_secs();
+                    if age >= ROOM_EXPIRY_SECS {
+                        return (StatusCode::GONE, "Pairing code has expired").into_response();
+                    }
+                }
+            }
         }
     }
 
@@ -347,17 +386,35 @@ pub async fn pair_page_handler(
     State(state): State<AppState>,
     Query(params): Query<PairPageQuery>,
 ) -> impl IntoResponse {
-    let rooms = state.relay.rooms.read().await;
-    match rooms.get(&params.code) {
-        Some(room) => {
-            let html = render_pair_page(&params.code, &room.hostname);
-            Ok(Html(html))
+    let (hostname, initial_status) = {
+        let rooms = state.relay.rooms.read().await;
+        match rooms.get(&params.code) {
+            Some(room) => {
+                let age = Instant::now().duration_since(room.created_at).as_secs();
+                let expired = room.astation_tx.is_none() && age >= ROOM_EXPIRY_SECS;
+                let status = InitialPageStatus {
+                    atem_connected: room.atem_tx.is_some(),
+                    astation_connected: room.astation_tx.is_some(),
+                    expired,
+                };
+                (room.hostname.clone(), status)
+            }
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Html("<h1>Pairing code not found</h1><p>The code may have expired.</p>".to_string()),
+                ).into_response()
+            }
         }
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Html("<h1>Pairing code not found</h1><p>The code may have expired.</p>".to_string()),
-        )),
-    }
+    };
+    let html = render_pair_page(&params.code, &hostname, &initial_status);
+    Html(html).into_response()
+}
+
+struct InitialPageStatus {
+    atem_connected: bool,
+    astation_connected: bool,
+    expired: bool,
 }
 
 /// HTML-escape a string to prevent XSS attacks
@@ -375,46 +432,143 @@ fn html_escape(s: &str) -> String {
         .collect()
 }
 
-fn render_pair_page(code: &str, hostname: &str) -> String {
-    let code_escaped = html_escape(code);
-    let hostname_escaped = html_escape(hostname);
+fn render_pair_page(code: &str, hostname: &str, status: &InitialPageStatus) -> String {
+    let code_esc = html_escape(code);
+    let hostname_esc = html_escape(hostname);
+    let code_url = urlencoding::encode(code);
+    // Initial state classes for JS
+    let atem_dot = if status.atem_connected { "dot connected" } else { "dot" };
+    let astation_dot = if status.astation_connected { "dot connected" } else { "dot" };
+    let expired_class = if status.expired { " expired" } else { "" };
 
-    format!(
-        r#"<!DOCTYPE html>
+    format!(r#"<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Atem Pairing — {code}</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #0a0a0a; color: #e0e0e0; }}
-    .card {{ background: #1a1a2e; border-radius: 16px; padding: 48px; text-align: center; max-width: 420px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }}
-    .code {{ font-size: 48px; font-weight: 700; letter-spacing: 4px; color: #00d4aa; margin: 24px 0; font-family: 'SF Mono', monospace; }}
-    .hostname {{ color: #888; font-size: 14px; margin-bottom: 32px; }}
-    .btn {{ display: inline-block; padding: 12px 32px; background: #00d4aa; color: #0a0a0a; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 16px; transition: background 0.2s; }}
-    .btn:hover {{ background: #00f5c4; }}
-    .download {{ margin-top: 24px; font-size: 13px; color: #666; }}
-    .download a {{ color: #00d4aa; }}
-    h2 {{ margin: 0 0 8px; font-size: 20px; color: #fff; }}
-    p {{ margin: 4px 0; font-size: 14px; color: #aaa; }}
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;background:#0a0a0a;color:#e0e0e0}}
+    .card{{background:#1a1a2e;border-radius:16px;padding:40px 48px;text-align:center;width:100%;max-width:440px;box-shadow:0 8px 32px rgba(0,0,0,.4);transition:opacity .4s}}
+    .card.expired{{opacity:.45;pointer-events:none}}
+    h2{{font-size:20px;color:#fff;margin-bottom:6px}}
+    .sub{{font-size:14px;color:#888;margin-bottom:4px}}
+    .code{{font-size:46px;font-weight:700;letter-spacing:5px;color:#00d4aa;margin:20px 0;font-family:'SF Mono',monospace}}
+    .hostname{{font-size:13px;color:#555;margin-bottom:28px}}
+    .btn{{display:inline-block;padding:11px 30px;background:#00d4aa;color:#0a0a0a;border-radius:8px;text-decoration:none;font-weight:600;font-size:15px;transition:background .2s}}
+    .btn:hover{{background:#00f5c4}}
+    .btn-close{{display:inline-block;padding:11px 30px;background:#2a1a1a;color:#ff6b6b;border:1px solid #ff6b6b44;border-radius:8px;font-weight:600;font-size:15px;cursor:pointer;transition:all .2s}}
+    .btn-close:hover{{background:#ff6b6b22}}
+    .status-row{{display:flex;justify-content:center;gap:24px;margin-top:28px;font-size:13px;color:#666}}
+    .dot{{width:8px;height:8px;border-radius:50%;background:#333;display:inline-block;margin-right:6px;transition:background .3s}}
+    .dot.connected{{background:#00d4aa;box-shadow:0 0 6px #00d4aa88}}
+    .info-box{{background:#0f1a14;border:1px solid #00d4aa33;border-radius:10px;padding:16px;margin:20px 0;font-size:13px;text-align:left}}
+    .info-row{{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #ffffff08}}
+    .info-row:last-child{{border-bottom:none}}
+    .info-label{{color:#666}}
+    .info-value{{color:#ccc;font-family:'SF Mono',monospace;font-size:12px}}
+    .success-icon{{font-size:36px;margin-bottom:12px}}
+    .download{{margin-top:20px;font-size:13px;color:#444}}
+    .download a{{color:#00d4aa;text-decoration:none}}
+    #expired-msg{{color:#ff6b6b;font-size:14px;margin-top:12px;display:none}}
+    #closed-msg{{color:#888;font-size:14px;margin-top:12px;display:none}}
+    #view-waiting,#view-paired{{display:none}}
   </style>
 </head>
 <body>
-  <div class="card">
-    <h2>Atem Pairing</h2>
-    <p>Enter this code in Astation to connect</p>
-    <div class="code">{code}</div>
-    <div class="hostname">Host: {hostname}</div>
-    <a class="btn" href="astation://pair?code={code_url}">Open in Astation</a>
-    <div class="download">
-      <p>Don't have Astation? <a href="https://github.com/AgoraIO-Community/astation/releases">Download</a></p>
+  <div class="card{expired_class}" id="card">
+    <div id="view-waiting">
+      <h2>Atem Pairing</h2>
+      <p class="sub">Open in Astation to connect</p>
+      <div class="code">{code}</div>
+      <div class="hostname">Host: {hostname}</div>
+      <a class="btn" href="astation://pair?code={code_url}">Open in Astation</a>
+      <div id="expired-msg">⏱ This pairing code has expired.</div>
+      <div class="download"><p>No Astation? <a href="https://github.com/AgoraIO-Community/astation/releases">Download</a></p></div>
+    </div>
+
+    <div id="view-paired">
+      <div class="success-icon">🔗</div>
+      <h2>Connected!</h2>
+      <p class="sub" style="margin-bottom:16px">Atem and Astation are paired via relay</p>
+      <div class="info-box">
+        <div class="info-row"><span class="info-label">Atem host</span><span class="info-value" id="paired-hostname">—</span></div>
+        <div class="info-row"><span class="info-label">Code</span><span class="info-value">{code}</span></div>
+      </div>
+      <button class="btn-close" onclick="closeRoom()">Close Connection</button>
+      <div id="closed-msg">Connection closed.</div>
+    </div>
+
+    <div class="status-row">
+      <span><span class="{atem_dot}" id="atem-dot"></span>Atem</span>
+      <span><span class="{astation_dot}" id="astation-dot"></span>Astation</span>
     </div>
   </div>
+
+  <script>
+    var CODE = {code_json};
+    var pollTimer = null;
+
+    function setDot(id, on) {{
+      var el = document.getElementById(id);
+      if (on) el.classList.add('connected'); else el.classList.remove('connected');
+    }}
+
+    function showExpired() {{
+      document.getElementById('card').classList.add('expired');
+      document.getElementById('expired-msg').style.display = 'block';
+      document.getElementById('view-waiting').style.display = 'block';
+      clearTimeout(pollTimer);
+    }}
+
+    function showPaired(data) {{
+      document.getElementById('view-waiting').style.display = 'none';
+      document.getElementById('view-paired').style.display = 'block';
+      document.getElementById('paired-hostname').textContent = data.hostname || '—';
+      clearTimeout(pollTimer);
+    }}
+
+    function showWaiting() {{
+      document.getElementById('view-waiting').style.display = 'block';
+      document.getElementById('view-paired').style.display = 'none';
+    }}
+
+    async function poll() {{
+      try {{
+        var resp = await fetch('/api/pair/' + CODE);
+        if (resp.status === 404) {{ showExpired(); return; }}
+        var data = await resp.json();
+        setDot('atem-dot', data.atem_connected);
+        setDot('astation-dot', data.astation_connected);
+        if (data.expired) {{ showExpired(); return; }}
+        if (data.paired) {{ showPaired(data); return; }}
+        showWaiting();
+        pollTimer = setTimeout(poll, 2000);
+      }} catch(e) {{
+        pollTimer = setTimeout(poll, 5000);
+      }}
+    }}
+
+    async function closeRoom() {{
+      try {{
+        await fetch('/api/pair/' + CODE, {{ method: 'DELETE' }});
+      }} catch(e) {{}}
+      document.getElementById('closed-msg').style.display = 'block';
+      document.querySelector('.btn-close').style.display = 'none';
+    }}
+
+    poll();
+  </script>
 </body>
 </html>"#,
-        code = code_escaped,
-        hostname = hostname_escaped,
-        code_url = urlencoding::encode(code),
+        code = code_esc,
+        hostname = hostname_esc,
+        code_url = code_url,
+        code_json = serde_json::to_string(code).unwrap_or_else(|_| format!("\"{}\"", code_esc)),
+        expired_class = expired_class,
+        atem_dot = atem_dot,
+        astation_dot = astation_dot,
     )
 }
 
@@ -547,9 +701,13 @@ mod tests {
         );
     }
 
+    fn default_status() -> InitialPageStatus {
+        InitialPageStatus { atem_connected: false, astation_connected: false, expired: false }
+    }
+
     #[test]
     fn render_pair_page_contains_code() {
-        let html = render_pair_page("TEST-CODE", "my-host");
+        let html = render_pair_page("TEST-CODE", "my-host", &default_status());
         assert!(html.contains("TEST-CODE"));
         assert!(html.contains("my-host"));
         assert!(html.contains("astation://pair?code=TEST-CODE"));
@@ -574,7 +732,7 @@ mod tests {
         };
         Router::new()
             .route("/api/pair", axum::routing::post(create_pair_handler))
-            .route("/api/pair/:code", axum::routing::get(pair_status_handler))
+            .route("/api/pair/:code", axum::routing::get(pair_status_handler).delete(delete_pair_handler))
             .route("/ws", axum::routing::get(ws_handler))
             .route("/pair", axum::routing::get(pair_page_handler))
             .with_state(state)
@@ -903,12 +1061,12 @@ mod tests {
     #[tokio::test]
     async fn test_pair_page_xss_protection() {
         // Test that hostname with HTML/JS is safely escaped
-        let html = render_pair_page("TEST-CODE", "<script>alert('xss')</script>");
+        let html = render_pair_page("TEST-CODE", "<script>alert('xss')</script>", &default_status());
         // If properly escaped, the literal string should appear, not executed
         assert!(!html.contains("<script>alert"), "Script tags should be escaped or removed");
 
         // Test with other XSS vectors
-        let html2 = render_pair_page("CODE-123", "' onload='alert(1)'");
+        let html2 = render_pair_page("CODE-123", "' onload='alert(1)'", &default_status());
         assert!(!html2.contains("onload='alert"), "Event handlers should be escaped");
     }
 
@@ -976,16 +1134,18 @@ mod tests {
         let status: PairStatusResponse = serde_json::from_slice(&body).unwrap();
         assert!(!status.paired, "Should not be paired initially");
 
-        // Simulate astation connection
-        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        // Simulate both sides connecting
+        let (tx_astation, _rx) = mpsc::unbounded_channel::<String>();
+        let (tx_atem, _rx2) = mpsc::unbounded_channel::<String>();
         {
             let mut rooms = state.relay.rooms.write().await;
             if let Some(room) = rooms.get_mut(&code) {
-                room.astation_tx = Some(tx);
+                room.astation_tx = Some(tx_astation);
+                room.atem_tx = Some(tx_atem);
             }
         }
 
-        // Check status after pairing
+        // Check status after both connected
         let app2 = Router::new()
             .route("/api/pair/:code", axum::routing::get(pair_status_handler))
             .with_state(state);
@@ -1002,7 +1162,9 @@ mod tests {
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let status: PairStatusResponse = serde_json::from_slice(&body).unwrap();
-        assert!(status.paired, "Should be paired after astation connects");
+        assert!(status.paired, "Should be paired after both sides connect");
+        assert!(status.astation_connected);
+        assert!(status.atem_connected);
     }
 
     #[tokio::test]
