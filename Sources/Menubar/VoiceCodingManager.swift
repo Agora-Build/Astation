@@ -1,4 +1,8 @@
 import Foundation
+#if os(macOS)
+import AppKit
+import AVFoundation
+#endif
 
 enum VoiceCodingMode {
     case off
@@ -26,6 +30,8 @@ class VoiceCodingManager: NSObject {
     private var rtcJoinTimeout: Timer?
     private var isPreparing: Bool = false
     private let silenceTimeoutSeconds: TimeInterval = 5.0
+    /// Test-only hook to force microphone permission result.
+    var _testMicrophonePermissionOverride: Bool?
 
     // ConvoAI agent lifecycle
     private let convoAIClient = ConvoAIClient()
@@ -57,6 +63,57 @@ class VoiceCodingManager: NSObject {
         targetAtemId = atemId
         return (atemId, channel)
     }
+
+    private func ensureMicrophonePermission(completion: @escaping (Bool) -> Void) {
+        if let override = _testMicrophonePermissionOverride {
+            completion(override)
+            return
+        }
+#if os(macOS)
+        // Avoid OS permission UI in unit tests.
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+            completion(true)
+            return
+        }
+
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            completion(true)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                DispatchQueue.main.async {
+                    if !granted {
+                        self.showMicrophonePermissionAlert()
+                    }
+                    completion(granted)
+                }
+            }
+        case .denied, .restricted:
+            showMicrophonePermissionAlert()
+            completion(false)
+        @unknown default:
+            completion(false)
+        }
+#else
+        completion(true)
+#endif
+    }
+
+#if os(macOS)
+    private func showMicrophonePermissionAlert() {
+        let alert = NSAlert()
+        alert.messageText = "Microphone Permission Needed"
+        alert.informativeText =
+            "PTT and Hands-Free require Microphone access. Enable it in System Settings > Privacy & Security > Microphone."
+        alert.addButton(withTitle: "Open Settings")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        if alert.runModal() == .alertFirstButtonReturn,
+           let settingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+            NSWorkspace.shared.open(settingsURL)
+        }
+    }
+#endif
 
     private func ensureRTCJoined(completion: @escaping (Bool) -> Void) {
         if hubManager.rtcManager.isInChannel {
@@ -124,18 +181,29 @@ class VoiceCodingManager: NSObject {
             Log.info("[VoiceCoding] startPTT ignored — mode is \(mode)")
             return
         }
-        mode = .ptt
-        isPreparing = true
-        updateStage("Voice: Starting PTT…")
-        Log.info("[VoiceCoding] PTT started")
-
-        ensureRTCJoined { [weak self] joined in
+        updateStage("Voice: Checking mic permission…")
+        ensureMicrophonePermission { [weak self] granted in
             guard let self = self else { return }
-            guard joined else {
-                self.cleanup()
+            guard granted else {
+                self.updateStage("Voice: Microphone permission required", autoHideAfter: 4.0)
+                self.mode = .off
+                self.isPreparing = false
                 return
             }
-            self.beginPTTWorkflow()
+
+            self.mode = .ptt
+            self.isPreparing = true
+            self.updateStage("Voice: Starting PTT…")
+            Log.info("[VoiceCoding] PTT started")
+
+            self.ensureRTCJoined { [weak self] joined in
+                guard let self = self else { return }
+                guard joined else {
+                    self.cleanup()
+                    return
+                }
+                self.beginPTTWorkflow()
+            }
         }
     }
 
@@ -224,18 +292,29 @@ class VoiceCodingManager: NSObject {
             Log.info("[VoiceCoding] startHandsFree ignored — mode is \(mode)")
             return
         }
-        mode = .handsFree
-        isPreparing = true
-        updateStage("Voice: Starting Hands-Free…")
-        Log.info("[VoiceCoding] Hands-Free started")
-
-        ensureRTCJoined { [weak self] joined in
+        updateStage("Voice: Checking mic permission…")
+        ensureMicrophonePermission { [weak self] granted in
             guard let self = self else { return }
-            guard joined else {
-                self.cleanup()
+            guard granted else {
+                self.updateStage("Voice: Microphone permission required", autoHideAfter: 4.0)
+                self.mode = .off
+                self.isPreparing = false
                 return
             }
-            self.beginHandsFreeWorkflow()
+
+            self.mode = .handsFree
+            self.isPreparing = true
+            self.updateStage("Voice: Starting Hands-Free…")
+            Log.info("[VoiceCoding] Hands-Free started")
+
+            self.ensureRTCJoined { [weak self] joined in
+                guard let self = self else { return }
+                guard joined else {
+                    self.cleanup()
+                    return
+                }
+                self.beginHandsFreeWorkflow()
+            }
         }
     }
 

@@ -228,6 +228,30 @@ final class VoiceCodingTests: XCTestCase {
         XCTAssertFalse(vcm.isWaitingForResponse)
     }
 
+    func testPTTFailsFastWhenMicrophonePermissionDenied() {
+        let hub = AstationHubManager(skipProjectLoad: true)
+        let vcm = hub.voiceCodingManager
+        vcm._testMicrophonePermissionOverride = false
+
+        vcm.startPTT()
+
+        XCTAssertEqual(vcm.mode, .off)
+        XCTAssertNil(vcm.activeSessionId)
+        XCTAssertFalse(vcm.isWaitingForResponse)
+    }
+
+    func testHandsFreeFailsFastWhenMicrophonePermissionDenied() {
+        let hub = AstationHubManager(skipProjectLoad: true)
+        let vcm = hub.voiceCodingManager
+        vcm._testMicrophonePermissionOverride = false
+
+        vcm.startHandsFree()
+
+        XCTAssertEqual(vcm.mode, .off)
+        XCTAssertNil(vcm.activeSessionId)
+        XCTAssertFalse(vcm.isWaitingForResponse)
+    }
+
     // MARK: - Wire format cross-platform compatibility
 
     func testVoiceRequestWireFormatSnakeCaseKeys() throws {
