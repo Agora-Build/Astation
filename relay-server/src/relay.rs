@@ -578,6 +578,7 @@ fn render_pair_page(code: &str, hostname: &str, status: &InitialPageStatus) -> S
     .dot.connected{{background:#00d4aa;box-shadow:0 0 6px #00d4aa88}}
     .info-box{{background:#0f1a14;border:1px solid #00d4aa33;border-radius:10px;padding:16px;margin:20px 0;font-size:13px;text-align:left}}
     .info-row{{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #ffffff08}}
+    .atem-tag{{background:#0f1a14;border:1px solid #00d4aa44;border-radius:4px;padding:2px 8px;margin:2px;display:inline-block;font-size:12px;color:#00d4aa}}
     .info-row:last-child{{border-bottom:none}}
     .info-label{{color:#666}}
     .info-value{{color:#ccc;font-family:'SF Mono',monospace;font-size:12px}}
@@ -606,7 +607,7 @@ fn render_pair_page(code: &str, hostname: &str, status: &InitialPageStatus) -> S
       <h2>Connected!</h2>
       <p class="sub" style="margin-bottom:16px">Atem and Astation are paired via relay</p>
       <div class="info-box">
-        <div class="info-row"><span class="info-label">Atem host</span><span class="info-value" id="paired-hostname">—</span></div>
+        <div class="info-row"><span class="info-label">Atem(s)</span><span class="info-value" id="atem-list">—</span></div>
         <div class="info-row"><span class="info-label">Code</span><span class="info-value">{code}</span></div>
       </div>
       <button class="btn-close" onclick="window.close()">Close Page</button>
@@ -634,11 +635,23 @@ fn render_pair_page(code: &str, hostname: &str, status: &InitialPageStatus) -> S
       clearTimeout(pollTimer);
     }}
 
+    function renderAtemList(atemIds) {{
+      var list = document.getElementById('atem-list');
+      if (!atemIds || atemIds.length === 0) {{
+        list.innerHTML = '—';
+        return;
+      }}
+      list.innerHTML = atemIds.map(function(id) {{
+        return '<span class="atem-tag">' + id.replace(/</g,'&lt;') + '</span>';
+      }}).join('');
+    }}
+
     function showPaired(data) {{
       document.getElementById('view-waiting').style.display = 'none';
       document.getElementById('view-paired').style.display = 'block';
-      document.getElementById('paired-hostname').textContent = data.hostname || '—';
-      clearTimeout(pollTimer);
+      renderAtemList(data.atem_ids);
+      // Keep polling — new Atems may connect after the first one
+      pollTimer = setTimeout(poll, 2000);
     }}
 
     function showWaiting() {{
