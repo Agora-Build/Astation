@@ -609,8 +609,7 @@ fn render_pair_page(code: &str, hostname: &str, status: &InitialPageStatus) -> S
         <div class="info-row"><span class="info-label">Atem host</span><span class="info-value" id="paired-hostname">—</span></div>
         <div class="info-row"><span class="info-label">Code</span><span class="info-value">{code}</span></div>
       </div>
-      <button class="btn-close" onclick="closeRoom()">Close Connection</button>
-      <div id="closed-msg">Connection closed.</div>
+      <button class="btn-close" onclick="window.close()">Close Page</button>
     </div>
 
     <div class="status-row">
@@ -661,14 +660,6 @@ fn render_pair_page(code: &str, hostname: &str, status: &InitialPageStatus) -> S
       }} catch(e) {{
         pollTimer = setTimeout(poll, 5000);
       }}
-    }}
-
-    async function closeRoom() {{
-      try {{
-        await fetch('/api/pair/' + CODE, {{ method: 'DELETE' }});
-      }} catch(e) {{}}
-      document.getElementById('closed-msg').style.display = 'block';
-      document.querySelector('.btn-close').style.display = 'none';
     }}
 
     poll();
