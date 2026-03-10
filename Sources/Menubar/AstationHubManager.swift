@@ -1,5 +1,6 @@
 import CStationCore
 import Foundation
+import Network
 
 // Hub Manager - Contains all business logic for Agora projects, tokens, etc.
 class AstationHubManager: ObservableObject {
@@ -31,6 +32,12 @@ class AstationHubManager: ObservableObject {
 
     /// Used by tests to inject a mock relay URL without touching UserDefaults.
     var _testRelayUrlOverride: String? = nil
+
+    /// Guards against concurrent identity relay reconnect attempts.
+    private var identityRelayActive = false
+    /// NWPathMonitor for the identity relay — fires when network becomes available,
+    /// enabling immediate reconnect without polling. Created once and reused.
+    private var identityRelayPathMonitor: NWPathMonitor?
 
     /// Station relay URL. Priority: test override > ASTATION_RELAY_URL env var > UserDefaults > default.
     var stationRelayUrl: String {
@@ -979,6 +986,13 @@ class AstationHubManager: ObservableObject {
     /// Connect to the relay using this Astation's own identity as the room code.
     /// Atem stores the identity after first pairing and uses it for TUI auto-connect.
     func startIdentityRelay() {
+        guard !identityRelayActive else { return }
+        identityRelayActive = true
+
+        // Start NWPathMonitor once — fires when network comes back, enabling
+        // immediate reconnect without polling. No battery overhead while offline.
+        startIdentityRelayMonitorIfNeeded()
+
         let identityCode = AstationIdentity.shared.id
         let wsScheme: String
         if stationRelayUrl.hasPrefix("https://") {
@@ -990,6 +1004,7 @@ class AstationHubManager: ObservableObject {
 
         guard let url = URL(string: wsUrl) else {
             Log.error("[AstationHub] Invalid identity relay URL: \(wsUrl)")
+            identityRelayActive = false
             return
         }
 
@@ -1016,6 +1031,28 @@ class AstationHubManager: ObservableObject {
         readIdentityRelayMessages(task: task, clientId: relayClientId)
     }
 
+    /// Start the network path monitor if not already running.
+    /// The monitor fires `startIdentityRelay()` immediately when the network
+    /// becomes available — no polling, no battery drain while offline.
+    private func startIdentityRelayMonitorIfNeeded() {
+        guard identityRelayPathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        identityRelayPathMonitor = monitor
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self = self else { return }
+            if path.status == .satisfied {
+                DispatchQueue.main.async {
+                    if !self.identityRelayActive {
+                        Log.info("[AstationHub] Network available — retrying identity relay immediately")
+                        self.startIdentityRelay()
+                    }
+                }
+            }
+        }
+        // Use a background queue so the monitor doesn't block the main thread
+        monitor.start(queue: DispatchQueue.global(qos: .background))
+    }
+
     private func readIdentityRelayMessages(task: URLSessionWebSocketTask, clientId: String) {
         task.receive { [weak self] result in
             switch result {
@@ -1035,12 +1072,19 @@ class AstationHubManager: ObservableObject {
                 self?.readIdentityRelayMessages(task: task, clientId: clientId)
 
             case .failure(let error):
-                Log.info("[AstationHub] Identity relay disconnected: \(error) — reconnecting in 10s")
+                Log.info("[AstationHub] Identity relay disconnected: \(error)")
                 DispatchQueue.main.async {
                     self?.removeClient(withId: clientId)
+                    self?.identityRelayActive = false
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 10.0) {
-                    self?.startIdentityRelay()
+                // Schedule a 30s fallback retry (only if network is still up).
+                // NWPathMonitor handles the "network-was-down" case: it will fire
+                // startIdentityRelay() immediately when connectivity is restored.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 30.0) {
+                    guard let self = self, !self.identityRelayActive else { return }
+                    guard self.identityRelayPathMonitor?.currentPath.status == .satisfied else { return }
+                    Log.info("[AstationHub] Retrying identity relay after 30s")
+                    self.startIdentityRelay()
                 }
             }
         }

@@ -20,6 +20,11 @@ const CODE_CHARS: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 /// Room expiry: 10 minutes if unpaired.
 const ROOM_EXPIRY_SECS: u64 = 600;
 
+/// WebSocket ping interval in seconds.
+/// Keeps idle connections alive across NAT firewalls without high bandwidth overhead.
+/// At 100k connections, 60s pings produce ~1700 tiny frames/sec (~10KB/s total) — negligible.
+const WS_PING_INTERVAL_SECS: u64 = 60;
+
 // --- Types ---
 
 struct PairRoom {
@@ -313,26 +318,62 @@ async fn handle_ws(hub: RelayHub, code: String, role: String, socket: WebSocket)
 
     tracing::info!("WS connected: role={} code={}", role, code);
 
-    // Task: forward messages from our channel to the WS sink
+    // Task: forward messages from our channel to the WS sink, with periodic pings
+    // for NAT keepalive. URLSession (macOS) and tungstenite (Atem) both auto-respond
+    // to server pings with pong — no client changes needed.
     let code_for_writer = code.clone();
     let write_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if ws_sink
-                .send(axum::extract::ws::Message::Text(msg.into()))
-                .await
-                .is_err()
-            {
-                tracing::debug!("WS write failed for {}", code_for_writer);
-                break;
+        let mut ping_interval = tokio::time::interval(
+            std::time::Duration::from_secs(WS_PING_INTERVAL_SECS)
+        );
+        ping_interval.tick().await; // skip the immediate first tick
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Some(text) => {
+                            if ws_sink
+                                .send(axum::extract::ws::Message::Text(text.into()))
+                                .await
+                                .is_err()
+                            {
+                                tracing::debug!("WS write failed for {}", code_for_writer);
+                                break;
+                            }
+                        }
+                        None => break, // channel closed
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    if ws_sink
+                        .send(axum::extract::ws::Message::Ping(Vec::new()))
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!("WS ping failed for {} — removing dead connection", code_for_writer);
+                        break;
+                    }
+                }
             }
         }
     });
 
-    // Read incoming frames and forward to the other side
+    // Read incoming frames and forward to the other side.
+    // A 90s idle timeout ensures dead connections (no pong response to our 60s ping)
+    // are detected and cleaned up within 90s rather than waiting for the OS TCP timeout.
     let hub_for_read = hub.clone();
     let role_for_read = role.clone();
     let code_for_read = code.clone();
-    while let Some(msg_result) = ws_stream.next().await {
+    let read_timeout = std::time::Duration::from_secs(WS_PING_INTERVAL_SECS + 30);
+    loop {
+        let msg_result = match tokio::time::timeout(read_timeout, ws_stream.next()).await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => break, // stream ended
+            Err(_) => {
+                tracing::debug!("WS idle timeout for {} {} — no frame in {}s", role, code_for_read, WS_PING_INTERVAL_SECS + 30);
+                break;
+            }
+        };
         match msg_result {
             Ok(axum::extract::ws::Message::Text(text)) => {
                 // Get the other side's sender from the room (it may have connected since we started)
@@ -352,6 +393,7 @@ async fn handle_ws(hub: RelayHub, code: String, role: String, socket: WebSocket)
                 }
             }
             Ok(axum::extract::ws::Message::Close(_)) => break,
+            Ok(axum::extract::ws::Message::Pong(_)) => {} // expected response to our Ping
             Err(e) => {
                 tracing::debug!("WS read error for {} {}: {}", role, code_for_read, e);
                 break;
