@@ -1011,24 +1011,26 @@ class AstationHubManager: ObservableObject {
         let task = URLSession.shared.webSocketTask(with: url)
         task.resume()
 
-        let relayClientId = "identity-relay"
-
-        // Wire sendHandler so hub can route messages to this relay client
+        // Wire sendHandler: route messages whose clientId starts with "relay-" through
+        // the identity relay WS as an envelope: {"atem_id":"<id>","payload":<msg>}.
+        // Multiple Atems can be connected simultaneously; each has its own "relay-<id>" clientId.
         let originalSend = sendHandler
         sendHandler = { [weak task] message, targetId in
-            if targetId == relayClientId {
-                if let jsonData = try? JSONEncoder().encode(message),
-                   let jsonString = String(data: jsonData, encoding: .utf8) {
-                    NetworkDebugLogger.logWebSocket(direction: "send", context: "identity-relay", message: jsonString)
-                    task?.send(.string(jsonString)) { _ in }
-                }
+            if targetId.hasPrefix("relay-") {
+                let atemId = String(targetId.dropFirst(6)) // strip "relay-" prefix
+                guard let payloadData = try? JSONEncoder().encode(message),
+                      let payloadObj = try? JSONSerialization.jsonObject(with: payloadData),
+                      let envelope = try? JSONSerialization.data(withJSONObject: ["atem_id": atemId, "payload": payloadObj]),
+                      let envelopeStr = String(data: envelope, encoding: .utf8) else { return }
+                NetworkDebugLogger.logWebSocket(direction: "send", context: "identity-relay:\(atemId)", message: envelopeStr)
+                task?.send(.string(envelopeStr)) { _ in }
             } else {
                 originalSend?(message, targetId)
             }
         }
 
         Log.info("[AstationHub] Identity relay connecting: \(wsUrl)")
-        readIdentityRelayMessages(task: task, clientId: relayClientId)
+        readIdentityRelayMessages(task: task)
     }
 
     /// Start the network path monitor if not already running.
@@ -1053,28 +1055,38 @@ class AstationHubManager: ObservableObject {
         monitor.start(queue: DispatchQueue.global(qos: .background))
     }
 
-    private func readIdentityRelayMessages(task: URLSessionWebSocketTask, clientId: String) {
+    private func readIdentityRelayMessages(task: URLSessionWebSocketTask) {
         task.receive { [weak self] result in
             switch result {
             case .success(let message):
                 switch message {
                 case .string(let text):
                     NetworkDebugLogger.logWebSocket(direction: "recv", context: "identity-relay", message: text)
+                    // Relay wraps Atem messages as {"atem_id":"<id>","payload":{...}}
+                    // Extract atem_id and decode payload, then use "relay-<atem_id>" as clientId.
                     if let data = text.data(using: .utf8),
-                       let msg = try? JSONDecoder().decode(AstationMessage.self, from: data) {
+                       let envelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let atemId = envelope["atem_id"] as? String,
+                       let payloadObj = envelope["payload"],
+                       let payloadData = try? JSONSerialization.data(withJSONObject: payloadObj),
+                       let msg = try? JSONDecoder().decode(AstationMessage.self, from: payloadData) {
+                        let relayClientId = "relay-\(atemId)"
                         DispatchQueue.main.async {
-                            self?.handleIdentityRelayMessage(msg, task: task, clientId: clientId)
+                            self?.handleIdentityRelayMessage(msg, task: task, clientId: relayClientId)
                         }
                     }
                 default:
                     break
                 }
-                self?.readIdentityRelayMessages(task: task, clientId: clientId)
+                self?.readIdentityRelayMessages(task: task)
 
             case .failure(let error):
                 Log.info("[AstationHub] Identity relay disconnected: \(error)")
                 DispatchQueue.main.async {
-                    self?.removeClient(withId: clientId)
+                    // Remove all relay-connected Atem clients (their WS is gone)
+                    self?.connectedClients
+                        .filter { $0.id.hasPrefix("relay-") }
+                        .forEach { self?.removeClient(withId: $0.id) }
                     self?.identityRelayActive = false
                 }
                 // Schedule a 30s fallback retry (only if network is still up).
