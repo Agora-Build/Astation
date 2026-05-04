@@ -40,6 +40,7 @@ struct AStationRtcEngineImpl
     std::string token;
     std::string channel;
     uint32_t uid{0};
+    uint32_t area_code{0};
     int enable_audio{1};
     int enable_video{0};
 
@@ -63,6 +64,7 @@ struct AStationRtcEngineImpl
           token(config.token ? config.token : ""),
           channel(config.channel ? config.channel : ""),
           uid(config.uid),
+          area_code(config.area_code),
           enable_audio(config.enable_audio),
           enable_video(config.enable_video),
           callbacks(cb),
@@ -195,6 +197,7 @@ struct AStationRtcEngineImpl
         ctx.eventHandler = this;
         ctx.channelProfile = agora::CHANNEL_PROFILE_LIVE_BROADCASTING;
         ctx.audioScenario = agora::rtc::AUDIO_SCENARIO_DEFAULT;
+        ctx.areaCode = area_code != 0 ? area_code : agora::rtc::AREA_CODE_GLOB;
 
         int ret = rtc_engine->initialize(ctx);
         if (ret != 0) {
@@ -231,8 +234,8 @@ struct AStationRtcEngineImpl
         }
 
         std::fprintf(stderr,
-            "[AStationRtc] Engine initialized (appId=%.8s... audio=%d video=%d)\n",
-            app_id.c_str(), enable_audio, enable_video);
+            "[AStationRtc] Engine initialized (appId=%.8s... audio=%d video=%d areaCode=0x%08x)\n",
+            app_id.c_str(), enable_audio, enable_video, ctx.areaCode);
         return true;
     }
 
@@ -623,6 +626,27 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
     return ret;
 }
 
+static bool is_valid_encryption_mode(int mode) {
+    switch (mode) {
+        case agora::rtc::AES_128_XTS:
+        case agora::rtc::AES_128_ECB:
+        case agora::rtc::AES_256_XTS:
+        case agora::rtc::SM4_128_ECB:
+        case agora::rtc::AES_128_GCM:
+        case agora::rtc::AES_256_GCM:
+        case agora::rtc::AES_128_GCM2:
+        case agora::rtc::AES_256_GCM2:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool encryption_mode_requires_salt(int mode) {
+    return mode == agora::rtc::AES_128_GCM2 ||
+           mode == agora::rtc::AES_256_GCM2;
+}
+
 // ---------------------------------------------------------------------------
 // C API implementation
 // ---------------------------------------------------------------------------
@@ -945,6 +969,75 @@ int astation_rtc_set_channel(AStationRtcEngine* engine, const char* channel,
         "[AStationRtc] Channel set to %s uid=%u\n",
         impl->channel.c_str(), impl->uid);
     return 0;
+}
+
+int astation_rtc_configure_encryption(AStationRtcEngine* engine,
+                                      int enabled,
+                                      int mode,
+                                      const char* key,
+                                      const uint8_t* salt,
+                                      int salt_len) {
+    if (!engine) return -1;
+    auto* impl = reinterpret_cast<AStationRtcEngineImpl*>(engine);
+
+    if (!impl->rtc_engine) {
+        std::fprintf(stderr,
+            "[AStationRtc] Cannot configure encryption: engine not initialized\n");
+        return -1;
+    }
+
+    agora::rtc::EncryptionConfig config;
+    if (!enabled) {
+        int ret = impl->rtc_engine->enableEncryption(false, config);
+        if (ret != 0) {
+            const char* desc = impl->rtc_engine->getErrorDescription(ret);
+            std::fprintf(stderr,
+                "[AStationRtc] enableEncryption(false) failed: %d (%s)\n",
+                ret, desc ? desc : "unknown");
+        } else {
+            std::fprintf(stderr, "[AStationRtc] Encryption disabled\n");
+        }
+        return ret;
+    }
+
+    if (!is_valid_encryption_mode(mode)) {
+        std::fprintf(stderr,
+            "[AStationRtc] Invalid encryption mode: %d\n",
+            mode);
+        return -2;
+    }
+
+    if (!key || key[0] == '\0') {
+        std::fprintf(stderr,
+            "[AStationRtc] Encryption key is required when encryption is enabled\n");
+        return -2;
+    }
+
+    config.encryptionMode = static_cast<agora::rtc::ENCRYPTION_MODE>(mode);
+    config.encryptionKey = key;
+    if (encryption_mode_requires_salt(mode)) {
+        if (!salt || salt_len != 32) {
+            std::fprintf(stderr,
+                "[AStationRtc] Encryption salt must be exactly 32 bytes for mode=%d\n",
+                mode);
+            return -2;
+        }
+        std::memcpy(config.encryptionKdfSalt, salt, 32);
+    }
+
+    int ret = impl->rtc_engine->enableEncryption(true, config);
+    if (ret != 0) {
+        const char* desc = impl->rtc_engine->getErrorDescription(ret);
+        std::fprintf(stderr,
+            "[AStationRtc] enableEncryption(true) failed: %d (%s)\n",
+            ret, desc ? desc : "unknown");
+    } else {
+        std::fprintf(stderr,
+            "[AStationRtc] Encryption enabled mode=%d requiresSalt=%d\n",
+            mode,
+            encryption_mode_requires_salt(mode) ? 1 : 0);
+    }
+    return ret;
 }
 
 } // extern "C"

@@ -15,6 +15,7 @@ struct AStationRtcConfig {
     const char* token;
     const char* channel;
     uint32_t uid;
+    uint32_t area_code;
     int enable_audio;
     int enable_video;
 };
@@ -48,6 +49,12 @@ int astation_rtc_get_screen_sources(AStationRtcEngine* engine,
                                     int max_count);
 int astation_rtc_set_token(AStationRtcEngine* engine, const char* token);
 int astation_rtc_set_channel(AStationRtcEngine* engine, const char* channel, uint32_t uid);
+int astation_rtc_configure_encryption(AStationRtcEngine* engine,
+                                      int enabled,
+                                      int mode,
+                                      const char* key,
+                                      const uint8_t* salt,
+                                      int salt_len);
 
 #ifdef __cplusplus
 }

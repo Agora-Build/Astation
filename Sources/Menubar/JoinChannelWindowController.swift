@@ -5,10 +5,17 @@ import AVFoundation
 class JoinChannelWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private let hubManager: AstationHubManager
+    private let encryptionModes = RTCEncryptionMode.manualJoinPickerOptions
+    private let geoFenceOptions = RTCGeoFence.manualJoinPickerOptions
     private var projectPicker: NSPopUpButton!
     private var channelField: NSTextField!
     private var uidField: NSTextField!
     private var roleControl: NSSegmentedControl!
+    private var encryptionModePopup: NSPopUpButton!
+    private var encryptionKeyField: NSSecureTextField!
+    private var saltLabel: NSTextField!
+    private var saltField: NSTextField!
+    private var geoFencePopup: NSPopUpButton!
     private var joinButton: NSButton!
     private var statusLabel: NSTextField!
 
@@ -26,7 +33,7 @@ class JoinChannelWindowController: NSObject, NSWindowDelegate {
         }
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 400, height: 280),
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 430),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -39,14 +46,15 @@ class JoinChannelWindowController: NSObject, NSWindowDelegate {
         let contentView = NSView(frame: window.contentView!.bounds)
         contentView.autoresizingMask = [.width, .height]
 
-        var y: CGFloat = 240
+        let fieldWidth: CGFloat = 320
+        var y: CGFloat = 390
 
         // Project picker
         let projectLabel = NSTextField(labelWithString: "Project:")
         projectLabel.frame = NSRect(x: 20, y: y, width: 80, height: 22)
         contentView.addSubview(projectLabel)
 
-        projectPicker = NSPopUpButton(frame: NSRect(x: 110, y: y - 2, width: 270, height: 26))
+        projectPicker = NSPopUpButton(frame: NSRect(x: 110, y: y - 2, width: fieldWidth, height: 26))
         contentView.addSubview(projectPicker)
         y -= 40
 
@@ -55,7 +63,7 @@ class JoinChannelWindowController: NSObject, NSWindowDelegate {
         channelLabel.frame = NSRect(x: 20, y: y, width: 80, height: 22)
         contentView.addSubview(channelLabel)
 
-        channelField = NSTextField(frame: NSRect(x: 110, y: y, width: 270, height: 22))
+        channelField = NSTextField(frame: NSRect(x: 110, y: y, width: fieldWidth, height: 22))
         channelField.placeholderString = "e.g. astation-default"
         channelField.stringValue = "astation-default"
         contentView.addSubview(channelField)
@@ -66,7 +74,7 @@ class JoinChannelWindowController: NSObject, NSWindowDelegate {
         uidLabel.frame = NSRect(x: 20, y: y, width: 80, height: 22)
         contentView.addSubview(uidLabel)
 
-        uidField = NSTextField(frame: NSRect(x: 110, y: y, width: 270, height: 22))
+        uidField = NSTextField(frame: NSRect(x: 110, y: y, width: fieldWidth, height: 22))
         uidField.placeholderString = "Numeric user ID"
         uidField.stringValue = String(UInt32.random(in: 1000...9999))
         contentView.addSubview(uidField)
@@ -86,19 +94,76 @@ class JoinChannelWindowController: NSObject, NSWindowDelegate {
         roleControl.frame = NSRect(x: 110, y: y, width: 200, height: 24)
         roleControl.selectedSegment = 0
         contentView.addSubview(roleControl)
+        y -= 40
+
+        // Encryption mode
+        let encryptionModeLabel = NSTextField(labelWithString: "Encrypt:")
+        encryptionModeLabel.frame = NSRect(x: 20, y: y, width: 80, height: 22)
+        contentView.addSubview(encryptionModeLabel)
+
+        encryptionModePopup = NSPopUpButton(frame: NSRect(x: 110, y: y - 2, width: fieldWidth, height: 26))
+        encryptionModePopup.addItems(withTitles: encryptionModes.map(\.title))
+        encryptionModePopup.target = self
+        encryptionModePopup.action = #selector(encryptionModeChanged)
+        if let defaultModeIndex = encryptionModes.firstIndex(of: .manualJoinDefault) {
+            encryptionModePopup.selectItem(at: defaultModeIndex)
+        }
+        contentView.addSubview(encryptionModePopup)
+        y -= 40
+
+        // Encryption key
+        let encryptionKeyLabel = NSTextField(labelWithString: "Key:")
+        encryptionKeyLabel.frame = NSRect(x: 20, y: y, width: 80, height: 22)
+        contentView.addSubview(encryptionKeyLabel)
+
+        encryptionKeyField = NSSecureTextField(frame: NSRect(x: 110, y: y, width: fieldWidth, height: 22))
+        encryptionKeyField.placeholderString = "Shared channel encryption key"
+        encryptionKeyField.maximumNumberOfLines = 1
+        encryptionKeyField.cell?.wraps = false
+        encryptionKeyField.cell?.usesSingleLineMode = true
+        encryptionKeyField.cell?.isScrollable = true
+        contentView.addSubview(encryptionKeyField)
+        y -= 40
+
+        // Encryption salt
+        saltLabel = NSTextField(labelWithString: "Salt:")
+        saltLabel.frame = NSRect(x: 20, y: y, width: 80, height: 22)
+        contentView.addSubview(saltLabel)
+
+        saltField = NSTextField(frame: NSRect(x: 110, y: y, width: fieldWidth, height: 22))
+        saltField.placeholderString = "32-byte salt in hex or base64"
+        saltField.stringValue = RTCEncryptionConfiguration.generateSaltHex()
+        saltField.maximumNumberOfLines = 1
+        saltField.cell?.wraps = false
+        saltField.cell?.usesSingleLineMode = true
+        saltField.cell?.isScrollable = true
+        contentView.addSubview(saltField)
+        y -= 40
+
+        // Geo fence
+        let geoFenceLabel = NSTextField(labelWithString: "Geo:")
+        geoFenceLabel.frame = NSRect(x: 20, y: y, width: 80, height: 22)
+        contentView.addSubview(geoFenceLabel)
+
+        geoFencePopup = NSPopUpButton(frame: NSRect(x: 110, y: y - 2, width: fieldWidth, height: 26))
+        geoFencePopup.addItems(withTitles: geoFenceOptions.map(\.title))
+        if let defaultGeoFenceIndex = geoFenceOptions.firstIndex(of: .manualJoinDefault) {
+            geoFencePopup.selectItem(at: defaultGeoFenceIndex)
+        }
+        contentView.addSubview(geoFencePopup)
         y -= 50
 
         // Status label
-        statusLabel = NSTextField(labelWithString: "")
+        statusLabel = NSTextField(wrappingLabelWithString: "")
         statusLabel.font = NSFont.systemFont(ofSize: 11)
-        statusLabel.frame = NSRect(x: 20, y: y + 16, width: 250, height: 18)
+        statusLabel.frame = NSRect(x: 20, y: y + 8, width: 330, height: 34)
         contentView.addSubview(statusLabel)
 
         // Join button
         joinButton = NSButton(title: "Join", target: self, action: #selector(joinChannel))
         joinButton.bezelStyle = .rounded
         joinButton.keyEquivalent = "\r"
-        joinButton.frame = NSRect(x: 290, y: y, width: 90, height: 32)
+        joinButton.frame = NSRect(x: 340, y: y, width: 90, height: 32)
         contentView.addSubview(joinButton)
 
         window.contentView = contentView
@@ -107,6 +172,7 @@ class JoinChannelWindowController: NSObject, NSWindowDelegate {
         self.window = window
 
         refreshProjectPicker()
+        updateEncryptionFields()
     }
 
     private func ensureMicrophonePermission(completion: @escaping (Bool) -> Void) {
@@ -158,6 +224,10 @@ class JoinChannelWindowController: NSObject, NSWindowDelegate {
         }
     }
 
+    @objc private func encryptionModeChanged() {
+        updateEncryptionFields()
+    }
+
     @objc private func joinChannel() {
         let projects = hubManager.getProjects()
         let idx = projectPicker.indexOfSelectedItem
@@ -182,6 +252,15 @@ class JoinChannelWindowController: NSObject, NSWindowDelegate {
             return
         }
 
+        let joinOptions: RTCJoinOptions
+        do {
+            joinOptions = try currentJoinOptions()
+        } catch {
+            statusLabel.stringValue = error.localizedDescription
+            statusLabel.textColor = .systemRed
+            return
+        }
+
         statusLabel.stringValue = "Checking microphone permission..."
         statusLabel.textColor = .systemBlue
         joinButton.isEnabled = false
@@ -189,18 +268,74 @@ class JoinChannelWindowController: NSObject, NSWindowDelegate {
         ensureMicrophonePermission { [weak self] micGranted in
             guard let self = self else { return }
 
-            self.hubManager.initializeRTC(appId: project.vendorKey)
-            self.hubManager.joinRTCChannel(channel: channel, uid: uid, projectId: project.id)
+            self.hubManager.initializeRTC(appId: project.vendorKey, geoFence: joinOptions.geoFence)
+            self.hubManager.joinRTCChannel(
+                channel: channel,
+                uid: uid,
+                projectId: project.id,
+                joinOptions: joinOptions
+            )
 
             self.statusLabel.stringValue = micGranted ? "Joining \(channel)..." : "Joining \(channel) (no mic permission)..."
             self.statusLabel.textColor = micGranted ? .systemBlue : .systemOrange
 
-            Log.info("[JoinChannel] Joining channel=\(channel) uid=\(uid) project=\(project.name) micPermission=\(micGranted)")
+            let encryptionMode = joinOptions.encryption?.mode.title ?? RTCEncryptionMode.none.title
+            Log.info(
+                "[JoinChannel] Joining channel=\(channel) uid=\(uid) project=\(project.name) " +
+                "micPermission=\(micGranted) geoFence=\(joinOptions.geoFence.title) encryption=\(encryptionMode)"
+            )
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 self?.window?.close()
             }
         }
+    }
+
+    private func selectedEncryptionMode() -> RTCEncryptionMode {
+        let index = encryptionModePopup.indexOfSelectedItem
+        guard index >= 0, index < encryptionModes.count else {
+            return .manualJoinDefault
+        }
+        return encryptionModes[index]
+    }
+
+    private func selectedGeoFence() -> RTCGeoFence {
+        let index = geoFencePopup.indexOfSelectedItem
+        guard index >= 0, index < geoFenceOptions.count else {
+            return .manualJoinDefault
+        }
+        return geoFenceOptions[index]
+    }
+
+    private func updateEncryptionFields() {
+        let mode = selectedEncryptionMode()
+        let encryptionEnabled = mode.isEnabled
+
+        encryptionKeyField.isEnabled = encryptionEnabled
+        saltLabel.isHidden = !mode.requiresSalt
+        saltField.isHidden = !mode.requiresSalt
+
+        if mode.requiresSalt && saltField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            saltField.stringValue = RTCEncryptionConfiguration.generateSaltHex()
+        }
+    }
+
+    private func currentJoinOptions() throws -> RTCJoinOptions {
+        let mode = selectedEncryptionMode()
+        if mode.requiresSalt && saltField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            saltField.stringValue = RTCEncryptionConfiguration.generateSaltHex()
+        }
+
+        let encryption = try RTCEncryptionConfiguration.make(
+            mode: mode,
+            key: encryptionKeyField.stringValue,
+            salt: saltField.stringValue
+        )
+
+        return RTCJoinOptions(
+            geoFence: selectedGeoFence(),
+            encryption: encryption
+        )
     }
 
     // MARK: - NSWindowDelegate

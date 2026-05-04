@@ -79,7 +79,7 @@ class RTCManager {
 
     /// Initialize the RTC engine with the given App ID.
     /// Must be called before joinChannel / leaveChannel / etc.
-    func initialize(appId: String) throws {
+    func initialize(appId: String, geoFence: RTCGeoFence = .noFence) throws {
         // Tear down previous engine if any
         if engine != nil {
             astation_rtc_destroy(engine)
@@ -96,6 +96,7 @@ class RTCManager {
             config.token = nil
             config.channel = nil
             config.uid = 0
+            config.area_code = geoFence.rawValue
             config.enable_audio = 1
             config.enable_video = 0
 
@@ -158,13 +159,18 @@ class RTCManager {
             throw RTCError.engineCreationFailed
         }
         engine = created
-        Log.info("[RTCManager] Engine initialized with appId=\(appId)")
+        Log.info("[RTCManager] Engine initialized with appId=\(appId) geoFence=\(geoFence.title)")
     }
 
     // MARK: - Channel
 
     /// Join an RTC channel with the given token, channel name, and uid.
-    func joinChannel(token: String, channel: String, uid: UInt32) {
+    func joinChannel(
+        token: String,
+        channel: String,
+        uid: UInt32,
+        joinOptions: RTCJoinOptions = .standard
+    ) {
         guard let engine = engine else {
             Log.info("[RTCManager] Cannot join: engine not initialized")
             return
@@ -175,6 +181,14 @@ class RTCManager {
         }
         token.withCString { tokenPtr in
             _ = astation_rtc_set_token(engine, tokenPtr)
+        }
+        let encryptionResult = configureEncryption(joinOptions.encryption)
+        if encryptionResult != 0 {
+            Log.error("[RTCManager] Failed to configure encryption: \(encryptionResult)")
+            DispatchQueue.main.async {
+                self.onError?(Int(encryptionResult), "Failed to configure channel encryption")
+            }
+            return
         }
         let result = astation_rtc_join(engine)
         if result != 0 {
@@ -323,6 +337,29 @@ class RTCManager {
         ScreenRegionSelector.hideOverlay()
         if result != 0 {
             Log.info("[RTCManager] Stop screen share failed with code \(result)")
+        }
+    }
+
+    private func configureEncryption(_ encryption: RTCEncryptionConfiguration?) -> Int32 {
+        guard let engine = engine else {
+            return -1
+        }
+
+        guard let encryption else {
+            return astation_rtc_configure_encryption(engine, 0, 0, nil, nil, 0)
+        }
+
+        return encryption.key.withCString { keyPtr in
+            encryption.saltBytes.withUnsafeBufferPointer { saltBuffer in
+                astation_rtc_configure_encryption(
+                    engine,
+                    1,
+                    encryption.mode.rawValue,
+                    keyPtr,
+                    saltBuffer.baseAddress,
+                    Int32(encryption.saltBytes.count)
+                )
+            }
         }
     }
 }

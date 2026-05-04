@@ -155,9 +155,9 @@ class AstationHubManager: ObservableObject {
     }
 
     /// Initialize the RTC engine using the App ID from the first available project.
-    func initializeRTC(appId: String) {
+    func initializeRTC(appId: String, geoFence: RTCGeoFence = .noFence) {
         do {
-            try rtcManager.initialize(appId: appId)
+            try rtcManager.initialize(appId: appId, geoFence: geoFence)
             Log.info("RTC engine initialized")
         } catch {
             Log.error("Failed to initialize RTC: \(error)")
@@ -165,7 +165,12 @@ class AstationHubManager: ObservableObject {
     }
 
     /// Join an RTC channel (generates a real token and joins).
-    func joinRTCChannel(channel: String, uid: Int, projectId: String? = nil) {
+    func joinRTCChannel(
+        channel: String,
+        uid: Int,
+        projectId: String? = nil,
+        joinOptions: RTCJoinOptions = .standard
+    ) {
         guard uid >= 0, uid <= Int(UInt32.max) else {
             Log.warn(" Invalid UID for RTC join: '\(uid)'")
             return
@@ -173,7 +178,12 @@ class AstationHubManager: ObservableObject {
         let uidNum = UInt32(uid)
         Task {
             let tokenResponse = await generateRTCToken(channel: channel, uid: uid, projectId: projectId)
-            rtcManager.joinChannel(token: tokenResponse.token, channel: channel, uid: uidNum)
+            rtcManager.joinChannel(
+                token: tokenResponse.token,
+                channel: channel,
+                uid: uidNum,
+                joinOptions: joinOptions
+            )
         }
     }
 
