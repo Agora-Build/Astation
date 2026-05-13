@@ -422,7 +422,10 @@ be derived from an SSO session.
 ## Out of scope (YAGNI)
 
 - Per-Atem paired-credential store on the Astation side. Astation has exactly
-  one session.
+  one Agora session (its own SSO login). Note: the existing
+  `Sources/Menubar/SessionStore.swift` keeps a per-Atem **session-token**
+  registry (relay auth) which is unrelated and stays as-is — that store is
+  about "who may talk to me", not "what Agora credentials to give them".
 - Web-paste-URL fallback for failed loopback (browser-issue case). Show the
   error and retry.
 - Auto-refresh on a timer. Lazy-on-use only.
