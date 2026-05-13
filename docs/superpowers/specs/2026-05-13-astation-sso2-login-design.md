@@ -274,16 +274,38 @@ JSON keys (snake_case): `access_token`, `refresh_token`, `expires_at`,
   client ID and used on subsequent sends. (Existing pair flow logic is
   preserved.)
 
-**Atem `websocket_client.rs::AstationMessage::CredentialSync`** — fields
-change to `{ access_token, refresh_token, expires_at, login_id, astation_id,
-save_credentials }`. The handler stores the entry via
-`CredentialEntry::new_paired(...)`. The `SsoTokenSync` variant becomes
-redundant and is removed; the single dispatch site in Atem is migrated to
-the unified `CredentialSync`.
+**Atem side**. The user explicitly chose to repurpose `credentialSync`
+rather than send the existing `SsoTokenSync` (even though Atem already
+accepts that one). This requires migrating all three `SsoTokenSync` sites
+in Atem and updating the `CredentialSync` variant:
 
-The Atem-side change is a small, localized rename + payload swap. The Astation
-build owns the source of both sides via the monorepo, so we update both in
-the same PR.
+1. `Atem/src/websocket_client.rs:223` — `CredentialSync` struct fields
+   change from `{customer_id, customer_secret, astation_id}` to
+   `{access_token, refresh_token, expires_at, login_id, astation_id,
+   save_credentials}`. `#[serde(rename = "credentialSync")]` stays.
+2. `Atem/src/websocket_client.rs:236` — delete the `SsoTokenSync` variant
+   entirely (no longer reachable once Astation stops sending it and the
+   two callers below are migrated).
+3. `Atem/src/cli.rs:1144` (`atem pair` blocking loop) — change the
+   `match Some(SsoTokenSync { … })` to `match Some(CredentialSync { … })`.
+   Body is identical: build `CredentialEntry::new_paired(...)` and persist.
+4. `Atem/src/app.rs:2017` (TUI dispatcher) — same rename:
+   `AstationMessage::SsoTokenSync { … } =>` becomes
+   `AstationMessage::CredentialSync { … } =>`. Body is identical.
+5. Delete the old `customer_id`/`customer_secret` handler for
+   `CredentialSync` if one exists; the new shape replaces it entirely.
+6. Tests at `websocket_client.rs:1711` (`credential_sync_roundtrip`),
+   `:1737` (`credential_sync_deserialize_from_json`), and the three
+   `sso_token_sync_*` tests at `:2079`/`:2112`/`:2135` — rewrite the
+   first two for the new payload, delete the last three.
+
+Wire compatibility note: this is a coordinated change. An older Atem
+build talking to a new Astation will fail to decode the new
+`credentialSync` payload (missing required fields). Acceptable because
+Astation and Atem ship from the same monorepo and we control rollout.
+
+The Astation build owns the source of both sides via the monorepo, so we
+update both in the same PR.
 
 ### 8. Settings UI
 
@@ -368,8 +390,10 @@ Unit tests (new files in `Tests/`):
 - `AstationMessageTests.swift` — `credentialSync` codable round-trip with all
   fields; missing optional `login_id` decodes correctly.
 
-Atem side: update `websocket_client.rs::credential_sync_roundtrip` and
-`credential_sync_deserialize_from_json` to the new payload.
+Atem side: rewrite `websocket_client.rs::credential_sync_roundtrip` and
+`credential_sync_deserialize_from_json` for the new payload; delete
+`sso_token_sync_roundtrip`, `sso_token_sync_deserialize_from_json`, and
+`sso_token_sync_without_login_id` (`websocket_client.rs:2079`–`:2154`).
 
 Manual smoke (post-merge):
 
@@ -436,8 +460,10 @@ Modified:
 - `Sources/Menubar/StatusBarController.swift` → menubar Sign in / out item
 - `Sources/Menubar/VoiceCodingManager.swift` (and other ConvoAI callers) →
   pass appId + signKey
-- Atem `src/websocket_client.rs` → `CredentialSync` payload + remove
-  `SsoTokenSync`
-- Atem dispatch site for `SsoTokenSync` → use `CredentialSync`
+- Atem `src/websocket_client.rs` → `CredentialSync` payload swap + remove
+  `SsoTokenSync` variant + rewrite credential_sync tests + delete
+  sso_token_sync tests (lines 2079–2154)
+- Atem `src/cli.rs:1144` (`atem pair` blocking match) → use `CredentialSync`
+- Atem `src/app.rs:2017` (TUI dispatcher match) → use `CredentialSync`
 - `CLAUDE.md` → update the "Mark Task Routing" section's adjacent
   credentials notes to mention SSO instead of customer_id/secret
