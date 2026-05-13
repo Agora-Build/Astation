@@ -117,7 +117,7 @@ actor SsoTokenProvider {
 
 Mirrors `Atem/src/sso_auth.rs::valid_token`. The refresh request is
 `POST {sso}/api/v0/oauth/token` with form fields `grant_type=refresh_token`,
-`client_id=astation`, `refresh_token=<…>`. On success it parses
+`client_id=atem`, `refresh_token=<…>`. On success it parses
 `{access_token, refresh_token, expires_in}` and persists the new session.
 
 ### 3. `SsoAuthManager`
@@ -138,7 +138,7 @@ Steps (1:1 with `Atem/src/sso_auth.rs::run_login_flow`):
    ```
    {sso}/api/v0/oauth/authorize
      ?response_type=code
-     &client_id=astation
+     &client_id=atem
      &redirect_uri=http://127.0.0.1:<port>/oauth/callback
      &scope=basic_info,console
      &state=<state>
@@ -151,7 +151,7 @@ Steps (1:1 with `Atem/src/sso_auth.rs::run_login_flow`):
 7. Reply with an HTML "Login successful" page (port the markup from
    `Atem/src/sso_auth.rs` so the success UX matches).
 8. `POST {sso}/api/v0/oauth/token` with `grant_type=authorization_code`,
-   `client_id=astation`, `code`, `code_verifier`, `redirect_uri`.
+   `client_id=atem`, `code`, `code_verifier`, `redirect_uri`.
 9. Decode `{access_token, refresh_token, expires_in}` →
    `SsoSession(expiresAt = now + expires_in, loginId)`.
 
@@ -164,8 +164,7 @@ Errors are surfaced as a `LoginError` enum:
 - `.tokenExchangeFailed(status: Int, body: String)`
 - `.network(Error)`
 
-The new `client_id=astation` value must be pre-registered in the SSO server.
-(Coordinate with the SSO team before merge; see Open Questions.)
+Reuse the existing `client_id=atem` registration (same as `Atem/src/sso_auth.rs::CLIENT_ID`). No new client registration in the SSO server is needed; Astation is effectively a second deployment of the same OAuth client.
 
 `SsoAuthManager` depends only on a SwiftNIO `EventLoopGroup` and a URLSession,
 so it is unit-testable by passing a stub `openURL` closure and driving the
@@ -409,8 +408,6 @@ be derived from an SSO session.
 
 ## Open questions
 
-- The SSO server team must register `client_id=astation`. Until that lands,
-  development can point at a staging SSO server via `ASTATION_SSO_URL`.
 - BFF endpoint shape: this design assumes `/api/cli/v1/projects` is the same
   endpoint Astation should use (it's what Atem uses). If the SSO/BFF team
   prefers a different path for desktop apps, it's a one-line change to the
