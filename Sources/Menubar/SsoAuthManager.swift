@@ -67,6 +67,13 @@ final class SsoAuthManager {
         if !callback.loginId.isEmpty {
             session.loginId = callback.loginId
         }
+
+        // Try to fetch a human-readable display name (email) from the userinfo
+        // endpoint. Falls back to the opaque loginId if unavailable.
+        if let displayName = try? await fetchDisplayName(accessToken: session.accessToken) {
+            session.loginId = displayName
+        }
+
         return session
     }
 
@@ -87,6 +94,26 @@ final class SsoAuthManager {
             + "&state=\(state)"
             + "&code_challenge=\(challenge)"
             + "&code_challenge_method=S256"
+    }
+
+    /// Best-effort fetch of the user's email or name from the SSO userinfo endpoint.
+    /// Returns nil on any failure so the caller can fall back to the opaque loginId.
+    private func fetchDisplayName(accessToken: String) async throws -> String? {
+        let url = URL(string: "\(ssoUrl)/api/v0/oauth/userinfo")!
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        let (data, response) = try await urlSession.data(for: req)
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            return nil
+        }
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        // Prefer email, fall back to name/display_name
+        if let email = obj["email"] as? String, !email.isEmpty { return email }
+        if let name = obj["name"] as? String, !name.isEmpty { return name }
+        if let name = obj["display_name"] as? String, !name.isEmpty { return name }
+        return nil
     }
 
     private func exchangeCode(code: String, verifier: String, redirectUri: String) async throws -> SsoSession {
