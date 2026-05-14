@@ -18,7 +18,8 @@ class AstationHubManager: ObservableObject {
     @Published var pinnedClientId: String?
 
     private var hubStartTime = Date()
-    let credentialManager = CredentialManager()
+    let sessionStore = SsoSessionStore()
+    let tokenProvider: SsoTokenProvider
     let apiClient = AgoraAPIClient()
     let rtcManager = RTCManager()
     let authGrantController = AuthGrantController()
@@ -53,10 +54,15 @@ class AstationHubManager: ObservableObject {
     var sendHandler: ((AstationMessage, String) -> Void)?
 
     init(skipProjectLoad: Bool = false) {
+        self.tokenProvider = SsoTokenProvider(
+            store: SsoSessionStore(),
+            refresher: SsoNetworkRefresher(),
+            ssoUrl: { SsoConfig.currentSsoUrl }
+        )
         Log.info("Initializing Astation Hub Manager")
         setupCore()
         setupRTCManager()
-        checkCredentialStatus()
+        checkSessionStatus()
         if !skipProjectLoad {
             loadProjects()
         }
@@ -69,7 +75,7 @@ class AstationHubManager: ObservableObject {
     }
 
     @objc private func handleCredentialsChanged() {
-        broadcastCredentials()
+        Task { await pushCredentials(targetClientId: nil) }
     }
 
     deinit {
@@ -193,70 +199,93 @@ class AstationHubManager: ObservableObject {
         rtcManager.leaveChannel()
     }
     
-    // MARK: - Credentials
-    
-    func getCredentials() -> AgoraCredentials? {
-        return credentialManager.load()
-    }
-    
-    func checkCredentialStatus() {
-        if credentialManager.hasCredentials {
-            Log.info("[AstationHub] Credentials found in encrypted storage")
+    // MARK: - SSO Session
+
+    /// Whether an SSO session is on disk. Used by the UI to render
+    /// "Signed in" vs "Sign in".
+    var hasSession: Bool { sessionStore.hasSession }
+
+    /// Loaded session (no refresh). Use `tokenProvider.validToken()` if you
+    /// need a fresh access token for a network call.
+    func currentSession() -> SsoSession? { sessionStore.load() }
+
+    func checkSessionStatus() {
+        if hasSession {
+            Log.info("[AstationHub] SSO session found")
         } else {
-            Log.info("[AstationHub] No credentials configured. Open Settings to add Agora credentials.")
+            Log.info("[AstationHub] No SSO session. Open Settings → Sign in with Agora.")
         }
     }
 
-    func reloadCredentials() {
-        checkCredentialStatus()
+    func reloadSession() {
+        checkSessionStatus()
         refreshProjects()
         broadcastCredentials()
     }
 
-    /// Send current credentials to all connected Atem instances.
+    /// Broadcast a refreshed-on-use credentialSync to every connected Atem.
     func broadcastCredentials() {
-        guard let credentials = credentialManager.load() else { return }
-        let msg = AstationMessage.credentialSync(
-            customerId: credentials.customerId,
-            customerSecret: credentials.customerSecret,
-            astationId: AstationIdentity.shared.id
-        )
-        broadcastHandler?(msg)
-        Log.info("[AstationHub] Broadcast credentialSync to all connected Atems")
+        Task { await pushCredentials(targetClientId: nil) }
     }
 
-    /// Send current credentials to a specific Atem client.
+    /// Send credentialSync to one specific Atem (e.g. just-connected).
     func sendCredentials(toClientId clientId: String) {
-        guard let credentials = credentialManager.load() else { return }
+        Task { await pushCredentials(targetClientId: clientId) }
+    }
+
+    private func pushCredentials(targetClientId: String?) async {
+        do { _ = try await tokenProvider.validToken() }
+        catch {
+            Log.info("[AstationHub] No session — skipping credentialSync (\(error.localizedDescription))")
+            return
+        }
+        guard let session = sessionStore.load() else { return }
         let msg = AstationMessage.credentialSync(
-            customerId: credentials.customerId,
-            customerSecret: credentials.customerSecret,
-            astationId: AstationIdentity.shared.id
+            accessToken: session.accessToken,
+            refreshToken: session.refreshToken,
+            expiresAt: session.expiresAt,
+            loginId: session.loginId,
+            astationId: AstationIdentity.shared.id,
+            saveCredentials: false
         )
-        sendHandler?(msg, clientId)
-        Log.info("[AstationHub] Sent credentialSync to client \(clientId.prefix(8))…")
+        if let id = targetClientId {
+            sendHandler?(msg, id)
+            Log.info("[AstationHub] Sent credentialSync to \(id.prefix(8))…")
+        } else {
+            broadcastHandler?(msg)
+            Log.info("[AstationHub] Broadcast credentialSync to all Atems")
+        }
     }
     
     // MARK: - Projects Management
 
-    /// Load projects: try real API first, fall back to empty list with error message.
+    /// Load projects from the BFF using the SSO access token.
     private func loadProjects() {
-        guard let credentials = credentialManager.load() else {
-            Log.info("[AstationHub] No credentials — cannot fetch projects. Open Settings to configure.")
-            DispatchQueue.main.async {
-                self.projects = []
-                self.projectLoadError = "No credentials configured"
-            }
-            return
-        }
-
         Task {
+            let token: String
+            do { token = try await tokenProvider.validToken() }
+            catch {
+                await MainActor.run {
+                    self.projects = []
+                    self.projectLoadError = error.localizedDescription
+                    Log.info("[AstationHub] Cannot load projects: \(error.localizedDescription)")
+                }
+                return
+            }
             do {
-                let fetched = try await apiClient.fetchProjects(credentials: credentials)
+                let fetched = try await apiClient.fetchProjects(accessToken: token,
+                                                                bffUrl: SsoConfig.currentBffUrl)
                 await MainActor.run {
                     self.projects = fetched
                     self.projectLoadError = nil
-                    Log.info(" Loaded \(fetched.count) projects from Agora Console API")
+                    Log.info(" Loaded \(fetched.count) projects from BFF")
+                }
+            } catch AgoraAPIError.unauthorized {
+                try? self.sessionStore.delete()
+                await MainActor.run {
+                    self.projects = []
+                    self.projectLoadError = "Session expired — please sign in again."
+                    NotificationCenter.default.post(name: .credentialsChanged, object: nil)
                 }
             } catch {
                 await MainActor.run {
