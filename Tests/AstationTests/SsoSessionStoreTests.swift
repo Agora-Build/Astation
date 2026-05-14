@@ -88,3 +88,31 @@ final class SsoSessionStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: path.path))
     }
 }
+
+final class SsoConfigTests: XCTestCase {
+    func testDefaultSsoUrl() {
+        // Clear UserDefaults + env to get the baked-in default.
+        UserDefaults.standard.removeObject(forKey: SsoConfig.ssoUrlKey)
+        unsetenv("ASTATION_SSO_URL")
+        XCTAssertEqual(SsoConfig.currentSsoUrl, "https://sso2.agora.io")
+    }
+
+    func testDefaultBffUrl() {
+        UserDefaults.standard.removeObject(forKey: SsoConfig.bffUrlKey)
+        unsetenv("ASTATION_BFF_URL")
+        XCTAssertEqual(SsoConfig.currentBffUrl, "https://agora-cli.agora.io")
+    }
+
+    func testEnvVarOverridesDefault() {
+        setenv("ASTATION_SSO_URL", "https://sso-staging.example", 1)
+        XCTAssertEqual(SsoConfig.currentSsoUrl, "https://sso-staging.example")
+        unsetenv("ASTATION_SSO_URL")
+    }
+
+    func testUserDefaultsOverridesDefault() {
+        unsetenv("ASTATION_BFF_URL")
+        UserDefaults.standard.set("https://bff.example", forKey: SsoConfig.bffUrlKey)
+        XCTAssertEqual(SsoConfig.currentBffUrl, "https://bff.example")
+        UserDefaults.standard.removeObject(forKey: SsoConfig.bffUrlKey)
+    }
+}
