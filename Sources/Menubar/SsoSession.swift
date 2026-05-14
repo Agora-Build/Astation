@@ -48,3 +48,61 @@ enum SsoError: Error, LocalizedError, Equatable {
         }
     }
 }
+
+import CryptoKit
+
+/// PKCE verifier/challenge + state generator. Pure helpers — no I/O.
+enum SsoPkce {
+    /// Returns (verifier, challenge). Verifier is base64url(32 random bytes);
+    /// challenge is base64url(SHA-256(verifier)).
+    static func generate() -> (verifier: String, challenge: String) {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        let verifier = Data(bytes).base64URLEncoded()
+        let challenge = Data(SHA256.hash(data: Data(verifier.utf8))).base64URLEncoded()
+        return (verifier, challenge)
+    }
+
+    /// 16 random bytes → base64url. Used for OAuth `state`.
+    static func generateState() -> String {
+        var bytes = [UInt8](repeating: 0, count: 16)
+        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        return Data(bytes).base64URLEncoded()
+    }
+}
+
+/// Parsed OAuth callback query string.
+struct SsoCallbackQuery: Equatable {
+    let code: String
+    let state: String
+    let loginId: String
+
+    /// `query` is the raw query string AFTER the `?` (no leading `?`).
+    /// Missing fields come back as empty strings.
+    static func parse(_ query: String) -> SsoCallbackQuery {
+        var code = "", state = "", loginId = ""
+        for pair in query.split(separator: "&") {
+            let kv = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard kv.count == 2 else { continue }
+            let key = String(kv[0])
+            let value = String(kv[1]).removingPercentEncoding ?? String(kv[1])
+            switch key {
+            case "code": code = value
+            case "state": state = value
+            case "loginId": loginId = value
+            default: continue
+            }
+        }
+        return SsoCallbackQuery(code: code, state: state, loginId: loginId)
+    }
+}
+
+extension Data {
+    /// base64url with no padding. RFC 7636-compatible.
+    func base64URLEncoded() -> String {
+        base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+}
