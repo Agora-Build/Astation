@@ -1,14 +1,12 @@
 # Astation SSO2 Login Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Replace Astation's customer_id/secret credential entry with OAuth 2.0 + PKCE login against `sso2.agora.io` (same flow as Atem), switch Astation's API calls to Bearer/BFF, switch ConvoAI to `agora token=<rtc_token>`, and repurpose the `credentialSync` WebSocket message to carry SSO tokens (with matching Atem-side migration).
 
 **Architecture:** New `SsoSession`, `SsoSessionStore`, `SsoAuthManager`, and `SsoTokenProvider` files replace `CredentialManager` + `AgoraCredentials`. `AgoraAPIClient` hits `agora-cli.agora.io/api/cli/v1/projects` with Bearer; `ConvoAIClient` mints an RTC dynamic token and uses `Authorization: agora token=<token>`. `AstationMessage.credentialSync` payload swaps to `{access_token, refresh_token, expires_at, login_id, astation_id, save_credentials}`. Atem's `CredentialSync` struct, its pair-flow match arm, and the TUI dispatch site all migrate to the new payload; the now-redundant `SsoTokenSync` variant is removed. Settings UI gets an "Agora Account" section (Sign in with Agora / Signed in as …); the menubar gets a mirrored entry.
 
 **Tech Stack:** Swift 5.9, SwiftNIO (already a dep — used for the loopback OAuth callback listener), Apple `CryptoKit` (AES-GCM + HKDF + SHA-256 + random bytes), `URLSession`, `NSWorkspace.open` for browser launch. Atem side: Rust + serde.
 
-**Spec:** `docs/superpowers/specs/2026-05-13-astation-sso2-login-design.md`
+**Spec:** `docs/specs/2026-05-13-astation-sso2-login-design.md`
 
 ---
 
@@ -173,7 +171,7 @@ git commit -m "$(cat <<'EOF'
 feat(sso): add SsoSession value type and SsoError
 
 First step toward replacing customer_id/secret with OAuth 2.0 + PKCE
-login. Spec: docs/superpowers/specs/2026-05-13-astation-sso2-login-design.md.
+login. Spec: docs/specs/2026-05-13-astation-sso2-login-design.md.
 
 🤖 Built with SMT <smt@agora.build>
 EOF
@@ -2770,11 +2768,11 @@ If you don't have macOS, note this in the commit / PR description so the next pe
 
 - [ ] **Step 5: Mark the spec status complete and commit**
 
-Edit `docs/superpowers/specs/2026-05-13-astation-sso2-login-design.md`: change the `Status:` line at the top to `Status: implemented`.
+Edit `docs/specs/2026-05-13-astation-sso2-login-design.md`: change the `Status:` line at the top to `Status: implemented`.
 
 ```bash
 cd /home/guohai/Dev/Agora.Build/Astation
-git add docs/superpowers/specs/2026-05-13-astation-sso2-login-design.md
+git add docs/specs/2026-05-13-astation-sso2-login-design.md
 git commit -m "$(cat <<'EOF'
 docs: mark SSO2 login spec implemented
 
