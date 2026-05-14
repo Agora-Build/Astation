@@ -344,23 +344,9 @@ final class VoiceCodingTests: XCTestCase {
         XCTAssertEqual(tts?["vendor"] as? String, "microsoft")
     }
 
-    func testConvoAIBasicAuthHeader() throws {
-        let credentials = AgoraCredentials(customerId: "my-customer", customerSecret: "my-secret")
-
-        // Replicate the auth header construction from ConvoAIClient
-        let authString = "\(credentials.customerId):\(credentials.customerSecret)"
-        let authData = authString.data(using: .utf8)!
-        let encoded = authData.base64EncodedString()
-        let header = "Basic \(encoded)"
-
-        // Verify Base64 encoding
-        XCTAssertEqual(encoded, "bXktY3VzdG9tZXI6bXktc2VjcmV0")
-        XCTAssertEqual(header, "Basic bXktY3VzdG9tZXI6bXktc2VjcmV0")
-
-        // Verify round-trip
-        let decoded = Data(base64Encoded: encoded)!
-        let decodedString = String(data: decoded, encoding: .utf8)!
-        XCTAssertEqual(decodedString, "my-customer:my-secret")
+    func testConvoAIAuthorizationHeaderIsAgoraTokenFormat() {
+        let header = ConvoAIClient.authorizationHeader(rtcToken: "abc.def.ghi")
+        XCTAssertEqual(header, "agora token=abc.def.ghi")
     }
 
     func testConvoAIStopAgentRequestFormat() throws {
