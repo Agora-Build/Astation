@@ -534,15 +534,18 @@ class VoiceCodingManager: NSObject {
     // MARK: - ConvoAI Agent
 
     private func createConvoAIAgent(sessionId: String) {
-        guard let credentials = hubManager.credentialManager.load(),
-              let appId = hubManager.projects.first?.vendorKey,
-              let channel = hubManager.rtcManager.currentChannel else {
-            Log.warn("[VoiceCoding] Missing credentials/appId/channel — skipping ConvoAI agent")
-            updateStage("Voice: Missing credentials", autoHideAfter: 2.0)
+        guard let project = hubManager.projects.first,
+              let channel = hubManager.rtcManager.currentChannel,
+              !project.vendorKey.isEmpty,
+              !project.signKey.isEmpty
+        else {
+            Log.warn("[VoiceCoding] Missing project (appId/signKey) or channel — skipping ConvoAI agent")
+            updateStage("Voice: Missing project", autoHideAfter: 2.0)
             cleanup()
             return
         }
-
+        let appId = project.vendorKey
+        let appCert = project.signKey
         let localUid = String(hubManager.rtcManager.currentUid)
         let relayUrl = hubManager.stationRelayUrl
 
@@ -550,10 +553,9 @@ class VoiceCodingManager: NSObject {
             do {
                 let agentToken = await hubManager.generateTokenForConvoAIAgent(channel: channel) ?? ""
                 let llmUrl = "\(relayUrl)/api/llm/chat?session_id=\(sessionId)"
-
                 let agentResp = try await self.convoAIClient.createAgent(
                     appId: appId,
-                    credentials: credentials,
+                    appCertificate: appCert,
                     channel: channel,
                     agentRtcUid: "1001",
                     remoteRtcUid: localUid,
@@ -566,7 +568,6 @@ class VoiceCodingManager: NSObject {
                 self.isPreparing = false
                 Log.info("[VoiceCoding] ConvoAI agent created: \(agentResp.agentId)")
                 self.updateStage(self.mode == .handsFree ? "Voice: Listening…" : "Voice: Listening…")
-
                 if self.deferredStopPTT {
                     Log.info("[VoiceCoding] Executing deferred stopPTT")
                     self.stopPTT()
@@ -581,14 +582,24 @@ class VoiceCodingManager: NSObject {
 
     private func stopConvoAIAgent() {
         guard let agentId = activeAgentId,
-              let credentials = hubManager.credentialManager.load(),
-              let appId = hubManager.projects.first?.vendorKey else {
-            return
-        }
+              let project = hubManager.projects.first,
+              let channel = hubManager.rtcManager.currentChannel,
+              !project.vendorKey.isEmpty,
+              !project.signKey.isEmpty
+        else { return }
+
+        let appId = project.vendorKey
+        let appCert = project.signKey
 
         Task {
             do {
-                try await convoAIClient.stopAgent(appId: appId, credentials: credentials, agentId: agentId)
+                try await convoAIClient.stopAgent(
+                    appId: appId,
+                    appCertificate: appCert,
+                    channel: channel,
+                    agentRtcUid: "1001",
+                    agentId: agentId
+                )
                 Log.info("[VoiceCoding] ConvoAI agent stopped: \(agentId)")
             } catch {
                 Log.error("[VoiceCoding] Failed to stop ConvoAI agent: \(error)")
