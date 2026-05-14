@@ -75,7 +75,7 @@ class AstationHubManager: ObservableObject {
     }
 
     @objc private func handleCredentialsChanged() {
-        Task { await pushCredentials(targetClientId: nil) }
+        reloadSession()
     }
 
     deinit {
