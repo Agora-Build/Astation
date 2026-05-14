@@ -132,23 +132,76 @@ extension SsoCallbackHandler {
     <html lang="en">
     <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Login successful</title>
     <style>
-      body{min-height:100vh;display:flex;align-items:center;justify-content:center;
-           background:#0f0f11;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0}
-      .card{text-align:center;padding:48px 56px;max-width:560px;width:100%;
-            background:#18181b;border:1px solid #2a2a2e;border-radius:16px}
+      *{margin:0;padding:0;box-sizing:border-box}
+      body{
+        min-height:100vh;display:flex;align-items:center;justify-content:center;
+        background:#0f0f11;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+      }
+      .card{
+        text-align:center;padding:48px 56px;max-width:560px;width:100%;
+        background:#18181b;border:1px solid #2a2a2e;border-radius:16px;
+        box-shadow:0 8px 32px rgba(0,0,0,.4);
+      }
       .icon{font-size:36px;color:#22c55e;margin-bottom:20px}
+      .url-row{
+        display:flex;align-items:center;gap:8px;
+        background:#09090b;border:1px solid #27272a;border-radius:8px;
+        padding:10px 12px;margin-bottom:24px;text-align:left;
+      }
+      .url-text{
+        flex:1;font-family:ui-monospace,monospace;font-size:11px;
+        color:#71717a;word-break:break-all;
+      }
+      .copy-btn{
+        flex-shrink:0;background:none;border:none;cursor:pointer;
+        color:#52525b;padding:2px;line-height:1;transition:color .15s;
+      }
+      .copy-btn:hover{color:#a1a1aa}
+      .copy-btn svg{display:block}
       h1{font-size:20px;font-weight:600;color:#f4f4f5;margin-bottom:8px}
-      p{font-size:14px;color:#71717a}
+      p{font-size:14px;color:#71717a;margin-bottom:28px}
+      .close-btn{
+        padding:9px 22px;border:none;border-radius:8px;
+        background:#3f3f46;color:#d4d4d8;font-size:14px;font-weight:500;
+        cursor:pointer;transition:background .15s;
+      }
+      .close-btn:hover{background:#52525b}
     </style>
     </head>
     <body>
-      <div class="card">
-        <div class="icon">&#x2713;</div>
-        <h1>Login successful</h1>
-        <p>Return to Astation to continue.</p>
+    <div class="card">
+      <div class="icon">&#x2713;</div>
+      <div class="url-row">
+        <span class="url-text" id="url"></span>
+        <button class="copy-btn" onclick="copyUrl()" title="Copy">
+          <svg id="icon-copy" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+          </svg>
+          <svg id="icon-check" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none">
+            <polyline points="20 6 9 17 4 12"/>
+          </svg>
+        </button>
       </div>
+      <h1>Login successful</h1>
+      <p>Return to Astation to continue.</p>
+      <button class="close-btn" onclick="window.close()">Close</button>
+    </div>
+    <script>
+      document.getElementById('url').textContent = window.location.href;
+      function copyUrl() {
+        navigator.clipboard.writeText(window.location.href).then(function() {
+          document.getElementById('icon-copy').style.display = 'none';
+          document.getElementById('icon-check').style.display = 'block';
+          setTimeout(function() {
+            document.getElementById('icon-copy').style.display = 'block';
+            document.getElementById('icon-check').style.display = 'none';
+          }, 1500);
+        });
+      }
+    </script>
     </body>
     </html>
     """

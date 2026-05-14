@@ -40,10 +40,17 @@ final class SsoNetworkRefresher: SsoTokenRefreshing {
     }
 
     /// application/x-www-form-urlencoded body.
+    /// RFC 3986 §3.4 form-urlencoded: only unreserved characters pass through.
+    private static let formAllowed: CharacterSet = {
+        var s = CharacterSet.alphanumerics
+        s.insert(charactersIn: "-._~")
+        return s
+    }()
+
     static func formBody(_ pairs: [String: String]) -> Data {
         let encoded = pairs.map { k, v in
-            let kk = k.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? k
-            let vv = v.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? v
+            let kk = k.addingPercentEncoding(withAllowedCharacters: formAllowed) ?? k
+            let vv = v.addingPercentEncoding(withAllowedCharacters: formAllowed) ?? v
             return "\(kk)=\(vv)"
         }.joined(separator: "&")
         return Data(encoded.utf8)
