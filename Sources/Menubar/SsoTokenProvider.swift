@@ -27,7 +27,7 @@ final class SsoNetworkRefresher: SsoTokenRefreshing {
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         req.httpBody = SsoNetworkRefresher.formBody([
             "grant_type": "refresh_token",
-            "client_id": SsoNetworkRefresher.clientId,
+            "client_id": SsoAuthManager.clientId,
             "refresh_token": refreshToken,
         ])
         let (data, response) = try await urlSession.data(for: req)
@@ -38,8 +38,6 @@ final class SsoNetworkRefresher: SsoTokenRefreshing {
         }
         return try SsoNetworkRefresher.decodeTokenResponse(data)
     }
-
-    static let clientId = "atem"
 
     /// application/x-www-form-urlencoded body.
     static func formBody(_ pairs: [String: String]) -> Data {
