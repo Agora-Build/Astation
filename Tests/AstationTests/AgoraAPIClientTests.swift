@@ -1,174 +1,84 @@
 import XCTest
 @testable import Menubar
 
-final class AgoraAPIClientTests: XCTestCase {
-
-    // MARK: - AgoraAPIProject decoding
-
-    func testDecodeProjectWithStringId() throws {
+final class BffProjectDecodeTests: XCTestCase {
+    func testDecodesProjectWithAllFields() throws {
         let json = """
         {
-            "id": "abc123",
-            "name": "Test Project",
-            "vendor_key": "4855aabb",
-            "sign_key": "cert1234",
-            "recording_server": null,
-            "status": 1,
-            "created": 1637153755
+          "projectId": "pid1",
+          "name": "App",
+          "appId": "0abc",
+          "signKey": "cert1",
+          "status": "active",
+          "createdAt": "2025-01-08T00:00:00Z",
+          "vid": 12345
         }
         """.data(using: .utf8)!
-        let project = try JSONDecoder().decode(AgoraAPIProject.self, from: json)
-        XCTAssertEqual(project.id, "abc123")
-        XCTAssertEqual(project.name, "Test Project")
-        XCTAssertEqual(project.vendor_key, "4855aabb")
-        XCTAssertEqual(project.sign_key, "cert1234")
-        XCTAssertNil(project.recording_server)
-        XCTAssertEqual(project.status, 1)
-        XCTAssertEqual(project.created, 1637153755)
+        let p = try JSONDecoder().decode(BffProject.self, from: json)
+        XCTAssertEqual(p.projectId, "pid1")
+        XCTAssertEqual(p.name, "App")
+        XCTAssertEqual(p.appId, "0abc")
+        XCTAssertEqual(p.signKey, "cert1")
+        XCTAssertEqual(p.status, "active")
+        XCTAssertEqual(p.createdAt, "2025-01-08T00:00:00Z")
+        XCTAssertEqual(p.vid, 12345)
     }
 
-    func testDecodeProjectWithRecordingServer() throws {
+    func testDecodeAllowsMissingSignKeyAndVid() throws {
         let json = """
-        {
-            "id": "proj1",
-            "name": "With Recording",
-            "vendor_key": "vk1",
-            "sign_key": "sk1",
-            "recording_server": "10.0.0.1",
-            "status": 0,
-            "created": 1700000000
-        }
+        {"projectId":"p","name":"n","appId":"a","status":"active","createdAt":"2025-01-01T00:00:00Z"}
         """.data(using: .utf8)!
-        let project = try JSONDecoder().decode(AgoraAPIProject.self, from: json)
-        XCTAssertEqual(project.recording_server, "10.0.0.1")
-        XCTAssertEqual(project.status, 0)
+        let p = try JSONDecoder().decode(BffProject.self, from: json)
+        XCTAssertNil(p.signKey)
+        XCTAssertNil(p.vid)
     }
 
-    // MARK: - AgoraAPIResponse decoding
-
-    func testDecodeFullResponse() throws {
+    func testEnvelopeDecodes() throws {
         let json = """
-        {
-            "projects": [
-                {
-                    "id": "p1",
-                    "name": "Project One",
-                    "vendor_key": "vk1",
-                    "sign_key": "sk1",
-                    "recording_server": null,
-                    "status": 1,
-                    "created": 1637153755
-                },
-                {
-                    "id": "p2",
-                    "name": "Project Two",
-                    "vendor_key": "vk2",
-                    "sign_key": "sk2",
-                    "recording_server": "192.168.1.1",
-                    "status": 0,
-                    "created": 1700000000
-                }
-            ]
-        }
+        {"items":[
+          {"projectId":"p1","name":"One","appId":"a1","signKey":"c1","status":"active","createdAt":"2025-01-01T00:00:00Z"}
+        ]}
         """.data(using: .utf8)!
-        let response = try JSONDecoder().decode(AgoraAPIResponse.self, from: json)
-        XCTAssertEqual(response.projects.count, 2)
-        XCTAssertEqual(response.projects[0].name, "Project One")
-        XCTAssertEqual(response.projects[1].name, "Project Two")
+        let env = try JSONDecoder().decode(BffProjectsEnvelope.self, from: json)
+        XCTAssertEqual(env.items.count, 1)
+        XCTAssertEqual(env.items[0].appId, "a1")
+    }
+}
+
+final class BffProjectMappingTests: XCTestCase {
+    func testMapsBffProjectToAgoraProject() {
+        let b = BffProject(projectId: "pid", name: "My App", appId: "0app",
+                           signKey: "cert", status: "active",
+                           createdAt: "2025-01-08T00:00:00Z", vid: 42)
+        let p = AgoraProject(from: b)
+        XCTAssertEqual(p.id, "0app")
+        XCTAssertEqual(p.vendorKey, "0app")
+        XCTAssertEqual(p.signKey, "cert")
+        XCTAssertEqual(p.name, "My App")
+        XCTAssertEqual(p.status, "active")
+        // 2025-01-08T00:00:00Z → 1736294400
+        XCTAssertEqual(p.created, 1_736_294_400)
     }
 
-    func testDecodeEmptyProjects() throws {
-        let json = """
-        { "projects": [] }
-        """.data(using: .utf8)!
-        let response = try JSONDecoder().decode(AgoraAPIResponse.self, from: json)
-        XCTAssertTrue(response.projects.isEmpty)
+    func testMapsWithMissingSignKey() {
+        let b = BffProject(projectId: "p", name: "n", appId: "a", signKey: nil,
+                           status: "disabled", createdAt: "bogus", vid: nil)
+        let p = AgoraProject(from: b)
+        XCTAssertEqual(p.signKey, "")
+        XCTAssertEqual(p.created, 0, "unparseable date falls back to 0")
     }
+}
 
-    func testDecodeInvalidJsonFails() {
-        let json = "not json".data(using: .utf8)!
-        XCTAssertThrowsError(try JSONDecoder().decode(AgoraAPIResponse.self, from: json))
+final class AgoraAPIErrorTests: XCTestCase {
+    func testUnauthorizedDescription() {
+        XCTAssertTrue(AgoraAPIError.unauthorized.errorDescription?
+            .contains("Session expired") == true)
     }
+}
 
-    func testDecodeMissingFieldsFails() {
-        // Missing vendor_key
-        let json = """
-        {
-            "projects": [{
-                "id": "p1",
-                "name": "Test",
-                "sign_key": "sk1",
-                "status": 1,
-                "created": 1637153755
-            }]
-        }
-        """.data(using: .utf8)!
-        XCTAssertThrowsError(try JSONDecoder().decode(AgoraAPIResponse.self, from: json))
-    }
+// MARK: - AgoraProject Codable round-trip
 
-    // MARK: - AgoraProject mapping
-
-    func testAPIProjectToAgoraProjectMapping() {
-        let raw = AgoraAPIProject(
-            id: "p1",
-            name: "My Project",
-            vendor_key: "app_id_123",
-            sign_key: "cert_456",
-            recording_server: nil,
-            status: 1,
-            created: 1637153755
-        )
-
-        let project = AgoraProject(
-            id: raw.vendor_key,
-            name: raw.name,
-            vendorKey: raw.vendor_key,
-            signKey: raw.sign_key,
-            status: raw.status == 1 ? "active" : "disabled",
-            created: raw.created
-        )
-
-        XCTAssertEqual(project.id, "app_id_123")
-        XCTAssertEqual(project.name, "My Project")
-        XCTAssertEqual(project.vendorKey, "app_id_123")
-        XCTAssertEqual(project.signKey, "cert_456")
-        XCTAssertEqual(project.status, "active")
-        XCTAssertEqual(project.created, 1637153755)
-    }
-
-    func testDisabledProjectMapping() {
-        let raw = AgoraAPIProject(
-            id: "p2",
-            name: "Disabled",
-            vendor_key: "vk2",
-            sign_key: "sk2",
-            recording_server: nil,
-            status: 0,
-            created: 1700000000
-        )
-
-        let status = raw.status == 1 ? "active" : "disabled"
-        XCTAssertEqual(status, "disabled")
-    }
-
-    // MARK: - AgoraAPIError
-
-    func testErrorDescriptions() {
-        XCTAssertEqual(
-            AgoraAPIError.noCredentials.errorDescription,
-            "No Agora credentials configured. Open Settings to add them."
-        )
-        XCTAssertEqual(
-            AgoraAPIError.httpError(401).errorDescription,
-            "Agora API returned HTTP 401"
-        )
-        XCTAssertTrue(
-            AgoraAPIError.decodingError("bad format").errorDescription!.contains("bad format")
-        )
-    }
-
-    // MARK: - AgoraProject Codable round-trip
-
+final class AgoraProjectCodableTests: XCTestCase {
     func testAgoraProjectEncodeDecode() throws {
         let project = AgoraProject(
             id: "app123",

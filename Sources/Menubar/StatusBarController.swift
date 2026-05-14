@@ -6,7 +6,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
     private let hubManager: AstationHubManager
     private let webSocketServer: AstationWebSocketServer
     private var statusMenu: NSMenu!
-    private lazy var settingsWindowController = SettingsWindowController(credentialManager: hubManager.credentialManager)
+    private lazy var settingsWindowController = SettingsWindowController(hubManager: hubManager)
     private lazy var devConsoleController = DevConsoleController(hubManager: hubManager)
     private lazy var projectsWindowController = ProjectsWindowController(hubManager: hubManager)
     private lazy var joinChannelWindowController = JoinChannelWindowController(hubManager: hubManager)
@@ -416,7 +416,20 @@ class StatusBarController: NSObject, NSMenuDelegate {
         statusMenu.addItem(stationItem)
         
         statusMenu.addItem(NSMenuItem.separator())
-        
+
+        // Agora Account (Sign in / Sign out)
+        let acctTitle: String
+        if hubManager.hasSession {
+            let id = hubManager.currentSession()?.loginId ?? "—"
+            acctTitle = "Sign out (\(id))"
+        } else {
+            acctTitle = "Sign in with Agora…"
+        }
+        let acctItem = NSMenuItem(title: acctTitle, action: #selector(signInOrOut), keyEquivalent: "")
+        acctItem.target = self
+        statusMenu.addItem(acctItem)
+        statusMenu.addItem(NSMenuItem.separator())
+
         // Settings
         let settingsItem = NSMenuItem(
             title: "Settings...",
@@ -795,6 +808,24 @@ class StatusBarController: NSObject, NSMenuDelegate {
             headerTapCount = 0
             Log.info("[StatusBar] Dev Console activated via 5-tap")
             devConsoleController.showWindow()
+        }
+    }
+
+    @objc private func signInOrOut() {
+        if hubManager.hasSession {
+            try? hubManager.sessionStore.delete()
+            NotificationCenter.default.post(name: .credentialsChanged, object: nil)
+        } else {
+            Task { @MainActor in
+                do {
+                    let mgr = SsoAuthManager(ssoUrl: SsoConfig.currentSsoUrl)
+                    let session = try await mgr.runLoginFlow()
+                    try hubManager.sessionStore.save(session)
+                    NotificationCenter.default.post(name: .credentialsChanged, object: nil)
+                } catch {
+                    Log.error("[StatusBar] sign-in failed: \(error)")
+                }
+            }
         }
     }
 

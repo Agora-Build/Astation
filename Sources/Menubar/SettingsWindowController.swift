@@ -17,27 +17,24 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     private var window: NSWindow?
-    private let credentialManager: CredentialManager
-    private var customerIdField: NSTextField!
-    private var customerSecretField: NSSecureTextField!
+    private let hubManager: AstationHubManager
     private var statusLabel: NSTextField!
-    private var saveButton: NSButton!
-    private var deleteButton: NSButton!
+    private var signInButton: NSButton!
+    private var signOutButton: NSButton!
+    private var identityLabel: NSTextField!
     private var stationUrlField: NSTextField!
     private var serverStatusLabel: NSTextField!
     private var serverInfoLabel: NSTextField!
 
-    init(credentialManager: CredentialManager) {
-        self.credentialManager = credentialManager
+    init(hubManager: AstationHubManager) {
+        self.hubManager = hubManager
         super.init()
-
-        // Listen for network changes
         NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(networkChanged),
-            name: .networkChanged,
-            object: nil
-        )
+            self, selector: #selector(networkChanged),
+            name: .networkChanged, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(sessionChanged),
+            name: .credentialsChanged, object: nil)
     }
 
     deinit {
@@ -112,59 +109,40 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         separator.boxType = .separator
         contentView.addSubview(separator)
 
-        // === Credentials Section ===
-        let titleLabel = NSTextField(labelWithString: "Agora Console Credentials")
-        titleLabel.font = NSFont.boldSystemFont(ofSize: 14)
-        titleLabel.frame = NSRect(x: 20, y: 200, width: 410, height: 24)
-        contentView.addSubview(titleLabel)
+        // === Agora Account Section ===
+        let acctTitle = NSTextField(labelWithString: "Agora Account")
+        acctTitle.font = NSFont.boldSystemFont(ofSize: 14)
+        acctTitle.frame = NSRect(x: 20, y: 200, width: 410, height: 24)
+        contentView.addSubview(acctTitle)
 
-        // Info label
-        let infoLabel = NSTextField(wrappingLabelWithString: "Enter your Customer ID and Customer Secret from console.agora.io > RESTful API. Credentials are encrypted and stored locally.")
-        infoLabel.font = NSFont.systemFont(ofSize: 11)
-        infoLabel.textColor = .secondaryLabelColor
-        infoLabel.frame = NSRect(x: 20, y: 160, width: 410, height: 36)
-        contentView.addSubview(infoLabel)
+        let info = NSTextField(wrappingLabelWithString:
+            "Sign in once with your Agora account. Astation uses this session to fetch projects and ship credentials to paired Atems. The session is encrypted on disk.")
+        info.font = NSFont.systemFont(ofSize: 11)
+        info.textColor = .secondaryLabelColor
+        info.frame = NSRect(x: 20, y: 150, width: 410, height: 46)
+        contentView.addSubview(info)
 
-        // Customer ID label + field
-        let idLabel = NSTextField(labelWithString: "Customer ID:")
-        idLabel.frame = NSRect(x: 20, y: 125, width: 120, height: 22)
-        contentView.addSubview(idLabel)
+        identityLabel = NSTextField(labelWithString: "")
+        identityLabel.font = NSFont.systemFont(ofSize: 12)
+        identityLabel.frame = NSRect(x: 20, y: 110, width: 410, height: 22)
+        contentView.addSubview(identityLabel)
 
-        customerIdField = NSTextField(frame: NSRect(x: 145, y: 125, width: 280, height: 22))
-        customerIdField.placeholderString = "Enter Customer ID"
-        contentView.addSubview(customerIdField)
+        signInButton = NSButton(title: "Sign in with Agora", target: self, action: #selector(signIn))
+        signInButton.bezelStyle = .rounded
+        signInButton.frame = NSRect(x: 20, y: 70, width: 180, height: 32)
+        contentView.addSubview(signInButton)
 
-        // Customer Secret label + field
-        let secretLabel = NSTextField(labelWithString: "Customer Secret:")
-        secretLabel.frame = NSRect(x: 20, y: 90, width: 120, height: 22)
-        contentView.addSubview(secretLabel)
+        signOutButton = NSButton(title: "Sign out", target: self, action: #selector(signOut))
+        signOutButton.bezelStyle = .rounded
+        signOutButton.frame = NSRect(x: 210, y: 70, width: 100, height: 32)
+        contentView.addSubview(signOutButton)
 
-        customerSecretField = NSSecureTextField(frame: NSRect(x: 145, y: 90, width: 280, height: 22))
-        customerSecretField.placeholderString = "Enter Customer Secret"
-        contentView.addSubview(customerSecretField)
-
-        // Status label
         statusLabel = NSTextField(labelWithString: "")
         statusLabel.font = NSFont.systemFont(ofSize: 11)
-        statusLabel.frame = NSRect(x: 20, y: 55, width: 410, height: 22)
+        statusLabel.frame = NSRect(x: 20, y: 40, width: 410, height: 22)
         contentView.addSubview(statusLabel)
 
-        // Update status based on current credential state
-        updateStatus()
-
-        // Save button
-        saveButton = NSButton(title: "Save", target: self, action: #selector(saveCredentials))
-        saveButton.bezelStyle = .rounded
-        saveButton.frame = NSRect(x: 310, y: 20, width: 115, height: 32)
-        saveButton.keyEquivalent = "\r" // Enter key
-        contentView.addSubview(saveButton)
-
-        // Delete button
-        deleteButton = NSButton(title: "Delete Credentials", target: self, action: #selector(deleteCredentials))
-        deleteButton.bezelStyle = .rounded
-        deleteButton.frame = NSRect(x: 20, y: 20, width: 150, height: 32)
-        deleteButton.isEnabled = credentialManager.hasCredentials
-        contentView.addSubview(deleteButton)
+        renderAccountState()
 
         window.contentView = contentView
         window.makeKeyAndOrderFront(nil)
@@ -173,49 +151,57 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         self.window = window
     }
 
-    private func updateStatus() {
-        if credentialManager.hasCredentials {
-            statusLabel.stringValue = "Credentials saved (encrypted)"
-            statusLabel.textColor = .systemGreen
-            customerIdField.placeholderString = "••••••••  (saved)"
-            customerSecretField.placeholderString = "••••••••  (saved)"
-            deleteButton?.isEnabled = true
-        } else {
-            statusLabel.stringValue = "No credentials configured"
+    private func renderAccountState() {
+        if let session = hubManager.currentSession() {
+            let id = session.loginId ?? "—"
+            identityLabel.stringValue = "Signed in as: \(id)"
+            let mins = max(0, Int64(session.expiresAt) - Int64(Date().timeIntervalSince1970)) / 60
+            statusLabel.stringValue = "Access token expires in \(mins) min"
             statusLabel.textColor = .secondaryLabelColor
-            customerIdField.placeholderString = "Enter Customer ID"
-            customerSecretField.placeholderString = "Enter Customer Secret"
-            deleteButton?.isEnabled = false
+            signInButton.isEnabled = false
+            signOutButton.isEnabled = true
+        } else {
+            identityLabel.stringValue = "Not signed in"
+            statusLabel.stringValue = ""
+            signInButton.isEnabled = true
+            signOutButton.isEnabled = false
         }
-        // Never pre-fill with real values
-        customerIdField?.stringValue = ""
-        customerSecretField?.stringValue = ""
     }
 
-    @objc private func saveCredentials() {
-        let customerId = customerIdField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let customerSecret = customerSecretField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    @objc private func signIn() {
+        signInButton.isEnabled = false
+        statusLabel.stringValue = "Waiting for browser…"
+        statusLabel.textColor = .secondaryLabelColor
 
-        guard !customerId.isEmpty, !customerSecret.isEmpty else {
-            statusLabel.stringValue = "Both fields are required"
-            statusLabel.textColor = .systemRed
-            return
+        Task { @MainActor in
+            do {
+                let mgr = SsoAuthManager(ssoUrl: SsoConfig.currentSsoUrl)
+                let session = try await mgr.runLoginFlow()
+                try hubManager.sessionStore.save(session)
+                NotificationCenter.default.post(name: .credentialsChanged, object: nil)
+                Log.info("[Settings] Signed in as \(session.loginId ?? "—")")
+            } catch {
+                statusLabel.stringValue = error.localizedDescription
+                statusLabel.textColor = .systemRed
+                signInButton.isEnabled = true
+            }
         }
+    }
 
-        let credentials = AgoraCredentials(customerId: customerId, customerSecret: customerSecret)
+    @objc private func signOut() {
+        let alert = NSAlert()
+        alert.messageText = "Sign out?"
+        alert.informativeText = "Astation will lose access to your projects until you sign in again. Paired Atems will not receive credential updates."
+        alert.addButton(withTitle: "Sign out")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        try? hubManager.sessionStore.delete()
+        NotificationCenter.default.post(name: .credentialsChanged, object: nil)
+    }
 
-        do {
-            try credentialManager.save(credentials)
-            statusLabel.stringValue = "Credentials saved (encrypted)"
-            statusLabel.textColor = .systemGreen
-            updateStatus()
-            print("[Settings] Credentials saved successfully")
-            NotificationCenter.default.post(name: .credentialsChanged, object: nil)
-        } catch {
-            statusLabel.stringValue = "Failed to save: \(error.localizedDescription)"
-            statusLabel.textColor = .systemRed
-            print("[Settings] Failed to save credentials: \(error)")
-        }
+    @objc private func sessionChanged() {
+        DispatchQueue.main.async { [weak self] in self?.renderAccountState() }
     }
 
     private func updateServerStatus() {
@@ -226,7 +212,6 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     @objc private func networkChanged() {
-        // Update displayed IP when network changes
         updateServerStatus()
         Log.info("Network changed - IP updated in settings UI")
     }
@@ -242,30 +227,8 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
 
         NotificationCenter.default.post(name: .serverInfoChanged, object: nil)
 
-        // Restore status after 2 seconds
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
             self?.updateServerStatus()
-        }
-    }
-
-    @objc private func deleteCredentials() {
-        let alert = NSAlert()
-        alert.messageText = "Delete Credentials?"
-        alert.informativeText = "This will remove your stored Agora credentials. You will need to re-enter them to use API features."
-        alert.addButton(withTitle: "Delete")
-        alert.addButton(withTitle: "Cancel")
-        alert.alertStyle = .warning
-
-        if alert.runModal() == .alertFirstButtonReturn {
-            do {
-                try credentialManager.delete()
-                updateStatus()
-                print("[Settings] Credentials deleted")
-            } catch {
-                statusLabel.stringValue = "Failed to delete: \(error.localizedDescription)"
-                statusLabel.textColor = .systemRed
-                print("[Settings] Failed to delete credentials: \(error)")
-            }
         }
     }
 

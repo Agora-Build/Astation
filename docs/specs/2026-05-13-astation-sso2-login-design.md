@@ -1,6 +1,6 @@
 # Astation SSO2 Login — Design
 
-Status: approved
+Status: implemented
 Date: 2026-05-13
 Related: `Atem/src/sso_auth.rs`, `Atem/src/credentials.rs`, `Atem/src/agora_api.rs`,
 `Atem/src/convo_test_server.rs`

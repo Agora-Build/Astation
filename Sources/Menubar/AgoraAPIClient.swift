@@ -1,96 +1,111 @@
 import Foundation
 
-/// Raw API response from Agora Console REST API
-struct AgoraAPIResponse: Codable {
-    let projects: [AgoraAPIProject]
+/// Envelope returned by `GET {bff}/api/cli/v1/projects`.
+struct BffProjectsEnvelope: Codable {
+    let items: [BffProject]
 }
 
-/// Raw project as returned by `GET https://api.agora.io/dev/v1/projects`
-struct AgoraAPIProject: Codable {
-    let id: String
+/// Project as returned by the BFF (CLI) API. Field names match Atem's BffProject
+/// (Atem/src/agora_api.rs).
+struct BffProject: Codable {
+    let projectId: String
     let name: String
-    let vendor_key: String   // app_id
-    let sign_key: String     // app_certificate
-    let recording_server: String?
-    let status: Int           // 1 = enabled
-    let created: UInt64       // Unix timestamp
+    let appId: String
+    let signKey: String?
+    let status: String
+    let createdAt: String
+    let vid: UInt64?
 }
 
 enum AgoraAPIError: LocalizedError {
-    case noCredentials
-    case httpError(Int)
+    case unauthorized
+    case httpError(Int, String)
     case decodingError(String)
+    case network(String)
 
     var errorDescription: String? {
         switch self {
-        case .noCredentials:
-            return "No Agora credentials configured. Open Settings to add them."
-        case .httpError(let code):
-            return "Agora API returned HTTP \(code)"
-        case .decodingError(let detail):
-            return "Failed to decode API response: \(detail)"
+        case .unauthorized:
+            return "Session expired — please sign in again."
+        case .httpError(let code, let body):
+            return "Agora BFF returned HTTP \(code): \(body.prefix(200))"
+        case .decodingError(let s):
+            return "Failed to decode BFF response: \(s)"
+        case .network(let s):
+            return "Network error: \(s)"
         }
     }
 }
 
-class AgoraAPIClient {
+final class AgoraAPIClient {
     private let session: URLSession
 
     init(session: URLSession = .shared) {
         self.session = session
     }
 
-    /// Fetch projects from the Agora Console API using stored credentials.
-    func fetchProjects(credentials: AgoraCredentials) async throws -> [AgoraProject] {
-        let url = URL(string: "https://api.agora.io/dev/v1/projects")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-
-        // Basic auth: base64(customer_id:customer_secret)
-        let authString = "\(credentials.customerId):\(credentials.customerSecret)"
-        guard let authData = authString.data(using: .utf8) else {
-            throw AgoraAPIError.noCredentials
+    /// Fetch projects from the BFF using a Bearer access token.
+    func fetchProjects(accessToken: String, bffUrl: String) async throws -> [AgoraProject] {
+        guard let url = URL(string: "\(bffUrl)/api/cli/v1/projects") else {
+            throw AgoraAPIError.network("invalid bff url")
         }
-        let base64Auth = authData.base64EncodedString()
-        request.setValue("Basic \(base64Auth)", forHTTPHeaderField: "Authorization")
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
 
-        NetworkDebugLogger.logRequest(request, label: "AgoraAPI")
+        NetworkDebugLogger.logRequest(req, label: "BFF")
+        let (data, response): (Data, URLResponse)
         do {
-            let (data, response) = try await session.data(for: request)
-            NetworkDebugLogger.logResponse(response, data: data, label: "AgoraAPI")
-
-            guard let httpResponse = response as? HTTPURLResponse else {
-                throw AgoraAPIError.httpError(0)
-            }
-
-            guard (200...201).contains(httpResponse.statusCode) else {
-                throw AgoraAPIError.httpError(httpResponse.statusCode)
-            }
-
-            let apiResponse: AgoraAPIResponse
-            do {
-                apiResponse = try JSONDecoder().decode(AgoraAPIResponse.self, from: data)
-            } catch {
-                let preview = String(data: data.prefix(500), encoding: .utf8) ?? "(binary)"
-                Log.error("[AgoraAPI] Decode failed. Raw response: \(preview)")
-                throw AgoraAPIError.decodingError(error.localizedDescription)
-            }
-
-            // Map API projects to our AgoraProject model
-            return apiResponse.projects.map { raw in
-                AgoraProject(
-                    id: raw.vendor_key,  // Use app_id as the project identifier
-                    name: raw.name,
-                    vendorKey: raw.vendor_key,
-                    signKey: raw.sign_key,
-                    status: raw.status == 1 ? "active" : "disabled",
-                    created: raw.created
-                )
-            }
+            (data, response) = try await session.data(for: req)
         } catch {
-            NetworkDebugLogger.logError(error, label: "AgoraAPI")
-            throw error
+            NetworkDebugLogger.logError(error, label: "BFF")
+            throw AgoraAPIError.network(String(describing: error))
         }
+        NetworkDebugLogger.logResponse(response, data: data, label: "BFF")
+
+        guard let http = response as? HTTPURLResponse else {
+            throw AgoraAPIError.network("no HTTP response")
+        }
+        if http.statusCode == 401 { throw AgoraAPIError.unauthorized }
+        guard (200...299).contains(http.statusCode) else {
+            let body = String(data: data, encoding: .utf8) ?? ""
+            throw AgoraAPIError.httpError(http.statusCode, body)
+        }
+
+        do {
+            let env = try JSONDecoder().decode(BffProjectsEnvelope.self, from: data)
+            return env.items.map(AgoraProject.init(from:))
+        } catch {
+            let preview = String(data: data.prefix(500), encoding: .utf8) ?? "(binary)"
+            Log.error("[BFF] decode failed. Raw: \(preview)")
+            throw AgoraAPIError.decodingError(String(describing: error))
+        }
+    }
+}
+
+extension AgoraProject {
+    /// Convert a BFF project to the in-memory `AgoraProject` that the rest of
+    /// Astation (and the WS protocol) already understands. App ID is used as
+    /// the canonical id.
+    init(from b: BffProject) {
+        self.init(
+            id: b.appId,
+            name: b.name,
+            vendorKey: b.appId,
+            signKey: b.signKey ?? "",
+            status: b.status,
+            created: AgoraProject.unixSecondsFromISO8601(b.createdAt)
+        )
+    }
+
+    static func unixSecondsFromISO8601(_ s: String) -> UInt64 {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = f.date(from: s) { return UInt64(d.timeIntervalSince1970) }
+        let f2 = ISO8601DateFormatter()
+        f2.formatOptions = [.withInternetDateTime]
+        if let d = f2.date(from: s) { return UInt64(d.timeIntervalSince1970) }
+        return 0
     }
 }

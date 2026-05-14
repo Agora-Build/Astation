@@ -43,7 +43,14 @@ enum AstationMessage: Codable {
     // Agent hub (Astation ↔ Atem)
     case agentListRequest
     case agentListResponse(agents: [AtemAgentInfo])
-    case credentialSync(customerId: String, customerSecret: String, astationId: String)
+    case credentialSync(
+        accessToken: String,
+        refreshToken: String,
+        expiresAt: UInt64,
+        loginId: String?,
+        astationId: String,
+        saveCredentials: Bool
+    )
     
     // Custom encoding/decoding to handle the enum cases
     private enum CodingKeys: String, CodingKey {
@@ -241,19 +248,25 @@ enum AstationMessage: Codable {
             var dataContainer = container.nestedContainer(keyedBy: AgentListKeys.self, forKey: .data)
             try dataContainer.encode(agents, forKey: .agents)
 
-        case .credentialSync(let customerId, let customerSecret, let astationId):
+        case .credentialSync(let at, let rt, let exp, let lid, let aid, let save):
             try container.encode(MessageType.credentialSync, forKey: .type)
-            var dataContainer = container.nestedContainer(keyedBy: CredentialSyncKeys.self, forKey: .data)
-            try dataContainer.encode(customerId, forKey: .customerId)
-            try dataContainer.encode(customerSecret, forKey: .customerSecret)
-            try dataContainer.encode(astationId, forKey: .astationId)
+            var dc = container.nestedContainer(keyedBy: CredentialSyncKeys.self, forKey: .data)
+            try dc.encode(at, forKey: .accessToken)
+            try dc.encode(rt, forKey: .refreshToken)
+            try dc.encode(exp, forKey: .expiresAt)
+            try dc.encodeIfPresent(lid, forKey: .loginId)
+            try dc.encode(aid, forKey: .astationId)
+            try dc.encode(save, forKey: .saveCredentials)
         }
     }
 
     private enum CredentialSyncKeys: String, CodingKey {
-        case customerId = "customer_id"
-        case customerSecret = "customer_secret"
+        case accessToken = "access_token"
+        case refreshToken = "refresh_token"
+        case expiresAt = "expires_at"
+        case loginId = "login_id"
         case astationId = "astation_id"
+        case saveCredentials = "save_credentials"
     }
     
     init(from decoder: Decoder) throws {
@@ -423,11 +436,15 @@ enum AstationMessage: Codable {
             self = .agentListResponse(agents: agents)
 
         case .credentialSync:
-            let dataContainer = try container.nestedContainer(keyedBy: CredentialSyncKeys.self, forKey: .data)
-            let customerId = try dataContainer.decode(String.self, forKey: .customerId)
-            let customerSecret = try dataContainer.decode(String.self, forKey: .customerSecret)
-            let astationId = try dataContainer.decodeIfPresent(String.self, forKey: .astationId) ?? AstationIdentity.shared.id
-            self = .credentialSync(customerId: customerId, customerSecret: customerSecret, astationId: astationId)
+            let dc = try container.nestedContainer(keyedBy: CredentialSyncKeys.self, forKey: .data)
+            let at = try dc.decode(String.self, forKey: .accessToken)
+            let rt = try dc.decode(String.self, forKey: .refreshToken)
+            let exp = try dc.decode(UInt64.self, forKey: .expiresAt)
+            let lid = try dc.decodeIfPresent(String.self, forKey: .loginId)
+            let aid = try dc.decodeIfPresent(String.self, forKey: .astationId) ?? AstationIdentity.shared.id
+            let save = try dc.decodeIfPresent(Bool.self, forKey: .saveCredentials) ?? false
+            self = .credentialSync(accessToken: at, refreshToken: rt, expiresAt: exp,
+                                   loginId: lid, astationId: aid, saveCredentials: save)
         }
     }
 }
