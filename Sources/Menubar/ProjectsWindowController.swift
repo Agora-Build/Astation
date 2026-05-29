@@ -113,8 +113,8 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
 
         let createdCol = NSTableColumn(identifier: createdColId)
         createdCol.title = "Created"
-        createdCol.width = 130
-        createdCol.minWidth = 90
+        createdCol.width = 160
+        createdCol.minWidth = 150
         table.addTableColumn(createdCol)
 
         scrollView.documentView = table
