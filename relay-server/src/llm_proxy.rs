@@ -244,6 +244,7 @@ mod tests {
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         }
     }
 

@@ -882,6 +882,7 @@ mod tests {
             rtc_sessions: crate::rtc_session::RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
         Router::new()
             .route("/api/pair", axum::routing::post(create_pair_handler))
@@ -1255,6 +1256,7 @@ mod tests {
             rtc_sessions: crate::rtc_session::RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
 
         // Create pair

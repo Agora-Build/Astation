@@ -516,6 +516,7 @@ mod tests {
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
         Router::new()
             .route("/api/rtc-sessions", post(create_rtc_session_handler))
@@ -832,6 +833,7 @@ mod tests {
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
         state
             .rtc_sessions
@@ -887,6 +889,7 @@ mod tests {
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
         state
             .rtc_sessions
@@ -951,6 +954,7 @@ mod tests {
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
         state
             .rtc_sessions
@@ -1004,6 +1008,7 @@ mod tests {
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
         let app = Router::new()
             .route("/api/rtc-sessions", post(create_rtc_session_handler))
@@ -1128,6 +1133,7 @@ mod tests {
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
         state
             .rtc_sessions
