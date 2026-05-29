@@ -265,11 +265,19 @@ class AstationHubManager: ObservableObject {
         Task {
             let token: String
             do { token = try await tokenProvider.validToken() }
-            catch {
+            catch SsoError.notSignedIn {
                 await MainActor.run {
                     self.projects = []
-                    self.projectLoadError = error.localizedDescription
-                    Log.info("[AstationHub] Cannot load projects: \(error.localizedDescription)")
+                    self.projectLoadError = "Not signed in. Open Settings → Sign in with Agora."
+                    Log.info("[AstationHub] Cannot load projects: not signed in")
+                }
+                return
+            } catch {
+                await MainActor.run {
+                    self.projects = []
+                    self.projectLoadError = "Session expired — please sign in again."
+                    NotificationCenter.default.post(name: .credentialsChanged, object: nil)
+                    Log.info("[AstationHub] Session expired, cleared: \(error.localizedDescription)")
                 }
                 return
             }
