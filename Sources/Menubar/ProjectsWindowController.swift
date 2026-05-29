@@ -90,13 +90,13 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
 
         let appIdCol = NSTableColumn(identifier: appIdColId)
         appIdCol.title = "App ID"
-        appIdCol.width = 220
-        appIdCol.minWidth = 120
+        appIdCol.width = 160
+        appIdCol.minWidth = 100
         table.addTableColumn(appIdCol)
 
         let certCol = NSTableColumn(identifier: certColId)
         certCol.title = "Certificate"
-        certCol.width = 240
+        certCol.width = 180
         certCol.minWidth = 140
         table.addTableColumn(certCol)
 
@@ -241,12 +241,12 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
 
         case appIdColId:
             return makeTextWithCopyCell(
-                tableView, id: "appIdCell", text: project.vendorKey, row: row,
+                tableView, id: "appIdCell", text: Self.masked(project.vendorKey), row: row,
                 copyAction: #selector(copyAppId(_:)))
 
         case certColId:
             let isVisible = certificateVisibility[project.vendorKey] ?? false
-            let displayText = isVisible ? project.signKey : String(repeating: "\u{2022}", count: 12)
+            let displayText = isVisible ? Self.masked(project.signKey) : String(repeating: "\u{2022}", count: 12)
             let toggleTitle = isVisible ? "Hide" : "Show"
             return makeCertCell(
                 tableView, id: "certCell", text: displayText, toggleTitle: toggleTitle, row: row)
@@ -261,6 +261,12 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
         default:
             return nil
         }
+    }
+
+    /// Show first 6 + "..." + last 6 chars. Short strings pass through unchanged.
+    private static func masked(_ s: String) -> String {
+        guard s.count > 16 else { return s }
+        return "\(s.prefix(6))...\(s.suffix(6))"
     }
 
     // MARK: - Cell Factories
