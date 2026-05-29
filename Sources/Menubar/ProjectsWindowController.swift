@@ -13,6 +13,7 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
     private let appIdColId = NSUserInterfaceItemIdentifier("appId")
     private let certColId = NSUserInterfaceItemIdentifier("cert")
     private let statusColId = NSUserInterfaceItemIdentifier("status")
+    private let createdColId = NSUserInterfaceItemIdentifier("created")
 
     init(hubManager: AstationHubManager) {
         self.hubManager = hubManager
@@ -102,9 +103,15 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
 
         let statusCol = NSTableColumn(identifier: statusColId)
         statusCol.title = "Status"
-        statusCol.width = 70
+        statusCol.width = 60
         statusCol.minWidth = 50
         table.addTableColumn(statusCol)
+
+        let createdCol = NSTableColumn(identifier: createdColId)
+        createdCol.title = "Created"
+        createdCol.width = 130
+        createdCol.minWidth = 90
+        table.addTableColumn(createdCol)
 
         scrollView.documentView = table
         contentView.addSubview(scrollView)
@@ -258,6 +265,10 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
             }
             return cell
 
+        case createdColId:
+            let dateStr = Self.formatDate(project.created)
+            return makeLabelCell(tableView, id: "createdCell", text: dateStr)
+
         default:
             return nil
         }
@@ -267,6 +278,17 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
     private static func masked(_ s: String) -> String {
         guard s.count > 16 else { return s }
         return "\(s.prefix(6))...\(s.suffix(6))"
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f
+    }()
+
+    private static func formatDate(_ unix: UInt64) -> String {
+        guard unix > 0 else { return "—" }
+        return dateFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(unix)))
     }
 
     // MARK: - Cell Factories
@@ -300,7 +322,7 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
 
         let label = NSTextField(labelWithString: text)
         label.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        label.lineBreakMode = .byTruncatingTail
+        label.lineBreakMode = .byClipping
         label.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(label)
 
@@ -330,7 +352,7 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
 
         let label = NSTextField(labelWithString: text)
         label.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        label.lineBreakMode = .byTruncatingTail
+        label.lineBreakMode = .byClipping
         label.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(label)
 
