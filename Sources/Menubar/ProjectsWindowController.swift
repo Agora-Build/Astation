@@ -45,14 +45,16 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         // Header
         let headerLabel = NSTextField(labelWithString: "Projects")
         headerLabel.font = NSFont.boldSystemFont(ofSize: 14)
-        headerLabel.frame = NSRect(x: 16, y: 410, width: 80, height: 24)
+        headerLabel.sizeToFit()
+        headerLabel.frame.origin = NSPoint(x: 16, y: 410)
         contentView.addSubview(headerLabel)
 
         selectionToast = NSTextField(labelWithString: "")
         selectionToast.font = NSFont.systemFont(ofSize: 12)
         selectionToast.textColor = .systemBlue
         selectionToast.alphaValue = 0
-        selectionToast.frame = NSRect(x: 96, y: 410, width: 480, height: 24)
+        let toastX = headerLabel.frame.maxX + 8
+        selectionToast.frame = NSRect(x: toastX, y: headerLabel.frame.origin.y, width: 480, height: headerLabel.frame.height)
         contentView.addSubview(selectionToast)
 
         // Refresh button
