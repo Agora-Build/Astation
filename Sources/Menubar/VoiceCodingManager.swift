@@ -126,14 +126,13 @@ class VoiceCodingManager: NSObject {
             return
         }
 
-        let projects = hubManager.getProjects()
-        guard let project = projects.first else {
+        guard let project = hubManager.effectiveProject else {
             updateStage("Voice: No projects configured", autoHideAfter: 2.0)
             finishRtcJoin(success: false)
             return
         }
 
-        let channel = "astation-default"
+        let channel = "astation-\(Self.randomHex(8))"
         let uid = Int.random(in: 1000...9999)
         updateStage("Voice: Joining RTC…")
         hubManager.initializeRTC(appId: project.vendorKey)
@@ -534,7 +533,7 @@ class VoiceCodingManager: NSObject {
     // MARK: - ConvoAI Agent
 
     private func createConvoAIAgent(sessionId: String) {
-        guard let project = hubManager.projects.first,
+        guard let project = hubManager.effectiveProject,
               let channel = hubManager.rtcManager.currentChannel,
               !project.vendorKey.isEmpty,
               !project.signKey.isEmpty
@@ -582,7 +581,7 @@ class VoiceCodingManager: NSObject {
 
     private func stopConvoAIAgent() {
         guard let agentId = activeAgentId,
-              let project = hubManager.projects.first,
+              let project = hubManager.effectiveProject,
               let channel = hubManager.rtcManager.currentChannel,
               !project.vendorKey.isEmpty,
               !project.signKey.isEmpty
@@ -649,6 +648,10 @@ class VoiceCodingManager: NSObject {
             self.updateStage("Voice: Listening…")
             Log.info("[VoiceCoding] Hands-Free session recycled: \(sessionId)")
         }
+    }
+
+    private static func randomHex(_ length: Int) -> String {
+        (0..<length).map { _ in String(format: "%x", Int.random(in: 0...15)) }.joined()
     }
 
     private func cleanup() {

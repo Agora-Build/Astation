@@ -97,6 +97,7 @@ class AstationApp: NSObject, NSApplicationDelegate {
             self?.statusBarController.showStatus()
         }
         hotkeyManager?.registerHotkeys()
+        statusBarController.hotkeyManager = hotkeyManager
 
         // Connect to relay using this Astation's identity, so Atem TUI can auto-reconnect
         // after the first `atem pair` without needing to pair again.

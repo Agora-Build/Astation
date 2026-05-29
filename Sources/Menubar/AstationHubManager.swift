@@ -6,6 +6,7 @@ import Network
 class AstationHubManager: ObservableObject {
     @Published var connectedClients: [ConnectedClient] = []
     @Published var projects: [AgoraProject] = []
+    @Published var selectedProject: AgoraProject?
     @Published var isClaudeRunning = false
     @Published var startTime = Date()
     @Published var voiceActive = false
@@ -264,11 +265,19 @@ class AstationHubManager: ObservableObject {
         Task {
             let token: String
             do { token = try await tokenProvider.validToken() }
-            catch {
+            catch SsoError.notSignedIn {
                 await MainActor.run {
                     self.projects = []
-                    self.projectLoadError = error.localizedDescription
-                    Log.info("[AstationHub] Cannot load projects: \(error.localizedDescription)")
+                    self.projectLoadError = "Not signed in. Open Settings → Sign in with Agora."
+                    Log.info("[AstationHub] Cannot load projects: not signed in")
+                }
+                return
+            } catch {
+                await MainActor.run {
+                    self.projects = []
+                    self.projectLoadError = "Session expired — please sign in again."
+                    NotificationCenter.default.post(name: .credentialsChanged, object: nil)
+                    Log.info("[AstationHub] Session expired, cleared: \(error.localizedDescription)")
                 }
                 return
             }
@@ -278,6 +287,9 @@ class AstationHubManager: ObservableObject {
                 await MainActor.run {
                     self.projects = fetched
                     self.projectLoadError = nil
+                    if self.selectedProject == nil || !fetched.contains(where: { $0.id == self.selectedProject?.id }) {
+                        self.selectedProject = fetched.first
+                    }
                     Log.info(" Loaded \(fetched.count) projects from BFF")
                 }
             } catch AgoraAPIError.unauthorized {
@@ -305,6 +317,20 @@ class AstationHubManager: ObservableObject {
     func getProjects() -> [AgoraProject] {
         return projects
     }
+
+    /// The project to use for RTC, ConvoAI, and token generation.
+    var effectiveProject: AgoraProject? {
+        selectedProject ?? projects.first
+    }
+
+    func selectProject(id: String) {
+        guard let project = projects.first(where: { $0.id == id }) else {
+            Log.warn("[AstationHub] selectProject: no project with id \(id)")
+            return
+        }
+        selectedProject = project
+        Log.info("[AstationHub] Selected project: \(project.name)")
+    }
     
     // MARK: - Token Management
     
@@ -322,7 +348,7 @@ class AstationHubManager: ObservableObject {
         if let projectId = projectId {
             project = projects.first(where: { $0.id == projectId || $0.vendorKey == projectId })
         } else {
-            project = projects.first
+            project = effectiveProject
         }
 
         guard let project = project, !project.signKey.isEmpty else {

@@ -6,12 +6,14 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
     private let hubManager: AstationHubManager
     private var tableView: NSTableView!
     private var statusLabel: NSTextField!
+    private var selectionToast: NSTextField!
     private var certificateVisibility: [String: Bool] = [:]
 
     private let nameColId = NSUserInterfaceItemIdentifier("name")
     private let appIdColId = NSUserInterfaceItemIdentifier("appId")
     private let certColId = NSUserInterfaceItemIdentifier("cert")
     private let statusColId = NSUserInterfaceItemIdentifier("status")
+    private let createdColId = NSUserInterfaceItemIdentifier("created")
 
     init(hubManager: AstationHubManager) {
         self.hubManager = hubManager
@@ -41,11 +43,24 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         let contentView = NSView(frame: window.contentView!.bounds)
         contentView.autoresizingMask = [.width, .height]
 
-        // Header
+        // Header + selection toast
         let headerLabel = NSTextField(labelWithString: "Projects")
         headerLabel.font = NSFont.boldSystemFont(ofSize: 14)
-        headerLabel.frame = NSRect(x: 16, y: 410, width: 200, height: 24)
+        headerLabel.sizeToFit()
+        headerLabel.frame = NSRect(x: 16, y: 410, width: headerLabel.frame.width, height: headerLabel.frame.height)
         contentView.addSubview(headerLabel)
+
+        selectionToast = NSTextField(labelWithString: "")
+        selectionToast.font = NSFont.boldSystemFont(ofSize: 14)
+        selectionToast.textColor = .systemBlue
+        selectionToast.alphaValue = 0
+        selectionToast.frame = NSRect(
+            x: headerLabel.frame.maxX + 8,
+            y: headerLabel.frame.origin.y,
+            width: 400,
+            height: headerLabel.frame.height
+        )
+        contentView.addSubview(selectionToast)
 
         // Refresh button
         let refreshButton = NSButton(
@@ -65,6 +80,10 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         let table = NSTableView()
         table.rowHeight = 28
         table.usesAlternatingRowBackgroundColors = true
+        table.allowsEmptySelection = true
+        table.allowsMultipleSelection = false
+        table.doubleAction = #selector(tableDoubleClicked)
+        table.target = self
         table.delegate = self
         table.dataSource = self
 
@@ -76,21 +95,27 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
 
         let appIdCol = NSTableColumn(identifier: appIdColId)
         appIdCol.title = "App ID"
-        appIdCol.width = 220
-        appIdCol.minWidth = 120
+        appIdCol.width = 160
+        appIdCol.minWidth = 100
         table.addTableColumn(appIdCol)
 
         let certCol = NSTableColumn(identifier: certColId)
         certCol.title = "Certificate"
-        certCol.width = 240
+        certCol.width = 180
         certCol.minWidth = 140
         table.addTableColumn(certCol)
 
         let statusCol = NSTableColumn(identifier: statusColId)
         statusCol.title = "Status"
-        statusCol.width = 70
+        statusCol.width = 60
         statusCol.minWidth = 50
         table.addTableColumn(statusCol)
+
+        let createdCol = NSTableColumn(identifier: createdColId)
+        createdCol.title = "Created"
+        createdCol.width = 160
+        createdCol.minWidth = 150
+        table.addTableColumn(createdCol)
 
         scrollView.documentView = table
         contentView.addSubview(scrollView)
@@ -184,6 +209,34 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
         return hubManager.getProjects().count
     }
 
+    @objc private func tableDoubleClicked() {
+        let row = tableView.clickedRow
+        guard row >= 0 else { return }
+        let projects = hubManager.getProjects()
+        guard row < projects.count else { return }
+        hubManager.selectProject(id: projects[row].id)
+        tableView.reloadData()
+        showSelectionToast("Selected: \(projects[row].name)")
+    }
+
+    private func showSelectionToast(_ text: String) {
+        // Cancel any in-flight animation so the new toast appears immediately.
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0
+            ctx.allowsImplicitAnimation = false
+            selectionToast.animator().alphaValue = 1
+        } completionHandler: { [weak self] in
+            guard let self else { return }
+            self.selectionToast.stringValue = text
+            self.selectionToast.alphaValue = 1
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 4.0
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                self.selectionToast.animator().alphaValue = 0
+            }
+        }
+    }
+
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int)
         -> NSView?
     {
@@ -193,24 +246,34 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
 
         switch colId {
         case nameColId:
-            return makeLabelCell(tableView, id: "nameCell", text: project.name)
+            let isSelected = hubManager.selectedProject?.id == project.id
+            let displayName = isSelected ? "\u{2713} \(project.name)" : "  \(project.name)"
+            return makeLabelCell(tableView, id: "nameCell", text: displayName)
 
         case appIdColId:
             return makeTextWithCopyCell(
-                tableView, id: "appIdCell", text: project.vendorKey, row: row,
+                tableView, id: "appIdCell", text: Self.masked(project.vendorKey), row: row,
                 copyAction: #selector(copyAppId(_:)))
 
         case certColId:
             let isVisible = certificateVisibility[project.vendorKey] ?? false
-            let displayText = isVisible ? project.signKey : String(repeating: "\u{2022}", count: 12)
+            let displayText = isVisible ? Self.masked(project.signKey) : String(repeating: "\u{2022}", count: 12)
             let toggleTitle = isVisible ? "Hide" : "Show"
             return makeCertCell(
                 tableView, id: "certCell", text: displayText, toggleTitle: toggleTitle, row: row)
 
         case statusColId:
             let cell = makeLabelCell(tableView, id: "statusCell", text: project.status)
-            if let textField = cell as? NSTextField {
-                textField.textColor = project.status == "active" ? .systemGreen : .secondaryLabelColor
+            if let cellView = cell as? NSTableCellView {
+                cellView.textField?.textColor = project.status == "active" ? .systemGreen : .secondaryLabelColor
+            }
+            return cell
+
+        case createdColId:
+            let dateStr = Self.formatDate(project.created)
+            let cell = makeLabelCell(tableView, id: "createdCell", text: dateStr)
+            if let cellView = cell as? NSTableCellView {
+                cellView.textField?.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
             }
             return cell
 
@@ -219,19 +282,45 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
         }
     }
 
+    /// Show first 6 + "..." + last 6 chars. Short strings pass through unchanged.
+    private static func masked(_ s: String) -> String {
+        guard s.count > 16 else { return s }
+        return "\(s.prefix(6))...\(s.suffix(6))"
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f
+    }()
+
+    private static func formatDate(_ unix: UInt64) -> String {
+        guard unix > 0 else { return "—" }
+        return dateFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(unix)))
+    }
+
     // MARK: - Cell Factories
 
     private func makeLabelCell(_ tableView: NSTableView, id: String, text: String) -> NSView {
         let cellId = NSUserInterfaceItemIdentifier(id)
-        if let existing = tableView.makeView(withIdentifier: cellId, owner: nil) as? NSTextField {
-            existing.stringValue = text
+        if let existing = tableView.makeView(withIdentifier: cellId, owner: nil) as? NSTableCellView {
+            existing.textField?.stringValue = text
             return existing
         }
+        let cell = NSTableCellView()
+        cell.identifier = cellId
         let label = NSTextField(labelWithString: text)
-        label.identifier = cellId
         label.font = NSFont.systemFont(ofSize: 12)
         label.lineBreakMode = .byTruncatingTail
-        return label
+        label.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(label)
+        cell.textField = label
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+            label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
+            label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+        return cell
     }
 
     private func makeTextWithCopyCell(
@@ -241,7 +330,7 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
 
         let label = NSTextField(labelWithString: text)
         label.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        label.lineBreakMode = .byTruncatingTail
+        label.lineBreakMode = .byClipping
         label.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(label)
 
@@ -271,7 +360,7 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
 
         let label = NSTextField(labelWithString: text)
         label.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        label.lineBreakMode = .byTruncatingTail
+        label.lineBreakMode = .byClipping
         label.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(label)
 

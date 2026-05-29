@@ -16,6 +16,9 @@ class HotkeyManager {
     /// Called when Ctrl+Shift+V is pressed (video toggle).
     var onVideoToggle: (() -> Void)?
 
+    private(set) var voiceHotkeyFailed = false
+    private(set) var videoHotkeyFailed = false
+
     private static let voiceHotkeyID = UInt32(1)
     private static let videoHotkeyID = UInt32(2)
     private static let hotkeySignature = OSType(0x4154454D)  // "ATEM" in ASCII
@@ -70,7 +73,8 @@ class HotkeyManager {
             &voiceHotkeyRef
         )
         if voiceResult != noErr {
-            print("[HotkeyManager] Failed to register Ctrl+V: \(voiceResult)")
+            voiceHotkeyFailed = true
+            Log.warn("[HotkeyManager] Failed to register Ctrl+V hotkey: \(voiceResult)")
         }
 
         // Ctrl+Shift+V → video toggle
@@ -87,10 +91,11 @@ class HotkeyManager {
             &videoHotkeyRef
         )
         if videoResult != noErr {
-            print("[HotkeyManager] Failed to register Ctrl+Shift+V: \(videoResult)")
+            videoHotkeyFailed = true
+            Log.warn("[HotkeyManager] Failed to register Ctrl+Shift+V hotkey: \(videoResult)")
         }
 
-        print("[HotkeyManager] Global hotkeys registered: Ctrl+V (voice), Ctrl+Shift+V (video)")
+        Log.info("[HotkeyManager] Global hotkeys registered: Ctrl+V (voice), Ctrl+Shift+V (video)")
     }
 
     /// Unregister all hotkeys.
@@ -103,7 +108,7 @@ class HotkeyManager {
             UnregisterEventHotKey(ref)
             videoHotkeyRef = nil
         }
-        print("[HotkeyManager] Hotkeys unregistered")
+        Log.info("[HotkeyManager] Hotkeys unregistered")
     }
 
     // MARK: - Carbon Event Handler
