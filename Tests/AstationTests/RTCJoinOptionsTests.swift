@@ -3,8 +3,8 @@ import XCTest
 @testable import Menubar
 
 final class RTCJoinOptionsTests: XCTestCase {
-    func testManualJoinDefaultsUseAes256Gcm2AndNoFence() {
-        XCTAssertEqual(RTCEncryptionMode.manualJoinDefault, .aes256Gcm2)
+    func testManualJoinDefaultsUseNoneEncryptionAndNoFence() {
+        XCTAssertEqual(RTCEncryptionMode.manualJoinDefault, .none)
         XCTAssertEqual(RTCGeoFence.manualJoinDefault, .noFence)
     }
 
