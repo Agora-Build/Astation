@@ -220,6 +220,10 @@ class JoinChannelWindowController: NSObject, NSWindowDelegate {
             joinButton?.isEnabled = false
         } else {
             projectPicker?.addItems(withTitles: projects.map { $0.name })
+            if let selected = hubManager.selectedProject,
+               let idx = projects.firstIndex(where: { $0.id == selected.id }) {
+                projectPicker?.selectItem(at: idx)
+            }
             projectPicker?.isEnabled = true
             joinButton?.isEnabled = true
         }
