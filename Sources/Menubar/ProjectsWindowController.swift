@@ -6,6 +6,7 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
     private let hubManager: AstationHubManager
     private var tableView: NSTableView!
     private var statusLabel: NSTextField!
+    private var selectionToast: NSTextField!
     private var certificateVisibility: [String: Bool] = [:]
 
     private let nameColId = NSUserInterfaceItemIdentifier("name")
@@ -44,8 +45,15 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         // Header
         let headerLabel = NSTextField(labelWithString: "Projects")
         headerLabel.font = NSFont.boldSystemFont(ofSize: 14)
-        headerLabel.frame = NSRect(x: 16, y: 410, width: 200, height: 24)
+        headerLabel.frame = NSRect(x: 16, y: 410, width: 80, height: 24)
         contentView.addSubview(headerLabel)
+
+        selectionToast = NSTextField(labelWithString: "")
+        selectionToast.font = NSFont.systemFont(ofSize: 12)
+        selectionToast.textColor = .systemGreen
+        selectionToast.alphaValue = 0
+        selectionToast.frame = NSRect(x: 96, y: 410, width: 480, height: 24)
+        contentView.addSubview(selectionToast)
 
         // Refresh button
         let refreshButton = NSButton(
@@ -67,6 +75,8 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         table.usesAlternatingRowBackgroundColors = true
         table.allowsEmptySelection = true
         table.allowsMultipleSelection = false
+        table.doubleAction = #selector(tableDoubleClicked)
+        table.target = self
         table.delegate = self
         table.dataSource = self
 
@@ -186,13 +196,24 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
         return hubManager.getProjects().count
     }
 
-    func tableViewSelectionDidChange(_ notification: Notification) {
-        let row = tableView.selectedRow
+    @objc private func tableDoubleClicked() {
+        let row = tableView.clickedRow
         guard row >= 0 else { return }
         let projects = hubManager.getProjects()
         guard row < projects.count else { return }
         hubManager.selectProject(id: projects[row].id)
         tableView.reloadData()
+        showSelectionToast("Selected: \(projects[row].name)")
+    }
+
+    private func showSelectionToast(_ text: String) {
+        selectionToast.stringValue = text
+        selectionToast.alphaValue = 1
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 4.0
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            selectionToast.animator().alphaValue = 0
+        }
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int)
