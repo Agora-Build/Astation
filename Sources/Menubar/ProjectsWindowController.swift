@@ -50,7 +50,7 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
 
         selectionToast = NSTextField(labelWithString: "")
         selectionToast.font = NSFont.systemFont(ofSize: 12)
-        selectionToast.textColor = .systemGreen
+        selectionToast.textColor = .systemBlue
         selectionToast.alphaValue = 0
         selectionToast.frame = NSRect(x: 96, y: 410, width: 480, height: 24)
         contentView.addSubview(selectionToast)
@@ -207,12 +207,20 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
     }
 
     private func showSelectionToast(_ text: String) {
-        selectionToast.stringValue = text
-        selectionToast.alphaValue = 1
+        // Cancel any in-flight animation so the new toast appears immediately.
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 4.0
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
-            selectionToast.animator().alphaValue = 0
+            ctx.duration = 0
+            ctx.allowsImplicitAnimation = false
+            selectionToast.animator().alphaValue = 1
+        } completionHandler: { [weak self] in
+            guard let self else { return }
+            self.selectionToast.stringValue = text
+            self.selectionToast.alphaValue = 1
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 4.0
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                self.selectionToast.animator().alphaValue = 0
+            }
         }
     }
 
@@ -243,8 +251,8 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
 
         case statusColId:
             let cell = makeLabelCell(tableView, id: "statusCell", text: project.status)
-            if let textField = cell as? NSTextField {
-                textField.textColor = project.status == "active" ? .systemGreen : .secondaryLabelColor
+            if let cellView = cell as? NSTableCellView {
+                cellView.textField?.textColor = project.status == "active" ? .systemGreen : .secondaryLabelColor
             }
             return cell
 
@@ -257,15 +265,24 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
 
     private func makeLabelCell(_ tableView: NSTableView, id: String, text: String) -> NSView {
         let cellId = NSUserInterfaceItemIdentifier(id)
-        if let existing = tableView.makeView(withIdentifier: cellId, owner: nil) as? NSTextField {
-            existing.stringValue = text
+        if let existing = tableView.makeView(withIdentifier: cellId, owner: nil) as? NSTableCellView {
+            existing.textField?.stringValue = text
             return existing
         }
+        let cell = NSTableCellView()
+        cell.identifier = cellId
         let label = NSTextField(labelWithString: text)
-        label.identifier = cellId
         label.font = NSFont.systemFont(ofSize: 12)
         label.lineBreakMode = .byTruncatingTail
-        return label
+        label.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(label)
+        cell.textField = label
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+            label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -2),
+            label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+        return cell
     }
 
     private func makeTextWithCopyCell(
