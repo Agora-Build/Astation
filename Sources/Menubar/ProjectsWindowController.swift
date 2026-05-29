@@ -271,7 +271,11 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
 
         case createdColId:
             let dateStr = Self.formatDate(project.created)
-            return makeLabelCell(tableView, id: "createdCell", text: dateStr)
+            let cell = makeLabelCell(tableView, id: "createdCell", text: dateStr)
+            if let cellView = cell as? NSTableCellView {
+                cellView.textField?.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            }
+            return cell
 
         default:
             return nil
