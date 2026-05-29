@@ -416,4 +416,77 @@ mod tests {
         let list = body_json(app.clone().oneshot(req("GET", "/api/vault?id=a", &sess, "")).await.unwrap()).await;
         assert_eq!(list[0]["summary"], "new summary");
     }
+
+    #[tokio::test]
+    async fn read_missing_vault_is_404() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        let resp = app.oneshot(req("GET", "/api/vault/v-doesnotexist?id=a", &sess, "")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn missing_client_id_is_400() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        // No ?id= query param.
+        let resp = app.oneshot(req("POST", "/api/vault", &sess, r#"{"summary":"x"}"#)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn ungranted_session_is_401() {
+        // A session that exists but is not granted must not authenticate.
+        let sessions = SessionStore::new();
+        let session = create_session("host"); // status defaults to Pending
+        let sess = session.id.clone();
+        sessions.create(session).await;
+        let state = AppState {
+            sessions,
+            relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
+            session_verify_cache: SessionVerifyCache::new(),
+            voice_sessions: VoiceSessionStore::new(),
+            vault: Arc::new(InMemoryVaultStore::new()),
+        };
+        let app = app(state);
+        let resp = app.oneshot(req("POST", "/api/vault?id=a", &sess, r#"{}"#)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn list_is_isolated_by_work_session() {
+        let (state, sess1) = test_state("ws-1").await;
+        // Second granted session in ws-2.
+        let mut s2 = create_session("h2");
+        s2.status = SessionStatus::Granted;
+        s2.astation_id = Some("ws-2".to_string());
+        let sess2 = s2.id.clone();
+        state.sessions.create(s2).await;
+        let app = app(state);
+
+        // Create one vault in each work session.
+        app.clone().oneshot(req("POST", "/api/vault?id=a", &sess1, r#"{"summary":"in-ws1"}"#)).await.unwrap();
+        app.clone().oneshot(req("POST", "/api/vault?id=b", &sess2, r#"{"summary":"in-ws2"}"#)).await.unwrap();
+
+        let list1 = body_json(app.clone().oneshot(req("GET", "/api/vault?id=a", &sess1, "")).await.unwrap()).await;
+        assert_eq!(list1.as_array().unwrap().len(), 1);
+        assert_eq!(list1[0]["summary"], "in-ws1");
+
+        let list2 = body_json(app.clone().oneshot(req("GET", "/api/vault?id=b", &sess2, "")).await.unwrap()).await;
+        assert_eq!(list2.as_array().unwrap().len(), 1);
+        assert_eq!(list2[0]["summary"], "in-ws2");
+    }
+
+    #[tokio::test]
+    async fn append_returns_incrementing_entry_nos_over_http() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        let vault_id = body_json(app.clone().oneshot(req("POST", "/api/vault?id=a", &sess, r#"{}"#)).await.unwrap()).await["vault_id"].as_str().unwrap().to_string();
+
+        let w1 = body_json(app.clone().oneshot(req("POST", &format!("/api/vault/{}?id=a", vault_id), &sess, r#"{"text":"one"}"#)).await.unwrap()).await;
+        let w2 = body_json(app.clone().oneshot(req("POST", &format!("/api/vault/{}?id=a", vault_id), &sess, r#"{"text":"two"}"#)).await.unwrap()).await;
+        assert_eq!(w1["entry_no"], 1);
+        assert_eq!(w2["entry_no"], 2);
+    }
 }

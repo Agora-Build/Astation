@@ -642,4 +642,95 @@ mod tests {
         let stranger = store.list_readable("ws-other", "stranger").await.unwrap();
         assert_eq!(stranger.len(), 0);
     }
+
+    #[tokio::test]
+    async fn multiple_appends_increment_entry_no_and_seq() {
+        let store = InMemoryVaultStore::new();
+        let id = store.create_vault("ws-1", "a", "").await.unwrap();
+        let w1 = store.append(&id, "a", "one").await.unwrap();
+        let w2 = store.append(&id, "a", "two").await.unwrap();
+        let w3 = store.append(&id, "a", "three").await.unwrap();
+        assert_eq!((w1.entry_no, w2.entry_no, w3.entry_no), (1, 2, 3));
+        assert!(w1.seq < w2.seq && w2.seq < w3.seq);
+        // All version 1 (distinct entries).
+        assert_eq!((w1.version, w2.version, w3.version), (1, 1, 1));
+
+        let current = store.read(&id, None, false).await.unwrap();
+        assert_eq!(current.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn overrides_are_isolated_per_entry_no() {
+        let store = InMemoryVaultStore::new();
+        let id = store.create_vault("ws-1", "a", "").await.unwrap();
+        store.append(&id, "a", "e1v1").await.unwrap(); // entry 1
+        store.append(&id, "a", "e2v1").await.unwrap(); // entry 2
+        let o1 = store.override_entry(&id, 1, "a", "e1v2").await.unwrap();
+        let o2 = store.override_entry(&id, 1, "a", "e1v3").await.unwrap();
+        assert_eq!(o1.version, 2);
+        assert_eq!(o2.version, 3);
+
+        let current = store.read(&id, None, false).await.unwrap();
+        assert_eq!(current.len(), 2, "still two entries");
+        // entry 1 shows v3, entry 2 untouched at v1.
+        assert_eq!(current[0].entry_no, 1);
+        assert_eq!(current[0].version, 3);
+        assert_eq!(current[0].content, "e1v3");
+        assert_eq!(current[1].entry_no, 2);
+        assert_eq!(current[1].version, 1);
+    }
+
+    #[tokio::test]
+    async fn override_unknown_entry_starts_at_version_1() {
+        let store = InMemoryVaultStore::new();
+        let id = store.create_vault("ws-1", "a", "").await.unwrap();
+        // Override an entry_no that was never appended.
+        let w = store.override_entry(&id, 7, "a", "ghost").await.unwrap();
+        assert_eq!(w.entry_no, 7);
+        assert_eq!(w.version, 1);
+    }
+
+    #[tokio::test]
+    async fn operations_on_missing_vault_return_not_found() {
+        let store = InMemoryVaultStore::new();
+        assert!(matches!(store.read("nope", None, false).await, Err(VaultError::NotFound)));
+        assert!(matches!(store.append("nope", "a", "x").await, Err(VaultError::NotFound)));
+        assert!(matches!(store.override_entry("nope", 1, "a", "x").await, Err(VaultError::NotFound)));
+        assert!(matches!(store.set_summary("nope", "x").await, Err(VaultError::NotFound)));
+        assert!(matches!(store.add_writer("nope", "a").await, Err(VaultError::NotFound)));
+        assert!(store.get_meta("nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn vaults_are_isolated_from_each_other() {
+        let store = InMemoryVaultStore::new();
+        let a = store.create_vault("ws-1", "x", "A").await.unwrap();
+        let b = store.create_vault("ws-1", "x", "B").await.unwrap();
+        assert_ne!(a, b);
+        store.append(&a, "x", "in-a").await.unwrap();
+
+        let a_entries = store.read(&a, None, true).await.unwrap();
+        let b_entries = store.read(&b, None, true).await.unwrap();
+        assert_eq!(a_entries.len(), 1);
+        assert_eq!(b_entries.len(), 0, "write to A must not leak into B");
+    }
+
+    #[tokio::test]
+    async fn set_summary_updates_list_view() {
+        let store = InMemoryVaultStore::new();
+        let id = store.create_vault("ws-1", "a", "old").await.unwrap();
+        store.set_summary(&id, "new").await.unwrap();
+        let items = store.list_readable("ws-1", "a").await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].summary, "new");
+    }
+
+    #[test]
+    fn vault_id_is_prefixed_and_unique() {
+        let a = generate_vault_id();
+        let b = generate_vault_id();
+        assert!(a.starts_with("v-"));
+        assert_eq!(a.len(), 10, "v- + 8 chars");
+        assert_ne!(a, b);
+    }
 }
