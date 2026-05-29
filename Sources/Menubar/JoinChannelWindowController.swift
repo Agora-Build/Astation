@@ -64,8 +64,9 @@ class JoinChannelWindowController: NSObject, NSWindowDelegate {
         contentView.addSubview(channelLabel)
 
         channelField = NSTextField(frame: NSRect(x: 110, y: y, width: fieldWidth, height: 22))
-        channelField.placeholderString = "e.g. astation-default"
-        channelField.stringValue = "astation-default"
+        let defaultChannel = "astation-\(Self.randomHex(8))"
+        channelField.placeholderString = "e.g. astation-a1b2c3d4"
+        channelField.stringValue = defaultChannel
         contentView.addSubview(channelField)
         y -= 40
 
@@ -336,6 +337,10 @@ class JoinChannelWindowController: NSObject, NSWindowDelegate {
             geoFence: selectedGeoFence(),
             encryption: encryption
         )
+    }
+
+    private static func randomHex(_ length: Int) -> String {
+        (0..<length).map { _ in String(format: "%x", Int.random(in: 0...15)) }.joined()
     }
 
     // MARK: - NSWindowDelegate

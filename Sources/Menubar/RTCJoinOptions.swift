@@ -11,12 +11,12 @@ enum RTCEncryptionMode: Int32, CaseIterable {
     case aes128Xts = 1
     case sm4_128Ecb = 4
 
-    static let manualJoinDefault: RTCEncryptionMode = .aes256Gcm2
+    static let manualJoinDefault: RTCEncryptionMode = .none
 
     static let manualJoinPickerOptions: [RTCEncryptionMode] = [
+        .none,
         .aes256Gcm2,
         .aes128Gcm2,
-        .none,
         .aes256Gcm,
         .aes128Gcm,
         .aes256Xts,

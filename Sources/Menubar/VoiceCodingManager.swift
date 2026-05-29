@@ -132,7 +132,7 @@ class VoiceCodingManager: NSObject {
             return
         }
 
-        let channel = "astation-default"
+        let channel = "astation-\(Self.randomHex(8))"
         let uid = Int.random(in: 1000...9999)
         updateStage("Voice: Joining RTC…")
         hubManager.initializeRTC(appId: project.vendorKey)
@@ -648,6 +648,10 @@ class VoiceCodingManager: NSObject {
             self.updateStage("Voice: Listening…")
             Log.info("[VoiceCoding] Hands-Free session recycled: \(sessionId)")
         }
+    }
+
+    private static func randomHex(_ length: Int) -> String {
+        (0..<length).map { _ in String(format: "%x", Int.random(in: 0...15)) }.joined()
     }
 
     private func cleanup() {
