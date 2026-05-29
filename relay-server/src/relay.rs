@@ -300,15 +300,30 @@ pub async fn ws_handler(
         }
     }
 
-    // Sanitize atem_id to URL-safe chars (hostname may contain spaces or special chars)
-    let atem_id = params.atem_id
-        .as_deref()
-        .map(|s| s.chars().filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.').collect::<String>())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("atem-{:x}", rand::thread_rng().gen::<u32>()));
+    // Sanitize atem_id. atem percent-encodes ids that may contain non-ASCII
+    // (CJK hostnames), so decode first, then keep non-ASCII while restricting
+    // ASCII to [A-Za-z0-9-] (matches atem's own identity rule).
+    let atem_id = sanitize_atem_id(params.atem_id.as_deref());
 
     ws.on_upgrade(move |socket| handle_ws(hub, code, role, atem_id, socket))
         .into_response()
+}
+
+/// Percent-decode an incoming atem_id and filter to a safe id, preserving
+/// non-ASCII characters. Falls back to a random id when empty/missing.
+fn sanitize_atem_id(raw: Option<&str>) -> String {
+    let decoded = urlencoding::decode(raw.unwrap_or(""))
+        .map(|c| c.into_owned())
+        .unwrap_or_default();
+    let filtered: String = decoded
+        .chars()
+        .filter(|c| !c.is_ascii() || c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    if filtered.is_empty() {
+        format!("atem-{:x}", rand::thread_rng().gen::<u32>())
+    } else {
+        filtered
+    }
 }
 
 /// Message routing protocol for multi-Atem rooms:
@@ -717,6 +732,27 @@ mod tests {
         let codes: Vec<String> = (0..20).map(|_| generate_pairing_code()).collect();
         let unique: std::collections::HashSet<&String> = codes.iter().collect();
         assert!(unique.len() > 1, "Pairing codes should vary");
+    }
+
+    #[test]
+    fn sanitize_atem_id_preserves_decoded_cjk() {
+        // "团队-mac" percent-encoded; non-ASCII preserved, ASCII restricted to [A-Za-z0-9-].
+        let encoded = "%E5%9B%A2%E9%98%9F-mac";
+        assert_eq!(sanitize_atem_id(Some(encoded)), "团队-mac");
+    }
+
+    #[test]
+    fn sanitize_atem_id_strips_unsafe_ascii() {
+        assert_eq!(sanitize_atem_id(Some("a_b.c d!e")), "abcde");
+        assert_eq!(sanitize_atem_id(Some("keep-this-123")), "keep-this-123");
+    }
+
+    #[test]
+    fn sanitize_atem_id_falls_back_when_empty() {
+        let id = sanitize_atem_id(None);
+        assert!(id.starts_with("atem-"));
+        let id2 = sanitize_atem_id(Some(""));
+        assert!(id2.starts_with("atem-"));
     }
 
     #[test]
