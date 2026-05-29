@@ -43,20 +43,25 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         let contentView = NSView(frame: window.contentView!.bounds)
         contentView.autoresizingMask = [.width, .height]
 
-        // Header
+        // Header + selection toast (use autolayout for baseline alignment)
         let headerLabel = NSTextField(labelWithString: "Projects")
         headerLabel.font = NSFont.boldSystemFont(ofSize: 14)
-        headerLabel.sizeToFit()
-        headerLabel.frame.origin = NSPoint(x: 16, y: 410)
+        headerLabel.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(headerLabel)
 
         selectionToast = NSTextField(labelWithString: "")
-        selectionToast.font = NSFont.systemFont(ofSize: 12)
+        selectionToast.font = NSFont.systemFont(ofSize: 13)
         selectionToast.textColor = .systemBlue
         selectionToast.alphaValue = 0
-        let toastX = headerLabel.frame.maxX + 8
-        selectionToast.frame = NSRect(x: toastX, y: headerLabel.frame.origin.y, width: 480, height: headerLabel.frame.height)
+        selectionToast.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(selectionToast)
+
+        NSLayoutConstraint.activate([
+            headerLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            headerLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: -30),
+            selectionToast.lastBaselineAnchor.constraint(equalTo: headerLabel.lastBaselineAnchor),
+            selectionToast.leadingAnchor.constraint(equalTo: headerLabel.trailingAnchor, constant: 8),
+        ])
 
         // Refresh button
         let refreshButton = NSButton(
@@ -282,7 +287,7 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
 
     private static let dateFormatter: DateFormatter = {
         let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd HH:mm"
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
         return f
     }()
 
