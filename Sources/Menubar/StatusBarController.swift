@@ -11,6 +11,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
     private lazy var projectsWindowController = ProjectsWindowController(hubManager: hubManager)
     private lazy var joinChannelWindowController = JoinChannelWindowController(hubManager: hubManager)
     private lazy var connectionsWindowController = ConnectionsWindowController(hubManager: hubManager)
+    var hotkeyManager: HotkeyManager?
     private var headerTapCount = 0
     private var lastHeaderTapTime: Date?
 
@@ -71,8 +72,14 @@ class StatusBarController: NSObject, NSMenuDelegate {
         statusItem.isEnabled = false
         statusMenu.addItem(statusItem)
         
+        let projectTitle: String
+        if let selected = hubManager.selectedProject {
+            projectTitle = "📋 Project: \(selected.name)"
+        } else {
+            projectTitle = "📋 Projects: \(systemStatus.projects) loaded"
+        }
         let projectsItem = NSMenuItem(
-            title: "📋 Projects: \(systemStatus.projects) loaded",
+            title: projectTitle,
             action: nil,
             keyEquivalent: ""
         )
@@ -108,16 +115,20 @@ class StatusBarController: NSObject, NSMenuDelegate {
             voiceOffItem.isEnabled = false
             statusMenu.addItem(voiceOffItem)
 
-            if hubManager.rtcManager.isInChannel {
-                let handsFreeItem = NSMenuItem(
-                    title: "Start Hands-Free Mode",
-                    action: #selector(startHandsFreeMode),
-                    keyEquivalent: ""
-                )
-                handsFreeItem.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Hands-Free")
-                handsFreeItem.target = self
-                statusMenu.addItem(handsFreeItem)
+            if hotkeyManager?.voiceHotkeyFailed == true {
+                let warn = NSMenuItem(title: "  ⚠ Ctrl+V hotkey unavailable (conflict)", action: nil, keyEquivalent: "")
+                warn.isEnabled = false
+                statusMenu.addItem(warn)
             }
+
+            let handsFreeItem = NSMenuItem(
+                title: "Start Hands-Free Mode",
+                action: #selector(startHandsFreeMode),
+                keyEquivalent: ""
+            )
+            handsFreeItem.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Hands-Free")
+            handsFreeItem.target = self
+            statusMenu.addItem(handsFreeItem)
 
         case .ptt:
             let pttItem = NSMenuItem(
@@ -159,6 +170,12 @@ class StatusBarController: NSObject, NSMenuDelegate {
         videoItem.image = NSImage(systemSymbolName: videoIcon, accessibilityDescription: "Video")
         videoItem.target = self
         statusMenu.addItem(videoItem)
+
+        if hotkeyManager?.videoHotkeyFailed == true {
+            let warn = NSMenuItem(title: "  ⚠ Ctrl+Shift+V hotkey unavailable (conflict)", action: nil, keyEquivalent: "")
+            warn.isEnabled = false
+            statusMenu.addItem(warn)
+        }
 
         statusMenu.addItem(NSMenuItem.separator())
 

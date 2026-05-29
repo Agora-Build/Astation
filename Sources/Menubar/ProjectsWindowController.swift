@@ -65,6 +65,8 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         let table = NSTableView()
         table.rowHeight = 28
         table.usesAlternatingRowBackgroundColors = true
+        table.allowsEmptySelection = true
+        table.allowsMultipleSelection = false
         table.delegate = self
         table.dataSource = self
 
@@ -184,6 +186,15 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
         return hubManager.getProjects().count
     }
 
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        let row = tableView.selectedRow
+        guard row >= 0 else { return }
+        let projects = hubManager.getProjects()
+        guard row < projects.count else { return }
+        hubManager.selectProject(id: projects[row].id)
+        tableView.reloadData()
+    }
+
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int)
         -> NSView?
     {
@@ -193,7 +204,9 @@ extension ProjectsWindowController: NSTableViewDataSource, NSTableViewDelegate {
 
         switch colId {
         case nameColId:
-            return makeLabelCell(tableView, id: "nameCell", text: project.name)
+            let isSelected = hubManager.selectedProject?.id == project.id
+            let displayName = isSelected ? "\u{2713} \(project.name)" : "  \(project.name)"
+            return makeLabelCell(tableView, id: "nameCell", text: displayName)
 
         case appIdColId:
             return makeTextWithCopyCell(

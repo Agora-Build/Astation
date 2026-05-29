@@ -126,8 +126,7 @@ class VoiceCodingManager: NSObject {
             return
         }
 
-        let projects = hubManager.getProjects()
-        guard let project = projects.first else {
+        guard let project = hubManager.effectiveProject else {
             updateStage("Voice: No projects configured", autoHideAfter: 2.0)
             finishRtcJoin(success: false)
             return
@@ -534,7 +533,7 @@ class VoiceCodingManager: NSObject {
     // MARK: - ConvoAI Agent
 
     private func createConvoAIAgent(sessionId: String) {
-        guard let project = hubManager.projects.first,
+        guard let project = hubManager.effectiveProject,
               let channel = hubManager.rtcManager.currentChannel,
               !project.vendorKey.isEmpty,
               !project.signKey.isEmpty
@@ -582,7 +581,7 @@ class VoiceCodingManager: NSObject {
 
     private func stopConvoAIAgent() {
         guard let agentId = activeAgentId,
-              let project = hubManager.projects.first,
+              let project = hubManager.effectiveProject,
               let channel = hubManager.rtcManager.currentChannel,
               !project.vendorKey.isEmpty,
               !project.signKey.isEmpty
