@@ -43,25 +43,24 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         let contentView = NSView(frame: window.contentView!.bounds)
         contentView.autoresizingMask = [.width, .height]
 
-        // Header + selection toast (use autolayout for baseline alignment)
+        // Header + selection toast
         let headerLabel = NSTextField(labelWithString: "Projects")
         headerLabel.font = NSFont.boldSystemFont(ofSize: 14)
-        headerLabel.translatesAutoresizingMaskIntoConstraints = false
+        headerLabel.sizeToFit()
+        headerLabel.frame = NSRect(x: 16, y: 410, width: headerLabel.frame.width, height: headerLabel.frame.height)
         contentView.addSubview(headerLabel)
 
         selectionToast = NSTextField(labelWithString: "")
-        selectionToast.font = NSFont.systemFont(ofSize: 13)
+        selectionToast.font = NSFont.boldSystemFont(ofSize: 14)
         selectionToast.textColor = .systemBlue
         selectionToast.alphaValue = 0
-        selectionToast.translatesAutoresizingMaskIntoConstraints = false
+        selectionToast.frame = NSRect(
+            x: headerLabel.frame.maxX + 8,
+            y: headerLabel.frame.origin.y,
+            width: 400,
+            height: headerLabel.frame.height
+        )
         contentView.addSubview(selectionToast)
-
-        NSLayoutConstraint.activate([
-            headerLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
-            headerLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: -30),
-            selectionToast.lastBaselineAnchor.constraint(equalTo: headerLabel.lastBaselineAnchor),
-            selectionToast.leadingAnchor.constraint(equalTo: headerLabel.trailingAnchor, constant: 8),
-        ])
 
         // Refresh button
         let refreshButton = NSButton(
