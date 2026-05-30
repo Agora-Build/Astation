@@ -51,7 +51,10 @@ enum AstationMessage: Codable {
         astationId: String,
         saveCredentials: Bool
     )
-    
+
+    // Remote agent control (Astation → Atem): text or key input to the agent PTY.
+    case agentInput(agentId: String?, kind: String, text: String?, key: String?)
+
     // Custom encoding/decoding to handle the enum cases
     private enum CodingKeys: String, CodingKey {
         case type
@@ -87,6 +90,7 @@ enum AstationMessage: Codable {
         case agentListRequest
         case agentListResponse
         case credentialSync
+        case agentInput
     }
     
     func encode(to encoder: Encoder) throws {
@@ -257,6 +261,14 @@ enum AstationMessage: Codable {
             try dc.encodeIfPresent(lid, forKey: .loginId)
             try dc.encode(aid, forKey: .astationId)
             try dc.encode(save, forKey: .saveCredentials)
+
+        case .agentInput(let agentId, let kind, let text, let key):
+            try container.encode(MessageType.agentInput, forKey: .type)
+            var dc = container.nestedContainer(keyedBy: AgentInputKeys.self, forKey: .data)
+            try dc.encodeIfPresent(agentId, forKey: .agentId)
+            try dc.encode(kind, forKey: .kind)
+            try dc.encodeIfPresent(text, forKey: .text)
+            try dc.encodeIfPresent(key, forKey: .key)
         }
     }
 
@@ -267,6 +279,13 @@ enum AstationMessage: Codable {
         case loginId = "login_id"
         case astationId = "astation_id"
         case saveCredentials = "save_credentials"
+    }
+
+    private enum AgentInputKeys: String, CodingKey {
+        case agentId
+        case kind
+        case text
+        case key
     }
     
     init(from decoder: Decoder) throws {
@@ -445,6 +464,14 @@ enum AstationMessage: Codable {
             let save = try dc.decodeIfPresent(Bool.self, forKey: .saveCredentials) ?? false
             self = .credentialSync(accessToken: at, refreshToken: rt, expiresAt: exp,
                                    loginId: lid, astationId: aid, saveCredentials: save)
+
+        case .agentInput:
+            let dc = try container.nestedContainer(keyedBy: AgentInputKeys.self, forKey: .data)
+            let agentId = try dc.decodeIfPresent(String.self, forKey: .agentId)
+            let kind = try dc.decode(String.self, forKey: .kind)
+            let text = try dc.decodeIfPresent(String.self, forKey: .text)
+            let key = try dc.decodeIfPresent(String.self, forKey: .key)
+            self = .agentInput(agentId: agentId, kind: kind, text: text, key: key)
         }
     }
 }

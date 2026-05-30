@@ -802,6 +802,32 @@ class AstationHubManager: ObservableObject {
         Log.info(" Voice command → \(clientId): \(text)\(isFinal ? " [final]" : "")")
     }
 
+    // MARK: - Remote Agent Control
+
+    /// Send a text instruction to the focused Atem's agent (written to its PTY stdin + Enter).
+    /// `agentId == nil` targets the Atem's focused/only agent.
+    func sendAgentText(_ text: String, agentId: String? = nil) {
+        guard let clientId = routeToFocusedAtem() else {
+            Log.info("[AgentInput] No Atem connected — text dropped: \(text)")
+            return
+        }
+        let message = AstationMessage.agentInput(agentId: agentId, kind: "text", text: text, key: nil)
+        sendHandler?(message, clientId)
+        Log.info("[AgentInput] text → \(clientId): \(text)")
+    }
+
+    /// Send a control key to the focused Atem's agent (written raw to its PTY).
+    /// `key` is one of: enter, esc, ctrl-c, up, down, y, n.
+    func sendAgentKey(_ key: String, agentId: String? = nil) {
+        guard let clientId = routeToFocusedAtem() else {
+            Log.info("[AgentInput] No Atem connected — key dropped: \(key)")
+            return
+        }
+        let message = AstationMessage.agentInput(agentId: agentId, kind: "key", text: nil, key: key)
+        sendHandler?(message, clientId)
+        Log.info("[AgentInput] key → \(clientId): \(key)")
+    }
+
     // MARK: - Mark Task Routing
 
     private func handleMarkTaskNotify(taskId: String, status: String, description: String) {
