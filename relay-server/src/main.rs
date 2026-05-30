@@ -7,6 +7,8 @@ mod session_verify;
 mod voice_session;
 mod voice_routes;
 mod llm_proxy;
+mod vault_store;
+mod vault_routes;
 mod web;
 
 use axum::http::{header, HeaderValue, Method};
@@ -30,6 +32,7 @@ pub struct AppState {
     pub rtc_sessions: RtcSessionStore,
     pub session_verify_cache: SessionVerifyCache,
     pub voice_sessions: VoiceSessionStore,
+    pub vault: Arc<dyn vault_store::VaultStore>,
 }
 
 #[tokio::main]
@@ -48,6 +51,32 @@ async fn main() {
     let rtc_sessions = RtcSessionStore::new();
     let session_verify_cache = SessionVerifyCache::new();
     let voice_sessions = VoiceSessionStore::new();
+
+    // Vault store: Postgres when DATABASE_URL is set (the durable path), else an
+    // in-memory fallback so the rest of the server still runs without a DB.
+    let vault: Arc<dyn vault_store::VaultStore> = match std::env::var("DATABASE_URL") {
+        Ok(url) if !url.is_empty() => {
+            tracing::info!("Connecting to Postgres for vault storage...");
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(5)
+                .connect(&url)
+                .await
+                .expect("Failed to connect to DATABASE_URL for vault storage");
+            sqlx::migrate!("./migrations")
+                .run(&pool)
+                .await
+                .expect("Failed to run vault migrations");
+            tracing::info!("Vault storage ready (Postgres)");
+            Arc::new(vault_store::PgVaultStore::new(pool))
+        }
+        _ => {
+            tracing::warn!(
+                "DATABASE_URL not set — vault storage is IN-MEMORY (not durable). \
+                 Set DATABASE_URL to enable persistent vaults."
+            );
+            Arc::new(vault_store::InMemoryVaultStore::new())
+        }
+    };
 
     // Spawn background cleanup for expired sessions
     let cleanup_sessions = sessions.clone();
@@ -109,6 +138,7 @@ async fn main() {
         rtc_sessions,
         session_verify_cache,
         voice_sessions,
+        vault,
     };
 
     // Configure CORS - Allow specific origin or default to localhost for development
@@ -209,6 +239,19 @@ async fn main() {
         .route(
             "/api/llm/chat",
             post(llm_proxy::llm_chat_handler),
+        )
+        // Vault API routes
+        .route(
+            "/api/vault",
+            post(vault_routes::create_vault_handler).get(vault_routes::list_vaults_handler),
+        )
+        .route(
+            "/api/vault/:id",
+            get(vault_routes::read_vault_handler).post(vault_routes::write_vault_handler),
+        )
+        .route(
+            "/api/vault/:id/summary",
+            post(vault_routes::set_summary_handler),
         )
         // Relay API routes
         .route("/api/pair", post(relay::create_pair_handler))

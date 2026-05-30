@@ -49,6 +49,18 @@ impl SessionVerifyCache {
         None
     }
 
+    /// Return the bound astation_id for a session if cached, valid, and not expired.
+    pub async fn get_astation_id(&self, session_id: &str) -> Option<String> {
+        let cache = self.cache.read().await;
+        let cached = cache.get(session_id)?;
+        let age = now_timestamp().saturating_sub(cached.cached_at);
+        if cached.valid && age < cached.ttl_seconds {
+            Some(cached.astation_id.clone())
+        } else {
+            None
+        }
+    }
+
     /// Cache a session validation result.
     pub async fn set(&self, session_id: String, astation_id: String, valid: bool, ttl_seconds: u64) {
         let mut cache = self.cache.write().await;

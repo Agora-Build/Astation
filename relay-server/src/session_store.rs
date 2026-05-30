@@ -132,6 +132,7 @@ mod tests {
             token: None,
             created_at: now - Duration::minutes(10),
             expires_at: now - Duration::minutes(5),
+            astation_id: None,
         };
         let expired_id = expired_session.id.clone();
         store.create(expired_session).await;
@@ -150,6 +151,7 @@ mod tests {
             token: Some("some-token".to_string()),
             created_at: now - Duration::minutes(10),
             expires_at: now - Duration::minutes(5),
+            astation_id: None,
         };
         let granted_id = granted_session.id.clone();
         store.create(granted_session).await;

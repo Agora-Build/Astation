@@ -3,12 +3,16 @@ services:
     build: .
     image: station-relay-server:latest
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
 
     environment:
       - CORS_ORIGIN=${CORS_ORIGIN:-https://station.agora.build}
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-https://station.agora.build}
       - PORT=${PORT:-3000}
       - RUST_LOG=${RUST_LOG:-info}
+      - DATABASE_URL=${DATABASE_URL:-postgres://vault:vault@postgres:5432/vault}
 
     ports:
       - "3000:3000"
@@ -19,3 +23,21 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-vault}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-vault}
+      - POSTGRES_DB=${POSTGRES_DB:-vault}
+    volumes:
+      - vault_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vault}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  vault_pgdata:

@@ -21,6 +21,10 @@ pub struct Session {
     pub token: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    /// The astation_id this session is bound to (the "work session"). Set when
+    /// known (e.g. at grant / verification time). Used as vault work_session_id.
+    #[serde(default)]
+    pub astation_id: Option<String>,
 }
 
 /// Generate an 8-digit numeric OTP.
@@ -49,6 +53,7 @@ pub fn create_session(hostname: &str) -> Session {
         token: None,
         created_at: now,
         expires_at: now + Duration::minutes(5),
+        astation_id: None,
     }
 }
 
@@ -151,6 +156,7 @@ mod tests {
             token: None,
             created_at: now - Duration::minutes(10),
             expires_at: now - Duration::minutes(5), // Already expired
+            astation_id: None,
         };
         assert!(
             !validate_otp(&session, "12345678"),

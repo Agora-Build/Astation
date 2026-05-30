@@ -72,6 +72,20 @@ Web screen sharing with up to 8 participants.
 - `GET /api/rtc-sessions/:id` → `{app_id, channel, host_uid}` - Get session info
 - `POST /api/rtc-sessions/:id/join {name}` → `{app_id, channel, token, uid}` - Join session (assigns unique UID)
 
+### Vault
+Durable, append-only, versioned shared context store for collaborating atems.
+Backed by Postgres (`DATABASE_URL`). All requests require
+`Authorization: session <session_id>` and `?id=<client_id>`.
+
+- `POST /api/vault {summary}` → `{vault_id}` - Create a vault
+- `GET /api/vault` → `[{vault_id, summary}]` - List readable vaults
+- `GET /api/vault/:id [?since=<seq>&history=true]` → `[VaultEntry]` - Read (current view or history)
+- `POST /api/vault/:id {text, entry_id?}` → `{entry_no, version, seq}` - Append (no `entry_id`) or override (with `entry_id`)
+- `POST /api/vault/:id/summary {text}` → `{}` - Update summary
+
+Authz: in-session callers (same `work_session_id` = bound astation_id) get read+write;
+out-of-session past content-writers get read-only; others are denied (403).
+
 ## Astation Integration
 
 The Astation macOS app uses this relay server for:
@@ -91,6 +105,7 @@ Config: Set `relay_url` and `ws_url` in `.atem/config.toml`
 | `PUBLIC_BASE_URL` | _(unset)_ | Public base URL used for generated session links (recommended in production) |
 | `PORT` | `3000` | Server port |
 | `RUST_LOG` | `info` | Log level (error, warn, info, debug, trace) |
+| `DATABASE_URL` | _(unset)_ | Postgres connection string for **vault** storage (e.g. `postgres://vault:vault@localhost:5432/vault`). When unset, vault storage falls back to **in-memory** (non-durable) and logs a warning. Migrations in `migrations/` run automatically at startup. |
 
 **Production:**
 ```bash

@@ -272,6 +272,7 @@ mod tests {
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
         Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -334,6 +335,7 @@ mod tests {
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -434,6 +436,7 @@ mod tests {
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -504,6 +507,7 @@ mod tests {
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -592,6 +596,7 @@ mod tests {
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
         let session = create_session("my-machine");
         let session_id = session.id.clone();
@@ -645,6 +650,7 @@ mod tests {
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -710,6 +716,7 @@ mod tests {
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -774,6 +781,7 @@ mod tests {
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -882,6 +890,7 @@ mod tests {
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -947,6 +956,7 @@ mod tests {
             rtc_sessions: RtcSessionStore::new(),
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
         };
 
         // Create an expired session manually
@@ -959,6 +969,7 @@ mod tests {
             token: None,
             created_at: now - Duration::minutes(10),
             expires_at: now - Duration::minutes(5),
+            astation_id: None,
         };
         let session_id = expired_session.id.clone();
         state.sessions.create(expired_session).await;
