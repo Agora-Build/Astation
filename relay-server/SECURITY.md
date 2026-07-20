@@ -205,7 +205,7 @@ Web User → Opens https://station.agora.build/session/{id}
 ### Recommended (Should Have)
 - [ ] **Structured Logging** - JSON logs for security events
 - [ ] **Monitoring/Alerting** - Prometheus + Grafana or similar
-- [ ] **Health Checks** - `/health` endpoint for uptime monitoring
+- [x] **Health Checks** - `/health` verifies the service and configured Vault store
 - [ ] **Error Tracking** - Sentry or similar for crash reports
 
 ### Optional (Nice to Have)
@@ -232,8 +232,8 @@ cp .env.example .env
 docker compose up -d
 
 # 3. Verify
-curl http://localhost:3000/api/pair
-# Expected: 400 Bad Request (server running)
+curl --fail http://localhost:3000/health
+# Expected: {"status":"ok","vault_store":"postgres"}
 ```
 
 ### Staging (Coolify)

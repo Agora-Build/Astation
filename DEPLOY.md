@@ -42,7 +42,7 @@ services:
     ports:
       - "3000:3000"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/api/pair"]
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -120,7 +120,7 @@ spec:
           value: "3000"
         livenessProbe:
           httpGet:
-            path: /api/pair
+            path: /health
             port: 3000
           initialDelaySeconds: 10
           periodSeconds: 30
@@ -385,7 +385,7 @@ Create ClusterIssuer (already in k8s/deployment.yaml above).
 
 ```bash
 # API Server health
-curl http://localhost:3000/api/pair
+curl --fail http://localhost:3000/health
 
 # Webapp health
 curl http://localhost/
@@ -437,13 +437,13 @@ The API server is stateless except for in-memory session stores. For multi-insta
 
 1. **Session affinity** - Use sticky sessions for WebSocket connections
 2. **Redis store** - Replace in-memory stores with Redis for shared state
-3. **Health checks** - Configure load balancer health checks on `/api/pair`
+3. **Health checks** - Configure load balancer health checks on `/health`
 
 ## Security
 
 1. **HTTPS Required** - Microphone access requires HTTPS (except localhost)
-2. **CORS** - API allows all origins by default (consider restricting in production)
-3. **Rate Limiting** - Add rate limiting for `/api/rtc-sessions` endpoints
+2. **CORS** - Set `CORS_ORIGIN` to the public webapp origin in production
+3. **Rate Limiting** - REST APIs are limited per client IP behind the trusted proxy
 4. **Firewall** - Restrict access to port 3000 (API should only be accessed via nginx proxy)
 5. **Token Validation** - Ensure Agora tokens have appropriate expiry times
 
@@ -451,7 +451,7 @@ The API server is stateless except for in-memory session stores. For multi-insta
 
 **Webapp can't connect to API:**
 - Check nginx proxy configuration
-- Verify API server is running: `curl http://localhost:3000/api/pair`
+- Verify API server is ready: `curl --fail http://localhost:3000/health`
 - Check browser console for CORS errors
 
 **Microphone not working:**
