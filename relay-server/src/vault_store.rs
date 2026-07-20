@@ -20,12 +20,6 @@ pub struct VaultEntry {
     pub created_at: DateTime<Utc>,
 }
 
-/// `POST /api/vault` response.
-#[derive(Debug, Clone, Serialize)]
-pub struct CreatedVault {
-    pub vault_id: String,
-}
-
 /// `GET /api/vault` list item.
 #[derive(Debug, Clone, Serialize)]
 pub struct VaultListItem {

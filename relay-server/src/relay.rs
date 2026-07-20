@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time::Instant;
 use validator::Validate;
 
+use crate::session_verify::SessionVerifyCache;
 use crate::AppState;
 
 // Characters for pairing codes — no ambiguous chars (0/O, 1/I/L excluded)
@@ -25,6 +26,9 @@ const ROOM_EXPIRY_SECS: u64 = 600;
 /// At 100k connections, 60s pings produce ~1700 tiny frames/sec (~10KB/s total) — negligible.
 const WS_PING_INTERVAL_SECS: u64 = 60;
 
+/// Astation pairing sessions remain valid for seven days of inactivity.
+const VERIFIED_SESSION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
 // --- Types ---
 
 struct PairRoom {
@@ -34,6 +38,8 @@ struct PairRoom {
     /// One sender per connected Atem, keyed by atem_id.
     /// Multiple Atems can be connected to the same room simultaneously.
     atem_txs: HashMap<String, mpsc::UnboundedSender<String>>,
+    /// Session claims waiting for a targeted Astation auth response.
+    pending_session_ids: HashMap<String, String>,
     astation_tx: Option<mpsc::UnboundedSender<String>>,
     created_at: Instant,
 }
@@ -149,6 +155,7 @@ pub async fn create_pair_handler(
         code: code.clone(),
         hostname: body.hostname,
         atem_txs: HashMap::new(),
+        pending_session_ids: HashMap::new(),
         astation_tx: None,
         created_at: Instant::now(),
     };
@@ -243,6 +250,7 @@ pub async fn ws_handler(
                                 code: code.clone(),
                                 hostname: s.hostname.clone(),
                                 atem_txs: HashMap::new(),
+                                pending_session_ids: HashMap::new(),
                                 astation_tx: None,
                                 created_at: Instant::now(),
                             },
@@ -251,7 +259,10 @@ pub async fn ws_handler(
                 }
 
                 let atem_id = params.atem_id.clone().unwrap_or_else(|| "session-atem".to_string());
-                return ws.on_upgrade(move |socket| handle_ws(hub, code, role, atem_id, socket))
+                let verify_cache = state.session_verify_cache.clone();
+                return ws.on_upgrade(move |socket| {
+                    handle_ws(hub, verify_cache, code, role, atem_id, socket)
+                })
                     .into_response();
             }
             _ => {
@@ -280,6 +291,7 @@ pub async fn ws_handler(
                 code: code.clone(),
                 hostname: "identity".to_string(),
                 atem_txs: HashMap::new(),
+                pending_session_ids: HashMap::new(),
                 astation_tx: None,
                 created_at: Instant::now(),
             }
@@ -305,7 +317,8 @@ pub async fn ws_handler(
     // ASCII to [A-Za-z0-9-] (matches atem's own identity rule).
     let atem_id = sanitize_atem_id(params.atem_id.as_deref());
 
-    ws.on_upgrade(move |socket| handle_ws(hub, code, role, atem_id, socket))
+    let verify_cache = state.session_verify_cache.clone();
+    ws.on_upgrade(move |socket| handle_ws(hub, verify_cache, code, role, atem_id, socket))
         .into_response()
 }
 
@@ -331,7 +344,14 @@ fn sanitize_atem_id(raw: Option<&str>) -> String {
 /// Atem → Astation:  relay WRAPS  `{"atem_id":"<id>","payload":<original_msg>}`
 /// Astation → Atem:  Astation sends `{"atem_id":"<id>","payload":<msg>}` → relay UNWRAPS, routes to that Atem
 /// Astation → ALL:   Astation sends raw JSON (no `atem_id` key) → relay BROADCASTS to every Atem in the room
-async fn handle_ws(hub: RelayHub, code: String, role: String, atem_id: String, socket: WebSocket) {
+async fn handle_ws(
+    hub: RelayHub,
+    verify_cache: SessionVerifyCache,
+    code: String,
+    role: String,
+    atem_id: String,
+    socket: WebSocket,
+) {
     let (mut ws_sink, mut ws_stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
@@ -429,6 +449,14 @@ async fn handle_ws(hub: RelayHub, code: String, role: String, atem_id: String, s
             Ok(axum::extract::ws::Message::Text(text)) => {
                 match role_for_read.as_str() {
                     "atem" => {
+                        record_atem_auth_attempt(
+                            &hub_for_read,
+                            &code_for_read,
+                            &atem_id_for_read,
+                            &text,
+                        )
+                        .await;
+
                         // Wrap with atem_id so Astation knows which Atem sent the message
                         let astation_tx = {
                             let rooms = hub_for_read.rooms.read().await;
@@ -452,6 +480,14 @@ async fn handle_ws(hub: RelayHub, code: String, role: String, atem_id: String, s
                             if let Some(target_id) = env.get("atem_id").and_then(|v| v.as_str()) {
                                 // Targeted: route payload to the specific Atem
                                 let payload = env.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+                                observe_astation_auth_response(
+                                    &hub_for_read,
+                                    &verify_cache,
+                                    &code_for_read,
+                                    target_id,
+                                    &payload,
+                                )
+                                .await;
                                 let payload_str = payload.to_string();
                                 let target_tx = {
                                     let rooms = hub_for_read.rooms.read().await;
@@ -493,8 +529,14 @@ async fn handle_ws(hub: RelayHub, code: String, role: String, atem_id: String, s
         let mut rooms = hub_for_read.rooms.write().await;
         if let Some(room) = rooms.get_mut(&code) {
             match role.as_str() {
-                "atem" => { room.atem_txs.remove(&atem_id); }
-                "astation" => { room.astation_tx = None; }
+                "atem" => {
+                    room.atem_txs.remove(&atem_id);
+                    room.pending_session_ids.remove(&atem_id);
+                }
+                "astation" => {
+                    room.astation_tx = None;
+                    room.pending_session_ids.clear();
+                }
                 _ => {}
             }
             // Remove the room only when all sides have disconnected
@@ -507,6 +549,110 @@ async fn handle_ws(hub: RelayHub, code: String, role: String, atem_id: String, s
 
     write_task.abort();
     tracing::info!("WS disconnected: role={} code={}", role, code);
+}
+
+fn status_update<'a>(payload: &'a serde_json::Value) -> Option<(&'a str, &'a serde_json::Value)> {
+    if payload.get("type")?.as_str()? != "statusUpdate" {
+        return None;
+    }
+    let data = payload.get("data")?;
+    Some((data.get("status")?.as_str()?, data.get("data")?))
+}
+
+async fn record_atem_auth_attempt(hub: &RelayHub, code: &str, atem_id: &str, text: &str) {
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    let Some(("auth", auth_data)) = status_update(&payload) else {
+        return;
+    };
+
+    let mut rooms = hub.rooms.write().await;
+    let Some(room) = rooms.get_mut(code) else {
+        return;
+    };
+    if let Some(session_id) = auth_data.get("session_id").and_then(|value| value.as_str()) {
+        if !session_id.is_empty() {
+            room.pending_session_ids
+                .insert(atem_id.to_string(), session_id.to_string());
+            return;
+        }
+    }
+    room.pending_session_ids.remove(atem_id);
+}
+
+enum AstationAuthOutcome {
+    Bind(String),
+    Reject(Option<String>),
+}
+
+fn astation_auth_outcome(
+    payload: &serde_json::Value,
+    pending_session_id: Option<&str>,
+) -> Option<AstationAuthOutcome> {
+    let (status, data) = status_update(payload)?;
+    match status {
+        "authenticated" => pending_session_id
+            .map(|session_id| AstationAuthOutcome::Bind(session_id.to_string())),
+        "auth" if data.get("status").and_then(|value| value.as_str()) == Some("granted") => data
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .filter(|session_id| !session_id.is_empty())
+            .map(|session_id| AstationAuthOutcome::Bind(session_id.to_string())),
+        "auth" if data.get("status").and_then(|value| value.as_str()) == Some("denied") => {
+            Some(AstationAuthOutcome::Reject(
+                pending_session_id.map(str::to_string),
+            ))
+        }
+        "error" => Some(AstationAuthOutcome::Reject(
+            pending_session_id.map(str::to_string),
+        )),
+        _ => None,
+    }
+}
+
+async fn observe_astation_auth_response(
+    hub: &RelayHub,
+    verify_cache: &SessionVerifyCache,
+    code: &str,
+    atem_id: &str,
+    payload: &serde_json::Value,
+) {
+    let outcome = {
+        let mut rooms = hub.rooms.write().await;
+        let Some(room) = rooms.get_mut(code) else {
+            return;
+        };
+        let outcome = astation_auth_outcome(
+            payload,
+            room.pending_session_ids.get(atem_id).map(String::as_str),
+        );
+        if outcome.is_some() {
+            room.pending_session_ids.remove(atem_id);
+        }
+        outcome
+    };
+
+    match outcome {
+        Some(AstationAuthOutcome::Bind(session_id)) => {
+            verify_cache
+                .set(
+                    session_id,
+                    code.to_string(),
+                    true,
+                    VERIFIED_SESSION_TTL_SECS,
+                )
+                .await;
+            tracing::info!(
+                "Bound verified Astation session for room {}",
+                &code[..code.len().min(16)]
+            );
+        }
+        Some(AstationAuthOutcome::Reject(Some(session_id))) => {
+            verify_cache.remove(&session_id).await;
+        }
+        _ => {}
+    }
 }
 
 /// GET /pair?code=XXXX — HTML landing page for pairing.
@@ -755,6 +901,107 @@ mod tests {
         assert!(id2.starts_with("atem-"));
     }
 
+    async fn hub_with_room(code: &str) -> RelayHub {
+        let hub = RelayHub::new();
+        hub.rooms.write().await.insert(
+            code.to_string(),
+            PairRoom {
+                code: code.to_string(),
+                hostname: "test-host".to_string(),
+                atem_txs: HashMap::new(),
+                pending_session_ids: HashMap::new(),
+                astation_tx: None,
+                created_at: Instant::now(),
+            },
+        );
+        hub
+    }
+
+    #[tokio::test]
+    async fn existing_session_binds_only_after_astation_confirms() {
+        let code = "astation-work-session";
+        let atem_id = "atem-a";
+        let hub = hub_with_room(code).await;
+        let cache = SessionVerifyCache::new();
+        cache
+            .set(
+                "session-denied".to_string(),
+                code.to_string(),
+                true,
+                VERIFIED_SESSION_TTL_SECS,
+            )
+            .await;
+        let request = serde_json::json!({
+            "type": "statusUpdate",
+            "data": {"status": "auth", "data": {"session_id": "session-existing"}}
+        })
+        .to_string();
+
+        record_atem_auth_attempt(&hub, code, atem_id, &request).await;
+        assert_eq!(cache.get_astation_id("session-existing").await, None);
+
+        let response = serde_json::json!({
+            "type": "statusUpdate",
+            "data": {"status": "authenticated", "data": {"method": "session"}}
+        });
+        observe_astation_auth_response(&hub, &cache, code, atem_id, &response).await;
+
+        assert_eq!(
+            cache.get_astation_id("session-existing").await.as_deref(),
+            Some(code)
+        );
+        assert!(hub.rooms.read().await[code].pending_session_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn newly_granted_pairing_session_binds_from_astation_response() {
+        let code = "astation-work-session";
+        let atem_id = "atem-a";
+        let hub = hub_with_room(code).await;
+        let cache = SessionVerifyCache::new();
+        let response = serde_json::json!({
+            "type": "statusUpdate",
+            "data": {
+                "status": "auth",
+                "data": {
+                    "status": "granted",
+                    "session_id": "session-new",
+                    "token": "secret"
+                }
+            }
+        });
+
+        observe_astation_auth_response(&hub, &cache, code, atem_id, &response).await;
+
+        assert_eq!(
+            cache.get_astation_id("session-new").await.as_deref(),
+            Some(code)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_auth_clears_pending_session_without_binding() {
+        let code = "astation-work-session";
+        let atem_id = "atem-a";
+        let hub = hub_with_room(code).await;
+        let cache = SessionVerifyCache::new();
+        let request = serde_json::json!({
+            "type": "statusUpdate",
+            "data": {"status": "auth", "data": {"session_id": "session-denied"}}
+        })
+        .to_string();
+        record_atem_auth_attempt(&hub, code, atem_id, &request).await;
+
+        let response = serde_json::json!({
+            "type": "statusUpdate",
+            "data": {"status": "error", "data": {"message": "Session expired"}}
+        });
+        observe_astation_auth_response(&hub, &cache, code, atem_id, &response).await;
+
+        assert_eq!(cache.get_astation_id("session-denied").await, None);
+        assert!(hub.rooms.read().await[code].pending_session_ids.is_empty());
+    }
+
     #[test]
     fn pairing_code_no_ambiguous_chars() {
         for _ in 0..100 {
@@ -776,6 +1023,7 @@ mod tests {
             code: "ABCD-EFGH".to_string(),
             hostname: "test-host".to_string(),
             atem_txs: HashMap::new(),
+            pending_session_ids: HashMap::new(),
             astation_tx: None,
             created_at: Instant::now(),
         };
@@ -799,6 +1047,7 @@ mod tests {
             code: "OLD1-CODE".to_string(),
             hostname: "old-host".to_string(),
             atem_txs: HashMap::new(),
+            pending_session_ids: HashMap::new(),
             astation_tx: None,
             created_at: Instant::now() - std::time::Duration::from_secs(ROOM_EXPIRY_SECS + 10),
         };
@@ -812,6 +1061,7 @@ mod tests {
             code: "NEW1-CODE".to_string(),
             hostname: "new-host".to_string(),
             atem_txs: HashMap::new(),
+            pending_session_ids: HashMap::new(),
             astation_tx: None,
             created_at: Instant::now(),
         };
@@ -837,6 +1087,7 @@ mod tests {
             code: "PAIR-CODE".to_string(),
             hostname: "paired-host".to_string(),
             atem_txs: HashMap::new(),
+            pending_session_ids: HashMap::new(),
             astation_tx: Some(tx),
             created_at: Instant::now() - std::time::Duration::from_secs(ROOM_EXPIRY_SECS + 10),
         };
@@ -1236,6 +1487,7 @@ mod tests {
             code: "OLD-ATEM".to_string(),
             hostname: "old-host".to_string(),
             atem_txs: old_atem_txs,
+            pending_session_ids: HashMap::new(),
             astation_tx: None,
             created_at: Instant::now() - std::time::Duration::from_secs(ROOM_EXPIRY_SECS + 10),
         };
@@ -1265,6 +1517,7 @@ mod tests {
             code: code.clone(),
             hostname: "test-host".to_string(),
             atem_txs: HashMap::new(),
+            pending_session_ids: HashMap::new(),
             astation_tx: None,
             created_at: Instant::now(),
         };
