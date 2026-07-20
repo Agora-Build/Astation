@@ -12,10 +12,6 @@ use crate::voice_session::VoiceSessionState;
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
-    #[serde(default)]
-    pub stream: bool,
-    #[serde(skip)]
-    pub session_id: Option<String>, // Will be extracted from headers or heuristics
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -262,8 +258,6 @@ mod tests {
                 role: "user".to_string(),
                 content: "Hello world".to_string(),
             }],
-            stream: false,
-            session_id: None,
         };
 
         let mut headers = axum::http::HeaderMap::new();
@@ -301,8 +295,6 @@ mod tests {
                 role: "user".to_string(),
                 content: "Create a function".to_string(),
             }],
-            stream: false,
-            session_id: None,
         };
 
         let mut headers = axum::http::HeaderMap::new();
@@ -338,8 +330,6 @@ mod tests {
                 role: "user".to_string(),
                 content: "Hello".to_string(),
             }],
-            stream: false,
-            session_id: None,
         };
 
         let headers = axum::http::HeaderMap::new(); // No session ID header
@@ -364,8 +354,6 @@ mod tests {
                 role: "user".to_string(),
                 content: "Hello".to_string(),
             }],
-            stream: false,
-            session_id: None,
         };
 
         let mut headers = axum::http::HeaderMap::new();
@@ -402,8 +390,6 @@ mod tests {
                 role: "user".to_string(),
                 content: "Final request".to_string(),
             }],
-            stream: false,
-            session_id: None,
         };
 
         let mut headers = axum::http::HeaderMap::new();
@@ -437,8 +423,6 @@ mod tests {
                 role: "user".to_string(),
                 content: "First chunk".to_string(),
             }],
-            stream: false,
-            session_id: None,
         };
 
         let mut headers = axum::http::HeaderMap::new();
@@ -473,8 +457,6 @@ mod tests {
                 role: "user".to_string(),
                 content: "Test".to_string(),
             }],
-            stream: false,
-            session_id: None,
         };
 
         // Use X-Session-ID instead of X-Voice-Session-ID
@@ -505,8 +487,6 @@ mod tests {
                 role: "user".to_string(),
                 content: "Hello via query param".to_string(),
             }],
-            stream: false,
-            session_id: None,
         };
 
         // No header — session ID comes from query param
@@ -546,8 +526,6 @@ mod tests {
                 role: "user".to_string(),
                 content: "Which session?".to_string(),
             }],
-            stream: false,
-            session_id: None,
         };
 
         // Both query param and header set — query param should win

@@ -455,6 +455,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verified_astation_session_can_create_vault() {
+        let session_id = "session-from-astation";
+        let verify_cache = SessionVerifyCache::new();
+        verify_cache
+            .set(
+                session_id.to_string(),
+                "astation-work-session".to_string(),
+                true,
+                300,
+            )
+            .await;
+        let state = AppState {
+            sessions: SessionStore::new(),
+            relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
+            session_verify_cache: verify_cache,
+            voice_sessions: VoiceSessionStore::new(),
+            vault: Arc::new(InMemoryVaultStore::new()),
+        };
+
+        let resp = app(state)
+            .oneshot(req(
+                "POST",
+                "/api/vault?id=atem-a",
+                session_id,
+                r#"{"summary":"verified"}"#,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(body_json(resp).await["vault_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
     async fn list_is_isolated_by_work_session() {
         let (state, sess1) = test_state("ws-1").await;
         // Second granted session in ws-2.

@@ -345,7 +345,7 @@ mod tests {
         ).await;
 
         state.voice_sessions.add_transcription("test-state", "Hello".to_string()).await;
-        trigger_voice_session_handler(
+        let _ = trigger_voice_session_handler(
             State(state.clone()),
             Path("test-state".to_string()),
         ).await.unwrap();
@@ -367,7 +367,7 @@ mod tests {
             session_id: "test-resp".to_string(),
             response: "Done!".to_string(),
         };
-        atem_response_handler(State(state.clone()), Json(req)).await.unwrap();
+        let _ = atem_response_handler(State(state.clone()), Json(req)).await.unwrap();
 
         let session = state.voice_sessions.get("test-resp").await.unwrap();
         assert_eq!(session.state, crate::voice_session::VoiceSessionState::ResponseReady);

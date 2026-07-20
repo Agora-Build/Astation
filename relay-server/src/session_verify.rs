@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,7 +12,6 @@ pub struct SessionVerifyCache {
 }
 
 struct CachedSession {
-    session_id: String,
     astation_id: String,
     valid: bool,
     cached_at: u64,
@@ -67,7 +66,6 @@ impl SessionVerifyCache {
         cache.insert(
             session_id.clone(),
             CachedSession {
-                session_id: session_id.clone(),
                 astation_id,
                 valid,
                 cached_at: now_timestamp(),
@@ -146,22 +144,6 @@ pub struct CacheStats {
     pub valid: usize,
     pub invalid: usize,
     pub expired: usize,
-}
-
-/// Message sent from Relay to Astation to verify a session.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SessionVerifyRequest {
-    pub session_id: String,
-    pub request_id: String, // For matching response
-}
-
-/// Message sent from Astation to Relay with verification result.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SessionVerifyResponse {
-    pub session_id: String,
-    pub request_id: String,
-    pub valid: bool,
-    pub astation_id: Option<String>, // Only if valid
 }
 
 fn now_timestamp() -> u64 {

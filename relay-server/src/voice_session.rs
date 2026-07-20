@@ -238,11 +238,6 @@ pub struct CreateVoiceSessionResponse {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct TriggerRequest {
-    // No body needed - session_id is in URL path
-}
-
 #[derive(Debug, Serialize)]
 pub struct TriggerResponse {
     pub session_id: String,
