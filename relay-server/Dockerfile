@@ -1,4 +1,4 @@
-FROM rust:1.85-slim AS builder
+FROM rust:1.88-slim AS builder
 
 WORKDIR /app
 
@@ -14,6 +14,9 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs \
 # Now copy the real source and do the final build. Only changed
 # source files are recompiled; all dependencies stay cached.
 COPY src/ src/
+# migrations/ is read at compile time by sqlx::migrate!("./migrations"),
+# so it must be present for the real build.
+COPY migrations/ migrations/
 # Touch main.rs so cargo knows it changed (avoids "nothing to compile").
 RUN touch src/main.rs && cargo build --release
 

@@ -4,7 +4,10 @@ Secure relay and session management server for Astation ecosystem.
 
 **Services:** Auth Sessions, WebSocket Relay (Atem ↔ Astation), RTC Sessions (web screen sharing)
 **Security:** Rate limiting, input validation, CORS, XSS protection
-**Status:** ✅ Production Ready | 90 tests passing
+**Status:** ✅ Production Ready | Test suite passing
+
+`GET /health` returns `200` when the relay and its configured Vault store are ready,
+and identifies the active store as `memory` or `postgres`.
 
 ---
 

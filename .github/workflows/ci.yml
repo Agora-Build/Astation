@@ -75,3 +75,5 @@ jobs:
       - name: Run relay server tests
         working-directory: relay-server
         run: cargo test
+      - name: Build relay server container
+        run: docker build --tag station-relay-server:ci relay-server

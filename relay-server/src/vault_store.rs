@@ -77,6 +77,11 @@ pub fn generate_vault_id() -> String {
 /// can use an in-memory implementation and production uses Postgres.
 #[async_trait]
 pub trait VaultStore: Send + Sync {
+    fn backend_name(&self) -> &'static str;
+
+    /// Verify that the backing store can serve requests.
+    async fn health_check(&self) -> Result<(), VaultError>;
+
     async fn create_vault(
         &self,
         work_session_id: &str,
@@ -163,6 +168,14 @@ impl Default for InMemoryVaultStore {
 
 #[async_trait]
 impl VaultStore for InMemoryVaultStore {
+    fn backend_name(&self) -> &'static str {
+        "memory"
+    }
+
+    async fn health_check(&self) -> Result<(), VaultError> {
+        Ok(())
+    }
+
     async fn create_vault(
         &self,
         work_session_id: &str,
@@ -359,6 +372,18 @@ fn db_err(e: sqlx::Error) -> VaultError {
 
 #[async_trait]
 impl VaultStore for PgVaultStore {
+    fn backend_name(&self) -> &'static str {
+        "postgres"
+    }
+
+    async fn health_check(&self) -> Result<(), VaultError> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn create_vault(
         &self,
         work_session_id: &str,

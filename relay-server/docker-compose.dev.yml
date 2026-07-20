@@ -33,7 +33,7 @@ services:
     # No security restrictions in dev
 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/api/pair"]
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
       interval: 10s
       timeout: 5s
       retries: 3
