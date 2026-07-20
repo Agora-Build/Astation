@@ -54,7 +54,9 @@ jobs:
         with:
           node-version: "20"
       - name: Run webapp tests
-        run: node webapp/tests/codec.test.js
+        run: |
+          node webapp/tests/codec.test.js
+          node webapp/tests/nginx.test.js
 
   test-relay-server:
     name: Relay Server Tests
