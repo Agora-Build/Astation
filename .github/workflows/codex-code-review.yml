@@ -66,7 +66,7 @@ jobs:
         run: node .github/scripts/ai-review.mjs
         env:
           AI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          AI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          AI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
           AI_MODEL: ${{ vars.CODEX_REVIEW_MODEL || 'gpt-5.5' }}
           AI_OUTPUT_PATH: ${{ runner.temp }}/codex-review.json
           AI_PROVIDER: codex
