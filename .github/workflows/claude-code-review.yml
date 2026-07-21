@@ -14,7 +14,11 @@ jobs:
   # secrets through the review comment. Restrict triggering to same-repository
   # branches, which require push access. Fork PRs never receive model secrets.
   review:
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    if: >-
+      ${{
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.user.type == 'User'
+      }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -46,6 +50,7 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           # Read-only job token: even if prompt-injected, the agent cannot write.
           github_token: ${{ github.token }}
+          show_full_output: true
           prompt: |
             You are a senior code reviewer for a pull request in ${{ github.repository }}.
             Review the changes on the checked-out merge ref. Focus on:

@@ -10,7 +10,11 @@ jobs:
     # posted verbatim, so untrusted PR text could try to exfiltrate secrets via
     # the review comment. Restrict to same-repository branches, which require
     # push access; fork PRs never receive model secrets.
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    if: >-
+      ${{
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.user.type == 'User'
+      }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
