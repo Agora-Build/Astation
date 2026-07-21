@@ -20,7 +20,12 @@ enum Log {
     static func setup() {
         let fm = FileManager.default
         // Ensure directory exists
-        try? fm.createDirectory(at: logDir, withIntermediateDirectories: true)
+        try? fm.createDirectory(
+            at: logDir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: logDir.path)
 
         // Rotate if too large (> 2 MB)
         if let attrs = try? fm.attributesOfItem(atPath: logFile.path),
@@ -28,12 +33,18 @@ enum Log {
             let oldFile = logDir.appendingPathComponent("astation.old.log")
             try? fm.removeItem(at: oldFile)
             try? fm.moveItem(at: logFile, to: oldFile)
+            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: oldFile.path)
         }
 
         // Create file if needed
         if !fm.fileExists(atPath: logFile.path) {
-            fm.createFile(atPath: logFile.path, contents: nil)
+            fm.createFile(
+                atPath: logFile.path,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]
+            )
         }
+        try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: logFile.path)
 
         fileHandle = FileHandle(forWritingAtPath: logFile.path)
         fileHandle?.seekToEndOfFile()

@@ -5,6 +5,7 @@ import Foundation
 struct SessionInfo: Codable {
     let id: String
     let hostname: String
+    var atemId: String?
     var lastActivity: Date
     let token: String
     let createdAt: Date
@@ -29,15 +30,18 @@ class SessionStore {
     private let storePath: URL
     private let queue = DispatchQueue(label: "build.agora.SessionStore", attributes: .concurrent)
 
-    init() {
-        // Store sessions in ~/Library/Application Support/Astation/sessions.json
+    init(storageURL: URL? = nil) {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let astation = appSupport.appendingPathComponent("Astation")
 
-        // Create directory if needed
-        try? FileManager.default.createDirectory(at: astation, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(
+            at: astation,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: astation.path)
 
-        storePath = astation.appendingPathComponent("sessions.json")
+        storePath = storageURL ?? astation.appendingPathComponent("sessions.json")
 
         // Load existing sessions
         loadFromDisk()
@@ -80,11 +84,12 @@ class SessionStore {
     }
 
     /// Create a new session after pairing approval.
-    func create(hostname: String) -> SessionInfo {
+    func create(hostname: String, atemId: String? = nil) -> SessionInfo {
         return queue.sync(flags: .barrier) {
             let session = SessionInfo(
                 id: UUID().uuidString,
                 hostname: hostname,
+                atemId: atemId,
                 lastActivity: Date(),
                 token: generateToken(),
                 createdAt: Date()
@@ -97,6 +102,59 @@ class SessionStore {
             // Save to disk
             saveToDisk()
 
+            return session
+        }
+    }
+
+    /// Authenticate a device by proving possession of its session token.
+    /// Legacy sessions are bound to the first atem_id that proves the token.
+    func authenticate(
+        sessionId: String,
+        atemId: String,
+        challenge: String,
+        proof: String,
+        astationId: String
+    ) -> SessionInfo? {
+        queue.sync(flags: .barrier) {
+            guard var session = sessions[sessionId], session.isValid else { return nil }
+            guard session.atemId == nil || session.atemId == atemId else { return nil }
+            guard DeviceAuthentication.verify(
+                proof: proof,
+                token: session.token,
+                challenge: challenge,
+                astationId: astationId,
+                atemId: atemId,
+                sessionId: sessionId
+            ) else { return nil }
+
+            session.atemId = atemId
+            session.lastActivity = Date()
+            sessions[sessionId] = session
+            saveToDisk()
+            return session
+        }
+    }
+
+    /// Return one stable device session for a locally authenticated Atem.
+    func createOrRefreshLocal(hostname: String, atemId: String) -> SessionInfo {
+        queue.sync(flags: .barrier) {
+            if var session = sessions.values.first(where: { $0.atemId == atemId && $0.isValid }) {
+                session.lastActivity = Date()
+                sessions[session.id] = session
+                saveToDisk()
+                return session
+            }
+
+            let session = SessionInfo(
+                id: UUID().uuidString,
+                hostname: hostname,
+                atemId: atemId,
+                lastActivity: Date(),
+                token: generateToken(),
+                createdAt: Date()
+            )
+            sessions[session.id] = session
+            saveToDisk()
             return session
         }
     }
@@ -153,7 +211,8 @@ class SessionStore {
             encoder.outputFormatting = .prettyPrinted
 
             let data = try encoder.encode(sessions)
-            try data.write(to: storePath)
+            try data.write(to: storePath, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storePath.path)
 
             Log.debug("💾 Sessions saved to disk (\(sessions.count) total)")
         } catch {
@@ -207,6 +266,7 @@ extension SessionStore {
             let session = SessionInfo(
                 id: id,
                 hostname: hostname,
+                atemId: nil,
                 lastActivity: lastActivity,
                 token: generateToken(),
                 createdAt: lastActivity

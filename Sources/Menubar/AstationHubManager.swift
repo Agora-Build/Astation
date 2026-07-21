@@ -1,4 +1,5 @@
 import CStationCore
+import AppKit
 import Foundation
 import Network
 
@@ -24,6 +25,7 @@ class AstationHubManager: ObservableObject {
     let apiClient = AgoraAPIClient()
     let rtcManager = RTCManager()
     let authGrantController = AuthGrantController()
+    let deviceSessionStore: SessionStore
     let timeSync = TimeSync()
     lazy var sessionLinkManager = SessionLinkManager(hubManager: self)
     lazy var voiceCodingManager = VoiceCodingManager(hubManager: self)
@@ -40,6 +42,8 @@ class AstationHubManager: ObservableObject {
     /// NWPathMonitor for the identity relay — fires when network becomes available,
     /// enabling immediate reconnect without polling. Created once and reused.
     private var identityRelayPathMonitor: NWPathMonitor?
+    private var identityRelayAuthChallenges: [String: String] = [:]
+    private var authenticatedIdentityRelayClients: Set<String> = []
 
     /// Station relay URL. Priority: test override > ASTATION_RELAY_URL env var > UserDefaults > default.
     var stationRelayUrl: String {
@@ -54,7 +58,8 @@ class AstationHubManager: ObservableObject {
     /// Set by AstationApp after wiring up the WebSocket server.
     var sendHandler: ((AstationMessage, String) -> Void)?
 
-    init(skipProjectLoad: Bool = false) {
+    init(skipProjectLoad: Bool = false, deviceSessionStore: SessionStore = SessionStore()) {
+        self.deviceSessionStore = deviceSessionStore
         self.tokenProvider = SsoTokenProvider(
             store: SsoSessionStore(),
             refresher: SsoNetworkRefresher(),
@@ -1178,6 +1183,8 @@ class AstationHubManager: ObservableObject {
                     self?.connectedClients
                         .filter { $0.id.hasPrefix("relay-") }
                         .forEach { self?.removeClient(withId: $0.id) }
+                    self?.identityRelayAuthChallenges.removeAll()
+                    self?.authenticatedIdentityRelayClients.removeAll()
                     self?.identityRelayActive = false
                 }
                 // Schedule a 30s fallback retry (only if network is still up).
@@ -1194,27 +1201,114 @@ class AstationHubManager: ObservableObject {
     }
 
     private func handleIdentityRelayMessage(_ msg: AstationMessage, task: URLSessionWebSocketTask, clientId: String) {
-        // When Atem connects to the identity relay room, it sends a "hello" to announce itself.
-        // We respond by registering it as a connected client (which sends credentials).
         if case .statusUpdate(let status, let data) = msg, status == "hello" {
             let hostname = data["hostname"] ?? "unknown"
-            Log.info("[AstationHub] Atem connected via identity relay from: \(hostname)")
-
-            let client = ConnectedClient(
-                id: clientId,
-                clientType: "Atem",
-                connectedAt: Date(),
-                hostname: "relay:\(hostname)"
-            )
-            // addClient calls sendCredentials(toClientId: clientId) via sendHandler
-            addClient(client)
+            let challenge = DeviceAuthentication.makeChallenge()
+            identityRelayAuthChallenges[clientId] = challenge
+            authenticatedIdentityRelayClients.remove(clientId)
+            sendHandler?(.statusUpdate(status: "auth_required", data: [
+                "astation_id": AstationIdentity.shared.id,
+                "challenge": challenge,
+                "transport": "relay",
+                "protocol": DeviceAuthentication.protocolVersion,
+                "hostname": hostname
+            ]), clientId)
+            Log.info("[AstationHub] Relay authentication required for \(hostname)")
             return
         }
 
-        // Forward all other messages through the hub and send any response back
+        if !authenticatedIdentityRelayClients.contains(clientId) {
+            handleIdentityRelayAuthentication(msg, clientId: clientId)
+            return
+        }
+
         if let response = handleMessage(msg, from: clientId) {
             sendHandler?(response, clientId)
         }
+    }
+
+    private func handleIdentityRelayAuthentication(_ msg: AstationMessage, clientId: String) {
+        guard case .statusUpdate(let status, let data) = msg,
+              status == "auth",
+              let challenge = identityRelayAuthChallenges[clientId] else {
+            Log.warn("[AstationHub] Dropped unauthenticated relay message from \(clientId)")
+            return
+        }
+
+        if let sessionId = data["session_id"],
+           let atemId = data["atem_id"],
+           let proof = data["proof"],
+           let session = deviceSessionStore.authenticate(
+                sessionId: sessionId,
+                atemId: atemId,
+                challenge: challenge,
+                proof: proof,
+                astationId: AstationIdentity.shared.id
+           ) {
+            finishIdentityRelayAuthentication(
+                clientId: clientId,
+                hostname: session.hostname,
+                response: .statusUpdate(status: "authenticated", data: [
+                    "method": "session_proof",
+                    "session_id": sessionId,
+                    "protocol": DeviceAuthentication.protocolVersion
+                ])
+            )
+            return
+        }
+
+        if data["session_id"] != nil {
+            sendHandler?(.error(message: "Session proof invalid - pairing required"), clientId)
+            return
+        }
+
+        guard let pairingCode = data["pairing_code"],
+              let hostname = data["hostname"],
+              let atemId = data["atem_id"] else {
+            sendHandler?(.error(message: "Invalid relay authentication credentials"), clientId)
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Remote Atem Pairing Request"
+        alert.informativeText = "Device: \(hostname)\nCode: \(pairingCode)\n\nAllow this Atem to connect through the relay?"
+        alert.addButton(withTitle: "Allow")
+        alert.addButton(withTitle: "Deny")
+        alert.alertStyle = .informational
+
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            sendHandler?(.auth(info: ["status": "denied", "message": "Pairing denied by user"]), clientId)
+            return
+        }
+
+        let session = deviceSessionStore.create(hostname: hostname, atemId: atemId)
+        finishIdentityRelayAuthentication(
+            clientId: clientId,
+            hostname: hostname,
+            response: .auth(info: [
+                "status": "granted",
+                "session_id": session.id,
+                "token": session.token,
+                "protocol": DeviceAuthentication.protocolVersion
+            ])
+        )
+    }
+
+    private func finishIdentityRelayAuthentication(
+        clientId: String,
+        hostname: String,
+        response: AstationMessage
+    ) {
+        identityRelayAuthChallenges.removeValue(forKey: clientId)
+        authenticatedIdentityRelayClients.insert(clientId)
+        sendHandler?(response, clientId)
+        addClient(ConnectedClient(
+            id: clientId,
+            clientType: "Atem",
+            connectedAt: Date(),
+            hostname: "relay:\(hostname)"
+        ))
+        Log.info("[AstationHub] Authenticated relay Atem: \(hostname)")
     }
 }
 

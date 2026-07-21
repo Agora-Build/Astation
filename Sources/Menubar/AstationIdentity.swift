@@ -26,14 +26,23 @@ class AstationIdentity {
                 try FileManager.default.createDirectory(
                     at: path.deletingLastPathComponent(),
                     withIntermediateDirectories: true,
-                    attributes: nil
+                    attributes: [.posixPermissions: 0o700]
                 )
                 try id.write(to: path, atomically: true, encoding: .utf8)
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: path.path
+                )
                 Log.info("Generated new Astation identity: \(id)")
             } catch {
                 Log.error("Failed to save Astation identity: \(error)")
             }
         }
+
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: path.path
+        )
     }
 
     /// Path to identity file: ~/Library/Application Support/Astation/identity.txt

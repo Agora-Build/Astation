@@ -51,7 +51,19 @@ swift build -c release
 
 ## How It Works
 
-Astation runs as a macOS menubar app with a WebSocket server. Multiple Atem instances connect to it, and the hub routes work to the focused (or first available) Atem.
+Astation runs as a macOS menubar app with direct and relay WebSocket transports. Multiple Atem instances can use loopback, LAN, and relay connections concurrently, and the hub routes work to the focused (or first available) authenticated Atem.
+
+### Atem Connections
+
+| Atem location | Transport | First connection | Offline behavior |
+|---------------|-----------|------------------|------------------|
+| Same Mac | `ws://127.0.0.1:8080/ws` | Transparent same-user proof | Works with all radios disabled |
+| Another LAN machine | `ws://<astation-ip>:8080/ws` | User-approved pairing | Works without internet or relay |
+| Remote network | Public `wss://` relay | User-approved pairing | Requires internet and relay |
+
+Loopback is identified from the socket peer address, not from a client-supplied header. LAN and relay clients receive a random challenge and must prove possession of their saved session token with HMAC-SHA256 before Astation registers the client or sends credentials.
+
+Direct LAN transport is currently plaintext WebSocket. The authentication protocol prevents session-ID-only impersonation, but LAN deployment is not production-ready until WSS certificate pinning is implemented. See [`docs/specs/2026-07-21-device-authentication-v2.md`](docs/specs/2026-07-21-device-authentication-v2.md).
 
 ### Mark Task Routing
 
@@ -82,20 +94,20 @@ Messages carry only IDs, status, and descriptions -- no images or file lists flo
 | `markTaskNotify` | Chisel -> Astation | New task available (with summary for display) |
 | `markTaskAssignment` | Astation -> Atem | Route task to a specific Atem |
 | `markTaskResult` | Atem -> Astation | Report task completion/failure |
-| `statusUpdate` | Astation -> Atem | Connection status on connect |
+| `statusUpdate` | Astation <-> Atem | Authentication challenge, proof, and connection status |
 | `heartbeat` / `pong` | Atem <-> Astation | Keep-alive |
 | `voice_toggle` | Astation -> Atem | Voice input state |
 | `video_toggle` | Astation -> Atem | Video state |
 | `atem_instance_list` | Astation -> Atem | Broadcast connected peers |
-| `auth_request` / `auth_response` | Atem <-> Astation | Authentication grant flow |
+| `auth_request` / `auth_response` | Atem <-> Astation | Legacy browser/deep-link grant flow |
 
-### Auth Grant Flow
+### Device Authentication
 
-Atem instances authenticate via a deep-link flow:
-
-1. Atem sends `auth_request` with session ID, hostname, and one-time password
-2. Astation presents the request to the user for approval
-3. On approval, sends `auth_response` with session token
+1. Astation sends `auth_required` with its identity, connection scope, protocol version, and a fresh challenge.
+2. Same-Mac Atems prove access to the `0600` bootstrap secret without an interactive prompt.
+3. Paired LAN and relay Atems send `session_id`, `atem_id`, and an HMAC proof. The session token itself is never sent during reconnect.
+4. An unknown device displays an eight-digit code and waits for explicit approval in Astation.
+5. Astation processes application messages and sends account credentials only after authentication succeeds.
 
 ### Voice-Driven Coding
 

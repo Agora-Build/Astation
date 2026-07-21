@@ -27,8 +27,9 @@ class AstationApp: NSObject, NSApplicationDelegate {
         mainMenu.addItem(editMenuItem)
         NSApp.mainMenu = mainMenu
 
-        // Initialize hub manager (business logic)
-        hubManager = AstationHubManager()
+        // Direct and relay transports must authenticate against the same devices.
+        let deviceSessionStore = SessionStore()
+        hubManager = AstationHubManager(deviceSessionStore: deviceSessionStore)
 
         // Initialize auth grant controller for deep-link auth flow
         authGrantController = AuthGrantController()
@@ -45,18 +46,21 @@ class AstationApp: NSObject, NSApplicationDelegate {
         )
 
         // Initialize WebSocket server
-        webSocketServer = AstationWebSocketServer(hubManager: hubManager)
+        webSocketServer = AstationWebSocketServer(
+            hubManager: hubManager,
+            sessionStore: deviceSessionStore
+        )
         
         // Initialize status bar
         statusBarController = StatusBarController(hubManager: hubManager, webSocketServer: webSocketServer)
         
-        // Start WebSocket server on all interfaces (0.0.0.0) so LAN clients can connect
+        // One listener supports offline loopback and authenticated LAN clients concurrently.
         do {
             try webSocketServer.start(host: "0.0.0.0", port: 8080)
             let localIP = getLocalNetworkIP() ?? "127.0.0.1"
             Log.info("WebSocket server started on all interfaces (port 8080)")
-            Log.info("  Local:   ws://127.0.0.1:8080")
-            Log.info("  Network: ws://\(localIP):8080")
+            Log.info("  Local (same-user): ws://127.0.0.1:8080/ws")
+            Log.info("  LAN (paired):      ws://\(localIP):8080/ws")
         } catch {
             Log.error("Failed to start WebSocket server: \(error)")
             NSApp.terminate(nil)

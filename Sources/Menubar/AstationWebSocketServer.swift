@@ -10,11 +10,22 @@ class AstationWebSocketServer {
     private var channel: Channel?
     private let hubManager: AstationHubManager
     private var connectedClients: [String: WebSocket] = [:]
-    private let sessionStore = SessionStore()
+    private let sessionStore: SessionStore
+    private let localBootstrapStore: LocalBootstrapStore?
     private var authenticatedClients: Set<String> = []  // Client IDs that have been authenticated
+    private var pendingAuthentication: [String: DirectAuthenticationContext] = [:]
 
-    init(hubManager: AstationHubManager) {
+    init(
+        hubManager: AstationHubManager,
+        sessionStore: SessionStore = SessionStore(),
+        localBootstrapStore: LocalBootstrapStore? = nil
+    ) {
         self.hubManager = hubManager
+        self.sessionStore = sessionStore
+        self.localBootstrapStore = localBootstrapStore ?? (try? LocalBootstrapStore())
+        if self.localBootstrapStore == nil {
+            Log.error("Local Atem authentication is unavailable: bootstrap secret could not be loaded")
+        }
     }
     
     func start(host: String, port: Int) throws {
@@ -25,8 +36,9 @@ class AstationWebSocketServer {
                 return channel.eventLoop.makeSucceededFuture(HTTPHeaders())
             },
             upgradePipelineHandler: { channel, _ in
+                let scope = DirectConnectionScope(peerAddress: channel.remoteAddress?.ipAddress)
                 return WebSocket.server(on: channel) { ws in
-                    self.handleWebSocketConnection(ws)
+                    self.handleWebSocketConnection(ws, scope: scope)
                 }
             }
         )
@@ -62,11 +74,16 @@ class AstationWebSocketServer {
         Log.info("WebSocket server stopped")
     }
     
-    private func handleWebSocketConnection(_ ws: WebSocket) {
+    private func handleWebSocketConnection(_ ws: WebSocket, scope: DirectConnectionScope) {
         let clientId = UUID().uuidString
         connectedClients[clientId] = ws
+        let challenge = DeviceAuthentication.makeChallenge()
+        pendingAuthentication[clientId] = DirectAuthenticationContext(
+            scope: scope,
+            challenge: challenge
+        )
 
-        Log.info("🔌 New WebSocket connection: \(clientId.prefix(8))")
+        Log.info("New \(scope.rawValue) WebSocket connection: \(clientId.prefix(8))")
 
         // Handle incoming messages
         ws.onText { ws, text in
@@ -81,8 +98,9 @@ class AstationWebSocketServer {
         ws.onClose.whenComplete { _ in
             self.connectedClients.removeValue(forKey: clientId)
             self.authenticatedClients.remove(clientId)
+            self.pendingAuthentication.removeValue(forKey: clientId)
             self.hubManager.removeClient(withId: clientId)
-            Log.info("🔌 WebSocket connection closed: \(clientId.prefix(8))")
+            Log.info("WebSocket connection closed: \(clientId.prefix(8))")
         }
 
         // Send auth challenge - client must respond with session or pairing code
@@ -90,7 +108,10 @@ class AstationWebSocketServer {
             status: "auth_required",
             data: [
                 "clientId": clientId,
-                "astation_id": AstationIdentity.shared.id
+                "astation_id": AstationIdentity.shared.id,
+                "challenge": challenge,
+                "transport": scope.rawValue,
+                "protocol": DeviceAuthentication.protocolVersion
             ]
         )
         sendMessage(authChallenge, to: clientId)
@@ -105,16 +126,15 @@ class AstationWebSocketServer {
             return
         }
 
-        // Handle session verification requests (from relay server)
-        if case .statusUpdate(let status, let messageData) = message, status == "session_verify_request" {
-            handleSessionVerifyRequest(messageData, from: clientId)
-            return
-        }
-
         // Check if client is authenticated
         if !authenticatedClients.contains(clientId) {
             // Client not authenticated - check if this is an auth message
             handleAuthMessage(message, from: clientId, ws: ws)
+            return
+        }
+
+        if case .statusUpdate(let status, let messageData) = message, status == "session_verify_request" {
+            handleSessionVerifyRequest(messageData, from: clientId)
             return
         }
 
@@ -138,51 +158,63 @@ class AstationWebSocketServer {
             Log.warn("⚠️  Unauthenticated client \(clientId.prefix(8)) sent non-auth message - rejecting")
             let errorMsg = AstationMessage.error(message: "Authentication required")
             sendMessage(errorMsg, to: clientId)
-            ws.close(code: .policyViolation)
+            _ = ws.close(code: .policyViolation)
             return
         }
 
-        // Check for session-based auth
-        if let sessionId = authInfo["session_id"] as? String {
-            if sessionStore.validate(sessionId: sessionId) {
-                // Session valid - authenticate client
-                authenticateClient(clientId, sessionId: sessionId)
-
-                // Add to hub manager
-                if let hostname = sessionStore.get(sessionId: sessionId)?.hostname {
-                    let client = ConnectedClient(
-                        id: clientId,
-                        clientType: "Atem",
-                        connectedAt: Date(),
-                        hostname: hostname
-                    )
-                    hubManager.addClient(client)
-                }
-
-                // Send success response
-                let successMsg = AstationMessage.statusUpdate(
-                    status: "authenticated",
-                    data: ["method": "session"]
-                )
-                sendMessage(successMsg, to: clientId)
-
-                Log.info("✅ Client \(clientId.prefix(8)) authenticated via session")
-                return
-            } else {
-                // Session invalid or expired
-                Log.warn("❌ Invalid/expired session from \(clientId.prefix(8))")
-                let errorMsg = AstationMessage.error(message: "Session expired - pairing required")
-                sendMessage(errorMsg, to: clientId)
-                ws.close(code: .policyViolation)
-                return
-            }
+        guard let context = pendingAuthentication[clientId] else {
+            sendMessage(.error(message: "Authentication challenge expired"), to: clientId)
+            _ = ws.close(code: .policyViolation)
+            return
         }
 
-        // Check for pairing-based auth
-        if let pairingCode = authInfo["pairing_code"] as? String,
-           let hostname = authInfo["hostname"] as? String {
-            // Show pairing dialog to user
-            showPairingDialog(code: pairingCode, hostname: hostname, clientId: clientId)
+        if context.scope == .loopback {
+            authenticateLoopback(authInfo, context: context, clientId: clientId, ws: ws)
+            return
+        }
+
+        if let sessionId = authInfo["session_id"],
+           let atemId = authInfo["atem_id"],
+           let proof = authInfo["proof"],
+           let session = sessionStore.authenticate(
+                sessionId: sessionId,
+                atemId: atemId,
+                challenge: context.challenge,
+                proof: proof,
+                astationId: AstationIdentity.shared.id
+           ) {
+                authenticateClient(clientId, sessionId: sessionId)
+                pendingAuthentication.removeValue(forKey: clientId)
+
+                let successMsg = AstationMessage.statusUpdate(
+                    status: "authenticated",
+                    data: [
+                        "method": "session_proof",
+                        "session_id": sessionId,
+                        "protocol": DeviceAuthentication.protocolVersion
+                    ]
+                )
+                sendMessage(successMsg, to: clientId)
+                registerClient(clientId, hostname: session.hostname)
+
+                Log.info("Client \(clientId.prefix(8)) authenticated via LAN session proof")
+                return
+        } else if authInfo["session_id"] != nil {
+            Log.warn("Invalid session proof from LAN client \(clientId.prefix(8))")
+            sendMessage(.error(message: "Session proof invalid - pairing required"), to: clientId)
+            return
+        }
+
+        if let pairingCode = authInfo["pairing_code"],
+           let hostname = authInfo["hostname"],
+           let atemId = authInfo["atem_id"] {
+            showPairingDialog(
+                code: pairingCode,
+                hostname: hostname,
+                atemId: atemId,
+                clientId: clientId,
+                ws: ws
+            )
             return
         }
 
@@ -190,7 +222,54 @@ class AstationWebSocketServer {
         Log.warn("⚠️  Client \(clientId.prefix(8)) sent invalid auth message")
         let errorMsg = AstationMessage.error(message: "Invalid auth credentials")
         sendMessage(errorMsg, to: clientId)
-        ws.close(code: .policyViolation)
+        _ = ws.close(code: .policyViolation)
+    }
+
+    private func authenticateLoopback(
+        _ authInfo: [String: String],
+        context: DirectAuthenticationContext,
+        clientId: String,
+        ws: WebSocket
+    ) {
+        guard let store = localBootstrapStore,
+              let atemId = authInfo["atem_id"],
+              let hostname = authInfo["hostname"],
+              let proof = authInfo["proof"],
+              DeviceAuthentication.verify(
+                proof: proof,
+                token: store.token,
+                challenge: context.challenge,
+                astationId: AstationIdentity.shared.id,
+                atemId: atemId,
+                sessionId: "local"
+              ) else {
+            Log.warn("Invalid same-user proof from loopback client \(clientId.prefix(8))")
+            sendMessage(.error(message: "Local authentication failed"), to: clientId)
+            _ = ws.close(code: .policyViolation)
+            return
+        }
+
+        let session = sessionStore.createOrRefreshLocal(hostname: hostname, atemId: atemId)
+        authenticatedClients.insert(clientId)
+        pendingAuthentication.removeValue(forKey: clientId)
+        sendMessage(.auth(info: [
+            "status": "granted",
+            "method": "local_proof",
+            "session_id": session.id,
+            "token": session.token,
+            "protocol": DeviceAuthentication.protocolVersion
+        ]), to: clientId)
+        registerClient(clientId, hostname: hostname)
+        Log.info("Loopback client \(clientId.prefix(8)) authenticated without interactive pairing")
+    }
+
+    private func registerClient(_ clientId: String, hostname: String) {
+        hubManager.addClient(ConnectedClient(
+            id: clientId,
+            clientType: "Atem",
+            connectedAt: Date(),
+            hostname: hostname
+        ))
     }
 
     private func authenticateClient(_ clientId: String, sessionId: String) {
@@ -212,7 +291,7 @@ class AstationWebSocketServer {
 
         // Get astation_id if session is valid
         var astationId: String? = nil
-        if isValid, let sessionInfo = sessionStore.get(sessionId: sessionId) {
+        if isValid, sessionStore.get(sessionId: sessionId) != nil {
             astationId = AstationIdentity.shared.id
             // Refresh the session since it's being used
             sessionStore.refresh(sessionId: sessionId)
@@ -239,7 +318,13 @@ class AstationWebSocketServer {
         Log.info("✅ Session verification response sent: valid=\(isValid)")
     }
 
-    private func showPairingDialog(code: String, hostname: String, clientId: String) {
+    private func showPairingDialog(
+        code: String,
+        hostname: String,
+        atemId: String,
+        clientId: String,
+        ws: WebSocket
+    ) {
         // Show pairing approval dialog on main thread
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
@@ -258,41 +343,24 @@ class AstationWebSocketServer {
 
             let response = alert.runModal()
 
-            if response == .alertFirstButtonReturn {
-                // User approved - create session
-                let session = self.sessionStore.create(hostname: hostname)
-
-                // Authenticate client
-                self.authenticatedClients.insert(clientId)
-
-                // Add to hub manager
-                let client = ConnectedClient(
-                    id: clientId,
-                    clientType: "Atem",
-                    connectedAt: Date(),
-                    hostname: hostname
-                )
-                self.hubManager.addClient(client)
-
-                // Send success with session info
-                let successMsg = AstationMessage.auth(info: [
-                    "status": "granted",
-                    "session_id": session.id,
-                    "token": session.token
-                ])
-                self.sendMessage(successMsg, to: clientId)
-
-                Log.info("✅ Pairing approved for \(hostname) (\(clientId.prefix(8)))")
-            } else {
-                // User denied
-                let errorMsg = AstationMessage.error(message: "Pairing denied by user")
-                self.sendMessage(errorMsg, to: clientId)
-
-                if let ws = self.connectedClients[clientId] {
-                    ws.close(code: .policyViolation)
+            ws.eventLoop.execute {
+                guard self.connectedClients[clientId] != nil else { return }
+                if response == .alertFirstButtonReturn {
+                    let session = self.sessionStore.create(hostname: hostname, atemId: atemId)
+                    self.authenticatedClients.insert(clientId)
+                    self.pendingAuthentication.removeValue(forKey: clientId)
+                    self.sendMessage(.auth(info: [
+                        "status": "granted",
+                        "session_id": session.id,
+                        "token": session.token
+                    ]), to: clientId)
+                    self.registerClient(clientId, hostname: hostname)
+                    Log.info("✅ Pairing approved for \(hostname) (\(clientId.prefix(8)))")
+                } else {
+                    self.sendMessage(.error(message: "Pairing denied by user"), to: clientId)
+                    _ = ws.close(code: .policyViolation)
+                    Log.info("❌ Pairing denied for \(hostname) (\(clientId.prefix(8)))")
                 }
-
-                Log.info("❌ Pairing denied for \(hostname) (\(clientId.prefix(8)))")
             }
         }
     }
@@ -320,7 +388,8 @@ class AstationWebSocketServer {
             return
         }
         
-        for (clientId, ws) in connectedClients {
+        for clientId in authenticatedClients {
+            guard let ws = connectedClients[clientId] else { continue }
             ws.send(text)
             NetworkDebugLogger.logWebSocket(direction: "send", context: "local \(clientId)", message: text)
         }
@@ -329,6 +398,29 @@ class AstationWebSocketServer {
     func getConnectedClientsCount() -> Int {
         return connectedClients.count
     }
+
+    var listeningPort: Int? {
+        channel?.localAddress?.port
+    }
+}
+
+private enum DirectConnectionScope: String {
+    case loopback
+    case lan
+
+    init(peerAddress: String?) {
+        switch peerAddress?.lowercased() {
+        case "127.0.0.1", "::1", "0:0:0:0:0:0:0:1", "::ffff:127.0.0.1":
+            self = .loopback
+        default:
+            self = .lan
+        }
+    }
+}
+
+private struct DirectAuthenticationContext {
+    let scope: DirectConnectionScope
+    let challenge: String
 }
 
 // Simple HTTP handler for WebSocket upgrade

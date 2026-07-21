@@ -62,11 +62,17 @@ Deep link authentication for Astation app.
 - `GET /api/sessions/:id/status` → `{status, token?}` - Poll for grant/deny
 - `POST /api/sessions/:id/grant {otp}` → `{token}` - User grants access (60 req/min limit)
 
-### WebSocket Relay (Pairing)
-Atem ↔ Astation message relay via pairing codes.
+### WebSocket Relay (Pairing and Reconnect)
+Atem <-> Astation message relay via pairing codes and persistent identity rooms.
 
 - `POST /api/pair {hostname}` → `{code}` - Create pairing room (10min expiry)
 - `WS /ws?role={atem|astation}&code={CODE}` - Connect and relay messages
+
+For identity-room reconnects, the relay is the transport, not the device
+authenticator. Astation sends a v2 challenge, verifies the Atem HMAC proof, and
+only then returns `authenticated`. The relay binds a session to the room only
+after observing that Astation response. See [`SECURITY.md`](SECURITY.md) for
+current production blockers.
 
 ### RTC Sessions
 Web screen sharing with up to 8 participants.
@@ -130,7 +136,7 @@ RUST_LOG=debug
 ## Testing
 
 ```bash
-cargo test  # 90 tests (auth, sessions, relay, RTC, validation)
+cargo test  # 177 tests (auth, sessions, relay, RTC, Voice, Vault, validation)
 ```
 
 
