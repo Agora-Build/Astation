@@ -6,17 +6,11 @@ on:
 
 jobs:
   codex-review:
-    # Trusted-author gate: the model gets OPENAI_API_KEY in env and its output is
+    # Trusted-branch gate: the model gets OPENAI_API_KEY in env and its output is
     # posted verbatim, so untrusted PR text could try to exfiltrate secrets via
-    # the review comment. Restrict to authors with push access — they already
-    # have repo-secret access, so this adds no exposure; fork/untrusted PRs don't
-    # run. (Mirrors claude-code-review.yml.)
-    if: >-
-      ${{
-        github.event.pull_request.author_association == 'OWNER' ||
-        github.event.pull_request.author_association == 'MEMBER' ||
-        github.event.pull_request.author_association == 'COLLABORATOR'
-      }}
+    # the review comment. Restrict to same-repository branches, which require
+    # push access; fork PRs never receive model secrets.
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -5,28 +5,16 @@ on:
     types: [opened, synchronize, ready_for_review, reopened]
 
 jobs:
-  gate-debug:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Show author association
-        run: echo "association=${{ github.event.pull_request.author_association }}"
-
   # The agent runs with a READ-ONLY token. PR title/diff are untrusted and are
   # fed to the model, so even if a malicious PR injects instructions, the agent
   # has no write capability. Posting is done by a separate, model-free job.
   #
-  # Trusted-author gate: the agent receives ANTHROPIC_API_KEY/BASE_URL in env and
+  # Trusted-branch gate: the agent receives ANTHROPIC_API_KEY/BASE_URL in env and
   # its output is posted verbatim, so untrusted PR text could try to exfiltrate
-  # secrets through the review comment. Restrict triggering to authors with push
-  # access — they already have access to repo secrets, so this adds no exposure.
-  # (Fork PRs get no secrets under the pull_request trigger and never run anyway.)
+  # secrets through the review comment. Restrict triggering to same-repository
+  # branches, which require push access. Fork PRs never receive model secrets.
   review:
-    if: >-
-      ${{
-        github.event.pull_request.author_association == 'OWNER' ||
-        github.event.pull_request.author_association == 'MEMBER' ||
-        github.event.pull_request.author_association == 'COLLABORATOR'
-      }}
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
