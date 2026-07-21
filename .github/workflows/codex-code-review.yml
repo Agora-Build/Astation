@@ -12,9 +12,11 @@ jobs:
     # have repo-secret access, so this adds no exposure; fork/untrusted PRs don't
     # run. (Mirrors claude-code-review.yml.)
     if: >-
-      github.event.pull_request.author_association == 'OWNER' ||
-      github.event.pull_request.author_association == 'MEMBER' ||
-      github.event.pull_request.author_association == 'COLLABORATOR'
+      ${{
+        github.event.pull_request.author_association == 'OWNER' ||
+        github.event.pull_request.author_association == 'MEMBER' ||
+        github.event.pull_request.author_association == 'COLLABORATOR'
+      }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

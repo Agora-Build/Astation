@@ -16,9 +16,11 @@ jobs:
   # (Fork PRs get no secrets under the pull_request trigger and never run anyway.)
   review:
     if: >-
-      github.event.pull_request.author_association == 'OWNER' ||
-      github.event.pull_request.author_association == 'MEMBER' ||
-      github.event.pull_request.author_association == 'COLLABORATOR'
+      ${{
+        github.event.pull_request.author_association == 'OWNER' ||
+        github.event.pull_request.author_association == 'MEMBER' ||
+        github.event.pull_request.author_association == 'COLLABORATOR'
+      }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
