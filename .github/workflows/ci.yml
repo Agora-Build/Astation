@@ -7,6 +7,20 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        description: PR head commit to test
+        required: true
+        type: string
+      pull_number:
+        description: Open PR containing the commit
+        required: true
+        type: string
+
+concurrency:
+  group: ci-${{ inputs.pull_number || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-macos:
@@ -14,6 +28,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head_sha || '' }}
 
       - name: Cache Agora SDK
         uses: actions/cache@v4
@@ -50,6 +66,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head_sha || '' }}
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -58,11 +76,16 @@ jobs:
           node webapp/tests/codec.test.js
           node webapp/tests/nginx.test.js
 
+      - name: Test AI review tooling
+        run: node --test .github/scripts/*.test.mjs
+
   test-relay-server:
     name: Relay Server Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head_sha || '' }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo registry and build artifacts
         uses: actions/cache@v4
@@ -79,3 +102,36 @@ jobs:
         run: cargo test
       - name: Build relay server container
         run: docker build --tag station-relay-server:ci relay-server
+
+  record-dispatch-context:
+    if: github.event_name == 'workflow_dispatch'
+    name: Record SMT CI Context
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Validate and write context
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+          PULL_NUMBER: ${{ inputs.pull_number }}
+        run: |
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid head SHA." >&2
+            exit 1
+          fi
+          if [[ ! "$PULL_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid pull request number." >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/smt-ci-context"
+          printf '{"headSha":"%s","pullNumber":%s}\n' \
+            "$HEAD_SHA" "$PULL_NUMBER" \
+            > "$RUNNER_TEMP/smt-ci-context/context.json"
+
+      - name: Upload context
+        uses: actions/upload-artifact@v4
+        with:
+          name: smt-ci-context
+          path: ${{ runner.temp }}/smt-ci-context/context.json
+          if-no-files-found: error
+          retention-days: 1
