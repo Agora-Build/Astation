@@ -5,6 +5,7 @@ import {
   buildPatchContext,
   extractClaudeReview,
   extractCodexReview,
+  isWorkflowChange,
   isWorkflowFile,
   modelEndpoint,
   requestModel,
@@ -61,6 +62,13 @@ test("detects only GitHub workflow files", () => {
   assert.equal(isWorkflowFile(".github/workflows/ci.yml"), true);
   assert.equal(isWorkflowFile(".github/scripts/ai-review.mjs"), false);
   assert.equal(isWorkflowFile("src/workflows/example.yml"), false);
+  assert.equal(
+    isWorkflowChange({
+      filename: "ci.yml.disabled",
+      previous_filename: ".github/workflows/ci.yml",
+    }),
+    true,
+  );
 });
 
 test("extracts text from Claude and Responses API payloads", () => {

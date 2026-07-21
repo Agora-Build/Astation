@@ -31,6 +31,14 @@ export function isWorkflowFile(filename) {
   return filename.startsWith(".github/workflows/");
 }
 
+export function isWorkflowChange(file) {
+  return (
+    isWorkflowFile(file.filename) ||
+    (typeof file.previous_filename === "string" &&
+      isWorkflowFile(file.previous_filename))
+  );
+}
+
 export function extractClaudeReview(response) {
   return (response.content || [])
     .filter((item) => item && item.type === "text" && typeof item.text === "string")
@@ -220,7 +228,7 @@ export async function validateTestedPullRequest(client, runId) {
     );
   }
   const isFork = pull.head?.repo?.full_name !== process.env.GITHUB_REPOSITORY;
-  const workflowChanges = files.filter((file) => isWorkflowFile(file.filename));
+  const workflowChanges = files.filter(isWorkflowChange);
   if (isFork && workflowChanges.length > 0) {
     throw new Error(
       `External pull requests may not modify workflow files: ${workflowChanges
