@@ -58,6 +58,9 @@ jobs:
           node webapp/tests/codec.test.js
           node webapp/tests/nginx.test.js
 
+      - name: Test AI review tooling
+        run: node --test .github/scripts/ai-review.test.mjs
+
   test-relay-server:
     name: Relay Server Tests
     runs-on: ubuntu-latest
