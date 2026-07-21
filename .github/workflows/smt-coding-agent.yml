@@ -92,7 +92,7 @@ jobs:
         run: node trusted/.github/scripts/prepare-codex-oss-home.mjs
         env:
           CODEX_HOME: ${{ runner.temp }}/codex-home
-          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
 
       - name: Make trusted tooling read-only
         run: chmod --recursive a-w trusted
