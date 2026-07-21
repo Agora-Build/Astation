@@ -130,10 +130,10 @@ async function findPullRequest(client, run) {
   return match?.number;
 }
 
-export async function validateTestedPullRequest(client, runId) {
+export async function validateTestedPullRequest(client, runId, dispatchContext = null) {
   const run = await client.request(`${client.root}/actions/runs/${runId}`);
-  if (run.event !== "pull_request" || run.conclusion !== "success") {
-    throw new Error("Review requires a successful pull_request CI run.");
+  if (!["pull_request", "workflow_dispatch"].includes(run.event) || run.conclusion !== "success") {
+    throw new Error("Review requires a successful PR or SMT-dispatched CI run.");
   }
 
   const ciWorkflow = await client.request(`${client.root}/actions/workflows/ci.yml`);
@@ -141,13 +141,27 @@ export async function validateTestedPullRequest(client, runId) {
     throw new Error("The triggering run is not the repository CI workflow.");
   }
 
-  const prNumber = await findPullRequest(client, run);
+  let testedSha = run.head_sha;
+  let prNumber;
+  if (run.event === "workflow_dispatch") {
+    if (
+      !dispatchContext ||
+      !/^[0-9a-f]{40}$/.test(dispatchContext.headSha) ||
+      !Number.isInteger(dispatchContext.pullNumber)
+    ) {
+      throw new Error("SMT-dispatched CI run is missing valid tested-commit context.");
+    }
+    testedSha = dispatchContext.headSha;
+    prNumber = dispatchContext.pullNumber;
+  } else {
+    prNumber = await findPullRequest(client, run);
+  }
   if (!prNumber) {
-    throw new Error(`No pull request found for tested commit ${run.head_sha}.`);
+    throw new Error(`No pull request found for tested commit ${testedSha}.`);
   }
 
   const pull = await client.request(`${client.root}/pulls/${prNumber}`);
-  if (pull.state !== "open" || pull.head?.sha !== run.head_sha) {
+  if (pull.state !== "open" || pull.head?.sha !== testedSha) {
     console.log(`Skipping stale CI result for pull request #${prNumber}.`);
     return null;
   }
@@ -187,7 +201,7 @@ export async function validateTestedPullRequest(client, runId) {
     );
   }
 
-  return { files, pull, run };
+  return { files, pull, run: { ...run, head_sha: testedSha } };
 }
 
 export function reviewEligibility({
@@ -317,7 +331,10 @@ async function main() {
   const repository = requireEnv("GITHUB_REPOSITORY");
   const runId = requireEnv("WORKFLOW_RUN_ID");
   const client = createGithubClient(githubToken, repository);
-  const context = await validateTestedPullRequest(client, runId);
+  const dispatchContext = process.env.CI_CONTEXT_PATH
+    ? JSON.parse(fs.readFileSync(process.env.CI_CONTEXT_PATH, "utf8"))
+    : null;
+  const context = await validateTestedPullRequest(client, runId, dispatchContext);
   if (!context) {
     appendActionOutput("reviewed", "false");
     return;

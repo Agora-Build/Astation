@@ -1,0 +1,300 @@
+name: SMT Coding Agent
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+concurrency:
+  group: smt-coding-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: >-
+      github.event.comment.user.type == 'User' &&
+      contains(github.event.comment.body, '@smt') &&
+      contains(github.event.comment.body, 'fix')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    outputs:
+      source_sha: ${{ steps.task.outputs.source_sha }}
+      status_comment_id: ${{ steps.task.outputs.status_comment_id }}
+
+    steps:
+      - name: Checkout trusted coding tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Authorize and prepare task
+        id: task
+        run: node trusted/.github/scripts/prepare-coding-task.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TASK_OUTPUT_DIR: ${{ runner.temp }}/smt-coding-task
+
+      - name: Upload task context
+        uses: actions/upload-artifact@v4
+        with:
+          name: smt-coding-task-${{ github.event.comment.id }}
+          path: ${{ runner.temp }}/smt-coding-task
+          if-no-files-found: error
+          retention-days: 1
+
+  agent:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout trusted coding tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Download task context
+        uses: actions/download-artifact@v4
+        with:
+          name: smt-coding-task-${{ github.event.comment.id }}
+          path: ${{ runner.temp }}/smt-coding-task
+
+      - name: Checkout exact target commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          path: target
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install pinned Codex CLI
+        run: npm install --global @openai/codex@0.144.5
+
+      - name: Prepare the OSS profile
+        run: node trusted/.github/scripts/prepare-codex-oss-home.mjs
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+
+      - name: Make trusted tooling read-only
+        run: chmod --recursive a-w trusted
+
+      - name: Enable the Linux sandbox and drop sudo
+        run: |
+          current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
+          if [[ -n "$current_userns" && "$current_userns" != "1" ]]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          current_apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
+          if [[ -n "$current_apparmor" && "$current_apparmor" != "0" ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          sudo gpasswd --delete "$USER" sudo
+          if sudo -n true 2>/dev/null; then
+            echo "Expected sudo to be disabled." >&2
+            exit 1
+          fi
+
+      - name: Run codex --profile oss
+        run: |
+          codex --profile oss exec \
+            --sandbox workspace-write \
+            --config sandbox_workspace_write.network_access=false \
+            --ephemeral \
+            --ignore-rules \
+            --color never \
+            --output-last-message "$RUNNER_TEMP/codex-final.txt" \
+            --cd "$GITHUB_WORKSPACE/target" \
+            - < "$RUNNER_TEMP/smt-coding-task/prompt.txt"
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+          OSS_API_KEY: ${{ secrets.SMT_OSS_API_KEY }}
+
+      - name: Collect generated patch
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: |
+          if [[ "$(git -C target rev-parse HEAD)" != "$SOURCE_SHA" ]]; then
+            echo "Codex changed repository history; refusing the result." >&2
+            exit 1
+          fi
+          git -C target add --intent-to-add .
+          mkdir -p "$RUNNER_TEMP/smt-coding-patch"
+          git -C target diff \
+            --binary --full-index --no-ext-diff --no-color HEAD \
+            > "$RUNNER_TEMP/smt-coding-patch/change.patch"
+          if [[ ! -s "$RUNNER_TEMP/smt-coding-patch/change.patch" ]]; then
+            echo "Codex produced no code changes." >&2
+            exit 1
+          fi
+
+      - name: Reject credential material in patch
+        run: node trusted/.github/scripts/check-coding-patch-secret.mjs
+        env:
+          PATCH_PATH: ${{ runner.temp }}/smt-coding-patch/change.patch
+          SMT_OSS_API_KEY: ${{ secrets.SMT_OSS_API_KEY }}
+
+      - name: Upload generated patch
+        uses: actions/upload-artifact@v4
+        with:
+          name: smt-coding-patch-${{ github.event.comment.id }}
+          path: ${{ runner.temp }}/smt-coding-patch/change.patch
+          if-no-files-found: error
+          retention-days: 1
+
+  validate:
+    needs: [prepare, agent]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout trusted coding tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Checkout exact target commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          path: target
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download generated patch
+        uses: actions/download-artifact@v4
+        with:
+          name: smt-coding-patch-${{ github.event.comment.id }}
+          path: ${{ runner.temp }}/smt-coding-patch
+
+      - name: Apply and validate patch policy
+        id: patch
+        run: >-
+          node trusted/.github/scripts/validate-coding-patch.mjs
+          "$RUNNER_TEMP/smt-coding-patch/change.patch"
+          "$GITHUB_WORKSPACE/target"
+
+      - name: Run webapp tests
+        if: steps.patch.outputs.test_webapp == 'true'
+        run: |
+          node target/webapp/tests/codec.test.js
+          node target/webapp/tests/nginx.test.js
+
+      - name: Set up Rust
+        if: steps.patch.outputs.test_relay == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run relay tests
+        if: steps.patch.outputs.test_relay == 'true'
+        working-directory: target/relay-server
+        run: cargo test
+
+      - name: Build relay container
+        if: steps.patch.outputs.test_relay == 'true'
+        run: docker build --tag station-relay-server:smt target/relay-server
+
+  write:
+    needs: [prepare, agent, validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    outputs:
+      commit_sha: ${{ steps.write.outputs.commit_sha }}
+      pull_number: ${{ steps.write.outputs.pull_number }}
+      pull_url: ${{ steps.write.outputs.pull_url }}
+
+    steps:
+      - name: Checkout trusted coding tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Download task context
+        uses: actions/download-artifact@v4
+        with:
+          name: smt-coding-task-${{ github.event.comment.id }}
+          path: ${{ runner.temp }}/smt-coding-task
+
+      - name: Download validated patch
+        uses: actions/download-artifact@v4
+        with:
+          name: smt-coding-patch-${{ github.event.comment.id }}
+          path: ${{ runner.temp }}/smt-coding-patch
+
+      - name: Checkout exact target commit with writer token
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          path: target
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Commit, push, and dispatch CI
+        id: write
+        run: node trusted/.github/scripts/write-coding-patch.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PATCH_PATH: ${{ runner.temp }}/smt-coding-patch/change.patch
+          TARGET_DIR: ${{ github.workspace }}/target
+          TASK_PATH: ${{ runner.temp }}/smt-coding-task/task.json
+
+  report:
+    needs: [prepare, agent, validate, write]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+
+    steps:
+      - name: Report coding task result
+        uses: actions/github-script@v7
+        env:
+          AGENT_RESULT: ${{ needs.agent.result }}
+          COMMIT_SHA: ${{ needs.write.outputs.commit_sha }}
+          PULL_URL: ${{ needs.write.outputs.pull_url }}
+          STATUS_COMMENT_ID: ${{ needs.prepare.outputs.status_comment_id }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          WRITE_RESULT: ${{ needs.write.result }}
+        with:
+          script: |
+            const success = process.env.WRITE_RESULT === 'success';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const detail = success
+              ? `Committed ${process.env.COMMIT_SHA.slice(0, 12)} to ${process.env.PULL_URL}. CI has been dispatched for the exact commit.\n\nRun: ${runUrl}`
+              : `Coding task stopped before completion. Agent: ${process.env.AGENT_RESULT}; validation: ${process.env.VALIDATE_RESULT}; writer: ${process.env.WRITE_RESULT}.\n\nRun: ${runUrl}`;
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: Number(process.env.STATUS_COMMENT_ID),
+              body: `${detail}\n\n<!-- astation-coding-task:${context.payload.comment.id} -->`,
+            });

@@ -21,7 +21,8 @@ jobs:
   review:
     if: >-
       (github.event_name == 'workflow_run' &&
-       github.event.workflow_run.event == 'pull_request' &&
+       (github.event.workflow_run.event == 'pull_request' ||
+        github.event.workflow_run.event == 'workflow_dispatch') &&
        github.event.workflow_run.conclusion == 'success') ||
       github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -43,6 +44,23 @@ jobs:
           persist-credentials: false
           sparse-checkout: .github/scripts
 
+      - name: Inspect tested CI run
+        id: ci-run
+        run: node .github/scripts/inspect-ci-run.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id || inputs.ci_run_id }}
+
+      - name: Download SMT CI context
+        if: steps.ci-run.outputs.event == 'workflow_dispatch'
+        uses: actions/download-artifact@v4
+        with:
+          name: smt-ci-context
+          path: ${{ runner.temp }}/smt-ci-context
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id || inputs.ci_run_id }}
+
       - name: Review the tested pull request
         id: review
         run: node .github/scripts/ai-review.mjs
@@ -52,6 +70,7 @@ jobs:
           AI_MODEL: ${{ vars.CLAUDE_REVIEW_MODEL || 'claude-opus-4-8' }}
           AI_OUTPUT_PATH: ${{ runner.temp }}/claude-review.json
           AI_PROVIDER: claude
+          CI_CONTEXT_PATH: ${{ steps.ci-run.outputs.event == 'workflow_dispatch' && format('{0}/smt-ci-context/context.json', runner.temp) || '' }}
           EXTERNAL_REVIEW_STABILITY_HOURS: "3"
           EXPECTED_CI_JOBS: Build macOS|Webapp Tests|Relay Server Tests
           GITHUB_TOKEN: ${{ github.token }}

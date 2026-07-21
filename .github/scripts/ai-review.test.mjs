@@ -21,7 +21,7 @@ import {
 process.env.EXPECTED_CI_JOBS = "Build macOS|Webapp Tests|Relay Server Tests";
 process.env.GITHUB_REPOSITORY = "Agora-Build/Astation";
 
-function validationClient({ files, pull }) {
+function validationClient({ files, pull, runOverrides = {} }) {
   const sha = "a".repeat(40);
   const run = {
     conclusion: "success",
@@ -29,6 +29,7 @@ function validationClient({ files, pull }) {
     head_sha: sha,
     pull_requests: [{ head: { sha }, number: 12 }],
     workflow_id: 100,
+    ...runOverrides,
   };
   return {
     client: {
@@ -186,6 +187,33 @@ test("rejects a partial changed-file listing", async () => {
     validateTestedPullRequest(client, "123"),
     /refusing a partial policy check and review/,
   );
+});
+
+test("validates the tested SHA recorded by an SMT-dispatched CI run", async () => {
+  const testedSha = "a".repeat(40);
+  const files = [
+    { additions: 1, deletions: 0, filename: "src/example.js", status: "added" },
+  ];
+  const { client } = validationClient({
+    files,
+    pull: {
+      changed_files: 1,
+      head: { repo: { full_name: "Agora-Build/Astation" }, sha: testedSha },
+      number: 12,
+      state: "open",
+    },
+    runOverrides: {
+      event: "workflow_dispatch",
+      head_sha: "f".repeat(40),
+      pull_requests: [],
+    },
+  });
+
+  const context = await validateTestedPullRequest(client, "123", {
+    headSha: testedSha,
+    pullNumber: 12,
+  });
+  assert.equal(context.run.head_sha, testedSha);
 });
 
 test("sends non-agent requests in each provider's native API format", async () => {
