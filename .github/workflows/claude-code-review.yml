@@ -5,6 +5,12 @@ on:
     types: [opened, synchronize, ready_for_review, reopened]
 
 jobs:
+  gate-debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show author association
+        run: echo "association=${{ github.event.pull_request.author_association }}"
+
   # The agent runs with a READ-ONLY token. PR title/diff are untrusted and are
   # fed to the model, so even if a malicious PR injects instructions, the agent
   # has no write capability. Posting is done by a separate, model-free job.
