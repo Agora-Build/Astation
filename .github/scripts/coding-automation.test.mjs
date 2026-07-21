@@ -129,9 +129,12 @@ test("recreates the local oss profile from the GitHub Actions base URL", () => {
   assert.match(baseConfig, /env_key = "OSS_API_KEY"/);
   assert.match(profile, /model = "gpt-5\.6-sol"/);
   assert.match(profile, /model_reasoning_effort = "xhigh"/);
+  assert.match(profile, /web_search = "live"/);
+  assert.match(profile, /network_access = false/);
   assert.match(profile, /exclude_tmpdir_env_var = true/);
   assert.match(profile, /exclude_slash_tmp = true/);
   assert.match(profile, /exclude = \["\*KEY\*"/);
+  assert.match(profile, /"\*CREDENTIAL\*"/);
 });
 
 test("rejects raw and encoded coding credentials in a patch", () => {

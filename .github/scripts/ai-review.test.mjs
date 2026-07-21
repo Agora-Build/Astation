@@ -6,6 +6,7 @@ import {
   extractClaudeReview,
   extractCodexReview,
   modelEndpoint,
+  redactSecrets,
   requestModel,
   reviewEligibility,
   validateTestedPullRequest,
@@ -88,6 +89,13 @@ test("extracts text from Claude and Responses API payloads", () => {
       output: [{ content: [{ type: "output_text", text: "One finding." }] }],
     }),
     "One finding.",
+  );
+});
+
+test("redacts runtime credentials before model input or persisted output", () => {
+  assert.equal(
+    redactSecrets("token=review-secret and review-secret", ["review-secret"]),
+    "token=[REDACTED] and [REDACTED]",
   );
 });
 

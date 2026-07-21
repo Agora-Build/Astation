@@ -115,7 +115,7 @@ jobs:
 
       - name: Run codex --profile oss
         run: |
-          codex --profile oss exec \
+          codex --profile oss --search exec \
             --sandbox workspace-write \
             --config sandbox_workspace_write.network_access=false \
             --ephemeral \
