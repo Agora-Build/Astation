@@ -4,15 +4,28 @@ on:
   workflow_run:
     workflows: [CI]
     types: [completed]
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: Successful CI workflow run ID
+        required: true
+        type: string
 
 permissions: {}
+
+concurrency:
+  group: codex-review-${{ github.event.workflow_run.id || inputs.ci_run_id }}
+  cancel-in-progress: false
 
 jobs:
   review:
     if: >-
-      github.event.workflow_run.event == 'pull_request' &&
-      github.event.workflow_run.conclusion == 'success'
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.event == 'pull_request' &&
+       github.event.workflow_run.conclusion == 'success') ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       actions: read
       contents: read
@@ -39,15 +52,16 @@ jobs:
           AI_MODEL: ${{ vars.CODEX_REVIEW_MODEL || 'gpt-5.5' }}
           AI_OUTPUT_PATH: ${{ runner.temp }}/codex-review.json
           AI_PROVIDER: codex
+          EXTERNAL_REVIEW_STABILITY_HOURS: "3"
           EXPECTED_CI_JOBS: Build macOS|Webapp Tests|Relay Server Tests
           GITHUB_TOKEN: ${{ github.token }}
-          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id || inputs.ci_run_id }}
 
       - name: Upload review output
         if: steps.review.outputs.reviewed == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: codex-review-${{ github.event.workflow_run.id }}
+          name: codex-review-${{ github.event.workflow_run.id || inputs.ci_run_id }}
           path: ${{ runner.temp }}/codex-review.json
           if-no-files-found: error
           retention-days: 1
@@ -56,6 +70,7 @@ jobs:
     needs: review
     if: needs.review.outputs.reviewed == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       actions: read
       contents: read
@@ -72,7 +87,7 @@ jobs:
       - name: Download review output
         uses: actions/download-artifact@v4
         with:
-          name: codex-review-${{ github.event.workflow_run.id }}
+          name: codex-review-${{ github.event.workflow_run.id || inputs.ci_run_id }}
           path: ${{ runner.temp }}/review-output
 
       - name: Post review comment

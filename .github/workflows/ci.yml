@@ -8,6 +8,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-macos:
     name: Build macOS
@@ -59,7 +63,7 @@ jobs:
           node webapp/tests/nginx.test.js
 
       - name: Test AI review tooling
-        run: node --test .github/scripts/ai-review.test.mjs
+        run: node --test .github/scripts/*.test.mjs
 
   test-relay-server:
     name: Relay Server Tests

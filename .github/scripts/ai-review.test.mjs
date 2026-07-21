@@ -5,12 +5,18 @@ import {
   buildPatchContext,
   extractClaudeReview,
   extractCodexReview,
-  isWorkflowChange,
-  isWorkflowFile,
   modelEndpoint,
   requestModel,
+  reviewEligibility,
   validateTestedPullRequest,
 } from "./ai-review.mjs";
+import {
+  isWorkflowChange,
+  isWorkflowFile,
+  reviewProviderMarker,
+  reviewRequestMarker,
+  reviewShaMarker,
+} from "./review-automation.mjs";
 
 process.env.EXPECTED_CI_JOBS = "Build macOS|Webapp Tests|Relay Server Tests";
 process.env.GITHUB_REPOSITORY = "Agora-Build/Astation";
@@ -212,4 +218,96 @@ test("sends non-agent requests in each provider's native API format", async () =
   assert.equal(requests[1].url, "https://gateway/openai/v1/responses");
   assert.equal(requests[1].headers.Authorization, "Bearer codex-key");
   assert.equal(requests[1].body.input, "diff");
+});
+
+test("reviews internal pull requests immediately after CI", () => {
+  const sha = "a".repeat(40);
+  const result = reviewEligibility({
+    comments: [],
+    now: Date.parse("2026-07-21T18:00:00Z"),
+    provider: "claude",
+    pull: {
+      draft: false,
+      head: { repo: { full_name: "Agora-Build/Astation" } },
+    },
+    repository: "Agora-Build/Astation",
+    run: { head_sha: sha, updated_at: "2026-07-21T17:59:00Z" },
+  });
+
+  assert.equal(result.eligible, true);
+});
+
+test("delays external Codex and skips automatic external Claude", () => {
+  const sha = "b".repeat(40);
+  const input = {
+    comments: [],
+    now: Date.parse("2026-07-21T18:00:00Z"),
+    pull: { draft: false, head: { repo: { full_name: "external/fork" } } },
+    repository: "Agora-Build/Astation",
+    run: { head_sha: sha, updated_at: "2026-07-21T16:00:01Z" },
+    stabilityHours: 3,
+  };
+
+  assert.equal(reviewEligibility({ ...input, provider: "codex" }).eligible, false);
+  assert.equal(reviewEligibility({ ...input, provider: "claude" }).eligible, false);
+  assert.equal(
+    reviewEligibility({
+      ...input,
+      now: Date.parse("2026-07-21T19:00:01Z"),
+      provider: "codex",
+    }).eligible,
+    true,
+  );
+  assert.equal(
+    reviewEligibility({
+      ...input,
+      now: Date.parse("2026-07-21T19:00:01Z"),
+      provider: "claude",
+    }).eligible,
+    false,
+  );
+});
+
+test("@smt review overrides external delay and draft status", () => {
+  const sha = "c".repeat(40);
+  const comments = [
+    {
+      body: reviewRequestMarker(sha, "manual"),
+      user: { login: "github-actions[bot]" },
+    },
+  ];
+  const result = reviewEligibility({
+    comments,
+    now: Date.parse("2026-07-21T18:00:00Z"),
+    provider: "claude",
+    pull: { draft: true, head: { repo: { full_name: "external/fork" } } },
+    repository: "Agora-Build/Astation",
+    run: { head_sha: sha, updated_at: "2026-07-21T17:59:00Z" },
+    stabilityHours: 3,
+  });
+
+  assert.equal(result.eligible, true);
+});
+
+test("deduplicates a provider review for the same commit", () => {
+  const sha = "d".repeat(40);
+  const comments = [
+    {
+      body: `${reviewProviderMarker("codex")}\n${reviewShaMarker(sha)}`,
+      user: { login: "github-actions[bot]" },
+    },
+  ];
+  const result = reviewEligibility({
+    comments,
+    provider: "codex",
+    pull: {
+      draft: false,
+      head: { repo: { full_name: "Agora-Build/Astation" } },
+    },
+    repository: "Agora-Build/Astation",
+    run: { head_sha: sha, updated_at: "2026-07-21T17:00:00Z" },
+  });
+
+  assert.equal(result.eligible, false);
+  assert.match(result.reason, /already reviewed/);
 });

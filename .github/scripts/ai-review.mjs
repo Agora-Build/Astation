@@ -1,16 +1,19 @@
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 
+import {
+  DEFAULT_STABILITY_HOURS,
+  createGithubClient,
+  hasCompletedReview,
+  hasReviewRequest,
+  isStableSince,
+  isWorkflowChange,
+  listPullRequestComments,
+  requireEnv,
+} from "./review-automation.mjs";
+
 const DEFAULT_DIFF_LIMIT = 120_000;
 const MAX_GITHUB_FILE_PAGES = 30;
-
-function requireEnv(name) {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`);
-  }
-  return value;
-}
 
 function trimTrailingSlash(value) {
   return value.replace(/\/+$/, "");
@@ -25,18 +28,6 @@ export function modelEndpoint(provider, baseUrl) {
     return base.endsWith("/v1/responses") ? base : `${base}/v1/responses`;
   }
   throw new Error(`Unsupported AI provider: ${provider}`);
-}
-
-export function isWorkflowFile(filename) {
-  return filename.startsWith(".github/workflows/");
-}
-
-export function isWorkflowChange(file) {
-  return (
-    isWorkflowFile(file.filename) ||
-    (typeof file.previous_filename === "string" &&
-      isWorkflowFile(file.previous_filename))
-  );
 }
 
 export function extractClaudeReview(response) {
@@ -120,47 +111,6 @@ function redact(value, secrets) {
   return result;
 }
 
-function githubClient(token, repository) {
-  const apiUrl = trimTrailingSlash(process.env.GITHUB_API_URL || "https://api.github.com");
-  const root = `/repos/${repository}`;
-
-  async function request(path, options = {}) {
-    const response = await fetch(`${apiUrl}${path}`, {
-      ...options,
-      headers: {
-        Accept: "application/vnd.github+json",
-        Authorization: `Bearer ${token}`,
-        "X-GitHub-Api-Version": "2022-11-28",
-        ...options.headers,
-      },
-      signal: AbortSignal.timeout(60_000),
-    });
-    if (!response.ok) {
-      const detail = (await response.text()).slice(0, 1_000);
-      throw new Error(`GitHub API ${response.status} for ${path}: ${detail}`);
-    }
-    return response.status === 204 ? null : response.json();
-  }
-
-  async function paginate(path, maxPages = Number.POSITIVE_INFINITY) {
-    const separator = path.includes("?") ? "&" : "?";
-    const items = [];
-    for (let page = 1; page <= maxPages; page += 1) {
-      const batch = await request(`${path}${separator}per_page=100&page=${page}`);
-      if (!Array.isArray(batch)) {
-        throw new Error(`Expected an array from GitHub API path: ${path}`);
-      }
-      items.push(...batch);
-      if (batch.length < 100) {
-        break;
-      }
-    }
-    return items;
-  }
-
-  return { paginate, request, root };
-}
-
 async function findPullRequest(client, run) {
   const eventPulls = Array.isArray(run.pull_requests) ? run.pull_requests : [];
   const eventMatch = eventPulls.find((pull) => pull.head?.sha === run.head_sha);
@@ -238,6 +188,45 @@ export async function validateTestedPullRequest(client, runId) {
   }
 
   return { files, pull, run };
+}
+
+export function reviewEligibility({
+  comments,
+  now = Date.now(),
+  provider,
+  pull,
+  repository,
+  run,
+  stabilityHours = DEFAULT_STABILITY_HOURS,
+}) {
+  if (hasCompletedReview(comments, provider, run.head_sha)) {
+    return { eligible: false, reason: `${provider} already reviewed this commit.` };
+  }
+
+  const manuallyRequested = hasReviewRequest(comments, run.head_sha, "manual");
+  if (pull.draft && !manuallyRequested) {
+    return { eligible: false, reason: "Draft pull requests wait for @smt review." };
+  }
+
+  const isExternal = pull.head?.repo?.full_name !== repository;
+  if (isExternal && provider === "claude" && !manuallyRequested) {
+    return {
+      eligible: false,
+      reason: "Claude reviews external pull requests only after @smt review.",
+    };
+  }
+  if (
+    isExternal &&
+    !manuallyRequested &&
+    !isStableSince(run.updated_at, stabilityHours, now)
+  ) {
+    return {
+      eligible: false,
+      reason: `External pull request has not been stable for ${stabilityHours} hours.`,
+    };
+  }
+
+  return { eligible: true, reason: "Review is eligible." };
 }
 
 function reviewPrompt(pull, run, files) {
@@ -324,17 +313,34 @@ export async function requestModel(provider, baseUrl, apiKey, model, prompt) {
 
 async function main() {
   const provider = requireEnv("AI_PROVIDER");
-  const apiKey = requireEnv("AI_API_KEY");
   const githubToken = requireEnv("GITHUB_TOKEN");
   const repository = requireEnv("GITHUB_REPOSITORY");
   const runId = requireEnv("WORKFLOW_RUN_ID");
-  const client = githubClient(githubToken, repository);
+  const client = createGithubClient(githubToken, repository);
   const context = await validateTestedPullRequest(client, runId);
   if (!context) {
     appendActionOutput("reviewed", "false");
     return;
   }
 
+  const comments = await listPullRequestComments(client, context.pull.number);
+  const eligibility = reviewEligibility({
+    comments,
+    provider,
+    pull: context.pull,
+    repository,
+    run: context.run,
+    stabilityHours: Number(
+      process.env.EXTERNAL_REVIEW_STABILITY_HOURS || DEFAULT_STABILITY_HOURS,
+    ),
+  });
+  if (!eligibility.eligible) {
+    console.log(`Skipping ${provider} review: ${eligibility.reason}`);
+    appendActionOutput("reviewed", "false");
+    return;
+  }
+
+  const apiKey = requireEnv("AI_API_KEY");
   const review = await requestModel(
     provider,
     requireEnv("AI_BASE_URL"),
