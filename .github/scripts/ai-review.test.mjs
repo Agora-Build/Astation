@@ -5,6 +5,7 @@ import {
   buildPatchContext,
   extractClaudeReview,
   extractCodexReview,
+  extractCodexStream,
   modelEndpoint,
   redactSecrets,
   requestModel,
@@ -90,6 +91,34 @@ test("extracts text from Claude and Responses API payloads", () => {
     }),
     "One finding.",
   );
+});
+
+test("extracts the completed review from a Responses API stream", () => {
+  const stream = [
+    "event: response.output_text.delta",
+    'data: {"type":"response.output_text.delta","delta":"Partial"}',
+    "",
+    "event: response.completed",
+    'data: {"type":"response.completed","response":{"output":[{"content":[{"type":"output_text","text":"Complete review"}]}]}}',
+    "",
+    "data: [DONE]",
+    "",
+  ].join("\n");
+
+  assert.equal(extractCodexStream(stream), "Complete review");
+});
+
+test("falls back to Responses API text deltas", () => {
+  const stream = [
+    'data: {"type":"response.output_text.delta","delta":"One "}',
+    "",
+    'data: {"type":"response.output_text.delta","delta":"finding."}',
+    "",
+    "data: [DONE]",
+    "",
+  ].join("\n");
+
+  assert.equal(extractCodexStream(stream), "One finding.");
 });
 
 test("redacts runtime credentials before model input or persisted output", () => {
@@ -229,10 +258,22 @@ test("sends non-agent requests in each provider's native API format", async () =
   const requests = [];
   globalThis.fetch = async (url, options) => {
     requests.push({ body: JSON.parse(options.body), headers: options.headers, url });
-    const response = url.endsWith("/v1/messages")
-      ? { content: [{ text: "Claude review", type: "text" }] }
-      : { output: [{ content: [{ text: "Codex review", type: "output_text" }] }] };
-    return new Response(JSON.stringify(response), { status: 200 });
+    if (url.endsWith("/v1/messages")) {
+      const response = { content: [{ text: "Claude review", type: "text" }] };
+      return new Response(JSON.stringify(response), { status: 200 });
+    }
+
+    const stream = [
+      "event: response.completed",
+      'data: {"type":"response.completed","response":{"output":[{"content":[{"type":"output_text","text":"Codex review"}]}]}}',
+      "",
+      "data: [DONE]",
+      "",
+    ].join("\n");
+    return new Response(stream, {
+      headers: { "content-type": "text/event-stream" },
+      status: 200,
+    });
   };
 
   try {
@@ -253,6 +294,7 @@ test("sends non-agent requests in each provider's native API format", async () =
   assert.equal(requests[0].body.messages[0].content, "diff");
   assert.equal(requests[1].url, "https://gateway/openai/v1/responses");
   assert.equal(requests[1].headers.Authorization, "Bearer codex-key");
+  assert.equal(requests[1].body.stream, true);
   assert.deepEqual(requests[1].body.input, [
     {
       content: "diff",
