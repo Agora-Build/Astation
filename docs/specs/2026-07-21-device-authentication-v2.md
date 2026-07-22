@@ -141,6 +141,12 @@ and covers:
 - cross-language HMAC test vectors, bounded authentication input, and private
   file modes.
 
+The relay test suite also starts the real Axum WebSocket router on an ephemeral
+loopback port. Its replacement-generation test connects Astation and two Atem
+sockets with the same device ID, then verifies that the original socket closes,
+stale targeted responses are dropped, the replacement routes messages in both
+directions, and its disconnect event carries the active `connection_id`.
+
 Run:
 
 ```bash

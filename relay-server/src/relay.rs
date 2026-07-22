@@ -1014,6 +1014,31 @@ mod tests {
     use crate::voice_session::VoiceSessionStore;
     use super::*;
     use crate::session_verify::SessionVerifyCache;
+    use tokio::net::TcpStream;
+    use tokio_tungstenite::{
+        tungstenite::Message as ClientMessage, MaybeTlsStream, WebSocketStream,
+    };
+
+    type TestSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    async fn next_client_json(socket: &mut TestSocket) -> serde_json::Value {
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+                .await
+                .expect("timed out waiting for WebSocket message")
+                .expect("WebSocket closed before receiving message")
+                .expect("failed to read WebSocket message");
+            match frame {
+                ClientMessage::Text(text) => {
+                    return serde_json::from_str(&text).expect("WebSocket text was not JSON");
+                }
+                ClientMessage::Close(frame) => {
+                    panic!("WebSocket closed unexpectedly: {frame:?}");
+                }
+                _ => {}
+            }
+        }
+    }
 
     #[test]
     fn pairing_code_format() {
@@ -1620,6 +1645,123 @@ mod tests {
             "Expected 404, 400, or 426 for non-upgrade WS request to nonexistent room, got {}",
             status
         );
+    }
+
+    #[tokio::test]
+    async fn practical_websocket_replacement_rejects_stale_generation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test relay");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, create_relay_app())
+                .await
+                .expect("test relay failed");
+        });
+        let base_url = format!("ws://{address}/ws");
+        let code = "practical-replacement";
+        let atem_id = "atem-office";
+
+        let (mut astation, _) = tokio_tungstenite::connect_async(format!(
+            "{base_url}?role=astation&code={code}"
+        ))
+        .await
+        .expect("failed to connect Astation");
+        let (mut original, _) = tokio_tungstenite::connect_async(format!(
+            "{base_url}?role=atem&code={code}&atem_id={atem_id}"
+        ))
+        .await
+        .expect("failed to connect original Atem");
+        let original_event = next_client_json(&mut astation).await;
+        assert_eq!(original_event["atem_id"], atem_id);
+        assert_eq!(original_event["relay_event"], "connected");
+        let original_connection_id = original_event["connection_id"]
+            .as_str()
+            .expect("connected event lacked connection_id")
+            .to_string();
+
+        let (mut replacement, _) = tokio_tungstenite::connect_async(format!(
+            "{base_url}?role=atem&code={code}&atem_id={atem_id}"
+        ))
+        .await
+        .expect("failed to connect replacement Atem");
+        let replacement_event = next_client_json(&mut astation).await;
+        assert_eq!(replacement_event["atem_id"], atem_id);
+        assert_eq!(replacement_event["relay_event"], "connected");
+        let replacement_connection_id = replacement_event["connection_id"]
+            .as_str()
+            .expect("replacement event lacked connection_id")
+            .to_string();
+        assert_ne!(original_connection_id, replacement_connection_id);
+
+        let original_closed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            async {
+                while let Some(frame) = original.next().await {
+                    match frame {
+                        Ok(ClientMessage::Close(_)) | Err(_) => return true,
+                        _ => {}
+                    }
+                }
+                true
+            },
+        )
+        .await
+        .unwrap_or(false);
+        assert!(original_closed, "replaced Atem socket remained open");
+
+        astation
+            .send(ClientMessage::Text(
+                serde_json::json!({
+                    "atem_id": atem_id,
+                    "connection_id": original_connection_id,
+                    "payload": {"probe": "stale"},
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                replacement.next(),
+            )
+            .await
+            .is_err(),
+            "stale targeted response reached replacement Atem"
+        );
+
+        astation
+            .send(ClientMessage::Text(
+                serde_json::json!({
+                    "atem_id": atem_id,
+                    "connection_id": replacement_connection_id,
+                    "payload": {"probe": "current"},
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next_client_json(&mut replacement).await["probe"], "current");
+
+        replacement
+            .send(ClientMessage::Text(
+                serde_json::json!({"probe": "from-atem"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let forwarded = next_client_json(&mut astation).await;
+        assert_eq!(forwarded["atem_id"], atem_id);
+        assert_eq!(forwarded["connection_id"], replacement_connection_id);
+        assert_eq!(forwarded["payload"]["probe"], "from-atem");
+
+        replacement.close(None).await.unwrap();
+        let disconnect_event = next_client_json(&mut astation).await;
+        assert_eq!(disconnect_event["atem_id"], atem_id);
+        assert_eq!(disconnect_event["connection_id"], replacement_connection_id);
+        assert_eq!(disconnect_event["relay_event"], "disconnected");
+
+        server.abort();
     }
 
     #[tokio::test]
