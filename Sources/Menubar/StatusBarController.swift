@@ -11,7 +11,6 @@ class StatusBarController: NSObject, NSMenuDelegate {
     private lazy var projectsWindowController = ProjectsWindowController(hubManager: hubManager)
     private lazy var joinChannelWindowController = JoinChannelWindowController(hubManager: hubManager)
     private lazy var connectionsWindowController = ConnectionsWindowController(hubManager: hubManager)
-    private lazy var remoteControlWindowController = RemoteControlWindowController(hubManager: hubManager)
     var hotkeyManager: HotkeyManager?
     private var headerTapCount = 0
     private var lastHeaderTapTime: Date?
@@ -376,15 +375,6 @@ class StatusBarController: NSObject, NSMenuDelegate {
         showProjectsItem.target = self
         statusMenu.addItem(showProjectsItem)
 
-        // Remote Agent Control
-        let remoteControlItem = NSMenuItem(
-            title: "🎮 Remote Agent Control",
-            action: #selector(showRemoteControl),
-            keyEquivalent: "r"
-        )
-        remoteControlItem.target = self
-        statusMenu.addItem(remoteControlItem)
-
         // Show Clients & Agents
         let onlineCount = hubManager.connectedClients.filter { $0.clientType == "Atem" }.count
         let clientsTitle = onlineCount > 0
@@ -397,15 +387,6 @@ class StatusBarController: NSObject, NSMenuDelegate {
         )
         showClientsItem.target = self
         statusMenu.addItem(showClientsItem)
-
-        // Show Connections (legacy developer panel)
-        let showConnectionsItem = NSMenuItem(
-            title: "🔌 Show Connections",
-            action: #selector(showConnections),
-            keyEquivalent: "n"
-        )
-        showConnectionsItem.target = self
-        statusMenu.addItem(showConnectionsItem)
 
         // Pair Remote Atem
         let pairRemoteItem = NSMenuItem(
@@ -483,33 +464,9 @@ class StatusBarController: NSObject, NSMenuDelegate {
         projectsWindowController.showWindow()
     }
 
-    @objc private func showRemoteControl() {
-        Log.info(" Remote agent control requested from status bar")
-        remoteControlWindowController.showWindow()
-    }
-
     @objc private func showClientsAndAgents() {
         Log.info(" Show clients & agents requested from status bar")
         connectionsWindowController.showAndFocus()
-    }
-    
-    @objc private func showConnections() {
-        Log.info(" Show connections requested from status bar")
-        let clientCount = webSocketServer.getConnectedClientsCount()
-        let clients = hubManager.connectedClients
-        
-        let alert = NSAlert()
-        alert.messageText = "Connected Clients (\(clientCount))"
-        
-        let clientList = clients.map { client in
-            let formatter = DateFormatter()
-            formatter.timeStyle = .medium
-            return "• \(client.clientType) (\(client.id.prefix(8))...)\n  Connected: \(formatter.string(from: client.connectedAt))"
-        }.joined(separator: "\n\n")
-        
-        alert.informativeText = clientList.isEmpty ? "No clients connected" : clientList
-        alert.alertStyle = .informational
-        alert.runModal()
     }
     
     @objc private func pairRemoteAtem() {

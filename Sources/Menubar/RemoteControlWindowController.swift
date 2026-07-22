@@ -9,6 +9,9 @@ class RemoteControlWindowController: NSObject, NSWindowDelegate, NSTextFieldDele
     private var targetLabel: NSTextField!
     private var inputField: NSTextField!
     private var sendButton: NSButton!
+    private var targetClientId: String?
+    private var targetAgentId: String?
+    private var targetAgentName: String?
 
     /// Control keys exposed in the key bar: (button title, wire key name).
     private let keys: [(String, String)] = [
@@ -26,7 +29,11 @@ class RemoteControlWindowController: NSObject, NSWindowDelegate, NSTextFieldDele
         super.init()
     }
 
-    func showWindow() {
+    func showWindow(clientId: String, agent: AtemAgentInfo) {
+        targetClientId = clientId
+        targetAgentId = agent.id
+        targetAgentName = agent.name.isEmpty ? agent.kind : agent.name
+
         if let existingWindow = window {
             existingWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
@@ -95,11 +102,15 @@ class RemoteControlWindowController: NSObject, NSWindowDelegate, NSTextFieldDele
     }
 
     private func refreshTarget() {
-        if let clientId = hubManager.routeToFocusedAtem() {
-            targetLabel.stringValue = "Target: \(clientId)"
+        if let clientId = targetClientId,
+           hubManager.connectedClients.contains(where: { $0.id == clientId }) {
+            let clientName = hubManager.connectedClients
+                .first(where: { $0.id == clientId })?
+                .hostname ?? String(clientId.prefix(8))
+            targetLabel.stringValue = "Target: \(targetAgentName ?? "Agent") on \(clientName)"
             targetLabel.textColor = .secondaryLabelColor
         } else {
-            targetLabel.stringValue = "⚠ No Atem connected — input will be dropped"
+            targetLabel.stringValue = "⚠ Target Atem is offline — input will be dropped"
             targetLabel.textColor = .systemOrange
         }
     }
@@ -107,14 +118,14 @@ class RemoteControlWindowController: NSObject, NSWindowDelegate, NSTextFieldDele
     @objc private func sendText() {
         let text = inputField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
-        hubManager.sendAgentText(text)
+        hubManager.sendAgentText(text, agentId: targetAgentId, clientId: targetClientId)
         inputField.stringValue = ""
         refreshTarget()
     }
 
     @objc private func sendKey(_ sender: NSButton) {
         guard let keyName = sender.identifier?.rawValue else { return }
-        hubManager.sendAgentKey(keyName)
+        hubManager.sendAgentKey(keyName, agentId: targetAgentId, clientId: targetClientId)
         refreshTarget()
     }
 

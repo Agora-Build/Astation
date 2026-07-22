@@ -94,4 +94,46 @@ final class AgentInputRoutingTests: XCTestCase {
         hub.sendAgentText("route me")
         XCTAssertEqual(captured.first?.1, "atem-2", "pinned client should win")
     }
+
+    func testRemoteControlRoutesToExplicitClientAndAgent() {
+        let hub = AstationHubManager(skipProjectLoad: true)
+        hub.connectedClients = [
+            ConnectedClient(id: "atem-1", clientType: "Atem", connectedAt: Date()),
+            ConnectedClient(id: "atem-2", clientType: "Atem", connectedAt: Date()),
+        ]
+        hub.pinnedClientId = "atem-1"
+
+        var captured: [(AstationMessage, String)] = []
+        hub.sendHandler = { msg, clientId in captured.append((msg, clientId)) }
+
+        hub.sendAgentText("inspect logs", agentId: "agent-9", clientId: "atem-2")
+        hub.sendAgentKey("ctrl-c", agentId: "agent-9", clientId: "atem-2")
+
+        XCTAssertEqual(captured.map(\.1), ["atem-2", "atem-2"])
+        guard case let .agentInput(textAgentId, textKind, text, _) = captured[0].0,
+              case let .agentInput(keyAgentId, keyKind, _, key) = captured[1].0 else {
+            return XCTFail("expected agentInput messages")
+        }
+        XCTAssertEqual(textAgentId, "agent-9")
+        XCTAssertEqual(textKind, "text")
+        XCTAssertEqual(text, "inspect logs")
+        XCTAssertEqual(keyAgentId, "agent-9")
+        XCTAssertEqual(keyKind, "key")
+        XCTAssertEqual(key, "ctrl-c")
+    }
+
+    func testRemoteControlDropsInputForOfflineExplicitClient() {
+        let hub = AstationHubManager(skipProjectLoad: true)
+        hub.connectedClients = [
+            ConnectedClient(id: "atem-online", clientType: "Atem", connectedAt: Date())
+        ]
+
+        var captured: [(AstationMessage, String)] = []
+        hub.sendHandler = { msg, clientId in captured.append((msg, clientId)) }
+
+        hub.sendAgentText("do not send", agentId: "agent-9", clientId: "atem-offline")
+        hub.sendAgentKey("enter", agentId: "agent-9", clientId: "atem-offline")
+
+        XCTAssertTrue(captured.isEmpty)
+    }
 }

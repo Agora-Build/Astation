@@ -846,28 +846,36 @@ class AstationHubManager: ObservableObject {
 
     // MARK: - Remote Agent Control
 
-    /// Send a text instruction to the focused Atem's agent (written to its PTY stdin + Enter).
-    /// `agentId == nil` targets the Atem's focused/only agent.
-    func sendAgentText(_ text: String, agentId: String? = nil) {
-        guard let clientId = routeToFocusedAtem() else {
+    /// Send a text instruction to an Atem agent (written to its PTY stdin + Enter).
+    /// When no client or agent is specified, the focused Atem and its focused agent are used.
+    func sendAgentText(_ text: String, agentId: String? = nil, clientId: String? = nil) {
+        guard let targetClientId = clientId ?? routeToFocusedAtem() else {
             Log.info("[AgentInput] No Atem connected — text dropped: \(text)")
             return
         }
+        guard connectedClients.contains(where: { $0.id == targetClientId }) else {
+            Log.info("[AgentInput] Target Atem offline — text dropped: \(targetClientId)")
+            return
+        }
         let message = AstationMessage.agentInput(agentId: agentId, kind: "text", text: text, key: nil)
-        sendHandler?(message, clientId)
-        Log.info("[AgentInput] text → \(clientId): \(text)")
+        sendHandler?(message, targetClientId)
+        Log.info("[AgentInput] text → \(targetClientId): \(text)")
     }
 
-    /// Send a control key to the focused Atem's agent (written raw to its PTY).
+    /// Send a control key to an Atem agent (written raw to its PTY).
     /// `key` is one of: enter, esc, ctrl-c, up, down, y, n.
-    func sendAgentKey(_ key: String, agentId: String? = nil) {
-        guard let clientId = routeToFocusedAtem() else {
+    func sendAgentKey(_ key: String, agentId: String? = nil, clientId: String? = nil) {
+        guard let targetClientId = clientId ?? routeToFocusedAtem() else {
             Log.info("[AgentInput] No Atem connected — key dropped: \(key)")
             return
         }
+        guard connectedClients.contains(where: { $0.id == targetClientId }) else {
+            Log.info("[AgentInput] Target Atem offline — key dropped: \(targetClientId)")
+            return
+        }
         let message = AstationMessage.agentInput(agentId: agentId, kind: "key", text: nil, key: key)
-        sendHandler?(message, clientId)
-        Log.info("[AgentInput] key → \(clientId): \(key)")
+        sendHandler?(message, targetClientId)
+        Log.info("[AgentInput] key → \(targetClientId): \(key)")
     }
 
     // MARK: - Mark Task Routing
@@ -1479,7 +1487,8 @@ class AstationHubManager: ObservableObject {
                 id: clientId,
                 clientType: "Atem",
                 connectedAt: Date(),
-                hostname: "relay:\(hostname)"
+                hostname: "relay:\(hostname)",
+                atemId: atemId
             ),
             relayConnectionId: connectionId
         )
@@ -1531,6 +1540,7 @@ struct ConnectedClient: Identifiable {
     let clientType: String
     let connectedAt: Date
     var hostname: String = "unknown"
+    var atemId: String?
     var tag: String = ""
     var lastActivity: Date = Date()
     var isFocused: Bool = false
