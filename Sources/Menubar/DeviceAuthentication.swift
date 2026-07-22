@@ -9,6 +9,7 @@ enum DeviceAuthentication {
     static let maxSessionIdBytes = 128
     static let maxRequestIdBytes = 128
     static let maxPairingCodeBytes = 32
+    static let maxRelayConnectionIdBytes = 64
 
     static func makeChallenge() -> String {
         randomHex(byteCount: 32)
@@ -29,6 +30,10 @@ enum DeviceAuthentication {
 
     static func relayClientMatchesAtemId(clientId: String, atemId: String) -> Bool {
         isValidAtemId(atemId) && clientId == "relay-\(atemId)"
+    }
+
+    static func isValidRelayConnectionId(_ value: String) -> Bool {
+        isBoundedText(value, maxBytes: maxRelayConnectionIdBytes) && UUID(uuidString: value) != nil
     }
 
     static func proof(
@@ -182,6 +187,86 @@ struct RelayAuthenticationChallengeStore {
 
     private mutating func removeExpired(now: Date) {
         entries = entries.filter { $0.value.expiresAt > now }
+    }
+}
+
+struct IdentityRelayAuthenticationState {
+    private var connectionIds: [String: String] = [:]
+    private var authenticatedConnectionIds: [String: String] = [:]
+    private var challenges = RelayAuthenticationChallengeStore()
+
+    mutating func connect(clientId: String, connectionId: String) -> Bool {
+        let previous = connectionIds.updateValue(connectionId, forKey: clientId)
+        guard previous != connectionId else { return false }
+        challenges.remove(clientId: clientId)
+        authenticatedConnectionIds.removeValue(forKey: clientId)
+        return previous != nil
+    }
+
+    mutating func disconnect(clientId: String, connectionId: String) -> Bool {
+        guard connectionIds[clientId] == connectionId else { return false }
+        connectionIds.removeValue(forKey: clientId)
+        authenticatedConnectionIds.removeValue(forKey: clientId)
+        challenges.remove(clientId: clientId)
+        return true
+    }
+
+    mutating func issueChallenge(
+        clientId: String,
+        connectionId: String,
+        challenge: String
+    ) -> Bool {
+        guard connectionIds[clientId] == connectionId,
+              !isAuthenticated(clientId: clientId, connectionId: connectionId) else {
+            return false
+        }
+        return challenges.issue(clientId: clientId, challenge: challenge)
+    }
+
+    mutating func challenge(clientId: String, connectionId: String) -> String? {
+        guard connectionIds[clientId] == connectionId else { return nil }
+        return challenges.challenge(for: clientId)
+    }
+
+    mutating func authenticate(
+        clientId: String,
+        atemId: String,
+        connectionId: String
+    ) -> Bool {
+        guard DeviceAuthentication.relayClientMatchesAtemId(clientId: clientId, atemId: atemId),
+              connectionIds[clientId] == connectionId,
+              challenges.challenge(for: clientId) != nil else {
+            return false
+        }
+        challenges.remove(clientId: clientId)
+        authenticatedConnectionIds[clientId] = connectionId
+        return true
+    }
+
+    mutating func reject(clientId: String, connectionId: String) {
+        guard connectionIds[clientId] == connectionId else { return }
+        challenges.remove(clientId: clientId)
+    }
+
+    func isAuthenticated(clientId: String, connectionId: String) -> Bool {
+        connectionIds[clientId] == connectionId &&
+            authenticatedConnectionIds[clientId] == connectionId
+    }
+
+    var authenticatedClientIds: [String] {
+        authenticatedConnectionIds.compactMap { clientId, connectionId in
+            connectionIds[clientId] == connectionId ? clientId : nil
+        }
+    }
+
+    func connectionId(for clientId: String) -> String? {
+        connectionIds[clientId]
+    }
+
+    mutating func removeAll() {
+        connectionIds.removeAll()
+        authenticatedConnectionIds.removeAll()
+        challenges.removeAll()
     }
 }
 

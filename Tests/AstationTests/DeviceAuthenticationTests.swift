@@ -30,6 +30,48 @@ final class DeviceAuthenticationTests: XCTestCase {
             clientId: "relay-atem-office",
             atemId: "atem-office\nspoof"
         ))
+        XCTAssertTrue(DeviceAuthentication.isValidRelayConnectionId(
+            "43c8a181-6567-49ae-9191-8e103a66cc55"
+        ))
+        XCTAssertFalse(DeviceAuthentication.isValidRelayConnectionId("connection-one"))
+    }
+
+    func testRelayAuthenticationIsBoundToConnectionGeneration() {
+        let clientId = "relay-atem-office"
+        let firstConnection = "43c8a181-6567-49ae-9191-8e103a66cc55"
+        let replacementConnection = "328e433e-82c0-4d54-9241-503de8ff55dd"
+        var state = IdentityRelayAuthenticationState()
+
+        XCTAssertFalse(state.connect(clientId: clientId, connectionId: firstConnection))
+        XCTAssertTrue(state.issueChallenge(
+            clientId: clientId,
+            connectionId: firstConnection,
+            challenge: "first-challenge"
+        ))
+        XCTAssertTrue(state.authenticate(
+            clientId: clientId,
+            atemId: "atem-office",
+            connectionId: firstConnection
+        ))
+        XCTAssertTrue(state.isAuthenticated(clientId: clientId, connectionId: firstConnection))
+
+        XCTAssertTrue(state.connect(clientId: clientId, connectionId: replacementConnection))
+        XCTAssertFalse(state.isAuthenticated(clientId: clientId, connectionId: replacementConnection))
+        XCTAssertNil(state.challenge(clientId: clientId, connectionId: firstConnection))
+        XCTAssertFalse(state.disconnect(clientId: clientId, connectionId: firstConnection))
+        XCTAssertEqual(state.connectionId(for: clientId), replacementConnection)
+
+        XCTAssertTrue(state.issueChallenge(
+            clientId: clientId,
+            connectionId: replacementConnection,
+            challenge: "replacement-challenge"
+        ))
+        XCTAssertTrue(state.authenticate(
+            clientId: clientId,
+            atemId: "atem-office",
+            connectionId: replacementConnection
+        ))
+        XCTAssertTrue(state.isAuthenticated(clientId: clientId, connectionId: replacementConnection))
     }
 
     func testProofMatchesProtocolVector() {

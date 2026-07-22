@@ -59,6 +59,11 @@ only causes Astation to issue a targeted challenge. The relay envelope
 `atem_id` must exactly match the device ID in the authentication payload, and
 an authenticated relay client cannot restart authentication with another
 `hello` message.
+The relay assigns every Atem WebSocket a random `connection_id`, announces
+connect and disconnect events to Astation, and includes both IDs in every
+envelope. Astation binds the challenge and authenticated state to that exact
+connection generation. It echoes the `connection_id` on targeted responses;
+the relay drops messages from stale sockets and responses for replaced sockets.
 Application broadcasts are delivered to authenticated direct and identity-relay
 clients, while pending clients are excluded.
 Direct connection state is confined to the NIO event loop; relay authentication
@@ -112,6 +117,8 @@ No DNS lookup, relay request, or internet service is required on this path.
 
 1. Merge both repository PRs before releasing either binary.
 2. Release Astation and Atem as a coordinated version pair.
+   Deploy the matching relay build before enabling identity-relay v2 because
+   Astation fails closed on envelopes without a `connection_id`.
 3. Existing session records remain readable, but old clients that send only a
    session ID cannot authenticate against v2.
 4. On `pairing required`, the updated Atem retries interactive pairing on the
