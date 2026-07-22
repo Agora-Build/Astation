@@ -59,6 +59,20 @@ export function extractCodexReview(response) {
 export function extractCodexStream(stream) {
   const deltas = [];
   let completedReview = "";
+  const trimmedStream = stream.trim();
+
+  if (trimmedStream.startsWith("{")) {
+    let payload;
+    try {
+      payload = JSON.parse(trimmedStream);
+    } catch {
+      throw new Error("codex API returned malformed JSON.");
+    }
+    if (payload.error) {
+      throw new Error(`codex API failed: ${payload.error.message || "unknown error"}`);
+    }
+    return extractCodexReview(payload);
+  }
 
   for (const block of stream.split(/\r?\n\r?\n/)) {
     const data = block
@@ -76,8 +90,17 @@ export function extractCodexStream(stream) {
       throw new Error("codex API returned a malformed streaming event.");
     }
 
-    if (event.type === "error") {
-      const message = event.error?.message || event.message || "unknown streaming error";
+    if (
+      event.type === "error" ||
+      event.type === "response.failed" ||
+      event.type === "response.incomplete"
+    ) {
+      const message =
+        event.error?.message ||
+        event.response?.error?.message ||
+        event.response?.incomplete_details?.reason ||
+        event.message ||
+        "unknown streaming error";
       throw new Error(`codex API stream failed: ${message}`);
     }
     if (event.type === "response.output_text.delta" && typeof event.delta === "string") {

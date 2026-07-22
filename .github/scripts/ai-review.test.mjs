@@ -121,6 +121,30 @@ test("falls back to Responses API text deltas", () => {
   assert.equal(extractCodexStream(stream), "One finding.");
 });
 
+test("surfaces failed Responses API streams", () => {
+  const stream = [
+    "event: response.failed",
+    'data: {"type":"response.failed","response":{"error":{"message":"model failed"}}}',
+    "",
+  ].join("\n");
+
+  assert.throws(() => extractCodexStream(stream), /stream failed: model failed/);
+});
+
+test("surfaces malformed Responses API streams", () => {
+  assert.throws(
+    () => extractCodexStream("data: {not-json}\n\n"),
+    /malformed streaming event/,
+  );
+});
+
+test("surfaces JSON error envelopes from the Responses API", () => {
+  assert.throws(
+    () => extractCodexStream('{"error":{"message":"proxy failed"}}'),
+    /codex API failed: proxy failed/,
+  );
+});
+
 test("redacts runtime credentials before model input or persisted output", () => {
   assert.equal(
     redactSecrets("token=review-secret and review-secret", ["review-secret"]),
