@@ -115,7 +115,11 @@ class SessionStore {
         proof: String,
         astationId: String
     ) -> SessionInfo? {
-        queue.sync(flags: .barrier) {
+        guard DeviceAuthentication.isValidSessionId(sessionId),
+              DeviceAuthentication.isValidAtemId(atemId) else {
+            return nil
+        }
+        return queue.sync(flags: .barrier) {
             guard var session = sessions[sessionId], session.isValid else { return nil }
             guard session.atemId == nil || session.atemId == atemId else { return nil }
             let bindsLegacySession = session.atemId == nil

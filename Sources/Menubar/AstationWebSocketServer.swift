@@ -7,6 +7,7 @@ import NIOWebSocket
 
 class AstationWebSocketServer {
     private var eventLoopGroup: EventLoopGroup!
+    private var stateEventLoop: EventLoop?
     private var channel: Channel?
     private let hubManager: AstationHubManager
     private var connectedClients: [String: WebSocket] = [:]
@@ -30,6 +31,7 @@ class AstationWebSocketServer {
     
     func start(host: String, port: Int) throws {
         eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        stateEventLoop = eventLoopGroup.next()
         
         let upgrader = NIOWebSocketServerUpgrader(
             shouldUpgrade: { channel, _ in
@@ -75,6 +77,7 @@ class AstationWebSocketServer {
     }
     
     private func handleWebSocketConnection(_ ws: WebSocket, scope: DirectConnectionScope) {
+        preconditionOnStateEventLoop()
         let clientId = UUID().uuidString
         connectedClients[clientId] = ws
         let challenge = DeviceAuthentication.makeChallenge()
@@ -134,6 +137,7 @@ class AstationWebSocketServer {
         }
 
         if case .statusUpdate(let status, let messageData) = message, status == "session_verify_request" {
+            // This legacy control message is deliberately protected by v2 authentication.
             handleSessionVerifyRequest(messageData, from: clientId)
             return
         }
@@ -207,7 +211,9 @@ class AstationWebSocketServer {
 
         if let pairingCode = authInfo["pairing_code"],
            let rawHostname = authInfo["hostname"],
-           let atemId = authInfo["atem_id"] {
+           let atemId = authInfo["atem_id"],
+           DeviceAuthentication.isValidPairingCode(pairingCode),
+           DeviceAuthentication.isValidAtemId(atemId) {
             showPairingDialog(
                 code: pairingCode,
                 hostname: DeviceAuthentication.deviceLabel(rawHostname),
@@ -281,7 +287,9 @@ class AstationWebSocketServer {
 
     private func handleSessionVerifyRequest(_ data: [String: String], from clientId: String) {
         guard let sessionId = data["session_id"],
-              let requestId = data["request_id"] else {
+              let requestId = data["request_id"],
+              DeviceAuthentication.isValidSessionId(sessionId),
+              DeviceAuthentication.isValidRequestId(requestId) else {
             Log.warn("⚠️  Session verify request missing required fields")
             return
         }
@@ -380,15 +388,13 @@ class AstationWebSocketServer {
     }
     
     func sendMessageToClient(_ message: AstationMessage, clientId: String) {
-        guard let eventLoopGroup else { return }
-        eventLoopGroup.next().execute {
+        executeOnStateEventLoop {
             self.sendMessage(message, to: clientId)
         }
     }
 
     func broadcastMessage(_ message: AstationMessage) {
-        guard let eventLoopGroup else { return }
-        eventLoopGroup.next().execute {
+        executeOnStateEventLoop {
             self.broadcastMessageOnEventLoop(message)
         }
     }
@@ -408,12 +414,24 @@ class AstationWebSocketServer {
     }
     
     func getConnectedClientsCount() -> Int {
-        guard let eventLoopGroup else { return 0 }
-        let eventLoop = eventLoopGroup.next()
+        guard let eventLoop = stateEventLoop else { return 0 }
         if eventLoop.inEventLoop {
             return connectedClients.count
         }
         return (try? eventLoop.submit { self.connectedClients.count }.wait()) ?? 0
+    }
+
+    private func executeOnStateEventLoop(_ operation: @escaping () -> Void) {
+        guard let eventLoop = stateEventLoop else { return }
+        if eventLoop.inEventLoop {
+            operation()
+        } else {
+            eventLoop.execute(operation)
+        }
+    }
+
+    private func preconditionOnStateEventLoop() {
+        precondition(stateEventLoop?.inEventLoop == true, "Direct connection state left its NIO event loop")
     }
 
     var listeningPort: Int? {

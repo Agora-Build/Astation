@@ -45,6 +45,28 @@ final class DirectConnectionTests: XCTestCase {
         XCTAssertEqual(result, "error:Local authentication failed")
     }
 
+    func testUnauthenticatedSessionVerificationIsRejected() throws {
+        let fixture = try DirectServerFixture(host: "127.0.0.1")
+        defer { fixture.shutdown() }
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+
+        let future = connect(
+            host: "127.0.0.1",
+            fixture: fixture,
+            group: group,
+            authMessage: { _ in
+                .statusUpdate(status: "session_verify_request", data: [
+                    "session_id": UUID().uuidString,
+                    "request_id": UUID().uuidString
+                ])
+            }
+        )
+
+        let (result, _) = try future.wait()
+        XCTAssertEqual(result, "error:Authentication required")
+    }
+
     func testLANSessionTokenCannotAuthenticateAsLoopback() throws {
         let fixture = try DirectServerFixture(host: "127.0.0.1")
         defer { fixture.shutdown() }

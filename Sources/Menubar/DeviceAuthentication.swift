@@ -3,6 +3,10 @@ import Foundation
 
 enum DeviceAuthentication {
     static let protocolVersion = "2"
+    static let maxAtemIdBytes = 255
+    static let maxSessionIdBytes = 128
+    static let maxRequestIdBytes = 128
+    static let maxPairingCodeBytes = 32
 
     static func makeChallenge() -> String {
         randomHex(byteCount: 32)
@@ -44,6 +48,11 @@ enum DeviceAuthentication {
         atemId: String,
         sessionId: String
     ) -> Bool {
+        guard isValidAtemId(atemId),
+              isValidSessionId(sessionId),
+              isValidProof(candidate) else {
+            return false
+        }
         let expected = proof(
             token: token,
             challenge: challenge,
@@ -52,6 +61,22 @@ enum DeviceAuthentication {
             sessionId: sessionId
         )
         return constantTimeEqual(candidate.lowercased(), expected)
+    }
+
+    static func isValidAtemId(_ value: String) -> Bool {
+        isBoundedText(value, maxBytes: maxAtemIdBytes)
+    }
+
+    static func isValidSessionId(_ value: String) -> Bool {
+        isBoundedText(value, maxBytes: maxSessionIdBytes)
+    }
+
+    static func isValidRequestId(_ value: String) -> Bool {
+        isBoundedText(value, maxBytes: maxRequestIdBytes)
+    }
+
+    static func isValidPairingCode(_ value: String) -> Bool {
+        isBoundedText(value, maxBytes: maxPairingCodeBytes)
     }
 
     private static func canonicalMessage(
@@ -72,6 +97,27 @@ enum DeviceAuthentication {
             difference |= left[index] ^ right[index]
         }
         return difference == 0
+    }
+
+    private static func isBoundedText(_ value: String, maxBytes: Int) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= maxBytes else { return false }
+        return !value.unicodeScalars.contains {
+            CharacterSet.controlCharacters.contains($0)
+        }
+    }
+
+    private static func isValidProof(_ value: String) -> Bool {
+        var count = 0
+        for byte in value.utf8 {
+            count += 1
+            guard count <= 64,
+                  (48...57).contains(byte) ||
+                  (65...70).contains(byte) ||
+                  (97...102).contains(byte) else {
+                return false
+            }
+        }
+        return count == 64
     }
 
     fileprivate static func randomHex(byteCount: Int) -> String {

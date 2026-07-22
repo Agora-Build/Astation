@@ -1201,6 +1201,7 @@ class AstationHubManager: ObservableObject {
     }
 
     private func handleIdentityRelayMessage(_ msg: AstationMessage, task: URLSessionWebSocketTask, clientId: String) {
+        dispatchPrecondition(condition: .onQueue(.main))
         if case .statusUpdate(let status, let data) = msg, status == "hello" {
             let hostname = DeviceAuthentication.deviceLabel(data["hostname"] ?? "unknown")
             let challenge = DeviceAuthentication.makeChallenge()
@@ -1228,12 +1229,14 @@ class AstationHubManager: ObservableObject {
     }
 
     func broadcastToAuthenticatedIdentityRelayClients(_ message: AstationMessage) {
+        dispatchPrecondition(condition: .onQueue(.main))
         for clientId in authenticatedIdentityRelayClients {
             sendHandler?(message, clientId)
         }
     }
 
     private func handleIdentityRelayAuthentication(_ msg: AstationMessage, clientId: String) {
+        dispatchPrecondition(condition: .onQueue(.main))
         guard case .statusUpdate(let status, let data) = msg,
               status == "auth",
               let challenge = identityRelayAuthChallenges[clientId] else {
@@ -1244,6 +1247,8 @@ class AstationHubManager: ObservableObject {
         if let sessionId = data["session_id"],
            let atemId = data["atem_id"],
            let proof = data["proof"],
+           DeviceAuthentication.isValidSessionId(sessionId),
+           DeviceAuthentication.isValidAtemId(atemId),
            let session = deviceSessionStore.authenticate(
                 sessionId: sessionId,
                 atemId: atemId,
@@ -1270,7 +1275,9 @@ class AstationHubManager: ObservableObject {
 
         guard let pairingCode = data["pairing_code"],
               let rawHostname = data["hostname"],
-              let atemId = data["atem_id"] else {
+              let atemId = data["atem_id"],
+              DeviceAuthentication.isValidPairingCode(pairingCode),
+              DeviceAuthentication.isValidAtemId(atemId) else {
             sendHandler?(.error(message: "Invalid relay authentication credentials"), clientId)
             return
         }
@@ -1307,6 +1314,7 @@ class AstationHubManager: ObservableObject {
         hostname: String,
         response: AstationMessage
     ) {
+        dispatchPrecondition(condition: .onQueue(.main))
         identityRelayAuthChallenges.removeValue(forKey: clientId)
         authenticatedIdentityRelayClients.insert(clientId)
         sendHandler?(response, clientId)

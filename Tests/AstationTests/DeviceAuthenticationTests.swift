@@ -41,6 +41,21 @@ final class DeviceAuthenticationTests: XCTestCase {
         ))
     }
 
+    func testRejectsOversizedOrMalformedAuthenticationFields() {
+        XCTAssertFalse(DeviceAuthentication.isValidAtemId(String(repeating: "a", count: 256)))
+        XCTAssertFalse(DeviceAuthentication.isValidSessionId("session\nother"))
+        XCTAssertFalse(DeviceAuthentication.isValidRequestId(""))
+        XCTAssertFalse(DeviceAuthentication.isValidPairingCode(String(repeating: "1", count: 33)))
+        XCTAssertFalse(DeviceAuthentication.verify(
+            proof: String(repeating: "z", count: 64),
+            token: "token-abc",
+            challenge: "challenge-123",
+            astationId: "astation-home",
+            atemId: "atem-office",
+            sessionId: "session-456"
+        ))
+    }
+
     func testBootstrapSecretIsStableAndPrivate() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AstationBootstrapTests-\(UUID().uuidString)")

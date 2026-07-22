@@ -61,6 +61,11 @@ clients, while pending clients are excluded.
 Direct connection state is confined to the NIO event loop; relay authentication
 state and pairing UI are confined to the main queue.
 
+Authentication input is bounded before proof or UI processing: `atem_id` is at
+most 255 UTF-8 bytes, session and request IDs are at most 128 bytes, pairing
+codes are at most 32 bytes, and HMAC proofs are exactly 64 hexadecimal bytes.
+Empty values and control characters are rejected.
+
 ## Local state
 
 Astation stores files under `~/Library/Application Support/Astation/`:
@@ -117,9 +122,11 @@ and covers:
 - invalid same-user proof rejection;
 - LAN session credentials rejected on the loopback scope;
 - application broadcasts excluded from unauthenticated sockets;
+- session-verification control messages rejected before device authentication;
 - five concurrently authenticated loopback clients;
 - a pre-paired connection through a real non-loopback interface, with no relay;
-- cross-language HMAC test vectors and private file modes.
+- cross-language HMAC test vectors, bounded authentication input, and private
+  file modes.
 
 Run:
 
