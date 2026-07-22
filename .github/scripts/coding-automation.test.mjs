@@ -192,7 +192,7 @@ test("rejects binary patches", () => {
   fs.writeFileSync(binaryPath, Buffer.from([0, 1, 9, 3]));
   const patchPath = path.join(repo, "change.patch");
   fs.writeFileSync(patchPath, git(repo, ["diff", "--binary", "--full-index", "HEAD"]));
-  fs.writeFileSync(binaryPath, Buffer.from([0, 1, 2, 3]));
+  git(repo, ["checkout", "--", "asset.bin"]);
 
   assert.throws(() => applyAndValidatePatch(patchPath, repo), /Binary changes/);
 });
