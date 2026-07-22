@@ -231,7 +231,8 @@ class AstationWebSocketServer {
         clientId: String,
         ws: WebSocket
     ) {
-        guard let store = localBootstrapStore,
+        guard authInfo["method"] == "local_proof",
+              let store = localBootstrapStore,
               let atemId = authInfo["atem_id"],
               let hostname = authInfo["hostname"],
               let proof = authInfo["proof"],

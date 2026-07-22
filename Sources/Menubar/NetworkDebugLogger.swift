@@ -101,16 +101,40 @@ enum NetworkDebugLogger {
                 options: [.sortedKeys]
               ),
               let sanitized = String(data: sanitizedData, encoding: .utf8) else {
-            return truncate(text)
+            return sanitizeUnstructuredText(text)
         }
         return truncate(sanitized)
     }
 
     private static let sensitiveKeys: Set<String> = [
-        "access_token", "api_key", "app_certificate", "authorization",
-        "cookie", "credential", "encryption_key", "pairing_code", "password",
-        "proof", "refresh_token", "secret", "session", "session_id", "token"
+        "access_token", "api_key", "app_certificate", "auth_token", "authorization",
+        "bearer", "bootstrap_token", "cookie", "credential", "encryption_key", "otp",
+        "pairing_code", "password", "proof", "refresh_token", "secret", "session",
+        "session_id", "session_token", "token"
     ]
+
+    private static func sanitizeUnstructuredText(_ text: String) -> String {
+        let replacements = [
+            (#"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"#, "Bearer <redacted>"),
+            (
+                #"(?i)\b(access[_-]?token|api[_-]?key|auth[_-]?token|bootstrap[_-]?token|otp|pairing[_-]?code|password|proof|refresh[_-]?token|secret|session[_-]?id|session[_-]?token|token)\b\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;&]+)"#,
+                "$1=<redacted>"
+            )
+        ]
+        let sanitized = replacements.reduce(text) { value, replacement in
+            guard let expression = try? NSRegularExpression(
+                pattern: replacement.0,
+                options: []
+            ) else { return value }
+            return expression.stringByReplacingMatches(
+                in: value,
+                options: [],
+                range: NSRange(value.startIndex..<value.endIndex, in: value),
+                withTemplate: replacement.1
+            )
+        }
+        return truncate(sanitized)
+    }
 
     private static func sanitizeJSONObject(_ value: Any) -> Any {
         if let dictionary = value as? [String: Any] {

@@ -16,4 +16,15 @@ final class NetworkDebugLoggerTests: XCTestCase {
     func testSanitizedPayloadLeavesNonJSONTextReadable() {
         XCTAssertEqual(NetworkDebugLogger.sanitizedPayload("connection closed"), "connection closed")
     }
+
+    func testSanitizedPayloadRedactsUnstructuredSecrets() {
+        let sanitized = NetworkDebugLogger.sanitizedPayload(
+            "request failed token=secret-value Authorization: Bearer header.payload.signature"
+        )
+
+        XCTAssertFalse(sanitized.contains("secret-value"))
+        XCTAssertFalse(sanitized.contains("header.payload.signature"))
+        XCTAssertTrue(sanitized.contains("token=<redacted>"))
+        XCTAssertTrue(sanitized.contains("Bearer <redacted>"))
+    }
 }

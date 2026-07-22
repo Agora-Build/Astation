@@ -19,6 +19,10 @@ All three paths can be active at the same time. A connection is local only when
 the kernel reports a loopback peer address. A LAN address, VPN address, forwarded
 header, hostname, or claimed role never receives the loopback policy.
 
+The same-Mac policy relies on the bootstrap file and its parent directory being
+owner-only (`0600`/`0700`); it proves access as the Astation OS account rather
+than inspecting the connecting process UID.
+
 ## Protocol
 
 Astation starts every direct connection with:
@@ -107,6 +111,7 @@ and covers:
 
 - loopback authentication with no network service;
 - invalid same-user proof rejection;
+- LAN session credentials rejected on the loopback scope;
 - application broadcasts excluded from unauthenticated sockets;
 - five concurrently authenticated loopback clients;
 - a pre-paired connection through a real non-loopback interface, with no relay;

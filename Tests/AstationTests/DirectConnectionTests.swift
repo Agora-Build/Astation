@@ -45,6 +45,39 @@ final class DirectConnectionTests: XCTestCase {
         XCTAssertEqual(result, "error:Local authentication failed")
     }
 
+    func testLANSessionTokenCannotAuthenticateAsLoopback() throws {
+        let fixture = try DirectServerFixture(host: "127.0.0.1")
+        defer { fixture.shutdown() }
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+
+        let atemId = "cross-scope-atem"
+        let session = fixture.sessions.create(hostname: "office", atemId: atemId)
+        let future = connect(
+            host: "127.0.0.1",
+            fixture: fixture,
+            group: group,
+            authMessage: { challengeData in
+                let proof = DeviceAuthentication.proof(
+                    token: session.token,
+                    challenge: challengeData["challenge"] ?? "",
+                    astationId: challengeData["astation_id"] ?? "",
+                    atemId: atemId,
+                    sessionId: "local"
+                )
+                return .statusUpdate(status: "auth", data: [
+                    "method": "local_proof",
+                    "atem_id": atemId,
+                    "hostname": "office",
+                    "proof": proof
+                ])
+            }
+        )
+
+        let (result, _) = try future.wait()
+        XCTAssertEqual(result, "error:Local authentication failed")
+    }
+
     func testFiveLoopbackClientsAuthenticateConcurrently() throws {
         let fixture = try DirectServerFixture(host: "127.0.0.1")
         defer { fixture.shutdown() }

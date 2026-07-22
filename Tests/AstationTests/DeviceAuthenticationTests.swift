@@ -85,4 +85,31 @@ final class DeviceAuthenticationTests: XCTestCase {
             astationId: "astation-home"
         ))
     }
+
+    func testLegacySessionBindsToFirstDeviceWithValidProof() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AstationLegacySessionTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = SessionStore(storageURL: directory.appendingPathComponent("sessions.json"))
+        let session = store.create(hostname: "legacy")
+        let proof = DeviceAuthentication.proof(
+            token: session.token,
+            challenge: "nonce",
+            astationId: "astation-home",
+            atemId: "atem-first",
+            sessionId: session.id
+        )
+
+        let authenticated = store.authenticate(
+            sessionId: session.id,
+            atemId: "atem-first",
+            challenge: "nonce",
+            proof: proof,
+            astationId: "astation-home"
+        )
+        XCTAssertEqual(authenticated?.atemId, "atem-first")
+        XCTAssertEqual(store.get(sessionId: session.id)?.atemId, "atem-first")
+    }
 }

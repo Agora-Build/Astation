@@ -67,7 +67,7 @@ enum DeviceAuthentication {
     fileprivate static func randomHex(byteCount: Int) -> String {
         var bytes = [UInt8](repeating: 0, count: byteCount)
         guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
-            return UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+            fatalError("Secure random generation failed")
         }
         return bytes.map { String(format: "%02x", $0) }.joined()
     }
