@@ -72,6 +72,61 @@ final class DeviceAuthenticationTests: XCTestCase {
         XCTAssertEqual(fileMode?.intValue, 0o600)
     }
 
+    func testBootstrapSecretRotatesWhenPermissionsAreInsecure() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AstationBootstrapPermissionTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let exposedToken = String(repeating: "a", count: 64)
+        let tokenURL = directory.appendingPathComponent(LocalBootstrapStore.filename)
+        try Data((exposedToken + "\n").utf8).write(to: tokenURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: tokenURL.path)
+
+        let store = try LocalBootstrapStore(directory: directory)
+        let mode = try FileManager.default.attributesOfItem(atPath: tokenURL.path)[.posixPermissions] as? NSNumber
+        XCTAssertNotEqual(store.token, exposedToken)
+        XCTAssertEqual(mode?.intValue, 0o600)
+    }
+
+    func testBootstrapSecretReplacesSymbolicLinkWithoutTouchingTarget() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AstationBootstrapSymlinkTests-\(UUID().uuidString)")
+        let directory = root.appendingPathComponent("store")
+        let target = root.appendingPathComponent("target")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let exposedToken = String(repeating: "b", count: 64)
+        try Data((exposedToken + "\n").utf8).write(to: target)
+        let tokenURL = directory.appendingPathComponent(LocalBootstrapStore.filename)
+        try FileManager.default.createSymbolicLink(at: tokenURL, withDestinationURL: target)
+
+        let store = try LocalBootstrapStore(directory: directory)
+        let targetContents = try String(contentsOf: target, encoding: .utf8)
+        let tokenValues = try tokenURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        XCTAssertNotEqual(store.token, exposedToken)
+        XCTAssertEqual(targetContents, exposedToken + "\n")
+        XCTAssertEqual(tokenValues.isRegularFile, true)
+        XCTAssertNotEqual(tokenValues.isSymbolicLink, true)
+    }
+
+    func testRelayAuthenticationChallengesAreBoundedAndExpire() {
+        let now = Date(timeIntervalSince1970: 1_000)
+        var store = RelayAuthenticationChallengeStore(maxPending: 2, lifetime: 10)
+
+        XCTAssertTrue(store.issue(clientId: "atem-a", challenge: "challenge-a", now: now))
+        XCTAssertTrue(store.issue(clientId: "atem-b", challenge: "challenge-b", now: now))
+        XCTAssertFalse(store.issue(clientId: "atem-c", challenge: "challenge-c", now: now))
+        XCTAssertEqual(store.challenge(for: "atem-a", now: now), "challenge-a")
+        XCTAssertNil(store.challenge(for: "atem-a", now: now.addingTimeInterval(11)))
+        XCTAssertTrue(store.issue(
+            clientId: "atem-c",
+            challenge: "challenge-c",
+            now: now.addingTimeInterval(11)
+        ))
+    }
+
     func testSessionRequiresTokenProofAndMatchingDevice() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AstationSessionTests-\(UUID().uuidString)")

@@ -1,5 +1,7 @@
 import CryptoKit
+import Darwin
 import Foundation
+import Security
 
 enum DeviceAuthentication {
     static let protocolVersion = "2"
@@ -79,6 +81,10 @@ enum DeviceAuthentication {
         isBoundedText(value, maxBytes: maxPairingCodeBytes)
     }
 
+    static func isValidBootstrapToken(_ value: String) -> Bool {
+        isValidProof(value)
+    }
+
     private static func canonicalMessage(
         challenge: String,
         astationId: String,
@@ -129,6 +135,49 @@ enum DeviceAuthentication {
     }
 }
 
+struct RelayAuthenticationChallengeStore {
+    private struct Entry {
+        let challenge: String
+        let expiresAt: Date
+    }
+
+    private var entries: [String: Entry] = [:]
+    private let maxPending: Int
+    private let lifetime: TimeInterval
+
+    init(maxPending: Int = 64, lifetime: TimeInterval = 120) {
+        self.maxPending = maxPending
+        self.lifetime = lifetime
+    }
+
+    mutating func issue(clientId: String, challenge: String, now: Date = Date()) -> Bool {
+        removeExpired(now: now)
+        guard entries[clientId] != nil || entries.count < maxPending else { return false }
+        entries[clientId] = Entry(
+            challenge: challenge,
+            expiresAt: now.addingTimeInterval(lifetime)
+        )
+        return true
+    }
+
+    mutating func challenge(for clientId: String, now: Date = Date()) -> String? {
+        removeExpired(now: now)
+        return entries[clientId]?.challenge
+    }
+
+    mutating func remove(clientId: String) {
+        entries.removeValue(forKey: clientId)
+    }
+
+    mutating func removeAll() {
+        entries.removeAll()
+    }
+
+    private mutating func removeExpired(now: Date) {
+        entries = entries.filter { $0.value.expiresAt > now }
+    }
+}
+
 /// A same-user secret shared by Astation and local Atem processes. It removes
 /// interactive pairing on loopback without trusting arbitrary browser pages.
 final class LocalBootstrapStore {
@@ -149,15 +198,33 @@ final class LocalBootstrapStore {
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
+        let directoryValues = try baseDirectory.resourceValues(forKeys: [
+            .isDirectoryKey,
+            .isSymbolicLinkKey
+        ])
+        let directoryAttributes = try fileManager.attributesOfItem(atPath: baseDirectory.path)
+        guard directoryValues.isDirectory == true,
+              directoryValues.isSymbolicLink != true,
+              Self.isOwnedByCurrentUser(directoryAttributes) else {
+            throw LocalBootstrapStoreError.insecureDirectory
+        }
         try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: baseDirectory.path)
 
         fileURL = baseDirectory.appendingPathComponent(Self.filename)
-        if let existing = try? String(contentsOf: fileURL, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !existing.isEmpty {
-            token = existing
-            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
-            return
+        if Self.itemExists(at: fileURL, fileManager: fileManager) {
+            let attributes = try? fileManager.attributesOfItem(atPath: fileURL.path)
+            if let attributes,
+               Self.isSecureTokenFile(fileURL, attributes: attributes),
+               let existing = try? String(contentsOf: fileURL, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               DeviceAuthentication.isValidBootstrapToken(existing) {
+                token = existing
+                try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+                return
+            }
+
+            Log.warn("Replacing insecure or malformed local bootstrap token")
+            try fileManager.removeItem(at: fileURL)
         }
 
         let generated = DeviceAuthentication.randomHex(byteCount: 32)
@@ -165,4 +232,32 @@ final class LocalBootstrapStore {
         try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
         token = generated
     }
+
+    private static func itemExists(at url: URL, fileManager: FileManager) -> Bool {
+        fileManager.fileExists(atPath: url.path) ||
+            (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) != nil
+    }
+
+    private static func isSecureTokenFile(
+        _ url: URL,
+        attributes: [FileAttributeKey: Any]
+    ) -> Bool {
+        let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        guard let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue else {
+            return false
+        }
+        return values?.isRegularFile == true &&
+            values?.isSymbolicLink != true &&
+            isOwnedByCurrentUser(attributes) &&
+            permissions & 0o077 == 0
+    }
+
+    private static func isOwnedByCurrentUser(_ attributes: [FileAttributeKey: Any]) -> Bool {
+        guard let owner = attributes[.ownerAccountID] as? NSNumber else { return false }
+        return owner.uint32Value == getuid()
+    }
+}
+
+private enum LocalBootstrapStoreError: Error {
+    case insecureDirectory
 }

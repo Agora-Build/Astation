@@ -42,7 +42,7 @@ class AstationHubManager: ObservableObject {
     /// NWPathMonitor for the identity relay — fires when network becomes available,
     /// enabling immediate reconnect without polling. Created once and reused.
     private var identityRelayPathMonitor: NWPathMonitor?
-    private var identityRelayAuthChallenges: [String: String] = [:]
+    private var identityRelayAuthChallenges = RelayAuthenticationChallengeStore()
     private var authenticatedIdentityRelayClients: Set<String> = []
 
     /// Station relay URL. Priority: test override > ASTATION_RELAY_URL env var > UserDefaults > default.
@@ -1163,6 +1163,7 @@ class AstationHubManager: ObservableObject {
                     if let data = text.data(using: .utf8),
                        let envelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                        let atemId = envelope["atem_id"] as? String,
+                       DeviceAuthentication.isValidAtemId(atemId),
                        let payloadObj = envelope["payload"],
                        let payloadData = try? JSONSerialization.data(withJSONObject: payloadObj),
                        let msg = try? JSONDecoder().decode(AstationMessage.self, from: payloadData) {
@@ -1205,7 +1206,11 @@ class AstationHubManager: ObservableObject {
         if case .statusUpdate(let status, let data) = msg, status == "hello" {
             let hostname = DeviceAuthentication.deviceLabel(data["hostname"] ?? "unknown")
             let challenge = DeviceAuthentication.makeChallenge()
-            identityRelayAuthChallenges[clientId] = challenge
+            guard identityRelayAuthChallenges.issue(clientId: clientId, challenge: challenge) else {
+                sendHandler?(.error(message: "Too many pending relay authentication requests"), clientId)
+                Log.warn("[AstationHub] Relay authentication challenge limit reached")
+                return
+            }
             authenticatedIdentityRelayClients.remove(clientId)
             sendHandler?(.statusUpdate(status: "auth_required", data: [
                 "astation_id": AstationIdentity.shared.id,
@@ -1239,7 +1244,7 @@ class AstationHubManager: ObservableObject {
         dispatchPrecondition(condition: .onQueue(.main))
         guard case .statusUpdate(let status, let data) = msg,
               status == "auth",
-              let challenge = identityRelayAuthChallenges[clientId] else {
+              let challenge = identityRelayAuthChallenges.challenge(for: clientId) else {
             Log.warn("[AstationHub] Dropped unauthenticated relay message from \(clientId)")
             return
         }
@@ -1315,7 +1320,7 @@ class AstationHubManager: ObservableObject {
         response: AstationMessage
     ) {
         dispatchPrecondition(condition: .onQueue(.main))
-        identityRelayAuthChallenges.removeValue(forKey: clientId)
+        identityRelayAuthChallenges.remove(clientId: clientId)
         authenticatedIdentityRelayClients.insert(clientId)
         sendHandler?(response, clientId)
         addClient(ConnectedClient(

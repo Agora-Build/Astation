@@ -65,6 +65,9 @@ Authentication input is bounded before proof or UI processing: `atem_id` is at
 most 255 UTF-8 bytes, session and request IDs are at most 128 bytes, pairing
 codes are at most 32 bytes, and HMAC proofs are exactly 64 hexadecimal bytes.
 Empty values and control characters are rejected.
+Relay challenges expire after two minutes and no more than 64 may be pending at
+once. Astation rotates the same-user bootstrap token instead of trusting an
+existing file with loose permissions, the wrong owner, or a symbolic-link path.
 
 ## Local state
 
