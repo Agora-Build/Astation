@@ -13,14 +13,18 @@ enum AtemClientListModel {
 
         var latestSessionByDevice: [String: SessionInfo] = [:]
         for session in activeSessions where session.isValid {
-            if let atemId = session.atemId, onlineAtemIds.contains(atemId) {
+            // Legacy sessions cannot be matched to a live device until v2 auth
+            // binds them to a stable Atem ID, so do not present a false offline row.
+            guard let atemId = session.atemId else { continue }
+            if onlineAtemIds.contains(atemId) {
                 continue
             }
 
-            let deviceKey = session.atemId.map { "atem:\($0)" } ?? "session:\(session.id)"
+            let deviceKey = "atem:\(atemId)"
             if let existing = latestSessionByDevice[deviceKey],
-               existing.lastActivity >= session.lastActivity {
-                continue
+               existing.lastActivity > session.lastActivity ||
+               (existing.lastActivity == session.lastActivity && existing.id < session.id) {
+                    continue
             }
             latestSessionByDevice[deviceKey] = session
         }
@@ -267,7 +271,8 @@ private struct OfflineClientRow: View {
         if session.hostname != "unknown" {
             return session.hostname
         }
-        return session.atemId.map { String($0.prefix(18)) } ?? String(session.id.prefix(8)) + "…"
+        return session.atemId.map { String($0.prefix(18)) + "…" }
+            ?? String(session.id.prefix(8)) + "…"
     }
 
     var body: some View {
