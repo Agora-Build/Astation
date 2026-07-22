@@ -227,6 +227,53 @@ final class DeviceAuthenticationTests: XCTestCase {
         ))
     }
 
+    func testSessionStoreSecuresExistingFileBeforeLoading() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AstationSessionPermissionTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sessionsURL = directory.appendingPathComponent("sessions.json")
+        let session = SessionStore(storageURL: sessionsURL).create(
+            hostname: "office",
+            atemId: "atem-office"
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: sessionsURL.path
+        )
+
+        let reopened = SessionStore(storageURL: sessionsURL)
+        let mode = try FileManager.default.attributesOfItem(atPath: sessionsURL.path)[.posixPermissions]
+            as? NSNumber
+        XCTAssertEqual(reopened.get(sessionId: session.id)?.atemId, "atem-office")
+        XCTAssertEqual(mode?.intValue, 0o600)
+    }
+
+    func testSessionStoreRefusesSymbolicLinkWithoutChangingTarget() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AstationSessionSymlinkTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let targetURL = root.appendingPathComponent("target.json")
+        let session = SessionStore(storageURL: targetURL).create(
+            hostname: "office",
+            atemId: "atem-office"
+        )
+        let originalData = try Data(contentsOf: targetURL)
+        let linkURL = root.appendingPathComponent("sessions.json")
+        try FileManager.default.createSymbolicLink(at: linkURL, withDestinationURL: targetURL)
+
+        let linkedStore = SessionStore(storageURL: linkURL)
+        XCTAssertNil(linkedStore.get(sessionId: session.id))
+        XCTAssertEqual(try Data(contentsOf: targetURL), originalData)
+        XCTAssertEqual(
+            try linkURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink,
+            true
+        )
+    }
+
     func testLegacySessionBindsToFirstDeviceWithValidProof() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AstationLegacySessionTests-\(UUID().uuidString)")

@@ -76,6 +76,8 @@ Empty values and control characters are rejected.
 Relay challenges expire after two minutes and no more than 64 may be pending at
 once. Astation rotates the same-user bootstrap token instead of trusting an
 existing file with loose permissions, the wrong owner, or a symbolic-link path.
+Before loading existing device sessions, Astation verifies that `sessions.json`
+is a current-user regular file, refuses symbolic links, and applies mode `0600`.
 
 ## Local state
 

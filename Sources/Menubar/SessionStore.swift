@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Session information for a paired Atem device.
@@ -230,12 +231,32 @@ class SessionStore {
 
     private func loadFromDisk() {
         // Must be called from queue with barrier
-        guard FileManager.default.fileExists(atPath: storePath.path) else {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: storePath.path) ||
+                (try? fileManager.destinationOfSymbolicLink(atPath: storePath.path)) != nil else {
             Log.debug("No existing sessions file found")
             return
         }
 
         do {
+            let values = try storePath.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .isSymbolicLinkKey
+            ])
+            let attributes = try fileManager.attributesOfItem(atPath: storePath.path)
+            let owner = (attributes[.ownerAccountID] as? NSNumber)?.uint32Value
+            guard values.isRegularFile == true,
+                  values.isSymbolicLink != true,
+                  owner == getuid() else {
+                Log.error("Refusing to load insecure sessions file at \(storePath.path)")
+                return
+            }
+
+            // Close the migration window before bearer tokens are read into memory.
+            try fileManager.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: storePath.path
+            )
             let data = try Data(contentsOf: storePath)
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
