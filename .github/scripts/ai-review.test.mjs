@@ -253,7 +253,13 @@ test("sends non-agent requests in each provider's native API format", async () =
   assert.equal(requests[0].body.messages[0].content, "diff");
   assert.equal(requests[1].url, "https://gateway/openai/v1/responses");
   assert.equal(requests[1].headers.Authorization, "Bearer codex-key");
-  assert.equal(requests[1].body.input, "diff");
+  assert.deepEqual(requests[1].body.input, [
+    {
+      content: "diff",
+      role: "user",
+      type: "message",
+    },
+  ]);
 });
 
 test("reviews internal pull requests immediately after CI", () => {

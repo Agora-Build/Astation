@@ -293,7 +293,13 @@ export async function requestModel(provider, baseUrl, apiKey, model, prompt) {
       "content-type": "application/json",
     };
     body = {
-      input: prompt,
+      input: [
+        {
+          type: "message",
+          role: "user",
+          content: prompt,
+        },
+      ],
       instructions: system,
       max_output_tokens: 4_096,
       model,
