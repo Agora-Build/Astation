@@ -15,13 +15,20 @@ enum DeviceAuthentication {
     }
 
     static func deviceLabel(_ value: String) -> String {
-        let cleaned = value.unicodeScalars.lazy
-            .filter { !CharacterSet.controlCharacters.contains($0) }
-            .prefix(255)
-            .map(String.init)
-            .joined()
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var cleaned = ""
+        var byteCount = 0
+        for scalar in value.unicodeScalars where !CharacterSet.controlCharacters.contains(scalar) {
+            let text = String(scalar)
+            guard byteCount + text.utf8.count <= 255 else { break }
+            cleaned.append(contentsOf: text)
+            byteCount += text.utf8.count
+        }
+        cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
         return cleaned.isEmpty ? "unknown" : cleaned
+    }
+
+    static func relayClientMatchesAtemId(clientId: String, atemId: String) -> Bool {
+        isValidAtemId(atemId) && clientId == "relay-\(atemId)"
     }
 
     static func proof(

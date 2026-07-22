@@ -11,6 +11,25 @@ final class DeviceAuthenticationTests: XCTestCase {
         XCTAssertFalse(label.contains("\n"))
         XCTAssertEqual(label.count, 255)
         XCTAssertEqual(DeviceAuthentication.deviceLabel("\n\t"), "unknown")
+
+        let multibyteLabel = DeviceAuthentication.deviceLabel(String(repeating: "界", count: 100))
+        XCTAssertEqual(multibyteLabel.utf8.count, 255)
+        XCTAssertEqual(multibyteLabel.count, 85)
+    }
+
+    func testRelayClientIdentityMustMatchAuthenticatedAtemId() {
+        XCTAssertTrue(DeviceAuthentication.relayClientMatchesAtemId(
+            clientId: "relay-atem-office",
+            atemId: "atem-office"
+        ))
+        XCTAssertFalse(DeviceAuthentication.relayClientMatchesAtemId(
+            clientId: "relay-atem-cloud",
+            atemId: "atem-office"
+        ))
+        XCTAssertFalse(DeviceAuthentication.relayClientMatchesAtemId(
+            clientId: "relay-atem-office",
+            atemId: "atem-office\nspoof"
+        ))
     }
 
     func testProofMatchesProtocolVector() {

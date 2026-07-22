@@ -15,6 +15,7 @@ class AstationWebSocketServer {
     private let localBootstrapStore: LocalBootstrapStore?
     private var authenticatedClients: Set<String> = []  // Client IDs that have been authenticated
     private var pendingAuthentication: [String: DirectAuthenticationContext] = [:]
+    private var pairingClients: Set<String> = []
 
     init(
         hubManager: AstationHubManager,
@@ -102,6 +103,7 @@ class AstationWebSocketServer {
             self.connectedClients.removeValue(forKey: clientId)
             self.authenticatedClients.remove(clientId)
             self.pendingAuthentication.removeValue(forKey: clientId)
+            self.pairingClients.remove(clientId)
             self.hubManager.removeClient(withId: clientId)
             Log.info("WebSocket connection closed: \(clientId.prefix(8))")
         }
@@ -156,6 +158,11 @@ class AstationWebSocketServer {
     }
 
     private func handleAuthMessage(_ message: AstationMessage, from clientId: String, ws: WebSocket) {
+        guard !pairingClients.contains(clientId) else {
+            sendMessage(.error(message: "Pairing approval is already pending"), to: clientId)
+            return
+        }
+
         // Extract auth credentials from message
         guard case .statusUpdate(let status, let authInfo) = message, status == "auth" else {
             // Not an auth message - reject
@@ -214,6 +221,7 @@ class AstationWebSocketServer {
            let atemId = authInfo["atem_id"],
            DeviceAuthentication.isValidPairingCode(pairingCode),
            DeviceAuthentication.isValidAtemId(atemId) {
+            pairingClients.insert(clientId)
             showPairingDialog(
                 code: pairingCode,
                 hostname: DeviceAuthentication.deviceLabel(rawHostname),
@@ -354,6 +362,7 @@ class AstationWebSocketServer {
             let response = alert.runModal()
 
             ws.eventLoop.execute {
+                self.pairingClients.remove(clientId)
                 guard self.connectedClients[clientId] != nil else { return }
                 if response == .alertFirstButtonReturn {
                     let session = self.sessionStore.create(hostname: hostname, atemId: atemId)
@@ -362,7 +371,8 @@ class AstationWebSocketServer {
                     self.sendMessage(.auth(info: [
                         "status": "granted",
                         "session_id": session.id,
-                        "token": session.token
+                        "token": session.token,
+                        "protocol": DeviceAuthentication.protocolVersion
                     ]), to: clientId)
                     self.registerClient(clientId, hostname: hostname)
                     Log.info("✅ Pairing approved for \(hostname) (\(clientId.prefix(8)))")

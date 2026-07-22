@@ -55,7 +55,10 @@ is the device session token and `session_id` is the saved session UUID.
 Astation compares proofs in constant time, binds legacy sessions to the first
 `atem_id` that proves possession, and rejects reuse with a different device ID.
 The relay path does not register `hello` as an authenticated client; `hello`
-only causes Astation to issue a targeted challenge.
+only causes Astation to issue a targeted challenge. The relay envelope
+`atem_id` must exactly match the device ID in the authentication payload, and
+an authenticated relay client cannot restart authentication with another
+`hello` message.
 Application broadcasts are delivered to authenticated direct and identity-relay
 clients, while pending clients are excluded.
 Direct connection state is confined to the NIO event loop; relay authentication

@@ -1204,6 +1204,11 @@ class AstationHubManager: ObservableObject {
     private func handleIdentityRelayMessage(_ msg: AstationMessage, task: URLSessionWebSocketTask, clientId: String) {
         dispatchPrecondition(condition: .onQueue(.main))
         if case .statusUpdate(let status, let data) = msg, status == "hello" {
+            guard !authenticatedIdentityRelayClients.contains(clientId) else {
+                sendHandler?(.error(message: "Relay client is already authenticated"), clientId)
+                Log.warn("[AstationHub] Ignored repeated hello from authenticated relay client \(clientId)")
+                return
+            }
             let hostname = DeviceAuthentication.deviceLabel(data["hostname"] ?? "unknown")
             let challenge = DeviceAuthentication.makeChallenge()
             guard identityRelayAuthChallenges.issue(clientId: clientId, challenge: challenge) else {
@@ -1211,7 +1216,6 @@ class AstationHubManager: ObservableObject {
                 Log.warn("[AstationHub] Relay authentication challenge limit reached")
                 return
             }
-            authenticatedIdentityRelayClients.remove(clientId)
             sendHandler?(.statusUpdate(status: "auth_required", data: [
                 "astation_id": AstationIdentity.shared.id,
                 "challenge": challenge,
@@ -1249,11 +1253,16 @@ class AstationHubManager: ObservableObject {
             return
         }
 
+        guard let atemId = data["atem_id"],
+              DeviceAuthentication.relayClientMatchesAtemId(clientId: clientId, atemId: atemId) else {
+            sendHandler?(.error(message: "Relay identity does not match authentication proof"), clientId)
+            Log.warn("[AstationHub] Rejected mismatched relay authentication identity for \(clientId)")
+            return
+        }
+
         if let sessionId = data["session_id"],
-           let atemId = data["atem_id"],
            let proof = data["proof"],
            DeviceAuthentication.isValidSessionId(sessionId),
-           DeviceAuthentication.isValidAtemId(atemId),
            let session = deviceSessionStore.authenticate(
                 sessionId: sessionId,
                 atemId: atemId,
@@ -1263,6 +1272,7 @@ class AstationHubManager: ObservableObject {
            ) {
             finishIdentityRelayAuthentication(
                 clientId: clientId,
+                atemId: atemId,
                 hostname: session.hostname,
                 response: .statusUpdate(status: "authenticated", data: [
                     "method": "session_proof",
@@ -1280,14 +1290,13 @@ class AstationHubManager: ObservableObject {
 
         guard let pairingCode = data["pairing_code"],
               let rawHostname = data["hostname"],
-              let atemId = data["atem_id"],
-              DeviceAuthentication.isValidPairingCode(pairingCode),
-              DeviceAuthentication.isValidAtemId(atemId) else {
+              DeviceAuthentication.isValidPairingCode(pairingCode) else {
             sendHandler?(.error(message: "Invalid relay authentication credentials"), clientId)
             return
         }
 
         let hostname = DeviceAuthentication.deviceLabel(rawHostname)
+        identityRelayAuthChallenges.remove(clientId: clientId)
         dispatchPrecondition(condition: .onQueue(.main))
         let alert = NSAlert()
         alert.messageText = "Remote Atem Pairing Request"
@@ -1304,6 +1313,7 @@ class AstationHubManager: ObservableObject {
         let session = deviceSessionStore.create(hostname: hostname, atemId: atemId)
         finishIdentityRelayAuthentication(
             clientId: clientId,
+            atemId: atemId,
             hostname: hostname,
             response: .auth(info: [
                 "status": "granted",
@@ -1316,10 +1326,16 @@ class AstationHubManager: ObservableObject {
 
     private func finishIdentityRelayAuthentication(
         clientId: String,
+        atemId: String,
         hostname: String,
         response: AstationMessage
     ) {
         dispatchPrecondition(condition: .onQueue(.main))
+        guard DeviceAuthentication.relayClientMatchesAtemId(clientId: clientId, atemId: atemId) else {
+            sendHandler?(.error(message: "Relay identity does not match authentication proof"), clientId)
+            Log.warn("[AstationHub] Refused to authenticate mismatched relay identity for \(clientId)")
+            return
+        }
         identityRelayAuthChallenges.remove(clientId: clientId)
         authenticatedIdentityRelayClients.insert(clientId)
         sendHandler?(response, clientId)
