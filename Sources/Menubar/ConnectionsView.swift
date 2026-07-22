@@ -1,9 +1,90 @@
 import SwiftUI
 
+enum AtemClientListModel {
+    static func onlineClients(
+        _ connectedClients: [ConnectedClient],
+        preferredClientId: String? = nil
+    ) -> [ConnectedClient] {
+        var preferredByDevice: [String: ConnectedClient] = [:]
+
+        for client in connectedClients where client.clientType == "Atem" {
+            let deviceKey = client.atemId.map { "atem:\($0)" } ?? "client:\(client.id)"
+            guard let existing = preferredByDevice[deviceKey] else {
+                preferredByDevice[deviceKey] = client
+                continue
+            }
+
+            if prefersClient(client, over: existing, preferredClientId: preferredClientId) {
+                preferredByDevice[deviceKey] = client
+            }
+        }
+
+        return preferredByDevice.values.sorted {
+            let left = $0.hostname.localizedCaseInsensitiveCompare($1.hostname)
+            return left == .orderedSame ? $0.id < $1.id : left == .orderedAscending
+        }
+    }
+
+    private static func prefersClient(
+        _ candidate: ConnectedClient,
+        over existing: ConnectedClient,
+        preferredClientId: String?
+    ) -> Bool {
+        if candidate.id == preferredClientId { return true }
+        if existing.id == preferredClientId { return false }
+        if candidate.isFocused != existing.isFocused { return candidate.isFocused }
+
+        let candidateIsDirect = !candidate.id.hasPrefix("relay-")
+        let existingIsDirect = !existing.id.hasPrefix("relay-")
+        if candidateIsDirect != existingIsDirect { return candidateIsDirect }
+        if candidate.connectedAt != existing.connectedAt {
+            return candidate.connectedAt > existing.connectedAt
+        }
+        return candidate.id < existing.id
+    }
+
+    static func offlineSessions(
+        activeSessions: [SessionInfo],
+        connectedClients: [ConnectedClient]
+    ) -> [SessionInfo] {
+        let onlineAtemIds = Set(
+            connectedClients
+                .filter { $0.clientType == "Atem" }
+                .compactMap(\.atemId)
+        )
+
+        var latestSessionByDevice: [String: SessionInfo] = [:]
+        for session in activeSessions where session.isValid {
+            // Legacy sessions cannot be matched to a live device until v2 auth
+            // binds them to a stable Atem ID, so do not present a false offline row.
+            guard let atemId = session.atemId else { continue }
+            if onlineAtemIds.contains(atemId) {
+                continue
+            }
+
+            let deviceKey = "atem:\(atemId)"
+            if let existing = latestSessionByDevice[deviceKey],
+               existing.lastActivity > session.lastActivity ||
+               (existing.lastActivity == session.lastActivity && existing.id < session.id) {
+                    continue
+            }
+            latestSessionByDevice[deviceKey] = session
+        }
+
+        return latestSessionByDevice.values.sorted {
+            if $0.lastActivity != $1.lastActivity {
+                return $0.lastActivity > $1.lastActivity
+            }
+            return $0.hostname.localizedCaseInsensitiveCompare($1.hostname) == .orderedAscending
+        }
+    }
+}
+
 // MARK: - Main window view
 
 struct ConnectionsView: View {
     @ObservedObject var hubManager: AstationHubManager
+    let onRemoteControl: (String, AtemAgentInfo) -> Void
     /// Which client's agents are shown on the right panel.
     @State private var selectedClientId: String?
 
@@ -12,18 +93,34 @@ struct ConnectionsView: View {
             ClientListPanel(hubManager: hubManager, selectedClientId: $selectedClientId)
                 .frame(minWidth: 230, maxWidth: 310)
 
-            AgentListPanel(hubManager: hubManager, clientId: selectedClientId)
+            AgentListPanel(
+                hubManager: hubManager,
+                clientId: selectedClientId,
+                onRemoteControl: onRemoteControl
+            )
                 .frame(minWidth: 340)
         }
         .frame(minWidth: 620, minHeight: 400)
         .onAppear {
-            // Default to the currently active/focused client
-            if selectedClientId == nil {
-                selectedClientId = hubManager.pinnedClientId
-                    ?? hubManager.focusedClient()?.id
-                    ?? hubManager.connectedClients.first?.id
-            }
+            selectAvailableClientIfNeeded()
         }
+        .onChange(of: hubManager.connectedClients.map(\.id)) { _, _ in
+            selectAvailableClientIfNeeded()
+        }
+    }
+
+    private func selectAvailableClientIfNeeded() {
+        let onlineClients = AtemClientListModel.onlineClients(
+            hubManager.connectedClients,
+            preferredClientId: hubManager.pinnedClientId
+        )
+        let onlineIds = Set(onlineClients.map(\.id))
+        if let selectedClientId, onlineIds.contains(selectedClientId) {
+            return
+        }
+        selectedClientId = onlineClients.first(where: { $0.id == hubManager.pinnedClientId })?.id
+            ?? onlineClients.first(where: \.isFocused)?.id
+            ?? onlineClients.first?.id
     }
 }
 
@@ -34,7 +131,26 @@ private struct ClientListPanel: View {
     @Binding var selectedClientId: String?
 
     private var onlineAtems: [ConnectedClient] {
-        hubManager.connectedClients.filter { $0.clientType == "Atem" }
+        AtemClientListModel.onlineClients(
+            hubManager.connectedClients,
+            preferredClientId: hubManager.pinnedClientId
+        )
+    }
+
+    private var offlineAtems: [SessionInfo] {
+        AtemClientListModel.offlineSessions(
+            activeSessions: hubManager.deviceSessionStore.getAllActive(),
+            connectedClients: onlineAtems
+        )
+    }
+
+    private var statusText: String {
+        switch (onlineAtems.count, offlineAtems.count) {
+        case (0, 0): return "none paired"
+        case (let online, 0): return online == 1 ? "1 online" : "\(online) online"
+        case (0, let offline): return offline == 1 ? "1 paired offline" : "\(offline) paired offline"
+        case (let online, let offline): return "\(online) online · \(offline) paired offline"
+        }
     }
 
     var body: some View {
@@ -44,8 +160,7 @@ private struct ClientListPanel: View {
                 Text("Atem Clients")
                     .font(.headline)
                 Spacer()
-                let n = onlineAtems.count
-                Text(n == 0 ? "none online" : n == 1 ? "1 online" : "\(n) online")
+                Text(statusText)
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -56,12 +171,11 @@ private struct ClientListPanel: View {
             Divider()
 
             // ── Body ──────────────────────────────────────────────────────
-            if onlineAtems.isEmpty {
+            if onlineAtems.isEmpty && offlineAtems.isEmpty {
                 emptyState
             } else {
                 ScrollView {
                     LazyVStack(spacing: 2) {
-                        // Online clients
                         ForEach(onlineAtems) { client in
                             OnlineClientRow(
                                 client: client,
@@ -80,6 +194,21 @@ private struct ClientListPanel: View {
                                 }
                             )
                         }
+
+                        if !offlineAtems.isEmpty {
+                            Text("Paired offline")
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 14)
+                                .padding(.top, onlineAtems.isEmpty ? 4 : 10)
+                                .padding(.bottom, 3)
+
+                            ForEach(offlineAtems, id: \.id) { session in
+                                OfflineClientRow(session: session)
+                            }
+                        }
                     }
                     .padding(.vertical, 4)
                 }
@@ -96,7 +225,7 @@ private struct ClientListPanel: View {
             Text("No Atem clients")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
-            Text("Start `atem` on a dev machine to connect.")
+            Text("Pair an Atem to add it here.")
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
@@ -182,11 +311,54 @@ private struct OnlineClientRow: View {
     }
 }
 
+// MARK: - Paired offline client row
+
+private struct OfflineClientRow: View {
+    let session: SessionInfo
+
+    private var displayName: String {
+        if session.hostname != "unknown" {
+            return session.hostname
+        }
+        return session.atemId.map { id in
+            id.count > 18 ? String(id.prefix(18)) + "…" : id
+        }
+            ?? String(session.id.prefix(8)) + "…"
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Circle()
+                .fill(Color(NSColor.tertiaryLabelColor))
+                .frame(width: 8, height: 8)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(displayName)
+                    .font(.subheadline)
+                Text("Paired · last seen \(relativeTime(from: session.lastActivity))")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Spacer()
+
+            Text("offline")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .padding(.horizontal, 4)
+        .help("Pairing expires after 7 days without activity")
+    }
+}
+
 // MARK: - Agent list panel
 
 private struct AgentListPanel: View {
     @ObservedObject var hubManager: AstationHubManager
     let clientId: String?
+    let onRemoteControl: (String, AtemAgentInfo) -> Void
 
     private var agents: [AtemAgentInfo] {
         guard let id = clientId else { return [] }
@@ -266,7 +438,13 @@ private struct AgentListPanel: View {
                 ScrollView {
                     LazyVStack(spacing: 6) {
                         ForEach(agents) { agent in
-                            AgentRow(agent: agent)
+                            AgentRow(
+                                agent: agent,
+                                onRemoteControl: {
+                                    guard let clientId else { return }
+                                    onRemoteControl(clientId, agent)
+                                }
+                            )
                         }
                     }
                     .padding(.vertical, 8)
@@ -282,6 +460,7 @@ private struct AgentListPanel: View {
 
 private struct AgentRow: View {
     let agent: AtemAgentInfo
+    let onRemoteControl: () -> Void
 
     private var statusColor: Color {
         switch agent.status {
@@ -348,6 +527,13 @@ private struct AgentRow: View {
                         .font(.caption)
                         .foregroundColor(statusColor)
                 }
+
+                Button(action: onRemoteControl) {
+                    Label("Remote Agent Control", systemImage: "keyboard")
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .disabled(agent.status == "Disconnected")
             }
 
             Spacer()

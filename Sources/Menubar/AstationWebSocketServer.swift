@@ -206,7 +206,7 @@ class AstationWebSocketServer {
                     ]
                 )
                 sendMessage(successMsg, to: clientId)
-                registerClient(clientId, hostname: session.hostname)
+                registerClient(clientId, hostname: session.hostname, atemId: atemId)
 
                 Log.info("Client \(clientId.prefix(8)) authenticated via LAN session proof")
                 return
@@ -275,16 +275,17 @@ class AstationWebSocketServer {
             "token": session.token,
             "protocol": DeviceAuthentication.protocolVersion
         ]), to: clientId)
-        registerClient(clientId, hostname: hostname)
+        registerClient(clientId, hostname: hostname, atemId: atemId)
         Log.info("Loopback client \(clientId.prefix(8)) authenticated without interactive pairing")
     }
 
-    private func registerClient(_ clientId: String, hostname: String) {
+    private func registerClient(_ clientId: String, hostname: String, atemId: String?) {
         hubManager.addClient(ConnectedClient(
             id: clientId,
             clientType: "Atem",
             connectedAt: Date(),
-            hostname: hostname
+            hostname: hostname,
+            atemId: atemId
         ))
     }
 
@@ -374,7 +375,7 @@ class AstationWebSocketServer {
                         "token": session.token,
                         "protocol": DeviceAuthentication.protocolVersion
                     ]), to: clientId)
-                    self.registerClient(clientId, hostname: hostname)
+                    self.registerClient(clientId, hostname: hostname, atemId: atemId)
                     Log.info("✅ Pairing approved for \(hostname) (\(clientId.prefix(8)))")
                 } else {
                     self.sendMessage(.error(message: "Pairing denied by user"), to: clientId)
