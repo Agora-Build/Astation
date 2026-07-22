@@ -206,11 +206,11 @@ class AstationWebSocketServer {
         }
 
         if let pairingCode = authInfo["pairing_code"],
-           let hostname = authInfo["hostname"],
+           let rawHostname = authInfo["hostname"],
            let atemId = authInfo["atem_id"] {
             showPairingDialog(
                 code: pairingCode,
-                hostname: hostname,
+                hostname: DeviceAuthentication.deviceLabel(rawHostname),
                 atemId: atemId,
                 clientId: clientId,
                 ws: ws
@@ -234,7 +234,7 @@ class AstationWebSocketServer {
         guard authInfo["method"] == "local_proof",
               let store = localBootstrapStore,
               let atemId = authInfo["atem_id"],
-              let hostname = authInfo["hostname"],
+              let rawHostname = authInfo["hostname"],
               let proof = authInfo["proof"],
               DeviceAuthentication.verify(
                 proof: proof,
@@ -250,6 +250,7 @@ class AstationWebSocketServer {
             return
         }
 
+        let hostname = DeviceAuthentication.deviceLabel(rawHostname)
         let session = sessionStore.createOrRefreshLocal(hostname: hostname, atemId: atemId)
         authenticatedClients.insert(clientId)
         pendingAuthentication.removeValue(forKey: clientId)
@@ -379,10 +380,20 @@ class AstationWebSocketServer {
     }
     
     func sendMessageToClient(_ message: AstationMessage, clientId: String) {
-        sendMessage(message, to: clientId)
+        guard let eventLoopGroup else { return }
+        eventLoopGroup.next().execute {
+            self.sendMessage(message, to: clientId)
+        }
     }
 
     func broadcastMessage(_ message: AstationMessage) {
+        guard let eventLoopGroup else { return }
+        eventLoopGroup.next().execute {
+            self.broadcastMessageOnEventLoop(message)
+        }
+    }
+
+    private func broadcastMessageOnEventLoop(_ message: AstationMessage) {
         guard let data = try? JSONEncoder().encode(message),
               let text = String(data: data, encoding: .utf8) else {
             Log.error("Failed to encode broadcast message")
@@ -397,7 +408,12 @@ class AstationWebSocketServer {
     }
     
     func getConnectedClientsCount() -> Int {
-        return connectedClients.count
+        guard let eventLoopGroup else { return 0 }
+        let eventLoop = eventLoopGroup.next()
+        if eventLoop.inEventLoop {
+            return connectedClients.count
+        }
+        return (try? eventLoop.submit { self.connectedClients.count }.wait()) ?? 0
     }
 
     var listeningPort: Int? {

@@ -1202,7 +1202,7 @@ class AstationHubManager: ObservableObject {
 
     private func handleIdentityRelayMessage(_ msg: AstationMessage, task: URLSessionWebSocketTask, clientId: String) {
         if case .statusUpdate(let status, let data) = msg, status == "hello" {
-            let hostname = data["hostname"] ?? "unknown"
+            let hostname = DeviceAuthentication.deviceLabel(data["hostname"] ?? "unknown")
             let challenge = DeviceAuthentication.makeChallenge()
             identityRelayAuthChallenges[clientId] = challenge
             authenticatedIdentityRelayClients.remove(clientId)
@@ -1269,12 +1269,14 @@ class AstationHubManager: ObservableObject {
         }
 
         guard let pairingCode = data["pairing_code"],
-              let hostname = data["hostname"],
+              let rawHostname = data["hostname"],
               let atemId = data["atem_id"] else {
             sendHandler?(.error(message: "Invalid relay authentication credentials"), clientId)
             return
         }
 
+        let hostname = DeviceAuthentication.deviceLabel(rawHostname)
+        dispatchPrecondition(condition: .onQueue(.main))
         let alert = NSAlert()
         alert.messageText = "Remote Atem Pairing Request"
         alert.informativeText = "Device: \(hostname)\nCode: \(pairingCode)\n\nAllow this Atem to connect through the relay?"

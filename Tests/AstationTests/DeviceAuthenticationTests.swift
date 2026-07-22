@@ -3,6 +3,16 @@ import XCTest
 @testable import Menubar
 
 final class DeviceAuthenticationTests: XCTestCase {
+    func testDeviceLabelRemovesControlsAndBoundsLength() {
+        let label = DeviceAuthentication.deviceLabel(
+            "office\n\u{0000}" + String(repeating: "x", count: 300)
+        )
+
+        XCTAssertFalse(label.contains("\n"))
+        XCTAssertEqual(label.count, 255)
+        XCTAssertEqual(DeviceAuthentication.deviceLabel("\n\t"), "unknown")
+    }
+
     func testProofMatchesProtocolVector() {
         let proof = DeviceAuthentication.proof(
             token: "token-abc",

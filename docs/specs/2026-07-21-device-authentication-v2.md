@@ -58,6 +58,8 @@ The relay path does not register `hello` as an authenticated client; `hello`
 only causes Astation to issue a targeted challenge.
 Application broadcasts are delivered to authenticated direct and identity-relay
 clients, while pending clients are excluded.
+Direct connection state is confined to the NIO event loop; relay authentication
+state and pairing UI are confined to the main queue.
 
 ## Local state
 

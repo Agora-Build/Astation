@@ -8,6 +8,16 @@ enum DeviceAuthentication {
         randomHex(byteCount: 32)
     }
 
+    static func deviceLabel(_ value: String) -> String {
+        let cleaned = value.unicodeScalars.lazy
+            .filter { !CharacterSet.controlCharacters.contains($0) }
+            .prefix(255)
+            .map(String.init)
+            .joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "unknown" : cleaned
+    }
+
     static func proof(
         token: String,
         challenge: String,
