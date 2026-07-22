@@ -2,6 +2,69 @@ import XCTest
 @testable import Menubar
 
 final class ConnectionsViewModelTests: XCTestCase {
+    func testOnlineClientsCollapseSameDeviceAndPreferDirectConnection() {
+        let connectedAt = Date()
+        let relay = ConnectedClient(
+            id: "relay-atem-office",
+            clientType: "Atem",
+            connectedAt: connectedAt.addingTimeInterval(10),
+            hostname: "office-mac",
+            atemId: "atem-office"
+        )
+        let direct = ConnectedClient(
+            id: "direct-socket",
+            clientType: "Atem",
+            connectedAt: connectedAt,
+            hostname: "office-mac",
+            atemId: "atem-office"
+        )
+
+        let result = AtemClientListModel.onlineClients([relay, direct])
+
+        XCTAssertEqual(result.map(\.id), ["direct-socket"])
+    }
+
+    func testOnlineClientsPreferPinnedConnectionForSameDevice() {
+        let direct = ConnectedClient(
+            id: "direct-socket",
+            clientType: "Atem",
+            connectedAt: Date(),
+            atemId: "atem-office"
+        )
+        let relay = ConnectedClient(
+            id: "relay-atem-office",
+            clientType: "Atem",
+            connectedAt: Date(),
+            atemId: "atem-office"
+        )
+
+        let result = AtemClientListModel.onlineClients(
+            [direct, relay],
+            preferredClientId: relay.id
+        )
+
+        XCTAssertEqual(result.map(\.id), ["relay-atem-office"])
+    }
+
+    func testOnlineClientsKeepLegacyConnectionsDistinct() {
+        let first = ConnectedClient(
+            id: "legacy-1",
+            clientType: "Atem",
+            connectedAt: Date(),
+            hostname: "shared-hostname"
+        )
+        let second = ConnectedClient(
+            id: "legacy-2",
+            clientType: "Atem",
+            connectedAt: Date(),
+            hostname: "shared-hostname"
+        )
+
+        let result = AtemClientListModel.onlineClients([second, first])
+
+        XCTAssertEqual(result.map(\.id), ["legacy-1", "legacy-2"])
+    }
+
     func testOfflineSessionsExcludeConnectedDevice() {
         let onlineSession = makeSession(id: "session-online", atemId: "atem-online")
         let offlineSession = makeSession(id: "session-offline", atemId: "atem-offline")

@@ -1,6 +1,48 @@
 import SwiftUI
 
 enum AtemClientListModel {
+    static func onlineClients(
+        _ connectedClients: [ConnectedClient],
+        preferredClientId: String? = nil
+    ) -> [ConnectedClient] {
+        var preferredByDevice: [String: ConnectedClient] = [:]
+
+        for client in connectedClients where client.clientType == "Atem" {
+            let deviceKey = client.atemId.map { "atem:\($0)" } ?? "client:\(client.id)"
+            guard let existing = preferredByDevice[deviceKey] else {
+                preferredByDevice[deviceKey] = client
+                continue
+            }
+
+            if prefersClient(client, over: existing, preferredClientId: preferredClientId) {
+                preferredByDevice[deviceKey] = client
+            }
+        }
+
+        return preferredByDevice.values.sorted {
+            let left = $0.hostname.localizedCaseInsensitiveCompare($1.hostname)
+            return left == .orderedSame ? $0.id < $1.id : left == .orderedAscending
+        }
+    }
+
+    private static func prefersClient(
+        _ candidate: ConnectedClient,
+        over existing: ConnectedClient,
+        preferredClientId: String?
+    ) -> Bool {
+        if candidate.id == preferredClientId { return true }
+        if existing.id == preferredClientId { return false }
+        if candidate.isFocused != existing.isFocused { return candidate.isFocused }
+
+        let candidateIsDirect = !candidate.id.hasPrefix("relay-")
+        let existingIsDirect = !existing.id.hasPrefix("relay-")
+        if candidateIsDirect != existingIsDirect { return candidateIsDirect }
+        if candidate.connectedAt != existing.connectedAt {
+            return candidate.connectedAt > existing.connectedAt
+        }
+        return candidate.id < existing.id
+    }
+
     static func offlineSessions(
         activeSessions: [SessionInfo],
         connectedClients: [ConnectedClient]
@@ -68,13 +110,17 @@ struct ConnectionsView: View {
     }
 
     private func selectAvailableClientIfNeeded() {
-        let onlineIds = Set(hubManager.connectedClients.map(\.id))
+        let onlineClients = AtemClientListModel.onlineClients(
+            hubManager.connectedClients,
+            preferredClientId: hubManager.pinnedClientId
+        )
+        let onlineIds = Set(onlineClients.map(\.id))
         if let selectedClientId, onlineIds.contains(selectedClientId) {
             return
         }
-        selectedClientId = hubManager.pinnedClientId
-            ?? hubManager.focusedClient()?.id
-            ?? hubManager.connectedClients.first?.id
+        selectedClientId = onlineClients.first(where: { $0.id == hubManager.pinnedClientId })?.id
+            ?? onlineClients.first(where: \.isFocused)?.id
+            ?? onlineClients.first?.id
     }
 }
 
@@ -85,7 +131,10 @@ private struct ClientListPanel: View {
     @Binding var selectedClientId: String?
 
     private var onlineAtems: [ConnectedClient] {
-        hubManager.connectedClients.filter { $0.clientType == "Atem" }
+        AtemClientListModel.onlineClients(
+            hubManager.connectedClients,
+            preferredClientId: hubManager.pinnedClientId
+        )
     }
 
     private var offlineAtems: [SessionInfo] {
@@ -271,7 +320,9 @@ private struct OfflineClientRow: View {
         if session.hostname != "unknown" {
             return session.hostname
         }
-        return session.atemId.map { String($0.prefix(18)) + "…" }
+        return session.atemId.map { id in
+            id.count > 18 ? String(id.prefix(18)) + "…" : id
+        }
             ?? String(session.id.prefix(8)) + "…"
     }
 

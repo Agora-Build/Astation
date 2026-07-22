@@ -103,10 +103,8 @@ class RemoteControlWindowController: NSObject, NSWindowDelegate, NSTextFieldDele
 
     private func refreshTarget() {
         if let clientId = targetClientId,
-           hubManager.connectedClients.contains(where: { $0.id == clientId }) {
-            let clientName = hubManager.connectedClients
-                .first(where: { $0.id == clientId })?
-                .hostname ?? String(clientId.prefix(8))
+           let client = hubManager.connectedClients.first(where: { $0.id == clientId }) {
+            let clientName = client.hostname
             targetLabel.stringValue = "Target: \(targetAgentName ?? "Agent") on \(clientName)"
             targetLabel.textColor = .secondaryLabelColor
         } else {
