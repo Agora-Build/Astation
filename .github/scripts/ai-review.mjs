@@ -56,6 +56,64 @@ export function extractCodexReview(response) {
     .trim();
 }
 
+export function extractCodexStream(stream) {
+  const deltas = [];
+  let completedReview = "";
+  const trimmedStream = stream.trim();
+
+  if (trimmedStream.startsWith("{")) {
+    let payload;
+    try {
+      payload = JSON.parse(trimmedStream);
+    } catch {
+      throw new Error("codex API returned malformed JSON.");
+    }
+    if (payload.error) {
+      throw new Error(`codex API failed: ${payload.error.message || "unknown error"}`);
+    }
+    return extractCodexReview(payload);
+  }
+
+  for (const block of stream.split(/\r?\n\r?\n/)) {
+    const data = block
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n")
+      .trim();
+    if (!data || data === "[DONE]") continue;
+
+    let event;
+    try {
+      event = JSON.parse(data);
+    } catch {
+      throw new Error("codex API returned a malformed streaming event.");
+    }
+
+    if (
+      event.type === "error" ||
+      event.type === "response.failed" ||
+      event.type === "response.incomplete"
+    ) {
+      const message =
+        event.error?.message ||
+        event.response?.error?.message ||
+        event.response?.incomplete_details?.reason ||
+        event.message ||
+        "unknown streaming error";
+      throw new Error(`codex API stream failed: ${message}`);
+    }
+    if (event.type === "response.output_text.delta" && typeof event.delta === "string") {
+      deltas.push(event.delta);
+    }
+    if (event.type === "response.completed") {
+      completedReview = extractCodexReview(event.response || event);
+    }
+  }
+
+  return (completedReview || deltas.join("")).trim();
+}
+
 export function buildPatchContext(files, limit = DEFAULT_DIFF_LIMIT) {
   const fullSummary = files
     .map(
@@ -303,6 +361,7 @@ export async function requestModel(provider, baseUrl, apiKey, model, prompt) {
       instructions: system,
       max_output_tokens: 4_096,
       model,
+      stream: true,
     };
   }
 
@@ -319,14 +378,18 @@ export async function requestModel(provider, baseUrl, apiKey, model, prompt) {
     );
   }
 
-  let payload;
-  try {
-    payload = JSON.parse(responseText);
-  } catch {
-    throw new Error(`${provider} API returned a non-JSON response.`);
+  let review;
+  if (provider === "codex") {
+    review = extractCodexStream(responseText);
+  } else {
+    let payload;
+    try {
+      payload = JSON.parse(responseText);
+    } catch {
+      throw new Error(`${provider} API returned a non-JSON response.`);
+    }
+    review = extractClaudeReview(payload);
   }
-  const review =
-    provider === "claude" ? extractClaudeReview(payload) : extractCodexReview(payload);
   if (!review) {
     throw new Error(`${provider} API returned an empty review.`);
   }
