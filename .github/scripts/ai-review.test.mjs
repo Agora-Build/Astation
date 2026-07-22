@@ -319,6 +319,8 @@ test("sends non-agent requests in each provider's native API format", async () =
   assert.equal(requests[1].url, "https://gateway/openai/v1/responses");
   assert.equal(requests[1].headers.Authorization, "Bearer codex-key");
   assert.equal(requests[1].body.stream, true);
+  assert.match(requests[1].body.instructions, /Review only the pull request metadata/);
+  assert.match(requests[1].body.instructions, /Never claim to inspect a checkout/);
   assert.deepEqual(requests[1].body.input, [
     {
       content: "diff",
