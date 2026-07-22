@@ -1227,6 +1227,12 @@ class AstationHubManager: ObservableObject {
         }
     }
 
+    func broadcastToAuthenticatedIdentityRelayClients(_ message: AstationMessage) {
+        for clientId in authenticatedIdentityRelayClients {
+            sendHandler?(message, clientId)
+        }
+    }
+
     private func handleIdentityRelayAuthentication(_ msg: AstationMessage, clientId: String) {
         guard case .statusUpdate(let status, let data) = msg,
               status == "auth",

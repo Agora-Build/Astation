@@ -68,8 +68,9 @@ class AstationApp: NSObject, NSApplicationDelegate {
         }
 
         // Wire broadcast handler so hubManager can broadcast to all connected Atems
-        hubManager.broadcastHandler = { [weak webSocketServer] message in
+        hubManager.broadcastHandler = { [weak webSocketServer, weak hubManager] message in
             webSocketServer?.broadcastMessage(message)
+            hubManager?.broadcastToAuthenticatedIdentityRelayClients(message)
         }
 
         // Wire send handler so hubManager can send to a specific Atem by client ID

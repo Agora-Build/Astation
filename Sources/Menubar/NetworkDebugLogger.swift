@@ -107,17 +107,17 @@ enum NetworkDebugLogger {
     }
 
     private static let sensitiveKeys: Set<String> = [
-        "access_token", "api_key", "app_certificate", "auth_token", "authorization",
-        "bearer", "bootstrap_token", "cookie", "credential", "encryption_key", "otp",
-        "pairing_code", "password", "proof", "refresh_token", "secret", "session",
-        "session_id", "session_token", "token"
+        "accesstoken", "apikey", "appcertificate", "authtoken", "authorization",
+        "bearer", "bootstraptoken", "cookie", "credential", "encryptionkey", "otp",
+        "pairingcode", "password", "proof", "refreshtoken", "secret", "session",
+        "sessionid", "sessiontoken", "token"
     ]
 
     private static func sanitizeUnstructuredText(_ text: String) -> String {
         let replacements = [
             (#"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"#, "Bearer <redacted>"),
             (
-                #"(?i)\b(access[_-]?token|api[_-]?key|auth[_-]?token|bootstrap[_-]?token|otp|pairing[_-]?code|password|proof|refresh[_-]?token|secret|session[_-]?id|session[_-]?token|token)\b\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;&]+)"#,
+                #"(?i)\b(access[_-]?token|api[_-]?key|auth[_-]?token|bootstrap[_-]?token|otp|pairing[_-]?code|password|proof|refresh[_-]?token|secret|session[_-]?id|session[_-]?token|token)\b[\"']?\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;&]+)"#,
                 "$1=<redacted>"
             )
         ]
@@ -139,7 +139,7 @@ enum NetworkDebugLogger {
     private static func sanitizeJSONObject(_ value: Any) -> Any {
         if let dictionary = value as? [String: Any] {
             return dictionary.reduce(into: [String: Any]()) { result, entry in
-                let normalizedKey = entry.key.lowercased().replacingOccurrences(of: "-", with: "_")
+                let normalizedKey = normalizedSensitiveKey(entry.key)
                 result[entry.key] = sensitiveKeys.contains(normalizedKey)
                     ? "<redacted>"
                     : sanitizeJSONObject(entry.value)
@@ -158,10 +158,14 @@ enum NetworkDebugLogger {
             return url.absoluteString
         }
         components.queryItems = items.map { item in
-            let normalizedName = item.name.lowercased().replacingOccurrences(of: "-", with: "_")
+            let normalizedName = normalizedSensitiveKey(item.name)
             guard sensitiveKeys.contains(normalizedName) else { return item }
             return URLQueryItem(name: item.name, value: "<redacted>")
         }
         return components.string ?? url.absoluteString
+    }
+
+    private static func normalizedSensitiveKey(_ key: String) -> String {
+        key.lowercased().filter { $0.isLetter || $0.isNumber }
     }
 }

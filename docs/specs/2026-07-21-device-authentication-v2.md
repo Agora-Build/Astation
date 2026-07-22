@@ -56,6 +56,8 @@ Astation compares proofs in constant time, binds legacy sessions to the first
 `atem_id` that proves possession, and rejects reuse with a different device ID.
 The relay path does not register `hello` as an authenticated client; `hello`
 only causes Astation to issue a targeted challenge.
+Application broadcasts are delivered to authenticated direct and identity-relay
+clients, while pending clients are excluded.
 
 ## Local state
 

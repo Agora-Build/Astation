@@ -118,6 +118,7 @@ class SessionStore {
         queue.sync(flags: .barrier) {
             guard var session = sessions[sessionId], session.isValid else { return nil }
             guard session.atemId == nil || session.atemId == atemId else { return nil }
+            let bindsLegacySession = session.atemId == nil
             guard DeviceAuthentication.verify(
                 proof: proof,
                 token: session.token,
@@ -131,6 +132,9 @@ class SessionStore {
             session.lastActivity = Date()
             sessions[sessionId] = session
             saveToDisk()
+            if bindsLegacySession {
+                Log.info("Bound legacy session \(sessionId.prefix(8)) to Atem \(atemId)")
+            }
             return session
         }
     }
