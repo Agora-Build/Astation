@@ -24,3 +24,4 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = "0.24"

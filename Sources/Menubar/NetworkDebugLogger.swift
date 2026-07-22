@@ -16,7 +16,7 @@ enum NetworkDebugLogger {
     static func logRequest(_ request: URLRequest, bodyOverride: Data? = nil, label: String? = nil) {
         guard isEnabled else { return }
         let method = request.httpMethod ?? "GET"
-        let url = request.url?.absoluteString ?? "(nil)"
+        let url = sanitizeURL(request.url)
         let headers = sanitizeHeaders(request.allHTTPHeaderFields ?? [:])
         let bodyData = bodyOverride ?? request.httpBody
         let body = formatBody(bodyData)
@@ -45,7 +45,7 @@ enum NetworkDebugLogger {
 
     static func logWebSocket(direction: String, context: String, message: String) {
         guard isEnabled else { return }
-        Log.debug("[WS] \(direction) \(context): \(truncate(message))")
+        Log.debug("[WS] \(direction) \(context): \(sanitizedPayload(message))")
     }
 
     static func logWebSocketBinary(direction: String, context: String, size: Int) {
@@ -81,7 +81,7 @@ enum NetworkDebugLogger {
         guard let data else { return "<empty>" }
         if data.isEmpty { return "<empty>" }
         if let text = String(data: data, encoding: .utf8) {
-            return truncate(text)
+            return sanitizedPayload(text)
         }
         return "<binary \(data.count) bytes>"
     }
@@ -91,5 +91,81 @@ enum NetworkDebugLogger {
         let prefix = String(text.prefix(maxPayloadLength))
         let remaining = text.count - maxPayloadLength
         return "\(prefix)…<truncated \(remaining) chars>"
+    }
+
+    static func sanitizedPayload(_ text: String) -> String {
+        guard let data = text.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let sanitizedData = try? JSONSerialization.data(
+                withJSONObject: sanitizeJSONObject(object),
+                options: [.sortedKeys]
+              ),
+              let sanitized = String(data: sanitizedData, encoding: .utf8) else {
+            return sanitizeUnstructuredText(text)
+        }
+        return truncate(sanitized)
+    }
+
+    private static let sensitiveKeys: Set<String> = [
+        "accesstoken", "apikey", "appcertificate", "authtoken", "authorization",
+        "bearer", "bootstraptoken", "cookie", "credential", "encryptionkey", "otp",
+        "pairingcode", "password", "proof", "refreshtoken", "secret", "session",
+        "sessionid", "sessiontoken", "token"
+    ]
+
+    private static func sanitizeUnstructuredText(_ text: String) -> String {
+        let replacements = [
+            (#"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"#, "Bearer <redacted>"),
+            (
+                #"(?i)\b(access[_-]?token|api[_-]?key|auth[_-]?token|bootstrap[_-]?token|otp|pairing[_-]?code|password|proof|refresh[_-]?token|secret|session[_-]?id|session[_-]?token|token)\b[\"']?\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;&]+)"#,
+                "$1=<redacted>"
+            )
+        ]
+        let sanitized = replacements.reduce(text) { value, replacement in
+            guard let expression = try? NSRegularExpression(
+                pattern: replacement.0,
+                options: []
+            ) else { return value }
+            return expression.stringByReplacingMatches(
+                in: value,
+                options: [],
+                range: NSRange(value.startIndex..<value.endIndex, in: value),
+                withTemplate: replacement.1
+            )
+        }
+        return truncate(sanitized)
+    }
+
+    private static func sanitizeJSONObject(_ value: Any) -> Any {
+        if let dictionary = value as? [String: Any] {
+            return dictionary.reduce(into: [String: Any]()) { result, entry in
+                let normalizedKey = normalizedSensitiveKey(entry.key)
+                result[entry.key] = sensitiveKeys.contains(normalizedKey)
+                    ? "<redacted>"
+                    : sanitizeJSONObject(entry.value)
+            }
+        }
+        if let array = value as? [Any] {
+            return array.map(sanitizeJSONObject)
+        }
+        return value
+    }
+
+    private static func sanitizeURL(_ url: URL?) -> String {
+        guard let url else { return "(nil)" }
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let items = components.queryItems else {
+            return url.absoluteString
+        }
+        components.queryItems = items.map { item in
+            let normalizedName = normalizedSensitiveKey(item.name)
+            guard sensitiveKeys.contains(normalizedName) else { return item }
+            return URLQueryItem(name: item.name, value: "<redacted>")
+        }
+        return components.string ?? url.absoluteString
+    }
+
+    private static func normalizedSensitiveKey(_ key: String) -> String {
+        key.lowercased().filter { $0.isLetter || $0.isNumber }
     }
 }

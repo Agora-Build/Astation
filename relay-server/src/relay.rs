@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::Instant;
+use uuid::Uuid;
 use validator::Validate;
 
 use crate::session_verify::SessionVerifyCache;
@@ -37,11 +38,45 @@ struct PairRoom {
     hostname: String,
     /// One sender per connected Atem, keyed by atem_id.
     /// Multiple Atems can be connected to the same room simultaneously.
-    atem_txs: HashMap<String, mpsc::UnboundedSender<String>>,
+    atem_txs: HashMap<String, AtemConnection>,
     /// Session claims waiting for a targeted Astation auth response.
     pending_session_ids: HashMap<String, String>,
     astation_tx: Option<mpsc::UnboundedSender<String>>,
+    astation_connection_id: Option<String>,
     created_at: Instant,
+}
+
+#[derive(Clone)]
+struct AtemConnection {
+    connection_id: String,
+    tx: mpsc::UnboundedSender<String>,
+}
+
+impl PairRoom {
+    fn is_current_atem_connection(&self, atem_id: &str, connection_id: &str) -> bool {
+        self.atem_txs
+            .get(atem_id)
+            .map(|connection| connection.connection_id == connection_id)
+            .unwrap_or(false)
+    }
+
+    fn remove_atem_if_current(&mut self, atem_id: &str, connection_id: &str) -> bool {
+        if !self.is_current_atem_connection(atem_id, connection_id) {
+            return false;
+        }
+        self.atem_txs.remove(atem_id);
+        self.pending_session_ids.remove(atem_id);
+        true
+    }
+}
+
+fn relay_connection_event(atem_id: &str, connection_id: &str, event: &str) -> String {
+    serde_json::json!({
+        "atem_id": atem_id,
+        "connection_id": connection_id,
+        "relay_event": event,
+    })
+    .to_string()
 }
 
 #[derive(Clone)]
@@ -157,6 +192,7 @@ pub async fn create_pair_handler(
         atem_txs: HashMap::new(),
         pending_session_ids: HashMap::new(),
         astation_tx: None,
+        astation_connection_id: None,
         created_at: Instant::now(),
     };
 
@@ -252,6 +288,7 @@ pub async fn ws_handler(
                                 atem_txs: HashMap::new(),
                                 pending_session_ids: HashMap::new(),
                                 astation_tx: None,
+                                astation_connection_id: None,
                                 created_at: Instant::now(),
                             },
                         );
@@ -293,6 +330,7 @@ pub async fn ws_handler(
                 atem_txs: HashMap::new(),
                 pending_session_ids: HashMap::new(),
                 astation_tx: None,
+                astation_connection_id: None,
                 created_at: Instant::now(),
             }
         });
@@ -341,8 +379,8 @@ fn sanitize_atem_id(raw: Option<&str>) -> String {
 
 /// Message routing protocol for multi-Atem rooms:
 ///
-/// Atem → Astation:  relay WRAPS  `{"atem_id":"<id>","payload":<original_msg>}`
-/// Astation → Atem:  Astation sends `{"atem_id":"<id>","payload":<msg>}` → relay UNWRAPS, routes to that Atem
+/// Atem → Astation: relay wraps the message with `atem_id` and a per-socket `connection_id`.
+/// Astation → Atem: Astation echoes both IDs with the payload; stale generations are dropped.
 /// Astation → ALL:   Astation sends raw JSON (no `atem_id` key) → relay BROADCASTS to every Atem in the room
 async fn handle_ws(
     hub: RelayHub,
@@ -354,9 +392,10 @@ async fn handle_ws(
 ) {
     let (mut ws_sink, mut ws_stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let connection_id = Uuid::new_v4().to_string();
 
     // Register this side's sender in the room
-    {
+    let startup_notifications = {
         let mut rooms = hub.rooms.write().await;
         let room = match rooms.get_mut(&code) {
             Some(r) => r,
@@ -366,19 +405,50 @@ async fn handle_ws(
             }
         };
 
+        let mut notifications = Vec::new();
         match role.as_str() {
             "atem" => {
-                room.atem_txs.insert(atem_id.clone(), tx.clone());
+                room.pending_session_ids.remove(&atem_id);
+                room.atem_txs.insert(
+                    atem_id.clone(),
+                    AtemConnection {
+                        connection_id: connection_id.clone(),
+                        tx: tx.clone(),
+                    },
+                );
+                if let Some(astation_tx) = room.astation_tx.clone() {
+                    notifications.push((
+                        astation_tx,
+                        relay_connection_event(&atem_id, &connection_id, "connected"),
+                    ));
+                }
             }
             "astation" => {
                 room.astation_tx = Some(tx.clone());
+                room.astation_connection_id = Some(connection_id.clone());
+                notifications.extend(room.atem_txs.iter().map(|(atem_id, connection)| {
+                    (
+                        tx.clone(),
+                        relay_connection_event(
+                            atem_id,
+                            &connection.connection_id,
+                            "connected",
+                        ),
+                    )
+                }));
             }
             _ => {
                 tracing::warn!("Unknown role: {}", role);
                 return;
             }
         }
+        notifications
     };
+
+    for (target, notification) in startup_notifications {
+        let _ = target.send(notification);
+    }
+    drop(tx);
 
     tracing::info!("WS connected: role={} code={}", role, code);
 
@@ -405,7 +475,10 @@ async fn handle_ws(
                                 break;
                             }
                         }
-                        None => break, // channel closed
+                        None => {
+                            let _ = ws_sink.close().await;
+                            break;
+                        }
                     }
                 }
                 _ = ping_interval.tick() => {
@@ -427,9 +500,9 @@ async fn handle_ws(
     // are detected and cleaned up within 90s rather than waiting for the OS TCP timeout.
     //
     // Routing rules (see handle_ws comment above for full protocol spec):
-    //  - Atem → relay: raw msg → relay wraps {"atem_id":id,"payload":msg} → Astation
+    //  - Atem → relay: raw msg → relay adds atem_id and connection_id → Astation
     //  - Astation → relay:
-    //      {"atem_id":"x","payload":msg}  → unwrap, forward payload to Atem "x"
+    //      targeted envelope with both IDs → forward only to that exact socket generation
     //      raw msg (no atem_id)           → broadcast payload to ALL Atems in room
     let hub_for_read = hub.clone();
     let role_for_read = role.clone();
@@ -449,6 +522,26 @@ async fn handle_ws(
             Ok(axum::extract::ws::Message::Text(text)) => {
                 match role_for_read.as_str() {
                     "atem" => {
+                        let is_current = {
+                            let rooms = hub_for_read.rooms.read().await;
+                            rooms
+                                .get(&code_for_read)
+                                .map(|room| {
+                                    room.is_current_atem_connection(
+                                        &atem_id_for_read,
+                                        &connection_id,
+                                    )
+                                })
+                                .unwrap_or(false)
+                        };
+                        if !is_current {
+                            tracing::debug!(
+                                "Dropping stale Atem connection: code={} atem_id={}",
+                                code_for_read,
+                                atem_id_for_read
+                            );
+                            break;
+                        }
                         record_atem_auth_attempt(
                             &hub_for_read,
                             &code_for_read,
@@ -465,21 +558,69 @@ async fn handle_ws(
                         if let Some(tx) = astation_tx {
                             // Parse payload as JSON value so serde handles escaping correctly
                             let envelope = if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&text) {
-                                serde_json::json!({"atem_id": atem_id_for_read, "payload": payload}).to_string()
+                                serde_json::json!({
+                                    "atem_id": atem_id_for_read,
+                                    "connection_id": connection_id.as_str(),
+                                    "payload": payload
+                                }).to_string()
                             } else {
                                 // Fallback: treat as raw string payload
-                                serde_json::json!({"atem_id": atem_id_for_read, "payload": text}).to_string()
+                                serde_json::json!({
+                                    "atem_id": atem_id_for_read,
+                                    "connection_id": connection_id.as_str(),
+                                    "payload": text
+                                }).to_string()
                             };
                             let _ = tx.send(envelope);
                         }
                     }
                     "astation" => {
-                        // Parse envelope: {"atem_id":"x","payload":{...}} → route to Atem x
+                        let is_current = {
+                            let rooms = hub_for_read.rooms.read().await;
+                            rooms
+                                .get(&code_for_read)
+                                .and_then(|room| room.astation_connection_id.as_deref())
+                                .map(|current| current == connection_id)
+                                .unwrap_or(false)
+                        };
+                        if !is_current {
+                            tracing::debug!("Dropping stale Astation connection: code={}", code_for_read);
+                            break;
+                        }
+                        // Parse a generation-bound envelope and route it to the current Atem socket.
                         // Or raw JSON (no atem_id) → broadcast to all Atems
                         if let Ok(env) = serde_json::from_str::<serde_json::Value>(&text) {
                             if let Some(target_id) = env.get("atem_id").and_then(|v| v.as_str()) {
+                                let Some(requested_connection_id) = env
+                                    .get("connection_id")
+                                    .and_then(|value| value.as_str()) else {
+                                        tracing::debug!(
+                                            "Dropping generationless targeted message: code={} atem_id={}",
+                                            code_for_read,
+                                            target_id
+                                        );
+                                        continue;
+                                    };
                                 // Targeted: route payload to the specific Atem
                                 let payload = env.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+                                let target_connection = {
+                                    let rooms = hub_for_read.rooms.read().await;
+                                    rooms
+                                        .get(&code_for_read)
+                                        .and_then(|room| room.atem_txs.get(target_id))
+                                        .filter(|connection| {
+                                            requested_connection_id == connection.connection_id
+                                        })
+                                        .cloned()
+                                };
+                                let Some(target_connection) = target_connection else {
+                                    tracing::debug!(
+                                        "Dropping message for stale or missing Atem connection: code={} atem_id={}",
+                                        code_for_read,
+                                        target_id
+                                    );
+                                    continue;
+                                };
                                 observe_astation_auth_response(
                                     &hub_for_read,
                                     &verify_cache,
@@ -489,20 +630,18 @@ async fn handle_ws(
                                 )
                                 .await;
                                 let payload_str = payload.to_string();
-                                let target_tx = {
-                                    let rooms = hub_for_read.rooms.read().await;
-                                    rooms.get(&code_for_read)
-                                        .and_then(|r| r.atem_txs.get(target_id).cloned())
-                                };
-                                if let Some(tx) = target_tx {
-                                    let _ = tx.send(payload_str);
-                                }
+                                let _ = target_connection.tx.send(payload_str);
                             } else {
                                 // Broadcast: send raw message to all Atems
                                 let txs: Vec<_> = {
                                     let rooms = hub_for_read.rooms.read().await;
                                     rooms.get(&code_for_read)
-                                        .map(|r| r.atem_txs.values().cloned().collect())
+                                        .map(|r| {
+                                            r.atem_txs
+                                                .values()
+                                                .map(|connection| connection.tx.clone())
+                                                .collect()
+                                        })
                                         .unwrap_or_default()
                                 };
                                 for tx in txs {
@@ -525,17 +664,32 @@ async fn handle_ws(
     }
 
     // Cleanup: remove our sender from the room
-    {
+    let disconnect_notification = {
         let mut rooms = hub_for_read.rooms.write().await;
+        let mut notification = None;
         if let Some(room) = rooms.get_mut(&code) {
             match role.as_str() {
                 "atem" => {
-                    room.atem_txs.remove(&atem_id);
-                    room.pending_session_ids.remove(&atem_id);
+                    if room.remove_atem_if_current(&atem_id, &connection_id) {
+                        notification = room.astation_tx.clone().map(|astation_tx| {
+                            (
+                                astation_tx,
+                                relay_connection_event(&atem_id, &connection_id, "disconnected"),
+                            )
+                        });
+                    }
                 }
                 "astation" => {
-                    room.astation_tx = None;
-                    room.pending_session_ids.clear();
+                    if room
+                        .astation_connection_id
+                        .as_deref()
+                        .map(|current| current == connection_id)
+                        .unwrap_or(false)
+                    {
+                        room.astation_tx = None;
+                        room.astation_connection_id = None;
+                        room.pending_session_ids.clear();
+                    }
                 }
                 _ => {}
             }
@@ -545,6 +699,11 @@ async fn handle_ws(
                 tracing::info!("Room {} removed (all sides disconnected)", code);
             }
         }
+        notification
+    };
+
+    if let Some((target, notification)) = disconnect_notification {
+        let _ = target.send(notification);
     }
 
     write_task.abort();
@@ -855,6 +1014,31 @@ mod tests {
     use crate::voice_session::VoiceSessionStore;
     use super::*;
     use crate::session_verify::SessionVerifyCache;
+    use tokio::net::TcpStream;
+    use tokio_tungstenite::{
+        tungstenite::Message as ClientMessage, MaybeTlsStream, WebSocketStream,
+    };
+
+    type TestSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    async fn next_client_json(socket: &mut TestSocket) -> serde_json::Value {
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+                .await
+                .expect("timed out waiting for WebSocket message")
+                .expect("WebSocket closed before receiving message")
+                .expect("failed to read WebSocket message");
+            match frame {
+                ClientMessage::Text(text) => {
+                    return serde_json::from_str(&text).expect("WebSocket text was not JSON");
+                }
+                ClientMessage::Close(frame) => {
+                    panic!("WebSocket closed unexpectedly: {frame:?}");
+                }
+                _ => {}
+            }
+        }
+    }
 
     #[test]
     fn pairing_code_format() {
@@ -901,6 +1085,53 @@ mod tests {
         assert!(id2.starts_with("atem-"));
     }
 
+    #[test]
+    fn relay_connection_event_carries_generation() {
+        let event = relay_connection_event(
+            "atem-office",
+            "43c8a181-6567-49ae-9191-8e103a66cc55",
+            "connected",
+        );
+        let value: serde_json::Value = serde_json::from_str(&event).unwrap();
+
+        assert_eq!(value["atem_id"], "atem-office");
+        assert_eq!(value["connection_id"], "43c8a181-6567-49ae-9191-8e103a66cc55");
+        assert_eq!(value["relay_event"], "connected");
+    }
+
+    #[test]
+    fn stale_atem_cleanup_does_not_remove_replacement() {
+        let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel::<String>();
+        let mut room = PairRoom {
+            code: "identity-room".to_string(),
+            hostname: "identity".to_string(),
+            atem_txs: HashMap::from([(
+                "atem-office".to_string(),
+                AtemConnection {
+                    connection_id: "replacement".to_string(),
+                    tx: replacement_tx,
+                },
+            )]),
+            pending_session_ids: HashMap::from([(
+                "atem-office".to_string(),
+                "session-new".to_string(),
+            )]),
+            astation_tx: None,
+            astation_connection_id: None,
+            created_at: Instant::now(),
+        };
+
+        assert!(!room.remove_atem_if_current("atem-office", "stale"));
+        assert!(room.is_current_atem_connection("atem-office", "replacement"));
+        assert_eq!(
+            room.pending_session_ids.get("atem-office").map(String::as_str),
+            Some("session-new")
+        );
+        assert!(room.remove_atem_if_current("atem-office", "replacement"));
+        assert!(!room.atem_txs.contains_key("atem-office"));
+        assert!(!room.pending_session_ids.contains_key("atem-office"));
+    }
+
     async fn hub_with_room(code: &str) -> RelayHub {
         let hub = RelayHub::new();
         hub.rooms.write().await.insert(
@@ -911,6 +1142,7 @@ mod tests {
                 atem_txs: HashMap::new(),
                 pending_session_ids: HashMap::new(),
                 astation_tx: None,
+                astation_connection_id: None,
                 created_at: Instant::now(),
             },
         );
@@ -1025,6 +1257,7 @@ mod tests {
             atem_txs: HashMap::new(),
             pending_session_ids: HashMap::new(),
             astation_tx: None,
+            astation_connection_id: None,
             created_at: Instant::now(),
         };
 
@@ -1049,6 +1282,7 @@ mod tests {
             atem_txs: HashMap::new(),
             pending_session_ids: HashMap::new(),
             astation_tx: None,
+            astation_connection_id: None,
             created_at: Instant::now() - std::time::Duration::from_secs(ROOM_EXPIRY_SECS + 10),
         };
         hub.rooms
@@ -1063,6 +1297,7 @@ mod tests {
             atem_txs: HashMap::new(),
             pending_session_ids: HashMap::new(),
             astation_tx: None,
+            astation_connection_id: None,
             created_at: Instant::now(),
         };
         hub.rooms
@@ -1089,6 +1324,7 @@ mod tests {
             atem_txs: HashMap::new(),
             pending_session_ids: HashMap::new(),
             astation_tx: Some(tx),
+            astation_connection_id: Some("astation-test".to_string()),
             created_at: Instant::now() - std::time::Duration::from_secs(ROOM_EXPIRY_SECS + 10),
         };
         hub.rooms
@@ -1412,6 +1648,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn practical_websocket_replacement_rejects_stale_generation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test relay");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, create_relay_app())
+                .await
+                .expect("test relay failed");
+        });
+        let base_url = format!("ws://{address}/ws");
+        let code = "practical-replacement";
+        let atem_id = "atem-office";
+
+        let (mut astation, _) = tokio_tungstenite::connect_async(format!(
+            "{base_url}?role=astation&code={code}"
+        ))
+        .await
+        .expect("failed to connect Astation");
+        let (mut original, _) = tokio_tungstenite::connect_async(format!(
+            "{base_url}?role=atem&code={code}&atem_id={atem_id}"
+        ))
+        .await
+        .expect("failed to connect original Atem");
+        let original_event = next_client_json(&mut astation).await;
+        assert_eq!(original_event["atem_id"], atem_id);
+        assert_eq!(original_event["relay_event"], "connected");
+        let original_connection_id = original_event["connection_id"]
+            .as_str()
+            .expect("connected event lacked connection_id")
+            .to_string();
+
+        let (mut replacement, _) = tokio_tungstenite::connect_async(format!(
+            "{base_url}?role=atem&code={code}&atem_id={atem_id}"
+        ))
+        .await
+        .expect("failed to connect replacement Atem");
+        let replacement_event = next_client_json(&mut astation).await;
+        assert_eq!(replacement_event["atem_id"], atem_id);
+        assert_eq!(replacement_event["relay_event"], "connected");
+        let replacement_connection_id = replacement_event["connection_id"]
+            .as_str()
+            .expect("replacement event lacked connection_id")
+            .to_string();
+        assert_ne!(original_connection_id, replacement_connection_id);
+
+        let original_closed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            async {
+                while let Some(frame) = original.next().await {
+                    match frame {
+                        Ok(ClientMessage::Close(_)) | Err(_) => return true,
+                        _ => {}
+                    }
+                }
+                true
+            },
+        )
+        .await
+        .unwrap_or(false);
+        assert!(original_closed, "replaced Atem socket remained open");
+
+        astation
+            .send(ClientMessage::Text(
+                serde_json::json!({
+                    "atem_id": atem_id,
+                    "connection_id": original_connection_id,
+                    "payload": {"probe": "stale"},
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                replacement.next(),
+            )
+            .await
+            .is_err(),
+            "stale targeted response reached replacement Atem"
+        );
+
+        astation
+            .send(ClientMessage::Text(
+                serde_json::json!({
+                    "atem_id": atem_id,
+                    "connection_id": replacement_connection_id,
+                    "payload": {"probe": "current"},
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next_client_json(&mut replacement).await["probe"], "current");
+
+        replacement
+            .send(ClientMessage::Text(
+                serde_json::json!({"probe": "from-atem"}).to_string(),
+            ))
+            .await
+            .unwrap();
+        let forwarded = next_client_json(&mut astation).await;
+        assert_eq!(forwarded["atem_id"], atem_id);
+        assert_eq!(forwarded["connection_id"], replacement_connection_id);
+        assert_eq!(forwarded["payload"]["probe"], "from-atem");
+
+        replacement.close(None).await.unwrap();
+        let disconnect_event = next_client_json(&mut astation).await;
+        assert_eq!(disconnect_event["atem_id"], atem_id);
+        assert_eq!(disconnect_event["connection_id"], replacement_connection_id);
+        assert_eq!(disconnect_event["relay_event"], "disconnected");
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn test_create_multiple_pairs_unique_codes() {
         let app = create_relay_app();
         let mut codes = std::collections::HashSet::new();
@@ -1482,13 +1835,20 @@ mod tests {
         // Create an old room but with atem connected (not astation)
         let (tx_atem, _rx) = mpsc::unbounded_channel::<String>();
         let mut old_atem_txs = HashMap::new();
-        old_atem_txs.insert("test-atem".to_string(), tx_atem);
+        old_atem_txs.insert(
+            "test-atem".to_string(),
+            AtemConnection {
+                connection_id: "connection-old".to_string(),
+                tx: tx_atem,
+            },
+        );
         let room = PairRoom {
             code: "OLD-ATEM".to_string(),
             hostname: "old-host".to_string(),
             atem_txs: old_atem_txs,
             pending_session_ids: HashMap::new(),
             astation_tx: None,
+            astation_connection_id: None,
             created_at: Instant::now() - std::time::Duration::from_secs(ROOM_EXPIRY_SECS + 10),
         };
         hub.rooms.write().await.insert("OLD-ATEM".to_string(), room);
@@ -1519,6 +1879,7 @@ mod tests {
             atem_txs: HashMap::new(),
             pending_session_ids: HashMap::new(),
             astation_tx: None,
+            astation_connection_id: None,
             created_at: Instant::now(),
         };
         state.relay.rooms.write().await.insert(code.clone(), room);
@@ -1551,7 +1912,13 @@ mod tests {
             let mut rooms = state.relay.rooms.write().await;
             if let Some(room) = rooms.get_mut(&code) {
                 room.astation_tx = Some(tx_astation);
-                room.atem_txs.insert("test-atem".to_string(), tx_atem);
+                room.atem_txs.insert(
+                    "test-atem".to_string(),
+                    AtemConnection {
+                        connection_id: "connection-test".to_string(),
+                        tx: tx_atem,
+                    },
+                );
             }
         }
 

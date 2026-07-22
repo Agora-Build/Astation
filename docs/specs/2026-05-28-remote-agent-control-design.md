@@ -28,7 +28,7 @@ session running under atem on the target machine."
 
 The hard parts already exist in Astation:
 
-- **Transport + targeting + relay envelope** — `AstationHubManager.sendHandler?(message, targetId)` is the universal send. For relay clients (`targetId == "relay-<atem_id>"`) it already wraps the message as `{"atem_id": "<id>", "payload": <message>}` and sends it over the identity relay; for direct clients it sends as-is. `routeToFocusedAtem()` picks the target atem (pinned or focused).
+- **Transport + targeting + relay envelope** — `AstationHubManager.sendHandler?(message, targetId)` is the universal send. For relay clients (`targetId == "relay-<atem_id>"`) it wraps the message with the Atem ID, the relay-assigned connection generation, and the payload; for direct clients it sends as-is. `routeToFocusedAtem()` picks the target Atem.
 - **Voice** — `VoiceCodingManager` + `sendVoiceCommand(text:isFinal:)` already do mic → ConvoAI ASR → `voiceCommand` / `voiceRequest` → atem. **Reuse as-is.** No new voice work in v1.
 - **Message plumbing** — `AstationMessage` (tagged `type`/`data` enum) with manual `Codable`. See CLAUDE.md → "Adding a New Message Type".
 
@@ -41,10 +41,10 @@ method mirroring `sendVoiceCommand`, and a minimal UI to enter it.
 routes by `atem_id`):
 
 ```json
-{ "atem_id": "<atem host id>", "payload": <AstationMessage JSON> }
+{ "atem_id": "<atem host id>", "connection_id": "<relay socket UUID>", "payload": <AstationMessage JSON> }
 ```
 
-So **`atem_id` is the envelope's job — do NOT put it inside the message payload.**
+So **`atem_id` and `connection_id` are the envelope's job — do NOT put them inside the message payload.**
 The `agentInput` payload carries only the agent selector + the input:
 
 ```json

@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Session information for a paired Atem device.
@@ -5,6 +6,7 @@ import Foundation
 struct SessionInfo: Codable {
     let id: String
     let hostname: String
+    var atemId: String?
     var lastActivity: Date
     let token: String
     let createdAt: Date
@@ -29,15 +31,18 @@ class SessionStore {
     private let storePath: URL
     private let queue = DispatchQueue(label: "build.agora.SessionStore", attributes: .concurrent)
 
-    init() {
-        // Store sessions in ~/Library/Application Support/Astation/sessions.json
+    init(storageURL: URL? = nil) {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let astation = appSupport.appendingPathComponent("Astation")
 
-        // Create directory if needed
-        try? FileManager.default.createDirectory(at: astation, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(
+            at: astation,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: astation.path)
 
-        storePath = astation.appendingPathComponent("sessions.json")
+        storePath = storageURL ?? astation.appendingPathComponent("sessions.json")
 
         // Load existing sessions
         loadFromDisk()
@@ -80,11 +85,12 @@ class SessionStore {
     }
 
     /// Create a new session after pairing approval.
-    func create(hostname: String) -> SessionInfo {
+    func create(hostname: String, atemId: String? = nil) -> SessionInfo {
         return queue.sync(flags: .barrier) {
             let session = SessionInfo(
                 id: UUID().uuidString,
                 hostname: hostname,
+                atemId: atemId,
                 lastActivity: Date(),
                 token: generateToken(),
                 createdAt: Date()
@@ -97,6 +103,67 @@ class SessionStore {
             // Save to disk
             saveToDisk()
 
+            return session
+        }
+    }
+
+    /// Authenticate a device by proving possession of its session token.
+    /// Legacy sessions are bound to the first atem_id that proves the token.
+    func authenticate(
+        sessionId: String,
+        atemId: String,
+        challenge: String,
+        proof: String,
+        astationId: String
+    ) -> SessionInfo? {
+        guard DeviceAuthentication.isValidSessionId(sessionId),
+              DeviceAuthentication.isValidAtemId(atemId) else {
+            return nil
+        }
+        return queue.sync(flags: .barrier) {
+            guard var session = sessions[sessionId], session.isValid else { return nil }
+            guard session.atemId == nil || session.atemId == atemId else { return nil }
+            let bindsLegacySession = session.atemId == nil
+            guard DeviceAuthentication.verify(
+                proof: proof,
+                token: session.token,
+                challenge: challenge,
+                astationId: astationId,
+                atemId: atemId,
+                sessionId: sessionId
+            ) else { return nil }
+
+            session.atemId = atemId
+            session.lastActivity = Date()
+            sessions[sessionId] = session
+            saveToDisk()
+            if bindsLegacySession {
+                Log.info("Bound legacy session \(sessionId.prefix(8)) to Atem \(atemId)")
+            }
+            return session
+        }
+    }
+
+    /// Return one stable device session for a locally authenticated Atem.
+    func createOrRefreshLocal(hostname: String, atemId: String) -> SessionInfo {
+        queue.sync(flags: .barrier) {
+            if var session = sessions.values.first(where: { $0.atemId == atemId && $0.isValid }) {
+                session.lastActivity = Date()
+                sessions[session.id] = session
+                saveToDisk()
+                return session
+            }
+
+            let session = SessionInfo(
+                id: UUID().uuidString,
+                hostname: hostname,
+                atemId: atemId,
+                lastActivity: Date(),
+                token: generateToken(),
+                createdAt: Date()
+            )
+            sessions[session.id] = session
+            saveToDisk()
             return session
         }
     }
@@ -153,7 +220,8 @@ class SessionStore {
             encoder.outputFormatting = .prettyPrinted
 
             let data = try encoder.encode(sessions)
-            try data.write(to: storePath)
+            try data.write(to: storePath, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storePath.path)
 
             Log.debug("💾 Sessions saved to disk (\(sessions.count) total)")
         } catch {
@@ -163,12 +231,32 @@ class SessionStore {
 
     private func loadFromDisk() {
         // Must be called from queue with barrier
-        guard FileManager.default.fileExists(atPath: storePath.path) else {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: storePath.path) ||
+                (try? fileManager.destinationOfSymbolicLink(atPath: storePath.path)) != nil else {
             Log.debug("No existing sessions file found")
             return
         }
 
         do {
+            let values = try storePath.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .isSymbolicLinkKey
+            ])
+            let attributes = try fileManager.attributesOfItem(atPath: storePath.path)
+            let owner = (attributes[.ownerAccountID] as? NSNumber)?.uint32Value
+            guard values.isRegularFile == true,
+                  values.isSymbolicLink != true,
+                  owner == getuid() else {
+                Log.error("Refusing to load insecure sessions file at \(storePath.path)")
+                return
+            }
+
+            // Close the migration window before bearer tokens are read into memory.
+            try fileManager.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: storePath.path
+            )
             let data = try Data(contentsOf: storePath)
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
@@ -207,6 +295,7 @@ extension SessionStore {
             let session = SessionInfo(
                 id: id,
                 hostname: hostname,
+                atemId: nil,
                 lastActivity: lastActivity,
                 token: generateToken(),
                 createdAt: lastActivity
