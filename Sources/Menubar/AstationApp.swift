@@ -1,5 +1,34 @@
 import Cocoa
 import Foundation
+import NIO
+
+struct StartupFailureAlertContent: Equatable {
+    let title: String
+    let message: String
+
+    static func make(error: Error, port: Int) -> StartupFailureAlertContent {
+        if isAddressAlreadyInUse(error) {
+            return StartupFailureAlertContent(
+                title: "Astation Could Not Start",
+                message: "Port \(port) is already in use. Another Astation instance or application may already be running.\n\nClose it, then open Astation again."
+            )
+        }
+
+        return StartupFailureAlertContent(
+            title: "Astation Could Not Start",
+            message: "The local connection server could not start on port \(port).\n\n\(error.localizedDescription)"
+        )
+    }
+
+    private static func isAddressAlreadyInUse(_ error: Error) -> Bool {
+        if let ioError = error as? IOError {
+            return ioError.errnoCode == EADDRINUSE
+        }
+
+        let nsError = error as NSError
+        return nsError.domain == NSPOSIXErrorDomain && nsError.code == Int(EADDRINUSE)
+    }
+}
 
 class AstationApp: NSObject, NSApplicationDelegate {
     var statusBarController: StatusBarController!
@@ -63,7 +92,7 @@ class AstationApp: NSObject, NSApplicationDelegate {
             Log.info("  LAN (paired):      ws://\(localIP):8080/ws")
         } catch {
             Log.error("Failed to start WebSocket server: \(error)")
-            NSApp.terminate(nil)
+            showStartupFailure(error, port: 8080)
             return
         }
 
@@ -113,6 +142,20 @@ class AstationApp: NSObject, NSApplicationDelegate {
         Log.info("Astation fully operational!")
         Log.info("Global hotkeys: Ctrl+V (PTT voice coding), Ctrl+Shift+V (video)")
         Log.info("Log file: \(Log.logFile.path)")
+    }
+
+    private func showStartupFailure(_ error: Error, port: Int) {
+        let content = StartupFailureAlertContent.make(error: error, port: port)
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = content.title
+        alert.informativeText = content.message
+        alert.addButton(withTitle: "OK")
+
+        NSApp.activate(ignoringOtherApps: true)
+        alert.window.level = .floating
+        alert.runModal()
+        NSApp.terminate(nil)
     }
 
     /// Get the local network IP address (e.g., 192.168.1.5) for LAN connections.
