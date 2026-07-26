@@ -1,5 +1,38 @@
 import Cocoa
 import Foundation
+import NIO
+
+struct StartupFailureAlertContent: Equatable {
+    let title: String
+    let message: String
+
+    static func make(error: Error, port: Int) -> StartupFailureAlertContent {
+        if isAddressAlreadyInUse(error) {
+            return StartupFailureAlertContent(
+                title: "Astation Could Not Start",
+                message: "Port \(port) is already in use. Another Astation instance or application may already be running.\n\nClose it, then open Astation again."
+            )
+        }
+
+        return StartupFailureAlertContent(
+            title: "Astation Could Not Start",
+            message: "The local connection server could not start on port \(port).\n\n\(diagnosticDescription(for: error))"
+        )
+    }
+
+    private static func isAddressAlreadyInUse(_ error: Error) -> Bool {
+        if let ioError = error as? IOError {
+            return ioError.errnoCode == EADDRINUSE
+        }
+
+        let nsError = error as NSError
+        return nsError.domain == NSPOSIXErrorDomain && nsError.code == Int(EADDRINUSE)
+    }
+
+    private static func diagnosticDescription(for error: Error) -> String {
+        (error as? IOError)?.localizedDescription ?? error.localizedDescription
+    }
+}
 
 class AstationApp: NSObject, NSApplicationDelegate {
     var statusBarController: StatusBarController!
@@ -55,15 +88,16 @@ class AstationApp: NSObject, NSApplicationDelegate {
         statusBarController = StatusBarController(hubManager: hubManager, webSocketServer: webSocketServer)
         
         // One listener supports offline loopback and authenticated LAN clients concurrently.
+        let webSocketPort = 8080
         do {
-            try webSocketServer.start(host: "0.0.0.0", port: 8080)
+            try webSocketServer.start(host: "0.0.0.0", port: webSocketPort)
             let localIP = getLocalNetworkIP() ?? "127.0.0.1"
-            Log.info("WebSocket server started on all interfaces (port 8080)")
-            Log.info("  Local (same-user): ws://127.0.0.1:8080/ws")
-            Log.info("  LAN (paired):      ws://\(localIP):8080/ws")
+            Log.info("WebSocket server started on all interfaces (port \(webSocketPort))")
+            Log.info("  Local (same-user): ws://127.0.0.1:\(webSocketPort)/ws")
+            Log.info("  LAN (paired):      ws://\(localIP):\(webSocketPort)/ws")
         } catch {
             Log.error("Failed to start WebSocket server: \(error)")
-            NSApp.terminate(nil)
+            showStartupFailure(error, port: webSocketPort)
             return
         }
 
@@ -113,6 +147,27 @@ class AstationApp: NSObject, NSApplicationDelegate {
         Log.info("Astation fully operational!")
         Log.info("Global hotkeys: Ctrl+V (PTT voice coding), Ctrl+Shift+V (video)")
         Log.info("Log file: \(Log.logFile.path)")
+    }
+
+    private func showStartupFailure(_ error: Error, port: Int) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.showStartupFailure(error, port: port)
+            }
+            return
+        }
+
+        let content = StartupFailureAlertContent.make(error: error, port: port)
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = content.title
+        alert.informativeText = content.message
+        alert.addButton(withTitle: "OK")
+
+        NSApp.activate(ignoringOtherApps: true)
+        alert.window.level = .floating
+        alert.runModal()
+        NSApp.terminate(nil)
     }
 
     /// Get the local network IP address (e.g., 192.168.1.5) for LAN connections.
