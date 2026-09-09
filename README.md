@@ -67,21 +67,29 @@ Direct LAN transport is currently plaintext WebSocket. The authentication protoc
 
 ### Android Device Sharing
 
-Build an Android app on development machine **A** and use a phone attached to the
-Mac running Astation (**B**). A must already be able to reach B, for example over
-NetBird. The phone connects to B by USB or Android wireless debugging.
+Build an Android app on your **development machine** and use a phone connected to
+the **Mac running Astation**. The development machine must be able to reach the
+Mac's selected IPv4 address and sharing port. Tailscale, NetBird, ZeroTier, other
+VPNs, and reachable local networks can provide that connection; Astation has no
+VPN-provider dependency. IPv6-only connections are not supported yet.
 
-1. Install Android SDK Platform-Tools on A and B; use matching versions.
-2. On B, open Astation's **Connections > Android Devices** tab. Astation finds ADB
+The phone connects to the Mac by USB or Android wireless debugging.
+
+1. Install Android SDK Platform-Tools on both computers. Use matching
+   Platform-Tools across different machines.
+2. On the Mac, open Astation's **Connections > Android Devices** tab. Astation finds ADB
    in common SDK/Homebrew locations, or use **Choose ADB** to select it.
 3. Connect and authorize the phone. For USB, enable USB debugging and accept the
    authorization prompt on the unlocked phone.
-4. Select **B's NetBird IPv4 address** from the interface list. Set a sharing port:
-   **5038 is only the default**; your edited port is saved.
-5. Limit the port to trusted development peers in your NetBird access policy, then
-   click **Start Sharing**. Copy the shell setup to a terminal on A.
+4. Select **this Mac's IPv4 address** on the network your development machine can
+   reach. Set a sharing port between **1024 and 65535**: **5038 is only the
+   default**; your edited port is saved.
+5. Allow only trusted development machines to reach that port through your VPN or
+   firewall rules, then click **Start Sharing**. Copy the shell setup to a terminal
+   on your development machine.
 
-For example, with B at `100.80.1.2` and a chosen sharing port of `6107`:
+For example, with the Mac at `100.80.1.2` and a chosen sharing port of `6107`, run
+these commands on your development machine:
 
 ```bash
 export ADB_SERVER_SOCKET=tcp:100.80.1.2:6107
@@ -98,18 +106,18 @@ For a single command, use `adb -H 100.80.1.2 -P 6107 devices -l`. Do not use
 `adb connect` with Astation's sharing address: it is a remote **ADB server**,
 not a phone's device-side endpoint.
 
-Astation binds only the selected IPv4 address and forwards to B's local ADB server
+Astation binds only the selected IPv4 address and forwards to the Mac's local ADB server
 at `127.0.0.1:5037`. Sharing exposes **all devices and emulators** on that server,
-including server-level ADB commands. NetBird provides peer access control and
-transport encryption; this TCP endpoint does not use Atem pairing or provide
-additional client authentication. The interface list shows local addresses and
-does not guess which VPN is NetBird.
+including server-level ADB commands. This TCP endpoint does not use Atem pairing
+or provide its own client authentication or encryption. Use a trusted network or
+a VPN that provides encryption and peer access control. The interface list shows
+assigned addresses; it does not identify VPN providers or configure their rules.
 
 **Stop Sharing** and app quit close remote connections while leaving local ADB
 running. Sharing starts off after each app launch. If the selected interface
 address disappears, sharing stops without falling back to another interface.
 An occupied sharing port produces an error; choose a different port and update
-A's command and NetBird policy. If local ADB is unavailable, use **Retry** after
+the development machine's command and relevant network rules. If local ADB is unavailable, use **Retry** after
 resolving the error. Protocol version conflicts are reported instead of silently
 restarting an existing ADB server.
 
@@ -117,16 +125,20 @@ restarting an existing ADB server.
 debugging and choose **Pair device with pairing code**. Enter that pairing
 IPv4/port and code, then separately enter the debugging IPv4/port from the main
 Wireless debugging screen. These ports may differ. For an already-paired phone,
-disable **Pair this phone first**. B must be able to reach the phone over Wi-Fi;
-A continues using B's sharing address. The device serial can change when switching
+disable **Pair this phone first**. The Mac must be able to reach the phone over
+Wi-Fi; the development machine continues using the Mac's sharing address and
+does not need a direct route to the phone. The device serial can change when switching
 from USB to wireless, so select the new serial from `adb devices -l`.
 
 Command-line APK installation, shell, file transfers, and logcat use this remote
 server arrangement directly. Full Android Studio Run/Debug support still requires
-validation with the actual A/B setup: `adb forward` listeners live on B, and
-`adb reverse` host destinations are also on B, so debugger/development-server
-connections may need additional tunnels. Real phone/NetBird validation is separate
+validation with your computers and phone: `adb forward` listeners live on the Mac
+running Astation, and `adb reverse` host destinations are also on that Mac, so
+debugger/development-server connections may need additional tunnels. Real phone/network validation is separate
 from the automated local TCP tests.
+
+See the [Android sharing guide](docs/android-device-sharing.md)
+for architecture, lifecycle behavior, and remaining hardware checks.
 
 ### Mark Task Routing
 
@@ -160,6 +172,7 @@ Messages carry only IDs, status, and descriptions -- no images or file lists flo
 | `statusUpdate` | Astation <-> Atem | Authentication challenge, proof, and connection status |
 | `heartbeat` / `pong` | Atem <-> Astation | Keep-alive |
 | `voice_toggle` | Astation -> Atem | Voice input state |
+| `agentInput` | Astation -> Atem | Text or control-key input for a selected agent |
 | `video_toggle` | Astation -> Atem | Video state |
 | `atem_instance_list` | Astation -> Atem | Broadcast connected peers |
 | `auth_request` / `auth_response` | Atem <-> Astation | Legacy browser/deep-link grant flow |
@@ -172,11 +185,23 @@ Messages carry only IDs, status, and descriptions -- no images or file lists flo
 4. An unknown device displays an eight-digit code and waits for explicit approval in Astation.
 5. Astation processes application messages and sends account credentials only after authentication succeeds.
 
+### Remote Agent Control
+
+Open **Connections > Clients & Agents**, select a connected Atem and an agent,
+and open its remote-control window to send text or control keys. Input goes to
+the selected client and agent; the agent's output remains in its Atem terminal.
+The `agentInput` payload contains `agentId`, `kind` (`text` or `key`), and the
+corresponding `text` or `key` field. Relay routing identifiers belong to the
+transport envelope. Voice continues through the existing voice-coding flow.
+
 ### Voice-Driven Coding
 
 Astation captures mic audio via AVAudioEngine, runs WebRTC VAD, streams through Agora RTC, and pushes transcriptions via Agora RTM to the active Atem instance. See `designs/data-flow-between-atem-and-astation.md` in the Atem repo.
 
 ## Architecture
+
+See the [architecture and feature guides](docs/README.md) for Android sharing,
+SSO authentication, Vault storage, and the device-authentication protocol.
 
 ```
 Sources/
@@ -188,7 +213,9 @@ Sources/
     AstationMessage.swift      # Codable message types (encode/decode)
     AstationWebSocketServer.swift  # NIO WebSocket server
     AuthGrantController.swift  # Auth request approval flow
-    CredentialManager.swift    # AES-GCM encrypted credential storage
+    SsoSessionStore.swift      # AES-GCM encrypted SSO session storage
+    SsoAuthManager.swift       # Browser login with OAuth 2.0 + PKCE
+    SsoTokenProvider.swift     # Lazy access-token refresh
     AgoraAPIClient.swift       # Agora REST API integration
     RTCManager.swift           # Agora RTC audio management
     HotkeyManager.swift        # Global hotkeys (Ctrl+V voice, Ctrl+Shift+V video)
@@ -197,8 +224,11 @@ core/
   src/astation_core.cpp    # C++ core (session management)
   src/astation_rtc.cpp     # RTC audio processing
   include/                 # C headers
-server/
-  src/main.rs              # Rust HTTP server (auth web fallback)
+relay-server/
+  src/main.rs              # Rust relay and HTTP API server
+  src/vault_routes.rs      # Vault API handlers
+  src/vault_store.rs       # Postgres/in-memory Vault storage
+  migrations/              # Postgres schema migrations
 ```
 
 ### Dependencies
@@ -209,7 +239,23 @@ server/
 
 ## Configuration
 
-Astation reads Agora credentials on first launch. Credentials are stored encrypted at `~/Library/Application Support/Astation/credentials.enc` using AES-GCM with a key derived from the machine's hardware UUID.
+Sign in through Astation's menu or Settings. The app opens a browser for OAuth
+2.0 + PKCE login and receives the callback on a local loopback listener. Its SSO
+session is stored in `~/Library/Application Support/Astation/credentials.enc`
+using AES-GCM with a key derived from the Mac's hardware UUID. Access tokens are
+refreshed when needed; project requests use the Agora BFF. Legacy manual customer
+credential files are removed during migration and require signing in again.
+
+SSO configuration resolves environment variables first, then saved UserDefaults,
+then the built-in defaults:
+
+| Setting | Default | Environment override | UserDefaults key |
+| --- | --- | --- | --- |
+| SSO URL | `https://sso2.agora.io` | `ASTATION_SSO_URL` | `AstationSsoUrl` |
+| BFF URL | `https://agora-cli.agora.io` | `ASTATION_BFF_URL` | `AstationBffUrl` |
+
+For relay deployment, Vault storage, and API configuration, see the
+[relay-server README](relay-server/README.md).
 
 ## Development
 
@@ -222,27 +268,28 @@ Use the local development script to build and run the menubar app:
 # Incrementally build Swift and launch; build the C++ core if missing.
 ./scripts/run-dev.sh
 
+# Incrementally build both components without launching.
+./scripts/run-dev.sh --build-only
+
 # Rebuild everything without launching.
 ./scripts/run-dev.sh --force-build --build-only
 ```
 
 Swift source changes are picked up on every run. Use `--force-build` after changing
-C++ code to rebuild both components. The script works from any working directory.
-Forced builds retain downloaded
-dependencies and Agora SDKs. Install CMake with `brew install cmake`, or set
+C++ code to rebuild both components. Forced builds use CMake's `--clean-first`
+and `swift package clean`, while retaining downloaded dependencies and Agora SDKs.
+The script resolves the repo root from its own location: from another directory,
+invoke it using its absolute path. Install CMake with `brew install cmake`, or set
 `CMAKE=/path/to/cmake`. Existing CMake SDK settings are preserved; optional
 `AGORA_SDK_DIR` and `AGORA_SKIP_DOWNLOAD` environment variables override them.
 Quit any existing Astation instance before launching the development build.
+Astation appears in the macOS menu bar; press Ctrl+C in the launching terminal to
+stop it. A failed build stops the script without launching an older executable.
 
 ```bash
-# Build and run core tests
-cd build && cmake .. -DBUILD_TESTING=ON && make && ctest --output-on-failure
-
-# Build Swift app
-swift build
-
-# Run
-swift run astation
+# Run these from the repo root after building both components.
+ctest --test-dir build --output-on-failure
+swift test
 ```
 
 ## Related Projects

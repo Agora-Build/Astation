@@ -8,6 +8,24 @@ Astation is a macOS menubar hub that routes tasks between Chisel (browser dev pa
 
 ## Build Commands
 
+The local development runner resolves paths relative to the repository:
+
+```bash
+./scripts/run-dev.sh                           # Incremental Swift build, then launch; build C++ if missing
+./scripts/run-dev.sh --force-build             # Clean/rebuild both C++ and Swift, then launch
+./scripts/run-dev.sh --build-only              # Incremental C++ and Swift builds without launching
+./scripts/run-dev.sh --force-build --build-only # Clean/rebuild both without launching
+```
+
+CMake is required when building the core (`brew install cmake`, or set `CMAKE`
+to its executable path). The script preserves cached SDK settings; optional
+`AGORA_SDK_DIR` and `AGORA_SKIP_DOWNLOAD` environment variables override them.
+Forced builds retain downloaded dependencies and SDKs. Use `--force-build` after
+changing C++ code. Run `ctest --test-dir build --output-on-failure` and `swift test`
+from the repository root after building.
+
+Manual build commands:
+
 ```bash
 # 1. Build C++ core library
 mkdir -p build && cd build
@@ -21,8 +39,8 @@ swift build                  # Debug build
 swift build -c release       # Release build
 swift run astation           # Run app
 
-# 3. Build Rust auth server (optional)
-cd server && cargo build
+# 3. Build Rust relay server (optional)
+cargo build --manifest-path relay-server/Cargo.toml
 ```
 
 ## Architecture
@@ -41,7 +59,9 @@ Sources/
     AstationMessage.swift          # Codable message types (encode/decode)
     AstationWebSocketServer.swift  # NIO-based WebSocket server
     AuthGrantController.swift      # Auth request approval flow
-    CredentialManager.swift        # AES-GCM encrypted credential storage
+    SsoSessionStore.swift          # AES-GCM encrypted SSO session storage
+    SsoAuthManager.swift           # Browser OAuth 2.0 + PKCE login
+    SsoTokenProvider.swift         # Lazy access-token refresh
     AgoraAPIClient.swift           # Agora REST API (projects, credentials)
     RTCManager.swift               # Agora RTC audio management
     HotkeyManager.swift            # Global hotkeys (Ctrl+V, Ctrl+Shift+V)
@@ -53,8 +73,8 @@ core/
   include/astation_core.h          # Public C header
   include/astation_rtc.h           # RTC C header
   tests/session_manager_test.cpp   # Core unit tests
-server/
-  src/main.rs                      # Rust HTTP server (auth web fallback)
+relay-server/
+  src/main.rs                      # Rust relay and HTTP API server
   src/routes.rs                    # Auth routes
   src/session_store.rs             # In-memory session storage
 third_party/
@@ -62,6 +82,18 @@ third_party/
 ```
 
 ### Key Components
+
+**Android Device Sharing** (`AndroidDeviceManager.swift`, `AndroidSharingServer.swift`,
+`AndroidDevicesView.swift`): The Connections window includes an Android Devices tab.
+The manager discovers the local ADB executable, polls devices, handles wireless
+pairing, and owns sharing configuration. The NIO proxy forwards a selected local
+IPv4 address/configurable port (default 5038) to `127.0.0.1:5037`. Remote development
+machines use `adb -H <mac-ip> -P <sharing-port>` or `ADB_SERVER_SOCKET`; `adb connect`
+is used only for the Mac-to-phone wireless connection. Access applies to the whole
+local ADB server. The listener uses network/VPN access controls, independently of
+Atem pairing. Sharing stops on address loss or app quit and starts off after
+relaunch. Keep UI/docs network-neutral and refer to "this Mac" and "your development
+machine". See `docs/android-device-sharing.md` for validation limits.
 
 **AstationHubManager** (`AstationHubManager.swift`): Central business logic:
 - `connectedClients: [ConnectedClient]` - tracked Atem connections
@@ -97,9 +129,12 @@ Message types:
 - `broadcastMessage(_:)` - send to all
 - Listens on configurable host/port (default: 0.0.0.0:8080)
 
-**CredentialManager** (`CredentialManager.swift`):
+**SSO session management** (`SsoSessionStore.swift`, `SsoAuthManager.swift`, `SsoTokenProvider.swift`):
+- Browser OAuth 2.0 + PKCE login with a loopback callback
 - AES-GCM encryption using key derived via HKDF from hardware UUID
 - Stores at `~/Library/Application Support/Astation/credentials.enc`
+- Lazy access-token refresh; `SsoConfig` resolves SSO/BFF URLs from environment,
+  UserDefaults, then defaults. See README for configuration keys.
 
 ### Dependencies
 
