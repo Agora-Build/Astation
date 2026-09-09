@@ -6,18 +6,22 @@ import SwiftUI
 class ConnectionsWindowController: NSWindowController {
     private var remoteControlWindowController: RemoteControlWindowController?
 
-    convenience init(hubManager: AstationHubManager) {
+    convenience init(hubManager: AstationHubManager, androidDeviceManager: AndroidDeviceManager) {
         let remoteControl = RemoteControlWindowController(hubManager: hubManager)
-        let content = ConnectionsView(
+        let clients = ConnectionsView(
             hubManager: hubManager,
             onRemoteControl: { clientId, agent in
                 remoteControl.showWindow(clientId: clientId, agent: agent)
             }
         )
+        let content = TabView {
+            clients.tabItem { Text("Clients & Agents") }
+            AndroidDevicesView(manager: androidDeviceManager).tabItem { Text("Android Devices") }
+        }
         let host = NSHostingController(rootView: content)
 
         let window = NSWindow(contentViewController: host)
-        window.title = "Clients & Agents"
+        window.title = "Connections"
         window.styleMask = [.titled, .closable, .resizable, .miniaturizable]
         window.setContentSize(NSSize(width: 720, height: 480))
         window.minSize = NSSize(width: 620, height: 360)

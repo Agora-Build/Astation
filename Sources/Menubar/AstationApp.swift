@@ -40,6 +40,7 @@ class AstationApp: NSObject, NSApplicationDelegate {
     var hubManager: AstationHubManager!
     private var authGrantController: AuthGrantController?
     private var hotkeyManager: HotkeyManager?
+    private var androidDeviceManager: AndroidDeviceManager?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.info("Initializing Astation components...")
@@ -85,7 +86,9 @@ class AstationApp: NSObject, NSApplicationDelegate {
         )
         
         // Initialize status bar
-        statusBarController = StatusBarController(hubManager: hubManager, webSocketServer: webSocketServer)
+        let androidDevices = AndroidDeviceManager()
+        androidDeviceManager = androidDevices
+        statusBarController = StatusBarController(hubManager: hubManager, webSocketServer: webSocketServer, androidDeviceManager: androidDevices)
         
         // One listener supports offline loopback and authenticated LAN clients concurrently.
         let webSocketPort = 8080
@@ -213,6 +216,7 @@ class AstationApp: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         Log.info("Shutting down Astation...")
         hotkeyManager?.unregisterAll()
+        androidDeviceManager?.shutdown()
         webSocketServer?.stop()
         Log.info("Astation terminated")
     }

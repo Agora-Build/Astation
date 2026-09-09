@@ -65,6 +65,69 @@ Loopback is identified from the socket peer address, not from a client-supplied 
 
 Direct LAN transport is currently plaintext WebSocket. The authentication protocol prevents session-ID-only impersonation, but LAN deployment is not production-ready until WSS certificate pinning is implemented. See [`docs/specs/2026-07-21-device-authentication-v2.md`](docs/specs/2026-07-21-device-authentication-v2.md).
 
+### Android Device Sharing
+
+Build an Android app on development machine **A** and use a phone attached to the
+Mac running Astation (**B**). A must already be able to reach B, for example over
+NetBird. The phone connects to B by USB or Android wireless debugging.
+
+1. Install Android SDK Platform-Tools on A and B; use matching versions.
+2. On B, open Astation's **Connections > Android Devices** tab. Astation finds ADB
+   in common SDK/Homebrew locations, or use **Choose ADB** to select it.
+3. Connect and authorize the phone. For USB, enable USB debugging and accept the
+   authorization prompt on the unlocked phone.
+4. Select **B's NetBird IPv4 address** from the interface list. Set a sharing port:
+   **5038 is only the default**; your edited port is saved.
+5. Limit the port to trusted development peers in your NetBird access policy, then
+   click **Start Sharing**. Copy the shell setup to a terminal on A.
+
+For example, with B at `100.80.1.2` and a chosen sharing port of `6107`:
+
+```bash
+export ADB_SERVER_SOCKET=tcp:100.80.1.2:6107
+adb devices -l
+adb -s <device-serial> install -r ./app-debug.apk
+adb -s <device-serial> shell am start -n <package>/<activity>
+adb -s <device-serial> logcat
+
+# Return this terminal to its default local ADB server.
+unset ADB_SERVER_SOCKET
+```
+
+For a single command, use `adb -H 100.80.1.2 -P 6107 devices -l`. Do not use
+`adb connect` with Astation's sharing address: it is a remote **ADB server**,
+not a phone's device-side endpoint.
+
+Astation binds only the selected IPv4 address and forwards to B's local ADB server
+at `127.0.0.1:5037`. Sharing exposes **all devices and emulators** on that server,
+including server-level ADB commands. NetBird provides peer access control and
+transport encryption; this TCP endpoint does not use Atem pairing or provide
+additional client authentication. The interface list shows local addresses and
+does not guess which VPN is NetBird.
+
+**Stop Sharing** and app quit close remote connections while leaving local ADB
+running. Sharing starts off after each app launch. If the selected interface
+address disappears, sharing stops without falling back to another interface.
+An occupied sharing port produces an error; choose a different port and update
+A's command and NetBird policy. If local ADB is unavailable, use **Retry** after
+resolving the error. Protocol version conflicts are reported instead of silently
+restarting an existing ADB server.
+
+**Wireless:** choose **Connect Wireless Phone**. On Android 11+, open Wireless
+debugging and choose **Pair device with pairing code**. Enter that pairing
+IPv4/port and code, then separately enter the debugging IPv4/port from the main
+Wireless debugging screen. These ports may differ. For an already-paired phone,
+disable **Pair this phone first**. B must be able to reach the phone over Wi-Fi;
+A continues using B's sharing address. The device serial can change when switching
+from USB to wireless, so select the new serial from `adb devices -l`.
+
+Command-line APK installation, shell, file transfers, and logcat use this remote
+server arrangement directly. Full Android Studio Run/Debug support still requires
+validation with the actual A/B setup: `adb forward` listeners live on B, and
+`adb reverse` host destinations are also on B, so debugger/development-server
+connections may need additional tunnels. Real phone/NetBird validation is separate
+from the automated local TCP tests.
+
 ### Mark Task Routing
 
 When a user draws annotations in [Chisel](https://github.com/Agora-Build/chisel) and clicks "Ask Agent to Work on It":
@@ -149,6 +212,27 @@ server/
 Astation reads Agora credentials on first launch. Credentials are stored encrypted at `~/Library/Application Support/Astation/credentials.enc` using AES-GCM with a key derived from the machine's hardware UUID.
 
 ## Development
+
+Use the local development script to build and run the menubar app:
+
+```bash
+# Rebuild all C++ and Swift build products, then launch.
+./scripts/run-dev.sh --force-build
+
+# Incrementally build Swift and launch; build the C++ core if missing.
+./scripts/run-dev.sh
+
+# Rebuild everything without launching.
+./scripts/run-dev.sh --force-build --build-only
+```
+
+Swift source changes are picked up on every run. Use `--force-build` after changing
+C++ code to rebuild both components. The script works from any working directory.
+Forced builds retain downloaded
+dependencies and Agora SDKs. Install CMake with `brew install cmake`, or set
+`CMAKE=/path/to/cmake`. Existing CMake SDK settings are preserved; optional
+`AGORA_SDK_DIR` and `AGORA_SKIP_DOWNLOAD` environment variables override them.
+Quit any existing Astation instance before launching the development build.
 
 ```bash
 # Build and run core tests

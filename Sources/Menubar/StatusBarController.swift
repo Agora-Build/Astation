@@ -5,19 +5,21 @@ class StatusBarController: NSObject, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let hubManager: AstationHubManager
     private let webSocketServer: AstationWebSocketServer
+    private let androidDeviceManager: AndroidDeviceManager
     private var statusMenu: NSMenu!
     private lazy var settingsWindowController = SettingsWindowController(hubManager: hubManager)
     private lazy var devConsoleController = DevConsoleController(hubManager: hubManager)
     private lazy var projectsWindowController = ProjectsWindowController(hubManager: hubManager)
     private lazy var joinChannelWindowController = JoinChannelWindowController(hubManager: hubManager)
-    private lazy var connectionsWindowController = ConnectionsWindowController(hubManager: hubManager)
+    private lazy var connectionsWindowController = ConnectionsWindowController(hubManager: hubManager, androidDeviceManager: androidDeviceManager)
     var hotkeyManager: HotkeyManager?
     private var headerTapCount = 0
     private var lastHeaderTapTime: Date?
 
-    init(hubManager: AstationHubManager, webSocketServer: AstationWebSocketServer) {
+    init(hubManager: AstationHubManager, webSocketServer: AstationWebSocketServer, androidDeviceManager: AndroidDeviceManager) {
         self.hubManager = hubManager
         self.webSocketServer = webSocketServer
+        self.androidDeviceManager = androidDeviceManager
         super.init()
         setupStatusBar()
     }
@@ -378,8 +380,8 @@ class StatusBarController: NSObject, NSMenuDelegate {
         // Show Clients & Agents
         let onlineCount = hubManager.connectedClients.filter { $0.clientType == "Atem" }.count
         let clientsTitle = onlineCount > 0
-            ? "🔌 Clients & Agents (\(onlineCount) online)"
-            : "🔌 Clients & Agents"
+            ? "🔌 Connections (\(onlineCount) Atem online)"
+            : "🔌 Connections"
         let showClientsItem = NSMenuItem(
             title: clientsTitle,
             action: #selector(showClientsAndAgents),
