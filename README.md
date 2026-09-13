@@ -140,6 +140,26 @@ from the automated local TCP tests.
 See the [Android sharing guide](docs/android-device-sharing.md)
 for architecture, lifecycle behavior, and remaining hardware checks.
 
+### Keyboard Shortcuts
+
+Open **Settings > Keyboard Shortcuts** to bind keys for push-to-talk voice and
+video sharing. Click a binding, press a combination, and release the key to save.
+Use Control, Option, or Command with a key, or a function key (F1-F20). Press
+Escape or click **Cancel Recording** to cancel. Shortcuts pause during recording
+and resume when you finish, switch tabs, close settings, or switch windows.
+
+Bindings apply immediately and persist across launches. **Clear** removes a
+binding; **Restore Defaults** restores **Ctrl+V** for voice and **Ctrl+Shift+V**
+for video. Hold the voice shortcut to speak and release it to send; the video
+shortcut toggles sharing. The menu displays your current bindings.
+
+Astation rejects duplicate bindings, conflicts with its menu commands, enabled
+macOS keyboard shortcuts, and combinations already registered by another app.
+An unsuccessful change keeps your previous bindings. **Check Conflicts** rechecks
+saved bindings and retries unavailable shortcuts after you free them elsewhere.
+Other apps' local menu shortcuts and shortcuts intercepted by keyboard-remapping
+tools cannot all be detected.
+
 ### Mark Task Routing
 
 When a user draws annotations in [Chisel](https://github.com/Agora-Build/chisel) and clicks "Ask Agent to Work on It":
@@ -218,7 +238,7 @@ Sources/
     SsoTokenProvider.swift     # Lazy access-token refresh
     AgoraAPIClient.swift       # Agora REST API integration
     RTCManager.swift           # Agora RTC audio management
-    HotkeyManager.swift        # Global hotkeys (Ctrl+V voice, Ctrl+Shift+V video)
+    HotkeyManager.swift        # Configurable global voice/video shortcuts
     StatusBarController.swift  # macOS menubar UI
 core/
   src/astation_core.cpp    # C++ core (session management)

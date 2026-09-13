@@ -1,7 +1,7 @@
 import Cocoa
 import Foundation
 
-class SettingsWindowController: NSObject, NSWindowDelegate {
+class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate {
     static let astationRelayUrlKey = "AstationRelayUrl"
 
     static let defaultStationURL = "https://station.agora.build"
@@ -18,6 +18,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
 
     private var window: NSWindow?
     private let hubManager: AstationHubManager
+    private let shortcutsController: KeyboardShortcutsViewController
     private var statusLabel: NSTextField!
     private var signInButton: NSButton!
     private var signOutButton: NSButton!
@@ -26,8 +27,9 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
     private var serverStatusLabel: NSTextField!
     private var serverInfoLabel: NSTextField!
 
-    init(hubManager: AstationHubManager) {
+    init(hubManager: AstationHubManager, hotkeyManager: HotkeyManager) {
         self.hubManager = hubManager
+        self.shortcutsController = KeyboardShortcutsViewController(manager: hotkeyManager)
         super.init()
         NotificationCenter.default.addObserver(
             self, selector: #selector(networkChanged),
@@ -43,13 +45,14 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
 
     func showWindow() {
         if let existingWindow = window {
+            shortcutsController.refresh()
             existingWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
         }
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 450, height: 440),
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 640),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -59,8 +62,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
         window.delegate = self
         window.isReleasedWhenClosed = false
 
-        let contentView = NSView(frame: window.contentView!.bounds)
-        contentView.autoresizingMask = [.width, .height]
+        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 450, height: 440))
 
         // === Server Info Section ===
         let serverTitle = NSTextField(labelWithString: "Server Info")
@@ -144,7 +146,27 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
 
         renderAccountState()
 
-        window.contentView = contentView
+        let tabs = NSTabView(frame: window.contentView!.bounds.insetBy(dx: 12, dy: 12))
+        tabs.autoresizingMask = [.width, .height]
+        tabs.delegate = self
+        let general = NSTabViewItem(identifier: "general")
+        general.label = "General"
+        let generalContainer = NSView()
+        generalContainer.addSubview(contentView)
+        contentView.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            contentView.widthAnchor.constraint(equalToConstant: 450),
+            contentView.heightAnchor.constraint(equalToConstant: 440),
+            contentView.centerXAnchor.constraint(equalTo: generalContainer.centerXAnchor),
+            contentView.topAnchor.constraint(equalTo: generalContainer.topAnchor, constant: 16)
+        ])
+        general.view = generalContainer
+        tabs.addTabViewItem(general)
+        let shortcuts = NSTabViewItem(identifier: "shortcuts")
+        shortcuts.label = "Keyboard Shortcuts"
+        shortcuts.viewController = shortcutsController
+        tabs.addTabViewItem(shortcuts)
+        window.contentView?.addSubview(tabs)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
@@ -152,6 +174,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     private func renderAccountState() {
+        guard identityLabel != nil else { return }
         if let session = hubManager.currentSession() {
             let id = session.loginId ?? "—"
             identityLabel.stringValue = "Signed in as: \(id)"
@@ -205,6 +228,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     private func updateServerStatus() {
+        guard serverInfoLabel != nil else { return }
         let localIP = getLocalNetworkIP() ?? "127.0.0.1"
         serverInfoLabel.stringValue = "WebSocket:\n• Local: ws://127.0.0.1:8080/ws\n• LAN: ws://\(localIP):8080/ws\n• VPN: ws://<vpn-ip>:8080/ws"
         serverStatusLabel.stringValue = ""
@@ -277,7 +301,13 @@ class SettingsWindowController: NSObject, NSWindowDelegate {
     // MARK: - NSWindowDelegate
 
     func windowWillClose(_ notification: Notification) {
+        shortcutsController.cancelRecording()
         window = nil
+    }
+
+    func tabView(_ tabView: NSTabView, willSelect tabViewItem: NSTabViewItem?) {
+        shortcutsController.cancelRecording()
+        shortcutsController.refresh()
     }
 }
 

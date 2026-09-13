@@ -88,7 +88,10 @@ class AstationApp: NSObject, NSApplicationDelegate {
         // Initialize status bar
         let androidDevices = AndroidDeviceManager()
         androidDeviceManager = androidDevices
-        statusBarController = StatusBarController(hubManager: hubManager, webSocketServer: webSocketServer, androidDeviceManager: androidDevices)
+        let shortcuts = HotkeyManager()
+        hotkeyManager = shortcuts
+        statusBarController = StatusBarController(hubManager: hubManager, webSocketServer: webSocketServer,
+                                                androidDeviceManager: androidDevices, hotkeyManager: shortcuts)
         
         // One listener supports offline loopback and authenticated LAN clients concurrently.
         let webSocketPort = 8080
@@ -120,8 +123,7 @@ class AstationApp: NSObject, NSApplicationDelegate {
         // Start network monitoring to detect IP changes
         NetworkMonitor.shared.startMonitoring()
 
-        // Initialize global hotkeys (Ctrl+V PTT, Ctrl+Shift+V video)
-        hotkeyManager = HotkeyManager()
+        // Connect the saved global shortcuts to voice and video actions.
         hotkeyManager?.onVoiceKeyDown = { [weak self] in
             let vcm = self?.hubManager.voiceCodingManager
             if vcm?.mode == .off {
@@ -141,14 +143,13 @@ class AstationApp: NSObject, NSApplicationDelegate {
             self?.statusBarController.showStatus()
         }
         hotkeyManager?.registerHotkeys()
-        statusBarController.hotkeyManager = hotkeyManager
 
         // Connect to relay using this Astation's identity, so Atem TUI can auto-reconnect
         // after the first `atem pair` without needing to pair again.
         hubManager.startIdentityRelay()
 
         Log.info("Astation fully operational!")
-        Log.info("Global hotkeys: Ctrl+V (PTT voice coding), Ctrl+Shift+V (video)")
+        Log.info("Global hotkeys: \(shortcuts.shortcutLabel(for: .voice)) (PTT voice coding), \(shortcuts.shortcutLabel(for: .video)) (video)")
         Log.info("Log file: \(Log.logFile.path)")
     }
 

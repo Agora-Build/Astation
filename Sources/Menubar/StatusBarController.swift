@@ -7,21 +7,33 @@ class StatusBarController: NSObject, NSMenuDelegate {
     private let webSocketServer: AstationWebSocketServer
     private let androidDeviceManager: AndroidDeviceManager
     private var statusMenu: NSMenu!
-    private lazy var settingsWindowController = SettingsWindowController(hubManager: hubManager)
+    private lazy var settingsWindowController = SettingsWindowController(hubManager: hubManager, hotkeyManager: hotkeyManager)
     private lazy var devConsoleController = DevConsoleController(hubManager: hubManager)
     private lazy var projectsWindowController = ProjectsWindowController(hubManager: hubManager)
     private lazy var joinChannelWindowController = JoinChannelWindowController(hubManager: hubManager)
     private lazy var connectionsWindowController = ConnectionsWindowController(hubManager: hubManager, androidDeviceManager: androidDeviceManager)
-    var hotkeyManager: HotkeyManager?
+    let hotkeyManager: HotkeyManager
     private var headerTapCount = 0
     private var lastHeaderTapTime: Date?
 
-    init(hubManager: AstationHubManager, webSocketServer: AstationWebSocketServer, androidDeviceManager: AndroidDeviceManager) {
+    init(hubManager: AstationHubManager, webSocketServer: AstationWebSocketServer, androidDeviceManager: AndroidDeviceManager,
+         hotkeyManager: HotkeyManager) {
         self.hubManager = hubManager
         self.webSocketServer = webSocketServer
         self.androidDeviceManager = androidDeviceManager
+        self.hotkeyManager = hotkeyManager
         super.init()
         setupStatusBar()
+        hotkeyManager.additionalMenus = { [weak self] in
+            guard let menu = self?.statusMenu else { return [] }
+            // Reserve contextual commands even while their menu items are hidden.
+            let contextual = NSMenu()
+            for (title, key) in [("Join Channel", "j"), ("Leave Channel", "l"),
+                                 ("Toggle Mic", "m"), ("Create Share Link", "s")] {
+                contextual.addItem(withTitle: title, action: nil, keyEquivalent: key)
+            }
+            return [menu, contextual]
+        }
     }
     
     private func setupStatusBar() {
@@ -109,7 +121,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
         switch vcm.mode {
         case .off:
             let voiceOffItem = NSMenuItem(
-                title: "Voice (Ctrl+V): Off",
+                title: "Voice (\(hotkeyManager.shortcutLabel(for: .voice))): Off",
                 action: nil,
                 keyEquivalent: ""
             )
@@ -117,8 +129,8 @@ class StatusBarController: NSObject, NSMenuDelegate {
             voiceOffItem.isEnabled = false
             statusMenu.addItem(voiceOffItem)
 
-            if hotkeyManager?.voiceHotkeyFailed == true {
-                let warn = NSMenuItem(title: "  ⚠ Ctrl+V hotkey unavailable (conflict)", action: nil, keyEquivalent: "")
+            if hotkeyManager.voiceHotkeyFailed {
+                let warn = NSMenuItem(title: "  ⚠ \(hotkeyManager.shortcutLabel(for: .voice)) unavailable - check Settings", action: nil, keyEquivalent: "")
                 warn.isEnabled = false
                 statusMenu.addItem(warn)
             }
@@ -165,7 +177,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
         let videoState = hubManager.videoActive ? "Sharing" : "Off"
         let videoIcon = hubManager.videoActive ? "video.fill" : "video.slash"
         let videoItem = NSMenuItem(
-            title: "Video (Ctrl+Shift+V): \(videoState)",
+            title: "Video (\(hotkeyManager.shortcutLabel(for: .video))): \(videoState)",
             action: #selector(toggleVideoHotkey),
             keyEquivalent: ""
         )
@@ -173,8 +185,8 @@ class StatusBarController: NSObject, NSMenuDelegate {
         videoItem.target = self
         statusMenu.addItem(videoItem)
 
-        if hotkeyManager?.videoHotkeyFailed == true {
-            let warn = NSMenuItem(title: "  ⚠ Ctrl+Shift+V hotkey unavailable (conflict)", action: nil, keyEquivalent: "")
+        if hotkeyManager.videoHotkeyFailed {
+            let warn = NSMenuItem(title: "  ⚠ \(hotkeyManager.shortcutLabel(for: .video)) unavailable - check Settings", action: nil, keyEquivalent: "")
             warn.isEnabled = false
             statusMenu.addItem(warn)
         }
