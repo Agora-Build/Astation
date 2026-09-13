@@ -9,10 +9,11 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     /// Returns the persisted Station relay URL.
     /// Env var ASTATION_RELAY_URL takes priority over UserDefaults.
     static var currentAstationRelayUrl: String {
-        if let envUrl = ProcessInfo.processInfo.environment["ASTATION_RELAY_URL"], !envUrl.isEmpty {
-            return envUrl
+        if let envUrl = ProcessInfo.processInfo.environment["ASTATION_RELAY_URL"] {
+            let normalized = StationRelayURL.normalizedBase(envUrl)
+            if !normalized.isEmpty { return normalized }
         }
-        let saved = UserDefaults.standard.string(forKey: astationRelayUrlKey) ?? ""
+        let saved = StationRelayURL.normalizedBase(UserDefaults.standard.string(forKey: astationRelayUrlKey) ?? "")
         return saved.isEmpty ? defaultStationURL : saved
     }
 
@@ -294,7 +295,8 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     }
 
     @objc private func saveServerInfo() {
-        let stationUrl = stationUrlField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stationUrl = StationRelayURL.normalizedBase(stationUrlField.stringValue)
+        stationUrlField.stringValue = stationUrl
 
         UserDefaults.standard.set(stationUrl, forKey: SettingsWindowController.astationRelayUrlKey)
 

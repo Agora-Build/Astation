@@ -14,24 +14,27 @@ for (const path of ['/', '/health']) {
   console.log(`${path}: HTTP ${response.status}`);
 }
 
-const url = new URL('/ws', origin);
-url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-url.searchParams.set('role', 'astation');
-url.searchParams.set('code', `astation-${randomUUID()}`);
-await new Promise((resolve, reject) => {
-  const socket = new WebSocket(url);
-  const timer = setTimeout(() => {
-    reject(new Error('Identity WebSocket connection timed out'));
-    socket.close();
-  }, 15_000);
-  socket.addEventListener('open', () => {
-    clearTimeout(timer);
-    console.log('Identity WebSocket: connected');
-    socket.close();
-    resolve();
-  }, { once: true });
-  socket.addEventListener('error', () => {
-    clearTimeout(timer);
-    reject(new Error('Identity WebSocket connection failed'));
-  }, { once: true });
-});
+for (const path of ['/ws', '//ws']) {
+  const url = new URL(origin);
+  url.pathname = path;
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  url.searchParams.set('role', 'astation');
+  url.searchParams.set('code', `astation-${randomUUID()}`);
+  await new Promise((resolve, reject) => {
+    const socket = new WebSocket(url);
+    const timer = setTimeout(() => {
+      reject(new Error('Identity WebSocket connection timed out'));
+      socket.close();
+    }, 15_000);
+    socket.addEventListener('open', () => {
+      clearTimeout(timer);
+      console.log(`Identity WebSocket ${path}: connected`);
+      socket.close();
+      resolve();
+    }, { once: true });
+    socket.addEventListener('error', () => {
+      clearTimeout(timer);
+      reject(new Error('Identity WebSocket connection failed'));
+    }, { once: true });
+  });
+}

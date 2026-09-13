@@ -46,7 +46,7 @@ class AstationHubManager: ObservableObject {
 
     /// Station relay URL. Priority: test override > ASTATION_RELAY_URL env var > UserDefaults > default.
     var stationRelayUrl: String {
-        _testRelayUrlOverride ?? SettingsWindowController.currentAstationRelayUrl
+        StationRelayURL.normalizedBase(_testRelayUrlOverride ?? SettingsWindowController.currentAstationRelayUrl)
     }
 
     /// Callback for broadcasting messages to all connected Atem clients.
@@ -1032,21 +1032,12 @@ class AstationHubManager: ObservableObject {
 
     /// Connect to a remote Atem via the relay service using a pairing code.
     func connectToRelay(code: String) {
-        let wsScheme: String
-        if stationRelayUrl.hasPrefix("https://") {
-            wsScheme = stationRelayUrl.replacingOccurrences(of: "https://", with: "wss://")
-        } else {
-            wsScheme = stationRelayUrl.replacingOccurrences(of: "http://", with: "ws://")
-        }
-        let wsUrl = "\(wsScheme)/ws?role=astation&code=\(code)"
-
-        Log.info("[AstationHub] Connecting to relay: \(wsUrl)")
-
         // Open a WebSocket to the relay and bridge messages
-        guard let url = URL(string: wsUrl) else {
-            Log.info("[AstationHub] Invalid relay URL: \(wsUrl)")
+        guard let url = StationRelayURL.webSocketURL(base: stationRelayUrl, code: code) else {
+            Log.info("[AstationHub] Invalid relay URL: \(stationRelayUrl)")
             return
         }
+        Log.info("[AstationHub] Connecting to relay: \(url.absoluteString)")
 
         let task = URLSession.shared.webSocketTask(with: url)
         task.resume()
@@ -1135,16 +1126,8 @@ class AstationHubManager: ObservableObject {
         startIdentityRelayMonitorIfNeeded()
 
         let identityCode = AstationIdentity.shared.id
-        let wsScheme: String
-        if stationRelayUrl.hasPrefix("https://") {
-            wsScheme = stationRelayUrl.replacingOccurrences(of: "https://", with: "wss://")
-        } else {
-            wsScheme = stationRelayUrl.replacingOccurrences(of: "http://", with: "ws://")
-        }
-        let wsUrl = "\(wsScheme)/ws?role=astation&code=\(identityCode)"
-
-        guard let url = URL(string: wsUrl) else {
-            Log.error("[AstationHub] Invalid identity relay URL: \(wsUrl)")
+        guard let url = StationRelayURL.webSocketURL(base: stationRelayUrl, code: identityCode) else {
+            Log.error("[AstationHub] Invalid identity relay URL: \(stationRelayUrl)")
             identityRelayActive = false
             return
         }
@@ -1193,7 +1176,7 @@ class AstationHubManager: ObservableObject {
             }
         }
 
-        Log.info("[AstationHub] Identity relay connecting: \(wsUrl)")
+        Log.info("[AstationHub] Identity relay connecting: \(url.absoluteString)")
         readIdentityRelayMessages(task: task)
     }
 
