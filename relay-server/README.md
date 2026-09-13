@@ -34,21 +34,16 @@ cp .env.example .env
 docker compose up -d
 ```
 
-### Staging (Coolify)
-```bash
-# Coolify UI:
-# 1. New Docker Compose service
-# 2. GitHub: Agora-Build/Astation, path: relay-server
-# 3. Environment:
-#    CORS_ORIGIN=https://station-staging.agora.build
-#    PUBLIC_BASE_URL=https://station-staging.agora.build
-# 4. Domain: station-staging.agora.build
-# 5. Deploy
-```
+### Production (Coolify on Volumetric)
+
+Every push to `main` builds the relay and webapp `:main` images, deploys both
+through Coolify, and verifies public HTTPS and the identity WebSocket. See the
+[production deployment guide](../DEPLOY.md#station-on-volumetric-coolify) for
+application IDs, GitHub secrets, runtime configuration, and Cloudflare routing.
 
 **URLs:**
 - Production: `https://station.agora.build`
-- Staging: `https://station-staging.agora.build`
+- Legacy staging alias: `https://station-staging.agora.build` (same deployment)
 - Dev: `http://localhost:3000`
 
 ---

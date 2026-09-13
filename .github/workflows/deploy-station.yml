@@ -1,0 +1,78 @@
+name: Deploy Station
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# Keep image publication and both Coolify deployments in the same serial run.
+concurrency:
+  group: station-production
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    name: Build ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - context: relay-server
+            image: station-relay-server
+          - context: webapp
+            image: station-webapp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image metadata
+        id: meta
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: echo "owner=${OWNER,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ steps.meta.outputs.owner }}/${{ matrix.image }}:main
+            ghcr.io/${{ steps.meta.outputs.owner }}/${{ matrix.image }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  deploy:
+    name: Deploy and verify production
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Deploy relay and wait for Coolify
+        env:
+          COOLIFY_WEBHOOK_URL: ${{ secrets.COOLIFY_RELAY_SERVER_WEBHOOK_URL }}
+          COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
+        run: node .github/scripts/deploy-coolify.mjs
+      - name: Deploy webapp and wait for Coolify
+        env:
+          COOLIFY_WEBHOOK_URL: ${{ secrets.COOLIFY_WEBAPP_WEBHOOK_URL }}
+          COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
+        run: node .github/scripts/deploy-coolify.mjs
+      - name: Verify public HTTPS and identity WebSocket
+        run: node .github/scripts/verify-station.mjs

@@ -298,52 +298,6 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  deploy-relay-server:
-    name: Deploy Relay Server to Coolify
-    needs: build-server-docker
-    if: needs.build-server-docker.result == 'success'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger Coolify deployment
-        run: |
-          set -euo pipefail
-          body_file=$(mktemp)
-          status_code=$(curl -sS -o "$body_file" -w "%{http_code}" -X POST "${{ secrets.COOLIFY_RELAY_SERVER_WEBHOOK_URL }}" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "tag": "${{ github.ref_name }}",
-              "service": "station-relay-server"
-            }')
-          echo "Coolify relay deploy webhook HTTP status: $status_code"
-          if [[ "$status_code" -lt 200 || "$status_code" -ge 300 ]]; then
-            echo "Relay deployment webhook failed"
-            cat "$body_file"
-            exit 1
-          fi
-
-  deploy-webapp:
-    name: Deploy Web App to Coolify
-    needs: build-webapp-docker
-    if: needs.build-webapp-docker.result == 'success'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger Coolify deployment
-        run: |
-          set -euo pipefail
-          body_file=$(mktemp)
-          status_code=$(curl -sS -o "$body_file" -w "%{http_code}" -X POST "${{ secrets.COOLIFY_WEBAPP_WEBHOOK_URL }}" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "tag": "${{ github.ref_name }}",
-              "service": "station-webapp"
-            }')
-          echo "Coolify webapp deploy webhook HTTP status: $status_code"
-          if [[ "$status_code" -lt 200 || "$status_code" -ge 300 ]]; then
-            echo "Webapp deployment webhook failed"
-            cat "$body_file"
-            exit 1
-          fi
-
   release:
     name: Create GitHub Release
     needs: [build-app, check-server-changes, check-webapp-changes]

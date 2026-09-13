@@ -24,6 +24,62 @@ This triggers `.github/workflows/release.yml` which:
 
 ## Production Deployment
 
+### Station on Volumetric (Coolify)
+
+Every push to `main` runs `.github/workflows/deploy-station.yml`. It builds both
+Linux AMD64 images, publishes `:main` and `:sha-<commit>` tags to GHCR, deploys
+the relay followed by the webapp, and waits for each Coolify deployment to finish.
+The final check requires public HTTPS, `/health`, and an identity WebSocket
+connection to `wss://station.agora.build/ws` to succeed. The workflow can also
+be run manually on `main` from GitHub Actions.
+
+Release tags continue to publish versioned and `:latest` images and the macOS
+installer. They do not deploy production; Coolify tracks `:main` so publishing
+an older release tag cannot roll production back.
+
+The existing Coolify applications on Volumetric are:
+
+| Application | Coolify UUID | Image | Host port |
+| --- | --- | --- | --- |
+| Relay | `oss4444o8ss40ckgwc40og4c` | `ghcr.io/agora-build/station-relay-server:main` | `3000` |
+| Webapp | `c0wwgk4c0owk0w4gsww4k0ss` | `ghcr.io/agora-build/station-webapp:main` | `3010` |
+
+Required GitHub Actions secrets:
+
+- `COOLIFY_API_TOKEN`: Coolify token with `deploy` and `read` permissions.
+- `COOLIFY_RELAY_SERVER_WEBHOOK_URL`: `https://smt.agora.build/api/v1/deploy?uuid=oss4444o8ss40ckgwc40og4c&force=false`.
+- `COOLIFY_WEBAPP_WEBHOOK_URL`: `https://smt.agora.build/api/v1/deploy?uuid=c0wwgk4c0owk0w4gsww4k0ss&force=false`.
+
+Runtime configuration:
+
+- Relay: `PUBLIC_BASE_URL=https://station.agora.build`,
+  `CORS_ORIGIN=https://station.agora.build`, `PORT=3000`, and the existing
+  PostgreSQL `DATABASE_URL`. Keep its `station-relay-server` network alias.
+- Webapp: `STATION_RELAY_UPSTREAM=station-relay-server:3000`. Both containers
+  must use the `coolify` Docker network. nginx uses Docker DNS to refresh the
+  relay address when Coolify replaces its container.
+- Cloudflare: publish `station.agora.build` on the existing Volumetric tunnel
+  with origin `http://10.0.0.1:3010` and a proxied CNAME to that tunnel's
+  `<tunnel-id>.cfargotunnel.com`. TLS terminates at Cloudflare; the tunnel
+  forwards `/`, `/health`, `/api/*`, and `/ws` to the webapp. `localhost` inside
+  the cloudflared container refers to that container, not Volumetric.
+
+Verification:
+
+```bash
+# Node.js 22 or newer; checks HTTPS, relay health, and WebSocket upgrade.
+node .github/scripts/verify-station.mjs
+
+# Inspect deployment history in GitHub Actions.
+gh run list --workflow deploy-station.yml
+```
+
+If DNS returns `NXDOMAIN`, restore the Cloudflare hostname and DNS record.
+If `/health` returns `502` while `http://127.0.0.1:3000/health` works on
+Volumetric, check the webapp's relay upstream and Docker DNS resolution.
+A successful deployment webhook only means the deployment was queued; the
+workflow also checks the final deployment status and public endpoints.
+
 ### Option 1: Docker Compose (Recommended)
 
 Create `docker-compose.yml`:

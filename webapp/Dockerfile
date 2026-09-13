@@ -1,4 +1,4 @@
-FROM nginx:alpine
+FROM nginx:1.28-alpine
 
 ENV STATION_RELAY_UPSTREAM=station-relay-server:3000
 
