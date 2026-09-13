@@ -1,7 +1,7 @@
 import Cocoa
 import Foundation
 
-class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate {
+class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, NSTableViewDataSource, NSTableViewDelegate {
     static let astationRelayUrlKey = "AstationRelayUrl"
 
     static let defaultStationURL = "https://station.agora.build"
@@ -17,6 +17,8 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate {
     }
 
     private var window: NSWindow?
+    private var tabView: NSTabView?
+    private var sidebarTable: NSTableView?
     private let hubManager: AstationHubManager
     private let shortcutsController: KeyboardShortcutsViewController
     private var statusLabel: NSTextField!
@@ -52,12 +54,13 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate {
         }
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 640),
-            styleMask: [.titled, .closable, .miniaturizable],
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Astation Settings"
+        window.contentMinSize = NSSize(width: 720, height: 520)
         window.center()
         window.delegate = self
         window.isReleasedWhenClosed = false
@@ -146,9 +149,10 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate {
 
         renderAccountState()
 
-        let tabs = NSTabView(frame: window.contentView!.bounds.insetBy(dx: 12, dy: 12))
-        tabs.autoresizingMask = [.width, .height]
+        let tabs = NSTabView()
+        tabs.tabViewType = .noTabsNoBorder
         tabs.delegate = self
+        tabView = tabs
         let general = NSTabViewItem(identifier: "general")
         general.label = "General"
         let generalContainer = NSView()
@@ -166,7 +170,56 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate {
         shortcuts.label = "Keyboard Shortcuts"
         shortcuts.viewController = shortcutsController
         tabs.addTabViewItem(shortcuts)
-        window.contentView?.addSubview(tabs)
+        let sidebar = NSVisualEffectView()
+        sidebar.material = .sidebar
+        sidebar.blendingMode = .behindWindow
+        let table = NSTableView()
+        table.headerView = nil
+        table.style = .sourceList
+        table.backgroundColor = .clear
+        table.rowHeight = 36
+        table.allowsEmptySelection = false
+        table.allowsMultipleSelection = false
+        table.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        table.setAccessibilityLabel("Settings categories")
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("settingsCategory"))
+        column.resizingMask = .autoresizingMask
+        table.addTableColumn(column)
+        table.dataSource = self
+        table.delegate = self
+        sidebarTable = table
+        let sidebarScroll = NSScrollView()
+        sidebarScroll.drawsBackground = false
+        sidebarScroll.documentView = table
+        sidebar.addSubview(sidebarScroll)
+        let divider = NSBox()
+        divider.boxType = .separator
+        let root = window.contentView!
+        for child in [sidebar, divider, tabs] as [NSView] {
+            child.translatesAutoresizingMaskIntoConstraints = false
+            root.addSubview(child)
+        }
+        sidebarScroll.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            sidebar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            sidebar.topAnchor.constraint(equalTo: root.topAnchor),
+            sidebar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            sidebar.widthAnchor.constraint(equalToConstant: 200),
+            sidebarScroll.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 8),
+            sidebarScroll.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -8),
+            sidebarScroll.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 16),
+            sidebarScroll.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -16),
+            divider.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            divider.topAnchor.constraint(equalTo: root.topAnchor),
+            divider.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            divider.widthAnchor.constraint(equalToConstant: 1),
+            tabs.leadingAnchor.constraint(equalTo: divider.trailingAnchor),
+            tabs.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            tabs.topAnchor.constraint(equalTo: root.topAnchor),
+            tabs.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+        ])
+        table.reloadData()
+        table.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
@@ -302,12 +355,60 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate {
 
     func windowWillClose(_ notification: Notification) {
         shortcutsController.cancelRecording()
+        tabView = nil
+        sidebarTable = nil
         window = nil
     }
 
     func tabView(_ tabView: NSTabView, willSelect tabViewItem: NSTabViewItem?) {
         shortcutsController.cancelRecording()
         shortcutsController.refresh()
+    }
+
+    func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
+        guard let tabViewItem else { return }
+        let index = tabView.indexOfTabViewItem(tabViewItem)
+        if sidebarTable?.selectedRow != index {
+            sidebarTable?.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        }
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        tabView?.numberOfTabViewItems ?? 0
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        guard let table = notification.object as? NSTableView, table === sidebarTable,
+              let tabs = tabView, table.selectedRow >= 0, table.selectedRow < tabs.numberOfTabViewItems else { return }
+        let selected = tabs.tabViewItem(at: table.selectedRow)
+        if tabs.selectedTabViewItem !== selected { tabs.selectTabViewItem(selected) }
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard let tabs = tabView, row >= 0, row < tabs.numberOfTabViewItems else { return nil }
+        let item = tabs.tabViewItem(at: row)
+        let cell = NSTableCellView()
+        let label = NSTextField(labelWithString: item.label)
+        label.font = .systemFont(ofSize: 13)
+        let symbol = (item.identifier as? String) == "general" ? "gearshape" : "keyboard"
+        let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil)!)
+        icon.contentTintColor = .secondaryLabelColor
+        for child in [icon, label] as [NSView] {
+            child.translatesAutoresizingMaskIntoConstraints = false
+            cell.addSubview(child)
+        }
+        cell.textField = label
+        cell.imageView = icon
+        NSLayoutConstraint.activate([
+            icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
+            icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 18),
+            icon.heightAnchor.constraint(equalToConstant: 18),
+            label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 8),
+            label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -6)
+        ])
+        return cell
     }
 }
 
