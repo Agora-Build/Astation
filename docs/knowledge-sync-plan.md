@@ -26,6 +26,7 @@ is the paired Astation.
 
 ## Global Constraints
 
+- **Astation is the control plane.** Atem Memory works only on machines your Astation has approved through pairing. The relay accepts only granted sessions bound to an Astation. atem refuses every memory, skill, and sync command (local ones included) unless the machine has an active pairing session for the configured Astation.
 - The account is `Caller.work_session_id` (the astation_id bound to the session). Every read and write is limited to it. `?id=<instance_id>` is `client_id` and is only used for logging and `source_machine` checks.
 - Wire JSON must match the atem client exactly (see "Wire contract"). If anything differs, the relay changes, not atem.
 - **A credential value never reaches the database.** Every memory `content` and every skill file is checked with the ported atem secret rules plus the reserved token `atem:memory:`. A match is refused per op: `{"ok": false, "error": "possible credential: <kind>"}` or `"reserved token"`. No partial writes.
@@ -265,11 +266,18 @@ Changes:
     - NotConfigured: "No Astation configured — set astation_relay_code (or ASTATION_RELAY_CODE); changes stay queued."
     - NotPaired: "Not paired with your Astation — run `atem pair`; changes stay queued."
     - Offline stays as it is today.
-  - Remove the SSO-token dependency from `client()`. `require_login()` still accepts any stored credential entry.
-  - Update the existing `sync_status_line` tests.
+  - Remove the SSO-token dependency from `client()`.
+  - **Pairing gate:** replace `require_login()` with `require_pairing()`. It runs first in `handle_sync`, `handle_memory`, and `handle_skill`, and it's a local check with no network: `relay_session()` must return a session. On `NotConfigured` or `NotPaired`, fail with "Atem Memory works only on machines paired with your Astation. Run `atem pair` (Astation approves this machine), then retry." Local commands (`add`, `list`, `search`, `rm`, `apply`, `status`) are gated too.
+  - Once a session exists, `client()` uses it. The gate and the client share `relay_session()`.
+  - Update the existing `sync_status_line` tests, and add a test for the gate message on the pure helper.
 - **`sync.rs`:** push skill ops in chunks of **8**. Memory ops keep chunks of 50. Use two constants, `MEMORY_PUSH_CHUNK` and `SKILL_PUSH_CHUNK`.
 - **Docs:**
-  - Spec §Identity & auth now reads: account = the paired Astation; any machine paired with the same Astation shares memory and skills; pair once per machine with `atem pair`; sessions renew on use and expire after 7 days idle; login-based accounts are a possible future follow-up.
+  - Spec §Identity & auth now reads:
+    - **Astation is the control plane.** Atem Memory works only on machines paired with, and approved by, your Astation.
+    - The account is the paired Astation. Every machine paired with the same Astation shares memory and skills.
+    - Pair once per machine with `atem pair`. Sessions renew on use and expire after 7 days idle. An unpaired or expired machine can't read, write, or sync.
+    - Login-based accounts are a possible future follow-up.
+    - Also update the spec's CLI section: "Every command refuses to run without `atem login`" becomes "…without an active Astation pairing".
   - AGENTS.md: change "SSO bearer auth" to "Astation pairing-session auth".
 
 - [ ] Steps: TDD the pure helpers (`auth_header`, the status-line variants, the chunk constants). Run `cargo test memory::` and the full `cargo test` (the known `agent_visualize` flake passes with `--test-threads=1`), then `cargo build`. Commit `feat(memory): sync with the Astation pairing session`.
