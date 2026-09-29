@@ -16,6 +16,13 @@ use validator::Validate;
 use crate::session_verify::SessionVerifyCache;
 use crate::AppState;
 
+/// A room code as it may appear in logs: the first 4 characters plus "…".
+/// Astation room codes are bearer-like identifiers (whoever presents one joins
+/// that room), so logs never carry them in full.
+pub(crate) fn mask_code(code: &str) -> String {
+    format!("{}…", code.chars().take(4).collect::<String>())
+}
+
 // Characters for pairing codes — no ambiguous chars (0/O, 1/I/L excluded)
 const CODE_CHARS: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
@@ -200,7 +207,7 @@ pub async fn create_pair_handler(
     rooms.insert(code.clone(), room);
     drop(rooms);
 
-    tracing::info!("Pair room created: {}", code);
+    tracing::info!("Pair room created: {}", mask_code(&code));
     (StatusCode::CREATED, Json(CreatePairResponse { code })).into_response()
 }
 
@@ -248,7 +255,7 @@ pub async fn delete_pair_handler(
 ) -> impl IntoResponse {
     let mut rooms = state.relay.rooms.write().await;
     if rooms.remove(&code).is_some() {
-        tracing::info!("Pair room closed by client: {}", code);
+        tracing::info!("Pair room closed by client: {}", mask_code(&code));
         (StatusCode::OK, Json(DeletePairResponse { closed: true })).into_response()
     } else {
         (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Room not found"}))).into_response()
@@ -323,7 +330,7 @@ pub async fn ws_handler(
     if role == "astation" {
         let mut rooms = hub.rooms.write().await;
         rooms.entry(code.clone()).or_insert_with(|| {
-            tracing::info!("Auto-creating identity room for code={}", &code[..code.len().min(16)]);
+            tracing::info!("Auto-creating identity room for code={}", mask_code(&code));
             PairRoom {
                 code: code.clone(),
                 hostname: "identity".to_string(),
@@ -400,7 +407,7 @@ async fn handle_ws(
         let room = match rooms.get_mut(&code) {
             Some(r) => r,
             None => {
-                tracing::warn!("Room {} disappeared before WS setup", code);
+                tracing::warn!("Room {} disappeared before WS setup", mask_code(&code));
                 return;
             }
         };
@@ -450,7 +457,7 @@ async fn handle_ws(
     }
     drop(tx);
 
-    tracing::info!("WS connected: role={} code={}", role, code);
+    tracing::info!("WS connected: role={} code={}", role, mask_code(&code));
 
     // Task: forward messages from our channel to the WS sink, with periodic pings
     // for NAT keepalive. URLSession (macOS) and tungstenite (Atem) both auto-respond
@@ -471,7 +478,7 @@ async fn handle_ws(
                                 .await
                                 .is_err()
                             {
-                                tracing::debug!("WS write failed for {}", code_for_writer);
+                                tracing::debug!("WS write failed for {}", mask_code(&code_for_writer));
                                 break;
                             }
                         }
@@ -487,7 +494,7 @@ async fn handle_ws(
                         .await
                         .is_err()
                     {
-                        tracing::debug!("WS ping failed for {} — removing dead connection", code_for_writer);
+                        tracing::debug!("WS ping failed for {} — removing dead connection", mask_code(&code_for_writer));
                         break;
                     }
                 }
@@ -514,7 +521,7 @@ async fn handle_ws(
             Ok(Some(msg)) => msg,
             Ok(None) => break, // stream ended
             Err(_) => {
-                tracing::debug!("WS idle timeout for {} {} — no frame in {}s", role, code_for_read, WS_PING_INTERVAL_SECS + 30);
+                tracing::debug!("WS idle timeout for {} {} — no frame in {}s", role, mask_code(&code_for_read), WS_PING_INTERVAL_SECS + 30);
                 break;
             }
         };
@@ -537,7 +544,7 @@ async fn handle_ws(
                         if !is_current {
                             tracing::debug!(
                                 "Dropping stale Atem connection: code={} atem_id={}",
-                                code_for_read,
+                                mask_code(&code_for_read),
                                 atem_id_for_read
                             );
                             break;
@@ -584,7 +591,7 @@ async fn handle_ws(
                                 .unwrap_or(false)
                         };
                         if !is_current {
-                            tracing::debug!("Dropping stale Astation connection: code={}", code_for_read);
+                            tracing::debug!("Dropping stale Astation connection: code={}", mask_code(&code_for_read));
                             break;
                         }
                         // Parse a generation-bound envelope and route it to the current Atem socket.
@@ -596,7 +603,7 @@ async fn handle_ws(
                                     .and_then(|value| value.as_str()) else {
                                         tracing::debug!(
                                             "Dropping generationless targeted message: code={} atem_id={}",
-                                            code_for_read,
+                                            mask_code(&code_for_read),
                                             target_id
                                         );
                                         continue;
@@ -616,7 +623,7 @@ async fn handle_ws(
                                 let Some(target_connection) = target_connection else {
                                     tracing::debug!(
                                         "Dropping message for stale or missing Atem connection: code={} atem_id={}",
-                                        code_for_read,
+                                        mask_code(&code_for_read),
                                         target_id
                                     );
                                     continue;
@@ -656,7 +663,7 @@ async fn handle_ws(
             Ok(axum::extract::ws::Message::Close(_)) => break,
             Ok(axum::extract::ws::Message::Pong(_)) => {} // expected response to our Ping
             Err(e) => {
-                tracing::debug!("WS read error for {} {}: {}", role, code_for_read, e);
+                tracing::debug!("WS read error for {} {}: {}", role, mask_code(&code_for_read), e);
                 break;
             }
             _ => {}
@@ -696,7 +703,7 @@ async fn handle_ws(
             // Remove the room only when all sides have disconnected
             if room.atem_txs.is_empty() && room.astation_tx.is_none() {
                 rooms.remove(&code);
-                tracing::info!("Room {} removed (all sides disconnected)", code);
+                tracing::info!("Room {} removed (all sides disconnected)", mask_code(&code));
             }
         }
         notification
@@ -707,7 +714,7 @@ async fn handle_ws(
     }
 
     write_task.abort();
-    tracing::info!("WS disconnected: role={} code={}", role, code);
+    tracing::info!("WS disconnected: role={} code={}", role, mask_code(&code));
 }
 
 fn status_update<'a>(payload: &'a serde_json::Value) -> Option<(&'a str, &'a serde_json::Value)> {
@@ -804,7 +811,7 @@ async fn observe_astation_auth_response(
                 .await;
             tracing::info!(
                 "Bound verified Astation session for room {}",
-                &code[..code.len().min(16)]
+                mask_code(&code)
             );
         }
         Some(AstationAuthOutcome::Reject(Some(session_id))) => {
@@ -1020,6 +1027,16 @@ mod tests {
     };
 
     type TestSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    #[test]
+    fn mask_code_shows_only_a_prefix() {
+        assert_eq!(mask_code("astation-0123456789abcdef"), "asta…");
+        assert_eq!(mask_code("ABCDEFGH"), "ABCD…");
+        assert_eq!(mask_code("ab"), "ab…");
+        assert_eq!(mask_code(""), "…");
+        // Char-based: never splits a multi-byte character (no panic).
+        assert_eq!(mask_code("日本語テキスト"), "日本語テ…");
+    }
 
     async fn next_client_json(socket: &mut TestSocket) -> serde_json::Value {
         loop {
