@@ -159,6 +159,7 @@ mod tests {
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
+            knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
         }
     }
 

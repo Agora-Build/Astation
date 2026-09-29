@@ -10,16 +10,16 @@ use crate::auth::SessionStatus;
 use crate::vault_store::VaultMeta;
 use crate::AppState;
 
-type ErrResp = (StatusCode, Json<serde_json::Value>);
+pub(crate) type ErrResp = (StatusCode, Json<serde_json::Value>);
 
-fn err(status: StatusCode, msg: &str) -> ErrResp {
+pub(crate) fn err(status: StatusCode, msg: &str) -> ErrResp {
     (status, Json(json!({ "error": msg })))
 }
 
-/// The authenticated caller of a vault request.
-struct Caller {
-    work_session_id: String,
-    client_id: String,
+/// The authenticated caller of a vault (or knowledge) request.
+pub(crate) struct Caller {
+    pub(crate) work_session_id: String,
+    pub(crate) client_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,10 +35,13 @@ pub struct VaultQuery {
 /// Validate the session + extract the client_id. Resolves work_session_id to
 /// the astation_id the session is bound to (Option A). 401 on bad session,
 /// 400 on missing client id.
-async fn resolve_caller(
+///
+/// `id` is the caller's `?id=<client_id>` query value; shared by vault and
+/// knowledge routes without coupling to either module's query struct shape.
+pub(crate) async fn resolve_caller(
     state: &AppState,
     headers: &HeaderMap,
-    query: &VaultQuery,
+    id: Option<&str>,
 ) -> Result<Caller, ErrResp> {
     // Authorization: session <session_id>
     let auth = headers
@@ -52,9 +55,7 @@ async fn resolve_caller(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "missing session authorization"))?;
 
-    let client_id = query
-        .id
-        .as_deref()
+    let client_id = id
         .filter(|s| !s.is_empty())
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "missing ?id=<client_id>"))?
         .to_string();
@@ -114,7 +115,7 @@ pub async fn create_vault_handler(
     Query(query): Query<VaultQuery>,
     Json(body): Json<CreateVaultRequest>,
 ) -> Result<Json<serde_json::Value>, ErrResp> {
-    let caller = resolve_caller(&state, &headers, &query).await?;
+    let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
     let vault_id = state
         .vault
         .create_vault(&caller.work_session_id, &caller.client_id, &body.summary)
@@ -129,7 +130,7 @@ pub async fn list_vaults_handler(
     headers: HeaderMap,
     Query(query): Query<VaultQuery>,
 ) -> Result<Json<serde_json::Value>, ErrResp> {
-    let caller = resolve_caller(&state, &headers, &query).await?;
+    let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
     let items = state
         .vault
         .list_readable(&caller.work_session_id, &caller.client_id)
@@ -145,7 +146,7 @@ pub async fn read_vault_handler(
     Path(vault_id): Path<String>,
     Query(query): Query<VaultQuery>,
 ) -> Result<Json<serde_json::Value>, ErrResp> {
-    let caller = resolve_caller(&state, &headers, &query).await?;
+    let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
     let meta = load_meta(&state, &vault_id).await?;
     if !can_read(&meta, &caller) {
         return Err(err(StatusCode::FORBIDDEN, "not authorized to read this vault"));
@@ -173,7 +174,7 @@ pub async fn write_vault_handler(
     Query(query): Query<VaultQuery>,
     Json(body): Json<WriteVaultRequest>,
 ) -> Result<Json<serde_json::Value>, ErrResp> {
-    let caller = resolve_caller(&state, &headers, &query).await?;
+    let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
     let meta = load_meta(&state, &vault_id).await?;
     if !can_write(&meta, &caller) {
         return Err(err(StatusCode::FORBIDDEN, "not authorized to write this vault"));
@@ -219,7 +220,7 @@ pub async fn set_summary_handler(
     Query(query): Query<VaultQuery>,
     Json(body): Json<SetSummaryRequest>,
 ) -> Result<Json<serde_json::Value>, ErrResp> {
-    let caller = resolve_caller(&state, &headers, &query).await?;
+    let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
     let meta = load_meta(&state, &vault_id).await?;
     // set-summary uses the read predicate (mutable, low-stakes).
     if !can_read(&meta, &caller) {
@@ -267,6 +268,7 @@ mod tests {
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: Arc::new(InMemoryVaultStore::new()),
+            knowledge: Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
         };
         (state, session_id)
     }
@@ -448,6 +450,7 @@ mod tests {
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: Arc::new(InMemoryVaultStore::new()),
+            knowledge: Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
         };
         let app = app(state);
         let resp = app.oneshot(req("POST", "/api/vault?id=a", &sess, r#"{}"#)).await.unwrap();
@@ -473,6 +476,7 @@ mod tests {
             session_verify_cache: verify_cache,
             voice_sessions: VoiceSessionStore::new(),
             vault: Arc::new(InMemoryVaultStore::new()),
+            knowledge: Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
         };
 
         let resp = app(state)

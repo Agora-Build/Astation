@@ -1,4 +1,5 @@
 mod auth;
+mod knowledge_routes;
 mod knowledge_secrets;
 mod knowledge_store;
 mod relay;
@@ -13,7 +14,7 @@ mod vault_store;
 mod vault_routes;
 mod web;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -42,6 +43,7 @@ pub struct AppState {
     pub session_verify_cache: SessionVerifyCache,
     pub voice_sessions: VoiceSessionStore,
     pub vault: Arc<dyn vault_store::VaultStore>,
+    pub knowledge: Arc<dyn knowledge_store::KnowledgeStore>,
 }
 
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -51,6 +53,7 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
             Json(serde_json::json!({
                 "status": "ok",
                 "vault_store": state.vault.backend_name(),
+                "knowledge_store": state.knowledge.backend_name(),
             })),
         ),
         Err(error) => {
@@ -80,11 +83,15 @@ async fn main() {
     let session_verify_cache = SessionVerifyCache::new();
     let voice_sessions = VoiceSessionStore::new();
 
-    // Vault store: Postgres when DATABASE_URL is set (the durable path), else an
-    // in-memory fallback so the rest of the server still runs without a DB.
-    let vault: Arc<dyn vault_store::VaultStore> = match std::env::var("DATABASE_URL") {
+    // Vault + knowledge (Atem Memory) stores: Postgres, sharing one pool, when
+    // DATABASE_URL is set (the durable path), else in-memory fallbacks so the
+    // rest of the server still runs without a DB.
+    let (vault, knowledge): (
+        Arc<dyn vault_store::VaultStore>,
+        Arc<dyn knowledge_store::KnowledgeStore>,
+    ) = match std::env::var("DATABASE_URL") {
         Ok(url) if !url.is_empty() => {
-            tracing::info!("Connecting to Postgres for vault storage...");
+            tracing::info!("Connecting to Postgres for vault + knowledge storage...");
             let pool = sqlx::postgres::PgPoolOptions::new()
                 .max_connections(5)
                 .connect(&url)
@@ -94,15 +101,21 @@ async fn main() {
                 .run(&pool)
                 .await
                 .expect("Failed to run vault migrations");
-            tracing::info!("Vault storage ready (Postgres)");
-            Arc::new(vault_store::PgVaultStore::new(pool))
+            tracing::info!("Vault + knowledge storage ready (Postgres)");
+            (
+                Arc::new(vault_store::PgVaultStore::new(pool.clone())),
+                Arc::new(knowledge_store::PgKnowledgeStore::new(pool)),
+            )
         }
         _ => {
             tracing::warn!(
-                "DATABASE_URL not set — vault storage is IN-MEMORY (not durable). \
+                "DATABASE_URL not set — vault + knowledge storage is IN-MEMORY (not durable). \
                  Set DATABASE_URL to enable persistent vaults."
             );
-            Arc::new(vault_store::InMemoryVaultStore::new())
+            (
+                Arc::new(vault_store::InMemoryVaultStore::new()),
+                Arc::new(knowledge_store::InMemoryKnowledgeStore::new()),
+            )
         }
     };
 
@@ -167,6 +180,7 @@ async fn main() {
         session_verify_cache,
         voice_sessions,
         vault,
+        knowledge,
     };
 
     // Configure CORS - Allow specific origin or default to localhost for development
@@ -284,6 +298,19 @@ async fn main() {
             "/api/vault/:id/summary",
             post(vault_routes::set_summary_handler),
         )
+        // Atem Memory API routes (knowledge sync)
+        .route(
+            "/api/memory/batch",
+            post(knowledge_routes::memory_batch_handler)
+                .layer(DefaultBodyLimit::max(2 * 1024 * 1024)),
+        )
+        .route("/api/memory", get(knowledge_routes::memory_pull_handler))
+        .route(
+            "/api/skills/batch",
+            post(knowledge_routes::skills_batch_handler)
+                .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route("/api/skills", get(knowledge_routes::skills_pull_handler))
         // Relay API routes
         .route("/api/pair", post(relay::create_pair_handler))
         .route("/api/pair/:code", get(relay::pair_status_handler).delete(relay::delete_pair_handler))
@@ -342,6 +369,7 @@ mod tests {
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: Arc::new(vault_store::InMemoryVaultStore::new()),
+            knowledge: Arc::new(knowledge_store::InMemoryKnowledgeStore::new()),
         }
     }
 
@@ -359,7 +387,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(
             body.as_ref(),
-            br#"{"status":"ok","vault_store":"memory"}"#
+            br#"{"knowledge_store":"memory","status":"ok","vault_store":"memory"}"#
         );
     }
 

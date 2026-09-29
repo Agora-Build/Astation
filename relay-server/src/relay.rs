@@ -1370,6 +1370,7 @@ mod tests {
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
+            knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
         };
         Router::new()
             .route("/api/pair", axum::routing::post(create_pair_handler))
@@ -1869,6 +1870,7 @@ mod tests {
             session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
+            knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
         };
 
         // Create pair

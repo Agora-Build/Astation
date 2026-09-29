@@ -94,6 +94,30 @@ Authz: in-session callers (same `work_session_id` = bound astation_id) can read 
 write content. Past content writers from another work session can read and update
 the summary, but cannot write content. Others are denied (403).
 
+### Knowledge sync (Atem Memory)
+Durable sync store for Atem's shared memories and skills across an astation's
+paired atem instances. Backed by Postgres (`DATABASE_URL`, same pool as
+Vault). All requests require `Authorization: session <session_id>` and
+`?id=<client_id>`; account = the caller's `work_session_id` (the paired
+astation_id) — atems paired to different astations never see each other's
+memories or skills.
+
+- `POST /api/memory/batch {ops: [...]}` → `[OpResult]` - Batch add/delete memory ops (body limit 2 MB)
+- `GET /api/memory [?since=<seq>&limit=<n>]` → `{memories: [MemoryRow], next_since}` - Pull memories (default `since=0`, `limit=200`)
+- `POST /api/skills/batch {ops: [...]}` → `[OpResult]` - Batch push/delete/purge skill ops (body limit 16 MB)
+- `GET /api/skills [?since=<seq>&limit=<n>]` → `{skills: [SkillRow], next_since}` - Pull skills (default `since=0`, `limit=200`)
+
+Every add/push op is scanned for credential-shaped content
+(`knowledge_secrets::find_secrets`/`check_bytes`) and for the reserved
+`atem:memory:` token before it is written; a match refuses that op only
+(the rest of the batch still applies) with `{ok:false,error:"..."}`. Skill
+files are sent base64-encoded in the request body and decoded server-side
+(no `base64` crate — a small hand-rolled RFC 4648 decoder in
+`knowledge_routes.rs`). Backing-store errors are never echoed to the client
+(`{ok:false,error:"internal error"}`, detail logged via `tracing::error!`).
+Dedup, tombstones, and purge semantics are implemented by `KnowledgeStore`
+(`knowledge_store.rs`).
+
 ## Astation Integration
 
 The Astation macOS app uses this relay server for:
@@ -113,7 +137,7 @@ Config: Set `relay_url` and `ws_url` in `.atem/config.toml`
 | `PUBLIC_BASE_URL` | _(unset)_ | Public base URL used for generated session links (recommended in production) |
 | `PORT` | `3000` | Server port |
 | `RUST_LOG` | `info` | Log level (error, warn, info, debug, trace) |
-| `DATABASE_URL` | _(unset)_ | Postgres connection string for **vault** storage (e.g. `postgres://vault:vault@localhost:5432/vault`). When unset, vault storage falls back to **in-memory** (non-durable) and logs a warning. Migrations in `migrations/` run automatically at startup. |
+| `DATABASE_URL` | _(unset)_ | Postgres connection string shared by **vault** and **knowledge sync (Atem Memory)** storage (e.g. `postgres://vault:vault@localhost:5432/vault`), one pool for both. When unset, both fall back to **in-memory** (non-durable) and log a warning. Migrations in `migrations/` run automatically at startup. |
 
 **Production:**
 ```bash
@@ -135,7 +159,7 @@ RUST_LOG=debug
 ## Testing
 
 ```bash
-cargo test  # 177 tests (auth, sessions, relay, RTC, Voice, Vault, validation)
+cargo test  # 230 tests (auth, sessions, relay, RTC, Voice, Vault, Knowledge sync, validation)
 ```
 
 
