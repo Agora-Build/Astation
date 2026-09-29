@@ -295,3 +295,54 @@ Changes:
    - `atem memory add` a test fact, then `atem sync`.
    - A second isolated HOME using the same pairing session pulls it, which proves cross-machine sync through production.
    - Purge the test memory afterwards.
+
+---
+
+### Task 5: atem — explicit capability tiers (centralized gates)
+
+Repo: `/home/guohai/Dev/Agora.Build/Atem`, same branch `feat/memory-pairing-auth`.
+
+Product rule (user, 2026-09-29):
+- **Tier 1 — `atem login`:** a limited set of functions.
+- **Tier 2 — paired with Astation:** the full set. Astation is the control plane.
+
+**Files:**
+- Modify: `src/auth.rs`
+- Modify: `src/memory/cmd.rs`
+- Modify: `src/cli.rs` (the vault handler and the project commands)
+- Modify: `AGENTS.md`
+
+**Interfaces (produce in `src/auth.rs`):**
+- `pub enum PairingProblem { NotConfigured, NotPaired }`
+- `pub struct PairedSession { pub relay_base: String, pub astation_id: String, pub session_id: String }`
+- `pub fn pairing_from(relay_base: &str, astation_id: Option<&str>, session_id: Option<String>) -> Result<PairedSession, PairingProblem>`: pure and unit-tested.
+- `pub fn pairing_session() -> Result<PairedSession, PairingProblem>`: loads `AtemConfig` and `SessionManager` the way `handle_vault_command` does. A config or session load failure maps to `NotConfigured` or `NotPaired` respectively.
+- `pub fn pairing_gate_message(feature: &str) -> String` = `format!("{feature} works only on machines paired with your Astation. Run `atem pair` (Astation approves this machine), then retry.")`
+- `pub fn require_pairing(feature: &str) -> anyhow::Result<PairedSession>`: the tier-2 gate. It's a local check with no network.
+- `pub fn login_gate_message(feature: &str) -> String` = `format!("{feature} requires `atem login` (your Agora account).")`
+- `pub fn require_login(feature: &str) -> anyhow::Result<()>`: the tier-1 gate. It's local and passes when `CredentialStore::load().entries` is non-empty.
+
+**Changes:**
+- **`src/memory/cmd.rs`:**
+  - Delete the local `relay_session`, `SessionProblem`, `require_pairing`, and `PAIRING_GATE_MSG`. Use `crate::auth::require_pairing("Atem Memory")` and `pairing_session()` instead.
+  - The memory gate text must stay byte-identical to today's: "Atem Memory works only on machines paired with your Astation. Run `atem pair` (Astation approves this machine), then retry."
+  - Status lines keep their current texts, mapped from `PairingProblem`.
+- **`src/cli.rs` vault handler:** replace its ad-hoc session resolution with `crate::auth::require_pairing("Atem Vault")`, and use the returned `relay_base` and `session_id`. The old "No Astation session found…" error goes away; behavior is otherwise identical.
+- **`src/cli.rs` project commands** (the `atem project …` handlers that call `valid_token`): call `crate::auth::require_login("atem project")` first so the message is consistent. Leave `atem token` and `atem serv …` ungated; they work with environment variables or a cached project.
+- **`AGENTS.md`:** add a "Capability tiers" subsection with this table:
+
+  | Tier | Needs | Commands |
+  |---|---|---|
+  | 0 | — | serv files, config, token with AGORA_APP_ID/CERT env |
+  | 1 | `atem login` | project, token (active project), serv rtc/convo/webhooks |
+  | 2 | paired with Astation | vault, sync, memory, skill, and Astation-driven remote agent control, voice coding, mark tasks, visualize |
+
+  Add one line: "New cross-machine or cross-agent features are tier 2 and must gate with `auth::require_pairing`."
+
+**Tests:**
+- `pairing_from`: all three outcomes.
+- The exact texts of `pairing_gate_message("Atem Memory")` and `login_gate_message("atem project")`.
+- Existing memory tests pass unchanged.
+- Run `cargo test` (the `agent_visualize` flake passes with `--test-threads=1`) and `cargo build`.
+
+**Commit:** `refactor(auth): explicit capability tiers — shared pairing/login gates`
