@@ -1,4 +1,5 @@
 mod auth;
+mod knowledge_secrets;
 mod relay;
 mod routes;
 mod rtc_session;
