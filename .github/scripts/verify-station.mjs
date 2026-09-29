@@ -7,7 +7,12 @@ for (const path of ['/', '/health']) {
   if (path === '/health') {
     const health = await response.json();
     if (health.status !== 'ok') throw new Error('Relay health is not ok');
-    console.log(`Relay health: ${health.status}; vault store: ${health.vault_store}`);
+    // Atem Memory sync must be durable in production: an in-memory store
+    // (DATABASE_URL missing) would silently lose every account's data on restart.
+    if (health.knowledge_store !== 'postgres') {
+      throw new Error(`Relay knowledge store is ${health.knowledge_store}, expected postgres`);
+    }
+    console.log(`Relay health: ${health.status}; vault store: ${health.vault_store}; knowledge store: ${health.knowledge_store}`);
   } else if (!(await response.text()).toLowerCase().includes('<!doctype html>')) {
     throw new Error('Station did not return the webapp HTML');
   }
