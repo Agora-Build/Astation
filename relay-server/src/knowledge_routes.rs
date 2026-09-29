@@ -105,12 +105,44 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
         let b2 = (v[2] << 6) | v[3];
         match pad {
             0 => out.extend_from_slice(&[b0, b1, b2]),
-            1 => out.extend_from_slice(&[b0, b1]),
-            2 => out.push(b0),
+            // 3 significant chars; the low 2 bits of the 3rd char don't
+            // contribute to any output byte and must be zero (canonical
+            // encoding) — matches atem's base64 0.21 STANDARD decoder,
+            // which rejects non-zero trailing bits as InvalidLastSymbol.
+            1 => {
+                if v[2] & 0x03 != 0 {
+                    return Err(());
+                }
+                out.extend_from_slice(&[b0, b1]);
+            }
+            // 2 significant chars; the low 4 bits of the 2nd char don't
+            // contribute to any output byte and must be zero.
+            2 => {
+                if v[1] & 0x0f != 0 {
+                    return Err(());
+                }
+                out.push(b0);
+            }
             _ => unreachable!(),
         }
     }
     Ok(out)
+}
+
+// ─────────────────────────── scope validation ───────────────────────────
+
+/// atem's `Memory.scope` deserializes into an enum accepting only these
+/// three values; anything else fails client-side and (worse) permanently
+/// blocks pull sync for the account once such a row lands in the page. So
+/// the relay refuses it up front instead of ever writing it.
+fn is_valid_memory_scope(s: &str) -> bool {
+    matches!(s, "global" | "project" | "machine")
+}
+
+/// atem's `Skill.scope` enum accepts only these two values (skills have no
+/// per-machine scope).
+fn is_valid_skill_scope(s: &str) -> bool {
+    matches!(s, "global" | "project")
 }
 
 // ─────────────────────────── memory batch ───────────────────────────
@@ -126,6 +158,9 @@ async fn apply_memory_op(state: &AppState, account: &str, op: Value) -> Value {
                 },
                 None => return op_err("invalid memory"),
             };
+            if !is_valid_memory_scope(&memory.scope) {
+                return op_err("invalid memory");
+            }
             if contains_reserved(&memory.content) {
                 return op_err("reserved token");
             }
@@ -242,6 +277,9 @@ async fn apply_skill_op(state: &AppState, account: &str, op: Value) -> Value {
                 },
                 None => return op_err("invalid skill"),
             };
+            if !is_valid_skill_scope(&skill.scope) {
+                return op_err("invalid skill");
+            }
             let base_version = op.get("base_version").and_then(Value::as_i64).unwrap_or(0);
             if let Err(bad) = check_skill_files(&skill.files) {
                 return bad;
@@ -263,6 +301,9 @@ async fn apply_skill_op(state: &AppState, account: &str, op: Value) -> Value {
                 Some(n) => n.to_string(),
                 None => return op_err("invalid delete"),
             };
+            if !is_valid_skill_scope(&scope) {
+                return op_err("invalid skill");
+            }
             match state.knowledge.delete_skill(account, &scope, &project, &name).await {
                 Ok(o) => json!({ "ok": true, "version": o.version, "seq": o.seq }),
                 Err(e) => store_err(e),
@@ -282,6 +323,9 @@ async fn apply_skill_op(state: &AppState, account: &str, op: Value) -> Value {
                     Err(_) => return op_err("invalid purge"),
                 },
             };
+            if !is_valid_skill_scope(&scope) {
+                return op_err("invalid skill");
+            }
             match state
                 .knowledge
                 .purge_skill(account, &scope, &project, &name, versions)
@@ -477,6 +521,17 @@ mod tests {
         assert!(base64_decode("!!!!").is_err(), "invalid chars");
         assert!(base64_decode("AAAAA===").is_err(), "3 pad chars");
         assert_eq!(base64_decode("").unwrap(), Vec::<u8>::new());
+    }
+
+    /// Non-canonical trailing bits: atem's base64 0.21 STANDARD decoder
+    /// rejects these (InvalidLastSymbol); the relay must too, or a row it
+    /// accepted but the client can't decode permanently blocks pull sync.
+    #[test]
+    fn base64_rejects_non_canonical_trailing_bits() {
+        assert!(base64_decode("QR==").is_err(), "2-pad group with nonzero trailing bits");
+        assert_eq!(base64_decode("QQ==").unwrap(), vec![0x41]);
+        assert_eq!(base64_decode("QUI=").unwrap(), vec![0x41, 0x42]);
+        assert!(base64_decode("QUJ=").is_err(), "1-pad group with nonzero trailing bits");
     }
 
     // ─────────────────────────── memory batch ───────────────────────────
@@ -691,6 +746,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn add_with_invalid_scope_is_refused() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        let mut mem = sample_memory("mem_1", "x");
+        mem["scope"] = json!("bogus");
+        let batch = json!({ "ops": [{"op": "add", "memory": mem}] });
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/memory/batch?id=a",
+                &sess,
+                &batch.to_string(),
+            ))
+            .await
+            .unwrap();
+        let results = body_json(resp).await;
+        assert_eq!(results["results"][0]["ok"], false);
+        assert_eq!(results["results"][0]["error"], "invalid memory");
+
+        let pulled = body_json(
+            app.oneshot(req("GET", "/api/memory?id=a", &sess, ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(pulled["memories"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
     async fn accounts_are_isolated() {
         let (state, sess1) = test_state("ws-1").await;
         let mut s2 = create_session("h2");
@@ -847,6 +932,78 @@ mod tests {
         let results = body_json(resp).await;
         assert_eq!(results["results"][0]["ok"], false);
         assert_eq!(results["results"][0]["error"], "invalid base64");
+    }
+
+    #[tokio::test]
+    async fn skill_push_with_invalid_scope_is_refused() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        let mut skill = sample_skill("x", json!({"SKILL.md": b64("# hi")}));
+        skill["scope"] = json!("machine"); // valid for memories, not skills
+        let push = json!({ "ops": [{"op": "push", "skill": skill, "base_version": 0}] });
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/skills/batch?id=a",
+                &sess,
+                &push.to_string(),
+            ))
+            .await
+            .unwrap();
+        let results = body_json(resp).await;
+        assert_eq!(results["results"][0]["ok"], false);
+        assert_eq!(results["results"][0]["error"], "invalid skill");
+
+        let pulled = body_json(
+            app.oneshot(req("GET", "/api/skills?id=a", &sess, ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(pulled["skills"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn skill_delete_with_invalid_scope_is_refused() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        let del = json!({ "ops": [
+            {"op": "delete", "scope": "bogus", "project": "", "name": "x"},
+        ]});
+        let resp = app
+            .oneshot(req(
+                "POST",
+                "/api/skills/batch?id=a",
+                &sess,
+                &del.to_string(),
+            ))
+            .await
+            .unwrap();
+        let results = body_json(resp).await;
+        assert_eq!(results["results"][0]["ok"], false);
+        assert_eq!(results["results"][0]["error"], "invalid skill");
+    }
+
+    #[tokio::test]
+    async fn skill_purge_with_invalid_scope_is_refused() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        let purge = json!({ "ops": [
+            {"op": "purge", "scope": "bogus", "project": "", "name": "x", "versions": null},
+        ]});
+        let resp = app
+            .oneshot(req(
+                "POST",
+                "/api/skills/batch?id=a",
+                &sess,
+                &purge.to_string(),
+            ))
+            .await
+            .unwrap();
+        let results = body_json(resp).await;
+        assert_eq!(results["results"][0]["ok"], false);
+        assert_eq!(results["results"][0]["error"], "invalid skill");
     }
 
     #[tokio::test]

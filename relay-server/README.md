@@ -159,7 +159,7 @@ RUST_LOG=debug
 ## Testing
 
 ```bash
-cargo test  # 230 tests (auth, sessions, relay, RTC, Voice, Vault, Knowledge sync, validation)
+cargo test  # 235 tests (auth, sessions, relay, RTC, Voice, Vault, Knowledge sync, validation)
 ```
 
 
