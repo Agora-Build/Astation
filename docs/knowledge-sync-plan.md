@@ -32,7 +32,7 @@ is the paired Astation.
 - **A credential value never reaches the database.** Every memory `content` and every skill file is checked with the ported atem secret rules plus the reserved token `atem:memory:`. A match is refused per op: `{"ok": false, "error": "possible credential: <kind>"}` or `"reserved token"`. No partial writes.
 - Deleting a memory: blanks `content` and `content_hash`, sets deleted, takes a new `seq`. **It is idempotent**: an unknown or already-deleted id returns `ok: true`.
 - Skill push always appends `max(version)+1`. `superseded_concurrent = base_version < current max live version`. Delete appends a tombstone version (`deleted: true`, `files: {}`). Purge sets `files={}`, `content_hash=''`, `deleted=true` on the chosen versions (all versions when `versions` is null), each with a new `seq`.
-- Per-request body limits: `/api/memory/batch` 2 MB; `/api/skills/batch` 16 MB. The atem client sends at most 8 skill ops per request.
+- Per-request body limits: `/api/memory/batch` 2 MB; `/api/skills/batch` 16 MB (production nginx matches these per location). Op caps: 64 memory ops, 16 skill ops (413 `too many ops`). The atem client sends at most 50 memory ops and 8 skill ops per request.
 - **No new crates** in either repo. Commit messages end with `🤖 Built with SMT <smt@agora.build>`.
 
 ## Wire contract
@@ -213,8 +213,8 @@ Handler behavior:
 - **`POST /api/memory/batch`** — `{"ops":[…]}`. For each op in order:
   - **`add`:** if `contains_reserved(content)`, the result is `{ok:false, error:"reserved token"}`. If `find_secrets(content)` is non-empty, the result is `{ok:false, error:"possible credential: <kind>"}`. Otherwise call `store.add_memory` and return `{ok:true, id, canonical_id?, seq}`.
   - **`delete`:** call `delete_memory` and return `{ok:true, id, seq}`.
-  - **Unknown `op`:** `{ok:false, error:"unknown op"}`.
-  - A store error on one op gives `{ok:false, error}` for that op, and processing continues.
+  - **Unknown `op`:** ~~`{ok:false, error:"unknown op"}`~~ — superseded by the final-review fix wave: a malformed body or unknown op is 400 for the whole batch (ops are typed), see `relay-server/README.md`.
+  - ~~A store error on one op gives `{ok:false, error}` for that op, and processing continues.~~ Superseded: a store (DB) error stops the batch with 503 `{"error":"temporarily unavailable"}`; atem keeps the ops queued.
   - Returns 200 `{"results":[…]}`.
 - **`POST /api/skills/batch`** —
   - **`push`:** base64-decode every file value. A decode failure gives `{ok:false, error:"invalid base64"}`. Run `check_bytes` on every decoded file and `contains_reserved` on UTF-8 files. Any finding gives `{ok:false, error:"possible credential: <path>: <kind>"}` and nothing is stored. Otherwise call `push_skill` and return `{ok:true, version, seq, superseded_concurrent}`.

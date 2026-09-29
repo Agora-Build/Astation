@@ -102,21 +102,46 @@ Vault). All requests require `Authorization: session <session_id>` and
 astation_id) — atems paired to different astations never see each other's
 memories or skills.
 
-- `POST /api/memory/batch {ops: [...]}` → `[OpResult]` - Batch add/delete memory ops (body limit 2 MB)
-- `GET /api/memory [?since=<seq>&limit=<n>]` → `{memories: [MemoryRow], next_since}` - Pull memories (default `since=0`, `limit=200`)
-- `POST /api/skills/batch {ops: [...]}` → `[OpResult]` - Batch push/delete/purge skill ops (body limit 16 MB)
-- `GET /api/skills [?since=<seq>&limit=<n>]` → `{skills: [SkillRow], next_since}` - Pull skills (default `since=0`, `limit=200`)
+- `POST /api/memory/batch {ops: [...]}` → `{"results": [OpResult]}` - Batch add/delete memory ops (body limit 2 MB, at most 64 ops)
+- `GET /api/memory [?since=<seq>&limit=<n>]` → `{"memories": [MemoryRow]}` - Pull memories (default `since=0`, `limit=200`, capped at 500). There is no `next_since`: the next cursor is the highest `seq` in the page.
+- `POST /api/skills/batch {ops: [...]}` → `{"results": [OpResult]}` - Batch push/delete/purge skill ops (body limit 16 MB, at most 16 ops)
+- `GET /api/skills [?since=<seq>&limit=<n>]` → `{"skills": [SkillRow]}` - Pull skills (default `since=0`, `limit=200`, capped at 500; no `next_since`)
 
-Every add/push op is scanned for credential-shaped content
-(`knowledge_secrets::find_secrets`/`check_bytes`) and for the reserved
-`atem:memory:` token before it is written; a match refuses that op only
-(the rest of the batch still applies) with `{ok:false,error:"..."}`. Skill
-files are sent base64-encoded in the request body and decoded server-side
-(no `base64` crate — a small hand-rolled RFC 4648 decoder in
-`knowledge_routes.rs`). Backing-store errors are never echoed to the client
-(`{ok:false,error:"internal error"}`, detail logged via `tracing::error!`).
-Dedup, tombstones, and purge semantics are implemented by `KnowledgeStore`
-(`knowledge_store.rs`).
+Batch requests are authenticated before the body is read (so an
+unauthenticated client can't make the relay buffer a large body), then:
+
+| Condition | Response |
+|-----------|----------|
+| Missing/invalid session | 401 (body never read) |
+| Missing `?id=` | 400 |
+| Body over the byte limit | 413 |
+| Over the op cap | 413 `{"error":"too many ops"}` |
+| Malformed body or an unknown `op` | 400 for the whole batch (the atem client never sends unknown ops) |
+| Backing-store (database) error | 503 `{"error":"temporarily unavailable"}` for the whole batch; processing stops, detail logged via `tracing::error!` |
+| Per-op input problem | 200, that op's result is `{ok:false,error:"..."}`; the rest still apply |
+
+A 503 is transient: atem keeps every op queued and retries, which is safe
+(add is idempotent by id, delete/purge are idempotent, a retried skill push
+appends a harmless duplicate version). Per-op refusals are permanent (atem
+acks them), so they are only ever input problems:
+
+- a credential-shaped value (`knowledge_secrets::find_secrets`/`check_bytes`)
+  → `possible credential: ...`; the reserved `atem:memory:` token →
+  `reserved token` (memories) / `possible credential: <path>: reserved token`
+  (skill files);
+- an invalid scope, or a NUL (`\u0000`, which Postgres can't store) in any
+  memory string field → `invalid memory`; in a skill's name/project/source/
+  hash or a file relpath → `invalid skill`;
+- skill file bytes that aren't canonical standard base64 → `invalid base64`;
+- a memory id owned by another account → `id conflict`.
+
+Skill files are sent base64-encoded in the request body and decoded
+server-side (no `base64` crate — a small hand-rolled RFC 4648 decoder in
+`knowledge_routes.rs`). Dedup, tombstones, and purge semantics are
+implemented by `KnowledgeStore` (`knowledge_store.rs`).
+
+Production nginx (`webapp/nginx.conf`) raises its 1 MB body cap to 16 MB for
+`/api/skills/batch` and 2 MB for `/api/memory/batch` only.
 
 ## Astation Integration
 

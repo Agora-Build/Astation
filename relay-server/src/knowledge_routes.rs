@@ -2,14 +2,32 @@
 //!
 //! Mirrors `vault_routes.rs`: session auth via `resolve_caller`, the account is
 //! `Caller.work_session_id` (the paired astation_id). Batch ops are validated
-//! (reserved tokens, credential scanning) here — the store never inspects
-//! memory content or skill file bytes.
+//! (reserved tokens, credential scanning, NUL bytes) here — the store never
+//! inspects memory content or skill file bytes.
+//!
+//! Batch handling, in order:
+//! 1. Authenticate (`resolve_caller`) from the headers + query. The body is
+//!    not read until the caller is known, so an unauthenticated client can't
+//!    make the relay buffer a large body.
+//! 2. Read the body with a hard byte cap (413 over it), then deserialize into
+//!    typed ops. A malformed body or an unknown `op` fails the whole batch with
+//!    400 — the atem client never sends an unknown op, so one means a broken
+//!    client, not something to refuse per op (atem acks per-op refusals).
+//! 3. Cap the op count (413 `{"error":"too many ops"}` over it).
+//! 4. Apply each op. Input problems are per-op `{ok:false,error}` refusals
+//!    (permanent: atem acks them). A backing-store failure stops the batch and
+//!    returns 503 `{"error":"temporarily unavailable"}` for the whole request
+//!    (transient: atem keeps every op queued and retries — add is idempotent
+//!    by id, delete/purge are idempotent, a retried skill push appends a
+//!    harmless duplicate version).
 
 use axum::{
+    body::Body,
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -19,6 +37,15 @@ use crate::vault_routes::{err, resolve_caller};
 use crate::AppState;
 
 type ErrResp = (StatusCode, Json<Value>);
+
+/// Byte limit on a `/api/memory/batch` body (also the route's `DefaultBodyLimit`).
+pub(crate) const MEMORY_BATCH_BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// Byte limit on a `/api/skills/batch` body (also the route's `DefaultBodyLimit`).
+pub(crate) const SKILLS_BATCH_BODY_LIMIT: usize = 16 * 1024 * 1024;
+/// Most ops in one memory batch (atem sends at most 50).
+pub(crate) const MEMORY_BATCH_MAX_OPS: usize = 64;
+/// Most ops in one skills batch (atem sends at most 8).
+pub(crate) const SKILLS_BATCH_MAX_OPS: usize = 16;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AuthQuery {
@@ -37,25 +64,95 @@ fn op_err(msg: impl Into<String>) -> Value {
     json!({ "ok": false, "error": msg.into() })
 }
 
-/// Maps a store error to a per-op result. `Db` (and any other non-domain
-/// error) never reaches the client as raw text — only a generic message,
-/// with the detail logged server-side.
-fn store_err(e: KnowledgeError) -> Value {
-    match &e {
-        KnowledgeError::IdConflict => op_err(e.to_string()),
-        KnowledgeError::Db(detail) => {
-            tracing::error!("knowledge store error: {}", detail);
-            op_err("internal error")
-        }
+/// The whole request fails with 503: the store is (probably transiently)
+/// unavailable. The detail is logged, never sent to the client.
+fn unavailable(e: KnowledgeError) -> ErrResp {
+    tracing::error!("knowledge store error: {}", e);
+    err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable")
+}
+
+/// A store call's result for one op: success → `ok(t)`; a domain refusal
+/// (`IdConflict`) → a per-op refusal; a `Db` error → abort the batch (503).
+fn store_result<T>(r: Result<T, KnowledgeError>, ok: impl FnOnce(T) -> Value) -> Result<Value, ErrResp> {
+    match r {
+        Ok(t) => Ok(ok(t)),
+        Err(e @ KnowledgeError::IdConflict) => Ok(op_err(e.to_string())),
+        Err(e @ KnowledgeError::Db(_)) => Err(unavailable(e)),
     }
 }
 
-fn internal_err(e: KnowledgeError) -> ErrResp {
-    match &e {
-        KnowledgeError::Db(detail) => tracing::error!("knowledge store error: {}", detail),
-        KnowledgeError::IdConflict => tracing::error!("knowledge store error: {}", e),
+// ─────────────────────────── batch body ───────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct Batch<T> {
+    ops: Vec<T>,
+}
+
+/// True when the body-read error is the byte cap (http-body-util's
+/// `LengthLimitError`, which axum wraps; matched by its message since that
+/// crate isn't a direct dependency).
+fn is_length_limit(e: &axum::Error) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(x) = cur {
+        if x.to_string() == "length limit exceeded" {
+            return true;
+        }
+        cur = x.source();
     }
-    err(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+    false
+}
+
+/// Read and parse a batch body (only ever called after `resolve_caller`).
+/// Over `limit` bytes → 413; malformed JSON or an unknown op → 400; more
+/// than `max_ops` ops → 413 `too many ops`.
+async fn read_batch<T: DeserializeOwned>(body: Body, limit: usize, max_ops: usize) -> Result<Vec<T>, ErrResp> {
+    let bytes = axum::body::to_bytes(body, limit).await.map_err(|e| {
+        if is_length_limit(&e) {
+            err(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
+        } else {
+            err(StatusCode::BAD_REQUEST, "could not read request body")
+        }
+    })?;
+    let batch: Batch<T> = serde_json::from_slice(&bytes)
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "invalid batch"))?;
+    if batch.ops.len() > max_ops {
+        return Err(err(StatusCode::PAYLOAD_TOO_LARGE, "too many ops"));
+    }
+    Ok(batch.ops)
+}
+
+/// Postgres TEXT and JSONB can't hold `\u0000`; such input is refused per op
+/// up front so a permanent input problem never surfaces as a (retried) 503.
+fn has_nul(fields: &[&str]) -> bool {
+    fields.iter().any(|f| f.contains('\0'))
+}
+
+fn memory_has_nul(m: &MemoryRow) -> bool {
+    has_nul(&[
+        &m.id,
+        &m.scope,
+        &m.project,
+        &m.machine,
+        &m.content,
+        &m.content_hash,
+        &m.confidence,
+        &m.source_agent,
+        &m.source_machine,
+    ])
+}
+
+fn skill_has_nul(s: &SkillRow) -> bool {
+    has_nul(&[
+        &s.scope,
+        &s.project,
+        &s.name,
+        &s.content_hash,
+        &s.source_agent,
+        &s.source_machine,
+    ]) || s
+        .files
+        .as_object()
+        .is_some_and(|o| o.keys().any(|k| k.contains('\0')))
 }
 
 // ─────────────────────────── base64 (standard alphabet, padded) ───────────────────────────
@@ -147,55 +244,43 @@ fn is_valid_skill_scope(s: &str) -> bool {
 
 // ─────────────────────────── memory batch ───────────────────────────
 
-async fn apply_memory_op(state: &AppState, account: &str, op: Value) -> Value {
-    let op_name = op.get("op").and_then(Value::as_str).unwrap_or("");
-    match op_name {
-        "add" => {
-            let memory: MemoryRow = match op.get("memory").cloned() {
-                Some(v) => match serde_json::from_value(v) {
-                    Ok(m) => m,
-                    Err(_) => return op_err("invalid memory"),
-                },
-                None => return op_err("invalid memory"),
-            };
-            if !is_valid_memory_scope(&memory.scope) {
-                return op_err("invalid memory");
-            }
-            if contains_reserved(&memory.content) {
-                return op_err("reserved token");
-            }
-            let findings = find_secrets(&memory.content);
-            if let Some(f) = findings.first() {
-                return op_err(format!("possible credential: {}", f.kind));
-            }
-            match state.knowledge.add_memory(account, memory).await {
-                Ok(o) => {
-                    let mut v = json!({ "ok": true, "id": o.id, "seq": o.seq });
-                    if let Some(cid) = o.canonical_id {
-                        v["canonical_id"] = json!(cid);
-                    }
-                    v
-                }
-                Err(e) => store_err(e),
-            }
-        }
-        "delete" => {
-            let id = match op.get("id").and_then(Value::as_str) {
-                Some(id) => id.to_string(),
-                None => return op_err("invalid delete"),
-            };
-            match state.knowledge.delete_memory(account, &id).await {
-                Ok(seq) => json!({ "ok": true, "id": id, "seq": seq }),
-                Err(e) => store_err(e),
-            }
-        }
-        _ => op_err("unknown op"),
-    }
+/// One `/api/memory/batch` op. Unknown `op` values fail deserialization (400).
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub(crate) enum MemoryOp {
+    Add { memory: MemoryRow },
+    Delete { id: String },
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct BatchRequest {
-    ops: Vec<Value>,
+async fn apply_memory_op(state: &AppState, account: &str, op: MemoryOp) -> Result<Value, ErrResp> {
+    match op {
+        MemoryOp::Add { memory } => {
+            if !is_valid_memory_scope(&memory.scope) || memory_has_nul(&memory) {
+                return Ok(op_err("invalid memory"));
+            }
+            if contains_reserved(&memory.content) {
+                return Ok(op_err("reserved token"));
+            }
+            if let Some(f) = find_secrets(&memory.content).first() {
+                return Ok(op_err(format!("possible credential: {}", f.kind)));
+            }
+            store_result(state.knowledge.add_memory(account, memory).await, |o| {
+                let mut v = json!({ "ok": true, "id": o.id, "seq": o.seq });
+                if let Some(cid) = o.canonical_id {
+                    v["canonical_id"] = json!(cid);
+                }
+                v
+            })
+        }
+        MemoryOp::Delete { id } => {
+            if has_nul(&[&id]) {
+                return Ok(op_err("invalid memory"));
+            }
+            store_result(state.knowledge.delete_memory(account, &id).await, |seq| {
+                json!({ "ok": true, "id": id, "seq": seq })
+            })
+        }
+    }
 }
 
 /// POST /api/memory/batch {ops:[…]} -> {results:[…]}
@@ -203,12 +288,13 @@ pub async fn memory_batch_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Json(body): Json<BatchRequest>,
+    body: Body,
 ) -> Result<Json<Value>, ErrResp> {
     let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
-    let mut results = Vec::with_capacity(body.ops.len());
-    for op in body.ops {
-        results.push(apply_memory_op(&state, &caller.work_session_id, op).await);
+    let ops: Vec<MemoryOp> = read_batch(body, MEMORY_BATCH_BODY_LIMIT, MEMORY_BATCH_MAX_OPS).await?;
+    let mut results = Vec::with_capacity(ops.len());
+    for op in ops {
+        results.push(apply_memory_op(&state, &caller.work_session_id, op).await?);
     }
     Ok(Json(json!({ "results": results })))
 }
@@ -226,7 +312,7 @@ pub async fn memory_pull_handler(
         .knowledge
         .pull_memories(&caller.work_session_id, since, limit)
         .await
-        .map_err(internal_err)?;
+        .map_err(unavailable)?;
     Ok(Json(json!({ "memories": rows })))
 }
 
@@ -266,76 +352,69 @@ fn check_skill_files(files: &Value) -> Result<(), Value> {
     Ok(())
 }
 
-async fn apply_skill_op(state: &AppState, account: &str, op: Value) -> Value {
-    let op_name = op.get("op").and_then(Value::as_str).unwrap_or("");
-    match op_name {
-        "push" => {
-            let skill: SkillRow = match op.get("skill").cloned() {
-                Some(v) => match serde_json::from_value(v) {
-                    Ok(s) => s,
-                    Err(_) => return op_err("invalid skill"),
-                },
-                None => return op_err("invalid skill"),
-            };
-            if !is_valid_skill_scope(&skill.scope) {
-                return op_err("invalid skill");
+/// One `/api/skills/batch` op. Unknown `op` values fail deserialization (400).
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub(crate) enum SkillOp {
+    Push {
+        skill: SkillRow,
+        base_version: i64,
+    },
+    Delete {
+        scope: String,
+        #[serde(default)]
+        project: String,
+        name: String,
+    },
+    Purge {
+        scope: String,
+        #[serde(default)]
+        project: String,
+        name: String,
+        #[serde(default)]
+        versions: Option<Vec<i64>>,
+    },
+}
+
+async fn apply_skill_op(state: &AppState, account: &str, op: SkillOp) -> Result<Value, ErrResp> {
+    match op {
+        SkillOp::Push { skill, base_version } => {
+            if !is_valid_skill_scope(&skill.scope) || skill_has_nul(&skill) {
+                return Ok(op_err("invalid skill"));
             }
-            let base_version = op.get("base_version").and_then(Value::as_i64).unwrap_or(0);
             if let Err(bad) = check_skill_files(&skill.files) {
-                return bad;
+                return Ok(bad);
             }
-            match state.knowledge.push_skill(account, skill, base_version).await {
-                Ok(o) => json!({
+            store_result(state.knowledge.push_skill(account, skill, base_version).await, |o| {
+                json!({
                     "ok": true,
                     "version": o.version,
                     "seq": o.seq,
                     "superseded_concurrent": o.superseded_concurrent,
-                }),
-                Err(e) => store_err(e),
-            }
+                })
+            })
         }
-        "delete" => {
-            let scope = op.get("scope").and_then(Value::as_str).unwrap_or("").to_string();
-            let project = op.get("project").and_then(Value::as_str).unwrap_or("").to_string();
-            let name = match op.get("name").and_then(Value::as_str) {
-                Some(n) => n.to_string(),
-                None => return op_err("invalid delete"),
-            };
-            if !is_valid_skill_scope(&scope) {
-                return op_err("invalid skill");
+        SkillOp::Delete { scope, project, name } => {
+            if !is_valid_skill_scope(&scope) || has_nul(&[&project, &name]) {
+                return Ok(op_err("invalid skill"));
             }
-            match state.knowledge.delete_skill(account, &scope, &project, &name).await {
-                Ok(o) => json!({ "ok": true, "version": o.version, "seq": o.seq }),
-                Err(e) => store_err(e),
-            }
+            store_result(
+                state.knowledge.delete_skill(account, &scope, &project, &name).await,
+                |o| json!({ "ok": true, "version": o.version, "seq": o.seq }),
+            )
         }
-        "purge" => {
-            let scope = op.get("scope").and_then(Value::as_str).unwrap_or("").to_string();
-            let project = op.get("project").and_then(Value::as_str).unwrap_or("").to_string();
-            let name = match op.get("name").and_then(Value::as_str) {
-                Some(n) => n.to_string(),
-                None => return op_err("invalid purge"),
-            };
-            let versions: Option<Vec<i64>> = match op.get("versions") {
-                None | Some(Value::Null) => None,
-                Some(v) => match serde_json::from_value(v.clone()) {
-                    Ok(vs) => Some(vs),
-                    Err(_) => return op_err("invalid purge"),
-                },
-            };
-            if !is_valid_skill_scope(&scope) {
-                return op_err("invalid skill");
+        SkillOp::Purge { scope, project, name, versions } => {
+            if !is_valid_skill_scope(&scope) || has_nul(&[&project, &name]) {
+                return Ok(op_err("invalid skill"));
             }
-            match state
-                .knowledge
-                .purge_skill(account, &scope, &project, &name, versions)
-                .await
-            {
-                Ok(_) => json!({ "ok": true }),
-                Err(e) => store_err(e),
-            }
+            store_result(
+                state
+                    .knowledge
+                    .purge_skill(account, &scope, &project, &name, versions)
+                    .await,
+                |_| json!({ "ok": true }),
+            )
         }
-        _ => op_err("unknown op"),
     }
 }
 
@@ -344,12 +423,13 @@ pub async fn skills_batch_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
-    Json(body): Json<BatchRequest>,
+    body: Body,
 ) -> Result<Json<Value>, ErrResp> {
     let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
-    let mut results = Vec::with_capacity(body.ops.len());
-    for op in body.ops {
-        results.push(apply_skill_op(&state, &caller.work_session_id, op).await);
+    let ops: Vec<SkillOp> = read_batch(body, SKILLS_BATCH_BODY_LIMIT, SKILLS_BATCH_MAX_OPS).await?;
+    let mut results = Vec::with_capacity(ops.len());
+    for op in ops {
+        results.push(apply_skill_op(&state, &caller.work_session_id, op).await?);
     }
     Ok(Json(json!({ "results": results })))
 }
@@ -367,7 +447,7 @@ pub async fn skills_pull_handler(
         .knowledge
         .pull_skills(&caller.work_session_id, since, limit)
         .await
-        .map_err(internal_err)?;
+        .map_err(unavailable)?;
     Ok(Json(json!({ "skills": rows })))
 }
 
@@ -375,7 +455,9 @@ pub async fn skills_pull_handler(
 mod tests {
     use super::*;
     use crate::auth::{create_session, SessionStatus};
-    use crate::knowledge_store::InMemoryKnowledgeStore;
+    use crate::knowledge_store::{
+        InMemoryKnowledgeStore, KnowledgeStore, MemoryAddOutcome, SkillPushOutcome,
+    };
     use crate::relay::RelayHub;
     use crate::rtc_session::RtcSessionStore;
     use crate::session_store::SessionStore;
@@ -383,7 +465,6 @@ mod tests {
     use crate::vault_store::InMemoryVaultStore;
     use crate::voice_session::VoiceSessionStore;
     use axum::body::Body;
-    use axum::extract::DefaultBodyLimit;
     use axum::http::Request;
     use axum::routing::{get, post};
     use axum::Router;
@@ -726,12 +807,18 @@ mod tests {
         assert_eq!(r[2]["seq"], 0);
     }
 
+    /// The whole batch is refused: atem never sends an unknown op, so one
+    /// means a broken client, not a per-op refusal to ack.
     #[tokio::test]
-    async fn unknown_memory_op_is_refused() {
+    async fn unknown_memory_op_fails_the_whole_batch() {
         let (state, sess) = test_state("ws-1").await;
         let app = app(state);
-        let batch = json!({ "ops": [{"op": "frobnicate"}] });
+        let batch = json!({ "ops": [
+            {"op": "add", "memory": sample_memory("mem_1", "fine")},
+            {"op": "frobnicate"},
+        ]});
         let resp = app
+            .clone()
             .oneshot(req(
                 "POST",
                 "/api/memory/batch?id=a",
@@ -740,9 +827,283 @@ mod tests {
             ))
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // Nothing from the batch was applied.
+        let pulled = body_json(
+            app.oneshot(req("GET", "/api/memory?id=a", &sess, ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(pulled["memories"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_skill_op_and_malformed_bodies_are_400() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        for (uri, body) in [
+            ("/api/skills/batch?id=a", json!({"ops": [{"op": "frobnicate"}]}).to_string()),
+            ("/api/skills/batch?id=a", "not json".to_string()),
+            ("/api/memory/batch?id=a", "{\"ops\": 5}".to_string()),
+            // A memory missing required fields is a malformed body too.
+            ("/api/memory/batch?id=a", json!({"ops": [{"op": "add", "memory": {"id": "x"}}]}).to_string()),
+        ] {
+            let resp = app.clone().oneshot(req("POST", uri, &sess, &body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{} {}", uri, body);
+        }
+    }
+
+    // ─────────────────────────── op caps ───────────────────────────
+
+    #[tokio::test]
+    async fn memory_batch_over_op_cap_is_413() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        let ops = |n: usize| {
+            json!({ "ops": (0..n).map(|i| json!({"op": "delete", "id": format!("m{}", i)})).collect::<Vec<_>>() })
+                .to_string()
+        };
+        let at_cap = app
+            .clone()
+            .oneshot(req("POST", "/api/memory/batch?id=a", &sess, &ops(MEMORY_BATCH_MAX_OPS)))
+            .await
+            .unwrap();
+        assert_eq!(at_cap.status(), StatusCode::OK);
+        let over = app
+            .oneshot(req("POST", "/api/memory/batch?id=a", &sess, &ops(MEMORY_BATCH_MAX_OPS + 1)))
+            .await
+            .unwrap();
+        assert_eq!(over.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body_json(over).await, json!({"error": "too many ops"}));
+    }
+
+    #[tokio::test]
+    async fn skills_batch_over_op_cap_is_413() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        let ops = |n: usize| {
+            json!({ "ops": (0..n).map(|i| json!({"op": "delete", "scope": "global", "project": "", "name": format!("s{}", i)})).collect::<Vec<_>>() })
+                .to_string()
+        };
+        let at_cap = app
+            .clone()
+            .oneshot(req("POST", "/api/skills/batch?id=a", &sess, &ops(SKILLS_BATCH_MAX_OPS)))
+            .await
+            .unwrap();
+        assert_eq!(at_cap.status(), StatusCode::OK);
+        let over = app
+            .oneshot(req("POST", "/api/skills/batch?id=a", &sess, &ops(SKILLS_BATCH_MAX_OPS + 1)))
+            .await
+            .unwrap();
+        assert_eq!(over.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body_json(over).await, json!({"error": "too many ops"}));
+    }
+
+    #[test]
+    fn op_caps_leave_room_for_atems_chunks() {
+        // atem sends at most 50 memory ops and 8 skill ops per request.
+        assert_eq!(MEMORY_BATCH_MAX_OPS, 64);
+        assert_eq!(SKILLS_BATCH_MAX_OPS, 16);
+    }
+
+    // ─────────────────────────── NUL bytes ───────────────────────────
+
+    /// Postgres TEXT/JSONB can't hold NUL; it must be a per-op refusal, never
+    /// a store error (which would now be a retried 503 forever).
+    #[tokio::test]
+    async fn nul_in_memory_fields_is_refused_per_op() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        let mut ops = vec![json!({"op": "add", "memory": sample_memory("mem_ok", "fine")})];
+        for field in ["id", "content", "project", "machine", "source_agent", "source_machine", "confidence", "content_hash"] {
+            let mut m = sample_memory(&format!("mem_{}", field), &format!("c {}", field));
+            m[field] = json!(format!("bad\u{0}{}", field));
+            ops.push(json!({"op": "add", "memory": m}));
+        }
+        ops.push(json!({"op": "delete", "id": "mem\u{0}x"}));
+        let resp = app
+            .clone()
+            .oneshot(req("POST", "/api/memory/batch?id=a", &sess, &json!({"ops": ops}).to_string()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
         let results = body_json(resp).await;
-        assert_eq!(results["results"][0]["ok"], false);
-        assert_eq!(results["results"][0]["error"], "unknown op");
+        let r = results["results"].as_array().unwrap();
+        assert_eq!(r[0]["ok"], true);
+        for x in &r[1..] {
+            assert_eq!(x["ok"], false, "{}", x);
+            assert_eq!(x["error"], "invalid memory", "{}", x);
+        }
+        let pulled = body_json(app.oneshot(req("GET", "/api/memory?id=a", &sess, "")).await.unwrap()).await;
+        assert_eq!(pulled["memories"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn nul_in_skill_fields_is_refused_per_op() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        let good = sample_skill("ok", json!({"SKILL.md": b64("# hi")}));
+        let mut ops = vec![json!({"op": "push", "skill": good, "base_version": 0})];
+        for field in ["name", "project", "source_agent", "source_machine", "content_hash"] {
+            let mut sk = sample_skill("x", json!({"SKILL.md": b64("# hi")}));
+            sk[field] = json!("bad\u{0}");
+            ops.push(json!({"op": "push", "skill": sk, "base_version": 0}));
+        }
+        let bad_path = sample_skill("y", json!({"a\u{0}.md": b64("# hi")}));
+        ops.push(json!({"op": "push", "skill": bad_path, "base_version": 0}));
+        ops.push(json!({"op": "delete", "scope": "global", "project": "", "name": "n\u{0}"}));
+        ops.push(json!({"op": "purge", "scope": "global", "project": "p\u{0}", "name": "n", "versions": null}));
+        let resp = app
+            .clone()
+            .oneshot(req("POST", "/api/skills/batch?id=a", &sess, &json!({"ops": ops}).to_string()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let results = body_json(resp).await;
+        let r = results["results"].as_array().unwrap();
+        assert_eq!(r[0]["ok"], true);
+        for x in &r[1..] {
+            assert_eq!(x["ok"], false, "{}", x);
+            assert_eq!(x["error"], "invalid skill", "{}", x);
+        }
+        let pulled = body_json(app.oneshot(req("GET", "/api/skills?id=a", &sess, "")).await.unwrap()).await;
+        assert_eq!(pulled["skills"].as_array().unwrap().len(), 1);
+    }
+
+    // ─────────────────────────── store failures → 503 ───────────────────────────
+
+    /// A store whose backend is down: every call fails with `Db`.
+    struct FailingStore;
+
+    #[async_trait::async_trait]
+    impl KnowledgeStore for FailingStore {
+        fn backend_name(&self) -> &'static str {
+            "failing"
+        }
+        async fn health_check(&self) -> Result<(), KnowledgeError> {
+            Err(KnowledgeError::Db("down".into()))
+        }
+        async fn add_memory(&self, _: &str, _: MemoryRow) -> Result<MemoryAddOutcome, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
+        async fn delete_memory(&self, _: &str, _: &str) -> Result<i64, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
+        async fn pull_memories(&self, _: &str, _: i64, _: i64) -> Result<Vec<MemoryRow>, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
+        async fn push_skill(&self, _: &str, _: SkillRow, _: i64) -> Result<SkillPushOutcome, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
+        async fn delete_skill(&self, _: &str, _: &str, _: &str, _: &str) -> Result<SkillPushOutcome, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
+        async fn purge_skill(&self, _: &str, _: &str, _: &str, _: &str, _: Option<Vec<i64>>) -> Result<u64, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
+        async fn pull_skills(&self, _: &str, _: i64, _: i64) -> Result<Vec<SkillRow>, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn store_failure_fails_the_whole_batch_with_503() {
+        let (mut state, sess) = test_state("ws-1").await;
+        state.knowledge = Arc::new(FailingStore);
+        let app = app(state);
+        let cases = [
+            ("/api/memory/batch?id=a", json!({"ops": [{"op": "add", "memory": sample_memory("mem_1", "x")}]})),
+            ("/api/memory/batch?id=a", json!({"ops": [{"op": "delete", "id": "mem_1"}]})),
+            ("/api/skills/batch?id=a", json!({"ops": [{"op": "push", "skill": sample_skill("x", json!({"SKILL.md": b64("# hi")})), "base_version": 0}]})),
+            ("/api/skills/batch?id=a", json!({"ops": [{"op": "delete", "scope": "global", "project": "", "name": "x"}]})),
+            ("/api/skills/batch?id=a", json!({"ops": [{"op": "purge", "scope": "global", "project": "", "name": "x", "versions": null}]})),
+        ];
+        for (uri, body) in cases {
+            let resp = app.clone().oneshot(req("POST", uri, &sess, &body.to_string())).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{} {}", uri, body);
+            let v = body_json(resp).await;
+            assert_eq!(v, json!({"error": "temporarily unavailable"}));
+            assert!(!v.to_string().contains("connection reset"));
+        }
+        for uri in ["/api/memory?id=a", "/api/skills?id=a"] {
+            let resp = app.clone().oneshot(req("GET", uri, &sess, "")).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{}", uri);
+        }
+    }
+
+    // ─────────────────────────── production router ───────────────────────────
+
+    fn prod_req(uri: &str, session: Option<&str>, body: Body) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            // The rate limiter keys on the client IP.
+            .header("x-forwarded-for", "203.0.113.50");
+        if let Some(s) = session {
+            b = b.header("authorization", format!("session {}", s));
+        }
+        b.body(body).unwrap()
+    }
+
+    /// An unauthenticated caller can't make the relay buffer a large body:
+    /// auth runs first and the body is never polled.
+    #[tokio::test]
+    async fn unauthenticated_oversized_body_is_401_without_reading_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for uri in ["/api/skills/batch?id=a", "/api/memory/batch?id=a"] {
+            let (state, _sess) = test_state("ws-1").await;
+            let app = crate::router(state);
+            let polled = Arc::new(AtomicBool::new(false));
+            let flag = polled.clone();
+            let stream = futures_util::stream::once(async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'x'; 17 * 1024 * 1024]))
+            });
+            let resp = app
+                .oneshot(prod_req(uri, None, Body::from_stream(stream)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{}", uri);
+            assert!(!polled.load(Ordering::SeqCst), "{}: body was read before auth", uri);
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_megabyte_skill_push_succeeds_through_production_router() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = crate::router(state);
+        // ~6 MB of text → ~8 MB of base64: above nginx's and axum's 1-2 MB
+        // defaults, below the 16 MB skills limit.
+        let text = "step: run the build and read the output carefully\n".repeat(120_000);
+        let files = json!({"SKILL.md": b64(&text)});
+        let body = json!({ "ops": [{"op": "push", "skill": sample_skill("big", files), "base_version": 0}] }).to_string();
+        assert!(body.len() > 2 * 1024 * 1024 && body.len() < 16 * 1024 * 1024, "{}", body.len());
+        let resp = app
+            .oneshot(prod_req("/api/skills/batch?id=a", Some(&sess), Body::from(body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["results"][0]["ok"], true, "{}", v);
+    }
+
+    #[tokio::test]
+    async fn over_limit_bodies_are_413_through_production_router() {
+        for (uri, limit) in [
+            ("/api/memory/batch?id=a", MEMORY_BATCH_BODY_LIMIT),
+            ("/api/skills/batch?id=a", SKILLS_BATCH_BODY_LIMIT),
+        ] {
+            let (state, sess) = test_state("ws-1").await;
+            let app = crate::router(state);
+            let big = "x".repeat(limit + 1);
+            let resp = app
+                .oneshot(prod_req(uri, Some(&sess), Body::from(big)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE, "{}", uri);
+        }
     }
 
     #[tokio::test]
@@ -1087,25 +1448,5 @@ mod tests {
         let rows = pulled["skills"].as_array().unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r["deleted"] == true));
-    }
-
-    #[tokio::test]
-    async fn oversized_skills_body_is_rejected() {
-        let (state, sess) = test_state("ws-1").await;
-        let app = Router::new()
-            .route(
-                "/api/skills/batch",
-                post(skills_batch_handler)
-                    .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
-            )
-            .with_state(state);
-
-        // Over 16 MiB of raw body bytes.
-        let big = "x".repeat(16 * 1024 * 1024 + 1);
-        let resp = app
-            .oneshot(req("POST", "/api/skills/batch?id=a", &sess, &big))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

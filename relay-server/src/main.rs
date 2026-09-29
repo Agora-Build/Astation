@@ -66,6 +66,159 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// CORS: `CORS_ORIGIN` (default the production webapp origin); `*` is dev-only.
+fn cors_layer() -> CorsLayer {
+    // Configure CORS - Allow specific origin or default to localhost for development
+    let allowed_origin = std::env::var("CORS_ORIGIN")
+        .unwrap_or_else(|_| "https://station.agora.build".to_string());
+
+    if allowed_origin == "*" {
+        // Development mode: allow all origins
+        tracing::warn!("CORS configured to allow ALL origins - only use in development!");
+        CorsLayer::permissive()
+    } else {
+        // Production mode: whitelist specific domain
+        tracing::info!("CORS configured to allow origin: {}", allowed_origin);
+        CorsLayer::new()
+            .allow_origin(allowed_origin.parse::<HeaderValue>().expect("Invalid CORS_ORIGIN"))
+            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+            .allow_credentials(true)
+    }
+}
+
+/// The production router: every route, its body limits, rate limiting and
+/// CORS. Shared by `main` and the tests so they exercise the real stack.
+fn router(state: AppState) -> Router {
+    // Configure rate limiting
+    // OTP/grant endpoints: 60 requests per minute per IP (strict)
+    // General endpoints: 600 requests per minute per IP
+    let governor_conf_strict = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(1) // 60 per minute
+            .burst_size(10)
+            .key_extractor(SmartIpKeyExtractor)
+            .use_headers()
+            .finish()
+            .unwrap(),
+    );
+
+    let governor_conf_general = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_millisecond(100) // 10 per second / 600 per minute
+            .burst_size(20)
+            .key_extractor(SmartIpKeyExtractor)
+            .use_headers()
+            .finish()
+            .unwrap(),
+    );
+
+    // Build the router with rate limiting on sensitive endpoints
+    // Strict rate limiting for OTP validation (brute force protection)
+    let auth_routes = Router::new()
+        .route(
+            "/api/sessions/:id/grant",
+            post(routes::grant_session_handler),
+        )
+        .layer(GovernorLayer {
+            config: governor_conf_strict,
+        });
+
+    // General rate limiting for other API endpoints
+    let general_routes = Router::new()
+        // Auth API routes
+        .route("/api/sessions", post(routes::create_session_handler))
+        .route(
+            "/api/sessions/:id/status",
+            get(routes::get_session_status_handler),
+        )
+        .route(
+            "/api/sessions/:id/deny",
+            post(routes::deny_session_handler),
+        )
+        // RTC Session API routes
+        .route(
+            "/api/rtc-sessions",
+            post(rtc_session::create_rtc_session_handler),
+        )
+        .route(
+            "/api/rtc-sessions/:id",
+            get(rtc_session::get_rtc_session_handler)
+                .delete(rtc_session::delete_rtc_session_handler),
+        )
+        .route(
+            "/api/rtc-sessions/:id/join",
+            post(rtc_session::join_rtc_session_handler),
+        )
+        // Voice Session API routes
+        .route(
+            "/api/voice-sessions",
+            post(voice_routes::create_voice_session_handler)
+                .get(voice_routes::list_voice_sessions_handler),
+        )
+        .route(
+            "/api/voice-sessions/:id",
+            get(voice_routes::get_voice_session_handler)
+                .delete(voice_routes::delete_voice_session_handler),
+        )
+        .route(
+            "/api/voice-sessions/:id/trigger",
+            post(voice_routes::trigger_voice_session_handler),
+        )
+        .route(
+            "/api/voice-sessions/response",
+            post(voice_routes::atem_response_handler),
+        )
+        // LLM Proxy (for Agora ConvoAI)
+        .route(
+            "/api/llm/chat",
+            post(llm_proxy::llm_chat_handler),
+        )
+        // Vault API routes
+        .route(
+            "/api/vault",
+            post(vault_routes::create_vault_handler).get(vault_routes::list_vaults_handler),
+        )
+        .route(
+            "/api/vault/:id",
+            get(vault_routes::read_vault_handler).post(vault_routes::write_vault_handler),
+        )
+        .route(
+            "/api/vault/:id/summary",
+            post(vault_routes::set_summary_handler),
+        )
+        // Atem Memory API routes (knowledge sync)
+        .route(
+            "/api/memory/batch",
+            post(knowledge_routes::memory_batch_handler)
+                .layer(DefaultBodyLimit::max(knowledge_routes::MEMORY_BATCH_BODY_LIMIT)),
+        )
+        .route("/api/memory", get(knowledge_routes::memory_pull_handler))
+        .route(
+            "/api/skills/batch",
+            post(knowledge_routes::skills_batch_handler)
+                .layer(DefaultBodyLimit::max(knowledge_routes::SKILLS_BATCH_BODY_LIMIT)),
+        )
+        .route("/api/skills", get(knowledge_routes::skills_pull_handler))
+        // Relay API routes
+        .route("/api/pair", post(relay::create_pair_handler))
+        .route("/api/pair/:code", get(relay::pair_status_handler).delete(relay::delete_pair_handler))
+        .layer(GovernorLayer {
+            config: governor_conf_general,
+        });
+
+    // Combine all routes
+    Router::new()
+        .merge(auth_routes)
+        .merge(general_routes)
+        .route("/health", get(health_handler))
+        .route("/ws", get(relay::ws_handler))
+        .route("/pair", get(relay::pair_page_handler))
+        .route("/auth", get(routes::auth_page_handler))
+        .layer(cors_layer())
+        .with_state(state)
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize tracing/logging
@@ -183,151 +336,7 @@ async fn main() {
         knowledge,
     };
 
-    // Configure CORS - Allow specific origin or default to localhost for development
-    let allowed_origin = std::env::var("CORS_ORIGIN")
-        .unwrap_or_else(|_| "https://station.agora.build".to_string());
-
-    let cors = if allowed_origin == "*" {
-        // Development mode: allow all origins
-        tracing::warn!("CORS configured to allow ALL origins - only use in development!");
-        CorsLayer::permissive()
-    } else {
-        // Production mode: whitelist specific domain
-        tracing::info!("CORS configured to allow origin: {}", allowed_origin);
-        CorsLayer::new()
-            .allow_origin(allowed_origin.parse::<HeaderValue>().expect("Invalid CORS_ORIGIN"))
-            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
-            .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
-            .allow_credentials(true)
-    };
-
-    // Configure rate limiting
-    // OTP/grant endpoints: 60 requests per minute per IP (strict)
-    // General endpoints: 600 requests per minute per IP
-    let governor_conf_strict = Arc::new(
-        GovernorConfigBuilder::default()
-            .per_second(1) // 60 per minute
-            .burst_size(10)
-            .key_extractor(SmartIpKeyExtractor)
-            .use_headers()
-            .finish()
-            .unwrap(),
-    );
-
-    let governor_conf_general = Arc::new(
-        GovernorConfigBuilder::default()
-            .per_millisecond(100) // 10 per second / 600 per minute
-            .burst_size(20)
-            .key_extractor(SmartIpKeyExtractor)
-            .use_headers()
-            .finish()
-            .unwrap(),
-    );
-
-    // Build the router with rate limiting on sensitive endpoints
-    // Strict rate limiting for OTP validation (brute force protection)
-    let auth_routes = Router::new()
-        .route(
-            "/api/sessions/:id/grant",
-            post(routes::grant_session_handler),
-        )
-        .layer(GovernorLayer {
-            config: governor_conf_strict,
-        });
-
-    // General rate limiting for other API endpoints
-    let general_routes = Router::new()
-        // Auth API routes
-        .route("/api/sessions", post(routes::create_session_handler))
-        .route(
-            "/api/sessions/:id/status",
-            get(routes::get_session_status_handler),
-        )
-        .route(
-            "/api/sessions/:id/deny",
-            post(routes::deny_session_handler),
-        )
-        // RTC Session API routes
-        .route(
-            "/api/rtc-sessions",
-            post(rtc_session::create_rtc_session_handler),
-        )
-        .route(
-            "/api/rtc-sessions/:id",
-            get(rtc_session::get_rtc_session_handler)
-                .delete(rtc_session::delete_rtc_session_handler),
-        )
-        .route(
-            "/api/rtc-sessions/:id/join",
-            post(rtc_session::join_rtc_session_handler),
-        )
-        // Voice Session API routes
-        .route(
-            "/api/voice-sessions",
-            post(voice_routes::create_voice_session_handler)
-                .get(voice_routes::list_voice_sessions_handler),
-        )
-        .route(
-            "/api/voice-sessions/:id",
-            get(voice_routes::get_voice_session_handler)
-                .delete(voice_routes::delete_voice_session_handler),
-        )
-        .route(
-            "/api/voice-sessions/:id/trigger",
-            post(voice_routes::trigger_voice_session_handler),
-        )
-        .route(
-            "/api/voice-sessions/response",
-            post(voice_routes::atem_response_handler),
-        )
-        // LLM Proxy (for Agora ConvoAI)
-        .route(
-            "/api/llm/chat",
-            post(llm_proxy::llm_chat_handler),
-        )
-        // Vault API routes
-        .route(
-            "/api/vault",
-            post(vault_routes::create_vault_handler).get(vault_routes::list_vaults_handler),
-        )
-        .route(
-            "/api/vault/:id",
-            get(vault_routes::read_vault_handler).post(vault_routes::write_vault_handler),
-        )
-        .route(
-            "/api/vault/:id/summary",
-            post(vault_routes::set_summary_handler),
-        )
-        // Atem Memory API routes (knowledge sync)
-        .route(
-            "/api/memory/batch",
-            post(knowledge_routes::memory_batch_handler)
-                .layer(DefaultBodyLimit::max(2 * 1024 * 1024)),
-        )
-        .route("/api/memory", get(knowledge_routes::memory_pull_handler))
-        .route(
-            "/api/skills/batch",
-            post(knowledge_routes::skills_batch_handler)
-                .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
-        )
-        .route("/api/skills", get(knowledge_routes::skills_pull_handler))
-        // Relay API routes
-        .route("/api/pair", post(relay::create_pair_handler))
-        .route("/api/pair/:code", get(relay::pair_status_handler).delete(relay::delete_pair_handler))
-        .layer(GovernorLayer {
-            config: governor_conf_general,
-        });
-
-    // Combine all routes
-    let app = Router::new()
-        .merge(auth_routes)
-        .merge(general_routes)
-        .route("/health", get(health_handler))
-        .route("/ws", get(relay::ws_handler))
-        .route("/pair", get(relay::pair_page_handler))
-        .route("/auth", get(routes::auth_page_handler))
-        .layer(cors)
-        .with_state(state);
+    let app = router(state);
 
     tracing::info!("Rate limiting configured:");
     tracing::info!("  - OTP validation: 60 requests/min per IP (burst: 10)");
