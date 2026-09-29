@@ -117,7 +117,8 @@ pub trait KnowledgeStore: Send + Sync {
         m: MemoryRow,
     ) -> Result<MemoryAddOutcome, KnowledgeError>;
 
-    /// Blank + tombstone the memory, returning its new seq. Unknown id → `Ok(0)`.
+    /// Blank + tombstone the memory, returning its new seq. Unknown id, or an
+    /// id owned by another account → `Ok(0)` (no change, no existence oracle).
     async fn delete_memory(&self, account: &str, id: &str) -> Result<i64, KnowledgeError>;
 
     /// Rows with `seq > since`, ascending, at most `min(limit, 500)`. Includes tombstones.
@@ -266,13 +267,15 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
 
     async fn delete_memory(&self, account: &str, id: &str) -> Result<i64, KnowledgeError> {
         let mut st = self.state.lock().await;
-        let idx = match st.memories.iter().position(|(_, r)| r.id == id) {
+        // An id owned by another account is treated exactly like an unknown id.
+        let idx = match st
+            .memories
+            .iter()
+            .position(|(acct, r)| acct == account && r.id == id)
+        {
             None => return Ok(0),
             Some(i) => i,
         };
-        if st.memories[idx].0 != account {
-            return Err(KnowledgeError::IdConflict);
-        }
         let seq = st.next_seq();
         let row = &mut st.memories[idx].1;
         row.content.clear();
@@ -468,20 +471,25 @@ const SKILL_COLS: &str = "scope, project, name, version, files::text AS files, c
      source_agent, source_machine, created_at, deleted, seq";
 const SKILL_KEY: &str = "account_id = $1 AND scope = $2 AND project = $3 AND name = $4";
 
-/// Serialize every writer of one skill key for the rest of the transaction.
-/// A transaction-scoped advisory lock is used instead of `SELECT … FOR UPDATE`
-/// because FOR UPDATE locks only existing rows: two concurrent *first* pushes
-/// of a key would both see `max(version) = 0`. Hash collisions only serialize
-/// unrelated keys; they never affect correctness.
-async fn lock_skill_key(
-    conn: &mut sqlx::PgConnection,
-    account: &str,
-    scope: &str,
-    project: &str,
-    name: &str,
-) -> Result<(), KnowledgeError> {
-    let key = serde_json::to_string(&["skill", account, scope, project, name])
-        .map_err(|e| KnowledgeError::Db(e.to_string()))?;
+/// Serialize every write transaction of one account; call it FIRST in each
+/// Pg write, before anything takes a `nextval('knowledge_seq')`.
+///
+/// Why: a seq is allocated inside the transaction but becomes visible only at
+/// commit. Without this lock, T1 (seq 10) could commit after T2 (seq 11); a
+/// pull in between returns 11, the client's `since` cursor moves past 10, and
+/// T1's row is never pulled. Holding a per-account lock from before `nextval`
+/// until commit makes per-account commit order equal seq order, and pulls are
+/// account-scoped, so a cursor never skips a row.
+///
+/// The same lock also serializes skill version computation (`max(version)+1`)
+/// for every key of the account, including the first push of a key, which
+/// `SELECT … FOR UPDATE` could not cover (no rows to lock yet). So no separate
+/// per-skill-key lock is taken, and there is no lock ordering to get wrong.
+/// It is a transaction-scoped advisory lock (released at commit/rollback);
+/// hash collisions only serialize unrelated accounts.
+async fn lock_account(conn: &mut sqlx::PgConnection, account: &str) -> Result<(), KnowledgeError> {
+    let key =
+        serde_json::to_string(&["acct", account]).map_err(|e| KnowledgeError::Db(e.to_string()))?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(key)
         .execute(conn)
@@ -588,6 +596,7 @@ impl KnowledgeStore for PgKnowledgeStore {
         m: MemoryRow,
     ) -> Result<MemoryAddOutcome, KnowledgeError> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        lock_account(&mut tx, account).await?;
         if let Some(o) = existing_memory_outcome(&mut tx, account, &m).await? {
             tx.commit().await.map_err(db_err)?;
             return Ok(o);
@@ -619,9 +628,10 @@ impl KnowledgeStore for PgKnowledgeStore {
                     seq,
                 })
             }
-            // Lost a race: a concurrent insert of the same dedup key
-            // (`memories_dedup`) or the same id (primary key) committed first.
-            // The transaction is aborted; re-read outside it.
+            // Lost a race: a concurrent insert of the same id (primary key,
+            // possibly from another account, which the account lock does not
+            // serialize) or of the same dedup key (`memories_dedup`) committed
+            // first. The transaction is aborted; re-read outside it.
             Err(e) if is_unique_violation(&e) => {
                 tx.rollback().await.map_err(db_err)?;
                 let mut conn = self.pool.acquire().await.map_err(db_err)?;
@@ -638,28 +648,20 @@ impl KnowledgeStore for PgKnowledgeStore {
 
     async fn delete_memory(&self, account: &str, id: &str) -> Result<i64, KnowledgeError> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        let owner: Option<String> =
-            sqlx::query_scalar("SELECT account_id FROM memories WHERE id = $1 FOR UPDATE")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db_err)?;
-        match owner {
-            None => return Ok(0),
-            Some(o) if o != account => return Err(KnowledgeError::IdConflict),
-            Some(_) => {}
-        }
-        let seq: i64 = sqlx::query_scalar(
+        lock_account(&mut tx, account).await?;
+        // Scoped to the account: an id owned by another account matches no row
+        // and is indistinguishable from an unknown id (Ok(0), no existence oracle).
+        let seq: Option<i64> = sqlx::query_scalar(
             "UPDATE memories SET content = '', content_hash = '', deleted = true, \
              seq = nextval('knowledge_seq') WHERE id = $1 AND account_id = $2 RETURNING seq",
         )
         .bind(id)
         .bind(account)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
-        Ok(seq)
+        Ok(seq.unwrap_or(0))
     }
 
     async fn pull_memories(
@@ -690,7 +692,7 @@ impl KnowledgeStore for PgKnowledgeStore {
         let files =
             serde_json::to_string(&s.files).map_err(|e| KnowledgeError::Db(e.to_string()))?;
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        lock_skill_key(&mut tx, account, &s.scope, &s.project, &s.name).await?;
+        lock_account(&mut tx, account).await?;
         let (cur, cur_live): (i64, i64) = sqlx::query_as(&format!(
             "SELECT COALESCE(MAX(version), 0)::bigint, \
              COALESCE(MAX(version) FILTER (WHERE NOT deleted), 0)::bigint \
@@ -738,7 +740,7 @@ impl KnowledgeStore for PgKnowledgeStore {
         name: &str,
     ) -> Result<SkillPushOutcome, KnowledgeError> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        lock_skill_key(&mut tx, account, scope, project, name).await?;
+        lock_account(&mut tx, account).await?;
         let latest: Option<(i64, String, String)> = sqlx::query_as(&format!(
             "SELECT version, source_agent, source_machine FROM skill_versions \
              WHERE {SKILL_KEY} ORDER BY version DESC LIMIT 1"
@@ -794,7 +796,7 @@ impl KnowledgeStore for PgKnowledgeStore {
         versions: Option<Vec<i64>>,
     ) -> Result<u64, KnowledgeError> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        lock_skill_key(&mut tx, account, scope, project, name).await?;
+        lock_account(&mut tx, account).await?;
         // Assign new seqs in version order (matches in-memory). Postgres evaluates a
         // volatile target-list function (nextval) after ORDER BY at the same level.
         let res = sqlx::query(&format!(
@@ -963,10 +965,10 @@ mod tests {
                 s.add_memory(B, mem("mem_1", "x")).await,
                 Err(KnowledgeError::IdConflict)
             ));
-            assert!(matches!(
-                s.delete_memory(B, "mem_1").await,
-                Err(KnowledgeError::IdConflict)
-            ));
+            // Deleting another account's id is indistinguishable from an
+            // unknown id: Ok(0), and A's row is untouched.
+            assert_eq!(s.delete_memory(B, "mem_1").await.unwrap(), 0);
+            assert_eq!(s.delete_memory(B, "mem_unknown").await.unwrap(), 0);
             assert!(s.pull_memories(B, 0, 100).await.unwrap().is_empty());
             let rows = s.pull_memories(A, 0, 100).await.unwrap();
             assert_eq!(rows.len(), 1);
@@ -1226,6 +1228,110 @@ mod tests {
             assert_eq!(s.pull_skills(A, 0, 100).await.unwrap().len(), 10);
         }
 
+        /// Concurrent writers on one account while a reader pulls with a
+        /// cursor (`since = max seq seen`). Every write must eventually be
+        /// observed: a row that becomes visible with a seq below the cursor
+        /// would be skipped forever.
+        pub async fn cursor_pull_never_skips_rows(s: Arc<dyn KnowledgeStore>) {
+            use std::collections::HashSet;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            const WRITERS: usize = 8;
+            const OPS: usize = 30;
+            let done = Arc::new(AtomicBool::new(false));
+
+            let reader = {
+                let (s, done) = (s.clone(), done.clone());
+                tokio::spawn(async move {
+                    let (mut mcur, mut scur) = (0i64, 0i64);
+                    let mut mem_seen: HashSet<(String, bool)> = HashSet::new();
+                    let mut skill_seen: HashSet<(String, i64)> = HashSet::new();
+                    loop {
+                        // Read the flag BEFORE pulling: once it is set, every
+                        // write has committed, so this pass drains the rest.
+                        let finished = done.load(Ordering::SeqCst);
+                        loop {
+                            let rows = s.pull_memories(A, mcur, 500).await.unwrap();
+                            let skills = s.pull_skills(A, scur, 500).await.unwrap();
+                            if rows.is_empty() && skills.is_empty() {
+                                break;
+                            }
+                            for r in rows {
+                                assert!(r.seq > mcur, "pull must be ascending past the cursor");
+                                mcur = r.seq;
+                                mem_seen.insert((r.id, r.deleted));
+                            }
+                            for r in skills {
+                                assert!(r.seq > scur, "pull must be ascending past the cursor");
+                                scur = r.seq;
+                                skill_seen.insert((r.name, r.version));
+                            }
+                        }
+                        if finished {
+                            return (mem_seen, skill_seen);
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+
+            let mut writers = Vec::new();
+            for w in 0..WRITERS {
+                let s = s.clone();
+                writers.push(tokio::spawn(async move {
+                    let mut added = Vec::new();
+                    let mut deleted = Vec::new();
+                    let mut pushed = Vec::new();
+                    for i in 0..OPS {
+                        let id = format!("mem_{w}_{i}");
+                        s.add_memory(A, mem(&id, &id)).await.unwrap();
+                        added.push(id.clone());
+                        if i % 3 == 0 {
+                            assert!(s.delete_memory(A, &id).await.unwrap() > 0);
+                            deleted.push(id);
+                        }
+                        if i % 2 == 0 {
+                            let name = format!("skill_{w}");
+                            let o = s
+                                .push_skill(A, skill(&name, &format!("{i}")), 0)
+                                .await
+                                .unwrap();
+                            pushed.push((name, o.version));
+                        }
+                    }
+                    (added, deleted, pushed)
+                }));
+            }
+            let mut want_mem: HashSet<(String, bool)> = HashSet::new();
+            let mut want_skill: HashSet<(String, i64)> = HashSet::new();
+            for h in writers {
+                let (added, deleted, pushed) = h.await.unwrap();
+                // Each add was visible live at some point unless it was
+                // deleted before the reader could see it; the tombstone of a
+                // deleted id must always be seen.
+                for id in added {
+                    if !deleted.contains(&id) {
+                        want_mem.insert((id, false));
+                    }
+                }
+                for id in deleted {
+                    want_mem.insert((id, true));
+                }
+                want_skill.extend(pushed);
+            }
+            done.store(true, Ordering::SeqCst);
+            let (mem_seen, skill_seen) = reader.await.unwrap();
+            let missing_mem: Vec<_> = want_mem.difference(&mem_seen).collect();
+            let missing_skill: Vec<_> = want_skill.difference(&skill_seen).collect();
+            assert!(
+                missing_mem.is_empty() && missing_skill.is_empty(),
+                "cursor skipped rows: {} memories {:?}, {} skills {:?}",
+                missing_mem.len(),
+                missing_mem.iter().take(5).collect::<Vec<_>>(),
+                missing_skill.len(),
+                missing_skill.iter().take(5).collect::<Vec<_>>()
+            );
+        }
+
         pub async fn concurrent_dedup_adds_converge(s: Arc<dyn KnowledgeStore>) {
             let mut handles = Vec::new();
             for i in 0..10 {
@@ -1314,6 +1420,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cursor_pull_never_skips_rows() {
+        scenarios::cursor_pull_never_skips_rows(Arc::new(InMemoryKnowledgeStore::new())).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_dedup_adds_converge() {
         scenarios::concurrent_dedup_adds_converge(Arc::new(InMemoryKnowledgeStore::new())).await;
     }
@@ -1369,6 +1480,14 @@ mod tests {
                     let _g = PG_LOCK.lock().await;
                     let s = fresh_pg().await;
                     scenarios::concurrent_skill_pushes_get_distinct_versions(Arc::new(s)).await;
+                }
+
+                #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+                #[ignore]
+                async fn cursor_pull_never_skips_rows() {
+                    let _g = PG_LOCK.lock().await;
+                    let s = fresh_pg().await;
+                    scenarios::cursor_pull_never_skips_rows(Arc::new(s)).await;
                 }
 
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
