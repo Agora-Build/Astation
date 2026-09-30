@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use validator::Validate;
 
 use crate::auth::{self, SessionStatus};
+use crate::cluster::StoreError;
+use crate::session_store::{DenyOutcome, GrantOutcome};
 use crate::web::auth_page;
 use crate::AppState;
 
@@ -52,6 +54,35 @@ pub struct AuthPageQuery {
     pub tag: String,
 }
 
+fn store_unavailable(error: StoreError) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::error!("Session store unavailable: {}", error);
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse { error: "Temporarily unavailable".to_string() }),
+    )
+}
+
+fn not_found() -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse { error: "Session not found".to_string() }),
+    )
+}
+
+fn already(status: &SessionStatus) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::CONFLICT,
+        Json(ErrorResponse {
+            error: format!(
+                "Session is already {}",
+                serde_json::to_string(status)
+                    .unwrap_or_default()
+                    .trim_matches('"')
+            ),
+        }),
+    )
+}
+
 // --- Route Handlers ---
 
 /// POST /api/sessions
@@ -80,7 +111,9 @@ pub async fn create_session_handler(
         created_at: session.created_at,
         expires_at: session.expires_at,
     };
-    state.sessions.create(session).await;
+    if let Err(error) = state.sessions.create(session).await {
+        return store_unavailable(error).into_response();
+    }
     (StatusCode::CREATED, Json(response)).into_response()
 }
 
@@ -90,36 +123,29 @@ pub async fn get_session_status_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.sessions.get(&id).await {
-        Some(session) => {
-            // Check if session has expired
-            let status = if session.status == SessionStatus::Pending
-                && chrono::Utc::now() > session.expires_at
-            {
-                SessionStatus::Expired
-            } else {
-                session.status.clone()
-            };
-
-            let token = if status == SessionStatus::Granted {
-                session.token.clone()
-            } else {
-                None
-            };
-
-            Ok(Json(SessionStatusResponse {
-                id: session.id,
-                status,
-                token,
-            }))
-        }
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "Session not found".to_string(),
-            }),
-        )),
-    }
+    let session = match state.sessions.get(&id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return Err(not_found()),
+        Err(error) => return Err(store_unavailable(error)),
+    };
+    // Check if session has expired
+    let status = if session.status == SessionStatus::Pending
+        && chrono::Utc::now() > session.expires_at
+    {
+        SessionStatus::Expired
+    } else {
+        session.status.clone()
+    };
+    let token = if status == SessionStatus::Granted {
+        session.token.clone()
+    } else {
+        None
+    };
+    Ok(Json(SessionStatusResponse {
+        id: session.id,
+        status,
+        token,
+    }))
 }
 
 /// POST /api/sessions/:id/grant
@@ -129,59 +155,23 @@ pub async fn grant_session_handler(
     Path(id): Path<String>,
     Json(body): Json<GrantRequest>,
 ) -> impl IntoResponse {
-    match state.sessions.get(&id).await {
-        Some(mut session) => {
-            // Check if already processed
-            if session.status != SessionStatus::Pending {
-                return Err((
-                    StatusCode::CONFLICT,
-                    Json(ErrorResponse {
-                        error: format!(
-                            "Session is already {}",
-                            serde_json::to_string(&session.status)
-                                .unwrap_or_default()
-                                .trim_matches('"')
-                        ),
-                    }),
-                ));
-            }
-
-            // Validate OTP
-            if !auth::validate_otp(&session, &body.otp) {
-                // Check if expired
-                if chrono::Utc::now() > session.expires_at {
-                    return Err((
-                        StatusCode::GONE,
-                        Json(ErrorResponse {
-                            error: "Session has expired".to_string(),
-                        }),
-                    ));
-                }
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    Json(ErrorResponse {
-                        error: "Invalid OTP".to_string(),
-                    }),
-                ));
-            }
-
-            session.status = SessionStatus::Granted;
-            session.token = Some(auth::generate_session_token());
-            let response = SessionStatusResponse {
-                id: session.id.clone(),
-                status: session.status.clone(),
-                token: session.token.clone(),
-            };
-            state.sessions.update(&id, session).await;
-
-            Ok(Json(response))
-        }
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "Session not found".to_string(),
-            }),
+    match state.sessions.grant(&id, &body.otp).await {
+        Err(error) => Err(store_unavailable(error)),
+        Ok(GrantOutcome::NotFound) => Err(not_found()),
+        Ok(GrantOutcome::NotPending(status)) => Err(already(&status)),
+        Ok(GrantOutcome::Expired) => Err((
+            StatusCode::GONE,
+            Json(ErrorResponse { error: "Session has expired".to_string() }),
         )),
+        Ok(GrantOutcome::InvalidOtp) => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse { error: "Invalid OTP".to_string() }),
+        )),
+        Ok(GrantOutcome::Granted(session)) => Ok(Json(SessionStatusResponse {
+            id: session.id,
+            status: session.status,
+            token: session.token,
+        })),
     }
 }
 
@@ -191,38 +181,15 @@ pub async fn deny_session_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.sessions.get(&id).await {
-        Some(mut session) => {
-            if session.status != SessionStatus::Pending {
-                return Err((
-                    StatusCode::CONFLICT,
-                    Json(ErrorResponse {
-                        error: format!(
-                            "Session is already {}",
-                            serde_json::to_string(&session.status)
-                                .unwrap_or_default()
-                                .trim_matches('"')
-                        ),
-                    }),
-                ));
-            }
-
-            session.status = SessionStatus::Denied;
-            let response = SessionStatusResponse {
-                id: session.id.clone(),
-                status: session.status.clone(),
-                token: None,
-            };
-            state.sessions.update(&id, session).await;
-
-            Ok(Json(response))
-        }
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: "Session not found".to_string(),
-            }),
-        )),
+    match state.sessions.deny(&id).await {
+        Err(error) => Err(store_unavailable(error)),
+        Ok(DenyOutcome::NotFound) => Err(not_found()),
+        Ok(DenyOutcome::NotPending(status)) => Err(already(&status)),
+        Ok(DenyOutcome::Denied(session)) => Ok(Json(SessionStatusResponse {
+            id: session.id,
+            status: session.status,
+            token: None,
+        })),
     }
 }
 
@@ -233,18 +200,25 @@ pub async fn auth_page_handler(
     Query(params): Query<AuthPageQuery>,
 ) -> impl IntoResponse {
     match state.sessions.get(&params.id).await {
-        Some(session) => Ok(Html(auth_page::render_auth_page(
+        Ok(Some(session)) => Ok(Html(auth_page::render_auth_page(
             &session.id,
             &params.tag,
             &session.otp,
         ))),
-        None => Err((
+        Ok(None) => Err((
             StatusCode::NOT_FOUND,
             Html(
                 "<h1>Session not found</h1><p>The requested session does not exist or has been removed.</p>"
                     .to_string(),
             ),
         )),
+        Err(error) => {
+            tracing::error!("Session store unavailable: {}", error);
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Html("<h1>Temporarily unavailable</h1><p>Please retry in a moment.</p>".to_string()),
+            ))
+        }
     }
 }
 
@@ -604,7 +578,7 @@ mod tests {
         };
         let session = create_session("my-machine");
         let session_id = session.id.clone();
-        state.sessions.create(session).await;
+        state.sessions.create(session).await.unwrap();
 
         let app = Router::new()
             .route("/auth", get(auth_page_handler))
@@ -981,7 +955,7 @@ mod tests {
             astation_id: None,
         };
         let session_id = expired_session.id.clone();
-        state.sessions.create(expired_session).await;
+        state.sessions.create(expired_session).await.unwrap();
 
         let app = Router::new()
             .route("/api/sessions/:id/status", get(get_session_status_handler))

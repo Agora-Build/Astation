@@ -632,7 +632,10 @@ pub async fn ws_handler(
 
     // Session-based auth (hybrid flow)
     if let Some(session_id) = params.session.clone() {
-        let session = state.sessions.get(&session_id).await;
+        let session = match state.sessions.get(&session_id).await {
+            Ok(session) => session,
+            Err(error) => return ws_unavailable(&error),
+        };
         match session {
             Some(s) if s.status == crate::auth::SessionStatus::Granted => {
                 // Valid session - use session_id as room code, role defaults to "atem"
@@ -640,6 +643,9 @@ pub async fn ws_handler(
                 let role = params.role.clone().unwrap_or_else(|| "atem".to_string());
                 if let Err(error) = hub.ensure_room(&code, &s.hostname, now).await {
                     return ws_unavailable(&error);
+                }
+                if let Err(error) = state.sessions.touch(&session_id).await {
+                    tracing::debug!("Could not refresh session {}: {}", mask_code(&session_id), error);
                 }
                 let atem_id = params.atem_id.clone().unwrap_or_else(|| "session-atem".to_string());
                 let identity = state.identity.clone();
@@ -3346,7 +3352,7 @@ mod tests {
         let mut granted = crate::auth::create_session("host");
         granted.status = crate::auth::SessionStatus::Granted;
         let session_id = granted.id.clone();
-        state.sessions.create(granted).await;
+        state.sessions.create(granted).await.unwrap();
         let (base_url, server) = spawn_relay(state.clone()).await;
         let code = "astation-routes";
         let key = TestKey::generate();

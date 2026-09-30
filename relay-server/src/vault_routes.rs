@@ -454,7 +454,7 @@ pub(crate) mod tests {
         session.status = SessionStatus::Granted;
         session.astation_id = Some("ws-1".to_string());
         let sess = session.id.clone();
-        state.sessions.create(session).await;
+        state.sessions.create(session).await.unwrap();
         let resp = app(state).oneshot(req("POST", "/api/vault?id=a", &sess, r#"{}"#)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
