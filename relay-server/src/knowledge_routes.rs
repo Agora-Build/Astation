@@ -499,12 +499,74 @@ pub async fn skills_pull_handler(
     Ok(Json(json!({ "skills": rows })))
 }
 
+// ─────────────────────────── skill history ───────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SkillKeyQuery {
+    id: Option<String>,
+    scope: Option<String>,
+    #[serde(default)]
+    project: String,
+    name: Option<String>,
+    version: Option<i64>,
+}
+
+/// `(scope, project, name)` from the query, or 400 `invalid skill`.
+fn skill_key(q: &SkillKeyQuery) -> Result<(String, String, String), ErrResp> {
+    let scope = q.scope.clone().unwrap_or_default();
+    let name = q.name.clone().unwrap_or_default();
+    if !is_valid_skill_scope(&scope) || name.is_empty() || has_nul(&[&q.project, &name]) {
+        return Err(err(StatusCode::BAD_REQUEST, "invalid skill"));
+    }
+    Ok((scope, q.project.clone(), name))
+}
+
+/// GET /api/skills/versions ?scope&project&name -> {versions:[…]} (newest first, no files)
+pub async fn skill_versions_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SkillKeyQuery>,
+) -> Result<Json<Value>, ErrResp> {
+    let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
+    let (scope, project, name) = skill_key(&query)?;
+    let versions = state
+        .knowledge
+        .skill_versions(&caller.work_session_id, &scope, &project, &name)
+        .await
+        .map_err(unavailable)?;
+    Ok(Json(json!({ "versions": versions })))
+}
+
+/// GET /api/skills/version ?scope&project&name&version -> {skill} | 404 | 410 (purged)
+pub async fn skill_version_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SkillKeyQuery>,
+) -> Result<Json<Value>, ErrResp> {
+    let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
+    let (scope, project, name) = skill_key(&query)?;
+    let version = query
+        .version
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "missing version"))?;
+    match state
+        .knowledge
+        .skill_version(&caller.work_session_id, &scope, &project, &name, version)
+        .await
+        .map_err(unavailable)?
+    {
+        None => Err(err(StatusCode::NOT_FOUND, "no such skill version")),
+        Some(row) if row.purged => Err(err(StatusCode::GONE, "skill version purged")),
+        Some(row) => Ok(Json(json!({ "skill": row }))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::vault_routes::tests::bind_session;
     use crate::knowledge_store::{
         InMemoryKnowledgeStore, KnowledgeStore, MemoryAddOutcome, SkillPushOutcome,
+        SkillVersionInfo,
     };
     use crate::relay::RelayHub;
     use crate::rtc_session::RtcSessionStore;
@@ -540,6 +602,8 @@ mod tests {
             .route("/api/memory", get(memory_pull_handler))
             .route("/api/skills/batch", post(skills_batch_handler))
             .route("/api/skills", get(skills_pull_handler))
+            .route("/api/skills/versions", get(skill_versions_handler))
+            .route("/api/skills/version", get(skill_version_handler))
             .with_state(state)
     }
 
@@ -1049,6 +1113,12 @@ mod tests {
         async fn pull_skills(&self, _: &str, _: i64, _: i64) -> Result<Vec<SkillRow>, KnowledgeError> {
             Err(KnowledgeError::Db("connection reset".into()))
         }
+        async fn skill_versions(&self, _: &str, _: &str, _: &str, _: &str) -> Result<Vec<SkillVersionInfo>, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
+        async fn skill_version(&self, _: &str, _: &str, _: &str, _: &str, _: i64) -> Result<Option<SkillRow>, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
     }
 
     #[tokio::test]
@@ -1071,7 +1141,12 @@ mod tests {
             assert_eq!(v, json!({"error": "temporarily unavailable"}));
             assert!(!v.to_string().contains("connection reset"));
         }
-        for uri in ["/api/memory?id=a", "/api/skills?id=a"] {
+        for uri in [
+            "/api/memory?id=a",
+            "/api/skills?id=a",
+            "/api/skills/versions?id=a&scope=global&name=x",
+            "/api/skills/version?id=a&scope=global&name=x&version=1",
+        ] {
             let resp = app.clone().oneshot(req("GET", uri, &sess, "")).await.unwrap();
             assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{}", uri);
         }
@@ -1612,5 +1687,112 @@ mod tests {
         assert_eq!(row["deleted"], true);
         assert!(row["deleted_at"].as_i64().unwrap() > 1_700_000_000);
         assert_eq!(row["content"], "");
+    }
+
+    // ─────────────────────────── skill history ───────────────────────────
+
+    async fn skill_op(app: &Router, sess: &str, op: Value) {
+        let (st, v) = call(app, "POST", "/api/skills/batch?id=a", sess, Some(json!({"ops": [op]}))).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["results"][0]["ok"], true, "{v}");
+    }
+
+    fn push_op(name: &str, body: &str) -> Value {
+        json!({"op": "push", "skill": sample_skill(name, json!({"SKILL.md": b64(body)})), "base_version": 0})
+    }
+
+    const X_KEY: &str = "scope=global&project=&name=x";
+
+    #[tokio::test]
+    async fn skill_versions_lists_history_without_files() {
+        let (state, sess) = test_state("ws-1").await;
+        let sess2 = bind_session(&state, "ws-2").await;
+        let app = app(state);
+        skill_op(&app, &sess, push_op("x", "v1")).await;
+        skill_op(&app, &sess, push_op("x", "v2")).await;
+        skill_op(&app, &sess, json!({"op": "delete", "scope": "global", "project": "", "name": "x"})).await;
+        skill_op(&app, &sess, json!({"op": "purge", "scope": "global", "project": "", "name": "x", "versions": [1]})).await;
+        let (st, v) = call(&app, "GET", &format!("/api/skills/versions?id=a&{X_KEY}"), &sess, None).await;
+        assert_eq!(st, StatusCode::OK);
+        let vs = v["versions"].as_array().unwrap();
+        let got: Vec<(i64, bool, bool, i64)> = vs.iter().map(|r| (
+            r["version"].as_i64().unwrap(), r["deleted"].as_bool().unwrap(),
+            r["purged"].as_bool().unwrap(), r["file_count"].as_i64().unwrap(),
+        )).collect();
+        assert_eq!(got, vec![(3, true, false, 0), (2, false, false, 1), (1, true, true, 0)]);
+        assert!(vs.iter().all(|r| r.get("files").is_none()));
+        assert_eq!(vs[1]["source_agent"], "claude");
+        assert_eq!(vs[1]["source_machine"], "m1");
+        assert_eq!(vs[1]["created_at"], 1_700_000_000);
+        // Another account sees an empty history.
+        let (st2, v2) = call(&app, "GET", &format!("/api/skills/versions?id=a&{X_KEY}"), &sess2, None).await;
+        assert_eq!((st2, v2), (StatusCode::OK, json!({"versions": []})));
+    }
+
+    #[tokio::test]
+    async fn skill_version_returns_files_404_and_410() {
+        let (state, sess) = test_state("ws-1").await;
+        let sess2 = bind_session(&state, "ws-2").await;
+        let app = app(state);
+        skill_op(&app, &sess, push_op("x", "v1")).await;
+        skill_op(&app, &sess, push_op("x", "v2")).await;
+        skill_op(&app, &sess, json!({"op": "delete", "scope": "global", "project": "", "name": "x"})).await;
+        skill_op(&app, &sess, json!({"op": "purge", "scope": "global", "project": "", "name": "x", "versions": [1]})).await;
+        let get = |v: i64| format!("/api/skills/version?id=a&{X_KEY}&version={v}");
+        let (st, v) = call(&app, "GET", &get(2), &sess, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["skill"]["version"], 2);
+        assert_eq!(v["skill"]["files"], json!({"SKILL.md": b64("v2")}));
+        assert!(v["skill"].get("purged").is_none());
+        let (st, v) = call(&app, "GET", &get(3), &sess, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!((v["skill"]["deleted"].clone(), v["skill"]["files"].clone()), (json!(true), json!({})));
+        let (st, v) = call(&app, "GET", &get(1), &sess, None).await;
+        assert_eq!((st, v), (StatusCode::GONE, json!({"error": "skill version purged"})));
+        let (st, v) = call(&app, "GET", &get(9), &sess, None).await;
+        assert_eq!((st, v), (StatusCode::NOT_FOUND, json!({"error": "no such skill version"})));
+        let (st, _) = call(&app, "GET", &get(2), &sess2, None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn skill_history_bad_queries_are_400_and_auth_is_required() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        for uri in [
+            "/api/skills/versions?id=a&scope=machine&name=x",
+            "/api/skills/versions?id=a&scope=global",
+            "/api/skills/versions?id=a&scope=global&name=x%00y",
+            "/api/skills/version?id=a&scope=global&name=x",
+            "/api/skills/version?id=a&scope=global&name=x&version=abc",
+        ] {
+            let (st, _) = call(&app, "GET", uri, &sess, None).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{uri}");
+        }
+        let resp = app
+            .oneshot(req_no_auth("GET", "/api/skills/versions?id=a&scope=global&name=x", ""))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn skill_history_routes_are_mounted_in_the_production_router() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = crate::router(state);
+        let get = |uri: &str| {
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("authorization", format!("session {}", sess))
+                .header("x-forwarded-for", "203.0.113.50")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let resp = app.clone().oneshot(get("/api/skills/versions?id=a&scope=global&name=x")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = app.oneshot(get("/api/skills/version?id=a&scope=global&name=x&version=1")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(resp).await, json!({"error": "no such skill version"}));
     }
 }

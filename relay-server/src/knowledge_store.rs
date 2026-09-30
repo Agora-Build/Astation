@@ -69,6 +69,9 @@ pub struct SkillRow {
     pub created_at: i64,
     #[serde(default)]
     pub deleted: bool,
+    /// Set by `purge`: this version's files were erased. Not on the wire.
+    #[serde(skip)]
+    pub purged: bool,
     #[serde(default)]
     pub seq: i64,
 }
@@ -89,6 +92,18 @@ pub struct SkillPushOutcome {
     pub version: i64,
     pub seq: i64,
     pub superseded_concurrent: bool,
+}
+
+/// One entry of a skill's history (`GET /api/skills/versions`). No files.
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+pub struct SkillVersionInfo {
+    pub version: i64,
+    pub created_at: i64,
+    pub source_agent: String,
+    pub source_machine: String,
+    pub file_count: i64,
+    pub deleted: bool,
+    pub purged: bool,
 }
 
 #[derive(Debug)]
@@ -183,6 +198,27 @@ pub trait KnowledgeStore: Send + Sync {
         name: &str,
         versions: Option<Vec<i64>>,
     ) -> Result<u64, KnowledgeError>;
+
+    /// Every version of one skill, newest first, without files. An unknown
+    /// skill (or another account's) -> empty.
+    async fn skill_versions(
+        &self,
+        account: &str,
+        scope: &str,
+        project: &str,
+        name: &str,
+    ) -> Result<Vec<SkillVersionInfo>, KnowledgeError>;
+
+    /// One version with its files; `None` when it doesn't exist (or is
+    /// another account's).
+    async fn skill_version(
+        &self,
+        account: &str,
+        scope: &str,
+        project: &str,
+        name: &str,
+        version: i64,
+    ) -> Result<Option<SkillRow>, KnowledgeError>;
 
     /// Rows with `seq > since`, ascending, at most `min(limit, 500)`. Includes tombstones.
     async fn pull_skills(
@@ -381,6 +417,7 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
             SkillRow {
                 version,
                 deleted: false,
+                purged: false,
                 seq,
                 ..s
             },
@@ -432,6 +469,7 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
                 source_machine: latest.source_machine,
                 created_at: now_secs(),
                 deleted: true,
+                purged: false,
                 seq,
             },
         ));
@@ -468,9 +506,54 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
             row.files = serde_json::json!({});
             row.content_hash.clear();
             row.deleted = true;
+            row.purged = true;
             row.seq = seq;
         }
         Ok(idxs.len() as u64)
+    }
+
+    async fn skill_versions(
+        &self,
+        account: &str,
+        scope: &str,
+        project: &str,
+        name: &str,
+    ) -> Result<Vec<SkillVersionInfo>, KnowledgeError> {
+        let st = self.state.lock().await;
+        let mut out: Vec<SkillVersionInfo> = st
+            .skills
+            .iter()
+            .filter(|(acct, r)| skill_key_matches(acct, r, account, scope, project, name))
+            .map(|(_, r)| SkillVersionInfo {
+                version: r.version,
+                created_at: r.created_at,
+                source_agent: r.source_agent.clone(),
+                source_machine: r.source_machine.clone(),
+                file_count: r.files.as_object().map_or(0, |o| o.len() as i64),
+                deleted: r.deleted,
+                purged: r.purged,
+            })
+            .collect();
+        out.sort_by(|a, b| b.version.cmp(&a.version));
+        Ok(out)
+    }
+
+    async fn skill_version(
+        &self,
+        account: &str,
+        scope: &str,
+        project: &str,
+        name: &str,
+        version: i64,
+    ) -> Result<Option<SkillRow>, KnowledgeError> {
+        let st = self.state.lock().await;
+        Ok(st
+            .skills
+            .iter()
+            .find(|(acct, r)| {
+                skill_key_matches(acct, r, account, scope, project, name) && r.version == version
+            })
+            .map(|(_, r)| r.clone()))
     }
 
     async fn pull_skills(
@@ -524,7 +607,7 @@ const MEMORY_COLS: &str = "id, scope, project, machine, content, content_hash, c
      source_agent, source_machine, created_at, (deleted_at IS NOT NULL) AS deleted, deleted_at, \
      valid_at, invalid_at, superseded_by, seq";
 const SKILL_COLS: &str = "scope, project, name, version, files::text AS files, content_hash, \
-     source_agent, source_machine, created_at, deleted, seq";
+     source_agent, source_machine, created_at, deleted, purged, seq";
 const SKILL_KEY: &str = "account_id = $1 AND scope = $2 AND project = $3 AND name = $4";
 
 /// Serialize every write transaction of one account; call it FIRST in each
@@ -609,6 +692,7 @@ struct PgSkillRow {
     source_machine: String,
     created_at: i64,
     deleted: bool,
+    purged: bool,
     seq: i64,
 }
 
@@ -627,6 +711,7 @@ impl TryFrom<PgSkillRow> for SkillRow {
             source_machine: r.source_machine,
             created_at: r.created_at,
             deleted: r.deleted,
+            purged: r.purged,
             seq: r.seq,
         })
     }
@@ -893,7 +978,7 @@ impl KnowledgeStore for PgKnowledgeStore {
                ORDER BY version \
              ) \
              UPDATE skill_versions sv SET files = '{{}}'::jsonb, content_hash = '', \
-               deleted = true, seq = renum.new_seq \
+               deleted = true, purged = true, seq = renum.new_seq \
              FROM renum WHERE sv.account_id = $1 AND sv.scope = $2 AND sv.project = $3 \
                AND sv.name = $4 AND sv.version = renum.version"
         ))
@@ -907,6 +992,49 @@ impl KnowledgeStore for PgKnowledgeStore {
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(res.rows_affected())
+    }
+
+    async fn skill_versions(
+        &self,
+        account: &str,
+        scope: &str,
+        project: &str,
+        name: &str,
+    ) -> Result<Vec<SkillVersionInfo>, KnowledgeError> {
+        sqlx::query_as::<_, SkillVersionInfo>(&format!(
+            "SELECT version, created_at, source_agent, source_machine, \
+             (SELECT count(*) FROM jsonb_object_keys(files))::bigint AS file_count, \
+             deleted, purged FROM skill_versions WHERE {SKILL_KEY} ORDER BY version DESC"
+        ))
+        .bind(account)
+        .bind(scope)
+        .bind(project)
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
+    async fn skill_version(
+        &self,
+        account: &str,
+        scope: &str,
+        project: &str,
+        name: &str,
+        version: i64,
+    ) -> Result<Option<SkillRow>, KnowledgeError> {
+        let row: Option<PgSkillRow> = sqlx::query_as(&format!(
+            "SELECT {SKILL_COLS} FROM skill_versions WHERE {SKILL_KEY} AND version = $5"
+        ))
+        .bind(account)
+        .bind(scope)
+        .bind(project)
+        .bind(name)
+        .bind(version)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(SkillRow::try_from).transpose()
     }
 
     async fn pull_skills(
@@ -971,6 +1099,7 @@ mod tests {
             source_machine: "m1".to_string(),
             created_at: 1_700_000_000,
             deleted: false,
+            purged: false,
             seq: 0,
         }
     }
@@ -1250,12 +1379,14 @@ mod tests {
             assert_ne!(rows[0].seq, rows[1].seq);
             for r in &rows {
                 assert!(r.deleted);
+                assert!(r.purged);
                 assert_eq!(r.files, json!({}));
                 assert_eq!(r.content_hash, "");
             }
             let all = s.pull_skills(A, 0, 100).await.unwrap();
             let v2 = all.iter().find(|r| r.version == 2).unwrap();
             assert!(!v2.deleted);
+            assert!(!v2.purged);
             assert_eq!(v2.files, json!({"SKILL.md": "v2"}));
 
             let n = s.purge_skill(A, "global", "", "x", None).await.unwrap();
@@ -1502,6 +1633,45 @@ mod tests {
             assert_eq!((r.deleted_at, r.invalid_at, r.superseded_by), (None, None, None));
         }
 
+        pub async fn skill_versions_list_newest_first_without_files(s: &dyn KnowledgeStore) {
+            for v in 1..=3 {
+                s.push_skill(A, skill("x", &format!("v{v}")), v - 1).await.unwrap();
+            }
+            s.delete_skill(A, "global", "", "x").await.unwrap(); // v4: delete marker
+            s.purge_skill(A, "global", "", "x", Some(vec![1])).await.unwrap();
+            s.push_skill(B, skill("x", "b"), 0).await.unwrap();
+            let vs = s.skill_versions(A, "global", "", "x").await.unwrap();
+            let got: Vec<(i64, i64, bool, bool)> =
+                vs.iter().map(|v| (v.version, v.file_count, v.deleted, v.purged)).collect();
+            assert_eq!(
+                got,
+                vec![(4, 0, true, false), (3, 1, false, false), (2, 1, false, false), (1, 0, true, true)]
+            );
+            assert_eq!(
+                (vs[1].source_agent.as_str(), vs[1].source_machine.as_str(), vs[1].created_at),
+                ("claude", "m1", 1_700_000_000)
+            );
+            assert!(s.skill_versions(A, "global", "", "nope").await.unwrap().is_empty());
+            assert!(s.skill_versions(A, "project", "", "x").await.unwrap().is_empty());
+            assert_eq!(s.skill_versions(B, "global", "", "x").await.unwrap().len(), 1);
+        }
+
+        pub async fn skill_version_returns_one_version(s: &dyn KnowledgeStore) {
+            s.push_skill(A, skill("x", "v1"), 0).await.unwrap();
+            s.push_skill(A, skill("x", "v2"), 1).await.unwrap();
+            s.delete_skill(A, "global", "", "x").await.unwrap(); // v3
+            s.purge_skill(A, "global", "", "x", Some(vec![1])).await.unwrap();
+            let v2 = s.skill_version(A, "global", "", "x", 2).await.unwrap().unwrap();
+            assert_eq!((v2.version, v2.deleted, v2.purged), (2, false, false));
+            assert_eq!(v2.files, json!({"SKILL.md": "v2"}));
+            let v1 = s.skill_version(A, "global", "", "x", 1).await.unwrap().unwrap();
+            assert!(v1.purged && v1.deleted && v1.files == json!({}));
+            let v3 = s.skill_version(A, "global", "", "x", 3).await.unwrap().unwrap();
+            assert!(v3.deleted && !v3.purged && v3.files == json!({}));
+            assert!(s.skill_version(A, "global", "", "x", 9).await.unwrap().is_none());
+            assert!(s.skill_version(B, "global", "", "x", 2).await.unwrap().is_none());
+        }
+
         pub async fn delete_records_deleted_at(s: &dyn KnowledgeStore) {
             s.add_memory(A, mem("mem_1", "x")).await.unwrap();
             let before = chrono::Utc::now().timestamp();
@@ -1608,6 +1778,8 @@ mod tests {
         dedup_ignores_invalid_rows,
         add_keeps_valid_at_and_ignores_client_state,
         delete_records_deleted_at,
+        skill_versions_list_newest_first_without_files,
+        skill_version_returns_one_version,
     );
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1726,6 +1898,8 @@ mod tests {
         dedup_ignores_invalid_rows,
         add_keeps_valid_at_and_ignores_client_state,
         delete_records_deleted_at,
+        skill_versions_list_newest_first_without_files,
+        skill_version_returns_one_version,
     );
 
     /// 0004 on pre-1.1 data: deleted rows get `deleted_at` (the migration
@@ -1854,6 +2028,7 @@ mod tests {
             (s.project.as_str(), s.deleted, s.seq, s.version),
             ("", false, 0, 3)
         );
+        assert!(!s.purged, "purged is never read from the wire");
         assert_eq!(s.files, json!({"SKILL.md": "aGk=", "a/b.sh": ""}));
         let v = serde_json::to_value(&s).unwrap();
         let mut keys: Vec<&String> = v.as_object().unwrap().keys().collect();
