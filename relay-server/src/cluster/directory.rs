@@ -461,6 +461,16 @@ pub(crate) mod scenarios {
         assert!(room.pending.is_empty());
     }
 
+    pub async fn add_pending_dedupes_by_connection_id(d: &dyn RoomDirectory) {
+        assert!(d.add_pending("astation-dd", &c("p1", "r1"), T0, 1).await.unwrap());
+        // Same connection id (even with another replica label): already pending, cap not hit.
+        assert!(d.add_pending("astation-dd", &c("p1", "r2"), T0, 1).await.unwrap());
+        assert_eq!(
+            d.get("astation-dd").await.unwrap().unwrap().pending,
+            vec![c("p1", "r1")]
+        );
+    }
+
     pub async fn legacy_owner_becomes_verified_when_it_proves(d: &dyn RoomDirectory) {
         d.claim_owner("astation-l", &c("s1", "r1"), T0).await.unwrap();
         assert_eq!(
@@ -582,6 +592,7 @@ mod tests {
         atem_join_requires_a_room_and_replaces,
         claim_owner_creates_the_room_and_replaces_the_owner,
         pending_respects_the_cap,
+        add_pending_dedupes_by_connection_id,
         promotion_rules,
         promotion_with_a_squatter_and_a_pending_socket,
         legacy_owner_becomes_verified_when_it_proves,
