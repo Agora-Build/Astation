@@ -4,8 +4,6 @@
 //! a Redis version (production, `REDIS_URL`).
 
 
-// Consumers land in later tasks of the multi-replica plan; remove then.
-#![allow(dead_code)]
 pub mod bus;
 pub mod directory;
 pub mod keys;
@@ -46,10 +44,14 @@ impl ConnRef {
         }
     }
 
+    // Task 13 (RedisRoomDirectory) stores ConnRefs as strings.
+    #[allow(dead_code)]
     pub fn encode(&self) -> String {
         format!("{}|{}", self.conn, self.replica)
     }
 
+    // Task 13 (RedisRoomDirectory) stores ConnRefs as strings.
+    #[allow(dead_code)]
     pub fn decode(value: &str) -> Option<Self> {
         let (conn, replica) = value.split_once('|')?;
         (!conn.is_empty() && !replica.is_empty()).then(|| Self::new(conn, replica))
@@ -57,6 +59,8 @@ impl ConnRef {
 }
 
 /// A random id for this process: 12 lowercase hex characters.
+// Task 19 (connect_cluster) names each Redis-mode process.
+#[allow(dead_code)]
 pub fn new_replica_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
 }

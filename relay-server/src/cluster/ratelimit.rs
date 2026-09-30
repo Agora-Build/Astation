@@ -22,11 +22,15 @@ pub const GENERAL_LIMIT_PER_MINUTE: u64 = 600;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RateDecision {
     Allowed,
+    // Constructed by Task 18 (RedisRateLimiter).
+    #[allow(dead_code)]
     Limited { retry_after_secs: u64 },
 }
 
 #[async_trait]
 pub trait SharedRateLimiter: Send + Sync {
+    // Task 18 (RedisRateLimiter)/Task 11 health.
+    #[allow(dead_code)]
     fn backend_name(&self) -> &'static str;
     /// Count one request from `ip` in `bucket` for the minute containing
     /// `now` (unix seconds).
@@ -48,6 +52,8 @@ impl SharedRateLimiter for NoopRateLimiter {
 }
 
 /// The decision for the `count`-th request of a one-minute window.
+// Task 18 (RedisRateLimiter) applies the window.
+#[allow(dead_code)]
 pub fn window_decision(count: u64, limit: u64, now: i64) -> RateDecision {
     if count <= limit {
         RateDecision::Allowed

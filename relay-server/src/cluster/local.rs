@@ -119,11 +119,15 @@ impl LocalSockets {
         self.codes_where(false)
     }
 
+    // Task 14 (resubscribe/room sweep).
+    #[allow(dead_code)]
     pub fn connection_ids(&self) -> Vec<String> {
         self.lock().keys().cloned().collect()
     }
 
     /// (Atem sockets, Astation sockets) on this replica.
+    // Task 11 (/health) and Task 33 (metrics).
+    #[allow(dead_code)]
     pub fn count_by_role(&self) -> (usize, usize) {
         let conns = self.lock();
         let astations = conns
@@ -133,10 +137,14 @@ impl LocalSockets {
         (conns.len() - astations, astations)
     }
 
+    // Task 11 (/health) and Task 33 (metrics).
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.lock().len()
     }
 
+    // Task 11 (/health) and Task 33 (metrics).
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.lock().is_empty()
     }

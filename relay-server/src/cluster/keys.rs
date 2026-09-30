@@ -15,6 +15,8 @@ use std::time::Duration;
 use crate::identity_store::{IdentityError, IdentityStore};
 
 /// Bound on a re-read after a `key-changed` announcement.
+// Task 14 (bus dispatcher) re-reads after key-changed.
+#[allow(dead_code)]
 pub const KEY_REREAD_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +122,8 @@ impl KeyCache {
     }
 
     /// Mark stale, unless the entry changed since `generation`.
+    // Task 14 (reload_one's caller).
+    #[allow(dead_code)]
     fn mark_stale(&self, astation_id: &str, generation: u64) {
         let mut inner = self.write();
         if inner.generation(astation_id) != generation {
@@ -134,6 +138,8 @@ impl KeyCache {
     /// can't be read, a cached key is kept but marked stale, so it still
     /// makes connects pending and is re-read before it verifies anything.
     /// A `set`/`forget` that lands during the read wins over its result.
+    // Task 14 (bus dispatcher on key-changed).
+    #[allow(dead_code)]
     pub async fn reload_one(&self, identity: &dyn IdentityStore, astation_id: &str) {
         let generation = self.read().generation(astation_id);
         match tokio::time::timeout(KEY_REREAD_TIMEOUT, identity.get_key(astation_id)).await {

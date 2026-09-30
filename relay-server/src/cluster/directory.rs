@@ -109,8 +109,12 @@ pub struct AtemLeave {
 
 #[async_trait]
 pub trait RoomDirectory: Send + Sync {
+    // Task 11 (/health) reports the backend.
+    #[allow(dead_code)]
     fn backend_name(&self) -> &'static str;
     /// POST /api/pair: a fresh room (replaces any room with this code).
+    // Task 13 (RedisRoomDirectory) and the Task 21 tests.
+    #[allow(dead_code)]
     async fn create_room(&self, code: &str, hostname: &str, now: i64) -> Result<(), StoreError>;
     /// Create the room if missing. True when it was created.
     async fn ensure_room(&self, code: &str, hostname: &str, now: i64) -> Result<bool, StoreError>;
