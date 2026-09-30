@@ -58,6 +58,10 @@ const IDENTITY_STORE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Close code: shared relay state unavailable, reconnect later (RFC 6455).
 pub(crate) const CLOSE_TRY_AGAIN: u16 = 1013;
 
+/// Fresh codes POST /api/pair tries before giving up (a collision never
+/// overwrites a live room).
+const MAX_PAIR_CODE_ATTEMPTS: usize = 10;
+
 /// Pending Astation sockets allowed per room (0 = no cap).
 pub(crate) const MAX_PENDING_ASTATIONS_PER_ROOM: usize = 0;
 
@@ -287,10 +291,29 @@ impl RelayHub {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn create_room(&self, code: &str, hostname: &str, now: i64) -> Result<(), StoreError> {
         self.inner.directory.create_room(code, hostname, now).await?;
         self.room_changed(code).await;
         Ok(())
+    }
+
+    /// A new pairing room under a fresh code from `next_code`; never
+    /// overwrites a live room. `None` when every attempt collided.
+    pub(crate) async fn create_pair_room(
+        &self,
+        hostname: &str,
+        now: i64,
+        mut next_code: impl FnMut() -> String,
+    ) -> Result<Option<String>, StoreError> {
+        for _ in 0..MAX_PAIR_CODE_ATTEMPTS {
+            let code = next_code();
+            if self.ensure_room(&code, hostname, now).await? {
+                return Ok(Some(code));
+            }
+            tracing::warn!("Pairing code collision on {}, retrying", mask_code(&code));
+        }
+        Ok(None)
     }
 
     pub(crate) async fn ensure_room(&self, code: &str, hostname: &str, now: i64) -> Result<bool, StoreError> {
@@ -353,6 +376,8 @@ impl RelayHub {
                         mask_code(code)
                     );
                 }
+                // Queued after the promotion, so an Atem frame may precede its
+                // `connected` event (as on the legacy-claim path; Astation copes).
                 for (atem_id, connection) in &atems {
                     self.inner.local.send(
                         connection_id,
@@ -370,8 +395,12 @@ impl RelayHub {
 
     /// Close every local socket of a room that no longer exists.
     fn evict_room_locally(&self, code: &str) {
-        for (connection_id, _) in self.inner.local.connections_in_room(code) {
-            self.inner.local.evict(&connection_id);
+        for (connection_id, role) in self.inner.local.connections_in_room(code) {
+            // An Astation keeps (or recreates) its room: one that registered
+            // just before the sweep must not be closed.
+            if matches!(role, SocketRole::Atem { .. }) {
+                self.inner.local.evict(&connection_id);
+            }
         }
     }
 
@@ -506,11 +535,23 @@ pub async fn create_pair_handler(
             .into_response();
     }
 
-    let code = generate_pairing_code();
     let now = chrono::Utc::now().timestamp();
-    if let Err(error) = state.relay.create_room(&code, &body.hostname, now).await {
-        return relay_state_unavailable(&error).into_response();
-    }
+    let code = match state
+        .relay
+        .create_pair_room(&body.hostname, now, generate_pairing_code)
+        .await
+    {
+        Ok(Some(code)) => code,
+        Ok(None) => {
+            tracing::error!("No free pairing code after {} attempts", MAX_PAIR_CODE_ATTEMPTS);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "could not allocate a pairing code"})),
+            )
+                .into_response();
+        }
+        Err(error) => return relay_state_unavailable(&error).into_response(),
+    };
 
     tracing::info!("Pair room created: {}", mask_code(&code));
     (StatusCode::CREATED, Json(CreatePairResponse { code })).into_response()
@@ -3689,6 +3730,55 @@ mod tests {
         assert_eq!(room.owner.map(|owner| owner.conn).as_deref(), Some("pending"));
         assert!(room.verified);
         assert!(room.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pair_code_collision_never_overwrites_a_live_room() {
+        let hub = RelayHub::new();
+        hub.create_room("TAKN-CODE", "live-host", now()).await.unwrap();
+        hub.directory().claim_owner("TAKN-CODE", &test_conn("owner"), now()).await.unwrap();
+        let mut codes = vec!["FREE-CODE", "TAKN-CODE"];
+        let code = hub
+            .create_pair_room("new-host", now(), || codes.pop().unwrap().to_string())
+            .await
+            .unwrap();
+        assert_eq!(code.as_deref(), Some("FREE-CODE"));
+        let live = hub.room("TAKN-CODE").await.unwrap().unwrap();
+        assert_eq!(live.hostname, "live-host");
+        assert_eq!(live.owner.map(|owner| owner.conn).as_deref(), Some("owner"));
+        assert_eq!(hub.room("FREE-CODE").await.unwrap().unwrap().hostname, "new-host");
+
+        // Every attempt collides: no room is overwritten.
+        let none = hub
+            .create_pair_room("x", now(), || "TAKN-CODE".to_string())
+            .await
+            .unwrap();
+        assert_eq!(none, None);
+        assert_eq!(hub.room("TAKN-CODE").await.unwrap().unwrap().hostname, "live-host");
+    }
+
+    /// The sweep closes the Atem sockets of a removed room, never an
+    /// Astation socket that registered just before it claims the room.
+    #[tokio::test]
+    async fn sweep_closes_only_atem_sockets() {
+        let directory = InMemoryRoomDirectory::new();
+        let hub = hub_over(&directory);
+        let mut atems = std::collections::BTreeMap::new();
+        atems.insert("atem-a".to_string(), test_conn("atem-conn"));
+        directory.insert_for_test(
+            "OLD-ROOM",
+            RoomInfo { atems, ..RoomInfo::new("h", now() - ROOM_EXPIRY_SECS - 10) },
+        );
+        let mut atem = hub.local().register(
+            "atem-conn",
+            "OLD-ROOM",
+            SocketRole::Atem { atem_id: "atem-a".into() },
+        );
+        let _astation = hub.local().register("astation-conn", "OLD-ROOM", SocketRole::Astation);
+        hub.cleanup_expired().await;
+        assert!(hub.room("OLD-ROOM").await.unwrap().is_none());
+        assert!(atem.frames.recv().await.is_none(), "the Atem's socket was closed");
+        assert!(hub.local().contains("astation-conn"), "the Astation socket stays");
     }
 
     #[tokio::test]
