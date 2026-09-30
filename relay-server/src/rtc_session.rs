@@ -386,7 +386,7 @@ impl RtcSessionStore {
             Ok(JoinOutcome::Full) => Err("Session is full (maximum 8 participants)".to_string()),
             Err(error) => {
                 tracing::error!("RTC session store unavailable: {}", error);
-                Err(format!("RTC session store unavailable: {error}"))
+                Err("Temporarily unavailable".to_string())
             }
         }
     }
@@ -711,9 +711,38 @@ mod tests {
         assert!(store.get("active").await.unwrap().is_some());
     }
 
+    struct BrokenBackend;
+
+    #[async_trait]
+    impl RtcBackend for BrokenBackend {
+        async fn create(&self, _: RtcSession) -> Result<(), StoreError> {
+            Err(StoreError::Unavailable("secret-host:6379".into()))
+        }
+        async fn get(&self, _: &str) -> Result<Option<RtcSession>, StoreError> {
+            Err(StoreError::Unavailable("secret-host:6379".into()))
+        }
+        async fn join(&self, _: &str, _: String, _: DateTime<Utc>) -> Result<JoinOutcome, StoreError> {
+            Err(StoreError::Unavailable("secret-host:6379".into()))
+        }
+        async fn delete(&self, _: &str) -> Result<bool, StoreError> {
+            Err(StoreError::Unavailable("secret-host:6379".into()))
+        }
+        async fn cleanup_expired(&self, _: DateTime<Utc>) -> Result<(), StoreError> {
+            Err(StoreError::Unavailable("secret-host:6379".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn join_error_body_does_not_leak_backend_text() {
+        let store = RtcSessionStore::with_backend(Arc::new(BrokenBackend));
+        let error = store.join("x", "n".into()).await.unwrap_err();
+        assert_eq!(error, "Temporarily unavailable");
+        assert_eq!(join_error_status(&error), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     #[tokio::test]
     async fn join_handler_maps_an_unavailable_store_to_503() {
-        assert_eq!(join_error_status("RTC session store unavailable: x"), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(join_error_status("Temporarily unavailable"), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(join_error_status("Session not found"), StatusCode::NOT_FOUND);
         assert_eq!(join_error_status("Session is full (maximum 8 participants)"), StatusCode::CONFLICT);
         assert_eq!(join_error_status("anything else"), StatusCode::INTERNAL_SERVER_ERROR);
