@@ -255,7 +255,6 @@ mod tests {
     use crate::relay::RelayHub;
     use crate::rtc_session::RtcSessionStore;
     use crate::session_store::SessionStore;
-    use crate::session_verify::SessionVerifyCache;
     use crate::voice_session::VoiceSessionStore;
     use axum::{
         body::Body,
@@ -270,9 +269,10 @@ mod tests {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
-            session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
+            knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -333,9 +333,10 @@ mod tests {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
-            session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
+            knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -434,9 +435,10 @@ mod tests {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
-            session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
+            knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -505,9 +507,10 @@ mod tests {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
-            session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
+            knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -594,9 +597,10 @@ mod tests {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
-            session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
+            knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         let session = create_session("my-machine");
         let session_id = session.id.clone();
@@ -648,9 +652,10 @@ mod tests {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
-            session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
+            knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -714,9 +719,10 @@ mod tests {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
-            session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
+            knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -779,9 +785,10 @@ mod tests {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
-            session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
+            knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -888,9 +895,10 @@ mod tests {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
-            session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
+            knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -954,9 +962,10 @@ mod tests {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
-            session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
+            knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
 
         // Create an expired session manually

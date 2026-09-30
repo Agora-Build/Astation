@@ -13,8 +13,15 @@ use tokio::time::Instant;
 use uuid::Uuid;
 use validator::Validate;
 
-use crate::session_verify::SessionVerifyCache;
+use crate::identity_store::{BindOutcome, IdentityError, IdentityStore, RegisterOutcome};
 use crate::AppState;
+
+/// A room code as it may appear in logs: the first 4 characters plus "…".
+/// Astation room codes are bearer-like identifiers (whoever presents one joins
+/// that room), so logs never carry them in full.
+pub(crate) fn mask_code(code: &str) -> String {
+    format!("{}…", code.chars().take(4).collect::<String>())
+}
 
 // Characters for pairing codes — no ambiguous chars (0/O, 1/I/L excluded)
 const CODE_CHARS: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -27,8 +34,18 @@ const ROOM_EXPIRY_SECS: u64 = 600;
 /// At 100k connections, 60s pings produce ~1700 tiny frames/sec (~10KB/s total) — negligible.
 const WS_PING_INTERVAL_SECS: u64 = 60;
 
-/// Astation pairing sessions remain valid for seven days of inactivity.
-const VERIFIED_SESSION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+/// An Astation must answer the relay-auth challenge within this window.
+const RELAY_AUTH_TIMEOUT_SECS: u64 = 10;
+
+/// Most session ids one `relaySessions` resync may list.
+const MAX_RELAY_SESSIONS: usize = 1000;
+
+/// Longest session id accepted in a binding message (Astation sends UUIDs).
+const MAX_SESSION_ID_LEN: usize = 128;
+
+/// Bound on each identity-store call made while verifying a proof, so a slow
+/// or unreachable database can't stall a connection past its challenge.
+const IDENTITY_STORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 // --- Types ---
 
@@ -39,10 +56,13 @@ struct PairRoom {
     /// One sender per connected Atem, keyed by atem_id.
     /// Multiple Atems can be connected to the same room simultaneously.
     atem_txs: HashMap<String, AtemConnection>,
-    /// Session claims waiting for a targeted Astation auth response.
-    pending_session_ids: HashMap<String, String>,
     astation_tx: Option<mpsc::UnboundedSender<String>>,
     astation_connection_id: Option<String>,
+    /// `role=astation` connections that must prove the registered key before
+    /// they may own the room, keyed by connection_id. They get no Atem traffic.
+    pending_astations: HashMap<String, mpsc::UnboundedSender<String>>,
+    /// The current owner (`astation_connection_id`) proved the room's key.
+    astation_verified: bool,
     created_at: Instant,
 }
 
@@ -53,6 +73,19 @@ struct AtemConnection {
 }
 
 impl PairRoom {
+    fn new(code: &str, hostname: &str) -> Self {
+        Self {
+            code: code.to_string(),
+            hostname: hostname.to_string(),
+            atem_txs: HashMap::new(),
+            astation_tx: None,
+            astation_connection_id: None,
+            pending_astations: HashMap::new(),
+            astation_verified: false,
+            created_at: Instant::now(),
+        }
+    }
+
     fn is_current_atem_connection(&self, atem_id: &str, connection_id: &str) -> bool {
         self.atem_txs
             .get(atem_id)
@@ -65,7 +98,6 @@ impl PairRoom {
             return false;
         }
         self.atem_txs.remove(atem_id);
-        self.pending_session_ids.remove(atem_id);
         true
     }
 }
@@ -82,12 +114,72 @@ fn relay_connection_event(atem_id: &str, connection_id: &str, event: &str) -> St
 #[derive(Clone)]
 pub struct RelayHub {
     rooms: Arc<RwLock<HashMap<String, PairRoom>>>,
+    /// How long an Astation has to answer the relay-auth challenge.
+    auth_timeout: std::time::Duration,
+    /// Authoritative copy of the registered Astation keys (astation_id →
+    /// lowercase hex), loaded at startup and written through on registration.
+    /// Connects and verifications read it with no I/O, so a connect flood or a
+    /// database outage can't lock registered Astations out.
+    keys: Arc<std::sync::RwLock<HashMap<String, String>>>,
 }
 
 impl RelayHub {
     pub fn new() -> Self {
         Self {
             rooms: Arc::new(RwLock::new(HashMap::new())),
+            auth_timeout: std::time::Duration::from_secs(RELAY_AUTH_TIMEOUT_SECS),
+            keys: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Replace the key cache with every key in `identity`. Called once at
+    /// startup (before serving).
+    pub async fn load_keys(&self, identity: &dyn IdentityStore) -> Result<usize, IdentityError> {
+        let keys: HashMap<String, String> = identity
+            .list_keys()
+            .await?
+            .into_iter()
+            .map(|(id, key)| (id, key.to_ascii_lowercase()))
+            .collect();
+        let count = keys.len();
+        *self.keys.write().unwrap_or_else(|e| e.into_inner()) = keys;
+        Ok(count)
+    }
+
+    fn cached_key(&self, astation_id: &str) -> Option<String> {
+        self.keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(astation_id)
+            .cloned()
+    }
+
+    fn has_key(&self, astation_id: &str) -> bool {
+        self.keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(astation_id)
+    }
+
+    fn cache_key(&self, astation_id: &str, public_key: &str) {
+        self.keys
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(astation_id.to_string(), public_key.to_ascii_lowercase());
+    }
+
+    fn forget_key(&self, astation_id: &str) {
+        self.keys
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(astation_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_auth_timeout(auth_timeout: std::time::Duration) -> Self {
+        Self {
+            auth_timeout,
+            ..Self::new()
         }
     }
 
@@ -97,8 +189,11 @@ impl RelayHub {
         let mut rooms = self.rooms.write().await;
         rooms.retain(|_, room| {
             let age = now.duration_since(room.created_at).as_secs();
-            // Keep if not expired, or if astation is connected (actively paired)
-            age < ROOM_EXPIRY_SECS || room.astation_tx.is_some()
+            // Keep if not expired, or if an astation is connected (actively
+            // paired) or still proving its key.
+            age < ROOM_EXPIRY_SECS
+                || room.astation_tx.is_some()
+                || !room.pending_astations.is_empty()
         });
     }
 }
@@ -186,21 +281,13 @@ pub async fn create_pair_handler(
 
     let hub = &state.relay;
     let code = generate_pairing_code();
-    let room = PairRoom {
-        code: code.clone(),
-        hostname: body.hostname,
-        atem_txs: HashMap::new(),
-        pending_session_ids: HashMap::new(),
-        astation_tx: None,
-        astation_connection_id: None,
-        created_at: Instant::now(),
-    };
+    let room = PairRoom::new(&code, &body.hostname);
 
     let mut rooms = hub.rooms.write().await;
     rooms.insert(code.clone(), room);
     drop(rooms);
 
-    tracing::info!("Pair room created: {}", code);
+    tracing::info!("Pair room created: {}", mask_code(&code));
     (StatusCode::CREATED, Json(CreatePairResponse { code })).into_response()
 }
 
@@ -241,14 +328,24 @@ pub async fn pair_status_handler(
 }
 
 /// DELETE /api/pair/:code — Close a pairing room.
-/// Removes the room, disconnecting both sides.
+/// Removes the room, disconnecting both sides. Unauthenticated, so it is
+/// refused (409) for a code with a registered Astation key: that room belongs
+/// to a verified Astation and must not be closable by anyone who knows the code.
 pub async fn delete_pair_handler(
     State(state): State<AppState>,
     axum::extract::Path(code): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    if state.relay.has_key(&code) {
+        tracing::warn!("Refused DELETE of keyed room {}", mask_code(&code));
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "room is owned by a registered Astation"})),
+        )
+            .into_response();
+    }
     let mut rooms = state.relay.rooms.write().await;
     if rooms.remove(&code).is_some() {
-        tracing::info!("Pair room closed by client: {}", code);
+        tracing::info!("Pair room closed by client: {}", mask_code(&code));
         (StatusCode::OK, Json(DeletePairResponse { closed: true })).into_response()
     } else {
         (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Room not found"}))).into_response()
@@ -280,25 +377,14 @@ pub async fn ws_handler(
                 {
                     let mut rooms = hub.rooms.write().await;
                     if !rooms.contains_key(&code) {
-                        rooms.insert(
-                            code.clone(),
-                            PairRoom {
-                                code: code.clone(),
-                                hostname: s.hostname.clone(),
-                                atem_txs: HashMap::new(),
-                                pending_session_ids: HashMap::new(),
-                                astation_tx: None,
-                                astation_connection_id: None,
-                                created_at: Instant::now(),
-                            },
-                        );
+                        rooms.insert(code.clone(), PairRoom::new(&code, &s.hostname));
                     }
                 }
 
                 let atem_id = params.atem_id.clone().unwrap_or_else(|| "session-atem".to_string());
-                let verify_cache = state.session_verify_cache.clone();
+                let identity = state.identity.clone();
                 return ws.on_upgrade(move |socket| {
-                    handle_ws(hub, verify_cache, code, role, atem_id, socket)
+                    handle_ws(hub, identity, code, role, atem_id, socket)
                 })
                     .into_response();
             }
@@ -323,16 +409,8 @@ pub async fn ws_handler(
     if role == "astation" {
         let mut rooms = hub.rooms.write().await;
         rooms.entry(code.clone()).or_insert_with(|| {
-            tracing::info!("Auto-creating identity room for code={}", &code[..code.len().min(16)]);
-            PairRoom {
-                code: code.clone(),
-                hostname: "identity".to_string(),
-                atem_txs: HashMap::new(),
-                pending_session_ids: HashMap::new(),
-                astation_tx: None,
-                astation_connection_id: None,
-                created_at: Instant::now(),
-            }
+            tracing::info!("Auto-creating identity room for code={}", mask_code(&code));
+            PairRoom::new(&code, "identity")
         });
     } else {
         let rooms = hub.rooms.read().await;
@@ -355,8 +433,8 @@ pub async fn ws_handler(
     // ASCII to [A-Za-z0-9-] (matches atem's own identity rule).
     let atem_id = sanitize_atem_id(params.atem_id.as_deref());
 
-    let verify_cache = state.session_verify_cache.clone();
-    ws.on_upgrade(move |socket| handle_ws(hub, verify_cache, code, role, atem_id, socket))
+    let identity = state.identity.clone();
+    ws.on_upgrade(move |socket| handle_ws(hub, identity, code, role, atem_id, socket))
         .into_response()
 }
 
@@ -377,14 +455,551 @@ fn sanitize_atem_id(raw: Option<&str>) -> String {
     }
 }
 
+// --- Astation relay identity (proof of possession) ---
+//
+// Exact protocol: docs/knowledge-sync-plan.md, "Extension: Astation
+// proof-of-possession + durable pairing". Summary:
+//
+//   relay → Astation (first frame on every role=astation socket; old Astations
+//   ignore it because it has no atem_id/connection_id):
+//     {"type":"relayAuthChallenge","protocol":"relay-auth-1","challenge":"<64 hex>"}
+//   Astation → relay (intercepted, never forwarded):
+//     {"type":"relayAuth","astation_id","public_key","signature"}
+//     signature = DER ECDSA P-256/SHA-256 over
+//     "station-relay-auth-v1\n<challenge>\n<astation_id>"
+//   relay → Astation: {"type":"relayAuthResult","status":"registered|verified|rejected","message"}
+//   then, from a verified connection only: relaySessions / relayBind /
+//   relayUnbind, each answered with a relayAck.
+//
+// No key registered for the room code: the socket owns the room at once
+// (legacy mode — relays as before but can't bind sessions); a valid proof
+// registers its key (trust on first use). Key registered: the socket is
+// pending — no room ownership, no Atem traffic — until it proves that key;
+// a wrong proof or none within the timeout is rejected and closed.
+
+const RELAY_AUTH_PROTOCOL: &str = "relay-auth-1";
+const RELAY_AUTH_CONTEXT: &str = "station-relay-auth-v1";
+
+/// A DER-encoded ECDSA P-256 signature is at most 72 bytes.
+const MAX_SIGNATURE_BYTES: usize = 72;
+
+/// Lowercase hex.
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Decode hex (either case). `None` on odd length or a non-hex character.
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    fn nibble(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = hex.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    bytes
+        .chunks(2)
+        .map(|pair| Some((nibble(pair[0])? << 4) | nibble(pair[1])?))
+        .collect()
+}
+
+/// A P-256 X9.63 uncompressed public key as lowercase hex (65 bytes = 130
+/// chars, `04` prefix), or `None` if `hex` isn't one.
+fn normalize_public_key(hex: &str) -> Option<String> {
+    let lower = hex.to_ascii_lowercase();
+    (lower.len() == 130 && lower.starts_with("04") && hex_decode(&lower).is_some())
+        .then_some(lower)
+}
+
+/// The DER signature bytes, or `None` if `hex` isn't a plausible one.
+fn decode_signature(hex: &str) -> Option<Vec<u8>> {
+    hex_decode(hex).filter(|sig| !sig.is_empty() && sig.len() <= MAX_SIGNATURE_BYTES)
+}
+
+/// The exact UTF-8 string an Astation signs.
+fn relay_auth_signing_message(challenge: &str, astation_id: &str) -> String {
+    format!("{RELAY_AUTH_CONTEXT}\n{challenge}\n{astation_id}")
+}
+
+/// Verify `signature` (DER) by `public_key_hex` over the signing message.
+fn verify_relay_signature(
+    public_key_hex: &str,
+    challenge: &str,
+    astation_id: &str,
+    signature: &[u8],
+) -> bool {
+    let Some(public_key) = hex_decode(public_key_hex) else {
+        return false;
+    };
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, public_key)
+        .verify(
+            relay_auth_signing_message(challenge, astation_id).as_bytes(),
+            signature,
+        )
+        .is_ok()
+}
+
+/// 32 random bytes as 64 lowercase hex characters.
+fn new_relay_challenge() -> String {
+    hex_encode(&rand::thread_rng().gen::<[u8; 32]>())
+}
+
+fn relay_auth_challenge_frame(challenge: &str) -> String {
+    serde_json::json!({
+        "type": "relayAuthChallenge",
+        "protocol": RELAY_AUTH_PROTOCOL,
+        "challenge": challenge,
+    })
+    .to_string()
+}
+
+fn relay_auth_result_frame(status: &str, message: &str) -> String {
+    serde_json::json!({
+        "type": "relayAuthResult",
+        "status": status,
+        "message": message,
+    })
+    .to_string()
+}
+
+fn relay_ack_ok(for_type: &str) -> String {
+    serde_json::json!({"type": "relayAck", "for": for_type, "ok": true}).to_string()
+}
+
+/// `relaySessions` success: also reports how many listed sessions were
+/// skipped because another Astation owns them.
+fn relay_sessions_ack(skipped: u64) -> String {
+    serde_json::json!({
+        "type": "relayAck",
+        "for": "relaySessions",
+        "ok": true,
+        "skipped": skipped,
+    })
+    .to_string()
+}
+
+fn relay_ack_err(for_type: &str, message: &str) -> String {
+    serde_json::json!({
+        "type": "relayAck",
+        "for": for_type,
+        "ok": false,
+        "message": message,
+    })
+    .to_string()
+}
+
+/// The relay-auth frame type of an Astation message, if it is one. These are
+/// handled (or dropped) by the relay and never forwarded to Atems.
+fn relay_control_type(message: &serde_json::Value) -> Option<&str> {
+    let kind = message.get("type")?.as_str()?;
+    matches!(
+        kind,
+        "relayAuth"
+            | "relaySessions"
+            | "relayBind"
+            | "relayUnbind"
+            | "relayAuthChallenge"
+            | "relayAuthResult"
+            | "relayAck"
+    )
+    .then_some(kind)
+}
+
+fn valid_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= MAX_SESSION_ID_LEN
+        && session_id.chars().all(|c| c.is_ascii_graphic())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthState {
+    /// No key was registered at connect: owns the room like an old Astation,
+    /// but can't bind sessions unless it proves a key.
+    Legacy,
+    /// A key is registered: must prove it before it owns the room.
+    Pending,
+    /// Proved (or registered) the room's key.
+    Verified,
+}
+
+struct AstationAuth {
+    challenge: String,
+    deadline: Instant,
+    state: AuthState,
+}
+
+/// Send a frame to this connection while something still holds its sender
+/// (the room, as owner or pending). A replaced socket has none left.
+fn send_self(weak_tx: &mpsc::WeakUnboundedSender<String>, frame: String) {
+    if let Some(tx) = weak_tx.upgrade() {
+        let _ = tx.send(frame);
+    }
+}
+
+/// Record a successful verification without blocking or failing it.
+fn touch_key_in_background(identity: &Arc<dyn IdentityStore>, astation_id: &str, now: i64) {
+    let identity = identity.clone();
+    let astation_id = astation_id.to_string();
+    tokio::spawn(async move {
+        if let Err(error) = identity.touch_key(&astation_id, now).await {
+            tracing::warn!(
+                "Could not record verification for Astation {}: {}",
+                mask_code(&astation_id),
+                error
+            );
+        }
+    });
+}
+
+const KEY_MISMATCH: &str = "public_key does not match the key registered for this astation_id";
+
+/// Check a `relayAuth` message. On success returns the status to report
+/// (`registered` or `verified`); on failure the rejection message.
+///
+/// A key in the relay's cache verifies with no I/O (the store is only touched
+/// in the background), so registered Astations keep relaying through a
+/// database outage. A presented key that differs from the cached one triggers
+/// a re-read (to pick up an admin reset); if the store is unreachable it is
+/// rejected. Registration needs the store: `INSERT … ON CONFLICT DO NOTHING`
+/// first, then the cache.
+async fn verify_relay_auth(
+    hub: &RelayHub,
+    identity: &Arc<dyn IdentityStore>,
+    code: &str,
+    challenge: &str,
+    message: &serde_json::Value,
+    now: i64,
+) -> Result<&'static str, &'static str> {
+    let field = |name: &str| message.get(name).and_then(|value| value.as_str());
+    let astation_id = field("astation_id").ok_or("invalid relayAuth message")?;
+    if astation_id != code {
+        return Err("astation_id does not match this connection");
+    }
+    let public_key = field("public_key")
+        .and_then(normalize_public_key)
+        .ok_or("invalid public_key")?;
+    let signature = field("signature")
+        .and_then(decode_signature)
+        .ok_or("invalid signature")?;
+    if !verify_relay_signature(&public_key, challenge, astation_id, &signature) {
+        return Err("signature verification failed");
+    }
+
+    if let Some(cached) = hub.cached_key(astation_id) {
+        if cached == public_key {
+            touch_key_in_background(identity, astation_id, now);
+            return Ok("verified");
+        }
+        // Mismatch: the cache may predate an admin reset. Re-read the key.
+        match tokio::time::timeout(IDENTITY_STORE_TIMEOUT, identity.get_key(astation_id)).await {
+            Ok(Ok(Some(stored))) => {
+                let stored = stored.to_ascii_lowercase();
+                hub.cache_key(astation_id, &stored);
+                if stored != public_key {
+                    return Err(KEY_MISMATCH);
+                }
+                touch_key_in_background(identity, astation_id, now);
+                return Ok("verified");
+            }
+            Ok(Ok(None)) => {
+                // Admin reset: fall through to registration of the new key.
+                hub.forget_key(astation_id);
+            }
+            Ok(Err(error)) => {
+                tracing::error!(
+                    "Identity store error re-reading the key of Astation {}: {}",
+                    mask_code(astation_id),
+                    error
+                );
+                return Err(KEY_MISMATCH);
+            }
+            Err(_) => {
+                tracing::error!(
+                    "Identity store timed out re-reading the key of Astation {}",
+                    mask_code(astation_id)
+                );
+                return Err(KEY_MISMATCH);
+            }
+        }
+    }
+
+    let registration = tokio::time::timeout(
+        IDENTITY_STORE_TIMEOUT,
+        identity.register_key_if_absent(astation_id, &public_key, now),
+    )
+    .await;
+    match registration {
+        Ok(Ok(RegisterOutcome::Registered)) => {
+            hub.cache_key(astation_id, &public_key);
+            Ok("registered")
+        }
+        Ok(Ok(RegisterOutcome::Existing(stored))) => {
+            let stored = stored.to_ascii_lowercase();
+            hub.cache_key(astation_id, &stored);
+            if stored == public_key {
+                touch_key_in_background(identity, astation_id, now);
+                Ok("verified")
+            } else {
+                Err(KEY_MISMATCH)
+            }
+        }
+        Ok(Err(error)) => {
+            tracing::error!(
+                "Identity store error registering Astation {}: {}",
+                mask_code(astation_id),
+                error
+            );
+            Err("identity store unavailable")
+        }
+        Err(_) => {
+            tracing::error!(
+                "Identity store timed out registering Astation {}",
+                mask_code(astation_id)
+            );
+            Err("identity store unavailable")
+        }
+    }
+}
+
+/// Apply a `relaySessions` / `relayBind` / `relayUnbind` from a verified
+/// Astation; returns the `relayAck` frame.
+async fn apply_binding_message(
+    identity: &dyn IdentityStore,
+    code: &str,
+    kind: &str,
+    message: &serde_json::Value,
+    now: i64,
+) -> String {
+    let store_error = |error: crate::identity_store::IdentityError| {
+        tracing::error!(
+            "Identity store error on {} from Astation {}: {}",
+            kind,
+            mask_code(code),
+            error
+        );
+        relay_ack_err(kind, "identity store unavailable")
+    };
+    match kind {
+        "relaySessions" => {
+            let Some(listed) = message.get("sessions").and_then(|value| value.as_array()) else {
+                return relay_ack_err(kind, "invalid relaySessions message");
+            };
+            if listed.len() > MAX_RELAY_SESSIONS {
+                tracing::warn!(
+                    "Refused relaySessions from Astation {}: {} ids (max {})",
+                    mask_code(code),
+                    listed.len(),
+                    MAX_RELAY_SESSIONS
+                );
+                return relay_ack_err(kind, "too many sessions (max 1000)");
+            }
+            let mut sessions = Vec::with_capacity(listed.len());
+            for value in listed {
+                match value.as_str().filter(|id| valid_session_id(id)) {
+                    Some(id) => sessions.push(id.to_string()),
+                    None => return relay_ack_err(kind, "invalid session_id"),
+                }
+            }
+            match identity.replace_all(code, &sessions, now).await {
+                Ok(outcome) => {
+                    if outcome.skipped > 0 {
+                        tracing::warn!(
+                            "Astation {} resync skipped {} session(s) bound to another Astation",
+                            mask_code(code),
+                            outcome.skipped
+                        );
+                    }
+                    tracing::info!(
+                        "Astation {} resynced sessions: {} bound, {} removed",
+                        mask_code(code),
+                        outcome.bound,
+                        outcome.removed
+                    );
+                    relay_sessions_ack(outcome.skipped)
+                }
+                Err(error) => store_error(error),
+            }
+        }
+        "relayBind" | "relayUnbind" => {
+            let Some(session_id) = message
+                .get("session_id")
+                .and_then(|value| value.as_str())
+                .filter(|id| valid_session_id(id))
+            else {
+                return relay_ack_err(kind, "invalid session_id");
+            };
+            if kind == "relayBind" {
+                match identity.bind(session_id, code, now).await {
+                    Ok(BindOutcome::Bound) => {
+                        tracing::info!(
+                            "Astation {} bound session {}",
+                            mask_code(code),
+                            mask_code(session_id)
+                        );
+                        relay_ack_ok(kind)
+                    }
+                    Ok(BindOutcome::OwnedByOther) => {
+                        tracing::warn!(
+                            "Astation {} tried to bind session {} owned by another Astation",
+                            mask_code(code),
+                            mask_code(session_id)
+                        );
+                        relay_ack_err(kind, "session is bound to another Astation")
+                    }
+                    Err(error) => store_error(error),
+                }
+            } else {
+                match identity.unbind(session_id, code).await {
+                    Ok(removed) => {
+                        tracing::info!(
+                            "Astation {} unbound session {} (removed: {})",
+                            mask_code(code),
+                            mask_code(session_id),
+                            removed
+                        );
+                        relay_ack_ok(kind)
+                    }
+                    Err(error) => store_error(error),
+                }
+            }
+        }
+        _ => relay_ack_err(kind, "unsupported message"),
+    }
+}
+
+/// Room bookkeeping after `connection_id` proved the room's key.
+///
+/// - An unverified owner on another socket (one that slipped in while the key
+///   was first being registered) is evicted; its socket then closes.
+/// - A pending connection takes over the room (replacing a verified owner too:
+///   that is an ordinary reconnect) and learns the connected Atems.
+/// - A connection that already owns the room is marked verified.
+async fn promote_verified_astation(
+    hub: &RelayHub,
+    code: &str,
+    connection_id: &str,
+    was_pending: bool,
+) {
+    let mut rooms = hub.rooms.write().await;
+    let Some(room) = rooms.get_mut(code) else {
+        return;
+    };
+    let owned_by_me = room.astation_connection_id.as_deref() == Some(connection_id);
+    if owned_by_me {
+        room.astation_verified = true;
+        return;
+    }
+    if room.astation_connection_id.is_some() && !room.astation_verified {
+        tracing::warn!(
+            "Evicting unverified Astation owner of keyed room {}",
+            mask_code(code)
+        );
+        room.astation_tx = None;
+        room.astation_connection_id = None;
+    }
+    if !was_pending {
+        return;
+    }
+    let Some(tx) = room.pending_astations.remove(connection_id) else {
+        return;
+    };
+    for (atem_id, connection) in &room.atem_txs {
+        let _ = tx.send(relay_connection_event(
+            atem_id,
+            &connection.connection_id,
+            "connected",
+        ));
+    }
+    room.astation_tx = Some(tx);
+    room.astation_connection_id = Some(connection_id.to_string());
+    room.astation_verified = true;
+}
+
+/// Handle a relay-auth frame from an Astation. Returns `false` when the
+/// connection must be closed (its rejection has been queued).
+#[allow(clippy::too_many_arguments)]
+async fn handle_astation_control(
+    hub: &RelayHub,
+    identity: &Arc<dyn IdentityStore>,
+    code: &str,
+    connection_id: &str,
+    weak_tx: &mpsc::WeakUnboundedSender<String>,
+    auth: &mut AstationAuth,
+    kind: &str,
+    message: &serde_json::Value,
+) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    match kind {
+        "relayAuth" => {
+            if auth.state == AuthState::Verified {
+                tracing::debug!("Ignoring repeated relayAuth from Astation {}", mask_code(code));
+                return true;
+            }
+            if Instant::now() >= auth.deadline {
+                tracing::warn!("Rejected late relayAuth from Astation {}", mask_code(code));
+                send_self(weak_tx, relay_auth_result_frame("rejected", "challenge expired"));
+                return false;
+            }
+            match verify_relay_auth(hub, identity, code, &auth.challenge, message, now).await {
+                Ok(status) => {
+                    let message = if status == "registered" {
+                        "key registered"
+                    } else {
+                        "key verified"
+                    };
+                    send_self(weak_tx, relay_auth_result_frame(status, message));
+                    let was_pending = auth.state == AuthState::Pending;
+                    auth.state = AuthState::Verified;
+                    promote_verified_astation(hub, code, connection_id, was_pending).await;
+                    tracing::info!("Astation {} relay identity {}", mask_code(code), status);
+                    true
+                }
+                Err(reason) => {
+                    tracing::warn!("Rejected relayAuth for Astation {}: {}", mask_code(code), reason);
+                    send_self(weak_tx, relay_auth_result_frame("rejected", reason));
+                    false
+                }
+            }
+        }
+        "relaySessions" | "relayBind" | "relayUnbind" => {
+            let ack = if auth.state == AuthState::Verified {
+                apply_binding_message(identity.as_ref(), code, kind, message, now).await
+            } else {
+                tracing::debug!(
+                    "Refused {} from unverified Astation {}",
+                    kind,
+                    mask_code(code)
+                );
+                relay_ack_err(kind, "not verified")
+            };
+            send_self(weak_tx, ack);
+            true
+        }
+        // Relay → Astation frame types echoed back: dropped.
+        _ => true,
+    }
+}
+
 /// Message routing protocol for multi-Atem rooms:
 ///
 /// Atem → Astation: relay wraps the message with `atem_id` and a per-socket `connection_id`.
 /// Astation → Atem: Astation echoes both IDs with the payload; stale generations are dropped.
 /// Astation → ALL:   Astation sends raw JSON (no `atem_id` key) → relay BROADCASTS to every Atem in the room
+/// Astation → relay: relay-auth frames (see above) are handled here, never forwarded.
 async fn handle_ws(
     hub: RelayHub,
-    verify_cache: SessionVerifyCache,
+    identity: Arc<dyn IdentityStore>,
     code: String,
     role: String,
     atem_id: String,
@@ -394,21 +1009,37 @@ async fn handle_ws(
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let connection_id = Uuid::new_v4().to_string();
 
+    // An Astation gets a challenge; it must prove the key first when one is
+    // registered for this room code (decided below from the key cache, with
+    // no I/O).
+    let mut astation_auth = (role == "astation").then(|| AstationAuth {
+        challenge: new_relay_challenge(),
+        deadline: Instant::now() + hub.auth_timeout,
+        state: AuthState::Legacy,
+    });
+
     // Register this side's sender in the room
     let startup_notifications = {
         let mut rooms = hub.rooms.write().await;
-        let room = match rooms.get_mut(&code) {
-            Some(r) => r,
-            None => {
-                tracing::warn!("Room {} disappeared before WS setup", code);
-                return;
+        let room = if role == "astation" {
+            // An Astation owns its identity room; recreate it if it was
+            // removed since ws_handler checked.
+            rooms
+                .entry(code.clone())
+                .or_insert_with(|| PairRoom::new(&code, "identity"))
+        } else {
+            match rooms.get_mut(&code) {
+                Some(r) => r,
+                None => {
+                    tracing::warn!("Room {} disappeared before WS setup", mask_code(&code));
+                    return;
+                }
             }
         };
 
         let mut notifications = Vec::new();
-        match role.as_str() {
-            "atem" => {
-                room.pending_session_ids.remove(&atem_id);
+        match (role.as_str(), astation_auth.as_mut()) {
+            ("atem", _) => {
                 room.atem_txs.insert(
                     atem_id.clone(),
                     AtemConnection {
@@ -423,19 +1054,33 @@ async fn handle_ws(
                     ));
                 }
             }
-            "astation" => {
-                room.astation_tx = Some(tx.clone());
-                room.astation_connection_id = Some(connection_id.clone());
-                notifications.extend(room.atem_txs.iter().map(|(atem_id, connection)| {
-                    (
-                        tx.clone(),
-                        relay_connection_event(
-                            atem_id,
-                            &connection.connection_id,
-                            "connected",
-                        ),
-                    )
-                }));
+            ("astation", Some(auth)) => {
+                // The challenge is always the first frame.
+                notifications.push((tx.clone(), relay_auth_challenge_frame(&auth.challenge)));
+                // Checked under the rooms lock: a registration that lands
+                // after this is handled by promote_verified_astation, which
+                // evicts an unverified owner.
+                if hub.has_key(&code) {
+                    auth.state = AuthState::Pending;
+                }
+                if auth.state == AuthState::Pending {
+                    room.pending_astations
+                        .insert(connection_id.clone(), tx.clone());
+                } else {
+                    room.astation_tx = Some(tx.clone());
+                    room.astation_connection_id = Some(connection_id.clone());
+                    room.astation_verified = false;
+                    notifications.extend(room.atem_txs.iter().map(|(atem_id, connection)| {
+                        (
+                            tx.clone(),
+                            relay_connection_event(
+                                atem_id,
+                                &connection.connection_id,
+                                "connected",
+                            ),
+                        )
+                    }));
+                }
             }
             _ => {
                 tracing::warn!("Unknown role: {}", role);
@@ -448,15 +1093,26 @@ async fn handle_ws(
     for (target, notification) in startup_notifications {
         let _ = target.send(notification);
     }
+    // Only the room holds this connection's sender from here on; replacing or
+    // removing it there ends the writer and closes the socket.
+    let weak_tx = tx.downgrade();
     drop(tx);
 
-    tracing::info!("WS connected: role={} code={}", role, code);
+    tracing::info!(
+        "WS connected: role={} code={}{}",
+        role,
+        mask_code(&code),
+        match astation_auth.as_ref().map(|auth| auth.state) {
+            Some(AuthState::Pending) => " (pending key proof)",
+            _ => "",
+        }
+    );
 
     // Task: forward messages from our channel to the WS sink, with periodic pings
     // for NAT keepalive. URLSession (macOS) and tungstenite (Atem) both auto-respond
     // to server pings with pong — no client changes needed.
     let code_for_writer = code.clone();
-    let write_task = tokio::spawn(async move {
+    let mut write_task = tokio::spawn(async move {
         let mut ping_interval = tokio::time::interval(
             std::time::Duration::from_secs(WS_PING_INTERVAL_SECS)
         );
@@ -471,7 +1127,7 @@ async fn handle_ws(
                                 .await
                                 .is_err()
                             {
-                                tracing::debug!("WS write failed for {}", code_for_writer);
+                                tracing::debug!("WS write failed for {}", mask_code(&code_for_writer));
                                 break;
                             }
                         }
@@ -487,7 +1143,7 @@ async fn handle_ws(
                         .await
                         .is_err()
                     {
-                        tracing::debug!("WS ping failed for {} — removing dead connection", code_for_writer);
+                        tracing::debug!("WS ping failed for {} — removing dead connection", mask_code(&code_for_writer));
                         break;
                     }
                 }
@@ -502,6 +1158,8 @@ async fn handle_ws(
     // Routing rules (see handle_ws comment above for full protocol spec):
     //  - Atem → relay: raw msg → relay adds atem_id and connection_id → Astation
     //  - Astation → relay:
+    //      relay-auth frame                → handled here, never forwarded
+    //      anything while pending          → dropped
     //      targeted envelope with both IDs → forward only to that exact socket generation
     //      raw msg (no atem_id)           → broadcast payload to ALL Atems in room
     let hub_for_read = hub.clone();
@@ -509,19 +1167,46 @@ async fn handle_ws(
     let code_for_read = code.clone();
     let atem_id_for_read = atem_id.clone();
     let read_timeout = std::time::Duration::from_secs(WS_PING_INTERVAL_SECS + 30);
+    // Set when this connection was rejected: its result frame must be flushed
+    // before the socket closes.
+    let mut rejected = false;
     loop {
-        let msg_result = match tokio::time::timeout(read_timeout, ws_stream.next()).await {
+        let pending_deadline = astation_auth
+            .as_ref()
+            .filter(|auth| auth.state == AuthState::Pending)
+            .map(|auth| auth.deadline);
+        if let Some(deadline) = pending_deadline {
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    "Pending Astation {} did not prove its key in time",
+                    mask_code(&code_for_read)
+                );
+                send_self(
+                    &weak_tx,
+                    relay_auth_result_frame("rejected", "authentication timed out"),
+                );
+                rejected = true;
+                break;
+            }
+        }
+        let wait = pending_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()).min(read_timeout))
+            .unwrap_or(read_timeout);
+        let msg_result = match tokio::time::timeout(wait, ws_stream.next()).await {
             Ok(Some(msg)) => msg,
             Ok(None) => break, // stream ended
+            Err(_) if pending_deadline.is_some_and(|deadline| Instant::now() >= deadline) => {
+                continue; // the deadline check at the top rejects it
+            }
             Err(_) => {
-                tracing::debug!("WS idle timeout for {} {} — no frame in {}s", role, code_for_read, WS_PING_INTERVAL_SECS + 30);
+                tracing::debug!("WS idle timeout for {} {} — no frame in {}s", role, mask_code(&code_for_read), WS_PING_INTERVAL_SECS + 30);
                 break;
             }
         };
         match msg_result {
             Ok(axum::extract::ws::Message::Text(text)) => {
-                match role_for_read.as_str() {
-                    "atem" => {
+                match (role_for_read.as_str(), astation_auth.as_mut()) {
+                    ("atem", _) => {
                         let is_current = {
                             let rooms = hub_for_read.rooms.read().await;
                             rooms
@@ -537,18 +1222,12 @@ async fn handle_ws(
                         if !is_current {
                             tracing::debug!(
                                 "Dropping stale Atem connection: code={} atem_id={}",
-                                code_for_read,
+                                mask_code(&code_for_read),
                                 atem_id_for_read
                             );
                             break;
                         }
-                        record_atem_auth_attempt(
-                            &hub_for_read,
-                            &code_for_read,
-                            &atem_id_for_read,
-                            &text,
-                        )
-                        .await;
+                        log_atem_auth_attempt(&code_for_read, &atem_id_for_read, &text);
 
                         // Wrap with atem_id so Astation knows which Atem sent the message
                         let astation_tx = {
@@ -574,7 +1253,35 @@ async fn handle_ws(
                             let _ = tx.send(envelope);
                         }
                     }
-                    "astation" => {
+                    ("astation", Some(auth)) => {
+                        let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
+                        if let Some(message) = parsed.as_ref() {
+                            if let Some(kind) = relay_control_type(message) {
+                                let keep_open = handle_astation_control(
+                                    &hub_for_read,
+                                    &identity,
+                                    &code_for_read,
+                                    &connection_id,
+                                    &weak_tx,
+                                    auth,
+                                    kind,
+                                    message,
+                                )
+                                .await;
+                                if !keep_open {
+                                    rejected = true;
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
+                        if auth.state == AuthState::Pending {
+                            tracing::debug!(
+                                "Dropping message from pending Astation {}",
+                                mask_code(&code_for_read)
+                            );
+                            continue;
+                        }
                         let is_current = {
                             let rooms = hub_for_read.rooms.read().await;
                             rooms
@@ -584,19 +1291,19 @@ async fn handle_ws(
                                 .unwrap_or(false)
                         };
                         if !is_current {
-                            tracing::debug!("Dropping stale Astation connection: code={}", code_for_read);
+                            tracing::debug!("Dropping stale Astation connection: code={}", mask_code(&code_for_read));
                             break;
                         }
                         // Parse a generation-bound envelope and route it to the current Atem socket.
                         // Or raw JSON (no atem_id) → broadcast to all Atems
-                        if let Ok(env) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(env) = parsed {
                             if let Some(target_id) = env.get("atem_id").and_then(|v| v.as_str()) {
                                 let Some(requested_connection_id) = env
                                     .get("connection_id")
                                     .and_then(|value| value.as_str()) else {
                                         tracing::debug!(
                                             "Dropping generationless targeted message: code={} atem_id={}",
-                                            code_for_read,
+                                            mask_code(&code_for_read),
                                             target_id
                                         );
                                         continue;
@@ -616,19 +1323,11 @@ async fn handle_ws(
                                 let Some(target_connection) = target_connection else {
                                     tracing::debug!(
                                         "Dropping message for stale or missing Atem connection: code={} atem_id={}",
-                                        code_for_read,
+                                        mask_code(&code_for_read),
                                         target_id
                                     );
                                     continue;
                                 };
-                                observe_astation_auth_response(
-                                    &hub_for_read,
-                                    &verify_cache,
-                                    &code_for_read,
-                                    target_id,
-                                    &payload,
-                                )
-                                .await;
                                 let payload_str = payload.to_string();
                                 let _ = target_connection.tx.send(payload_str);
                             } else {
@@ -656,7 +1355,7 @@ async fn handle_ws(
             Ok(axum::extract::ws::Message::Close(_)) => break,
             Ok(axum::extract::ws::Message::Pong(_)) => {} // expected response to our Ping
             Err(e) => {
-                tracing::debug!("WS read error for {} {}: {}", role, code_for_read, e);
+                tracing::debug!("WS read error for {} {}: {}", role, mask_code(&code_for_read), e);
                 break;
             }
             _ => {}
@@ -680,6 +1379,7 @@ async fn handle_ws(
                     }
                 }
                 "astation" => {
+                    room.pending_astations.remove(&connection_id);
                     if room
                         .astation_connection_id
                         .as_deref()
@@ -688,15 +1388,18 @@ async fn handle_ws(
                     {
                         room.astation_tx = None;
                         room.astation_connection_id = None;
-                        room.pending_session_ids.clear();
+                        room.astation_verified = false;
                     }
                 }
                 _ => {}
             }
             // Remove the room only when all sides have disconnected
-            if room.atem_txs.is_empty() && room.astation_tx.is_none() {
+            if room.atem_txs.is_empty()
+                && room.astation_tx.is_none()
+                && room.pending_astations.is_empty()
+            {
                 rooms.remove(&code);
-                tracing::info!("Room {} removed (all sides disconnected)", code);
+                tracing::info!("Room {} removed (all sides disconnected)", mask_code(&code));
             }
         }
         notification
@@ -706,8 +1409,13 @@ async fn handle_ws(
         let _ = target.send(notification);
     }
 
+    if rejected {
+        // The room no longer holds our sender, so the writer drains the
+        // rejection, closes the socket, and exits.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut write_task).await;
+    }
     write_task.abort();
-    tracing::info!("WS disconnected: role={} code={}", role, code);
+    tracing::info!("WS disconnected: role={} code={}", role, mask_code(&code));
 }
 
 fn status_update<'a>(payload: &'a serde_json::Value) -> Option<(&'a str, &'a serde_json::Value)> {
@@ -718,100 +1426,30 @@ fn status_update<'a>(payload: &'a serde_json::Value) -> Option<(&'a str, &'a ser
     Some((data.get("status")?.as_str()?, data.get("data")?))
 }
 
-async fn record_atem_auth_attempt(hub: &RelayHub, code: &str, atem_id: &str, text: &str) {
+/// Log an Atem's auth request (masked). Observation only: bindings come
+/// exclusively from a verified Astation's relayBind/relaySessions.
+fn log_atem_auth_attempt(code: &str, atem_id: &str, text: &str) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
     let Ok(payload) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
     };
     let Some(("auth", auth_data)) = status_update(&payload) else {
         return;
     };
-
-    let mut rooms = hub.rooms.write().await;
-    let Some(room) = rooms.get_mut(code) else {
-        return;
-    };
-    if let Some(session_id) = auth_data.get("session_id").and_then(|value| value.as_str()) {
-        if !session_id.is_empty() {
-            room.pending_session_ids
-                .insert(atem_id.to_string(), session_id.to_string());
-            return;
-        }
-    }
-    room.pending_session_ids.remove(atem_id);
-}
-
-enum AstationAuthOutcome {
-    Bind(String),
-    Reject(Option<String>),
-}
-
-fn astation_auth_outcome(
-    payload: &serde_json::Value,
-    pending_session_id: Option<&str>,
-) -> Option<AstationAuthOutcome> {
-    let (status, data) = status_update(payload)?;
-    match status {
-        "authenticated" => pending_session_id
-            .map(|session_id| AstationAuthOutcome::Bind(session_id.to_string())),
-        "auth" if data.get("status").and_then(|value| value.as_str()) == Some("granted") => data
-            .get("session_id")
-            .and_then(|value| value.as_str())
-            .filter(|session_id| !session_id.is_empty())
-            .map(|session_id| AstationAuthOutcome::Bind(session_id.to_string())),
-        "auth" if data.get("status").and_then(|value| value.as_str()) == Some("denied") => {
-            Some(AstationAuthOutcome::Reject(
-                pending_session_id.map(str::to_string),
-            ))
-        }
-        "error" => Some(AstationAuthOutcome::Reject(
-            pending_session_id.map(str::to_string),
-        )),
-        _ => None,
-    }
-}
-
-async fn observe_astation_auth_response(
-    hub: &RelayHub,
-    verify_cache: &SessionVerifyCache,
-    code: &str,
-    atem_id: &str,
-    payload: &serde_json::Value,
-) {
-    let outcome = {
-        let mut rooms = hub.rooms.write().await;
-        let Some(room) = rooms.get_mut(code) else {
-            return;
-        };
-        let outcome = astation_auth_outcome(
-            payload,
-            room.pending_session_ids.get(atem_id).map(String::as_str),
-        );
-        if outcome.is_some() {
-            room.pending_session_ids.remove(atem_id);
-        }
-        outcome
-    };
-
-    match outcome {
-        Some(AstationAuthOutcome::Bind(session_id)) => {
-            verify_cache
-                .set(
-                    session_id,
-                    code.to_string(),
-                    true,
-                    VERIFIED_SESSION_TTL_SECS,
-                )
-                .await;
-            tracing::info!(
-                "Bound verified Astation session for room {}",
-                &code[..code.len().min(16)]
-            );
-        }
-        Some(AstationAuthOutcome::Reject(Some(session_id))) => {
-            verify_cache.remove(&session_id).await;
-        }
-        _ => {}
-    }
+    let session = auth_data
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .filter(|session_id| !session_id.is_empty())
+        .map(mask_code)
+        .unwrap_or_else(|| "-".to_string());
+    tracing::debug!(
+        "Atem auth attempt: code={} atem_id={} session={}",
+        mask_code(code),
+        atem_id,
+        session
+    );
 }
 
 /// GET /pair?code=XXXX — HTML landing page for pairing.
@@ -1013,13 +1651,22 @@ fn render_pair_page(code: &str, hostname: &str, status: &InitialPageStatus) -> S
 mod tests {
     use crate::voice_session::VoiceSessionStore;
     use super::*;
-    use crate::session_verify::SessionVerifyCache;
     use tokio::net::TcpStream;
     use tokio_tungstenite::{
         tungstenite::Message as ClientMessage, MaybeTlsStream, WebSocketStream,
     };
 
     type TestSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    #[test]
+    fn mask_code_shows_only_a_prefix() {
+        assert_eq!(mask_code("astation-0123456789abcdef"), "asta…");
+        assert_eq!(mask_code("ABCDEFGH"), "ABCD…");
+        assert_eq!(mask_code("ab"), "ab…");
+        assert_eq!(mask_code(""), "…");
+        // Char-based: never splits a multi-byte character (no panic).
+        assert_eq!(mask_code("日本語テキスト"), "日本語テ…");
+    }
 
     async fn next_client_json(socket: &mut TestSocket) -> serde_json::Value {
         loop {
@@ -1103,8 +1750,6 @@ mod tests {
     fn stale_atem_cleanup_does_not_remove_replacement() {
         let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel::<String>();
         let mut room = PairRoom {
-            code: "identity-room".to_string(),
-            hostname: "identity".to_string(),
             atem_txs: HashMap::from([(
                 "atem-office".to_string(),
                 AtemConnection {
@@ -1112,126 +1757,13 @@ mod tests {
                     tx: replacement_tx,
                 },
             )]),
-            pending_session_ids: HashMap::from([(
-                "atem-office".to_string(),
-                "session-new".to_string(),
-            )]),
-            astation_tx: None,
-            astation_connection_id: None,
-            created_at: Instant::now(),
+            ..PairRoom::new("identity-room", "identity")
         };
 
         assert!(!room.remove_atem_if_current("atem-office", "stale"));
         assert!(room.is_current_atem_connection("atem-office", "replacement"));
-        assert_eq!(
-            room.pending_session_ids.get("atem-office").map(String::as_str),
-            Some("session-new")
-        );
         assert!(room.remove_atem_if_current("atem-office", "replacement"));
         assert!(!room.atem_txs.contains_key("atem-office"));
-        assert!(!room.pending_session_ids.contains_key("atem-office"));
-    }
-
-    async fn hub_with_room(code: &str) -> RelayHub {
-        let hub = RelayHub::new();
-        hub.rooms.write().await.insert(
-            code.to_string(),
-            PairRoom {
-                code: code.to_string(),
-                hostname: "test-host".to_string(),
-                atem_txs: HashMap::new(),
-                pending_session_ids: HashMap::new(),
-                astation_tx: None,
-                astation_connection_id: None,
-                created_at: Instant::now(),
-            },
-        );
-        hub
-    }
-
-    #[tokio::test]
-    async fn existing_session_binds_only_after_astation_confirms() {
-        let code = "astation-work-session";
-        let atem_id = "atem-a";
-        let hub = hub_with_room(code).await;
-        let cache = SessionVerifyCache::new();
-        cache
-            .set(
-                "session-denied".to_string(),
-                code.to_string(),
-                true,
-                VERIFIED_SESSION_TTL_SECS,
-            )
-            .await;
-        let request = serde_json::json!({
-            "type": "statusUpdate",
-            "data": {"status": "auth", "data": {"session_id": "session-existing"}}
-        })
-        .to_string();
-
-        record_atem_auth_attempt(&hub, code, atem_id, &request).await;
-        assert_eq!(cache.get_astation_id("session-existing").await, None);
-
-        let response = serde_json::json!({
-            "type": "statusUpdate",
-            "data": {"status": "authenticated", "data": {"method": "session"}}
-        });
-        observe_astation_auth_response(&hub, &cache, code, atem_id, &response).await;
-
-        assert_eq!(
-            cache.get_astation_id("session-existing").await.as_deref(),
-            Some(code)
-        );
-        assert!(hub.rooms.read().await[code].pending_session_ids.is_empty());
-    }
-
-    #[tokio::test]
-    async fn newly_granted_pairing_session_binds_from_astation_response() {
-        let code = "astation-work-session";
-        let atem_id = "atem-a";
-        let hub = hub_with_room(code).await;
-        let cache = SessionVerifyCache::new();
-        let response = serde_json::json!({
-            "type": "statusUpdate",
-            "data": {
-                "status": "auth",
-                "data": {
-                    "status": "granted",
-                    "session_id": "session-new",
-                    "token": "secret"
-                }
-            }
-        });
-
-        observe_astation_auth_response(&hub, &cache, code, atem_id, &response).await;
-
-        assert_eq!(
-            cache.get_astation_id("session-new").await.as_deref(),
-            Some(code)
-        );
-    }
-
-    #[tokio::test]
-    async fn rejected_auth_clears_pending_session_without_binding() {
-        let code = "astation-work-session";
-        let atem_id = "atem-a";
-        let hub = hub_with_room(code).await;
-        let cache = SessionVerifyCache::new();
-        let request = serde_json::json!({
-            "type": "statusUpdate",
-            "data": {"status": "auth", "data": {"session_id": "session-denied"}}
-        })
-        .to_string();
-        record_atem_auth_attempt(&hub, code, atem_id, &request).await;
-
-        let response = serde_json::json!({
-            "type": "statusUpdate",
-            "data": {"status": "error", "data": {"message": "Session expired"}}
-        });
-        observe_astation_auth_response(&hub, &cache, code, atem_id, &response).await;
-
-        assert_eq!(cache.get_astation_id("session-denied").await, None);
-        assert!(hub.rooms.read().await[code].pending_session_ids.is_empty());
     }
 
     #[test]
@@ -1255,9 +1787,10 @@ mod tests {
             code: "ABCD-EFGH".to_string(),
             hostname: "test-host".to_string(),
             atem_txs: HashMap::new(),
-            pending_session_ids: HashMap::new(),
             astation_tx: None,
             astation_connection_id: None,
+            pending_astations: HashMap::new(),
+            astation_verified: false,
             created_at: Instant::now(),
         };
 
@@ -1280,9 +1813,10 @@ mod tests {
             code: "OLD1-CODE".to_string(),
             hostname: "old-host".to_string(),
             atem_txs: HashMap::new(),
-            pending_session_ids: HashMap::new(),
             astation_tx: None,
             astation_connection_id: None,
+            pending_astations: HashMap::new(),
+            astation_verified: false,
             created_at: Instant::now() - std::time::Duration::from_secs(ROOM_EXPIRY_SECS + 10),
         };
         hub.rooms
@@ -1295,9 +1829,10 @@ mod tests {
             code: "NEW1-CODE".to_string(),
             hostname: "new-host".to_string(),
             atem_txs: HashMap::new(),
-            pending_session_ids: HashMap::new(),
             astation_tx: None,
             astation_connection_id: None,
+            pending_astations: HashMap::new(),
+            astation_verified: false,
             created_at: Instant::now(),
         };
         hub.rooms
@@ -1322,9 +1857,10 @@ mod tests {
             code: "PAIR-CODE".to_string(),
             hostname: "paired-host".to_string(),
             atem_txs: HashMap::new(),
-            pending_session_ids: HashMap::new(),
             astation_tx: Some(tx),
             astation_connection_id: Some("astation-test".to_string()),
+            pending_astations: HashMap::new(),
+            astation_verified: false,
             created_at: Instant::now() - std::time::Duration::from_secs(ROOM_EXPIRY_SECS + 10),
         };
         hub.rooms
@@ -1367,9 +1903,10 @@ mod tests {
             sessions: crate::session_store::SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: crate::rtc_session::RtcSessionStore::new(),
-            session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
+            knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         Router::new()
             .route("/api/pair", axum::routing::post(create_pair_handler))
@@ -1667,6 +2204,9 @@ mod tests {
         ))
         .await
         .expect("failed to connect Astation");
+        // A legacy Astation (no registered key) ignores the challenge and
+        // relays as before.
+        assert_eq!(next_client_json(&mut astation).await["type"], "relayAuthChallenge");
         let (mut original, _) = tokio_tungstenite::connect_async(format!(
             "{base_url}?role=atem&code={code}&atem_id={atem_id}"
         ))
@@ -1846,9 +2386,10 @@ mod tests {
             code: "OLD-ATEM".to_string(),
             hostname: "old-host".to_string(),
             atem_txs: old_atem_txs,
-            pending_session_ids: HashMap::new(),
             astation_tx: None,
             astation_connection_id: None,
+            pending_astations: HashMap::new(),
+            astation_verified: false,
             created_at: Instant::now() - std::time::Duration::from_secs(ROOM_EXPIRY_SECS + 10),
         };
         hub.rooms.write().await.insert("OLD-ATEM".to_string(), room);
@@ -1866,9 +2407,10 @@ mod tests {
             sessions: crate::session_store::SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: crate::rtc_session::RtcSessionStore::new(),
-            session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
+            knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
 
         // Create pair
@@ -1877,9 +2419,10 @@ mod tests {
             code: code.clone(),
             hostname: "test-host".to_string(),
             atem_txs: HashMap::new(),
-            pending_session_ids: HashMap::new(),
             astation_tx: None,
             astation_connection_id: None,
+            pending_astations: HashMap::new(),
+            astation_verified: false,
             created_at: Instant::now(),
         };
         state.relay.rooms.write().await.insert(code.clone(), room);
@@ -1996,5 +2539,992 @@ mod tests {
         assert!(!chars_str.contains('1'), "CODE_CHARS should not contain 1");
         assert!(!chars_str.contains('I'), "CODE_CHARS should not contain I");
         assert!(!chars_str.contains('L'), "CODE_CHARS should not contain L");
+    }
+
+    // ─────────────── Astation proof-of-possession + durable bindings ───────────────
+
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+
+    /// A software P-256 key acting as a real Astation's relay identity.
+    struct TestKey {
+        pair: EcdsaKeyPair,
+        rng: ring::rand::SystemRandom,
+    }
+
+    impl TestKey {
+        fn generate() -> Self {
+            let rng = ring::rand::SystemRandom::new();
+            let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
+                .expect("generate P-256 key");
+            let pair =
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                    .expect("load P-256 key");
+            Self { pair, rng }
+        }
+
+        /// X9.63 uncompressed public key, lowercase hex (what Astation sends).
+        fn public_hex(&self) -> String {
+            hex_encode(self.pair.public_key().as_ref())
+        }
+
+        /// DER signature over the protocol's signed message, lowercase hex.
+        fn sign_hex(&self, challenge: &str, astation_id: &str) -> String {
+            let message = relay_auth_signing_message(challenge, astation_id);
+            let sig = self
+                .pair
+                .sign(&self.rng, message.as_bytes())
+                .expect("sign challenge");
+            hex_encode(sig.as_ref())
+        }
+
+        fn relay_auth(&self, challenge: &str, astation_id: &str) -> serde_json::Value {
+            serde_json::json!({
+                "type": "relayAuth",
+                "astation_id": astation_id,
+                "public_key": self.public_hex(),
+                "signature": self.sign_hex(challenge, astation_id),
+            })
+        }
+    }
+
+    const TEST_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
+
+    fn identity_state(identity: std::sync::Arc<dyn crate::identity_store::IdentityStore>) -> crate::AppState {
+        crate::AppState {
+            sessions: crate::session_store::SessionStore::new(),
+            relay: RelayHub::with_auth_timeout(TEST_AUTH_TIMEOUT),
+            rtc_sessions: crate::rtc_session::RtcSessionStore::new(),
+            voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
+            knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity,
+        }
+    }
+
+    fn memory_identity_state() -> crate::AppState {
+        identity_state(std::sync::Arc::new(
+            crate::identity_store::InMemoryIdentityStore::new(),
+        ))
+    }
+
+    /// Serve the production router on an ephemeral port; returns the ws base URL.
+    async fn spawn_relay(state: crate::AppState) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test relay");
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                crate::router(state)
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("test relay failed");
+        });
+        (format!("ws://{address}/ws"), server)
+    }
+
+    /// Open `role=astation` and read the challenge that must arrive first.
+    async fn connect_astation(base_url: &str, code: &str) -> (TestSocket, String) {
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("{base_url}?role=astation&code={code}"))
+                .await
+                .expect("failed to connect Astation");
+        let challenge = next_client_json(&mut socket).await;
+        assert_eq!(challenge["type"], "relayAuthChallenge");
+        assert_eq!(challenge["protocol"], "relay-auth-1");
+        let value = challenge["challenge"].as_str().unwrap().to_string();
+        assert_eq!(value.len(), 64);
+        assert!(value.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+        (socket, value)
+    }
+
+    async fn connect_atem(base_url: &str, code: &str, atem_id: &str) -> TestSocket {
+        tokio_tungstenite::connect_async(format!(
+            "{base_url}?role=atem&code={code}&atem_id={atem_id}"
+        ))
+        .await
+        .expect("failed to connect Atem")
+        .0
+    }
+
+    async fn send_json(socket: &mut TestSocket, value: serde_json::Value) {
+        socket
+            .send(ClientMessage::Text(value.to_string()))
+            .await
+            .expect("send failed");
+    }
+
+    /// Answer the challenge with `key`; returns the relayAuthResult.
+    async fn authenticate(
+        socket: &mut TestSocket,
+        key: &TestKey,
+        code: &str,
+        challenge: &str,
+    ) -> serde_json::Value {
+        send_json(socket, key.relay_auth(challenge, code)).await;
+        let result = next_client_json(socket).await;
+        assert_eq!(result["type"], "relayAuthResult");
+        result
+    }
+
+    /// Connect, prove `key`, and assert the expected status.
+    async fn verified_astation(
+        base_url: &str,
+        code: &str,
+        key: &TestKey,
+        expected_status: &str,
+    ) -> TestSocket {
+        let (mut socket, challenge) = connect_astation(base_url, code).await;
+        let result = authenticate(&mut socket, key, code, &challenge).await;
+        assert_eq!(result["status"], expected_status, "{result}");
+        socket
+    }
+
+    /// Send a control message and return the relay's ack.
+    async fn control(socket: &mut TestSocket, value: serde_json::Value) -> serde_json::Value {
+        let kind = value["type"].as_str().unwrap().to_string();
+        send_json(socket, value).await;
+        let ack = next_client_json(socket).await;
+        assert_eq!(ack["type"], "relayAck");
+        assert_eq!(ack["for"], kind.as_str());
+        ack
+    }
+
+    async fn assert_closed(socket: &mut TestSocket) {
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                match socket.next().await {
+                    None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_))) => return true,
+                    Some(Ok(ClientMessage::Text(text))) => {
+                        panic!("unexpected frame before close: {text}")
+                    }
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(closed, "socket was not closed");
+    }
+
+    async fn assert_silent(socket: &mut TestSocket, millis: u64) {
+        match tokio::time::timeout(std::time::Duration::from_millis(millis), socket.next()).await
+        {
+            Err(_) => {}
+            Ok(Some(Ok(ClientMessage::Text(text)))) => panic!("unexpected frame: {text}"),
+            Ok(other) => panic!("unexpected socket event: {other:?}"),
+        }
+    }
+
+    async fn resolve(state: &crate::AppState, session_id: &str) -> Option<String> {
+        state
+            .identity
+            .resolve(session_id, chrono::Utc::now().timestamp())
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn signing_message_matches_protocol() {
+        assert_eq!(
+            relay_auth_signing_message("ab12", "astation-x"),
+            "station-relay-auth-v1\nab12\nastation-x"
+        );
+    }
+
+    #[test]
+    fn hex_round_trips_and_rejects_bad_input() {
+        assert_eq!(hex_decode("00ff10Ab").unwrap(), vec![0x00, 0xff, 0x10, 0xab]);
+        assert_eq!(hex_encode(&[0x00, 0xff, 0x10, 0xab]), "00ff10ab");
+        assert_eq!(hex_decode("").unwrap(), Vec::<u8>::new());
+        assert!(hex_decode("abc").is_none(), "odd length");
+        assert!(hex_decode("zz").is_none(), "non-hex");
+        assert!(hex_decode("é1").is_none(), "non-ASCII");
+    }
+
+    #[test]
+    fn public_key_is_validated_and_lowercased() {
+        let key = TestKey::generate();
+        let upper = key.public_hex().to_uppercase();
+        assert_eq!(normalize_public_key(&upper), Some(key.public_hex()));
+        assert!(normalize_public_key(&key.public_hex()[..128]).is_none(), "too short");
+        assert!(normalize_public_key(&format!("{}00", key.public_hex())).is_none(), "too long");
+        let compressed_prefix = format!("02{}", &key.public_hex()[2..]);
+        assert!(normalize_public_key(&compressed_prefix).is_none(), "not 04-prefixed");
+        let non_hex = format!("04{}", "g".repeat(128));
+        assert!(normalize_public_key(&non_hex).is_none(), "non-hex");
+    }
+
+    #[test]
+    fn signature_verifies_only_for_the_signed_challenge_and_id() {
+        let key = TestKey::generate();
+        let other = TestKey::generate();
+        let challenge = "11".repeat(32);
+        let sig = hex_decode(&key.sign_hex(&challenge, "astation-a")).unwrap();
+        assert!(verify_relay_signature(&key.public_hex(), &challenge, "astation-a", &sig));
+        assert!(!verify_relay_signature(&other.public_hex(), &challenge, "astation-a", &sig));
+        assert!(!verify_relay_signature(&key.public_hex(), &"22".repeat(32), "astation-a", &sig));
+        assert!(!verify_relay_signature(&key.public_hex(), &challenge, "astation-b", &sig));
+        assert!(decode_signature("zz").is_none());
+        assert!(decode_signature("").is_none());
+        assert!(decode_signature(&"ab".repeat(200)).is_none(), "longer than a DER P-256 signature");
+    }
+
+    #[test]
+    fn protocol_frames_have_the_exact_shape() {
+        let challenge: serde_json::Value =
+            serde_json::from_str(&relay_auth_challenge_frame("ab")).unwrap();
+        assert_eq!(
+            challenge,
+            serde_json::json!({"type":"relayAuthChallenge","protocol":"relay-auth-1","challenge":"ab"})
+        );
+        let result: serde_json::Value =
+            serde_json::from_str(&relay_auth_result_frame("verified", "ok")).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({"type":"relayAuthResult","status":"verified","message":"ok"})
+        );
+        let ack: serde_json::Value = serde_json::from_str(&relay_ack_ok("relayBind")).unwrap();
+        assert_eq!(ack, serde_json::json!({"type":"relayAck","for":"relayBind","ok":true}));
+        let ack: serde_json::Value =
+            serde_json::from_str(&relay_sessions_ack(3)).unwrap();
+        assert_eq!(
+            ack,
+            serde_json::json!({"type":"relayAck","for":"relaySessions","ok":true,"skipped":3})
+        );
+        let ack: serde_json::Value =
+            serde_json::from_str(&relay_ack_err("relayUnbind", "nope")).unwrap();
+        assert_eq!(
+            ack,
+            serde_json::json!({"type":"relayAck","for":"relayUnbind","ok":false,"message":"nope"})
+        );
+    }
+
+    /// An old Astation ignores the challenge: it still relays both ways (also
+    /// after the challenge window), but it can never create a binding — not by
+    /// control messages and not by the auth traffic the relay passes along.
+    #[tokio::test]
+    async fn legacy_astation_relays_but_creates_no_bindings() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-legacy";
+
+        let (mut astation, _challenge) = connect_astation(&base_url, code).await;
+        tokio::time::sleep(TEST_AUTH_TIMEOUT * 2).await;
+
+        let mut atem = connect_atem(&base_url, code, "atem-a").await;
+        let connected = next_client_json(&mut astation).await;
+        assert_eq!(connected["relay_event"], "connected");
+        let connection_id = connected["connection_id"].as_str().unwrap().to_string();
+
+        // Atem asks to authenticate with a session; Astation grants it.
+        send_json(
+            &mut atem,
+            serde_json::json!({"type":"statusUpdate","data":{"status":"auth","data":{"session_id":"session-legacy"}}}),
+        )
+        .await;
+        let forwarded = next_client_json(&mut astation).await;
+        assert_eq!(forwarded["payload"]["data"]["data"]["session_id"], "session-legacy");
+        send_json(
+            &mut astation,
+            serde_json::json!({
+                "atem_id": "atem-a",
+                "connection_id": connection_id,
+                "payload": {"type":"statusUpdate","data":{"status":"authenticated","data":{}}},
+            }),
+        )
+        .await;
+        assert_eq!(next_client_json(&mut atem).await["data"]["status"], "authenticated");
+        send_json(
+            &mut astation,
+            serde_json::json!({
+                "atem_id": "atem-a",
+                "connection_id": connection_id,
+                "payload": {"type":"statusUpdate","data":{"status":"auth","data":{"status":"granted","session_id":"session-granted"}}},
+            }),
+        )
+        .await;
+        assert_eq!(next_client_json(&mut atem).await["data"]["data"]["status"], "granted");
+
+        // Binding control messages are refused without a verified key.
+        let ack = control(&mut astation, serde_json::json!({"type":"relayBind","session_id":"session-legacy"})).await;
+        assert_eq!(ack["ok"], false);
+        let ack = control(&mut astation, serde_json::json!({"type":"relaySessions","sessions":["session-legacy"]})).await;
+        assert_eq!(ack["ok"], false);
+
+        // Broadcast still reaches the Atem.
+        send_json(&mut astation, serde_json::json!({"probe":"broadcast"})).await;
+        assert_eq!(next_client_json(&mut atem).await["probe"], "broadcast");
+
+        assert_eq!(resolve(&state, "session-legacy").await, None);
+        assert_eq!(resolve(&state, "session-granted").await, None);
+        assert_eq!(state.identity.get_key(code).await.unwrap(), None);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn valid_proof_registers_key_and_later_connections_verify() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-tofu";
+        let key = TestKey::generate();
+
+        let mut first = verified_astation(&base_url, code, &key, "registered").await;
+        assert_eq!(
+            state.identity.get_key(code).await.unwrap(),
+            Some(key.public_hex())
+        );
+
+        // Reconnect (e.g. after a network change): pending until verified, then
+        // it owns the room and the old socket is closed.
+        let mut atem = connect_atem(&base_url, code, "atem-a").await;
+        assert_eq!(next_client_json(&mut first).await["relay_event"], "connected");
+        let (mut second, challenge) = connect_astation(&base_url, code).await;
+        // Uppercase key hex is accepted (compared lowercase).
+        let mut auth = key.relay_auth(&challenge, code);
+        auth["public_key"] = serde_json::Value::String(key.public_hex().to_uppercase());
+        send_json(&mut second, auth).await;
+        let result = next_client_json(&mut second).await;
+        assert_eq!(result["status"], "verified", "{result}");
+        let connected = next_client_json(&mut second).await;
+        assert_eq!(connected["relay_event"], "connected");
+        assert_eq!(connected["atem_id"], "atem-a");
+        assert_closed(&mut first).await;
+
+        send_json(&mut atem, serde_json::json!({"probe":"to-new-owner"})).await;
+        assert_eq!(next_client_json(&mut second).await["payload"]["probe"], "to-new-owner");
+        server.abort();
+    }
+
+    /// A second key for a registered id is rejected and closed, and while it
+    /// was pending it neither owned the room nor saw Atem traffic.
+    #[tokio::test]
+    async fn wrong_key_is_rejected_and_does_not_take_over_the_room() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-owned";
+        let owner_key = TestKey::generate();
+        let mut owner = verified_astation(&base_url, code, &owner_key, "registered").await;
+        let mut atem = connect_atem(&base_url, code, "atem-a").await;
+        assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+
+        let (mut intruder, challenge) = connect_astation(&base_url, code).await;
+        // Pending: no connected events, no Atem traffic, room still the owner's.
+        send_json(&mut atem, serde_json::json!({"probe":"while-pending"})).await;
+        assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "while-pending");
+        assert_silent(&mut intruder, 150).await;
+        // Its non-control messages go nowhere.
+        send_json(&mut intruder, serde_json::json!({"probe":"from-intruder"})).await;
+        assert_silent(&mut atem, 150).await;
+
+        let result = authenticate(&mut intruder, &TestKey::generate(), code, &challenge).await;
+        assert_eq!(result["status"], "rejected", "{result}");
+        assert_closed(&mut intruder).await;
+
+        // A valid signature by the right key over the wrong challenge fails too.
+        let (mut replay, _challenge) = connect_astation(&base_url, code).await;
+        let result = authenticate(&mut replay, &owner_key, code, &challenge).await;
+        assert_eq!(result["status"], "rejected", "{result}");
+        assert_closed(&mut replay).await;
+
+        assert_eq!(
+            state.identity.get_key(code).await.unwrap(),
+            Some(owner_key.public_hex())
+        );
+        send_json(&mut owner, serde_json::json!({"probe":"owner-still-here"})).await;
+        assert_eq!(next_client_json(&mut atem).await["probe"], "owner-still-here");
+        send_json(&mut atem, serde_json::json!({"probe":"to-owner"})).await;
+        assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "to-owner");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_connection_times_out() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-timeout";
+        let key = TestKey::generate();
+        let mut owner = verified_astation(&base_url, code, &key, "registered").await;
+
+        let (mut silent, _challenge) = connect_astation(&base_url, code).await;
+        let result = tokio::time::timeout(TEST_AUTH_TIMEOUT * 5, next_client_json(&mut silent))
+            .await
+            .expect("no timeout result");
+        assert_eq!(result["type"], "relayAuthResult");
+        assert_eq!(result["status"], "rejected");
+        assert_closed(&mut silent).await;
+
+        // The owner is unaffected.
+        let mut atem = connect_atem(&base_url, code, "atem-a").await;
+        assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+        send_json(&mut atem, serde_json::json!({"probe":"x"})).await;
+        assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "x");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn late_answer_from_legacy_connection_is_rejected() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-late";
+        let key = TestKey::generate();
+        let (mut astation, challenge) = connect_astation(&base_url, code).await;
+        tokio::time::sleep(TEST_AUTH_TIMEOUT * 2).await;
+        let result = authenticate(&mut astation, &key, code, &challenge).await;
+        assert_eq!(result["status"], "rejected", "{result}");
+        assert_closed(&mut astation).await;
+        assert_eq!(state.identity.get_key(code).await.unwrap(), None);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn proof_for_another_astation_id_is_rejected() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let key = TestKey::generate();
+        let (mut astation, challenge) = connect_astation(&base_url, "astation-mine").await;
+        let result = authenticate(&mut astation, &key, "astation-theirs", &challenge).await;
+        assert_eq!(result["status"], "rejected", "{result}");
+        assert_closed(&mut astation).await;
+        assert_eq!(state.identity.get_key("astation-mine").await.unwrap(), None);
+        assert_eq!(state.identity.get_key("astation-theirs").await.unwrap(), None);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn control_messages_are_never_forwarded_to_atems() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-control";
+        let key = TestKey::generate();
+        let mut astation = verified_astation(&base_url, code, &key, "registered").await;
+        let mut atem = connect_atem(&base_url, code, "atem-a").await;
+        assert_eq!(next_client_json(&mut astation).await["relay_event"], "connected");
+
+        control(&mut astation, serde_json::json!({"type":"relaySessions","sessions":["s1"]})).await;
+        control(&mut astation, serde_json::json!({"type":"relayBind","session_id":"s2"})).await;
+        control(&mut astation, serde_json::json!({"type":"relayUnbind","session_id":"s2"})).await;
+        // A repeated relayAuth and relay→Astation frame types are dropped silently.
+        send_json(&mut astation, key.relay_auth(&"00".repeat(32), code)).await;
+        send_json(&mut astation, serde_json::json!({"type":"relayAck","for":"relayBind","ok":true})).await;
+        send_json(&mut astation, serde_json::json!({"type":"relayAuthResult","status":"verified","message":""})).await;
+        send_json(&mut astation, serde_json::json!({"type":"relayAuthChallenge","protocol":"relay-auth-1","challenge":"00"})).await;
+
+        // The first thing the Atem receives is the ordinary broadcast.
+        send_json(&mut astation, serde_json::json!({"probe":"after-control"})).await;
+        assert_eq!(next_client_json(&mut atem).await["probe"], "after-control");
+        assert_silent(&mut astation, 100).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn binding_messages_drive_resolve_caller() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-binder";
+        let key = TestKey::generate();
+        let mut astation = verified_astation(&base_url, code, &key, "registered").await;
+
+        let ack = control(&mut astation, serde_json::json!({"type":"relaySessions","sessions":["s1","s2"]})).await;
+        assert_eq!(ack, serde_json::json!({"type":"relayAck","for":"relaySessions","ok":true,"skipped":0}));
+        assert_eq!(resolve(&state, "s1").await.as_deref(), Some(code));
+        assert_eq!(resolve(&state, "s2").await.as_deref(), Some(code));
+
+        let ack = control(&mut astation, serde_json::json!({"type":"relayBind","session_id":"s3"})).await;
+        assert_eq!(ack, serde_json::json!({"type":"relayAck","for":"relayBind","ok":true}));
+        assert_eq!(resolve(&state, "s3").await.as_deref(), Some(code));
+
+        let ack = control(&mut astation, serde_json::json!({"type":"relayUnbind","session_id":"s1"})).await;
+        assert_eq!(ack, serde_json::json!({"type":"relayAck","for":"relayUnbind","ok":true}));
+        assert_eq!(resolve(&state, "s1").await, None);
+
+        // Full resync: exactly the listed set.
+        control(&mut astation, serde_json::json!({"type":"relaySessions","sessions":["s2"]})).await;
+        assert_eq!(resolve(&state, "s2").await.as_deref(), Some(code));
+        assert_eq!(resolve(&state, "s3").await, None);
+
+        // Another Astation's session: bind refused, resync skips it.
+        let now = chrono::Utc::now().timestamp();
+        state.identity.bind("s-other", "astation-other", now).await.unwrap();
+        let ack = control(&mut astation, serde_json::json!({"type":"relayBind","session_id":"s-other"})).await;
+        assert_eq!(ack["ok"], false);
+        assert!(ack["message"].is_string());
+        let ack = control(&mut astation, serde_json::json!({"type":"relaySessions","sessions":["s2","s-other"]})).await;
+        assert_eq!(ack, serde_json::json!({"type":"relayAck","for":"relaySessions","ok":true,"skipped":1}));
+        assert_eq!(resolve(&state, "s-other").await.as_deref(), Some("astation-other"));
+
+        // Too many ids: refused, nothing changes.
+        let many: Vec<String> = (0..1001).map(|i| format!("s-many-{i}")).collect();
+        let ack = control(&mut astation, serde_json::json!({"type":"relaySessions","sessions":many})).await;
+        assert_eq!(ack["ok"], false);
+        assert_eq!(resolve(&state, "s2").await.as_deref(), Some(code));
+        assert_eq!(resolve(&state, "s-many-0").await, None);
+        // Exactly the cap is fine.
+        let cap: Vec<String> = (0..1000).map(|i| format!("s-cap-{i}")).collect();
+        let ack = control(&mut astation, serde_json::json!({"type":"relaySessions","sessions":cap})).await;
+        assert_eq!(ack["ok"], true);
+        assert_eq!(resolve(&state, "s-cap-999").await.as_deref(), Some(code));
+
+        // Malformed messages: refused.
+        for bad in [
+            serde_json::json!({"type":"relayBind"}),
+            serde_json::json!({"type":"relayBind","session_id":""}),
+            serde_json::json!({"type":"relayBind","session_id":"x".repeat(200)}),
+            serde_json::json!({"type":"relaySessions","sessions":"s1"}),
+            serde_json::json!({"type":"relaySessions","sessions":[1]}),
+            serde_json::json!({"type":"relayUnbind","session_id":7}),
+        ] {
+            assert_eq!(control(&mut astation, bad.clone()).await["ok"], false, "{bad}");
+        }
+
+        // The cap-sized resync replaced the set; s2 is gone.
+        assert_eq!(resolve(&state, "s2").await, None);
+
+        // resolve_caller authorizes exactly the bound sessions.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", "session s-cap-0".parse().unwrap());
+        let caller = crate::vault_routes::resolve_caller(&state, &headers, Some("atem-a"))
+            .await
+            .unwrap_or_else(|e| panic!("bound session did not resolve: {}", e.0));
+        assert_eq!(caller.work_session_id, code);
+        headers.insert("authorization", "session s2".parse().unwrap());
+        let denied = crate::vault_routes::resolve_caller(&state, &headers, Some("atem-a")).await;
+        assert_eq!(denied.err().map(|e| e.0), Some(HttpStatusCode::UNAUTHORIZED));
+        server.abort();
+    }
+
+    async fn http_status(
+        state: &crate::AppState,
+        method: &str,
+        uri: &str,
+        session: &str,
+        body: &str,
+    ) -> HttpStatusCode {
+        crate::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("authorization", format!("session {session}"))
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", "203.0.113.77")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn assert_routes(state: &crate::AppState, session: &str, expected: HttpStatusCode) {
+        for (method, uri, body) in [
+            ("POST", "/api/vault?id=atem-a", r#"{"summary":"x"}"#),
+            ("GET", "/api/vault?id=atem-a", ""),
+            ("GET", "/api/memory?id=atem-a", ""),
+            ("GET", "/api/skills?id=atem-a", ""),
+            ("POST", "/api/memory/batch?id=atem-a", r#"{"ops":[]}"#),
+        ] {
+            assert_eq!(
+                http_status(state, method, uri, session, body).await,
+                expected,
+                "{method} {uri}"
+            );
+        }
+    }
+
+    /// Vault and knowledge routes: 401 until the verified Astation binds the
+    /// session, 200 after, 401 again once it is unbound. A granted
+    /// SessionStore session alone authorizes nothing.
+    #[tokio::test]
+    async fn vault_and_knowledge_routes_need_a_binding() {
+        let state = memory_identity_state();
+        let mut granted = crate::auth::create_session("host");
+        granted.status = crate::auth::SessionStatus::Granted;
+        let session_id = granted.id.clone();
+        state.sessions.create(granted).await;
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-routes";
+        let key = TestKey::generate();
+
+        assert_routes(&state, &session_id, HttpStatusCode::UNAUTHORIZED).await;
+
+        let mut astation = verified_astation(&base_url, code, &key, "registered").await;
+        let ack = control(&mut astation, serde_json::json!({"type":"relayBind","session_id":session_id})).await;
+        assert_eq!(ack["ok"], true);
+        assert_routes(&state, &session_id, HttpStatusCode::OK).await;
+
+        control(&mut astation, serde_json::json!({"type":"relayUnbind","session_id":session_id})).await;
+        assert_routes(&state, &session_id, HttpStatusCode::UNAUTHORIZED).await;
+        server.abort();
+    }
+
+    /// Bindings live in Postgres: a relay restart (new AppState, new pool) keeps
+    /// authorizing them. Run with IDENTITY_TEST_DATABASE_URL (see identity_store).
+    #[tokio::test]
+    #[ignore]
+    async fn pg_bindings_survive_a_new_app_state() {
+        let _guard = crate::identity_store::tests::PG_LOCK.lock().await;
+        let store = crate::identity_store::tests::fresh_pg().await;
+        let state = identity_state(std::sync::Arc::new(store));
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-pg-restart";
+        let key = TestKey::generate();
+        let mut astation = verified_astation(&base_url, code, &key, "registered").await;
+        let ack = control(&mut astation, serde_json::json!({"type":"relayBind","session_id":"pg-session"})).await;
+        assert_eq!(ack["ok"], true);
+        server.abort();
+
+        let url = std::env::var("IDENTITY_TEST_DATABASE_URL").unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .unwrap();
+        let restarted = identity_state(std::sync::Arc::new(
+            crate::identity_store::PgIdentityStore::new(pool),
+        ));
+        // As main() does at startup.
+        assert_eq!(restarted.relay.load_keys(restarted.identity.as_ref()).await.unwrap(), 1);
+        assert_routes(&restarted, "pg-session", HttpStatusCode::OK).await;
+        assert_routes(&restarted, "pg-unbound", HttpStatusCode::UNAUTHORIZED).await;
+
+        // The registered key survived too: the same key now verifies.
+        let (base_url, server) = spawn_relay(restarted).await;
+        verified_astation(&base_url, code, &key, "verified").await;
+        server.abort();
+    }
+
+    // ─────────────── Key cache, DB outages, admin reset, DELETE ───────────────
+
+    use crate::identity_store::{
+        BindOutcome as StoreBindOutcome, IdentityError as StoreError, InMemoryIdentityStore,
+        RegisterOutcome as StoreRegisterOutcome, ReplaceOutcome,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// An in-memory identity store that counts calls and can be taken "down".
+    #[derive(Clone, Default)]
+    struct FlakyIdentity {
+        inner: InMemoryIdentityStore,
+        down: std::sync::Arc<AtomicBool>,
+        calls: std::sync::Arc<AtomicUsize>,
+    }
+
+    impl FlakyIdentity {
+        fn check(&self) -> Result<(), StoreError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.down.load(Ordering::SeqCst) {
+                Err(StoreError::Db("database is down".into()))
+            } else {
+                Ok(())
+            }
+        }
+        fn set_down(&self, down: bool) {
+            self.down.store(down, Ordering::SeqCst);
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IdentityStore for FlakyIdentity {
+        fn backend_name(&self) -> &'static str {
+            "flaky"
+        }
+        async fn get_key(&self, id: &str) -> Result<Option<String>, StoreError> {
+            self.check()?;
+            self.inner.get_key(id).await
+        }
+        async fn register_key_if_absent(
+            &self,
+            id: &str,
+            key: &str,
+            now: i64,
+        ) -> Result<StoreRegisterOutcome, StoreError> {
+            self.check()?;
+            self.inner.register_key_if_absent(id, key, now).await
+        }
+        async fn touch_key(&self, id: &str, now: i64) -> Result<(), StoreError> {
+            self.check()?;
+            self.inner.touch_key(id, now).await
+        }
+        async fn list_keys(&self) -> Result<Vec<(String, String)>, StoreError> {
+            self.check()?;
+            self.inner.list_keys().await
+        }
+        async fn bind(&self, s: &str, id: &str, now: i64) -> Result<StoreBindOutcome, StoreError> {
+            self.check()?;
+            self.inner.bind(s, id, now).await
+        }
+        async fn unbind(&self, s: &str, id: &str) -> Result<bool, StoreError> {
+            self.check()?;
+            self.inner.unbind(s, id).await
+        }
+        async fn replace_all(
+            &self,
+            id: &str,
+            sessions: &[String],
+            now: i64,
+        ) -> Result<ReplaceOutcome, StoreError> {
+            self.check()?;
+            self.inner.replace_all(id, sessions, now).await
+        }
+        async fn resolve(&self, s: &str, now: i64) -> Result<Option<String>, StoreError> {
+            self.check()?;
+            self.inner.resolve(s, now).await
+        }
+    }
+
+    fn flaky_state() -> (crate::AppState, FlakyIdentity) {
+        let flaky = FlakyIdentity::default();
+        (identity_state(std::sync::Arc::new(flaky.clone())), flaky)
+    }
+
+    #[tokio::test]
+    async fn connecting_does_no_identity_store_io() {
+        let (state, flaky) = flaky_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let key = TestKey::generate();
+        let _owner = verified_astation(&base_url, "astation-io", &key, "registered").await;
+        let before = flaky.calls();
+        let (_pending, _) = connect_astation(&base_url, "astation-io").await;
+        let (_legacy, _) = connect_astation(&base_url, "astation-io-keyless").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(flaky.calls(), before, "a connect touched the identity store");
+        server.abort();
+    }
+
+    /// With the database down a registered Astation still verifies from the
+    /// key cache and keeps relaying; binding changes fail softly.
+    #[tokio::test]
+    async fn registered_astation_verifies_while_db_is_down() {
+        let (state, flaky) = flaky_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-db-down";
+        let key = TestKey::generate();
+        let mut old = verified_astation(&base_url, code, &key, "registered").await;
+        let mut atem = connect_atem(&base_url, code, "atem-a").await;
+        assert_eq!(next_client_json(&mut old).await["relay_event"], "connected");
+
+        flaky.set_down(true);
+        let mut new = verified_astation(&base_url, code, &key, "verified").await;
+        assert_eq!(next_client_json(&mut new).await["relay_event"], "connected");
+        assert_closed(&mut old).await;
+        send_json(&mut atem, serde_json::json!({"probe":"db-down"})).await;
+        assert_eq!(next_client_json(&mut new).await["payload"]["probe"], "db-down");
+
+        let ack = control(&mut new, serde_json::json!({"type":"relayBind","session_id":"s1"})).await;
+        assert_eq!(ack["ok"], false);
+        assert_eq!(ack["message"], "identity store unavailable");
+        // Still the owner.
+        send_json(&mut new, serde_json::json!({"probe":"still-owner"})).await;
+        assert_eq!(next_client_json(&mut atem).await["probe"], "still-owner");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn wrong_key_while_db_is_down_is_rejected_and_owner_untouched() {
+        let (state, flaky) = flaky_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-db-down-wrong";
+        let key = TestKey::generate();
+        let mut owner = verified_astation(&base_url, code, &key, "registered").await;
+        let mut atem = connect_atem(&base_url, code, "atem-a").await;
+        assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+
+        flaky.set_down(true);
+        let (mut intruder, challenge) = connect_astation(&base_url, code).await;
+        let result = authenticate(&mut intruder, &TestKey::generate(), code, &challenge).await;
+        assert_eq!(result["status"], "rejected", "{result}");
+        assert_closed(&mut intruder).await;
+
+        send_json(&mut atem, serde_json::json!({"probe":"to-owner"})).await;
+        assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "to-owner");
+        assert!(state.relay.has_key(code), "a DB error must not forget the key");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn registration_while_db_is_down_is_rejected_and_retry_works() {
+        let (state, flaky) = flaky_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-db-down-new";
+        let key = TestKey::generate();
+        flaky.set_down(true);
+        let (mut astation, challenge) = connect_astation(&base_url, code).await;
+        let result = authenticate(&mut astation, &key, code, &challenge).await;
+        assert_eq!(result["status"], "rejected");
+        assert_eq!(result["message"], "identity store unavailable");
+        assert_closed(&mut astation).await;
+        assert!(!state.relay.has_key(code));
+
+        // Still keyless, so the retry is a legacy socket that registers.
+        flaky.set_down(false);
+        verified_astation(&base_url, code, &key, "registered").await;
+        assert!(state.relay.has_key(code));
+        server.abort();
+    }
+
+    /// An admin reset (row deleted) is picked up when a different key
+    /// connects: the mismatch re-reads the store. Until then the cached old
+    /// key still verifies (documented; restart the relay to revoke at once).
+    #[tokio::test]
+    async fn admin_reset_is_picked_up_on_key_mismatch() {
+        let (state, flaky) = flaky_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-reset";
+        let old_key = TestKey::generate();
+        let new_key = TestKey::generate();
+        verified_astation(&base_url, code, &old_key, "registered").await;
+
+        flaky.inner.delete_key(code).await;
+        verified_astation(&base_url, code, &old_key, "verified").await;
+
+        verified_astation(&base_url, code, &new_key, "registered").await;
+        assert_eq!(state.identity.get_key(code).await.unwrap(), Some(new_key.public_hex()));
+        let (mut old, challenge) = connect_astation(&base_url, code).await;
+        let result = authenticate(&mut old, &old_key, code, &challenge).await;
+        assert_eq!(result["status"], "rejected", "{result}");
+        server.abort();
+    }
+
+    /// Keys registered before a restart make those ids pending from the first
+    /// connect (main() loads the cache at startup).
+    #[tokio::test]
+    async fn loaded_keys_make_known_ids_pending() {
+        let (state, flaky) = flaky_state();
+        let code = "astation-preloaded";
+        let key = TestKey::generate();
+        flaky
+            .inner
+            .register_key_if_absent(code, &key.public_hex(), 1)
+            .await
+            .unwrap();
+        assert_eq!(state.relay.load_keys(state.identity.as_ref()).await.unwrap(), 1);
+        let (base_url, server) = spawn_relay(state.clone()).await;
+
+        let (mut astation, challenge) = connect_astation(&base_url, code).await;
+        let _atem = connect_atem(&base_url, code, "atem-a").await;
+        assert_silent(&mut astation, 150).await;
+        let result = authenticate(&mut astation, &key, code, &challenge).await;
+        assert_eq!(result["status"], "verified");
+        assert_eq!(next_client_json(&mut astation).await["relay_event"], "connected");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn atem_joining_while_an_astation_is_pending_is_not_announced_to_it() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-pending-join";
+        let key = TestKey::generate();
+        let mut owner = verified_astation(&base_url, code, &key, "registered").await;
+        let (mut pending, _challenge) = connect_astation(&base_url, code).await;
+
+        let mut atem = connect_atem(&base_url, code, "atem-late").await;
+        assert_eq!(next_client_json(&mut owner).await["atem_id"], "atem-late");
+        send_json(&mut atem, serde_json::json!({"probe":"x"})).await;
+        assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "x");
+        assert_silent(&mut pending, 150).await;
+        server.abort();
+    }
+
+    async fn delete_room(state: &crate::AppState, code: &str) -> (HttpStatusCode, serde_json::Value) {
+        let response = crate::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/pair/{code}"))
+                    .header("x-forwarded-for", "203.0.113.78")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+    }
+
+    #[tokio::test]
+    async fn delete_is_refused_for_a_keyed_room() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-undeletable";
+        let key = TestKey::generate();
+        let mut owner = verified_astation(&base_url, code, &key, "registered").await;
+        let mut atem = connect_atem(&base_url, code, "atem-a").await;
+        assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+
+        let (status, body) = delete_room(&state, code).await;
+        assert_eq!(status, HttpStatusCode::CONFLICT);
+        assert_eq!(body, serde_json::json!({"error":"room is owned by a registered Astation"}));
+
+        send_json(&mut owner, serde_json::json!({"probe":"survived"})).await;
+        assert_eq!(next_client_json(&mut atem).await["probe"], "survived");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delete_still_closes_keyless_rooms() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-keyless-delete";
+        let (_legacy, _challenge) = connect_astation(&base_url, code).await;
+        let (status, body) = delete_room(&state, code).await;
+        assert_eq!(status, HttpStatusCode::OK);
+        assert_eq!(body["closed"], true);
+        assert!(!state.relay.rooms.read().await.contains_key(code));
+        server.abort();
+    }
+
+    /// First-registration race: an unverified socket that became owner is
+    /// evicted when the registering (or a pending) connection verifies.
+    #[tokio::test]
+    async fn verification_evicts_an_unverified_owner() {
+        let hub = RelayHub::new();
+        let (squatter_tx, mut squatter_rx) = mpsc::unbounded_channel::<String>();
+        let (pending_tx, _pending_rx) = mpsc::unbounded_channel::<String>();
+        let mut room = PairRoom::new("astation-race", "identity");
+        room.astation_tx = Some(squatter_tx);
+        room.astation_connection_id = Some("squatter".to_string());
+        room.pending_astations.insert("pending".to_string(), pending_tx);
+        hub.rooms.write().await.insert("astation-race".to_string(), room);
+
+        // The registering socket was replaced, so it is not the owner.
+        promote_verified_astation(&hub, "astation-race", "registrar", false).await;
+        {
+            let rooms = hub.rooms.read().await;
+            let room = &rooms["astation-race"];
+            assert!(room.astation_tx.is_none());
+            assert!(room.astation_connection_id.is_none());
+        }
+        assert!(squatter_rx.recv().await.is_none(), "squatter's sender was dropped");
+
+        promote_verified_astation(&hub, "astation-race", "pending", true).await;
+        let rooms = hub.rooms.read().await;
+        let room = &rooms["astation-race"];
+        assert_eq!(room.astation_connection_id.as_deref(), Some("pending"));
+        assert!(room.astation_verified);
+        assert!(room.pending_astations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn verification_keeps_a_verified_owner_until_a_pending_one_takes_over() {
+        let hub = RelayHub::new();
+        let (owner_tx, _owner_rx) = mpsc::unbounded_channel::<String>();
+        let mut room = PairRoom::new("astation-verified", "identity");
+        room.astation_tx = Some(owner_tx);
+        room.astation_connection_id = Some("owner".to_string());
+        room.astation_verified = true;
+        hub.rooms.write().await.insert("astation-verified".to_string(), room);
+
+        // A stale, non-pending verified socket doesn't disturb the owner.
+        promote_verified_astation(&hub, "astation-verified", "stale", false).await;
+        let rooms = hub.rooms.read().await;
+        assert_eq!(rooms["astation-verified"].astation_connection_id.as_deref(), Some("owner"));
     }
 }

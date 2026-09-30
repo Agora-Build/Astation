@@ -61,13 +61,61 @@ Deep link authentication for Astation app.
 Atem <-> Astation message relay via pairing codes and persistent identity rooms.
 
 - `POST /api/pair {hostname}` → `{code}` - Create pairing room (10min expiry)
+- `DELETE /api/pair/:code` → `{closed: true}` - Close a room; `409 {"error":"room is owned by a registered Astation"}` when the code has a registered Astation key
 - `WS /ws?role={atem|astation}&code={CODE}` - Connect and relay messages
 
 For identity-room reconnects, the relay is the transport, not the device
 authenticator. Astation sends a v2 challenge, verifies the Atem HMAC proof, and
-only then returns `authenticated`. The relay binds a session to the room only
-after observing that Astation response. See [`SECURITY.md`](SECURITY.md) for
-current production blockers.
+only then returns `authenticated`. The relay does not derive bindings from that
+traffic. See [`SECURITY.md`](SECURITY.md) for the security status.
+
+### Astation relay identity + session bindings
+Exact spec: [`docs/knowledge-sync-plan.md`](../docs/knowledge-sync-plan.md),
+"Extension: Astation proof-of-possession + durable pairing". All frames are
+raw JSON text on the `role=astation` socket; the relay handles them itself and
+never forwards them to Atems.
+
+1. Relay → Astation, first frame on every `role=astation` socket (old
+   Astations ignore it):
+   `{"type":"relayAuthChallenge","protocol":"relay-auth-1","challenge":"<64 lowercase hex>"}`
+2. Astation → relay, within 10 s:
+   `{"type":"relayAuth","astation_id":"<room code>","public_key":"<hex>","signature":"<hex>"}`
+   - `public_key`: P-256 X9.63 uncompressed, 65 bytes (130 hex chars, `04…`);
+     either case, compared lowercase.
+   - `signature`: DER ECDSA (SHA-256) over the UTF-8 string
+     `station-relay-auth-v1\n<challenge>\n<astation_id>`.
+3. Relay → Astation:
+   `{"type":"relayAuthResult","status":"registered|verified|rejected","message":"<text>"}`
+   - `registered`: no key existed for this code; this key is now it (TOFU).
+   - `verified`: the proof matches the registered key.
+   - `rejected`: wrong key, bad signature/encoding, `astation_id` ≠ the room
+     code, late answer, no answer in 10 s (pending sockets), or the database
+     is unavailable while registering a new key. The socket is then closed.
+4. Only after `registered`/`verified`, Astation → relay:
+   `{"type":"relaySessions","sessions":["<session_id>", …]}` (full resync;
+   bindings become exactly this set; at most 1000 ids),
+   `{"type":"relayBind","session_id":"<id>"}`,
+   `{"type":"relayUnbind","session_id":"<id>"}`.
+   Relay → Astation acks (clients only need `ok`):
+   - `{"type":"relayAck","for":"relayBind","ok":true}` (same for `relayUnbind`,
+     which is idempotent)
+   - `{"type":"relayAck","for":"relaySessions","ok":true,"skipped":<n>}` —
+     `skipped` counts listed sessions bound to another Astation (left alone)
+   - `{"type":"relayAck","for":"<type>","ok":false,"message":"<text>"}` — not
+     verified, more than 1000 ids, an invalid `session_id` (empty, over 128
+     chars, or anything but visible ASCII), `relayBind` of a session bound to another
+     Astation, or an identity-store error. Nothing is changed.
+
+Connection states: with no key registered for the code the socket owns the
+room at once (**legacy mode**: relays as before, cannot bind). With a key
+registered it is **pending** — no room ownership, no Atem traffic or
+`relay_event` notifications — until it verifies, then it replaces the room
+owner. Registered keys are cached in memory (loaded at startup, written
+through on registration): connects do no database I/O and a cached key
+verifies even while the database is down; a different key forces a re-read
+(admin reset) before rejection. Bindings live in Postgres (`astation_keys`, `session_bindings`) and are
+the only thing `resolve_caller` (vault + Atem Memory) accepts; they expire
+after 7 days without use.
 
 ### RTC Sessions
 Web screen sharing with up to 8 participants.
@@ -82,7 +130,9 @@ transaction boundaries, and the exact current access predicates.
 
 Durable, append-only, versioned shared context store for collaborating atems.
 Backed by Postgres (`DATABASE_URL`). All requests require
-`Authorization: session <session_id>` and `?id=<client_id>`.
+`Authorization: session <session_id>` and `?id=<client_id>`. The session must
+be bound by a verified Astation (see above): `401` otherwise, `503` if the
+identity store is unavailable.
 
 - `POST /api/vault {summary}` → `{vault_id}` - Create a vault
 - `GET /api/vault` → `[{vault_id, summary}]` - List readable vaults
@@ -93,6 +143,55 @@ Backed by Postgres (`DATABASE_URL`). All requests require
 Authz: in-session callers (same `work_session_id` = bound astation_id) can read and
 write content. Past content writers from another work session can read and update
 the summary, but cannot write content. Others are denied (403).
+
+### Knowledge sync (Atem Memory)
+Durable sync store for Atem's shared memories and skills across an astation's
+paired atem instances. Backed by Postgres (`DATABASE_URL`, same pool as
+Vault). All requests require `Authorization: session <session_id>` and
+`?id=<client_id>`; account = the caller's `work_session_id` (the paired
+astation_id) — atems paired to different astations never see each other's
+memories or skills.
+
+- `POST /api/memory/batch {ops: [...]}` → `{"results": [OpResult]}` - Batch add/delete memory ops (body limit 2 MB, at most 64 ops)
+- `GET /api/memory [?since=<seq>&limit=<n>]` → `{"memories": [MemoryRow]}` - Pull memories (default `since=0`, `limit=200`, capped at 500). There is no `next_since`: the next cursor is the highest `seq` in the page.
+- `POST /api/skills/batch {ops: [...]}` → `{"results": [OpResult]}` - Batch push/delete/purge skill ops (body limit 16 MB, at most 16 ops)
+- `GET /api/skills [?since=<seq>&limit=<n>]` → `{"skills": [SkillRow]}` - Pull skills (default `since=0`, `limit=200`, capped at 500; no `next_since`)
+
+Batch requests are authenticated before the body is read (so an
+unauthenticated client can't make the relay buffer a large body), then:
+
+| Condition | Response |
+|-----------|----------|
+| Missing/invalid/unbound session | 401 (body never read) |
+| Missing `?id=` | 400 |
+| Body over the byte limit | 413 |
+| Over the op cap | 413 `{"error":"too many ops"}` |
+| Malformed body or an unknown `op` | 400 for the whole batch (the atem client never sends unknown ops) |
+| Backing-store (database) error | 503 `{"error":"temporarily unavailable"}` for the whole batch; processing stops, detail logged via `tracing::error!` |
+| Per-op input problem | 200, that op's result is `{ok:false,error:"..."}`; the rest still apply |
+
+A 503 is transient: atem keeps every op queued and retries, which is safe
+(add is idempotent by id, delete/purge are idempotent, a retried skill push
+appends a harmless duplicate version). Per-op refusals are permanent (atem
+acks them), so they are only ever input problems:
+
+- a credential-shaped value (`knowledge_secrets::find_secrets`/`check_bytes`)
+  → `possible credential: ...`; the reserved `atem:memory:` token →
+  `reserved token` (memories) / `possible credential: <path>: reserved token`
+  (skill files);
+- an invalid scope, or a NUL (`\u0000`, which Postgres can't store) in any
+  memory string field → `invalid memory`; in a skill's name/project/source/
+  hash or a file relpath → `invalid skill`;
+- skill file bytes that aren't canonical standard base64 → `invalid base64`;
+- a memory id owned by another account → `id conflict`.
+
+Skill files are sent base64-encoded in the request body and decoded
+server-side (no `base64` crate — a small hand-rolled RFC 4648 decoder in
+`knowledge_routes.rs`). Dedup, tombstones, and purge semantics are
+implemented by `KnowledgeStore` (`knowledge_store.rs`).
+
+Production nginx (`webapp/nginx.conf`) raises its 1 MB body cap to 16 MB for
+`/api/skills/batch` and 2 MB for `/api/memory/batch` only.
 
 ## Astation Integration
 
@@ -113,7 +212,7 @@ Config: Set `relay_url` and `ws_url` in `.atem/config.toml`
 | `PUBLIC_BASE_URL` | _(unset)_ | Public base URL used for generated session links (recommended in production) |
 | `PORT` | `3000` | Server port |
 | `RUST_LOG` | `info` | Log level (error, warn, info, debug, trace) |
-| `DATABASE_URL` | _(unset)_ | Postgres connection string for **vault** storage (e.g. `postgres://vault:vault@localhost:5432/vault`). When unset, vault storage falls back to **in-memory** (non-durable) and logs a warning. Migrations in `migrations/` run automatically at startup. |
+| `DATABASE_URL` | _(unset)_ | Postgres connection string shared by **vault**, **knowledge sync (Atem Memory)**, and **relay identity** (Astation keys + session bindings) storage (e.g. `postgres://vault:vault@localhost:5432/vault`), one pool for all. When unset, all fall back to **in-memory** (non-durable: bindings and registered keys are lost on restart) and log a warning. Migrations in `migrations/` run automatically at startup. |
 
 **Production:**
 ```bash
@@ -135,7 +234,13 @@ RUST_LOG=debug
 ## Testing
 
 ```bash
-cargo test  # 177 tests (auth, sessions, relay, RTC, Voice, Vault, validation)
+cargo test  # 266 tests (auth, sessions, relay + relay identity, RTC, Voice, Vault, Knowledge sync, validation)
+# Postgres suites are #[ignore]d; run each against a throwaway local database:
+#   docker run --rm -d --name relay-test-pg -e POSTGRES_PASSWORD=pw -p 55433:5432 postgres:16
+#   IDENTITY_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test identity_store -- --ignored
+#   IDENTITY_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test relay:: -- --ignored
+#   KNOWLEDGE_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test knowledge_store -- --ignored
+#   docker rm -f relay-test-pg
 ```
 
 

@@ -1925,6 +1925,7 @@ dependencies = [
  "futures-util",
  "governor",
  "rand",
+ "ring",
  "serde",
  "serde_json",
  "sqlx",
