@@ -71,14 +71,18 @@ fn needs_touch(last_used_at: i64, now: i64) -> bool {
     now - last_used_at >= BINDING_TOUCH_INTERVAL_SECS
 }
 
-/// Listed sessions, deduplicated, first occurrence order kept.
+/// Listed sessions, deduplicated and sorted. `replace_all` upserts them in this
+/// order so two Astations resyncing overlapping sets always lock the rows in
+/// the same order (no Postgres deadlock between them).
 fn dedup_sessions(sessions: &[String]) -> Vec<String> {
-    let mut seen = HashSet::new();
-    sessions
+    let mut listed: Vec<String> = sessions
         .iter()
-        .filter(|s| seen.insert(s.as_str()))
         .cloned()
-        .collect()
+        .collect::<HashSet<String>>()
+        .into_iter()
+        .collect();
+    listed.sort();
+    listed
 }
 
 /// Storage for Astation keys and session bindings.
@@ -774,6 +778,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_tofu_has_one_winner() {
         scenarios::concurrent_tofu_has_one_winner(Arc::new(InMemoryIdentityStore::new())).await;
+    }
+
+    #[test]
+    fn dedup_sessions_sorts_for_a_stable_lock_order() {
+        assert_eq!(
+            dedup_sessions(&v(&["s3", "s1", "s3", "s2", "s1"])),
+            v(&["s1", "s2", "s3"])
+        );
+        assert!(dedup_sessions(&[]).is_empty());
     }
 
     #[tokio::test]
