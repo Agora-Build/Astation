@@ -86,8 +86,6 @@ fn dedup_sessions(sessions: &[String]) -> Vec<String> {
 }
 
 /// Storage for Astation keys and session bindings.
-// Consumed by the relay protocol (Task 7); until then only tests call it.
-#[allow(dead_code)]
 #[async_trait]
 pub trait IdentityStore: Send + Sync {
     fn backend_name(&self) -> &'static str;
@@ -511,7 +509,7 @@ impl IdentityStore for PgIdentityStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const A: &str = "astation-a";
@@ -832,10 +830,10 @@ mod tests {
     }
 
     /// Pg tests share one database, so they run one at a time.
-    static PG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(crate) static PG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Run the migrations, then empty the identity tables (local DB only).
-    async fn fresh_pg() -> PgIdentityStore {
+    pub(crate) async fn fresh_pg() -> PgIdentityStore {
         let url = std::env::var("IDENTITY_TEST_DATABASE_URL")
             .expect("set IDENTITY_TEST_DATABASE_URL to run the Postgres tests");
         assert!(

@@ -149,14 +149,12 @@ mod tests {
     use crate::relay::RelayHub;
     use crate::session_store::SessionStore;
     use crate::rtc_session::RtcSessionStore;
-    use crate::session_verify::SessionVerifyCache;
 
     fn create_test_state() -> AppState {
         AppState {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
-            session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),

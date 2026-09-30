@@ -6,7 +6,6 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::auth::SessionStatus;
 use crate::vault_store::VaultMeta;
 use crate::AppState;
 
@@ -32,9 +31,11 @@ pub struct VaultQuery {
     pub history: Option<bool>,
 }
 
-/// Validate the session + extract the client_id. Resolves work_session_id to
-/// the astation_id the session is bound to (Option A). 401 on bad session,
-/// 400 on missing client id.
+/// Validate the session + extract the client_id. The session resolves to the
+/// astation_id (work_session_id) it is bound to; the only source is the
+/// durable binding a verified Astation pushed (`relayBind`/`relaySessions`,
+/// see `relay.rs`). 401 on a missing or unbound session, 400 on a missing
+/// client id, 503 if the identity store is unavailable.
 ///
 /// `id` is the caller's `?id=<client_id>` query value; shared by vault and
 /// knowledge routes without coupling to either module's query struct shape.
@@ -60,21 +61,15 @@ pub(crate) async fn resolve_caller(
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "missing ?id=<client_id>"))?
         .to_string();
 
-    // Resolve the bound astation_id (work_session_id). Primary source: a granted
-    // session in the SessionStore carrying astation_id (Option A). Fallback: the
-    // cross-service verify cache (which maps session -> astation_id).
-    let work_session_id = match state.sessions.get(session_id).await {
-        Some(s) if s.status == SessionStatus::Granted => {
-            if let Some(aid) = s.astation_id {
-                Some(aid)
-            } else {
-                state.session_verify_cache.get_astation_id(session_id).await
-            }
-        }
-        Some(_) => None, // exists but not granted
-        None => state.session_verify_cache.get_astation_id(session_id).await,
-    }
-    .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid or unbound session"))?;
+    let work_session_id = state
+        .identity
+        .resolve(session_id, chrono::Utc::now().timestamp())
+        .await
+        .map_err(|e| {
+            tracing::error!("Identity store error resolving a session: {}", e);
+            err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable")
+        })?
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid or unbound session"))?;
 
     Ok(Caller {
         work_session_id,
@@ -235,13 +230,13 @@ pub async fn set_summary_handler(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::auth::{create_session, SessionStatus};
+    use crate::identity_store::IdentityError;
     use crate::relay::RelayHub;
     use crate::rtc_session::RtcSessionStore;
     use crate::session_store::SessionStore;
-    use crate::session_verify::SessionVerifyCache;
     use crate::vault_store::InMemoryVaultStore;
     use crate::voice_session::VoiceSessionStore;
     use axum::body::Body;
@@ -251,26 +246,31 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    /// Build an AppState with an in-memory vault and a granted session bound to
+    /// A new session id bound to `astation_id` in the identity store (what a
+    /// verified Astation's relayBind does).
+    pub(crate) async fn bind_session(state: &AppState, astation_id: &str) -> String {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        state
+            .identity
+            .bind(&session_id, astation_id, chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        session_id
+    }
+
+    /// Build an AppState with an in-memory vault and a session bound to
     /// `astation_id`. Returns (state, session_id).
     async fn test_state(astation_id: &str) -> (AppState, String) {
-        let sessions = SessionStore::new();
-        let mut session = create_session("test-host");
-        session.status = SessionStatus::Granted;
-        session.astation_id = Some(astation_id.to_string());
-        let session_id = session.id.clone();
-        sessions.create(session).await;
-
         let state = AppState {
-            sessions,
+            sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
-            session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: Arc::new(InMemoryVaultStore::new()),
             knowledge: Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
+        let session_id = bind_session(&state, astation_id).await;
         (state, session_id)
     }
 
@@ -368,12 +368,8 @@ mod tests {
     async fn authz_out_of_session_past_writer_read_only() {
         // Vault created in ws-1 by client-a, who becomes a writer.
         let (state, sess1) = test_state("ws-1").await;
-        // Add a second granted session bound to a different work session ws-2.
-        let mut s2 = create_session("host2");
-        s2.status = SessionStatus::Granted;
-        s2.astation_id = Some("ws-2".to_string());
-        let sess2 = s2.id.clone();
-        state.sessions.create(s2).await;
+        // Add a second session bound to a different work session ws-2.
+        let sess2 = bind_session(&state, "ws-2").await;
 
         let app = app(state);
         let vault_id = body_json(app.clone().oneshot(req("POST", "/api/vault?id=client-a", &sess1, r#"{}"#)).await.unwrap()).await["vault_id"].as_str().unwrap().to_string();
@@ -437,56 +433,41 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    #[tokio::test]
-    async fn ungranted_session_is_401() {
-        // A session that exists but is not granted must not authenticate.
-        let sessions = SessionStore::new();
-        let session = create_session("host"); // status defaults to Pending
-        let sess = session.id.clone();
-        sessions.create(session).await;
-        let state = AppState {
-            sessions,
+    fn unbound_state() -> AppState {
+        AppState {
+            sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
-            session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: Arc::new(InMemoryVaultStore::new()),
             knowledge: Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
-        };
-        let app = app(state);
-        let resp = app.oneshot(req("POST", "/api/vault?id=a", &sess, r#"{}"#)).await.unwrap();
+        }
+    }
+
+    /// A granted SessionStore session (even one carrying an astation_id)
+    /// authorizes nothing without an identity binding.
+    #[tokio::test]
+    async fn granted_but_unbound_session_is_401() {
+        let state = unbound_state();
+        let mut session = create_session("host");
+        session.status = SessionStatus::Granted;
+        session.astation_id = Some("ws-1".to_string());
+        let sess = session.id.clone();
+        state.sessions.create(session).await;
+        let resp = app(state).oneshot(req("POST", "/api/vault?id=a", &sess, r#"{}"#)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    async fn verified_astation_session_can_create_vault() {
-        let session_id = "session-from-astation";
-        let verify_cache = SessionVerifyCache::new();
-        verify_cache
-            .set(
-                session_id.to_string(),
-                "astation-work-session".to_string(),
-                true,
-                300,
-            )
-            .await;
-        let state = AppState {
-            sessions: SessionStore::new(),
-            relay: RelayHub::new(),
-            rtc_sessions: RtcSessionStore::new(),
-            session_verify_cache: verify_cache,
-            voice_sessions: VoiceSessionStore::new(),
-            vault: Arc::new(InMemoryVaultStore::new()),
-            knowledge: Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
-            identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
-        };
-
+    async fn identity_binding_authorizes_vault_create() {
+        let state = unbound_state();
+        let session_id = bind_session(&state, "astation-work-session").await;
         let resp = app(state)
             .oneshot(req(
                 "POST",
                 "/api/vault?id=atem-a",
-                session_id,
+                &session_id,
                 r#"{"summary":"verified"}"#,
             ))
             .await
@@ -497,14 +478,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unbound_session_is_401_again() {
+        let state = unbound_state();
+        let session_id = bind_session(&state, "ws-1").await;
+        assert!(state.identity.unbind(&session_id, "ws-1").await.unwrap());
+        let resp = app(state).oneshot(req("GET", "/api/vault?id=a", &session_id, "")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// An identity store that always fails (database down).
+    struct FailingIdentity;
+
+    #[async_trait::async_trait]
+    impl crate::identity_store::IdentityStore for FailingIdentity {
+        fn backend_name(&self) -> &'static str {
+            "failing"
+        }
+        async fn get_key(&self, _: &str) -> Result<Option<String>, IdentityError> {
+            Err(IdentityError::Db("down".into()))
+        }
+        async fn register_key_if_absent(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+        ) -> Result<crate::identity_store::RegisterOutcome, IdentityError> {
+            Err(IdentityError::Db("down".into()))
+        }
+        async fn touch_key(&self, _: &str, _: i64) -> Result<(), IdentityError> {
+            Err(IdentityError::Db("down".into()))
+        }
+        async fn bind(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+        ) -> Result<crate::identity_store::BindOutcome, IdentityError> {
+            Err(IdentityError::Db("down".into()))
+        }
+        async fn unbind(&self, _: &str, _: &str) -> Result<bool, IdentityError> {
+            Err(IdentityError::Db("down".into()))
+        }
+        async fn replace_all(
+            &self,
+            _: &str,
+            _: &[String],
+            _: i64,
+        ) -> Result<crate::identity_store::ReplaceOutcome, IdentityError> {
+            Err(IdentityError::Db("down".into()))
+        }
+        async fn resolve(&self, _: &str, _: i64) -> Result<Option<String>, IdentityError> {
+            Err(IdentityError::Db("down".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_store_error_is_503() {
+        let mut state = unbound_state();
+        state.identity = Arc::new(FailingIdentity);
+        let resp = app(state).oneshot(req("GET", "/api/vault?id=a", "some-session", "")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn list_is_isolated_by_work_session() {
         let (state, sess1) = test_state("ws-1").await;
-        // Second granted session in ws-2.
-        let mut s2 = create_session("h2");
-        s2.status = SessionStatus::Granted;
-        s2.astation_id = Some("ws-2".to_string());
-        let sess2 = s2.id.clone();
-        state.sessions.create(s2).await;
+        // Second session, bound to ws-2.
+        let sess2 = bind_session(&state, "ws-2").await;
         let app = app(state);
 
         // Create one vault in each work session.

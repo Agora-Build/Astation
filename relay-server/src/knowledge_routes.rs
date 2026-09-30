@@ -454,14 +454,13 @@ pub async fn skills_pull_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{create_session, SessionStatus};
+    use crate::vault_routes::tests::bind_session;
     use crate::knowledge_store::{
         InMemoryKnowledgeStore, KnowledgeStore, MemoryAddOutcome, SkillPushOutcome,
     };
     use crate::relay::RelayHub;
     use crate::rtc_session::RtcSessionStore;
     use crate::session_store::SessionStore;
-    use crate::session_verify::SessionVerifyCache;
     use crate::vault_store::InMemoryVaultStore;
     use crate::voice_session::VoiceSessionStore;
     use axum::body::Body;
@@ -471,26 +470,19 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    /// Build an AppState with in-memory stores and a granted session bound to
+    /// Build an AppState with in-memory stores and a session bound to
     /// `astation_id`. Returns (state, session_id).
     async fn test_state(astation_id: &str) -> (AppState, String) {
-        let sessions = SessionStore::new();
-        let mut session = create_session("test-host");
-        session.status = SessionStatus::Granted;
-        session.astation_id = Some(astation_id.to_string());
-        let session_id = session.id.clone();
-        sessions.create(session).await;
-
         let state = AppState {
-            sessions,
+            sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
-            session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: Arc::new(InMemoryVaultStore::new()),
             knowledge: Arc::new(InMemoryKnowledgeStore::new()),
             identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
+        let session_id = bind_session(&state, astation_id).await;
         (state, session_id)
     }
 
@@ -1140,11 +1132,7 @@ mod tests {
     #[tokio::test]
     async fn accounts_are_isolated() {
         let (state, sess1) = test_state("ws-1").await;
-        let mut s2 = create_session("h2");
-        s2.status = SessionStatus::Granted;
-        s2.astation_id = Some("ws-2".to_string());
-        let sess2 = s2.id.clone();
-        state.sessions.create(s2).await;
+        let sess2 = bind_session(&state, "ws-2").await;
         let app = app(state);
 
         let add_mem = json!({ "ops": [{"op": "add", "memory": sample_memory("mem_1", "secret-to-ws1")}] });

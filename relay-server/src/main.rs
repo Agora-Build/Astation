@@ -7,7 +7,6 @@ mod relay;
 mod routes;
 mod rtc_session;
 mod session_store;
-mod session_verify;
 mod voice_session;
 mod voice_routes;
 mod llm_proxy;
@@ -23,7 +22,6 @@ use axum::{Json, Router};
 use relay::RelayHub;
 use rtc_session::RtcSessionStore;
 use session_store::SessionStore;
-use session_verify::SessionVerifyCache;
 use voice_session::VoiceSessionStore;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -41,7 +39,6 @@ pub struct AppState {
     pub sessions: SessionStore,
     pub relay: RelayHub,
     pub rtc_sessions: RtcSessionStore,
-    pub session_verify_cache: SessionVerifyCache,
     pub voice_sessions: VoiceSessionStore,
     pub vault: Arc<dyn vault_store::VaultStore>,
     pub knowledge: Arc<dyn knowledge_store::KnowledgeStore>,
@@ -236,7 +233,6 @@ async fn main() {
     let sessions = SessionStore::new();
     let relay = RelayHub::new();
     let rtc_sessions = RtcSessionStore::new();
-    let session_verify_cache = SessionVerifyCache::new();
     let voice_sessions = VoiceSessionStore::new();
 
     // Vault + knowledge (Atem Memory) + identity stores: Postgres, sharing one
@@ -311,16 +307,6 @@ async fn main() {
         }
     });
 
-    // Spawn background cleanup for session verify cache
-    let cleanup_verify = session_verify_cache.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300)); // 5 minutes
-        loop {
-            interval.tick().await;
-            cleanup_verify.cleanup_expired().await;
-        }
-    });
-
     // Spawn background cleanup for expired voice sessions
     let cleanup_voice = voice_sessions.clone();
     tokio::spawn(async move {
@@ -336,7 +322,6 @@ async fn main() {
         sessions,
         relay,
         rtc_sessions,
-        session_verify_cache,
         voice_sessions,
         vault,
         knowledge,
@@ -382,7 +367,6 @@ mod tests {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
-            session_verify_cache: SessionVerifyCache::new(),
             voice_sessions: VoiceSessionStore::new(),
             vault: Arc::new(vault_store::InMemoryVaultStore::new()),
             knowledge: Arc::new(knowledge_store::InMemoryKnowledgeStore::new()),
