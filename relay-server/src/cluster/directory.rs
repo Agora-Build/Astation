@@ -208,7 +208,7 @@ impl RoomDirectory for InMemoryRoomDirectory {
         let room = rooms
             .entry(code.to_string())
             .or_insert_with(|| RoomInfo::new(IDENTITY_HOSTNAME, now));
-        if room.pending.contains(conn) {
+        if room.pending.iter().any(|p| p.conn == conn.conn) {
             return Ok(true);
         }
         if max_pending > 0 && room.pending.len() >= max_pending {
@@ -445,6 +445,22 @@ pub(crate) mod scenarios {
         );
     }
 
+    pub async fn promotion_with_a_squatter_and_a_pending_socket(d: &dyn RoomDirectory) {
+        d.claim_owner("astation-sq", &c("squatter", "r1"), T0).await.unwrap();
+        d.add_pending("astation-sq", &c("pending", "r2"), T0, 0).await.unwrap();
+        assert_eq!(
+            d.promote("astation-sq", &c("pending", "r2"), true).await.unwrap(),
+            Promotion::Promoted {
+                previous_owner: Some(c("squatter", "r1")),
+                atems: vec![],
+            }
+        );
+        let room = d.get("astation-sq").await.unwrap().unwrap();
+        assert_eq!(room.owner, Some(c("pending", "r2")));
+        assert!(room.verified);
+        assert!(room.pending.is_empty());
+    }
+
     pub async fn legacy_owner_becomes_verified_when_it_proves(d: &dyn RoomDirectory) {
         d.claim_owner("astation-l", &c("s1", "r1"), T0).await.unwrap();
         assert_eq!(
@@ -567,6 +583,7 @@ mod tests {
         claim_owner_creates_the_room_and_replaces_the_owner,
         pending_respects_the_cap,
         promotion_rules,
+        promotion_with_a_squatter_and_a_pending_socket,
         legacy_owner_becomes_verified_when_it_proves,
         leave_atem_ignores_a_stale_connection,
         leaving_last_member_removes_the_room,
