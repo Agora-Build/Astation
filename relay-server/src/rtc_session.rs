@@ -518,6 +518,7 @@ mod tests {
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         Router::new()
             .route("/api/rtc-sessions", post(create_rtc_session_handler))
@@ -836,6 +837,7 @@ mod tests {
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         state
             .rtc_sessions
@@ -893,6 +895,7 @@ mod tests {
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         state
             .rtc_sessions
@@ -959,6 +962,7 @@ mod tests {
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         state
             .rtc_sessions
@@ -1014,6 +1018,7 @@ mod tests {
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         let app = Router::new()
             .route("/api/rtc-sessions", post(create_rtc_session_handler))
@@ -1140,6 +1145,7 @@ mod tests {
             voice_sessions: VoiceSessionStore::new(),
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         state
             .rtc_sessions

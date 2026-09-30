@@ -489,6 +489,7 @@ mod tests {
             voice_sessions: VoiceSessionStore::new(),
             vault: Arc::new(InMemoryVaultStore::new()),
             knowledge: Arc::new(InMemoryKnowledgeStore::new()),
+            identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         (state, session_id)
     }

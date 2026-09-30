@@ -1,4 +1,5 @@
 mod auth;
+mod identity_store;
 mod knowledge_routes;
 mod knowledge_secrets;
 mod knowledge_store;
@@ -44,6 +45,8 @@ pub struct AppState {
     pub voice_sessions: VoiceSessionStore,
     pub vault: Arc<dyn vault_store::VaultStore>,
     pub knowledge: Arc<dyn knowledge_store::KnowledgeStore>,
+    /// Astation keys + durable session bindings (Postgres when DATABASE_URL is set).
+    pub identity: Arc<dyn identity_store::IdentityStore>,
 }
 
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -236,12 +239,13 @@ async fn main() {
     let session_verify_cache = SessionVerifyCache::new();
     let voice_sessions = VoiceSessionStore::new();
 
-    // Vault + knowledge (Atem Memory) stores: Postgres, sharing one pool, when
-    // DATABASE_URL is set (the durable path), else in-memory fallbacks so the
-    // rest of the server still runs without a DB.
-    let (vault, knowledge): (
+    // Vault + knowledge (Atem Memory) + identity stores: Postgres, sharing one
+    // pool, when DATABASE_URL is set (the durable path), else in-memory
+    // fallbacks so the rest of the server still runs without a DB.
+    let (vault, knowledge, identity): (
         Arc<dyn vault_store::VaultStore>,
         Arc<dyn knowledge_store::KnowledgeStore>,
+        Arc<dyn identity_store::IdentityStore>,
     ) = match std::env::var("DATABASE_URL") {
         Ok(url) if !url.is_empty() => {
             tracing::info!("Connecting to Postgres for vault + knowledge storage...");
@@ -254,20 +258,22 @@ async fn main() {
                 .run(&pool)
                 .await
                 .expect("Failed to run vault migrations");
-            tracing::info!("Vault + knowledge storage ready (Postgres)");
+            tracing::info!("Vault + knowledge + identity storage ready (Postgres)");
             (
                 Arc::new(vault_store::PgVaultStore::new(pool.clone())),
-                Arc::new(knowledge_store::PgKnowledgeStore::new(pool)),
+                Arc::new(knowledge_store::PgKnowledgeStore::new(pool.clone())),
+                Arc::new(identity_store::PgIdentityStore::new(pool)),
             )
         }
         _ => {
             tracing::warn!(
-                "DATABASE_URL not set — vault + knowledge storage is IN-MEMORY (not durable). \
-                 Set DATABASE_URL to enable persistent vaults."
+                "DATABASE_URL not set — vault + knowledge + identity storage is IN-MEMORY \
+                 (not durable). Set DATABASE_URL to enable persistent storage."
             );
             (
                 Arc::new(vault_store::InMemoryVaultStore::new()),
                 Arc::new(knowledge_store::InMemoryKnowledgeStore::new()),
+                Arc::new(identity_store::InMemoryIdentityStore::new()),
             )
         }
     };
@@ -334,6 +340,7 @@ async fn main() {
         voice_sessions,
         vault,
         knowledge,
+        identity,
     };
 
     let app = router(state);
@@ -379,6 +386,7 @@ mod tests {
             voice_sessions: VoiceSessionStore::new(),
             vault: Arc::new(vault_store::InMemoryVaultStore::new()),
             knowledge: Arc::new(knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: Arc::new(identity_store::InMemoryIdentityStore::new()),
         }
     }
 

@@ -269,6 +269,7 @@ mod tests {
             voice_sessions: VoiceSessionStore::new(),
             vault: Arc::new(InMemoryVaultStore::new()),
             knowledge: Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         (state, session_id)
     }
@@ -451,6 +452,7 @@ mod tests {
             voice_sessions: VoiceSessionStore::new(),
             vault: Arc::new(InMemoryVaultStore::new()),
             knowledge: Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
         let app = app(state);
         let resp = app.oneshot(req("POST", "/api/vault?id=a", &sess, r#"{}"#)).await.unwrap();
@@ -477,6 +479,7 @@ mod tests {
             voice_sessions: VoiceSessionStore::new(),
             vault: Arc::new(InMemoryVaultStore::new()),
             knowledge: Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
         };
 
         let resp = app(state)
