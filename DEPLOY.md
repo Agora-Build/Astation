@@ -212,7 +212,9 @@ metadata:
   name: relay-server
   namespace: astation
 spec:
-  replicas: 2
+  replicas: 1  # must stay 1: rooms and the Astation key cache are in memory (see Scaling)
+  strategy:
+    type: Recreate  # never run two relay pods at once, even during a rollout
   selector:
     matchLabels:
       app: relay-server
@@ -531,26 +533,46 @@ sudo tail -f /var/log/nginx/access.log
 
 ## Scaling
 
-### Horizontal Scaling
+### The relay runs as exactly one instance
+
+Do not scale the relay beyond one instance. It keeps state in memory that
+every connection for an account must share:
+
+- **Rooms.** An Astation and its Atems meet in an in-memory room keyed by the
+  Astation's code. With two instances, an Astation on one and an Atem on the
+  other never meet, so chat, remote control and pairing break.
+- **The Astation key cache.** Relay identity keys are loaded into memory at
+  startup and updated as Astations register (see "Relay identity" above). A
+  key registered on one instance is unknown to another, which would treat
+  that Astation as unregistered.
+
+Sticky sessions don't fix this: the Astation and its Atems are separate
+clients, so a load balancer can send them to different instances. Running
+more than one relay would need shared room state and cache invalidation,
+which the relay doesn't have.
+
+Postgres data (vault, Atem Memory, keys, bindings) is already shared and
+isn't the limit.
+
+### Scaling the webapp
+
+The webapp (nginx plus static files) is stateless and can scale freely:
 
 **Docker Compose:**
 ```bash
-docker compose up -d --scale station-relay-server=3 --scale station-webapp=3
+docker compose up -d --scale station-webapp=3
 ```
 
 **Kubernetes:**
 ```bash
-kubectl scale deployment relay-server --replicas=5 -n astation
 kubectl scale deployment webapp --replicas=10 -n astation
 ```
 
 ### Load Balancing
 
-The API server is stateless except for in-memory session stores. For multi-instance deployments, consider:
-
-1. **Session affinity** - Use sticky sessions for WebSocket connections
-2. **Redis store** - Replace in-memory stores with Redis for shared state
-3. **Health checks** - Configure load balancer health checks on `/health`
+Put the load balancer in front of the webapp only; the webapp proxies
+`/api/*` and `/ws` to the single relay. Configure health checks on
+`/health`.
 
 ## Security
 
@@ -590,7 +612,9 @@ The API server is stateless except for in-memory session stores. For multi-insta
 # Pull latest images
 docker compose pull
 
-# Restart services (zero-downtime with multiple replicas)
+# Restart services. The relay restart drops every WebSocket for a few
+# seconds; Astations and Atems reconnect on their own. Vault and Atem Memory
+# data is in Postgres and survives.
 docker compose up -d
 
 # Verify new version
@@ -599,7 +623,42 @@ docker compose logs | grep "version"
 
 ## Backup
 
-The API server stores data in-memory only. Sessions expire after 4 hours. No backup needed for stateless services.
+**Back up the relay's Postgres database.** It is the only durable state, and
+losing it loses every account's data:
+
+| Table | Holds | If lost |
+| --- | --- | --- |
+| `vaults`, `vault_entries` | Vault contents and history | Gone for good |
+| `memories`, `skill_versions` | Atem Memory: memories and every skill version | Gone from the relay. Each machine still has its latest copy in `~/.config/atem/knowledge.db`, but skill history and anything not yet pulled is lost |
+| `astation_keys` | Registered Astation relay keys | Every Astation re-registers on its next connect by trust on first use, which reopens the squatting window (`relay-server/SECURITY.md`) |
+| `session_bindings` | Which pairing sessions each Astation authorized | Vault and Memory return 401 until each Astation reconnects and resyncs its sessions |
+
+Everything else (rooms, WebSockets, the key cache) is in memory and rebuilt on
+restart.
+
+**On Volumetric (Coolify):** enable scheduled backups on the Postgres resource
+the relay's `DATABASE_URL` points to (Coolify → the database → Backups), with
+off-server storage (S3-compatible), not just local disk. Test a restore
+occasionally.
+
+**Anywhere else:**
+```bash
+# Daily dump (custom format, compressed)
+pg_dump --format=custom --file=station-$(date +%F).dump "$DATABASE_URL"
+
+# Restore into an empty database, then start the relay
+pg_restore --clean --if-exists --dbname="$DATABASE_URL" station-YYYY-MM-DD.dump
+```
+
+- **Treat backups as sensitive.** Vault entries, memories and skills are
+  stored unencrypted, so a backup is readable by anyone who holds it. Encrypt
+  backups at rest and restrict who can access them.
+- **Restoring an older backup rolls data back** to that point: newer memories
+  and skill versions are lost on the relay. Atems still hold their own
+  copies, but ops they already sent are not re-sent.
+- **Keys and admin resets:** a restore brings back `astation_keys` as of the
+  backup. An Astation whose key was reset after the backup is taken is
+  rejected until you repeat the admin reset.
 
 ## Support
 
