@@ -106,6 +106,10 @@ pub trait IdentityStore: Send + Sync {
     /// Record a successful verification. No-op when no key is registered.
     async fn touch_key(&self, astation_id: &str, now: i64) -> Result<(), IdentityError>;
 
+    /// Every registered `(astation_id, public_key)`. The relay loads these into
+    /// its in-memory key cache at startup.
+    async fn list_keys(&self) -> Result<Vec<(String, String)>, IdentityError>;
+
     /// Bind `session_id` to `astation_id` (or refresh `last_used_at` if this
     /// Astation already owns it). A session owned by another Astation is left
     /// alone and `OwnedByOther` is returned — even if that binding has expired.
@@ -193,6 +197,12 @@ impl InMemoryIdentityStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Test stand-in for the admin reset (`DELETE FROM astation_keys …`).
+    #[cfg(test)]
+    pub(crate) async fn delete_key(&self, astation_id: &str) {
+        self.state.lock().await.keys.remove(astation_id);
+    }
 }
 
 #[async_trait]
@@ -225,6 +235,15 @@ impl IdentityStore for InMemoryIdentityStore {
             },
         );
         Ok(RegisterOutcome::Registered)
+    }
+
+    async fn list_keys(&self) -> Result<Vec<(String, String)>, IdentityError> {
+        let st = self.state.lock().await;
+        Ok(st
+            .keys
+            .iter()
+            .map(|(id, k)| (id.clone(), k.public_key.clone()))
+            .collect())
     }
 
     async fn touch_key(&self, astation_id: &str, now: i64) -> Result<(), IdentityError> {
@@ -400,6 +419,13 @@ impl IdentityStore for PgIdentityStore {
         }
     }
 
+    async fn list_keys(&self) -> Result<Vec<(String, String)>, IdentityError> {
+        sqlx::query_as("SELECT astation_id, public_key FROM astation_keys")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)
+    }
+
     async fn touch_key(&self, astation_id: &str, now: i64) -> Result<(), IdentityError> {
         sqlx::query("UPDATE astation_keys SET last_verified_at = $2 WHERE astation_id = $1")
             .bind(astation_id)
@@ -551,6 +577,22 @@ pub(crate) mod tests {
                 RegisterOutcome::Registered
             );
             assert_eq!(s.get_key(B).await.unwrap().as_deref(), Some(KEY2));
+        }
+
+        pub async fn list_keys_returns_all(s: &dyn IdentityStore) {
+            assert!(s.list_keys().await.unwrap().is_empty());
+            s.register_key_if_absent(A, KEY1, T0).await.unwrap();
+            s.register_key_if_absent(B, KEY2, T0).await.unwrap();
+            s.register_key_if_absent(A, KEY2, T0).await.unwrap();
+            let mut keys = s.list_keys().await.unwrap();
+            keys.sort();
+            assert_eq!(
+                keys,
+                vec![
+                    (A.to_string(), KEY1.to_string()),
+                    (B.to_string(), KEY2.to_string())
+                ]
+            );
         }
 
         pub async fn touch_key_never_registers(s: &dyn IdentityStore) {
@@ -761,6 +803,7 @@ pub(crate) mod tests {
 
     mem_tests!(
         tofu_first_key_wins,
+        list_keys_returns_all,
         touch_key_never_registers,
         bind_and_resolve,
         bind_owned_by_other_is_rejected,
@@ -925,6 +968,7 @@ pub(crate) mod tests {
 
     pg_tests!(
         tofu_first_key_wins,
+        list_keys_returns_all,
         touch_key_never_registers,
         bind_and_resolve,
         bind_owned_by_other_is_rejected,

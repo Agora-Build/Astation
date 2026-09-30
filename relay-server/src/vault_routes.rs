@@ -508,6 +508,9 @@ pub(crate) mod tests {
         async fn touch_key(&self, _: &str, _: i64) -> Result<(), IdentityError> {
             Err(IdentityError::Db("down".into()))
         }
+        async fn list_keys(&self) -> Result<Vec<(String, String)>, IdentityError> {
+            Err(IdentityError::Db("down".into()))
+        }
         async fn bind(
             &self,
             _: &str,

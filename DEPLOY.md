@@ -88,16 +88,26 @@ security notes: `relay-server/SECURITY.md`). Keys and bindings live in the
 relay's Postgres (`astation_keys`, `session_bindings`, migration
 `0003_astation_identity`, applied automatically at startup).
 
-Rollout order:
+Rollout order (Astation first, so the first-use registration window is as
+short as possible; see "First-use squatting" in `relay-server/SECURITY.md`):
 
-1. **Deploy the relay.** Astations that predate relay identity ignore the new
-   challenge and keep working in legacy mode: chat and remote control relay as
-   before. Vault and Atem Memory return `401` for their Atems from this deploy
-   on, because the relay no longer derives bindings from auth traffic.
-2. **Ship the Astation update.** On its next relay connect it registers its key
-   (trust on first use) and pushes its active sessions; vault and memory work
-   again, and bindings now survive relay restarts. Atems keep their changes
-   queued meanwhile.
+1. **Ship the Astation update first.** Against the current relay it is inert:
+   it only sends `relayAuth` in reply to a `relayAuthChallenge`, which the
+   current relay never sends, and the binding messages only after a
+   `registered`/`verified` result. Let users update before step 2.
+2. **Deploy the relay.** The restart drops every relay socket; updated
+   Astations reconnect within seconds, answer the challenge, register their
+   key (trust on first use), and push their active sessions, so vault and Atem
+   Memory keep working and bindings now survive relay restarts. Astations not
+   yet updated ignore the challenge and stay in legacy mode: chat and remote
+   control relay as before, but vault and memory return `401` for their Atems
+   (the relay no longer derives bindings from auth traffic) until they update.
+   Atems keep their changes queued meanwhile.
+
+The relay loads all registered keys into memory at startup (logged as
+`Loaded N Astation relay key(s)`) and serves connects and verifications from
+that cache, so a database outage does not lock registered Astations out of
+relay chat.
 
 Admin reset, for a lost or replaced Mac (its Astation reports "Relay rejected
 this Astation's key"). Relay logs show only the first 4 characters of an id, so
@@ -109,7 +119,15 @@ SELECT astation_id, registered_at, last_verified_at FROM astation_keys
 DELETE FROM astation_keys WHERE astation_id = '<id>';
 ```
 
-Bindings are kept. The next verified connect for that id registers the new key.
+Bindings are kept. The next connect with a new key for that id registers it
+(the mismatch makes the relay re-read the stored key). Until then the relay's
+in-memory cache still accepts the old key, so **restart the relay after the
+`DELETE` if the old key must be revoked immediately** (e.g. a stolen Mac). A
+reset done while the relay can't reach the database is likewise picked up only
+by a later re-read or a restart.
+
+`DELETE /api/pair/:code` is refused with `409` for a code that has a registered
+key; use the SQL above, not the API, to manage such rooms.
 
 Rollback caveat: once `0003` has been applied, a relay image built before it
 fails at startup (`sqlx` migrate error `VersionMissing(3)`: the database has a

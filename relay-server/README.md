@@ -61,6 +61,7 @@ Deep link authentication for Astation app.
 Atem <-> Astation message relay via pairing codes and persistent identity rooms.
 
 - `POST /api/pair {hostname}` → `{code}` - Create pairing room (10min expiry)
+- `DELETE /api/pair/:code` → `{closed: true}` - Close a room; `409 {"error":"room is owned by a registered Astation"}` when the code has a registered Astation key
 - `WS /ws?role={atem|astation}&code={CODE}` - Connect and relay messages
 
 For identity-room reconnects, the relay is the transport, not the device
@@ -88,8 +89,8 @@ never forwards them to Atems.
    - `registered`: no key existed for this code; this key is now it (TOFU).
    - `verified`: the proof matches the registered key.
    - `rejected`: wrong key, bad signature/encoding, `astation_id` ≠ the room
-     code, late answer, or no answer in 10 s (pending sockets). The socket is
-     then closed.
+     code, late answer, no answer in 10 s (pending sockets), or the database
+     is unavailable while registering a new key. The socket is then closed.
 4. Only after `registered`/`verified`, Astation → relay:
    `{"type":"relaySessions","sessions":["<session_id>", …]}` (full resync;
    bindings become exactly this set; at most 1000 ids),
@@ -109,7 +110,10 @@ Connection states: with no key registered for the code the socket owns the
 room at once (**legacy mode**: relays as before, cannot bind). With a key
 registered it is **pending** — no room ownership, no Atem traffic or
 `relay_event` notifications — until it verifies, then it replaces the room
-owner. Bindings live in Postgres (`astation_keys`, `session_bindings`) and are
+owner. Registered keys are cached in memory (loaded at startup, written
+through on registration): connects do no database I/O and a cached key
+verifies even while the database is down; a different key forces a re-read
+(admin reset) before rejection. Bindings live in Postgres (`astation_keys`, `session_bindings`) and are
 the only thing `resolve_caller` (vault + Atem Memory) accepts; they expire
 after 7 days without use.
 

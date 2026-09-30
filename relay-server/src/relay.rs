@@ -13,7 +13,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 use validator::Validate;
 
-use crate::identity_store::{BindOutcome, IdentityStore, RegisterOutcome};
+use crate::identity_store::{BindOutcome, IdentityError, IdentityStore, RegisterOutcome};
 use crate::AppState;
 
 /// A room code as it may appear in logs: the first 4 characters plus "…".
@@ -43,6 +43,10 @@ const MAX_RELAY_SESSIONS: usize = 1000;
 /// Longest session id accepted in a binding message (Astation sends UUIDs).
 const MAX_SESSION_ID_LEN: usize = 128;
 
+/// Bound on each identity-store call made while verifying a proof, so a slow
+/// or unreachable database can't stall a connection past its challenge.
+const IDENTITY_STORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 // --- Types ---
 
 struct PairRoom {
@@ -57,10 +61,8 @@ struct PairRoom {
     /// `role=astation` connections that must prove the registered key before
     /// they may own the room, keyed by connection_id. They get no Atem traffic.
     pending_astations: HashMap<String, mpsc::UnboundedSender<String>>,
-    /// A connection of this room has proven a registered key. New Astation
-    /// connections are then pending even if their key lookup raced the
-    /// registration.
-    key_known: bool,
+    /// The current owner (`astation_connection_id`) proved the room's key.
+    astation_verified: bool,
     created_at: Instant,
 }
 
@@ -79,7 +81,7 @@ impl PairRoom {
             astation_tx: None,
             astation_connection_id: None,
             pending_astations: HashMap::new(),
-            key_known: false,
+            astation_verified: false,
             created_at: Instant::now(),
         }
     }
@@ -114,6 +116,11 @@ pub struct RelayHub {
     rooms: Arc<RwLock<HashMap<String, PairRoom>>>,
     /// How long an Astation has to answer the relay-auth challenge.
     auth_timeout: std::time::Duration,
+    /// Authoritative copy of the registered Astation keys (astation_id →
+    /// lowercase hex), loaded at startup and written through on registration.
+    /// Connects and verifications read it with no I/O, so a connect flood or a
+    /// database outage can't lock registered Astations out.
+    keys: Arc<std::sync::RwLock<HashMap<String, String>>>,
 }
 
 impl RelayHub {
@@ -121,7 +128,51 @@ impl RelayHub {
         Self {
             rooms: Arc::new(RwLock::new(HashMap::new())),
             auth_timeout: std::time::Duration::from_secs(RELAY_AUTH_TIMEOUT_SECS),
+            keys: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Replace the key cache with every key in `identity`. Called once at
+    /// startup (before serving).
+    pub async fn load_keys(&self, identity: &dyn IdentityStore) -> Result<usize, IdentityError> {
+        let keys: HashMap<String, String> = identity
+            .list_keys()
+            .await?
+            .into_iter()
+            .map(|(id, key)| (id, key.to_ascii_lowercase()))
+            .collect();
+        let count = keys.len();
+        *self.keys.write().unwrap_or_else(|e| e.into_inner()) = keys;
+        Ok(count)
+    }
+
+    fn cached_key(&self, astation_id: &str) -> Option<String> {
+        self.keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(astation_id)
+            .cloned()
+    }
+
+    fn has_key(&self, astation_id: &str) -> bool {
+        self.keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(astation_id)
+    }
+
+    fn cache_key(&self, astation_id: &str, public_key: &str) {
+        self.keys
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(astation_id.to_string(), public_key.to_ascii_lowercase());
+    }
+
+    fn forget_key(&self, astation_id: &str) {
+        self.keys
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(astation_id);
     }
 
     #[cfg(test)]
@@ -277,11 +328,21 @@ pub async fn pair_status_handler(
 }
 
 /// DELETE /api/pair/:code — Close a pairing room.
-/// Removes the room, disconnecting both sides.
+/// Removes the room, disconnecting both sides. Unauthenticated, so it is
+/// refused (409) for a code with a registered Astation key: that room belongs
+/// to a verified Astation and must not be closable by anyone who knows the code.
 pub async fn delete_pair_handler(
     State(state): State<AppState>,
     axum::extract::Path(code): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    if state.relay.has_key(&code) {
+        tracing::warn!("Refused DELETE of keyed room {}", mask_code(&code));
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "room is owned by a registered Astation"})),
+        )
+            .into_response();
+    }
     let mut rooms = state.relay.rooms.write().await;
     if rooms.remove(&code).is_some() {
         tracing::info!("Pair room closed by client: {}", mask_code(&code));
@@ -586,10 +647,35 @@ fn send_self(weak_tx: &mpsc::WeakUnboundedSender<String>, frame: String) {
     }
 }
 
+/// Record a successful verification without blocking or failing it.
+fn touch_key_in_background(identity: &Arc<dyn IdentityStore>, astation_id: &str, now: i64) {
+    let identity = identity.clone();
+    let astation_id = astation_id.to_string();
+    tokio::spawn(async move {
+        if let Err(error) = identity.touch_key(&astation_id, now).await {
+            tracing::warn!(
+                "Could not record verification for Astation {}: {}",
+                mask_code(&astation_id),
+                error
+            );
+        }
+    });
+}
+
+const KEY_MISMATCH: &str = "public_key does not match the key registered for this astation_id";
+
 /// Check a `relayAuth` message. On success returns the status to report
 /// (`registered` or `verified`); on failure the rejection message.
+///
+/// A key in the relay's cache verifies with no I/O (the store is only touched
+/// in the background), so registered Astations keep relaying through a
+/// database outage. A presented key that differs from the cached one triggers
+/// a re-read (to pick up an admin reset); if the store is unreachable it is
+/// rejected. Registration needs the store: `INSERT … ON CONFLICT DO NOTHING`
+/// first, then the cache.
 async fn verify_relay_auth(
-    identity: &dyn IdentityStore,
+    hub: &RelayHub,
+    identity: &Arc<dyn IdentityStore>,
     code: &str,
     challenge: &str,
     message: &serde_json::Value,
@@ -609,29 +695,77 @@ async fn verify_relay_auth(
     if !verify_relay_signature(&public_key, challenge, astation_id, &signature) {
         return Err("signature verification failed");
     }
-    match identity
-        .register_key_if_absent(astation_id, &public_key, now)
-        .await
-    {
-        Ok(RegisterOutcome::Registered) => Ok("registered"),
-        Ok(RegisterOutcome::Existing(stored)) if stored.to_ascii_lowercase() == public_key => {
-            if let Err(error) = identity.touch_key(astation_id, now).await {
-                tracing::warn!(
-                    "Could not record verification for Astation {}: {}",
+
+    if let Some(cached) = hub.cached_key(astation_id) {
+        if cached == public_key {
+            touch_key_in_background(identity, astation_id, now);
+            return Ok("verified");
+        }
+        // Mismatch: the cache may predate an admin reset. Re-read the key.
+        match tokio::time::timeout(IDENTITY_STORE_TIMEOUT, identity.get_key(astation_id)).await {
+            Ok(Ok(Some(stored))) => {
+                let stored = stored.to_ascii_lowercase();
+                hub.cache_key(astation_id, &stored);
+                if stored != public_key {
+                    return Err(KEY_MISMATCH);
+                }
+                touch_key_in_background(identity, astation_id, now);
+                return Ok("verified");
+            }
+            Ok(Ok(None)) => {
+                // Admin reset: fall through to registration of the new key.
+                hub.forget_key(astation_id);
+            }
+            Ok(Err(error)) => {
+                tracing::error!(
+                    "Identity store error re-reading the key of Astation {}: {}",
                     mask_code(astation_id),
                     error
                 );
+                return Err(KEY_MISMATCH);
             }
-            Ok("verified")
+            Err(_) => {
+                tracing::error!(
+                    "Identity store timed out re-reading the key of Astation {}",
+                    mask_code(astation_id)
+                );
+                return Err(KEY_MISMATCH);
+            }
         }
-        Ok(RegisterOutcome::Existing(_)) => {
-            Err("public_key does not match the key registered for this astation_id")
+    }
+
+    let registration = tokio::time::timeout(
+        IDENTITY_STORE_TIMEOUT,
+        identity.register_key_if_absent(astation_id, &public_key, now),
+    )
+    .await;
+    match registration {
+        Ok(Ok(RegisterOutcome::Registered)) => {
+            hub.cache_key(astation_id, &public_key);
+            Ok("registered")
         }
-        Err(error) => {
+        Ok(Ok(RegisterOutcome::Existing(stored))) => {
+            let stored = stored.to_ascii_lowercase();
+            hub.cache_key(astation_id, &stored);
+            if stored == public_key {
+                touch_key_in_background(identity, astation_id, now);
+                Ok("verified")
+            } else {
+                Err(KEY_MISMATCH)
+            }
+        }
+        Ok(Err(error)) => {
             tracing::error!(
-                "Identity store error verifying Astation {}: {}",
+                "Identity store error registering Astation {}: {}",
                 mask_code(astation_id),
                 error
+            );
+            Err("identity store unavailable")
+        }
+        Err(_) => {
+            tracing::error!(
+                "Identity store timed out registering Astation {}",
+                mask_code(astation_id)
             );
             Err("identity store unavailable")
         }
@@ -744,8 +878,13 @@ async fn apply_binding_message(
     }
 }
 
-/// A verified connection that was pending takes over the room: it replaces
-/// the current owner (whose socket then closes) and learns the connected Atems.
+/// Room bookkeeping after `connection_id` proved the room's key.
+///
+/// - An unverified owner on another socket (one that slipped in while the key
+///   was first being registered) is evicted; its socket then closes.
+/// - A pending connection takes over the room (replacing a verified owner too:
+///   that is an ordinary reconnect) and learns the connected Atems.
+/// - A connection that already owns the room is marked verified.
 async fn promote_verified_astation(
     hub: &RelayHub,
     code: &str,
@@ -756,7 +895,19 @@ async fn promote_verified_astation(
     let Some(room) = rooms.get_mut(code) else {
         return;
     };
-    room.key_known = true;
+    let owned_by_me = room.astation_connection_id.as_deref() == Some(connection_id);
+    if owned_by_me {
+        room.astation_verified = true;
+        return;
+    }
+    if room.astation_connection_id.is_some() && !room.astation_verified {
+        tracing::warn!(
+            "Evicting unverified Astation owner of keyed room {}",
+            mask_code(code)
+        );
+        room.astation_tx = None;
+        room.astation_connection_id = None;
+    }
     if !was_pending {
         return;
     }
@@ -772,6 +923,7 @@ async fn promote_verified_astation(
     }
     room.astation_tx = Some(tx);
     room.astation_connection_id = Some(connection_id.to_string());
+    room.astation_verified = true;
 }
 
 /// Handle a relay-auth frame from an Astation. Returns `false` when the
@@ -779,7 +931,7 @@ async fn promote_verified_astation(
 #[allow(clippy::too_many_arguments)]
 async fn handle_astation_control(
     hub: &RelayHub,
-    identity: &dyn IdentityStore,
+    identity: &Arc<dyn IdentityStore>,
     code: &str,
     connection_id: &str,
     weak_tx: &mpsc::WeakUnboundedSender<String>,
@@ -799,7 +951,7 @@ async fn handle_astation_control(
                 send_self(weak_tx, relay_auth_result_frame("rejected", "challenge expired"));
                 return false;
             }
-            match verify_relay_auth(identity, code, &auth.challenge, message, now).await {
+            match verify_relay_auth(hub, identity, code, &auth.challenge, message, now).await {
                 Ok(status) => {
                     let message = if status == "registered" {
                         "key registered"
@@ -822,7 +974,7 @@ async fn handle_astation_control(
         }
         "relaySessions" | "relayBind" | "relayUnbind" => {
             let ack = if auth.state == AuthState::Verified {
-                apply_binding_message(identity, code, kind, message, now).await
+                apply_binding_message(identity.as_ref(), code, kind, message, now).await
             } else {
                 tracing::debug!(
                     "Refused {} from unverified Astation {}",
@@ -858,41 +1010,30 @@ async fn handle_ws(
     let connection_id = Uuid::new_v4().to_string();
 
     // An Astation gets a challenge; it must prove the key first when one is
-    // registered for this room code.
-    let mut astation_auth = if role == "astation" {
-        let key_registered = match identity.get_key(&code).await {
-            Ok(key) => key.is_some(),
-            Err(error) => {
-                // Fail closed: without the lookup a takeover can't be ruled out.
-                tracing::error!(
-                    "Identity lookup failed for Astation {}: {} — requiring proof",
-                    mask_code(&code),
-                    error
-                );
-                true
-            }
-        };
-        Some(AstationAuth {
-            challenge: new_relay_challenge(),
-            deadline: Instant::now() + hub.auth_timeout,
-            state: if key_registered {
-                AuthState::Pending
-            } else {
-                AuthState::Legacy
-            },
-        })
-    } else {
-        None
-    };
+    // registered for this room code (decided below from the key cache, with
+    // no I/O).
+    let mut astation_auth = (role == "astation").then(|| AstationAuth {
+        challenge: new_relay_challenge(),
+        deadline: Instant::now() + hub.auth_timeout,
+        state: AuthState::Legacy,
+    });
 
     // Register this side's sender in the room
     let startup_notifications = {
         let mut rooms = hub.rooms.write().await;
-        let room = match rooms.get_mut(&code) {
-            Some(r) => r,
-            None => {
-                tracing::warn!("Room {} disappeared before WS setup", mask_code(&code));
-                return;
+        let room = if role == "astation" {
+            // An Astation owns its identity room; recreate it if it was
+            // removed since ws_handler checked.
+            rooms
+                .entry(code.clone())
+                .or_insert_with(|| PairRoom::new(&code, "identity"))
+        } else {
+            match rooms.get_mut(&code) {
+                Some(r) => r,
+                None => {
+                    tracing::warn!("Room {} disappeared before WS setup", mask_code(&code));
+                    return;
+                }
             }
         };
 
@@ -916,7 +1057,10 @@ async fn handle_ws(
             ("astation", Some(auth)) => {
                 // The challenge is always the first frame.
                 notifications.push((tx.clone(), relay_auth_challenge_frame(&auth.challenge)));
-                if room.key_known {
+                // Checked under the rooms lock: a registration that lands
+                // after this is handled by promote_verified_astation, which
+                // evicts an unverified owner.
+                if hub.has_key(&code) {
                     auth.state = AuthState::Pending;
                 }
                 if auth.state == AuthState::Pending {
@@ -925,6 +1069,7 @@ async fn handle_ws(
                 } else {
                     room.astation_tx = Some(tx.clone());
                     room.astation_connection_id = Some(connection_id.clone());
+                    room.astation_verified = false;
                     notifications.extend(room.atem_txs.iter().map(|(atem_id, connection)| {
                         (
                             tx.clone(),
@@ -1114,7 +1259,7 @@ async fn handle_ws(
                             if let Some(kind) = relay_control_type(message) {
                                 let keep_open = handle_astation_control(
                                     &hub_for_read,
-                                    identity.as_ref(),
+                                    &identity,
                                     &code_for_read,
                                     &connection_id,
                                     &weak_tx,
@@ -1243,6 +1388,7 @@ async fn handle_ws(
                     {
                         room.astation_tx = None;
                         room.astation_connection_id = None;
+                        room.astation_verified = false;
                     }
                 }
                 _ => {}
@@ -1644,7 +1790,7 @@ mod tests {
             astation_tx: None,
             astation_connection_id: None,
             pending_astations: HashMap::new(),
-            key_known: false,
+            astation_verified: false,
             created_at: Instant::now(),
         };
 
@@ -1670,7 +1816,7 @@ mod tests {
             astation_tx: None,
             astation_connection_id: None,
             pending_astations: HashMap::new(),
-            key_known: false,
+            astation_verified: false,
             created_at: Instant::now() - std::time::Duration::from_secs(ROOM_EXPIRY_SECS + 10),
         };
         hub.rooms
@@ -1686,7 +1832,7 @@ mod tests {
             astation_tx: None,
             astation_connection_id: None,
             pending_astations: HashMap::new(),
-            key_known: false,
+            astation_verified: false,
             created_at: Instant::now(),
         };
         hub.rooms
@@ -1714,7 +1860,7 @@ mod tests {
             astation_tx: Some(tx),
             astation_connection_id: Some("astation-test".to_string()),
             pending_astations: HashMap::new(),
-            key_known: false,
+            astation_verified: false,
             created_at: Instant::now() - std::time::Duration::from_secs(ROOM_EXPIRY_SECS + 10),
         };
         hub.rooms
@@ -2243,7 +2389,7 @@ mod tests {
             astation_tx: None,
             astation_connection_id: None,
             pending_astations: HashMap::new(),
-            key_known: false,
+            astation_verified: false,
             created_at: Instant::now() - std::time::Duration::from_secs(ROOM_EXPIRY_SECS + 10),
         };
         hub.rooms.write().await.insert("OLD-ATEM".to_string(), room);
@@ -2276,7 +2422,7 @@ mod tests {
             astation_tx: None,
             astation_connection_id: None,
             pending_astations: HashMap::new(),
-            key_known: false,
+            astation_verified: false,
             created_at: Instant::now(),
         };
         state.relay.rooms.write().await.insert(code.clone(), room);
@@ -3039,6 +3185,8 @@ mod tests {
         let restarted = identity_state(std::sync::Arc::new(
             crate::identity_store::PgIdentityStore::new(pool),
         ));
+        // As main() does at startup.
+        assert_eq!(restarted.relay.load_keys(restarted.identity.as_ref()).await.unwrap(), 1);
         assert_routes(&restarted, "pg-session", HttpStatusCode::OK).await;
         assert_routes(&restarted, "pg-unbound", HttpStatusCode::UNAUTHORIZED).await;
 
@@ -3046,5 +3194,337 @@ mod tests {
         let (base_url, server) = spawn_relay(restarted).await;
         verified_astation(&base_url, code, &key, "verified").await;
         server.abort();
+    }
+
+    // ─────────────── Key cache, DB outages, admin reset, DELETE ───────────────
+
+    use crate::identity_store::{
+        BindOutcome as StoreBindOutcome, IdentityError as StoreError, InMemoryIdentityStore,
+        RegisterOutcome as StoreRegisterOutcome, ReplaceOutcome,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// An in-memory identity store that counts calls and can be taken "down".
+    #[derive(Clone, Default)]
+    struct FlakyIdentity {
+        inner: InMemoryIdentityStore,
+        down: std::sync::Arc<AtomicBool>,
+        calls: std::sync::Arc<AtomicUsize>,
+    }
+
+    impl FlakyIdentity {
+        fn check(&self) -> Result<(), StoreError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.down.load(Ordering::SeqCst) {
+                Err(StoreError::Db("database is down".into()))
+            } else {
+                Ok(())
+            }
+        }
+        fn set_down(&self, down: bool) {
+            self.down.store(down, Ordering::SeqCst);
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IdentityStore for FlakyIdentity {
+        fn backend_name(&self) -> &'static str {
+            "flaky"
+        }
+        async fn get_key(&self, id: &str) -> Result<Option<String>, StoreError> {
+            self.check()?;
+            self.inner.get_key(id).await
+        }
+        async fn register_key_if_absent(
+            &self,
+            id: &str,
+            key: &str,
+            now: i64,
+        ) -> Result<StoreRegisterOutcome, StoreError> {
+            self.check()?;
+            self.inner.register_key_if_absent(id, key, now).await
+        }
+        async fn touch_key(&self, id: &str, now: i64) -> Result<(), StoreError> {
+            self.check()?;
+            self.inner.touch_key(id, now).await
+        }
+        async fn list_keys(&self) -> Result<Vec<(String, String)>, StoreError> {
+            self.check()?;
+            self.inner.list_keys().await
+        }
+        async fn bind(&self, s: &str, id: &str, now: i64) -> Result<StoreBindOutcome, StoreError> {
+            self.check()?;
+            self.inner.bind(s, id, now).await
+        }
+        async fn unbind(&self, s: &str, id: &str) -> Result<bool, StoreError> {
+            self.check()?;
+            self.inner.unbind(s, id).await
+        }
+        async fn replace_all(
+            &self,
+            id: &str,
+            sessions: &[String],
+            now: i64,
+        ) -> Result<ReplaceOutcome, StoreError> {
+            self.check()?;
+            self.inner.replace_all(id, sessions, now).await
+        }
+        async fn resolve(&self, s: &str, now: i64) -> Result<Option<String>, StoreError> {
+            self.check()?;
+            self.inner.resolve(s, now).await
+        }
+    }
+
+    fn flaky_state() -> (crate::AppState, FlakyIdentity) {
+        let flaky = FlakyIdentity::default();
+        (identity_state(std::sync::Arc::new(flaky.clone())), flaky)
+    }
+
+    #[tokio::test]
+    async fn connecting_does_no_identity_store_io() {
+        let (state, flaky) = flaky_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let key = TestKey::generate();
+        let _owner = verified_astation(&base_url, "astation-io", &key, "registered").await;
+        let before = flaky.calls();
+        let (_pending, _) = connect_astation(&base_url, "astation-io").await;
+        let (_legacy, _) = connect_astation(&base_url, "astation-io-keyless").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(flaky.calls(), before, "a connect touched the identity store");
+        server.abort();
+    }
+
+    /// With the database down a registered Astation still verifies from the
+    /// key cache and keeps relaying; binding changes fail softly.
+    #[tokio::test]
+    async fn registered_astation_verifies_while_db_is_down() {
+        let (state, flaky) = flaky_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-db-down";
+        let key = TestKey::generate();
+        let mut old = verified_astation(&base_url, code, &key, "registered").await;
+        let mut atem = connect_atem(&base_url, code, "atem-a").await;
+        assert_eq!(next_client_json(&mut old).await["relay_event"], "connected");
+
+        flaky.set_down(true);
+        let mut new = verified_astation(&base_url, code, &key, "verified").await;
+        assert_eq!(next_client_json(&mut new).await["relay_event"], "connected");
+        assert_closed(&mut old).await;
+        send_json(&mut atem, serde_json::json!({"probe":"db-down"})).await;
+        assert_eq!(next_client_json(&mut new).await["payload"]["probe"], "db-down");
+
+        let ack = control(&mut new, serde_json::json!({"type":"relayBind","session_id":"s1"})).await;
+        assert_eq!(ack["ok"], false);
+        assert_eq!(ack["message"], "identity store unavailable");
+        // Still the owner.
+        send_json(&mut new, serde_json::json!({"probe":"still-owner"})).await;
+        assert_eq!(next_client_json(&mut atem).await["probe"], "still-owner");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn wrong_key_while_db_is_down_is_rejected_and_owner_untouched() {
+        let (state, flaky) = flaky_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-db-down-wrong";
+        let key = TestKey::generate();
+        let mut owner = verified_astation(&base_url, code, &key, "registered").await;
+        let mut atem = connect_atem(&base_url, code, "atem-a").await;
+        assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+
+        flaky.set_down(true);
+        let (mut intruder, challenge) = connect_astation(&base_url, code).await;
+        let result = authenticate(&mut intruder, &TestKey::generate(), code, &challenge).await;
+        assert_eq!(result["status"], "rejected", "{result}");
+        assert_closed(&mut intruder).await;
+
+        send_json(&mut atem, serde_json::json!({"probe":"to-owner"})).await;
+        assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "to-owner");
+        assert!(state.relay.has_key(code), "a DB error must not forget the key");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn registration_while_db_is_down_is_rejected_and_retry_works() {
+        let (state, flaky) = flaky_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-db-down-new";
+        let key = TestKey::generate();
+        flaky.set_down(true);
+        let (mut astation, challenge) = connect_astation(&base_url, code).await;
+        let result = authenticate(&mut astation, &key, code, &challenge).await;
+        assert_eq!(result["status"], "rejected");
+        assert_eq!(result["message"], "identity store unavailable");
+        assert_closed(&mut astation).await;
+        assert!(!state.relay.has_key(code));
+
+        // Still keyless, so the retry is a legacy socket that registers.
+        flaky.set_down(false);
+        verified_astation(&base_url, code, &key, "registered").await;
+        assert!(state.relay.has_key(code));
+        server.abort();
+    }
+
+    /// An admin reset (row deleted) is picked up when a different key
+    /// connects: the mismatch re-reads the store. Until then the cached old
+    /// key still verifies (documented; restart the relay to revoke at once).
+    #[tokio::test]
+    async fn admin_reset_is_picked_up_on_key_mismatch() {
+        let (state, flaky) = flaky_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-reset";
+        let old_key = TestKey::generate();
+        let new_key = TestKey::generate();
+        verified_astation(&base_url, code, &old_key, "registered").await;
+
+        flaky.inner.delete_key(code).await;
+        verified_astation(&base_url, code, &old_key, "verified").await;
+
+        verified_astation(&base_url, code, &new_key, "registered").await;
+        assert_eq!(state.identity.get_key(code).await.unwrap(), Some(new_key.public_hex()));
+        let (mut old, challenge) = connect_astation(&base_url, code).await;
+        let result = authenticate(&mut old, &old_key, code, &challenge).await;
+        assert_eq!(result["status"], "rejected", "{result}");
+        server.abort();
+    }
+
+    /// Keys registered before a restart make those ids pending from the first
+    /// connect (main() loads the cache at startup).
+    #[tokio::test]
+    async fn loaded_keys_make_known_ids_pending() {
+        let (state, flaky) = flaky_state();
+        let code = "astation-preloaded";
+        let key = TestKey::generate();
+        flaky
+            .inner
+            .register_key_if_absent(code, &key.public_hex(), 1)
+            .await
+            .unwrap();
+        assert_eq!(state.relay.load_keys(state.identity.as_ref()).await.unwrap(), 1);
+        let (base_url, server) = spawn_relay(state.clone()).await;
+
+        let (mut astation, challenge) = connect_astation(&base_url, code).await;
+        let _atem = connect_atem(&base_url, code, "atem-a").await;
+        assert_silent(&mut astation, 150).await;
+        let result = authenticate(&mut astation, &key, code, &challenge).await;
+        assert_eq!(result["status"], "verified");
+        assert_eq!(next_client_json(&mut astation).await["relay_event"], "connected");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn atem_joining_while_an_astation_is_pending_is_not_announced_to_it() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-pending-join";
+        let key = TestKey::generate();
+        let mut owner = verified_astation(&base_url, code, &key, "registered").await;
+        let (mut pending, _challenge) = connect_astation(&base_url, code).await;
+
+        let mut atem = connect_atem(&base_url, code, "atem-late").await;
+        assert_eq!(next_client_json(&mut owner).await["atem_id"], "atem-late");
+        send_json(&mut atem, serde_json::json!({"probe":"x"})).await;
+        assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "x");
+        assert_silent(&mut pending, 150).await;
+        server.abort();
+    }
+
+    async fn delete_room(state: &crate::AppState, code: &str) -> (HttpStatusCode, serde_json::Value) {
+        let response = crate::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/pair/{code}"))
+                    .header("x-forwarded-for", "203.0.113.78")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+    }
+
+    #[tokio::test]
+    async fn delete_is_refused_for_a_keyed_room() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-undeletable";
+        let key = TestKey::generate();
+        let mut owner = verified_astation(&base_url, code, &key, "registered").await;
+        let mut atem = connect_atem(&base_url, code, "atem-a").await;
+        assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+
+        let (status, body) = delete_room(&state, code).await;
+        assert_eq!(status, HttpStatusCode::CONFLICT);
+        assert_eq!(body, serde_json::json!({"error":"room is owned by a registered Astation"}));
+
+        send_json(&mut owner, serde_json::json!({"probe":"survived"})).await;
+        assert_eq!(next_client_json(&mut atem).await["probe"], "survived");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delete_still_closes_keyless_rooms() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-keyless-delete";
+        let (_legacy, _challenge) = connect_astation(&base_url, code).await;
+        let (status, body) = delete_room(&state, code).await;
+        assert_eq!(status, HttpStatusCode::OK);
+        assert_eq!(body["closed"], true);
+        assert!(!state.relay.rooms.read().await.contains_key(code));
+        server.abort();
+    }
+
+    /// First-registration race: an unverified socket that became owner is
+    /// evicted when the registering (or a pending) connection verifies.
+    #[tokio::test]
+    async fn verification_evicts_an_unverified_owner() {
+        let hub = RelayHub::new();
+        let (squatter_tx, mut squatter_rx) = mpsc::unbounded_channel::<String>();
+        let (pending_tx, _pending_rx) = mpsc::unbounded_channel::<String>();
+        let mut room = PairRoom::new("astation-race", "identity");
+        room.astation_tx = Some(squatter_tx);
+        room.astation_connection_id = Some("squatter".to_string());
+        room.pending_astations.insert("pending".to_string(), pending_tx);
+        hub.rooms.write().await.insert("astation-race".to_string(), room);
+
+        // The registering socket was replaced, so it is not the owner.
+        promote_verified_astation(&hub, "astation-race", "registrar", false).await;
+        {
+            let rooms = hub.rooms.read().await;
+            let room = &rooms["astation-race"];
+            assert!(room.astation_tx.is_none());
+            assert!(room.astation_connection_id.is_none());
+        }
+        assert!(squatter_rx.recv().await.is_none(), "squatter's sender was dropped");
+
+        promote_verified_astation(&hub, "astation-race", "pending", true).await;
+        let rooms = hub.rooms.read().await;
+        let room = &rooms["astation-race"];
+        assert_eq!(room.astation_connection_id.as_deref(), Some("pending"));
+        assert!(room.astation_verified);
+        assert!(room.pending_astations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn verification_keeps_a_verified_owner_until_a_pending_one_takes_over() {
+        let hub = RelayHub::new();
+        let (owner_tx, _owner_rx) = mpsc::unbounded_channel::<String>();
+        let mut room = PairRoom::new("astation-verified", "identity");
+        room.astation_tx = Some(owner_tx);
+        room.astation_connection_id = Some("owner".to_string());
+        room.astation_verified = true;
+        hub.rooms.write().await.insert("astation-verified".to_string(), room);
+
+        // A stale, non-pending verified socket doesn't disturb the owner.
+        promote_verified_astation(&hub, "astation-verified", "stale", false).await;
+        let rooms = hub.rooms.read().await;
+        assert_eq!(rooms["astation-verified"].astation_connection_id.as_deref(), Some("owner"));
     }
 }

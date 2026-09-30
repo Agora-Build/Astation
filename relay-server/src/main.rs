@@ -274,6 +274,14 @@ async fn main() {
         }
     };
 
+    // The relay decides Pending vs legacy Astation connections and verifies
+    // registered keys from an in-memory cache, so it is loaded once here.
+    let key_count = relay
+        .load_keys(identity.as_ref())
+        .await
+        .expect("Failed to load Astation relay keys");
+    tracing::info!("Loaded {} Astation relay key(s)", key_count);
+
     // Spawn background cleanup for expired sessions
     let cleanup_sessions = sessions.clone();
     tokio::spawn(async move {

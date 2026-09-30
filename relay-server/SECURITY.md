@@ -53,8 +53,21 @@ proof-of-possession + durable pairing"; summary in `README.md`.
   `relay_event` notifications, and its messages are dropped, until it proves
   the key. A wrong key, a signature over another challenge or code, or no
   answer within 10 s gets `relayAuthResult rejected` and the socket is closed;
-  the current owner is untouched. If the key lookup itself fails (database
-  down), the socket is treated as pending (fail closed).
+  the current owner is untouched.
+- **Key cache.** The relay keeps every registered key in memory: loaded from
+  Postgres at startup, written through on registration. Connecting does no
+  database I/O (Pending vs legacy is decided from the cache), and a proof with
+  the cached key verifies without the database (`last_verified_at` is updated
+  in the background), so a connect flood or a database outage cannot lock
+  registered Astations out of relay chat. Registering a new key needs the
+  database; if it is down only that registration is rejected. A presented key
+  that differs from the cached one makes the relay re-read the stored key
+  before rejecting (this is how an admin reset is picked up); if the database
+  is unreachable it is rejected and the cached key stays.
+- **Room closing.** The unauthenticated `DELETE /api/pair/:code` is refused
+  (`409 {"error":"room is owned by a registered Astation"}`) for a code with a
+  registered key, so knowing a room code no longer lets anyone evict a verified
+  owner. Keyless pairing rooms can still be closed as before.
 - **Legacy mode.** An Astation without a registered key (old versions ignore
   the challenge) still owns its room and relays chat and remote control as
   before, but it can never create bindings, so vault and Atem Memory do not
@@ -64,8 +77,13 @@ proof-of-possession + durable pairing"; summary in `README.md`.
   bound to another Astation is never taken over. Relay-auth frames are
   intercepted and never forwarded to Atems.
 - **Admin reset.** A lost or replaced Mac cannot prove the old key; an operator
-  deletes its `astation_keys` row (see `../DEPLOY.md`), and the next verified
-  connect registers the new key. Bindings are kept.
+  deletes its `astation_keys` row (see `../DEPLOY.md`), and the next connect
+  with a new key registers it (its mismatch against the cache forces a
+  re-read). Bindings are kept. Until the new key connects or the relay
+  restarts, the relay's cache still accepts the **old** key: to revoke a
+  compromised key immediately, restart the relay after the `DELETE`. A reset
+  made while the relay cannot reach the database is likewise only picked up by
+  a later re-read or a restart.
 - Relay logs mask room codes and session ids (first 4 characters).
 
 Residual risks:
@@ -75,18 +93,27 @@ Residual risks:
   it first (the rightful `relayBind` is then refused and logged). Session ids
   are UUIDv4 values that only travel between an Atem, its Astation and the
   relay, so this requires prior knowledge of the id.
-- **First-use squatting.** Whoever proves a key first for a room code owns it.
-  Room codes are random per installation, so this needs prior knowledge of the
-  code; recovery is the admin reset.
+- **First-use squatting.** Whoever proves a key first for a room code owns it,
+  and the code is not secret: every Atem paired with that Astation stores it
+  (`astation_relay_code` in its `config.toml`) and sends it in its WebSocket
+  URL, and it appears in the pairing link. Anyone holding it can register their
+  own key before the real Astation does. That squat locks the real Astation out
+  of its relay room entirely (relay chat and remote control as well as vault
+  and memory), because its connections stay pending and are rejected. Recovery
+  is the admin reset. The rollout order in `../DEPLOY.md` (Astation update
+  first, then the relay) keeps this window to the seconds between the relay
+  restart and the updated Astations reconnecting.
 - **Legacy rooms.** A room with no registered key can still be taken over as
-  before (without gaining vault or memory access) until its Astation updates.
+  before (without gaining vault or memory access), and closed with
+  `DELETE /api/pair/:code`, until its Astation updates and registers a key.
 
 ## Production blockers
 
 1. ~~`role=astation` identity-room ownership is not authenticated.~~
    **Addressed** by the Astation relay identity above (TOFU key, pending
-   connections, legacy mode without bindings, admin reset). Residual: the
-   session-squatting and first-use risks listed there.
+   connections, legacy mode without bindings, key cache, `DELETE` refused for
+   keyed rooms, admin reset). Residual: the session-squatting, first-use
+   squatting, and legacy-room risks listed there.
 2. Voice, LLM, and RTC session endpoints are not consistently protected by an
    authenticated device session.
 3. Vault authorization still accepts a session identifier at the HTTP boundary;
