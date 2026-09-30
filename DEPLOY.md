@@ -554,6 +554,20 @@ which the relay doesn't have.
 Postgres data (vault, Atem Memory, keys, bindings) is already shared and
 isn't the limit.
 
+**If failover is ever needed** (not built): route by room code. Every relay
+WebSocket carries it (`/ws?role=astation&code=<id>`, `/ws?role=atem&code=<id>`),
+so nginx can hash on it (`hash $arg_code consistent;`), and send
+`/api/pair/:code` the same way. An Astation and its Atems then always reach
+the same instance. It still needs two changes:
+
+- every instance learns about key changes (Postgres `LISTEN/NOTIFY`, or a
+  rate-limited re-read on a cache miss);
+- voice and RTC sessions are routed by their id or moved to Postgres.
+
+This gives failover, since only a failed instance's rooms reconnect, not
+more capacity per room. A single relay handles many thousands of idle
+WebSockets, so capacity isn't the reason to add one.
+
 ### Scaling the webapp
 
 The webapp (nginx plus static files) is stateless and can scale freely:
