@@ -476,6 +476,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_grant_of_expired_session_is_gone_for_any_otp() {
+        let state = AppState {
+            sessions: SessionStore::new(),
+            relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
+            voice_sessions: VoiceSessionStore::new(),
+            vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
+            knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+        };
+        let mut session = create_session("late-host");
+        session.expires_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let id = session.id.clone();
+        let otp = session.otp.clone();
+        state.sessions.create(session).await.unwrap();
+        let app = Router::new()
+            .route("/api/sessions/:id/grant", post(grant_session_handler))
+            .with_state(state);
+
+        for attempt in [otp.as_str(), "00000000"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/sessions/{}/grant", id))
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(format!(r#"{{"otp": "{}"}}"#, attempt)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::GONE);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json, serde_json::json!({"error": "Session has expired"}));
+        }
+    }
+
+    #[tokio::test]
     async fn test_grant_with_wrong_otp() {
         let state = AppState {
             sessions: SessionStore::new(),

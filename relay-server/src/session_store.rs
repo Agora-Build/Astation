@@ -414,4 +414,20 @@ mod tests {
             DenyOutcome::NotPending(SessionStatus::Denied)
         ));
     }
+
+    #[tokio::test]
+    async fn grant_of_a_finished_expired_session_is_not_pending() {
+        let store = SessionStore::new();
+        for status in [SessionStatus::Granted, SessionStatus::Denied] {
+            let mut session = create_session("done-host");
+            session.status = status.clone();
+            session.expires_at = Utc::now() - Duration::minutes(5);
+            let (id, otp) = (session.id.clone(), session.otp.clone());
+            store.create(session).await.unwrap();
+            match store.grant(&id, &otp).await.unwrap() {
+                GrantOutcome::NotPending(got) => assert_eq!(got, status),
+                other => panic!("expected NotPending({status:?}), got {other:?}"),
+            }
+        }
+    }
 }
