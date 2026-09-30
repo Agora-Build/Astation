@@ -980,6 +980,9 @@ mod tests {
         async fn add_memory(&self, _: &str, _: MemoryRow) -> Result<MemoryAddOutcome, KnowledgeError> {
             Err(KnowledgeError::Db("connection reset".into()))
         }
+        async fn invalidate_memory(&self, _: &str, _: &str, _: i64, _: Option<&str>) -> Result<i64, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
         async fn delete_memory(&self, _: &str, _: &str) -> Result<i64, KnowledgeError> {
             Err(KnowledgeError::Db("connection reset".into()))
         }
