@@ -22,6 +22,7 @@ use crate::cluster::directory::{
     AtemJoin, InMemoryRoomDirectory, Promotion, RoomDirectory, RoomInfo, IDENTITY_HOSTNAME,
 };
 use crate::cluster::keys::KeyCache;
+use crate::cluster::ratelimit::{NoopRateLimiter, SharedRateLimiter};
 use crate::cluster::local::{LocalSockets, SocketOutbox, SocketRole};
 use crate::cluster::{ConnRef, StoreError, SINGLE_REPLICA_ID};
 use crate::identity_store::{BindOutcome, IdentityError, IdentityStore, RegisterOutcome};
@@ -97,6 +98,7 @@ pub(crate) struct HubParts {
     pub bus: Arc<dyn ReplicaBus>,
     pub local: LocalSockets,
     pub keys: KeyCache,
+    pub rate_limiter: Arc<dyn SharedRateLimiter>,
     pub auth_timeout: Duration,
 }
 
@@ -106,6 +108,7 @@ struct HubInner {
     bus: Arc<dyn ReplicaBus>,
     local: LocalSockets,
     keys: KeyCache,
+    rate_limiter: Arc<dyn SharedRateLimiter>,
     auth_timeout: Duration,
 }
 
@@ -133,6 +136,7 @@ impl RelayHub {
             bus: Arc::new(LoopbackBus::new(SINGLE_REPLICA_ID, local.clone())),
             local,
             keys: KeyCache::new(),
+            rate_limiter: Arc::new(NoopRateLimiter),
             auth_timeout,
         })
     }
@@ -145,6 +149,7 @@ impl RelayHub {
                 bus: parts.bus,
                 local: parts.local,
                 keys: parts.keys,
+                rate_limiter: parts.rate_limiter,
                 auth_timeout: parts.auth_timeout,
             }),
         }
@@ -153,6 +158,24 @@ impl RelayHub {
     #[cfg(test)]
     pub(crate) fn with_auth_timeout(auth_timeout: Duration) -> Self {
         Self::in_memory(InMemoryRoomDirectory::new(), auth_timeout)
+    }
+
+    pub(crate) fn rate_limiter(&self) -> Arc<dyn SharedRateLimiter> {
+        self.inner.rate_limiter.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_rate_limiter(rate_limiter: Arc<dyn SharedRateLimiter>) -> Self {
+        let local = LocalSockets::new();
+        Self::from_parts(HubParts {
+            replica_id: SINGLE_REPLICA_ID.to_string(),
+            directory: Arc::new(InMemoryRoomDirectory::new()),
+            bus: Arc::new(LoopbackBus::new(SINGLE_REPLICA_ID, local.clone())),
+            local,
+            keys: KeyCache::new(),
+            rate_limiter,
+            auth_timeout: Duration::from_secs(RELAY_AUTH_TIMEOUT_SECS),
+        })
     }
 
     pub fn replica_id(&self) -> &str {
@@ -2108,6 +2131,7 @@ mod tests {
             bus: bus.clone(),
             local: local.clone(),
             keys: crate::cluster::keys::KeyCache::new(),
+            rate_limiter: std::sync::Arc::new(crate::cluster::ratelimit::NoopRateLimiter),
             auth_timeout: TEST_AUTH_TIMEOUT,
         });
         let mut here = local.register("a", "room", SocketRole::Astation);

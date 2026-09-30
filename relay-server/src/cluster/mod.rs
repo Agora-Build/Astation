@@ -10,6 +10,7 @@ pub mod bus;
 pub mod directory;
 pub mod keys;
 pub mod local;
+pub mod ratelimit;
 
 use std::fmt;
 

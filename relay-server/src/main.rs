@@ -20,6 +20,7 @@ use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use cluster::ratelimit::{shared_rate_limit, SharedLimit, GENERAL_LIMIT_PER_MINUTE, GRANT_LIMIT_PER_MINUTE};
 use relay::RelayHub;
 use rtc_session::RtcSessionStore;
 use session_store::SessionStore;
@@ -123,7 +124,15 @@ fn router(state: AppState) -> Router {
         )
         .layer(GovernorLayer {
             config: governor_conf_strict,
-        });
+        })
+        .layer(axum::middleware::from_fn_with_state(
+            SharedLimit {
+                hub: state.relay.clone(),
+                bucket: "grant",
+                limit: GRANT_LIMIT_PER_MINUTE,
+            },
+            shared_rate_limit,
+        ));
 
     // General rate limiting for other API endpoints
     let general_routes = Router::new()
@@ -206,7 +215,15 @@ fn router(state: AppState) -> Router {
         .route("/api/pair/:code", get(relay::pair_status_handler).delete(relay::delete_pair_handler))
         .layer(GovernorLayer {
             config: governor_conf_general,
-        });
+        })
+        .layer(axum::middleware::from_fn_with_state(
+            SharedLimit {
+                hub: state.relay.clone(),
+                bucket: "general",
+                limit: GENERAL_LIMIT_PER_MINUTE,
+            },
+            shared_rate_limit,
+        ));
 
     // Combine all routes
     Router::new()
