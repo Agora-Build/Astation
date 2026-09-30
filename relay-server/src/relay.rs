@@ -1,18 +1,29 @@
 use axum::{
-    extract::{ws::WebSocket, Query, State, WebSocketUpgrade},
+    extract::{
+        ws::{CloseFrame, Message, WebSocket},
+        Query, State, WebSocketUpgrade,
+    },
     http::StatusCode,
-    response::{Html, IntoResponse, Json},
+    response::{Html, IntoResponse, Json, Response},
 };
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use std::time::Duration;
 use tokio::time::Instant;
 use uuid::Uuid;
 use validator::Validate;
 
+use crate::cluster::bus::{BroadcastMessage, InboxMessage, LoopbackBus, ReplicaBus};
+use crate::cluster::directory::{
+    AtemJoin, InMemoryRoomDirectory, Promotion, RoomDirectory, RoomInfo, IDENTITY_HOSTNAME,
+};
+use crate::cluster::keys::KeyCache;
+use crate::cluster::local::{LocalSockets, SocketOutbox, SocketRole};
+use crate::cluster::{ConnRef, StoreError, SINGLE_REPLICA_ID};
 use crate::identity_store::{BindOutcome, IdentityError, IdentityStore, RegisterOutcome};
 use crate::AppState;
 
@@ -26,16 +37,13 @@ pub(crate) fn mask_code(code: &str) -> String {
 // Characters for pairing codes — no ambiguous chars (0/O, 1/I/L excluded)
 const CODE_CHARS: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
-/// Room expiry: 10 minutes if unpaired.
-const ROOM_EXPIRY_SECS: u64 = 600;
-
 /// WebSocket ping interval in seconds.
 /// Keeps idle connections alive across NAT firewalls without high bandwidth overhead.
 /// At 100k connections, 60s pings produce ~1700 tiny frames/sec (~10KB/s total) — negligible.
 const WS_PING_INTERVAL_SECS: u64 = 60;
 
 /// An Astation must answer the relay-auth challenge within this window.
-const RELAY_AUTH_TIMEOUT_SECS: u64 = 10;
+pub(crate) const RELAY_AUTH_TIMEOUT_SECS: u64 = 10;
 
 /// Most session ids one `relaySessions` resync may list.
 const MAX_RELAY_SESSIONS: usize = 1000;
@@ -47,60 +55,13 @@ const MAX_SESSION_ID_LEN: usize = 128;
 /// or unreachable database can't stall a connection past its challenge.
 const IDENTITY_STORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Close code: shared relay state unavailable, reconnect later (RFC 6455).
+pub(crate) const CLOSE_TRY_AGAIN: u16 = 1013;
+
+/// Pending Astation sockets allowed per room (0 = no cap).
+pub(crate) const MAX_PENDING_ASTATIONS_PER_ROOM: usize = 0;
+
 // --- Types ---
-
-struct PairRoom {
-    #[allow(dead_code)]
-    code: String,
-    hostname: String,
-    /// One sender per connected Atem, keyed by atem_id.
-    /// Multiple Atems can be connected to the same room simultaneously.
-    atem_txs: HashMap<String, AtemConnection>,
-    astation_tx: Option<mpsc::UnboundedSender<String>>,
-    astation_connection_id: Option<String>,
-    /// `role=astation` connections that must prove the registered key before
-    /// they may own the room, keyed by connection_id. They get no Atem traffic.
-    pending_astations: HashMap<String, mpsc::UnboundedSender<String>>,
-    /// The current owner (`astation_connection_id`) proved the room's key.
-    astation_verified: bool,
-    created_at: Instant,
-}
-
-#[derive(Clone)]
-struct AtemConnection {
-    connection_id: String,
-    tx: mpsc::UnboundedSender<String>,
-}
-
-impl PairRoom {
-    fn new(code: &str, hostname: &str) -> Self {
-        Self {
-            code: code.to_string(),
-            hostname: hostname.to_string(),
-            atem_txs: HashMap::new(),
-            astation_tx: None,
-            astation_connection_id: None,
-            pending_astations: HashMap::new(),
-            astation_verified: false,
-            created_at: Instant::now(),
-        }
-    }
-
-    fn is_current_atem_connection(&self, atem_id: &str, connection_id: &str) -> bool {
-        self.atem_txs
-            .get(atem_id)
-            .map(|connection| connection.connection_id == connection_id)
-            .unwrap_or(false)
-    }
-
-    fn remove_atem_if_current(&mut self, atem_id: &str, connection_id: &str) -> bool {
-        if !self.is_current_atem_connection(atem_id, connection_id) {
-            return false;
-        }
-        self.atem_txs.remove(atem_id);
-        true
-    }
-}
 
 fn relay_connection_event(atem_id: &str, connection_id: &str, event: &str) -> String {
     serde_json::json!({
@@ -111,90 +72,343 @@ fn relay_connection_event(atem_id: &str, connection_id: &str, event: &str) -> St
     .to_string()
 }
 
+/// An Atem frame wrapped for its Astation. A non-JSON frame travels as a
+/// JSON string payload.
+fn atem_envelope(atem_id: &str, connection_id: &str, text: &str) -> String {
+    let payload = serde_json::from_str::<serde_json::Value>(text)
+        .unwrap_or_else(|_| serde_json::Value::String(text.to_string()));
+    serde_json::json!({
+        "atem_id": atem_id,
+        "connection_id": connection_id,
+        "payload": payload,
+    })
+    .to_string()
+}
+
+/// What a hub is built from: in-memory parts by default, Redis-backed
+/// parts when REDIS_URL is set.
+pub(crate) struct HubParts {
+    pub replica_id: String,
+    pub directory: Arc<dyn RoomDirectory>,
+    pub bus: Arc<dyn ReplicaBus>,
+    pub local: LocalSockets,
+    pub keys: KeyCache,
+    pub auth_timeout: Duration,
+}
+
+struct HubInner {
+    replica_id: String,
+    directory: Arc<dyn RoomDirectory>,
+    bus: Arc<dyn ReplicaBus>,
+    local: LocalSockets,
+    keys: KeyCache,
+    auth_timeout: Duration,
+}
+
+/// The relay: this replica's sockets plus the shared room directory, the
+/// replica bus and the Astation key cache.
 #[derive(Clone)]
 pub struct RelayHub {
-    rooms: Arc<RwLock<HashMap<String, PairRoom>>>,
-    /// How long an Astation has to answer the relay-auth challenge.
-    auth_timeout: std::time::Duration,
-    /// Authoritative copy of the registered Astation keys (astation_id →
-    /// lowercase hex), loaded at startup and written through on registration.
-    /// Connects and verifications read it with no I/O, so a connect flood or a
-    /// database outage can't lock registered Astations out.
-    keys: Arc<std::sync::RwLock<HashMap<String, String>>>,
+    inner: Arc<HubInner>,
 }
 
 impl RelayHub {
+    /// Single-instance hub: in-memory directory, loopback bus.
     pub fn new() -> Self {
+        Self::in_memory(
+            InMemoryRoomDirectory::new(),
+            Duration::from_secs(RELAY_AUTH_TIMEOUT_SECS),
+        )
+    }
+
+    pub(crate) fn in_memory(directory: InMemoryRoomDirectory, auth_timeout: Duration) -> Self {
+        let local = LocalSockets::new();
+        Self::from_parts(HubParts {
+            replica_id: SINGLE_REPLICA_ID.to_string(),
+            directory: Arc::new(directory),
+            bus: Arc::new(LoopbackBus::new(SINGLE_REPLICA_ID, local.clone())),
+            local,
+            keys: KeyCache::new(),
+            auth_timeout,
+        })
+    }
+
+    pub(crate) fn from_parts(parts: HubParts) -> Self {
         Self {
-            rooms: Arc::new(RwLock::new(HashMap::new())),
-            auth_timeout: std::time::Duration::from_secs(RELAY_AUTH_TIMEOUT_SECS),
-            keys: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            inner: Arc::new(HubInner {
+                replica_id: parts.replica_id,
+                directory: parts.directory,
+                bus: parts.bus,
+                local: parts.local,
+                keys: parts.keys,
+                auth_timeout: parts.auth_timeout,
+            }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_auth_timeout(auth_timeout: Duration) -> Self {
+        Self::in_memory(InMemoryRoomDirectory::new(), auth_timeout)
+    }
+
+    pub fn replica_id(&self) -> &str {
+        &self.inner.replica_id
+    }
+
+    pub(crate) fn local(&self) -> &LocalSockets {
+        &self.inner.local
+    }
+
+    pub(crate) fn keys(&self) -> &KeyCache {
+        &self.inner.keys
+    }
+
+    pub(crate) fn directory(&self) -> &dyn RoomDirectory {
+        self.inner.directory.as_ref()
+    }
+
+    pub(crate) fn auth_timeout(&self) -> Duration {
+        self.inner.auth_timeout
+    }
+
+    fn me(&self, connection_id: &str) -> ConnRef {
+        ConnRef::new(connection_id, &self.inner.replica_id)
     }
 
     /// Replace the key cache with every key in `identity`. Called once at
     /// startup (before serving).
     pub async fn load_keys(&self, identity: &dyn IdentityStore) -> Result<usize, IdentityError> {
-        let keys: HashMap<String, String> = identity
-            .list_keys()
-            .await?
-            .into_iter()
-            .map(|(id, key)| (id, key.to_ascii_lowercase()))
-            .collect();
-        let count = keys.len();
-        *self.keys.write().unwrap_or_else(|e| e.into_inner()) = keys;
-        Ok(count)
+        self.inner.keys.load(identity).await
     }
 
-    fn cached_key(&self, astation_id: &str) -> Option<String> {
-        self.keys
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(astation_id)
-            .cloned()
-    }
-
-    fn has_key(&self, astation_id: &str) -> bool {
-        self.keys
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(astation_id)
-    }
-
-    fn cache_key(&self, astation_id: &str, public_key: &str) {
-        self.keys
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(astation_id.to_string(), public_key.to_ascii_lowercase());
-    }
-
-    fn forget_key(&self, astation_id: &str) {
-        self.keys
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(astation_id);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_auth_timeout(auth_timeout: std::time::Duration) -> Self {
-        Self {
-            auth_timeout,
-            ..Self::new()
+    /// Queue a frame on a connection, here or on its replica.
+    pub(crate) async fn deliver(&self, target: &ConnRef, frame: String) {
+        if target.replica == self.inner.replica_id {
+            self.inner.local.send(&target.conn, frame);
+            return;
+        }
+        let message = InboxMessage::Deliver {
+            connection_ids: vec![target.conn.clone()],
+            frame,
+        };
+        if let Err(error) = self.inner.bus.send_inbox(&target.replica, message).await {
+            tracing::debug!("Dropped a frame for replica {}: {}", target.replica, error);
         }
     }
 
-    /// Remove rooms that are older than ROOM_EXPIRY_SECS and have no astation connected.
+    /// Queue a frame on many connections: one bus message per replica.
+    pub(crate) async fn deliver_many(&self, targets: Vec<ConnRef>, frame: String) {
+        let mut by_replica: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for target in targets {
+            by_replica.entry(target.replica).or_default().push(target.conn);
+        }
+        for (replica, connection_ids) in by_replica {
+            if replica == self.inner.replica_id {
+                for connection_id in connection_ids {
+                    self.inner.local.send(&connection_id, frame.clone());
+                }
+                continue;
+            }
+            let message = InboxMessage::Deliver {
+                connection_ids,
+                frame: frame.clone(),
+            };
+            if let Err(error) = self.inner.bus.send_inbox(&replica, message).await {
+                tracing::debug!("Dropped a broadcast for replica {}: {}", replica, error);
+            }
+        }
+    }
+
+    /// End a connection wherever it is. `None` evicts it like a replaced
+    /// socket today; `Some((code, reason))` sends that close code.
+    pub(crate) async fn close_connection(&self, target: &ConnRef, code: Option<(u16, &str)>) {
+        if target.replica == self.inner.replica_id {
+            match code {
+                None => {
+                    self.inner.local.evict(&target.conn);
+                }
+                Some((code, reason)) => {
+                    self.inner.local.close_with(&target.conn, code, reason);
+                }
+            }
+            return;
+        }
+        let message = InboxMessage::Close {
+            connection_id: target.conn.clone(),
+            code: code.map(|(code, _)| code),
+            reason: code.map(|(_, reason)| reason.to_string()).unwrap_or_default(),
+        };
+        if let Err(error) = self.inner.bus.send_inbox(&target.replica, message).await {
+            tracing::debug!("Could not close a connection on replica {}: {}", target.replica, error);
+        }
+    }
+
+    /// A room's directory entry changed: other replicas drop cached copies.
+    pub(crate) async fn room_changed(&self, code: &str) {
+        let message = BroadcastMessage::RoomChanged { code: code.to_string() };
+        if let Err(error) = self.inner.bus.broadcast(message).await {
+            tracing::debug!("Could not announce a change of room {}: {}", mask_code(code), error);
+        }
+    }
+
+    /// An Astation key was registered, replaced or forgotten here.
+    pub(crate) async fn announce_key_change(&self, astation_id: &str) {
+        let message = BroadcastMessage::KeyChanged { astation_id: astation_id.to_string() };
+        if let Err(error) = self.inner.bus.broadcast(message).await {
+            tracing::warn!(
+                "Could not announce a key change for Astation {}: {}",
+                mask_code(astation_id),
+                error
+            );
+        }
+    }
+
+    /// The room as frame routing sees it.
+    async fn route_view(&self, code: &str) -> Result<Option<RoomInfo>, StoreError> {
+        self.inner.directory.get(code).await
+    }
+
+    /// The room, read fresh (HTTP endpoints, connect checks).
+    pub(crate) async fn room(&self, code: &str) -> Result<Option<RoomInfo>, StoreError> {
+        self.inner.directory.get(code).await
+    }
+
+    /// The current connection of `atem_id`, only if it is `connection_id`
+    /// (stale generations are dropped).
+    async fn find_atem(&self, code: &str, atem_id: &str, connection_id: &str) -> Option<ConnRef> {
+        match self.route_view(code).await {
+            Ok(room) => room
+                .and_then(|room| room.atems.get(atem_id).cloned())
+                .filter(|current| current.conn == connection_id),
+            Err(error) => {
+                tracing::debug!("Room lookup failed for {}: {}", mask_code(code), error);
+                None
+            }
+        }
+    }
+
+    pub(crate) async fn create_room(&self, code: &str, hostname: &str, now: i64) -> Result<(), StoreError> {
+        self.inner.directory.create_room(code, hostname, now).await?;
+        self.room_changed(code).await;
+        Ok(())
+    }
+
+    pub(crate) async fn ensure_room(&self, code: &str, hostname: &str, now: i64) -> Result<bool, StoreError> {
+        let created = self.inner.directory.ensure_room(code, hostname, now).await?;
+        if created {
+            self.room_changed(code).await;
+        }
+        Ok(created)
+    }
+
+    /// Remove a room and end every socket in it (DELETE /api/pair/:code).
+    pub(crate) async fn close_room(&self, code: &str) -> Result<bool, StoreError> {
+        let Some(room) = self.inner.directory.delete_room(code).await? else {
+            return Ok(false);
+        };
+        self.room_changed(code).await;
+        let members = room
+            .owner
+            .into_iter()
+            .chain(room.pending)
+            .chain(room.atems.into_values());
+        for member in members {
+            self.close_connection(&member, None).await;
+        }
+        Ok(true)
+    }
+
+    /// Room bookkeeping after `connection_id` proved the room's key
+    /// (`RoomDirectory::promote`): an unverified owner is evicted, a pending
+    /// connection takes over (replacing a verified owner too: an ordinary
+    /// reconnect) and learns the connected Atems, and a connection that
+    /// already owns the room is marked verified.
+    pub(crate) async fn promote_verified(
+        &self,
+        code: &str,
+        connection_id: &str,
+        was_pending: bool,
+    ) -> Result<(), StoreError> {
+        let me = self.me(connection_id);
+        match self.inner.directory.promote(code, &me, was_pending).await? {
+            Promotion::NoRoom => return Ok(()),
+            Promotion::AlreadyOwner => {}
+            Promotion::NotPending { evicted } => {
+                if let Some(evicted) = evicted {
+                    tracing::warn!(
+                        "Evicting unverified Astation owner of keyed room {}",
+                        mask_code(code)
+                    );
+                    self.close_connection(&evicted, None).await;
+                }
+            }
+            Promotion::Promoted {
+                previous_owner,
+                evicted_unverified,
+                atems,
+            } => {
+                if evicted_unverified {
+                    tracing::warn!(
+                        "Evicting unverified Astation owner of keyed room {}",
+                        mask_code(code)
+                    );
+                }
+                for (atem_id, connection) in &atems {
+                    self.inner.local.send(
+                        connection_id,
+                        relay_connection_event(atem_id, &connection.conn, "connected"),
+                    );
+                }
+                if let Some(previous) = previous_owner {
+                    self.close_connection(&previous, None).await;
+                }
+            }
+        }
+        self.room_changed(code).await;
+        Ok(())
+    }
+
+    /// Close every local socket of a room that no longer exists.
+    fn evict_room_locally(&self, code: &str) {
+        for (connection_id, _) in self.inner.local.connections_in_room(code) {
+            self.inner.local.evict(&connection_id);
+        }
+    }
+
+    /// Periodic room upkeep, idempotent on every replica:
+    /// - in-memory: remove rooms that are older than ROOM_EXPIRY_SECS and
+    ///   have no Astation (Redis expires them itself);
+    /// - keep alive the rooms where this replica holds an Astation socket;
+    /// - close local Atem sockets whose room is gone (as today's sweep did).
     pub async fn cleanup_expired(&self) {
-        let now = Instant::now();
-        let mut rooms = self.rooms.write().await;
-        rooms.retain(|_, room| {
-            let age = now.duration_since(room.created_at).as_secs();
-            // Keep if not expired, or if an astation is connected (actively
-            // paired) or still proving its key.
-            age < ROOM_EXPIRY_SECS
-                || room.astation_tx.is_some()
-                || !room.pending_astations.is_empty()
-        });
+        let now = chrono::Utc::now().timestamp();
+        match self.inner.directory.remove_expired(now).await {
+            Ok(removed) => {
+                for code in removed {
+                    self.evict_room_locally(&code);
+                }
+            }
+            Err(error) => tracing::warn!("Room sweep failed: {}", error),
+        }
+        for code in self.inner.local.codes_with_astations() {
+            if let Err(error) = self.inner.directory.touch(&code).await {
+                tracing::debug!("Room heartbeat failed for {}: {}", mask_code(&code), error);
+            }
+        }
+        let atem_codes = self.inner.local.codes_with_atems();
+        if atem_codes.is_empty() {
+            return;
+        }
+        match self.inner.directory.exists(&atem_codes).await {
+            Ok(present) => {
+                for (code, exists) in atem_codes.iter().zip(present) {
+                    if !exists {
+                        self.evict_room_locally(code);
+                    }
+                }
+            }
+            Err(error) => tracing::debug!("Room existence check failed: {}", error),
+        }
     }
 }
 
@@ -265,6 +479,19 @@ pub struct PairPageQuery {
 
 // --- Handlers ---
 
+fn relay_state_unavailable(error: &StoreError) -> (StatusCode, Json<serde_json::Value>) {
+    tracing::error!("Relay state unavailable: {}", error);
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "relay state unavailable"})),
+    )
+}
+
+fn ws_unavailable(error: &StoreError) -> Response {
+    tracing::error!("Refused a WebSocket, relay state unavailable: {}", error);
+    (StatusCode::SERVICE_UNAVAILABLE, "Relay state unavailable, retry shortly").into_response()
+}
+
 /// POST /api/pair — Register for pairing, get a code back.
 pub async fn create_pair_handler(
     State(state): State<AppState>,
@@ -279,13 +506,11 @@ pub async fn create_pair_handler(
             .into_response();
     }
 
-    let hub = &state.relay;
     let code = generate_pairing_code();
-    let room = PairRoom::new(&code, &body.hostname);
-
-    let mut rooms = hub.rooms.write().await;
-    rooms.insert(code.clone(), room);
-    drop(rooms);
+    let now = chrono::Utc::now().timestamp();
+    if let Err(error) = state.relay.create_room(&code, &body.hostname, now).await {
+        return relay_state_unavailable(&error).into_response();
+    }
 
     tracing::info!("Pair room created: {}", mask_code(&code));
     (StatusCode::CREATED, Json(CreatePairResponse { code })).into_response()
@@ -296,35 +521,32 @@ pub async fn pair_status_handler(
     State(state): State<AppState>,
     axum::extract::Path(code): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let rooms = state.relay.rooms.read().await;
-    match rooms.get(&code) {
-        Some(room) => {
-            let atem_count = room.atem_txs.len();
-            let atem_connected = atem_count > 0;
-            let astation_connected = room.astation_tx.is_some();
-            let paired = atem_connected && astation_connected;
-            let age = Instant::now().duration_since(room.created_at).as_secs();
-            let expired = !astation_connected && age >= ROOM_EXPIRY_SECS;
-            let atem_ids = if atem_count > 0 {
-                Some(room.atem_txs.keys().cloned().collect())
-            } else {
-                None
-            };
-            Ok(Json(PairStatusResponse {
-                paired,
-                hostname: room.hostname.clone(),
-                atem_count,
-                atem_ids,
-                atem_connected,
-                astation_connected,
-                expired,
-            }))
-        }
-        None => Err((
+    let room = match state.relay.room(&code).await {
+        Ok(room) => room,
+        Err(error) => return relay_state_unavailable(&error).into_response(),
+    };
+    let Some(room) = room else {
+        return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Room not found"})),
-        )),
-    }
+        )
+            .into_response();
+    };
+    let now = chrono::Utc::now().timestamp();
+    let atem_count = room.atems.len();
+    let atem_connected = atem_count > 0;
+    let astation_connected = room.owner.is_some();
+    let atem_ids = (atem_count > 0).then(|| room.atems.keys().cloned().collect());
+    Json(PairStatusResponse {
+        paired: atem_connected && astation_connected,
+        hostname: room.hostname.clone(),
+        atem_count,
+        atem_ids,
+        atem_connected,
+        astation_connected,
+        expired: room.is_expired(now),
+    })
+    .into_response()
 }
 
 /// DELETE /api/pair/:code — Close a pairing room.
@@ -335,7 +557,7 @@ pub async fn delete_pair_handler(
     State(state): State<AppState>,
     axum::extract::Path(code): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    if state.relay.has_key(&code) {
+    if state.relay.keys().contains(&code) {
         tracing::warn!("Refused DELETE of keyed room {}", mask_code(&code));
         return (
             StatusCode::CONFLICT,
@@ -343,12 +565,15 @@ pub async fn delete_pair_handler(
         )
             .into_response();
     }
-    let mut rooms = state.relay.rooms.write().await;
-    if rooms.remove(&code).is_some() {
-        tracing::info!("Pair room closed by client: {}", mask_code(&code));
-        (StatusCode::OK, Json(DeletePairResponse { closed: true })).into_response()
-    } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Room not found"}))).into_response()
+    match state.relay.close_room(&code).await {
+        Ok(true) => {
+            tracing::info!("Pair room closed by client: {}", mask_code(&code));
+            (StatusCode::OK, Json(DeletePairResponse { closed: true })).into_response()
+        }
+        Ok(false) => {
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Room not found"}))).into_response()
+        }
+        Err(error) => relay_state_unavailable(&error).into_response(),
     }
 }
 
@@ -362,30 +587,23 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     let hub = state.relay.clone();
+    let now = chrono::Utc::now().timestamp();
 
     // Session-based auth (hybrid flow)
     if let Some(session_id) = params.session.clone() {
-        // Validate session
         let session = state.sessions.get(&session_id).await;
         match session {
             Some(s) if s.status == crate::auth::SessionStatus::Granted => {
                 // Valid session - use session_id as room code, role defaults to "atem"
                 let code = format!("session-{}", session_id);
                 let role = params.role.clone().unwrap_or_else(|| "atem".to_string());
-
-                // Create room if it doesn't exist
-                {
-                    let mut rooms = hub.rooms.write().await;
-                    if !rooms.contains_key(&code) {
-                        rooms.insert(code.clone(), PairRoom::new(&code, &s.hostname));
-                    }
+                if let Err(error) = hub.ensure_room(&code, &s.hostname, now).await {
+                    return ws_unavailable(&error);
                 }
-
                 let atem_id = params.atem_id.clone().unwrap_or_else(|| "session-atem".to_string());
                 let identity = state.identity.clone();
-                return ws.on_upgrade(move |socket| {
-                    handle_ws(hub, identity, code, role, atem_id, socket)
-                })
+                return ws
+                    .on_upgrade(move |socket| handle_ws(hub, identity, code, role, atem_id, socket))
                     .into_response();
             }
             _ => {
@@ -407,24 +625,20 @@ pub async fn ws_handler(
     // For astation: auto-create identity room if it doesn't exist (allows persistent relay rooms).
     // For atem/other: verify the room exists and has not expired.
     if role == "astation" {
-        let mut rooms = hub.rooms.write().await;
-        rooms.entry(code.clone()).or_insert_with(|| {
-            tracing::info!("Auto-creating identity room for code={}", mask_code(&code));
-            PairRoom::new(&code, "identity")
-        });
+        match hub.ensure_room(&code, IDENTITY_HOSTNAME, now).await {
+            Ok(true) => tracing::info!("Auto-creating identity room for code={}", mask_code(&code)),
+            Ok(false) => {}
+            Err(error) => return ws_unavailable(&error),
+        }
     } else {
-        let rooms = hub.rooms.read().await;
-        match rooms.get(&code) {
-            None => return (StatusCode::NOT_FOUND, "Room not found").into_response(),
-            Some(room) => {
-                // If room is expired (no astation and older than limit), reject with 410 Gone
-                if room.astation_tx.is_none() {
-                    let age = Instant::now().duration_since(room.created_at).as_secs();
-                    if age >= ROOM_EXPIRY_SECS {
-                        return (StatusCode::GONE, "Pairing code has expired").into_response();
-                    }
-                }
+        match hub.room(&code).await {
+            Err(error) => return ws_unavailable(&error),
+            Ok(None) => return (StatusCode::NOT_FOUND, "Room not found").into_response(),
+            // No Astation and older than the limit: 410 Gone.
+            Ok(Some(room)) if room.is_expired(now) => {
+                return (StatusCode::GONE, "Pairing code has expired").into_response();
             }
+            Ok(Some(_)) => {}
         }
     }
 
@@ -639,14 +853,6 @@ struct AstationAuth {
     state: AuthState,
 }
 
-/// Send a frame to this connection while something still holds its sender
-/// (the room, as owner or pending). A replaced socket has none left.
-fn send_self(weak_tx: &mpsc::WeakUnboundedSender<String>, frame: String) {
-    if let Some(tx) = weak_tx.upgrade() {
-        let _ = tx.send(frame);
-    }
-}
-
 /// Record a successful verification without blocking or failing it.
 fn touch_key_in_background(identity: &Arc<dyn IdentityStore>, astation_id: &str, now: i64) {
     let identity = identity.clone();
@@ -696,16 +902,22 @@ async fn verify_relay_auth(
         return Err("signature verification failed");
     }
 
-    if let Some(cached) = hub.cached_key(astation_id) {
-        if cached == public_key {
+    let keys = hub.keys();
+    if let Some(cached) = keys.get(astation_id) {
+        if cached.public_key == public_key && !cached.stale {
             touch_key_in_background(identity, astation_id, now);
             return Ok("verified");
         }
-        // Mismatch: the cache may predate an admin reset. Re-read the key.
+        // Mismatch, or an entry a failed re-read left stale: the cache may
+        // predate an admin reset. Re-read the key.
         match tokio::time::timeout(IDENTITY_STORE_TIMEOUT, identity.get_key(astation_id)).await {
             Ok(Ok(Some(stored))) => {
                 let stored = stored.to_ascii_lowercase();
-                hub.cache_key(astation_id, &stored);
+                let changed = stored != cached.public_key;
+                keys.set(astation_id, &stored);
+                if changed {
+                    hub.announce_key_change(astation_id).await;
+                }
                 if stored != public_key {
                     return Err(KEY_MISMATCH);
                 }
@@ -714,7 +926,8 @@ async fn verify_relay_auth(
             }
             Ok(Ok(None)) => {
                 // Admin reset: fall through to registration of the new key.
-                hub.forget_key(astation_id);
+                keys.forget(astation_id);
+                hub.announce_key_change(astation_id).await;
             }
             Ok(Err(error)) => {
                 tracing::error!(
@@ -741,12 +954,17 @@ async fn verify_relay_auth(
     .await;
     match registration {
         Ok(Ok(RegisterOutcome::Registered)) => {
-            hub.cache_key(astation_id, &public_key);
+            keys.set(astation_id, &public_key);
+            hub.announce_key_change(astation_id).await;
             Ok("registered")
         }
         Ok(Ok(RegisterOutcome::Existing(stored))) => {
             let stored = stored.to_ascii_lowercase();
-            hub.cache_key(astation_id, &stored);
+            let known = keys.get(astation_id).map(|cached| cached.public_key);
+            keys.set(astation_id, &stored);
+            if known.as_deref() != Some(stored.as_str()) {
+                hub.announce_key_change(astation_id).await;
+            }
             if stored == public_key {
                 touch_key_in_background(identity, astation_id, now);
                 Ok("verified")
@@ -878,63 +1096,13 @@ async fn apply_binding_message(
     }
 }
 
-/// Room bookkeeping after `connection_id` proved the room's key.
-///
-/// - An unverified owner on another socket (one that slipped in while the key
-///   was first being registered) is evicted; its socket then closes.
-/// - A pending connection takes over the room (replacing a verified owner too:
-///   that is an ordinary reconnect) and learns the connected Atems.
-/// - A connection that already owns the room is marked verified.
-async fn promote_verified_astation(
-    hub: &RelayHub,
-    code: &str,
-    connection_id: &str,
-    was_pending: bool,
-) {
-    let mut rooms = hub.rooms.write().await;
-    let Some(room) = rooms.get_mut(code) else {
-        return;
-    };
-    let owned_by_me = room.astation_connection_id.as_deref() == Some(connection_id);
-    if owned_by_me {
-        room.astation_verified = true;
-        return;
-    }
-    if room.astation_connection_id.is_some() && !room.astation_verified {
-        tracing::warn!(
-            "Evicting unverified Astation owner of keyed room {}",
-            mask_code(code)
-        );
-        room.astation_tx = None;
-        room.astation_connection_id = None;
-    }
-    if !was_pending {
-        return;
-    }
-    let Some(tx) = room.pending_astations.remove(connection_id) else {
-        return;
-    };
-    for (atem_id, connection) in &room.atem_txs {
-        let _ = tx.send(relay_connection_event(
-            atem_id,
-            &connection.connection_id,
-            "connected",
-        ));
-    }
-    room.astation_tx = Some(tx);
-    room.astation_connection_id = Some(connection_id.to_string());
-    room.astation_verified = true;
-}
-
 /// Handle a relay-auth frame from an Astation. Returns `false` when the
 /// connection must be closed (its rejection has been queued).
-#[allow(clippy::too_many_arguments)]
 async fn handle_astation_control(
     hub: &RelayHub,
     identity: &Arc<dyn IdentityStore>,
     code: &str,
     connection_id: &str,
-    weak_tx: &mpsc::WeakUnboundedSender<String>,
     auth: &mut AstationAuth,
     kind: &str,
     message: &serde_json::Value,
@@ -948,7 +1116,10 @@ async fn handle_astation_control(
             }
             if Instant::now() >= auth.deadline {
                 tracing::warn!("Rejected late relayAuth from Astation {}", mask_code(code));
-                send_self(weak_tx, relay_auth_result_frame("rejected", "challenge expired"));
+                hub.local().send(
+                    connection_id,
+                    relay_auth_result_frame("rejected", "challenge expired"),
+                );
                 return false;
             }
             match verify_relay_auth(hub, identity, code, &auth.challenge, message, now).await {
@@ -958,16 +1129,24 @@ async fn handle_astation_control(
                     } else {
                         "key verified"
                     };
-                    send_self(weak_tx, relay_auth_result_frame(status, message));
+                    hub.local().send(connection_id, relay_auth_result_frame(status, message));
                     let was_pending = auth.state == AuthState::Pending;
                     auth.state = AuthState::Verified;
-                    promote_verified_astation(hub, code, connection_id, was_pending).await;
+                    if let Err(error) = hub.promote_verified(code, connection_id, was_pending).await {
+                        tracing::error!(
+                            "Relay state unavailable promoting Astation {}: {}",
+                            mask_code(code),
+                            error
+                        );
+                        hub.local().close_with(connection_id, CLOSE_TRY_AGAIN, "relay state unavailable");
+                        return false;
+                    }
                     tracing::info!("Astation {} relay identity {}", mask_code(code), status);
                     true
                 }
                 Err(reason) => {
                     tracing::warn!("Rejected relayAuth for Astation {}: {}", mask_code(code), reason);
-                    send_self(weak_tx, relay_auth_result_frame("rejected", reason));
+                    hub.local().send(connection_id, relay_auth_result_frame("rejected", reason));
                     false
                 }
             }
@@ -983,11 +1162,135 @@ async fn handle_astation_control(
                 );
                 relay_ack_err(kind, "not verified")
             };
-            send_self(weak_tx, ack);
+            hub.local().send(connection_id, ack);
             true
         }
         // Relay → Astation frame types echoed back: dropped.
         _ => true,
+    }
+}
+
+/// How a new socket entered its room.
+enum Registration {
+    Registered,
+    /// An Atem's room is gone (removed since ws_handler checked).
+    RoomGone,
+    /// The room already has MAX_PENDING_ASTATIONS_PER_ROOM pending sockets.
+    TooManyPending,
+}
+
+/// Put a new socket into its room and send its startup frames.
+async fn register_connection(
+    hub: &RelayHub,
+    code: &str,
+    atem_id: &str,
+    connection_id: &str,
+    auth: Option<&mut AstationAuth>,
+) -> Result<Registration, StoreError> {
+    let me = hub.me(connection_id);
+    let Some(auth) = auth else {
+        return match hub.directory().join_atem(code, atem_id, &me).await? {
+            AtemJoin::NoRoom => Ok(Registration::RoomGone),
+            AtemJoin::Joined { replaced, owner } => {
+                hub.room_changed(code).await;
+                if let Some(replaced) = replaced {
+                    hub.close_connection(&replaced, None).await;
+                }
+                if let Some(owner) = owner {
+                    hub.deliver(&owner, relay_connection_event(atem_id, connection_id, "connected"))
+                        .await;
+                }
+                Ok(Registration::Registered)
+            }
+        };
+    };
+    // The challenge is always the first frame.
+    hub.local().send(connection_id, relay_auth_challenge_frame(&auth.challenge));
+    // Decided from the key cache, with no I/O. A registration that lands
+    // after this is handled by promote_verified, which evicts an
+    // unverified owner.
+    if hub.keys().contains(code) {
+        auth.state = AuthState::Pending;
+    }
+    let now = chrono::Utc::now().timestamp();
+    if auth.state == AuthState::Pending {
+        let admitted = hub
+            .directory()
+            .add_pending(code, &me, now, MAX_PENDING_ASTATIONS_PER_ROOM)
+            .await?;
+        if !admitted {
+            return Ok(Registration::TooManyPending);
+        }
+        hub.room_changed(code).await;
+        return Ok(Registration::Registered);
+    }
+    let claim = hub.directory().claim_owner(code, &me, now).await?;
+    hub.room_changed(code).await;
+    if let Some(replaced) = claim.replaced {
+        hub.close_connection(&replaced, None).await;
+    }
+    for (atem, connection) in &claim.atems {
+        hub.local().send(
+            connection_id,
+            relay_connection_event(atem, &connection.conn, "connected"),
+        );
+    }
+    Ok(Registration::Registered)
+}
+
+/// Forward queued frames to the socket, with periodic pings for NAT
+/// keepalive (URLSession and tungstenite answer server pings, no client
+/// change). Ends when the queue's sender is gone (flush, then a plain
+/// close) or on a close request (that close frame, at once).
+async fn write_loop(
+    mut ws_sink: SplitSink<WebSocket, Message>,
+    mut outbox: SocketOutbox,
+    code: String,
+) {
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(WS_PING_INTERVAL_SECS));
+    ping_interval.tick().await; // skip the immediate first tick
+    let mut watch_close = true;
+    loop {
+        tokio::select! {
+            biased;
+            changed = outbox.close.changed(), if watch_close => {
+                if changed.is_err() {
+                    // Evicted: no close code; flush the queue below.
+                    watch_close = false;
+                    continue;
+                }
+                let request = outbox.close.borrow_and_update().clone();
+                if let Some((close_code, reason)) = request {
+                    let _ = ws_sink
+                        .send(Message::Close(Some(CloseFrame {
+                            code: close_code,
+                            reason: reason.into(),
+                        })))
+                        .await;
+                    break;
+                }
+            }
+            msg = outbox.frames.recv() => {
+                match msg {
+                    Some(text) => {
+                        if ws_sink.send(Message::Text(text)).await.is_err() {
+                            tracing::debug!("WS write failed for {}", mask_code(&code));
+                            break;
+                        }
+                    }
+                    None => {
+                        let _ = ws_sink.close().await;
+                        break;
+                    }
+                }
+            }
+            _ = ping_interval.tick() => {
+                if ws_sink.send(Message::Ping(Vec::new())).await.is_err() {
+                    tracing::debug!("WS ping failed for {} — removing dead connection", mask_code(&code));
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -997,6 +1300,9 @@ async fn handle_astation_control(
 /// Astation → Atem: Astation echoes both IDs with the payload; stale generations are dropped.
 /// Astation → ALL:   Astation sends raw JSON (no `atem_id` key) → relay BROADCASTS to every Atem in the room
 /// Astation → relay: relay-auth frames (see above) are handled here, never forwarded.
+///
+/// The socket may be on any replica; its peers may be on others (delivered
+/// through the bus).
 async fn handle_ws(
     hub: RelayHub,
     identity: Arc<dyn IdentityStore>,
@@ -1005,98 +1311,63 @@ async fn handle_ws(
     atem_id: String,
     socket: WebSocket,
 ) {
-    let (mut ws_sink, mut ws_stream) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let socket_role = match role.as_str() {
+        "atem" => SocketRole::Atem { atem_id: atem_id.clone() },
+        "astation" => SocketRole::Astation,
+        _ => {
+            tracing::warn!("Unknown role: {}", role);
+            return;
+        }
+    };
+    let (ws_sink, mut ws_stream) = socket.split();
     let connection_id = Uuid::new_v4().to_string();
+    let local = hub.local().clone();
+    let outbox = local.register(&connection_id, &code, socket_role);
 
     // An Astation gets a challenge; it must prove the key first when one is
-    // registered for this room code (decided below from the key cache, with
-    // no I/O).
+    // registered for this room code (decided from the key cache, no I/O).
     let mut astation_auth = (role == "astation").then(|| AstationAuth {
         challenge: new_relay_challenge(),
-        deadline: Instant::now() + hub.auth_timeout,
+        deadline: Instant::now() + hub.auth_timeout(),
         state: AuthState::Legacy,
     });
 
-    // Register this side's sender in the room
-    let startup_notifications = {
-        let mut rooms = hub.rooms.write().await;
-        let room = if role == "astation" {
-            // An Astation owns its identity room; recreate it if it was
-            // removed since ws_handler checked.
-            rooms
-                .entry(code.clone())
-                .or_insert_with(|| PairRoom::new(&code, "identity"))
-        } else {
-            match rooms.get_mut(&code) {
-                Some(r) => r,
-                None => {
-                    tracing::warn!("Room {} disappeared before WS setup", mask_code(&code));
-                    return;
-                }
-            }
-        };
+    // The writer runs from the start, so a refusal below still reaches the client.
+    let mut write_task = tokio::spawn(write_loop(ws_sink, outbox, code.clone()));
 
-        let mut notifications = Vec::new();
-        match (role.as_str(), astation_auth.as_mut()) {
-            ("atem", _) => {
-                room.atem_txs.insert(
-                    atem_id.clone(),
-                    AtemConnection {
-                        connection_id: connection_id.clone(),
-                        tx: tx.clone(),
-                    },
-                );
-                if let Some(astation_tx) = room.astation_tx.clone() {
-                    notifications.push((
-                        astation_tx,
-                        relay_connection_event(&atem_id, &connection_id, "connected"),
-                    ));
-                }
-            }
-            ("astation", Some(auth)) => {
-                // The challenge is always the first frame.
-                notifications.push((tx.clone(), relay_auth_challenge_frame(&auth.challenge)));
-                // Checked under the rooms lock: a registration that lands
-                // after this is handled by promote_verified_astation, which
-                // evicts an unverified owner.
-                if hub.has_key(&code) {
-                    auth.state = AuthState::Pending;
-                }
-                if auth.state == AuthState::Pending {
-                    room.pending_astations
-                        .insert(connection_id.clone(), tx.clone());
-                } else {
-                    room.astation_tx = Some(tx.clone());
-                    room.astation_connection_id = Some(connection_id.clone());
-                    room.astation_verified = false;
-                    notifications.extend(room.atem_txs.iter().map(|(atem_id, connection)| {
-                        (
-                            tx.clone(),
-                            relay_connection_event(
-                                atem_id,
-                                &connection.connection_id,
-                                "connected",
-                            ),
-                        )
-                    }));
-                }
-            }
-            _ => {
-                tracing::warn!("Unknown role: {}", role);
-                return;
-            }
+    let registration =
+        register_connection(&hub, &code, &atem_id, &connection_id, astation_auth.as_mut()).await;
+    let refused = match registration {
+        Ok(Registration::Registered) => false,
+        Ok(Registration::RoomGone) => {
+            tracing::warn!("Room {} disappeared before WS setup", mask_code(&code));
+            local.evict(&connection_id);
+            true
         }
-        notifications
+        Ok(Registration::TooManyPending) => {
+            tracing::warn!(
+                "Refused a pending Astation for room {}: too many pending connections",
+                mask_code(&code)
+            );
+            local.close_with(&connection_id, CLOSE_TRY_AGAIN, "too many pending connections");
+            true
+        }
+        Err(error) => {
+            tracing::error!(
+                "Relay state unavailable registering {} in room {}: {}",
+                role,
+                mask_code(&code),
+                error
+            );
+            local.close_with(&connection_id, CLOSE_TRY_AGAIN, "relay state unavailable");
+            true
+        }
     };
-
-    for (target, notification) in startup_notifications {
-        let _ = target.send(notification);
+    if refused {
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut write_task).await;
+        write_task.abort();
+        return;
     }
-    // Only the room holds this connection's sender from here on; replacing or
-    // removing it there ends the writer and closes the socket.
-    let weak_tx = tx.downgrade();
-    drop(tx);
 
     tracing::info!(
         "WS connected: role={} code={}{}",
@@ -1107,49 +1378,6 @@ async fn handle_ws(
             _ => "",
         }
     );
-
-    // Task: forward messages from our channel to the WS sink, with periodic pings
-    // for NAT keepalive. URLSession (macOS) and tungstenite (Atem) both auto-respond
-    // to server pings with pong — no client changes needed.
-    let code_for_writer = code.clone();
-    let mut write_task = tokio::spawn(async move {
-        let mut ping_interval = tokio::time::interval(
-            std::time::Duration::from_secs(WS_PING_INTERVAL_SECS)
-        );
-        ping_interval.tick().await; // skip the immediate first tick
-        loop {
-            tokio::select! {
-                msg = rx.recv() => {
-                    match msg {
-                        Some(text) => {
-                            if ws_sink
-                                .send(axum::extract::ws::Message::Text(text.into()))
-                                .await
-                                .is_err()
-                            {
-                                tracing::debug!("WS write failed for {}", mask_code(&code_for_writer));
-                                break;
-                            }
-                        }
-                        None => {
-                            let _ = ws_sink.close().await;
-                            break;
-                        }
-                    }
-                }
-                _ = ping_interval.tick() => {
-                    if ws_sink
-                        .send(axum::extract::ws::Message::Ping(Vec::new()))
-                        .await
-                        .is_err()
-                    {
-                        tracing::debug!("WS ping failed for {} — removing dead connection", mask_code(&code_for_writer));
-                        break;
-                    }
-                }
-            }
-        }
-    });
 
     // Read incoming frames and forward to the other side.
     // A 90s idle timeout ensures dead connections (no pong response to our 60s ping)
@@ -1162,14 +1390,10 @@ async fn handle_ws(
     //      anything while pending          → dropped
     //      targeted envelope with both IDs → forward only to that exact socket generation
     //      raw msg (no atem_id)           → broadcast payload to ALL Atems in room
-    let hub_for_read = hub.clone();
-    let role_for_read = role.clone();
-    let code_for_read = code.clone();
-    let atem_id_for_read = atem_id.clone();
-    let read_timeout = std::time::Duration::from_secs(WS_PING_INTERVAL_SECS + 30);
-    // Set when this connection was rejected: its result frame must be flushed
-    // before the socket closes.
-    let mut rejected = false;
+    let read_timeout = Duration::from_secs(WS_PING_INTERVAL_SECS + 30);
+    // Set when the writer must flush (a rejection, a close frame) before
+    // the socket goes.
+    let mut flush_writer = false;
     loop {
         let pending_deadline = astation_auth
             .as_ref()
@@ -1179,13 +1403,13 @@ async fn handle_ws(
             if Instant::now() >= deadline {
                 tracing::warn!(
                     "Pending Astation {} did not prove its key in time",
-                    mask_code(&code_for_read)
+                    mask_code(&code)
                 );
-                send_self(
-                    &weak_tx,
+                local.send(
+                    &connection_id,
                     relay_auth_result_frame("rejected", "authentication timed out"),
                 );
-                rejected = true;
+                flush_writer = true;
                 break;
             }
         }
@@ -1199,220 +1423,176 @@ async fn handle_ws(
                 continue; // the deadline check at the top rejects it
             }
             Err(_) => {
-                tracing::debug!("WS idle timeout for {} {} — no frame in {}s", role, mask_code(&code_for_read), WS_PING_INTERVAL_SECS + 30);
+                tracing::debug!(
+                    "WS idle timeout for {} {} — no frame in {}s",
+                    role,
+                    mask_code(&code),
+                    WS_PING_INTERVAL_SECS + 30
+                );
                 break;
             }
         };
         match msg_result {
-            Ok(axum::extract::ws::Message::Text(text)) => {
-                match (role_for_read.as_str(), astation_auth.as_mut()) {
-                    ("atem", _) => {
-                        let is_current = {
-                            let rooms = hub_for_read.rooms.read().await;
-                            rooms
-                                .get(&code_for_read)
-                                .map(|room| {
-                                    room.is_current_atem_connection(
-                                        &atem_id_for_read,
-                                        &connection_id,
-                                    )
-                                })
-                                .unwrap_or(false)
-                        };
-                        if !is_current {
-                            tracing::debug!(
-                                "Dropping stale Atem connection: code={} atem_id={}",
-                                mask_code(&code_for_read),
-                                atem_id_for_read
-                            );
-                            break;
-                        }
-                        log_atem_auth_attempt(&code_for_read, &atem_id_for_read, &text);
-
-                        // Wrap with atem_id so Astation knows which Atem sent the message
-                        let astation_tx = {
-                            let rooms = hub_for_read.rooms.read().await;
-                            rooms.get(&code_for_read).and_then(|r| r.astation_tx.clone())
-                        };
-                        if let Some(tx) = astation_tx {
-                            // Parse payload as JSON value so serde handles escaping correctly
-                            let envelope = if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&text) {
-                                serde_json::json!({
-                                    "atem_id": atem_id_for_read,
-                                    "connection_id": connection_id.as_str(),
-                                    "payload": payload
-                                }).to_string()
-                            } else {
-                                // Fallback: treat as raw string payload
-                                serde_json::json!({
-                                    "atem_id": atem_id_for_read,
-                                    "connection_id": connection_id.as_str(),
-                                    "payload": text
-                                }).to_string()
-                            };
-                            let _ = tx.send(envelope);
-                        }
+            Ok(Message::Text(text)) => match (role.as_str(), astation_auth.as_mut()) {
+                ("atem", _) => {
+                    // A replaced or removed Atem socket is no longer registered here.
+                    if !local.contains(&connection_id) {
+                        tracing::debug!(
+                            "Dropping stale Atem connection: code={} atem_id={}",
+                            mask_code(&code),
+                            atem_id
+                        );
+                        break;
                     }
-                    ("astation", Some(auth)) => {
-                        let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
-                        if let Some(message) = parsed.as_ref() {
-                            if let Some(kind) = relay_control_type(message) {
-                                let keep_open = handle_astation_control(
-                                    &hub_for_read,
-                                    &identity,
-                                    &code_for_read,
-                                    &connection_id,
-                                    &weak_tx,
-                                    auth,
-                                    kind,
-                                    message,
-                                )
+                    log_atem_auth_attempt(&code, &atem_id, &text);
+                    match hub.route_view(&code).await {
+                        Ok(Some(RoomInfo { owner: Some(owner), .. })) => {
+                            hub.deliver(&owner, atem_envelope(&atem_id, &connection_id, &text))
                                 .await;
-                                if !keep_open {
-                                    rejected = true;
-                                    break;
-                                }
-                                continue;
-                            }
                         }
-                        if auth.state == AuthState::Pending {
-                            tracing::debug!(
-                                "Dropping message from pending Astation {}",
-                                mask_code(&code_for_read)
-                            );
+                        Ok(_) => {}
+                        Err(error) => tracing::debug!(
+                            "Dropped an Atem frame for {}: {}",
+                            mask_code(&code),
+                            error
+                        ),
+                    }
+                }
+                ("astation", Some(auth)) => {
+                    let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
+                    if let Some(message) = parsed.as_ref() {
+                        if let Some(kind) = relay_control_type(message) {
+                            let keep_open = handle_astation_control(
+                                &hub,
+                                &identity,
+                                &code,
+                                &connection_id,
+                                auth,
+                                kind,
+                                message,
+                            )
+                            .await;
+                            if !keep_open {
+                                flush_writer = true;
+                                break;
+                            }
                             continue;
                         }
-                        let is_current = {
-                            let rooms = hub_for_read.rooms.read().await;
-                            rooms
-                                .get(&code_for_read)
-                                .and_then(|room| room.astation_connection_id.as_deref())
-                                .map(|current| current == connection_id)
-                                .unwrap_or(false)
-                        };
-                        if !is_current {
-                            tracing::debug!("Dropping stale Astation connection: code={}", mask_code(&code_for_read));
-                            break;
-                        }
-                        // Parse a generation-bound envelope and route it to the current Atem socket.
-                        // Or raw JSON (no atem_id) → broadcast to all Atems
-                        if let Some(env) = parsed {
-                            if let Some(target_id) = env.get("atem_id").and_then(|v| v.as_str()) {
-                                let Some(requested_connection_id) = env
-                                    .get("connection_id")
-                                    .and_then(|value| value.as_str()) else {
-                                        tracing::debug!(
-                                            "Dropping generationless targeted message: code={} atem_id={}",
-                                            mask_code(&code_for_read),
-                                            target_id
-                                        );
-                                        continue;
-                                    };
-                                // Targeted: route payload to the specific Atem
-                                let payload = env.get("payload").cloned().unwrap_or(serde_json::Value::Null);
-                                let target_connection = {
-                                    let rooms = hub_for_read.rooms.read().await;
-                                    rooms
-                                        .get(&code_for_read)
-                                        .and_then(|room| room.atem_txs.get(target_id))
-                                        .filter(|connection| {
-                                            requested_connection_id == connection.connection_id
-                                        })
-                                        .cloned()
-                                };
-                                let Some(target_connection) = target_connection else {
-                                    tracing::debug!(
-                                        "Dropping message for stale or missing Atem connection: code={} atem_id={}",
-                                        mask_code(&code_for_read),
-                                        target_id
-                                    );
-                                    continue;
-                                };
-                                let payload_str = payload.to_string();
-                                let _ = target_connection.tx.send(payload_str);
-                            } else {
-                                // Broadcast: send raw message to all Atems
-                                let txs: Vec<_> = {
-                                    let rooms = hub_for_read.rooms.read().await;
-                                    rooms.get(&code_for_read)
-                                        .map(|r| {
-                                            r.atem_txs
-                                                .values()
-                                                .map(|connection| connection.tx.clone())
-                                                .collect()
-                                        })
-                                        .unwrap_or_default()
-                                };
-                                for tx in txs {
-                                    let _ = tx.send(text.to_string());
-                                }
-                            }
-                        }
                     }
-                    _ => {}
+                    if auth.state == AuthState::Pending {
+                        tracing::debug!(
+                            "Dropping message from pending Astation {}",
+                            mask_code(&code)
+                        );
+                        continue;
+                    }
+                    // A replaced owner is no longer registered here.
+                    if !local.contains(&connection_id) {
+                        tracing::debug!("Dropping stale Astation connection: code={}", mask_code(&code));
+                        break;
+                    }
+                    // A generation-bound envelope goes to that exact Atem
+                    // socket; raw JSON (no atem_id) goes to all Atems.
+                    let Some(envelope) = parsed else {
+                        continue;
+                    };
+                    if let Some(target_id) = envelope.get("atem_id").and_then(|v| v.as_str()) {
+                        let Some(requested_connection_id) = envelope
+                            .get("connection_id")
+                            .and_then(|value| value.as_str())
+                        else {
+                            tracing::debug!(
+                                "Dropping generationless targeted message: code={} atem_id={}",
+                                mask_code(&code),
+                                target_id
+                            );
+                            continue;
+                        };
+                        let payload = envelope
+                            .get("payload")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        match hub.find_atem(&code, target_id, requested_connection_id).await {
+                            Some(target) => hub.deliver(&target, payload.to_string()).await,
+                            None => tracing::debug!(
+                                "Dropping message for stale or missing Atem connection: code={} atem_id={}",
+                                mask_code(&code),
+                                target_id
+                            ),
+                        }
+                    } else {
+                        let targets = match hub.route_view(&code).await {
+                            Ok(Some(room)) => room.atems.into_values().collect(),
+                            Ok(None) => Vec::new(),
+                            Err(error) => {
+                                tracing::debug!(
+                                    "Dropped a broadcast for {}: {}",
+                                    mask_code(&code),
+                                    error
+                                );
+                                Vec::new()
+                            }
+                        };
+                        hub.deliver_many(targets, text.to_string()).await;
+                    }
                 }
-            }
-            Ok(axum::extract::ws::Message::Close(_)) => break,
-            Ok(axum::extract::ws::Message::Pong(_)) => {} // expected response to our Ping
+                _ => {}
+            },
+            Ok(Message::Close(_)) => break,
+            Ok(Message::Pong(_)) => {} // expected response to our Ping
             Err(e) => {
-                tracing::debug!("WS read error for {} {}: {}", role, mask_code(&code_for_read), e);
+                tracing::debug!("WS read error for {} {}: {}", role, mask_code(&code), e);
                 break;
             }
             _ => {}
         }
     }
 
-    // Cleanup: remove our sender from the room
-    let disconnect_notification = {
-        let mut rooms = hub_for_read.rooms.write().await;
-        let mut notification = None;
-        if let Some(room) = rooms.get_mut(&code) {
-            match role.as_str() {
-                "atem" => {
-                    if room.remove_atem_if_current(&atem_id, &connection_id) {
-                        notification = room.astation_tx.clone().map(|astation_tx| {
-                            (
-                                astation_tx,
-                                relay_connection_event(&atem_id, &connection_id, "disconnected"),
-                            )
-                        });
+    // Cleanup: leave the room (a stale close can't remove a newer connection).
+    match role.as_str() {
+        "atem" => match hub.directory().leave_atem(&code, &atem_id, &connection_id).await {
+            Ok(leave) => {
+                if leave.removed || leave.room_removed {
+                    hub.room_changed(&code).await;
+                }
+                if leave.removed {
+                    if let Some(owner) = leave.owner {
+                        hub.deliver(
+                            &owner,
+                            relay_connection_event(&atem_id, &connection_id, "disconnected"),
+                        )
+                        .await;
                     }
                 }
-                "astation" => {
-                    room.pending_astations.remove(&connection_id);
-                    if room
-                        .astation_connection_id
-                        .as_deref()
-                        .map(|current| current == connection_id)
-                        .unwrap_or(false)
-                    {
-                        room.astation_tx = None;
-                        room.astation_connection_id = None;
-                        room.astation_verified = false;
-                    }
+                if leave.room_removed {
+                    tracing::info!("Room {} removed (all sides disconnected)", mask_code(&code));
                 }
-                _ => {}
             }
-            // Remove the room only when all sides have disconnected
-            if room.atem_txs.is_empty()
-                && room.astation_tx.is_none()
-                && room.pending_astations.is_empty()
-            {
-                rooms.remove(&code);
-                tracing::info!("Room {} removed (all sides disconnected)", mask_code(&code));
+            Err(error) => tracing::warn!(
+                "Could not remove an Atem from room {}: {}",
+                mask_code(&code),
+                error
+            ),
+        },
+        _ => match hub.directory().leave_astation(&code, &connection_id).await {
+            Ok(room_removed) => {
+                hub.room_changed(&code).await;
+                if room_removed {
+                    tracing::info!("Room {} removed (all sides disconnected)", mask_code(&code));
+                }
             }
-        }
-        notification
-    };
-
-    if let Some((target, notification)) = disconnect_notification {
-        let _ = target.send(notification);
+            Err(error) => tracing::warn!(
+                "Could not remove an Astation from room {}: {}",
+                mask_code(&code),
+                error
+            ),
+        },
     }
 
-    if rejected {
-        // The room no longer holds our sender, so the writer drains the
-        // rejection, closes the socket, and exits.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut write_task).await;
+    // Drop our sender: the writer flushes what is queued and closes the socket.
+    local.evict(&connection_id);
+    if flush_writer {
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut write_task).await;
     }
     write_task.abort();
     tracing::info!("WS disconnected: role={} code={}", role, mask_code(&code));
@@ -1457,29 +1637,31 @@ pub async fn pair_page_handler(
     State(state): State<AppState>,
     Query(params): Query<PairPageQuery>,
 ) -> impl IntoResponse {
-    let (hostname, initial_status) = {
-        let rooms = state.relay.rooms.read().await;
-        match rooms.get(&params.code) {
-            Some(room) => {
-                let age = Instant::now().duration_since(room.created_at).as_secs();
-                let expired = room.astation_tx.is_none() && age >= ROOM_EXPIRY_SECS;
-                let status = InitialPageStatus {
-                    atem_connected: !room.atem_txs.is_empty(),
-                    astation_connected: room.astation_tx.is_some(),
-                    expired,
-                };
-                (room.hostname.clone(), status)
-            }
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Html("<h1>Pairing code not found</h1><p>The code may have expired.</p>".to_string()),
-                ).into_response()
-            }
+    let room = match state.relay.room(&params.code).await {
+        Ok(room) => room,
+        Err(error) => {
+            tracing::error!("Relay state unavailable for the pair page: {}", error);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Html("<h1>Temporarily unavailable</h1><p>Please retry in a moment.</p>".to_string()),
+            )
+                .into_response();
         }
     };
-    let html = render_pair_page(&params.code, &hostname, &initial_status);
-    Html(html).into_response()
+    let Some(room) = room else {
+        return (
+            StatusCode::NOT_FOUND,
+            Html("<h1>Pairing code not found</h1><p>The code may have expired.</p>".to_string()),
+        )
+            .into_response();
+    };
+    let now = chrono::Utc::now().timestamp();
+    let initial_status = InitialPageStatus {
+        atem_connected: !room.atems.is_empty(),
+        astation_connected: room.owner.is_some(),
+        expired: room.is_expired(now),
+    };
+    Html(render_pair_page(&params.code, &room.hostname, &initial_status)).into_response()
 }
 
 struct InitialPageStatus {
@@ -1747,26 +1929,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_atem_cleanup_does_not_remove_replacement() {
-        let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel::<String>();
-        let mut room = PairRoom {
-            atem_txs: HashMap::from([(
-                "atem-office".to_string(),
-                AtemConnection {
-                    connection_id: "replacement".to_string(),
-                    tx: replacement_tx,
-                },
-            )]),
-            ..PairRoom::new("identity-room", "identity")
-        };
-
-        assert!(!room.remove_atem_if_current("atem-office", "stale"));
-        assert!(room.is_current_atem_connection("atem-office", "replacement"));
-        assert!(room.remove_atem_if_current("atem-office", "replacement"));
-        assert!(!room.atem_txs.contains_key("atem-office"));
-    }
-
-    #[test]
     fn pairing_code_no_ambiguous_chars() {
         for _ in 0..100 {
             let code = generate_pairing_code();
@@ -1782,99 +1944,66 @@ mod tests {
     #[tokio::test]
     async fn relay_hub_create_and_lookup() {
         let hub = RelayHub::new();
+        hub.create_room("ABCD-EFGH", "test-host", now()).await.unwrap();
+        let room = hub.room("ABCD-EFGH").await.unwrap().expect("room exists");
+        assert_eq!(room.hostname, "test-host");
+    }
 
-        let room = PairRoom {
-            code: "ABCD-EFGH".to_string(),
-            hostname: "test-host".to_string(),
-            atem_txs: HashMap::new(),
-            astation_tx: None,
-            astation_connection_id: None,
-            pending_astations: HashMap::new(),
-            astation_verified: false,
-            created_at: Instant::now(),
-        };
-
-        hub.rooms
-            .write()
-            .await
-            .insert("ABCD-EFGH".to_string(), room);
-
-        let rooms = hub.rooms.read().await;
-        assert!(rooms.contains_key("ABCD-EFGH"));
-        assert_eq!(rooms["ABCD-EFGH"].hostname, "test-host");
+    fn hub_over(directory: &InMemoryRoomDirectory) -> RelayHub {
+        RelayHub::in_memory(directory.clone(), TEST_AUTH_TIMEOUT)
     }
 
     #[tokio::test]
     async fn relay_hub_cleanup_expired() {
-        let hub = RelayHub::new();
-
-        // Create a room with a very old timestamp
-        let room = PairRoom {
-            code: "OLD1-CODE".to_string(),
-            hostname: "old-host".to_string(),
-            atem_txs: HashMap::new(),
-            astation_tx: None,
-            astation_connection_id: None,
-            pending_astations: HashMap::new(),
-            astation_verified: false,
-            created_at: Instant::now() - std::time::Duration::from_secs(ROOM_EXPIRY_SECS + 10),
-        };
-        hub.rooms
-            .write()
-            .await
-            .insert("OLD1-CODE".to_string(), room);
-
-        // Create a fresh room
-        let fresh = PairRoom {
-            code: "NEW1-CODE".to_string(),
-            hostname: "new-host".to_string(),
-            atem_txs: HashMap::new(),
-            astation_tx: None,
-            astation_connection_id: None,
-            pending_astations: HashMap::new(),
-            astation_verified: false,
-            created_at: Instant::now(),
-        };
-        hub.rooms
-            .write()
-            .await
-            .insert("NEW1-CODE".to_string(), fresh);
-
+        let directory = InMemoryRoomDirectory::new();
+        let hub = hub_over(&directory);
+        directory.insert_for_test("OLD1-CODE", RoomInfo::new("old-host", now() - ROOM_EXPIRY_SECS - 10));
+        directory.insert_for_test("NEW1-CODE", RoomInfo::new("new-host", now()));
         hub.cleanup_expired().await;
-
-        let rooms = hub.rooms.read().await;
-        assert!(!rooms.contains_key("OLD1-CODE"), "Expired room should be removed");
-        assert!(rooms.contains_key("NEW1-CODE"), "Fresh room should remain");
+        assert!(hub.room("OLD1-CODE").await.unwrap().is_none(), "Expired room should be removed");
+        assert!(hub.room("NEW1-CODE").await.unwrap().is_some(), "Fresh room should remain");
     }
 
     #[tokio::test]
     async fn relay_hub_cleanup_keeps_paired() {
-        let hub = RelayHub::new();
-
-        // Create an old but paired room (astation_tx is Some)
-        let (tx, _rx) = mpsc::unbounded_channel::<String>();
-        let room = PairRoom {
-            code: "PAIR-CODE".to_string(),
-            hostname: "paired-host".to_string(),
-            atem_txs: HashMap::new(),
-            astation_tx: Some(tx),
-            astation_connection_id: Some("astation-test".to_string()),
-            pending_astations: HashMap::new(),
-            astation_verified: false,
-            created_at: Instant::now() - std::time::Duration::from_secs(ROOM_EXPIRY_SECS + 10),
-        };
-        hub.rooms
-            .write()
-            .await
-            .insert("PAIR-CODE".to_string(), room);
-
+        let directory = InMemoryRoomDirectory::new();
+        let hub = hub_over(&directory);
+        directory.insert_for_test(
+            "PAIR-CODE",
+            RoomInfo {
+                owner: Some(test_conn("astation-test")),
+                ..RoomInfo::new("paired-host", now() - ROOM_EXPIRY_SECS - 10)
+            },
+        );
         hub.cleanup_expired().await;
-
-        let rooms = hub.rooms.read().await;
         assert!(
-            rooms.contains_key("PAIR-CODE"),
+            hub.room("PAIR-CODE").await.unwrap().is_some(),
             "Paired room should not be cleaned up"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_keeps_recently_paired() {
+        let directory = InMemoryRoomDirectory::new();
+        let hub = hub_over(&directory);
+        let mut atems = std::collections::BTreeMap::new();
+        atems.insert("test-atem".to_string(), test_conn("connection-old"));
+        directory.insert_for_test(
+            "OLD-ATEM",
+            RoomInfo { atems, ..RoomInfo::new("old-host", now() - ROOM_EXPIRY_SECS - 10) },
+        );
+        let mut atem = hub.local().register(
+            "connection-old",
+            "OLD-ATEM",
+            SocketRole::Atem { atem_id: "test-atem".into() },
+        );
+        hub.cleanup_expired().await;
+        // Removed (only an Astation keeps a room), and its Atem socket is closed.
+        assert!(
+            hub.room("OLD-ATEM").await.unwrap().is_none(),
+            "Room with only atem connected should be cleaned up"
+        );
+        assert!(atem.frames.recv().await.is_none(), "the Atem's socket was closed");
     }
 
     fn default_status() -> InitialPageStatus {
@@ -1887,6 +2016,85 @@ mod tests {
         assert!(html.contains("TEST-CODE"));
         assert!(html.contains("my-host"));
         assert!(html.contains("astation://pair?code=TEST-CODE"));
+    }
+
+    use crate::cluster::bus::{BroadcastMessage as BusBroadcast, InboxMessage, ReplicaBus as BusTrait};
+    use crate::cluster::directory::{InMemoryRoomDirectory, RoomInfo, ROOM_EXPIRY_SECS};
+    use crate::cluster::local::SocketRole;
+    use crate::cluster::{ConnRef, StoreError as ClusterError, SINGLE_REPLICA_ID};
+
+    fn now() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    fn test_conn(conn: &str) -> ConnRef {
+        ConnRef::new(conn, SINGLE_REPLICA_ID)
+    }
+
+    /// A bus that records what a hub publishes to other replicas.
+    #[derive(Default)]
+    struct RecordingBus {
+        inbox: std::sync::Mutex<Vec<(String, InboxMessage)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BusTrait for RecordingBus {
+        fn backend_name(&self) -> &'static str {
+            "recording"
+        }
+        async fn send_inbox(&self, replica_id: &str, message: InboxMessage) -> Result<(), ClusterError> {
+            self.inbox.lock().unwrap().push((replica_id.to_string(), message));
+            Ok(())
+        }
+        async fn broadcast(&self, _message: BusBroadcast) -> Result<(), ClusterError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn deliveries_stay_local_or_go_to_the_owning_replica() {
+        let bus = std::sync::Arc::new(RecordingBus::default());
+        let local = crate::cluster::local::LocalSockets::new();
+        let hub = RelayHub::from_parts(HubParts {
+            replica_id: "r1".to_string(),
+            directory: std::sync::Arc::new(InMemoryRoomDirectory::new()),
+            bus: bus.clone(),
+            local: local.clone(),
+            keys: crate::cluster::keys::KeyCache::new(),
+            auth_timeout: TEST_AUTH_TIMEOUT,
+        });
+        let mut here = local.register("a", "room", SocketRole::Astation);
+        hub.deliver_many(
+            vec![ConnRef::new("a", "r1"), ConnRef::new("b", "r2"), ConnRef::new("c", "r2")],
+            "frame".to_string(),
+        )
+        .await;
+        assert_eq!(here.frames.recv().await.as_deref(), Some("frame"));
+        hub.deliver(&ConnRef::new("x", "r3"), "one".to_string()).await;
+        hub.close_connection(&ConnRef::new("y", "r2"), None).await;
+        hub.close_connection(&ConnRef::new("a", "r1"), Some((1012, "restart"))).await;
+        assert!(!local.contains("a"));
+        let sent = bus.inbox.lock().unwrap().clone();
+        assert_eq!(
+            sent,
+            vec![
+                (
+                    "r2".to_string(),
+                    InboxMessage::Deliver {
+                        connection_ids: vec!["b".into(), "c".into()],
+                        frame: "frame".into(),
+                    }
+                ),
+                (
+                    "r3".to_string(),
+                    InboxMessage::Deliver { connection_ids: vec!["x".into()], frame: "one".into() }
+                ),
+                (
+                    "r2".to_string(),
+                    InboxMessage::Close { connection_id: "y".into(), code: None, reason: String::new() }
+                ),
+            ]
+        );
     }
 
     // --- Integration tests (HTTP endpoint tests) ---
@@ -2369,39 +2577,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cleanup_expired_keeps_recently_paired() {
-        let hub = RelayHub::new();
-
-        // Create an old room but with atem connected (not astation)
-        let (tx_atem, _rx) = mpsc::unbounded_channel::<String>();
-        let mut old_atem_txs = HashMap::new();
-        old_atem_txs.insert(
-            "test-atem".to_string(),
-            AtemConnection {
-                connection_id: "connection-old".to_string(),
-                tx: tx_atem,
-            },
-        );
-        let room = PairRoom {
-            code: "OLD-ATEM".to_string(),
-            hostname: "old-host".to_string(),
-            atem_txs: old_atem_txs,
-            astation_tx: None,
-            astation_connection_id: None,
-            pending_astations: HashMap::new(),
-            astation_verified: false,
-            created_at: Instant::now() - std::time::Duration::from_secs(ROOM_EXPIRY_SECS + 10),
-        };
-        hub.rooms.write().await.insert("OLD-ATEM".to_string(), room);
-
-        hub.cleanup_expired().await;
-
-        let rooms = hub.rooms.read().await;
-        // Should be removed (only astation_tx prevents cleanup)
-        assert!(!rooms.contains_key("OLD-ATEM"), "Room with only atem connected should be cleaned up");
-    }
-
-    #[tokio::test]
     async fn test_pair_status_shows_unpaired_then_paired() {
         let state = crate::AppState {
             sessions: crate::session_store::SessionStore::new(),
@@ -2415,17 +2590,7 @@ mod tests {
 
         // Create pair
         let code = generate_pairing_code();
-        let room = PairRoom {
-            code: code.clone(),
-            hostname: "test-host".to_string(),
-            atem_txs: HashMap::new(),
-            astation_tx: None,
-            astation_connection_id: None,
-            pending_astations: HashMap::new(),
-            astation_verified: false,
-            created_at: Instant::now(),
-        };
-        state.relay.rooms.write().await.insert(code.clone(), room);
+        state.relay.create_room(&code, "test-host", now()).await.unwrap();
 
         let app = Router::new()
             .route("/api/pair/:code", axum::routing::get(pair_status_handler))
@@ -2449,21 +2614,18 @@ mod tests {
         assert!(!status.paired, "Should not be paired initially");
 
         // Simulate both sides connecting
-        let (tx_astation, _rx) = mpsc::unbounded_channel::<String>();
-        let (tx_atem, _rx2) = mpsc::unbounded_channel::<String>();
-        {
-            let mut rooms = state.relay.rooms.write().await;
-            if let Some(room) = rooms.get_mut(&code) {
-                room.astation_tx = Some(tx_astation);
-                room.atem_txs.insert(
-                    "test-atem".to_string(),
-                    AtemConnection {
-                        connection_id: "connection-test".to_string(),
-                        tx: tx_atem,
-                    },
-                );
-            }
-        }
+        state
+            .relay
+            .directory()
+            .claim_owner(&code, &test_conn("astation-conn"), now())
+            .await
+            .unwrap();
+        state
+            .relay
+            .directory()
+            .join_atem(&code, "test-atem", &test_conn("connection-test"))
+            .await
+            .unwrap();
 
         // Check status after both connected
         let app2 = Router::new()
@@ -3343,7 +3505,32 @@ mod tests {
 
         send_json(&mut atem, serde_json::json!({"probe":"to-owner"})).await;
         assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "to-owner");
-        assert!(state.relay.has_key(code), "a DB error must not forget the key");
+        assert!(state.relay.keys().contains(code), "a DB error must not forget the key");
+        server.abort();
+    }
+
+    /// A key that a failed re-read left stale is re-read before it verifies
+    /// anything: while the database is still down even the right key is
+    /// refused (fail closed).
+    #[tokio::test]
+    async fn stale_key_is_reread_before_it_verifies() {
+        let (state, flaky) = flaky_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-stale";
+        let key = TestKey::generate();
+        verified_astation(&base_url, code, &key, "registered").await;
+
+        flaky.set_down(true);
+        state.relay.keys().reload_one(&flaky, code).await;
+        assert!(state.relay.keys().get(code).unwrap().stale);
+        let (mut refused, challenge) = connect_astation(&base_url, code).await;
+        let result = authenticate(&mut refused, &key, code, &challenge).await;
+        assert_eq!(result["status"], "rejected", "{result}");
+        assert_closed(&mut refused).await;
+
+        flaky.set_down(false);
+        verified_astation(&base_url, code, &key, "verified").await;
+        assert!(!state.relay.keys().get(code).unwrap().stale);
         server.abort();
     }
 
@@ -3359,12 +3546,12 @@ mod tests {
         assert_eq!(result["status"], "rejected");
         assert_eq!(result["message"], "identity store unavailable");
         assert_closed(&mut astation).await;
-        assert!(!state.relay.has_key(code));
+        assert!(!state.relay.keys().contains(code));
 
         // Still keyless, so the retry is a legacy socket that registers.
         flaky.set_down(false);
         verified_astation(&base_url, code, &key, "registered").await;
-        assert!(state.relay.has_key(code));
+        assert!(state.relay.keys().contains(code));
         server.abort();
     }
 
@@ -3477,7 +3664,7 @@ mod tests {
         let (status, body) = delete_room(&state, code).await;
         assert_eq!(status, HttpStatusCode::OK);
         assert_eq!(body["closed"], true);
-        assert!(!state.relay.rooms.read().await.contains_key(code));
+        assert!(state.relay.room(code).await.unwrap().is_none());
         server.abort();
     }
 
@@ -3486,45 +3673,37 @@ mod tests {
     #[tokio::test]
     async fn verification_evicts_an_unverified_owner() {
         let hub = RelayHub::new();
-        let (squatter_tx, mut squatter_rx) = mpsc::unbounded_channel::<String>();
-        let (pending_tx, _pending_rx) = mpsc::unbounded_channel::<String>();
-        let mut room = PairRoom::new("astation-race", "identity");
-        room.astation_tx = Some(squatter_tx);
-        room.astation_connection_id = Some("squatter".to_string());
-        room.pending_astations.insert("pending".to_string(), pending_tx);
-        hub.rooms.write().await.insert("astation-race".to_string(), room);
+        let code = "astation-race";
+        let mut squatter = hub.local().register("squatter", code, SocketRole::Astation);
+        let _pending = hub.local().register("pending", code, SocketRole::Astation);
+        hub.directory().claim_owner(code, &test_conn("squatter"), now()).await.unwrap();
+        assert!(hub.directory().add_pending(code, &test_conn("pending"), now(), 0).await.unwrap());
 
         // The registering socket was replaced, so it is not the owner.
-        promote_verified_astation(&hub, "astation-race", "registrar", false).await;
-        {
-            let rooms = hub.rooms.read().await;
-            let room = &rooms["astation-race"];
-            assert!(room.astation_tx.is_none());
-            assert!(room.astation_connection_id.is_none());
-        }
-        assert!(squatter_rx.recv().await.is_none(), "squatter's sender was dropped");
+        hub.promote_verified(code, "registrar", false).await.unwrap();
+        assert!(hub.room(code).await.unwrap().unwrap().owner.is_none());
+        assert!(squatter.frames.recv().await.is_none(), "squatter's sender was dropped");
 
-        promote_verified_astation(&hub, "astation-race", "pending", true).await;
-        let rooms = hub.rooms.read().await;
-        let room = &rooms["astation-race"];
-        assert_eq!(room.astation_connection_id.as_deref(), Some("pending"));
-        assert!(room.astation_verified);
-        assert!(room.pending_astations.is_empty());
+        hub.promote_verified(code, "pending", true).await.unwrap();
+        let room = hub.room(code).await.unwrap().unwrap();
+        assert_eq!(room.owner.map(|owner| owner.conn).as_deref(), Some("pending"));
+        assert!(room.verified);
+        assert!(room.pending.is_empty());
     }
 
     #[tokio::test]
     async fn verification_keeps_a_verified_owner_until_a_pending_one_takes_over() {
         let hub = RelayHub::new();
-        let (owner_tx, _owner_rx) = mpsc::unbounded_channel::<String>();
-        let mut room = PairRoom::new("astation-verified", "identity");
-        room.astation_tx = Some(owner_tx);
-        room.astation_connection_id = Some("owner".to_string());
-        room.astation_verified = true;
-        hub.rooms.write().await.insert("astation-verified".to_string(), room);
+        let code = "astation-verified";
+        let _owner = hub.local().register("owner", code, SocketRole::Astation);
+        hub.directory().claim_owner(code, &test_conn("owner"), now()).await.unwrap();
+        hub.promote_verified(code, "owner", false).await.unwrap();
 
         // A stale, non-pending verified socket doesn't disturb the owner.
-        promote_verified_astation(&hub, "astation-verified", "stale", false).await;
-        let rooms = hub.rooms.read().await;
-        assert_eq!(rooms["astation-verified"].astation_connection_id.as_deref(), Some("owner"));
+        hub.promote_verified(code, "stale", false).await.unwrap();
+        let room = hub.room(code).await.unwrap().unwrap();
+        assert_eq!(room.owner.map(|owner| owner.conn).as_deref(), Some("owner"));
+        assert!(room.verified);
+        assert!(hub.local().contains("owner"));
     }
 }
