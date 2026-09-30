@@ -10,6 +10,12 @@ enum RelayIdentityKeyError: Error, Equatable {
     case keychain(OSStatus)
     /// A Secure Enclave key blob is stored but the Secure Enclave is unavailable.
     case secureEnclaveUnavailable
+    /// A key item exists but cannot be decoded. It is never replaced automatically:
+    /// the relay has this Astation's key registered (TOFU), so a new key would be
+    /// locked out until an admin reset.
+    case undecodableStoredKey
+    /// `SecAccessControlCreateWithFlags` returned nil for the Secure Enclave key.
+    case accessControlUnavailable
 }
 
 /// Result of reading the persisted key material.
@@ -128,19 +134,16 @@ final class RelayIdentityKey {
     // MARK: Load or create
 
     /// Load the persisted key, or create and persist a new one.
-    /// Only generates a new key when none is stored or the stored blob is unreadable;
-    /// a Keychain read error is thrown instead so a registered key is never replaced
-    /// by a transient failure.
+    /// A new key is generated ONLY when no item exists. A Keychain read error or an
+    /// undecodable stored item is thrown and the item is left untouched, so a key
+    /// the relay has registered is never silently replaced.
     static func loadOrCreate(
         storage: RelayIdentityKeyStorage = KeychainRelayIdentityKeyStorage(),
         preferSecureEnclave: Bool = SecureEnclave.isAvailable
     ) throws -> RelayIdentityKey {
         switch storage.read() {
         case .found(let data):
-            if let key = try decode(data) {
-                return key
-            }
-            Log.warn("[RelayIdentity] Stored relay identity key is unreadable — generating a new one")
+            return try decode(data)
         case .notFound:
             break
         case .failed(let status):
@@ -156,27 +159,49 @@ final class RelayIdentityKey {
         return key
     }
 
-    /// Returns nil when the blob is corrupt/unusable (caller regenerates).
-    /// Throws when the blob is a Secure Enclave key but the enclave is unavailable,
-    /// so it is not overwritten.
-    private static func decode(_ data: Data) throws -> RelayIdentityKey? {
+    /// Decode a stored item. Never returns a fresh key: any failure throws so the
+    /// caller leaves the stored item in place.
+    private static func decode(_ data: Data) throws -> RelayIdentityKey {
         if data.count == softwareKeyLength {
-            guard let key = try? P256.Signing.PrivateKey(rawRepresentation: data) else { return nil }
-            return RelayIdentityKey(softwareKey: key)
+            do {
+                let key = try P256.Signing.PrivateKey(rawRepresentation: data)
+                return RelayIdentityKey(softwareKey: key)
+            } catch {
+                Log.error("[RelayIdentity] Stored software relay key is undecodable (left in place): \(error)")
+                throw RelayIdentityKeyError.undecodableStoredKey
+            }
         }
         guard SecureEnclave.isAvailable else {
+            Log.error("[RelayIdentity] Stored Secure Enclave relay key but the Secure Enclave is unavailable")
             throw RelayIdentityKeyError.secureEnclaveUnavailable
         }
-        guard let key = try? SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: data) else {
-            return nil
+        do {
+            let key = try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: data)
+            return RelayIdentityKey(secureEnclaveKey: key)
+        } catch {
+            Log.error("[RelayIdentity] Stored Secure Enclave relay key is undecodable (left in place): \(error)")
+            throw RelayIdentityKeyError.undecodableStoredKey
         }
-        return RelayIdentityKey(secureEnclaveKey: key)
+    }
+
+    /// Secure Enclave key usable after first unlock, so signing works while the
+    /// screen is locked (overnight reconnects).
+    private static func makeSecureEnclaveKey() throws -> SecureEnclave.P256.Signing.PrivateKey {
+        guard let accessControl = SecAccessControlCreateWithFlags(
+            nil,
+            kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            .privateKeyUsage,
+            nil
+        ) else {
+            throw RelayIdentityKeyError.accessControlUnavailable
+        }
+        return try SecureEnclave.P256.Signing.PrivateKey(accessControl: accessControl)
     }
 
     private static func generate(preferSecureEnclave: Bool) -> (RelayIdentityKey, Data) {
         if preferSecureEnclave {
             do {
-                let key = try SecureEnclave.P256.Signing.PrivateKey()
+                let key = try makeSecureEnclaveKey()
                 return (RelayIdentityKey(secureEnclaveKey: key), key.dataRepresentation)
             } catch {
                 Log.warn("[RelayIdentity] Secure Enclave key creation failed, using software key: \(error)")
@@ -203,6 +228,7 @@ enum RelayIdentityProtocol {
     static let statusVerified = "verified"
     static let statusRejected = "rejected"
     static let rejectedMenuMessage = "Relay rejected this Astation's key"
+    static let keyUnavailableMenuMessage = "Relay identity key unreadable — relay works, vault/memory unavailable"
 
     /// Parse a raw identity-socket frame as a relay control frame.
     /// Returns nil for Atem envelopes and anything unrecognised, so existing

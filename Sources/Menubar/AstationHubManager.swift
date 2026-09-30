@@ -49,8 +49,12 @@ class AstationHubManager: ObservableObject {
     /// True once the relay answered `relayAuthResult` registered|verified on
     /// `identityRelayTask`. Binding messages are only sent while verified. Main thread.
     private(set) var identityRelayVerified = false
-    /// Lazily loaded relay identity key (Keychain / Secure Enclave). Main thread.
-    private var relayIdentityKey: RelayIdentityKey?
+    /// Relay identity key, preloaded off the main thread (Keychain / Secure Enclave).
+    /// The challenge handler only signs with the cached key. Main thread.
+    private var relayIdentityKeyState: RelayIdentityKeyLoadState = .notLoaded
+    /// A challenge that arrived while the key was still loading; answered when the
+    /// load finishes (the relay allows 10 s). Main thread.
+    private var pendingRelayChallenge: (challenge: String, task: URLSessionWebSocketTask)?
     /// Hourly expiry sweep so expired pairing sessions are unbound on the relay.
     private var sessionExpiryTimer: Timer?
     /// Relay identity problem shown in the menu (nil when fine).
@@ -1155,7 +1159,9 @@ class AstationHubManager: ObservableObject {
         task.resume()
         identityRelayTask = task
         identityRelayVerified = false
+        pendingRelayChallenge = nil
         startSessionExpiryTimerIfNeeded()
+        preloadRelayIdentityKeyIfNeeded()
 
         // Wire sendHandler: route messages whose clientId starts with "relay-" through
         // the identity relay WS with the current Atem socket generation.
@@ -1280,6 +1286,7 @@ class AstationHubManager: ObservableObject {
                     if self?.identityRelayTask === task {
                         self?.identityRelayTask = nil
                         self?.identityRelayVerified = false
+                        self?.pendingRelayChallenge = nil
                     }
                     self?.identityRelayActive = false
                 }
@@ -1318,25 +1325,71 @@ class AstationHubManager: ObservableObject {
         }
     }
 
-    private func loadRelayIdentityKey() -> RelayIdentityKey? {
-        if let cached = relayIdentityKey {
-            return cached
+    /// Load (or create) the relay identity key once, on a background queue, so no
+    /// Keychain / Secure Enclave work happens on main inside the challenge window.
+    /// Retried on the next identity relay (re)connect after a failure.
+    private func preloadRelayIdentityKeyIfNeeded() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        switch relayIdentityKeyState {
+        case .loading, .loaded:
+            return
+        case .notLoaded, .failed:
+            break
         }
-        do {
-            let key = try RelayIdentityKey.loadOrCreate()
-            relayIdentityKey = key
-            return key
-        } catch {
-            Log.error("[RelayIdentity] Cannot load relay identity key: \(error)")
-            return nil
+        relayIdentityKeyState = .loading
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let state: RelayIdentityKeyLoadState
+            do {
+                let key = try RelayIdentityKey.loadOrCreate()
+                state = .loaded(key)
+            } catch {
+                Log.error("[RelayIdentity] Cannot load relay identity key (staying in legacy relay mode): \(error)")
+                state = .failed
+            }
+            DispatchQueue.main.async {
+                self?.finishRelayIdentityKeyLoad(state)
+            }
+        }
+    }
+
+    private func finishRelayIdentityKeyLoad(_ state: RelayIdentityKeyLoadState) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        relayIdentityKeyState = state
+        switch state {
+        case .loaded:
+            if relayIdentityStatusMessage == RelayIdentityProtocol.keyUnavailableMenuMessage {
+                relayIdentityStatusMessage = nil
+            }
+            if let pending = pendingRelayChallenge {
+                pendingRelayChallenge = nil
+                if pending.task === identityRelayTask {
+                    answerRelayAuthChallenge(pending.challenge, task: pending.task)
+                }
+            }
+        case .failed:
+            pendingRelayChallenge = nil
+            relayIdentityStatusMessage = RelayIdentityProtocol.keyUnavailableMenuMessage
+        case .notLoaded, .loading:
+            break
         }
     }
 
     private func answerRelayAuthChallenge(_ challenge: String, task: URLSessionWebSocketTask) {
         dispatchPrecondition(condition: .onQueue(.main))
-        // Without a key the socket stays in the relay's legacy mode (relaying works,
-        // vault/memory bindings do not).
-        guard let key = loadRelayIdentityKey() else { return }
+        // Only the cached key is used here. Without it the socket stays in the relay's
+        // legacy mode (relaying works, vault/memory bindings do not).
+        let key: RelayIdentityKey
+        switch relayIdentityKeyState {
+        case .loaded(let loaded):
+            key = loaded
+        case .loading:
+            pendingRelayChallenge = (challenge: challenge, task: task)
+            Log.info("[RelayIdentity] Relay challenge received while the key is loading — answering when ready")
+            return
+        case .notLoaded, .failed:
+            Log.warn("[RelayIdentity] No relay identity key — staying in legacy relay mode for this connection")
+            return
+        }
         let astationId = AstationIdentity.shared.id
         let signature: String
         do {
@@ -1675,6 +1728,14 @@ class AstationHubManager: ObservableObject {
 }
 
 // MARK: - Data Models
+
+/// Load state of the relay identity key (main-thread owned by AstationHubManager).
+enum RelayIdentityKeyLoadState {
+    case notLoaded
+    case loading
+    case loaded(RelayIdentityKey)
+    case failed
+}
 
 struct ConnectedClient: Identifiable {
     let id: String

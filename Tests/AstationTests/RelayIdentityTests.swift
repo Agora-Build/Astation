@@ -108,18 +108,19 @@ final class RelayIdentityTests: XCTestCase {
         XCTAssertEqual(storage.writeCount, 0)
     }
 
-    func testLoadOrCreateRegeneratesCorruptSoftwareKey() throws {
+    func testLoadOrCreateNeverReplacesUndecodableStoredKey() throws {
         // 32 zero bytes is not a valid P-256 scalar.
         let corrupt = Data(repeating: 0, count: RelayIdentityKey.softwareKeyLength)
         if (try? P256.Signing.PrivateKey(rawRepresentation: corrupt)) != nil {
-            throw XCTSkip("CryptoKit accepted a zero scalar; corrupt-key path not exercisable")
+            throw XCTSkip("CryptoKit accepted a zero scalar; undecodable-key path not exercisable")
         }
         let storage = MemoryRelayIdentityKeyStorage()
         storage.stored = corrupt
-        let key = try RelayIdentityKey.loadOrCreate(storage: storage, preferSecureEnclave: false)
-        XCTAssertEqual(storage.writeCount, 1)
-        XCTAssertNotEqual(storage.stored, corrupt)
-        XCTAssertEqual(key.publicKeyHex.count, 130)
+        XCTAssertThrowsError(try RelayIdentityKey.loadOrCreate(storage: storage, preferSecureEnclave: false)) { error in
+            XCTAssertEqual(error as? RelayIdentityKeyError, RelayIdentityKeyError.undecodableStoredKey)
+        }
+        XCTAssertEqual(storage.writeCount, 0)
+        XCTAssertEqual(storage.stored, corrupt)
     }
 
     // MARK: Outbound JSON
