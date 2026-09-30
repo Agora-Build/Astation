@@ -324,7 +324,9 @@ async fn main() {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            cleanup_voice.cleanup_expired().await;
+            if let Err(error) = cleanup_voice.cleanup_expired().await {
+                tracing::debug!("Voice session sweep failed: {}", error);
+            }
             tracing::debug!("Cleaned up expired voice sessions");
         }
     });
