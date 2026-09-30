@@ -18,8 +18,11 @@
 //!    (permanent: atem acks them). A backing-store failure stops the batch and
 //!    returns 503 `{"error":"temporarily unavailable"}` for the whole request
 //!    (transient: atem keeps every op queued and retries — add is idempotent
-//!    by id, delete/purge are idempotent, a retried skill push appends a
-//!    harmless duplicate version).
+//!    by id, delete/invalidate/purge are idempotent, a retried skill push appends a
+//!    harmless duplicate version). An invalidate's `superseded_by` is only a
+//!    hint: the relay doesn't check that it exists or belongs to the account.
+
+use std::collections::HashMap;
 
 use axum::{
     body::Body,
@@ -250,12 +253,31 @@ fn is_valid_skill_scope(s: &str) -> bool {
 pub(crate) enum MemoryOp {
     Add { memory: MemoryRow },
     Delete { id: String },
+    /// Final and idempotent; never changes content.
+    Invalidate {
+        id: String,
+        invalid_at: i64,
+        #[serde(default)]
+        superseded_by: Option<String>,
+    },
 }
 
-async fn apply_memory_op(state: &AppState, account: &str, op: MemoryOp) -> Result<Value, ErrResp> {
+/// `canon` maps an id the client sent to the canonical id an earlier `add`
+/// in the same batch was deduplicated onto, so a later `delete`/`invalidate`
+/// in the batch (as `id` or `superseded_by`) names a row that exists.
+async fn apply_memory_op(
+    state: &AppState,
+    account: &str,
+    op: MemoryOp,
+    canon: &mut HashMap<String, String>,
+) -> Result<Value, ErrResp> {
+    let mapped = |canon: &HashMap<String, String>, id: &str| canon.get(id).cloned().unwrap_or_else(|| id.to_string());
     match op {
         MemoryOp::Add { memory } => {
-            if !is_valid_memory_scope(&memory.scope) || memory_has_nul(&memory) {
+            if !is_valid_memory_scope(&memory.scope)
+                || memory_has_nul(&memory)
+                || memory.valid_at.is_some_and(|v| v <= 0)
+            {
                 return Ok(op_err("invalid memory"));
             }
             if contains_reserved(&memory.content) {
@@ -264,7 +286,13 @@ async fn apply_memory_op(state: &AppState, account: &str, op: MemoryOp) -> Resul
             if let Some(f) = find_secrets(&memory.content).first() {
                 return Ok(op_err(format!("possible credential: {}", f.kind)));
             }
-            store_result(state.knowledge.add_memory(account, memory).await, |o| {
+            let r = state.knowledge.add_memory(account, memory).await;
+            if let Ok(o) = &r {
+                if let Some(cid) = &o.canonical_id {
+                    canon.insert(o.id.clone(), cid.clone());
+                }
+            }
+            store_result(r, |o| {
                 let mut v = json!({ "ok": true, "id": o.id, "seq": o.seq });
                 if let Some(cid) = o.canonical_id {
                     v["canonical_id"] = json!(cid);
@@ -276,9 +304,28 @@ async fn apply_memory_op(state: &AppState, account: &str, op: MemoryOp) -> Resul
             if has_nul(&[&id]) {
                 return Ok(op_err("invalid memory"));
             }
-            store_result(state.knowledge.delete_memory(account, &id).await, |seq| {
+            let target = mapped(canon, &id);
+            store_result(state.knowledge.delete_memory(account, &target).await, |seq| {
                 json!({ "ok": true, "id": id, "seq": seq })
             })
+        }
+        MemoryOp::Invalidate { id, invalid_at, superseded_by } => {
+            if invalid_at <= 0
+                || has_nul(&[&id])
+                || superseded_by.as_deref().is_some_and(|s| s.contains('\0'))
+            {
+                return Ok(op_err("invalid memory"));
+            }
+            let target = mapped(canon, &id);
+            // `superseded_by` is a hint: not checked for existence or ownership.
+            let successor = superseded_by.map(|s| mapped(canon, &s));
+            store_result(
+                state
+                    .knowledge
+                    .invalidate_memory(account, &target, invalid_at, successor.as_deref())
+                    .await,
+                |seq| json!({ "ok": true, "id": id, "seq": seq }),
+            )
         }
     }
 }
@@ -293,8 +340,9 @@ pub async fn memory_batch_handler(
     let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
     let ops: Vec<MemoryOp> = read_batch(body, MEMORY_BATCH_BODY_LIMIT, MEMORY_BATCH_MAX_OPS).await?;
     let mut results = Vec::with_capacity(ops.len());
+    let mut canon = HashMap::new();
     for op in ops {
-        results.push(apply_memory_op(&state, &caller.work_session_id, op).await?);
+        results.push(apply_memory_op(&state, &caller.work_session_id, op, &mut canon).await?);
     }
     Ok(Json(json!({ "results": results })))
 }
@@ -1011,6 +1059,7 @@ mod tests {
         let cases = [
             ("/api/memory/batch?id=a", json!({"ops": [{"op": "add", "memory": sample_memory("mem_1", "x")}]})),
             ("/api/memory/batch?id=a", json!({"ops": [{"op": "delete", "id": "mem_1"}]})),
+            ("/api/memory/batch?id=a", json!({"ops": [{"op": "invalidate", "id": "mem_1", "invalid_at": 5}]})),
             ("/api/skills/batch?id=a", json!({"ops": [{"op": "push", "skill": sample_skill("x", json!({"SKILL.md": b64("# hi")})), "base_version": 0}]})),
             ("/api/skills/batch?id=a", json!({"ops": [{"op": "delete", "scope": "global", "project": "", "name": "x"}]})),
             ("/api/skills/batch?id=a", json!({"ops": [{"op": "purge", "scope": "global", "project": "", "name": "x", "versions": null}]})),
@@ -1440,5 +1489,128 @@ mod tests {
         let rows = pulled["skills"].as_array().unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r["deleted"] == true));
+    }
+
+    // ─────────────────────────── invalidate + validity ───────────────────────────
+
+    async fn call(app: &Router, method: &str, uri: &str, session: &str, body: Option<Value>) -> (StatusCode, Value) {
+        let b = body.map(|v| v.to_string()).unwrap_or_default();
+        let resp = app.clone().oneshot(req(method, uri, session, &b)).await.unwrap();
+        let status = resp.status();
+        (status, body_json(resp).await)
+    }
+
+    fn add_op(id: &str, content: &str) -> Value {
+        json!({"op": "add", "memory": sample_memory(id, content)})
+    }
+
+    async fn pull_row(app: &Router, sess: &str, id: &str) -> Value {
+        let (_, v) = call(app, "GET", "/api/memory?id=a", sess, None).await;
+        v["memories"].as_array().unwrap().iter().find(|r| r["id"] == id).cloned().unwrap_or(Value::Null)
+    }
+
+    const MEM_BATCH: &str = "/api/memory/batch?id=a";
+
+    #[tokio::test]
+    async fn invalidate_marks_fact_invalid_and_keeps_content() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [add_op("mem_old", "port 8765"), add_op("mem_new", "port 9000")]}))).await;
+        let (st, v) = call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [
+            {"op": "invalidate", "id": "mem_old", "invalid_at": 1_790_000_000, "superseded_by": "mem_new"},
+        ]}))).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["results"][0]["ok"], true, "{v}");
+        assert!(v["results"][0]["seq"].as_i64().unwrap() > 0);
+        let row = pull_row(&app, &sess, "mem_old").await;
+        assert_eq!(row["content"], "port 8765");
+        assert_eq!(row["invalid_at"], 1_790_000_000);
+        assert_eq!(row["superseded_by"], "mem_new");
+        assert_eq!(row["deleted"], false);
+        assert_eq!(row["deleted_at"], Value::Null);
+        assert_eq!(pull_row(&app, &sess, "mem_new").await["invalid_at"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn invalidate_is_final_and_unknown_or_foreign_ids_are_ok() {
+        let (state, sess) = test_state("ws-1").await;
+        let sess2 = bind_session(&state, "ws-2").await;
+        let app = app(state);
+        call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [add_op("mem_1", "x")]}))).await;
+        let inv = |id: &str, at: i64| json!({"op": "invalidate", "id": id, "invalid_at": at});
+        let (_, v) = call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [inv("mem_1", 100), inv("mem_1", 200), inv("mem_unknown", 100)]}))).await;
+        let r = v["results"].as_array().unwrap();
+        assert!(r.iter().all(|x| x["ok"] == true), "{v}");
+        assert!(r[0]["seq"].as_i64().unwrap() > 0);
+        assert_eq!((r[1]["seq"].clone(), r[2]["seq"].clone()), (json!(0), json!(0)));
+        // Another account can't touch it, and can't tell that it exists.
+        let (_, v2) = call(&app, "POST", MEM_BATCH, &sess2, Some(json!({"ops": [inv("mem_1", 300)]}))).await;
+        assert_eq!(v2["results"][0], json!({"ok": true, "id": "mem_1", "seq": 0}));
+        assert_eq!(pull_row(&app, &sess, "mem_1").await["invalid_at"], 100);
+    }
+
+    #[tokio::test]
+    async fn invalidate_input_problems_are_refused_per_op() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [add_op("mem_1", "x")]}))).await;
+        let (st, v) = call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [
+            {"op": "invalidate", "id": "mem_1", "invalid_at": 0},
+            {"op": "invalidate", "id": "mem_1", "invalid_at": -5},
+            {"op": "invalidate", "id": "mem\u{0}1", "invalid_at": 5},
+            {"op": "invalidate", "id": "mem_1", "invalid_at": 5, "superseded_by": "mem\u{0}2"},
+        ]}))).await;
+        assert_eq!(st, StatusCode::OK);
+        for x in v["results"].as_array().unwrap() {
+            assert_eq!(x, &json!({"ok": false, "error": "invalid memory"}));
+        }
+        assert_eq!(pull_row(&app, &sess, "mem_1").await["invalid_at"], Value::Null);
+        // A missing invalid_at is a malformed op: the whole batch is 400.
+        let (st, _) = call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [{"op": "invalidate", "id": "mem_1"}]}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn invalidate_follows_a_canonical_id_from_the_same_batch() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [add_op("mem_old", "port 8765"), add_op("mem_canon", "port 9000")]}))).await;
+        // Another machine replaced mem_old with the same text mem_canon already has.
+        let (_, v) = call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [
+            add_op("mem_new", "port 9000"),
+            {"op": "invalidate", "id": "mem_old", "invalid_at": 5, "superseded_by": "mem_new"},
+        ]}))).await;
+        assert_eq!(v["results"][0]["canonical_id"], "mem_canon");
+        assert_eq!(v["results"][1]["ok"], true);
+        assert_eq!(pull_row(&app, &sess, "mem_old").await["superseded_by"], "mem_canon");
+    }
+
+    #[tokio::test]
+    async fn add_carries_valid_at_and_refuses_non_positive() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        let mut m = sample_memory("mem_1", "x");
+        m["valid_at"] = json!(1_690_000_000);
+        let mut bad = sample_memory("mem_2", "y");
+        bad["valid_at"] = json!(0);
+        let (_, v) = call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [
+            {"op": "add", "memory": m}, {"op": "add", "memory": bad},
+        ]}))).await;
+        assert_eq!(v["results"][0]["ok"], true);
+        assert_eq!(v["results"][1], json!({"ok": false, "error": "invalid memory"}));
+        assert_eq!(pull_row(&app, &sess, "mem_1").await["valid_at"], 1_690_000_000);
+        assert_eq!(pull_row(&app, &sess, "mem_2").await, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn deleted_rows_carry_deleted_at_and_the_legacy_flag() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [add_op("mem_1", "x")]}))).await;
+        call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [{"op": "delete", "id": "mem_1"}]}))).await;
+        let row = pull_row(&app, &sess, "mem_1").await;
+        assert_eq!(row["deleted"], true);
+        assert!(row["deleted_at"].as_i64().unwrap() > 1_700_000_000);
+        assert_eq!(row["content"], "");
     }
 }
