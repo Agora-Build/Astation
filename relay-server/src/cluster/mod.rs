@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 pub mod bus;
 pub mod directory;
+pub mod keys;
 pub mod local;
 
 use std::fmt;
