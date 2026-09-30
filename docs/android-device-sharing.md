@@ -2,8 +2,9 @@
 
 Date: 2026-09-08
 
-Status: Implemented. Local automated validation passes; physical phone, remote
-network, and Android Studio debugger validation remain pending.
+Status: Implemented, including configurable forwarded ports for direct scrcpy
+connections. Physical phone, remote network, and Android Studio debugger
+validation remain pending.
 
 ## Purpose and terminology
 
@@ -39,6 +40,11 @@ ADB client -- reachable IPv4/TCP ---> Sharing listener: selected IP + port
 Astation uses the standard ADB client/server protocol. Its NIO TCP proxy forwards
 bytes between the selected network interface and the Mac's local ADB server.
 It does not implement Android's device-side protocol.
+
+Optional forwarded ports use the same proxy and selected network address, each
+connecting to a configured `127.0.0.1:<local-port>` on the Mac. These ports carry
+scrcpy's video/audio/control streams or other explicitly configured local TCP
+services. ADB commands and forwarded streams use separate TCP listeners.
 
 The sharing port defaults to **5038** and is editable from **1024 to 65535**. The
 chosen port is saved. Port **5037** remains the local ADB server port. Keeping the
@@ -97,6 +103,53 @@ adb -H 100.80.1.2 -P 6107 devices -l
 The example address and port are placeholders for the actual values selected in
 Astation. Copied commands use the listener's bound address and port.
 
+## Direct scrcpy access without SSH
+
+1. Install scrcpy on the development machine and configure device sharing as
+   described above. Use an authorized USB or wireless device connected to the Mac.
+2. Before starting sharing, click **Add Port** under **Forwarded Ports (scrcpy)**.
+   The first suggested mapping is shared port `27183` to local port `27183`,
+   unless that port is already configured. Both fields are editable.
+3. Start sharing and allow the development machine to reach both the ADB sharing
+   port and the shared forwarded port on the selected network address.
+4. Beside the phone, choose **Copy scrcpy Command** and select a mapping. Run the
+   copied command on the development machine.
+
+For ADB sharing on `100.80.1.2:6107` and shared port `31000` mapped to local port
+`27183`, the command is:
+
+```bash
+ADB_SERVER_SOCKET='tcp:100.80.1.2:6107' scrcpy --serial 'DEVICE_SERIAL' \
+  --force-adb-forward --port=27183 \
+  --tunnel-host=100.80.1.2 --tunnel-port=31000
+```
+
+`--port` selects the local ADB forward on the Mac. `--tunnel-host` and
+`--tunnel-port` tell scrcpy how to reach it through Astation. The shared and local
+ports may be equal when binding the selected network address separately from
+loopback, or different as in this example. Pinning a single local port prevents
+scrcpy from choosing another port outside the configured mapping.
+
+The local port does not have to be listening when sharing starts: scrcpy creates
+its ADB forward later. A connection attempted before that target exists is closed;
+future connections work once scrcpy starts listening. Astation does not create or
+remove ADB forward entries; scrcpy manages them. Use a distinct local port for
+each simultaneous scrcpy session, even when targeting different phones.
+
+Up to 16 mappings are supported. Shared and local ports must be in `1024...65535`.
+Shared ports must be distinct from each other and the ADB sharing port. Invalid
+or occupied shared ports fail the entire start and close any listeners already
+opened. Port edits are disabled while sharing or a device operation is in progress.
+Mappings persist across launches, but sharing always starts off. Commands are only
+available for active mappings and authorized devices.
+
+These are raw TCP forwards to the configured local services; they have the same
+network access requirements as the ADB sharing listener. Only expose services
+intended for the trusted development machine. Reverse ADB connections still target
+the Mac, not the development machine.
+
+## Device-side ADB endpoints
+
 `adb connect <mac-ip>:<sharing-port>` is **not supported** by this endpoint.
 `adb connect` expects a device-side ADB endpoint, while Astation exposes an ADB
 server. It is used separately on the Mac to connect to a wireless phone.
@@ -135,13 +188,13 @@ legacy `adb tcpip 5555`, and persistent reconnect policies are outside this vers
 - Assigned addresses are checked every second. If the selected address disappears,
   sharing closes and an error asks the user to select an available address. There
   is no automatic fallback to another interface.
-- Stop Sharing and app quit close the listener and remote streams. The local ADB
+- Stop Sharing and app quit close all ADB and forwarded-port listeners and remote streams. The local ADB
   server and its device connections remain available to local tools.
 - Device polling normally checks local ADB every two seconds. If the backend
   becomes unavailable, sharing stops and Retry is offered. Device commands are
   serialized, bounded, and cancelled during shutdown.
 - TCP forwarding uses backpressure and bounded read/write buffers, allows up to
-  32 simultaneous client connections, and handles half-close without dropping
+  32 simultaneous client connections across all listeners, and handles half-close without dropping
   queued response data. Long-lived shell/logcat streams have no command timeout.
 
 The raw sharing endpoint provides no client authentication or encryption of its
@@ -159,8 +212,9 @@ All feature code lives in `Sources/Menubar` and uses existing SwiftNIO dependenc
 | --- | --- |
 | `ADBClient.swift` | Executable discovery, isolated local-server environment, asynchronous process execution, timeout/cancellation/output bounds |
 | `AndroidDevice.swift` | Device parsing, identity, transport and state, port/endpoint validation, shell command quoting |
+| `AndroidPortForward.swift` | Saved editable port mappings, range/duplicate/count validation, active mapping values |
 | `AndroidDeviceManager.swift` | Observable device and sharing state, polling, pairing, interface monitoring, saved settings, Start/Stop coordination |
-| `AndroidSharingServer.swift` | NIO TCP listener/proxy, backpressure, connection limit, half-close/shutdown, direct ADB server version probe |
+| `AndroidSharingServer.swift` | NIO TCP listeners/proxy, all-or-nothing startup, backpressure, shared connection limit, half-close/shutdown, direct ADB server version probe |
 | `AndroidNetworkInterfaces.swift` | Enumerate active non-loopback IPv4 addresses and validate IPv4 text |
 | `AndroidDevicesView.swift` | Native device list, network/port selection, copy actions, wireless pairing sheet |
 | `ConnectionsWindowController.swift` | Wrap existing Clients & Agents view and Android Devices view in tabs |
@@ -168,6 +222,7 @@ All feature code lives in `Sources/Menubar` and uses existing SwiftNIO dependenc
 | `AstationApp.swift` | Own the manager and shut it down at app quit |
 | `Tests/AstationTests/AndroidDeviceTests.swift` | Device/command parsing, saved configuration, and process execution checks |
 | `Tests/AstationTests/AndroidSharingServerTests.swift` | TCP integration, backend probing, and address-loss lifecycle checks |
+| `Tests/AstationTests/AndroidPortForwardTests.swift` | Mapping validation/persistence and scrcpy command generation |
 
 Device and sharing coordination use a single manager. The existing
 `ConnectionsView.swift` client/agent implementation is preserved. No additional
@@ -249,9 +304,12 @@ it, streaming logcat, and transferring files. Repeat after switching to wireless
 ### Android Studio and debugger limits
 
 Remote ADB does not make every debugging port local to the development machine.
-`adb forward` listeners live on the Mac running the ADB server. The host-side
-endpoint of `adb reverse` is also that Mac. IDE debugger, JDWP, and framework
-server workflows may therefore require additional tunnels or explicit routes.
+`adb forward` listeners live on the Mac running the ADB server. Configured
+forwarded-port mappings now expose chosen listeners on the selected network
+address. The client tool must use that address and shared port, as the generated
+scrcpy command does. The host-side endpoint of `adb reverse` is also the Mac; IDE
+debugger, JDWP, and framework server workflows may still require additional
+tunnels or explicit routes to reach services on the development machine.
 
 Validate the actual tool versions before claiming full IDE support. The debugger
 acceptance criterion is hitting a breakpoint from the development machine on the

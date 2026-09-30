@@ -33,7 +33,7 @@ struct AndroidDevicesView: View {
                                 if manager.isSharing { manager.stopSharing() } else { manager.startSharing() }
                             }.disabled(manager.isBusy || (!manager.isSharing && !manager.isReady))
                         }
-                        Text("Sharing gives remote machines access to all devices and emulators on this Mac's ADB server. Allow only trusted machines to reach this port through your VPN or firewall rules.")
+                        Text("Sharing gives remote machines access to all devices and emulators on this Mac's ADB server, plus the local services exposed by forwarded ports. Allow only trusted machines to reach the sharing and forwarded ports through your VPN or firewall rules.")
                             .font(.caption).foregroundStyle(.secondary)
                         if let endpoint = manager.endpoint {
                             Divider()
@@ -46,6 +46,37 @@ struct AndroidDevicesView: View {
                                 .font(.caption).foregroundStyle(.secondary)
                         } else { Text("Sharing off").foregroundStyle(.secondary) }
                         if let error = manager.sharingError { Text(error).foregroundStyle(.red).textSelection(.enabled) }
+                    }.padding(8)
+                }
+                GroupBox("Forwarded Ports (scrcpy)") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Forward a port on the selected network address to a local port on this Mac. For scrcpy, start with shared port 27183 and local port 27183.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        ForEach($manager.portForwards) { $forward in
+                            HStack {
+                                Text("Shared port")
+                                TextField("27183", text: $forward.sharedPort)
+                                    .frame(width: 80)
+                                    .accessibilityLabel("Shared port")
+                                Image(systemName: "arrow.right").foregroundStyle(.secondary)
+                                Text("Local port")
+                                TextField("27183", text: $forward.localPort)
+                                    .frame(width: 80)
+                                    .accessibilityLabel("Local port on this Mac")
+                                Spacer()
+                                Button("Remove") { manager.removePortForward(id: forward.id) }
+                            }.disabled(manager.isSharing || manager.isBusy)
+                        }
+                        Button("Add Port") { manager.addPortForward() }
+                            .disabled(manager.isSharing || manager.isBusy || manager.portForwards.count >= AndroidForwardedPort.maximumCount)
+                        if let address = manager.boundAddress {
+                            ForEach(manager.boundForwardedPorts) { forward in
+                                Text("\(address):\(forward.sharedPort) -> 127.0.0.1:\(forward.localPort)")
+                                    .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                            }
+                        }
+                        Text("Ports start and stop with sharing. After starting, copy a scrcpy command from your device below and run it on the remote computer. scrcpy creates the local ADB forward when it starts; no SSH tunnel is needed. Use a separate local port for each simultaneous scrcpy session.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }.padding(8)
                 }
                 HStack {
@@ -69,11 +100,21 @@ struct AndroidDevicesView: View {
                                 Text(device.serial).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                             }
                             Spacer()
-                            Button("Copy Device Command") {
-                                if let address = manager.boundAddress, let port = manager.boundPort {
-                                    copy(AndroidCommands.deviceCommand(address: address, port: port, serial: device.serial))
-                                }
-                            }.disabled(!manager.isSharing || !device.isAuthorized)
+                            VStack(alignment: .trailing, spacing: 8) {
+                                Button("Copy Device Command") {
+                                    if let address = manager.boundAddress, let port = manager.boundPort {
+                                        copy(AndroidCommands.deviceCommand(address: address, port: port, serial: device.serial))
+                                    }
+                                }.disabled(!manager.isSharing || !device.isAuthorized)
+                                Menu("Copy scrcpy Command") {
+                                    ForEach(manager.boundForwardedPorts) { forward in
+                                        Button("Shared \(forward.sharedPort) / local \(forward.localPort)") {
+                                            if let command = manager.scrcpyCommand(for: device, forward: forward) { copy(command) }
+                                        }
+                                    }
+                                }.disabled(!manager.isSharing || manager.isBusy || !device.isAuthorized || manager.boundForwardedPorts.isEmpty)
+                                    .help("Add a forwarded port and start sharing to copy a direct scrcpy command.")
+                            }
                         }.padding(6).frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
@@ -86,7 +127,7 @@ struct AndroidDevicesView: View {
                 if !manager.adbVersion.isEmpty {
                     Text(manager.adbVersion).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                 }
-                Text("Use matching Platform-Tools across different machines. APK installation, shell, and logcat use this connection directly. IDE debugger and development-server ports may need additional tunnels.")
+                Text("Use matching Platform-Tools across different machines. APK installation, shell, and logcat use the ADB connection directly. scrcpy uses a forwarded port as well. Reverse connections to services on the development machine still need a separate route or tunnel.")
                     .font(.caption).foregroundStyle(.secondary)
             }.padding(20)
         }

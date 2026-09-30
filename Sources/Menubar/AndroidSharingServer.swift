@@ -5,7 +5,8 @@ import NIO
 final class AndroidSharingServer: @unchecked Sendable {
     private let group: MultiThreadedEventLoopGroup
     private let loop: EventLoop
-    private var listener: Channel?
+    private var listeners: [Channel] = []
+    private var isStarting = false
     private var connections: [ObjectIdentifier: Channel] = [:]
     private var generation = 0
     private var activeClients = 0
@@ -20,20 +21,59 @@ final class AndroidSharingServer: @unchecked Sendable {
         self.maximumConnections = maximumConnections
     }
 
-    func start(address: String, port: Int) async throws -> Int {
+    func start(address: String, port: Int, forwardedPorts: [AndroidForwardedPort] = []) async throws -> Int {
         // The UI validates interface ownership; reject wildcard binds at the transport too.
         guard AndroidNetworkInterfaces.isIPv4(address), address != "0.0.0.0" else {
             throw AndroidSharingError.message("Choose a specific local IPv4 address.")
         }
-        let backendAddress = try SocketAddress(ipAddress: "127.0.0.1", port: backendPort)
+        try AndroidForwardedPort.validate(forwardedPorts, sharingPort: port)
+        let endpoints = [(sharedPort: port, localPort: backendPort)] + forwardedPorts.map {
+            (sharedPort: $0.sharedPort, localPort: $0.localPort)
+        }
+        if address == "127.0.0.1", endpoints.contains(where: { endpoint in
+            endpoints.contains(where: { $0.sharedPort == endpoint.localPort })
+        }) {
+            throw AndroidSharingError.message("A shared listener cannot forward back into another sharing listener on loopback.")
+        }
         let eventLoop = loop
         return try await eventLoop.flatSubmit {
-            guard self.listener == nil else {
+            guard self.listeners.isEmpty, !self.isStarting else {
                 return eventLoop.makeFailedFuture(AndroidSharingError.message("Sharing is already running."))
             }
             self.generation += 1
             let generation = self.generation
-            return ServerBootstrap(group: eventLoop)
+            self.isStarting = true
+            let binding = endpoints.reduce(eventLoop.makeSucceededFuture([Int]())) { previous, endpoint in
+                previous.flatMap { ports -> EventLoopFuture<[Int]> in
+                    guard self.generation == generation else { return eventLoop.makeFailedFuture(CancellationError()) }
+                    return self.bind(address: address, port: endpoint.sharedPort, targetPort: endpoint.localPort, generation: generation)
+                        .flatMap { channel -> EventLoopFuture<[Int]> in
+                            guard self.generation == generation else {
+                                return channel.close().flatMapThrowing { throw CancellationError() }
+                            }
+                            self.listeners.append(channel)
+                            return eventLoop.makeSucceededFuture(ports + [channel.localAddress!.port!])
+                        }
+                }
+            }
+            return binding.flatMapThrowing { ports in
+                guard self.generation == generation else { throw CancellationError() }
+                self.isStarting = false
+                return ports[0]
+            }.flatMapError { error in
+                guard self.generation == generation else { return eventLoop.makeFailedFuture(error) }
+                // A partial start must not leave ADB or any earlier forwarded port exposed.
+                return self.closeAll().flatMapThrowing { throw error }
+            }
+        }.get()
+    }
+
+    private func bind(address: String, port: Int, targetPort: Int, generation: Int) -> EventLoopFuture<Channel> {
+        let eventLoop = loop
+        let backendAddress: SocketAddress
+        do { backendAddress = try SocketAddress(ipAddress: "127.0.0.1", port: targetPort) }
+        catch { return eventLoop.makeFailedFuture(error) }
+        return ServerBootstrap(group: eventLoop)
                 .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
                 .childChannelOption(ChannelOptions.autoRead, value: false)
                 .childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
@@ -41,7 +81,7 @@ final class AndroidSharingServer: @unchecked Sendable {
                 .childChannelOption(ChannelOptions.maxMessagesPerRead, value: 1)
                 .childChannelOption(ChannelOptions.writeBufferWaterMark, value: ChannelOptions.Types.WriteBufferWaterMark(low: 16_384, high: 65_536))
                 .childChannelInitializer { channel in
-                    guard self.generation == generation, self.activeClients < self.maximumConnections else {
+                    guard self.generation == generation, !self.isStarting, self.activeClients < self.maximumConnections else {
                         return channel.close()
                     }
                     self.activeClients += 1
@@ -75,14 +115,9 @@ final class AndroidSharingServer: @unchecked Sendable {
                     })
                 }
                 .bind(host: address, port: port)
-                .flatMap { channel in
-                    guard self.generation == generation else {
-                        return channel.close().flatMapThrowing { throw CancellationError() }
-                    }
-                    self.listener = channel
-                    return eventLoop.makeSucceededFuture(channel.localAddress!.port!)
+                .flatMapError { error in
+                    eventLoop.makeFailedFuture(AndroidSharingError.message("Could not listen on \(address):\(port): \(error.localizedDescription)"))
                 }
-        }.get()
     }
 
     private func track(_ channel: Channel) {
@@ -99,8 +134,9 @@ final class AndroidSharingServer: @unchecked Sendable {
         let eventLoop = loop
         return eventLoop.flatSubmit {
             self.generation += 1
-            let channels = Array(self.connections.values) + (self.listener.map { [$0] } ?? [])
-            self.listener = nil
+            let channels = Array(self.connections.values) + self.listeners
+            self.listeners.removeAll()
+            self.isStarting = false
             return EventLoopFuture.andAllComplete(channels.map { $0.close() }, on: eventLoop)
         }
     }

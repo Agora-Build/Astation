@@ -11,6 +11,13 @@ final class AndroidDeviceManager: ObservableObject {
     @Published var portText: String {
         didSet { defaults.set(portText, forKey: "androidSharing.port") }
     }
+    @Published var portForwards: [AndroidPortForward] {
+        didSet {
+            if let data = try? JSONEncoder().encode(portForwards) {
+                defaults.set(data, forKey: "androidSharing.portForwards")
+            }
+        }
+    }
     @Published private(set) var adbPath: String?
     @Published private(set) var adbVersion = ""
     @Published private(set) var deviceError: String?
@@ -19,6 +26,7 @@ final class AndroidDeviceManager: ObservableObject {
     @Published private(set) var isBusy = false
     @Published private(set) var boundAddress: String?
     @Published private(set) var boundPort: Int?
+    @Published private(set) var boundForwardedPorts: [AndroidForwardedPort] = []
     @Published private(set) var isReady = false
 
     var isSharing: Bool { boundPort != nil }
@@ -48,6 +56,8 @@ final class AndroidDeviceManager: ObservableObject {
         self.addressProvider = addressProvider
         selectedAddressID = defaults.string(forKey: "androidSharing.address") ?? ""
         portText = defaults.string(forKey: "androidSharing.port") ?? "5038"
+        portForwards = defaults.data(forKey: "androidSharing.portForwards")
+            .flatMap { try? JSONDecoder().decode([AndroidPortForward].self, from: $0) } ?? []
         adbPath = ADBClient.discover(saved: defaults.string(forKey: "androidSharing.adbPath"))
     }
 
@@ -156,6 +166,24 @@ final class AndroidDeviceManager: ObservableObject {
         retry()
     }
 
+    func addPortForward() {
+        guard !isSharing, !isBusy, portForwards.count < AndroidForwardedPort.maximumCount else { return }
+        let used = Set(portForwards.flatMap { [Int($0.sharedPort), Int($0.localPort)].compactMap { $0 } } + [Int(portText)].compactMap { $0 })
+        let port = (27183...65535).first { !used.contains($0) } ?? 27183
+        portForwards.append(AndroidPortForward(sharedPort: String(port), localPort: String(port)))
+    }
+
+    func removePortForward(id: UUID) {
+        guard !isSharing, !isBusy else { return }
+        portForwards.removeAll { $0.id == id }
+    }
+
+    func scrcpyCommand(for device: AndroidDevice, forward: AndroidForwardedPort) -> String? {
+        guard device.isAuthorized, !isBusy, let boundAddress, let boundPort,
+              boundForwardedPorts.contains(forward) else { return nil }
+        return AndroidCommands.scrcpyCommand(address: boundAddress, port: boundPort, serial: device.serial, forward: forward)
+    }
+
     func startSharing() {
         perform { [weak self] in
             guard let self else { return }
@@ -164,19 +192,25 @@ final class AndroidDeviceManager: ObservableObject {
                 guard let port = AndroidCommands.port(self.portText) else {
                     throw AndroidSharingError.message("Enter a sharing port between 1024 and 65535.")
                 }
+                let forwards = try self.portForwards.map { try $0.validated() }
+                try AndroidForwardedPort.validate(forwards, sharingPort: port)
                 let currentAddresses = self.addressProvider()
                 guard let address = currentAddresses.first(where: { $0.id == self.selectedAddressID }) else {
                     throw AndroidSharingError.message("Choose an IPv4 address assigned to this Mac that your development machine can reach.")
                 }
                 try await self.refresh(allowStart: true)
-                let boundPort = try await self.server.start(address: address.address, port: port)
+                let boundPort = try await self.server.start(address: address.address, port: port, forwardedPorts: forwards)
                 try Task.checkCancellation()
                 guard self.addressProvider().contains(address) else {
                     throw AndroidSharingError.message("The selected network address changed while starting sharing.")
                 }
                 self.boundAddress = address.address
+                self.boundForwardedPorts = forwards
                 self.boundPort = boundPort
             } catch {
+                self.boundAddress = nil
+                self.boundPort = nil
+                self.boundForwardedPorts = []
                 await self.server.stop()
                 self.sharingError = "Could not start sharing: \(error.localizedDescription)"
             }
@@ -190,6 +224,7 @@ final class AndroidDeviceManager: ObservableObject {
     private func stopSharing(reason: String?) async {
         boundPort = nil
         boundAddress = nil
+        boundForwardedPorts = []
         await server.stop()
         sharingError = reason
     }
@@ -234,6 +269,9 @@ final class AndroidDeviceManager: ObservableObject {
         monitor?.cancel()
         networkMonitor?.cancel()
         operation?.cancel()
+        boundPort = nil
+        boundAddress = nil
+        boundForwardedPorts = []
         server.shutdown()
     }
 }

@@ -131,11 +131,30 @@ does not need a direct route to the phone. The device serial can change when swi
 from USB to wireless, so select the new serial from `adb devices -l`.
 
 Command-line APK installation, shell, file transfers, and logcat use this remote
-server arrangement directly. Full Android Studio Run/Debug support still requires
-validation with your computers and phone: `adb forward` listeners live on the Mac
-running Astation, and `adb reverse` host destinations are also on that Mac, so
-debugger/development-server connections may need additional tunnels. Real phone/network validation is separate
-from the automated local TCP tests.
+server arrangement directly. For **scrcpy without SSH**, add a mapping under
+**Forwarded Ports (scrcpy)** before starting sharing. The default suggestion is
+shared port **27183** to local port **27183**. Start sharing, then choose
+**Copy scrcpy Command** beside an authorized device and select its port mapping.
+Run the copied command on the development machine, where scrcpy must be installed.
+Both the ADB sharing port and the shared scrcpy port must be reachable.
+
+For example, with ADB sharing on `100.80.1.2:6107` and a mapping from shared port
+`31000` to local port `27183`, the command is:
+
+```bash
+ADB_SERVER_SOCKET='tcp:100.80.1.2:6107' scrcpy --serial 'DEVICE_SERIAL' \
+  --force-adb-forward --port=27183 \
+  --tunnel-host=100.80.1.2 --tunnel-port=31000
+```
+
+Mappings are saved but remain off until **Start Sharing**. All configured ports
+start together; a conflict rolls back the start. **Stop Sharing**, app quit, or
+loss of the selected network address closes all shared listeners and streams.
+Use separate local ports for simultaneous scrcpy sessions. Full Android Studio
+Run/Debug support still requires validation: forwarded debugger ports can use
+these mappings, but `adb reverse` destinations are still on the Mac and may need
+additional tunnels to reach the development machine. Real phone/network validation
+is separate from the automated local TCP tests.
 
 See the [Android sharing guide](docs/android-device-sharing.md)
 for architecture, lifecycle behavior, and remaining hardware checks.

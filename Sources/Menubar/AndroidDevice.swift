@@ -58,6 +58,11 @@ enum AndroidCommands {
         "adb -H \(quote(address)) -P \(port) -s \(quote(serial)) shell"
     }
 
+    static func scrcpyCommand(address: String, port: Int, serial: String, forward: AndroidForwardedPort) -> String {
+        "ADB_SERVER_SOCKET=\(quote("tcp:\(address):\(port)")) scrcpy --serial \(quote(serial)) " +
+            "--force-adb-forward --port=\(forward.localPort) --tunnel-host=\(quote(address)) --tunnel-port=\(forward.sharedPort)"
+    }
+
     static func wirelessEndpoint(_ value: String) -> Bool {
         let parts = value.split(separator: ":", omittingEmptySubsequences: false)
         guard parts.count == 2, let port = Int(parts[1]), (1...65535).contains(port) else { return false }
