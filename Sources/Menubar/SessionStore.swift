@@ -31,6 +31,14 @@ class SessionStore {
     private let storePath: URL
     private let queue = DispatchQueue(label: "build.agora.SessionStore", attributes: .concurrent)
 
+    /// Called on the main queue with the session ID after a session is granted
+    /// (created, locally refreshed, or authenticated by proof). Used to push a
+    /// relay binding. Set once from the main thread.
+    var onSessionGranted: ((String) -> Void)?
+    /// Called on the main queue with the IDs of sessions that were deleted or
+    /// expired. Used to revoke relay bindings. Set once from the main thread.
+    var onSessionsRemoved: (([String]) -> Void)?
+
     init(storageURL: URL? = nil) {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let astation = appSupport.appendingPathComponent("Astation")
@@ -86,7 +94,7 @@ class SessionStore {
 
     /// Create a new session after pairing approval.
     func create(hostname: String, atemId: String? = nil) -> SessionInfo {
-        return queue.sync(flags: .barrier) {
+        let created = queue.sync(flags: .barrier) { () -> SessionInfo in
             let session = SessionInfo(
                 id: UUID().uuidString,
                 hostname: hostname,
@@ -105,6 +113,8 @@ class SessionStore {
 
             return session
         }
+        notifyGranted(created.id)
+        return created
     }
 
     /// Authenticate a device by proving possession of its session token.
@@ -120,7 +130,7 @@ class SessionStore {
               DeviceAuthentication.isValidAtemId(atemId) else {
             return nil
         }
-        return queue.sync(flags: .barrier) {
+        let authenticated = queue.sync(flags: .barrier) { () -> SessionInfo? in
             guard var session = sessions[sessionId], session.isValid else { return nil }
             guard session.atemId == nil || session.atemId == atemId else { return nil }
             let bindsLegacySession = session.atemId == nil
@@ -142,11 +152,15 @@ class SessionStore {
             }
             return session
         }
+        if let authenticated {
+            notifyGranted(authenticated.id)
+        }
+        return authenticated
     }
 
     /// Return one stable device session for a locally authenticated Atem.
     func createOrRefreshLocal(hostname: String, atemId: String) -> SessionInfo {
-        queue.sync(flags: .barrier) {
+        let local = queue.sync(flags: .barrier) { () -> SessionInfo in
             if var session = sessions.values.first(where: { $0.atemId == atemId && $0.isValid }) {
                 session.lastActivity = Date()
                 sessions[session.id] = session
@@ -166,6 +180,8 @@ class SessionStore {
             saveToDisk()
             return session
         }
+        notifyGranted(local.id)
+        return local
     }
 
     /// Delete a specific session.
@@ -174,6 +190,7 @@ class SessionStore {
             if let session = self.sessions.removeValue(forKey: sessionId) {
                 Log.info("🗑️ Session deleted: \(sessionId.prefix(8)) (hostname: \(session.hostname))")
                 self.saveToDisk()
+                self.notifyRemoved([sessionId])
             }
         }
     }
@@ -198,15 +215,32 @@ class SessionStore {
     /// Clean up expired sessions.
     func cleanupExpired() {
         queue.async(flags: .barrier) {
-            let before = self.sessions.count
-            self.sessions = self.sessions.filter { $0.value.isValid }
-            let after = self.sessions.count
-            let removed = before - after
-
-            if removed > 0 {
-                Log.info("🧹 Cleaned up \(removed) expired session(s)")
-                self.saveToDisk()
+            let expiredIds = self.sessions.filter { !$0.value.isValid }.map { $0.key }
+            for id in expiredIds {
+                self.sessions.removeValue(forKey: id)
             }
+
+            if !expiredIds.isEmpty {
+                Log.info("🧹 Cleaned up \(expiredIds.count) expired session(s)")
+                self.saveToDisk()
+                self.notifyRemoved(expiredIds)
+            }
+        }
+    }
+
+    // MARK: - Change notifications
+
+    /// Callbacks always hop to the main queue so they never run inside the
+    /// store's barrier (a callback reading the store would otherwise deadlock).
+    private func notifyGranted(_ sessionId: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?.onSessionGranted?(sessionId)
+        }
+    }
+
+    private func notifyRemoved(_ sessionIds: [String]) {
+        DispatchQueue.main.async { [weak self] in
+            self?.onSessionsRemoved?(sessionIds)
         }
     }
 
