@@ -85,7 +85,17 @@ class StatusBarController: NSObject, NSMenuDelegate {
         )
         statusItem.isEnabled = false
         statusMenu.addItem(statusItem)
-        
+
+        if let relayIdentityWarning = hubManager.relayIdentityStatusMessage {
+            let relayIdentityItem = NSMenuItem(
+                title: "⚠️ \(relayIdentityWarning)",
+                action: nil,
+                keyEquivalent: ""
+            )
+            relayIdentityItem.isEnabled = false
+            statusMenu.addItem(relayIdentityItem)
+        }
+
         let projectTitle: String
         if let selected = hubManager.selectedProject {
             projectTitle = "📋 Project: \(selected.name)"
