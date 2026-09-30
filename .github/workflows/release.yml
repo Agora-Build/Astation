@@ -106,6 +106,19 @@ jobs:
             fi
           done
 
+          # AgoraRtcKit links aosl transitively through its SwiftPM package.
+          AOSL_FRAMEWORK=".build/artifacts/agorainfra_macos/aosl/aosl.xcframework/$PLATFORM/aosl.framework"
+          if [ ! -d "$AOSL_FRAMEWORK" ]; then
+            echo "Missing SwiftPM artifact: $AOSL_FRAMEWORK" >&2
+            exit 1
+          fi
+          cp -R "$AOSL_FRAMEWORK" "$APP_DIR/Frameworks/"
+          echo "Bundled: aosl.framework"
+
+          install_name_tool \
+            -add_rpath "@executable_path/../Frameworks" \
+            "$APP_DIR/MacOS/Astation"
+
           cat > "$APP_DIR/Info.plist" << 'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -141,6 +154,40 @@ jobs:
           </dict>
           </plist>
           PLIST
+
+      - name: Smoke-test packaged app
+        run: |
+          APP_EXECUTABLE="Astation.app/Contents/MacOS/Astation"
+          SMOKE_LOG="$RUNNER_TEMP/astation-package-smoke.log"
+
+          ASTATION_RELAY_URL="http://127.0.0.1:1" \
+            "$APP_EXECUTABLE" >"$SMOKE_LOG" 2>&1 &
+          APP_PID=$!
+
+          cleanup() {
+            if kill -0 "$APP_PID" 2>/dev/null; then
+              kill "$APP_PID"
+              wait "$APP_PID" || true
+            fi
+          }
+          trap cleanup EXIT
+
+          for _ in {1..5}; do
+            sleep 1
+            if ! kill -0 "$APP_PID" 2>/dev/null; then
+              if wait "$APP_PID"; then
+                STATUS=0
+              else
+                STATUS=$?
+              fi
+              cat "$SMOKE_LOG"
+              echo "Packaged app exited during smoke test (status $STATUS)" >&2
+              exit 1
+            fi
+          done
+
+          echo "Packaged app remained running for 5 seconds"
+          cat "$SMOKE_LOG"
 
       - name: Create .pkg installer
         run: |
