@@ -7,6 +7,7 @@
 // Consumers land in later tasks of the multi-replica plan; remove then.
 #![allow(dead_code)]
 pub mod bus;
+pub mod directory;
 pub mod local;
 
 use std::fmt;
