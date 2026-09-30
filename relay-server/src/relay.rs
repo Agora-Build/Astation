@@ -22,8 +22,8 @@ use crate::cluster::directory::{
     AtemJoin, InMemoryRoomDirectory, Promotion, RoomDirectory, RoomInfo, IDENTITY_HOSTNAME,
 };
 use crate::cluster::keys::KeyCache;
-use crate::cluster::ratelimit::{NoopRateLimiter, SharedRateLimiter};
 use crate::cluster::local::{LocalSockets, SocketOutbox, SocketRole};
+use crate::cluster::ratelimit::{NoopRateLimiter, SharedRateLimiter};
 use crate::cluster::{ConnRef, StoreError, SINGLE_REPLICA_ID};
 use crate::identity_store::{BindOutcome, IdentityError, IdentityStore, RegisterOutcome};
 use crate::AppState;

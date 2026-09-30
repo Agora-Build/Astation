@@ -69,6 +69,9 @@ pub struct SharedLimit {
     pub hub: RelayHub,
     pub bucket: &'static str,
     pub limit: u64,
+    /// The burst size of the route's tower_governor config; the governor
+    /// reports it as `x-ratelimit-limit`, so this layer does too.
+    pub burst: u64,
 }
 
 pub async fn shared_rate_limit(State(limit): State<SharedLimit>, request: Request, next: Next) -> Response {
@@ -79,7 +82,7 @@ pub async fn shared_rate_limit(State(limit): State<SharedLimit>, request: Reques
     let now = chrono::Utc::now().timestamp();
     match limit.hub.rate_limiter().hit(limit.bucket, &ip, limit.limit, now).await {
         Ok(RateDecision::Allowed) => next.run(request).await,
-        Ok(RateDecision::Limited { retry_after_secs }) => too_many_requests(retry_after_secs),
+        Ok(RateDecision::Limited { retry_after_secs }) => too_many_requests(retry_after_secs, limit.burst),
         Err(error) => {
             tracing::debug!("Shared rate limit unavailable, per-replica limit applies: {}", error);
             next.run(request).await
@@ -87,16 +90,18 @@ pub async fn shared_rate_limit(State(limit): State<SharedLimit>, request: Reques
     }
 }
 
-/// Same status and body as tower_governor's rejection.
-fn too_many_requests(wait: u64) -> Response {
+/// Same status, body and headers as tower_governor's rejection with
+/// `use_headers()` (no `retry-after`).
+fn too_many_requests(wait: u64, burst: u64) -> Response {
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
         format!("Too Many Requests! Wait for {}s", wait),
     )
         .into_response();
-    response
-        .headers_mut()
-        .insert("retry-after", HeaderValue::from(wait));
+    let headers = response.headers_mut();
+    headers.insert("x-ratelimit-after", HeaderValue::from(wait));
+    headers.insert("x-ratelimit-limit", HeaderValue::from(burst));
+    headers.insert("x-ratelimit-remaining", HeaderValue::from(0u64));
     response
 }
 
@@ -148,6 +153,7 @@ mod tests {
             hub: RelayHub::with_rate_limiter(limiter),
             bucket: "general",
             limit: GENERAL_LIMIT_PER_MINUTE,
+            burst: 20,
         };
         Router::new()
             .route("/limited", get(|| async { "ok" }))
@@ -170,7 +176,10 @@ mod tests {
     async fn limited_requests_get_governor_shaped_429() {
         let response = call(app(Arc::new(AlwaysLimited))).await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(response.headers()["retry-after"], "7");
+        assert_eq!(response.headers()["x-ratelimit-after"], "7");
+        assert_eq!(response.headers()["x-ratelimit-limit"], "20");
+        assert_eq!(response.headers()["x-ratelimit-remaining"], "0");
+        assert!(response.headers().get("retry-after").is_none());
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body.as_ref(), b"Too Many Requests! Wait for 7s");
     }

@@ -54,7 +54,7 @@ pub fn apply_inbox(local: &LocalSockets, message: InboxMessage) {
 
 #[async_trait]
 pub trait ReplicaBus: Send + Sync {
-    // Task 11 (/health) reports the backend.
+    // Task 12 (RedisBus) test/impl.
     #[allow(dead_code)]
     fn backend_name(&self) -> &'static str;
     /// Publish to one replica's inbox.

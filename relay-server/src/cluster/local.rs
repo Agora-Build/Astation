@@ -119,14 +119,14 @@ impl LocalSockets {
         self.codes_where(false)
     }
 
-    // Task 14 (resubscribe/room sweep).
+    // Task 20 (two-relay harness) and Task 25 (SIGTERM drain).
     #[allow(dead_code)]
     pub fn connection_ids(&self) -> Vec<String> {
         self.lock().keys().cloned().collect()
     }
 
     /// (Atem sockets, Astation sockets) on this replica.
-    // Task 11 (/health) and Task 33 (metrics).
+    // Task 33 (metrics).
     #[allow(dead_code)]
     pub fn count_by_role(&self) -> (usize, usize) {
         let conns = self.lock();
@@ -137,13 +137,13 @@ impl LocalSockets {
         (conns.len() - astations, astations)
     }
 
-    // Task 11 (/health) and Task 33 (metrics).
+    // Only tests use it; kept as the clippy len_without_is_empty pair of is_empty.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.lock().len()
     }
 
-    // Task 11 (/health) and Task 33 (metrics).
+    // Task 25 (drain test asserts it).
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.lock().is_empty()

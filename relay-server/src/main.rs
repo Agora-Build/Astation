@@ -130,6 +130,7 @@ fn router(state: AppState) -> Router {
                 hub: state.relay.clone(),
                 bucket: "grant",
                 limit: GRANT_LIMIT_PER_MINUTE,
+                burst: 10,
             },
             shared_rate_limit,
         ));
@@ -221,6 +222,7 @@ fn router(state: AppState) -> Router {
                 hub: state.relay.clone(),
                 bucket: "general",
                 limit: GENERAL_LIMIT_PER_MINUTE,
+            burst: 20,
             },
             shared_rate_limit,
         ));
