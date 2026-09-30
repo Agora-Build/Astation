@@ -65,9 +65,53 @@ Atem <-> Astation message relay via pairing codes and persistent identity rooms.
 
 For identity-room reconnects, the relay is the transport, not the device
 authenticator. Astation sends a v2 challenge, verifies the Atem HMAC proof, and
-only then returns `authenticated`. The relay binds a session to the room only
-after observing that Astation response. See [`SECURITY.md`](SECURITY.md) for
-current production blockers.
+only then returns `authenticated`. The relay does not derive bindings from that
+traffic. See [`SECURITY.md`](SECURITY.md) for the security status.
+
+### Astation relay identity + session bindings
+Exact spec: [`docs/knowledge-sync-plan.md`](../docs/knowledge-sync-plan.md),
+"Extension: Astation proof-of-possession + durable pairing". All frames are
+raw JSON text on the `role=astation` socket; the relay handles them itself and
+never forwards them to Atems.
+
+1. Relay → Astation, first frame on every `role=astation` socket (old
+   Astations ignore it):
+   `{"type":"relayAuthChallenge","protocol":"relay-auth-1","challenge":"<64 lowercase hex>"}`
+2. Astation → relay, within 10 s:
+   `{"type":"relayAuth","astation_id":"<room code>","public_key":"<hex>","signature":"<hex>"}`
+   - `public_key`: P-256 X9.63 uncompressed, 65 bytes (130 hex chars, `04…`);
+     either case, compared lowercase.
+   - `signature`: DER ECDSA (SHA-256) over the UTF-8 string
+     `station-relay-auth-v1\n<challenge>\n<astation_id>`.
+3. Relay → Astation:
+   `{"type":"relayAuthResult","status":"registered|verified|rejected","message":"<text>"}`
+   - `registered`: no key existed for this code; this key is now it (TOFU).
+   - `verified`: the proof matches the registered key.
+   - `rejected`: wrong key, bad signature/encoding, `astation_id` ≠ the room
+     code, late answer, or no answer in 10 s (pending sockets). The socket is
+     then closed.
+4. Only after `registered`/`verified`, Astation → relay:
+   `{"type":"relaySessions","sessions":["<session_id>", …]}` (full resync;
+   bindings become exactly this set; at most 1000 ids),
+   `{"type":"relayBind","session_id":"<id>"}`,
+   `{"type":"relayUnbind","session_id":"<id>"}`.
+   Relay → Astation acks (clients only need `ok`):
+   - `{"type":"relayAck","for":"relayBind","ok":true}` (same for `relayUnbind`,
+     which is idempotent)
+   - `{"type":"relayAck","for":"relaySessions","ok":true,"skipped":<n>}` —
+     `skipped` counts listed sessions bound to another Astation (left alone)
+   - `{"type":"relayAck","for":"<type>","ok":false,"message":"<text>"}` — not
+     verified, more than 1000 ids, an invalid `session_id` (empty, over 128
+     chars, or anything but visible ASCII), `relayBind` of a session bound to another
+     Astation, or an identity-store error. Nothing is changed.
+
+Connection states: with no key registered for the code the socket owns the
+room at once (**legacy mode**: relays as before, cannot bind). With a key
+registered it is **pending** — no room ownership, no Atem traffic or
+`relay_event` notifications — until it verifies, then it replaces the room
+owner. Bindings live in Postgres (`astation_keys`, `session_bindings`) and are
+the only thing `resolve_caller` (vault + Atem Memory) accepts; they expire
+after 7 days without use.
 
 ### RTC Sessions
 Web screen sharing with up to 8 participants.
@@ -82,7 +126,9 @@ transaction boundaries, and the exact current access predicates.
 
 Durable, append-only, versioned shared context store for collaborating atems.
 Backed by Postgres (`DATABASE_URL`). All requests require
-`Authorization: session <session_id>` and `?id=<client_id>`.
+`Authorization: session <session_id>` and `?id=<client_id>`. The session must
+be bound by a verified Astation (see above): `401` otherwise, `503` if the
+identity store is unavailable.
 
 - `POST /api/vault {summary}` → `{vault_id}` - Create a vault
 - `GET /api/vault` → `[{vault_id, summary}]` - List readable vaults
@@ -112,7 +158,7 @@ unauthenticated client can't make the relay buffer a large body), then:
 
 | Condition | Response |
 |-----------|----------|
-| Missing/invalid session | 401 (body never read) |
+| Missing/invalid/unbound session | 401 (body never read) |
 | Missing `?id=` | 400 |
 | Body over the byte limit | 413 |
 | Over the op cap | 413 `{"error":"too many ops"}` |
@@ -162,7 +208,7 @@ Config: Set `relay_url` and `ws_url` in `.atem/config.toml`
 | `PUBLIC_BASE_URL` | _(unset)_ | Public base URL used for generated session links (recommended in production) |
 | `PORT` | `3000` | Server port |
 | `RUST_LOG` | `info` | Log level (error, warn, info, debug, trace) |
-| `DATABASE_URL` | _(unset)_ | Postgres connection string shared by **vault** and **knowledge sync (Atem Memory)** storage (e.g. `postgres://vault:vault@localhost:5432/vault`), one pool for both. When unset, both fall back to **in-memory** (non-durable) and log a warning. Migrations in `migrations/` run automatically at startup. |
+| `DATABASE_URL` | _(unset)_ | Postgres connection string shared by **vault**, **knowledge sync (Atem Memory)**, and **relay identity** (Astation keys + session bindings) storage (e.g. `postgres://vault:vault@localhost:5432/vault`), one pool for all. When unset, all fall back to **in-memory** (non-durable: bindings and registered keys are lost on restart) and log a warning. Migrations in `migrations/` run automatically at startup. |
 
 **Production:**
 ```bash
@@ -184,7 +230,13 @@ RUST_LOG=debug
 ## Testing
 
 ```bash
-cargo test  # 235 tests (auth, sessions, relay, RTC, Voice, Vault, Knowledge sync, validation)
+cargo test  # 266 tests (auth, sessions, relay + relay identity, RTC, Voice, Vault, Knowledge sync, validation)
+# Postgres suites are #[ignore]d; run each against a throwaway local database:
+#   docker run --rm -d --name relay-test-pg -e POSTGRES_PASSWORD=pw -p 55433:5432 postgres:16
+#   IDENTITY_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test identity_store -- --ignored
+#   IDENTITY_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test relay:: -- --ignored
+#   KNOWLEDGE_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test knowledge_store -- --ignored
+#   docker rm -f relay-test-pg
 ```
 
 

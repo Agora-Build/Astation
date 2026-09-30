@@ -80,6 +80,45 @@ Volumetric, check the webapp's relay upstream and Docker DNS resolution.
 A successful deployment webhook only means the deployment was queued; the
 workflow also checks the final deployment status and public endpoints.
 
+#### Relay identity (Astation keys + session bindings)
+
+Vault and Atem Memory authorize a session only through a binding pushed by an
+Astation that proved its relay key (protocol: `relay-server/README.md`,
+security notes: `relay-server/SECURITY.md`). Keys and bindings live in the
+relay's Postgres (`astation_keys`, `session_bindings`, migration
+`0003_astation_identity`, applied automatically at startup).
+
+Rollout order:
+
+1. **Deploy the relay.** Astations that predate relay identity ignore the new
+   challenge and keep working in legacy mode: chat and remote control relay as
+   before. Vault and Atem Memory return `401` for their Atems from this deploy
+   on, because the relay no longer derives bindings from auth traffic.
+2. **Ship the Astation update.** On its next relay connect it registers its key
+   (trust on first use) and pushes its active sessions; vault and memory work
+   again, and bindings now survive relay restarts. Atems keep their changes
+   queued meanwhile.
+
+Admin reset, for a lost or replaced Mac (its Astation reports "Relay rejected
+this Astation's key"). Relay logs show only the first 4 characters of an id, so
+look it up first:
+
+```sql
+SELECT astation_id, registered_at, last_verified_at FROM astation_keys
+ WHERE astation_id LIKE '<first chars>%';
+DELETE FROM astation_keys WHERE astation_id = '<id>';
+```
+
+Bindings are kept. The next verified connect for that id registers the new key.
+
+Rollback caveat: once `0003` has been applied, a relay image built before it
+fails at startup (`sqlx` migrate error `VersionMissing(3)`: the database has a
+migration the binary does not know). Roll back to an image that includes
+`0003` (any `:sha-<commit>` from this change on). Only if you must run an older
+image: `DELETE FROM _sqlx_migrations WHERE version = 3;` lets it start (the
+tables stay and are ignored; a later deploy re-applies `0003`, which is
+`CREATE … IF NOT EXISTS`).
+
 ### Option 1: Docker Compose (Recommended)
 
 Create `docker-compose.yml`:

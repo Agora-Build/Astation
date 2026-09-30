@@ -1,5 +1,10 @@
 # Relay Server Session Support - TODO
 
+> **Historical.** `session_verify.rs` / `SessionVerifyCache` were removed: vault
+> and Atem Memory now authorize sessions only through durable bindings pushed by
+> a verified Astation. See `README.md` ("Astation relay identity + session
+> bindings") and `SECURITY.md`.
+
 ## Current Status
 
 ✅ **Infrastructure Complete:**
