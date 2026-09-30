@@ -313,7 +313,9 @@ async fn main() {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            cleanup_rtc.cleanup_expired().await;
+            if let Err(error) = cleanup_rtc.cleanup_expired().await {
+                tracing::debug!("RTC session sweep failed: {}", error);
+            }
             tracing::debug!("Cleaned up expired RTC sessions");
         }
     });

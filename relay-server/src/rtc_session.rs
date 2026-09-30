@@ -1,8 +1,9 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, OnceLock};
+
+use async_trait::async_trait;
+
+use crate::cluster::StoreError;
 
 use axum::{
     extract::{Path, State},
@@ -177,19 +178,6 @@ pub struct Participant {
     pub joined_at: DateTime<Utc>,
 }
 
-/// Internal session data (uid_counter is atomic and not directly clonable).
-pub struct RtcSessionInner {
-    pub id: String,
-    pub app_id: String,
-    pub channel: String,
-    pub token: String,
-    pub uid_counter: AtomicU32,
-    pub host_uid: u32,
-    pub created_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-    pub participants: Vec<Participant>,
-}
-
 /// Snapshot of an RTC session (returned by store operations).
 #[derive(Clone, Debug)]
 pub struct RtcSession {
@@ -202,22 +190,6 @@ pub struct RtcSession {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub participants: Vec<Participant>,
-}
-
-impl RtcSessionInner {
-    fn snapshot(&self) -> RtcSession {
-        RtcSession {
-            id: self.id.clone(),
-            app_id: self.app_id.clone(),
-            channel: self.channel.clone(),
-            token: self.token.clone(),
-            uid_counter_value: self.uid_counter.load(Ordering::SeqCst),
-            host_uid: self.host_uid,
-            created_at: self.created_at,
-            expires_at: self.expires_at,
-            participants: self.participants.clone(),
-        }
-    }
 }
 
 // --- Request / Response types ---
@@ -269,102 +241,162 @@ pub struct RtcSessionError {
 
 // --- Store ---
 
+pub const MAX_RTC_PARTICIPANTS: usize = 8;
+pub const RTC_FIRST_UID: u32 = 1000;
+pub const RTC_SESSION_TTL_HOURS: i64 = 4;
+
+#[derive(Debug)]
+pub enum JoinOutcome {
+    NotFound,
+    Full,
+    Joined(JoinRtcSessionResponse),
+}
+
+#[async_trait]
+pub trait RtcBackend: Send + Sync {
+    async fn create(&self, session: RtcSession) -> Result<(), StoreError>;
+    async fn get(&self, id: &str) -> Result<Option<RtcSession>, StoreError>;
+    /// Take the next uid and add a participant, atomically, unless the
+    /// session already has MAX_RTC_PARTICIPANTS.
+    async fn join(&self, id: &str, name: String, now: DateTime<Utc>) -> Result<JoinOutcome, StoreError>;
+    async fn delete(&self, id: &str) -> Result<bool, StoreError>;
+    async fn cleanup_expired(&self, now: DateTime<Utc>) -> Result<(), StoreError>;
+}
+
+#[derive(Clone, Default)]
+pub struct InMemoryRtcBackend {
+    sessions: Arc<std::sync::Mutex<HashMap<String, RtcSession>>>,
+}
+
+impl InMemoryRtcBackend {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, RtcSession>> {
+        self.sessions.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[async_trait]
+impl RtcBackend for InMemoryRtcBackend {
+    async fn create(&self, session: RtcSession) -> Result<(), StoreError> {
+        self.lock().insert(session.id.clone(), session);
+        Ok(())
+    }
+
+    async fn get(&self, id: &str) -> Result<Option<RtcSession>, StoreError> {
+        Ok(self.lock().get(id).cloned())
+    }
+
+    async fn join(&self, id: &str, name: String, now: DateTime<Utc>) -> Result<JoinOutcome, StoreError> {
+        let mut sessions = self.lock();
+        let Some(session) = sessions.get_mut(id) else {
+            return Ok(JoinOutcome::NotFound);
+        };
+        let current_count = session.participants.len();
+        tracing::info!(
+            "Join request for session {}: current participants = {}, name = {}",
+            id,
+            current_count,
+            name
+        );
+        // Enforce 8-person limit (including host)
+        if current_count >= MAX_RTC_PARTICIPANTS {
+            tracing::warn!("Session {} is full ({} participants)", id, current_count);
+            return Ok(JoinOutcome::Full);
+        }
+        let uid = session.uid_counter_value;
+        session.uid_counter_value += 1;
+        session.participants.push(Participant {
+            uid,
+            display_name: Some(name.clone()),
+            joined_at: now,
+        });
+        tracing::info!(
+            "User {} joined session {} with UID {} (total participants: {})",
+            name,
+            id,
+            uid,
+            session.participants.len()
+        );
+        Ok(JoinOutcome::Joined(JoinRtcSessionResponse {
+            app_id: session.app_id.clone(),
+            channel: session.channel.clone(),
+            token: session.token.clone(),
+            uid,
+            name,
+        }))
+    }
+
+    async fn delete(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.lock().remove(id).is_some())
+    }
+
+    async fn cleanup_expired(&self, now: DateTime<Utc>) -> Result<(), StoreError> {
+        self.lock().retain(|_, session| now <= session.expires_at);
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct RtcSessionStore {
-    sessions: Arc<RwLock<HashMap<String, Arc<RwLock<RtcSessionInner>>>>>,
+    backend: Arc<dyn RtcBackend>,
 }
 
 impl RtcSessionStore {
     pub fn new() -> Self {
-        RtcSessionStore {
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-        }
+        Self::with_backend(Arc::new(InMemoryRtcBackend::default()))
     }
 
-    pub async fn create(&self, id: String, app_id: String, channel: String, token: String, host_uid: u32) -> RtcSession {
+    pub fn with_backend(backend: Arc<dyn RtcBackend>) -> Self {
+        Self { backend }
+    }
+
+    pub async fn create(
+        &self,
+        id: String,
+        app_id: String,
+        channel: String,
+        token: String,
+        host_uid: u32,
+    ) -> Result<RtcSession, StoreError> {
         let now = Utc::now();
-        let inner = RtcSessionInner {
-            id: id.clone(),
+        let session = RtcSession {
+            id,
             app_id,
             channel,
             token,
-            uid_counter: AtomicU32::new(1000),
+            uid_counter_value: RTC_FIRST_UID,
             host_uid,
             created_at: now,
-            expires_at: now + Duration::hours(4),
+            expires_at: now + Duration::hours(RTC_SESSION_TTL_HOURS),
             participants: Vec::new(),
         };
-        let snapshot = inner.snapshot();
-        let arc_inner = Arc::new(RwLock::new(inner));
-        let mut sessions = self.sessions.write().await;
-        sessions.insert(id, arc_inner);
-        snapshot
+        self.backend.create(session.clone()).await?;
+        Ok(session)
     }
 
-    pub async fn get(&self, id: &str) -> Option<RtcSession> {
-        let sessions = self.sessions.read().await;
-        if let Some(inner) = sessions.get(id) {
-            let inner = inner.read().await;
-            Some(inner.snapshot())
-        } else {
-            None
-        }
+    pub async fn get(&self, id: &str) -> Result<Option<RtcSession>, StoreError> {
+        self.backend.get(id).await
     }
 
+    /// Join a session; the error text drives the HTTP status (see
+    /// `join_error_status`).
     pub async fn join(&self, id: &str, name: String) -> Result<JoinRtcSessionResponse, String> {
-        let sessions = self.sessions.read().await;
-        if let Some(inner_arc) = sessions.get(id) {
-            let mut inner = inner_arc.write().await;
-
-            let current_count = inner.participants.len();
-            tracing::info!("Join request for session {}: current participants = {}, name = {}", id, current_count, name);
-
-            // Enforce 8-person limit (including host)
-            if current_count >= 8 {
-                tracing::warn!("Session {} is full ({} participants)", id, current_count);
-                return Err("Session is full (maximum 8 participants)".to_string());
+        match self.backend.join(id, name, Utc::now()).await {
+            Ok(JoinOutcome::Joined(response)) => Ok(response),
+            Ok(JoinOutcome::NotFound) => Err("Session not found".to_string()),
+            Ok(JoinOutcome::Full) => Err("Session is full (maximum 8 participants)".to_string()),
+            Err(error) => {
+                tracing::error!("RTC session store unavailable: {}", error);
+                Err(format!("RTC session store unavailable: {error}"))
             }
-
-            let uid = inner.uid_counter.fetch_add(1, Ordering::SeqCst);
-            inner.participants.push(Participant {
-                uid,
-                display_name: Some(name.clone()),
-                joined_at: Utc::now(),
-            });
-
-            tracing::info!("User {} joined session {} with UID {} (total participants: {})",
-                name, id, uid, inner.participants.len());
-
-            Ok(JoinRtcSessionResponse {
-                app_id: inner.app_id.clone(),
-                channel: inner.channel.clone(),
-                token: inner.token.clone(),
-                uid,
-                name,
-            })
-        } else {
-            Err("Session not found".to_string())
         }
     }
 
-    pub async fn delete(&self, id: &str) -> bool {
-        let mut sessions = self.sessions.write().await;
-        sessions.remove(id).is_some()
+    pub async fn delete(&self, id: &str) -> Result<bool, StoreError> {
+        self.backend.delete(id).await
     }
 
-    pub async fn cleanup_expired(&self) {
-        let now = Utc::now();
-        let mut sessions = self.sessions.write().await;
-        let mut expired_ids = Vec::new();
-        for (id, inner_arc) in sessions.iter() {
-            let inner = inner_arc.read().await;
-            if now > inner.expires_at {
-                expired_ids.push(id.clone());
-            }
-        }
-        for id in expired_ids {
-            sessions.remove(&id);
-        }
+    pub async fn cleanup_expired(&self) -> Result<(), StoreError> {
+        self.backend.cleanup_expired(Utc::now()).await
     }
 }
 
@@ -372,6 +404,27 @@ impl Default for RtcSessionStore {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// HTTP status for a `join` error message.
+fn join_error_status(error: &str) -> StatusCode {
+    if error.contains("unavailable") {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if error.contains("not found") {
+        StatusCode::NOT_FOUND
+    } else if error.contains("full") {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+fn rtc_unavailable(error: StoreError) -> (StatusCode, Json<RtcSessionError>) {
+    tracing::error!("RTC session store unavailable: {}", error);
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(RtcSessionError { error: "Temporarily unavailable".to_string() }),
+    )
 }
 
 // --- Route Handlers ---
@@ -416,10 +469,13 @@ pub async fn create_rtc_session_handler(
 
     tracing::info!("Generated session URL: {}", url);
 
-    state
+    if let Err(error) = state
         .rtc_sessions
         .create(id.clone(), body.app_id, body.channel, body.token, body.host_uid)
-        .await;
+        .await
+    {
+        return rtc_unavailable(error).into_response();
+    }
 
     (
         StatusCode::CREATED,
@@ -432,8 +488,8 @@ pub async fn create_rtc_session_handler(
 pub async fn get_rtc_session_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> impl IntoResponse {
-    match state.rtc_sessions.get(&id).await {
+) -> Result<Json<GetRtcSessionResponse>, (StatusCode, Json<RtcSessionError>)> {
+    match state.rtc_sessions.get(&id).await.map_err(rtc_unavailable)? {
         Some(session) => Ok(Json(GetRtcSessionResponse {
             app_id: session.app_id,
             channel: session.channel,
@@ -468,13 +524,7 @@ pub async fn join_rtc_session_handler(
     match state.rtc_sessions.join(&id, body.name).await {
         Ok(response) => Ok(Json(response)),
         Err(error) => {
-            let status = if error.contains("not found") {
-                StatusCode::NOT_FOUND
-            } else if error.contains("full") {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
+            let status = join_error_status(&error);
             Err((status, Json(RtcSessionError { error })))
         }
     }
@@ -485,10 +535,10 @@ pub async fn delete_rtc_session_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if state.rtc_sessions.delete(&id).await {
-        StatusCode::OK
-    } else {
-        StatusCode::NOT_FOUND
+    match state.rtc_sessions.delete(&id).await {
+        Ok(true) => StatusCode::OK,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(error) => rtc_unavailable(error).0,
     }
 }
 
@@ -545,14 +595,14 @@ mod tests {
                 "token-abc".into(),
                 5678,
             )
-            .await;
+            .await.unwrap();
 
         assert_eq!(session.id, "test-id");
         assert_eq!(session.app_id, "app123");
         assert_eq!(session.channel, "my-channel");
         assert_eq!(session.host_uid, 5678);
 
-        let retrieved = store.get("test-id").await;
+        let retrieved = store.get("test-id").await.unwrap();
         assert!(retrieved.is_some());
         let retrieved = retrieved.unwrap();
         assert_eq!(retrieved.app_id, "app123");
@@ -564,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_nonexistent() {
         let store = RtcSessionStore::new();
-        assert!(store.get("does-not-exist").await.is_none());
+        assert!(store.get("does-not-exist").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -572,10 +622,10 @@ mod tests {
         let store = RtcSessionStore::new();
         store
             .create("del-me".into(), "app".into(), "ch".into(), "tok".into(), 1)
-            .await;
-        assert!(store.get("del-me").await.is_some());
-        assert!(store.delete("del-me").await);
-        assert!(store.get("del-me").await.is_none());
+            .await.unwrap();
+        assert!(store.get("del-me").await.unwrap().is_some());
+        assert!(store.delete("del-me").await.unwrap());
+        assert!(store.get("del-me").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -583,7 +633,7 @@ mod tests {
         let store = RtcSessionStore::new();
         store
             .create("join-test".into(), "app".into(), "ch".into(), "tok".into(), 1)
-            .await;
+            .await.unwrap();
 
         let r1 = store.join("join-test", "Alice".into()).await.unwrap();
         let r2 = store.join("join-test", "Bob".into()).await.unwrap();
@@ -605,7 +655,7 @@ mod tests {
         let store = RtcSessionStore::new();
         store
             .create("info-test".into(), "my-app".into(), "room1".into(), "secret-token".into(), 42)
-            .await;
+            .await.unwrap();
 
         let resp = store.join("info-test", "Dave".into()).await.unwrap();
         assert_eq!(resp.app_id, "my-app");
@@ -619,11 +669,11 @@ mod tests {
         let store = RtcSessionStore::new();
         store
             .create("part-test".into(), "app".into(), "ch".into(), "tok".into(), 1)
-            .await;
+            .await.unwrap();
 
         let _ = store.join("part-test", "Alice".into()).await;
 
-        let session = store.get("part-test").await.unwrap();
+        let session = store.get("part-test").await.unwrap().unwrap();
         assert_eq!(session.participants.len(), 1);
         assert_eq!(
             session.participants[0].display_name,
@@ -634,34 +684,39 @@ mod tests {
 
     #[tokio::test]
     async fn test_cleanup_expired() {
-        let store = RtcSessionStore::new();
-
-        // Create an expired session by manipulating internally
-        {
-            let inner = RtcSessionInner {
+        let backend = InMemoryRtcBackend::default();
+        let store = RtcSessionStore::with_backend(Arc::new(backend.clone()));
+        backend
+            .create(RtcSession {
                 id: "expired".into(),
                 app_id: "a".into(),
                 channel: "c".into(),
                 token: "t".into(),
-                uid_counter: AtomicU32::new(1000),
+                uid_counter_value: RTC_FIRST_UID,
                 host_uid: 1,
                 created_at: Utc::now() - Duration::hours(5),
                 expires_at: Utc::now() - Duration::hours(1),
                 participants: Vec::new(),
-            };
-            let mut sessions = store.sessions.write().await;
-            sessions.insert("expired".into(), Arc::new(RwLock::new(inner)));
-        }
-
-        // Create an active session
+            })
+            .await
+            .unwrap();
         store
             .create("active".into(), "a".into(), "c".into(), "t".into(), 1)
-            .await;
+            .await
+            .unwrap();
 
-        store.cleanup_expired().await;
+        store.cleanup_expired().await.unwrap();
 
-        assert!(store.get("expired").await.is_none());
-        assert!(store.get("active").await.is_some());
+        assert!(store.get("expired").await.unwrap().is_none());
+        assert!(store.get("active").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn join_handler_maps_an_unavailable_store_to_503() {
+        assert_eq!(join_error_status("RTC session store unavailable: x"), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(join_error_status("Session not found"), StatusCode::NOT_FOUND);
+        assert_eq!(join_error_status("Session is full (maximum 8 participants)"), StatusCode::CONFLICT);
+        assert_eq!(join_error_status("anything else"), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
@@ -669,11 +724,11 @@ mod tests {
         let store = RtcSessionStore::new();
         store
             .create("keep-me".into(), "a".into(), "c".into(), "t".into(), 1)
-            .await;
+            .await.unwrap();
 
-        store.cleanup_expired().await;
+        store.cleanup_expired().await.unwrap();
 
-        assert!(store.get("keep-me").await.is_some());
+        assert!(store.get("keep-me").await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -681,7 +736,7 @@ mod tests {
         let store = RtcSessionStore::new();
         store
             .create("uid-test".into(), "a".into(), "c".into(), "t".into(), 1)
-            .await;
+            .await.unwrap();
 
         let resp = store.join("uid-test", "First".into()).await.unwrap();
         assert_eq!(resp.uid, 1000);
@@ -692,7 +747,7 @@ mod tests {
         let store = RtcSessionStore::new();
         store
             .create("concurrent".into(), "a".into(), "c".into(), "t".into(), 1)
-            .await;
+            .await.unwrap();
 
         let mut handles = Vec::new();
         for i in 0..10 {
@@ -725,7 +780,7 @@ mod tests {
         let store = RtcSessionStore::new();
         store
             .create("full-test".into(), "a".into(), "c".into(), "t".into(), 1)
-            .await;
+            .await.unwrap();
 
         // Join 8 people successfully
         for i in 0..8 {
@@ -839,7 +894,8 @@ mod tests {
         state
             .rtc_sessions
             .create("get-test".into(), "app1".into(), "room1".into(), "tok".into(), 99)
-            .await;
+            .await
+            .unwrap();
 
         let app = Router::new()
             .route("/api/rtc-sessions/:id", get(get_rtc_session_handler))
@@ -896,7 +952,8 @@ mod tests {
         state
             .rtc_sessions
             .create("join-h".into(), "app1".into(), "room1".into(), "tok1".into(), 42)
-            .await;
+            .await
+            .unwrap();
 
         let app = Router::new()
             .route(
@@ -962,7 +1019,8 @@ mod tests {
         state
             .rtc_sessions
             .create("del-h".into(), "a".into(), "c".into(), "t".into(), 1)
-            .await;
+            .await
+            .unwrap();
 
         let app = Router::new()
             .route(
@@ -1143,7 +1201,8 @@ mod tests {
         state
             .rtc_sessions
             .create("full-h".into(), "app1".into(), "room1".into(), "tok1".into(), 42)
-            .await;
+            .await
+            .unwrap();
 
         // Fill session to capacity (8 participants)
         for i in 0..8 {
@@ -1183,12 +1242,12 @@ mod tests {
         let store = RtcSessionStore::new();
         store
             .create("race-test".into(), "a".into(), "c".into(), "t".into(), 1)
-            .await;
+            .await.unwrap();
 
         // Spawn concurrent operations: cleanup and join
         let store1 = store.clone();
         let cleanup_task = tokio::spawn(async move {
-            store1.cleanup_expired().await;
+            store1.cleanup_expired().await.unwrap();
         });
 
         let store2 = store.clone();
@@ -1199,7 +1258,7 @@ mod tests {
         let _ = tokio::join!(cleanup_task, join_task);
 
         // Session should still exist and have at least one participant
-        let session = store.get("race-test").await;
+        let session = store.get("race-test").await.unwrap();
         assert!(session.is_some(), "Session should not be cleaned up while active");
     }
 
@@ -1237,14 +1296,14 @@ mod tests {
         let store = RtcSessionStore::new();
         store
             .create("name-test".into(), "app".into(), "ch".into(), "tok".into(), 1)
-            .await;
+            .await.unwrap();
 
         // Join multiple users
         store.join("name-test", "Alice".into()).await.unwrap();
         store.join("name-test", "Bob".into()).await.unwrap();
         store.join("name-test", "Charlie".into()).await.unwrap();
 
-        let session = store.get("name-test").await.unwrap();
+        let session = store.get("name-test").await.unwrap().unwrap();
         assert_eq!(session.participants.len(), 3);
 
         let names: Vec<String> = session.participants.iter()
@@ -1258,15 +1317,15 @@ mod tests {
         let store = RtcSessionStore::new();
         store
             .create("del-part".into(), "app".into(), "ch".into(), "tok".into(), 1)
-            .await;
+            .await.unwrap();
 
         // Add participants
         store.join("del-part", "User1".into()).await.unwrap();
         store.join("del-part", "User2".into()).await.unwrap();
 
         // Delete should succeed even with participants
-        assert!(store.delete("del-part").await);
-        assert!(store.get("del-part").await.is_none());
+        assert!(store.delete("del-part").await.unwrap());
+        assert!(store.get("del-part").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1276,16 +1335,16 @@ mod tests {
         // Create session (not expired)
         store
             .create("active-with-parts".into(), "a".into(), "c".into(), "t".into(), 1)
-            .await;
+            .await.unwrap();
 
         // Add participants
         store.join("active-with-parts", "User1".into()).await.unwrap();
         store.join("active-with-parts", "User2".into()).await.unwrap();
 
-        store.cleanup_expired().await;
+        store.cleanup_expired().await.unwrap();
 
         // Should still exist
-        let session = store.get("active-with-parts").await;
+        let session = store.get("active-with-parts").await.unwrap();
         assert!(session.is_some());
         assert_eq!(session.unwrap().participants.len(), 2);
     }
