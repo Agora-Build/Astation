@@ -91,7 +91,10 @@ pub enum Promotion {
     NotPending { evicted: Option<ConnRef> },
     /// The pending connection now owns the room.
     Promoted {
+        /// The replaced owner (to be closed).
         previous_owner: Option<ConnRef>,
+        /// `previous_owner` had not proved the key (evicted, not replaced).
+        evicted_unverified: bool,
         atems: Vec<(String, ConnRef)>,
     },
 }
@@ -242,6 +245,7 @@ impl RoomDirectory for InMemoryRoomDirectory {
         room.verified = true;
         Ok(Promotion::Promoted {
             previous_owner,
+            evicted_unverified: evicted.is_some(),
             atems: room.atem_list(),
         })
     }
@@ -416,6 +420,7 @@ pub(crate) mod scenarios {
             d.promote("astation-race", &c("pending", "r2"), true).await.unwrap(),
             Promotion::Promoted {
                 previous_owner: None,
+                evicted_unverified: false,
                 atems: vec![("atem-a".to_string(), c("t1", "r1"))],
             }
         );
@@ -440,6 +445,7 @@ pub(crate) mod scenarios {
             d.promote("astation-race", &c("again", "r1"), true).await.unwrap(),
             Promotion::Promoted {
                 previous_owner: Some(c("pending", "r2")),
+                evicted_unverified: false,
                 atems: vec![("atem-a".to_string(), c("t1", "r1"))],
             }
         );
@@ -452,6 +458,7 @@ pub(crate) mod scenarios {
             d.promote("astation-sq", &c("pending", "r2"), true).await.unwrap(),
             Promotion::Promoted {
                 previous_owner: Some(c("squatter", "r1")),
+                evicted_unverified: true,
                 atems: vec![],
             }
         );
