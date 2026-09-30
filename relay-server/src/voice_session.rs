@@ -276,6 +276,7 @@ impl VoiceBackend for InMemoryVoiceBackend {
             .filter(|session| session.state == VoiceSessionState::ResponseReady)
             .and_then(|session| session.response.clone());
         if let Some(reply) = arrived {
+            drop(receiver);
             self.waiters.prune(session_id);
             return Ok(WaitOutcome::Reply(reply));
         }
@@ -672,7 +673,20 @@ mod tests {
     async fn wait_reply_times_out() {
         let store = VoiceSessionStore::new();
         store.create("slow".to_string(), "atem".to_string(), "ch".to_string()).await.unwrap();
+        let started = tokio::time::Instant::now();
         let result = store.wait_reply("slow", std::time::Duration::from_secs(30)).await.unwrap();
         assert_eq!(result, WaitOutcome::TimedOut);
+        assert!(started.elapsed() >= std::time::Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn early_wait_reply_leaves_no_waiter_behind() {
+        let backend = InMemoryVoiceBackend::default();
+        let store = VoiceSessionStore::with_backend(std::sync::Arc::new(backend.clone()));
+        store.create("early2".to_string(), "atem".to_string(), "ch".to_string()).await.unwrap();
+        store.set_response("early2", "here".to_string()).await.unwrap();
+        let result = store.wait_reply("early2", std::time::Duration::from_millis(50)).await.unwrap();
+        assert_eq!(result, WaitOutcome::Reply("here".to_string()));
+        assert!(!backend.waiters.lock().contains_key("early2"));
     }
 }

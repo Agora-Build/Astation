@@ -579,6 +579,7 @@ mod tests {
         state.voice_sessions.trigger("test-timeout").await.unwrap();
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-voice-session-id", "test-timeout".parse().unwrap());
+        let started = tokio::time::Instant::now();
         let response = llm_chat_handler(
             State(state),
             Query(LlmChatQuery { session_id: None }),
@@ -588,5 +589,6 @@ mod tests {
             }),
         ).await;
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(started.elapsed() >= std::time::Duration::from_secs(30));
     }
 }
