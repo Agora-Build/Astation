@@ -13,9 +13,9 @@ use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 
 use super::StoreError;
 
+/// Bound on every Redis call, so a slow Redis can't stall a connect.
 // Consumers land in Tasks 11-19; drop the allow as they do.
 #[allow(dead_code)]
-/// Bound on every Redis call, so a slow Redis can't stall a connect.
 pub const REDIS_TIMEOUT: Duration = Duration::from_secs(3);
 
 // Consumers land in Tasks 11-19; drop the allow as they do.
@@ -24,9 +24,9 @@ pub(crate) fn redis_error(error: redis::RedisError) -> StoreError {
     StoreError::Unavailable(error.to_string())
 }
 
+/// A reconnecting command connection plus the client (for pub/sub).
 // Consumers land in Tasks 11-19; drop the allow as they do.
 #[allow(dead_code)]
-/// A reconnecting command connection plus the client (for pub/sub).
 #[derive(Clone)]
 pub struct RedisConn {
     client: redis::Client,
@@ -36,14 +36,16 @@ pub struct RedisConn {
 // Consumers land in Tasks 11-19; drop the allow as they do.
 #[allow(dead_code)]
 impl RedisConn {
+    /// One connect attempt, bounded by REDIS_TIMEOUT, with no internal retry
+    /// or backoff. Startup-level retrying belongs to the caller (Task 19's loop).
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
         let client = redis::Client::open(url).map_err(redis_error)?;
         let config = ConnectionManagerConfig::new()
             .set_connection_timeout(REDIS_TIMEOUT)
             .set_response_timeout(REDIS_TIMEOUT)
-            .set_number_of_retries(2);
+            .set_number_of_retries(0);
         let manager = tokio::time::timeout(
-            REDIS_TIMEOUT * 2,
+            REDIS_TIMEOUT,
             client.get_connection_manager_with_config(config),
         )
         .await
@@ -77,7 +79,6 @@ impl RedisConn {
     }
 }
 
-
 #[cfg(test)]
 pub(crate) mod test_support {
     //! Redis suites are #[ignore]d and need TEST_REDIS_URL (localhost only:
@@ -89,18 +90,20 @@ pub(crate) mod test_support {
 
     /// True only for a `redis://` URL whose host is this machine.
     pub(crate) fn is_local_redis_url(url: &str) -> bool {
-        let rest = match url.split_once("://") {
-            Some(("redis", rest)) => rest,
-            _ => return false,
+        let parsed = match url::Url::parse(url) {
+            Ok(parsed) => parsed,
+            Err(_) => return false,
         };
-        let authority = rest.split(['/', '?']).next().unwrap_or("");
-        let hostport = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
-        let host = if let Some(stripped) = hostport.strip_prefix('[') {
-            stripped.split(']').next().unwrap_or("")
-        } else {
-            hostport.split(':').next().unwrap_or("")
-        };
-        matches!(host, "localhost" | "127.0.0.1" | "::1")
+        parsed.scheme() == "redis"
+            && matches!(
+                parsed.host(),
+                // `redis` is not a "special" scheme, so the url crate leaves a
+                // dotted-quad host as a string instead of parsing it to Ipv4.
+                Some(url::Host::Domain("localhost"))
+                    | Some(url::Host::Domain("127.0.0.1"))
+                    | Some(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST))
+                    | Some(url::Host::Ipv6(std::net::Ipv6Addr::LOCALHOST))
+            )
     }
 
     pub(crate) fn test_url() -> String {
@@ -142,12 +145,20 @@ mod tests {
         assert!(!is_local_redis_url("redis://localhost.evil.com:6379"));
         assert!(!is_local_redis_url("redis://localhost@prod.example.com:6379"));
         assert!(!is_local_redis_url("rediss://127.0.0.1:6379"));
+        assert!(!is_local_redis_url("redis://evil.com#@localhost"));
+        assert!(!is_local_redis_url("redis://127.0.0.1.evil.com"));
+        assert!(!is_local_redis_url("redis://localhost@evil"));
+        assert!(!is_local_redis_url("redis://user:pw@evil.com/"));
+        assert!(!is_local_redis_url("rediss://localhost"));
+        assert!(is_local_redis_url("redis://[::1]:6379/"));
     }
 
     #[tokio::test]
     async fn unreachable_redis_is_a_store_error() {
+        let started = std::time::Instant::now();
         let error = RedisConn::connect("redis://127.0.0.1:1/").await.err().expect("no server on port 1");
         assert!(matches!(error, StoreError::Unavailable(_)));
+        assert!(started.elapsed() < REDIS_TIMEOUT, "took {:?}", started.elapsed());
     }
 
     #[tokio::test]
