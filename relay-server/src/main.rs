@@ -1,4 +1,5 @@
 mod auth;
+mod cluster;
 mod identity_store;
 mod knowledge_routes;
 mod knowledge_secrets;
