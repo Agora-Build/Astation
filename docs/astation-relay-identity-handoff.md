@@ -46,7 +46,7 @@ So Astation must *prove* its identity to the relay. The relay must then learn
 | Repo / branch | What | Head |
 |---|---|---|
 | Astation `feat/relay-identity-swift` (this branch) | Swift: identity key + relay protocol + tests + CI step + this doc | `3050545` (+ this doc) |
-| Astation `feat/knowledge-sync` | Relay: knowledge-sync endpoints, identity store, proof-of-possession, docs. `feat/relay-identity-swift` was branched from it at `6e2f5d9` | `7d7ac35`, final relay fix round in progress |
+| Astation `feat/knowledge-sync` | Relay: knowledge-sync endpoints, identity store, proof-of-possession, docs. `feat/relay-identity-swift` was branched from it at `6e2f5d9` | `8729cb8`, relay work complete and reviewed |
 | Atem `feat/memory-pairing-auth` | atem client: sync via the pairing session, tier gates, docs | `46f86df` |
 
 Binding plan (all tasks, exact contract): `docs/knowledge-sync-plan.md`. The
@@ -236,8 +236,12 @@ against a DB that has it (sqlx `VersionMissing`).
 
 **Admin reset** (lost or replaced Mac):
 `DELETE FROM astation_keys WHERE astation_id = '<id>';`. The next verified
-connect registers the new key. During a DB outage a reset needs a relay restart,
-because the relay caches keys in memory.
+connect registers the new key. The relay caches keys in memory, so for a
+**stolen Mac** restart the relay right after the DELETE; otherwise the old key
+keeps verifying. Even then the id is keyless until the new Mac connects, and
+whoever connects first registers by TOFU. So have the replacement Mac online
+when you reset. Key pinning is a follow-up. The key cache assumes a single
+relay instance.
 
 ---
 
