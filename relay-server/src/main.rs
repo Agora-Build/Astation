@@ -224,6 +224,7 @@ async fn run_supervisor(
         return;
     }
     hub.drain(grace).await;
+    // By design the supervisor-failure exit skips the in-flight HTTP grace.
     exit(name);
 }
 
@@ -509,8 +510,9 @@ fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// SIGTERM (docker stop, Coolify redeploy) or Ctrl-C.
-async fn shutdown_signal() {
+/// SIGTERM (docker stop, Coolify redeploy) or Ctrl-C. Returns the
+/// conventional exit code of the signal received (143 / 130).
+async fn shutdown_signal() -> i32 {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -529,8 +531,8 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
+        _ = ctrl_c => 130,
+        _ = terminate => 143,
     }
 }
 
@@ -732,9 +734,9 @@ async fn main() {
         // Our handlers replaced the default action, so without this a
         // second signal would do nothing until the drain ends.
         tokio::spawn(async {
-            shutdown_signal().await;
+            let code = shutdown_signal().await;
             tracing::warn!("Second shutdown signal during the drain: exiting now");
-            std::process::exit(130);
+            std::process::exit(code);
         });
     };
     serve_with_drain(listener, app, shutdown_hub, signal, relay::DRAIN_GRACE)

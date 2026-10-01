@@ -64,7 +64,7 @@ const IDENTITY_STORE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Close code: shared relay state unavailable, reconnect later (RFC 6455).
 pub(crate) const CLOSE_TRY_AGAIN: u16 = 1013;
 /// Bound on flushing a socket's queued frames before its close frame.
-const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Fresh codes POST /api/pair tries before giving up (a collision never
 /// overwrites a live room).
