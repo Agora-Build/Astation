@@ -474,3 +474,178 @@ async fn redis_racing_astations_leave_exactly_one_owner() {
     send_json(&mut atem, serde_json::json!({"probe": "winner"})).await;
     assert_eq!(next_client_json(winner).await["payload"]["probe"], "winner");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn redis_pairing_session_create_grant_poll_and_websocket_across_replicas() {
+    let _guard = REDIS_LOCK.lock().await;
+    let (_shared, one, two) = two_replicas().await;
+    let (status, created) = http(&one.state, "POST", "/api/sessions", r#"{"hostname":"mac"}"#, &[]).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = created["id"].as_str().unwrap().to_string();
+    let otp = created["otp"].as_str().unwrap().to_string();
+    let grant_uri = format!("/api/sessions/{id}/grant");
+    let grant_body = serde_json::json!({ "otp": otp }).to_string();
+
+    // Two clicks on different replicas: exactly one applies.
+    let (on_two, on_one) = tokio::join!(
+        http(&two.state, "POST", &grant_uri, &grant_body, &[]),
+        http(&one.state, "POST", &grant_uri, &grant_body, &[]),
+    );
+    let mut statuses = vec![on_two.0, on_one.0];
+    statuses.sort();
+    assert_eq!(statuses, vec![StatusCode::OK, StatusCode::CONFLICT]);
+
+    let (status, polled) = http(&one.state, "GET", &format!("/api/sessions/{id}/status"), "", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(polled["status"], "granted");
+    assert_eq!(polled["token"].as_str().map(str::len), Some(64));
+
+    let (_atem, _) = tokio_tungstenite::connect_async(format!("{}?session={id}&atem_id=atem-s", two.ws))
+        .await
+        .expect("session WebSocket on replica 2");
+    let code = format!("session-{id}");
+    let mut seen = false;
+    for _ in 0..100 {
+        if let Some(room) = one.state.relay.room(&code).await.unwrap() {
+            if room.atems.contains_key("atem-s") {
+                seen = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(seen, "replica 1 sees the Atem that connected to replica 2");
+}
+
+async fn voice_session(replica: &Replica) -> String {
+    let (status, created) = http(
+        &replica.state,
+        "POST",
+        "/api/voice-sessions",
+        r#"{"atem_id":"atem-v","channel":"ch"}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    created["session_id"].as_str().unwrap().to_string()
+}
+
+async fn llm_chat(state: &AppState, id: &str) -> (StatusCode, serde_json::Value) {
+    http(
+        state,
+        "POST",
+        &format!("/api/llm/chat?session_id={id}"),
+        r#"{"messages":[{"role":"user","content":"go"}]}"#,
+        &[],
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn redis_voice_wait_on_one_replica_is_answered_on_the_other() {
+    let _guard = REDIS_LOCK.lock().await;
+    let (_shared, one, two) = two_replicas().await;
+
+    // Waiting on 1, answered on 2.
+    let id = voice_session(&one).await;
+    let (status, _) = http(&one.state, "POST", &format!("/api/voice-sessions/{id}/trigger"), "", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let waiting = tokio::spawn({
+        let state = one.state.clone();
+        let id = id.clone();
+        async move { llm_chat(&state, &id).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let answer = serde_json::json!({"session_id": id, "response": "done on two"}).to_string();
+    let answered = std::time::Instant::now();
+    let (status, _) = http(&two.state, "POST", "/api/voice-sessions/response", &answer, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = waiting.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["choices"][0]["message"]["content"], "done on two");
+    // Woken by replica 2's publish, not by the 1 s re-read of :reply (which
+    // would land at least 700 ms after the answer).
+    assert!(answered.elapsed() < Duration::from_millis(500), "woken after {:?}", answered.elapsed());
+
+    // The answer arrives before anyone waits.
+    let early = voice_session(&one).await;
+    let (status, _) = http(&one.state, "POST", &format!("/api/voice-sessions/{early}/trigger"), "", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let answer = serde_json::json!({"session_id": early, "response": "early"}).to_string();
+    let (status, _) = http(&two.state, "POST", "/api/voice-sessions/response", &answer, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    // Let replica 2's publish reach replica 1 and find no waiter there, so
+    // only the stored answer can satisfy the wait below.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let started = std::time::Instant::now();
+    assert_eq!(
+        one.state.voice_sessions.wait_reply(&early, Duration::from_secs(5)).await.unwrap(),
+        crate::voice_session::WaitOutcome::Reply("early".to_string())
+    );
+    // Found by the read before waiting, not by the 1 s re-read.
+    assert!(started.elapsed() < Duration::from_millis(500), "found after {:?}", started.elapsed());
+    let (status, body) = llm_chat(&one.state, &early).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["choices"][0]["message"]["content"], "early");
+
+    // Nobody answers: the wait times out (the handler's 30 s is the same
+    // wait with LLM_WAIT_SECS; see llm_proxy::test_triggered_times_out_with_504).
+    let silent = voice_session(&one).await;
+    let (status, _) = http(&one.state, "POST", &format!("/api/voice-sessions/{silent}/trigger"), "", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        one.state.voice_sessions.wait_reply(&silent, Duration::from_secs(1)),
+    )
+    .await
+    .expect("the wait ends at its deadline");
+    assert_eq!(outcome.unwrap(), crate::voice_session::WaitOutcome::TimedOut);
+    assert!(started.elapsed() >= Duration::from_millis(950), "gave up after {:?}", started.elapsed());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn redis_concurrent_rtc_joins_across_replicas_hold_the_cap() {
+    let _guard = REDIS_LOCK.lock().await;
+    let (_shared, one, two) = two_replicas().await;
+    let (status, created) = http(
+        &one.state,
+        "POST",
+        "/api/rtc-sessions",
+        r#"{"app_id":"app","channel":"ch","token":"tok","host_uid":1}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = created["id"].as_str().unwrap().to_string();
+    let joins: Vec<_> = (0..12)
+        .map(|i| {
+            let state = if i % 2 == 0 { one.state.clone() } else { two.state.clone() };
+            let id = id.clone();
+            tokio::spawn(async move { state.rtc_sessions.join(&id, format!("user-{i}")).await })
+        })
+        .collect();
+    let mut uids = Vec::new();
+    let mut full = 0;
+    for join in joins {
+        match join.await.unwrap() {
+            Ok(response) => uids.push(response.uid),
+            Err(error) => {
+                assert!(error.contains("full"), "{error}");
+                full += 1;
+            }
+        }
+    }
+    uids.sort();
+    assert_eq!(uids, (1000..1008).collect::<Vec<u32>>());
+    assert_eq!(full, 4);
+    let (status, _) = http(&two.state, "GET", &format!("/api/rtc-sessions/{id}"), "", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let stored = two.state.rtc_sessions.get(&id).await.unwrap().expect("session on replica 2");
+    let mut stored_uids: Vec<u32> = stored.participants.iter().map(|p| p.uid).collect();
+    stored_uids.sort();
+    assert_eq!(stored_uids, uids, "replica 2 sees exactly the uids handed out");
+}
