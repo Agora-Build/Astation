@@ -5,9 +5,20 @@
 //!
 //! Each socket's queue is bounded (spec: "Bounded send queues"): at most
 //! 1,000 frames or 4 MB. A frame that doesn't fit is dropped (frames are
-//! best effort), and a client whose queue stays full for 10 s is closed with
-//! 1013 (reconnect). `send` never waits, so a slow client can't hold up the
-//! bus dispatcher or anyone else.
+//! best effort), and a client whose writer has taken no frame for 10 s since
+//! its queue stopped taking frames is closed with 1013 (reconnect). `send`
+//! never waits, so a slow client can't hold up the bus dispatcher or anyone
+//! else.
+//!
+//! What can be dropped: only frames for a socket whose queue is already
+//! full, and that includes control frames (a `relayAck`, or a
+//! `relayAuthResult` queued just before a close). A fresh connection's auth
+//! frames go to an empty queue and are never dropped. A close code is never
+//! lost: it travels on the watch channel, not the queue.
+//!
+//! Worst case per socket: 4 MB plus one frame, because an empty queue takes
+//! any single frame. That frame is at most axum's default WebSocket
+//! `max_message_size` (64 MiB), plus the relay's envelope around it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -55,11 +66,23 @@ pub type CloseRequest = Option<(u16, String)>;
 struct LocalConn {
     tx: mpsc::Sender<String>,
     queued_bytes: Arc<AtomicUsize>,
-    /// Since when frames have not fit (None: the last frame fit).
-    full_since: Option<Instant>,
+    /// Frames the writer has taken off the queue (its progress).
+    sent_frames: Arc<AtomicU64>,
+    /// Set while frames don't fit (None: the last frame fit, or the writer
+    /// has made progress since).
+    stall: Option<Stall>,
     close: watch::Sender<CloseRequest>,
     code: String,
     role: SocketRole,
+}
+
+/// A queue that has stopped taking frames: since when, and how many frames
+/// the writer had taken by then. It is stalled only while that count stays
+/// the same (a queue held just under the byte cap is as stuck as one at it).
+#[derive(Clone, Copy)]
+struct Stall {
+    since: Instant,
+    sent_frames: u64,
 }
 
 /// The receiving half, owned by the socket's writer task.
@@ -67,12 +90,14 @@ pub struct SocketOutbox {
     pub frames: mpsc::Receiver<String>,
     pub close: watch::Receiver<CloseRequest>,
     pub queued_bytes: Arc<AtomicUsize>,
+    sent_frames: Arc<AtomicU64>,
 }
 
 impl SocketOutbox {
     /// The writer took `frame` off the queue.
     pub fn sent(&self, frame: &str) {
         self.queued_bytes.fetch_sub(frame.len(), Ordering::Relaxed);
+        self.sent_frames.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -106,12 +131,14 @@ impl LocalSockets {
         let (tx, frames) = mpsc::channel(self.limits.frames);
         let (close, close_rx) = watch::channel(None);
         let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let sent_frames = Arc::new(AtomicU64::new(0));
         self.lock().insert(
             connection_id.to_string(),
             LocalConn {
                 tx,
                 queued_bytes: queued_bytes.clone(),
-                full_since: None,
+                sent_frames: sent_frames.clone(),
+                stall: None,
                 close,
                 code: code.to_string(),
                 role,
@@ -121,6 +148,7 @@ impl LocalSockets {
             frames,
             close: close_rx,
             queued_bytes,
+            sent_frames,
         }
     }
 
@@ -140,7 +168,7 @@ impl LocalSockets {
             conn.queued_bytes.fetch_add(len, Ordering::Relaxed);
             match conn.tx.try_send(frame) {
                 Ok(()) => {
-                    conn.full_since = None;
+                    conn.stall = None;
                     return true;
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -152,9 +180,25 @@ impl LocalSockets {
                 }
             }
         }
-        let since = *conn.full_since.get_or_insert_with(Instant::now);
-        if since.elapsed() >= self.limits.stall {
-            if let Some(conn) = conns.remove(connection_id) {
+        // The frame doesn't fit: start the stall, restart it if the writer
+        // has made progress since, or close a client stalled for too long.
+        let sent_frames = conn.sent_frames.load(Ordering::Relaxed);
+        let stalled_too_long = match conn.stall {
+            Some(stall) if stall.sent_frames == sent_frames => {
+                stall.since.elapsed() >= self.limits.stall
+            }
+            _ => {
+                conn.stall = Some(Stall {
+                    since: Instant::now(),
+                    sent_frames,
+                });
+                false
+            }
+        };
+        if stalled_too_long {
+            let conn = conns.remove(connection_id);
+            drop(conns);
+            if let Some(conn) = conn {
                 self.close_slow(conn);
             }
         }
@@ -172,30 +216,31 @@ impl LocalSockets {
             .send(Some((CLOSE_SLOW_CLIENT, "client too slow".to_string())));
     }
 
-    /// Close clients whose queue has stayed full for `stall` while no new
-    /// frame arrived; forget the stall of clients that caught up. Returns
-    /// how many were closed.
+    /// Close clients whose writer has taken no frame for `stall` since
+    /// their queue stopped taking frames, while no new frame arrived; forget
+    /// the stall of clients that made progress. Returns how many were closed.
     pub fn sweep_slow(&self) -> usize {
         let mut conns = self.lock();
         let mut stalled = Vec::new();
         for (id, conn) in conns.iter_mut() {
-            let Some(since) = conn.full_since else {
+            let Some(stall) = conn.stall else {
                 continue;
             };
-            let still_full = conn.tx.capacity() == 0
-                || conn.queued_bytes.load(Ordering::Relaxed) >= self.limits.bytes;
-            if !still_full {
-                conn.full_since = None;
-            } else if since.elapsed() >= self.limits.stall {
+            let progressed = conn.sent_frames.load(Ordering::Relaxed) != stall.sent_frames
+                || conn.queued_bytes.load(Ordering::Relaxed) == 0;
+            if progressed {
+                conn.stall = None;
+            } else if stall.since.elapsed() >= self.limits.stall {
                 stalled.push(id.clone());
             }
         }
-        for id in &stalled {
-            if let Some(conn) = conns.remove(id) {
-                self.close_slow(conn);
-            }
+        let closed: Vec<LocalConn> = stalled.iter().filter_map(|id| conns.remove(id)).collect();
+        drop(conns);
+        let count = closed.len();
+        for conn in closed {
+            self.close_slow(conn);
         }
-        stalled.len()
+        count
     }
 
     /// Clients closed for being too slow since start.
@@ -510,6 +555,60 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(local.sweep_slow(), 1, "full by bytes for longer than the stall");
         assert!(!local.contains("c"));
+    }
+
+    /// A queue held just under the byte cap (each new frame too big to fit)
+    /// with no writer progress is stalled, and the sweep closes it.
+    #[tokio::test(start_paused = true)]
+    async fn a_client_stalled_just_under_the_byte_cap_is_closed() {
+        let local = LocalSockets::with_limits(QueueLimits {
+            frames: 100,
+            bytes: 10,
+            stall: Duration::from_secs(10),
+        });
+        let mut outbox = local.register("c", "room", SocketRole::Astation);
+        assert!(local.send("c", "123456".into()), "6 bytes queued, never drained");
+        let mut closed_after = None;
+        for second in 1..=15 {
+            assert!(!local.send("c", "abcde".into()), "6 + 5 > 10: rejected");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if local.sweep_slow() == 1 {
+                closed_after = Some(second);
+                break;
+            }
+        }
+        assert_eq!(closed_after, Some(10), "closed once stalled for 10 s");
+        assert!(!local.contains("c"));
+        assert!(outbox.close.changed().await.is_ok());
+        assert_eq!(
+            *outbox.close.borrow(),
+            Some((CLOSE_SLOW_CLIENT, "client too slow".to_string()))
+        );
+        assert_eq!(local.slow_client_closes(), 1);
+    }
+
+    /// A slow client whose writer keeps taking frames is never closed,
+    /// even though its queue is refilled to the cap as fast as it drains.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_but_progressing_client_is_not_closed() {
+        let local = LocalSockets::with_limits(QueueLimits {
+            frames: 2,
+            bytes: 1024,
+            stall: Duration::from_secs(10),
+        });
+        let mut outbox = local.register("c", "room", SocketRole::Astation);
+        for second in 0..60 {
+            // Fill to the cap; the rest is rejected.
+            while local.send("c", format!("{second}")) {}
+            assert!(!local.send("c", "extra".into()));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            local.sweep_slow();
+            // The writer takes one frame a second.
+            let frame = outbox.frames.try_recv().expect("queued");
+            outbox.sent(&frame);
+        }
+        assert!(local.contains("c"), "progressing, so never closed");
+        assert_eq!(local.slow_client_closes(), 0);
     }
 
     #[test]

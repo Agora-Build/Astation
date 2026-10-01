@@ -229,8 +229,9 @@ async fn run_supervisor(
     exit(name);
 }
 
-/// The background sweeps every replica runs every 60 s: expired pairing
-/// sessions, room upkeep, expired RTC and voice sessions. Shared by `main`
+/// The background sweeps every replica runs: every 60 s, expired pairing
+/// sessions, room upkeep, expired RTC and voice sessions; every 1 s, the
+/// slow-client sweep (closes sockets stalled for 10 s). Shared by `main`
 /// (which supervises them for the life of the process) and the two-relay
 /// test harness (which aborts them).
 fn spawn_upkeep(
