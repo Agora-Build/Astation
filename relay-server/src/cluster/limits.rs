@@ -2,7 +2,8 @@
 //! RELAY_WS_MAX_PER_IP concurrent `/ws` connections per client IP on each
 //! replica. The key is the raw header string (no IP normalization), so
 //! without Cloudflare in front a client can vary it, and IPv6 clients can
-//! rotate addresses within their /64. (The pending-Astation cap per room lives in the directory.)
+//! rotate addresses within their /64. (The pending-Astation caps, per room
+//! and per (room, client IP), live in the directory.)
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -22,6 +23,14 @@ pub struct WsConnLimiter {
 pub struct WsPermit {
     limiter: WsConnLimiter,
     ip: String,
+}
+
+impl WsPermit {
+    /// The client IP this socket was admitted under (also what the
+    /// per-IP pending-Astation cap counts).
+    pub fn ip(&self) -> &str {
+        &self.ip
+    }
 }
 
 impl Drop for WsPermit {

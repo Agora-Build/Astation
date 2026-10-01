@@ -44,8 +44,10 @@ behind N replicas one IP can hold up to about N × the limit. The client IP is
 then the peer address. Cloudflare sets `CF-Connecting-IP` itself, so in
 production it can't be forged; a relay reachable without Cloudflare in front
 trusts client-sent `X-Forwarded-For`/`X-Real-IP` and its per-IP limit can be
-dodged. A room holds at most 4 pending (not yet verified) Astation sockets; a
-fifth is closed with `1013`.
+dodged. A room holds at most 2 pending (not yet verified) Astation sockets
+from one client IP (the same address as above) and 32 in all
+(`MAX_PENDING_ASTATIONS_PER_IP`, `MAX_PENDING_ASTATIONS_PER_ROOM` in
+`src/relay.rs`); one more is closed with `1013`.
 
 ---
 

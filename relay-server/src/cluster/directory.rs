@@ -28,6 +28,24 @@ pub struct RoomInfo {
     pub atems: BTreeMap<String, ConnRef>,
     /// Astation connections that must prove the key first. Sorted.
     pub pending: Vec<ConnRef>,
+    /// Pending connection id → the client IP it connected from (the
+    /// per-IP pending cap counts these).
+    pub pending_ips: BTreeMap<String, String>,
+}
+
+/// Caps on a room's pending Astation sockets; 0 means no cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingCaps {
+    /// Pending sockets from one client IP.
+    pub per_ip: usize,
+    /// Pending sockets in total.
+    pub per_room: usize,
+}
+
+impl PendingCaps {
+    // Used by tests and the directory scenarios.
+    #[allow(dead_code)]
+    pub const NONE: Self = Self { per_ip: 0, per_room: 0 };
 }
 
 impl RoomInfo {
@@ -39,6 +57,7 @@ impl RoomInfo {
             verified: false,
             atems: BTreeMap::new(),
             pending: Vec::new(),
+            pending_ips: BTreeMap::new(),
         }
     }
 
@@ -53,6 +72,39 @@ impl RoomInfo {
 
     fn keep_on_sweep(&self, now: i64) -> bool {
         now - self.created_at < ROOM_EXPIRY_SECS || self.owner.is_some() || !self.pending.is_empty()
+    }
+
+    /// Whether one more pending socket from `ip` fits under `caps`.
+    fn admits_pending(&self, ip: &str, caps: PendingCaps) -> bool {
+        if caps.per_room > 0 && self.pending.len() >= caps.per_room {
+            return false;
+        }
+        let from_ip = self
+            .pending
+            .iter()
+            .filter(|pending| self.pending_ips.get(&pending.conn).map(String::as_str) == Some(ip))
+            .count();
+        caps.per_ip == 0 || from_ip < caps.per_ip
+    }
+
+    /// Add `conn` to pending (a connection id already pending is admitted
+    /// unchanged). False when `caps` are full.
+    fn try_pending(&mut self, conn: &ConnRef, ip: &str, caps: PendingCaps) -> bool {
+        if self.pending.iter().any(|p| p.conn == conn.conn) {
+            return true;
+        }
+        if !self.admits_pending(ip, caps) {
+            return false;
+        }
+        self.pending.push(conn.clone());
+        self.pending.sort();
+        self.pending_ips.insert(conn.conn.clone(), ip.to_string());
+        true
+    }
+
+    fn remove_pending(&mut self, connection_id: &str) {
+        self.pending.retain(|pending| pending.conn != connection_id);
+        self.pending_ips.remove(connection_id);
     }
 
     fn atem_list(&self) -> Vec<(String, ConnRef)> {
@@ -120,9 +172,17 @@ pub trait RoomDirectory: Send + Sync {
     async fn join_atem(&self, code: &str, atem_id: &str, conn: &ConnRef) -> Result<AtemJoin, StoreError>;
     /// A legacy (keyless) Astation takes the room, creating it if missing.
     async fn claim_owner(&self, code: &str, conn: &ConnRef, now: i64) -> Result<OwnerClaim, StoreError>;
-    /// A keyed Astation waits to prove its key. False when `max_pending`
-    /// (> 0) sockets are already pending.
-    async fn add_pending(&self, code: &str, conn: &ConnRef, now: i64, max_pending: usize) -> Result<bool, StoreError>;
+    /// A keyed Astation (connected from client `ip`) waits to prove its
+    /// key. False when `caps` are full: too many pending sockets from that
+    /// IP, or in the room.
+    async fn add_pending(
+        &self,
+        code: &str,
+        conn: &ConnRef,
+        ip: &str,
+        now: i64,
+        caps: PendingCaps,
+    ) -> Result<bool, StoreError>;
     /// Room bookkeeping after `conn` proved the room's key, atomically.
     async fn promote(&self, code: &str, conn: &ConnRef, was_pending: bool) -> Result<Promotion, StoreError>;
     /// Remove the Atem only if `connection_id` is its current connection.
@@ -208,20 +268,19 @@ impl RoomDirectory for InMemoryRoomDirectory {
         })
     }
 
-    async fn add_pending(&self, code: &str, conn: &ConnRef, now: i64, max_pending: usize) -> Result<bool, StoreError> {
+    async fn add_pending(
+        &self,
+        code: &str,
+        conn: &ConnRef,
+        ip: &str,
+        now: i64,
+        caps: PendingCaps,
+    ) -> Result<bool, StoreError> {
         let mut rooms = self.lock();
         let room = rooms
             .entry(code.to_string())
             .or_insert_with(|| RoomInfo::new(IDENTITY_HOSTNAME, now));
-        if room.pending.iter().any(|p| p.conn == conn.conn) {
-            return Ok(true);
-        }
-        if max_pending > 0 && room.pending.len() >= max_pending {
-            return Ok(false);
-        }
-        room.pending.push(conn.clone());
-        room.pending.sort();
-        Ok(true)
+        Ok(room.try_pending(conn, ip, caps))
     }
 
     async fn promote(&self, code: &str, conn: &ConnRef, was_pending: bool) -> Result<Promotion, StoreError> {
@@ -243,6 +302,7 @@ impl RoomDirectory for InMemoryRoomDirectory {
             return Ok(Promotion::NotPending { evicted });
         };
         room.pending.remove(position);
+        room.pending_ips.remove(&conn.conn);
         room.owner = Some(conn.clone());
         room.verified = true;
         Ok(Promotion::Promoted {
@@ -278,7 +338,7 @@ impl RoomDirectory for InMemoryRoomDirectory {
         let Some(room) = rooms.get_mut(code) else {
             return Ok(false);
         };
-        room.pending.retain(|pending| pending.conn != connection_id);
+        room.remove_pending(connection_id);
         if room.owner.as_ref().map(|owner| owner.conn == connection_id).unwrap_or(false) {
             room.owner = None;
             room.verified = false;
@@ -325,6 +385,8 @@ pub(crate) mod scenarios {
     use std::sync::Arc;
 
     const T0: i64 = 1_700_000_000;
+    /// The client address of pending sockets unless a scenario varies it.
+    const IP: &str = "192.0.2.1";
 
     fn c(conn: &str, replica: &str) -> ConnRef {
         ConnRef::new(conn, replica)
@@ -386,18 +448,43 @@ pub(crate) mod scenarios {
         );
     }
 
-    pub async fn pending_respects_the_cap(d: &dyn RoomDirectory) {
-        assert!(d.add_pending("astation-p", &c("p1", "r1"), T0, 2).await.unwrap());
-        assert!(d.add_pending("astation-p", &c("p2", "r2"), T0, 2).await.unwrap());
-        assert!(!d.add_pending("astation-p", &c("p3", "r1"), T0, 2).await.unwrap());
+    pub async fn pending_respects_the_caps(d: &dyn RoomDirectory) {
+        let caps = PendingCaps { per_ip: 2, per_room: 4 };
+        let (ip_a, ip_b, ip_c) = ("203.0.113.1", "203.0.113.2", "2001:db8::3");
+        assert!(d.add_pending("astation-p", &c("p1", "r1"), ip_a, T0, caps).await.unwrap());
+        assert!(d.add_pending("astation-p", &c("p2", "r2"), ip_a, T0, caps).await.unwrap());
+        // A third from one address is refused; another address still fits.
+        assert!(!d.add_pending("astation-p", &c("p3", "r1"), ip_a, T0, caps).await.unwrap());
+        assert!(d.add_pending("astation-p", &c("p4", "r1"), ip_b, T0, caps).await.unwrap());
+        assert!(d.add_pending("astation-p", &c("p5", "r2"), ip_c, T0, caps).await.unwrap());
+        // The room as a whole is full.
+        assert!(!d.add_pending("astation-p", &c("p6", "r2"), "198.51.100.9", T0, caps).await.unwrap());
         assert!(
-            d.add_pending("astation-p", &c("p3", "r1"), T0, 0).await.unwrap(),
+            d.add_pending("astation-p", &c("p3", "r1"), ip_a, T0, PendingCaps::NONE).await.unwrap(),
             "0 means no cap"
         );
         let room = d.get("astation-p").await.unwrap().unwrap();
-        assert_eq!(room.pending, vec![c("p1", "r1"), c("p2", "r2"), c("p3", "r1")]);
+        assert_eq!(
+            room.pending,
+            vec![c("p1", "r1"), c("p2", "r2"), c("p3", "r1"), c("p4", "r1"), c("p5", "r2")]
+        );
+        assert_eq!(room.pending_ips.get("p4").map(String::as_str), Some(ip_b));
+        assert_eq!(room.pending_ips.get("p5").map(String::as_str), Some(ip_c));
         assert_eq!(room.owner, None);
         assert_eq!(room.hostname, IDENTITY_HOSTNAME);
+        // Slots freed by leaving or by promotion count no more.
+        let per_ip_3 = PendingCaps { per_ip: 3, per_room: 0 };
+        assert!(!d.leave_astation("astation-p", "p1").await.unwrap());
+        assert!(!d.add_pending("astation-p", &c("p7", "r1"), ip_a, T0, PendingCaps { per_ip: 2, per_room: 0 }).await.unwrap());
+        assert!(d.add_pending("astation-p", &c("p7", "r1"), ip_a, T0, per_ip_3).await.unwrap());
+        assert!(matches!(
+            d.promote("astation-p", &c("p7", "r1"), true).await.unwrap(),
+            Promotion::Promoted { .. }
+        ));
+        let room = d.get("astation-p").await.unwrap().unwrap();
+        assert!(!room.pending_ips.contains_key("p1"));
+        assert!(!room.pending_ips.contains_key("p7"));
+        assert!(d.add_pending("astation-p", &c("p8", "r1"), ip_a, T0, per_ip_3).await.unwrap());
     }
 
     pub async fn promotion_rules(d: &dyn RoomDirectory) {
@@ -407,7 +494,7 @@ pub(crate) mod scenarios {
         );
         // An unverified owner (squatter) plus a pending socket.
         d.claim_owner("astation-race", &c("squatter", "r1"), T0).await.unwrap();
-        d.add_pending("astation-race", &c("pending", "r2"), T0, 0).await.unwrap();
+        d.add_pending("astation-race", &c("pending", "r2"), IP, T0, PendingCaps::NONE).await.unwrap();
         d.join_atem("astation-race", "atem-a", &c("t1", "r1")).await.unwrap();
 
         // A verifier that is not pending (its socket was replaced) only evicts the squatter.
@@ -442,7 +529,7 @@ pub(crate) mod scenarios {
             Promotion::NotPending { evicted: None }
         );
         // A pending reconnect replaces the verified owner (an ordinary reconnect).
-        d.add_pending("astation-race", &c("again", "r1"), T0, 0).await.unwrap();
+        d.add_pending("astation-race", &c("again", "r1"), IP, T0, PendingCaps::NONE).await.unwrap();
         assert_eq!(
             d.promote("astation-race", &c("again", "r1"), true).await.unwrap(),
             Promotion::Promoted {
@@ -455,7 +542,7 @@ pub(crate) mod scenarios {
 
     pub async fn promotion_with_a_squatter_and_a_pending_socket(d: &dyn RoomDirectory) {
         d.claim_owner("astation-sq", &c("squatter", "r1"), T0).await.unwrap();
-        d.add_pending("astation-sq", &c("pending", "r2"), T0, 0).await.unwrap();
+        d.add_pending("astation-sq", &c("pending", "r2"), IP, T0, PendingCaps::NONE).await.unwrap();
         assert_eq!(
             d.promote("astation-sq", &c("pending", "r2"), true).await.unwrap(),
             Promotion::Promoted {
@@ -471,9 +558,10 @@ pub(crate) mod scenarios {
     }
 
     pub async fn add_pending_dedupes_by_connection_id(d: &dyn RoomDirectory) {
-        assert!(d.add_pending("astation-dd", &c("p1", "r1"), T0, 1).await.unwrap());
+        let one = PendingCaps { per_ip: 1, per_room: 1 };
+        assert!(d.add_pending("astation-dd", &c("p1", "r1"), IP, T0, one).await.unwrap());
         // Same connection id (even with another replica label): already pending, cap not hit.
-        assert!(d.add_pending("astation-dd", &c("p1", "r2"), T0, 1).await.unwrap());
+        assert!(d.add_pending("astation-dd", &c("p1", "r2"), IP, T0, one).await.unwrap());
         assert_eq!(
             d.get("astation-dd").await.unwrap().unwrap().pending,
             vec![c("p1", "r1")]
@@ -509,7 +597,7 @@ pub(crate) mod scenarios {
 
     pub async fn leaving_last_member_removes_the_room(d: &dyn RoomDirectory) {
         d.claim_owner("astation-e", &c("s1", "r1"), T0).await.unwrap();
-        d.add_pending("astation-e", &c("p1", "r2"), T0, 0).await.unwrap();
+        d.add_pending("astation-e", &c("p1", "r2"), IP, T0, PendingCaps::NONE).await.unwrap();
         d.join_atem("astation-e", "atem-a", &c("t1", "r2")).await.unwrap();
         assert!(!d.leave_astation("astation-e", "p1").await.unwrap());
         assert!(!d.leave_astation("astation-e", "someone-else").await.unwrap());
@@ -529,7 +617,7 @@ pub(crate) mod scenarios {
     pub async fn delete_room_returns_its_members(d: &dyn RoomDirectory) {
         assert_eq!(d.delete_room("nope").await.unwrap(), None);
         d.claim_owner("ROOM-D", &c("s1", "r1"), T0).await.unwrap();
-        d.add_pending("ROOM-D", &c("p1", "r2"), T0, 0).await.unwrap();
+        d.add_pending("ROOM-D", &c("p1", "r2"), IP, T0, PendingCaps::NONE).await.unwrap();
         d.join_atem("ROOM-D", "atem-a", &c("t1", "r2")).await.unwrap();
         let room = d.delete_room("ROOM-D").await.unwrap().expect("members");
         assert_eq!(room.owner, Some(c("s1", "r1")));
@@ -554,8 +642,8 @@ pub(crate) mod scenarios {
     pub async fn concurrent_promotions_leave_one_owner(d: Arc<dyn RoomDirectory>) {
         d.claim_owner("astation-c", &c("old", "r1"), T0).await.unwrap();
         d.promote("astation-c", &c("old", "r1"), false).await.unwrap();
-        d.add_pending("astation-c", &c("a", "r1"), T0, 0).await.unwrap();
-        d.add_pending("astation-c", &c("b", "r2"), T0, 0).await.unwrap();
+        d.add_pending("astation-c", &c("a", "r1"), IP, T0, PendingCaps::NONE).await.unwrap();
+        d.add_pending("astation-c", &c("b", "r2"), IP, T0, PendingCaps::NONE).await.unwrap();
         let (da, db) = (d.clone(), d.clone());
         let (ra, rb) = tokio::join!(
             tokio::spawn(async move { da.promote("astation-c", &c("a", "r1"), true).await.unwrap() }),
@@ -600,7 +688,7 @@ mod tests {
         ensure_room_is_idempotent,
         atem_join_requires_a_room_and_replaces,
         claim_owner_creates_the_room_and_replaces_the_owner,
-        pending_respects_the_cap,
+        pending_respects_the_caps,
         add_pending_dedupes_by_connection_id,
         promotion_rules,
         promotion_with_a_squatter_and_a_pending_socket,

@@ -2,7 +2,7 @@
 //! script over one room's keys only: KEYS[1] = relay:room:<code> (hash
 //! {owner_conn, owner_replica, verified, hostname, created_at, paired}),
 //! KEYS[2] = …:atems (atem_id → conn|replica), KEYS[3] = …:pending
-//! (conn → replica). So "set owner = me, verified, remove me from pending,
+//! (conn → replica|client_ip; the IP feeds the per-IP pending cap). So "set owner = me, verified, remove me from pending,
 //! return the previous owner" is atomic and two replicas can't both win.
 //!
 //! The room key expires ROOM_EXPIRY_SECS after creation, and again after an
@@ -17,8 +17,8 @@ use redis::Script;
 
 use super::{keys, RedisConn};
 use crate::cluster::directory::{
-    AtemJoin, AtemLeave, OwnerClaim, Promotion, RoomDirectory, RoomInfo, IDENTITY_HOSTNAME,
-    ROOM_EXPIRY_SECS,
+    AtemJoin, AtemLeave, OwnerClaim, PendingCaps, Promotion, RoomDirectory, RoomInfo,
+    IDENTITY_HOSTNAME, ROOM_EXPIRY_SECS,
 };
 use crate::cluster::{ConnRef, StoreError};
 
@@ -47,6 +47,25 @@ local function keep_alive(ttl)
 end
 local function clear_owner()
   redis.call('HSET', KEYS[1], 'owner_conn', '', 'owner_replica', '', 'verified', '0', 'paired', '0')
+end
+-- Add conn to pending unless the caps (0 = none) are full: per_room
+-- pending sockets in all, per_ip from one client address. A connection id
+-- already pending is admitted unchanged (its stored value is kept).
+local function try_pending(conn, replica, ip, per_room, per_ip)
+  if redis.call('HEXISTS', KEYS[3], conn) == 1 then return true end
+  per_room, per_ip = tonumber(per_room), tonumber(per_ip)
+  local values = redis.call('HVALS', KEYS[3])
+  if per_room > 0 and #values >= per_room then return false end
+  if per_ip > 0 then
+    local same = 0
+    for i = 1, #values do
+      local bar = string.find(values[i], '|', 1, true)
+      if bar and string.sub(values[i], bar + 1) == ip then same = same + 1 end
+    end
+    if same >= per_ip then return false end
+  end
+  redis.call('HSET', KEYS[3], conn, replica .. '|' .. ip)
+  return true
 end
 -- Append the Atem pairs (Rust sorts them by atem id).
 local function append_atems(out)
@@ -93,16 +112,11 @@ keep_alive(ARGV[5])
 return append_atems(out)
 "#;
 
-// ARGV: conn, replica, hostname, created_at, ttl, max_pending (0 = no cap) → '1' | '0'
-// A connection id that is already pending is admitted unchanged (its stored
-// replica is kept), before the cap check — as the in-memory directory does.
+// ARGV: conn, replica, hostname, created_at, ttl, ip, per_room, per_ip
+// (caps: 0 = none) → '1' | '0'
 const ADD_PENDING: &str = r#"
 if redis.call('EXISTS', KEYS[1]) == 0 then new_room(ARGV[3], ARGV[4], ARGV[5]) end
-if redis.call('HEXISTS', KEYS[3], ARGV[1]) == 0 then
-  local cap = tonumber(ARGV[6])
-  if cap > 0 and redis.call('HLEN', KEYS[3]) >= cap then return '0' end
-  redis.call('HSET', KEYS[3], ARGV[1], ARGV[2])
-end
+if not try_pending(ARGV[1], ARGV[2], ARGV[6], ARGV[7], ARGV[8]) then return '0' end
 keep_alive(ARGV[5])
 return '1'
 "#;
@@ -227,9 +241,17 @@ fn room_info(
     pending: &HashMap<String, String>,
 ) -> RoomInfo {
     let field = |name: &str| room.get(name).map(String::as_str).unwrap_or("");
+    // `replica|ip` (a bare replica from before the per-IP cap has no IP).
+    let mut pending_ips = std::collections::BTreeMap::new();
     let mut pending: Vec<ConnRef> = pending
         .iter()
-        .map(|(conn, replica)| ConnRef::new(conn, replica))
+        .map(|(conn, value)| match value.split_once('|') {
+            Some((replica, ip)) => {
+                pending_ips.insert(conn.clone(), ip.to_string());
+                ConnRef::new(conn, replica)
+            }
+            None => ConnRef::new(conn, value),
+        })
         .collect();
     pending.sort();
     RoomInfo {
@@ -242,6 +264,7 @@ fn room_info(
             .filter_map(|(atem_id, value)| ConnRef::decode(value).map(|conn| (atem_id.clone(), conn)))
             .collect(),
         pending,
+        pending_ips,
     }
 }
 
@@ -381,7 +404,14 @@ impl RoomDirectory for RedisRoomDirectory {
         })
     }
 
-    async fn add_pending(&self, code: &str, conn: &ConnRef, now: i64, max_pending: usize) -> Result<bool, StoreError> {
+    async fn add_pending(
+        &self,
+        code: &str,
+        conn: &ConnRef,
+        ip: &str,
+        now: i64,
+        caps: PendingCaps,
+    ) -> Result<bool, StoreError> {
         let admitted: String = self
             .eval(
                 &self.add_pending,
@@ -392,7 +422,9 @@ impl RoomDirectory for RedisRoomDirectory {
                     IDENTITY_HOSTNAME.to_string(),
                     now.to_string(),
                     ROOM_EXPIRY_SECS.to_string(),
-                    max_pending.to_string(),
+                    ip.to_string(),
+                    caps.per_room.to_string(),
+                    caps.per_ip.to_string(),
                 ],
             )
             .await?;
@@ -525,7 +557,7 @@ mod tests {
             ensure_room_is_idempotent,
             atem_join_requires_a_room_and_replaces,
             claim_owner_creates_the_room_and_replaces_the_owner,
-            pending_respects_the_cap,
+            pending_respects_the_caps,
             add_pending_dedupes_by_connection_id,
             promotion_rules,
             promotion_with_a_squatter_and_a_pending_socket,
@@ -552,7 +584,7 @@ mod tests {
             let d = RedisRoomDirectory::new(conn.clone());
             d.create_room("ROOM-K", "host", 1_700_000_000).await.unwrap();
             d.join_atem("ROOM-K", "atem-a", &ConnRef::new("t1", "r1")).await.unwrap();
-            d.add_pending("ROOM-K", &ConnRef::new("p1", "r2"), 1_700_000_000, 0).await.unwrap();
+            d.add_pending("ROOM-K", &ConnRef::new("p1", "r2"), "192.0.2.1", 1_700_000_000, PendingCaps::NONE).await.unwrap();
             let (room, atems, pending): (HashMap<String, String>, HashMap<String, String>, HashMap<String, String>) = conn
                 .run(|mut c| async move {
                     redis::pipe()
@@ -570,7 +602,7 @@ mod tests {
             assert_eq!(room["verified"], "0");
             assert_eq!(room["paired"], "0");
             assert_eq!(atems["atem-a"], "t1|r1");
-            assert_eq!(pending["p1"], "r2");
+            assert_eq!(pending["p1"], "r2|192.0.2.1");
             for key in ["relay:room:ROOM-K", "relay:room:ROOM-K:atems", "relay:room:ROOM-K:pending"] {
                 let left = ttl(&conn, key).await;
                 assert!((590..=600).contains(&left), "{key} ttl {left}");
@@ -604,14 +636,14 @@ mod tests {
             };
             d.create_room("ROOM-R", "h", 1).await.unwrap();
             d.join_atem("ROOM-R", "atem-a", &ConnRef::new("t1", "r1")).await.unwrap();
-            d.add_pending("ROOM-R", &ConnRef::new("p1", "r1"), 1, 0).await.unwrap();
+            d.add_pending("ROOM-R", &ConnRef::new("p1", "r1"), "192.0.2.1", 1, PendingCaps::NONE).await.unwrap();
 
             shorten(conn.clone()).await;
             assert!(d.touch("ROOM-R").await.unwrap());
             all_fresh(conn.clone()).await;
 
             shorten(conn.clone()).await;
-            d.add_pending("ROOM-R", &ConnRef::new("p2", "r1"), 1, 0).await.unwrap();
+            d.add_pending("ROOM-R", &ConnRef::new("p2", "r1"), "192.0.2.1", 1, PendingCaps::NONE).await.unwrap();
             all_fresh(conn.clone()).await;
 
             shorten(conn.clone()).await;
@@ -666,7 +698,7 @@ mod tests {
 
             assert!(d.delete_room("ROOM-L").await.unwrap().is_some());
             plant(conn.clone()).await;
-            assert!(d.add_pending("ROOM-L", &ConnRef::new("p1", "r1"), 1, 0).await.unwrap());
+            assert!(d.add_pending("ROOM-L", &ConnRef::new("p1", "r1"), "192.0.2.1", 1, PendingCaps::NONE).await.unwrap());
             let room = d.get("ROOM-L").await.unwrap().unwrap();
             assert!(room.atems.is_empty());
             assert_eq!(room.pending.len(), 1);

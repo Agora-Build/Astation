@@ -197,8 +197,9 @@ IP can hold up to about N × the limit. The client IP is `CF-Connecting-IP`
 traffic always comes through the Cloudflare tunnel, so the limit can't be
 dodged with forged headers there; keep the relay and webapp ports private (a
 client reaching nginx directly could forge `X-Forwarded-For`). A room holds at
-most 4 pending (not yet verified) Astation sockets; a fifth is closed with
-`1013`.
+most 2 pending (not yet verified) Astation sockets from one client IP and 32
+in all; one more is closed with `1013`. The per-IP cap keeps one address from
+filling a room's pending slots and locking its owner's reconnects out.
 
 **If Valkey is unreachable:** new WebSockets are refused (`503`), the pairing,
 voice and RTC endpoints return `503`, and `/health` returns `503`. Vault and

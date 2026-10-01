@@ -109,7 +109,7 @@ if ever needed.
 | `relay:replicas` | sorted set | Presence index: member `replica_id`, score = its expiry (unix seconds). Replicas list peers from it instead of scanning `relay:replica:*` | Entries past their score are ignored and trimmed on refresh |
 | `relay:room:<code>` | hash | `owner_conn`, `owner_replica`, `verified`, `hostname`, `created_at`, `paired` | 10 min while unpaired (today's `ROOM_EXPIRY_SECS`); refreshed by heartbeats once connected |
 | `relay:room:<code>:atems` | hash | `atem_id` → `connection_id\|replica_id` | Same as the room |
-| `relay:room:<code>:pending` | hash | `connection_id` → `replica_id` | Same as the room |
+| `relay:room:<code>:pending` | hash | `connection_id` → `replica_id\|client_ip` (the IP feeds the per-IP pending cap) | Same as the room |
 | `relay:session:<id>` | hash | Pairing/OTP session fields | Pending: until its 5-min `expires_at` + 60 s (clients still see `expired`/`410`); granted or denied: 7 days, refreshed on each `?session=` connect |
 | `relay:voice:<id>` | hash | Status, bounded text buffer, last activity | 60 s of inactivity |
 | `relay:voice:<id>:reply` | string | The Atem's answer, if it arrived before anyone waited | 30 s |

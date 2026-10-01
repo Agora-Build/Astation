@@ -22,7 +22,8 @@ use validator::Validate;
 
 use crate::cluster::bus::{apply_inbox, BroadcastMessage, BusEvent, InboxMessage, LoopbackBus, ReplicaBus};
 use crate::cluster::directory::{
-    AtemJoin, InMemoryRoomDirectory, Promotion, RoomDirectory, RoomInfo, IDENTITY_HOSTNAME,
+    AtemJoin, InMemoryRoomDirectory, PendingCaps, Promotion, RoomDirectory, RoomInfo,
+    IDENTITY_HOSTNAME,
 };
 use crate::cluster::health::{ClusterHealth, SingleInstance};
 use crate::cluster::keys::KeyCache;
@@ -74,8 +75,19 @@ const MAX_PAIR_CODE_ATTEMPTS: usize = 10;
 /// A key reload after a bus resubscribe gives up after this long.
 pub(crate) const KEY_RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Pending Astation sockets allowed per room.
-pub(crate) const MAX_PENDING_ASTATIONS_PER_ROOM: usize = 4;
+/// Pending Astation sockets allowed per room from one client IP (the same
+/// address the per-IP WebSocket limit uses), so one address can't fill a
+/// room's pending slots and lock the owner's reconnects out.
+pub(crate) const MAX_PENDING_ASTATIONS_PER_IP: usize = 2;
+
+/// Pending Astation sockets allowed per room in total, across addresses.
+pub(crate) const MAX_PENDING_ASTATIONS_PER_ROOM: usize = 32;
+
+/// Both pending caps, as the directory takes them.
+const PENDING_CAPS: PendingCaps = PendingCaps {
+    per_ip: MAX_PENDING_ASTATIONS_PER_IP,
+    per_room: MAX_PENDING_ASTATIONS_PER_ROOM,
+};
 
 /// Close code on drain (RFC 6455 "service restart"): reconnect elsewhere.
 pub(crate) const CLOSE_SERVICE_RESTART: u16 = 1012;
@@ -1610,7 +1622,8 @@ enum Registration {
     Registered,
     /// An Atem's room is gone (removed since ws_handler checked).
     RoomGone,
-    /// The room already has MAX_PENDING_ASTATIONS_PER_ROOM pending sockets.
+    /// The room's pending caps are full (MAX_PENDING_ASTATIONS_PER_IP from
+    /// this client IP, or MAX_PENDING_ASTATIONS_PER_ROOM in all).
     TooManyPending,
 }
 
@@ -1620,6 +1633,7 @@ async fn register_connection(
     code: &str,
     atem_id: &str,
     connection_id: &str,
+    client_ip: &str,
     auth: Option<&mut AstationAuth>,
 ) -> Result<Registration, StoreError> {
     let me = hub.me(connection_id);
@@ -1651,7 +1665,7 @@ async fn register_connection(
     if auth.state == AuthState::Pending {
         let admitted = hub
             .directory()
-            .add_pending(code, &me, now, MAX_PENDING_ASTATIONS_PER_ROOM)
+            .add_pending(code, &me, client_ip, now, PENDING_CAPS)
             .await?;
         if !admitted {
             return Ok(Registration::TooManyPending);
@@ -1764,7 +1778,7 @@ async fn handle_ws(
     role: String,
     atem_id: String,
     socket: WebSocket,
-    _permit: WsPermit,
+    permit: WsPermit,
 ) {
     let _active = ActiveSocket::new(&hub);
     let socket_role = match role.as_str() {
@@ -1803,7 +1817,8 @@ async fn handle_ws(
     }
 
     let registration =
-        register_connection(&hub, &code, &atem_id, &connection_id, astation_auth.as_mut()).await;
+        register_connection(&hub, &code, &atem_id, &connection_id, permit.ip(), astation_auth.as_mut())
+            .await;
     let refused = match registration {
         Ok(Registration::Registered) => false,
         Ok(Registration::RoomGone) => {
@@ -2620,7 +2635,10 @@ pub(crate) mod tests {
             .unwrap();
         hub.directory().join_atem(code, "atem-live", &ConnRef::new("t1", "r1")).await.unwrap();
         hub.directory().join_atem(code, "atem-dead", &ConnRef::new("t2", "dead")).await.unwrap();
-        hub.directory().add_pending(code, &ConnRef::new("p1", "dead"), now(), 0).await.unwrap();
+        hub.directory()
+            .add_pending(code, &ConnRef::new("p1", "dead"), "192.0.2.1", now(), PendingCaps::NONE)
+            .await
+            .unwrap();
         let room = hub.room(code).await.unwrap().unwrap();
         assert_eq!(room.owner, None);
         assert!(!room.verified);
@@ -4550,7 +4568,11 @@ pub(crate) mod tests {
         let mut squatter = hub.local().register("squatter", code, SocketRole::Astation);
         let _pending = hub.local().register("pending", code, SocketRole::Astation);
         hub.directory().claim_owner(code, &test_conn("squatter"), now()).await.unwrap();
-        assert!(hub.directory().add_pending(code, &test_conn("pending"), now(), 0).await.unwrap());
+        assert!(hub
+            .directory()
+            .add_pending(code, &test_conn("pending"), "192.0.2.1", now(), PendingCaps::NONE)
+            .await
+            .unwrap());
 
         // The registering socket was replaced, so it is not the owner.
         hub.promote_verified(code, "registrar", false).await.unwrap();
@@ -4645,8 +4667,15 @@ pub(crate) mod tests {
         ) -> Result<crate::cluster::directory::OwnerClaim, ClusterError> {
             self.inner.claim_owner(code, conn, now).await
         }
-        async fn add_pending(&self, code: &str, conn: &ConnRef, now: i64, max_pending: usize) -> Result<bool, ClusterError> {
-            self.inner.add_pending(code, conn, now, max_pending).await
+        async fn add_pending(
+            &self,
+            code: &str,
+            conn: &ConnRef,
+            ip: &str,
+            now: i64,
+            caps: PendingCaps,
+        ) -> Result<bool, ClusterError> {
+            self.inner.add_pending(code, conn, ip, now, caps).await
         }
         async fn promote(&self, code: &str, conn: &ConnRef, was_pending: bool) -> Result<Promotion, ClusterError> {
             self.inner.promote(code, conn, was_pending).await
@@ -4799,22 +4828,55 @@ pub(crate) mod tests {
         server.abort();
     }
 
+    /// Pending Astations are capped per (room, client IP) at 2 and per room
+    /// at 32: one address can't fill a room's pending slots and lock its
+    /// owner's reconnects out.
     #[tokio::test]
-    async fn a_room_takes_at_most_four_pending_astations() {
-        let state = memory_identity_state();
+    async fn pending_astations_are_capped_per_client_ip_and_per_room() {
+        let state = crate::AppState {
+            relay: RelayHub::with_auth_timeout(Duration::from_secs(10)),
+            ..memory_identity_state()
+        };
         let (base_url, server) = spawn_relay(state.clone()).await;
         let code = "astation-crowd";
+        let query = format!("role=astation&code={code}");
         let key = TestKey::generate();
         let _owner = verified_astation(&base_url, code, &key, "registered").await;
-        let mut pending = Vec::new();
-        for _ in 0..MAX_PENDING_ASTATIONS_PER_ROOM {
-            pending.push(connect_astation(&base_url, code).await);
+        let pending_from = |ip: &'static str| {
+            let (base_url, query) = (base_url.clone(), query.clone());
+            async move {
+                let mut socket = connect_from(&base_url, &query, ip, None).await.expect("upgrade");
+                let challenge = next_client_json(&mut socket).await;
+                assert_eq!(challenge["type"], "relayAuthChallenge");
+                socket
+            }
+        };
+        let mut held = vec![pending_from("203.0.113.50").await, pending_from("203.0.113.50").await];
+        // A third from the same address is refused …
+        let mut third = connect_from(&base_url, &query, "203.0.113.50", None).await.expect("upgrade");
+        assert_eq!(next_client_json(&mut third).await["type"], "relayAuthChallenge");
+        assert_eq!(close_code(&mut third).await, 1013);
+        // … while another address still goes pending.
+        let mut other = pending_from("203.0.113.51").await;
+        assert_silent(&mut other, 150).await;
+        held.push(other);
+        // The room as a whole takes 32.
+        const IPS: [&str; 14] = [
+            "198.51.100.1", "198.51.100.2", "198.51.100.3", "198.51.100.4", "198.51.100.5",
+            "198.51.100.6", "198.51.100.7", "198.51.100.8", "198.51.100.9", "198.51.100.10",
+            "198.51.100.11", "198.51.100.12", "198.51.100.13", "198.51.100.14",
+        ];
+        held.push(pending_from("203.0.113.51").await);
+        for ip in IPS {
+            held.push(pending_from(ip).await);
+            held.push(pending_from(ip).await);
         }
-        let (mut fifth, _) = tokio_tungstenite::connect_async(format!("{base_url}?role=astation&code={code}"))
-            .await
-            .expect("upgrade");
-        assert_eq!(close_code(&mut fifth).await, 1013);
-        assert_eq!(MAX_PENDING_ASTATIONS_PER_ROOM, 4);
+        assert_eq!(held.len(), 32);
+        assert_eq!(state.relay.room(code).await.unwrap().unwrap().pending.len(), 32);
+        let mut over = connect_from(&base_url, &query, "192.0.2.1", None).await.expect("upgrade");
+        assert_eq!(next_client_json(&mut over).await["type"], "relayAuthChallenge");
+        assert_eq!(close_code(&mut over).await, 1013);
+        assert_eq!((MAX_PENDING_ASTATIONS_PER_IP, MAX_PENDING_ASTATIONS_PER_ROOM), (2, 32));
         server.abort();
     }
 
