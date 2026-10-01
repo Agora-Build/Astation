@@ -6,7 +6,9 @@
 //!
 //! Fail-closed exception: a key marked stale (its re-read failed) is
 //! re-read before it verifies anything, so during a continuing database
-//! outage even the correct key is rejected until the store answers.
+//! outage even the correct key is rejected until the store answers. A failed
+//! re-read of an id with no cached key leaves a stale placeholder (empty
+//! key), so that id's connects still go pending.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -19,6 +21,7 @@ pub const KEY_REREAD_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedKey {
+    /// Empty for a placeholder (a failed re-read of an id not cached).
     pub public_key: String,
     /// A `key-changed` re-read failed: re-read before trusting this key.
     pub stale: bool,
@@ -119,21 +122,26 @@ impl KeyCache {
         self.write().forget(astation_id);
     }
 
-    /// Mark stale, unless the entry changed since `generation`.
+    /// Mark stale, unless the entry changed since `generation`. An id with
+    /// no entry gets a stale placeholder (empty key): a key may exist in the
+    /// store, so its connects must go pending (fail closed).
     fn mark_stale(&self, astation_id: &str, generation: u64) {
         let mut inner = self.write();
         if inner.generation(astation_id) != generation {
             return;
         }
-        if let Some(entry) = inner.keys.get_mut(astation_id) {
-            entry.stale = true;
-        }
+        inner
+            .keys
+            .entry(astation_id.to_string())
+            .and_modify(|entry| entry.stale = true)
+            .or_insert(CachedKey { public_key: String::new(), stale: true });
     }
 
     /// After a `key-changed` announcement: re-read one key. If the store
-    /// can't be read, a cached key is kept but marked stale, so it still
-    /// makes connects pending and is re-read before it verifies anything.
-    /// A `set`/`forget` that lands during the read wins over its result.
+    /// can't be read, a cached key is kept but marked stale (an uncached id
+    /// gets a stale placeholder), so it makes connects pending and is
+    /// re-read before it verifies anything. A `set`/`forget` that lands
+    /// during the read wins over its result.
     pub async fn reload_one(&self, identity: &dyn IdentityStore, astation_id: &str) {
         let generation = self.read().generation(astation_id);
         match tokio::time::timeout(KEY_REREAD_TIMEOUT, identity.get_key(astation_id)).await {
@@ -257,9 +265,107 @@ mod tests {
         // A later successful set clears it.
         cache.set("astation-a", "04aa");
         assert!(!cache.get("astation-a").unwrap().stale);
-        // An unknown id stays unknown.
+    }
+
+    /// A key-changed for an id this cache doesn't hold means a key exists
+    /// (or changed) elsewhere. If the store can't be read, a stale
+    /// placeholder fails closed: connects for that id go pending, and
+    /// verification re-reads the store (the empty key matches nothing).
+    #[tokio::test]
+    async fn failed_reload_of_an_unknown_id_leaves_a_stale_placeholder() {
+        let cache = KeyCache::new();
         cache.reload_one(&DownStore, "astation-unknown").await;
-        assert!(!cache.contains("astation-unknown"));
+        assert!(cache.contains("astation-unknown"));
+        assert_eq!(
+            cache.get("astation-unknown"),
+            Some(CachedKey { public_key: String::new(), stale: true })
+        );
+        // The store answering later replaces it…
+        let store = InMemoryIdentityStore::new();
+        store.register_key_if_absent("astation-unknown", "04AA", 1).await.unwrap();
+        cache.reload_one(&store, "astation-unknown").await;
+        assert_eq!(
+            cache.get("astation-unknown"),
+            Some(CachedKey { public_key: "04aa".into(), stale: false })
+        );
+        // … or removes it when there is no key.
+        cache.reload_one(&DownStore, "astation-none").await;
+        cache.reload_one(&store, "astation-none").await;
+        assert!(!cache.contains("astation-none"));
+        // A full load drops a placeholder the listing doesn't have.
+        cache.reload_one(&DownStore, "astation-none").await;
+        cache.load(&store).await.unwrap();
+        assert!(!cache.contains("astation-none"));
+        assert!(cache.contains("astation-unknown"));
+    }
+
+    /// A store whose `get_key` waits until released, then fails.
+    struct SlowDown {
+        entered: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl IdentityStore for SlowDown {
+        fn backend_name(&self) -> &'static str {
+            "slow-down"
+        }
+        async fn get_key(&self, _: &str) -> Result<Option<String>, IdentityError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Err(IdentityError::Db("down".into()))
+        }
+        async fn register_key_if_absent(&self, _: &str, _: &str, _: i64) -> Result<RegisterOutcome, IdentityError> {
+            unreachable!()
+        }
+        async fn touch_key(&self, _: &str, _: i64) -> Result<(), IdentityError> {
+            unreachable!()
+        }
+        async fn list_keys(&self) -> Result<Vec<(String, String)>, IdentityError> {
+            unreachable!()
+        }
+        async fn bind(&self, _: &str, _: &str, _: i64) -> Result<BindOutcome, IdentityError> {
+            unreachable!()
+        }
+        async fn unbind(&self, _: &str, _: &str) -> Result<bool, IdentityError> {
+            unreachable!()
+        }
+        async fn replace_all(&self, _: &str, _: &[String], _: i64) -> Result<ReplaceOutcome, IdentityError> {
+            unreachable!()
+        }
+        async fn resolve(&self, _: &str, _: i64) -> Result<Option<String>, IdentityError> {
+            unreachable!()
+        }
+    }
+
+    /// The placeholder obeys the generation rule: a forget or set that lands
+    /// while the failing read is in flight wins.
+    #[tokio::test]
+    async fn a_failed_slow_reload_does_not_override_a_newer_forget_or_set() {
+        for newer_set in [false, true] {
+            let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+            let release = std::sync::Arc::new(tokio::sync::Notify::new());
+            let store = SlowDown { entered: entered.clone(), release: release.clone() };
+            let cache = KeyCache::new();
+            let c2 = cache.clone();
+            let task = tokio::spawn(async move { c2.reload_one(&store, "astation-a").await });
+            entered.notified().await;
+            if newer_set {
+                cache.set("astation-a", "04bb");
+            } else {
+                cache.forget("astation-a");
+            }
+            release.notify_one();
+            task.await.unwrap();
+            if newer_set {
+                assert_eq!(
+                    cache.get("astation-a"),
+                    Some(CachedKey { public_key: "04bb".into(), stale: false })
+                );
+            } else {
+                assert!(!cache.contains("astation-a"), "a forget during the read wins");
+            }
+        }
     }
 
     /// A store whose `get_key` waits until released (a slow read), then

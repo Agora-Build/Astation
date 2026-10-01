@@ -1058,3 +1058,43 @@ async fn redis_forget_key_and_registration_reach_both_replicas() {
     let result = authenticate(&mut old, &old_key, code, &challenge).await;
     assert_eq!(result["status"], "rejected", "{result}");
 }
+
+/// Reviewer probe (final review I1): the key is registered on replica 2 and
+/// replica 1's cache lacks it (a lost `key-changed`). A keyless "squatter"
+/// on replica 1 must not take the room from the verified owner nor get its
+/// Atems' frames; the owner stays connected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn redis_a_squatter_on_a_replica_without_the_key_cannot_displace_the_verified_owner() {
+    let _guard = REDIS_LOCK.lock().await;
+    let (_shared, one, two) = two_replicas().await;
+    let code = "astation-squat";
+    let key = TestKey::generate();
+    let mut owner = verified_astation(&two.ws, code, &key, "registered").await;
+    eventually("replica 1 learned the key", || one.state.relay.keys().contains(code)).await;
+    one.state.relay.keys().forget(code); // as if key-changed never arrived
+    let mut atem = connect_atem(&one.ws, code, "atem-a").await;
+    assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+
+    let (mut squatter, _) = connect_astation(&one.ws, code).await;
+    send_json(&mut atem, serde_json::json!({"probe": "to-owner"})).await;
+    assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "to-owner");
+    assert_silent(&mut squatter, 200).await;
+    let room = two.state.relay.room(code).await.unwrap().unwrap();
+    assert_eq!(room.owner.map(|owner| owner.replica), Some(two.id().to_string()));
+    assert!(room.verified);
+
+    // Never proves the key: rejected at the deadline; the owner stays.
+    let result = next_client_json(&mut squatter).await;
+    assert_eq!(result["status"], "rejected", "{result}");
+    wait_closed(&mut squatter).await;
+    send_json(&mut atem, serde_json::json!({"probe": "after"})).await;
+    assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "after");
+    send_json(&mut owner, serde_json::json!({"probe": "to-atem"})).await;
+    assert_eq!(next_client_json(&mut atem).await["probe"], "to-atem");
+
+    // The real Astation on replica 1 (no key cached) proves it from the store.
+    let mut moved = verified_astation(&one.ws, code, &key, "verified").await;
+    assert_eq!(next_client_json(&mut moved).await["relay_event"], "connected");
+    wait_closed(&mut owner).await;
+}

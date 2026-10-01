@@ -100,11 +100,19 @@ return {'1', replaced,
   redis.call('HGET', KEYS[1], 'owner_replica') or ''}
 "#;
 
-// ARGV: conn, replica, hostname, created_at, ttl
-// → {prev_conn, prev_replica, atem_id, conn|replica, …}
+// ARGV: conn, replica, hostname, created_at, ttl, ip, per_room, per_ip
+// → {'claimed', prev_conn, prev_replica, atem_id, conn|replica, …}
+//   | {'pending'} | {'full'}
+// A verified owner is never replaced: the caller joins pending instead.
 const CLAIM_OWNER: &str = r#"
 if redis.call('EXISTS', KEYS[1]) == 0 then new_room(ARGV[3], ARGV[4], ARGV[5]) end
-local out = {redis.call('HGET', KEYS[1], 'owner_conn') or '',
+if (redis.call('HGET', KEYS[1], 'owner_conn') or '') ~= ''
+    and (redis.call('HGET', KEYS[1], 'verified') or '0') == '1' then
+  if not try_pending(ARGV[1], ARGV[2], ARGV[6], ARGV[7], ARGV[8]) then return {'full'} end
+  keep_alive(ARGV[5])
+  return {'pending'}
+end
+local out = {'claimed', redis.call('HGET', KEYS[1], 'owner_conn') or '',
              redis.call('HGET', KEYS[1], 'owner_replica') or ''}
 redis.call('HSET', KEYS[1], 'owner_conn', ARGV[1], 'owner_replica', ARGV[2],
   'verified', '0', 'paired', '1')
@@ -384,7 +392,14 @@ impl RoomDirectory for RedisRoomDirectory {
         })
     }
 
-    async fn claim_owner(&self, code: &str, conn: &ConnRef, now: i64) -> Result<OwnerClaim, StoreError> {
+    async fn claim_owner(
+        &self,
+        code: &str,
+        conn: &ConnRef,
+        ip: &str,
+        now: i64,
+        caps: PendingCaps,
+    ) -> Result<OwnerClaim, StoreError> {
         let out: Vec<String> = self
             .eval(
                 &self.claim_owner,
@@ -395,12 +410,19 @@ impl RoomDirectory for RedisRoomDirectory {
                     IDENTITY_HOSTNAME.to_string(),
                     now.to_string(),
                     ROOM_EXPIRY_SECS.to_string(),
+                    ip.to_string(),
+                    caps.per_room.to_string(),
+                    caps.per_ip.to_string(),
                 ],
             )
             .await?;
-        Ok(OwnerClaim {
-            replaced: conn_ref(at(&out, 0), at(&out, 1)),
-            atems: atem_pairs(out.get(2..).unwrap_or(&[])),
+        Ok(match at(&out, 0) {
+            "pending" => OwnerClaim::Pending,
+            "full" => OwnerClaim::TooManyPending,
+            _ => OwnerClaim::Claimed {
+                replaced: conn_ref(at(&out, 1), at(&out, 2)),
+                atems: atem_pairs(out.get(3..).unwrap_or(&[])),
+            },
         })
     }
 
@@ -557,6 +579,7 @@ mod tests {
             ensure_room_is_idempotent,
             atem_join_requires_a_room_and_replaces,
             claim_owner_creates_the_room_and_replaces_the_owner,
+            claim_owner_waits_behind_a_verified_owner,
             pending_respects_the_caps,
             add_pending_dedupes_by_connection_id,
             promotion_rules,
@@ -647,7 +670,7 @@ mod tests {
             all_fresh(conn.clone()).await;
 
             shorten(conn.clone()).await;
-            d.claim_owner("ROOM-R", &ConnRef::new("s1", "r1"), 1).await.unwrap();
+            d.claim_owner("ROOM-R", &ConnRef::new("s1", "r1"), "192.0.2.1", 1, PendingCaps::NONE).await.unwrap();
             all_fresh(conn.clone()).await;
 
             // The owner proving its key (already the owner) keeps the room alive too.
@@ -692,8 +715,8 @@ mod tests {
 
             assert!(d.delete_room("ROOM-L").await.unwrap().is_some());
             plant(conn.clone()).await;
-            let claim = d.claim_owner("ROOM-L", &ConnRef::new("s1", "r1"), 1).await.unwrap();
-            assert!(claim.atems.is_empty(), "claim_owner inherited {:?}", claim.atems);
+            let claim = d.claim_owner("ROOM-L", &ConnRef::new("s1", "r1"), "192.0.2.1", 1, PendingCaps::NONE).await.unwrap();
+            assert_eq!(claim, OwnerClaim::Claimed { replaced: None, atems: vec![] }, "claim_owner inherited Atems");
             assert!(d.get("ROOM-L").await.unwrap().unwrap().pending.is_empty());
 
             assert!(d.delete_room("ROOM-L").await.unwrap().is_some());

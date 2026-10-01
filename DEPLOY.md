@@ -345,7 +345,13 @@ as `Loaded N Astation relay key(s)`) and serves connects and verifications
 from that cache, so a database outage does not lock registered Astations out
 of relay chat. With `REDIS_URL`, a key change on one replica (a registration,
 a re-read that finds a new key, or `admin forget-key`) is announced on Valkey
-and every replica re-reads that key.
+and every replica re-reads that key. If that re-read fails, the replica keeps
+the id as a stale placeholder, so its connects stay pending and must prove the
+key against Postgres (fail closed). After a Valkey resubscribe each replica
+reloads every key, retrying with backoff (1 s doubling to 30 s) until it
+succeeds. Room ownership in Valkey is authoritative: a socket without a key
+proof never displaces a verified owner, even on a replica whose cache missed
+the key; it waits as pending instead.
 
 Admin reset, for a lost, stolen or replaced Mac (its Astation reports "Relay
 rejected this Astation's key"). Relay logs show only the first 4 characters of

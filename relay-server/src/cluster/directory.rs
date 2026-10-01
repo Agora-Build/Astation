@@ -127,11 +127,21 @@ pub enum AtemJoin {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnerClaim {
-    /// The previous owner (to be closed).
-    pub replaced: Option<ConnRef>,
-    /// The room's Atems (the new owner is told about each).
-    pub atems: Vec<(String, ConnRef)>,
+pub enum OwnerClaim {
+    /// The caller owns the room now (unverified).
+    Claimed {
+        /// The previous, unverified owner (to be closed).
+        replaced: Option<ConnRef>,
+        /// The room's Atems (the new owner is told about each).
+        atems: Vec<(String, ConnRef)>,
+    },
+    /// A verified owner holds the room, so the caller was added to pending
+    /// instead: it must prove the key like any keyed Astation. (The
+    /// directory is authoritative; the caller's key cache may lack a key
+    /// registered on another replica.)
+    Pending,
+    /// As `Pending`, but the pending caps are full: the caller is refused.
+    TooManyPending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,8 +180,18 @@ pub trait RoomDirectory: Send + Sync {
     async fn ensure_room(&self, code: &str, hostname: &str, now: i64) -> Result<bool, StoreError>;
     async fn get(&self, code: &str) -> Result<Option<RoomInfo>, StoreError>;
     async fn join_atem(&self, code: &str, atem_id: &str, conn: &ConnRef) -> Result<AtemJoin, StoreError>;
-    /// A legacy (keyless) Astation takes the room, creating it if missing.
-    async fn claim_owner(&self, code: &str, conn: &ConnRef, now: i64) -> Result<OwnerClaim, StoreError>;
+    /// A legacy (keyless) Astation takes the room, creating it if missing,
+    /// and replaces an unverified owner. A verified owner is never replaced
+    /// here: the caller joins pending instead (under `caps`, as
+    /// `add_pending`).
+    async fn claim_owner(
+        &self,
+        code: &str,
+        conn: &ConnRef,
+        ip: &str,
+        now: i64,
+        caps: PendingCaps,
+    ) -> Result<OwnerClaim, StoreError>;
     /// A keyed Astation (connected from client `ip`) waits to prove its
     /// key. False when `caps` are full: too many pending sockets from that
     /// IP, or in the room.
@@ -255,14 +275,28 @@ impl RoomDirectory for InMemoryRoomDirectory {
         })
     }
 
-    async fn claim_owner(&self, code: &str, conn: &ConnRef, now: i64) -> Result<OwnerClaim, StoreError> {
+    async fn claim_owner(
+        &self,
+        code: &str,
+        conn: &ConnRef,
+        ip: &str,
+        now: i64,
+        caps: PendingCaps,
+    ) -> Result<OwnerClaim, StoreError> {
         let mut rooms = self.lock();
         let room = rooms
             .entry(code.to_string())
             .or_insert_with(|| RoomInfo::new(IDENTITY_HOSTNAME, now));
+        if room.owner.is_some() && room.verified {
+            return Ok(if room.try_pending(conn, ip, caps) {
+                OwnerClaim::Pending
+            } else {
+                OwnerClaim::TooManyPending
+            });
+        }
         let replaced = room.owner.replace(conn.clone());
         room.verified = false;
-        Ok(OwnerClaim {
+        Ok(OwnerClaim::Claimed {
             replaced,
             atems: room.atem_list(),
         })
@@ -418,7 +452,7 @@ pub(crate) mod scenarios {
             d.join_atem("ROOM", "atem-a", &c("t1", "r1")).await.unwrap(),
             AtemJoin::Joined { replaced: None, owner: None }
         );
-        d.claim_owner("ROOM", &c("s1", "r2"), T0).await.unwrap();
+        d.claim_owner("ROOM", &c("s1", "r2"), IP, T0, PendingCaps::NONE).await.unwrap();
         assert_eq!(
             d.join_atem("ROOM", "atem-a", &c("t2", "r2")).await.unwrap(),
             AtemJoin::Joined {
@@ -431,21 +465,61 @@ pub(crate) mod scenarios {
     }
 
     pub async fn claim_owner_creates_the_room_and_replaces_the_owner(d: &dyn RoomDirectory) {
-        let first = d.claim_owner("astation-x", &c("s1", "r1"), T0).await.unwrap();
-        assert_eq!(first, OwnerClaim { replaced: None, atems: vec![] });
+        let first = d.claim_owner("astation-x", &c("s1", "r1"), IP, T0, PendingCaps::NONE).await.unwrap();
+        assert_eq!(first, OwnerClaim::Claimed { replaced: None, atems: vec![] });
         let room = d.get("astation-x").await.unwrap().unwrap();
         assert_eq!(room.hostname, IDENTITY_HOSTNAME);
         assert_eq!(room.owner, Some(c("s1", "r1")));
         assert!(!room.verified);
         d.join_atem("astation-x", "atem-a", &c("t1", "r2")).await.unwrap();
-        let second = d.claim_owner("astation-x", &c("s2", "r2"), T0).await.unwrap();
+        let second = d.claim_owner("astation-x", &c("s2", "r2"), IP, T0, PendingCaps::NONE).await.unwrap();
         assert_eq!(
             second,
-            OwnerClaim {
+            OwnerClaim::Claimed {
                 replaced: Some(c("s1", "r1")),
                 atems: vec![("atem-a".to_string(), c("t1", "r2"))],
             }
         );
+    }
+
+    /// A verified owner is never displaced by a claim: the claimant goes
+    /// pending (under the caps) and the owner stays verified.
+    pub async fn claim_owner_waits_behind_a_verified_owner(d: &dyn RoomDirectory) {
+        let caps = PendingCaps { per_ip: 1, per_room: 0 };
+        d.claim_owner("astation-v", &c("s1", "r1"), IP, T0, caps).await.unwrap();
+        d.join_atem("astation-v", "atem-a", &c("t1", "r2")).await.unwrap();
+        assert_eq!(
+            d.promote("astation-v", &c("s1", "r1"), false).await.unwrap(),
+            Promotion::AlreadyOwner
+        );
+        assert_eq!(
+            d.claim_owner("astation-v", &c("squatter", "r2"), IP, T0, caps).await.unwrap(),
+            OwnerClaim::Pending
+        );
+        assert_eq!(
+            d.claim_owner("astation-v", &c("another", "r2"), IP, T0, caps).await.unwrap(),
+            OwnerClaim::TooManyPending
+        );
+        let room = d.get("astation-v").await.unwrap().unwrap();
+        assert_eq!(room.owner, Some(c("s1", "r1")));
+        assert!(room.verified);
+        assert_eq!(room.pending, vec![c("squatter", "r2")]);
+        assert_eq!(room.pending_ips.get("squatter").map(String::as_str), Some(IP));
+        // Proving the key promotes the waiting claimant (an ordinary reconnect).
+        assert_eq!(
+            d.promote("astation-v", &c("squatter", "r2"), true).await.unwrap(),
+            Promotion::Promoted {
+                previous_owner: Some(c("s1", "r1")),
+                evicted_unverified: false,
+                atems: vec![("atem-a".to_string(), c("t1", "r2"))],
+            }
+        );
+        // Once the verified owner leaves, a claim takes the room again.
+        d.leave_astation("astation-v", "squatter").await.unwrap();
+        assert!(matches!(
+            d.claim_owner("astation-v", &c("legacy", "r1"), IP, T0, caps).await.unwrap(),
+            OwnerClaim::Claimed { replaced: None, .. }
+        ));
     }
 
     pub async fn pending_respects_the_caps(d: &dyn RoomDirectory) {
@@ -493,7 +567,7 @@ pub(crate) mod scenarios {
             Promotion::NoRoom
         );
         // An unverified owner (squatter) plus a pending socket.
-        d.claim_owner("astation-race", &c("squatter", "r1"), T0).await.unwrap();
+        d.claim_owner("astation-race", &c("squatter", "r1"), IP, T0, PendingCaps::NONE).await.unwrap();
         d.add_pending("astation-race", &c("pending", "r2"), IP, T0, PendingCaps::NONE).await.unwrap();
         d.join_atem("astation-race", "atem-a", &c("t1", "r1")).await.unwrap();
 
@@ -541,7 +615,7 @@ pub(crate) mod scenarios {
     }
 
     pub async fn promotion_with_a_squatter_and_a_pending_socket(d: &dyn RoomDirectory) {
-        d.claim_owner("astation-sq", &c("squatter", "r1"), T0).await.unwrap();
+        d.claim_owner("astation-sq", &c("squatter", "r1"), IP, T0, PendingCaps::NONE).await.unwrap();
         d.add_pending("astation-sq", &c("pending", "r2"), IP, T0, PendingCaps::NONE).await.unwrap();
         assert_eq!(
             d.promote("astation-sq", &c("pending", "r2"), true).await.unwrap(),
@@ -569,7 +643,7 @@ pub(crate) mod scenarios {
     }
 
     pub async fn legacy_owner_becomes_verified_when_it_proves(d: &dyn RoomDirectory) {
-        d.claim_owner("astation-l", &c("s1", "r1"), T0).await.unwrap();
+        d.claim_owner("astation-l", &c("s1", "r1"), IP, T0, PendingCaps::NONE).await.unwrap();
         assert_eq!(
             d.promote("astation-l", &c("s1", "r1"), false).await.unwrap(),
             Promotion::AlreadyOwner
@@ -578,7 +652,7 @@ pub(crate) mod scenarios {
     }
 
     pub async fn leave_atem_ignores_a_stale_connection(d: &dyn RoomDirectory) {
-        d.claim_owner("astation-s", &c("s1", "r1"), T0).await.unwrap();
+        d.claim_owner("astation-s", &c("s1", "r1"), IP, T0, PendingCaps::NONE).await.unwrap();
         d.join_atem("astation-s", "atem-office", &c("replacement", "r2")).await.unwrap();
         assert_eq!(
             d.leave_atem("astation-s", "atem-office", "stale").await.unwrap(),
@@ -596,7 +670,7 @@ pub(crate) mod scenarios {
     }
 
     pub async fn leaving_last_member_removes_the_room(d: &dyn RoomDirectory) {
-        d.claim_owner("astation-e", &c("s1", "r1"), T0).await.unwrap();
+        d.claim_owner("astation-e", &c("s1", "r1"), IP, T0, PendingCaps::NONE).await.unwrap();
         d.add_pending("astation-e", &c("p1", "r2"), IP, T0, PendingCaps::NONE).await.unwrap();
         d.join_atem("astation-e", "atem-a", &c("t1", "r2")).await.unwrap();
         assert!(!d.leave_astation("astation-e", "p1").await.unwrap());
@@ -616,7 +690,7 @@ pub(crate) mod scenarios {
 
     pub async fn delete_room_returns_its_members(d: &dyn RoomDirectory) {
         assert_eq!(d.delete_room("nope").await.unwrap(), None);
-        d.claim_owner("ROOM-D", &c("s1", "r1"), T0).await.unwrap();
+        d.claim_owner("ROOM-D", &c("s1", "r1"), IP, T0, PendingCaps::NONE).await.unwrap();
         d.add_pending("ROOM-D", &c("p1", "r2"), IP, T0, PendingCaps::NONE).await.unwrap();
         d.join_atem("ROOM-D", "atem-a", &c("t1", "r2")).await.unwrap();
         let room = d.delete_room("ROOM-D").await.unwrap().expect("members");
@@ -640,7 +714,7 @@ pub(crate) mod scenarios {
     /// Two sockets proving at once: one ends as owner, and its promotion
     /// names the other as the previous owner (so the other gets closed).
     pub async fn concurrent_promotions_leave_one_owner(d: Arc<dyn RoomDirectory>) {
-        d.claim_owner("astation-c", &c("old", "r1"), T0).await.unwrap();
+        d.claim_owner("astation-c", &c("old", "r1"), IP, T0, PendingCaps::NONE).await.unwrap();
         d.promote("astation-c", &c("old", "r1"), false).await.unwrap();
         d.add_pending("astation-c", &c("a", "r1"), IP, T0, PendingCaps::NONE).await.unwrap();
         d.add_pending("astation-c", &c("b", "r2"), IP, T0, PendingCaps::NONE).await.unwrap();
@@ -688,6 +762,7 @@ mod tests {
         ensure_room_is_idempotent,
         atem_join_requires_a_room_and_replaces,
         claim_owner_creates_the_room_and_replaces_the_owner,
+        claim_owner_waits_behind_a_verified_owner,
         pending_respects_the_caps,
         add_pending_dedupes_by_connection_id,
         promotion_rules,

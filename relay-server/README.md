@@ -150,7 +150,9 @@ Connection states: with no key registered for the code the socket owns the
 room at once (**legacy mode**: relays as before, cannot bind). With a key
 registered it is **pending** — no room ownership, no Atem traffic or
 `relay_event` notifications — until it verifies, then it replaces the room
-owner. Registered keys are cached in memory (loaded at startup, written
+owner. A socket also goes pending when the room already has a verified owner,
+even if this replica's key cache doesn't know the key yet (the room directory
+is authoritative); its proof is then checked against the database. Registered keys are cached in memory (loaded at startup, written
 through on registration): connects do no database I/O and a cached key
 verifies even while the database is down; a different key forces a re-read
 (admin reset) before rejection. Bindings live in Postgres (`astation_keys`, `session_bindings`) and are

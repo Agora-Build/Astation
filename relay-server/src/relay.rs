@@ -22,7 +22,7 @@ use validator::Validate;
 
 use crate::cluster::bus::{apply_inbox, BroadcastMessage, BusEvent, InboxMessage, LoopbackBus, ReplicaBus};
 use crate::cluster::directory::{
-    AtemJoin, InMemoryRoomDirectory, PendingCaps, Promotion, RoomDirectory, RoomInfo,
+    AtemJoin, InMemoryRoomDirectory, OwnerClaim, PendingCaps, Promotion, RoomDirectory, RoomInfo,
     IDENTITY_HOSTNAME,
 };
 use crate::cluster::health::{ClusterHealth, SingleInstance};
@@ -72,8 +72,13 @@ const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_millis(1500);
 /// overwrites a live room).
 const MAX_PAIR_CODE_ATTEMPTS: usize = 10;
 
-/// A key reload after a bus resubscribe gives up after this long.
+/// One try of the key reload after a bus resubscribe gives up after this long.
 pub(crate) const KEY_RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A failed key reload after a resubscribe is retried after this pause,
+/// doubling up to KEY_RELOAD_BACKOFF_MAX, until a try succeeds.
+const KEY_RELOAD_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+pub(crate) const KEY_RELOAD_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// Pending Astation sockets allowed per room from one client IP (the same
 /// address the per-IP WebSocket limit uses), so one address can't fill a
@@ -588,25 +593,35 @@ impl RelayHub {
                         // Anything published while we were away is lost:
                         // drop cached rooms and re-read every key.
                         hub.clear_room_cache();
-                        // One reload at a time, each bounded; a resubscribe
-                        // that lands mid-reload re-arms one more run.
+                        // One reload at a time, each try bounded; a failed
+                        // try is retried with backoff until one succeeds (a
+                        // key-changed lost meanwhile must not leave a key
+                        // missing for good). A resubscribe that lands
+                        // mid-reload re-arms one more run.
                         reload_again.store(true, Ordering::SeqCst);
                         if !reload_busy.swap(true, Ordering::SeqCst) {
                             let (keys, identity) = (hub.keys().clone(), identity.clone());
                             let (busy, again) = (reload_busy.clone(), reload_again.clone());
                             tokio::spawn(async move {
+                                let mut backoff = KEY_RELOAD_BACKOFF_INITIAL;
                                 loop {
                                     again.store(false, Ordering::SeqCst);
-                                    match tokio::time::timeout(KEY_RELOAD_TIMEOUT, keys.load(identity.as_ref())).await {
-                                        Ok(Ok(_)) => {}
-                                        Ok(Err(error)) => tracing::warn!(
-                                            "Could not reload relay keys after resubscribing: {}",
-                                            error
-                                        ),
-                                        Err(_) => tracing::warn!(
-                                            "Reloading relay keys after resubscribing timed out"
-                                        ),
+                                    let failure = match tokio::time::timeout(KEY_RELOAD_TIMEOUT, keys.load(identity.as_ref())).await {
+                                        Ok(Ok(_)) => None,
+                                        Ok(Err(error)) => Some(error.to_string()),
+                                        Err(_) => Some("timed out".to_string()),
+                                    };
+                                    if let Some(failure) = failure {
+                                        tracing::warn!(
+                                            "Could not reload relay keys after resubscribing ({}); retrying in {:?}",
+                                            failure,
+                                            backoff
+                                        );
+                                        tokio::time::sleep(backoff).await;
+                                        backoff = (backoff * 2).min(KEY_RELOAD_BACKOFF_MAX);
+                                        continue;
                                     }
+                                    backoff = KEY_RELOAD_BACKOFF_INITIAL;
                                     busy.store(false, Ordering::SeqCst);
                                     if !again.load(Ordering::SeqCst) || busy.swap(true, Ordering::SeqCst) {
                                         break;
@@ -1657,7 +1672,9 @@ async fn register_connection(
     hub.local().send(connection_id, relay_auth_challenge_frame(&auth.challenge));
     // Decided from the key cache, with no I/O. A registration that lands
     // after this is handled by promote_verified, which evicts an
-    // unverified owner.
+    // unverified owner. The cache can lack a key registered on another
+    // replica (a lost key-changed): then claim_owner below finds the
+    // verified owner and puts this socket in pending instead.
     if hub.keys().contains(code) {
         auth.state = AuthState::Pending;
     }
@@ -1673,12 +1690,26 @@ async fn register_connection(
         hub.room_changed(code).await;
         return Ok(Registration::Registered);
     }
-    let claim = hub.directory().claim_owner(code, &me, now).await?;
+    let (replaced, atems) = match hub
+        .directory()
+        .claim_owner(code, &me, client_ip, now, PENDING_CAPS)
+        .await?
+    {
+        OwnerClaim::Claimed { replaced, atems } => (replaced, atems),
+        OwnerClaim::Pending => {
+            // Verified owner: prove the key (verification re-reads it from
+            // the identity store, as this cache lacks it).
+            auth.state = AuthState::Pending;
+            hub.room_changed(code).await;
+            return Ok(Registration::Registered);
+        }
+        OwnerClaim::TooManyPending => return Ok(Registration::TooManyPending),
+    };
     hub.room_changed(code).await;
-    if let Some(replaced) = claim.replaced {
+    if let Some(replaced) = replaced {
         hub.close_connection(&replaced, None).await;
     }
-    for (atem, connection) in &claim.atems {
+    for (atem, connection) in &atems {
         hub.local().send(
             connection_id,
             relay_connection_event(atem, &connection.conn, "connected"),
@@ -2630,7 +2661,7 @@ pub(crate) mod tests {
         }));
         let code = "astation-dead-owner";
         hub.directory()
-            .claim_owner(code, &ConnRef::new("s1", "dead"), now())
+            .claim_owner(code, &ConnRef::new("s1", "dead"), "192.0.2.1", now(), PendingCaps::NONE)
             .await
             .unwrap();
         hub.directory().join_atem(code, "atem-live", &ConnRef::new("t1", "r1")).await.unwrap();
@@ -2726,13 +2757,13 @@ pub(crate) mod tests {
             ..HubParts::single_instance(directory.clone(), TEST_AUTH_TIMEOUT)
         });
         let code = "astation-cache";
-        directory.claim_owner(code, &test_conn("owner-1"), now()).await.unwrap();
+        directory.claim_owner(code, &test_conn("owner-1"), "192.0.2.1", now(), PendingCaps::NONE).await.unwrap();
         assert_eq!(
             hub.route_view(code).await.unwrap().unwrap().owner,
             Some(test_conn("owner-1"))
         );
         // Changed behind the hub's back (another replica): still cached …
-        directory.claim_owner(code, &test_conn("owner-2"), now()).await.unwrap();
+        directory.claim_owner(code, &test_conn("owner-2"), "192.0.2.1", now(), PendingCaps::NONE).await.unwrap();
         assert_eq!(
             hub.route_view(code).await.unwrap().unwrap().owner,
             Some(test_conn("owner-1"))
@@ -2823,9 +2854,9 @@ pub(crate) mod tests {
 
         // room-changed from another replica drops the cached entry; a
         // second copy (or our own echo) is harmless.
-        directory.claim_owner("room-a", &test_conn("o1"), now()).await.unwrap();
+        directory.claim_owner("room-a", &test_conn("o1"), "192.0.2.1", now(), PendingCaps::NONE).await.unwrap();
         assert_eq!(owner(hub.clone(), "room-a").await, Some(test_conn("o1")));
-        directory.claim_owner("room-a", &test_conn("o2"), now()).await.unwrap();
+        directory.claim_owner("room-a", &test_conn("o2"), "192.0.2.1", now(), PendingCaps::NONE).await.unwrap();
         for _ in 0..2 {
             events_tx
                 .send(BusEvent::Broadcast(BusBroadcast::RoomChanged { code: "room-a".into() }))
@@ -2842,15 +2873,15 @@ pub(crate) mod tests {
         assert!(fresh, "room-changed invalidated the cached room");
 
         // Our own room_changed invalidates locally before announcing.
-        directory.claim_owner("room-a", &test_conn("o3"), now()).await.unwrap();
+        directory.claim_owner("room-a", &test_conn("o3"), "192.0.2.1", now(), PendingCaps::NONE).await.unwrap();
         hub.room_changed("room-a").await;
         assert_eq!(owner(hub.clone(), "room-a").await, Some(test_conn("o3")));
 
         // Resubscribed: every cached room is dropped and every key re-read.
-        directory.claim_owner("room-b", &test_conn("b1"), now()).await.unwrap();
+        directory.claim_owner("room-b", &test_conn("b1"), "192.0.2.1", now(), PendingCaps::NONE).await.unwrap();
         assert_eq!(owner(hub.clone(), "room-b").await, Some(test_conn("b1")));
-        directory.claim_owner("room-a", &test_conn("o4"), now()).await.unwrap();
-        directory.claim_owner("room-b", &test_conn("b2"), now()).await.unwrap();
+        directory.claim_owner("room-a", &test_conn("o4"), "192.0.2.1", now(), PendingCaps::NONE).await.unwrap();
+        directory.claim_owner("room-b", &test_conn("b2"), "192.0.2.1", now(), PendingCaps::NONE).await.unwrap();
         identity.register_key_if_absent("astation-r", "04CD", 1).await.unwrap();
         hub.keys().set("astation-gone", "04ef");
         events_tx.send(BusEvent::Resubscribed).unwrap();
@@ -2873,13 +2904,28 @@ pub(crate) mod tests {
         task.await.unwrap();
     }
 
-    /// `list_keys` counts its calls and never returns (until the timeout drops it).
-    struct HangingList(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    /// `list_keys` counts its calls and how many run at once. Call 1 never
+    /// returns (until the timeout drops it), call 2 fails, later calls list
+    /// one key.
+    #[derive(Default)]
+    struct FlakyList {
+        calls: std::sync::atomic::AtomicUsize,
+        running: std::sync::atomic::AtomicUsize,
+        most_at_once: std::sync::atomic::AtomicUsize,
+    }
+
+    struct Running<'a>(&'a FlakyList);
+
+    impl Drop for Running<'_> {
+        fn drop(&mut self) {
+            self.0.running.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 
     #[async_trait::async_trait]
-    impl IdentityStore for HangingList {
+    impl IdentityStore for FlakyList {
         fn backend_name(&self) -> &'static str {
-            "hanging-list"
+            "flaky-list"
         }
         async fn get_key(&self, _: &str) -> Result<Option<String>, StoreError> {
             unreachable!()
@@ -2891,8 +2937,15 @@ pub(crate) mod tests {
             unreachable!()
         }
         async fn list_keys(&self) -> Result<Vec<(String, String)>, StoreError> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            std::future::pending().await
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let now_running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_at_once.fetch_max(now_running, Ordering::SeqCst);
+            let _running = Running(self);
+            match call {
+                1 => std::future::pending().await,
+                2 => Err(StoreError::Db("database is down".into())),
+                _ => Ok(vec![("astation-k".to_string(), "04aa".to_string())]),
+            }
         }
         async fn bind(&self, _: &str, _: &str, _: i64) -> Result<StoreBindOutcome, StoreError> {
             unreachable!()
@@ -2908,36 +2961,42 @@ pub(crate) mod tests {
         }
     }
 
+    /// After a resubscribe the full key reload is single-flight, each try is
+    /// bounded, and a failed or timed-out try is retried with backoff until
+    /// one succeeds (keys published while unsubscribed must not stay missing).
     #[tokio::test(start_paused = true)]
-    async fn key_reload_after_resubscribe_is_bounded_and_single_flight() {
+    async fn key_reload_after_resubscribe_retries_until_it_succeeds() {
         use crate::cluster::bus::BusEvent;
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = std::sync::Arc::new(FlakyList::default());
         let hub = RelayHub::in_memory(InMemoryRoomDirectory::new(), TEST_AUTH_TIMEOUT);
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
         let task = hub.spawn_bus_dispatcher(
-            std::sync::Arc::new(HangingList(calls.clone())),
+            store.clone(),
             crate::voice_session::ReplyWaiters::default(),
             events_rx,
         );
+        let calls = || store.calls.load(Ordering::SeqCst);
         let settle = || tokio::time::sleep(Duration::from_millis(100));
         events_tx.send(BusEvent::Resubscribed).unwrap();
         settle().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        // Two more mid-reload: no concurrent reload yet.
+        assert_eq!(calls(), 1);
+        // Two more mid-reload: no concurrent reload.
         events_tx.send(BusEvent::Resubscribed).unwrap();
         events_tx.send(BusEvent::Resubscribed).unwrap();
         settle().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "single flight");
-        // The first reload times out; the re-armed one runs exactly once.
-        tokio::time::sleep(KEY_RELOAD_TIMEOUT).await;
-        settle().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "re-armed once");
-        tokio::time::sleep(KEY_RELOAD_TIMEOUT * 2).await;
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "no more runs");
+        assert_eq!(calls(), 1, "single flight");
+        // The first try times out, the second fails, the third succeeds.
+        tokio::time::sleep(KEY_RELOAD_TIMEOUT + KEY_RELOAD_BACKOFF_MAX * 3).await;
+        assert_eq!(calls(), 3, "retried after a timeout and an error");
+        assert!(hub.keys().contains("astation-k"));
+        // Done: no more tries.
+        tokio::time::sleep(KEY_RELOAD_BACKOFF_MAX * 4).await;
+        assert_eq!(calls(), 3, "no more runs after a success");
         // Free again afterwards.
         events_tx.send(BusEvent::Resubscribed).unwrap();
         settle().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(calls(), 4);
+        assert_eq!(store.most_at_once.load(Ordering::SeqCst), 1, "never two reloads at once");
         drop(events_tx);
         task.await.unwrap();
     }
@@ -2946,9 +3005,9 @@ pub(crate) mod tests {
     async fn without_cache_routing_reads_the_directory() {
         let directory = InMemoryRoomDirectory::new();
         let hub = RelayHub::in_memory(directory.clone(), TEST_AUTH_TIMEOUT);
-        directory.claim_owner("room-n", &test_conn("o1"), now()).await.unwrap();
+        directory.claim_owner("room-n", &test_conn("o1"), "192.0.2.1", now(), PendingCaps::NONE).await.unwrap();
         assert_eq!(hub.route_view("room-n").await.unwrap().unwrap().owner, Some(test_conn("o1")));
-        directory.claim_owner("room-n", &test_conn("o2"), now()).await.unwrap();
+        directory.claim_owner("room-n", &test_conn("o2"), "192.0.2.1", now(), PendingCaps::NONE).await.unwrap();
         assert_eq!(hub.route_view("room-n").await.unwrap().unwrap().owner, Some(test_conn("o2")));
     }
 
@@ -3472,7 +3531,7 @@ pub(crate) mod tests {
         state
             .relay
             .directory()
-            .claim_owner(&code, &test_conn("astation-conn"), now())
+            .claim_owner(&code, &test_conn("astation-conn"), "192.0.2.1", now(), PendingCaps::NONE)
             .await
             .unwrap();
         state
@@ -4389,6 +4448,35 @@ pub(crate) mod tests {
         server.abort();
     }
 
+    /// A key-changed whose re-read failed for an id this replica never
+    /// cached leaves a stale placeholder: connects go pending (fail closed),
+    /// the owner is not dropped, and verification re-reads the store.
+    #[tokio::test]
+    async fn a_placeholder_key_makes_connects_pending_and_verification_rereads_the_store() {
+        let (state, flaky) = flaky_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-placeholder";
+        let key = TestKey::generate();
+        flaky.inner.register_key_if_absent(code, &key.public_hex(), 1).await.unwrap();
+
+        flaky.set_down(true);
+        state.relay.keys().reload_one(&flaky, code).await;
+        assert_eq!(state.relay.keys().get(code).unwrap().public_key, "");
+        assert!(!state.relay.drop_verified_owner_if_key_forgotten(code).await);
+        let (mut astation, challenge) = connect_astation(&base_url, code).await;
+        let _atem = connect_atem(&base_url, code, "atem-a").await;
+        assert_silent(&mut astation, 150).await; // pending: no Atem events
+        let result = authenticate(&mut astation, &key, code, &challenge).await;
+        assert_eq!(result["status"], "rejected", "store down: fail closed");
+        assert_closed(&mut astation).await;
+
+        flaky.set_down(false);
+        let mut astation = verified_astation(&base_url, code, &key, "verified").await;
+        assert_eq!(next_client_json(&mut astation).await["relay_event"], "connected");
+        assert_eq!(state.relay.keys().get(code).unwrap().public_key, key.public_hex());
+        server.abort();
+    }
+
     #[tokio::test]
     async fn registration_while_db_is_down_is_rejected_and_retry_works() {
         let (state, flaky) = flaky_state();
@@ -4466,6 +4554,43 @@ pub(crate) mod tests {
         .await;
         assert!(closed.is_ok(), "the verified owner stayed connected");
         assert!(!hub.drop_verified_owner_if_key_forgotten(code).await);
+        server.abort();
+    }
+
+    /// The directory is authoritative: a replica whose key cache lacks a key
+    /// (a lost `key-changed`) must not let a keyless "squatter" displace the
+    /// verified owner. The squatter waits as pending, gets no Atem traffic,
+    /// and is rejected; the real Astation proves its key by re-reading the
+    /// store.
+    #[tokio::test]
+    async fn a_squatter_waits_behind_a_verified_owner_the_key_cache_lacks() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-uncached";
+        let key = TestKey::generate();
+        let mut owner = verified_astation(&base_url, code, &key, "registered").await;
+        let mut atem = connect_atem(&base_url, code, "atem-a").await;
+        assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+        state.relay.keys().forget(code);
+
+        let (mut squatter, _) = connect_astation(&base_url, code).await;
+        send_json(&mut atem, serde_json::json!({"probe": "to-owner"})).await;
+        assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "to-owner");
+        assert_silent(&mut squatter, 150).await;
+        let room = state.relay.room(code).await.unwrap().unwrap();
+        assert!(room.verified);
+        assert_eq!(room.pending.len(), 1);
+        let result = next_client_json(&mut squatter).await;
+        assert_eq!(result["type"], "relayAuthResult");
+        assert_eq!(result["status"], "rejected");
+        assert_closed(&mut squatter).await;
+        send_json(&mut atem, serde_json::json!({"probe": "still-owner"})).await;
+        assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "still-owner");
+
+        // The real Astation reconnecting proves its key from the store.
+        let mut again = verified_astation(&base_url, code, &key, "verified").await;
+        assert_eq!(next_client_json(&mut again).await["relay_event"], "connected");
+        assert_closed(&mut owner).await;
         server.abort();
     }
 
@@ -4567,7 +4692,7 @@ pub(crate) mod tests {
         let code = "astation-race";
         let mut squatter = hub.local().register("squatter", code, SocketRole::Astation);
         let _pending = hub.local().register("pending", code, SocketRole::Astation);
-        hub.directory().claim_owner(code, &test_conn("squatter"), now()).await.unwrap();
+        hub.directory().claim_owner(code, &test_conn("squatter"), "192.0.2.1", now(), PendingCaps::NONE).await.unwrap();
         assert!(hub
             .directory()
             .add_pending(code, &test_conn("pending"), "192.0.2.1", now(), PendingCaps::NONE)
@@ -4590,7 +4715,7 @@ pub(crate) mod tests {
     async fn pair_code_collision_never_overwrites_a_live_room() {
         let hub = RelayHub::new();
         hub.create_room("TAKN-CODE", "live-host", now()).await.unwrap();
-        hub.directory().claim_owner("TAKN-CODE", &test_conn("owner"), now()).await.unwrap();
+        hub.directory().claim_owner("TAKN-CODE", &test_conn("owner"), "192.0.2.1", now(), PendingCaps::NONE).await.unwrap();
         let mut codes = vec!["FREE-CODE", "TAKN-CODE"];
         let code = hub
             .create_pair_room("new-host", now(), || codes.pop().unwrap().to_string())
@@ -4663,9 +4788,11 @@ pub(crate) mod tests {
             &self,
             code: &str,
             conn: &ConnRef,
+            ip: &str,
             now: i64,
+            caps: PendingCaps,
         ) -> Result<crate::cluster::directory::OwnerClaim, ClusterError> {
-            self.inner.claim_owner(code, conn, now).await
+            self.inner.claim_owner(code, conn, ip, now, caps).await
         }
         async fn add_pending(
             &self,
@@ -4733,7 +4860,7 @@ pub(crate) mod tests {
         let hub = RelayHub::new();
         let code = "astation-verified";
         let _owner = hub.local().register("owner", code, SocketRole::Astation);
-        hub.directory().claim_owner(code, &test_conn("owner"), now()).await.unwrap();
+        hub.directory().claim_owner(code, &test_conn("owner"), "192.0.2.1", now(), PendingCaps::NONE).await.unwrap();
         hub.promote_verified(code, "owner", false).await.unwrap();
 
         // A stale, non-pending verified socket doesn't disturb the owner.
