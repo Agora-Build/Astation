@@ -110,6 +110,12 @@ pub trait IdentityStore: Send + Sync {
     /// its in-memory key cache at startup.
     async fn list_keys(&self) -> Result<Vec<(String, String)>, IdentityError>;
 
+    /// Admin reset: delete the registered key (bindings are kept). Returns
+    /// whether a key was deleted. Stores that can't delete keep the default.
+    async fn delete_key(&self, _astation_id: &str) -> Result<bool, IdentityError> {
+        Err(IdentityError::Db("this identity store cannot delete keys".to_string()))
+    }
+
     /// Bind `session_id` to `astation_id` (or refresh `last_used_at` if this
     /// Astation already owns it). A session owned by another Astation is left
     /// alone and `OwnedByOther` is returned — even if that binding has expired.
@@ -197,12 +203,6 @@ impl InMemoryIdentityStore {
     pub fn new() -> Self {
         Self::default()
     }
-
-    /// Test stand-in for the admin reset (`DELETE FROM astation_keys …`).
-    #[cfg(test)]
-    pub(crate) async fn delete_key(&self, astation_id: &str) {
-        self.state.lock().await.keys.remove(astation_id);
-    }
 }
 
 #[async_trait]
@@ -235,6 +235,10 @@ impl IdentityStore for InMemoryIdentityStore {
             },
         );
         Ok(RegisterOutcome::Registered)
+    }
+
+    async fn delete_key(&self, astation_id: &str) -> Result<bool, IdentityError> {
+        Ok(self.state.lock().await.keys.remove(astation_id).is_some())
     }
 
     async fn list_keys(&self) -> Result<Vec<(String, String)>, IdentityError> {
@@ -419,6 +423,15 @@ impl IdentityStore for PgIdentityStore {
         }
     }
 
+    async fn delete_key(&self, astation_id: &str) -> Result<bool, IdentityError> {
+        let result = sqlx::query("DELETE FROM astation_keys WHERE astation_id = $1")
+            .bind(astation_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn list_keys(&self) -> Result<Vec<(String, String)>, IdentityError> {
         sqlx::query_as("SELECT astation_id, public_key FROM astation_keys")
             .fetch_all(&self.pool)
@@ -577,6 +590,23 @@ pub(crate) mod tests {
                 RegisterOutcome::Registered
             );
             assert_eq!(s.get_key(B).await.unwrap().as_deref(), Some(KEY2));
+        }
+
+        pub async fn delete_key_removes_only_that_key(s: &dyn IdentityStore) {
+            s.register_key_if_absent(A, KEY1, T0).await.unwrap();
+            s.register_key_if_absent(B, KEY2, T0).await.unwrap();
+            s.bind("s1", A, T0).await.unwrap();
+            assert!(s.delete_key(A).await.unwrap());
+            assert!(!s.delete_key(A).await.unwrap());
+            assert_eq!(s.get_key(A).await.unwrap(), None);
+            assert_eq!(s.get_key(B).await.unwrap().as_deref(), Some(KEY2));
+            // An admin reset keeps bindings.
+            assert_eq!(s.resolve("s1", T0 + 1).await.unwrap().as_deref(), Some(A));
+            // The next key registers.
+            assert_eq!(
+                s.register_key_if_absent(A, KEY2, T0 + 2).await.unwrap(),
+                RegisterOutcome::Registered
+            );
         }
 
         pub async fn list_keys_returns_all(s: &dyn IdentityStore) {
@@ -802,6 +832,7 @@ pub(crate) mod tests {
     }
 
     mem_tests!(
+        delete_key_removes_only_that_key,
         tofu_first_key_wins,
         list_keys_returns_all,
         touch_key_never_registers,
@@ -967,6 +998,7 @@ pub(crate) mod tests {
     }
 
     pg_tests!(
+        delete_key_removes_only_that_key,
         tofu_first_key_wins,
         list_keys_returns_all,
         touch_key_never_registers,

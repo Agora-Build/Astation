@@ -2733,7 +2733,7 @@ pub(crate) mod tests {
         assert_eq!(owner(hub.clone(), "room-b").await, Some(test_conn("b2")));
 
         // key-changed for a key deleted elsewhere forgets it.
-        identity.delete_key("astation-r").await;
+        identity.delete_key("astation-r").await.unwrap();
         events_tx
             .send(BusEvent::Broadcast(BusBroadcast::KeyChanged { astation_id: "astation-r".into() }))
             .unwrap();
@@ -4292,7 +4292,7 @@ pub(crate) mod tests {
         let new_key = TestKey::generate();
         verified_astation(&base_url, code, &old_key, "registered").await;
 
-        flaky.inner.delete_key(code).await;
+        flaky.inner.delete_key(code).await.unwrap();
         verified_astation(&base_url, code, &old_key, "verified").await;
 
         verified_astation(&base_url, code, &new_key, "registered").await;

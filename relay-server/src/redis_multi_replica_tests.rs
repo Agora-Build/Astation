@@ -1011,3 +1011,43 @@ async fn redis_drain_closes_with_1012_and_removes_entries_and_presence() {
     assert_eq!(health["status"], "draining");
     assert_eq!(refused_status(format!("{}?role=astation&code=x", one.ws)).await, 503);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn redis_forget_key_and_registration_reach_both_replicas() {
+    let _guard = REDIS_LOCK.lock().await;
+    let (shared, one, two) = two_replicas().await;
+    let code = "astation-forget";
+    let old_key = TestKey::generate();
+    let owner = verified_astation(&one.ws, code, &old_key, "registered").await;
+    eventually("both replicas know the key", || {
+        one.state.relay.keys().contains(code) && two.state.relay.keys().contains(code)
+    })
+    .await;
+
+    let admin_conn = crate::cluster::redis::RedisConn::connect(&test_url()).await.unwrap();
+    let publisher = crate::cluster::redis::bus::RedisBus::publisher(admin_conn, "admin");
+    let outcome = crate::admin::forget_key(shared.identity.as_ref(), Some(&publisher), code)
+        .await
+        .unwrap();
+    assert_eq!(outcome, crate::admin::ForgetOutcome { deleted: true, announced: true });
+    eventually("both replicas dropped the key", || {
+        !one.state.relay.keys().contains(code) && !two.state.relay.keys().contains(code)
+    })
+    .await;
+    drop(owner);
+
+    // A new key registers on replica 2 and reaches replica 1.
+    let new_key = TestKey::generate();
+    let _new_owner = verified_astation(&two.ws, code, &new_key, "registered").await;
+    let expected = new_key.public_hex();
+    eventually("replica 1 learned the new key", || {
+        one.state.relay.keys().get(code).map(|cached| cached.public_key) == Some(expected.clone())
+    })
+    .await;
+
+    // The old key is refused on replica 1 at once, without a restart.
+    let (mut old, challenge) = connect_astation(&one.ws, code).await;
+    let result = authenticate(&mut old, &old_key, code, &challenge).await;
+    assert_eq!(result["status"], "rejected", "{result}");
+}

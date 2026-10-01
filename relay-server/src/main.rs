@@ -1,3 +1,4 @@
+mod admin;
 mod auth;
 mod cluster;
 mod identity_store;
@@ -589,6 +590,15 @@ async fn main() {
         .with_level(true)
         .init();
 
+    // `station-relay-server admin …`: an operator command, not the server.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("admin") {
+        std::process::exit(admin::main(&args[1..]).await);
+    }
+    serve().await;
+}
+
+async fn serve() {
     tracing::info!("Starting Astation server...");
 
     // Configuration errors stop the relay before anything connects.
