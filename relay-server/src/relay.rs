@@ -542,8 +542,10 @@ impl RelayHub {
                     }
                     BusEvent::Broadcast(BroadcastMessage::KeyChanged { astation_id }) => {
                         let (keys, identity) = (hub.keys().clone(), identity.clone());
+                        let hub = hub.clone();
                         tokio::spawn(async move {
                             keys.reload_one(identity.as_ref(), &astation_id).await;
+                            hub.drop_verified_owner_if_key_forgotten(&astation_id).await;
                         });
                     }
                     BusEvent::VoiceReply { session_id, reply } => {
@@ -685,6 +687,34 @@ impl RelayHub {
         }
         self.room_changed(code).await;
         Ok(())
+    }
+
+    /// After a key re-read: when the key is now ABSENT (an admin forgot it,
+    /// not a re-registration with a new key), a verified Astation owner on
+    /// this replica no longer proves anything, so it is disconnected (the
+    /// socket's own cleanup leaves the room through the guarded path).
+    /// Idempotent: a repeat finds no local verified owner. A key that could
+    /// not be re-read stays cached (stale), so nothing is evicted then.
+    pub(crate) async fn drop_verified_owner_if_key_forgotten(&self, astation_id: &str) -> bool {
+        if self.inner.keys.contains(astation_id) {
+            return false;
+        }
+        let room = match self.inner.directory.get(astation_id).await {
+            Ok(Some(room)) => room,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!("Could not check the room of a forgotten key {}: {}", mask_code(astation_id), error);
+                return false;
+            }
+        };
+        let Some(owner) = room.owner.filter(|owner| {
+            room.verified && owner.replica == self.inner.replica_id && self.inner.local.contains(&owner.conn)
+        }) else {
+            return false;
+        };
+        tracing::warn!("Key of Astation {} was forgotten: disconnecting its verified socket", mask_code(astation_id));
+        self.close_connection(&owner, None).await;
+        true
     }
 
     /// Close every local socket of a room that no longer exists.
@@ -4300,6 +4330,42 @@ pub(crate) mod tests {
         let (mut old, challenge) = connect_astation(&base_url, code).await;
         let result = authenticate(&mut old, &old_key, code, &challenge).await;
         assert_eq!(result["status"], "rejected", "{result}");
+        server.abort();
+    }
+
+    /// A forgotten key (absent after the re-read) disconnects the verified
+    /// owner; a changed key (re-registration) and repeats do nothing.
+    #[tokio::test]
+    async fn forgotten_key_disconnects_the_verified_owner_but_a_changed_key_does_not() {
+        let (state, flaky) = flaky_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-forgotten";
+        let key = TestKey::generate();
+        let mut owner = verified_astation(&base_url, code, &key, "registered").await;
+        let hub = state.relay.clone();
+
+        // Changed: another key is stored; the cache holds it; nobody is dropped.
+        flaky.inner.delete_key(code).await.unwrap();
+        flaky.inner.register_key_if_absent(code, &TestKey::generate().public_hex(), 2).await.unwrap();
+        hub.keys().reload_one(&flaky, code).await;
+        assert!(!hub.drop_verified_owner_if_key_forgotten(code).await);
+        assert!(hub.local().contains(&hub.room(code).await.unwrap().unwrap().owner.unwrap().conn));
+
+        // Absent: forgotten. The owner goes, and a repeat is a no-op.
+        flaky.inner.delete_key(code).await.unwrap();
+        hub.keys().reload_one(&flaky, code).await;
+        assert!(hub.drop_verified_owner_if_key_forgotten(code).await);
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match owner.next().await {
+                    None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_))) => return,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "the verified owner stayed connected");
+        assert!(!hub.drop_verified_owner_if_key_forgotten(code).await);
         server.abort();
     }
 

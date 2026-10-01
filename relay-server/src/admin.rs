@@ -57,7 +57,7 @@ pub async fn main(args: &[String]) -> i32 {
     };
     let Some(database_url) = std::env::var("DATABASE_URL").ok().filter(|url| !url.is_empty()) else {
         eprintln!("DATABASE_URL is required");
-        return 2;
+        return 1;
     };
     let pool = match sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
@@ -81,13 +81,12 @@ pub async fn main(args: &[String]) -> i32 {
         },
         None => None,
     };
-    let masked = crate::relay::mask_code(&astation_id);
-    match forget_key(&identity, bus.as_ref().map(|bus| bus as &dyn ReplicaBus), &astation_id).await {
+        match forget_key(&identity, bus.as_ref().map(|bus| bus as &dyn ReplicaBus), &astation_id).await {
         Ok(outcome) => {
             if outcome.deleted {
-                println!("Deleted the relay key of {masked}.");
+                println!("Deleted the relay key of {astation_id}.");
             } else {
-                println!("No relay key was registered for {masked}.");
+                println!("No relay key was registered for {astation_id}.");
             }
             if outcome.announced {
                 println!("Announced on relay:broadcast: every relay replica drops its cached key now.");
@@ -124,6 +123,68 @@ mod tests {
             forget_key(&identity, None, "astation-a").await.unwrap(),
             ForgetOutcome { deleted: false, announced: false }
         );
+    }
+
+    struct RecordingBus(std::sync::Mutex<Vec<BroadcastMessage>>);
+
+    #[async_trait::async_trait]
+    impl ReplicaBus for RecordingBus {
+        fn backend_name(&self) -> &'static str {
+            "recording"
+        }
+        async fn send_inbox(
+            &self,
+            _replica_id: &str,
+            _message: crate::cluster::bus::InboxMessage,
+        ) -> Result<(), crate::cluster::StoreError> {
+            Ok(())
+        }
+        async fn broadcast(&self, message: BroadcastMessage) -> Result<(), crate::cluster::StoreError> {
+            self.0.lock().unwrap().push(message);
+            Ok(())
+        }
+    }
+
+    struct FailingBus;
+
+    #[async_trait::async_trait]
+    impl ReplicaBus for FailingBus {
+        fn backend_name(&self) -> &'static str {
+            "failing"
+        }
+        async fn send_inbox(
+            &self,
+            _replica_id: &str,
+            _message: crate::cluster::bus::InboxMessage,
+        ) -> Result<(), crate::cluster::StoreError> {
+            Ok(())
+        }
+        async fn broadcast(&self, _message: BroadcastMessage) -> Result<(), crate::cluster::StoreError> {
+            Err(crate::cluster::StoreError::Unavailable("down".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn announces_exactly_one_key_changed_after_the_key_is_gone() {
+        let identity = InMemoryIdentityStore::new();
+        identity.register_key_if_absent("astation-a", "04aa", 1).await.unwrap();
+        let bus = RecordingBus(Default::default());
+        forget_key(&identity, Some(&bus), "astation-a").await.unwrap();
+        {
+            let sent = bus.0.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            assert!(matches!(&sent[0], BroadcastMessage::KeyChanged { astation_id } if astation_id == "astation-a"));
+        }
+        assert_eq!(identity.get_key("astation-a").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_failing_bus_still_deletes_and_says_restart() {
+        let identity = InMemoryIdentityStore::new();
+        identity.register_key_if_absent("astation-a", "04aa", 1).await.unwrap();
+        let error = forget_key(&identity, Some(&FailingBus), "astation-a").await.unwrap_err();
+        assert!(error.contains("restart the relay replicas"), "{error}");
+        assert_eq!(identity.get_key("astation-a").await.unwrap(), None);
     }
 
     #[tokio::test]

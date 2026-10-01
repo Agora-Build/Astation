@@ -1035,7 +1035,8 @@ async fn redis_forget_key_and_registration_reach_both_replicas() {
         !one.state.relay.keys().contains(code) && !two.state.relay.keys().contains(code)
     })
     .await;
-    drop(owner);
+    let mut owner = owner;
+    wait_closed(&mut owner).await;
 
     // A new key registers on replica 2 and reaches replica 1.
     let new_key = TestKey::generate();
