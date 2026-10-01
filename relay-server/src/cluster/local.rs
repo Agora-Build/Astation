@@ -119,8 +119,8 @@ impl LocalSockets {
         self.codes_where(false)
     }
 
-    // Task 20 (two-relay harness) and Task 25 (SIGTERM drain).
-    #[allow(dead_code)]
+    // The two-relay harness (tests); Task 25 (SIGTERM drain) uses it in `main`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn connection_ids(&self) -> Vec<String> {
         self.lock().keys().cloned().collect()
     }

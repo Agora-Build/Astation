@@ -15,6 +15,9 @@ mod vault_store;
 mod vault_routes;
 mod web;
 
+#[cfg(test)]
+mod redis_multi_replica_tests;
+
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::IntoResponse;
@@ -97,26 +100,59 @@ fn check_single_instance(expected_replicas: usize) -> Result<(), String> {
 const REDIS_CONNECT_ATTEMPTS: u32 = 10;
 const REDIS_CONNECT_RETRY_SECS: u64 = 3;
 
-/// Connect to Redis, retrying unreachable/timeouts for about 30 s, then give
-/// up (exit 1) so the orchestrator restarts the relay. A permanent failure
-/// (bad URL, wrong password) exits at once. Never logs the URL. `keys` is already loaded; the replica
-/// serves from it.
+/// Redis mode, one replica (shared by `main` and the two-relay test
+/// harness): connect around the already loaded `keys`, retrying
+/// unreachable/timeouts for about 30 s, then re-read the keys once the bus
+/// is subscribed. A permanent failure (bad URL, wrong password) gives up at
+/// once. `Err` carries the message to log before exiting (`main` exits 1 so
+/// the orchestrator restarts the relay). Never logs the URL.
+async fn start_redis_replica(
+    url: &str,
+    identity: Arc<dyn identity_store::IdentityStore>,
+    keys: cluster::keys::KeyCache,
+    auth_timeout: std::time::Duration,
+) -> Result<cluster::redis::RedisCluster, String> {
+    let cluster = connect_redis_cluster(url, identity.clone(), keys, auth_timeout).await?;
+    // A key registered on another replica between the load and the bus
+    // subscription was announced while we weren't listening: re-read once
+    // now that key-changed messages reach us.
+    match tokio::time::timeout(
+        relay::KEY_RELOAD_TIMEOUT,
+        cluster.relay.load_keys(identity.as_ref()),
+    )
+    .await
+    {
+        Ok(Ok(count)) => tracing::info!("Re-read {} Astation relay key(s) after subscribing", count),
+        Ok(Err(error)) => tracing::warn!("Could not re-read relay keys after subscribing: {}", error),
+        Err(_) => tracing::warn!(
+            "Re-reading relay keys after subscribing timed out after {:?}",
+            relay::KEY_RELOAD_TIMEOUT
+        ),
+    }
+    tracing::info!(
+        "Shared relay state ready (Redis); replica {}, {} live replica(s)",
+        cluster.relay.replica_id(),
+        cluster::health::ClusterHealth::replicas(&cluster.health)
+    );
+    Ok(cluster)
+}
+
+/// The bounded connect retries of `start_redis_replica`.
 async fn connect_redis_cluster(
     url: &str,
     identity: Arc<dyn identity_store::IdentityStore>,
     keys: cluster::keys::KeyCache,
-) -> cluster::redis::RedisCluster {
-    let auth_timeout = std::time::Duration::from_secs(relay::RELAY_AUTH_TIMEOUT_SECS);
+    auth_timeout: std::time::Duration,
+) -> Result<cluster::redis::RedisCluster, String> {
     for attempt in 1..=REDIS_CONNECT_ATTEMPTS {
         match cluster::redis::connect_cluster_with_keys(url, identity.clone(), keys.clone(), auth_timeout).await {
-            Ok(cluster) => return cluster,
+            Ok(cluster) => return Ok(cluster),
             // A bad URL or wrong credentials won't fix themselves.
             Err(cluster::redis::ConnectError::Permanent(detail)) => {
-                tracing::error!(
+                return Err(format!(
                     "Redis connect failed and retrying won't help (check REDIS_URL and its password): {}",
                     detail
-                );
-                std::process::exit(1);
+                ));
             }
             Err(cluster::redis::ConnectError::Retryable(error)) => {
                 tracing::error!(
@@ -131,11 +167,80 @@ async fn connect_redis_cluster(
             }
         }
     }
-    tracing::error!(
+    Err(format!(
         "Could not reach REDIS_URL after {} attempts; exiting so the relay is restarted",
         REDIS_CONNECT_ATTEMPTS
-    );
-    std::process::exit(1);
+    ))
+}
+
+/// The background sweeps every replica runs every 60 s: expired pairing
+/// sessions, room upkeep, expired RTC and voice sessions. Shared by `main`
+/// (which detaches them for the life of the process) and the two-relay
+/// test harness (which aborts them).
+fn spawn_upkeep(
+    relay: &RelayHub,
+    sessions: &SessionStore,
+    rtc_sessions: &RtcSessionStore,
+    voice_sessions: &VoiceSessionStore,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    // Spawn background cleanup for expired sessions
+    let cleanup_sessions = sessions.clone();
+    let sessions_sweep = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            if let Err(error) = cleanup_sessions.cleanup_expired().await {
+                tracing::debug!("Session sweep failed: {}", error);
+            }
+            tracing::debug!("Cleaned up expired sessions");
+        }
+    });
+
+    // Room upkeep every 60 s (pre-flight 7). In-memory: sweep expired rooms.
+    // Redis: rooms expire on their own (EXPIRE 600), so each replica
+    // refreshes every room where it holds an Astation socket (owner or
+    // pending) and closes its Atem sockets whose room no longer exists.
+    // A Redis outage longer than ~9 minutes (600 s TTL minus one interval)
+    // lets live rooms expire: their sockets are then closed and clients
+    // reconnect, recreating them.
+    let cleanup_relay = relay.clone();
+    let rooms_sweep = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        // A sweep slowed by a Redis outage must not be followed by a burst.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            cleanup_relay.cleanup_expired().await;
+            tracing::debug!("Cleaned up expired pair rooms");
+        }
+    });
+
+    // Spawn background cleanup for expired RTC sessions
+    let cleanup_rtc = rtc_sessions.clone();
+    let rtc_sweep = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            if let Err(error) = cleanup_rtc.cleanup_expired().await {
+                tracing::debug!("RTC session sweep failed: {}", error);
+            }
+            tracing::debug!("Cleaned up expired RTC sessions");
+        }
+    });
+
+    // Spawn background cleanup for expired voice sessions
+    let cleanup_voice = voice_sessions.clone();
+    let voice_sweep = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            if let Err(error) = cleanup_voice.cleanup_expired().await {
+                tracing::debug!("Voice session sweep failed: {}", error);
+            }
+            tracing::debug!("Cleaned up expired voice sessions");
+        }
+    });
+    vec![sessions_sweep, rooms_sweep, rtc_sweep, voice_sweep]
 }
 
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -410,28 +515,14 @@ async fn main() {
     let (relay, sessions, rtc_sessions, voice_sessions) = match redis_url {
         Some(url) => {
             tracing::info!("Connecting to Redis for shared relay state...");
-            let cluster = connect_redis_cluster(&url, identity.clone(), keys).await;
-            // A key registered on another replica between the load above and
-            // the bus subscription was announced while we weren't listening:
-            // re-read once now that key-changed messages reach us.
-            match tokio::time::timeout(
-                relay::KEY_RELOAD_TIMEOUT,
-                cluster.relay.load_keys(identity.as_ref()),
-            )
-            .await
-            {
-                Ok(Ok(count)) => tracing::info!("Re-read {} Astation relay key(s) after subscribing", count),
-                Ok(Err(error)) => tracing::warn!("Could not re-read relay keys after subscribing: {}", error),
-                Err(_) => tracing::warn!(
-                    "Re-reading relay keys after subscribing timed out after {:?}",
-                    relay::KEY_RELOAD_TIMEOUT
-                ),
-            }
-            tracing::info!(
-                "Shared relay state ready (Redis); replica {}, {} live replica(s)",
-                cluster.relay.replica_id(),
-                cluster::health::ClusterHealth::replicas(&cluster.health)
-            );
+            let auth_timeout = std::time::Duration::from_secs(relay::RELAY_AUTH_TIMEOUT_SECS);
+            let cluster = match start_redis_replica(&url, identity.clone(), keys, auth_timeout).await {
+                Ok(cluster) => cluster,
+                Err(message) => {
+                    tracing::error!("{}", message);
+                    std::process::exit(1);
+                }
+            };
             // The cluster's background tasks (bus, dispatcher, presence) are
             // detached and run for the life of the process.
             (
@@ -460,63 +551,8 @@ async fn main() {
         }
     };
 
-    // Spawn background cleanup for expired sessions
-    let cleanup_sessions = sessions.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            if let Err(error) = cleanup_sessions.cleanup_expired().await {
-                tracing::debug!("Session sweep failed: {}", error);
-            }
-            tracing::debug!("Cleaned up expired sessions");
-        }
-    });
-
-    // Room upkeep every 60 s (pre-flight 7). In-memory: sweep expired rooms.
-    // Redis: rooms expire on their own (EXPIRE 600), so each replica
-    // refreshes every room where it holds an Astation socket (owner or
-    // pending) and closes its Atem sockets whose room no longer exists.
-    // A Redis outage longer than ~9 minutes (600 s TTL minus one interval)
-    // lets live rooms expire: their sockets are then closed and clients
-    // reconnect, recreating them.
-    let cleanup_relay = relay.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-        // A sweep slowed by a Redis outage must not be followed by a burst.
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            cleanup_relay.cleanup_expired().await;
-            tracing::debug!("Cleaned up expired pair rooms");
-        }
-    });
-
-    // Spawn background cleanup for expired RTC sessions
-    let cleanup_rtc = rtc_sessions.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            if let Err(error) = cleanup_rtc.cleanup_expired().await {
-                tracing::debug!("RTC session sweep failed: {}", error);
-            }
-            tracing::debug!("Cleaned up expired RTC sessions");
-        }
-    });
-
-    // Spawn background cleanup for expired voice sessions
-    let cleanup_voice = voice_sessions.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            if let Err(error) = cleanup_voice.cleanup_expired().await {
-                tracing::debug!("Voice session sweep failed: {}", error);
-            }
-            tracing::debug!("Cleaned up expired voice sessions");
-        }
-    });
+    // Detached: they run for the life of the process.
+    spawn_upkeep(&relay, &sessions, &rtc_sessions, &voice_sessions);
 
     let state = AppState {
         sessions,

@@ -2140,7 +2140,7 @@ fn render_pair_page(code: &str, hostname: &str, status: &InitialPageStatus) -> S
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::voice_session::VoiceSessionStore;
     use super::*;
     use tokio::net::TcpStream;
@@ -2148,7 +2148,7 @@ mod tests {
         tungstenite::Message as ClientMessage, MaybeTlsStream, WebSocketStream,
     };
 
-    type TestSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+    pub(crate) type TestSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
     #[test]
     fn mask_code_shows_only_a_prefix() {
@@ -2160,7 +2160,7 @@ mod tests {
         assert_eq!(mask_code("日本語テキスト"), "日本語テ…");
     }
 
-    async fn next_client_json(socket: &mut TestSocket) -> serde_json::Value {
+    pub(crate) async fn next_client_json(socket: &mut TestSocket) -> serde_json::Value {
         loop {
             let frame = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
                 .await
@@ -3293,13 +3293,13 @@ mod tests {
     use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
     /// A software P-256 key acting as a real Astation's relay identity.
-    struct TestKey {
+    pub(crate) struct TestKey {
         pair: EcdsaKeyPair,
         rng: ring::rand::SystemRandom,
     }
 
     impl TestKey {
-        fn generate() -> Self {
+        pub(crate) fn generate() -> Self {
             let rng = ring::rand::SystemRandom::new();
             let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
                 .expect("generate P-256 key");
@@ -3310,12 +3310,12 @@ mod tests {
         }
 
         /// X9.63 uncompressed public key, lowercase hex (what Astation sends).
-        fn public_hex(&self) -> String {
+        pub(crate) fn public_hex(&self) -> String {
             hex_encode(self.pair.public_key().as_ref())
         }
 
         /// DER signature over the protocol's signed message, lowercase hex.
-        fn sign_hex(&self, challenge: &str, astation_id: &str) -> String {
+        pub(crate) fn sign_hex(&self, challenge: &str, astation_id: &str) -> String {
             let message = relay_auth_signing_message(challenge, astation_id);
             let sig = self
                 .pair
@@ -3324,7 +3324,7 @@ mod tests {
             hex_encode(sig.as_ref())
         }
 
-        fn relay_auth(&self, challenge: &str, astation_id: &str) -> serde_json::Value {
+        pub(crate) fn relay_auth(&self, challenge: &str, astation_id: &str) -> serde_json::Value {
             serde_json::json!({
                 "type": "relayAuth",
                 "astation_id": astation_id,
@@ -3334,7 +3334,7 @@ mod tests {
         }
     }
 
-    const TEST_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
+    pub(crate) const TEST_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
 
     fn identity_state(identity: std::sync::Arc<dyn crate::identity_store::IdentityStore>) -> crate::AppState {
         crate::AppState {
@@ -3355,7 +3355,7 @@ mod tests {
     }
 
     /// Serve the production router on an ephemeral port; returns the ws base URL.
-    async fn spawn_relay(state: crate::AppState) -> (String, tokio::task::JoinHandle<()>) {
+    pub(crate) async fn spawn_relay(state: crate::AppState) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind test relay");
@@ -3373,7 +3373,7 @@ mod tests {
     }
 
     /// Open `role=astation` and read the challenge that must arrive first.
-    async fn connect_astation(base_url: &str, code: &str) -> (TestSocket, String) {
+    pub(crate) async fn connect_astation(base_url: &str, code: &str) -> (TestSocket, String) {
         let (mut socket, _) =
             tokio_tungstenite::connect_async(format!("{base_url}?role=astation&code={code}"))
                 .await
@@ -3387,7 +3387,7 @@ mod tests {
         (socket, value)
     }
 
-    async fn connect_atem(base_url: &str, code: &str, atem_id: &str) -> TestSocket {
+    pub(crate) async fn connect_atem(base_url: &str, code: &str, atem_id: &str) -> TestSocket {
         tokio_tungstenite::connect_async(format!(
             "{base_url}?role=atem&code={code}&atem_id={atem_id}"
         ))
@@ -3396,7 +3396,7 @@ mod tests {
         .0
     }
 
-    async fn send_json(socket: &mut TestSocket, value: serde_json::Value) {
+    pub(crate) async fn send_json(socket: &mut TestSocket, value: serde_json::Value) {
         socket
             .send(ClientMessage::Text(value.to_string()))
             .await
@@ -3404,7 +3404,7 @@ mod tests {
     }
 
     /// Answer the challenge with `key`; returns the relayAuthResult.
-    async fn authenticate(
+    pub(crate) async fn authenticate(
         socket: &mut TestSocket,
         key: &TestKey,
         code: &str,
@@ -3417,7 +3417,7 @@ mod tests {
     }
 
     /// Connect, prove `key`, and assert the expected status.
-    async fn verified_astation(
+    pub(crate) async fn verified_astation(
         base_url: &str,
         code: &str,
         key: &TestKey,
@@ -3430,7 +3430,7 @@ mod tests {
     }
 
     /// Send a control message and return the relay's ack.
-    async fn control(socket: &mut TestSocket, value: serde_json::Value) -> serde_json::Value {
+    pub(crate) async fn control(socket: &mut TestSocket, value: serde_json::Value) -> serde_json::Value {
         let kind = value["type"].as_str().unwrap().to_string();
         send_json(socket, value).await;
         let ack = next_client_json(socket).await;
@@ -3439,7 +3439,7 @@ mod tests {
         ack
     }
 
-    async fn assert_closed(socket: &mut TestSocket) {
+    pub(crate) async fn assert_closed(socket: &mut TestSocket) {
         let closed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
                 match socket.next().await {
@@ -3456,7 +3456,7 @@ mod tests {
         assert!(closed, "socket was not closed");
     }
 
-    async fn assert_silent(socket: &mut TestSocket, millis: u64) {
+    pub(crate) async fn assert_silent(socket: &mut TestSocket, millis: u64) {
         match tokio::time::timeout(std::time::Duration::from_millis(millis), socket.next()).await
         {
             Err(_) => {}

@@ -170,7 +170,7 @@ pub struct RedisCluster {
 impl RedisCluster {
     /// Stop this replica's background tasks (bus, dispatcher, presence).
     /// Dropping a `RedisCluster` without calling this leaves them running.
-    // Tests and the Task 20 two-relay harness; `main` keeps them for life.
+    // Tests and the two-relay harness; `main` keeps them for life.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn abort(&self) {
         for task in &self.tasks {
@@ -179,9 +179,9 @@ impl RedisCluster {
     }
 }
 
-/// Build a replica on Redis with an empty key cache (tests and harnesses
+/// Build a replica on Redis with an empty key cache (tests
 /// load keys afterwards with `relay.load_keys`).
-// Tests and the Task 20 two-relay harness; `main` passes its loaded keys.
+// Tests only; `main` and the two-relay harness pass loaded keys.
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn connect_cluster(
     url: &str,
