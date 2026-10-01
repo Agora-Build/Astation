@@ -71,16 +71,13 @@ jobs:
       # hook URL per line, any webhook-capable platform). For each: trigger,
       # wait for the Coolify deployment when COOLIFY_API_TOKEN is set, then
       # wait for /health before the next one, so the other relays keep serving
-      # while one restarts. Any failure stops the run. With RELAY_DEPLOY_HOOKS
-      # unset it falls back to COOLIFY_RELAY_SERVER_WEBHOOK_URL, then
-      # COOLIFY_RELAY_B_WEBHOOK_URL if set.
+      # while one restarts. Any failure stops the run. RELAY_DEPLOY_HOOKS
+      # (one URL per line) is required.
       # STATION_MIN_REPLICAS / STATION_REQUIRE_REDIS are opt-in: unset repo
       # variables mean "not checked", so a single relay without Redis passes.
       - name: Deploy relays one at a time, waiting for health after each
         env:
           RELAY_DEPLOY_HOOKS: ${{ secrets.RELAY_DEPLOY_HOOKS }}
-          COOLIFY_RELAY_SERVER_WEBHOOK_URL: ${{ secrets.COOLIFY_RELAY_SERVER_WEBHOOK_URL }}
-          COOLIFY_RELAY_B_WEBHOOK_URL: ${{ secrets.COOLIFY_RELAY_B_WEBHOOK_URL }}
           COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
           STATION_MIN_REPLICAS: ${{ vars.STATION_MIN_REPLICAS }}
           STATION_REQUIRE_REDIS: ${{ vars.STATION_REQUIRE_REDIS }}

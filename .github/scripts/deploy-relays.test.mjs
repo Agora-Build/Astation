@@ -9,29 +9,15 @@ const D = 'https://coolify.example/api/v1/deploy?uuid=relay-d';
 const health = { origin: 'https://station.test', minReplicas: 0, requireRedis: false };
 
 test('RELAY_DEPLOY_HOOKS: one per line, in order, blanks and whitespace ignored', () => {
-  assert.deepEqual(relayHooksFromEnv({ RELAY_DEPLOY_HOOKS: `\n  ${B}  \r\n\n\t${A}\n${C}\n   \n` }).hooks, [B, A, C]);
-  // It wins over the older secrets.
-  assert.deepEqual(
-    relayHooksFromEnv({ RELAY_DEPLOY_HOOKS: C, COOLIFY_RELAY_SERVER_WEBHOOK_URL: A, COOLIFY_RELAY_B_WEBHOOK_URL: B }).hooks,
-    [C],
-  );
+  assert.deepEqual(relayHooksFromEnv({ RELAY_DEPLOY_HOOKS: `\n  ${B}  \r\n\n\t${A}\n${C}\n   \n` }), [B, A, C]);
 });
 
-test('falls back to the older secrets when RELAY_DEPLOY_HOOKS is empty or unset', () => {
+test('the old COOLIFY_* relay variables are ignored', () => {
+  const old = { COOLIFY_RELAY_SERVER_WEBHOOK_URL: A, COOLIFY_RELAY_B_WEBHOOK_URL: B };
+  assert.deepEqual(relayHooksFromEnv({ ...old, RELAY_DEPLOY_HOOKS: C }), [C]);
   for (const RELAY_DEPLOY_HOOKS of [undefined, '', '  \n\n ']) {
-    assert.deepEqual(relayHooksFromEnv({ RELAY_DEPLOY_HOOKS, COOLIFY_RELAY_SERVER_WEBHOOK_URL: A }).hooks, [A]);
-    assert.deepEqual(
-      relayHooksFromEnv({ RELAY_DEPLOY_HOOKS, COOLIFY_RELAY_SERVER_WEBHOOK_URL: A, COOLIFY_RELAY_B_WEBHOOK_URL: B }).hooks,
-      [A, B],
-    );
-    assert.deepEqual(
-      relayHooksFromEnv({ RELAY_DEPLOY_HOOKS, COOLIFY_RELAY_SERVER_WEBHOOK_URL: A, COOLIFY_RELAY_B_WEBHOOK_URL: '' }).hooks,
-      [A],
-    );
+    assert.deepEqual(relayHooksFromEnv({ ...old, RELAY_DEPLOY_HOOKS }), []);
   }
-  // Like the old workflow: relay-b alone is not enough.
-  assert.deepEqual(relayHooksFromEnv({ COOLIFY_RELAY_B_WEBHOOK_URL: B }).hooks, []);
-  assert.deepEqual(relayHooksFromEnv({}).hooks, []);
 });
 
 function recorder() {
@@ -138,9 +124,32 @@ test('no hook URL appears in any log line or error', async () => {
   assert.equal(redact(`GET ${new URL(A).href} failed`, A), 'GET <relay hook> failed');
 });
 
-test('no hooks configured is an error', async () => {
-  const { options } = recorder();
-  await assert.rejects(deployRelays({ ...options, hooks: [], token: 'tok' }), /No relay deploy hook configured/);
+test('empty or unset RELAY_DEPLOY_HOOKS fails before any HTTP call', async () => {
+  const { events, logs, options } = recorder();
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls++;
+    return new Response('{}');
+  };
+  for (const RELAY_DEPLOY_HOOKS of [undefined, '', ' \n ']) {
+    for (const token of [undefined, 'tok']) {
+      await assert.rejects(
+        deployRelays({
+          ...options,
+          fetchImpl,
+          hooks: relayHooksFromEnv({ RELAY_DEPLOY_HOOKS, COOLIFY_RELAY_SERVER_WEBHOOK_URL: A }),
+          token,
+        }),
+        error => {
+          assert.equal(error.message, 'RELAY_DEPLOY_HOOKS is required: set it to the relay deploy URLs, one per line');
+          return true;
+        },
+      );
+    }
+  }
+  assert.equal(calls, 0);
+  assert.deepEqual(events, []);
+  assert.deepEqual(logs, []);
 });
 
 test('triggerHook POSTs without following redirects and checks the status', async () => {
@@ -175,19 +184,4 @@ test('with the token, every hook is checked before any is triggered', async () =
   const { events, options } = recorder();
   await deployRelays({ ...options, hooks: [A, C], token: '' });
   assert.deepEqual(events.map(([kind]) => kind), ['trigger', 'health', 'trigger', 'health']);
-});
-
-test('the older COOLIFY_* secrets still require the token', async () => {
-  for (const token of [undefined, '']) {
-    const { events, logs, options } = recorder();
-    await assert.rejects(
-      deployRelays({ ...options, hooks: [A, B], token, fromFallback: true }),
-      /COOLIFY_API_TOKEN is required with COOLIFY_RELAY_SERVER_WEBHOOK_URL/,
-    );
-    assert.deepEqual(events, []);
-    assert.deepEqual(logs, []);
-  }
-  const { events, options } = recorder();
-  await deployRelays({ ...options, hooks: [A], token: 'tok', fromFallback: true });
-  assert.deepEqual(events.map(([kind]) => kind), ['coolify', 'health']);
 });
