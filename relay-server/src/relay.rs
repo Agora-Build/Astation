@@ -1711,10 +1711,6 @@ async fn handle_ws(
     let local = hub.local().clone();
     let outbox = local.register(&connection_id, &code, socket_role);
     let mut reader_close = outbox.close.clone();
-    // Upgraded after the drain listed the sockets: close it the same way.
-    if hub.is_draining() {
-        local.close_with(&connection_id, CLOSE_SERVICE_RESTART, "relay restarting");
-    }
 
     // An Astation gets a challenge; it must prove the key first when one is
     // registered for this room code (decided from the key cache, no I/O).
@@ -1726,6 +1722,16 @@ async fn handle_ws(
 
     // The writer runs from the start, so a refusal below still reaches the client.
     let mut write_task = tokio::spawn(write_loop(ws_sink, outbox, code.clone()));
+
+    // Upgraded after the drain listed the sockets (SeqCst: a socket is
+    // either listed or sees the flag here): close it with 1012 before it
+    // joins its room, so nobody is told it connected.
+    if hub.is_draining() {
+        local.close_with(&connection_id, CLOSE_SERVICE_RESTART, "relay restarting");
+        let _ = tokio::time::timeout(Duration::from_secs(2), &mut write_task).await;
+        write_task.abort();
+        return;
+    }
 
     let registration =
         register_connection(&hub, &code, &atem_id, &connection_id, astation_auth.as_mut()).await;
@@ -4605,6 +4611,42 @@ pub(crate) mod tests {
             }
             other => panic!("a draining relay accepted a socket: {:?}", other.map(|_| ())),
         }
+        server.abort();
+    }
+
+    /// A socket upgraded just before the drain flag was set (it passed the
+    /// ws_handler check) is closed with 1012 before it joins its room.
+    #[tokio::test]
+    async fn a_socket_upgraded_during_a_drain_never_joins_its_room() {
+        let hub = RelayHub::new();
+        let code = "astation-late";
+        hub.ensure_room(code, "host", chrono::Utc::now().timestamp()).await.unwrap();
+        hub.drain(std::time::Duration::from_millis(10)).await;
+
+        let late_hub = hub.clone();
+        let app = Router::new().route(
+            "/late",
+            axum::routing::get(move |ws: WebSocketUpgrade| async move {
+                let identity: Arc<dyn IdentityStore> =
+                    Arc::new(crate::identity_store::InMemoryIdentityStore::new());
+                ws.on_upgrade(move |socket| {
+                    handle_ws(late_hub, identity, code.to_string(), "atem".into(), "atem-late".into(), socket)
+                })
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (mut atem, _) = tokio_tungstenite::connect_async(format!("ws://{address}/late"))
+            .await
+            .expect("upgrade");
+        assert_eq!(close_code(&mut atem).await, 1012);
+        let room = hub.room(code).await.unwrap().expect("room kept");
+        assert!(room.atems.is_empty(), "a late socket must not join: {:?}", room.atems);
+        assert!(hub.local().is_empty());
         server.abort();
     }
 }

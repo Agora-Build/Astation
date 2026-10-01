@@ -178,29 +178,53 @@ async fn connect_redis_cluster(
 type NamedTask = (&'static str, tokio::task::JoinHandle<()>);
 
 /// Wait until the first task ends. Unless the relay is draining (then
-/// tasks ending is expected), that is a failure: a replica that silently
-/// stopped processing the bus or refreshing its presence must not keep
-/// looking healthy, so log it and call `on_failure` (`main`: exit 1, and
-/// the orchestrator restarts the relay).
-async fn supervise(tasks: Vec<NamedTask>, hub: RelayHub, on_failure: impl FnOnce(&'static str)) {
+/// tasks ending is expected), that is a failure: log it and return the
+/// task's name.
+async fn supervise(tasks: Vec<NamedTask>, hub: &RelayHub) -> Option<&'static str> {
     if tasks.is_empty() {
-        return;
+        return None;
     }
     let (names, handles): (Vec<&'static str>, Vec<_>) = tasks.into_iter().unzip();
     let (result, index, _rest) = futures_util::future::select_all(handles).await;
     let name = names[index];
     if hub.is_draining() {
         tracing::debug!("Background task '{}' ended during drain", name);
-        return;
+        return None;
     }
     match result {
-        Ok(()) => tracing::error!("Background task '{}' stopped unexpectedly; exiting", name),
+        Ok(()) => tracing::error!("Background task '{}' stopped unexpectedly; draining, then exiting", name),
         Err(error) if error.is_panic() => {
-            tracing::error!("Background task '{}' panicked; exiting", name)
+            tracing::error!("Background task '{}' panicked; draining, then exiting", name)
         }
-        Err(error) => tracing::error!("Background task '{}' ended ({}); exiting", name, error),
+        Err(error) => tracing::error!(
+            "Background task '{}' ended ({}); draining, then exiting",
+            name,
+            error
+        ),
     }
-    on_failure(name);
+    Some(name)
+}
+
+/// A replica that silently stopped processing the bus or refreshing its
+/// presence must not keep looking healthy. When a supervised task fails,
+/// drain (fail /health, close sockets with 1012, leave rooms, withdraw
+/// presence) and then call `exit` (`main`: exit 1, and the orchestrator
+/// restarts the relay). A drain already under way (SIGTERM) is left to
+/// finish on its own.
+async fn run_supervisor(
+    tasks: Vec<NamedTask>,
+    hub: RelayHub,
+    grace: std::time::Duration,
+    exit: impl FnOnce(&'static str),
+) {
+    let Some(name) = supervise(tasks, &hub).await else {
+        return;
+    };
+    if hub.is_draining() {
+        return;
+    }
+    hub.drain(grace).await;
+    exit(name);
 }
 
 /// The background sweeps every replica runs every 60 s: expired pairing
@@ -510,6 +534,51 @@ async fn shutdown_signal() {
     }
 }
 
+/// Serve until `signal`, then drain (fail /health, close sockets with
+/// 1012, leave rooms, withdraw presence) and let in-flight HTTP requests
+/// finish, for at most `grace` after the drain: a long poll (LLM proxy, up
+/// to 30 s) must not hold up a redeploy.
+async fn serve_with_drain<S>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    hub: RelayHub,
+    signal: S,
+    grace: std::time::Duration,
+) -> std::io::Result<()>
+where
+    S: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        signal.await;
+        tracing::info!("Shutdown signal received: draining relay sockets");
+        hub.drain(grace).await;
+        let _ = drained_tx.send(());
+    });
+    // The bound starts once the drain is done (sockets gone, presence
+    // withdrawn); before the signal the server runs for as long as it likes.
+    let deadline = async move {
+        match drained_rx.await {
+            Ok(()) => tokio::time::sleep(grace).await,
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        result = server => result,
+        _ = deadline => {
+            tracing::warn!(
+                "In-flight HTTP requests still running {:?} after the drain; abandoning them",
+                grace
+            );
+            Ok(())
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize tracing/logging
@@ -624,7 +693,9 @@ async fn main() {
     // outside a drain stops the relay (exit 1) so it is restarted.
     let mut background = cluster_tasks;
     background.extend(spawn_upkeep(&relay, &sessions, &rtc_sessions, &voice_sessions));
-    tokio::spawn(supervise(background, relay.clone(), |_| std::process::exit(1)));
+    tokio::spawn(run_supervisor(background, relay.clone(), relay::DRAIN_GRACE, |_| {
+        std::process::exit(1)
+    }));
 
     let state = AppState {
         sessions,
@@ -656,17 +727,19 @@ async fn main() {
 
     tracing::info!("Astation server listening on http://{}", addr);
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
+    let signal = async {
         shutdown_signal().await;
-        tracing::info!("Shutdown signal received: draining relay sockets");
-        shutdown_hub.drain(relay::DRAIN_GRACE).await;
-    })
-    .await
-    .expect("Server error");
+        // Our handlers replaced the default action, so without this a
+        // second signal would do nothing until the drain ends.
+        tokio::spawn(async {
+            shutdown_signal().await;
+            tracing::warn!("Second shutdown signal during the drain: exiting now");
+            std::process::exit(130);
+        });
+    };
+    serve_with_drain(listener, app, shutdown_hub, signal, relay::DRAIN_GRACE)
+        .await
+        .expect("Server error");
     tracing::info!("Relay stopped");
 }
 
@@ -760,13 +833,16 @@ mod tests {
         assert_eq!(body.as_ref(), br#"{"redis":"unavailable","status":"unhealthy"}"#);
     }
 
-    /// Runs `supervise` and returns the task it reported (None: none).
+    /// Runs `run_supervisor` with an injected exit; returns the task it
+    /// exited for (None: it didn't exit).
     async fn supervised(tasks: Vec<NamedTask>, hub: RelayHub) -> Option<&'static str> {
         let reported = Arc::new(std::sync::Mutex::new(None));
         let sink = reported.clone();
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            supervise(tasks, hub, move |name| *sink.lock().unwrap() = Some(name)),
+            run_supervisor(tasks, hub, std::time::Duration::from_millis(100), move |name| {
+                *sink.lock().unwrap() = Some(name)
+            }),
         )
         .await
         .expect("the supervisor did not return");
@@ -793,11 +869,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_task_drains_the_relay_before_the_exit() {
+        let hub = RelayHub::new();
+        let mut outbox = hub.local().register("c1", "room", cluster::local::SocketRole::Astation);
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let sink = seen.clone();
+        let observed = hub.clone();
+        let tasks: Vec<NamedTask> = vec![("bus dispatcher", tokio::spawn(async {}))];
+        run_supervisor(tasks, hub, std::time::Duration::from_millis(100), move |name| {
+            *sink.lock().unwrap() = Some((name, observed.is_draining(), observed.local().is_empty()))
+        })
+        .await;
+        assert_eq!(*seen.lock().unwrap(), Some(("bus dispatcher", true, true)));
+        assert!(outbox.close.changed().await.is_ok());
+        assert_eq!(outbox.close.borrow().as_ref().map(|close| close.0), Some(1012));
+    }
+
+    #[tokio::test]
     async fn supervisor_expects_tasks_to_end_while_draining() {
         let hub = RelayHub::new();
         hub.drain(std::time::Duration::from_millis(10)).await;
         let tasks: Vec<NamedTask> = vec![("bus dispatcher", tokio::spawn(async {}))];
         assert_eq!(supervised(tasks, hub).await, None);
+    }
+
+    #[tokio::test]
+    async fn shutdown_abandons_in_flight_requests_after_the_grace() {
+        use tokio::io::AsyncWriteExt;
+        let app = Router::new().route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                "late"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hub = RelayHub::new();
+        let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+        let grace = std::time::Duration::from_millis(200);
+        let server = tokio::spawn(serve_with_drain(
+            listener,
+            app,
+            hub.clone(),
+            async move {
+                let _ = signal_rx.await;
+            },
+            grace,
+        ));
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: relay\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        signal_tx.send(()).unwrap();
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(3), server).await;
+        assert!(finished.is_ok(), "shutdown waited for the in-flight request");
+        assert!(hub.is_draining());
     }
 
     #[tokio::test]
