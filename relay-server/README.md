@@ -293,8 +293,8 @@ cargo test  # unit + in-memory integration suites
 ### Load test
 
 `loadtest/` is a separate crate (its own workspace and `Cargo.lock`), so it
-adds nothing to the relay binary, its Docker image or `cargo test`; CI only
-builds it. It speaks the real protocol: each room is an Astation socket
+adds nothing to the relay binary, its Docker image or `cargo test`; CI
+builds it and runs its unit tests. It speaks the real protocol: each room is an Astation socket
 (`role=astation`, id `astation-lt-<run-id>-<n>`) that answers the relay's
 `relayAuthChallenge` with a `relayAuth` signed by its own fresh P-256 key,
 plus Atem sockets (`role=atem`) on the *other* replicas. Every interval each
@@ -309,10 +309,20 @@ Default run (the spec's target): `--astations 10000 --atems-per-astation 2`
 **Safety.** Only loopback URLs (`localhost`, `127.0.0.0/8`, `::1`) are
 accepted; anything else needs `--i-know-this-is-production`. Never point it at
 the production relays without a planned window: it opens tens of thousands
-of sockets, and each room registers an Astation key in the identity store
-(with Postgres, clean up afterwards with
-`DELETE FROM astation_keys WHERE astation_id LIKE 'astation-lt-%';` or
-`station-relay-server admin forget-key <id>` per id).
+of sockets, and each room registers an Astation key in the identity store.
+With Postgres, clean up afterwards. The ids are
+`astation-lt-<run-id>-0` … `-<astations - 1>`; the run id is printed on the
+first line. With `REDIS_URL` set, use `forget-key`, which also evicts the key
+from every replica's cache:
+
+```bash
+# in any relay container (it has DATABASE_URL and REDIS_URL set)
+for n in $(seq 0 9999); do station-relay-server admin forget-key "astation-lt-<run-id>-$n"; done
+```
+
+A raw `DELETE FROM astation_keys WHERE astation_id LIKE 'astation-lt-%';` is
+quicker but leaves the keys in the relays' caches until each relay restarts.
+`forget-key` doesn't.
 
 **Two local relays + Valkey:**
 
@@ -350,8 +360,9 @@ Atem) and that window's p50/p99; at the end the totals and `PASS` or `FAIL`
 (exit 0 or 1).
 
 **Pass criteria** (spec, "Scaling to 10k+"): `PASS`, meaning p99 frame
-latency under 100 ms over the whole run, no lost frames in any flow, and no
-failed connect, rejected `relayAuth`, incomplete room or socket dropped
+latency under 100 ms over the whole run, no lost frames in any flow, no
+sequence gaps, duplicates or reordering (each receiver checks every sender's
+`seq` per flow), and no failed connect, rejected `relayAuth`, incomplete room or socket dropped
 before the end; **and** each relay's memory (`docker stats` / RSS) flat over
 the 30 minutes after the ramp (the client can't see that). Expect a ~40 ms
 bump on a few frames once a minute, right after the relay's 60 s ping of each

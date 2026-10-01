@@ -24,6 +24,7 @@
 //! `--i-know-this-is-production` is passed. A run registers one Astation key
 //! per room in the relays' identity store (see the README for cleanup).
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -35,6 +36,7 @@ use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
+use tokio_tungstenite::tungstenite::http::Uri;
 use tokio_tungstenite::{
     connect_async_with_config, tungstenite::Message, MaybeTlsStream, WebSocketStream,
 };
@@ -146,18 +148,20 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
     Ok(args)
 }
 
-/// The host of a `ws://` or `wss://` URL (IPv6 without brackets).
-fn url_host(url: &str) -> Option<&str> {
-    let rest = url
-        .strip_prefix("ws://")
-        .or_else(|| url.strip_prefix("wss://"))?;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let authority = authority.rsplit('@').next()?;
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split(']').next()?,
-        None => authority.split(':').next()?,
-    };
-    (!host.is_empty()).then_some(host)
+/// The host of a `ws://` or `wss://` URL (IPv6 without brackets), parsed
+/// with the same `http::Uri` parser tungstenite connects with, so the guard
+/// sees exactly the host the client dials.
+fn url_host(url: &str) -> Option<String> {
+    let uri: Uri = url.parse().ok()?;
+    if !matches!(uri.scheme_str(), Some("ws") | Some("wss")) {
+        return None;
+    }
+    let host = uri.host()?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|v6| v6.strip_suffix(']'))
+        .unwrap_or(host);
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -170,8 +174,8 @@ fn is_loopback_host(host: &str) -> bool {
 
 /// Refuse anything but a loopback ws(s) URL unless `production` is set.
 fn check_target(url: &str, production: bool) -> Result<(), String> {
-    let host = url_host(url).ok_or_else(|| format!("not a ws:// or wss:// URL: {url}"))?;
-    if is_loopback_host(host) || production {
+    let host = url_host(url).ok_or_else(|| format!("not a valid ws:// or wss:// URL: {url}"))?;
+    if is_loopback_host(&host) || production {
         Ok(())
     } else {
         Err(format!(
@@ -203,6 +207,9 @@ struct Stats {
     /// Astation → one Atem (targeted envelope), one per Atem frame.
     uni_sent: AtomicU64,
     uni_received: AtomicU64,
+    /// Per (sender, flow) sequence checks at the receivers.
+    seq_gaps: AtomicU64,
+    seq_duplicates: AtomicU64,
     window: Mutex<Vec<u32>>,
     all: Mutex<Vec<u32>>,
 }
@@ -219,6 +226,30 @@ impl Stats {
 
     fn get(counter: &AtomicU64) -> u64 {
         counter.load(Ordering::Relaxed)
+    }
+}
+
+/// Per-(sender, flow) sequence check at one receiver: each sender's frames
+/// must arrive as 1, 2, 3, … A skipped number is a gap (a frame lost in the
+/// middle); a number at or below the last seen is a duplicate or reorder.
+#[derive(Default)]
+struct SeqTracker {
+    last: HashMap<String, u64>,
+}
+
+impl SeqTracker {
+    fn observe(&mut self, stats: &Stats, key: &str, seq: Option<u64>) {
+        let Some(seq) = seq else {
+            Stats::bump(&stats.seq_gaps, 1);
+            return;
+        };
+        let last = self.last.entry(key.to_string()).or_insert(0);
+        if seq > *last {
+            Stats::bump(&stats.seq_gaps, seq - *last - 1);
+            *last = seq;
+        } else {
+            Stats::bump(&stats.seq_duplicates, 1);
+        }
     }
 }
 
@@ -384,6 +415,8 @@ async fn astation(
         let connected = connected.clone();
         let all_connected = all_connected.clone();
         async move {
+            let mut seqs = SeqTracker::default();
+            let mut uni_seq: HashMap<String, u64> = HashMap::new();
             while let Some(Ok(message)) = stream.next().await {
                 let Message::Text(text) = message else {
                     continue;
@@ -398,10 +431,18 @@ async fn astation(
                 } else if let Some(sent) = value["payload"]["lt"]["sent_us"].as_u64() {
                     Stats::bump(&stats.up_received, 1);
                     stats.record(sent);
+                    let atem_id = value["atem_id"].as_str().unwrap_or_default().to_string();
+                    seqs.observe(
+                        &stats,
+                        &format!("{atem_id}/up"),
+                        value["payload"]["lt"]["seq"].as_u64(),
+                    );
+                    let seq = uni_seq.entry(atem_id).or_insert(0);
+                    *seq += 1;
                     let reply = serde_json::json!({
                         "atem_id": value["atem_id"],
                         "connection_id": value["connection_id"],
-                        "payload": {"lt_uni": {"sent_us": now_us()}},
+                        "payload": {"lt_uni": {"seq": *seq, "sent_us": now_us()}},
                     });
                     if tx.send(reply.to_string()).is_ok() {
                         Stats::bump(&stats.uni_sent, 1);
@@ -420,13 +461,15 @@ async fn astation(
     {
         Stats::bump(&stats.rooms_incomplete, 1);
     }
-    let mut tick = tokio::time::interval_at((plan.traffic_start + offset).into(), plan.interval);
+    let mut tick = send_interval(plan, offset);
+    let mut seq: u64 = 0;
     loop {
         tick.tick().await;
         if Instant::now() >= plan.stop {
             break;
         }
-        let frame = serde_json::json!({"lt_bcast": {"sent_us": now_us()}}).to_string();
+        seq += 1;
+        let frame = serde_json::json!({"lt_bcast": {"seq": seq, "sent_us": now_us()}}).to_string();
         if tx.send(frame).is_err() {
             break;
         }
@@ -461,6 +504,8 @@ async fn atem(
     let reader = tokio::spawn({
         let stats = stats.clone();
         async move {
+            // One sender (the room's Astation): key by flow.
+            let mut seqs = SeqTracker::default();
             while let Some(Ok(message)) = stream.next().await {
                 let Message::Text(text) = message else {
                     continue;
@@ -471,9 +516,11 @@ async fn atem(
                 if let Some(sent) = value["lt_bcast"]["sent_us"].as_u64() {
                     Stats::bump(&stats.bcast_received, 1);
                     stats.record(sent);
+                    seqs.observe(&stats, "bcast", value["lt_bcast"]["seq"].as_u64());
                 } else if let Some(sent) = value["lt_uni"]["sent_us"].as_u64() {
                     Stats::bump(&stats.uni_received, 1);
                     stats.record(sent);
+                    seqs.observe(&stats, "uni", value["lt_uni"]["seq"].as_u64());
                 }
             }
             if Instant::now() < plan.stop {
@@ -481,7 +528,7 @@ async fn atem(
             }
         }
     });
-    let mut tick = tokio::time::interval_at((plan.traffic_start + offset).into(), plan.interval);
+    let mut tick = send_interval(plan, offset);
     let mut seq: u64 = 0;
     loop {
         tick.tick().await;
@@ -501,6 +548,14 @@ async fn atem(
     let _ = sink.close().await;
     reader.abort();
     stats.open.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// A room's send clock. A late tick (busy client) delays the following ones
+/// instead of bursting to catch up, so a stall doesn't spike the load.
+fn send_interval(plan: Plan, offset: Duration) -> tokio::time::Interval {
+    let mut tick = tokio::time::interval_at((plan.traffic_start + offset).into(), plan.interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick
 }
 
 /// One room: its Astation (on `urls[room]`), then its Atems once the
@@ -597,7 +652,7 @@ async fn main() {
                 window.sort_unstable();
                 println!(
                     "{:>7} open {:>6}  up {}/{}  bcast {}/{}  uni {}/{}  p50 {:.1} ms  p99 {:.1} ms  \
-                     errors {}  auth {}  incomplete {}  dropped {}",
+                     gaps {}  dups {}  errors {}  auth {}  incomplete {}  dropped {}",
                     phase(&plan),
                     Stats::get(&stats.open),
                     Stats::get(&stats.up_received),
@@ -608,6 +663,8 @@ async fn main() {
                     Stats::get(&stats.uni_sent),
                     percentile_ms(&window, 0.50),
                     percentile_ms(&window, 0.99),
+                    Stats::get(&stats.seq_gaps),
+                    Stats::get(&stats.seq_duplicates),
                     Stats::get(&stats.connect_errors),
                     Stats::get(&stats.auth_errors),
                     Stats::get(&stats.rooms_incomplete),
@@ -643,9 +700,11 @@ async fn main() {
     let auth = Stats::get(&stats.auth_errors);
     let incomplete = Stats::get(&stats.rooms_incomplete);
     let dropped = Stats::get(&stats.dropped_sockets);
+    let gaps = Stats::get(&stats.seq_gaps);
+    let duplicates = Stats::get(&stats.seq_duplicates);
     println!(
         "total: {} samples  p50 {:.1} ms  p99 {:.1} ms  max {:.1} ms  lost frames up {} bcast {} uni {}  \
-         connect errors {}  auth errors {}  incomplete rooms {}  dropped sockets {}",
+         seq gaps {}  duplicates/reordered {}  connect errors {}  auth errors {}  incomplete rooms {}  dropped sockets {}",
         all.len(),
         p50,
         p99,
@@ -653,6 +712,8 @@ async fn main() {
         up_lost,
         bcast_lost,
         uni_lost,
+        gaps,
+        duplicates,
         errors,
         auth,
         incomplete,
@@ -661,9 +722,11 @@ async fn main() {
     let pass = !all.is_empty()
         && p99 < P99_LIMIT_MS
         && up_lost + bcast_lost + uni_lost == 0
+        && gaps + duplicates == 0
         && errors + auth + incomplete + dropped == 0;
     println!(
-        "{}  (p99 < {P99_LIMIT_MS} ms, no lost frames, no failed or dropped sockets; \
+        "{}  (p99 < {P99_LIMIT_MS} ms, no lost, skipped, duplicate or reordered frames, \
+         no failed or dropped sockets; \
          also check relay memory is flat)",
         if pass { "PASS" } else { "FAIL" }
     );
@@ -697,7 +760,10 @@ mod tests {
             "wss://station.agora.build/ws",
             "ws://10.0.0.5:3000/ws",
             "ws://localhost.evil.com/ws",
+            "ws://127.0.0.1.evil.com/ws",
             "ws://user@example.com:80/ws",
+            "ws://127.0.0.1@evil.com/ws",
+            "ws://localhost:3000@evil.com/ws",
             "ws://[2001:db8::1]:3000/ws",
         ] {
             assert!(check_target(url, false).is_err(), "{url}");
@@ -705,6 +771,24 @@ mod tests {
         }
         assert!(args(&["--url", "wss://station.agora.build/ws"]).is_err());
         assert!(args(&["--url", "wss://station.agora.build/ws", PRODUCTION_FLAG]).is_ok());
+    }
+
+    #[test]
+    fn userinfo_tricks_resolve_to_the_dialed_host() {
+        // Userinfo before a loopback host: the client dials loopback.
+        assert!(check_target("ws://evil.com@127.0.0.1/ws", false).is_ok());
+        assert!(check_target("ws://user:pw@[::1]:3000/ws", false).is_ok());
+        assert_eq!(
+            url_host("ws://user:pw@[::1]:3000/ws").as_deref(),
+            Some("::1")
+        );
+        assert_eq!(
+            url_host("ws://127.0.0.1@evil.com/ws").as_deref(),
+            Some("evil.com")
+        );
+        // A backslash is not a valid URI character: refused even with the flag.
+        assert!(check_target("ws://evil.com\\@127.0.0.1/ws", false).is_err());
+        assert!(check_target("ws://evil.com\\@127.0.0.1/ws", true).is_err());
     }
 
     #[test]
@@ -720,6 +804,25 @@ mod tests {
         assert_eq!(parsed.astations * (1 + parsed.atems_per_astation), 30_000);
         assert_eq!(parsed.duration, Duration::from_secs(1_800));
         assert!(!parsed.production);
+    }
+
+    #[test]
+    fn sequence_gaps_and_duplicates() {
+        let stats = Stats::default();
+        let mut seqs = SeqTracker::default();
+        for seq in [1, 2, 3] {
+            seqs.observe(&stats, "a/up", Some(seq));
+            seqs.observe(&stats, "b/up", Some(seq));
+        }
+        assert_eq!(Stats::get(&stats.seq_gaps), 0);
+        assert_eq!(Stats::get(&stats.seq_duplicates), 0);
+        seqs.observe(&stats, "a/up", Some(6)); // 4, 5 skipped
+        assert_eq!(Stats::get(&stats.seq_gaps), 2);
+        seqs.observe(&stats, "a/up", Some(6)); // duplicate
+        seqs.observe(&stats, "b/up", Some(2)); // reordered
+        assert_eq!(Stats::get(&stats.seq_duplicates), 2);
+        seqs.observe(&stats, "c/up", None); // no seq at all
+        assert_eq!(Stats::get(&stats.seq_gaps), 3);
     }
 
     #[test]

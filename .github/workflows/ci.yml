@@ -108,7 +108,7 @@ jobs:
             ~/.cargo/git
             relay-server/target
             relay-server/loadtest/target
-          key: ${{ runner.os }}-cargo-relay-${{ hashFiles('relay-server/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-relay-${{ hashFiles('relay-server/Cargo.lock', 'relay-server/loadtest/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-relay-
       - name: Run relay server tests
@@ -119,9 +119,9 @@ jobs:
         env:
           TEST_REDIS_URL: redis://127.0.0.1:56379/
         run: cargo test redis -- --ignored --test-threads=1
-      - name: Build relay load test client
+      - name: Test relay load test client
         working-directory: relay-server/loadtest
-        run: cargo build --locked
+        run: cargo test --locked
       - name: Build relay server container
         run: docker build --tag station-relay-server:ci relay-server
 
