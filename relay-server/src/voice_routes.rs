@@ -65,9 +65,9 @@ pub async fn trigger_voice_session_handler(
         .ok_or(StatusCode::NOT_FOUND)?;
 
     tracing::info!(
-        "Triggered session {}: accumulated_text = \"{}\"",
+        "Triggered session {}: {} bytes accumulated",
         session_id,
-        accumulated_text
+        accumulated_text.len()
     );
 
     Ok(Json(TriggerResponse {
@@ -90,7 +90,7 @@ pub async fn atem_response_handler(
         .ok_or(StatusCode::NOT_FOUND)?;
 
     tracing::info!(
-        "Received response for session {}: {} chars",
+        "Received response for session {}: {} bytes",
         req.session_id,
         req.response.len()
     );

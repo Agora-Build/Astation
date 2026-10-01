@@ -199,6 +199,11 @@ mod tests {
         assert!((4 * 3600 - 10..=4 * 3600).contains(&ttl), "ttl {ttl}");
         let joined = store.join("rtc-1", "Alice".into()).await.unwrap();
         assert_eq!(joined.uid, 1000);
+        let ttl: i64 = conn
+            .run(|mut c| async move { redis::cmd("TTL").arg("relay:rtc:rtc-1").query_async(&mut c).await })
+            .await
+            .unwrap();
+        assert!((4 * 3600 - 10..=4 * 3600).contains(&ttl), "ttl after join {ttl}");
         assert_eq!((joined.app_id.as_str(), joined.token.as_str()), ("app", "tok"));
         let loaded = store.get("rtc-1").await.unwrap().unwrap();
         assert_eq!(loaded.participants.len(), 1);
@@ -258,6 +263,19 @@ mod tests {
         assert_eq!(loaded.participants.len(), 8);
         assert_eq!(loaded.uid_counter_value, RTC_FIRST_UID + 8, "a refused join takes no uid");
         assert_eq!(store.join("nope", "A".into()).await.unwrap_err(), "Session not found");
+
+        // Non-ASCII display names round-trip (cjson passes bytes through).
+        store.create("names".into(), "app".into(), "ch".into(), "tok".into(), 1).await.unwrap();
+        store.join("names", "张伟".into()).await.unwrap();
+        store.join("names", "Ünï".into()).await.unwrap();
+        let loaded = store.get("names").await.unwrap().unwrap();
+        let names: Vec<_> = loaded.participants.iter().map(|p| p.display_name.clone().unwrap()).collect();
+        assert_eq!(names, vec!["张伟".to_string(), "Ünï".to_string()]);
+        let ttl: i64 = conn
+            .run(|mut c| async move { redis::cmd("TTL").arg("relay:rtc:names").query_async(&mut c).await })
+            .await
+            .unwrap();
+        assert!((4 * 3600 - 10..=4 * 3600).contains(&ttl), "ttl after joins {ttl}");
 
         // Sessions are independent, each starting at the first uid.
         store.create("other".into(), "app".into(), "ch".into(), "tok".into(), 1).await.unwrap();

@@ -119,7 +119,7 @@ impl ReplicaBus for RedisBus {
     async fn broadcast(&self, message: BroadcastMessage) -> Result<(), StoreError> {
         let payload = serde_json::to_string(&message)
             .map_err(|error| StoreError::Unavailable(error.to_string()))?;
-        tracing::trace!("Replica {} broadcasting {}", self.replica_id, payload);
+        tracing::trace!("Replica {} broadcasting {} bytes", self.replica_id, payload.len());
         self.publish(keys::BROADCAST_CHANNEL.to_string(), payload).await
     }
 }
