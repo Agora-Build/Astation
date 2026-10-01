@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message as ClientMessage;
 use tower::ServiceExt;
@@ -1148,4 +1148,58 @@ async fn redis_a_replaced_socket_whose_bus_close_was_lost_stops_relaying() {
     send_json(&mut atem, serde_json::json!({"probe": "stale-atem"})).await;
     wait_closed(&mut atem).await;
     assert_silent(&mut owner, 200).await;
+}
+
+/// Final review I4: a client frame bigger than the bus limit (8 MiB) is
+/// not published to another replica (Valkey's pub/sub output buffer limit
+/// would drop the receiving subscriber); later frames still cross.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn redis_an_oversize_frame_is_not_published_across_replicas() {
+    let _guard = REDIS_LOCK.lock().await;
+    let (_shared, one, two) = two_replicas().await;
+    let code = "astation-big";
+    let key = TestKey::generate();
+    let mut owner = verified_astation(&one.ws, code, &key, "registered").await;
+    let mut atem = connect_atem(&two.ws, code, "atem-big").await;
+    assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+
+    // Watch replica 1's inbox directly.
+    let client = redis::Client::open(test_url()).unwrap();
+    let mut watcher = client.get_async_pubsub().await.unwrap();
+    watcher.subscribe(format!("relay:inbox:{}", one.id())).await.unwrap();
+    let largest = Arc::new(AtomicUsize::new(0));
+    let seen_small = Arc::new(AtomicBool::new(false));
+    let watch = tokio::spawn({
+        let (largest, seen_small) = (largest.clone(), seen_small.clone());
+        async move {
+            let mut messages = watcher.on_message();
+            while let Some(message) = messages.next().await {
+                let payload: String = message.get_payload().unwrap_or_default();
+                largest.fetch_max(payload.len(), Ordering::SeqCst);
+                if payload.contains("after-big") {
+                    seen_small.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    });
+    let dropped = || {
+        crate::cluster::metrics::metrics()
+            .bus_oversize_dropped
+            .load(Ordering::Relaxed)
+    };
+    let dropped_before = dropped();
+
+    let big = "a".repeat(crate::cluster::bus::BUS_MAX_FRAME_BYTES + 1024);
+    atem.send(ClientMessage::Text(big)).await.unwrap();
+    send_json(&mut atem, serde_json::json!({"probe": "after-big"})).await;
+    assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "after-big");
+    eventually("the watcher saw the small frame", || seen_small.load(Ordering::SeqCst)).await;
+    watch.abort();
+    assert!(
+        largest.load(Ordering::SeqCst) <= crate::cluster::bus::BUS_MAX_FRAME_BYTES,
+        "published {} bytes",
+        largest.load(Ordering::SeqCst)
+    );
+    assert_eq!(dropped(), dropped_before + 1);
 }

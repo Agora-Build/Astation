@@ -36,6 +36,13 @@ Each WebSocket's send queue holds at most 1,000 frames or 4 MB
 that doesn't fit is dropped, and a client whose queue stays full for 10 s is
 closed with `1013`.
 
+With Redis, a frame for a socket on another replica travels over Valkey
+pub/sub. A message over 8 MiB serialized (`BUS_MAX_FRAME_BYTES` in
+`src/cluster/bus.rs`) is not published: it is dropped with a warning and
+counted in `relay_bus_oversize_dropped_total`, since Valkey would disconnect
+the receiving replica's subscriber (`client-output-buffer-limit pubsub`, hard
+32 MB by default). Frames between sockets on one replica are unaffected.
+
 Each replica accepts at most 200 concurrent `/ws` connections per client IP
 (`RELAY_WS_MAX_PER_IP`); the next upgrade gets `429` "Too many WebSocket
 connections from this address" until one closes. The count is per replica, so

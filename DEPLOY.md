@@ -262,7 +262,16 @@ new Coolify UUIDs in the resource table at the top of this section.
      **off** (no host port). Network: the default `coolify` network.
    - Custom configuration (Redis configuration / command arguments):
      `maxmemory 512mb`, `maxmemory-policy noeviction`, `save ""`,
-     `appendonly no`.
+     `appendonly no`. Keep Valkey's default
+     `client-output-buffer-limit pubsub 32mb 8mb 60`: a relay's bus
+     subscriber that falls more than 32 MB behind (or 8 MB for 60 s) is
+     disconnected and loses every cross-replica frame until it resubscribes.
+     So the relay never publishes a message over 8 MiB to another replica
+     (`BUS_MAX_FRAME_BYTES`): a bigger client frame whose target socket is on
+     another replica is dropped with a warning and counted in
+     `relay_bus_oversize_dropped_total`. Frames between sockets on the same
+     replica are not limited this way. Don't lower the pubsub limit below
+     about 4 × 8 MiB.
    - Backups: none. Start it and copy its internal URL,
      `redis://default:<password>@<valkey container name>:6379`.
    - Check in the Valkey container's terminal:

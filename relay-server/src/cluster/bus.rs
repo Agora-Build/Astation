@@ -8,6 +8,15 @@ use serde::{Deserialize, Serialize};
 use super::local::LocalSockets;
 use super::StoreError;
 
+/// Largest inbox message (serialized, so including JSON escaping of the
+/// frame) published to another replica. Bigger client frames are dropped
+/// with a warning and counted (`relay_bus_oversize_dropped_total`): Valkey
+/// disconnects a subscriber whose pub/sub output buffer passes its
+/// `client-output-buffer-limit pubsub` (hard 32 MB by default), which would
+/// cost that replica every message until it resubscribes. Frames between
+/// sockets on one replica are not affected.
+pub const BUS_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum InboxMessage {
@@ -33,6 +42,32 @@ pub enum BroadcastMessage {
     KeyChanged { astation_id: String },
     /// A room's directory entry changed: drop any cached copy.
     RoomChanged { code: String },
+}
+
+/// An inbox message whose serialized size (`payload_len`) is over
+/// BUS_MAX_FRAME_BYTES must not be published: warn (masked ids), count it,
+/// and say so.
+pub fn drop_if_oversize(replica_id: &str, message: &InboxMessage, payload_len: usize) -> bool {
+    if payload_len <= BUS_MAX_FRAME_BYTES {
+        return false;
+    }
+    let targets: Vec<String> = match message {
+        InboxMessage::Deliver { connection_ids, .. } => {
+            connection_ids.iter().map(|id| crate::relay::mask_code(id)).collect()
+        }
+        InboxMessage::Close { connection_id, .. } => vec![crate::relay::mask_code(connection_id)],
+    };
+    tracing::warn!(
+        "Dropped a {}-byte frame for connection(s) {} on replica {}: over the {}-byte bus limit",
+        payload_len,
+        targets.join(", "),
+        replica_id,
+        BUS_MAX_FRAME_BYTES
+    );
+    super::metrics::metrics()
+        .bus_oversize_dropped
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
 }
 
 /// Apply an inbox message to this replica's sockets.

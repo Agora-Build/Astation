@@ -13,6 +13,7 @@ const LATENCY_BUCKETS: [f64; 9] = [0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.0
 pub struct Metrics {
     pub bus_published: AtomicU64,
     pub bus_received: AtomicU64,
+    pub bus_oversize_dropped: AtomicU64,
     pub slow_client_closes: AtomicU64,
     pub rate_limited_http: AtomicU64,
     pub rate_limited_ws: AtomicU64,
@@ -70,6 +71,11 @@ impl Metrics {
                 "relay_bus_received_total",
                 "Messages received from the bus.",
                 get(&self.bus_received),
+            ),
+            (
+                "relay_bus_oversize_dropped_total",
+                "Frames for another replica dropped for being over the 8 MiB bus limit.",
+                get(&self.bus_oversize_dropped),
             ),
             (
                 "relay_slow_client_closes_total",
@@ -174,12 +180,36 @@ pub(crate) fn assert_valid_exposition(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::bus::{drop_if_oversize, InboxMessage, BUS_MAX_FRAME_BYTES};
+
+    /// The limit applies to the serialized message: JSON escaping can grow
+    /// a frame up to 6× (control characters become `\u00XX`).
+    #[test]
+    fn oversize_bus_messages_are_dropped_and_counted() {
+        let deliver = |frame: String| InboxMessage::Deliver {
+            connection_ids: vec!["43c8a181-6567-49ae-9191-8e103a66cc55".into()],
+            frame,
+        };
+        let size = |message: &InboxMessage| serde_json::to_string(message).unwrap().len();
+        let counter = || metrics().bus_oversize_dropped.load(Ordering::Relaxed);
+        let before = counter();
+        let fits = deliver("a".repeat(BUS_MAX_FRAME_BYTES - 1024));
+        assert!(!drop_if_oversize("r2", &fits, size(&fits)));
+        let escaped = deliver("\u{1}".repeat(BUS_MAX_FRAME_BYTES / 4));
+        assert!(size(&escaped) > BUS_MAX_FRAME_BYTES);
+        assert!(drop_if_oversize("r2", &escaped, size(&escaped)));
+        let big = deliver("a".repeat(BUS_MAX_FRAME_BYTES + 1));
+        assert!(drop_if_oversize("r2", &big, size(&big)));
+        // Process-wide counter: other tests may count too.
+        assert!(counter() >= before + 2);
+    }
 
     #[test]
     fn renders_prometheus_text() {
         let metrics = Metrics::default();
         metrics.bus_published.fetch_add(3, Ordering::Relaxed);
         metrics.bus_received.fetch_add(2, Ordering::Relaxed);
+        metrics.bus_oversize_dropped.fetch_add(6, Ordering::Relaxed);
         metrics.slow_client_closes.fetch_add(1, Ordering::Relaxed);
         metrics.rate_limited_ws.fetch_add(4, Ordering::Relaxed);
         metrics.observe_redis(Duration::from_micros(700), true);
@@ -192,6 +222,7 @@ mod tests {
             "relay_rooms 5",
             "relay_bus_published_total 3",
             "relay_bus_received_total 2",
+            "relay_bus_oversize_dropped_total 6",
             "relay_slow_client_closes_total 1",
             "relay_rate_limited_total{kind=\"http\"} 0",
             "relay_rate_limited_total{kind=\"ws\"} 4",

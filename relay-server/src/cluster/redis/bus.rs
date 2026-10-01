@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::{keys, redis_error, RedisConn, REDIS_TIMEOUT};
-use crate::cluster::bus::{BroadcastMessage, BusEvent, InboxMessage, ReplicaBus};
+use crate::cluster::bus::{drop_if_oversize, BroadcastMessage, BusEvent, InboxMessage, ReplicaBus};
 use crate::cluster::StoreError;
 
 /// Published to a replica's own inbox to prove its subscription is alive.
@@ -120,6 +120,9 @@ impl ReplicaBus for RedisBus {
     async fn send_inbox(&self, replica_id: &str, message: InboxMessage) -> Result<(), StoreError> {
         let payload = serde_json::to_string(&message)
             .map_err(|error| StoreError::Unavailable(error.to_string()))?;
+        if drop_if_oversize(replica_id, &message, payload.len()) {
+            return Ok(());
+        }
         self.publish(keys::inbox_channel(replica_id), payload).await
     }
 
