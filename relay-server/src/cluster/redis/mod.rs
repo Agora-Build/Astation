@@ -2,59 +2,50 @@
 //! REDIS_URL. Redis holds only live state; losing it makes clients
 //! reconnect but loses nothing durable.
 
-// Consumers land in Tasks 11-19; drop the allow as they do.
-#[allow(dead_code)]
-pub mod keys;
-// Consumers land in Tasks 13-19; drop the allow as they do.
-#[allow(dead_code)]
 pub mod bus;
-#[allow(dead_code)]
-pub mod presence;
-// Consumer lands in Task 19 (connect_cluster); drop the allow then.
-#[allow(dead_code)]
 pub mod directory;
-// Consumer lands in Task 19 (connect_cluster); drop the allow then.
-#[allow(dead_code)]
-pub mod sessions;
-// Consumer lands in Task 19 (connect_cluster); drop the allow then.
-#[allow(dead_code)]
-pub mod voice;
-// Consumer lands in Task 19 (connect_cluster); drop the allow then.
-#[allow(dead_code)]
-pub mod rtc;
-// Consumer lands in Task 19 (connect_cluster); drop the allow then.
-#[allow(dead_code)]
+pub mod keys;
+pub mod presence;
 pub mod ratelimit;
+pub mod rtc;
+pub mod sessions;
+pub mod voice;
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
+use tokio::task::JoinHandle;
 
+use super::health::ClusterHealth;
 use super::StoreError;
+use crate::cluster::bus::ReplicaBus;
+use crate::cluster::directory::RoomDirectory;
+use crate::cluster::keys::KeyCache;
+use crate::cluster::local::LocalSockets;
+use crate::cluster::new_replica_id;
+use crate::cluster::ratelimit::SharedRateLimiter;
+use crate::identity_store::IdentityStore;
+use crate::relay::{HubParts, RelayHub};
+use crate::rtc_session::RtcSessionStore;
+use crate::session_store::SessionStore;
+use crate::voice_session::{ReplyWaiters, VoiceSessionStore};
 
 /// Bound on every Redis call, so a slow Redis can't stall a connect.
-// Consumers land in Tasks 11-19; drop the allow as they do.
-#[allow(dead_code)]
 pub const REDIS_TIMEOUT: Duration = Duration::from_secs(3);
 
-// Consumers land in Tasks 11-19; drop the allow as they do.
-#[allow(dead_code)]
 pub(crate) fn redis_error(error: redis::RedisError) -> StoreError {
     StoreError::Unavailable(error.to_string())
 }
 
 /// A reconnecting command connection plus the client (for pub/sub).
-// Consumers land in Tasks 11-19; drop the allow as they do.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct RedisConn {
     client: redis::Client,
     manager: ConnectionManager,
 }
 
-// Consumers land in Tasks 11-19; drop the allow as they do.
-#[allow(dead_code)]
 impl RedisConn {
     /// One connect attempt, bounded by REDIS_TIMEOUT, with no internal retry
     /// or backoff. Startup-level retrying belongs to the caller (Task 19's loop).
@@ -97,6 +88,102 @@ impl RedisConn {
         })
         .await
     }
+}
+
+/// One relay replica whose shared state lives in Redis.
+pub struct RedisCluster {
+    pub relay: RelayHub,
+    pub sessions: SessionStore,
+    pub voice_sessions: VoiceSessionStore,
+    pub rtc_sessions: RtcSessionStore,
+    pub health: presence::RedisHealth,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl RedisCluster {
+    /// Stop this replica's background tasks (bus, dispatcher, presence).
+    /// Dropping a `RedisCluster` without calling this leaves them running.
+    // Tests and the Task 20 two-relay harness; `main` keeps them for life.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn abort(&self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+/// Build a replica on Redis with an empty key cache (tests and harnesses
+/// load keys afterwards with `relay.load_keys`).
+// Tests and the Task 20 two-relay harness; `main` passes its loaded keys.
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn connect_cluster(
+    url: &str,
+    identity: Arc<dyn IdentityStore>,
+    auth_timeout: Duration,
+) -> Result<RedisCluster, StoreError> {
+    connect_cluster_with_keys(url, identity, KeyCache::new(), auth_timeout).await
+}
+
+/// Build a replica on Redis around `keys` (already loaded by the caller):
+/// presence (one awaited refresh, so peers are known before serving), bus
+/// subscription with its self-heartbeat, the bus dispatcher, then the
+/// directory, sessions, voice, RTC and the shared rate limiter. Everything
+/// is running when this returns, so the caller may start serving.
+pub async fn connect_cluster_with_keys(
+    url: &str,
+    identity: Arc<dyn IdentityStore>,
+    keys: KeyCache,
+    auth_timeout: Duration,
+) -> Result<RedisCluster, StoreError> {
+    let conn = RedisConn::connect(url).await?;
+    let replica_id = new_replica_id();
+    let health = presence::RedisHealth::start(conn.clone(), &replica_id).await?;
+    let (bus, events, bus_task) = match bus::RedisBus::start(conn.clone(), &replica_id).await {
+        Ok(started) => started,
+        Err(error) => {
+            // Don't leave a presence key behind for a replica that never ran.
+            if let Err(withdraw_error) = health.withdraw().await {
+                tracing::debug!("Could not withdraw replica {}: {}", replica_id, withdraw_error);
+            }
+            return Err(error);
+        }
+    };
+    let waiters = ReplyWaiters::default();
+    let directory: Arc<dyn RoomDirectory> = Arc::new(directory::RedisRoomDirectory::new(conn.clone()));
+    let bus: Arc<dyn ReplicaBus> = Arc::new(bus);
+    let rate_limiter: Arc<dyn SharedRateLimiter> = Arc::new(ratelimit::RedisRateLimiter::new(conn.clone()));
+    tracing::info!(
+        "Relay replica {} backends: rooms={}, bus={}, rate limits={}",
+        replica_id,
+        directory.backend_name(),
+        bus.backend_name(),
+        rate_limiter.backend_name()
+    );
+    let relay = RelayHub::from_parts(HubParts {
+        replica_id: replica_id.clone(),
+        directory,
+        bus,
+        local: LocalSockets::new(),
+        keys,
+        rate_limiter,
+        health: Arc::new(health.clone()),
+        cache_rooms: true,
+        auth_timeout,
+    });
+    let dispatcher = relay.spawn_bus_dispatcher(identity, waiters.clone(), events);
+    let presence_task = health.spawn_refresh();
+    tracing::info!("Relay replica {} joined the cluster", replica_id);
+    Ok(RedisCluster {
+        sessions: SessionStore::with_backend(Arc::new(sessions::RedisSessionBackend::new(conn.clone()))),
+        voice_sessions: VoiceSessionStore::with_backend(Arc::new(voice::RedisVoiceBackend::new(
+            conn.clone(),
+            waiters,
+        ))),
+        rtc_sessions: RtcSessionStore::with_backend(Arc::new(rtc::RedisRtcBackend::new(conn))),
+        relay,
+        health,
+        tasks: vec![bus_task, dispatcher, presence_task],
+    })
 }
 
 #[cfg(test)]
@@ -179,6 +266,26 @@ mod tests {
         let error = RedisConn::connect("redis://127.0.0.1:1/").await.err().expect("no server on port 1");
         assert!(matches!(error, StoreError::Unavailable(_)));
         assert!(started.elapsed() < REDIS_TIMEOUT, "took {:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn redis_connect_cluster_builds_a_replica() {
+        let _guard = REDIS_LOCK.lock().await;
+        flush().await;
+        let identity: std::sync::Arc<dyn crate::identity_store::IdentityStore> =
+            std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new());
+        let timeout = std::time::Duration::from_secs(10);
+        let one = connect_cluster(&test_url(), identity.clone(), timeout).await.unwrap();
+        let two = connect_cluster(&test_url(), identity, timeout).await.unwrap();
+        assert_ne!(one.relay.replica_id(), two.relay.replica_id());
+        assert_eq!(one.health.refresh().await.unwrap(), 2);
+        assert_eq!(one.relay.redis_status().await, "ok");
+        assert_eq!(one.relay.replica_count(), 2);
+        one.relay.create_room("ROOM-C", "h", 1_700_000_000).await.unwrap();
+        assert!(two.relay.room("ROOM-C").await.unwrap().is_some());
+        one.abort();
+        two.abort();
     }
 
     #[tokio::test]

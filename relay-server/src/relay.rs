@@ -143,8 +143,6 @@ impl RoomCache {
         entries.remove(code);
     }
 
-    // Resubscribe only; Task 19 (connect_cluster) spawns the dispatcher.
-    #[allow(dead_code)]
     fn clear(&self) {
         let mut entries = self.lock();
         self.epoch.fetch_add(1, Ordering::SeqCst);
@@ -212,6 +210,17 @@ impl RelayHub {
             InMemoryRoomDirectory::new(),
             Duration::from_secs(RELAY_AUTH_TIMEOUT_SECS),
         )
+    }
+
+    /// Single-instance hub around an already-loaded key cache (startup).
+    pub(crate) fn from_keys(keys: KeyCache) -> Self {
+        Self::from_parts(HubParts {
+            keys,
+            ..HubParts::single_instance(
+                InMemoryRoomDirectory::new(),
+                Duration::from_secs(RELAY_AUTH_TIMEOUT_SECS),
+            )
+        })
     }
 
     pub(crate) fn in_memory(directory: InMemoryRoomDirectory, auth_timeout: Duration) -> Self {
@@ -466,8 +475,6 @@ impl RelayHub {
         }
     }
 
-    // Task 19 (connect_cluster) spawns the dispatcher; drop the allow then.
-    #[allow(dead_code)]
     pub(crate) fn clear_room_cache(&self) {
         if let Some(cache) = &self.inner.room_cache {
             cache.clear();
@@ -477,8 +484,6 @@ impl RelayHub {
     /// Apply what other replicas publish to this one (Redis mode). Never
     /// waits on a client or the identity store: socket sends are queued,
     /// key re-reads run on their own tasks. Ends when `events` closes.
-    // Task 19 (connect_cluster) spawns it; drop the allow then.
-    #[allow(dead_code)]
     pub(crate) fn spawn_bus_dispatcher(
         &self,
         identity: Arc<dyn IdentityStore>,

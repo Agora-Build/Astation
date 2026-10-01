@@ -14,8 +14,6 @@ pub trait ClusterHealth: Send + Sync {
     fn replicas(&self) -> usize;
     fn is_live(&self, replica_id: &str) -> bool;
     /// Stop advertising this replica (drain).
-    // Consumer lands with drain (later task); drop the allow then.
-    #[allow(dead_code)]
     async fn withdraw(&self) -> Result<(), StoreError>;
 }
 

@@ -109,8 +109,6 @@ pub struct AtemLeave {
 
 #[async_trait]
 pub trait RoomDirectory: Send + Sync {
-    // No caller until the backend is wired (Task 19).
-    #[allow(dead_code)]
     fn backend_name(&self) -> &'static str;
     /// POST /api/pair: a fresh room (replaces any room with this code).
     // Task 13 (RedisRoomDirectory) and the Task 21 tests.

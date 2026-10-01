@@ -57,8 +57,6 @@ impl ConnRef {
 }
 
 /// A random id for this process: 12 lowercase hex characters.
-// Task 19 (connect_cluster) names each Redis-mode process.
-#[allow(dead_code)]
 pub fn new_replica_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
 }

@@ -27,8 +27,6 @@ pub enum RateDecision {
 
 #[async_trait]
 pub trait SharedRateLimiter: Send + Sync {
-    // No caller until Task 19 wires the health report.
-    #[allow(dead_code)]
     fn backend_name(&self) -> &'static str;
     /// Count one request from `ip` in `bucket` for the minute containing
     /// `now` (unix seconds).

@@ -48,6 +48,64 @@ pub struct AppState {
     pub identity: Arc<dyn identity_store::IdentityStore>,
 }
 
+fn redis_url() -> Option<String> {
+    std::env::var("REDIS_URL").ok().filter(|url| !url.trim().is_empty())
+}
+
+/// RELAY_REPLICAS_EXPECTED (default 1): how many replicas this deployment runs.
+fn replicas_expected() -> usize {
+    std::env::var("RELAY_REPLICAS_EXPECTED")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(1)
+}
+
+/// Without Redis every replica would have its own rooms and sessions.
+fn check_single_instance(expected_replicas: usize) -> Result<(), String> {
+    if expected_replicas > 1 {
+        return Err(format!(
+            "RELAY_REPLICAS_EXPECTED={expected_replicas} but REDIS_URL is not set: \
+             several relay replicas need Redis for shared state. Set REDIS_URL or run one replica."
+        ));
+    }
+    Ok(())
+}
+
+const REDIS_CONNECT_ATTEMPTS: u32 = 10;
+const REDIS_CONNECT_RETRY_SECS: u64 = 3;
+
+/// Connect to Redis, retrying for about 30 s, then give up (exit 1) so the
+/// orchestrator restarts the relay. `keys` is already loaded; the replica
+/// serves from it.
+async fn connect_redis_cluster(
+    url: &str,
+    identity: Arc<dyn identity_store::IdentityStore>,
+    keys: cluster::keys::KeyCache,
+) -> cluster::redis::RedisCluster {
+    let auth_timeout = std::time::Duration::from_secs(relay::RELAY_AUTH_TIMEOUT_SECS);
+    for attempt in 1..=REDIS_CONNECT_ATTEMPTS {
+        match cluster::redis::connect_cluster_with_keys(url, identity.clone(), keys.clone(), auth_timeout).await {
+            Ok(cluster) => return cluster,
+            Err(error) => {
+                tracing::error!(
+                    "Redis connect attempt {}/{} failed: {}",
+                    attempt,
+                    REDIS_CONNECT_ATTEMPTS,
+                    error
+                );
+                if attempt < REDIS_CONNECT_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_secs(REDIS_CONNECT_RETRY_SECS)).await;
+                }
+            }
+        }
+    }
+    tracing::error!(
+        "Could not reach REDIS_URL after {} attempts; exiting so the relay is restarted",
+        REDIS_CONNECT_ATTEMPTS
+    );
+    std::process::exit(1);
+}
+
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     let redis = state.relay.redis_status().await;
     match state.vault.health_check().await {
@@ -259,12 +317,6 @@ async fn main() {
 
     tracing::info!("Starting Astation server...");
 
-    // Initialize stores
-    let sessions = SessionStore::new();
-    let relay = RelayHub::new();
-    let rtc_sessions = RtcSessionStore::new();
-    let voice_sessions = VoiceSessionStore::new();
-
     // Vault + knowledge (Atem Memory) + identity stores: Postgres, sharing one
     // pool, when DATABASE_URL is set (the durable path), else in-memory
     // fallbacks so the rest of the server still runs without a DB.
@@ -305,12 +357,63 @@ async fn main() {
     };
 
     // The relay decides Pending vs legacy Astation connections and verifies
-    // registered keys from an in-memory cache, so it is loaded once here.
-    let key_count = relay
-        .load_keys(identity.as_ref())
+    // registered keys from an in-memory cache, so it is loaded once here,
+    // before the relay's shared state is set up.
+    let keys = cluster::keys::KeyCache::new();
+    let key_count = keys
+        .load(identity.as_ref())
         .await
         .expect("Failed to load Astation relay keys");
     tracing::info!("Loaded {} Astation relay key(s)", key_count);
+
+    // Rooms, pairing/voice/RTC sessions and rate limits: Redis when
+    // REDIS_URL is set (several replicas), else in memory (one replica).
+    // Startup order in Redis mode: keys above → Redis connect (bounded
+    // retries, then exit 1) → presence (one refresh, so peers are known) →
+    // bus subscription + dispatcher → background sweeps below → listener.
+    let (relay, sessions, rtc_sessions, voice_sessions) = match redis_url() {
+        Some(url) => {
+            tracing::info!("Connecting to Redis for shared relay state...");
+            let cluster = connect_redis_cluster(&url, identity.clone(), keys).await;
+            // A key registered on another replica between the load above and
+            // the bus subscription was announced while we weren't listening:
+            // re-read once now that key-changed messages reach us.
+            match cluster.relay.load_keys(identity.as_ref()).await {
+                Ok(count) => tracing::info!("Re-read {} Astation relay key(s) after subscribing", count),
+                Err(error) => tracing::warn!("Could not re-read relay keys after subscribing: {}", error),
+            }
+            tracing::info!(
+                "Shared relay state ready (Redis); replica {}, {} live replica(s)",
+                cluster.relay.replica_id(),
+                cluster::health::ClusterHealth::replicas(&cluster.health)
+            );
+            // The cluster's background tasks (bus, dispatcher, presence) are
+            // detached and run for the life of the process.
+            (
+                cluster.relay,
+                cluster.sessions,
+                cluster.rtc_sessions,
+                cluster.voice_sessions,
+            )
+        }
+        None => {
+            if let Err(message) = check_single_instance(replicas_expected()) {
+                tracing::error!("{}", message);
+                std::process::exit(1);
+            }
+            tracing::warn!(
+                "REDIS_URL not set — rooms, pairing/voice/RTC sessions and rate limits are \
+                 IN-MEMORY: run exactly ONE relay replica. Set REDIS_URL to run several."
+            );
+            let relay = RelayHub::from_keys(keys);
+            (
+                relay,
+                SessionStore::new(),
+                RtcSessionStore::new(),
+                VoiceSessionStore::new(),
+            )
+        }
+    };
 
     // Spawn background cleanup for expired sessions
     let cleanup_sessions = sessions.clone();
@@ -325,7 +428,13 @@ async fn main() {
         }
     });
 
-    // Spawn background cleanup for expired pair rooms
+    // Room upkeep every 60 s (pre-flight 7). In-memory: sweep expired rooms.
+    // Redis: rooms expire on their own (EXPIRE 600), so each replica
+    // refreshes every room where it holds an Astation socket (owner or
+    // pending) and closes its Atem sockets whose room no longer exists.
+    // A Redis outage longer than ~9 minutes (600 s TTL minus one interval)
+    // lets live rooms expire: their sockets are then closed and clients
+    // reconnect, recreating them.
     let cleanup_relay = relay.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
@@ -416,6 +525,14 @@ mod tests {
             knowledge: Arc::new(knowledge_store::InMemoryKnowledgeStore::new()),
             identity: Arc::new(identity_store::InMemoryIdentityStore::new()),
         }
+    }
+
+    #[test]
+    fn several_replicas_need_redis() {
+        assert!(check_single_instance(1).is_ok());
+        let message = check_single_instance(2).unwrap_err();
+        assert!(message.contains("RELAY_REPLICAS_EXPECTED=2"), "{message}");
+        assert!(message.contains("REDIS_URL"), "{message}");
     }
 
     #[tokio::test]
