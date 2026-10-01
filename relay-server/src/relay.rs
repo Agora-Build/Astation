@@ -1667,6 +1667,7 @@ where
                     // the flush is bounded so a stalled client can't hold it.
                     let flush = async {
                         while let Ok(text) = outbox.frames.try_recv() {
+                            outbox.sent(&text);
                             if ws_sink.send(Message::Text(text)).await.is_err() {
                                 return false;
                             }
@@ -1689,6 +1690,8 @@ where
             msg = outbox.frames.recv() => {
                 match msg {
                     Some(text) => {
+                        // Off the queue: its bytes no longer count toward the cap.
+                        outbox.sent(&text);
                         if ws_sink.send(Message::Text(text)).await.is_err() {
                             tracing::debug!("WS write failed for {}", mask_code(&code));
                             break;
@@ -2318,6 +2321,49 @@ pub(crate) mod tests {
             }
             other => panic!("expected a 1013 close last, got {other:?}"),
         }
+    }
+
+    /// The writer releases each frame's bytes from the queue's byte cap as
+    /// it sends it, on the normal path and on the flush before a close.
+    #[tokio::test]
+    async fn write_loop_releases_the_bytes_of_frames_it_sends() {
+        use crate::cluster::local::QueueLimits;
+        let local = LocalSockets::with_limits(QueueLimits {
+            frames: 100,
+            bytes: 10,
+            stall: Duration::from_secs(60),
+        });
+        for close_code in [None, Some(CLOSE_TRY_AGAIN)] {
+            let outbox = local.register("c1", "ROOM", SocketRole::Astation);
+            let queued = outbox.queued_bytes.clone();
+            assert!(local.send("c1", "12345".to_string()));
+            assert!(local.send("c1", "678".to_string()));
+            assert_eq!(queued.load(std::sync::atomic::Ordering::Relaxed), 8);
+            match close_code {
+                None => assert!(local.evict("c1")),
+                Some(code) => assert!(local.close_with("c1", code, "bye")),
+            }
+            let mut written: Vec<Message> = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), write_loop(&mut written, outbox, "ROOM".to_string()))
+                .await
+                .expect("the writer ends");
+            assert_eq!(queued.load(std::sync::atomic::Ordering::Relaxed), 0, "{close_code:?}");
+        }
+
+        // A live socket keeps taking frames past the byte cap's worth in total.
+        let outbox = local.register("c2", "ROOM", SocketRole::Astation);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let sink = Box::pin(futures_util::sink::unfold(tx, |tx, message: Message| async move {
+            tx.send(message).map_err(|_| ())?;
+            Ok::<_, ()>(tx)
+        }));
+        let writer = tokio::spawn(write_loop(sink, outbox, "ROOM".to_string()));
+        for n in 0..20 {
+            assert!(local.send("c2", format!("{n:05}")), "frame {n} fits: earlier ones were sent");
+            let message = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap();
+            assert!(matches!(message, Some(Message::Text(_))));
+        }
+        writer.abort();
     }
 
     #[test]

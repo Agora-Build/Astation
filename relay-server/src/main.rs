@@ -296,11 +296,22 @@ fn spawn_upkeep(
             tracing::debug!("Cleaned up expired voice sessions");
         }
     });
+    // Close clients whose send queue has stayed full for 10 s while no new
+    // frame arrived (a new frame checks on its own).
+    let sweep_slow = relay.clone();
+    let slow_sweep = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            sweep_slow.local().sweep_slow();
+        }
+    });
     vec![
         ("session sweep", sessions_sweep),
         ("room keep-alive", rooms_sweep),
         ("RTC session sweep", rtc_sweep),
         ("voice session sweep", voice_sweep),
+        ("slow-client sweep", slow_sweep),
     ]
 }
 
@@ -895,6 +906,26 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), Some(("bus dispatcher", true, true)));
         assert!(outbox.close.changed().await.is_ok());
         assert_eq!(outbox.close.borrow().as_ref().map(|close| close.0), Some(1012));
+    }
+
+    /// The upkeep closes a client whose queue stays full with no new frames
+    /// arriving (`send` alone would only notice on the next frame).
+    #[tokio::test(start_paused = true)]
+    async fn upkeep_closes_a_client_that_stays_full() {
+        use cluster::local::{SocketRole, CLOSE_SLOW_CLIENT, MAX_QUEUED_FRAMES, SLOW_CLIENT_TIMEOUT};
+        let hub = RelayHub::new();
+        let mut outbox = hub.local().register("stuck", "room", SocketRole::Astation);
+        for n in 0..=MAX_QUEUED_FRAMES {
+            hub.local().send("stuck", format!("{n}"));
+        }
+        let tasks = spawn_upkeep(&hub, &SessionStore::new(), &RtcSessionStore::new(), &VoiceSessionStore::new());
+        tokio::time::sleep(SLOW_CLIENT_TIMEOUT + std::time::Duration::from_secs(2)).await;
+        assert!(!hub.local().contains("stuck"));
+        assert!(outbox.close.changed().await.is_ok());
+        assert_eq!(outbox.close.borrow().as_ref().map(|close| close.0), Some(CLOSE_SLOW_CLIENT));
+        for (_, task) in tasks {
+            task.abort();
+        }
     }
 
     #[tokio::test]
