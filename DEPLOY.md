@@ -24,19 +24,73 @@ This triggers `.github/workflows/release.yml` which:
 
 ## Production Deployment
 
+### Running several relays (any platform)
+
+The relay can run as several identical replicas behind the webapp's nginx.
+Nothing in the relay or the deploy workflow is tied to Coolify; any platform
+that can run a Docker image and redeploy it from a webhook works. The relays
+need:
+
+- **The same image**: `ghcr.io/agora-build/station-relay-server:main` (or one
+  `:sha-<commit>` tag) on every replica, with the same environment.
+- **Shared state**: the same Postgres `DATABASE_URL` (durable data) and the
+  same Valkey/Redis `REDIS_URL` (live rooms, sessions, cross-replica frames;
+  see "Relay replicas and Valkey" below), plus
+  `RELAY_REPLICAS_EXPECTED=<number of relays>` (above 1 the relay refuses to
+  start without `REDIS_URL`).
+- **One DNS name for all of them**: nginx reaches the relays through
+  `STATION_RELAY_UPSTREAM` (`<name>:3000`) and re-resolves `<name>` every
+  10 s, spreading requests over every address it returns. The name must
+  resolve to every relay (a shared Docker network alias, a headless service,
+  round-robin DNS). A relay the name doesn't resolve to still counts in
+  `/health`'s `"replicas"` (presence is in Valkey) but never gets traffic.
+- **SIGTERM to stop**: the relay drains on SIGTERM (see "Shutdown" below), so
+  the platform should send SIGTERM and allow about 15 s before SIGKILL.
+- **A health check** on `GET /health`, port 3000, so the platform keeps the old
+  container serving until the new one is healthy.
+
+**Deploy hooks.** The workflow deploys relays from the GitHub Actions secret
+`RELAY_DEPLOY_HOOKS`: the relays' deploy webhook URLs, **one per line** (blank
+lines and surrounding whitespace are ignored), deployed **in that order**,
+one at a time (`.github/scripts/deploy-relays.mjs`). For each hook:
+
+1. trigger it. With the `COOLIFY_API_TOKEN` secret set, every hook must be a
+   Coolify `/api/v1/deploy?uuid=...` URL: it is called with the token and the
+   workflow waits until that Coolify deployment has finished. Without the
+   token the hook gets a plain `POST` (the shape most platforms' deploy hooks
+   accept) and the workflow does not wait for the platform;
+2. wait until `/health` is healthy (as `verify-station.mjs --wait-health`,
+   honoring `STATION_REQUIRE_REDIS` and `STATION_MIN_REPLICAS`) before
+   triggering the next hook, so the other relays keep serving while one
+   restarts.
+
+Any failure stops the run: later hooks are not triggered and keep serving the
+previous image. Hook URLs are masked in the logs and the script never prints
+them; it refers to them as "relay hook 1/N".
+
+Without the Coolify token the health wait right after a trigger can pass
+against the old, still-healthy container if the platform deploys slowly. Use
+the platform's own rolling-deploy health check, or a hook that returns only
+once the deploy is done, if that matters.
+
+If `RELAY_DEPLOY_HOOKS` is empty or unset, the older secrets still work: the
+workflow deploys `COOLIFY_RELAY_SERVER_WEBHOOK_URL`, then
+`COOLIFY_RELAY_B_WEBHOOK_URL` if it is set.
+
 ### Station on Volumetric (Coolify)
+
+This is the production setup, and a worked example of the section above.
 
 Every push to `main` runs `.github/workflows/deploy-station.yml`. It builds both
 Linux AMD64 images, publishes `:main` and `:sha-<commit>` tags to GHCR, then
 deploys one application at a time, waiting for each Coolify deployment to
 finish:
 
-1. relay-a, then wait until `https://station.agora.build/health` is healthy
-   (polled every 5 s, up to 36 times);
-2. relay-b, only if the `COOLIFY_RELAY_B_WEBHOOK_URL` secret is set, then wait
-   for health again;
-3. the webapp;
-4. the final check: public HTTPS, a healthy `/health` (Postgres knowledge
+1. each relay in `RELAY_DEPLOY_HOOKS` order (relay-a, then relay-b), waiting
+   after each until `https://station.agora.build/health` is healthy (polled
+   every 5 s, up to 36 times);
+2. the webapp;
+3. the final check: public HTTPS, a healthy `/health` (Postgres knowledge
    store; Redis `ok` and at least `STATION_MIN_REPLICAS` live replicas when
    those checks are switched on, see below), and an identity WebSocket
    connection to `wss://station.agora.build/ws`.
@@ -59,11 +113,17 @@ The Coolify resources on Volumetric are:
 Required GitHub Actions secrets:
 
 - `COOLIFY_API_TOKEN`: Coolify token with `deploy` and `read` permissions.
-- `COOLIFY_RELAY_SERVER_WEBHOOK_URL`: relay-a,
-  `https://smt.agora.build/api/v1/deploy?uuid=oss4444o8ss40ckgwc40og4c&force=false`.
-- `COOLIFY_RELAY_B_WEBHOOK_URL`: relay-b,
-  `https://smt.agora.build/api/v1/deploy?uuid=<relay-b uuid>&force=false`.
-  Optional: while it is unset the workflow skips relay-b.
+- `RELAY_DEPLOY_HOOKS`: the relays' Coolify deploy webhooks, one per line,
+  relay-a first:
+  ```
+  https://smt.agora.build/api/v1/deploy?uuid=oss4444o8ss40ckgwc40og4c&force=false
+  https://smt.agora.build/api/v1/deploy?uuid=<relay-b uuid>&force=false
+  ```
+  With one relay, only the first line.
+- `COOLIFY_RELAY_SERVER_WEBHOOK_URL` (older, still honored): relay-a's webhook.
+  Used only while `RELAY_DEPLOY_HOOKS` is empty or unset, followed by
+  `COOLIFY_RELAY_B_WEBHOOK_URL` if that is set. Both can be deleted once
+  `RELAY_DEPLOY_HOOKS` is in place.
 - `COOLIFY_WEBAPP_WEBHOOK_URL`: `https://smt.agora.build/api/v1/deploy?uuid=c0wwgk4c0owk0w4gsww4k0ss&force=false`.
 
 GitHub Actions repository variables (both checks are **off while unset**, so
@@ -233,14 +293,15 @@ using that database.
 1. Deploy Valkey (checklist below).
 2. Set `REDIS_URL` on relay-a and deploy it, still one instance; verify
    `/health` shows `"redis":"ok"` and `"replicas":1`.
-3. Add relay-b, set `RELAY_REPLICAS_EXPECTED=2` on both relays, the
-   `COOLIFY_RELAY_B_WEBHOOK_URL` secret, and the variables
+3. Add relay-b, set `RELAY_REPLICAS_EXPECTED=2` on both relays, add its
+   webhook as the second line of `RELAY_DEPLOY_HOOKS`, and set the variables
    `STATION_REQUIRE_REDIS=1` and `STATION_MIN_REPLICAS=2`; verify
    `"replicas":2`.
 
 **Rollback,** in this order:
 
-1. Remove relay-b: delete the `COOLIFY_RELAY_B_WEBHOOK_URL` secret, set
+1. Remove relay-b: remove its line from `RELAY_DEPLOY_HOOKS` (and delete
+   `COOLIFY_RELAY_B_WEBHOOK_URL` if the older secrets are still in use), set
    `STATION_MIN_REPLICAS=1`, stop and delete relay-b in Coolify.
 2. If Valkey itself is the problem: on relay-a set `RELAY_REPLICAS_EXPECTED=1`
    **first** (above 1 without `REDIS_URL` refuses to start), then remove
@@ -314,10 +375,15 @@ new Coolify UUIDs in the resource table at the top of this section.
    print **two** addresses. A missing alias on relay-b still makes `/health`
    report `"replicas":2` (presence is in Valkey), but nginx would never route
    to relay-b.
-5. **GitHub.** Add the secret `COOLIFY_RELAY_B_WEBHOOK_URL`
-   (`https://smt.agora.build/api/v1/deploy?uuid=<relay-b uuid>&force=false`)
-   and set the repository variables `STATION_REQUIRE_REDIS=1` and
-   `STATION_MIN_REPLICAS=2` (explicitly; unset means "not checked"). Re-run
+5. **GitHub.** Set the secret `RELAY_DEPLOY_HOOKS` to both relays' webhooks,
+   one per line, relay-a first:
+   `https://smt.agora.build/api/v1/deploy?uuid=oss4444o8ss40ckgwc40og4c&force=false`
+   and `https://smt.agora.build/api/v1/deploy?uuid=<relay-b uuid>&force=false`
+   (`gh secret set RELAY_DEPLOY_HOOKS < hooks.txt`).
+   `COOLIFY_RELAY_SERVER_WEBHOOK_URL` is no longer read once
+   `RELAY_DEPLOY_HOOKS` is set and can be deleted. Set the repository
+   variables `STATION_REQUIRE_REDIS=1` and `STATION_MIN_REPLICAS=2`
+   (explicitly; unset means "not checked"). Re-run
    "Deploy Station" on `main`: relay-a, health, relay-b, health, webapp,
    verify.
 6. **Verify two replicas.** `/health` shows `"replicas":2` (repeat the curl a
