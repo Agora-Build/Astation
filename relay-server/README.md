@@ -7,7 +7,18 @@ Secure relay and session management server for Astation ecosystem.
 **Status:** ✅ Production Ready | Test suite passing
 
 `GET /health` returns `200` when the relay and its configured Vault store are ready,
-and identifies the active store as `memory` or `postgres`.
+and identifies the active store as `memory` or `postgres`. It also reports
+`redis` (`disabled`, `ok`, `unavailable`) and `replicas` (live relay replicas),
+and returns `503` while Redis is unreachable (`{"status":"unhealthy","redis":"unavailable"}`)
+or the relay is draining (`{"status":"draining"}`).
+
+The relay runs as one instance with everything in memory, or, with
+`REDIS_URL`, as several replicas sharing rooms, sessions and rate limits
+through Redis/Valkey (design: [`docs/specs/2026-09-30-relay-multi-replica.md`](../docs/specs/2026-09-30-relay-multi-replica.md)).
+On SIGTERM a relay drains: `/health` and new `/ws` upgrades get `503`, every
+WebSocket is closed with `1012` (reconnect), its room entries are withdrawn,
+and in-flight HTTP gets at most 5 s more. A second SIGTERM exits at once (143;
+SIGINT 130).
 
 ---
 
@@ -212,6 +223,8 @@ Config: Set `relay_url` and `ws_url` in `.atem/config.toml`
 | `PUBLIC_BASE_URL` | _(unset)_ | Public base URL used for generated session links (recommended in production) |
 | `PORT` | `3000` | Server port |
 | `RUST_LOG` | `info` | Log level (error, warn, info, debug, trace) |
+| `REDIS_URL` | _(unset)_ | Redis/Valkey for shared relay state: rooms, pairing/OTP, voice and RTC sessions, shared rate-limit counters, replica-to-replica delivery. Required to run more than one replica. Unset: in-memory, one replica only. At startup an unreachable Redis is retried for about 30 s, then the relay exits 1; a malformed URL or wrong password exits 1 at once. The URL (and its password) is never logged. |
+| `RELAY_REPLICAS_EXPECTED` | `1` | How many relay replicas the deployment runs. Above 1 without `REDIS_URL`, the relay refuses to start (exit 1); a value that isn't a positive integer also exits 1. |
 | `DATABASE_URL` | _(unset)_ | Postgres connection string shared by **vault**, **knowledge sync (Atem Memory)**, and **relay identity** (Astation keys + session bindings) storage (e.g. `postgres://vault:vault@localhost:5432/vault`), one pool for all. When unset, all fall back to **in-memory** (non-durable: bindings and registered keys are lost on restart) and log a warning. Migrations in `migrations/` run automatically at startup. |
 
 **Production:**
@@ -234,13 +247,19 @@ RUST_LOG=debug
 ## Testing
 
 ```bash
-cargo test  # 266 tests (auth, sessions, relay + relay identity, RTC, Voice, Vault, Knowledge sync, validation)
+cargo test  # unit + in-memory integration suites
 # Postgres suites are #[ignore]d; run each against a throwaway local database:
 #   docker run --rm -d --name relay-test-pg -e POSTGRES_PASSWORD=pw -p 55433:5432 postgres:16
 #   IDENTITY_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test identity_store -- --ignored
 #   IDENTITY_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test relay:: -- --ignored
 #   KNOWLEDGE_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test knowledge_store -- --ignored
 #   docker rm -f relay-test-pg
+# Redis suites (every Redis unit + two relays in one process) are #[ignore]d
+# too; CI runs them against a Valkey service. TEST_REDIS_URL must point at
+# localhost (the harness runs FLUSHDB):
+#   docker run --rm -d --name relay-test-valkey -p 56379:6379 valkey/valkey:8
+#   TEST_REDIS_URL=redis://127.0.0.1:56379/ cargo test redis -- --ignored --test-threads=1
+#   docker rm -f relay-test-valkey
 ```
 
 
@@ -270,12 +289,14 @@ docker compose up -d
 # Use reverse proxy (Nginx/Caddy/Cloudflare) for HTTPS
 ```
 
-**Scaling:**
-```yaml
-# Add to docker-compose.yml
-deploy:
-  replicas: 3
-```
+**Scaling:** set `REDIS_URL` on every replica, then run as many replicas as
+needed behind the webapp (see `../DEPLOY.md`, "Relay replicas"). Without
+`REDIS_URL`, run exactly one.
+
+**Admin:** `station-relay-server admin forget-key <astation_id>` deletes an
+Astation's relay key and, with `REDIS_URL`, makes every replica drop it and
+disconnect that Astation's verified socket at once (runbook: `../DEPLOY.md`,
+"Admin reset"). Exit codes: 0 done, 1 database/Redis error, 2 bad arguments.
 
 **Monitoring:** Check `docker compose logs -f`
 
@@ -285,7 +306,8 @@ deploy:
 
 - **CORS errors**: Set `CORS_ORIGIN` env var to match your domain
 - **429 Rate limit**: Normal - client exceeded 60/600 req/min limit
-- **404 Session not found**: Session expired or server restarted (in-memory storage)
+- **404 Session not found**: Session expired, or the relay restarted in in-memory mode (or Valkey restarted)
+- **503 "Relay state unavailable"**: the relay can't reach Redis (`REDIS_URL`); `/health` shows `"redis":"unavailable"`
 
 ---
 

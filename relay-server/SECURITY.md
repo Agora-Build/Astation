@@ -62,8 +62,13 @@ proof-of-possession + durable pairing"; summary in `README.md`.
   registered Astations out of relay chat. Registering a new key needs the
   database; if it is down only that registration is rejected. A presented key
   that differs from the cached one makes the relay re-read the stored key
-  before rejecting (this is how an admin reset is picked up); if the database
-  is unreachable it is rejected and the cached key stays.
+  before rejecting; if the database is unreachable it is rejected and the
+  cached key stays. With several replicas (`REDIS_URL`), a registration, a
+  re-read that finds a new key, or `admin forget-key` is announced on Valkey
+  (`key-changed` on `relay:broadcast`) and every replica re-reads that key;
+  if a re-read fails the key is marked stale and must be re-read before it
+  verifies again (fail closed). Pub/sub is best effort, so a replica whose
+  subscription reconnects re-reads every key.
 - **Room closing.** The unauthenticated `DELETE /api/pair/:code` is refused
   (`409 {"error":"room is owned by a registered Astation"}`) for a code with a
   registered key, so knowing a room code no longer lets anyone evict a verified
@@ -76,14 +81,18 @@ proof-of-possession + durable pairing"; summary in `README.md`.
   resync, at most 1000 ids), `relayBind` and `relayUnbind`. A session already
   bound to another Astation is never taken over. Relay-auth frames are
   intercepted and never forwarded to Atems.
-- **Admin reset.** A lost or replaced Mac cannot prove the old key; an operator
-  deletes its `astation_keys` row (see `../DEPLOY.md`), and the next connect
-  with a new key registers it (its mismatch against the cache forces a
-  re-read). Bindings are kept. Until the new key connects or the relay
-  restarts, the relay's cache still accepts the **old** key: to revoke a
-  compromised key immediately, restart the relay after the `DELETE`. A reset
-  made while the relay cannot reach the database is likewise only picked up by
-  a later re-read or a restart.
+- **Admin reset.** A lost, stolen or replaced Mac cannot prove the old key;
+  an operator runs `station-relay-server admin forget-key <astation_id>` in a
+  relay container (runbook: `../DEPLOY.md`, "Admin reset"). It deletes the
+  `astation_keys` row, then announces `key-changed`: every relay replica drops
+  the cached key and disconnects that Astation's live verified socket at once,
+  so a compromised key is revoked immediately. Bindings are kept. The
+  replacement Mac's Astation then connects with its new key, which registers
+  by trust on first use; bring it online promptly, because until then the
+  room is open to first-use squatting (below). Without `REDIS_URL`, or if the
+  announcement fails (the command says so and exits 1), or when the row is
+  deleted by hand in SQL, the cached **old** key keeps verifying until every
+  relay replica is restarted.
 - Relay logs mask room codes and session ids (first 4 characters).
 
 Residual risks:
@@ -135,6 +144,11 @@ and the deployed configuration requires them.
   (Astation keys + session bindings) storage.
 - Keep secrets in the deployment secret store and out of URLs and logs.
 - Use `RUST_LOG=info` or stricter in production.
+- With several relay replicas, set `REDIS_URL` as a secret and keep Valkey on
+  the private network with a password and no public port. It holds pairing
+  session ids (a pending one can authorize a WebSocket): restrict access like
+  the database. It holds only live state, so it needs no persistence or
+  backups.
 
 See `../docs/specs/2026-07-21-device-authentication-v2.md` for the coordinated
 Astation/Atem protocol, rollout order, and current LAN limitation.
