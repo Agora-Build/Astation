@@ -58,7 +58,10 @@ jobs:
     name: Deploy and verify production
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Each relay hook can take ~20 min (Coolify wait up to 15 min + health
+    # wait up to 3 min), plus ~30 min for the webapp and the final check:
+    # 90 fits 3 relays. Raise it before adding a fourth.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -86,6 +89,8 @@ jobs:
           # Mask each hook on its own (trimmed, as the script reads it).
           while IFS= read -r hook || [ -n "$hook" ]; do
             hook="$(printf '%s' "$hook" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            # Workflow-command data escaping (CR/LF can't occur: lines are split).
+            hook="${hook//%/%25}"
             if [ -n "$hook" ]; then echo "::add-mask::$hook"; fi
           done <<< "${RELAY_DEPLOY_HOOKS:-}"
           node .github/scripts/deploy-relays.mjs

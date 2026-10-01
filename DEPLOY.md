@@ -55,8 +55,9 @@ lines and surrounding whitespace are ignored), deployed **in that order**,
 one at a time (`.github/scripts/deploy-relays.mjs`). For each hook:
 
 1. trigger it. With the `COOLIFY_API_TOKEN` secret set, every hook must be a
-   Coolify `/api/v1/deploy?uuid=...` URL: it is called with the token and the
-   workflow waits until that Coolify deployment has finished. Without the
+   Coolify `/api/v1/deploy?uuid=...` URL (all lines are checked before any is
+   triggered): it is called with the token and the workflow waits until that
+   Coolify deployment has finished. Without the
    token the hook gets a plain `POST` (the shape most platforms' deploy hooks
    accept) and the workflow does not wait for the platform;
 2. wait until `/health` is healthy (as `verify-station.mjs --wait-health`,
@@ -68,14 +69,24 @@ Any failure stops the run: later hooks are not triggered and keep serving the
 previous image. Hook URLs are masked in the logs and the script never prints
 them; it refers to them as "relay hook 1/N".
 
-Without the Coolify token the health wait right after a trigger can pass
-against the old, still-healthy container if the platform deploys slowly. Use
-the platform's own rolling-deploy health check, or a hook that returns only
-once the deploy is done, if that matters.
+Without the Coolify token the workflow can't see the platform's deploy, so
+the health wait right after a trigger can pass against the old, still-healthy
+container while the new one is still starting. On other platforms rely on the
+platform's own rolling deploy and health check (it keeps the old container
+until the new one passes `/health`), or use a hook that returns only once the
+deploy is done. A possible improvement: have `/health` report the running
+commit, so the workflow can wait until that relay serves this run's commit.
 
 If `RELAY_DEPLOY_HOOKS` is empty or unset, the older secrets still work: the
 workflow deploys `COOLIFY_RELAY_SERVER_WEBHOOK_URL`, then
-`COOLIFY_RELAY_B_WEBHOOK_URL` if it is set.
+`COOLIFY_RELAY_B_WEBHOOK_URL` if it is set. These always need
+`COOLIFY_API_TOKEN`; without it the run fails before calling anything.
+
+The deploy job's `timeout-minutes` (90) fits three relay hooks. Each hook can
+take about 20 minutes (Coolify wait up to 15, health wait up to 3) and the
+webapp plus the final check about 30 more, so raise it in
+`.github/workflows/deploy-station.yml` before adding a fourth relay
+(about 20 × hooks + 30).
 
 ### Station on Volumetric (Coolify)
 

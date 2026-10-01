@@ -5,6 +5,7 @@ import { deployRelays, redact, relayHooksFromEnv, triggerHook } from './deploy-r
 const A = 'https://coolify.example/api/v1/deploy?uuid=relay-a&force=false';
 const B = 'https://coolify.example/api/v1/deploy?uuid=relay-b&force=false';
 const C = 'https://render.example/deploy/srv-c?key=secret-c';
+const D = 'https://coolify.example/api/v1/deploy?uuid=relay-d';
 const health = { origin: 'https://station.test', minReplicas: 0, requireRedis: false };
 
 test('RELAY_DEPLOY_HOOKS: one per line, in order, blanks and whitespace ignored', () => {
@@ -87,7 +88,7 @@ test('a failed deploy or health wait stops the run', async () => {
     throw new Error(`Coolify deployment ended with status: failed (${webhookURL})`);
   };
   await assert.rejects(
-    deployRelays({ ...deployFails.options, hooks: [A, B, C], token: 'tok' }),
+    deployRelays({ ...deployFails.options, hooks: [A, B, D], token: 'tok' }),
     error => {
       assert.match(error.message, /^relay hook 1\/3 failed: Coolify deployment ended with status: failed/);
       assert.match(error.message, /2 later relay hook\(s\) not triggered/);
@@ -120,22 +121,14 @@ test('a failed deploy or health wait stops the run', async () => {
 
 test('no hook URL appears in any log line or error', async () => {
   const { logs, options } = recorder();
-  await deployRelays({ ...options, hooks: [A, C], token: 'tok' });
+  await deployRelays({ ...options, hooks: [A, D], token: 'tok' });
+  await deployRelays({ ...options, hooks: [C], token: '' });
   const text = logs.join('\n');
-  for (const secret of [A, C, 'relay-a', 'secret-c', 'coolify.example', 'render.example']) {
+  for (const secret of [A, C, D, 'relay-a', 'relay-d', 'secret-c', 'coolify.example', 'render.example']) {
     assert.ok(!text.includes(secret), `log leaked ${secret}:\n${text}`);
   }
   assert.match(text, /relay hook 1\/2: Coolify deployment for <relay hook> queued/);
   assert.match(text, /relay hook 2\/2: Relay healthy/);
-
-  // The real Coolify client rejects a non-Coolify hook without echoing it.
-  const real = recorder();
-  delete real.options.deploy;
-  await assert.rejects(deployRelays({ ...real.options, hooks: [C], token: 'tok' }), error => {
-    assert.ok(!error.message.includes('render.example'), error.message);
-    assert.match(error.message, /relay hook 1\/1 failed: Expected a Coolify/);
-    return true;
-  });
 
   // An unparseable hook isn't echoed either.
   await assert.rejects(triggerHook('not a url secret-xyz'), error => {
@@ -167,4 +160,34 @@ test('triggerHook POSTs without following redirects and checks the status', asyn
     error => error.message === 'the hook returned HTTP 404',
   );
   await assert.rejects(triggerHook('ftp://x.example/deploy'), /http\(s\)/);
+});
+
+test('with the token, every hook is checked before any is triggered', async () => {
+  for (const bad of [C, 'not a url', 'https://coolify.example/api/v1/deploy', 'ftp://coolify.example/api/v1/deploy?uuid=x']) {
+    const { events, options } = recorder();
+    await assert.rejects(deployRelays({ ...options, hooks: [A, B, bad], token: 'tok' }), error => {
+      assert.equal(error.message, 'relay hook 3/3 is not a Coolify /api/v1/deploy?uuid=... URL');
+      return true;
+    });
+    assert.deepEqual(events, [], 'nothing may be triggered');
+  }
+  // Without the token any http(s) hook is fine.
+  const { events, options } = recorder();
+  await deployRelays({ ...options, hooks: [A, C], token: '' });
+  assert.deepEqual(events.map(([kind]) => kind), ['trigger', 'health', 'trigger', 'health']);
+});
+
+test('the older COOLIFY_* secrets still require the token', async () => {
+  for (const token of [undefined, '']) {
+    const { events, logs, options } = recorder();
+    await assert.rejects(
+      deployRelays({ ...options, hooks: [A, B], token, fromFallback: true }),
+      /COOLIFY_API_TOKEN is required with COOLIFY_RELAY_SERVER_WEBHOOK_URL/,
+    );
+    assert.deepEqual(events, []);
+    assert.deepEqual(logs, []);
+  }
+  const { events, options } = recorder();
+  await deployRelays({ ...options, hooks: [A], token: 'tok', fromFallback: true });
+  assert.deepEqual(events.map(([kind]) => kind), ['coolify', 'health']);
 });

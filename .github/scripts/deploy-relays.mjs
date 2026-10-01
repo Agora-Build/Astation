@@ -6,7 +6,7 @@
 // Hook URLs are secrets (a deploy hook is usually its own credential): they
 // are never printed. Hooks are referred to as "relay hook <i>/<n>".
 import { pathToFileURL } from 'node:url';
-import { deployCoolify } from './deploy-coolify.mjs';
+import { deployCoolify, isCoolifyDeployURL } from './deploy-coolify.mjs';
 import { settingsFromEnv, waitForHealth } from './verify-station.mjs';
 
 /**
@@ -76,11 +76,29 @@ export async function deployRelays({
   deploy = deployCoolify,
   trigger = triggerHook,
   wait = waitForHealth,
+  fromFallback = false,
 }) {
   if (!hooks.length) {
     throw new Error('No relay deploy hook configured: set RELAY_DEPLOY_HOOKS (or COOLIFY_RELAY_SERVER_WEBHOOK_URL)');
   }
+  // The older COOLIFY_* secrets always needed the token (the old workflow
+  // failed without it); don't turn them into unauthenticated POSTs.
+  if (fromFallback && !token) {
+    throw new Error(
+      'COOLIFY_API_TOKEN is required with COOLIFY_RELAY_SERVER_WEBHOOK_URL / COOLIFY_RELAY_B_WEBHOOK_URL ' +
+        '(or set RELAY_DEPLOY_HOOKS)',
+    );
+  }
   const total = hooks.length;
+  // With the token every hook goes through the Coolify API: check them all
+  // before triggering any, so a bad later line can't stop a half-done rollout.
+  if (token) {
+    for (const [index, hook] of hooks.entries()) {
+      if (!isCoolifyDeployURL(hook)) {
+        throw new Error(`relay hook ${index + 1}/${total} is not a Coolify /api/v1/deploy?uuid=... URL`);
+      }
+    }
+  }
   for (const [index, hook] of hooks.entries()) {
     const label = `relay hook ${index + 1}/${total}`;
     const safeLog = line => log(`${label}: ${redact(line, hook)}`);
@@ -109,6 +127,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     if (hooks.length) console.log(`${hooks.length} relay hook(s) from ${source}`);
     await deployRelays({
       hooks,
+      fromFallback: source !== 'RELAY_DEPLOY_HOOKS',
       token: process.env.COOLIFY_API_TOKEN,
       health: settingsFromEnv(),
     });
