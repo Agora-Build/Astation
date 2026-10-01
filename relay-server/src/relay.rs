@@ -12,7 +12,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -68,6 +68,9 @@ pub(crate) const CLOSE_TRY_AGAIN: u16 = 1013;
 /// Fresh codes POST /api/pair tries before giving up (a collision never
 /// overwrites a live room).
 const MAX_PAIR_CODE_ATTEMPTS: usize = 10;
+
+/// A key reload after a bus resubscribe gives up after this long.
+const KEY_RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Pending Astation sockets allowed per room (0 = no cap).
 pub(crate) const MAX_PENDING_ASTATIONS_PER_ROOM: usize = 0;
@@ -371,7 +374,13 @@ impl RelayHub {
             reason: code.map(|(_, reason)| reason.to_string()).unwrap_or_default(),
         };
         if let Err(error) = self.inner.bus.send_inbox(&target.replica, message).await {
-            tracing::debug!("Could not close a connection on replica {}: {}", target.replica, error);
+            if code.is_none() {
+                // An eviction/replacement that did not arrive can leave two
+                // live owners until the next heartbeat.
+                tracing::warn!("Could not close a replaced connection on replica {}: {}", target.replica, error);
+            } else {
+                tracing::debug!("Could not close a connection on replica {}: {}", target.replica, error);
+            }
         }
     }
 
@@ -472,6 +481,8 @@ impl RelayHub {
         mut events: mpsc::UnboundedReceiver<BusEvent>,
     ) -> JoinHandle<()> {
         let hub = self.clone();
+        let reload_busy = Arc::new(AtomicBool::new(false));
+        let reload_again = Arc::new(AtomicBool::new(false));
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
                 match event {
@@ -492,12 +503,32 @@ impl RelayHub {
                         // Anything published while we were away is lost:
                         // drop cached rooms and re-read every key.
                         hub.clear_room_cache();
-                        let (keys, identity) = (hub.keys().clone(), identity.clone());
-                        tokio::spawn(async move {
-                            if let Err(error) = keys.load(identity.as_ref()).await {
-                                tracing::warn!("Could not reload relay keys after resubscribing: {}", error);
-                            }
-                        });
+                        // One reload at a time, each bounded; a resubscribe
+                        // that lands mid-reload re-arms one more run.
+                        reload_again.store(true, Ordering::SeqCst);
+                        if !reload_busy.swap(true, Ordering::SeqCst) {
+                            let (keys, identity) = (hub.keys().clone(), identity.clone());
+                            let (busy, again) = (reload_busy.clone(), reload_again.clone());
+                            tokio::spawn(async move {
+                                loop {
+                                    again.store(false, Ordering::SeqCst);
+                                    match tokio::time::timeout(KEY_RELOAD_TIMEOUT, keys.load(identity.as_ref())).await {
+                                        Ok(Ok(_)) => {}
+                                        Ok(Err(error)) => tracing::warn!(
+                                            "Could not reload relay keys after resubscribing: {}",
+                                            error
+                                        ),
+                                        Err(_) => tracing::warn!(
+                                            "Reloading relay keys after resubscribing timed out"
+                                        ),
+                                    }
+                                    busy.store(false, Ordering::SeqCst);
+                                    if !again.load(Ordering::SeqCst) || busy.swap(true, Ordering::SeqCst) {
+                                        break;
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
             }
@@ -2549,6 +2580,75 @@ mod tests {
             .unwrap();
         assert!(eventually(|| !keys.contains("astation-r")).await, "key-changed forgot the key");
 
+        drop(events_tx);
+        task.await.unwrap();
+    }
+
+    /// `list_keys` counts its calls and never returns (until the timeout drops it).
+    struct HangingList(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl IdentityStore for HangingList {
+        fn backend_name(&self) -> &'static str {
+            "hanging-list"
+        }
+        async fn get_key(&self, _: &str) -> Result<Option<String>, StoreError> {
+            unreachable!()
+        }
+        async fn register_key_if_absent(&self, _: &str, _: &str, _: i64) -> Result<StoreRegisterOutcome, StoreError> {
+            unreachable!()
+        }
+        async fn touch_key(&self, _: &str, _: i64) -> Result<(), StoreError> {
+            unreachable!()
+        }
+        async fn list_keys(&self) -> Result<Vec<(String, String)>, StoreError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        }
+        async fn bind(&self, _: &str, _: &str, _: i64) -> Result<StoreBindOutcome, StoreError> {
+            unreachable!()
+        }
+        async fn unbind(&self, _: &str, _: &str) -> Result<bool, StoreError> {
+            unreachable!()
+        }
+        async fn replace_all(&self, _: &str, _: &[String], _: i64) -> Result<ReplaceOutcome, StoreError> {
+            unreachable!()
+        }
+        async fn resolve(&self, _: &str, _: i64) -> Result<Option<String>, StoreError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn key_reload_after_resubscribe_is_bounded_and_single_flight() {
+        use crate::cluster::bus::BusEvent;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hub = RelayHub::in_memory(InMemoryRoomDirectory::new(), TEST_AUTH_TIMEOUT);
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = hub.spawn_bus_dispatcher(
+            std::sync::Arc::new(HangingList(calls.clone())),
+            crate::voice_session::ReplyWaiters::default(),
+            events_rx,
+        );
+        let settle = || tokio::time::sleep(Duration::from_millis(100));
+        events_tx.send(BusEvent::Resubscribed).unwrap();
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Two more mid-reload: no concurrent reload yet.
+        events_tx.send(BusEvent::Resubscribed).unwrap();
+        events_tx.send(BusEvent::Resubscribed).unwrap();
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "single flight");
+        // The first reload times out; the re-armed one runs exactly once.
+        tokio::time::sleep(KEY_RELOAD_TIMEOUT).await;
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "re-armed once");
+        tokio::time::sleep(KEY_RELOAD_TIMEOUT * 2).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "no more runs");
+        // Free again afterwards.
+        events_tx.send(BusEvent::Resubscribed).unwrap();
+        settle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         drop(events_tx);
         task.await.unwrap();
     }
