@@ -164,16 +164,23 @@ pub struct RedisCluster {
     pub voice_sessions: VoiceSessionStore,
     pub rtc_sessions: RtcSessionStore,
     pub health: presence::RedisHealth,
-    tasks: Vec<JoinHandle<()>>,
+    /// Background tasks, named for the supervisor in `main`.
+    tasks: Vec<(&'static str, JoinHandle<()>)>,
 }
 
 impl RedisCluster {
+    /// Hand the background tasks to a supervisor (`main`). `abort` then
+    /// has nothing left to stop.
+    pub fn take_tasks(&mut self) -> Vec<(&'static str, JoinHandle<()>)> {
+        std::mem::take(&mut self.tasks)
+    }
+
     /// Stop this replica's background tasks (bus, dispatcher, presence).
     /// Dropping a `RedisCluster` without calling this leaves them running.
-    // Tests and the two-relay harness; `main` keeps them for life.
+    // Tests and the two-relay harness; `main` supervises them instead.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn abort(&self) {
-        for task in &self.tasks {
+        for (_, task) in &self.tasks {
             task.abort();
         }
     }
@@ -249,7 +256,11 @@ pub async fn connect_cluster_with_keys(
         rtc_sessions: RtcSessionStore::with_backend(Arc::new(rtc::RedisRtcBackend::new(conn))),
         relay,
         health,
-        tasks: vec![bus_task, dispatcher, presence_task],
+        tasks: vec![
+            ("bus subscriber", bus_task),
+            ("bus dispatcher", dispatcher),
+            ("presence refresh", presence_task),
+        ],
     })
 }
 

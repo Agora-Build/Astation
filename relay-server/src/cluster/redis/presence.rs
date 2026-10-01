@@ -21,6 +21,9 @@ pub struct RedisHealth {
     replica_id: String,
     started_at: i64,
     live: Arc<RwLock<HashSet<String>>>,
+    /// Set by `withdraw` (drain). Held across each refresh, so a refresh
+    /// already in flight can't re-add the key after the withdrawal.
+    withdrawn: Arc<tokio::sync::Mutex<bool>>,
 }
 
 impl RedisHealth {
@@ -33,6 +36,7 @@ impl RedisHealth {
             replica_id: replica_id.to_string(),
             started_at: chrono::Utc::now().timestamp(),
             live: Arc::new(RwLock::new(live)),
+            withdrawn: Arc::new(tokio::sync::Mutex::new(false)),
         }
     }
 
@@ -49,8 +53,13 @@ impl RedisHealth {
         self.refresh_at(chrono::Utc::now().timestamp()).await
     }
 
-    /// `refresh` with an injectable clock (unix seconds).
+    /// `refresh` with an injectable clock (unix seconds). After `withdraw`
+    /// it writes nothing and returns the last known count.
     pub(crate) async fn refresh_at(&self, now: i64) -> Result<usize, StoreError> {
+        let withdrawn = self.withdrawn.lock().await;
+        if *withdrawn {
+            return Ok(self.replicas());
+        }
         let presence = keys::replica(&self.replica_id);
         let id = self.replica_id.clone();
         let started_at = self.started_at;
@@ -111,6 +120,8 @@ impl ClusterHealth for RedisHealth {
     }
 
     async fn withdraw(&self) -> Result<(), StoreError> {
+        let mut withdrawn = self.withdrawn.lock().await;
+        *withdrawn = true;
         let presence = keys::replica(&self.replica_id);
         let id = self.replica_id.clone();
         self.conn
@@ -151,6 +162,24 @@ mod tests {
         b.withdraw().await.unwrap();
         assert_eq!(a.refresh().await.unwrap(), 1);
         assert!(!a.is_live("replica-b"));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn redis_presence_stays_withdrawn() {
+        let _guard = REDIS_LOCK.lock().await;
+        let conn = fresh_conn().await;
+        let a = RedisHealth::start(conn.clone(), "replica-a").await.unwrap();
+        let b = RedisHealth::start(conn.clone(), "replica-b").await.unwrap();
+        b.withdraw().await.unwrap();
+        // A refresh after the withdrawal (the 10 s task) must not bring it back.
+        b.refresh().await.unwrap();
+        assert_eq!(a.refresh().await.unwrap(), 1);
+        let exists: i64 = conn
+            .run(|mut c| async move { redis::cmd("EXISTS").arg("relay:replica:replica-b").query_async(&mut c).await })
+            .await
+            .unwrap();
+        assert_eq!(exists, 0);
     }
 
     #[tokio::test]

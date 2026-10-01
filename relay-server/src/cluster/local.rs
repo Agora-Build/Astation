@@ -119,8 +119,7 @@ impl LocalSockets {
         self.codes_where(false)
     }
 
-    // The two-relay harness (tests); Task 25 (SIGTERM drain) uses it in `main`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Every socket on this replica (drain closes them all).
     pub fn connection_ids(&self) -> Vec<String> {
         self.lock().keys().cloned().collect()
     }
@@ -143,8 +142,8 @@ impl LocalSockets {
         self.lock().len()
     }
 
-    // Task 25 (drain test asserts it).
-    #[allow(dead_code)]
+    // Only tests use it (the drain test asserts it).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.lock().is_empty()
     }

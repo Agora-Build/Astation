@@ -173,16 +173,46 @@ async fn connect_redis_cluster(
     ))
 }
 
+/// A background task that must run for the life of the process, named
+/// for the log line if it stops.
+type NamedTask = (&'static str, tokio::task::JoinHandle<()>);
+
+/// Wait until the first task ends. Unless the relay is draining (then
+/// tasks ending is expected), that is a failure: a replica that silently
+/// stopped processing the bus or refreshing its presence must not keep
+/// looking healthy, so log it and call `on_failure` (`main`: exit 1, and
+/// the orchestrator restarts the relay).
+async fn supervise(tasks: Vec<NamedTask>, hub: RelayHub, on_failure: impl FnOnce(&'static str)) {
+    if tasks.is_empty() {
+        return;
+    }
+    let (names, handles): (Vec<&'static str>, Vec<_>) = tasks.into_iter().unzip();
+    let (result, index, _rest) = futures_util::future::select_all(handles).await;
+    let name = names[index];
+    if hub.is_draining() {
+        tracing::debug!("Background task '{}' ended during drain", name);
+        return;
+    }
+    match result {
+        Ok(()) => tracing::error!("Background task '{}' stopped unexpectedly; exiting", name),
+        Err(error) if error.is_panic() => {
+            tracing::error!("Background task '{}' panicked; exiting", name)
+        }
+        Err(error) => tracing::error!("Background task '{}' ended ({}); exiting", name, error),
+    }
+    on_failure(name);
+}
+
 /// The background sweeps every replica runs every 60 s: expired pairing
 /// sessions, room upkeep, expired RTC and voice sessions. Shared by `main`
-/// (which detaches them for the life of the process) and the two-relay
+/// (which supervises them for the life of the process) and the two-relay
 /// test harness (which aborts them).
 fn spawn_upkeep(
     relay: &RelayHub,
     sessions: &SessionStore,
     rtc_sessions: &RtcSessionStore,
     voice_sessions: &VoiceSessionStore,
-) -> Vec<tokio::task::JoinHandle<()>> {
+) -> Vec<NamedTask> {
     // Spawn background cleanup for expired sessions
     let cleanup_sessions = sessions.clone();
     let sessions_sweep = tokio::spawn(async move {
@@ -240,10 +270,21 @@ fn spawn_upkeep(
             tracing::debug!("Cleaned up expired voice sessions");
         }
     });
-    vec![sessions_sweep, rooms_sweep, rtc_sweep, voice_sweep]
+    vec![
+        ("session sweep", sessions_sweep),
+        ("room keep-alive", rooms_sweep),
+        ("RTC session sweep", rtc_sweep),
+        ("voice session sweep", voice_sweep),
+    ]
 }
 
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
+    if state.relay.is_draining() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "status": "draining" })),
+        );
+    }
     let redis = state.relay.redis_status().await;
     match state.vault.health_check().await {
         Ok(()) if redis != "unavailable" => (
@@ -444,6 +485,31 @@ fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// SIGTERM (docker stop, Coolify redeploy) or Ctrl-C.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::error!("Could not listen for SIGTERM: {}", error);
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize tracing/logging
@@ -512,24 +578,26 @@ async fn main() {
     // Startup order in Redis mode: keys above → Redis connect (bounded
     // retries, then exit 1) → presence (one refresh, so peers are known) →
     // bus subscription + dispatcher → background sweeps below → listener.
-    let (relay, sessions, rtc_sessions, voice_sessions) = match redis_url {
+    let (relay, sessions, rtc_sessions, voice_sessions, cluster_tasks) = match redis_url {
         Some(url) => {
             tracing::info!("Connecting to Redis for shared relay state...");
             let auth_timeout = std::time::Duration::from_secs(relay::RELAY_AUTH_TIMEOUT_SECS);
-            let cluster = match start_redis_replica(&url, identity.clone(), keys, auth_timeout).await {
+            let mut cluster = match start_redis_replica(&url, identity.clone(), keys, auth_timeout).await {
                 Ok(cluster) => cluster,
                 Err(message) => {
                     tracing::error!("{}", message);
                     std::process::exit(1);
                 }
             };
-            // The cluster's background tasks (bus, dispatcher, presence) are
-            // detached and run for the life of the process.
+            // The cluster's background tasks (bus, dispatcher, presence)
+            // run for the life of the process, supervised below.
+            let tasks = cluster.take_tasks();
             (
                 cluster.relay,
                 cluster.sessions,
                 cluster.rtc_sessions,
                 cluster.voice_sessions,
+                tasks,
             )
         }
         None => {
@@ -547,12 +615,16 @@ async fn main() {
                 SessionStore::new(),
                 RtcSessionStore::new(),
                 VoiceSessionStore::new(),
+                Vec::new(),
             )
         }
     };
 
-    // Detached: they run for the life of the process.
-    spawn_upkeep(&relay, &sessions, &rtc_sessions, &voice_sessions);
+    // Background tasks run for the life of the process; one that stops
+    // outside a drain stops the relay (exit 1) so it is restarted.
+    let mut background = cluster_tasks;
+    background.extend(spawn_upkeep(&relay, &sessions, &rtc_sessions, &voice_sessions));
+    tokio::spawn(supervise(background, relay.clone(), |_| std::process::exit(1)));
 
     let state = AppState {
         sessions,
@@ -564,6 +636,7 @@ async fn main() {
         identity,
     };
 
+    let shutdown_hub = state.relay.clone();
     let app = router(state);
 
     tracing::info!("Rate limiting configured:");
@@ -587,8 +660,14 @@ async fn main() {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-        .await
-        .expect("Server error");
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        tracing::info!("Shutdown signal received: draining relay sockets");
+        shutdown_hub.drain(relay::DRAIN_GRACE).await;
+    })
+    .await
+    .expect("Server error");
+    tracing::info!("Relay stopped");
 }
 
 #[cfg(test)]
@@ -679,6 +758,59 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body.as_ref(), br#"{"redis":"unavailable","status":"unhealthy"}"#);
+    }
+
+    /// Runs `supervise` and returns the task it reported (None: none).
+    async fn supervised(tasks: Vec<NamedTask>, hub: RelayHub) -> Option<&'static str> {
+        let reported = Arc::new(std::sync::Mutex::new(None));
+        let sink = reported.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            supervise(tasks, hub, move |name| *sink.lock().unwrap() = Some(name)),
+        )
+        .await
+        .expect("the supervisor did not return");
+        let name = *reported.lock().unwrap();
+        name
+    }
+
+    #[tokio::test]
+    async fn supervisor_reports_a_task_that_ends_early() {
+        let tasks: Vec<NamedTask> = vec![
+            ("presence refresh", tokio::spawn(std::future::pending::<()>())),
+            ("bus dispatcher", tokio::spawn(async {})),
+        ];
+        assert_eq!(supervised(tasks, RelayHub::new()).await, Some("bus dispatcher"));
+    }
+
+    #[tokio::test]
+    async fn supervisor_reports_a_task_that_panics() {
+        let tasks: Vec<NamedTask> = vec![
+            ("room keep-alive", tokio::spawn(async { panic!("boom") })),
+            ("bus subscriber", tokio::spawn(std::future::pending::<()>())),
+        ];
+        assert_eq!(supervised(tasks, RelayHub::new()).await, Some("room keep-alive"));
+    }
+
+    #[tokio::test]
+    async fn supervisor_expects_tasks_to_end_while_draining() {
+        let hub = RelayHub::new();
+        hub.drain(std::time::Duration::from_millis(10)).await;
+        let tasks: Vec<NamedTask> = vec![("bus dispatcher", tokio::spawn(async {}))];
+        assert_eq!(supervised(tasks, hub).await, None);
+    }
+
+    #[tokio::test]
+    async fn health_fails_while_draining() {
+        let state = test_state();
+        state.relay.drain(std::time::Duration::from_millis(10)).await;
+        let response = router(state)
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), br#"{"status":"draining"}"#);
     }
 
     #[tokio::test]

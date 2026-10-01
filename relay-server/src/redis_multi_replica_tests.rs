@@ -140,7 +140,7 @@ struct Replica {
     proxy: CutProxy,
     server: JoinHandle<()>,
     /// The 60 s sweeps `main` runs (sessions, rooms, RTC, voice).
-    upkeep: Vec<JoinHandle<()>>,
+    upkeep: Vec<(&'static str, JoinHandle<()>)>,
 }
 
 impl Replica {
@@ -151,7 +151,7 @@ impl Replica {
     fn stop_tasks(&self) {
         self.server.abort();
         self.cluster.abort();
-        for task in &self.upkeep {
+        for (_, task) in &self.upkeep {
             task.abort();
         }
     }
@@ -974,4 +974,32 @@ async fn redis_outage_closes_with_1013_and_the_replica_recovers_when_redis_retur
         vaults.as_array().unwrap().iter().any(|v| v["vault_id"] == vault_id.as_str()),
         "{vaults}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn redis_drain_closes_with_1012_and_removes_entries_and_presence() {
+    let _guard = REDIS_LOCK.lock().await;
+    let (_shared, one, two) = two_replicas().await;
+    let code = "astation-drain";
+    let (mut astation, _challenge) = connect_astation(&two.ws, code).await;
+    let mut atem = connect_atem(&one.ws, code, "atem-a").await;
+    let atem_id = next_client_json(&mut astation).await["connection_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    one.state.relay.drain(Duration::from_secs(5)).await;
+
+    assert_eq!(expect_close_code(&mut atem).await, 1012);
+    let gone = next_client_json(&mut astation).await;
+    assert_eq!(gone["relay_event"], "disconnected");
+    assert_eq!(gone["connection_id"], atem_id.as_str());
+    assert!(two.state.relay.room(code).await.unwrap().unwrap().atems.is_empty());
+    assert_eq!(two.cluster.health.refresh().await.unwrap(), 1, "presence withdrawn");
+
+    let (status, health) = http(&one.state, "GET", "/health", "", &[]).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(health["status"], "draining");
+    assert_eq!(refused_status(format!("{}?role=astation&code=x", one.ws)).await, 503);
 }

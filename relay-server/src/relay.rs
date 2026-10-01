@@ -12,7 +12,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -74,6 +74,12 @@ pub(crate) const KEY_RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Pending Astation sockets allowed per room (0 = no cap).
 pub(crate) const MAX_PENDING_ASTATIONS_PER_ROOM: usize = 0;
+
+/// Close code on drain (RFC 6455 "service restart"): reconnect elsewhere.
+pub(crate) const CLOSE_SERVICE_RESTART: u16 = 1012;
+
+/// How long a drain waits for its sockets to leave their rooms.
+pub const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
 // --- Types ---
 
@@ -194,6 +200,8 @@ struct HubInner {
     health: Arc<dyn ClusterHealth>,
     auth_timeout: Duration,
     room_cache: Option<RoomCache>,
+    draining: AtomicBool,
+    active_sockets: AtomicUsize,
 }
 
 /// The relay: this replica's sockets plus the shared room directory, the
@@ -239,6 +247,8 @@ impl RelayHub {
                 health: parts.health,
                 auth_timeout: parts.auth_timeout,
                 room_cache: parts.cache_rooms.then(RoomCache::default),
+                draining: AtomicBool::new(false),
+                active_sockets: AtomicUsize::new(0),
             }),
         }
     }
@@ -297,6 +307,35 @@ impl RelayHub {
 
     pub fn replica_id(&self) -> &str {
         &self.inner.replica_id
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.inner.draining.load(Ordering::SeqCst)
+    }
+
+    /// SIGTERM: refuse new sockets and fail /health, close every local
+    /// socket with 1012, wait (up to `grace`) until they have left their
+    /// rooms, then withdraw this replica's presence.
+    pub async fn drain(&self, grace: Duration) {
+        self.inner.draining.store(true, Ordering::SeqCst);
+        let connection_ids = self.inner.local.connection_ids();
+        tracing::info!("Draining {} relay socket(s)", connection_ids.len());
+        for connection_id in &connection_ids {
+            self.inner
+                .local
+                .close_with(connection_id, CLOSE_SERVICE_RESTART, "relay restarting");
+        }
+        let deadline = Instant::now() + grace;
+        while self.inner.active_sockets.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let left = self.inner.active_sockets.load(Ordering::SeqCst);
+        if left > 0 {
+            tracing::warn!("Drain grace ({:?}) ended with {} socket(s) still open", grace, left);
+        }
+        if let Err(error) = self.inner.health.withdraw().await {
+            tracing::warn!("Could not withdraw replica presence: {}", error);
+        }
     }
 
     pub(crate) fn local(&self) -> &LocalSockets {
@@ -710,6 +749,23 @@ impl Default for RelayHub {
     }
 }
 
+/// Counts a live `handle_ws` so a drain can wait for every socket to
+/// leave its room.
+struct ActiveSocket(RelayHub);
+
+impl ActiveSocket {
+    fn new(hub: &RelayHub) -> Self {
+        hub.inner.active_sockets.fetch_add(1, Ordering::SeqCst);
+        Self(hub.clone())
+    }
+}
+
+impl Drop for ActiveSocket {
+    fn drop(&mut self) {
+        self.0.inner.active_sockets.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Generate an 8-char pairing code like "ABCD-EFGH" (no ambiguous chars).
 fn generate_pairing_code() -> String {
     let mut rng = rand::thread_rng();
@@ -890,6 +946,9 @@ pub async fn ws_handler(
     Query(params): Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    if state.relay.is_draining() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Relay is restarting, reconnect").into_response();
+    }
     let hub = state.relay.clone();
     let now = chrono::Utc::now().timestamp();
 
@@ -1621,6 +1680,7 @@ async fn handle_ws(
     atem_id: String,
     socket: WebSocket,
 ) {
+    let _active = ActiveSocket::new(&hub);
     let socket_role = match role.as_str() {
         "atem" => SocketRole::Atem { atem_id: atem_id.clone() },
         "astation" => SocketRole::Astation,
@@ -1633,6 +1693,11 @@ async fn handle_ws(
     let connection_id = Uuid::new_v4().to_string();
     let local = hub.local().clone();
     let outbox = local.register(&connection_id, &code, socket_role);
+    let mut reader_close = outbox.close.clone();
+    // Upgraded after the drain listed the sockets: close it the same way.
+    if hub.is_draining() {
+        local.close_with(&connection_id, CLOSE_SERVICE_RESTART, "relay restarting");
+    }
 
     // An Astation gets a challenge; it must prove the key first when one is
     // registered for this room code (decided from the key cache, no I/O).
@@ -1704,6 +1769,7 @@ async fn handle_ws(
     // Set when the writer must flush (a rejection, a close frame) before
     // the socket goes.
     let mut flush_writer = false;
+    let mut watch_close = true;
     loop {
         let pending_deadline = astation_auth
             .as_ref()
@@ -1726,7 +1792,27 @@ async fn handle_ws(
         let wait = pending_deadline
             .map(|deadline| deadline.saturating_duration_since(Instant::now()).min(read_timeout))
             .unwrap_or(read_timeout);
-        let msg_result = match tokio::time::timeout(wait, ws_stream.next()).await {
+        let next = tokio::select! {
+            biased;
+            changed = reader_close.changed(), if watch_close => {
+                match changed {
+                    // Closed with a code (drain, overload): let the
+                    // writer send the close frame, then leave.
+                    Ok(()) if reader_close.borrow().is_some() => {
+                        flush_writer = true;
+                        break;
+                    }
+                    Ok(()) => continue,
+                    // Evicted (no code): keep reading until the client goes.
+                    Err(_) => {
+                        watch_close = false;
+                        continue;
+                    }
+                }
+            }
+            next = tokio::time::timeout(wait, ws_stream.next()) => next,
+        };
+        let msg_result = match next {
             Ok(Some(msg)) => msg,
             Ok(None) => break, // stream ended
             Err(_) if pending_deadline.is_some_and(|deadline| Instant::now() >= deadline) => {
@@ -4425,5 +4511,52 @@ pub(crate) mod tests {
         assert_eq!(room.owner.map(|owner| owner.conn).as_deref(), Some("owner"));
         assert!(room.verified);
         assert!(hub.local().contains("owner"));
+    }
+
+    async fn close_code(socket: &mut TestSocket) -> u16 {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(ClientMessage::Close(Some(frame)))) => return u16::from(frame.code),
+                    Some(Ok(ClientMessage::Close(None))) | None | Some(Err(_)) => return 0,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await
+        .expect("no close within 5 s")
+    }
+
+    #[tokio::test]
+    async fn drain_closes_sockets_with_1012_and_empties_the_room() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-drain";
+        let (mut astation, _challenge) = connect_astation(&base_url, code).await;
+        let mut atem = connect_atem(&base_url, code, "atem-a").await;
+        assert_eq!(next_client_json(&mut astation).await["relay_event"], "connected");
+
+        state.relay.drain(std::time::Duration::from_secs(5)).await;
+
+        assert_eq!(close_code(&mut atem).await, 1012);
+        assert_eq!(close_code(&mut astation).await, 1012);
+        assert!(state.relay.room(code).await.unwrap().is_none(), "entries removed");
+        assert!(state.relay.local().is_empty());
+
+        let response = crate::router(state.clone())
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), HttpStatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), br#"{"status":"draining"}"#);
+
+        match tokio_tungstenite::connect_async(format!("{base_url}?role=astation&code=late")).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status().as_u16(), 503)
+            }
+            other => panic!("a draining relay accepted a socket: {:?}", other.map(|_| ())),
+        }
+        server.abort();
     }
 }
