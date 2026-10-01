@@ -36,6 +36,7 @@ local function is_empty()
     and (redis.call('HGET', KEYS[1], 'owner_conn') or '') == ''
 end
 local function new_room(hostname, created_at, ttl)
+  redis.call('DEL', KEYS[2], KEYS[3])
   redis.call('HSET', KEYS[1], 'hostname', hostname, 'created_at', created_at,
     'owner_conn', '', 'owner_replica', '', 'verified', '0', 'paired', '0')
   redis.call('EXPIRE', KEYS[1], ttl)
@@ -115,6 +116,7 @@ local oc = redis.call('HGET', KEYS[1], 'owner_conn') or ''
 local orp = redis.call('HGET', KEYS[1], 'owner_replica') or ''
 if oc ~= '' and oc == ARGV[1] then
   redis.call('HSET', KEYS[1], 'verified', '1')
+  keep_alive(ARGV[4])
   return {'owner'}
 end
 local ec, er, evicted = '', '', '0'
@@ -616,11 +618,58 @@ mod tests {
             d.claim_owner("ROOM-R", &ConnRef::new("s1", "r1"), 1).await.unwrap();
             all_fresh(conn.clone()).await;
 
+            // The owner proving its key (already the owner) keeps the room alive too.
+            shorten(conn.clone()).await;
+            assert_eq!(
+                d.promote("ROOM-R", &ConnRef::new("s1", "r1"), false).await.unwrap(),
+                Promotion::AlreadyOwner
+            );
+            all_fresh(conn.clone()).await;
+
             // An Atem joining doesn't extend the room, but its hash follows the room's TTL.
             shorten(conn.clone()).await;
             d.join_atem("ROOM-R", "atem-b", &ConnRef::new("t2", "r1")).await.unwrap();
             let left = ttl(&conn, "relay:room:ROOM-R:atems").await;
             assert!((1..=5).contains(&left), "atems ttl {left}");
+        }
+
+        #[tokio::test]
+        #[ignore]
+        async fn a_recreated_room_drops_leftover_members_redis() {
+            let _guard = REDIS_LOCK.lock().await;
+            let conn = fresh_conn().await;
+            let d = RedisRoomDirectory::new(conn.clone());
+            // Member hashes left behind without their room (e.g. the room key
+            // expired first): a new room must not inherit them.
+            let plant = |conn: RedisConn| async move {
+                conn.run(|mut c| async move {
+                    redis::pipe()
+                        .hset("relay:room:ROOM-L:atems", "atem-old", "t0|r0").ignore()
+                        .hset("relay:room:ROOM-L:pending", "p-old", "r0").ignore()
+                        .query_async::<()>(&mut c)
+                        .await
+                })
+                .await
+                .unwrap();
+            };
+            plant(conn.clone()).await;
+            assert!(d.ensure_room("ROOM-L", "h", 1).await.unwrap());
+            let room = d.get("ROOM-L").await.unwrap().unwrap();
+            assert!(room.atems.is_empty(), "ensure_room inherited {:?}", room.atems);
+            assert!(room.pending.is_empty());
+
+            assert!(d.delete_room("ROOM-L").await.unwrap().is_some());
+            plant(conn.clone()).await;
+            let claim = d.claim_owner("ROOM-L", &ConnRef::new("s1", "r1"), 1).await.unwrap();
+            assert!(claim.atems.is_empty(), "claim_owner inherited {:?}", claim.atems);
+            assert!(d.get("ROOM-L").await.unwrap().unwrap().pending.is_empty());
+
+            assert!(d.delete_room("ROOM-L").await.unwrap().is_some());
+            plant(conn.clone()).await;
+            assert!(d.add_pending("ROOM-L", &ConnRef::new("p1", "r1"), 1, 0).await.unwrap());
+            let room = d.get("ROOM-L").await.unwrap().unwrap();
+            assert!(room.atems.is_empty());
+            assert_eq!(room.pending.len(), 1);
         }
 
         #[tokio::test]
