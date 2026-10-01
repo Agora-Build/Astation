@@ -9,7 +9,7 @@ permissions:
   contents: read
   packages: write
 
-# Keep image publication and both Coolify deployments in the same serial run.
+# Keep image publication and the relay and webapp deployments in one serial run.
 concurrency:
   group: station-production
   cancel-in-progress: false
@@ -64,15 +64,47 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Deploy relay and wait for Coolify
+      - name: Deploy relay-a and wait for Coolify
         env:
           COOLIFY_WEBHOOK_URL: ${{ secrets.COOLIFY_RELAY_SERVER_WEBHOOK_URL }}
           COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
         run: node .github/scripts/deploy-coolify.mjs
+      # relay-b keeps serving while relay-a restarts; wait until relay-a is
+      # back (the live replica count recovers) before touching relay-b.
+      # STATION_MIN_REPLICAS / STATION_REQUIRE_REDIS are opt-in: unset repo
+      # variables mean "not checked", so a single relay without Redis passes.
+      - name: Wait for relay health after relay-a
+        env:
+          STATION_MIN_REPLICAS: ${{ vars.STATION_MIN_REPLICAS }}
+          STATION_REQUIRE_REDIS: ${{ vars.STATION_REQUIRE_REDIS }}
+        run: node .github/scripts/verify-station.mjs --wait-health
+      - name: Deploy relay-b and wait for Coolify
+        id: relay_b
+        env:
+          COOLIFY_WEBHOOK_URL: ${{ secrets.COOLIFY_RELAY_B_WEBHOOK_URL }}
+          COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${COOLIFY_WEBHOOK_URL:-}" ]; then
+            echo "COOLIFY_RELAY_B_WEBHOOK_URL is not set: single relay, skipping relay-b."
+            echo "deployed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          node .github/scripts/deploy-coolify.mjs
+          echo "deployed=true" >> "$GITHUB_OUTPUT"
+      - name: Wait for relay health after relay-b
+        if: steps.relay_b.outputs.deployed == 'true'
+        env:
+          STATION_MIN_REPLICAS: ${{ vars.STATION_MIN_REPLICAS }}
+          STATION_REQUIRE_REDIS: ${{ vars.STATION_REQUIRE_REDIS }}
+        run: node .github/scripts/verify-station.mjs --wait-health
       - name: Deploy webapp and wait for Coolify
         env:
           COOLIFY_WEBHOOK_URL: ${{ secrets.COOLIFY_WEBAPP_WEBHOOK_URL }}
           COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
         run: node .github/scripts/deploy-coolify.mjs
-      - name: Verify public HTTPS and identity WebSocket
+      - name: Verify public HTTPS, relay health and identity WebSocket
+        env:
+          STATION_MIN_REPLICAS: ${{ vars.STATION_MIN_REPLICAS }}
+          STATION_REQUIRE_REDIS: ${{ vars.STATION_REQUIRE_REDIS }}
         run: node .github/scripts/verify-station.mjs
