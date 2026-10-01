@@ -1,0 +1,18 @@
+[package]
+name = "relay-loadtest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Its own workspace: not part of the relay build, its tests or its Docker image.
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde_json = "1"
+# P-256 proof of possession (relayAuth), as Astation and the relay use.
+ring = "0.17"
+# wss:// — rustls with the ring provider (no aws-lc build).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

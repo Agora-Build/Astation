@@ -285,6 +285,79 @@ cargo test  # unit + in-memory integration suites
 #   docker rm -f relay-test-valkey
 ```
 
+### Load test
+
+`loadtest/` is a separate crate (its own workspace and `Cargo.lock`), so it
+adds nothing to the relay binary, its Docker image or `cargo test`; CI only
+builds it. It speaks the real protocol: each room is an Astation socket
+(`role=astation`, id `astation-lt-<run-id>-<n>`) that answers the relay's
+`relayAuthChallenge` with a `relayAuth` signed by its own fresh P-256 key,
+plus Atem sockets (`role=atem`) on the *other* replicas. Every interval each
+Atem sends a frame (enveloped by the relay), the Astation answers it with a
+targeted envelope and broadcasts one frame to all its Atems. Rooms are
+spread round-robin over the `--url`s and their ticks spread over the
+interval.
+
+Default run (the spec's target): `--astations 10000 --atems-per-astation 2`
+(30k sockets), ramp 500 sockets/s, then 30 minutes of traffic every 5 s.
+
+**Safety.** Only loopback URLs (`localhost`, `127.0.0.0/8`, `::1`) are
+accepted; anything else needs `--i-know-this-is-production`. Never point it at
+the production relays without a planned window: it opens tens of thousands
+of sockets, and each room registers an Astation key in the identity store
+(with Postgres, clean up afterwards with
+`DELETE FROM astation_keys WHERE astation_id LIKE 'astation-lt-%';` or
+`station-relay-server admin forget-key <id>` per id).
+
+**Two local relays + Valkey:**
+
+```bash
+# Client host limits (30k sockets from one machine):
+ulimit -n 65535
+sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+
+docker run --rm -d --name relay-lt-valkey -p 127.0.0.1:56380:6379 valkey/valkey:8
+cargo build --release
+for port in 3341 3342; do
+  REDIS_URL=redis://127.0.0.1:56380/ RELAY_REPLICAS_EXPECTED=2 \
+  RELAY_WS_MAX_PER_IP=20000 PORT=$port RUST_LOG=warn \
+    ./target/release/station-relay-server > relay-$port.log 2>&1 &
+done
+# The relays need `ulimit -n` above their share of sockets too (start them
+# from the same shell). RELAY_WS_MAX_PER_IP must exceed each replica's share
+# of sockets from the load host (default 200 refuses the rest with 429).
+
+cd loadtest && cargo build --release
+./target/release/relay-loadtest --url ws://127.0.0.1:3341/ws --url ws://127.0.0.1:3342/ws \
+  --astations 50 --atems-per-astation 3 --duration-secs 60 --interval-ms 1000   # smoke
+./target/release/relay-loadtest --url ws://127.0.0.1:3341/ws --url ws://127.0.0.1:3342/ws  # full 30k
+
+# Meanwhile, every few minutes: relay memory and sockets.
+docker stats --no-stream   # containerized relays, or: ps -o rss= -p <relay pid>
+curl -s 127.0.0.1:3341/metrics | grep -E '^relay_(sockets|rooms|slow)'
+
+kill %1 %2; docker rm -f relay-lt-valkey
+```
+
+Every 10 s it prints the phase, open sockets, frames received/sent per flow
+(`up` Atem → Astation, `bcast` Astation → all Atems, `uni` Astation → one
+Atem) and that window's p50/p99; at the end the totals and `PASS` or `FAIL`
+(exit 0 or 1).
+
+**Pass criteria** (spec, "Scaling to 10k+"): `PASS`, meaning p99 frame
+latency under 100 ms over the whole run, no lost frames in any flow, and no
+failed connect, rejected `relayAuth`, incomplete room or socket dropped
+before the end; **and** each relay's memory (`docker stats` / RSS) flat over
+the 30 minutes after the ramp (the client can't see that). Expect a ~40 ms
+bump on a few frames once a minute, right after the relay's 60 s ping of each
+socket (seen in local runs); it is far too rare to move the p99.
+
+**Before claiming 10k:** run the full 30k test against production-like relays
+(two replicas, Valkey, `RELAY_WS_MAX_PER_IP=20000` for the run) and record
+the result (date, commit, hosts, the `total:` line, relay memory at start and
+end) in `../DEPLOY.md`'s sizing paragraph. No 10k claim without that record;
+rerun it before raising any limit.
+
 
 ---
 
