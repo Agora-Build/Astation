@@ -11,13 +11,17 @@ use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use uuid::Uuid;
 use validator::Validate;
 
-use crate::cluster::bus::{BroadcastMessage, InboxMessage, LoopbackBus, ReplicaBus};
+use crate::cluster::bus::{apply_inbox, BroadcastMessage, BusEvent, InboxMessage, LoopbackBus, ReplicaBus};
 use crate::cluster::directory::{
     AtemJoin, InMemoryRoomDirectory, Promotion, RoomDirectory, RoomInfo, IDENTITY_HOSTNAME,
 };
@@ -27,6 +31,7 @@ use crate::cluster::local::{LocalSockets, SocketOutbox, SocketRole};
 use crate::cluster::ratelimit::{NoopRateLimiter, SharedRateLimiter};
 use crate::cluster::{ConnRef, StoreError, SINGLE_REPLICA_ID};
 use crate::identity_store::{BindOutcome, IdentityError, IdentityStore, RegisterOutcome};
+use crate::voice_session::ReplyWaiters;
 use crate::AppState;
 
 /// A room code as it may appear in logs: the first 4 characters plus "…".
@@ -91,6 +96,59 @@ fn atem_envelope(atem_id: &str, connection_id: &str, text: &str) -> String {
     .to_string()
 }
 
+/// Cached room entries live this long even without an invalidation.
+const ROOM_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Above this many entries the cache is cleared rather than grown.
+const ROOM_CACHE_MAX: usize = 100_000;
+
+/// Directory entries of rooms this replica routes for. Invalidated by
+/// `room-changed`; the epoch keeps a read that raced an invalidation
+/// from being stored.
+#[derive(Default)]
+struct RoomCache {
+    epoch: AtomicU64,
+    entries: std::sync::Mutex<HashMap<String, (Instant, Option<RoomInfo>)>>,
+}
+
+impl RoomCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (Instant, Option<RoomInfo>)>> {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn get(&self, code: &str) -> Option<Option<RoomInfo>> {
+        self.lock()
+            .get(code)
+            .filter(|(stored, _)| stored.elapsed() < ROOM_CACHE_TTL)
+            .map(|(_, room)| room.clone())
+    }
+
+    fn put(&self, code: &str, room: Option<RoomInfo>, epoch: u64) {
+        let mut entries = self.lock();
+        if self.epoch.load(Ordering::SeqCst) != epoch {
+            return;
+        }
+        if entries.len() >= ROOM_CACHE_MAX {
+            entries.clear();
+        }
+        entries.insert(code.to_string(), (Instant::now(), room));
+    }
+
+    fn invalidate(&self, code: &str) {
+        let mut entries = self.lock();
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        entries.remove(code);
+    }
+
+    // Resubscribe only; Task 19 (connect_cluster) spawns the dispatcher.
+    #[allow(dead_code)]
+    fn clear(&self) {
+        let mut entries = self.lock();
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        entries.clear();
+    }
+}
+
 /// What a hub is built from: in-memory parts by default, Redis-backed
 /// parts when REDIS_URL is set.
 pub(crate) struct HubParts {
@@ -102,6 +160,8 @@ pub(crate) struct HubParts {
     pub rate_limiter: Arc<dyn SharedRateLimiter>,
     pub health: Arc<dyn ClusterHealth>,
     pub auth_timeout: Duration,
+    /// Cache routing lookups (Redis mode; one replica reads its own memory).
+    pub cache_rooms: bool,
 }
 
 impl HubParts {
@@ -118,6 +178,7 @@ impl HubParts {
             rate_limiter: Arc::new(NoopRateLimiter),
             health: Arc::new(SingleInstance),
             auth_timeout,
+            cache_rooms: false,
         }
     }
 }
@@ -131,6 +192,7 @@ struct HubInner {
     rate_limiter: Arc<dyn SharedRateLimiter>,
     health: Arc<dyn ClusterHealth>,
     auth_timeout: Duration,
+    room_cache: Option<RoomCache>,
 }
 
 /// The relay: this replica's sockets plus the shared room directory, the
@@ -164,6 +226,7 @@ impl RelayHub {
                 rate_limiter: parts.rate_limiter,
                 health: parts.health,
                 auth_timeout: parts.auth_timeout,
+                room_cache: parts.cache_rooms.then(RoomCache::default),
             }),
         }
     }
@@ -314,6 +377,7 @@ impl RelayHub {
 
     /// A room's directory entry changed: other replicas drop cached copies.
     pub(crate) async fn room_changed(&self, code: &str) {
+        self.invalidate_room(code);
         let message = BroadcastMessage::RoomChanged { code: code.to_string() };
         if let Err(error) = self.inner.bus.broadcast(message).await {
             tracing::debug!("Could not announce a change of room {}: {}", mask_code(code), error);
@@ -332,9 +396,18 @@ impl RelayHub {
         }
     }
 
-    /// The room as frame routing sees it.
+    /// The room as frame routing sees it: from the cache when enabled.
     async fn route_view(&self, code: &str) -> Result<Option<RoomInfo>, StoreError> {
-        self.inner.directory.get(code).await
+        let Some(cache) = &self.inner.room_cache else {
+            return self.inner.directory.get(code).await;
+        };
+        if let Some(hit) = cache.get(code) {
+            return Ok(hit);
+        }
+        let epoch = cache.epoch.load(Ordering::SeqCst);
+        let room = self.inner.directory.get(code).await?;
+        cache.put(code, room.clone(), epoch);
+        Ok(room)
     }
 
     /// The room, read fresh (HTTP endpoints, connect checks), without
@@ -349,17 +422,86 @@ impl RelayHub {
     }
 
     /// The current connection of `atem_id`, only if it is `connection_id`
-    /// (stale generations are dropped).
+    /// (stale generations are dropped). A cached miss is re-read once: the
+    /// Atem may have just reconnected on another replica.
     async fn find_atem(&self, code: &str, atem_id: &str, connection_id: &str) -> Option<ConnRef> {
+        let lookup = |room: Option<RoomInfo>| {
+            room.and_then(|room| room.atems.get(atem_id).cloned())
+                .filter(|current| current.conn == connection_id)
+        };
         match self.route_view(code).await {
-            Ok(room) => room
-                .and_then(|room| room.atems.get(atem_id).cloned())
-                .filter(|current| current.conn == connection_id),
+            Ok(room) => {
+                if let Some(found) = lookup(room) {
+                    return Some(found);
+                }
+            }
             Err(error) => {
                 tracing::debug!("Room lookup failed for {}: {}", mask_code(code), error);
-                None
+                return None;
             }
         }
+        // Without a cache the read above was already fresh.
+        self.inner.room_cache.as_ref()?;
+        self.invalidate_room(code);
+        self.route_view(code).await.ok().and_then(lookup)
+    }
+
+    pub(crate) fn invalidate_room(&self, code: &str) {
+        if let Some(cache) = &self.inner.room_cache {
+            cache.invalidate(code);
+        }
+    }
+
+    // Task 19 (connect_cluster) spawns the dispatcher; drop the allow then.
+    #[allow(dead_code)]
+    pub(crate) fn clear_room_cache(&self) {
+        if let Some(cache) = &self.inner.room_cache {
+            cache.clear();
+        }
+    }
+
+    /// Apply what other replicas publish to this one (Redis mode). Never
+    /// waits on a client or the identity store: socket sends are queued,
+    /// key re-reads run on their own tasks. Ends when `events` closes.
+    // Task 19 (connect_cluster) spawns it; drop the allow then.
+    #[allow(dead_code)]
+    pub(crate) fn spawn_bus_dispatcher(
+        &self,
+        identity: Arc<dyn IdentityStore>,
+        waiters: ReplyWaiters,
+        mut events: mpsc::UnboundedReceiver<BusEvent>,
+    ) -> JoinHandle<()> {
+        let hub = self.clone();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                match event {
+                    BusEvent::Inbox(message) => apply_inbox(hub.local(), message),
+                    BusEvent::Broadcast(BroadcastMessage::RoomChanged { code }) => {
+                        hub.invalidate_room(&code)
+                    }
+                    BusEvent::Broadcast(BroadcastMessage::KeyChanged { astation_id }) => {
+                        let (keys, identity) = (hub.keys().clone(), identity.clone());
+                        tokio::spawn(async move {
+                            keys.reload_one(identity.as_ref(), &astation_id).await;
+                        });
+                    }
+                    BusEvent::VoiceReply { session_id, reply } => {
+                        waiters.wake(&session_id, &reply);
+                    }
+                    BusEvent::Resubscribed => {
+                        // Anything published while we were away is lost:
+                        // drop cached rooms and re-read every key.
+                        hub.clear_room_cache();
+                        let (keys, identity) = (hub.keys().clone(), identity.clone());
+                        tokio::spawn(async move {
+                            if let Err(error) = keys.load(identity.as_ref()).await {
+                                tracing::warn!("Could not reload relay keys after resubscribing: {}", error);
+                            }
+                        });
+                    }
+                }
+            }
+        })
     }
 
     #[cfg(test)]
@@ -2254,6 +2396,171 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn cached_routing_follows_room_changed() {
+        let directory = InMemoryRoomDirectory::new();
+        let hub = RelayHub::from_parts(HubParts {
+            cache_rooms: true,
+            ..HubParts::single_instance(directory.clone(), TEST_AUTH_TIMEOUT)
+        });
+        let code = "astation-cache";
+        directory.claim_owner(code, &test_conn("owner-1"), now()).await.unwrap();
+        assert_eq!(
+            hub.route_view(code).await.unwrap().unwrap().owner,
+            Some(test_conn("owner-1"))
+        );
+        // Changed behind the hub's back (another replica): still cached …
+        directory.claim_owner(code, &test_conn("owner-2"), now()).await.unwrap();
+        assert_eq!(
+            hub.route_view(code).await.unwrap().unwrap().owner,
+            Some(test_conn("owner-1"))
+        );
+        // … until the room-changed announcement arrives.
+        hub.invalidate_room(code);
+        assert_eq!(
+            hub.route_view(code).await.unwrap().unwrap().owner,
+            Some(test_conn("owner-2"))
+        );
+        // A targeted frame for a connection the cache doesn't know re-reads once.
+        directory.join_atem(code, "atem-a", &test_conn("t-new")).await.unwrap();
+        assert_eq!(hub.find_atem(code, "atem-a", "t-new").await, Some(test_conn("t-new")));
+        assert_eq!(hub.find_atem(code, "atem-a", "t-stale").await, None);
+    }
+
+    #[tokio::test]
+    async fn bus_dispatcher_applies_every_event() {
+        use crate::cluster::bus::BusEvent;
+        let hub = RelayHub::from_parts(HubParts {
+            cache_rooms: true,
+            ..HubParts::single_instance(InMemoryRoomDirectory::new(), TEST_AUTH_TIMEOUT)
+        });
+        let identity = std::sync::Arc::new(InMemoryIdentityStore::new());
+        identity.register_key_if_absent("astation-k", "04AB", 1).await.unwrap();
+        let waiters = crate::voice_session::ReplyWaiters::default();
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = hub.spawn_bus_dispatcher(identity.clone(), waiters.clone(), events_rx);
+
+        let mut socket = hub.local().register("c1", "room", SocketRole::Astation);
+        events_tx
+            .send(BusEvent::Inbox(InboxMessage::Deliver {
+                connection_ids: vec!["c1".into()],
+                frame: "hi".into(),
+            }))
+            .unwrap();
+        assert_eq!(socket.frames.recv().await.as_deref(), Some("hi"));
+
+        let reply = waiters.register("voice-1");
+        events_tx
+            .send(BusEvent::VoiceReply { session_id: "voice-1".into(), reply: "answer".into() })
+            .unwrap();
+        assert_eq!(reply.await.unwrap(), "answer");
+
+        events_tx
+            .send(BusEvent::Broadcast(BusBroadcast::KeyChanged { astation_id: "astation-k".into() }))
+            .unwrap();
+        let mut learned = false;
+        for _ in 0..100 {
+            if hub.keys().contains("astation-k") {
+                learned = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(learned, "key-changed made the hub re-read the key");
+
+        drop(events_tx);
+        task.await.unwrap();
+    }
+
+    /// Poll until `check` holds (dispatcher work runs on spawned tasks).
+    async fn eventually(mut check: impl FnMut() -> bool) -> bool {
+        for _ in 0..100 {
+            if check() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn bus_dispatcher_room_changed_resubscribe_and_key_reset() {
+        use crate::cluster::bus::BusEvent;
+        let directory = InMemoryRoomDirectory::new();
+        let hub = RelayHub::from_parts(HubParts {
+            cache_rooms: true,
+            ..HubParts::single_instance(directory.clone(), TEST_AUTH_TIMEOUT)
+        });
+        let identity = std::sync::Arc::new(InMemoryIdentityStore::new());
+        let waiters = crate::voice_session::ReplyWaiters::default();
+        let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = hub.spawn_bus_dispatcher(identity.clone(), waiters, events_rx);
+        let owner = |hub: RelayHub, code: &'static str| async move {
+            hub.route_view(code).await.unwrap().unwrap().owner
+        };
+
+        // room-changed from another replica drops the cached entry; a
+        // second copy (or our own echo) is harmless.
+        directory.claim_owner("room-a", &test_conn("o1"), now()).await.unwrap();
+        assert_eq!(owner(hub.clone(), "room-a").await, Some(test_conn("o1")));
+        directory.claim_owner("room-a", &test_conn("o2"), now()).await.unwrap();
+        for _ in 0..2 {
+            events_tx
+                .send(BusEvent::Broadcast(BusBroadcast::RoomChanged { code: "room-a".into() }))
+                .unwrap();
+        }
+        let mut fresh = false;
+        for _ in 0..100 {
+            if owner(hub.clone(), "room-a").await == Some(test_conn("o2")) {
+                fresh = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(fresh, "room-changed invalidated the cached room");
+
+        // Our own room_changed invalidates locally before announcing.
+        directory.claim_owner("room-a", &test_conn("o3"), now()).await.unwrap();
+        hub.room_changed("room-a").await;
+        assert_eq!(owner(hub.clone(), "room-a").await, Some(test_conn("o3")));
+
+        // Resubscribed: every cached room is dropped and every key re-read.
+        directory.claim_owner("room-b", &test_conn("b1"), now()).await.unwrap();
+        assert_eq!(owner(hub.clone(), "room-b").await, Some(test_conn("b1")));
+        directory.claim_owner("room-a", &test_conn("o4"), now()).await.unwrap();
+        directory.claim_owner("room-b", &test_conn("b2"), now()).await.unwrap();
+        identity.register_key_if_absent("astation-r", "04CD", 1).await.unwrap();
+        hub.keys().set("astation-gone", "04ef");
+        events_tx.send(BusEvent::Resubscribed).unwrap();
+        let keys = hub.keys().clone();
+        assert!(
+            eventually(|| keys.contains("astation-r") && !keys.contains("astation-gone")).await,
+            "resubscribe reloaded the keys"
+        );
+        assert_eq!(owner(hub.clone(), "room-a").await, Some(test_conn("o4")));
+        assert_eq!(owner(hub.clone(), "room-b").await, Some(test_conn("b2")));
+
+        // key-changed for a key deleted elsewhere forgets it.
+        identity.delete_key("astation-r").await;
+        events_tx
+            .send(BusEvent::Broadcast(BusBroadcast::KeyChanged { astation_id: "astation-r".into() }))
+            .unwrap();
+        assert!(eventually(|| !keys.contains("astation-r")).await, "key-changed forgot the key");
+
+        drop(events_tx);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn without_cache_routing_reads_the_directory() {
+        let directory = InMemoryRoomDirectory::new();
+        let hub = RelayHub::in_memory(directory.clone(), TEST_AUTH_TIMEOUT);
+        directory.claim_owner("room-n", &test_conn("o1"), now()).await.unwrap();
+        assert_eq!(hub.route_view("room-n").await.unwrap().unwrap().owner, Some(test_conn("o1")));
+        directory.claim_owner("room-n", &test_conn("o2"), now()).await.unwrap();
+        assert_eq!(hub.route_view("room-n").await.unwrap().unwrap().owner, Some(test_conn("o2")));
     }
 
     // --- Integration tests (HTTP endpoint tests) ---
