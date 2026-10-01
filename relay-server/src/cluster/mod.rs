@@ -3,7 +3,6 @@
 //! trait with an in-memory version (tests, single instance, local dev) and
 //! a Redis version (production, `REDIS_URL`).
 
-
 pub mod bus;
 pub mod directory;
 pub mod health;

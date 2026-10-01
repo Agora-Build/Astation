@@ -81,7 +81,7 @@ pub async fn main(args: &[String]) -> i32 {
         },
         None => None,
     };
-        match forget_key(&identity, bus.as_ref().map(|bus| bus as &dyn ReplicaBus), &astation_id).await {
+    match forget_key(&identity, bus.as_ref().map(|bus| bus as &dyn ReplicaBus), &astation_id).await {
         Ok(outcome) => {
             if outcome.deleted {
                 println!("Deleted the relay key of {astation_id}.");
