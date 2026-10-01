@@ -10,7 +10,7 @@
 //!   docker rm -f relay-test-valkey
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,6 +39,8 @@ use crate::AppState;
 struct CutProxy {
     port: u16,
     cut: Arc<AtomicBool>,
+    /// Connections dropped because the proxy was cut.
+    refused: Arc<AtomicUsize>,
     links: Arc<Mutex<Vec<JoinHandle<()>>>>,
     accept: JoinHandle<()>,
 }
@@ -48,12 +50,14 @@ impl CutProxy {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let cut = Arc::new(AtomicBool::new(false));
+        let refused = Arc::new(AtomicUsize::new(0));
         let links: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::default();
         let accept = tokio::spawn({
-            let (cut, links) = (cut.clone(), links.clone());
+            let (cut, refused, links) = (cut.clone(), refused.clone(), links.clone());
             async move {
                 while let Ok((mut inbound, _)) = listener.accept().await {
                     if cut.load(Ordering::SeqCst) {
+                        refused.fetch_add(1, Ordering::SeqCst);
                         continue; // dropped: the connection is refused
                     }
                     let link = tokio::spawn(async move {
@@ -65,7 +69,7 @@ impl CutProxy {
                 }
             }
         });
-        Self { port, cut, links, accept }
+        Self { port, cut, refused, links, accept }
     }
 
     fn url(&self) -> String {
@@ -77,6 +81,11 @@ impl CutProxy {
         for link in self.links.lock().unwrap().drain(..) {
             link.abort();
         }
+    }
+
+    /// How many connections were dropped while cut.
+    fn refused(&self) -> usize {
+        self.refused.load(Ordering::SeqCst)
     }
 
     /// Redis is back: new connections pass again (cut links stay cut).
@@ -685,8 +694,10 @@ async fn cut_proxy_refuses_while_cut_and_passes_again_after_restore() {
     let mut buf = [0u8; 4];
     held.read_exact(&mut buf).await.unwrap();
 
+    assert_eq!(proxy.refused(), 0);
     proxy.cut();
     assert!(!round_trip(proxy.port).await, "refused while cut");
+    assert_eq!(proxy.refused(), 1);
     let mut rest = Vec::new();
     let dropped = tokio::time::timeout(Duration::from_secs(5), held.read_to_end(&mut rest)).await;
     assert!(dropped.is_ok(), "the open link is dropped by the cut");
@@ -694,7 +705,9 @@ async fn cut_proxy_refuses_while_cut_and_passes_again_after_restore() {
     proxy.restore();
     assert!(round_trip(proxy.port).await, "passes again after restore");
     proxy.cut();
+    assert_eq!(proxy.refused(), 1, "passing connections are not counted");
     assert!(!round_trip(proxy.port).await, "can be cut again");
+    assert_eq!(proxy.refused(), 2);
     server.abort();
 }
 
@@ -730,6 +743,73 @@ async fn redis_a_crashed_replica_is_recovered_by_reconnecting_clients() {
     assert_eq!(pair["paired"], true);
 }
 
+/// The next frame that is not a relay_event.
+async fn next_frame(socket: &mut TestSocket) -> serde_json::Value {
+    loop {
+        let frame = next_client_json(socket).await;
+        if frame.get("relay_event").is_none() {
+            return frame;
+        }
+    }
+}
+
+/// An Atem on the crashed replica reconnects to the healthy one with the
+/// same atem_id: its new connection replaces the entry the dead replica
+/// left behind, and only the new connection is routed to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn redis_an_atem_from_a_crashed_replica_reconnects_and_replaces_its_entry() {
+    let _guard = REDIS_LOCK.lock().await;
+    let (_shared, one, two) = two_replicas().await;
+    let code = "astation-crash-atem";
+    let key = TestKey::generate();
+    let mut astation = verified_astation(&two.ws, code, &key, "registered").await;
+    let mut atem = connect_atem(&one.ws, code, "atem-a").await;
+    let connected = next_client_json(&mut astation).await;
+    assert_eq!(connected["relay_event"], "connected");
+    assert_eq!(connected["atem_id"], "atem-a");
+    let old_id = connected["connection_id"].as_str().unwrap().to_string();
+
+    one.crash();
+    wait_closed(&mut atem).await;
+
+    let mut atem = connect_atem(&two.ws, code, "atem-a").await;
+    let new_id = loop {
+        let event = next_client_json(&mut astation).await;
+        if event["relay_event"] == "connected" {
+            assert_eq!(event["atem_id"], "atem-a");
+            let id = event["connection_id"].as_str().unwrap().to_string();
+            assert_ne!(id, old_id, "a connected event for the dead connection");
+            break id;
+        }
+    };
+
+    send_json(&mut atem, serde_json::json!({"probe": "after-crash"})).await;
+    let frame = next_frame(&mut astation).await;
+    assert_eq!(frame["atem_id"], "atem-a");
+    assert_eq!(frame["connection_id"], new_id.as_str());
+    assert_eq!(frame["payload"]["probe"], "after-crash");
+
+    // The dead connection's id is not routed to; the new one is.
+    send_json(
+        &mut astation,
+        serde_json::json!({"atem_id": "atem-a", "connection_id": old_id, "payload": {"probe": "stale"}}),
+    )
+    .await;
+    assert_silent(&mut atem, 150).await;
+    send_json(
+        &mut astation,
+        serde_json::json!({"atem_id": "atem-a", "connection_id": new_id, "payload": {"probe": "to-atem"}}),
+    )
+    .await;
+    assert_eq!(next_client_json(&mut atem).await["probe"], "to-atem");
+
+    let room = two.state.relay.room(code).await.unwrap().expect("room");
+    let entry = room.atems.get("atem-a").expect("atem-a's entry");
+    assert_eq!(entry.conn, new_id, "the entry names the new connection");
+    assert_eq!(entry.replica, two.id());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn redis_down_means_503s_but_vault_and_memory_keep_working() {
@@ -740,14 +820,21 @@ async fn redis_down_means_503s_but_vault_and_memory_keep_working() {
 
     one.proxy.cut();
 
-    for (method, uri, body) in [
-        ("POST", "/api/pair", r#"{"hostname":"h"}"#),
-        ("POST", "/api/sessions", r#"{"hostname":"h"}"#),
-        ("POST", "/api/rtc-sessions", r#"{"app_id":"a","channel":"c","token":"t","host_uid":1}"#),
-        ("POST", "/api/voice-sessions", r#"{"atem_id":"a","channel":"c"}"#),
+    for (method, uri, body, error) in [
+        ("POST", "/api/pair", r#"{"hostname":"h"}"#, serde_json::json!({"error": "relay state unavailable"})),
+        ("POST", "/api/sessions", r#"{"hostname":"h"}"#, serde_json::json!({"error": "Temporarily unavailable"})),
+        (
+            "POST",
+            "/api/rtc-sessions",
+            r#"{"app_id":"a","channel":"c","token":"t","host_uid":1}"#,
+            serde_json::json!({"error": "Temporarily unavailable"}),
+        ),
+        // The voice routes answer with a bare status, no body.
+        ("POST", "/api/voice-sessions", r#"{"atem_id":"a","channel":"c"}"#, serde_json::Value::Null),
     ] {
-        let (status, _) = http(&one.state, method, uri, body, &[]).await;
+        let (status, response) = http(&one.state, method, uri, body, &[]).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{method} {uri}");
+        assert_eq!(response, error, "{method} {uri}");
     }
     let (status, health) = http(&one.state, "GET", "/health", "", &[]).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -761,8 +848,30 @@ async fn redis_down_means_503s_but_vault_and_memory_keep_working() {
     let auth = [("authorization", "session sess-down")];
     let (status, _) = http(&one.state, "POST", "/api/vault?id=atem-a", r#"{"summary":"x"}"#, &auth).await;
     assert_eq!(status, StatusCode::OK);
-    let (status, _) = http(&one.state, "GET", "/api/memory?id=atem-a", "", &auth).await;
+    let memory = serde_json::json!({
+        "id": "mem-down",
+        "scope": "global",
+        "project": "",
+        "machine": "",
+        "content": "written while Redis was down",
+        "content_hash": "h:down",
+        "confidence": "high",
+        "source_agent": "claude",
+        "source_machine": "m1",
+        "created_at": 1_700_000_000,
+        "deleted": false,
+        "seq": 0,
+    });
+    let batch = serde_json::json!({"ops": [{"op": "add", "memory": memory}]}).to_string();
+    let (status, added) = http(&one.state, "POST", "/api/memory/batch?id=atem-a", &batch, &auth).await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+    assert_eq!(added["results"][0]["ok"], true, "{added}");
+    let (status, pulled) = http(&one.state, "GET", "/api/memory?id=atem-a", "", &auth).await;
     assert_eq!(status, StatusCode::OK);
+    let memories = pulled["memories"].as_array().unwrap();
+    assert_eq!(memories.len(), 1, "{pulled}");
+    assert_eq!(memories[0]["id"], "mem-down");
+    assert_eq!(memories[0]["content"], "written while Redis was down");
 
     // The other replica is unaffected.
     let (status, health) = http(&two.state, "GET", "/health", "", &[]).await;
@@ -827,9 +936,11 @@ async fn redis_outage_closes_with_1013_and_the_replica_recovers_when_redis_retur
     assert_eq!(refused_status(format!("{}?role=atem&code={code}&atem_id=atem-a", one.ws)).await, 503);
 
     // Keep Redis away until replica one's bus has lost its subscription
-    // and failed to resubscribe a few times (backoff 0.1 s, 0.2 s, 0.4 s).
+    // and failed to resubscribe a few times (backoff 0.1 s, 0.2 s, 0.4 s):
+    // four more refused connections, a margin for the heartbeat's reconnects.
     eventually_async("replica one's bus lost Redis", || async { inbox_subscribers(&one).await == 0 }).await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let base = one.proxy.refused();
+    eventually_async("replica one retried Redis", || async { one.proxy.refused() >= base + 4 }).await;
 
     one.proxy.restore();
     eventually_async("/health recovers", || async {
