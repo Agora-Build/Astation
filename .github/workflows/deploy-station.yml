@@ -58,7 +58,7 @@ jobs:
     name: Deploy and verify production
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -70,7 +70,8 @@ jobs:
           COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
         run: node .github/scripts/deploy-coolify.mjs
       # relay-b keeps serving while relay-a restarts; wait until relay-a is
-      # back (the live replica count recovers) before touching relay-b.
+      # healthy again before touching relay-b. With STATION_MIN_REPLICAS=2
+      # this also waits until both replicas are live again.
       # STATION_MIN_REPLICAS / STATION_REQUIRE_REDIS are opt-in: unset repo
       # variables mean "not checked", so a single relay without Redis passes.
       - name: Wait for relay health after relay-a

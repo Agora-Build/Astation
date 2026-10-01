@@ -58,7 +58,7 @@ export async function waitForHealth({
         ? healthProblems(health, { minReplicas, requireRedis })
         : [`/health returned HTTP ${status}`];
       if (problems.length === 0) {
-        log(`Relay healthy: redis ${health.redis}, ${health.replicas} live replica(s)`);
+        log(`Relay healthy: redis ${health.redis ?? 'n/a'}, ${health.replicas ?? 'n/a'} live replica(s)`);
         return health;
       }
       last = problems.join('; ');
