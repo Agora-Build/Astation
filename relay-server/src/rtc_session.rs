@@ -160,11 +160,7 @@ fn derive_session_base_url(headers: &HeaderMap, configured_base: Option<&str>) -
         }
     }
 
-    let inferred_proto = if local_hostname(&host) {
-        "http"
-    } else {
-        "https"
-    };
+    let inferred_proto = if local_hostname(&host) { "http" } else { "https" };
     let proto = forwarded_proto
         .or_else(|| first_csv_header_value(headers, "x-forwarded-proto"))
         .and_then(|value| normalize_proto(&value).map(str::to_string))
@@ -262,12 +258,7 @@ pub trait RtcBackend: Send + Sync {
     async fn get(&self, id: &str) -> Result<Option<RtcSession>, StoreError>;
     /// Take the next uid and add a participant, atomically, unless the
     /// session already has MAX_RTC_PARTICIPANTS.
-    async fn join(
-        &self,
-        id: &str,
-        name: String,
-        now: DateTime<Utc>,
-    ) -> Result<JoinOutcome, StoreError>;
+    async fn join(&self, id: &str, name: String, now: DateTime<Utc>) -> Result<JoinOutcome, StoreError>;
     async fn delete(&self, id: &str) -> Result<bool, StoreError>;
     async fn cleanup_expired(&self, now: DateTime<Utc>) -> Result<(), StoreError>;
 }
@@ -294,12 +285,7 @@ impl RtcBackend for InMemoryRtcBackend {
         Ok(self.lock().get(id).cloned())
     }
 
-    async fn join(
-        &self,
-        id: &str,
-        name: String,
-        now: DateTime<Utc>,
-    ) -> Result<JoinOutcome, StoreError> {
+    async fn join(&self, id: &str, name: String, now: DateTime<Utc>) -> Result<JoinOutcome, StoreError> {
         let mut sessions = self.lock();
         let Some(session) = sessions.get_mut(id) else {
             return Ok(JoinOutcome::NotFound);
@@ -437,9 +423,7 @@ fn rtc_unavailable(error: StoreError) -> (StatusCode, Json<RtcSessionError>) {
     tracing::error!("RTC session store unavailable: {}", error);
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(RtcSessionError {
-            error: "Temporarily unavailable".to_string(),
-        }),
+        Json(RtcSessionError { error: "Temporarily unavailable".to_string() }),
     )
 }
 
@@ -466,22 +450,10 @@ pub async fn create_rtc_session_handler(
     let id = Uuid::new_v4().to_string();
 
     // Log all relevant headers for debugging
-    let host_header = headers
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("(none)");
-    let x_fwd_host = headers
-        .get("x-forwarded-host")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("(none)");
-    let x_fwd_port = headers
-        .get("x-forwarded-port")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("(none)");
-    let x_fwd_proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("(none)");
+    let host_header = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or("(none)");
+    let x_fwd_host = headers.get("x-forwarded-host").and_then(|h| h.to_str().ok()).unwrap_or("(none)");
+    let x_fwd_port = headers.get("x-forwarded-port").and_then(|h| h.to_str().ok()).unwrap_or("(none)");
+    let x_fwd_proto = headers.get("x-forwarded-proto").and_then(|h| h.to_str().ok()).unwrap_or("(none)");
 
     tracing::info!(
         "Creating RTC session - Headers: Host={}, X-Forwarded-Host={}, X-Forwarded-Port={}, X-Forwarded-Proto={}",
@@ -499,13 +471,7 @@ pub async fn create_rtc_session_handler(
 
     if let Err(error) = state
         .rtc_sessions
-        .create(
-            id.clone(),
-            body.app_id,
-            body.channel,
-            body.token,
-            body.host_uid,
-        )
+        .create(id.clone(), body.app_id, body.channel, body.token, body.host_uid)
         .await
     {
         return rtc_unavailable(error).into_response();
@@ -581,15 +547,15 @@ pub async fn delete_rtc_session_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::relay::RelayHub;
-    use crate::session_store::SessionStore;
-    use crate::voice_session::VoiceSessionStore;
     use axum::{
         body::Body,
         http::{HeaderMap, HeaderValue, Request, StatusCode},
         routing::{delete, get, post},
         Router,
     };
+    use crate::relay::RelayHub;
+    use crate::session_store::SessionStore;
+    use crate::voice_session::VoiceSessionStore;
     use tower::ServiceExt;
 
     fn create_test_app() -> Router {
@@ -605,8 +571,14 @@ mod tests {
         Router::new()
             .route("/api/rtc-sessions", post(create_rtc_session_handler))
             .route("/api/rtc-sessions/:id", get(get_rtc_session_handler))
-            .route("/api/rtc-sessions/:id/join", post(join_rtc_session_handler))
-            .route("/api/rtc-sessions/:id", delete(delete_rtc_session_handler))
+            .route(
+                "/api/rtc-sessions/:id/join",
+                post(join_rtc_session_handler),
+            )
+            .route(
+                "/api/rtc-sessions/:id",
+                delete(delete_rtc_session_handler),
+            )
             .with_state(state)
     }
 
@@ -623,8 +595,7 @@ mod tests {
                 "token-abc".into(),
                 5678,
             )
-            .await
-            .unwrap();
+            .await.unwrap();
 
         assert_eq!(session.id, "test-id");
         assert_eq!(session.app_id, "app123");
@@ -651,8 +622,7 @@ mod tests {
         let store = RtcSessionStore::new();
         store
             .create("del-me".into(), "app".into(), "ch".into(), "tok".into(), 1)
-            .await
-            .unwrap();
+            .await.unwrap();
         assert!(store.get("del-me").await.unwrap().is_some());
         assert!(store.delete("del-me").await.unwrap());
         assert!(store.get("del-me").await.unwrap().is_none());
@@ -662,15 +632,8 @@ mod tests {
     async fn test_join_assigns_unique_uids() {
         let store = RtcSessionStore::new();
         store
-            .create(
-                "join-test".into(),
-                "app".into(),
-                "ch".into(),
-                "tok".into(),
-                1,
-            )
-            .await
-            .unwrap();
+            .create("join-test".into(), "app".into(), "ch".into(), "tok".into(), 1)
+            .await.unwrap();
 
         let r1 = store.join("join-test", "Alice".into()).await.unwrap();
         let r2 = store.join("join-test", "Bob".into()).await.unwrap();
@@ -691,15 +654,8 @@ mod tests {
     async fn test_join_returns_correct_session_info() {
         let store = RtcSessionStore::new();
         store
-            .create(
-                "info-test".into(),
-                "my-app".into(),
-                "room1".into(),
-                "secret-token".into(),
-                42,
-            )
-            .await
-            .unwrap();
+            .create("info-test".into(), "my-app".into(), "room1".into(), "secret-token".into(), 42)
+            .await.unwrap();
 
         let resp = store.join("info-test", "Dave".into()).await.unwrap();
         assert_eq!(resp.app_id, "my-app");
@@ -712,15 +668,8 @@ mod tests {
     async fn test_join_records_participant_name() {
         let store = RtcSessionStore::new();
         store
-            .create(
-                "part-test".into(),
-                "app".into(),
-                "ch".into(),
-                "tok".into(),
-                1,
-            )
-            .await
-            .unwrap();
+            .create("part-test".into(), "app".into(), "ch".into(), "tok".into(), 1)
+            .await.unwrap();
 
         let _ = store.join("part-test", "Alice".into()).await;
 
@@ -772,12 +721,7 @@ mod tests {
         async fn get(&self, _: &str) -> Result<Option<RtcSession>, StoreError> {
             Err(StoreError::Unavailable("secret-host:6379".into()))
         }
-        async fn join(
-            &self,
-            _: &str,
-            _: String,
-            _: DateTime<Utc>,
-        ) -> Result<JoinOutcome, StoreError> {
+        async fn join(&self, _: &str, _: String, _: DateTime<Utc>) -> Result<JoinOutcome, StoreError> {
             Err(StoreError::Unavailable("secret-host:6379".into()))
         }
         async fn delete(&self, _: &str) -> Result<bool, StoreError> {
@@ -798,22 +742,10 @@ mod tests {
 
     #[tokio::test]
     async fn join_handler_maps_an_unavailable_store_to_503() {
-        assert_eq!(
-            join_error_status("Temporarily unavailable"),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        assert_eq!(
-            join_error_status("Session not found"),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            join_error_status("Session is full (maximum 8 participants)"),
-            StatusCode::CONFLICT
-        );
-        assert_eq!(
-            join_error_status("anything else"),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
+        assert_eq!(join_error_status("Temporarily unavailable"), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(join_error_status("Session not found"), StatusCode::NOT_FOUND);
+        assert_eq!(join_error_status("Session is full (maximum 8 participants)"), StatusCode::CONFLICT);
+        assert_eq!(join_error_status("anything else"), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
@@ -821,8 +753,7 @@ mod tests {
         let store = RtcSessionStore::new();
         store
             .create("keep-me".into(), "a".into(), "c".into(), "t".into(), 1)
-            .await
-            .unwrap();
+            .await.unwrap();
 
         store.cleanup_expired().await.unwrap();
 
@@ -834,8 +765,7 @@ mod tests {
         let store = RtcSessionStore::new();
         store
             .create("uid-test".into(), "a".into(), "c".into(), "t".into(), 1)
-            .await
-            .unwrap();
+            .await.unwrap();
 
         let resp = store.join("uid-test", "First".into()).await.unwrap();
         assert_eq!(resp.uid, 1000);
@@ -846,8 +776,7 @@ mod tests {
         let store = RtcSessionStore::new();
         store
             .create("concurrent".into(), "a".into(), "c".into(), "t".into(), 1)
-            .await
-            .unwrap();
+            .await.unwrap();
 
         let mut handles = Vec::new();
         for i in 0..10 {
@@ -880,8 +809,7 @@ mod tests {
         let store = RtcSessionStore::new();
         store
             .create("full-test".into(), "a".into(), "c".into(), "t".into(), 1)
-            .await
-            .unwrap();
+            .await.unwrap();
 
         // Join 8 people successfully
         for i in 0..8 {
@@ -994,13 +922,7 @@ mod tests {
         };
         state
             .rtc_sessions
-            .create(
-                "get-test".into(),
-                "app1".into(),
-                "room1".into(),
-                "tok".into(),
-                99,
-            )
+            .create("get-test".into(), "app1".into(), "room1".into(), "tok".into(), 99)
             .await
             .unwrap();
 
@@ -1058,18 +980,15 @@ mod tests {
         };
         state
             .rtc_sessions
-            .create(
-                "join-h".into(),
-                "app1".into(),
-                "room1".into(),
-                "tok1".into(),
-                42,
-            )
+            .create("join-h".into(), "app1".into(), "room1".into(), "tok1".into(), 42)
             .await
             .unwrap();
 
         let app = Router::new()
-            .route("/api/rtc-sessions/:id/join", post(join_rtc_session_handler))
+            .route(
+                "/api/rtc-sessions/:id/join",
+                post(join_rtc_session_handler),
+            )
             .with_state(state);
 
         let response = app
@@ -1133,7 +1052,10 @@ mod tests {
             .unwrap();
 
         let app = Router::new()
-            .route("/api/rtc-sessions/:id", delete(delete_rtc_session_handler))
+            .route(
+                "/api/rtc-sessions/:id",
+                delete(delete_rtc_session_handler),
+            )
             .with_state(state);
 
         let response = app
@@ -1182,8 +1104,14 @@ mod tests {
         let app = Router::new()
             .route("/api/rtc-sessions", post(create_rtc_session_handler))
             .route("/api/rtc-sessions/:id", get(get_rtc_session_handler))
-            .route("/api/rtc-sessions/:id/join", post(join_rtc_session_handler))
-            .route("/api/rtc-sessions/:id", delete(delete_rtc_session_handler))
+            .route(
+                "/api/rtc-sessions/:id/join",
+                post(join_rtc_session_handler),
+            )
+            .route(
+                "/api/rtc-sessions/:id",
+                delete(delete_rtc_session_handler),
+            )
             .with_state(state);
 
         // Step 1: Create
@@ -1301,27 +1229,20 @@ mod tests {
         };
         state
             .rtc_sessions
-            .create(
-                "full-h".into(),
-                "app1".into(),
-                "room1".into(),
-                "tok1".into(),
-                42,
-            )
+            .create("full-h".into(), "app1".into(), "room1".into(), "tok1".into(), 42)
             .await
             .unwrap();
 
         // Fill session to capacity (8 participants)
         for i in 0..8 {
-            state
-                .rtc_sessions
-                .join("full-h", format!("User{}", i))
-                .await
-                .unwrap();
+            state.rtc_sessions.join("full-h", format!("User{}", i)).await.unwrap();
         }
 
         let app = Router::new()
-            .route("/api/rtc-sessions/:id/join", post(join_rtc_session_handler))
+            .route(
+                "/api/rtc-sessions/:id/join",
+                post(join_rtc_session_handler),
+            )
             .with_state(state);
 
         // 9th person should get 409 Conflict
@@ -1350,8 +1271,7 @@ mod tests {
         let store = RtcSessionStore::new();
         store
             .create("race-test".into(), "a".into(), "c".into(), "t".into(), 1)
-            .await
-            .unwrap();
+            .await.unwrap();
 
         // Spawn concurrent operations: cleanup and join
         let store1 = store.clone();
@@ -1360,17 +1280,15 @@ mod tests {
         });
 
         let store2 = store.clone();
-        let join_task =
-            tokio::spawn(async move { store2.join("race-test", "RaceUser".into()).await });
+        let join_task = tokio::spawn(async move {
+            store2.join("race-test", "RaceUser".into()).await
+        });
 
         let _ = tokio::join!(cleanup_task, join_task);
 
         // Session should still exist and have at least one participant
         let session = store.get("race-test").await.unwrap();
-        assert!(
-            session.is_some(),
-            "Session should not be cleaned up while active"
-        );
+        assert!(session.is_some(), "Session should not be cleaned up while active");
     }
 
     #[tokio::test]
@@ -1399,25 +1317,15 @@ mod tests {
 
         assert!(resp.url.contains("/session/"));
         assert!(resp.url.contains(&resp.id));
-        assert!(
-            uuid::Uuid::parse_str(&resp.id).is_ok(),
-            "Session ID should be valid UUID"
-        );
+        assert!(uuid::Uuid::parse_str(&resp.id).is_ok(), "Session ID should be valid UUID");
     }
 
     #[tokio::test]
     async fn test_participant_names_persistence() {
         let store = RtcSessionStore::new();
         store
-            .create(
-                "name-test".into(),
-                "app".into(),
-                "ch".into(),
-                "tok".into(),
-                1,
-            )
-            .await
-            .unwrap();
+            .create("name-test".into(), "app".into(), "ch".into(), "tok".into(), 1)
+            .await.unwrap();
 
         // Join multiple users
         store.join("name-test", "Alice".into()).await.unwrap();
@@ -1427,9 +1335,7 @@ mod tests {
         let session = store.get("name-test").await.unwrap().unwrap();
         assert_eq!(session.participants.len(), 3);
 
-        let names: Vec<String> = session
-            .participants
-            .iter()
+        let names: Vec<String> = session.participants.iter()
             .filter_map(|p| p.display_name.clone())
             .collect();
         assert_eq!(names, vec!["Alice", "Bob", "Charlie"]);
@@ -1439,15 +1345,8 @@ mod tests {
     async fn test_delete_session_with_participants() {
         let store = RtcSessionStore::new();
         store
-            .create(
-                "del-part".into(),
-                "app".into(),
-                "ch".into(),
-                "tok".into(),
-                1,
-            )
-            .await
-            .unwrap();
+            .create("del-part".into(), "app".into(), "ch".into(), "tok".into(), 1)
+            .await.unwrap();
 
         // Add participants
         store.join("del-part", "User1".into()).await.unwrap();
@@ -1464,25 +1363,12 @@ mod tests {
 
         // Create session (not expired)
         store
-            .create(
-                "active-with-parts".into(),
-                "a".into(),
-                "c".into(),
-                "t".into(),
-                1,
-            )
-            .await
-            .unwrap();
+            .create("active-with-parts".into(), "a".into(), "c".into(), "t".into(), 1)
+            .await.unwrap();
 
         // Add participants
-        store
-            .join("active-with-parts", "User1".into())
-            .await
-            .unwrap();
-        store
-            .join("active-with-parts", "User2".into())
-            .await
-            .unwrap();
+        store.join("active-with-parts", "User1".into()).await.unwrap();
+        store.join("active-with-parts", "User2".into()).await.unwrap();
 
         store.cleanup_expired().await.unwrap();
 

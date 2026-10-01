@@ -113,9 +113,7 @@ pub trait IdentityStore: Send + Sync {
     /// Admin reset: delete the registered key (bindings are kept). Returns
     /// whether a key was deleted. Stores that can't delete keep the default.
     async fn delete_key(&self, _astation_id: &str) -> Result<bool, IdentityError> {
-        Err(IdentityError::Db(
-            "this identity store cannot delete keys".to_string(),
-        ))
+        Err(IdentityError::Db("this identity store cannot delete keys".to_string()))
     }
 
     /// Bind `session_id` to `astation_id` (or refresh `last_used_at` if this

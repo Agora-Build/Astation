@@ -239,9 +239,7 @@ fn room_info(
         verified: field("verified") == "1",
         atems: atems
             .iter()
-            .filter_map(|(atem_id, value)| {
-                ConnRef::decode(value).map(|conn| (atem_id.clone(), conn))
-            })
+            .filter_map(|(atem_id, value)| ConnRef::decode(value).map(|conn| (atem_id.clone(), conn)))
             .collect(),
         pending,
     }
@@ -283,11 +281,7 @@ impl RedisRoomDirectory {
     where
         T: redis::FromRedisValue + Send,
     {
-        let (room, atems, pending) = (
-            keys::room(code),
-            keys::room_atems(code),
-            keys::room_pending(code),
-        );
+        let (room, atems, pending) = (keys::room(code), keys::room_atems(code), keys::room_pending(code));
         self.conn
             .run(|mut c| async move {
                 let mut invocation = script.prepare_invoke();
@@ -312,11 +306,7 @@ impl RoomDirectory for RedisRoomDirectory {
             .eval(
                 &self.create_room,
                 code,
-                vec![
-                    hostname.to_string(),
-                    now.to_string(),
-                    ROOM_EXPIRY_SECS.to_string(),
-                ],
+                vec![hostname.to_string(), now.to_string(), ROOM_EXPIRY_SECS.to_string()],
             )
             .await?;
         Ok(())
@@ -327,22 +317,15 @@ impl RoomDirectory for RedisRoomDirectory {
             .eval(
                 &self.ensure_room,
                 code,
-                vec![
-                    hostname.to_string(),
-                    now.to_string(),
-                    ROOM_EXPIRY_SECS.to_string(),
-                ],
+                vec![hostname.to_string(), now.to_string(), ROOM_EXPIRY_SECS.to_string()],
             )
             .await?;
         Ok(created == "1")
     }
 
     async fn get(&self, code: &str) -> Result<Option<RoomInfo>, StoreError> {
-        let (room_key, atems_key, pending_key) = (
-            keys::room(code),
-            keys::room_atems(code),
-            keys::room_pending(code),
-        );
+        let (room_key, atems_key, pending_key) =
+            (keys::room(code), keys::room_atems(code), keys::room_pending(code));
         let (room, atems, pending): (
             HashMap<String, String>,
             HashMap<String, String>,
@@ -365,18 +348,9 @@ impl RoomDirectory for RedisRoomDirectory {
         Ok(Some(room_info(&room, &atems, &pending)))
     }
 
-    async fn join_atem(
-        &self,
-        code: &str,
-        atem_id: &str,
-        conn: &ConnRef,
-    ) -> Result<AtemJoin, StoreError> {
+    async fn join_atem(&self, code: &str, atem_id: &str, conn: &ConnRef) -> Result<AtemJoin, StoreError> {
         let out: Vec<String> = self
-            .eval(
-                &self.join_atem,
-                code,
-                vec![atem_id.to_string(), conn.encode()],
-            )
+            .eval(&self.join_atem, code, vec![atem_id.to_string(), conn.encode()])
             .await?;
         if at(&out, 0) != "1" {
             return Ok(AtemJoin::NoRoom);
@@ -387,12 +361,7 @@ impl RoomDirectory for RedisRoomDirectory {
         })
     }
 
-    async fn claim_owner(
-        &self,
-        code: &str,
-        conn: &ConnRef,
-        now: i64,
-    ) -> Result<OwnerClaim, StoreError> {
+    async fn claim_owner(&self, code: &str, conn: &ConnRef, now: i64) -> Result<OwnerClaim, StoreError> {
         let out: Vec<String> = self
             .eval(
                 &self.claim_owner,
@@ -412,13 +381,7 @@ impl RoomDirectory for RedisRoomDirectory {
         })
     }
 
-    async fn add_pending(
-        &self,
-        code: &str,
-        conn: &ConnRef,
-        now: i64,
-        max_pending: usize,
-    ) -> Result<bool, StoreError> {
+    async fn add_pending(&self, code: &str, conn: &ConnRef, now: i64, max_pending: usize) -> Result<bool, StoreError> {
         let admitted: String = self
             .eval(
                 &self.add_pending,
@@ -436,12 +399,7 @@ impl RoomDirectory for RedisRoomDirectory {
         Ok(admitted == "1")
     }
 
-    async fn promote(
-        &self,
-        code: &str,
-        conn: &ConnRef,
-        was_pending: bool,
-    ) -> Result<Promotion, StoreError> {
+    async fn promote(&self, code: &str, conn: &ConnRef, was_pending: bool) -> Result<Promotion, StoreError> {
         let out: Vec<String> = self
             .eval(
                 &self.promote,
@@ -468,12 +426,7 @@ impl RoomDirectory for RedisRoomDirectory {
         })
     }
 
-    async fn leave_atem(
-        &self,
-        code: &str,
-        atem_id: &str,
-        connection_id: &str,
-    ) -> Result<AtemLeave, StoreError> {
+    async fn leave_atem(&self, code: &str, atem_id: &str, connection_id: &str) -> Result<AtemLeave, StoreError> {
         let out: Vec<String> = self
             .eval(
                 &self.leave_atem,
@@ -597,20 +550,10 @@ mod tests {
             let _guard = REDIS_LOCK.lock().await;
             let conn = fresh_conn().await;
             let d = RedisRoomDirectory::new(conn.clone());
-            d.create_room("ROOM-K", "host", 1_700_000_000)
-                .await
-                .unwrap();
-            d.join_atem("ROOM-K", "atem-a", &ConnRef::new("t1", "r1"))
-                .await
-                .unwrap();
-            d.add_pending("ROOM-K", &ConnRef::new("p1", "r2"), 1_700_000_000, 0)
-                .await
-                .unwrap();
-            let (room, atems, pending): (
-                HashMap<String, String>,
-                HashMap<String, String>,
-                HashMap<String, String>,
-            ) = conn
+            d.create_room("ROOM-K", "host", 1_700_000_000).await.unwrap();
+            d.join_atem("ROOM-K", "atem-a", &ConnRef::new("t1", "r1")).await.unwrap();
+            d.add_pending("ROOM-K", &ConnRef::new("p1", "r2"), 1_700_000_000, 0).await.unwrap();
+            let (room, atems, pending): (HashMap<String, String>, HashMap<String, String>, HashMap<String, String>) = conn
                 .run(|mut c| async move {
                     redis::pipe()
                         .hgetall("relay:room:ROOM-K")
@@ -628,11 +571,7 @@ mod tests {
             assert_eq!(room["paired"], "0");
             assert_eq!(atems["atem-a"], "t1|r1");
             assert_eq!(pending["p1"], "r2");
-            for key in [
-                "relay:room:ROOM-K",
-                "relay:room:ROOM-K:atems",
-                "relay:room:ROOM-K:pending",
-            ] {
+            for key in ["relay:room:ROOM-K", "relay:room:ROOM-K:atems", "relay:room:ROOM-K:pending"] {
                 let left = ttl(&conn, key).await;
                 assert!((590..=600).contains(&left), "{key} ttl {left}");
             }
@@ -648,18 +587,9 @@ mod tests {
             let shorten = |conn: RedisConn| async move {
                 conn.run(|mut c| async move {
                     redis::pipe()
-                        .cmd("EXPIRE")
-                        .arg("relay:room:ROOM-R")
-                        .arg(5)
-                        .ignore()
-                        .cmd("EXPIRE")
-                        .arg("relay:room:ROOM-R:atems")
-                        .arg(5)
-                        .ignore()
-                        .cmd("EXPIRE")
-                        .arg("relay:room:ROOM-R:pending")
-                        .arg(5)
-                        .ignore()
+                        .cmd("EXPIRE").arg("relay:room:ROOM-R").arg(5).ignore()
+                        .cmd("EXPIRE").arg("relay:room:ROOM-R:atems").arg(5).ignore()
+                        .cmd("EXPIRE").arg("relay:room:ROOM-R:pending").arg(5).ignore()
                         .query_async::<()>(&mut c)
                         .await
                 })
@@ -667,54 +597,38 @@ mod tests {
                 .unwrap();
             };
             let all_fresh = |conn: RedisConn| async move {
-                for key in [
-                    "relay:room:ROOM-R",
-                    "relay:room:ROOM-R:atems",
-                    "relay:room:ROOM-R:pending",
-                ] {
+                for key in ["relay:room:ROOM-R", "relay:room:ROOM-R:atems", "relay:room:ROOM-R:pending"] {
                     let left = ttl(&conn, key).await;
                     assert!((590..=600).contains(&left), "{key} ttl {left}");
                 }
             };
             d.create_room("ROOM-R", "h", 1).await.unwrap();
-            d.join_atem("ROOM-R", "atem-a", &ConnRef::new("t1", "r1"))
-                .await
-                .unwrap();
-            d.add_pending("ROOM-R", &ConnRef::new("p1", "r1"), 1, 0)
-                .await
-                .unwrap();
+            d.join_atem("ROOM-R", "atem-a", &ConnRef::new("t1", "r1")).await.unwrap();
+            d.add_pending("ROOM-R", &ConnRef::new("p1", "r1"), 1, 0).await.unwrap();
 
             shorten(conn.clone()).await;
             assert!(d.touch("ROOM-R").await.unwrap());
             all_fresh(conn.clone()).await;
 
             shorten(conn.clone()).await;
-            d.add_pending("ROOM-R", &ConnRef::new("p2", "r1"), 1, 0)
-                .await
-                .unwrap();
+            d.add_pending("ROOM-R", &ConnRef::new("p2", "r1"), 1, 0).await.unwrap();
             all_fresh(conn.clone()).await;
 
             shorten(conn.clone()).await;
-            d.claim_owner("ROOM-R", &ConnRef::new("s1", "r1"), 1)
-                .await
-                .unwrap();
+            d.claim_owner("ROOM-R", &ConnRef::new("s1", "r1"), 1).await.unwrap();
             all_fresh(conn.clone()).await;
 
             // The owner proving its key (already the owner) keeps the room alive too.
             shorten(conn.clone()).await;
             assert_eq!(
-                d.promote("ROOM-R", &ConnRef::new("s1", "r1"), false)
-                    .await
-                    .unwrap(),
+                d.promote("ROOM-R", &ConnRef::new("s1", "r1"), false).await.unwrap(),
                 Promotion::AlreadyOwner
             );
             all_fresh(conn.clone()).await;
 
             // An Atem joining doesn't extend the room, but its hash follows the room's TTL.
             shorten(conn.clone()).await;
-            d.join_atem("ROOM-R", "atem-b", &ConnRef::new("t2", "r1"))
-                .await
-                .unwrap();
+            d.join_atem("ROOM-R", "atem-b", &ConnRef::new("t2", "r1")).await.unwrap();
             let left = ttl(&conn, "relay:room:ROOM-R:atems").await;
             assert!((1..=5).contains(&left), "atems ttl {left}");
         }
@@ -730,10 +644,8 @@ mod tests {
             let plant = |conn: RedisConn| async move {
                 conn.run(|mut c| async move {
                     redis::pipe()
-                        .hset("relay:room:ROOM-L:atems", "atem-old", "t0|r0")
-                        .ignore()
-                        .hset("relay:room:ROOM-L:pending", "p-old", "r0")
-                        .ignore()
+                        .hset("relay:room:ROOM-L:atems", "atem-old", "t0|r0").ignore()
+                        .hset("relay:room:ROOM-L:pending", "p-old", "r0").ignore()
                         .query_async::<()>(&mut c)
                         .await
                 })
@@ -743,32 +655,18 @@ mod tests {
             plant(conn.clone()).await;
             assert!(d.ensure_room("ROOM-L", "h", 1).await.unwrap());
             let room = d.get("ROOM-L").await.unwrap().unwrap();
-            assert!(
-                room.atems.is_empty(),
-                "ensure_room inherited {:?}",
-                room.atems
-            );
+            assert!(room.atems.is_empty(), "ensure_room inherited {:?}", room.atems);
             assert!(room.pending.is_empty());
 
             assert!(d.delete_room("ROOM-L").await.unwrap().is_some());
             plant(conn.clone()).await;
-            let claim = d
-                .claim_owner("ROOM-L", &ConnRef::new("s1", "r1"), 1)
-                .await
-                .unwrap();
-            assert!(
-                claim.atems.is_empty(),
-                "claim_owner inherited {:?}",
-                claim.atems
-            );
+            let claim = d.claim_owner("ROOM-L", &ConnRef::new("s1", "r1"), 1).await.unwrap();
+            assert!(claim.atems.is_empty(), "claim_owner inherited {:?}", claim.atems);
             assert!(d.get("ROOM-L").await.unwrap().unwrap().pending.is_empty());
 
             assert!(d.delete_room("ROOM-L").await.unwrap().is_some());
             plant(conn.clone()).await;
-            assert!(d
-                .add_pending("ROOM-L", &ConnRef::new("p1", "r1"), 1, 0)
-                .await
-                .unwrap());
+            assert!(d.add_pending("ROOM-L", &ConnRef::new("p1", "r1"), 1, 0).await.unwrap());
             let room = d.get("ROOM-L").await.unwrap().unwrap();
             assert!(room.atems.is_empty());
             assert_eq!(room.pending.len(), 1);
@@ -782,9 +680,7 @@ mod tests {
             d.create_room("X", "h", 1).await.unwrap();
             // "X:atems" must not be room X's Atem hash.
             assert_eq!(
-                d.join_atem("X:atems", "atem-a", &ConnRef::new("t1", "r1"))
-                    .await
-                    .unwrap(),
+                d.join_atem("X:atems", "atem-a", &ConnRef::new("t1", "r1")).await.unwrap(),
                 AtemJoin::NoRoom
             );
             d.create_room("X:atems", "h2", 2).await.unwrap();

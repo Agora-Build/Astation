@@ -361,10 +361,7 @@ mod tests {
         assert!(!local.contains("c1"));
         assert_eq!(outbox.frames.recv().await.as_deref(), Some("last"));
         assert_eq!(outbox.frames.recv().await, None);
-        assert!(
-            outbox.close.changed().await.is_err(),
-            "evict sends no close code"
-        );
+        assert!(outbox.close.changed().await.is_err(), "evict sends no close code");
     }
 
     #[tokio::test]
@@ -381,20 +378,8 @@ mod tests {
     fn room_and_role_queries() {
         let local = LocalSockets::new();
         let _a = local.register("a1", "room-a", SocketRole::Astation);
-        let _b = local.register(
-            "t1",
-            "room-a",
-            SocketRole::Atem {
-                atem_id: "atem-1".into(),
-            },
-        );
-        let _c = local.register(
-            "t2",
-            "room-b",
-            SocketRole::Atem {
-                atem_id: "atem-2".into(),
-            },
-        );
+        let _b = local.register("t1", "room-a", SocketRole::Atem { atem_id: "atem-1".into() });
+        let _c = local.register("t2", "room-b", SocketRole::Atem { atem_id: "atem-2".into() });
         assert_eq!(local.codes_with_astations(), vec!["room-a".to_string()]);
         assert_eq!(
             local.codes_with_atems(),
@@ -412,10 +397,7 @@ mod tests {
         assert_eq!(local.room_count(), 2);
         let mut ids = local.connection_ids();
         ids.sort();
-        assert_eq!(
-            ids,
-            vec!["a1".to_string(), "t1".to_string(), "t2".to_string()]
-        );
+        assert_eq!(ids, vec!["a1".to_string(), "t1".to_string(), "t2".to_string()]);
     }
 
     use std::time::Duration;
@@ -434,10 +416,7 @@ mod tests {
         assert!(local.contains("slow"), "not yet stalled for long");
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(!local.send("slow", "4".into()));
-        assert!(
-            !local.contains("slow"),
-            "full for longer than the stall limit"
-        );
+        assert!(!local.contains("slow"), "full for longer than the stall limit");
         assert!(outbox.close.changed().await.is_ok());
         assert_eq!(
             *outbox.close.borrow(),
@@ -476,14 +455,8 @@ mod tests {
             stall: Duration::from_secs(60),
         });
         let mut outbox = local.register("c", "room", SocketRole::Astation);
-        assert!(
-            local.send("c", "x".repeat(20)),
-            "an empty queue takes any one frame"
-        );
-        assert!(
-            !local.send("c", "y".into()),
-            "but nothing after it until it is sent"
-        );
+        assert!(local.send("c", "x".repeat(20)), "an empty queue takes any one frame");
+        assert!(!local.send("c", "y".into()), "but nothing after it until it is sent");
         let frame = outbox.frames.recv().await.unwrap();
         outbox.sent(&frame);
         assert_eq!(outbox.queued_bytes.load(Ordering::Relaxed), 0);
@@ -492,11 +465,7 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_closes_only_clients_that_stay_full() {
-        let limits = QueueLimits {
-            frames: 1,
-            bytes: 1024,
-            stall: Duration::from_millis(50),
-        };
+        let limits = QueueLimits { frames: 1, bytes: 1024, stall: Duration::from_millis(50) };
         let local = LocalSockets::with_limits(limits);
         let _stuck = local.register("stuck", "room", SocketRole::Astation);
         let mut caught_up = local.register("caught-up", "room", SocketRole::Astation);
@@ -527,22 +496,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(80)).await;
         let frame = outbox.frames.recv().await.unwrap();
         outbox.sent(&frame);
-        assert!(
-            local.send("c", "c".into()),
-            "drained below the cap: fits again"
-        );
-        assert!(
-            !local.send("c", "d".into()),
-            "full again: a new stall timer"
-        );
+        assert!(local.send("c", "c".into()), "drained below the cap: fits again");
+        assert!(!local.send("c", "d".into()), "full again: a new stall timer");
         tokio::time::sleep(Duration::from_millis(40)).await;
         // 120 ms since the queue first filled, 40 ms since it last did.
         assert!(!local.send("c", "e".into()));
         assert_eq!(local.sweep_slow(), 0);
-        assert!(
-            local.contains("c"),
-            "the stall restarted when the queue drained"
-        );
+        assert!(local.contains("c"), "the stall restarted when the queue drained");
         tokio::time::sleep(Duration::from_millis(70)).await;
         assert!(!local.send("c", "f".into()));
         assert!(!local.contains("c"), "full for 110 ms on the new timer");
@@ -577,11 +537,7 @@ mod tests {
         })
         .await
         .expect("delivery never waits on a full queue");
-        assert_eq!(
-            received,
-            5 * MAX_QUEUED_FRAMES,
-            "the healthy client got every frame"
-        );
+        assert_eq!(received, 5 * MAX_QUEUED_FRAMES, "the healthy client got every frame");
         assert!(local.contains("stuck"), "full, but not yet for 10 s");
 
         tokio::time::sleep(SLOW_CLIENT_TIMEOUT).await;
@@ -603,11 +559,7 @@ mod tests {
         assert!(local.send("c", "1234".into()));
         assert!(!local.send("c", "5".into()));
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            local.sweep_slow(),
-            1,
-            "full by bytes for longer than the stall"
-        );
+        assert_eq!(local.sweep_slow(), 1, "full by bytes for longer than the stall");
         assert!(!local.contains("c"));
     }
 
@@ -621,10 +573,7 @@ mod tests {
             stall: Duration::from_secs(10),
         });
         let mut outbox = local.register("c", "room", SocketRole::Astation);
-        assert!(
-            local.send("c", "123456".into()),
-            "6 bytes queued, never drained"
-        );
+        assert!(local.send("c", "123456".into()), "6 bytes queued, never drained");
         let mut closed_after = None;
         for second in 1..=15 {
             assert!(!local.send("c", "abcde".into()), "6 + 5 > 10: rejected");
@@ -672,11 +621,7 @@ mod tests {
     fn default_limits_match_the_spec() {
         assert_eq!(
             QueueLimits::default(),
-            QueueLimits {
-                frames: 1000,
-                bytes: 4 * 1024 * 1024,
-                stall: Duration::from_secs(10)
-            }
+            QueueLimits { frames: 1000, bytes: 4 * 1024 * 1024, stall: Duration::from_secs(10) }
         );
         assert_eq!(CLOSE_SLOW_CLIENT, 1013);
     }

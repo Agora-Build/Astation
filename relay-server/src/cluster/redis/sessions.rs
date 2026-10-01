@@ -64,9 +64,7 @@ fn parse_status(name: &str) -> Option<SessionStatus> {
 }
 
 fn parse_time(value: Option<&String>) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value?)
-        .ok()
-        .map(|time| time.with_timezone(&Utc))
+    DateTime::parse_from_rfc3339(value?).ok().map(|time| time.with_timezone(&Utc))
 }
 
 fn non_empty(value: Option<&String>) -> Option<String> {
@@ -76,9 +74,7 @@ fn non_empty(value: Option<&String>) -> Option<String> {
 /// How long a session stays in Redis (pre-flight note 2).
 pub fn session_ttl_secs(session: &Session, now: DateTime<Utc>) -> i64 {
     match session.status {
-        SessionStatus::Pending => {
-            ((session.expires_at - now).num_seconds() + PENDING_GRACE_SECS).max(1)
-        }
+        SessionStatus::Pending => ((session.expires_at - now).num_seconds() + PENDING_GRACE_SECS).max(1),
         _ => DECIDED_SESSION_TTL_SECS,
     }
 }
@@ -92,14 +88,8 @@ fn session_fields(session: &Session) -> Vec<(&'static str, String)> {
         ("token", session.token.clone().unwrap_or_default()),
         ("created_at", session.created_at.to_rfc3339()),
         ("expires_at", session.expires_at.to_rfc3339()),
-        (
-            "expires_at_ms",
-            session.expires_at.timestamp_millis().to_string(),
-        ),
-        (
-            "astation_id",
-            session.astation_id.clone().unwrap_or_default(),
-        ),
+        ("expires_at_ms", session.expires_at.timestamp_millis().to_string()),
+        ("astation_id", session.astation_id.clone().unwrap_or_default()),
     ]
 }
 
@@ -153,12 +143,7 @@ impl RedisSessionBackend {
             .await
     }
 
-    async fn script(
-        &self,
-        script: &Script,
-        id: &str,
-        args: Vec<String>,
-    ) -> Result<Vec<String>, StoreError> {
+    async fn script(&self, script: &Script, id: &str, args: Vec<String>) -> Result<Vec<String>, StoreError> {
         let key = keys::session(id);
         self.conn
             .run(|mut c| async move {
@@ -181,9 +166,9 @@ impl RedisSessionBackend {
         if map.is_empty() {
             return Ok(None);
         }
-        session_from_hash(&map).map(Some).ok_or_else(|| {
-            StoreError::Unavailable(format!("malformed session {}", crate::relay::mask_code(id)))
-        })
+        session_from_hash(&map)
+            .map(Some)
+            .ok_or_else(|| StoreError::Unavailable(format!("malformed session {}", crate::relay::mask_code(id))))
     }
 }
 
@@ -209,13 +194,7 @@ impl SessionBackend for RedisSessionBackend {
             .await
     }
 
-    async fn grant(
-        &self,
-        id: &str,
-        otp: &str,
-        token: &str,
-        now: DateTime<Utc>,
-    ) -> Result<GrantOutcome, StoreError> {
+    async fn grant(&self, id: &str, otp: &str, token: &str, now: DateTime<Utc>) -> Result<GrantOutcome, StoreError> {
         let out = self
             .script(
                 &self.grant,
@@ -234,9 +213,7 @@ impl SessionBackend for RedisSessionBackend {
                 None => GrantOutcome::NotFound,
             },
             Some("not_pending") => GrantOutcome::NotPending(
-                out.get(1)
-                    .and_then(|name| parse_status(name))
-                    .unwrap_or(SessionStatus::Expired),
+                out.get(1).and_then(|name| parse_status(name)).unwrap_or(SessionStatus::Expired),
             ),
             Some("expired") => GrantOutcome::Expired,
             Some("invalid_otp") => GrantOutcome::InvalidOtp,
@@ -254,9 +231,7 @@ impl SessionBackend for RedisSessionBackend {
                 None => DenyOutcome::NotFound,
             },
             Some("not_pending") => DenyOutcome::NotPending(
-                out.get(1)
-                    .and_then(|name| parse_status(name))
-                    .unwrap_or(SessionStatus::Expired),
+                out.get(1).and_then(|name| parse_status(name)).unwrap_or(SessionStatus::Expired),
             ),
             _ => DenyOutcome::NotFound,
         })
@@ -316,16 +291,10 @@ mod tests {
         assert_eq!(loaded.astation_id.as_deref(), Some("astation-1"));
         // Pending: until 60 s after the 5-minute expiry.
         let pending_ttl = ttl(&conn, &id).await;
-        assert!(
-            (300..=360).contains(&pending_ttl),
-            "pending ttl {pending_ttl}"
-        );
+        assert!((300..=360).contains(&pending_ttl), "pending ttl {pending_ttl}");
 
         let otp = session.otp.clone();
-        assert!(matches!(
-            store.grant(&id, "00000000").await.unwrap(),
-            GrantOutcome::InvalidOtp
-        ));
+        assert!(matches!(store.grant(&id, "00000000").await.unwrap(), GrantOutcome::InvalidOtp));
         let granted = match store.grant(&id, &otp).await.unwrap() {
             GrantOutcome::Granted(granted) => granted,
             other => panic!("expected Granted, got {other:?}"),
@@ -333,37 +302,22 @@ mod tests {
         assert_eq!(granted.token.as_ref().map(String::len), Some(64));
         assert_eq!(store.get(&id).await.unwrap().unwrap().token, granted.token);
         let granted_ttl = ttl(&conn, &id).await;
-        assert!(
-            granted_ttl > DECIDED_SESSION_TTL_SECS - 10,
-            "granted ttl {granted_ttl}"
-        );
+        assert!(granted_ttl > DECIDED_SESSION_TTL_SECS - 10, "granted ttl {granted_ttl}");
         assert!(matches!(
             store.grant(&id, &otp).await.unwrap(),
             GrantOutcome::NotPending(SessionStatus::Granted)
         ));
         // Lower the TTL first, so the touch visibly restores it.
         let key = keys::session(&id);
-        conn.run(|mut c| async move {
-            redis::cmd("EXPIRE")
-                .arg(&key)
-                .arg(100)
-                .query_async::<()>(&mut c)
-                .await
-        })
-        .await
-        .unwrap();
+        conn.run(|mut c| async move { redis::cmd("EXPIRE").arg(&key).arg(100).query_async::<()>(&mut c).await })
+            .await
+            .unwrap();
         assert!(ttl(&conn, &id).await <= 100);
         store.touch(&id).await.unwrap();
         let touched_ttl = ttl(&conn, &id).await;
-        assert!(
-            touched_ttl > DECIDED_SESSION_TTL_SECS - 10,
-            "touched ttl {touched_ttl}"
-        );
+        assert!(touched_ttl > DECIDED_SESSION_TTL_SECS - 10, "touched ttl {touched_ttl}");
 
-        assert!(matches!(
-            store.grant("missing", &otp).await.unwrap(),
-            GrantOutcome::NotFound
-        ));
+        assert!(matches!(store.grant("missing", &otp).await.unwrap(), GrantOutcome::NotFound));
         store.delete(&id).await.unwrap();
         assert!(store.get(&id).await.unwrap().is_none());
     }
@@ -380,30 +334,18 @@ mod tests {
         let expired_id = expired.id.clone();
         let otp = expired.otp.clone();
         store.create(expired).await.unwrap();
-        assert!(
-            store.get(&expired_id).await.unwrap().is_some(),
-            "kept for the grace period"
-        );
-        assert!(matches!(
-            store.grant(&expired_id, &otp).await.unwrap(),
-            GrantOutcome::Expired
-        ));
+        assert!(store.get(&expired_id).await.unwrap().is_some(), "kept for the grace period");
+        assert!(matches!(store.grant(&expired_id, &otp).await.unwrap(), GrantOutcome::Expired));
 
         let pending = create_session("deny-me");
         let pending_id = pending.id.clone();
         store.create(pending).await.unwrap();
-        assert!(matches!(
-            store.deny(&pending_id).await.unwrap(),
-            DenyOutcome::Denied(_)
-        ));
+        assert!(matches!(store.deny(&pending_id).await.unwrap(), DenyOutcome::Denied(_)));
         assert!(matches!(
             store.deny(&pending_id).await.unwrap(),
             DenyOutcome::NotPending(SessionStatus::Denied)
         ));
-        assert!(matches!(
-            store.deny("missing").await.unwrap(),
-            DenyOutcome::NotFound
-        ));
+        assert!(matches!(store.deny("missing").await.unwrap(), DenyOutcome::NotFound));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -420,15 +362,9 @@ mod tests {
         let _guard = REDIS_LOCK.lock().await;
         let (store, conn) = store().await;
         let key = keys::session("wrong-type");
-        conn.run(|mut c| async move {
-            redis::cmd("SET")
-                .arg(&key)
-                .arg("x")
-                .query_async::<()>(&mut c)
-                .await
-        })
-        .await
-        .unwrap();
+        conn.run(|mut c| async move { redis::cmd("SET").arg(&key).arg("x").query_async::<()>(&mut c).await })
+            .await
+            .unwrap();
         assert!(store.touch("wrong-type").await.is_err());
         store.touch("missing").await.unwrap();
     }
@@ -440,8 +376,7 @@ mod tests {
     async fn redis_sessions_pass_the_shared_scenarios() {
         let _guard = REDIS_LOCK.lock().await;
         scenarios::grant_is_atomic_and_checks_in_order(store().await.0).await;
-        scenarios::grant_of_an_expired_session_is_expired_even_with_the_right_otp(store().await.0)
-            .await;
+        scenarios::grant_of_an_expired_session_is_expired_even_with_the_right_otp(store().await.0).await;
         scenarios::deny_applies_only_while_pending(store().await.0).await;
         scenarios::grant_of_a_finished_expired_session_is_not_pending(store().await.0).await;
     }

@@ -115,13 +115,12 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn parse_max_is_strict() {
         assert_eq!(WsConnLimiter::parse_max(None), Ok(DEFAULT_WS_MAX_PER_IP));
-        assert_eq!(
-            WsConnLimiter::parse_max(Some("  ")),
-            Ok(DEFAULT_WS_MAX_PER_IP)
-        );
+        assert_eq!(WsConnLimiter::parse_max(Some("  ")), Ok(DEFAULT_WS_MAX_PER_IP));
         assert_eq!(WsConnLimiter::parse_max(Some(" 50 ")), Ok(50));
         for bad in ["0", "-1", "abc", "1.5"] {
             let message = WsConnLimiter::parse_max(Some(bad)).unwrap_err();
@@ -129,17 +128,12 @@ mod tests {
         }
     }
 
-    use super::*;
-
     #[test]
     fn permits_are_counted_per_ip_and_released_on_drop() {
         let limiter = WsConnLimiter::new(2);
         let a1 = limiter.try_acquire("203.0.113.1").expect("first");
         let _a2 = limiter.try_acquire("203.0.113.1").expect("second");
-        assert!(
-            limiter.try_acquire("203.0.113.1").is_none(),
-            "third is over the cap"
-        );
+        assert!(limiter.try_acquire("203.0.113.1").is_none(), "third is over the cap");
         let _b1 = limiter.try_acquire("203.0.113.2").expect("another IP");
         assert_eq!(limiter.open("203.0.113.1"), 2);
         drop(a1);
@@ -154,14 +148,8 @@ mod tests {
         let held: Vec<_> = (0..200)
             .map(|_| limiter.try_acquire("203.0.113.1").expect("within the cap"))
             .collect();
-        assert!(
-            limiter.try_acquire("203.0.113.1").is_none(),
-            "201st is refused"
-        );
-        assert!(
-            limiter.try_acquire("203.0.113.2").is_some(),
-            "other IPs are unaffected"
-        );
+        assert!(limiter.try_acquire("203.0.113.1").is_none(), "201st is refused");
+        assert!(limiter.try_acquire("203.0.113.2").is_some(), "other IPs are unaffected");
         drop(held);
         assert_eq!(limiter.open("203.0.113.1"), 0);
     }

@@ -55,10 +55,7 @@ pub async fn main(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let Some(database_url) = std::env::var("DATABASE_URL")
-        .ok()
-        .filter(|url| !url.is_empty())
-    else {
+    let Some(database_url) = std::env::var("DATABASE_URL").ok().filter(|url| !url.is_empty()) else {
         eprintln!("DATABASE_URL is required");
         return 1;
     };
@@ -74,10 +71,7 @@ pub async fn main(args: &[String]) -> i32 {
         }
     };
     let identity = PgIdentityStore::new(pool);
-    let bus = match std::env::var("REDIS_URL")
-        .ok()
-        .filter(|url| !url.trim().is_empty())
-    {
+    let bus = match std::env::var("REDIS_URL").ok().filter(|url| !url.trim().is_empty()) {
         Some(url) => match RedisConn::connect_checked(&url).await {
             Ok(conn) => Some(RedisBus::publisher(conn, "admin")),
             Err(error) => {
@@ -87,13 +81,7 @@ pub async fn main(args: &[String]) -> i32 {
         },
         None => None,
     };
-    match forget_key(
-        &identity,
-        bus.as_ref().map(|bus| bus as &dyn ReplicaBus),
-        &astation_id,
-    )
-    .await
-    {
+        match forget_key(&identity, bus.as_ref().map(|bus| bus as &dyn ReplicaBus), &astation_id).await {
         Ok(outcome) => {
             if outcome.deleted {
                 println!("Deleted the relay key of {astation_id}.");
@@ -101,9 +89,7 @@ pub async fn main(args: &[String]) -> i32 {
                 println!("No relay key was registered for {astation_id}.");
             }
             if outcome.announced {
-                println!(
-                    "Announced on relay:broadcast: every relay replica drops its cached key now."
-                );
+                println!("Announced on relay:broadcast: every relay replica drops its cached key now.");
             } else {
                 println!("REDIS_URL is not set: restart the relay to drop its cached key.");
             }
@@ -126,27 +112,16 @@ mod tests {
     #[tokio::test]
     async fn forget_key_deletes_and_announces() {
         let identity = InMemoryIdentityStore::new();
-        identity
-            .register_key_if_absent("astation-a", "04aa", 1)
-            .await
-            .unwrap();
+        identity.register_key_if_absent("astation-a", "04aa", 1).await.unwrap();
         let bus = LoopbackBus::new("admin", LocalSockets::new());
         assert_eq!(
-            forget_key(&identity, Some(&bus), "astation-a")
-                .await
-                .unwrap(),
-            ForgetOutcome {
-                deleted: true,
-                announced: true
-            }
+            forget_key(&identity, Some(&bus), "astation-a").await.unwrap(),
+            ForgetOutcome { deleted: true, announced: true }
         );
         assert_eq!(identity.get_key("astation-a").await.unwrap(), None);
         assert_eq!(
             forget_key(&identity, None, "astation-a").await.unwrap(),
-            ForgetOutcome {
-                deleted: false,
-                announced: false
-            }
+            ForgetOutcome { deleted: false, announced: false }
         );
     }
 
@@ -164,10 +139,7 @@ mod tests {
         ) -> Result<(), crate::cluster::StoreError> {
             Ok(())
         }
-        async fn broadcast(
-            &self,
-            message: BroadcastMessage,
-        ) -> Result<(), crate::cluster::StoreError> {
+        async fn broadcast(&self, message: BroadcastMessage) -> Result<(), crate::cluster::StoreError> {
             self.0.lock().unwrap().push(message);
             Ok(())
         }
@@ -187,10 +159,7 @@ mod tests {
         ) -> Result<(), crate::cluster::StoreError> {
             Ok(())
         }
-        async fn broadcast(
-            &self,
-            _message: BroadcastMessage,
-        ) -> Result<(), crate::cluster::StoreError> {
+        async fn broadcast(&self, _message: BroadcastMessage) -> Result<(), crate::cluster::StoreError> {
             Err(crate::cluster::StoreError::Unavailable("down".into()))
         }
     }
@@ -198,20 +167,13 @@ mod tests {
     #[tokio::test]
     async fn announces_exactly_one_key_changed_after_the_key_is_gone() {
         let identity = InMemoryIdentityStore::new();
-        identity
-            .register_key_if_absent("astation-a", "04aa", 1)
-            .await
-            .unwrap();
+        identity.register_key_if_absent("astation-a", "04aa", 1).await.unwrap();
         let bus = RecordingBus(Default::default());
-        forget_key(&identity, Some(&bus), "astation-a")
-            .await
-            .unwrap();
+        forget_key(&identity, Some(&bus), "astation-a").await.unwrap();
         {
             let sent = bus.0.lock().unwrap();
             assert_eq!(sent.len(), 1);
-            assert!(
-                matches!(&sent[0], BroadcastMessage::KeyChanged { astation_id } if astation_id == "astation-a")
-            );
+            assert!(matches!(&sent[0], BroadcastMessage::KeyChanged { astation_id } if astation_id == "astation-a"));
         }
         assert_eq!(identity.get_key("astation-a").await.unwrap(), None);
     }
@@ -219,13 +181,8 @@ mod tests {
     #[tokio::test]
     async fn a_failing_bus_still_deletes_and_says_restart() {
         let identity = InMemoryIdentityStore::new();
-        identity
-            .register_key_if_absent("astation-a", "04aa", 1)
-            .await
-            .unwrap();
-        let error = forget_key(&identity, Some(&FailingBus), "astation-a")
-            .await
-            .unwrap_err();
+        identity.register_key_if_absent("astation-a", "04aa", 1).await.unwrap();
+        let error = forget_key(&identity, Some(&FailingBus), "astation-a").await.unwrap_err();
         assert!(error.contains("restart the relay replicas"), "{error}");
         assert_eq!(identity.get_key("astation-a").await.unwrap(), None);
     }
@@ -234,9 +191,6 @@ mod tests {
     async fn bad_arguments_print_usage() {
         assert_eq!(main(&[]).await, 2);
         assert_eq!(main(&["forget-key".to_string()]).await, 2);
-        assert_eq!(
-            main(&["drop-everything".to_string(), "x".to_string()]).await,
-            2
-        );
+        assert_eq!(main(&["drop-everything".to_string(), "x".to_string()]).await, 2);
     }
 }

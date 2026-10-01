@@ -46,10 +46,7 @@ impl Inner {
         self.bump(astation_id);
         self.keys.insert(
             astation_id.to_string(),
-            CachedKey {
-                public_key: public_key.to_ascii_lowercase(),
-                stale: false,
-            },
+            CachedKey { public_key: public_key.to_ascii_lowercase(), stale: false },
         );
     }
 
@@ -84,17 +81,15 @@ impl KeyCache {
         let before = self.read().generations.clone();
         let listed = identity.list_keys().await?;
         let mut inner = self.write();
-        let moved =
-            |inner: &Inner, id: &str| inner.generation(id) != before.get(id).copied().unwrap_or(0);
+        let moved = |inner: &Inner, id: &str| {
+            inner.generation(id) != before.get(id).copied().unwrap_or(0)
+        };
         let mut keys: HashMap<String, CachedKey> = HashMap::new();
         for (id, key) in listed {
             if !moved(&inner, &id) {
                 keys.insert(
                     id,
-                    CachedKey {
-                        public_key: key.to_ascii_lowercase(),
-                        stale: false,
-                    },
+                    CachedKey { public_key: key.to_ascii_lowercase(), stale: false },
                 );
             }
         }
@@ -189,12 +184,7 @@ mod tests {
         async fn get_key(&self, _: &str) -> Result<Option<String>, IdentityError> {
             Err(IdentityError::Db("down".into()))
         }
-        async fn register_key_if_absent(
-            &self,
-            _: &str,
-            _: &str,
-            _: i64,
-        ) -> Result<RegisterOutcome, IdentityError> {
+        async fn register_key_if_absent(&self, _: &str, _: &str, _: i64) -> Result<RegisterOutcome, IdentityError> {
             Err(IdentityError::Db("down".into()))
         }
         async fn touch_key(&self, _: &str, _: i64) -> Result<(), IdentityError> {
@@ -209,12 +199,7 @@ mod tests {
         async fn unbind(&self, _: &str, _: &str) -> Result<bool, IdentityError> {
             Err(IdentityError::Db("down".into()))
         }
-        async fn replace_all(
-            &self,
-            _: &str,
-            _: &[String],
-            _: i64,
-        ) -> Result<ReplaceOutcome, IdentityError> {
+        async fn replace_all(&self, _: &str, _: &[String], _: i64) -> Result<ReplaceOutcome, IdentityError> {
             Err(IdentityError::Db("down".into()))
         }
         async fn resolve(&self, _: &str, _: i64) -> Result<Option<String>, IdentityError> {
@@ -225,18 +210,12 @@ mod tests {
     #[tokio::test]
     async fn load_set_forget() {
         let store = InMemoryIdentityStore::new();
-        store
-            .register_key_if_absent("astation-a", "04AA", 1)
-            .await
-            .unwrap();
+        store.register_key_if_absent("astation-a", "04AA", 1).await.unwrap();
         let cache = KeyCache::new();
         assert_eq!(cache.load(&store).await.unwrap(), 1);
         assert_eq!(
             cache.get("astation-a"),
-            Some(CachedKey {
-                public_key: "04aa".into(),
-                stale: false
-            })
+            Some(CachedKey { public_key: "04aa".into(), stale: false })
         );
         cache.set("astation-b", "04BB");
         assert!(cache.contains("astation-b"));
@@ -251,17 +230,11 @@ mod tests {
         let cache = KeyCache::new();
         cache.set("astation-a", "04aa");
         // The key was replaced in the store.
-        store
-            .register_key_if_absent("astation-a", "04CC", 1)
-            .await
-            .unwrap();
+        store.register_key_if_absent("astation-a", "04CC", 1).await.unwrap();
         cache.reload_one(&store, "astation-a").await;
         assert_eq!(cache.get("astation-a").unwrap().public_key, "04cc");
         // A key registered elsewhere reaches this cache.
-        store
-            .register_key_if_absent("astation-new", "04dd", 1)
-            .await
-            .unwrap();
+        store.register_key_if_absent("astation-new", "04dd", 1).await.unwrap();
         cache.reload_one(&store, "astation-new").await;
         assert!(cache.contains("astation-new"));
         // Deleted (admin reset): forgotten.
@@ -277,10 +250,7 @@ mod tests {
         cache.reload_one(&DownStore, "astation-a").await;
         assert_eq!(
             cache.get("astation-a"),
-            Some(CachedKey {
-                public_key: "04aa".into(),
-                stale: true
-            })
+            Some(CachedKey { public_key: "04aa".into(), stale: true })
         );
         // Still pending on connect.
         assert!(cache.contains("astation-a"));
@@ -310,12 +280,7 @@ mod tests {
             self.release.notified().await;
             Ok(self.answer.clone())
         }
-        async fn register_key_if_absent(
-            &self,
-            _: &str,
-            _: &str,
-            _: i64,
-        ) -> Result<RegisterOutcome, IdentityError> {
+        async fn register_key_if_absent(&self, _: &str, _: &str, _: i64) -> Result<RegisterOutcome, IdentityError> {
             unreachable!()
         }
         async fn touch_key(&self, _: &str, _: i64) -> Result<(), IdentityError> {
@@ -324,11 +289,7 @@ mod tests {
         async fn list_keys(&self) -> Result<Vec<(String, String)>, IdentityError> {
             self.entered.notify_one();
             self.release.notified().await;
-            Ok(self
-                .answer
-                .iter()
-                .map(|k| ("astation-a".to_string(), k.clone()))
-                .collect())
+            Ok(self.answer.iter().map(|k| ("astation-a".to_string(), k.clone())).collect())
         }
         async fn bind(&self, _: &str, _: &str, _: i64) -> Result<BindOutcome, IdentityError> {
             unreachable!()
@@ -336,12 +297,7 @@ mod tests {
         async fn unbind(&self, _: &str, _: &str) -> Result<bool, IdentityError> {
             unreachable!()
         }
-        async fn replace_all(
-            &self,
-            _: &str,
-            _: &[String],
-            _: i64,
-        ) -> Result<ReplaceOutcome, IdentityError> {
+        async fn replace_all(&self, _: &str, _: &[String], _: i64) -> Result<ReplaceOutcome, IdentityError> {
             unreachable!()
         }
         async fn resolve(&self, _: &str, _: i64) -> Result<Option<String>, IdentityError> {
@@ -349,13 +305,7 @@ mod tests {
         }
     }
 
-    fn slow(
-        answer: &str,
-    ) -> (
-        SlowStore,
-        std::sync::Arc<tokio::sync::Notify>,
-        std::sync::Arc<tokio::sync::Notify>,
-    ) {
+    fn slow(answer: &str) -> (SlowStore, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>) {
         let entered = std::sync::Arc::new(tokio::sync::Notify::new());
         let release = std::sync::Arc::new(tokio::sync::Notify::new());
         let store = SlowStore {
@@ -433,10 +383,7 @@ mod tests {
         cache.reload_one(&DownStore, "astation-a").await;
         assert!(cache.get("astation-a").unwrap().stale);
         let store = InMemoryIdentityStore::new();
-        store
-            .register_key_if_absent("astation-a", "04aa", 1)
-            .await
-            .unwrap();
+        store.register_key_if_absent("astation-a", "04aa", 1).await.unwrap();
         cache.load(&store).await.unwrap();
         assert!(!cache.get("astation-a").unwrap().stale);
     }
@@ -452,12 +399,7 @@ mod tests {
             async fn get_key(&self, _: &str) -> Result<Option<String>, IdentityError> {
                 std::future::pending().await
             }
-            async fn register_key_if_absent(
-                &self,
-                _: &str,
-                _: &str,
-                _: i64,
-            ) -> Result<RegisterOutcome, IdentityError> {
+            async fn register_key_if_absent(&self, _: &str, _: &str, _: i64) -> Result<RegisterOutcome, IdentityError> {
                 unreachable!()
             }
             async fn touch_key(&self, _: &str, _: i64) -> Result<(), IdentityError> {
@@ -472,12 +414,7 @@ mod tests {
             async fn unbind(&self, _: &str, _: &str) -> Result<bool, IdentityError> {
                 unreachable!()
             }
-            async fn replace_all(
-                &self,
-                _: &str,
-                _: &[String],
-                _: i64,
-            ) -> Result<ReplaceOutcome, IdentityError> {
+            async fn replace_all(&self, _: &str, _: &[String], _: i64) -> Result<ReplaceOutcome, IdentityError> {
                 unreachable!()
             }
             async fn resolve(&self, _: &str, _: i64) -> Result<Option<String>, IdentityError> {
@@ -489,10 +426,7 @@ mod tests {
         cache.reload_one(&Hang, "astation-a").await;
         assert_eq!(
             cache.get("astation-a"),
-            Some(CachedKey {
-                public_key: "04aa".into(),
-                stale: true
-            })
+            Some(CachedKey { public_key: "04aa".into(), stale: true })
         );
     }
 }

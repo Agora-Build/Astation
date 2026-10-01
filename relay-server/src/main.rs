@@ -5,15 +5,15 @@ mod identity_store;
 mod knowledge_routes;
 mod knowledge_secrets;
 mod knowledge_store;
-mod llm_proxy;
 mod relay;
 mod routes;
 mod rtc_session;
 mod session_store;
-mod vault_routes;
-mod vault_store;
-mod voice_routes;
 mod voice_session;
+mod voice_routes;
+mod llm_proxy;
+mod vault_store;
+mod vault_routes;
 mod web;
 
 #[cfg(test)]
@@ -24,19 +24,20 @@ use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use cluster::ratelimit::{
-    shared_rate_limit, SharedLimit, GENERAL_LIMIT_PER_MINUTE, GRANT_LIMIT_PER_MINUTE,
-};
+use cluster::ratelimit::{shared_rate_limit, SharedLimit, GENERAL_LIMIT_PER_MINUTE, GRANT_LIMIT_PER_MINUTE};
 use relay::RelayHub;
 use rtc_session::RtcSessionStore;
 use session_store::SessionStore;
+use voice_session::VoiceSessionStore;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_governor::{
-    governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer,
+    governor::GovernorConfigBuilder,
+    key_extractor::SmartIpKeyExtractor,
+    GovernorLayer,
 };
 use tower_http::cors::CorsLayer;
-use voice_session::VoiceSessionStore;
+
 
 /// Shared state accessible by all route handlers.
 #[derive(Clone)]
@@ -52,9 +53,7 @@ pub struct AppState {
 }
 
 fn redis_url() -> Option<String> {
-    std::env::var("REDIS_URL")
-        .ok()
-        .filter(|url| !url.trim().is_empty())
+    std::env::var("REDIS_URL").ok().filter(|url| !url.trim().is_empty())
 }
 
 /// RELAY_REPLICAS_EXPECTED: unset or blank means 1; anything else must be
@@ -131,8 +130,7 @@ async fn start_redis_replica(
     auth_timeout: std::time::Duration,
     ws_max_per_ip: usize,
 ) -> Result<cluster::redis::RedisCluster, String> {
-    let cluster =
-        connect_redis_cluster(url, identity.clone(), keys, auth_timeout, ws_max_per_ip).await?;
+    let cluster = connect_redis_cluster(url, identity.clone(), keys, auth_timeout, ws_max_per_ip).await?;
     // A key registered on another replica between the load and the bus
     // subscription was announced while we weren't listening: re-read once
     // now that key-changed messages reach us.
@@ -142,12 +140,8 @@ async fn start_redis_replica(
     )
     .await
     {
-        Ok(Ok(count)) => {
-            tracing::info!("Re-read {} Astation relay key(s) after subscribing", count)
-        }
-        Ok(Err(error)) => {
-            tracing::warn!("Could not re-read relay keys after subscribing: {}", error)
-        }
+        Ok(Ok(count)) => tracing::info!("Re-read {} Astation relay key(s) after subscribing", count),
+        Ok(Err(error)) => tracing::warn!("Could not re-read relay keys after subscribing: {}", error),
         Err(_) => tracing::warn!(
             "Re-reading relay keys after subscribing timed out after {:?}",
             relay::KEY_RELOAD_TIMEOUT
@@ -195,8 +189,7 @@ async fn connect_redis_cluster(
                     error
                 );
                 if attempt < REDIS_CONNECT_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_secs(REDIS_CONNECT_RETRY_SECS))
-                        .await;
+                    tokio::time::sleep(std::time::Duration::from_secs(REDIS_CONNECT_RETRY_SECS)).await;
                 }
             }
         }
@@ -226,15 +219,9 @@ async fn supervise(tasks: Vec<NamedTask>, hub: &RelayHub) -> Option<&'static str
         return None;
     }
     match result {
-        Ok(()) => tracing::error!(
-            "Background task '{}' stopped unexpectedly; draining, then exiting",
-            name
-        ),
+        Ok(()) => tracing::error!("Background task '{}' stopped unexpectedly; draining, then exiting", name),
         Err(error) if error.is_panic() => {
-            tracing::error!(
-                "Background task '{}' panicked; draining, then exiting",
-                name
-            )
+            tracing::error!("Background task '{}' panicked; draining, then exiting", name)
         }
         Err(error) => tracing::error!(
             "Background task '{}' ended ({}); draining, then exiting",
@@ -358,11 +345,7 @@ fn spawn_upkeep(
 /// GET /metrics — Prometheus text format, per replica (not proxied by nginx).
 async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     let local = state.relay.local();
-    let body = cluster::metrics::metrics().render(
-        state.relay.replica_id(),
-        local.count_by_role(),
-        local.room_count(),
-    );
+    let body = cluster::metrics::metrics().render(state.relay.replica_id(), local.count_by_role(), local.room_count());
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
@@ -405,8 +388,8 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
 /// CORS: `CORS_ORIGIN` (default the production webapp origin); `*` is dev-only.
 fn cors_layer() -> CorsLayer {
     // Configure CORS - Allow specific origin or default to localhost for development
-    let allowed_origin =
-        std::env::var("CORS_ORIGIN").unwrap_or_else(|_| "https://station.agora.build".to_string());
+    let allowed_origin = std::env::var("CORS_ORIGIN")
+        .unwrap_or_else(|_| "https://station.agora.build".to_string());
 
     if allowed_origin == "*" {
         // Development mode: allow all origins
@@ -416,11 +399,7 @@ fn cors_layer() -> CorsLayer {
         // Production mode: whitelist specific domain
         tracing::info!("CORS configured to allow origin: {}", allowed_origin);
         CorsLayer::new()
-            .allow_origin(
-                allowed_origin
-                    .parse::<HeaderValue>()
-                    .expect("Invalid CORS_ORIGIN"),
-            )
+            .allow_origin(allowed_origin.parse::<HeaderValue>().expect("Invalid CORS_ORIGIN"))
             .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
             .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
             .allow_credentials(true)
@@ -481,7 +460,10 @@ fn router(state: AppState) -> Router {
             "/api/sessions/:id/status",
             get(routes::get_session_status_handler),
         )
-        .route("/api/sessions/:id/deny", post(routes::deny_session_handler))
+        .route(
+            "/api/sessions/:id/deny",
+            post(routes::deny_session_handler),
+        )
         // RTC Session API routes
         .route(
             "/api/rtc-sessions",
@@ -516,7 +498,10 @@ fn router(state: AppState) -> Router {
             post(voice_routes::atem_response_handler),
         )
         // LLM Proxy (for Agora ConvoAI)
-        .route("/api/llm/chat", post(llm_proxy::llm_chat_handler))
+        .route(
+            "/api/llm/chat",
+            post(llm_proxy::llm_chat_handler),
+        )
         // Vault API routes
         .route(
             "/api/vault",
@@ -533,24 +518,19 @@ fn router(state: AppState) -> Router {
         // Atem Memory API routes (knowledge sync)
         .route(
             "/api/memory/batch",
-            post(knowledge_routes::memory_batch_handler).layer(DefaultBodyLimit::max(
-                knowledge_routes::MEMORY_BATCH_BODY_LIMIT,
-            )),
+            post(knowledge_routes::memory_batch_handler)
+                .layer(DefaultBodyLimit::max(knowledge_routes::MEMORY_BATCH_BODY_LIMIT)),
         )
         .route("/api/memory", get(knowledge_routes::memory_pull_handler))
         .route(
             "/api/skills/batch",
-            post(knowledge_routes::skills_batch_handler).layer(DefaultBodyLimit::max(
-                knowledge_routes::SKILLS_BATCH_BODY_LIMIT,
-            )),
+            post(knowledge_routes::skills_batch_handler)
+                .layer(DefaultBodyLimit::max(knowledge_routes::SKILLS_BATCH_BODY_LIMIT)),
         )
         .route("/api/skills", get(knowledge_routes::skills_pull_handler))
         // Relay API routes
         .route("/api/pair", post(relay::create_pair_handler))
-        .route(
-            "/api/pair/:code",
-            get(relay::pair_status_handler).delete(relay::delete_pair_handler),
-        )
+        .route("/api/pair/:code", get(relay::pair_status_handler).delete(relay::delete_pair_handler))
         .layer(GovernorLayer {
             config: governor_conf_general,
         })
@@ -559,7 +539,7 @@ fn router(state: AppState) -> Router {
                 hub: state.relay.clone(),
                 bucket: "general",
                 limit: GENERAL_LIMIT_PER_MINUTE,
-                burst: 20,
+            burst: 20,
             },
             shared_rate_limit,
         ));
@@ -730,21 +710,14 @@ async fn serve() {
         Some(url) => {
             tracing::info!("Connecting to Redis for shared relay state...");
             let auth_timeout = std::time::Duration::from_secs(relay::RELAY_AUTH_TIMEOUT_SECS);
-            let mut cluster = match start_redis_replica(
-                &url,
-                identity.clone(),
-                keys,
-                auth_timeout,
-                ws_max_per_ip,
-            )
-            .await
-            {
-                Ok(cluster) => cluster,
-                Err(message) => {
-                    tracing::error!("{}", message);
-                    std::process::exit(1);
-                }
-            };
+            let mut cluster =
+                match start_redis_replica(&url, identity.clone(), keys, auth_timeout, ws_max_per_ip).await {
+                    Ok(cluster) => cluster,
+                    Err(message) => {
+                        tracing::error!("{}", message);
+                        std::process::exit(1);
+                    }
+                };
             // The cluster's background tasks (bus, dispatcher, presence)
             // run for the life of the process, supervised below.
             let tasks = cluster.take_tasks();
@@ -779,18 +752,10 @@ async fn serve() {
     // Background tasks run for the life of the process; one that stops
     // outside a drain stops the relay (exit 1) so it is restarted.
     let mut background = cluster_tasks;
-    background.extend(spawn_upkeep(
-        &relay,
-        &sessions,
-        &rtc_sessions,
-        &voice_sessions,
-    ));
-    tokio::spawn(run_supervisor(
-        background,
-        relay.clone(),
-        relay::DRAIN_GRACE,
-        |_| std::process::exit(1),
-    ));
+    background.extend(spawn_upkeep(&relay, &sessions, &rtc_sessions, &voice_sessions));
+    tokio::spawn(run_supervisor(background, relay.clone(), relay::DRAIN_GRACE, |_| {
+        std::process::exit(1)
+    }));
 
     let state = AppState {
         sessions,
@@ -880,26 +845,15 @@ mod tests {
     #[tokio::test]
     async fn metrics_are_served() {
         let response = router(test_state())
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers()["content-type"],
-            "text/plain; version=0.0.4"
-        );
+        assert_eq!(response.headers()["content-type"], "text/plain; version=0.0.4");
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("relay_sockets{role=\"atem\"} 0"), "{text}");
-        assert!(
-            text.contains("relay_replica_info{replica=\"local\"} 1"),
-            "{text}"
-        );
+        assert!(text.contains("relay_replica_info{replica=\"local\"} 1"), "{text}");
         crate::cluster::metrics::assert_valid_exposition(&text);
     }
 
@@ -909,12 +863,7 @@ mod tests {
             .route("/health", get(health_handler))
             .with_state(test_state());
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -951,20 +900,12 @@ mod tests {
         let response = Router::new()
             .route("/health", get(health_handler))
             .with_state(state)
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(
-            body.as_ref(),
-            br#"{"redis":"unavailable","status":"unhealthy"}"#
-        );
+        assert_eq!(body.as_ref(), br#"{"redis":"unavailable","status":"unhealthy"}"#);
     }
 
     /// Runs `run_supervisor` with an injected exit; returns the task it
@@ -974,12 +915,9 @@ mod tests {
         let sink = reported.clone();
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            run_supervisor(
-                tasks,
-                hub,
-                std::time::Duration::from_millis(100),
-                move |name| *sink.lock().unwrap() = Some(name),
-            ),
+            run_supervisor(tasks, hub, std::time::Duration::from_millis(100), move |name| {
+                *sink.lock().unwrap() = Some(name)
+            }),
         )
         .await
         .expect("the supervisor did not return");
@@ -990,16 +928,10 @@ mod tests {
     #[tokio::test]
     async fn supervisor_reports_a_task_that_ends_early() {
         let tasks: Vec<NamedTask> = vec![
-            (
-                "presence refresh",
-                tokio::spawn(std::future::pending::<()>()),
-            ),
+            ("presence refresh", tokio::spawn(std::future::pending::<()>())),
             ("bus dispatcher", tokio::spawn(async {})),
         ];
-        assert_eq!(
-            supervised(tasks, RelayHub::new()).await,
-            Some("bus dispatcher")
-        );
+        assert_eq!(supervised(tasks, RelayHub::new()).await, Some("bus dispatcher"));
     }
 
     #[tokio::test]
@@ -1008,65 +940,41 @@ mod tests {
             ("room keep-alive", tokio::spawn(async { panic!("boom") })),
             ("bus subscriber", tokio::spawn(std::future::pending::<()>())),
         ];
-        assert_eq!(
-            supervised(tasks, RelayHub::new()).await,
-            Some("room keep-alive")
-        );
+        assert_eq!(supervised(tasks, RelayHub::new()).await, Some("room keep-alive"));
     }
 
     #[tokio::test]
     async fn a_failed_task_drains_the_relay_before_the_exit() {
         let hub = RelayHub::new();
-        let mut outbox = hub
-            .local()
-            .register("c1", "room", cluster::local::SocketRole::Astation);
+        let mut outbox = hub.local().register("c1", "room", cluster::local::SocketRole::Astation);
         let seen = Arc::new(std::sync::Mutex::new(None));
         let sink = seen.clone();
         let observed = hub.clone();
         let tasks: Vec<NamedTask> = vec![("bus dispatcher", tokio::spawn(async {}))];
-        run_supervisor(
-            tasks,
-            hub,
-            std::time::Duration::from_millis(100),
-            move |name| {
-                *sink.lock().unwrap() =
-                    Some((name, observed.is_draining(), observed.local().is_empty()))
-            },
-        )
+        run_supervisor(tasks, hub, std::time::Duration::from_millis(100), move |name| {
+            *sink.lock().unwrap() = Some((name, observed.is_draining(), observed.local().is_empty()))
+        })
         .await;
         assert_eq!(*seen.lock().unwrap(), Some(("bus dispatcher", true, true)));
         assert!(outbox.close.changed().await.is_ok());
-        assert_eq!(
-            outbox.close.borrow().as_ref().map(|close| close.0),
-            Some(1012)
-        );
+        assert_eq!(outbox.close.borrow().as_ref().map(|close| close.0), Some(1012));
     }
 
     /// The upkeep closes a client whose queue stays full with no new frames
     /// arriving (`send` alone would only notice on the next frame).
     #[tokio::test(start_paused = true)]
     async fn upkeep_closes_a_client_that_stays_full() {
-        use cluster::local::{
-            SocketRole, CLOSE_SLOW_CLIENT, MAX_QUEUED_FRAMES, SLOW_CLIENT_TIMEOUT,
-        };
+        use cluster::local::{SocketRole, CLOSE_SLOW_CLIENT, MAX_QUEUED_FRAMES, SLOW_CLIENT_TIMEOUT};
         let hub = RelayHub::new();
         let mut outbox = hub.local().register("stuck", "room", SocketRole::Astation);
         for n in 0..=MAX_QUEUED_FRAMES {
             hub.local().send("stuck", format!("{n}"));
         }
-        let tasks = spawn_upkeep(
-            &hub,
-            &SessionStore::new(),
-            &RtcSessionStore::new(),
-            &VoiceSessionStore::new(),
-        );
+        let tasks = spawn_upkeep(&hub, &SessionStore::new(), &RtcSessionStore::new(), &VoiceSessionStore::new());
         tokio::time::sleep(SLOW_CLIENT_TIMEOUT + std::time::Duration::from_secs(2)).await;
         assert!(!hub.local().contains("stuck"));
         assert!(outbox.close.changed().await.is_ok());
-        assert_eq!(
-            outbox.close.borrow().as_ref().map(|close| close.0),
-            Some(CLOSE_SLOW_CLIENT)
-        );
+        assert_eq!(outbox.close.borrow().as_ref().map(|close| close.0), Some(CLOSE_SLOW_CLIENT));
         for (_, task) in tasks {
             task.abort();
         }
@@ -1112,27 +1020,16 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         signal_tx.send(()).unwrap();
         let finished = tokio::time::timeout(std::time::Duration::from_secs(3), server).await;
-        assert!(
-            finished.is_ok(),
-            "shutdown waited for the in-flight request"
-        );
+        assert!(finished.is_ok(), "shutdown waited for the in-flight request");
         assert!(hub.is_draining());
     }
 
     #[tokio::test]
     async fn health_fails_while_draining() {
         let state = test_state();
-        state
-            .relay
-            .drain(std::time::Duration::from_millis(10))
-            .await;
+        state.relay.drain(std::time::Duration::from_millis(10)).await;
         let response = router(state)
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1154,11 +1051,7 @@ mod tests {
             .route("/limited", get(|| async { "ok" }))
             .layer(GovernorLayer { config });
 
-        for expected in [
-            StatusCode::OK,
-            StatusCode::OK,
-            StatusCode::TOO_MANY_REQUESTS,
-        ] {
+        for expected in [StatusCode::OK, StatusCode::OK, StatusCode::TOO_MANY_REQUESTS] {
             let response = app
                 .clone()
                 .oneshot(

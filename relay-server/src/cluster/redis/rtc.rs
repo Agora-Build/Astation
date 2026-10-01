@@ -30,9 +30,7 @@ return {'joined', tostring(uid), redis.call('HGET', KEYS[1], 'app_id'),
 "#;
 
 fn parse_time(value: Option<&String>) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value?)
-        .ok()
-        .map(|time| time.with_timezone(&Utc))
+    DateTime::parse_from_rfc3339(value?).ok().map(|time| time.with_timezone(&Utc))
 }
 
 fn parse_participants(raw: &str) -> Vec<Participant> {
@@ -52,9 +50,7 @@ fn session_from_hash(map: &HashMap<String, String>) -> Option<RtcSession> {
         host_uid: map.get("host_uid")?.parse().ok()?,
         created_at: parse_time(map.get("created_at"))?,
         expires_at: parse_time(map.get("expires_at"))?,
-        participants: parse_participants(
-            map.get("participants").map(String::as_str).unwrap_or("[]"),
-        ),
+        participants: parse_participants(map.get("participants").map(String::as_str).unwrap_or("[]")),
     })
 }
 
@@ -113,26 +109,13 @@ impl RtcBackend for RedisRtcBackend {
             .conn
             .run(|mut c| async move { redis::cmd("HGETALL").arg(&key).query_async(&mut c).await })
             .await?;
-        Ok(if map.is_empty() {
-            None
-        } else {
-            session_from_hash(&map)
-        })
+        Ok(if map.is_empty() { None } else { session_from_hash(&map) })
     }
 
-    async fn join(
-        &self,
-        id: &str,
-        name: String,
-        now: DateTime<Utc>,
-    ) -> Result<JoinOutcome, StoreError> {
+    async fn join(&self, id: &str, name: String, now: DateTime<Utc>) -> Result<JoinOutcome, StoreError> {
         let key = keys::rtc(id);
         let script = &self.join;
-        let args = vec![
-            name.clone(),
-            now.to_rfc3339(),
-            MAX_RTC_PARTICIPANTS.to_string(),
-        ];
+        let args = vec![name.clone(), now.to_rfc3339(), MAX_RTC_PARTICIPANTS.to_string()];
         let out: Vec<String> = self
             .conn
             .run(|mut c| async move {
@@ -204,59 +187,29 @@ mod tests {
             .await
             .unwrap();
         let loaded = store.get("rtc-1").await.unwrap().unwrap();
-        assert_eq!(
-            (
-                loaded.app_id.as_str(),
-                loaded.channel.as_str(),
-                loaded.token.as_str()
-            ),
-            ("app", "ch", "tok")
-        );
+        assert_eq!((loaded.app_id.as_str(), loaded.channel.as_str(), loaded.token.as_str()), ("app", "ch", "tok"));
         assert_eq!(loaded.host_uid, 42);
         assert_eq!(loaded.created_at, created.created_at);
         assert_eq!(loaded.uid_counter_value, RTC_FIRST_UID);
         assert!(loaded.participants.is_empty());
         let ttl: i64 = conn
-            .run(|mut c| async move {
-                redis::cmd("TTL")
-                    .arg("relay:rtc:rtc-1")
-                    .query_async(&mut c)
-                    .await
-            })
+            .run(|mut c| async move { redis::cmd("TTL").arg("relay:rtc:rtc-1").query_async(&mut c).await })
             .await
             .unwrap();
         assert!((4 * 3600 - 10..=4 * 3600).contains(&ttl), "ttl {ttl}");
         let joined = store.join("rtc-1", "Alice".into()).await.unwrap();
         assert_eq!(joined.uid, 1000);
         let ttl: i64 = conn
-            .run(|mut c| async move {
-                redis::cmd("TTL")
-                    .arg("relay:rtc:rtc-1")
-                    .query_async(&mut c)
-                    .await
-            })
+            .run(|mut c| async move { redis::cmd("TTL").arg("relay:rtc:rtc-1").query_async(&mut c).await })
             .await
             .unwrap();
-        assert!(
-            (4 * 3600 - 10..=4 * 3600).contains(&ttl),
-            "ttl after join {ttl}"
-        );
-        assert_eq!(
-            (joined.app_id.as_str(), joined.token.as_str()),
-            ("app", "tok")
-        );
+        assert!((4 * 3600 - 10..=4 * 3600).contains(&ttl), "ttl after join {ttl}");
+        assert_eq!((joined.app_id.as_str(), joined.token.as_str()), ("app", "tok"));
         let loaded = store.get("rtc-1").await.unwrap().unwrap();
         assert_eq!(loaded.participants.len(), 1);
-        assert_eq!(
-            loaded.participants[0].display_name.as_deref(),
-            Some("Alice")
-        );
+        assert_eq!(loaded.participants[0].display_name.as_deref(), Some("Alice"));
         assert_eq!(loaded.uid_counter_value, 1001);
-        assert!(store
-            .join("missing", "Bob".into())
-            .await
-            .unwrap_err()
-            .contains("not found"));
+        assert!(store.join("missing", "Bob".into()).await.unwrap_err().contains("not found"));
         assert!(store.delete("rtc-1").await.unwrap());
         assert!(!store.delete("rtc-1").await.unwrap());
     }
@@ -267,10 +220,7 @@ mod tests {
         let _guard = REDIS_LOCK.lock().await;
         let conn = fresh_conn().await;
         let store = RtcSessionStore::with_backend(Arc::new(RedisRtcBackend::new(conn)));
-        store
-            .create("rtc-c".into(), "a".into(), "c".into(), "t".into(), 1)
-            .await
-            .unwrap();
+        store.create("rtc-c".into(), "a".into(), "c".into(), "t".into(), 1).await.unwrap();
         let handles: Vec<_> = (0..12)
             .map(|i| {
                 let store = store.clone();
@@ -301,10 +251,7 @@ mod tests {
         let _guard = REDIS_LOCK.lock().await;
         let conn = fresh_conn().await;
         let store = RtcSessionStore::with_backend(Arc::new(RedisRtcBackend::new(conn.clone())));
-        store
-            .create("seq".into(), "app".into(), "ch".into(), "tok".into(), 1)
-            .await
-            .unwrap();
+        store.create("seq".into(), "app".into(), "ch".into(), "tok".into(), 1).await.unwrap();
         for expected in RTC_FIRST_UID..RTC_FIRST_UID + 8 {
             let joined = store.join("seq", format!("U{expected}")).await.unwrap();
             assert_eq!(joined.uid, expected);
@@ -314,53 +261,25 @@ mod tests {
         assert_eq!(error, "Session is full (maximum 8 participants)");
         let loaded = store.get("seq").await.unwrap().unwrap();
         assert_eq!(loaded.participants.len(), 8);
-        assert_eq!(
-            loaded.uid_counter_value,
-            RTC_FIRST_UID + 8,
-            "a refused join takes no uid"
-        );
-        assert_eq!(
-            store.join("nope", "A".into()).await.unwrap_err(),
-            "Session not found"
-        );
+        assert_eq!(loaded.uid_counter_value, RTC_FIRST_UID + 8, "a refused join takes no uid");
+        assert_eq!(store.join("nope", "A".into()).await.unwrap_err(), "Session not found");
 
         // Non-ASCII display names round-trip (cjson passes bytes through).
-        store
-            .create("names".into(), "app".into(), "ch".into(), "tok".into(), 1)
-            .await
-            .unwrap();
+        store.create("names".into(), "app".into(), "ch".into(), "tok".into(), 1).await.unwrap();
         store.join("names", "张伟".into()).await.unwrap();
         store.join("names", "Ünï".into()).await.unwrap();
         let loaded = store.get("names").await.unwrap().unwrap();
-        let names: Vec<_> = loaded
-            .participants
-            .iter()
-            .map(|p| p.display_name.clone().unwrap())
-            .collect();
+        let names: Vec<_> = loaded.participants.iter().map(|p| p.display_name.clone().unwrap()).collect();
         assert_eq!(names, vec!["张伟".to_string(), "Ünï".to_string()]);
         let ttl: i64 = conn
-            .run(|mut c| async move {
-                redis::cmd("TTL")
-                    .arg("relay:rtc:names")
-                    .query_async(&mut c)
-                    .await
-            })
+            .run(|mut c| async move { redis::cmd("TTL").arg("relay:rtc:names").query_async(&mut c).await })
             .await
             .unwrap();
-        assert!(
-            (4 * 3600 - 10..=4 * 3600).contains(&ttl),
-            "ttl after joins {ttl}"
-        );
+        assert!((4 * 3600 - 10..=4 * 3600).contains(&ttl), "ttl after joins {ttl}");
 
         // Sessions are independent, each starting at the first uid.
-        store
-            .create("other".into(), "app".into(), "ch".into(), "tok".into(), 1)
-            .await
-            .unwrap();
-        assert_eq!(
-            store.join("other", "A".into()).await.unwrap().uid,
-            RTC_FIRST_UID
-        );
+        store.create("other".into(), "app".into(), "ch".into(), "tok".into(), 1).await.unwrap();
+        assert_eq!(store.join("other", "A".into()).await.unwrap().uid, RTC_FIRST_UID);
 
         // Expiry: a session past its expiry is gone.
         let backend = RedisRtcBackend::new(conn.clone());
@@ -382,10 +301,7 @@ mod tests {
         assert!(store.get("short").await.unwrap().is_some());
         tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
         assert!(store.get("short").await.unwrap().is_none());
-        assert_eq!(
-            store.join("short", "Late".into()).await.unwrap_err(),
-            "Session not found"
-        );
+        assert_eq!(store.join("short", "Late".into()).await.unwrap_err(), "Session not found");
     }
 
     /// Two replicas (separate connections, separate stores) racing for one session.
@@ -396,9 +312,7 @@ mod tests {
         let conn = fresh_conn().await;
         let one = RtcSessionStore::with_backend(Arc::new(RedisRtcBackend::new(conn.clone())));
         let two = RtcSessionStore::with_backend(Arc::new(RedisRtcBackend::new(conn.clone())));
-        one.create("rtc-two".into(), "a".into(), "c".into(), "t".into(), 1)
-            .await
-            .unwrap();
+        one.create("rtc-two".into(), "a".into(), "c".into(), "t".into(), 1).await.unwrap();
         let handles: Vec<_> = (0..16)
             .map(|i| {
                 let store = if i % 2 == 0 { one.clone() } else { two.clone() };
@@ -413,14 +327,6 @@ mod tests {
         }
         uids.sort();
         assert_eq!(uids, (1000..1008).collect::<Vec<u32>>());
-        assert_eq!(
-            one.get("rtc-two")
-                .await
-                .unwrap()
-                .unwrap()
-                .participants
-                .len(),
-            8
-        );
+        assert_eq!(one.get("rtc-two").await.unwrap().unwrap().participants.len(), 8);
     }
 }
