@@ -621,7 +621,7 @@ async fn redis_concurrent_rtc_joins_across_replicas_hold_the_cap() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
     let id = created["id"].as_str().unwrap().to_string();
-    let joins: Vec<_> = (0..12)
+    let joins: Vec<_> = (0..20)
         .map(|i| {
             let state = if i % 2 == 0 { one.state.clone() } else { two.state.clone() };
             let id = id.clone();
@@ -641,7 +641,7 @@ async fn redis_concurrent_rtc_joins_across_replicas_hold_the_cap() {
     }
     uids.sort();
     assert_eq!(uids, (1000..1008).collect::<Vec<u32>>());
-    assert_eq!(full, 4);
+    assert_eq!(full, 12);
     let (status, _) = http(&two.state, "GET", &format!("/api/rtc-sessions/{id}"), "", &[]).await;
     assert_eq!(status, StatusCode::OK);
     let stored = two.state.rtc_sessions.get(&id).await.unwrap().expect("session on replica 2");
