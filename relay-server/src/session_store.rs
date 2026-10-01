@@ -174,11 +174,107 @@ impl Default for SessionStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::auth::{create_session, SessionStatus};
     use chrono::{Duration, Utc};
     use uuid::Uuid;
+
+    /// Shared session scenarios: the in-memory tests and the Redis suite
+    /// both run these, so the two backends stay interchangeable.
+    pub(crate) mod scenarios {
+        use super::*;
+
+        pub(crate) async fn grant_is_atomic_and_checks_in_order(store: SessionStore) {
+            let session = create_session("grant-host");
+            let id = session.id.clone();
+            let otp = session.otp.clone();
+            store.create(session).await.unwrap();
+
+            assert!(matches!(store.grant("missing", &otp).await.unwrap(), GrantOutcome::NotFound));
+            assert!(matches!(store.grant(&id, "00000000").await.unwrap(), GrantOutcome::InvalidOtp));
+            let granted = match store.grant(&id, &otp).await.unwrap() {
+                GrantOutcome::Granted(session) => session,
+                other => panic!("expected Granted, got {other:?}"),
+            };
+            assert_eq!(granted.status, SessionStatus::Granted);
+            assert_eq!(granted.token.as_ref().map(String::len), Some(64));
+            assert!(matches!(
+                store.grant(&id, &otp).await.unwrap(),
+                GrantOutcome::NotPending(SessionStatus::Granted)
+            ));
+            assert!(matches!(
+                store.deny(&id).await.unwrap(),
+                DenyOutcome::NotPending(SessionStatus::Granted)
+            ));
+        }
+
+        pub(crate) async fn grant_of_an_expired_session_is_expired_even_with_the_right_otp(store: SessionStore) {
+            let now = Utc::now();
+            let expired = Session {
+                id: Uuid::new_v4().to_string(),
+                otp: "12345678".to_string(),
+                hostname: "late".to_string(),
+                status: SessionStatus::Pending,
+                token: None,
+                created_at: now - Duration::minutes(10),
+                expires_at: now - Duration::minutes(5),
+                astation_id: None,
+            };
+            let id = expired.id.clone();
+            store.create(expired).await.unwrap();
+            assert!(matches!(store.grant(&id, "12345678").await.unwrap(), GrantOutcome::Expired));
+            assert!(matches!(store.grant(&id, "00000000").await.unwrap(), GrantOutcome::Expired));
+        }
+
+        pub(crate) async fn concurrent_grants_apply_once(store: SessionStore) {
+            let session = create_session("race-host");
+            let (id, otp) = (session.id.clone(), session.otp.clone());
+            store.create(session).await.unwrap();
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let (store, id, otp) = (store.clone(), id.clone(), otp.clone());
+                    tokio::spawn(async move { store.grant(&id, &otp).await.unwrap() })
+                })
+                .collect();
+            let mut granted = 0;
+            for handle in handles {
+                if matches!(handle.await.unwrap(), GrantOutcome::Granted(_)) {
+                    granted += 1;
+                }
+            }
+            assert_eq!(granted, 1);
+        }
+
+        pub(crate) async fn deny_applies_only_while_pending(store: SessionStore) {
+            let session = create_session("deny-host");
+            let id = session.id.clone();
+            store.create(session).await.unwrap();
+            assert!(matches!(store.deny("missing").await.unwrap(), DenyOutcome::NotFound));
+            match store.deny(&id).await.unwrap() {
+                DenyOutcome::Denied(session) => assert_eq!(session.status, SessionStatus::Denied),
+                other => panic!("expected Denied, got {other:?}"),
+            }
+            assert!(matches!(
+                store.deny(&id).await.unwrap(),
+                DenyOutcome::NotPending(SessionStatus::Denied)
+            ));
+        }
+
+        pub(crate) async fn grant_of_a_finished_expired_session_is_not_pending(store: SessionStore) {
+            for status in [SessionStatus::Granted, SessionStatus::Denied] {
+                let mut session = create_session("done-host");
+                session.status = status.clone();
+                session.expires_at = Utc::now() - Duration::minutes(5);
+                let (id, otp) = (session.id.clone(), session.otp.clone());
+                store.create(session).await.unwrap();
+                match store.grant(&id, &otp).await.unwrap() {
+                    GrantOutcome::NotPending(got) => assert_eq!(got, status),
+                    other => panic!("expected NotPending({status:?}), got {other:?}"),
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_create_and_get_session() {
@@ -333,101 +429,26 @@ mod tests {
 
     #[tokio::test]
     async fn grant_is_atomic_and_checks_in_order() {
-        let store = SessionStore::new();
-        let session = create_session("grant-host");
-        let id = session.id.clone();
-        let otp = session.otp.clone();
-        store.create(session).await.unwrap();
-
-        assert!(matches!(store.grant("missing", &otp).await.unwrap(), GrantOutcome::NotFound));
-        assert!(matches!(store.grant(&id, "00000000").await.unwrap(), GrantOutcome::InvalidOtp));
-        let granted = match store.grant(&id, &otp).await.unwrap() {
-            GrantOutcome::Granted(session) => session,
-            other => panic!("expected Granted, got {other:?}"),
-        };
-        assert_eq!(granted.status, SessionStatus::Granted);
-        assert_eq!(granted.token.as_ref().map(String::len), Some(64));
-        assert!(matches!(
-            store.grant(&id, &otp).await.unwrap(),
-            GrantOutcome::NotPending(SessionStatus::Granted)
-        ));
-        assert!(matches!(
-            store.deny(&id).await.unwrap(),
-            DenyOutcome::NotPending(SessionStatus::Granted)
-        ));
+        scenarios::grant_is_atomic_and_checks_in_order(SessionStore::new()).await;
     }
 
     #[tokio::test]
     async fn grant_of_an_expired_session_is_expired_even_with_the_right_otp() {
-        let store = SessionStore::new();
-        let now = Utc::now();
-        let expired = Session {
-            id: Uuid::new_v4().to_string(),
-            otp: "12345678".to_string(),
-            hostname: "late".to_string(),
-            status: SessionStatus::Pending,
-            token: None,
-            created_at: now - Duration::minutes(10),
-            expires_at: now - Duration::minutes(5),
-            astation_id: None,
-        };
-        let id = expired.id.clone();
-        store.create(expired).await.unwrap();
-        assert!(matches!(store.grant(&id, "12345678").await.unwrap(), GrantOutcome::Expired));
-        assert!(matches!(store.grant(&id, "00000000").await.unwrap(), GrantOutcome::Expired));
+        scenarios::grant_of_an_expired_session_is_expired_even_with_the_right_otp(SessionStore::new()).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_grants_apply_once() {
-        let store = SessionStore::new();
-        let session = create_session("race-host");
-        let (id, otp) = (session.id.clone(), session.otp.clone());
-        store.create(session).await.unwrap();
-        let handles: Vec<_> = (0..8)
-            .map(|_| {
-                let (store, id, otp) = (store.clone(), id.clone(), otp.clone());
-                tokio::spawn(async move { store.grant(&id, &otp).await.unwrap() })
-            })
-            .collect();
-        let mut granted = 0;
-        for handle in handles {
-            if matches!(handle.await.unwrap(), GrantOutcome::Granted(_)) {
-                granted += 1;
-            }
-        }
-        assert_eq!(granted, 1);
+        scenarios::concurrent_grants_apply_once(SessionStore::new()).await;
     }
 
     #[tokio::test]
     async fn deny_applies_only_while_pending() {
-        let store = SessionStore::new();
-        let session = create_session("deny-host");
-        let id = session.id.clone();
-        store.create(session).await.unwrap();
-        assert!(matches!(store.deny("missing").await.unwrap(), DenyOutcome::NotFound));
-        match store.deny(&id).await.unwrap() {
-            DenyOutcome::Denied(session) => assert_eq!(session.status, SessionStatus::Denied),
-            other => panic!("expected Denied, got {other:?}"),
-        }
-        assert!(matches!(
-            store.deny(&id).await.unwrap(),
-            DenyOutcome::NotPending(SessionStatus::Denied)
-        ));
+        scenarios::deny_applies_only_while_pending(SessionStore::new()).await;
     }
 
     #[tokio::test]
     async fn grant_of_a_finished_expired_session_is_not_pending() {
-        let store = SessionStore::new();
-        for status in [SessionStatus::Granted, SessionStatus::Denied] {
-            let mut session = create_session("done-host");
-            session.status = status.clone();
-            session.expires_at = Utc::now() - Duration::minutes(5);
-            let (id, otp) = (session.id.clone(), session.otp.clone());
-            store.create(session).await.unwrap();
-            match store.grant(&id, &otp).await.unwrap() {
-                GrantOutcome::NotPending(got) => assert_eq!(got, status),
-                other => panic!("expected NotPending({status:?}), got {other:?}"),
-            }
-        }
+        scenarios::grant_of_a_finished_expired_session_is_not_pending(SessionStore::new()).await;
     }
 }
