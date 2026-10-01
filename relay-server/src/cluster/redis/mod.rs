@@ -16,6 +16,9 @@ pub mod directory;
 // Consumer lands in Task 19 (connect_cluster); drop the allow then.
 #[allow(dead_code)]
 pub mod sessions;
+// Consumer lands in Task 19 (connect_cluster); drop the allow then.
+#[allow(dead_code)]
+pub mod voice;
 
 use std::future::Future;
 use std::time::Duration;

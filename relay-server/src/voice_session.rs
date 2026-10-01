@@ -9,6 +9,21 @@ use tokio::sync::{oneshot, RwLock};
 
 use crate::cluster::StoreError;
 
+/// Cap on a voice session's transcript buffer (it was unbounded).
+pub const MAX_VOICE_BUFFER_BYTES: usize = 64 * 1024;
+
+/// The last `max` bytes of `text`, cut at a character boundary.
+pub fn tail_within(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
 /// Voice session state machine for LLM request accumulation
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum VoiceSessionState {
@@ -50,9 +65,14 @@ impl VoiceSession {
         }
     }
 
-    /// Add transcription chunk to buffer
+    /// Add transcription chunk to buffer. The buffer keeps its newest chunks
+    /// within MAX_VOICE_BUFFER_BYTES.
     pub fn add_transcription(&mut self, text: String) {
-        self.buffer.push(text);
+        self.buffer.push(tail_within(&text, MAX_VOICE_BUFFER_BYTES).to_string());
+        let mut total: usize = self.buffer.iter().map(String::len).sum();
+        while total > MAX_VOICE_BUFFER_BYTES && self.buffer.len() > 1 {
+            total -= self.buffer.remove(0).len();
+        }
         self.last_activity = Utc::now();
     }
 
@@ -123,6 +143,12 @@ impl ReplyWaiters {
             let _ = sender.send(reply.to_string());
         }
         count
+    }
+
+    /// Whether any request still waits on `session_id`.
+    #[cfg(test)]
+    pub(crate) fn is_waiting(&self, session_id: &str) -> bool {
+        self.lock().contains_key(session_id)
     }
 
     /// Drop waiters whose request is gone (timed out).
@@ -400,7 +426,7 @@ pub struct AtemResponseResponse {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -534,17 +560,7 @@ mod tests {
 
     #[tokio::test]
     async fn waiter_mechanism() {
-        let store = VoiceSessionStore::new();
-        store.create("test".to_string(), "atem".to_string(), "channel".to_string()).await.unwrap();
-        tokio::spawn({
-            let store = store.clone();
-            async move {
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                store.set_response("test", "Response!".to_string()).await.unwrap();
-            }
-        });
-        let result = store.wait_reply("test", std::time::Duration::from_secs(5)).await.unwrap();
-        assert_eq!(result, WaitOutcome::Reply("Response!".to_string()));
+        scenarios::reply_wakes_a_waiter(VoiceSessionStore::new()).await;
     }
 
     #[tokio::test]
@@ -645,48 +661,153 @@ mod tests {
 
     #[tokio::test]
     async fn waiter_multiple_waiters_all_notified() {
-        let store = VoiceSessionStore::new();
-        store.create("test".to_string(), "atem".to_string(), "ch".to_string()).await.unwrap();
-        let wait = std::time::Duration::from_secs(5);
-        let (a, b, _) = tokio::join!(
-            store.wait_reply("test", wait),
-            store.wait_reply("test", wait),
-            async {
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                store.set_response("test", "Response!".to_string()).await.unwrap();
-            }
-        );
-        assert_eq!(a.unwrap(), WaitOutcome::Reply("Response!".to_string()));
-        assert_eq!(b.unwrap(), WaitOutcome::Reply("Response!".to_string()));
+        scenarios::multiple_waiters_all_notified(VoiceSessionStore::new()).await;
     }
 
     #[tokio::test]
     async fn wait_reply_returns_an_answer_that_arrived_first() {
-        let store = VoiceSessionStore::new();
-        store.create("early".to_string(), "atem".to_string(), "ch".to_string()).await.unwrap();
-        store.set_response("early", "already here".to_string()).await.unwrap();
-        let result = store.wait_reply("early", std::time::Duration::from_millis(50)).await.unwrap();
-        assert_eq!(result, WaitOutcome::Reply("already here".to_string()));
+        scenarios::answer_that_arrived_first_is_returned(VoiceSessionStore::new()).await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn wait_reply_times_out() {
-        let store = VoiceSessionStore::new();
-        store.create("slow".to_string(), "atem".to_string(), "ch".to_string()).await.unwrap();
-        let started = tokio::time::Instant::now();
-        let result = store.wait_reply("slow", std::time::Duration::from_secs(30)).await.unwrap();
-        assert_eq!(result, WaitOutcome::TimedOut);
-        assert!(started.elapsed() >= std::time::Duration::from_secs(30));
+        assert_eq!(crate::llm_proxy::LLM_WAIT_SECS, 30);
+        scenarios::wait_times_out_after(
+            VoiceSessionStore::new(),
+            std::time::Duration::from_secs(crate::llm_proxy::LLM_WAIT_SECS),
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn early_wait_reply_leaves_no_waiter_behind() {
         let backend = InMemoryVoiceBackend::default();
         let store = VoiceSessionStore::with_backend(std::sync::Arc::new(backend.clone()));
-        store.create("early2".to_string(), "atem".to_string(), "ch".to_string()).await.unwrap();
-        store.set_response("early2", "here".to_string()).await.unwrap();
-        let result = store.wait_reply("early2", std::time::Duration::from_millis(50)).await.unwrap();
-        assert_eq!(result, WaitOutcome::Reply("here".to_string()));
-        assert!(!backend.waiters.lock().contains_key("early2"));
+        scenarios::early_reply_leaves_no_waiter_behind(store, &backend.waiters).await;
+    }
+
+    #[tokio::test]
+    async fn stale_reply_never_answers_a_new_turn() {
+        scenarios::stale_reply_never_answers_a_new_turn(VoiceSessionStore::new()).await;
+    }
+
+    #[test]
+    fn transcript_buffer_is_capped_at_64_kb() {
+        let mut session = VoiceSession::new("cap".into(), "atem".into(), "ch".into());
+        let chunk = "x".repeat(1024);
+        for _ in 0..70 {
+            session.add_transcription(chunk.clone());
+        }
+        let total: usize = session.buffer.iter().map(String::len).sum();
+        assert!(total <= MAX_VOICE_BUFFER_BYTES);
+        assert_eq!(session.buffer.len(), 64);
+        session.add_transcription("the latest words".to_string());
+        assert_eq!(session.buffer.last().map(String::as_str), Some("the latest words"));
+
+        let mut big = VoiceSession::new("big".into(), "atem".into(), "ch".into());
+        big.add_transcription(format!("{}é{}", "a".repeat(70_000), "tail"));
+        assert_eq!(big.buffer.len(), 1);
+        assert!(big.buffer[0].len() <= MAX_VOICE_BUFFER_BYTES);
+        assert!(big.buffer[0].ends_with("étail"));
+    }
+
+    #[test]
+    fn tail_within_cuts_at_a_character_boundary() {
+        assert_eq!(tail_within("hello", 10), "hello");
+        assert_eq!(tail_within("hello", 3), "llo");
+        assert_eq!(tail_within("日本語", 4), "語");
+    }
+
+    /// Shared wait scenarios: the in-memory tests and the Redis suite both
+    /// run these, so the two backends stay interchangeable.
+    pub(crate) mod scenarios {
+        use super::*;
+
+        pub(crate) async fn reply_wakes_a_waiter(store: VoiceSessionStore) {
+            store.create("test".to_string(), "atem".to_string(), "channel".to_string()).await.unwrap();
+            tokio::spawn({
+                let store = store.clone();
+                async move {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    store.set_response("test", "Response!".to_string()).await.unwrap();
+                }
+            });
+            let result = store.wait_reply("test", std::time::Duration::from_secs(5)).await.unwrap();
+            assert_eq!(result, WaitOutcome::Reply("Response!".to_string()));
+        }
+
+        pub(crate) async fn multiple_waiters_all_notified(store: VoiceSessionStore) {
+            store.create("test".to_string(), "atem".to_string(), "ch".to_string()).await.unwrap();
+            let wait = std::time::Duration::from_secs(5);
+            let (a, b, _) = tokio::join!(
+                store.wait_reply("test", wait),
+                store.wait_reply("test", wait),
+                async {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    store.set_response("test", "Response!".to_string()).await.unwrap();
+                }
+            );
+            assert_eq!(a.unwrap(), WaitOutcome::Reply("Response!".to_string()));
+            assert_eq!(b.unwrap(), WaitOutcome::Reply("Response!".to_string()));
+        }
+
+        pub(crate) async fn answer_that_arrived_first_is_returned(store: VoiceSessionStore) {
+            store.create("early".to_string(), "atem".to_string(), "ch".to_string()).await.unwrap();
+            store.set_response("early", "already here".to_string()).await.unwrap();
+            let result = store.wait_reply("early", std::time::Duration::from_millis(50)).await.unwrap();
+            assert_eq!(result, WaitOutcome::Reply("already here".to_string()));
+        }
+
+        pub(crate) async fn wait_times_out_after(store: VoiceSessionStore, timeout: std::time::Duration) {
+            store.create("slow".to_string(), "atem".to_string(), "ch".to_string()).await.unwrap();
+            let started = tokio::time::Instant::now();
+            let result = store.wait_reply("slow", timeout).await.unwrap();
+            assert_eq!(result, WaitOutcome::TimedOut);
+            let elapsed = started.elapsed();
+            assert!(elapsed >= timeout, "timed out early: {elapsed:?}");
+            assert!(elapsed < timeout + std::time::Duration::from_secs(2), "timed out late: {elapsed:?}");
+        }
+
+        pub(crate) async fn early_reply_leaves_no_waiter_behind(store: VoiceSessionStore, waiters: &ReplyWaiters) {
+            store.create("early2".to_string(), "atem".to_string(), "ch".to_string()).await.unwrap();
+            store.set_response("early2", "here".to_string()).await.unwrap();
+            let result = store.wait_reply("early2", std::time::Duration::from_millis(50)).await.unwrap();
+            assert_eq!(result, WaitOutcome::Reply("here".to_string()));
+            assert!(!waiters.is_waiting("early2"));
+            // A wait that times out leaves none behind either.
+            store.create("quiet".to_string(), "atem".to_string(), "ch".to_string()).await.unwrap();
+            let result = store.wait_reply("quiet", std::time::Duration::from_millis(50)).await.unwrap();
+            assert_eq!(result, WaitOutcome::TimedOut);
+            assert!(!waiters.is_waiting("quiet"));
+        }
+
+        /// The answer to turn one must not answer turn two: the new trigger
+        /// waits for a new answer.
+        pub(crate) async fn stale_reply_never_answers_a_new_turn(store: VoiceSessionStore) {
+            store.create("turns".to_string(), "atem".to_string(), "ch".to_string()).await.unwrap();
+            store.trigger("turns").await.unwrap();
+            store.set_response("turns", "first".to_string()).await.unwrap();
+            assert_eq!(
+                store.wait_reply("turns", std::time::Duration::from_millis(50)).await.unwrap(),
+                WaitOutcome::Reply("first".to_string())
+            );
+
+            store.add_transcription("turns", "next".to_string()).await.unwrap();
+            store.trigger("turns").await.unwrap();
+            // Longer than one Redis re-read interval, so the poll runs too.
+            assert_eq!(
+                store.wait_reply("turns", std::time::Duration::from_millis(1500)).await.unwrap(),
+                WaitOutcome::TimedOut
+            );
+
+            let (second, _) = tokio::join!(
+                store.wait_reply("turns", std::time::Duration::from_secs(5)),
+                async {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    store.set_response("turns", "second".to_string()).await.unwrap();
+                }
+            );
+            assert_eq!(second.unwrap(), WaitOutcome::Reply("second".to_string()));
+        }
     }
 }
