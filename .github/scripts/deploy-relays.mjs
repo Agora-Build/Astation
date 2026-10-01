@@ -12,24 +12,14 @@ import { settingsFromEnv, waitForHealth } from './verify-station.mjs';
 /**
  * The relay deploy hooks, in deploy order.
  *
- * RELAY_DEPLOY_HOOKS: one URL per line; blank lines and surrounding whitespace
- * are ignored. When it is empty or unset, the older secrets are used:
- * COOLIFY_RELAY_SERVER_WEBHOOK_URL, then COOLIFY_RELAY_B_WEBHOOK_URL if set.
+ * RELAY_DEPLOY_HOOKS is the only source: one URL per line; blank lines and
+ * surrounding whitespace are ignored.
  */
 export function relayHooksFromEnv(env = process.env) {
-  const hooks = (env.RELAY_DEPLOY_HOOKS ?? '')
+  return (env.RELAY_DEPLOY_HOOKS ?? '')
     .split(/\r?\n/)
     .map(line => line.trim())
     .filter(Boolean);
-  if (hooks.length) return { hooks, source: 'RELAY_DEPLOY_HOOKS' };
-  const relayA = (env.COOLIFY_RELAY_SERVER_WEBHOOK_URL ?? '').trim();
-  const relayB = (env.COOLIFY_RELAY_B_WEBHOOK_URL ?? '').trim();
-  // Without the relay-a secret the old workflow failed; keep failing.
-  if (!relayA) return { hooks: [], source: 'none' };
-  return {
-    hooks: relayB ? [relayA, relayB] : [relayA],
-    source: 'COOLIFY_RELAY_SERVER_WEBHOOK_URL / COOLIFY_RELAY_B_WEBHOOK_URL',
-  };
 }
 
 /** Replace every spelling of a hook URL in text with a placeholder. */
@@ -76,18 +66,9 @@ export async function deployRelays({
   deploy = deployCoolify,
   trigger = triggerHook,
   wait = waitForHealth,
-  fromFallback = false,
 }) {
   if (!hooks.length) {
-    throw new Error('No relay deploy hook configured: set RELAY_DEPLOY_HOOKS (or COOLIFY_RELAY_SERVER_WEBHOOK_URL)');
-  }
-  // The older COOLIFY_* secrets always needed the token (the old workflow
-  // failed without it); don't turn them into unauthenticated POSTs.
-  if (fromFallback && !token) {
-    throw new Error(
-      'COOLIFY_API_TOKEN is required with COOLIFY_RELAY_SERVER_WEBHOOK_URL / COOLIFY_RELAY_B_WEBHOOK_URL ' +
-        '(or set RELAY_DEPLOY_HOOKS)',
-    );
+    throw new Error('RELAY_DEPLOY_HOOKS is required: set it to the relay deploy URLs, one per line');
   }
   const total = hooks.length;
   // With the token every hook goes through the Coolify API: check them all
@@ -123,11 +104,9 @@ export async function deployRelays({
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const run = async () => {
-    const { hooks, source } = relayHooksFromEnv();
-    if (hooks.length) console.log(`${hooks.length} relay hook(s) from ${source}`);
+    const hooks = relayHooksFromEnv();
     await deployRelays({
       hooks,
-      fromFallback: source !== 'RELAY_DEPLOY_HOOKS',
       token: process.env.COOLIFY_API_TOKEN,
       health: settingsFromEnv(),
     });

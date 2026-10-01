@@ -77,10 +77,8 @@ until the new one passes `/health`), or use a hook that returns only once the
 deploy is done. A possible improvement: have `/health` report the running
 commit, so the workflow can wait until that relay serves this run's commit.
 
-If `RELAY_DEPLOY_HOOKS` is empty or unset, the older secrets still work: the
-workflow deploys `COOLIFY_RELAY_SERVER_WEBHOOK_URL`, then
-`COOLIFY_RELAY_B_WEBHOOK_URL` if it is set. These always need
-`COOLIFY_API_TOKEN`; without it the run fails before calling anything.
+`RELAY_DEPLOY_HOOKS` is required: if it is empty or unset the run fails
+before calling anything. One relay is one line.
 
 The deploy job's `timeout-minutes` (90) fits three relay hooks. Each hook can
 take about 20 minutes (Coolify wait up to 15, health wait up to 3) and the
@@ -130,11 +128,8 @@ Required GitHub Actions secrets:
   https://smt.agora.build/api/v1/deploy?uuid=oss4444o8ss40ckgwc40og4c&force=false
   https://smt.agora.build/api/v1/deploy?uuid=<relay-b uuid>&force=false
   ```
-  With one relay, only the first line.
-- `COOLIFY_RELAY_SERVER_WEBHOOK_URL` (older, still honored): relay-a's webhook.
-  Used only while `RELAY_DEPLOY_HOOKS` is empty or unset, followed by
-  `COOLIFY_RELAY_B_WEBHOOK_URL` if that is set. Both can be deleted once
-  `RELAY_DEPLOY_HOOKS` is in place.
+  With one relay, only the first line. Required: there is no fallback to the
+  older per-relay secrets, which are no longer read and can be deleted.
 - `COOLIFY_WEBAPP_WEBHOOK_URL`: `https://smt.agora.build/api/v1/deploy?uuid=c0wwgk4c0owk0w4gsww4k0ss&force=false`.
 
 GitHub Actions repository variables (both checks are **off while unset**, so
@@ -311,8 +306,7 @@ using that database.
 
 **Rollback,** in this order:
 
-1. Remove relay-b: remove its line from `RELAY_DEPLOY_HOOKS` (and delete
-   `COOLIFY_RELAY_B_WEBHOOK_URL` if the older secrets are still in use), set
+1. Remove relay-b: remove its line from `RELAY_DEPLOY_HOOKS`, set
    `STATION_MIN_REPLICAS=1`, stop and delete relay-b in Coolify.
 2. If Valkey itself is the problem: on relay-a set `RELAY_REPLICAS_EXPECTED=1`
    **first** (above 1 without `REDIS_URL` refuses to start), then remove
@@ -391,8 +385,7 @@ new Coolify UUIDs in the resource table at the top of this section.
    `https://smt.agora.build/api/v1/deploy?uuid=oss4444o8ss40ckgwc40og4c&force=false`
    and `https://smt.agora.build/api/v1/deploy?uuid=<relay-b uuid>&force=false`
    (`gh secret set RELAY_DEPLOY_HOOKS < hooks.txt`).
-   `COOLIFY_RELAY_SERVER_WEBHOOK_URL` is no longer read once
-   `RELAY_DEPLOY_HOOKS` is set and can be deleted. Set the repository
+   Set the repository
    variables `STATION_REQUIRE_REDIS=1` and `STATION_MIN_REPLICAS=2`
    (explicitly; unset means "not checked"). Re-run
    "Deploy Station" on `main`: relay-a, health, relay-b, health, webapp,
