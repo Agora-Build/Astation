@@ -9,6 +9,7 @@ pub mod health;
 pub mod keys;
 pub mod limits;
 pub mod local;
+pub mod metrics;
 pub mod ratelimit;
 pub mod redis;
 

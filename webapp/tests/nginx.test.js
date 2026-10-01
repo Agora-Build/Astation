@@ -41,3 +41,13 @@ assert.match(
 );
 
 console.log("nginx proxy tests passed");
+
+// /metrics is scraped from each relay container directly; it must never be
+// reachable through nginx (it would leak operational info).
+const metricsLocation = config.match(/location\s*=\s*\/metrics\s*\{([\s\S]*?)\}/);
+assert.ok(metricsLocation, "nginx must answer /metrics explicitly");
+assert.match(metricsLocation[1], /return\s+404\s*;/, "/metrics must be 404 at nginx");
+assert.ok(
+  !/proxy_pass[^;]*metrics/.test(config),
+  "nginx must not proxy /metrics to the relay",
+);

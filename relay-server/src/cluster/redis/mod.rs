@@ -144,11 +144,14 @@ impl RedisConn {
         F: FnOnce(ConnectionManager) -> Fut,
         Fut: Future<Output = redis::RedisResult<T>>,
     {
-        match tokio::time::timeout(REDIS_TIMEOUT, op(self.manager.clone())).await {
+        let started = std::time::Instant::now();
+        let result = match tokio::time::timeout(REDIS_TIMEOUT, op(self.manager.clone())).await {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(error)) => Err(redis_error(error)),
             Err(_) => Err(StoreError::Unavailable("redis call timed out".to_string())),
-        }
+        };
+        crate::cluster::metrics::metrics().observe_redis(started.elapsed(), result.is_ok());
+        result
     }
 
     pub async fn ping(&self) -> Result<(), StoreError> {

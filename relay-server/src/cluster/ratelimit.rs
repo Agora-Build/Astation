@@ -98,6 +98,9 @@ pub async fn shared_rate_limit(
     {
         Ok(RateDecision::Allowed) => next.run(request).await,
         Ok(RateDecision::Limited { retry_after_secs }) => {
+            crate::cluster::metrics::metrics()
+                .rate_limited_http
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             too_many_requests(retry_after_secs, limit.burst)
         }
         Err(error) => {

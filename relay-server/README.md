@@ -15,6 +15,12 @@ or the relay is draining (`{"status":"draining"}`).
 The relay runs as one instance with everything in memory, or, with
 `REDIS_URL`, as several replicas sharing rooms, sessions and rate limits
 through Redis/Valkey (design: [`docs/specs/2026-09-30-relay-multi-replica.md`](../docs/specs/2026-09-30-relay-multi-replica.md)).
+`GET /metrics` serves per-replica Prometheus text (sockets by role, rooms,
+bus publish/receive, Redis latency histogram and errors, slow-client closes,
+rate-limit refusals). It is outside rate limiting and **not** proxied by the
+webapp nginx (which answers 404): scrape each relay container directly on the
+internal network.
+
 On SIGTERM a relay drains: `/health` and new `/ws` upgrades get `503`, every
 WebSocket is closed with `1012` (reconnect), its room entries are withdrawn,
 and in-flight HTTP gets at most 5 s more. A second SIGTERM exits at once (143;

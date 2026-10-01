@@ -93,7 +93,8 @@ impl RedisBus {
     }
 
     async fn publish(&self, channel: String, payload: String) -> Result<(), StoreError> {
-        self.conn
+        let result = self
+            .conn
             .run(|mut c| async move {
                 redis::cmd("PUBLISH")
                     .arg(&channel)
@@ -102,7 +103,13 @@ impl RedisBus {
                     .await
                     .map(|_| ())
             })
-            .await
+            .await;
+        if result.is_ok() {
+            crate::cluster::metrics::metrics()
+                .bus_published
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 }
 

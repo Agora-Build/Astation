@@ -99,6 +99,10 @@ Runtime configuration:
   forwards `/`, `/health`, `/api/*`, and `/ws` to the webapp. `localhost` inside
   the cloudflared container refers to that container, not Volumetric.
 
+Metrics: each relay serves Prometheus text at `GET :3000/metrics`. The webapp
+nginx answers 404 for `/metrics` on purpose, so scrape each relay container
+directly on the coolify network (never through the public hostname).
+
 Shutdown (Coolify redeploy or stop, i.e. SIGTERM): the relay drains. `/health`
 and new `/ws` upgrades get `503` (nginx then retries another replica), every
 WebSocket is closed with code `1012` (clients reconnect, landing on another

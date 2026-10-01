@@ -207,6 +207,9 @@ impl LocalSockets {
 
     fn close_slow(&self, conn: LocalConn) {
         self.slow_closed.fetch_add(1, Ordering::Relaxed);
+        crate::cluster::metrics::metrics()
+            .slow_client_closes
+            .fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             "Closing a slow relay client (send queue full for {:?})",
             self.limits.stall
@@ -300,8 +303,6 @@ impl LocalSockets {
     }
 
     /// Rooms with at least one socket on this replica.
-    // Task 33 (metrics).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn room_count(&self) -> usize {
         self.lock()
             .values()
@@ -316,8 +317,6 @@ impl LocalSockets {
     }
 
     /// (Atem sockets, Astation sockets) on this replica.
-    // Task 33 (metrics).
-    #[allow(dead_code)]
     pub fn count_by_role(&self) -> (usize, usize) {
         let conns = self.lock();
         let astations = conns
@@ -445,6 +444,13 @@ mod tests {
             Some((CLOSE_SLOW_CLIENT, "client too slow".to_string()))
         );
         assert_eq!(local.slow_client_closes(), 1);
+        // Process-wide counter: other tests may close slow clients too.
+        assert!(
+            crate::cluster::metrics::metrics()
+                .slow_client_closes
+                .load(Ordering::Relaxed)
+                >= 1
+        );
     }
 
     #[tokio::test]

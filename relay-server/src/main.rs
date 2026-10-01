@@ -355,6 +355,17 @@ fn spawn_upkeep(
     ]
 }
 
+/// GET /metrics — Prometheus text format, per replica (not proxied by nginx).
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let local = state.relay.local();
+    let body = cluster::metrics::metrics().render(
+        state.relay.replica_id(),
+        local.count_by_role(),
+        local.room_count(),
+    );
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
+}
+
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     if state.relay.is_draining() {
         return (
@@ -558,6 +569,7 @@ fn router(state: AppState) -> Router {
         .merge(auth_routes)
         .merge(general_routes)
         .route("/health", get(health_handler))
+        .route("/metrics", get(metrics_handler))
         .route("/ws", get(relay::ws_handler))
         .route("/pair", get(relay::pair_page_handler))
         .route("/auth", get(routes::auth_page_handler))
@@ -863,6 +875,32 @@ mod tests {
             let message = parse_replicas_expected(Some(bad)).unwrap_err();
             assert!(message.contains("RELAY_REPLICAS_EXPECTED"), "{message}");
         }
+    }
+
+    #[tokio::test]
+    async fn metrics_are_served() {
+        let response = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/plain; version=0.0.4"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("relay_sockets{role=\"atem\"} 0"), "{text}");
+        assert!(
+            text.contains("relay_replica_info{replica=\"local\"} 1"),
+            "{text}"
+        );
+        crate::cluster::metrics::assert_valid_exposition(&text);
     }
 
     #[tokio::test]

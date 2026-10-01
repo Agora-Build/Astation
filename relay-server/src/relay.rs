@@ -585,6 +585,9 @@ impl RelayHub {
         let reload_again = Arc::new(AtomicBool::new(false));
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
+                crate::cluster::metrics::metrics()
+                    .bus_received
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 match event {
                     BusEvent::Inbox(message) => apply_inbox(hub.local(), message),
                     BusEvent::Broadcast(BroadcastMessage::RoomChanged { code }) => {
@@ -1083,6 +1086,9 @@ pub async fn ws_handler(
         peer.map(|axum::extract::ConnectInfo(address)| address),
     );
     let Some(permit) = state.relay.ws_limiter().try_acquire(&ip) else {
+        crate::cluster::metrics::metrics()
+            .rate_limited_ws
+            .fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             "Refused a WebSocket: {} connections already open from one address",
             state.relay.ws_limiter().open(&ip)
@@ -5560,6 +5566,9 @@ pub(crate) mod tests {
             ..memory_identity_state()
         };
         let (base_url, server) = spawn_relay(state.clone()).await;
+        let refused_before = crate::cluster::metrics::metrics()
+            .rate_limited_ws
+            .load(Ordering::Relaxed);
         let _held = connect_from(
             &base_url,
             "role=astation&code=astation-cf-1",
@@ -5599,6 +5608,13 @@ pub(crate) mod tests {
         .expect("another IP is unaffected");
         assert_eq!(state.relay.ws_limiter().open("203.0.113.1"), 1);
         assert_eq!(state.relay.ws_limiter().open("203.0.113.2"), 1);
+        // Process-wide counter: other tests may refuse sockets too.
+        assert!(
+            crate::cluster::metrics::metrics()
+                .rate_limited_ws
+                .load(Ordering::Relaxed)
+                > refused_before
+        );
         server.abort();
     }
 
