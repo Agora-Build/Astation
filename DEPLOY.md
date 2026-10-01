@@ -287,6 +287,13 @@ new Coolify UUIDs in the resource table at the top of this section.
    network alias. Redeploy relay-a. **If it doesn't become healthy, remove
    `REDIS_URL` at once and redeploy** (that is the rollback), then read the
    relay log.
+   **Close host port 3000:** relay-a publishes `3000` on the host, which
+   bypasses Cloudflare: anyone reaching it can read the unauthenticated
+   `/metrics` and forge `X-Forwarded-For` past the per-IP WebSocket and
+   pending-Astation caps. Remove the host port mapping (nginx reaches relays
+   by the `station-relay-server` alias on the `coolify` network), or bind it
+   to `127.0.0.1`, or firewall it so only the host can connect. Check from
+   another machine: `curl -m 5 http://<server ip>:3000/health` must fail.
 3. **Verify one relay with Redis** (these checks apply once the multi-replica
    relay image has been deployed from `main`; an older image reports no
    `redis`/`replicas`). `curl -s https://station.agora.build/health` shows
@@ -398,7 +405,10 @@ still works, but likewise needs a restart of every relay replica.
 
 Bindings are kept. Then get the replacement (or recovered) Mac online: its
 Astation connects with its new key, which registers by trust on first use, and
-it pushes its sessions again. Do this promptly, since until then anyone holding
+it pushes its sessions again. After `forget-key` the **first** key to connect
+wins (trust on first use), so the replacement Mac must connect before the
+stolen one does: a stolen Mac that is still online reconnects on its own and
+would re-register its old key. Do this promptly, since until then anyone holding
 the room code could register first (see "First-use squatting" in
 `relay-server/SECURITY.md`).
 
