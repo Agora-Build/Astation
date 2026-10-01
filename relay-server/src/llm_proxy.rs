@@ -95,7 +95,7 @@ pub async fn llm_chat_handler(
 
     // Get last user message for logging
     let last_message = req.messages.last().map(|m| m.content.clone()).unwrap_or_default();
-    tracing::info!("Session {}: User message: {}", session_id, last_message);
+    tracing::info!("Session {}: user message received ({} bytes)", session_id, last_message.len());
 
     let voice = &state.voice_sessions;
     if let Err(error) = voice.increment_requests(&session_id).await {
