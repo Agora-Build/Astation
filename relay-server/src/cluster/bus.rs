@@ -99,6 +99,18 @@ impl ReplicaBus for LoopbackBus {
     }
 }
 
+/// What a replica's bus subscription delivers to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BusEvent {
+    Inbox(InboxMessage),
+    Broadcast(BroadcastMessage),
+    /// An Atem's answer for a waiting voice request (`relay:voice-reply:<id>`).
+    VoiceReply { session_id: String, reply: String },
+    /// The subscription was lost and re-established: anything published
+    /// in between was missed.
+    Resubscribed,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

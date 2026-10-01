@@ -5,6 +5,9 @@
 // Consumers land in Tasks 11-19; drop the allow as they do.
 #[allow(dead_code)]
 pub mod keys;
+// Consumers land in Tasks 13-19; drop the allow as they do.
+#[allow(dead_code)]
+pub mod bus;
 #[allow(dead_code)]
 pub mod presence;
 
