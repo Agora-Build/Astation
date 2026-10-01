@@ -17,9 +17,14 @@ The relay runs as one instance with everything in memory, or, with
 through Redis/Valkey (design: [`docs/specs/2026-09-30-relay-multi-replica.md`](../docs/specs/2026-09-30-relay-multi-replica.md)).
 `GET /metrics` serves per-replica Prometheus text (sockets by role, rooms,
 bus publish/receive, Redis latency histogram and errors, slow-client closes,
-rate-limit refusals). It is outside rate limiting and **not** proxied by the
-webapp nginx (which answers 404): scrape each relay container directly on the
-internal network.
+rate-limit refusals). It is outside rate limiting, **unauthenticated**, and
+**not** proxied by the webapp nginx (which answers 404): it relies on network
+isolation, so scrape each relay container directly on the internal network.
+The standalone `docker-compose.yml` publishes port 3000 on the host, which
+exposes `/metrics` too: firewall that port or bind it to localhost
+(`"127.0.0.1:3000:3000"`). `relay_rate_limited_total{kind="http"}` counts
+refusals by the shared limiter only; the per-replica governor's `429`s
+are not counted.
 
 On SIGTERM a relay drains: `/health` and new `/ws` upgrades get `503`, every
 WebSocket is closed with `1012` (reconnect), its room entries are withdrawn,
@@ -246,7 +251,7 @@ Config: Set `relay_url` and `ws_url` in `.atem/config.toml`
 | `PORT` | `3000` | Server port |
 | `RUST_LOG` | `info` | Log level (error, warn, info, debug, trace) |
 | `REDIS_URL` | _(unset)_ | Redis/Valkey for shared relay state: rooms, pairing/OTP, voice and RTC sessions, shared rate-limit counters, replica-to-replica delivery. Required to run more than one replica. Unset: in-memory, one replica only. At startup Redis is tried 10 times, 3 s apart (about 27 s if refused, up to about 57 s if it doesn't answer), then the relay exits 1; a malformed URL or wrong password exits 1 at once. The URL (and its password) is never logged. |
-| `RELAY_WS_MAX_PER_IP` | `200` | Concurrent `/ws` connections allowed per client IP on each replica; over it the upgrade gets `429`. Raise it for load tests that open many sockets from one machine. A value that isn't a positive integer exits 1 at startup. |
+| `RELAY_WS_MAX_PER_IP` | `200` | Concurrent `/ws` connections allowed per client IP on each replica; over it the upgrade gets `429`. Raise it for load tests that open many sockets from one machine. Blank means unset (default `200`); any other value that isn't a positive integer exits 1 at startup. |
 | `RELAY_REPLICAS_EXPECTED` | `1` | How many relay replicas the deployment runs. Above 1 without `REDIS_URL`, the relay refuses to start (exit 1); a value that isn't a positive integer also exits 1. |
 | `DATABASE_URL` | _(unset)_ | Postgres connection string shared by **vault**, **knowledge sync (Atem Memory)**, and **relay identity** (Astation keys + session bindings) storage (e.g. `postgres://vault:vault@localhost:5432/vault`), one pool for all. When unset, all fall back to **in-memory** (non-durable: bindings and registered keys are lost on restart) and log a warning. Migrations in `migrations/` run automatically at startup. |
 

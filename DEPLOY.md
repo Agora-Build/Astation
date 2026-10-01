@@ -99,9 +99,10 @@ Runtime configuration:
   forwards `/`, `/health`, `/api/*`, and `/ws` to the webapp. `localhost` inside
   the cloudflared container refers to that container, not Volumetric.
 
-Metrics: each relay serves Prometheus text at `GET :3000/metrics`. The webapp
-nginx answers 404 for `/metrics` on purpose, so scrape each relay container
-directly on the coolify network (never through the public hostname).
+Metrics: each relay serves Prometheus text at `GET :3000/metrics`. The
+endpoint is unauthenticated and relies on network isolation: the webapp nginx
+answers 404 for `/metrics` on purpose, so scrape each relay container directly
+on the coolify network (never through the public hostname).
 
 Shutdown (Coolify redeploy or stop, i.e. SIGTERM): the relay drains. `/health`
 and new `/ws` upgrades get `503` (nginx then retries another replica), every
@@ -829,7 +830,7 @@ Put the load balancer in front of the webapp only; the webapp proxies
 1. **HTTPS Required** - Microphone access requires HTTPS (except localhost)
 2. **CORS** - Set `CORS_ORIGIN` to the public webapp origin in production
 3. **Rate Limiting** - REST APIs are limited per client IP behind the trusted proxy; `/ws` allows 200 concurrent connections per client IP per replica (`RELAY_WS_MAX_PER_IP`), keyed on Cloudflare's `CF-Connecting-IP`
-4. **Firewall** - Restrict access to port 3000 (API should only be accessed via nginx proxy)
+4. **Firewall** - Restrict access to port 3000 (API should only be accessed via nginx proxy). The docker-compose example publishes `3000:3000`, which also exposes the unauthenticated `/metrics`: firewall it or publish `127.0.0.1:3000:3000` instead
 5. **Token Validation** - Ensure Agora tokens have appropriate expiry times
 6. **Valkey** - Private network only, password in the `REDIS_URL` secret; it holds pairing session ids, so restrict it like the database
 
