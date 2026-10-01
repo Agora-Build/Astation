@@ -1,4 +1,3 @@
-#![allow(unused_imports, dead_code)]
 //! Two relays in one process sharing Valkey, with the Astation and its
 //! Atems deliberately on different replicas (spec: "Testing"). An
 //! in-process identity store, vault and knowledge store stand in for the
@@ -123,6 +122,7 @@ struct Replica {
     cluster: RedisCluster,
     /// ws://127.0.0.1:<port>/ws
     ws: String,
+    #[allow(dead_code)] // used from Task 23 (Redis outage) and Task 25 (drain)
     proxy: CutProxy,
     server: JoinHandle<()>,
     /// The 60 s sweeps `main` runs (sessions, rooms, RTC, voice).
@@ -144,6 +144,7 @@ impl Replica {
 
     /// Crash: Redis goes first (so nothing is cleaned up), then every
     /// socket drops and the replica's tasks stop.
+    #[allow(dead_code)] // used from Task 23 (Redis outage) and Task 25 (drain)
     fn crash(&self) {
         self.proxy.cut();
         self.stop_tasks();
@@ -251,6 +252,7 @@ async fn wait_closed(socket: &mut TestSocket) {
 }
 
 /// The close code the relay sent (0: closed without one).
+#[allow(dead_code)] // used from Task 23 (Redis outage) and Task 25 (drain)
 async fn expect_close_code(socket: &mut TestSocket) -> u16 {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -266,6 +268,7 @@ async fn expect_close_code(socket: &mut TestSocket) -> u16 {
 }
 
 /// The HTTP status a refused WebSocket upgrade got.
+#[allow(dead_code)] // used from Task 23 (Redis outage) and Task 25 (drain)
 async fn refused_status(url: String) -> u16 {
     match tokio_tungstenite::connect_async(url).await {
         Err(tokio_tungstenite::tungstenite::Error::Http(response)) => response.status().as_u16(),
@@ -316,4 +319,158 @@ async fn redis_two_replicas_carry_frames_across() {
     let forwarded = next_client_json(&mut astation).await;
     assert_eq!(forwarded["atem_id"], "atem-h");
     assert_eq!(forwarded["payload"]["probe"], "from-atem");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn redis_chat_crosses_replicas_both_ways_in_order() {
+    let _guard = REDIS_LOCK.lock().await;
+    let (_shared, one, two) = two_replicas().await;
+    let code = "astation-cross";
+    let key = TestKey::generate();
+    let mut astation = verified_astation(&one.ws, code, &key, "registered").await;
+    let mut remote_atem = connect_atem(&two.ws, code, "atem-remote").await;
+    let connected = next_client_json(&mut astation).await;
+    assert_eq!(connected["relay_event"], "connected");
+    assert_eq!(connected["atem_id"], "atem-remote");
+    let remote_id = connected["connection_id"].as_str().unwrap().to_string();
+    let mut local_atem = connect_atem(&one.ws, code, "atem-local").await;
+    assert_eq!(next_client_json(&mut astation).await["atem_id"], "atem-local");
+
+    // Atem (replica 2) → Astation (replica 1), order kept.
+    for seq in 0..50 {
+        send_json(&mut remote_atem, serde_json::json!({ "seq": seq })).await;
+    }
+    for seq in 0..50 {
+        let frame = next_client_json(&mut astation).await;
+        assert_eq!(frame["atem_id"], "atem-remote");
+        assert_eq!(frame["connection_id"], remote_id.as_str());
+        assert_eq!(frame["payload"]["seq"], seq);
+    }
+
+    // Astation → one Atem on the other replica, order kept.
+    for seq in 0..50 {
+        send_json(
+            &mut astation,
+            serde_json::json!({"atem_id": "atem-remote", "connection_id": remote_id, "payload": {"seq": seq}}),
+        )
+        .await;
+    }
+    for seq in 0..50 {
+        assert_eq!(next_client_json(&mut remote_atem).await["seq"], seq);
+    }
+    assert_silent(&mut local_atem, 150).await;
+
+    // Astation → all Atems (one local, one remote).
+    send_json(&mut astation, serde_json::json!({"probe": "all"})).await;
+    assert_eq!(next_client_json(&mut local_atem).await["probe"], "all");
+    assert_eq!(next_client_json(&mut remote_atem).await["probe"], "all");
+
+    // Disconnect notices cross replicas too.
+    remote_atem.close(None).await.unwrap();
+    let gone = next_client_json(&mut astation).await;
+    assert_eq!(gone["relay_event"], "disconnected");
+    assert_eq!(gone["connection_id"], remote_id.as_str());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn redis_stale_connection_ids_are_dropped_across_replicas() {
+    let _guard = REDIS_LOCK.lock().await;
+    let (_shared, one, two) = two_replicas().await;
+    let code = "astation-stale";
+    let (mut astation, _challenge) = connect_astation(&one.ws, code).await; // legacy owner
+    let mut original = connect_atem(&two.ws, code, "atem-office").await;
+    let original_id = next_client_json(&mut astation).await["connection_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut replacement = connect_atem(&one.ws, code, "atem-office").await;
+    let replacement_id = next_client_json(&mut astation).await["connection_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(original_id, replacement_id);
+    // The original (replica 2) is closed through the bus.
+    wait_closed(&mut original).await;
+
+    send_json(
+        &mut astation,
+        serde_json::json!({"atem_id": "atem-office", "connection_id": original_id, "payload": {"probe": "stale"}}),
+    )
+    .await;
+    assert_silent(&mut replacement, 150).await;
+    send_json(
+        &mut astation,
+        serde_json::json!({"atem_id": "atem-office", "connection_id": replacement_id, "payload": {"probe": "current"}}),
+    )
+    .await;
+    assert_eq!(next_client_json(&mut replacement).await["probe"], "current");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn redis_pending_on_one_replica_evicts_the_verified_owner_on_the_other() {
+    let _guard = REDIS_LOCK.lock().await;
+    let (_shared, one, two) = two_replicas().await;
+    let code = "astation-move";
+    let key = TestKey::generate();
+    let mut old = verified_astation(&two.ws, code, &key, "registered").await;
+    let mut atem = connect_atem(&one.ws, code, "atem-a").await;
+    assert_eq!(next_client_json(&mut old).await["relay_event"], "connected");
+    eventually("replica 1 knows the key", || one.state.relay.keys().contains(code)).await;
+
+    let (mut new, challenge) = connect_astation(&one.ws, code).await;
+    // Pending: no ownership, no Atem traffic.
+    send_json(&mut atem, serde_json::json!({"probe": "while-pending"})).await;
+    assert_eq!(next_client_json(&mut old).await["payload"]["probe"], "while-pending");
+    assert_silent(&mut new, 150).await;
+
+    let result = authenticate(&mut new, &key, code, &challenge).await;
+    assert_eq!(result["status"], "verified", "{result}");
+    let connected = next_client_json(&mut new).await;
+    assert_eq!(connected["relay_event"], "connected");
+    assert_eq!(connected["atem_id"], "atem-a");
+    assert_closed(&mut old).await;
+
+    send_json(&mut atem, serde_json::json!({"probe": "to-new-owner"})).await;
+    assert_eq!(next_client_json(&mut new).await["payload"]["probe"], "to-new-owner");
+    let room = two.state.relay.room(code).await.unwrap().unwrap();
+    assert_eq!(room.owner.map(|owner| owner.replica), Some(one.id().to_string()));
+    assert!(room.verified);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn redis_racing_astations_leave_exactly_one_owner() {
+    let _guard = REDIS_LOCK.lock().await;
+    let (_shared, one, two) = two_replicas().await;
+    let code = "astation-race";
+    let key = TestKey::generate();
+    let mut first_owner = verified_astation(&one.ws, code, &key, "registered").await;
+    eventually("replica 2 knows the key", || two.state.relay.keys().contains(code)).await;
+
+    let (mut on_one, challenge_one) = connect_astation(&one.ws, code).await;
+    let (mut on_two, challenge_two) = connect_astation(&two.ws, code).await;
+    let (result_one, result_two) = tokio::join!(
+        authenticate(&mut on_one, &key, code, &challenge_one),
+        authenticate(&mut on_two, &key, code, &challenge_two),
+    );
+    assert_eq!(result_one["status"], "verified");
+    assert_eq!(result_two["status"], "verified");
+
+    let owner = one.state.relay.room(code).await.unwrap().unwrap().owner.expect("an owner");
+    let (winner, loser) = if owner.replica == one.id() {
+        (&mut on_one, &mut on_two)
+    } else {
+        (&mut on_two, &mut on_one)
+    };
+    wait_closed(loser).await;
+    wait_closed(&mut first_owner).await;
+
+    // The winner owns the room: an Atem on either replica reaches it.
+    let mut atem = connect_atem(&two.ws, code, "atem-after-race").await;
+    assert_eq!(next_client_json(winner).await["relay_event"], "connected");
+    send_json(&mut atem, serde_json::json!({"probe": "winner"})).await;
+    assert_eq!(next_client_json(winner).await["payload"]["probe"], "winner");
 }
