@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { deployCoolify } from './deploy-coolify.mjs';
+import { deployCoolify, isCoolifyDeployURL } from './deploy-coolify.mjs';
 
 function harness(responses) {
   const requests = [];
@@ -52,4 +52,19 @@ test('rejects an empty queue and bounds deployment waiting', async () => {
   await assert.rejects(deployCoolify(empty.options), /did not return one queued deployment/);
   const pending = harness([queued(), json({ status: 'in_progress' })]);
   await assert.rejects(deployCoolify({ ...pending.options, maxPolls: 1 }), /Timed out/);
+});
+
+test('recognizes Coolify deploy webhook URLs', () => {
+  assert.ok(isCoolifyDeployURL('https://coolify.example/api/v1/deploy?uuid=abc&force=false'));
+  for (const url of [
+    'https://coolify.example/api/v1/deploy',
+    'https://coolify.example/api/v1/deploy?uuid=',
+    'https://coolify.example/deploy?uuid=abc',
+    'ftp://coolify.example/api/v1/deploy?uuid=abc',
+    'not a url',
+    '',
+    undefined,
+  ]) {
+    assert.equal(isCoolifyDeployURL(url), false, String(url));
+  }
 });

@@ -1,5 +1,20 @@
 import { pathToFileURL } from 'node:url';
 
+/** True for a Coolify deploy webhook: an http(s) /api/v1/deploy URL with a uuid. */
+export function isCoolifyDeployURL(webhookURL) {
+  let url;
+  try {
+    url = new URL(webhookURL);
+  } catch {
+    return false;
+  }
+  return (
+    (url.protocol === 'https:' || url.protocol === 'http:') &&
+    url.pathname === '/api/v1/deploy' &&
+    Boolean(url.searchParams.get('uuid'))
+  );
+}
+
 export async function deployCoolify({
   webhookURL,
   token,
@@ -11,10 +26,10 @@ export async function deployCoolify({
   if (!webhookURL || !token) {
     throw new Error('COOLIFY_WEBHOOK_URL and COOLIFY_API_TOKEN are required');
   }
-  const webhook = new URL(webhookURL);
-  if (webhook.pathname !== '/api/v1/deploy' || !webhook.searchParams.get('uuid')) {
+  if (!isCoolifyDeployURL(webhookURL)) {
     throw new Error('Expected a Coolify /api/v1/deploy?uuid=... URL');
   }
+  const webhook = new URL(webhookURL);
   const request = async url => {
     const response = await fetchImpl(url, {
       headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },

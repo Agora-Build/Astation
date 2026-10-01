@@ -35,3 +35,6 @@ third_party/agora/rtc_mac/libs/*.xcframework
 api-server/target/
 relay-server/target/
 relay-server/loadtest/target/
+
+# Local agent work notes
+.superpowers/
