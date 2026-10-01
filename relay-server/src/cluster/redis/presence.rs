@@ -24,6 +24,8 @@ pub struct RedisHealth {
 }
 
 impl RedisHealth {
+    /// Starts with only this replica live. Callers must use `start` (or
+    /// `refresh` first), or peers look dead and their entries are stripped.
     pub fn new(conn: RedisConn, replica_id: &str) -> Self {
         let live = HashSet::from([replica_id.to_string()]);
         Self {
@@ -34,46 +36,39 @@ impl RedisHealth {
         }
     }
 
+    /// `new` plus one awaited refresh, so peers are known before serving.
+    pub async fn start(conn: RedisConn, replica_id: &str) -> Result<Self, StoreError> {
+        let health = Self::new(conn, replica_id);
+        health.refresh().await?;
+        Ok(health)
+    }
+
     /// Renew this replica's presence and re-list the live replicas.
+    /// On failure the last known live set is kept (fails open, by design).
     pub async fn refresh(&self) -> Result<usize, StoreError> {
+        self.refresh_at(chrono::Utc::now().timestamp()).await
+    }
+
+    /// `refresh` with an injectable clock (unix seconds).
+    pub(crate) async fn refresh_at(&self, now: i64) -> Result<usize, StoreError> {
         let presence = keys::replica(&self.replica_id);
+        let id = self.replica_id.clone();
         let started_at = self.started_at;
-        let found: HashSet<String> = self
+        let expires = now + PRESENCE_TTL_SECS as i64;
+        let (_, _, _, found): ((), i64, i64, Vec<String>) = self
             .conn
             .run(|mut c| async move {
-                redis::cmd("SET")
-                    .arg(&presence)
-                    .arg(started_at)
-                    .arg("EX")
-                    .arg(PRESENCE_TTL_SECS)
-                    .query_async::<()>(&mut c)
-                    .await?;
-                let mut cursor: u64 = 0;
-                let mut ids = HashSet::new();
-                loop {
-                    let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
-                        .arg(cursor)
-                        .arg("MATCH")
-                        .arg(keys::REPLICA_PATTERN)
-                        .arg("COUNT")
-                        .arg(1000)
-                        .query_async(&mut c)
-                        .await?;
-                    ids.extend(
-                        batch
-                            .iter()
-                            .filter_map(|key| key.strip_prefix(keys::REPLICA_PREFIX))
-                            .map(keys::unpart),
-                    );
-                    if next == 0 {
-                        break;
-                    }
-                    cursor = next;
-                }
-                Ok(ids)
+                redis::pipe()
+                    .atomic()
+                    .cmd("SET").arg(&presence).arg(started_at).arg("EX").arg(PRESENCE_TTL_SECS)
+                    .cmd("ZADD").arg(keys::REPLICAS_INDEX).arg(expires).arg(&id)
+                    .cmd("ZREMRANGEBYSCORE").arg(keys::REPLICAS_INDEX).arg("-inf").arg(format!("({now}"))
+                    .cmd("ZRANGEBYSCORE").arg(keys::REPLICAS_INDEX).arg(now).arg("+inf")
+                    .query_async(&mut c)
+                    .await
             })
             .await?;
-        let mut live = found;
+        let mut live: HashSet<String> = found.into_iter().collect();
         live.insert(self.replica_id.clone());
         let count = live.len();
         *self.live.write().unwrap_or_else(|e| e.into_inner()) = live;
@@ -117,8 +112,15 @@ impl ClusterHealth for RedisHealth {
 
     async fn withdraw(&self) -> Result<(), StoreError> {
         let presence = keys::replica(&self.replica_id);
+        let id = self.replica_id.clone();
         self.conn
-            .run(|mut c| async move { redis::cmd("DEL").arg(&presence).query_async::<()>(&mut c).await })
+            .run(|mut c| async move {
+                redis::pipe()
+                    .cmd("DEL").arg(&presence)
+                    .cmd("ZREM").arg(keys::REPLICAS_INDEX).arg(&id)
+                    .query_async::<()>(&mut c)
+                    .await
+            })
             .await
     }
 }
@@ -149,5 +151,32 @@ mod tests {
         b.withdraw().await.unwrap();
         assert_eq!(a.refresh().await.unwrap(), 1);
         assert!(!a.is_live("replica-b"));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn redis_presence_expires_replicas_that_stop_refreshing() {
+        let _guard = REDIS_LOCK.lock().await;
+        let conn = fresh_conn().await;
+        let a = RedisHealth::new(conn.clone(), "replica-a");
+        let b = RedisHealth::new(conn.clone(), "replica-b");
+        let t = 1_000_000;
+        b.refresh_at(t).await.unwrap();
+        assert_eq!(a.refresh_at(t).await.unwrap(), 2);
+        assert_eq!(a.refresh_at(t + 20).await.unwrap(), 2);
+        assert_eq!(a.refresh_at(t + 31).await.unwrap(), 1);
+        assert!(!a.is_live("replica-b"));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn redis_presence_start_sees_live_peers_at_once() {
+        let _guard = REDIS_LOCK.lock().await;
+        let conn = fresh_conn().await;
+        let a = RedisHealth::start(conn.clone(), "replica-a").await.unwrap();
+        let b = RedisHealth::start(conn.clone(), "replica-b").await.unwrap();
+        assert!(b.is_live("replica-a"));
+        assert_eq!(b.replicas(), 2);
+        assert_eq!(a.replicas(), 1);
     }
 }

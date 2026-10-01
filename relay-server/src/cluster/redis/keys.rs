@@ -17,6 +17,8 @@ pub fn unpart(escaped: &str) -> String {
     escaped.replace("%3A", ":").replace("%25", "%")
 }
 
+/// Sorted set of live replica ids, scored by expiry (unix seconds).
+pub const REPLICAS_INDEX: &str = "relay:replicas";
 pub const REPLICA_PREFIX: &str = "relay:replica:";
 pub const REPLICA_PATTERN: &str = "relay:replica:*";
 pub const VOICE_PREFIX: &str = "relay:voice:";
