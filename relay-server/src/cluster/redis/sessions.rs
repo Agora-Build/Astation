@@ -182,6 +182,7 @@ impl SessionBackend for RedisSessionBackend {
         self.load(id).await
     }
 
+    /// Test/admin only; never use for status transitions (blind overwrite).
     async fn update(&self, id: &str, session: Session) -> Result<(), StoreError> {
         self.write(id, &session).await
     }
@@ -237,10 +238,9 @@ impl SessionBackend for RedisSessionBackend {
     }
 
     async fn touch(&self, id: &str) -> Result<(), StoreError> {
-        let _ = self
-            .script(&self.touch, id, vec![DECIDED_SESSION_TTL_SECS.to_string()])
-            .await;
-        Ok(())
+        self.script(&self.touch, id, vec![DECIDED_SESSION_TTL_SECS.to_string()])
+            .await
+            .map(|_| ())
     }
 
     async fn cleanup_expired(&self) -> Result<(), StoreError> {
@@ -307,7 +307,15 @@ mod tests {
             store.grant(&id, &otp).await.unwrap(),
             GrantOutcome::NotPending(SessionStatus::Granted)
         ));
+        // Lower the TTL first, so the touch visibly restores it.
+        let key = keys::session(&id);
+        conn.run(|mut c| async move { redis::cmd("EXPIRE").arg(&key).arg(100).query_async::<()>(&mut c).await })
+            .await
+            .unwrap();
+        assert!(ttl(&conn, &id).await <= 100);
         store.touch(&id).await.unwrap();
+        let touched_ttl = ttl(&conn, &id).await;
+        assert!(touched_ttl > DECIDED_SESSION_TTL_SECS - 10, "touched ttl {touched_ttl}");
 
         assert!(matches!(store.grant("missing", &otp).await.unwrap(), GrantOutcome::NotFound));
         store.delete(&id).await.unwrap();
@@ -344,23 +352,21 @@ mod tests {
     #[ignore]
     async fn redis_sessions_concurrent_grants_apply_once() {
         let _guard = REDIS_LOCK.lock().await;
-        let (store, _conn) = store().await;
-        let session = create_session("race");
-        let (id, otp) = (session.id.clone(), session.otp.clone());
-        store.create(session).await.unwrap();
-        let handles: Vec<_> = (0..8)
-            .map(|_| {
-                let (store, id, otp) = (store.clone(), id.clone(), otp.clone());
-                tokio::spawn(async move { store.grant(&id, &otp).await.unwrap() })
-            })
-            .collect();
-        let mut granted = 0;
-        for handle in handles {
-            if matches!(handle.await.unwrap(), GrantOutcome::Granted(_)) {
-                granted += 1;
-            }
-        }
-        assert_eq!(granted, 1);
+        scenarios::concurrent_grants_apply_once(store().await.0).await;
+    }
+
+    /// A touch that fails reaches the caller (relay.rs logs it).
+    #[tokio::test]
+    #[ignore]
+    async fn redis_sessions_touch_reports_errors() {
+        let _guard = REDIS_LOCK.lock().await;
+        let (store, conn) = store().await;
+        let key = keys::session("wrong-type");
+        conn.run(|mut c| async move { redis::cmd("SET").arg(&key).arg("x").query_async::<()>(&mut c).await })
+            .await
+            .unwrap();
+        assert!(store.touch("wrong-type").await.is_err());
+        store.touch("missing").await.unwrap();
     }
 
     /// The same scenarios the in-memory backend passes, including the

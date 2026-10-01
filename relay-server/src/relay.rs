@@ -375,9 +375,14 @@ impl RelayHub {
         };
         if let Err(error) = self.inner.bus.send_inbox(&target.replica, message).await {
             if code.is_none() {
-                // An eviction/replacement that did not arrive can leave two
-                // live owners until the next heartbeat.
-                tracing::warn!("Could not close a replaced connection on replica {}: {}", target.replica, error);
+                // An eviction/replacement (or a DELETE /api/pair room close)
+                // that did not arrive can leave a live socket behind until
+                // the next heartbeat.
+                tracing::warn!(
+                    "Could not close an evicted or removed connection on replica {}: {}",
+                    target.replica,
+                    error
+                );
             } else {
                 tracing::debug!("Could not close a connection on replica {}: {}", target.replica, error);
             }
