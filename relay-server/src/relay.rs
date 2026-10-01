@@ -70,7 +70,7 @@ pub(crate) const CLOSE_TRY_AGAIN: u16 = 1013;
 const MAX_PAIR_CODE_ATTEMPTS: usize = 10;
 
 /// A key reload after a bus resubscribe gives up after this long.
-const KEY_RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const KEY_RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Pending Astation sockets allowed per room (0 = no cap).
 pub(crate) const MAX_PENDING_ASTATIONS_PER_ROOM: usize = 0;
@@ -673,9 +673,18 @@ impl RelayHub {
             }
             Err(error) => tracing::warn!("Room sweep failed: {}", error),
         }
-        for code in self.inner.local.codes_with_astations() {
-            if let Err(error) = self.inner.directory.touch(&code).await {
-                tracing::debug!("Room heartbeat failed for {}: {}", mask_code(&code), error);
+        let astation_codes = self.inner.local.codes_with_astations();
+        for (done, code) in astation_codes.iter().enumerate() {
+            if let Err(error) = self.inner.directory.touch(code).await {
+                // Shared state is down: each further touch would only wait
+                // out its own timeout. The next sweep tries them all again.
+                tracing::warn!(
+                    "Room heartbeat failed; skipping {} of {} room(s) this sweep: {}",
+                    astation_codes.len() - done,
+                    astation_codes.len(),
+                    error
+                );
+                break;
             }
         }
         let atem_codes = self.inner.local.codes_with_atems();
@@ -4314,6 +4323,92 @@ mod tests {
         assert!(hub.room("OLD-ROOM").await.unwrap().is_none());
         assert!(atem.frames.recv().await.is_none(), "the Atem's socket was closed");
         assert!(hub.local().contains("astation-conn"), "the Astation socket stays");
+    }
+
+    /// Every call delegates to an in-memory directory except `touch`,
+    /// which fails (shared state down) and counts its calls.
+    struct TouchFails {
+        inner: InMemoryRoomDirectory,
+        touches: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl RoomDirectory for TouchFails {
+        fn backend_name(&self) -> &'static str {
+            "touch-fails"
+        }
+        async fn create_room(&self, code: &str, hostname: &str, now: i64) -> Result<(), ClusterError> {
+            self.inner.create_room(code, hostname, now).await
+        }
+        async fn ensure_room(&self, code: &str, hostname: &str, now: i64) -> Result<bool, ClusterError> {
+            self.inner.ensure_room(code, hostname, now).await
+        }
+        async fn get(&self, code: &str) -> Result<Option<RoomInfo>, ClusterError> {
+            self.inner.get(code).await
+        }
+        async fn join_atem(&self, code: &str, atem_id: &str, conn: &ConnRef) -> Result<AtemJoin, ClusterError> {
+            self.inner.join_atem(code, atem_id, conn).await
+        }
+        async fn claim_owner(
+            &self,
+            code: &str,
+            conn: &ConnRef,
+            now: i64,
+        ) -> Result<crate::cluster::directory::OwnerClaim, ClusterError> {
+            self.inner.claim_owner(code, conn, now).await
+        }
+        async fn add_pending(&self, code: &str, conn: &ConnRef, now: i64, max_pending: usize) -> Result<bool, ClusterError> {
+            self.inner.add_pending(code, conn, now, max_pending).await
+        }
+        async fn promote(&self, code: &str, conn: &ConnRef, was_pending: bool) -> Result<Promotion, ClusterError> {
+            self.inner.promote(code, conn, was_pending).await
+        }
+        async fn leave_atem(
+            &self,
+            code: &str,
+            atem_id: &str,
+            connection_id: &str,
+        ) -> Result<crate::cluster::directory::AtemLeave, ClusterError> {
+            self.inner.leave_atem(code, atem_id, connection_id).await
+        }
+        async fn leave_astation(&self, code: &str, connection_id: &str) -> Result<bool, ClusterError> {
+            self.inner.leave_astation(code, connection_id).await
+        }
+        async fn delete_room(&self, code: &str) -> Result<Option<RoomInfo>, ClusterError> {
+            self.inner.delete_room(code).await
+        }
+        async fn touch(&self, _code: &str) -> Result<bool, ClusterError> {
+            self.touches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ClusterError::Unavailable("redis call timed out".into()))
+        }
+        async fn exists(&self, codes: &[String]) -> Result<Vec<bool>, ClusterError> {
+            self.inner.exists(codes).await
+        }
+        async fn remove_expired(&self, now: i64) -> Result<Vec<String>, ClusterError> {
+            self.inner.remove_expired(now).await
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_stops_touching_rooms_after_the_first_error() {
+        let touches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let directory = TouchFails {
+            inner: InMemoryRoomDirectory::new(),
+            touches: touches.clone(),
+        };
+        let hub = RelayHub::from_parts(HubParts {
+            directory: Arc::new(directory),
+            ..HubParts::single_instance(InMemoryRoomDirectory::new(), TEST_AUTH_TIMEOUT)
+        });
+        let _sockets: Vec<_> = ["ROOM-A", "ROOM-B", "ROOM-C"]
+            .iter()
+            .enumerate()
+            .map(|(i, code)| hub.local().register(&format!("astation-{i}"), code, SocketRole::Astation))
+            .collect();
+        hub.cleanup_expired().await;
+        assert_eq!(touches.load(std::sync::atomic::Ordering::SeqCst), 1, "one failed touch ends this sweep's touches");
+        hub.cleanup_expired().await;
+        assert_eq!(touches.load(std::sync::atomic::Ordering::SeqCst), 2, "the next sweep tries again");
     }
 
     #[tokio::test]

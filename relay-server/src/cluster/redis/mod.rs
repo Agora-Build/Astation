@@ -46,22 +46,89 @@ pub struct RedisConn {
     manager: ConnectionManager,
 }
 
+/// Why a startup connect failed. Retrying can't fix a `Permanent` one (a
+/// bad REDIS_URL or wrong credentials). Messages never contain the URL.
+#[derive(Debug)]
+pub enum ConnectError {
+    Permanent(String),
+    Retryable(StoreError),
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectError::Permanent(detail) => write!(f, "{detail}"),
+            ConnectError::Retryable(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl From<StoreError> for ConnectError {
+    fn from(error: StoreError) -> Self {
+        ConnectError::Retryable(error)
+    }
+}
+
+impl From<ConnectError> for StoreError {
+    fn from(error: ConnectError) -> Self {
+        match error {
+            ConnectError::Permanent(detail) => StoreError::Unavailable(detail),
+            ConnectError::Retryable(error) => error,
+        }
+    }
+}
+
+/// An invalid client config (unparseable URL) or an authentication failure
+/// (wrong password: AuthenticationFailed / WRONGPASS; none sent: NOAUTH).
+/// Everything else (refused, timeouts, loading) may pass, so it is retried.
+pub(crate) fn is_permanent_connect_error(error: &redis::RedisError) -> bool {
+    matches!(
+        error.kind(),
+        redis::ErrorKind::InvalidClientConfig | redis::ErrorKind::AuthenticationFailed
+    ) || matches!(error.code(), Some("NOAUTH") | Some("WRONGPASS"))
+}
+
+fn connect_error(error: redis::RedisError) -> ConnectError {
+    if is_permanent_connect_error(&error) {
+        // The kind and the server's reply only: never the URL (it may hold
+        // the password).
+        let detail = match (error.code(), error.detail()) {
+            (Some(code), Some(detail)) => format!("{code} {detail}"),
+            (None, Some(detail)) => format!("{}: {}", error.category(), detail),
+            (_, None) => error.category().to_string(),
+        };
+        ConnectError::Permanent(detail)
+    } else {
+        ConnectError::Retryable(redis_error(error))
+    }
+}
+
 impl RedisConn {
-    /// One connect attempt, bounded by REDIS_TIMEOUT, with no internal retry
-    /// or backoff. Startup-level retrying belongs to the caller (Task 19's loop).
+    /// `connect_checked` as a StoreError (the Redis test suites).
+    #[cfg(test)]
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
-        let client = redis::Client::open(url).map_err(redis_error)?;
+        Ok(Self::connect_checked(url).await?)
+    }
+
+    /// One connect attempt, bounded by REDIS_TIMEOUT, with no internal retry
+    /// or backoff; startup-level retrying belongs to the caller (`main`).
+    /// Tells permanent failures from ones worth retrying, and ends with a
+    /// PING so a missing password shows up here (NOAUTH).
+    pub async fn connect_checked(url: &str) -> Result<Self, ConnectError> {
+        let client = redis::Client::open(url).map_err(connect_error)?;
         let config = ConnectionManagerConfig::new()
             .set_connection_timeout(REDIS_TIMEOUT)
             .set_response_timeout(REDIS_TIMEOUT)
             .set_number_of_retries(0);
-        let manager = tokio::time::timeout(
-            REDIS_TIMEOUT,
-            client.get_connection_manager_with_config(config),
-        )
-        .await
-        .map_err(|_| StoreError::Unavailable("redis connect timed out".to_string()))?
-        .map_err(redis_error)?;
+        let connecting = async {
+            let mut manager = client.get_connection_manager_with_config(config).await?;
+            redis::cmd("PING").query_async::<String>(&mut manager).await?;
+            Ok::<_, redis::RedisError>(manager)
+        };
+        let manager = tokio::time::timeout(REDIS_TIMEOUT, connecting)
+            .await
+            .map_err(|_| StoreError::Unavailable("redis connect timed out".to_string()))?
+            .map_err(connect_error)?;
         Ok(Self { client, manager })
     }
 
@@ -121,7 +188,7 @@ pub async fn connect_cluster(
     identity: Arc<dyn IdentityStore>,
     auth_timeout: Duration,
 ) -> Result<RedisCluster, StoreError> {
-    connect_cluster_with_keys(url, identity, KeyCache::new(), auth_timeout).await
+    Ok(connect_cluster_with_keys(url, identity, KeyCache::new(), auth_timeout).await?)
 }
 
 /// Build a replica on Redis around `keys` (already loaded by the caller):
@@ -134,8 +201,8 @@ pub async fn connect_cluster_with_keys(
     identity: Arc<dyn IdentityStore>,
     keys: KeyCache,
     auth_timeout: Duration,
-) -> Result<RedisCluster, StoreError> {
-    let conn = RedisConn::connect(url).await?;
+) -> Result<RedisCluster, ConnectError> {
+    let conn = RedisConn::connect_checked(url).await?;
     let replica_id = new_replica_id();
     let health = presence::RedisHealth::start(conn.clone(), &replica_id).await?;
     let (bus, events, bus_task) = match bus::RedisBus::start(conn.clone(), &replica_id).await {
@@ -145,7 +212,7 @@ pub async fn connect_cluster_with_keys(
             if let Err(withdraw_error) = health.withdraw().await {
                 tracing::debug!("Could not withdraw replica {}: {}", replica_id, withdraw_error);
             }
-            return Err(error);
+            return Err(error.into());
         }
     };
     let waiters = ReplyWaiters::default();
@@ -266,6 +333,50 @@ mod tests {
         let error = RedisConn::connect("redis://127.0.0.1:1/").await.err().expect("no server on port 1");
         assert!(matches!(error, StoreError::Unavailable(_)));
         assert!(started.elapsed() < REDIS_TIMEOUT, "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn only_config_and_auth_errors_are_permanent() {
+        use redis::{ErrorKind, RedisError};
+        let refused = RedisError::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        let timed_out = RedisError::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert!(!is_permanent_connect_error(&refused));
+        assert!(!is_permanent_connect_error(&timed_out));
+        assert!(!is_permanent_connect_error(&RedisError::from((ErrorKind::BusyLoadingError, "loading"))));
+        assert!(!is_permanent_connect_error(&RedisError::from((ErrorKind::TryAgain, "try again"))));
+        assert!(is_permanent_connect_error(&RedisError::from((ErrorKind::InvalidClientConfig, "bad url"))));
+        assert!(is_permanent_connect_error(&RedisError::from((ErrorKind::AuthenticationFailed, "wrong password"))));
+        for code in ["NOAUTH", "WRONGPASS"] {
+            // A server error reply with a code redis-rs has no kind for.
+            let reply = format!("-{code} authentication problem\r\n");
+            let error = match redis::parse_redis_value(reply.as_bytes()) {
+                Ok(redis::Value::ServerError(error)) => RedisError::from(error),
+                Ok(other) => panic!("{code}: parsed as {other:?}"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), Some(code));
+            assert!(is_permanent_connect_error(&error), "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bad_redis_url_is_permanent_and_never_echoed() {
+        for url in ["not a url", "redis://:hunter2@127.0.0.1:notaport/", "http://:hunter2@127.0.0.1/"] {
+            match RedisConn::connect_checked(url).await {
+                Err(ConnectError::Permanent(message)) => {
+                    assert!(!message.contains("hunter2"), "{message}");
+                    assert!(!message.contains(url), "{message}");
+                }
+                Err(other) => panic!("{url}: expected a permanent error, got {other}"),
+                Ok(_) => panic!("{url}: connected"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_redis_is_retryable() {
+        let error = RedisConn::connect_checked("redis://127.0.0.1:1/").await.err().expect("no server on port 1");
+        assert!(matches!(error, ConnectError::Retryable(_)), "{error}");
     }
 
     #[tokio::test]

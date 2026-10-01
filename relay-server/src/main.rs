@@ -52,12 +52,35 @@ fn redis_url() -> Option<String> {
     std::env::var("REDIS_URL").ok().filter(|url| !url.trim().is_empty())
 }
 
-/// RELAY_REPLICAS_EXPECTED (default 1): how many replicas this deployment runs.
+/// RELAY_REPLICAS_EXPECTED: unset or blank means 1; anything else must be
+/// a positive integer.
+fn parse_replicas_expected(value: Option<&str>) -> Result<usize, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(1),
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(count) if count > 0 => Ok(count),
+            _ => Err(format!(
+                "RELAY_REPLICAS_EXPECTED must be a positive integer (how many relay replicas run), got {raw:?}"
+            )),
+        },
+    }
+}
+
+/// RELAY_REPLICAS_EXPECTED (default 1): how many replicas this deployment
+/// runs. An invalid value stops the relay (exit 1).
 fn replicas_expected() -> usize {
-    std::env::var("RELAY_REPLICAS_EXPECTED")
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(1)
+    let raw = match std::env::var("RELAY_REPLICAS_EXPECTED") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => Some("<not UTF-8>".to_string()),
+    };
+    match parse_replicas_expected(raw.as_deref()) {
+        Ok(count) => count,
+        Err(message) => {
+            tracing::error!("{}", message);
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Without Redis every replica would have its own rooms and sessions.
@@ -74,8 +97,9 @@ fn check_single_instance(expected_replicas: usize) -> Result<(), String> {
 const REDIS_CONNECT_ATTEMPTS: u32 = 10;
 const REDIS_CONNECT_RETRY_SECS: u64 = 3;
 
-/// Connect to Redis, retrying for about 30 s, then give up (exit 1) so the
-/// orchestrator restarts the relay. `keys` is already loaded; the replica
+/// Connect to Redis, retrying unreachable/timeouts for about 30 s, then give
+/// up (exit 1) so the orchestrator restarts the relay. A permanent failure
+/// (bad URL, wrong password) exits at once. Never logs the URL. `keys` is already loaded; the replica
 /// serves from it.
 async fn connect_redis_cluster(
     url: &str,
@@ -86,7 +110,15 @@ async fn connect_redis_cluster(
     for attempt in 1..=REDIS_CONNECT_ATTEMPTS {
         match cluster::redis::connect_cluster_with_keys(url, identity.clone(), keys.clone(), auth_timeout).await {
             Ok(cluster) => return cluster,
-            Err(error) => {
+            // A bad URL or wrong credentials won't fix themselves.
+            Err(cluster::redis::ConnectError::Permanent(detail)) => {
+                tracing::error!(
+                    "Redis connect failed and retrying won't help (check REDIS_URL and its password): {}",
+                    detail
+                );
+                std::process::exit(1);
+            }
+            Err(cluster::redis::ConnectError::Retryable(error)) => {
                 tracing::error!(
                     "Redis connect attempt {}/{} failed: {}",
                     attempt,
@@ -317,6 +349,10 @@ async fn main() {
 
     tracing::info!("Starting Astation server...");
 
+    // Configuration errors stop the relay before anything connects.
+    let redis_url = redis_url();
+    let expected_replicas = replicas_expected();
+
     // Vault + knowledge (Atem Memory) + identity stores: Postgres, sharing one
     // pool, when DATABASE_URL is set (the durable path), else in-memory
     // fallbacks so the rest of the server still runs without a DB.
@@ -371,16 +407,25 @@ async fn main() {
     // Startup order in Redis mode: keys above → Redis connect (bounded
     // retries, then exit 1) → presence (one refresh, so peers are known) →
     // bus subscription + dispatcher → background sweeps below → listener.
-    let (relay, sessions, rtc_sessions, voice_sessions) = match redis_url() {
+    let (relay, sessions, rtc_sessions, voice_sessions) = match redis_url {
         Some(url) => {
             tracing::info!("Connecting to Redis for shared relay state...");
             let cluster = connect_redis_cluster(&url, identity.clone(), keys).await;
             // A key registered on another replica between the load above and
             // the bus subscription was announced while we weren't listening:
             // re-read once now that key-changed messages reach us.
-            match cluster.relay.load_keys(identity.as_ref()).await {
-                Ok(count) => tracing::info!("Re-read {} Astation relay key(s) after subscribing", count),
-                Err(error) => tracing::warn!("Could not re-read relay keys after subscribing: {}", error),
+            match tokio::time::timeout(
+                relay::KEY_RELOAD_TIMEOUT,
+                cluster.relay.load_keys(identity.as_ref()),
+            )
+            .await
+            {
+                Ok(Ok(count)) => tracing::info!("Re-read {} Astation relay key(s) after subscribing", count),
+                Ok(Err(error)) => tracing::warn!("Could not re-read relay keys after subscribing: {}", error),
+                Err(_) => tracing::warn!(
+                    "Re-reading relay keys after subscribing timed out after {:?}",
+                    relay::KEY_RELOAD_TIMEOUT
+                ),
             }
             tracing::info!(
                 "Shared relay state ready (Redis); replica {}, {} live replica(s)",
@@ -397,7 +442,7 @@ async fn main() {
             )
         }
         None => {
-            if let Err(message) = check_single_instance(replicas_expected()) {
+            if let Err(message) = check_single_instance(expected_replicas) {
                 tracing::error!("{}", message);
                 std::process::exit(1);
             }
@@ -438,6 +483,8 @@ async fn main() {
     let cleanup_relay = relay.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        // A sweep slowed by a Redis outage must not be followed by a burst.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
             cleanup_relay.cleanup_expired().await;
@@ -533,6 +580,18 @@ mod tests {
         let message = check_single_instance(2).unwrap_err();
         assert!(message.contains("RELAY_REPLICAS_EXPECTED=2"), "{message}");
         assert!(message.contains("REDIS_URL"), "{message}");
+    }
+
+    #[test]
+    fn replicas_expected_must_be_a_positive_integer() {
+        assert_eq!(parse_replicas_expected(None), Ok(1));
+        assert_eq!(parse_replicas_expected(Some("  ")), Ok(1));
+        assert_eq!(parse_replicas_expected(Some("1")), Ok(1));
+        assert_eq!(parse_replicas_expected(Some(" 3 ")), Ok(3));
+        for bad in ["0", "-1", "two", "2.5", "1e3"] {
+            let message = parse_replicas_expected(Some(bad)).unwrap_err();
+            assert!(message.contains("RELAY_REPLICAS_EXPECTED"), "{message}");
+        }
     }
 
     #[tokio::test]

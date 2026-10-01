@@ -22,7 +22,7 @@ pub const REPLICAS_INDEX: &str = "relay:replicas";
 pub const REPLICA_PREFIX: &str = "relay:replica:";
 // Spec key-table name only: presence lists replicas from REPLICAS_INDEX
 // rather than SCANning this pattern, so only the key-table test reads it.
-#[allow(dead_code)]
+#[cfg(test)]
 pub const REPLICA_PATTERN: &str = "relay:replica:*";
 pub const VOICE_PREFIX: &str = "relay:voice:";
 pub const VOICE_PATTERN: &str = "relay:voice:*";
