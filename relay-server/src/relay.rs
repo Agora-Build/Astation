@@ -6,7 +6,6 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse, Json, Response},
 };
-use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -64,6 +63,8 @@ const IDENTITY_STORE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 /// Close code: shared relay state unavailable, reconnect later (RFC 6455).
 pub(crate) const CLOSE_TRY_AGAIN: u16 = 1013;
+/// Bound on flushing a socket's queued frames before its close frame.
+const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Fresh codes POST /api/pair tries before giving up (a collision never
 /// overwrites a live room).
@@ -1610,12 +1611,12 @@ async fn register_connection(
 /// Forward queued frames to the socket, with periodic pings for NAT
 /// keepalive (URLSession and tungstenite answer server pings, no client
 /// change). Ends when the queue's sender is gone (flush, then a plain
-/// close) or on a close request (that close frame, at once).
-async fn write_loop(
-    mut ws_sink: SplitSink<WebSocket, Message>,
-    mut outbox: SocketOutbox,
-    code: String,
-) {
+/// close) or on a close request (flush what was queued, then that close
+/// frame).
+async fn write_loop<S>(mut ws_sink: S, mut outbox: SocketOutbox, code: String)
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
     let mut ping_interval = tokio::time::interval(Duration::from_secs(WS_PING_INTERVAL_SECS));
     ping_interval.tick().await; // skip the immediate first tick
     let mut watch_close = true;
@@ -1630,6 +1631,22 @@ async fn write_loop(
                 }
                 let request = outbox.close.borrow_and_update().clone();
                 if let Some((close_code, reason)) = request {
+                    // Frames queued before the close request go first (a
+                    // relayAuthResult before its 1013, as `evict` flushes).
+                    // `close_with` dropped the sender, so the queue is finite;
+                    // the flush is bounded so a stalled client can't hold it.
+                    let flush = async {
+                        while let Ok(text) = outbox.frames.try_recv() {
+                            if ws_sink.send(Message::Text(text)).await.is_err() {
+                                return false;
+                            }
+                        }
+                        true
+                    };
+                    let flushed = tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, flush).await;
+                    if !matches!(flushed, Ok(true)) {
+                        tracing::debug!("WS flush before close failed for {}", mask_code(&code));
+                    }
                     let _ = ws_sink
                         .send(Message::Close(Some(CloseFrame {
                             code: close_code,
@@ -2235,6 +2252,37 @@ pub(crate) mod tests {
     };
 
     pub(crate) type TestSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    /// A frame queued before `close_with` reaches the client before the
+    /// close frame, even when the writer first runs after both (a slow host:
+    /// the relayAuthResult that precedes a 1013 was being dropped).
+    #[tokio::test]
+    async fn write_loop_flushes_queued_frames_before_a_close_code() {
+        let local = LocalSockets::new();
+        let outbox = local.register("c1", "ROOM", SocketRole::Astation);
+        assert!(local.send("c1", "first".to_string()));
+        assert!(local.send("c1", "second".to_string()));
+        assert!(local.close_with("c1", CLOSE_TRY_AGAIN, "relay state unavailable"));
+        let mut written: Vec<Message> = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), write_loop(&mut written, outbox, "ROOM".to_string()))
+            .await
+            .expect("the writer stops after the close frame");
+        let texts: Vec<String> = written
+            .iter()
+            .filter_map(|message| match message {
+                Message::Text(text) => Some(text.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["first", "second"], "{written:?}");
+        match written.last() {
+            Some(Message::Close(Some(frame))) => {
+                assert_eq!(frame.code, CLOSE_TRY_AGAIN);
+                assert_eq!(frame.reason, "relay state unavailable");
+            }
+            other => panic!("expected a 1013 close last, got {other:?}"),
+        }
+    }
 
     #[test]
     fn mask_code_shows_only_a_prefix() {

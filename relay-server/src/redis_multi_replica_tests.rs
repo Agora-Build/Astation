@@ -929,6 +929,14 @@ async fn redis_outage_closes_with_1013_and_the_replica_recovers_when_redis_retur
     // Upgraded before the outage, proving its key during it: the promotion
     // needs Redis, so the relay closes the socket with 1013.
     let (mut late, challenge) = connect_astation(&one.ws, code).await;
+    // The challenge is queued before the pending entry is written, so wait
+    // for that entry: otherwise the cut can land on the registration (also
+    // a 1013, but before the key proof this step is about).
+    eventually_async("the late Astation is pending", || async {
+        let room = one.state.relay.room(code).await.unwrap().unwrap();
+        room.pending.len() == 1
+    })
+    .await;
     one.proxy.cut();
     let result = authenticate(&mut late, &key, code, &challenge).await;
     assert_eq!(result["status"], "verified", "{result}");
