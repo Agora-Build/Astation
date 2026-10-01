@@ -339,6 +339,11 @@ impl VoiceBackend for RedisVoiceBackend {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut first_check = true;
         let outcome = loop {
+            // Past the deadline, don't read again: a slow Redis call here
+            // could push the caller's 504 beyond its limit.
+            if !first_check && tokio::time::Instant::now() >= deadline {
+                break Ok(WaitOutcome::TimedOut);
+            }
             match self.stored_reply(session_id).await {
                 Ok(Some(reply)) => break Ok(WaitOutcome::Reply(reply)),
                 Ok(None) => {}
@@ -424,6 +429,51 @@ mod tests {
         assert_eq!(store.trigger("missing").await.unwrap(), None);
         assert_eq!(store.set_response("missing", "x".into()).await.unwrap(), None);
         assert_eq!(store.increment_requests("missing").await.unwrap(), None);
+    }
+
+    async fn raw_ttl(conn: &RedisConn, key: &str) -> i64 {
+        let key = key.to_string();
+        conn.run(|mut c| async move { redis::cmd("TTL").arg(&key).query_async(&mut c).await })
+            .await
+            .unwrap()
+    }
+
+    async fn lower_ttl(conn: &RedisConn, key: &str) {
+        let key = key.to_string();
+        conn.run(|mut c| async move { redis::cmd("EXPIRE").arg(&key).arg(5).query_async::<()>(&mut c).await })
+            .await
+            .unwrap();
+    }
+
+    /// Each write refreshes the 60 s idle TTL; the stored answer lives 30 s.
+    #[tokio::test]
+    #[ignore]
+    async fn redis_voice_ttls_are_pinned() {
+        let _guard = REDIS_LOCK.lock().await;
+        let conn = fresh_conn().await;
+        let (store, _waiters, _task) = replica(&conn, "voice-ttl").await;
+        store.create("v-ttl".into(), "atem".into(), "ch".into()).await.unwrap();
+        let key = keys::voice("v-ttl");
+        let reply = keys::voice_reply("v-ttl");
+        let near_idle = |ttl: i64| (55..=60).contains(&ttl);
+
+        assert!(near_idle(raw_ttl(&conn, &key).await));
+        lower_ttl(&conn, &key).await;
+        store.add_transcription("v-ttl", "hello".into()).await.unwrap();
+        let ttl = raw_ttl(&conn, &key).await;
+        assert!(near_idle(ttl), "add_transcription ttl {ttl}");
+
+        lower_ttl(&conn, &key).await;
+        store.trigger("v-ttl").await.unwrap();
+        let ttl = raw_ttl(&conn, &key).await;
+        assert!(near_idle(ttl), "trigger ttl {ttl}");
+
+        lower_ttl(&conn, &key).await;
+        store.set_response("v-ttl", "answer".into()).await.unwrap();
+        let ttl = raw_ttl(&conn, &key).await;
+        assert!(near_idle(ttl), "set_response ttl {ttl}");
+        let reply_ttl = raw_ttl(&conn, &reply).await;
+        assert!((25..=30).contains(&reply_ttl), "reply ttl {reply_ttl}");
     }
 
     #[tokio::test]
