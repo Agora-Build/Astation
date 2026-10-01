@@ -45,6 +45,32 @@ class AstationIdentity {
         )
     }
 
+    enum RestoreError: Error, LocalizedError {
+        case invalidId
+
+        var errorDescription: String? {
+            "That isn't an Astation ID (expected astation-<UUID>)."
+        }
+    }
+
+    /// Replaces the saved identity with `id` from a recovery kit. It takes
+    /// effect the next time Astation starts; `shared.id` is unchanged until then.
+    static func restore(_ id: String) throws {
+        guard RecoveryKit.isValidAstationId(id) else { throw RestoreError.invalidId }
+        let path = identityPath()
+        try FileManager.default.createDirectory(
+            at: path.deletingLastPathComponent(),
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try id.write(to: path, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: path.path
+        )
+        Log.info("Restored Astation identity from a recovery kit: \(id) (takes effect on restart)")
+    }
+
     /// Path to identity file: ~/Library/Application Support/Astation/identity.txt
     private static func identityPath() -> URL {
         let appSupport = FileManager.default.urls(

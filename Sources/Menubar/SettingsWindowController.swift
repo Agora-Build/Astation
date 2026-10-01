@@ -29,6 +29,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var stationUrlField: NSTextField!
     private var serverStatusLabel: NSTextField!
     private var serverInfoLabel: NSTextField!
+    private var recoveryStatusLabel: NSTextField?
 
     init(hubManager: AstationHubManager, hotkeyManager: HotkeyManager) {
         self.hubManager = hubManager
@@ -171,6 +172,10 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         shortcuts.label = "Keyboard Shortcuts"
         shortcuts.viewController = shortcutsController
         tabs.addTabViewItem(shortcuts)
+        let security = NSTabViewItem(identifier: "security")
+        security.label = "Security"
+        security.view = makeSecurityView()
+        tabs.addTabViewItem(security)
         let sidebar = NSVisualEffectView()
         sidebar.material = .sidebar
         sidebar.blendingMode = .behindWindow
@@ -311,6 +316,194 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         }
     }
 
+    // MARK: - Security (account recovery)
+
+    private func makeSecurityView() -> NSView {
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 450, height: 440))
+
+        let title = NSTextField(labelWithString: "Account Recovery")
+        title.font = NSFont.boldSystemFont(ofSize: 14)
+        title.frame = NSRect(x: 20, y: 395, width: 410, height: 24)
+        content.addSubview(title)
+
+        let info = NSTextField(wrappingLabelWithString:
+            "The relay stores your memories, skills and vaults under this Astation's ID. Save the recovery kit somewhere off this Mac, such as a password manager, so you can get them back if this Mac is lost.")
+        info.font = NSFont.systemFont(ofSize: 11)
+        info.textColor = .secondaryLabelColor
+        info.frame = NSRect(x: 20, y: 335, width: 410, height: 56)
+        content.addSubview(info)
+
+        let idLabel = NSTextField(labelWithString: "Astation ID: \(RecoveryKit.masked(AstationIdentity.shared.id))")
+        idLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        idLabel.frame = NSRect(x: 20, y: 305, width: 410, height: 22)
+        content.addSubview(idLabel)
+
+        let showButton = NSButton(title: "Show Recovery Kit…", target: self, action: #selector(showRecoveryKit))
+        showButton.bezelStyle = .rounded
+        showButton.frame = NSRect(x: 20, y: 265, width: 180, height: 32)
+        content.addSubview(showButton)
+
+        let separator = NSBox(frame: NSRect(x: 20, y: 250, width: 410, height: 1))
+        separator.boxType = .separator
+        content.addSubview(separator)
+
+        let restoreTitle = NSTextField(labelWithString: "Restore on a New Mac")
+        restoreTitle.font = NSFont.boldSystemFont(ofSize: 14)
+        restoreTitle.frame = NSRect(x: 20, y: 215, width: 410, height: 24)
+        content.addSubview(restoreTitle)
+
+        let restoreInfo = NSTextField(wrappingLabelWithString:
+            "Replace this Astation's ID with the one in your recovery kit. Astation quits; open it again to finish. Atems paired with the current ID will need to pair again.")
+        restoreInfo.font = NSFont.systemFont(ofSize: 11)
+        restoreInfo.textColor = .secondaryLabelColor
+        restoreInfo.frame = NSRect(x: 20, y: 160, width: 410, height: 50)
+        content.addSubview(restoreInfo)
+
+        let restoreButton = NSButton(title: "Restore Account…", target: self, action: #selector(restoreAccount))
+        restoreButton.bezelStyle = .rounded
+        restoreButton.frame = NSRect(x: 20, y: 120, width: 180, height: 32)
+        content.addSubview(restoreButton)
+
+        let status = NSTextField(wrappingLabelWithString: "")
+        status.font = NSFont.systemFont(ofSize: 11)
+        status.frame = NSRect(x: 20, y: 70, width: 410, height: 40)
+        content.addSubview(status)
+        recoveryStatusLabel = status
+
+        let container = NSView()
+        container.addSubview(content)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            content.widthAnchor.constraint(equalToConstant: 450),
+            content.heightAnchor.constraint(equalToConstant: 440),
+            content.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            content.topAnchor.constraint(equalTo: container.topAnchor, constant: 16)
+        ])
+        return container
+    }
+
+    private func setRecoveryStatus(_ message: String, isError: Bool) {
+        recoveryStatusLabel?.stringValue = message
+        recoveryStatusLabel?.textColor = isError ? .systemRed : .secondaryLabelColor
+    }
+
+    /// A monospaced text box for an alert's accessory view.
+    private static func textBox(_ text: String, editable: Bool) -> (NSScrollView, NSTextView) {
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 420, height: 130))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        let textView = NSTextView(frame: NSRect(origin: .zero, size: scroll.contentSize))
+        textView.isEditable = editable
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView.string = text
+        textView.autoresizingMask = [.width]
+        scroll.documentView = textView
+        return (scroll, textView)
+    }
+
+    @objc private func showRecoveryKit() {
+        DeviceOwnerAuth.authenticate(reason: "show your Astation recovery kit") { [weak self] ok in
+            guard let self else { return }
+            guard ok else {
+                self.setRecoveryStatus("Not authenticated, so the recovery kit wasn't shown.", isError: true)
+                return
+            }
+            let kit = RecoveryKit(
+                astationId: AstationIdentity.shared.id,
+                relayURL: SettingsWindowController.currentAstationRelayUrl
+            )
+            let text = kit.text()
+            let alert = NSAlert()
+            alert.messageText = "Astation Recovery Kit"
+            alert.informativeText = "Save this somewhere off this Mac, such as a password manager. You need it to get your memories, skills and vaults back if this Mac is lost."
+            alert.accessoryView = Self.textBox(text, editable: false).0
+            alert.addButton(withTitle: "Copy")
+            alert.addButton(withTitle: "Save to File…")
+            alert.addButton(withTitle: "Done")
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+                self.setRecoveryStatus("Recovery kit copied to the clipboard.", isError: false)
+            case .alertSecondButtonReturn:
+                self.saveRecoveryKit(text)
+            default:
+                break
+            }
+        }
+    }
+
+    private func saveRecoveryKit(_ text: String) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "Astation Recovery Kit.txt"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try text.write(to: url, atomically: true, encoding: .utf8)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            setRecoveryStatus("Saved to \(url.path).", isError: false)
+        } catch {
+            setRecoveryStatus("Couldn't save the recovery kit: \(error.localizedDescription)", isError: true)
+        }
+    }
+
+    @objc private func restoreAccount() {
+        DeviceOwnerAuth.authenticate(reason: "restore an Astation account") { [weak self] ok in
+            guard let self else { return }
+            guard ok else {
+                self.setRecoveryStatus("Not authenticated, so nothing was restored.", isError: true)
+                return
+            }
+            let input = NSAlert()
+            input.messageText = "Restore Account"
+            input.informativeText = "Paste your recovery kit, or just the Astation ID."
+            let (box, textView) = Self.textBox("", editable: true)
+            input.accessoryView = box
+            input.addButton(withTitle: "Continue")
+            input.addButton(withTitle: "Cancel")
+            input.window.initialFirstResponder = textView
+            guard input.runModal() == .alertFirstButtonReturn else { return }
+
+            guard let kit = RecoveryKit.parse(textView.string) else {
+                self.setRecoveryStatus("No Astation ID found in what you pasted.", isError: true)
+                return
+            }
+            let current = AstationIdentity.shared.id
+            guard kit.astationId != current else {
+                self.setRecoveryStatus("This Mac already uses that Astation ID.", isError: false)
+                return
+            }
+
+            let confirm = NSAlert()
+            confirm.alertStyle = .warning
+            confirm.messageText = "Replace this Astation's ID?"
+            confirm.informativeText = """
+            Current: \(current)
+            New: \(kit.astationId)
+
+            Astation will quit; open it again to finish. Atems paired with the current ID will need to pair again.
+
+            The relay still trusts the old Mac's device key for this ID. Once, on the relay server, run:
+            station-relay-server admin forget-key \(kit.astationId)
+            """
+            confirm.addButton(withTitle: "Replace and Quit")
+            confirm.addButton(withTitle: "Cancel")
+            guard confirm.runModal() == .alertFirstButtonReturn else { return }
+
+            do {
+                try AstationIdentity.restore(kit.astationId)
+            } catch {
+                self.setRecoveryStatus(error.localizedDescription, isError: true)
+                return
+            }
+            if !kit.relayURL.isEmpty {
+                UserDefaults.standard.set(StationRelayURL.normalizedBase(kit.relayURL), forKey: SettingsWindowController.astationRelayUrlKey)
+            }
+            NSApp.terminate(nil)
+        }
+    }
+
     // MARK: - Helper Methods
 
     /// Get the local network IP address (e.g., 192.168.1.5) for LAN connections.
@@ -392,7 +585,12 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         let cell = NSTableCellView()
         let label = NSTextField(labelWithString: item.label)
         label.font = .systemFont(ofSize: 13)
-        let symbol = (item.identifier as? String) == "general" ? "gearshape" : "keyboard"
+        let symbol: String
+        switch item.identifier as? String {
+        case "general": symbol = "gearshape"
+        case "security": symbol = "lock.shield"
+        default: symbol = "keyboard"
+        }
         let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil)!)
         icon.contentTintColor = .secondaryLabelColor
         for child in [icon, label] as [NSView] {

@@ -443,8 +443,13 @@ proof never displaces a verified owner, even on a replica whose cache missed
 the key; it waits as pending instead.
 
 Admin reset, for a lost, stolen or replaced Mac (its Astation reports "Relay
-rejected this Astation's key"). Relay logs show only the first 4 characters of
-an id, so look it up first:
+rejected this Astation's key"). A user who moves their account to a new Mac
+does this: Settings → Security → **Restore Account…**, paste the recovery kit
+they saved from the old Mac, then reopen Astation. The relay still holds the
+old Mac's key for that id, so it rejects the new Mac until the reset below.
+After the reset, the new Mac's key registers on first connect, the account's
+bindings are kept, and its memory, skills and vaults are reachable again.
+Relay logs show only the first 4 characters of an id, so look it up first:
 
 ```sql
 SELECT astation_id, registered_at, last_verified_at FROM astation_keys
