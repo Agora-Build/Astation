@@ -20,6 +20,11 @@ WebSocket is closed with `1012` (reconnect), its room entries are withdrawn,
 and in-flight HTTP gets at most 5 s more. A second SIGTERM exits at once (143;
 SIGINT 130).
 
+Each WebSocket's send queue holds at most 1,000 frames or 4 MB
+(`MAX_QUEUED_FRAMES`, `MAX_QUEUED_BYTES` in `src/cluster/local.rs`); a frame
+that doesn't fit is dropped, and a client whose queue stays full for 10 s is
+closed with `1013`.
+
 ---
 
 ## Quick Start
@@ -223,7 +228,7 @@ Config: Set `relay_url` and `ws_url` in `.atem/config.toml`
 | `PUBLIC_BASE_URL` | _(unset)_ | Public base URL used for generated session links (recommended in production) |
 | `PORT` | `3000` | Server port |
 | `RUST_LOG` | `info` | Log level (error, warn, info, debug, trace) |
-| `REDIS_URL` | _(unset)_ | Redis/Valkey for shared relay state: rooms, pairing/OTP, voice and RTC sessions, shared rate-limit counters, replica-to-replica delivery. Required to run more than one replica. Unset: in-memory, one replica only. At startup an unreachable Redis is retried for about 30 s, then the relay exits 1; a malformed URL or wrong password exits 1 at once. The URL (and its password) is never logged. |
+| `REDIS_URL` | _(unset)_ | Redis/Valkey for shared relay state: rooms, pairing/OTP, voice and RTC sessions, shared rate-limit counters, replica-to-replica delivery. Required to run more than one replica. Unset: in-memory, one replica only. At startup Redis is tried 10 times, 3 s apart (about 27 s if refused, up to about 57 s if it doesn't answer), then the relay exits 1; a malformed URL or wrong password exits 1 at once. The URL (and its password) is never logged. |
 | `RELAY_REPLICAS_EXPECTED` | `1` | How many relay replicas the deployment runs. Above 1 without `REDIS_URL`, the relay refuses to start (exit 1); a value that isn't a positive integer also exits 1. |
 | `DATABASE_URL` | _(unset)_ | Postgres connection string shared by **vault**, **knowledge sync (Atem Memory)**, and **relay identity** (Astation keys + session bindings) storage (e.g. `postgres://vault:vault@localhost:5432/vault`), one pool for all. When unset, all fall back to **in-memory** (non-durable: bindings and registered keys are lost on restart) and log a warning. Migrations in `migrations/` run automatically at startup. |
 
@@ -296,7 +301,7 @@ needed behind the webapp (see `../DEPLOY.md`, "Relay replicas"). Without
 **Admin:** `station-relay-server admin forget-key <astation_id>` deletes an
 Astation's relay key and, with `REDIS_URL`, makes every replica drop it and
 disconnect that Astation's verified socket at once (runbook: `../DEPLOY.md`,
-"Admin reset"). Exit codes: 0 done, 1 database/Redis error, 2 bad arguments.
+"Admin reset"). Exit codes: 0 done, 1 database/Redis error (with `REDIS_URL` set but Redis unreachable, nothing is deleted), 2 bad arguments.
 
 **Monitoring:** Check `docker compose logs -f`
 

@@ -89,7 +89,9 @@ proof-of-possession + durable pairing"; summary in `README.md`.
   so a compromised key is revoked immediately. Bindings are kept. The
   replacement Mac's Astation then connects with its new key, which registers
   by trust on first use; bring it online promptly, because until then the
-  room is open to first-use squatting (below). Without `REDIS_URL`, or if the
+  room is open to first-use squatting (below). With `REDIS_URL` set but
+  Valkey unreachable, the command exits 1 without deleting anything. Without
+  `REDIS_URL`, or if the
   announcement fails (the command says so and exits 1), or when the row is
   deleted by hand in SQL, the cached **old** key keeps verifying until every
   relay replica is restarted.
@@ -131,6 +133,8 @@ Residual risks:
    aware so an old socket cannot remove its replacement.
 5. WebSocket connection admission and message size/rate limits need explicit
    production bounds.
+   Partly addressed: bounded per-connection send queues (1,000 frames / 4 MB;
+   a client stalled for 10 s is closed with 1013).
 
 Do not describe a deployment as production-ready until these items have tests
 and the deployed configuration requires them.

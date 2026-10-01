@@ -1,7 +1,8 @@
 # Relay multi-replica design
 
 Status: design, approved in discussion 2026-09-30. Steps 1–5 built
-(`feat/relay-multi-replica`); step 6 (10k+ readiness) not built yet.
+(`feat/relay-multi-replica`); step 6 (10k+ readiness): bounded send queues
+built, the rest not yet.
 Operations: `DEPLOY.md`, "Relay replicas and Valkey".
 
 ## Goal
