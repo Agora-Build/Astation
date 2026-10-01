@@ -1645,7 +1645,16 @@ async fn handle_astation_control(
             }
         }
         "relaySessions" | "relayBind" | "relayUnbind" => {
-            let ack = if auth.state == AuthState::Verified {
+            // An evicted socket (replaced, or its key forgotten) may still be
+            // read until the client goes: it no longer speaks for the room.
+            let ack = if !hub.local().contains(connection_id) {
+                tracing::debug!(
+                    "Refused {} from an evicted Astation socket {}",
+                    kind,
+                    mask_code(code)
+                );
+                relay_ack_err(kind, "not verified")
+            } else if auth.state == AuthState::Verified {
                 apply_binding_message(identity.as_ref(), code, kind, message, now).await
             } else {
                 tracing::debug!(
@@ -4722,6 +4731,50 @@ pub(crate) mod tests {
         send_json(&mut atem, serde_json::json!({"probe": "from-old-atem"})).await;
         assert_closed(&mut atem).await;
         assert_silent(&mut owner, 150).await;
+        server.abort();
+    }
+
+    /// Binding messages are refused from a socket that is no longer
+    /// registered here (evicted, e.g. by forget-key), even if its reader
+    /// still runs and its auth state says verified.
+    #[tokio::test]
+    async fn binding_messages_from_an_evicted_socket_are_refused() {
+        let (state, flaky) = flaky_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-evicted-binder";
+        let key = TestKey::generate();
+        let _owner = verified_astation(&base_url, code, &key, "registered").await;
+        let hub = state.relay.clone();
+        let connection_id = hub.room(code).await.unwrap().unwrap().owner.unwrap().conn;
+        let identity: Arc<dyn IdentityStore> = Arc::new(flaky.clone());
+        let mut auth = AstationAuth {
+            challenge: String::new(),
+            deadline: Instant::now() + Duration::from_secs(10),
+            state: AuthState::Verified,
+        };
+        let bind = |session: &str| serde_json::json!({"type": "relayBind", "session_id": session});
+
+        // Still registered: applied.
+        assert!(
+            handle_astation_control(&hub, &identity, code, &connection_id, &mut auth, "relayBind", &bind("s-live"))
+                .await
+        );
+        assert_eq!(resolve(&state, "s-live").await.as_deref(), Some(code));
+
+        // Evicted by forget-key: refused, nothing stored.
+        flaky.inner.delete_key(code).await.unwrap();
+        hub.keys().reload_one(&flaky, code).await;
+        assert!(hub.drop_verified_owner_if_key_forgotten(code).await);
+        assert!(!hub.local().contains(&connection_id));
+        for (kind, message) in [
+            ("relayBind", bind("s-evicted")),
+            ("relayUnbind", serde_json::json!({"type": "relayUnbind", "session_id": "s-live"})),
+            ("relaySessions", serde_json::json!({"type": "relaySessions", "sessions": ["s-evicted"]})),
+        ] {
+            handle_astation_control(&hub, &identity, code, &connection_id, &mut auth, kind, &message).await;
+        }
+        assert_eq!(resolve(&state, "s-evicted").await, None);
+        assert_eq!(resolve(&state, "s-live").await.as_deref(), Some(code), "unbind was refused");
         server.abort();
     }
 
