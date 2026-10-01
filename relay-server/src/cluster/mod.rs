@@ -6,6 +6,7 @@
 
 pub mod bus;
 pub mod directory;
+pub mod health;
 pub mod keys;
 pub mod local;
 pub mod ratelimit;

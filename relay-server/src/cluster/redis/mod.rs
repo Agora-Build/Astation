@@ -5,6 +5,8 @@
 // Consumers land in Tasks 11-19; drop the allow as they do.
 #[allow(dead_code)]
 pub mod keys;
+#[allow(dead_code)]
+pub mod presence;
 
 use std::future::Future;
 use std::time::Duration;

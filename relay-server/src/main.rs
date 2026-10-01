@@ -49,15 +49,25 @@ pub struct AppState {
 }
 
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let redis = state.relay.redis_status().await;
     match state.vault.health_check().await {
-        Ok(()) => (
+        Ok(()) if redis != "unavailable" => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "status": "ok",
                 "vault_store": state.vault.backend_name(),
                 "knowledge_store": state.knowledge.backend_name(),
+                "redis": redis,
+                "replicas": state.relay.replica_count(),
             })),
         ),
+        Ok(()) => {
+            tracing::error!("Health check failed: Redis unavailable");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "status": "unhealthy", "redis": redis })),
+            )
+        }
         Err(error) => {
             tracing::error!("Health check failed: {}", error);
             (
@@ -422,8 +432,41 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(
             body.as_ref(),
-            br#"{"knowledge_store":"memory","status":"ok","vault_store":"memory"}"#
+            br#"{"knowledge_store":"memory","redis":"disabled","replicas":1,"status":"ok","vault_store":"memory"}"#
         );
+    }
+
+    #[tokio::test]
+    async fn health_fails_when_redis_is_unavailable() {
+        struct Down;
+        #[async_trait::async_trait]
+        impl cluster::health::ClusterHealth for Down {
+            async fn redis_status(&self) -> &'static str {
+                "unavailable"
+            }
+            fn replicas(&self) -> usize {
+                1
+            }
+            fn is_live(&self, _: &str) -> bool {
+                true
+            }
+            async fn withdraw(&self) -> Result<(), cluster::StoreError> {
+                Ok(())
+            }
+        }
+        let state = AppState {
+            relay: RelayHub::with_health(Arc::new(Down)),
+            ..test_state()
+        };
+        let response = Router::new()
+            .route("/health", get(health_handler))
+            .with_state(state)
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), br#"{"redis":"unavailable","status":"unhealthy"}"#);
     }
 
     #[tokio::test]

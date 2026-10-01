@@ -21,6 +21,7 @@ use crate::cluster::bus::{BroadcastMessage, InboxMessage, LoopbackBus, ReplicaBu
 use crate::cluster::directory::{
     AtemJoin, InMemoryRoomDirectory, Promotion, RoomDirectory, RoomInfo, IDENTITY_HOSTNAME,
 };
+use crate::cluster::health::{ClusterHealth, SingleInstance};
 use crate::cluster::keys::KeyCache;
 use crate::cluster::local::{LocalSockets, SocketOutbox, SocketRole};
 use crate::cluster::ratelimit::{NoopRateLimiter, SharedRateLimiter};
@@ -99,7 +100,26 @@ pub(crate) struct HubParts {
     pub local: LocalSockets,
     pub keys: KeyCache,
     pub rate_limiter: Arc<dyn SharedRateLimiter>,
+    pub health: Arc<dyn ClusterHealth>,
     pub auth_timeout: Duration,
+}
+
+impl HubParts {
+    /// Single-instance parts: in-memory directory, loopback bus, no
+    /// shared limits, no Redis.
+    pub(crate) fn single_instance(directory: InMemoryRoomDirectory, auth_timeout: Duration) -> Self {
+        let local = LocalSockets::new();
+        Self {
+            replica_id: SINGLE_REPLICA_ID.to_string(),
+            directory: Arc::new(directory),
+            bus: Arc::new(LoopbackBus::new(SINGLE_REPLICA_ID, local.clone())),
+            local,
+            keys: KeyCache::new(),
+            rate_limiter: Arc::new(NoopRateLimiter),
+            health: Arc::new(SingleInstance),
+            auth_timeout,
+        }
+    }
 }
 
 struct HubInner {
@@ -109,6 +129,7 @@ struct HubInner {
     local: LocalSockets,
     keys: KeyCache,
     rate_limiter: Arc<dyn SharedRateLimiter>,
+    health: Arc<dyn ClusterHealth>,
     auth_timeout: Duration,
 }
 
@@ -129,16 +150,7 @@ impl RelayHub {
     }
 
     pub(crate) fn in_memory(directory: InMemoryRoomDirectory, auth_timeout: Duration) -> Self {
-        let local = LocalSockets::new();
-        Self::from_parts(HubParts {
-            replica_id: SINGLE_REPLICA_ID.to_string(),
-            directory: Arc::new(directory),
-            bus: Arc::new(LoopbackBus::new(SINGLE_REPLICA_ID, local.clone())),
-            local,
-            keys: KeyCache::new(),
-            rate_limiter: Arc::new(NoopRateLimiter),
-            auth_timeout,
-        })
+        Self::from_parts(HubParts::single_instance(directory, auth_timeout))
     }
 
     pub(crate) fn from_parts(parts: HubParts) -> Self {
@@ -150,6 +162,7 @@ impl RelayHub {
                 local: parts.local,
                 keys: parts.keys,
                 rate_limiter: parts.rate_limiter,
+                health: parts.health,
                 auth_timeout: parts.auth_timeout,
             }),
         }
@@ -166,16 +179,45 @@ impl RelayHub {
 
     #[cfg(test)]
     pub(crate) fn with_rate_limiter(rate_limiter: Arc<dyn SharedRateLimiter>) -> Self {
-        let local = LocalSockets::new();
         Self::from_parts(HubParts {
-            replica_id: SINGLE_REPLICA_ID.to_string(),
-            directory: Arc::new(InMemoryRoomDirectory::new()),
-            bus: Arc::new(LoopbackBus::new(SINGLE_REPLICA_ID, local.clone())),
-            local,
-            keys: KeyCache::new(),
             rate_limiter,
-            auth_timeout: Duration::from_secs(RELAY_AUTH_TIMEOUT_SECS),
+            ..HubParts::single_instance(
+                InMemoryRoomDirectory::new(),
+                Duration::from_secs(RELAY_AUTH_TIMEOUT_SECS),
+            )
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_health(health: Arc<dyn ClusterHealth>) -> Self {
+        Self::from_parts(HubParts {
+            health,
+            ..HubParts::single_instance(
+                InMemoryRoomDirectory::new(),
+                Duration::from_secs(RELAY_AUTH_TIMEOUT_SECS),
+            )
+        })
+    }
+
+    /// "disabled", "ok" or "unavailable" (for /health).
+    pub async fn redis_status(&self) -> &'static str {
+        self.inner.health.redis_status().await
+    }
+
+    pub fn replica_count(&self) -> usize {
+        self.inner.health.replicas()
+    }
+
+    /// A directory entry on a replica without a live presence key is gone.
+    fn without_dead_replicas(&self, mut room: RoomInfo) -> RoomInfo {
+        let health = &self.inner.health;
+        if room.owner.as_ref().is_some_and(|owner| !health.is_live(&owner.replica)) {
+            room.owner = None;
+            room.verified = false;
+        }
+        room.atems.retain(|_, connection| health.is_live(&connection.replica));
+        room.pending.retain(|connection| health.is_live(&connection.replica));
+        room
     }
 
     pub fn replica_id(&self) -> &str {
@@ -295,9 +337,15 @@ impl RelayHub {
         self.inner.directory.get(code).await
     }
 
-    /// The room, read fresh (HTTP endpoints, connect checks).
+    /// The room, read fresh (HTTP endpoints, connect checks), without
+    /// entries left by dead replicas.
     pub(crate) async fn room(&self, code: &str) -> Result<Option<RoomInfo>, StoreError> {
-        self.inner.directory.get(code).await
+        Ok(self
+            .inner
+            .directory
+            .get(code)
+            .await?
+            .map(|room| self.without_dead_replicas(room)))
     }
 
     /// The current connection of `atem_id`, only if it is `connection_id`
@@ -2093,6 +2141,49 @@ mod tests {
     use crate::cluster::local::SocketRole;
     use crate::cluster::{ConnRef, StoreError as ClusterError, SINGLE_REPLICA_ID};
 
+    /// Health with a fixed set of live replicas.
+    struct FakeHealth {
+        live: Vec<&'static str>,
+        redis: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::cluster::health::ClusterHealth for FakeHealth {
+        async fn redis_status(&self) -> &'static str {
+            self.redis
+        }
+        fn replicas(&self) -> usize {
+            self.live.len()
+        }
+        fn is_live(&self, replica_id: &str) -> bool {
+            self.live.contains(&replica_id)
+        }
+        async fn withdraw(&self) -> Result<(), ClusterError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn entries_on_dead_replicas_are_treated_as_gone() {
+        let hub = RelayHub::with_health(std::sync::Arc::new(FakeHealth {
+            live: vec!["r1"],
+            redis: "ok",
+        }));
+        let code = "astation-dead-owner";
+        hub.directory()
+            .claim_owner(code, &ConnRef::new("s1", "dead"), now())
+            .await
+            .unwrap();
+        hub.directory().join_atem(code, "atem-live", &ConnRef::new("t1", "r1")).await.unwrap();
+        hub.directory().join_atem(code, "atem-dead", &ConnRef::new("t2", "dead")).await.unwrap();
+        hub.directory().add_pending(code, &ConnRef::new("p1", "dead"), now(), 0).await.unwrap();
+        let room = hub.room(code).await.unwrap().unwrap();
+        assert_eq!(room.owner, None);
+        assert!(!room.verified);
+        assert_eq!(room.atems.keys().collect::<Vec<_>>(), vec!["atem-live"]);
+        assert!(room.pending.is_empty());
+    }
+
     fn now() -> i64 {
         chrono::Utc::now().timestamp()
     }
@@ -2127,12 +2218,9 @@ mod tests {
         let local = crate::cluster::local::LocalSockets::new();
         let hub = RelayHub::from_parts(HubParts {
             replica_id: "r1".to_string(),
-            directory: std::sync::Arc::new(InMemoryRoomDirectory::new()),
             bus: bus.clone(),
             local: local.clone(),
-            keys: crate::cluster::keys::KeyCache::new(),
-            rate_limiter: std::sync::Arc::new(crate::cluster::ratelimit::NoopRateLimiter),
-            auth_timeout: TEST_AUTH_TIMEOUT,
+            ..HubParts::single_instance(InMemoryRoomDirectory::new(), TEST_AUTH_TIMEOUT)
         });
         let mut here = local.register("a", "room", SocketRole::Astation);
         hub.deliver_many(
