@@ -38,15 +38,26 @@ pub enum BroadcastMessage {
 /// Apply an inbox message to this replica's sockets.
 pub fn apply_inbox(local: &LocalSockets, message: InboxMessage) {
     match message {
-        InboxMessage::Deliver { connection_ids, frame } => {
+        InboxMessage::Deliver {
+            connection_ids,
+            frame,
+        } => {
             for connection_id in connection_ids {
                 local.send(&connection_id, frame.clone());
             }
         }
-        InboxMessage::Close { connection_id, code: None, .. } => {
+        InboxMessage::Close {
+            connection_id,
+            code: None,
+            ..
+        } => {
             local.evict(&connection_id);
         }
-        InboxMessage::Close { connection_id, code: Some(code), reason } => {
+        InboxMessage::Close {
+            connection_id,
+            code: Some(code),
+            reason,
+        } => {
             local.close_with(&connection_id, code, &reason);
         }
     }
@@ -87,7 +98,10 @@ impl ReplicaBus for LoopbackBus {
         if replica_id == self.replica_id {
             apply_inbox(&self.local, message);
         } else {
-            tracing::debug!("No replica {} in single-instance mode; message dropped", replica_id);
+            tracing::debug!(
+                "No replica {} in single-instance mode; message dropped",
+                replica_id
+            );
         }
         Ok(())
     }
@@ -103,7 +117,10 @@ pub enum BusEvent {
     Inbox(InboxMessage),
     Broadcast(BroadcastMessage),
     /// An Atem's answer for a waiting voice request (`relay:voice-reply:<id>`).
-    VoiceReply { session_id: String, reply: String },
+    VoiceReply {
+        session_id: String,
+        reply: String,
+    },
     /// The subscription was lost and re-established: anything published
     /// in between was missed.
     Resubscribed,
@@ -144,14 +161,18 @@ mod tests {
             json!({"type":"close","connection_id":"c1","code":null,"reason":""})
         );
         assert_eq!(
-            serde_json::to_value(BroadcastMessage::KeyChanged { astation_id: "a".into() }).unwrap(),
+            serde_json::to_value(BroadcastMessage::KeyChanged {
+                astation_id: "a".into()
+            })
+            .unwrap(),
             json!({"type":"key-changed","astation_id":"a"})
         );
         assert_eq!(
             serde_json::to_value(BroadcastMessage::RoomChanged { code: "X".into() }).unwrap(),
             json!({"type":"room-changed","code":"X"})
         );
-        let parsed: InboxMessage = serde_json::from_value(serde_json::to_value(&deliver).unwrap()).unwrap();
+        let parsed: InboxMessage =
+            serde_json::from_value(serde_json::to_value(&deliver).unwrap()).unwrap();
         assert_eq!(parsed, deliver);
     }
 
@@ -176,7 +197,11 @@ mod tests {
 
         bus.send_inbox(
             "local",
-            InboxMessage::Close { connection_id: "a".into(), code: None, reason: String::new() },
+            InboxMessage::Close {
+                connection_id: "a".into(),
+                code: None,
+                reason: String::new(),
+            },
         )
         .await
         .unwrap();
@@ -184,7 +209,11 @@ mod tests {
 
         bus.send_inbox(
             "local",
-            InboxMessage::Close { connection_id: "b".into(), code: Some(1012), reason: "restart".into() },
+            InboxMessage::Close {
+                connection_id: "b".into(),
+                code: Some(1012),
+                reason: "restart".into(),
+            },
         )
         .await
         .unwrap();
@@ -194,13 +223,18 @@ mod tests {
         // Single-instance mode has no other replica and nobody to broadcast to.
         bus.send_inbox(
             "elsewhere",
-            InboxMessage::Deliver { connection_ids: vec!["zzz".into()], frame: "x".into() },
+            InboxMessage::Deliver {
+                connection_ids: vec!["zzz".into()],
+                frame: "x".into(),
+            },
         )
         .await
         .unwrap();
-        bus.broadcast(BroadcastMessage::KeyChanged { astation_id: "a".into() })
-            .await
-            .unwrap();
+        bus.broadcast(BroadcastMessage::KeyChanged {
+            astation_id: "a".into(),
+        })
+        .await
+        .unwrap();
         assert_eq!(bus.backend_name(), "memory");
     }
 }

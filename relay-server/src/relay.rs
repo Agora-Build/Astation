@@ -20,13 +20,15 @@ use tokio::time::Instant;
 use uuid::Uuid;
 use validator::Validate;
 
-use crate::cluster::bus::{apply_inbox, BroadcastMessage, BusEvent, InboxMessage, LoopbackBus, ReplicaBus};
+use crate::cluster::bus::{
+    apply_inbox, BroadcastMessage, BusEvent, InboxMessage, LoopbackBus, ReplicaBus,
+};
 use crate::cluster::directory::{
     AtemJoin, InMemoryRoomDirectory, Promotion, RoomDirectory, RoomInfo, IDENTITY_HOSTNAME,
 };
 use crate::cluster::health::{ClusterHealth, SingleInstance};
 use crate::cluster::keys::KeyCache;
-use crate::cluster::limits::{client_ip, WsConnLimiter, WsPermit};
+use crate::cluster::limits::{client_ip, WsConnLimiter, WsPermit, DEFAULT_WS_MAX_PER_IP};
 use crate::cluster::local::{LocalSockets, SocketOutbox, SocketRole};
 use crate::cluster::ratelimit::{NoopRateLimiter, SharedRateLimiter};
 use crate::cluster::{ConnRef, StoreError, SINGLE_REPLICA_ID};
@@ -177,7 +179,10 @@ pub(crate) struct HubParts {
 impl HubParts {
     /// Single-instance parts: in-memory directory, loopback bus, no
     /// shared limits, no Redis.
-    pub(crate) fn single_instance(directory: InMemoryRoomDirectory, auth_timeout: Duration) -> Self {
+    pub(crate) fn single_instance(
+        directory: InMemoryRoomDirectory,
+        auth_timeout: Duration,
+    ) -> Self {
         let local = LocalSockets::new();
         Self {
             replica_id: SINGLE_REPLICA_ID.to_string(),
@@ -189,7 +194,7 @@ impl HubParts {
             health: Arc::new(SingleInstance),
             auth_timeout,
             cache_rooms: false,
-            ws_limiter: WsConnLimiter::from_env(),
+            ws_limiter: WsConnLimiter::new(DEFAULT_WS_MAX_PER_IP),
         }
     }
 }
@@ -226,9 +231,10 @@ impl RelayHub {
     }
 
     /// Single-instance hub around an already-loaded key cache (startup).
-    pub(crate) fn from_keys(keys: KeyCache) -> Self {
+    pub(crate) fn from_keys(keys: KeyCache, ws_max_per_ip: usize) -> Self {
         Self::from_parts(HubParts {
             keys,
+            ws_limiter: WsConnLimiter::new(ws_max_per_ip),
             ..HubParts::single_instance(
                 InMemoryRoomDirectory::new(),
                 Duration::from_secs(RELAY_AUTH_TIMEOUT_SECS),
@@ -314,12 +320,18 @@ impl RelayHub {
     /// A directory entry on a replica without a live presence key is gone.
     fn without_dead_replicas(&self, mut room: RoomInfo) -> RoomInfo {
         let health = &self.inner.health;
-        if room.owner.as_ref().is_some_and(|owner| !health.is_live(&owner.replica)) {
+        if room
+            .owner
+            .as_ref()
+            .is_some_and(|owner| !health.is_live(&owner.replica))
+        {
             room.owner = None;
             room.verified = false;
         }
-        room.atems.retain(|_, connection| health.is_live(&connection.replica));
-        room.pending.retain(|connection| health.is_live(&connection.replica));
+        room.atems
+            .retain(|_, connection| health.is_live(&connection.replica));
+        room.pending
+            .retain(|connection| health.is_live(&connection.replica));
         room
     }
 
@@ -349,7 +361,11 @@ impl RelayHub {
         }
         let left = self.inner.active_sockets.load(Ordering::SeqCst);
         if left > 0 {
-            tracing::warn!("Drain grace ({:?}) ended with {} socket(s) still open", grace, left);
+            tracing::warn!(
+                "Drain grace ({:?}) ended with {} socket(s) still open",
+                grace,
+                left
+            );
         }
         if let Err(error) = self.inner.health.withdraw().await {
             tracing::warn!("Could not withdraw replica presence: {}", error);
@@ -401,7 +417,10 @@ impl RelayHub {
     pub(crate) async fn deliver_many(&self, targets: Vec<ConnRef>, frame: String) {
         let mut by_replica: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for target in targets {
-            by_replica.entry(target.replica).or_default().push(target.conn);
+            by_replica
+                .entry(target.replica)
+                .or_default()
+                .push(target.conn);
         }
         for (replica, connection_ids) in by_replica {
             if replica == self.inner.replica_id {
@@ -437,7 +456,9 @@ impl RelayHub {
         let message = InboxMessage::Close {
             connection_id: target.conn.clone(),
             code: code.map(|(code, _)| code),
-            reason: code.map(|(_, reason)| reason.to_string()).unwrap_or_default(),
+            reason: code
+                .map(|(_, reason)| reason.to_string())
+                .unwrap_or_default(),
         };
         if let Err(error) = self.inner.bus.send_inbox(&target.replica, message).await {
             if code.is_none() {
@@ -450,7 +471,11 @@ impl RelayHub {
                     error
                 );
             } else {
-                tracing::debug!("Could not close a connection on replica {}: {}", target.replica, error);
+                tracing::debug!(
+                    "Could not close a connection on replica {}: {}",
+                    target.replica,
+                    error
+                );
             }
         }
     }
@@ -458,15 +483,23 @@ impl RelayHub {
     /// A room's directory entry changed: other replicas drop cached copies.
     pub(crate) async fn room_changed(&self, code: &str) {
         self.invalidate_room(code);
-        let message = BroadcastMessage::RoomChanged { code: code.to_string() };
+        let message = BroadcastMessage::RoomChanged {
+            code: code.to_string(),
+        };
         if let Err(error) = self.inner.bus.broadcast(message).await {
-            tracing::debug!("Could not announce a change of room {}: {}", mask_code(code), error);
+            tracing::debug!(
+                "Could not announce a change of room {}: {}",
+                mask_code(code),
+                error
+            );
         }
     }
 
     /// An Astation key was registered, replaced or forgotten here.
     pub(crate) async fn announce_key_change(&self, astation_id: &str) {
-        let message = BroadcastMessage::KeyChanged { astation_id: astation_id.to_string() };
+        let message = BroadcastMessage::KeyChanged {
+            astation_id: astation_id.to_string(),
+        };
         if let Err(error) = self.inner.bus.broadcast(message).await {
             tracing::warn!(
                 "Could not announce a key change for Astation {}: {}",
@@ -581,7 +614,12 @@ impl RelayHub {
                             tokio::spawn(async move {
                                 loop {
                                     again.store(false, Ordering::SeqCst);
-                                    match tokio::time::timeout(KEY_RELOAD_TIMEOUT, keys.load(identity.as_ref())).await {
+                                    match tokio::time::timeout(
+                                        KEY_RELOAD_TIMEOUT,
+                                        keys.load(identity.as_ref()),
+                                    )
+                                    .await
+                                    {
                                         Ok(Ok(_)) => {}
                                         Ok(Err(error)) => tracing::warn!(
                                             "Could not reload relay keys after resubscribing: {}",
@@ -592,7 +630,9 @@ impl RelayHub {
                                         ),
                                     }
                                     busy.store(false, Ordering::SeqCst);
-                                    if !again.load(Ordering::SeqCst) || busy.swap(true, Ordering::SeqCst) {
+                                    if !again.load(Ordering::SeqCst)
+                                        || busy.swap(true, Ordering::SeqCst)
+                                    {
                                         break;
                                     }
                                 }
@@ -605,8 +645,16 @@ impl RelayHub {
     }
 
     #[cfg(test)]
-    pub(crate) async fn create_room(&self, code: &str, hostname: &str, now: i64) -> Result<(), StoreError> {
-        self.inner.directory.create_room(code, hostname, now).await?;
+    pub(crate) async fn create_room(
+        &self,
+        code: &str,
+        hostname: &str,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .directory
+            .create_room(code, hostname, now)
+            .await?;
         self.room_changed(code).await;
         Ok(())
     }
@@ -629,8 +677,17 @@ impl RelayHub {
         Ok(None)
     }
 
-    pub(crate) async fn ensure_room(&self, code: &str, hostname: &str, now: i64) -> Result<bool, StoreError> {
-        let created = self.inner.directory.ensure_room(code, hostname, now).await?;
+    pub(crate) async fn ensure_room(
+        &self,
+        code: &str,
+        hostname: &str,
+        now: i64,
+    ) -> Result<bool, StoreError> {
+        let created = self
+            .inner
+            .directory
+            .ensure_room(code, hostname, now)
+            .await?;
         if created {
             self.room_changed(code).await;
         }
@@ -720,16 +777,25 @@ impl RelayHub {
             Ok(Some(room)) => room,
             Ok(None) => return false,
             Err(error) => {
-                tracing::warn!("Could not check the room of a forgotten key {}: {}", mask_code(astation_id), error);
+                tracing::warn!(
+                    "Could not check the room of a forgotten key {}: {}",
+                    mask_code(astation_id),
+                    error
+                );
                 return false;
             }
         };
         let Some(owner) = room.owner.filter(|owner| {
-            room.verified && owner.replica == self.inner.replica_id && self.inner.local.contains(&owner.conn)
+            room.verified
+                && owner.replica == self.inner.replica_id
+                && self.inner.local.contains(&owner.conn)
         }) else {
             return false;
         };
-        tracing::warn!("Key of Astation {} was forgotten: disconnecting its verified socket", mask_code(astation_id));
+        tracing::warn!(
+            "Key of Astation {} was forgotten: disconnecting its verified socket",
+            mask_code(astation_id)
+        );
         self.close_connection(&owner, None).await;
         true
     }
@@ -885,7 +951,11 @@ fn relay_state_unavailable(error: &StoreError) -> (StatusCode, Json<serde_json::
 
 fn ws_unavailable(error: &StoreError) -> Response {
     tracing::error!("Refused a WebSocket, relay state unavailable: {}", error);
-    (StatusCode::SERVICE_UNAVAILABLE, "Relay state unavailable, retry shortly").into_response()
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Relay state unavailable, retry shortly",
+    )
+        .into_response()
 }
 
 /// POST /api/pair — Register for pairing, get a code back.
@@ -910,7 +980,10 @@ pub async fn create_pair_handler(
     {
         Ok(Some(code)) => code,
         Ok(None) => {
-            tracing::error!("No free pairing code after {} attempts", MAX_PAIR_CODE_ATTEMPTS);
+            tracing::error!(
+                "No free pairing code after {} attempts",
+                MAX_PAIR_CODE_ATTEMPTS
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "could not allocate a pairing code"})),
@@ -978,9 +1051,11 @@ pub async fn delete_pair_handler(
             tracing::info!("Pair room closed by client: {}", mask_code(&code));
             (StatusCode::OK, Json(DeletePairResponse { closed: true })).into_response()
         }
-        Ok(false) => {
-            (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Room not found"}))).into_response()
-        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Room not found"})),
+        )
+            .into_response(),
         Err(error) => relay_state_unavailable(&error).into_response(),
     }
 }
@@ -997,15 +1072,25 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     if state.relay.is_draining() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "Relay is restarting, reconnect").into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Relay is restarting, reconnect",
+        )
+            .into_response();
     }
-    let ip = client_ip(&headers, peer.map(|axum::extract::ConnectInfo(address)| address));
+    let ip = client_ip(
+        &headers,
+        peer.map(|axum::extract::ConnectInfo(address)| address),
+    );
     let Some(permit) = state.relay.ws_limiter().try_acquire(&ip) else {
         tracing::warn!(
             "Refused a WebSocket: {} connections already open from one address",
             state.relay.ws_limiter().open(&ip)
         );
-        return (StatusCode::TOO_MANY_REQUESTS, "Too many WebSocket connections from this address")
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many WebSocket connections from this address",
+        )
             .into_response();
     };
     let hub = state.relay.clone();
@@ -1026,12 +1111,21 @@ pub async fn ws_handler(
                     return ws_unavailable(&error);
                 }
                 if let Err(error) = state.sessions.touch(&session_id).await {
-                    tracing::debug!("Could not refresh session {}: {}", mask_code(&session_id), error);
+                    tracing::debug!(
+                        "Could not refresh session {}: {}",
+                        mask_code(&session_id),
+                        error
+                    );
                 }
-                let atem_id = params.atem_id.clone().unwrap_or_else(|| "session-atem".to_string());
+                let atem_id = params
+                    .atem_id
+                    .clone()
+                    .unwrap_or_else(|| "session-atem".to_string());
                 let identity = state.identity.clone();
                 return ws
-                    .on_upgrade(move |socket| handle_ws(hub, identity, code, role, atem_id, socket, permit))
+                    .on_upgrade(move |socket| {
+                        handle_ws(hub, identity, code, role, atem_id, socket, permit)
+                    })
                     .into_response();
             }
             _ => {
@@ -1043,7 +1137,9 @@ pub async fn ws_handler(
     // Pairing-based auth (traditional flow)
     let code = match params.code.clone() {
         Some(c) => c,
-        None => return (StatusCode::BAD_REQUEST, "Missing code or session parameter").into_response(),
+        None => {
+            return (StatusCode::BAD_REQUEST, "Missing code or session parameter").into_response()
+        }
     };
     let role = match params.role.clone() {
         Some(r) => r,
@@ -1160,8 +1256,7 @@ fn hex_decode(hex: &str) -> Option<Vec<u8>> {
 /// chars, `04` prefix), or `None` if `hex` isn't one.
 fn normalize_public_key(hex: &str) -> Option<String> {
     let lower = hex.to_ascii_lowercase();
-    (lower.len() == 130 && lower.starts_with("04") && hex_decode(&lower).is_some())
-        .then_some(lower)
+    (lower.len() == 130 && lower.starts_with("04") && hex_decode(&lower).is_some()).then_some(lower)
 }
 
 /// The DER signature bytes, or `None` if `hex` isn't a plausible one.
@@ -1539,7 +1634,10 @@ async fn handle_astation_control(
     match kind {
         "relayAuth" => {
             if auth.state == AuthState::Verified {
-                tracing::debug!("Ignoring repeated relayAuth from Astation {}", mask_code(code));
+                tracing::debug!(
+                    "Ignoring repeated relayAuth from Astation {}",
+                    mask_code(code)
+                );
                 return true;
             }
             if Instant::now() >= auth.deadline {
@@ -1557,24 +1655,35 @@ async fn handle_astation_control(
                     } else {
                         "key verified"
                     };
-                    hub.local().send(connection_id, relay_auth_result_frame(status, message));
+                    hub.local()
+                        .send(connection_id, relay_auth_result_frame(status, message));
                     let was_pending = auth.state == AuthState::Pending;
                     auth.state = AuthState::Verified;
-                    if let Err(error) = hub.promote_verified(code, connection_id, was_pending).await {
+                    if let Err(error) = hub.promote_verified(code, connection_id, was_pending).await
+                    {
                         tracing::error!(
                             "Relay state unavailable promoting Astation {}: {}",
                             mask_code(code),
                             error
                         );
-                        hub.local().close_with(connection_id, CLOSE_TRY_AGAIN, "relay state unavailable");
+                        hub.local().close_with(
+                            connection_id,
+                            CLOSE_TRY_AGAIN,
+                            "relay state unavailable",
+                        );
                         return false;
                     }
                     tracing::info!("Astation {} relay identity {}", mask_code(code), status);
                     true
                 }
                 Err(reason) => {
-                    tracing::warn!("Rejected relayAuth for Astation {}: {}", mask_code(code), reason);
-                    hub.local().send(connection_id, relay_auth_result_frame("rejected", reason));
+                    tracing::warn!(
+                        "Rejected relayAuth for Astation {}: {}",
+                        mask_code(code),
+                        reason
+                    );
+                    hub.local()
+                        .send(connection_id, relay_auth_result_frame("rejected", reason));
                     false
                 }
             }
@@ -1625,15 +1734,19 @@ async fn register_connection(
                     hub.close_connection(&replaced, None).await;
                 }
                 if let Some(owner) = owner {
-                    hub.deliver(&owner, relay_connection_event(atem_id, connection_id, "connected"))
-                        .await;
+                    hub.deliver(
+                        &owner,
+                        relay_connection_event(atem_id, connection_id, "connected"),
+                    )
+                    .await;
                 }
                 Ok(Registration::Registered)
             }
         };
     };
     // The challenge is always the first frame.
-    hub.local().send(connection_id, relay_auth_challenge_frame(&auth.challenge));
+    hub.local()
+        .send(connection_id, relay_auth_challenge_frame(&auth.challenge));
     // Decided from the key cache, with no I/O. A registration that lands
     // after this is handled by promote_verified, which evicts an
     // unverified owner.
@@ -1761,7 +1874,9 @@ async fn handle_ws(
 ) {
     let _active = ActiveSocket::new(&hub);
     let socket_role = match role.as_str() {
-        "atem" => SocketRole::Atem { atem_id: atem_id.clone() },
+        "atem" => SocketRole::Atem {
+            atem_id: atem_id.clone(),
+        },
         "astation" => SocketRole::Astation,
         _ => {
             tracing::warn!("Unknown role: {}", role);
@@ -1795,8 +1910,14 @@ async fn handle_ws(
         return;
     }
 
-    let registration =
-        register_connection(&hub, &code, &atem_id, &connection_id, astation_auth.as_mut()).await;
+    let registration = register_connection(
+        &hub,
+        &code,
+        &atem_id,
+        &connection_id,
+        astation_auth.as_mut(),
+    )
+    .await;
     let refused = match registration {
         Ok(Registration::Registered) => false,
         Ok(Registration::RoomGone) => {
@@ -1809,7 +1930,11 @@ async fn handle_ws(
                 "Refused a pending Astation for room {}: too many pending connections",
                 mask_code(&code)
             );
-            local.close_with(&connection_id, CLOSE_TRY_AGAIN, "too many pending connections");
+            local.close_with(
+                &connection_id,
+                CLOSE_TRY_AGAIN,
+                "too many pending connections",
+            );
             true
         }
         Err(error) => {
@@ -1875,7 +2000,11 @@ async fn handle_ws(
             }
         }
         let wait = pending_deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()).min(read_timeout))
+            .map(|deadline| {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(read_timeout)
+            })
             .unwrap_or(read_timeout);
         let next = tokio::select! {
             biased;
@@ -1927,7 +2056,9 @@ async fn handle_ws(
                     }
                     log_atem_auth_attempt(&code, &atem_id, &text);
                     match hub.route_view(&code).await {
-                        Ok(Some(RoomInfo { owner: Some(owner), .. })) => {
+                        Ok(Some(RoomInfo {
+                            owner: Some(owner), ..
+                        })) => {
                             hub.deliver(&owner, atem_envelope(&atem_id, &connection_id, &text))
                                 .await;
                         }
@@ -1969,7 +2100,10 @@ async fn handle_ws(
                     }
                     // A replaced owner is no longer registered here.
                     if !local.contains(&connection_id) {
-                        tracing::debug!("Dropping stale Astation connection: code={}", mask_code(&code));
+                        tracing::debug!(
+                            "Dropping stale Astation connection: code={}",
+                            mask_code(&code)
+                        );
                         break;
                     }
                     // A generation-bound envelope goes to that exact Atem
@@ -2031,7 +2165,11 @@ async fn handle_ws(
 
     // Cleanup: leave the room (a stale close can't remove a newer connection).
     match role.as_str() {
-        "atem" => match hub.directory().leave_atem(&code, &atem_id, &connection_id).await {
+        "atem" => match hub
+            .directory()
+            .leave_atem(&code, &atem_id, &connection_id)
+            .await
+        {
             Ok(leave) => {
                 if leave.removed || leave.room_removed {
                     hub.room_changed(&code).await;
@@ -2124,7 +2262,9 @@ pub async fn pair_page_handler(
             tracing::error!("Relay state unavailable for the pair page: {}", error);
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Html("<h1>Temporarily unavailable</h1><p>Please retry in a moment.</p>".to_string()),
+                Html(
+                    "<h1>Temporarily unavailable</h1><p>Please retry in a moment.</p>".to_string(),
+                ),
             )
                 .into_response();
         }
@@ -2142,7 +2282,12 @@ pub async fn pair_page_handler(
         astation_connected: room.owner.is_some(),
         expired: room.is_expired(now),
     };
-    Html(render_pair_page(&params.code, &room.hostname, &initial_status)).into_response()
+    Html(render_pair_page(
+        &params.code,
+        &room.hostname,
+        &initial_status,
+    ))
+    .into_response()
 }
 
 struct InitialPageStatus {
@@ -2171,11 +2316,20 @@ fn render_pair_page(code: &str, hostname: &str, status: &InitialPageStatus) -> S
     let hostname_esc = html_escape(hostname);
     let code_url = urlencoding::encode(code);
     // Initial state classes for JS
-    let atem_dot = if status.atem_connected { "dot connected" } else { "dot" };
-    let astation_dot = if status.astation_connected { "dot connected" } else { "dot" };
+    let atem_dot = if status.atem_connected {
+        "dot connected"
+    } else {
+        "dot"
+    };
+    let astation_dot = if status.astation_connected {
+        "dot connected"
+    } else {
+        "dot"
+    };
     let expired_class = if status.expired { " expired" } else { "" };
 
-    format!(r#"<!DOCTYPE html>
+    format!(
+        r#"<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -2312,8 +2466,8 @@ fn render_pair_page(code: &str, hostname: &str, status: &InitialPageStatus) -> S
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::voice_session::VoiceSessionStore;
     use super::*;
+    use crate::voice_session::VoiceSessionStore;
     use tokio::net::TcpStream;
     use tokio_tungstenite::{
         tungstenite::Message as ClientMessage, MaybeTlsStream, WebSocketStream,
@@ -2332,9 +2486,12 @@ pub(crate) mod tests {
         assert!(local.send("c1", "second".to_string()));
         assert!(local.close_with("c1", CLOSE_TRY_AGAIN, "relay state unavailable"));
         let mut written: Vec<Message> = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), write_loop(&mut written, outbox, "ROOM".to_string()))
-            .await
-            .expect("the writer stops after the close frame");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            write_loop(&mut written, outbox, "ROOM".to_string()),
+        )
+        .await
+        .expect("the writer stops after the close frame");
         let texts: Vec<String> = written
             .iter()
             .filter_map(|message| match message {
@@ -2373,23 +2530,38 @@ pub(crate) mod tests {
                 Some(code) => assert!(local.close_with("c1", code, "bye")),
             }
             let mut written: Vec<Message> = Vec::new();
-            tokio::time::timeout(Duration::from_secs(2), write_loop(&mut written, outbox, "ROOM".to_string()))
-                .await
-                .expect("the writer ends");
-            assert_eq!(queued.load(std::sync::atomic::Ordering::Relaxed), 0, "{close_code:?}");
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                write_loop(&mut written, outbox, "ROOM".to_string()),
+            )
+            .await
+            .expect("the writer ends");
+            assert_eq!(
+                queued.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "{close_code:?}"
+            );
         }
 
         // A live socket keeps taking frames past the byte cap's worth in total.
         let outbox = local.register("c2", "ROOM", SocketRole::Astation);
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        let sink = Box::pin(futures_util::sink::unfold(tx, |tx, message: Message| async move {
-            tx.send(message).map_err(|_| ())?;
-            Ok::<_, ()>(tx)
-        }));
+        let sink = Box::pin(futures_util::sink::unfold(
+            tx,
+            |tx, message: Message| async move {
+                tx.send(message).map_err(|_| ())?;
+                Ok::<_, ()>(tx)
+            },
+        ));
         let writer = tokio::spawn(write_loop(sink, outbox, "ROOM".to_string()));
         for n in 0..20 {
-            assert!(local.send("c2", format!("{n:05}")), "frame {n} fits: earlier ones were sent");
-            let message = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.unwrap();
+            assert!(
+                local.send("c2", format!("{n:05}")),
+                "frame {n} fits: earlier ones were sent"
+            );
+            let message = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap();
             assert!(matches!(message, Some(Message::Text(_))));
         }
         writer.abort();
@@ -2479,7 +2651,10 @@ pub(crate) mod tests {
         let value: serde_json::Value = serde_json::from_str(&event).unwrap();
 
         assert_eq!(value["atem_id"], "atem-office");
-        assert_eq!(value["connection_id"], "43c8a181-6567-49ae-9191-8e103a66cc55");
+        assert_eq!(
+            value["connection_id"],
+            "43c8a181-6567-49ae-9191-8e103a66cc55"
+        );
         assert_eq!(value["relay_event"], "connected");
     }
 
@@ -2499,7 +2674,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn relay_hub_create_and_lookup() {
         let hub = RelayHub::new();
-        hub.create_room("ABCD-EFGH", "test-host", now()).await.unwrap();
+        hub.create_room("ABCD-EFGH", "test-host", now())
+            .await
+            .unwrap();
         let room = hub.room("ABCD-EFGH").await.unwrap().expect("room exists");
         assert_eq!(room.hostname, "test-host");
     }
@@ -2512,11 +2689,20 @@ pub(crate) mod tests {
     async fn relay_hub_cleanup_expired() {
         let directory = InMemoryRoomDirectory::new();
         let hub = hub_over(&directory);
-        directory.insert_for_test("OLD1-CODE", RoomInfo::new("old-host", now() - ROOM_EXPIRY_SECS - 10));
+        directory.insert_for_test(
+            "OLD1-CODE",
+            RoomInfo::new("old-host", now() - ROOM_EXPIRY_SECS - 10),
+        );
         directory.insert_for_test("NEW1-CODE", RoomInfo::new("new-host", now()));
         hub.cleanup_expired().await;
-        assert!(hub.room("OLD1-CODE").await.unwrap().is_none(), "Expired room should be removed");
-        assert!(hub.room("NEW1-CODE").await.unwrap().is_some(), "Fresh room should remain");
+        assert!(
+            hub.room("OLD1-CODE").await.unwrap().is_none(),
+            "Expired room should be removed"
+        );
+        assert!(
+            hub.room("NEW1-CODE").await.unwrap().is_some(),
+            "Fresh room should remain"
+        );
     }
 
     #[tokio::test]
@@ -2545,12 +2731,17 @@ pub(crate) mod tests {
         atems.insert("test-atem".to_string(), test_conn("connection-old"));
         directory.insert_for_test(
             "OLD-ATEM",
-            RoomInfo { atems, ..RoomInfo::new("old-host", now() - ROOM_EXPIRY_SECS - 10) },
+            RoomInfo {
+                atems,
+                ..RoomInfo::new("old-host", now() - ROOM_EXPIRY_SECS - 10)
+            },
         );
         let mut atem = hub.local().register(
             "connection-old",
             "OLD-ATEM",
-            SocketRole::Atem { atem_id: "test-atem".into() },
+            SocketRole::Atem {
+                atem_id: "test-atem".into(),
+            },
         );
         hub.cleanup_expired().await;
         // Removed (only an Astation keeps a room), and its Atem socket is closed.
@@ -2558,11 +2749,18 @@ pub(crate) mod tests {
             hub.room("OLD-ATEM").await.unwrap().is_none(),
             "Room with only atem connected should be cleaned up"
         );
-        assert!(atem.frames.recv().await.is_none(), "the Atem's socket was closed");
+        assert!(
+            atem.frames.recv().await.is_none(),
+            "the Atem's socket was closed"
+        );
     }
 
     fn default_status() -> InitialPageStatus {
-        InitialPageStatus { atem_connected: false, astation_connected: false, expired: false }
+        InitialPageStatus {
+            atem_connected: false,
+            astation_connected: false,
+            expired: false,
+        }
     }
 
     #[test]
@@ -2573,7 +2771,9 @@ pub(crate) mod tests {
         assert!(html.contains("astation://pair?code=TEST-CODE"));
     }
 
-    use crate::cluster::bus::{BroadcastMessage as BusBroadcast, InboxMessage, ReplicaBus as BusTrait};
+    use crate::cluster::bus::{
+        BroadcastMessage as BusBroadcast, InboxMessage, ReplicaBus as BusTrait,
+    };
     use crate::cluster::directory::{InMemoryRoomDirectory, RoomInfo, ROOM_EXPIRY_SECS};
     use crate::cluster::local::SocketRole;
     use crate::cluster::{ConnRef, StoreError as ClusterError, SINGLE_REPLICA_ID};
@@ -2611,9 +2811,18 @@ pub(crate) mod tests {
             .claim_owner(code, &ConnRef::new("s1", "dead"), now())
             .await
             .unwrap();
-        hub.directory().join_atem(code, "atem-live", &ConnRef::new("t1", "r1")).await.unwrap();
-        hub.directory().join_atem(code, "atem-dead", &ConnRef::new("t2", "dead")).await.unwrap();
-        hub.directory().add_pending(code, &ConnRef::new("p1", "dead"), now(), 0).await.unwrap();
+        hub.directory()
+            .join_atem(code, "atem-live", &ConnRef::new("t1", "r1"))
+            .await
+            .unwrap();
+        hub.directory()
+            .join_atem(code, "atem-dead", &ConnRef::new("t2", "dead"))
+            .await
+            .unwrap();
+        hub.directory()
+            .add_pending(code, &ConnRef::new("p1", "dead"), now(), 0)
+            .await
+            .unwrap();
         let room = hub.room(code).await.unwrap().unwrap();
         assert_eq!(room.owner, None);
         assert!(!room.verified);
@@ -2640,8 +2849,15 @@ pub(crate) mod tests {
         fn backend_name(&self) -> &'static str {
             "recording"
         }
-        async fn send_inbox(&self, replica_id: &str, message: InboxMessage) -> Result<(), ClusterError> {
-            self.inbox.lock().unwrap().push((replica_id.to_string(), message));
+        async fn send_inbox(
+            &self,
+            replica_id: &str,
+            message: InboxMessage,
+        ) -> Result<(), ClusterError> {
+            self.inbox
+                .lock()
+                .unwrap()
+                .push((replica_id.to_string(), message));
             Ok(())
         }
         async fn broadcast(&self, _message: BusBroadcast) -> Result<(), ClusterError> {
@@ -2661,14 +2877,20 @@ pub(crate) mod tests {
         });
         let mut here = local.register("a", "room", SocketRole::Astation);
         hub.deliver_many(
-            vec![ConnRef::new("a", "r1"), ConnRef::new("b", "r2"), ConnRef::new("c", "r2")],
+            vec![
+                ConnRef::new("a", "r1"),
+                ConnRef::new("b", "r2"),
+                ConnRef::new("c", "r2"),
+            ],
             "frame".to_string(),
         )
         .await;
         assert_eq!(here.frames.recv().await.as_deref(), Some("frame"));
-        hub.deliver(&ConnRef::new("x", "r3"), "one".to_string()).await;
+        hub.deliver(&ConnRef::new("x", "r3"), "one".to_string())
+            .await;
         hub.close_connection(&ConnRef::new("y", "r2"), None).await;
-        hub.close_connection(&ConnRef::new("a", "r1"), Some((1012, "restart"))).await;
+        hub.close_connection(&ConnRef::new("a", "r1"), Some((1012, "restart")))
+            .await;
         assert!(!local.contains("a"));
         let sent = bus.inbox.lock().unwrap().clone();
         assert_eq!(
@@ -2683,11 +2905,18 @@ pub(crate) mod tests {
                 ),
                 (
                     "r3".to_string(),
-                    InboxMessage::Deliver { connection_ids: vec!["x".into()], frame: "one".into() }
+                    InboxMessage::Deliver {
+                        connection_ids: vec!["x".into()],
+                        frame: "one".into()
+                    }
                 ),
                 (
                     "r2".to_string(),
-                    InboxMessage::Close { connection_id: "y".into(), code: None, reason: String::new() }
+                    InboxMessage::Close {
+                        connection_id: "y".into(),
+                        code: None,
+                        reason: String::new()
+                    }
                 ),
             ]
         );
@@ -2701,13 +2930,19 @@ pub(crate) mod tests {
             ..HubParts::single_instance(directory.clone(), TEST_AUTH_TIMEOUT)
         });
         let code = "astation-cache";
-        directory.claim_owner(code, &test_conn("owner-1"), now()).await.unwrap();
+        directory
+            .claim_owner(code, &test_conn("owner-1"), now())
+            .await
+            .unwrap();
         assert_eq!(
             hub.route_view(code).await.unwrap().unwrap().owner,
             Some(test_conn("owner-1"))
         );
         // Changed behind the hub's back (another replica): still cached …
-        directory.claim_owner(code, &test_conn("owner-2"), now()).await.unwrap();
+        directory
+            .claim_owner(code, &test_conn("owner-2"), now())
+            .await
+            .unwrap();
         assert_eq!(
             hub.route_view(code).await.unwrap().unwrap().owner,
             Some(test_conn("owner-1"))
@@ -2719,8 +2954,14 @@ pub(crate) mod tests {
             Some(test_conn("owner-2"))
         );
         // A targeted frame for a connection the cache doesn't know re-reads once.
-        directory.join_atem(code, "atem-a", &test_conn("t-new")).await.unwrap();
-        assert_eq!(hub.find_atem(code, "atem-a", "t-new").await, Some(test_conn("t-new")));
+        directory
+            .join_atem(code, "atem-a", &test_conn("t-new"))
+            .await
+            .unwrap();
+        assert_eq!(
+            hub.find_atem(code, "atem-a", "t-new").await,
+            Some(test_conn("t-new"))
+        );
         assert_eq!(hub.find_atem(code, "atem-a", "t-stale").await, None);
     }
 
@@ -2732,7 +2973,10 @@ pub(crate) mod tests {
             ..HubParts::single_instance(InMemoryRoomDirectory::new(), TEST_AUTH_TIMEOUT)
         });
         let identity = std::sync::Arc::new(InMemoryIdentityStore::new());
-        identity.register_key_if_absent("astation-k", "04AB", 1).await.unwrap();
+        identity
+            .register_key_if_absent("astation-k", "04AB", 1)
+            .await
+            .unwrap();
         let waiters = crate::voice_session::ReplyWaiters::default();
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
         let task = hub.spawn_bus_dispatcher(identity.clone(), waiters.clone(), events_rx);
@@ -2748,12 +2992,17 @@ pub(crate) mod tests {
 
         let reply = waiters.register("voice-1");
         events_tx
-            .send(BusEvent::VoiceReply { session_id: "voice-1".into(), reply: "answer".into() })
+            .send(BusEvent::VoiceReply {
+                session_id: "voice-1".into(),
+                reply: "answer".into(),
+            })
             .unwrap();
         assert_eq!(reply.await.unwrap(), "answer");
 
         events_tx
-            .send(BusEvent::Broadcast(BusBroadcast::KeyChanged { astation_id: "astation-k".into() }))
+            .send(BusEvent::Broadcast(BusBroadcast::KeyChanged {
+                astation_id: "astation-k".into(),
+            }))
             .unwrap();
         let mut learned = false;
         for _ in 0..100 {
@@ -2798,12 +3047,20 @@ pub(crate) mod tests {
 
         // room-changed from another replica drops the cached entry; a
         // second copy (or our own echo) is harmless.
-        directory.claim_owner("room-a", &test_conn("o1"), now()).await.unwrap();
+        directory
+            .claim_owner("room-a", &test_conn("o1"), now())
+            .await
+            .unwrap();
         assert_eq!(owner(hub.clone(), "room-a").await, Some(test_conn("o1")));
-        directory.claim_owner("room-a", &test_conn("o2"), now()).await.unwrap();
+        directory
+            .claim_owner("room-a", &test_conn("o2"), now())
+            .await
+            .unwrap();
         for _ in 0..2 {
             events_tx
-                .send(BusEvent::Broadcast(BusBroadcast::RoomChanged { code: "room-a".into() }))
+                .send(BusEvent::Broadcast(BusBroadcast::RoomChanged {
+                    code: "room-a".into(),
+                }))
                 .unwrap();
         }
         let mut fresh = false;
@@ -2817,16 +3074,31 @@ pub(crate) mod tests {
         assert!(fresh, "room-changed invalidated the cached room");
 
         // Our own room_changed invalidates locally before announcing.
-        directory.claim_owner("room-a", &test_conn("o3"), now()).await.unwrap();
+        directory
+            .claim_owner("room-a", &test_conn("o3"), now())
+            .await
+            .unwrap();
         hub.room_changed("room-a").await;
         assert_eq!(owner(hub.clone(), "room-a").await, Some(test_conn("o3")));
 
         // Resubscribed: every cached room is dropped and every key re-read.
-        directory.claim_owner("room-b", &test_conn("b1"), now()).await.unwrap();
+        directory
+            .claim_owner("room-b", &test_conn("b1"), now())
+            .await
+            .unwrap();
         assert_eq!(owner(hub.clone(), "room-b").await, Some(test_conn("b1")));
-        directory.claim_owner("room-a", &test_conn("o4"), now()).await.unwrap();
-        directory.claim_owner("room-b", &test_conn("b2"), now()).await.unwrap();
-        identity.register_key_if_absent("astation-r", "04CD", 1).await.unwrap();
+        directory
+            .claim_owner("room-a", &test_conn("o4"), now())
+            .await
+            .unwrap();
+        directory
+            .claim_owner("room-b", &test_conn("b2"), now())
+            .await
+            .unwrap();
+        identity
+            .register_key_if_absent("astation-r", "04CD", 1)
+            .await
+            .unwrap();
         hub.keys().set("astation-gone", "04ef");
         events_tx.send(BusEvent::Resubscribed).unwrap();
         let keys = hub.keys().clone();
@@ -2840,9 +3112,14 @@ pub(crate) mod tests {
         // key-changed for a key deleted elsewhere forgets it.
         identity.delete_key("astation-r").await.unwrap();
         events_tx
-            .send(BusEvent::Broadcast(BusBroadcast::KeyChanged { astation_id: "astation-r".into() }))
+            .send(BusEvent::Broadcast(BusBroadcast::KeyChanged {
+                astation_id: "astation-r".into(),
+            }))
             .unwrap();
-        assert!(eventually(|| !keys.contains("astation-r")).await, "key-changed forgot the key");
+        assert!(
+            eventually(|| !keys.contains("astation-r")).await,
+            "key-changed forgot the key"
+        );
 
         drop(events_tx);
         task.await.unwrap();
@@ -2859,7 +3136,12 @@ pub(crate) mod tests {
         async fn get_key(&self, _: &str) -> Result<Option<String>, StoreError> {
             unreachable!()
         }
-        async fn register_key_if_absent(&self, _: &str, _: &str, _: i64) -> Result<StoreRegisterOutcome, StoreError> {
+        async fn register_key_if_absent(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+        ) -> Result<StoreRegisterOutcome, StoreError> {
             unreachable!()
         }
         async fn touch_key(&self, _: &str, _: i64) -> Result<(), StoreError> {
@@ -2875,7 +3157,12 @@ pub(crate) mod tests {
         async fn unbind(&self, _: &str, _: &str) -> Result<bool, StoreError> {
             unreachable!()
         }
-        async fn replace_all(&self, _: &str, _: &[String], _: i64) -> Result<ReplaceOutcome, StoreError> {
+        async fn replace_all(
+            &self,
+            _: &str,
+            _: &[String],
+            _: i64,
+        ) -> Result<ReplaceOutcome, StoreError> {
             unreachable!()
         }
         async fn resolve(&self, _: &str, _: i64) -> Result<Option<String>, StoreError> {
@@ -2921,10 +3208,22 @@ pub(crate) mod tests {
     async fn without_cache_routing_reads_the_directory() {
         let directory = InMemoryRoomDirectory::new();
         let hub = RelayHub::in_memory(directory.clone(), TEST_AUTH_TIMEOUT);
-        directory.claim_owner("room-n", &test_conn("o1"), now()).await.unwrap();
-        assert_eq!(hub.route_view("room-n").await.unwrap().unwrap().owner, Some(test_conn("o1")));
-        directory.claim_owner("room-n", &test_conn("o2"), now()).await.unwrap();
-        assert_eq!(hub.route_view("room-n").await.unwrap().unwrap().owner, Some(test_conn("o2")));
+        directory
+            .claim_owner("room-n", &test_conn("o1"), now())
+            .await
+            .unwrap();
+        assert_eq!(
+            hub.route_view("room-n").await.unwrap().unwrap().owner,
+            Some(test_conn("o1"))
+        );
+        directory
+            .claim_owner("room-n", &test_conn("o2"), now())
+            .await
+            .unwrap();
+        assert_eq!(
+            hub.route_view("room-n").await.unwrap().unwrap().owner,
+            Some(test_conn("o2"))
+        );
     }
 
     // --- Integration tests (HTTP endpoint tests) ---
@@ -2948,7 +3247,10 @@ pub(crate) mod tests {
         };
         Router::new()
             .route("/api/pair", axum::routing::post(create_pair_handler))
-            .route("/api/pair/:code", axum::routing::get(pair_status_handler).delete(delete_pair_handler))
+            .route(
+                "/api/pair/:code",
+                axum::routing::get(pair_status_handler).delete(delete_pair_handler),
+            )
             .route("/ws", axum::routing::get(ws_handler))
             .route("/pair", axum::routing::get(pair_page_handler))
             .with_state(state)
@@ -2984,7 +3286,11 @@ pub(crate) mod tests {
 
         let resp: CreatePairResponse = serde_json::from_str(&body_str).unwrap();
         // Code should be in XXXX-XXXX format (9 chars total)
-        assert_eq!(resp.code.len(), 9, "Code should be 9 characters (XXXX-XXXX)");
+        assert_eq!(
+            resp.code.len(),
+            9,
+            "Code should be 9 characters (XXXX-XXXX)"
+        );
         assert_eq!(
             &resp.code[4..5],
             "-",
@@ -3082,7 +3388,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let status_resp: PairStatusResponse = serde_json::from_slice(&body).unwrap();
-        assert!(!status_resp.paired, "Newly created pair should not be paired yet");
+        assert!(
+            !status_resp.paired,
+            "Newly created pair should not be paired yet"
+        );
         assert_eq!(status_resp.hostname, "dev-machine");
     }
 
@@ -3237,14 +3546,16 @@ pub(crate) mod tests {
         let code = "practical-replacement";
         let atem_id = "atem-office";
 
-        let (mut astation, _) = tokio_tungstenite::connect_async(format!(
-            "{base_url}?role=astation&code={code}"
-        ))
-        .await
-        .expect("failed to connect Astation");
+        let (mut astation, _) =
+            tokio_tungstenite::connect_async(format!("{base_url}?role=astation&code={code}"))
+                .await
+                .expect("failed to connect Astation");
         // A legacy Astation (no registered key) ignores the challenge and
         // relays as before.
-        assert_eq!(next_client_json(&mut astation).await["type"], "relayAuthChallenge");
+        assert_eq!(
+            next_client_json(&mut astation).await["type"],
+            "relayAuthChallenge"
+        );
         let (mut original, _) = tokio_tungstenite::connect_async(format!(
             "{base_url}?role=atem&code={code}&atem_id={atem_id}"
         ))
@@ -3272,18 +3583,15 @@ pub(crate) mod tests {
             .to_string();
         assert_ne!(original_connection_id, replacement_connection_id);
 
-        let original_closed = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            async {
-                while let Some(frame) = original.next().await {
-                    match frame {
-                        Ok(ClientMessage::Close(_)) | Err(_) => return true,
-                        _ => {}
-                    }
+        let original_closed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(frame) = original.next().await {
+                match frame {
+                    Ok(ClientMessage::Close(_)) | Err(_) => return true,
+                    _ => {}
                 }
-                true
-            },
-        )
+            }
+            true
+        })
         .await
         .unwrap_or(false);
         assert!(original_closed, "replaced Atem socket remained open");
@@ -3300,12 +3608,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(150),
-                replacement.next(),
-            )
-            .await
-            .is_err(),
+            tokio::time::timeout(std::time::Duration::from_millis(150), replacement.next(),)
+                .await
+                .is_err(),
             "stale targeted response reached replacement Atem"
         );
 
@@ -3369,11 +3674,7 @@ pub(crate) mod tests {
             codes.insert(resp.code);
         }
 
-        assert_eq!(
-            codes.len(),
-            10,
-            "All 10 pairing codes should be unique"
-        );
+        assert_eq!(codes.len(), 10, "All 10 pairing codes should be unique");
     }
 
     #[tokio::test]
@@ -3397,13 +3698,23 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_pair_page_xss_protection() {
         // Test that hostname with HTML/JS is safely escaped
-        let html = render_pair_page("TEST-CODE", "<script>alert('xss')</script>", &default_status());
+        let html = render_pair_page(
+            "TEST-CODE",
+            "<script>alert('xss')</script>",
+            &default_status(),
+        );
         // If properly escaped, the literal string should appear, not executed
-        assert!(!html.contains("<script>alert"), "Script tags should be escaped or removed");
+        assert!(
+            !html.contains("<script>alert"),
+            "Script tags should be escaped or removed"
+        );
 
         // Test with other XSS vectors
         let html2 = render_pair_page("CODE-123", "' onload='alert(1)'", &default_status());
-        assert!(!html2.contains("onload='alert"), "Event handlers should be escaped");
+        assert!(
+            !html2.contains("onload='alert"),
+            "Event handlers should be escaped"
+        );
     }
 
     #[tokio::test]
@@ -3420,7 +3731,11 @@ pub(crate) mod tests {
 
         // Create pair
         let code = generate_pairing_code();
-        state.relay.create_room(&code, "test-host", now()).await.unwrap();
+        state
+            .relay
+            .create_room(&code, "test-host", now())
+            .await
+            .unwrap();
 
         let app = Router::new()
             .route("/api/pair/:code", axum::routing::get(pair_status_handler))
@@ -3439,7 +3754,9 @@ pub(crate) mod tests {
             .unwrap();
 
         assert_eq!(response.status(), HttpStatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let status: PairStatusResponse = serde_json::from_slice(&body).unwrap();
         assert!(!status.paired, "Should not be paired initially");
 
@@ -3472,7 +3789,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let status: PairStatusResponse = serde_json::from_slice(&body).unwrap();
         assert!(status.paired, "Should be paired after both sides connect");
         assert!(status.astation_connected);
@@ -3520,7 +3839,11 @@ pub(crate) mod tests {
             }
         }
 
-        assert_eq!(codes.len(), 10, "All concurrent pairs should have unique codes");
+        assert_eq!(
+            codes.len(),
+            10,
+            "All concurrent pairs should have unique codes"
+        );
     }
 
     #[test]
@@ -3581,7 +3904,9 @@ pub(crate) mod tests {
 
     pub(crate) const TEST_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
 
-    fn identity_state(identity: std::sync::Arc<dyn crate::identity_store::IdentityStore>) -> crate::AppState {
+    fn identity_state(
+        identity: std::sync::Arc<dyn crate::identity_store::IdentityStore>,
+    ) -> crate::AppState {
         crate::AppState {
             sessions: crate::session_store::SessionStore::new(),
             relay: RelayHub::with_auth_timeout(TEST_AUTH_TIMEOUT),
@@ -3600,7 +3925,9 @@ pub(crate) mod tests {
     }
 
     /// Serve the production router on an ephemeral port; returns the ws base URL.
-    pub(crate) async fn spawn_relay(state: crate::AppState) -> (String, tokio::task::JoinHandle<()>) {
+    pub(crate) async fn spawn_relay(
+        state: crate::AppState,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind test relay");
@@ -3608,8 +3935,7 @@ pub(crate) mod tests {
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                crate::router(state)
-                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                crate::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .await
             .expect("test relay failed");
@@ -3628,7 +3954,9 @@ pub(crate) mod tests {
         assert_eq!(challenge["protocol"], "relay-auth-1");
         let value = challenge["challenge"].as_str().unwrap().to_string();
         assert_eq!(value.len(), 64);
-        assert!(value.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+        assert!(value
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
         (socket, value)
     }
 
@@ -3675,7 +4003,10 @@ pub(crate) mod tests {
     }
 
     /// Send a control message and return the relay's ack.
-    pub(crate) async fn control(socket: &mut TestSocket, value: serde_json::Value) -> serde_json::Value {
+    pub(crate) async fn control(
+        socket: &mut TestSocket,
+        value: serde_json::Value,
+    ) -> serde_json::Value {
         let kind = value["type"].as_str().unwrap().to_string();
         send_json(socket, value).await;
         let ack = next_client_json(socket).await;
@@ -3702,8 +4033,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn assert_silent(socket: &mut TestSocket, millis: u64) {
-        match tokio::time::timeout(std::time::Duration::from_millis(millis), socket.next()).await
-        {
+        match tokio::time::timeout(std::time::Duration::from_millis(millis), socket.next()).await {
             Err(_) => {}
             Ok(Some(Ok(ClientMessage::Text(text)))) => panic!("unexpected frame: {text}"),
             Ok(other) => panic!("unexpected socket event: {other:?}"),
@@ -3728,7 +4058,10 @@ pub(crate) mod tests {
 
     #[test]
     fn hex_round_trips_and_rejects_bad_input() {
-        assert_eq!(hex_decode("00ff10Ab").unwrap(), vec![0x00, 0xff, 0x10, 0xab]);
+        assert_eq!(
+            hex_decode("00ff10Ab").unwrap(),
+            vec![0x00, 0xff, 0x10, 0xab]
+        );
         assert_eq!(hex_encode(&[0x00, 0xff, 0x10, 0xab]), "00ff10ab");
         assert_eq!(hex_decode("").unwrap(), Vec::<u8>::new());
         assert!(hex_decode("abc").is_none(), "odd length");
@@ -3741,10 +4074,19 @@ pub(crate) mod tests {
         let key = TestKey::generate();
         let upper = key.public_hex().to_uppercase();
         assert_eq!(normalize_public_key(&upper), Some(key.public_hex()));
-        assert!(normalize_public_key(&key.public_hex()[..128]).is_none(), "too short");
-        assert!(normalize_public_key(&format!("{}00", key.public_hex())).is_none(), "too long");
+        assert!(
+            normalize_public_key(&key.public_hex()[..128]).is_none(),
+            "too short"
+        );
+        assert!(
+            normalize_public_key(&format!("{}00", key.public_hex())).is_none(),
+            "too long"
+        );
         let compressed_prefix = format!("02{}", &key.public_hex()[2..]);
-        assert!(normalize_public_key(&compressed_prefix).is_none(), "not 04-prefixed");
+        assert!(
+            normalize_public_key(&compressed_prefix).is_none(),
+            "not 04-prefixed"
+        );
         let non_hex = format!("04{}", "g".repeat(128));
         assert!(normalize_public_key(&non_hex).is_none(), "non-hex");
     }
@@ -3755,13 +4097,36 @@ pub(crate) mod tests {
         let other = TestKey::generate();
         let challenge = "11".repeat(32);
         let sig = hex_decode(&key.sign_hex(&challenge, "astation-a")).unwrap();
-        assert!(verify_relay_signature(&key.public_hex(), &challenge, "astation-a", &sig));
-        assert!(!verify_relay_signature(&other.public_hex(), &challenge, "astation-a", &sig));
-        assert!(!verify_relay_signature(&key.public_hex(), &"22".repeat(32), "astation-a", &sig));
-        assert!(!verify_relay_signature(&key.public_hex(), &challenge, "astation-b", &sig));
+        assert!(verify_relay_signature(
+            &key.public_hex(),
+            &challenge,
+            "astation-a",
+            &sig
+        ));
+        assert!(!verify_relay_signature(
+            &other.public_hex(),
+            &challenge,
+            "astation-a",
+            &sig
+        ));
+        assert!(!verify_relay_signature(
+            &key.public_hex(),
+            &"22".repeat(32),
+            "astation-a",
+            &sig
+        ));
+        assert!(!verify_relay_signature(
+            &key.public_hex(),
+            &challenge,
+            "astation-b",
+            &sig
+        ));
         assert!(decode_signature("zz").is_none());
         assert!(decode_signature("").is_none());
-        assert!(decode_signature(&"ab".repeat(200)).is_none(), "longer than a DER P-256 signature");
+        assert!(
+            decode_signature(&"ab".repeat(200)).is_none(),
+            "longer than a DER P-256 signature"
+        );
     }
 
     #[test]
@@ -3779,9 +4144,11 @@ pub(crate) mod tests {
             serde_json::json!({"type":"relayAuthResult","status":"verified","message":"ok"})
         );
         let ack: serde_json::Value = serde_json::from_str(&relay_ack_ok("relayBind")).unwrap();
-        assert_eq!(ack, serde_json::json!({"type":"relayAck","for":"relayBind","ok":true}));
-        let ack: serde_json::Value =
-            serde_json::from_str(&relay_sessions_ack(3)).unwrap();
+        assert_eq!(
+            ack,
+            serde_json::json!({"type":"relayAck","for":"relayBind","ok":true})
+        );
+        let ack: serde_json::Value = serde_json::from_str(&relay_sessions_ack(3)).unwrap();
         assert_eq!(
             ack,
             serde_json::json!({"type":"relayAck","for":"relaySessions","ok":true,"skipped":3})
@@ -3818,7 +4185,10 @@ pub(crate) mod tests {
         )
         .await;
         let forwarded = next_client_json(&mut astation).await;
-        assert_eq!(forwarded["payload"]["data"]["data"]["session_id"], "session-legacy");
+        assert_eq!(
+            forwarded["payload"]["data"]["data"]["session_id"],
+            "session-legacy"
+        );
         send_json(
             &mut astation,
             serde_json::json!({
@@ -3828,7 +4198,10 @@ pub(crate) mod tests {
             }),
         )
         .await;
-        assert_eq!(next_client_json(&mut atem).await["data"]["status"], "authenticated");
+        assert_eq!(
+            next_client_json(&mut atem).await["data"]["status"],
+            "authenticated"
+        );
         send_json(
             &mut astation,
             serde_json::json!({
@@ -3838,12 +4211,23 @@ pub(crate) mod tests {
             }),
         )
         .await;
-        assert_eq!(next_client_json(&mut atem).await["data"]["data"]["status"], "granted");
+        assert_eq!(
+            next_client_json(&mut atem).await["data"]["data"]["status"],
+            "granted"
+        );
 
         // Binding control messages are refused without a verified key.
-        let ack = control(&mut astation, serde_json::json!({"type":"relayBind","session_id":"session-legacy"})).await;
+        let ack = control(
+            &mut astation,
+            serde_json::json!({"type":"relayBind","session_id":"session-legacy"}),
+        )
+        .await;
         assert_eq!(ack["ok"], false);
-        let ack = control(&mut astation, serde_json::json!({"type":"relaySessions","sessions":["session-legacy"]})).await;
+        let ack = control(
+            &mut astation,
+            serde_json::json!({"type":"relaySessions","sessions":["session-legacy"]}),
+        )
+        .await;
         assert_eq!(ack["ok"], false);
 
         // Broadcast still reaches the Atem.
@@ -3872,7 +4256,10 @@ pub(crate) mod tests {
         // Reconnect (e.g. after a network change): pending until verified, then
         // it owns the room and the old socket is closed.
         let mut atem = connect_atem(&base_url, code, "atem-a").await;
-        assert_eq!(next_client_json(&mut first).await["relay_event"], "connected");
+        assert_eq!(
+            next_client_json(&mut first).await["relay_event"],
+            "connected"
+        );
         let (mut second, challenge) = connect_astation(&base_url, code).await;
         // Uppercase key hex is accepted (compared lowercase).
         let mut auth = key.relay_auth(&challenge, code);
@@ -3886,7 +4273,10 @@ pub(crate) mod tests {
         assert_closed(&mut first).await;
 
         send_json(&mut atem, serde_json::json!({"probe":"to-new-owner"})).await;
-        assert_eq!(next_client_json(&mut second).await["payload"]["probe"], "to-new-owner");
+        assert_eq!(
+            next_client_json(&mut second).await["payload"]["probe"],
+            "to-new-owner"
+        );
         server.abort();
     }
 
@@ -3900,12 +4290,18 @@ pub(crate) mod tests {
         let owner_key = TestKey::generate();
         let mut owner = verified_astation(&base_url, code, &owner_key, "registered").await;
         let mut atem = connect_atem(&base_url, code, "atem-a").await;
-        assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+        assert_eq!(
+            next_client_json(&mut owner).await["relay_event"],
+            "connected"
+        );
 
         let (mut intruder, challenge) = connect_astation(&base_url, code).await;
         // Pending: no connected events, no Atem traffic, room still the owner's.
         send_json(&mut atem, serde_json::json!({"probe":"while-pending"})).await;
-        assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "while-pending");
+        assert_eq!(
+            next_client_json(&mut owner).await["payload"]["probe"],
+            "while-pending"
+        );
         assert_silent(&mut intruder, 150).await;
         // Its non-control messages go nowhere.
         send_json(&mut intruder, serde_json::json!({"probe":"from-intruder"})).await;
@@ -3926,9 +4322,15 @@ pub(crate) mod tests {
             Some(owner_key.public_hex())
         );
         send_json(&mut owner, serde_json::json!({"probe":"owner-still-here"})).await;
-        assert_eq!(next_client_json(&mut atem).await["probe"], "owner-still-here");
+        assert_eq!(
+            next_client_json(&mut atem).await["probe"],
+            "owner-still-here"
+        );
         send_json(&mut atem, serde_json::json!({"probe":"to-owner"})).await;
-        assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "to-owner");
+        assert_eq!(
+            next_client_json(&mut owner).await["payload"]["probe"],
+            "to-owner"
+        );
         server.abort();
     }
 
@@ -3950,7 +4352,10 @@ pub(crate) mod tests {
 
         // The owner is unaffected.
         let mut atem = connect_atem(&base_url, code, "atem-a").await;
-        assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+        assert_eq!(
+            next_client_json(&mut owner).await["relay_event"],
+            "connected"
+        );
         send_json(&mut atem, serde_json::json!({"probe":"x"})).await;
         assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "x");
         server.abort();
@@ -3981,7 +4386,10 @@ pub(crate) mod tests {
         assert_eq!(result["status"], "rejected", "{result}");
         assert_closed(&mut astation).await;
         assert_eq!(state.identity.get_key("astation-mine").await.unwrap(), None);
-        assert_eq!(state.identity.get_key("astation-theirs").await.unwrap(), None);
+        assert_eq!(
+            state.identity.get_key("astation-theirs").await.unwrap(),
+            None
+        );
         server.abort();
     }
 
@@ -3993,15 +4401,38 @@ pub(crate) mod tests {
         let key = TestKey::generate();
         let mut astation = verified_astation(&base_url, code, &key, "registered").await;
         let mut atem = connect_atem(&base_url, code, "atem-a").await;
-        assert_eq!(next_client_json(&mut astation).await["relay_event"], "connected");
+        assert_eq!(
+            next_client_json(&mut astation).await["relay_event"],
+            "connected"
+        );
 
-        control(&mut astation, serde_json::json!({"type":"relaySessions","sessions":["s1"]})).await;
-        control(&mut astation, serde_json::json!({"type":"relayBind","session_id":"s2"})).await;
-        control(&mut astation, serde_json::json!({"type":"relayUnbind","session_id":"s2"})).await;
+        control(
+            &mut astation,
+            serde_json::json!({"type":"relaySessions","sessions":["s1"]}),
+        )
+        .await;
+        control(
+            &mut astation,
+            serde_json::json!({"type":"relayBind","session_id":"s2"}),
+        )
+        .await;
+        control(
+            &mut astation,
+            serde_json::json!({"type":"relayUnbind","session_id":"s2"}),
+        )
+        .await;
         // A repeated relayAuth and relay→Astation frame types are dropped silently.
         send_json(&mut astation, key.relay_auth(&"00".repeat(32), code)).await;
-        send_json(&mut astation, serde_json::json!({"type":"relayAck","for":"relayBind","ok":true})).await;
-        send_json(&mut astation, serde_json::json!({"type":"relayAuthResult","status":"verified","message":""})).await;
+        send_json(
+            &mut astation,
+            serde_json::json!({"type":"relayAck","for":"relayBind","ok":true}),
+        )
+        .await;
+        send_json(
+            &mut astation,
+            serde_json::json!({"type":"relayAuthResult","status":"verified","message":""}),
+        )
+        .await;
         send_json(&mut astation, serde_json::json!({"type":"relayAuthChallenge","protocol":"relay-auth-1","challenge":"00"})).await;
 
         // The first thing the Atem receives is the ordinary broadcast.
@@ -4019,43 +4450,94 @@ pub(crate) mod tests {
         let key = TestKey::generate();
         let mut astation = verified_astation(&base_url, code, &key, "registered").await;
 
-        let ack = control(&mut astation, serde_json::json!({"type":"relaySessions","sessions":["s1","s2"]})).await;
-        assert_eq!(ack, serde_json::json!({"type":"relayAck","for":"relaySessions","ok":true,"skipped":0}));
+        let ack = control(
+            &mut astation,
+            serde_json::json!({"type":"relaySessions","sessions":["s1","s2"]}),
+        )
+        .await;
+        assert_eq!(
+            ack,
+            serde_json::json!({"type":"relayAck","for":"relaySessions","ok":true,"skipped":0})
+        );
         assert_eq!(resolve(&state, "s1").await.as_deref(), Some(code));
         assert_eq!(resolve(&state, "s2").await.as_deref(), Some(code));
 
-        let ack = control(&mut astation, serde_json::json!({"type":"relayBind","session_id":"s3"})).await;
-        assert_eq!(ack, serde_json::json!({"type":"relayAck","for":"relayBind","ok":true}));
+        let ack = control(
+            &mut astation,
+            serde_json::json!({"type":"relayBind","session_id":"s3"}),
+        )
+        .await;
+        assert_eq!(
+            ack,
+            serde_json::json!({"type":"relayAck","for":"relayBind","ok":true})
+        );
         assert_eq!(resolve(&state, "s3").await.as_deref(), Some(code));
 
-        let ack = control(&mut astation, serde_json::json!({"type":"relayUnbind","session_id":"s1"})).await;
-        assert_eq!(ack, serde_json::json!({"type":"relayAck","for":"relayUnbind","ok":true}));
+        let ack = control(
+            &mut astation,
+            serde_json::json!({"type":"relayUnbind","session_id":"s1"}),
+        )
+        .await;
+        assert_eq!(
+            ack,
+            serde_json::json!({"type":"relayAck","for":"relayUnbind","ok":true})
+        );
         assert_eq!(resolve(&state, "s1").await, None);
 
         // Full resync: exactly the listed set.
-        control(&mut astation, serde_json::json!({"type":"relaySessions","sessions":["s2"]})).await;
+        control(
+            &mut astation,
+            serde_json::json!({"type":"relaySessions","sessions":["s2"]}),
+        )
+        .await;
         assert_eq!(resolve(&state, "s2").await.as_deref(), Some(code));
         assert_eq!(resolve(&state, "s3").await, None);
 
         // Another Astation's session: bind refused, resync skips it.
         let now = chrono::Utc::now().timestamp();
-        state.identity.bind("s-other", "astation-other", now).await.unwrap();
-        let ack = control(&mut astation, serde_json::json!({"type":"relayBind","session_id":"s-other"})).await;
+        state
+            .identity
+            .bind("s-other", "astation-other", now)
+            .await
+            .unwrap();
+        let ack = control(
+            &mut astation,
+            serde_json::json!({"type":"relayBind","session_id":"s-other"}),
+        )
+        .await;
         assert_eq!(ack["ok"], false);
         assert!(ack["message"].is_string());
-        let ack = control(&mut astation, serde_json::json!({"type":"relaySessions","sessions":["s2","s-other"]})).await;
-        assert_eq!(ack, serde_json::json!({"type":"relayAck","for":"relaySessions","ok":true,"skipped":1}));
-        assert_eq!(resolve(&state, "s-other").await.as_deref(), Some("astation-other"));
+        let ack = control(
+            &mut astation,
+            serde_json::json!({"type":"relaySessions","sessions":["s2","s-other"]}),
+        )
+        .await;
+        assert_eq!(
+            ack,
+            serde_json::json!({"type":"relayAck","for":"relaySessions","ok":true,"skipped":1})
+        );
+        assert_eq!(
+            resolve(&state, "s-other").await.as_deref(),
+            Some("astation-other")
+        );
 
         // Too many ids: refused, nothing changes.
         let many: Vec<String> = (0..1001).map(|i| format!("s-many-{i}")).collect();
-        let ack = control(&mut astation, serde_json::json!({"type":"relaySessions","sessions":many})).await;
+        let ack = control(
+            &mut astation,
+            serde_json::json!({"type":"relaySessions","sessions":many}),
+        )
+        .await;
         assert_eq!(ack["ok"], false);
         assert_eq!(resolve(&state, "s2").await.as_deref(), Some(code));
         assert_eq!(resolve(&state, "s-many-0").await, None);
         // Exactly the cap is fine.
         let cap: Vec<String> = (0..1000).map(|i| format!("s-cap-{i}")).collect();
-        let ack = control(&mut astation, serde_json::json!({"type":"relaySessions","sessions":cap})).await;
+        let ack = control(
+            &mut astation,
+            serde_json::json!({"type":"relaySessions","sessions":cap}),
+        )
+        .await;
         assert_eq!(ack["ok"], true);
         assert_eq!(resolve(&state, "s-cap-999").await.as_deref(), Some(code));
 
@@ -4068,7 +4550,11 @@ pub(crate) mod tests {
             serde_json::json!({"type":"relaySessions","sessions":[1]}),
             serde_json::json!({"type":"relayUnbind","session_id":7}),
         ] {
-            assert_eq!(control(&mut astation, bad.clone()).await["ok"], false, "{bad}");
+            assert_eq!(
+                control(&mut astation, bad.clone()).await["ok"],
+                false,
+                "{bad}"
+            );
         }
 
         // The cap-sized resync replaced the set; s2 is gone.
@@ -4083,7 +4569,10 @@ pub(crate) mod tests {
         assert_eq!(caller.work_session_id, code);
         headers.insert("authorization", "session s2".parse().unwrap());
         let denied = crate::vault_routes::resolve_caller(&state, &headers, Some("atem-a")).await;
-        assert_eq!(denied.err().map(|e| e.0), Some(HttpStatusCode::UNAUTHORIZED));
+        assert_eq!(
+            denied.err().map(|e| e.0),
+            Some(HttpStatusCode::UNAUTHORIZED)
+        );
         server.abort();
     }
 
@@ -4143,11 +4632,19 @@ pub(crate) mod tests {
         assert_routes(&state, &session_id, HttpStatusCode::UNAUTHORIZED).await;
 
         let mut astation = verified_astation(&base_url, code, &key, "registered").await;
-        let ack = control(&mut astation, serde_json::json!({"type":"relayBind","session_id":session_id})).await;
+        let ack = control(
+            &mut astation,
+            serde_json::json!({"type":"relayBind","session_id":session_id}),
+        )
+        .await;
         assert_eq!(ack["ok"], true);
         assert_routes(&state, &session_id, HttpStatusCode::OK).await;
 
-        control(&mut astation, serde_json::json!({"type":"relayUnbind","session_id":session_id})).await;
+        control(
+            &mut astation,
+            serde_json::json!({"type":"relayUnbind","session_id":session_id}),
+        )
+        .await;
         assert_routes(&state, &session_id, HttpStatusCode::UNAUTHORIZED).await;
         server.abort();
     }
@@ -4164,7 +4661,11 @@ pub(crate) mod tests {
         let code = "astation-pg-restart";
         let key = TestKey::generate();
         let mut astation = verified_astation(&base_url, code, &key, "registered").await;
-        let ack = control(&mut astation, serde_json::json!({"type":"relayBind","session_id":"pg-session"})).await;
+        let ack = control(
+            &mut astation,
+            serde_json::json!({"type":"relayBind","session_id":"pg-session"}),
+        )
+        .await;
         assert_eq!(ack["ok"], true);
         server.abort();
 
@@ -4178,7 +4679,14 @@ pub(crate) mod tests {
             crate::identity_store::PgIdentityStore::new(pool),
         ));
         // As main() does at startup.
-        assert_eq!(restarted.relay.load_keys(restarted.identity.as_ref()).await.unwrap(), 1);
+        assert_eq!(
+            restarted
+                .relay
+                .load_keys(restarted.identity.as_ref())
+                .await
+                .unwrap(),
+            1
+        );
         assert_routes(&restarted, "pg-session", HttpStatusCode::OK).await;
         assert_routes(&restarted, "pg-unbound", HttpStatusCode::UNAUTHORIZED).await;
 
@@ -4285,7 +4793,11 @@ pub(crate) mod tests {
         let (_pending, _) = connect_astation(&base_url, "astation-io").await;
         let (_legacy, _) = connect_astation(&base_url, "astation-io-keyless").await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(flaky.calls(), before, "a connect touched the identity store");
+        assert_eq!(
+            flaky.calls(),
+            before,
+            "a connect touched the identity store"
+        );
         server.abort();
     }
 
@@ -4306,9 +4818,16 @@ pub(crate) mod tests {
         assert_eq!(next_client_json(&mut new).await["relay_event"], "connected");
         assert_closed(&mut old).await;
         send_json(&mut atem, serde_json::json!({"probe":"db-down"})).await;
-        assert_eq!(next_client_json(&mut new).await["payload"]["probe"], "db-down");
+        assert_eq!(
+            next_client_json(&mut new).await["payload"]["probe"],
+            "db-down"
+        );
 
-        let ack = control(&mut new, serde_json::json!({"type":"relayBind","session_id":"s1"})).await;
+        let ack = control(
+            &mut new,
+            serde_json::json!({"type":"relayBind","session_id":"s1"}),
+        )
+        .await;
         assert_eq!(ack["ok"], false);
         assert_eq!(ack["message"], "identity store unavailable");
         // Still the owner.
@@ -4325,7 +4844,10 @@ pub(crate) mod tests {
         let key = TestKey::generate();
         let mut owner = verified_astation(&base_url, code, &key, "registered").await;
         let mut atem = connect_atem(&base_url, code, "atem-a").await;
-        assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+        assert_eq!(
+            next_client_json(&mut owner).await["relay_event"],
+            "connected"
+        );
 
         flaky.set_down(true);
         let (mut intruder, challenge) = connect_astation(&base_url, code).await;
@@ -4334,8 +4856,14 @@ pub(crate) mod tests {
         assert_closed(&mut intruder).await;
 
         send_json(&mut atem, serde_json::json!({"probe":"to-owner"})).await;
-        assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "to-owner");
-        assert!(state.relay.keys().contains(code), "a DB error must not forget the key");
+        assert_eq!(
+            next_client_json(&mut owner).await["payload"]["probe"],
+            "to-owner"
+        );
+        assert!(
+            state.relay.keys().contains(code),
+            "a DB error must not forget the key"
+        );
         server.abort();
     }
 
@@ -4401,7 +4929,10 @@ pub(crate) mod tests {
         verified_astation(&base_url, code, &old_key, "verified").await;
 
         verified_astation(&base_url, code, &new_key, "registered").await;
-        assert_eq!(state.identity.get_key(code).await.unwrap(), Some(new_key.public_hex()));
+        assert_eq!(
+            state.identity.get_key(code).await.unwrap(),
+            Some(new_key.public_hex())
+        );
         let (mut old, challenge) = connect_astation(&base_url, code).await;
         let result = authenticate(&mut old, &old_key, code, &challenge).await;
         assert_eq!(result["status"], "rejected", "{result}");
@@ -4421,10 +4952,16 @@ pub(crate) mod tests {
 
         // Changed: another key is stored; the cache holds it; nobody is dropped.
         flaky.inner.delete_key(code).await.unwrap();
-        flaky.inner.register_key_if_absent(code, &TestKey::generate().public_hex(), 2).await.unwrap();
+        flaky
+            .inner
+            .register_key_if_absent(code, &TestKey::generate().public_hex(), 2)
+            .await
+            .unwrap();
         hub.keys().reload_one(&flaky, code).await;
         assert!(!hub.drop_verified_owner_if_key_forgotten(code).await);
-        assert!(hub.local().contains(&hub.room(code).await.unwrap().unwrap().owner.unwrap().conn));
+        assert!(hub
+            .local()
+            .contains(&hub.room(code).await.unwrap().unwrap().owner.unwrap().conn));
 
         // Absent: forgotten. The owner goes, and a repeat is a no-op.
         flaky.inner.delete_key(code).await.unwrap();
@@ -4456,7 +4993,14 @@ pub(crate) mod tests {
             .register_key_if_absent(code, &key.public_hex(), 1)
             .await
             .unwrap();
-        assert_eq!(state.relay.load_keys(state.identity.as_ref()).await.unwrap(), 1);
+        assert_eq!(
+            state
+                .relay
+                .load_keys(state.identity.as_ref())
+                .await
+                .unwrap(),
+            1
+        );
         let (base_url, server) = spawn_relay(state.clone()).await;
 
         let (mut astation, challenge) = connect_astation(&base_url, code).await;
@@ -4464,7 +5008,10 @@ pub(crate) mod tests {
         assert_silent(&mut astation, 150).await;
         let result = authenticate(&mut astation, &key, code, &challenge).await;
         assert_eq!(result["status"], "verified");
-        assert_eq!(next_client_json(&mut astation).await["relay_event"], "connected");
+        assert_eq!(
+            next_client_json(&mut astation).await["relay_event"],
+            "connected"
+        );
         server.abort();
     }
 
@@ -4485,7 +5032,10 @@ pub(crate) mod tests {
         server.abort();
     }
 
-    async fn delete_room(state: &crate::AppState, code: &str) -> (HttpStatusCode, serde_json::Value) {
+    async fn delete_room(
+        state: &crate::AppState,
+        code: &str,
+    ) -> (HttpStatusCode, serde_json::Value) {
         let response = crate::router(state.clone())
             .oneshot(
                 Request::builder()
@@ -4498,8 +5048,13 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
     }
 
     #[tokio::test]
@@ -4510,11 +5065,17 @@ pub(crate) mod tests {
         let key = TestKey::generate();
         let mut owner = verified_astation(&base_url, code, &key, "registered").await;
         let mut atem = connect_atem(&base_url, code, "atem-a").await;
-        assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+        assert_eq!(
+            next_client_json(&mut owner).await["relay_event"],
+            "connected"
+        );
 
         let (status, body) = delete_room(&state, code).await;
         assert_eq!(status, HttpStatusCode::CONFLICT);
-        assert_eq!(body, serde_json::json!({"error":"room is owned by a registered Astation"}));
+        assert_eq!(
+            body,
+            serde_json::json!({"error":"room is owned by a registered Astation"})
+        );
 
         send_json(&mut owner, serde_json::json!({"probe":"survived"})).await;
         assert_eq!(next_client_json(&mut atem).await["probe"], "survived");
@@ -4542,17 +5103,32 @@ pub(crate) mod tests {
         let code = "astation-race";
         let mut squatter = hub.local().register("squatter", code, SocketRole::Astation);
         let _pending = hub.local().register("pending", code, SocketRole::Astation);
-        hub.directory().claim_owner(code, &test_conn("squatter"), now()).await.unwrap();
-        assert!(hub.directory().add_pending(code, &test_conn("pending"), now(), 0).await.unwrap());
+        hub.directory()
+            .claim_owner(code, &test_conn("squatter"), now())
+            .await
+            .unwrap();
+        assert!(hub
+            .directory()
+            .add_pending(code, &test_conn("pending"), now(), 0)
+            .await
+            .unwrap());
 
         // The registering socket was replaced, so it is not the owner.
-        hub.promote_verified(code, "registrar", false).await.unwrap();
+        hub.promote_verified(code, "registrar", false)
+            .await
+            .unwrap();
         assert!(hub.room(code).await.unwrap().unwrap().owner.is_none());
-        assert!(squatter.frames.recv().await.is_none(), "squatter's sender was dropped");
+        assert!(
+            squatter.frames.recv().await.is_none(),
+            "squatter's sender was dropped"
+        );
 
         hub.promote_verified(code, "pending", true).await.unwrap();
         let room = hub.room(code).await.unwrap().unwrap();
-        assert_eq!(room.owner.map(|owner| owner.conn).as_deref(), Some("pending"));
+        assert_eq!(
+            room.owner.map(|owner| owner.conn).as_deref(),
+            Some("pending")
+        );
         assert!(room.verified);
         assert!(room.pending.is_empty());
     }
@@ -4560,8 +5136,13 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn pair_code_collision_never_overwrites_a_live_room() {
         let hub = RelayHub::new();
-        hub.create_room("TAKN-CODE", "live-host", now()).await.unwrap();
-        hub.directory().claim_owner("TAKN-CODE", &test_conn("owner"), now()).await.unwrap();
+        hub.create_room("TAKN-CODE", "live-host", now())
+            .await
+            .unwrap();
+        hub.directory()
+            .claim_owner("TAKN-CODE", &test_conn("owner"), now())
+            .await
+            .unwrap();
         let mut codes = vec!["FREE-CODE", "TAKN-CODE"];
         let code = hub
             .create_pair_room("new-host", now(), || codes.pop().unwrap().to_string())
@@ -4571,7 +5152,10 @@ pub(crate) mod tests {
         let live = hub.room("TAKN-CODE").await.unwrap().unwrap();
         assert_eq!(live.hostname, "live-host");
         assert_eq!(live.owner.map(|owner| owner.conn).as_deref(), Some("owner"));
-        assert_eq!(hub.room("FREE-CODE").await.unwrap().unwrap().hostname, "new-host");
+        assert_eq!(
+            hub.room("FREE-CODE").await.unwrap().unwrap().hostname,
+            "new-host"
+        );
 
         // Every attempt collides: no room is overwritten.
         let none = hub
@@ -4579,7 +5163,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(none, None);
-        assert_eq!(hub.room("TAKN-CODE").await.unwrap().unwrap().hostname, "live-host");
+        assert_eq!(
+            hub.room("TAKN-CODE").await.unwrap().unwrap().hostname,
+            "live-host"
+        );
     }
 
     /// The sweep closes the Atem sockets of a removed room, never an
@@ -4592,18 +5179,31 @@ pub(crate) mod tests {
         atems.insert("atem-a".to_string(), test_conn("atem-conn"));
         directory.insert_for_test(
             "OLD-ROOM",
-            RoomInfo { atems, ..RoomInfo::new("h", now() - ROOM_EXPIRY_SECS - 10) },
+            RoomInfo {
+                atems,
+                ..RoomInfo::new("h", now() - ROOM_EXPIRY_SECS - 10)
+            },
         );
         let mut atem = hub.local().register(
             "atem-conn",
             "OLD-ROOM",
-            SocketRole::Atem { atem_id: "atem-a".into() },
+            SocketRole::Atem {
+                atem_id: "atem-a".into(),
+            },
         );
-        let _astation = hub.local().register("astation-conn", "OLD-ROOM", SocketRole::Astation);
+        let _astation = hub
+            .local()
+            .register("astation-conn", "OLD-ROOM", SocketRole::Astation);
         hub.cleanup_expired().await;
         assert!(hub.room("OLD-ROOM").await.unwrap().is_none());
-        assert!(atem.frames.recv().await.is_none(), "the Atem's socket was closed");
-        assert!(hub.local().contains("astation-conn"), "the Astation socket stays");
+        assert!(
+            atem.frames.recv().await.is_none(),
+            "the Atem's socket was closed"
+        );
+        assert!(
+            hub.local().contains("astation-conn"),
+            "the Astation socket stays"
+        );
     }
 
     /// Every call delegates to an in-memory directory except `touch`,
@@ -4618,16 +5218,31 @@ pub(crate) mod tests {
         fn backend_name(&self) -> &'static str {
             "touch-fails"
         }
-        async fn create_room(&self, code: &str, hostname: &str, now: i64) -> Result<(), ClusterError> {
+        async fn create_room(
+            &self,
+            code: &str,
+            hostname: &str,
+            now: i64,
+        ) -> Result<(), ClusterError> {
             self.inner.create_room(code, hostname, now).await
         }
-        async fn ensure_room(&self, code: &str, hostname: &str, now: i64) -> Result<bool, ClusterError> {
+        async fn ensure_room(
+            &self,
+            code: &str,
+            hostname: &str,
+            now: i64,
+        ) -> Result<bool, ClusterError> {
             self.inner.ensure_room(code, hostname, now).await
         }
         async fn get(&self, code: &str) -> Result<Option<RoomInfo>, ClusterError> {
             self.inner.get(code).await
         }
-        async fn join_atem(&self, code: &str, atem_id: &str, conn: &ConnRef) -> Result<AtemJoin, ClusterError> {
+        async fn join_atem(
+            &self,
+            code: &str,
+            atem_id: &str,
+            conn: &ConnRef,
+        ) -> Result<AtemJoin, ClusterError> {
             self.inner.join_atem(code, atem_id, conn).await
         }
         async fn claim_owner(
@@ -4638,10 +5253,21 @@ pub(crate) mod tests {
         ) -> Result<crate::cluster::directory::OwnerClaim, ClusterError> {
             self.inner.claim_owner(code, conn, now).await
         }
-        async fn add_pending(&self, code: &str, conn: &ConnRef, now: i64, max_pending: usize) -> Result<bool, ClusterError> {
+        async fn add_pending(
+            &self,
+            code: &str,
+            conn: &ConnRef,
+            now: i64,
+            max_pending: usize,
+        ) -> Result<bool, ClusterError> {
             self.inner.add_pending(code, conn, now, max_pending).await
         }
-        async fn promote(&self, code: &str, conn: &ConnRef, was_pending: bool) -> Result<Promotion, ClusterError> {
+        async fn promote(
+            &self,
+            code: &str,
+            conn: &ConnRef,
+            was_pending: bool,
+        ) -> Result<Promotion, ClusterError> {
             self.inner.promote(code, conn, was_pending).await
         }
         async fn leave_atem(
@@ -4652,14 +5278,19 @@ pub(crate) mod tests {
         ) -> Result<crate::cluster::directory::AtemLeave, ClusterError> {
             self.inner.leave_atem(code, atem_id, connection_id).await
         }
-        async fn leave_astation(&self, code: &str, connection_id: &str) -> Result<bool, ClusterError> {
+        async fn leave_astation(
+            &self,
+            code: &str,
+            connection_id: &str,
+        ) -> Result<bool, ClusterError> {
             self.inner.leave_astation(code, connection_id).await
         }
         async fn delete_room(&self, code: &str) -> Result<Option<RoomInfo>, ClusterError> {
             self.inner.delete_room(code).await
         }
         async fn touch(&self, _code: &str) -> Result<bool, ClusterError> {
-            self.touches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.touches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(ClusterError::Unavailable("redis call timed out".into()))
         }
         async fn exists(&self, codes: &[String]) -> Result<Vec<bool>, ClusterError> {
@@ -4684,12 +5315,23 @@ pub(crate) mod tests {
         let _sockets: Vec<_> = ["ROOM-A", "ROOM-B", "ROOM-C"]
             .iter()
             .enumerate()
-            .map(|(i, code)| hub.local().register(&format!("astation-{i}"), code, SocketRole::Astation))
+            .map(|(i, code)| {
+                hub.local()
+                    .register(&format!("astation-{i}"), code, SocketRole::Astation)
+            })
             .collect();
         hub.cleanup_expired().await;
-        assert_eq!(touches.load(std::sync::atomic::Ordering::SeqCst), 1, "one failed touch ends this sweep's touches");
+        assert_eq!(
+            touches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one failed touch ends this sweep's touches"
+        );
         hub.cleanup_expired().await;
-        assert_eq!(touches.load(std::sync::atomic::Ordering::SeqCst), 2, "the next sweep tries again");
+        assert_eq!(
+            touches.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the next sweep tries again"
+        );
     }
 
     #[tokio::test]
@@ -4697,7 +5339,10 @@ pub(crate) mod tests {
         let hub = RelayHub::new();
         let code = "astation-verified";
         let _owner = hub.local().register("owner", code, SocketRole::Astation);
-        hub.directory().claim_owner(code, &test_conn("owner"), now()).await.unwrap();
+        hub.directory()
+            .claim_owner(code, &test_conn("owner"), now())
+            .await
+            .unwrap();
         hub.promote_verified(code, "owner", false).await.unwrap();
 
         // A stale, non-pending verified socket doesn't disturb the owner.
@@ -4729,28 +5374,45 @@ pub(crate) mod tests {
         let code = "astation-drain";
         let (mut astation, _challenge) = connect_astation(&base_url, code).await;
         let mut atem = connect_atem(&base_url, code, "atem-a").await;
-        assert_eq!(next_client_json(&mut astation).await["relay_event"], "connected");
+        assert_eq!(
+            next_client_json(&mut astation).await["relay_event"],
+            "connected"
+        );
 
         state.relay.drain(std::time::Duration::from_secs(5)).await;
 
         assert_eq!(close_code(&mut atem).await, 1012);
         assert_eq!(close_code(&mut astation).await, 1012);
-        assert!(state.relay.room(code).await.unwrap().is_none(), "entries removed");
+        assert!(
+            state.relay.room(code).await.unwrap().is_none(),
+            "entries removed"
+        );
         assert!(state.relay.local().is_empty());
 
         let response = crate::router(state.clone())
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), HttpStatusCode::SERVICE_UNAVAILABLE);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(body.as_ref(), br#"{"status":"draining"}"#);
 
-        match tokio_tungstenite::connect_async(format!("{base_url}?role=astation&code=late")).await {
+        match tokio_tungstenite::connect_async(format!("{base_url}?role=astation&code=late")).await
+        {
             Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
                 assert_eq!(response.status().as_u16(), 503)
             }
-            other => panic!("a draining relay accepted a socket: {:?}", other.map(|_| ())),
+            other => panic!(
+                "a draining relay accepted a socket: {:?}",
+                other.map(|_| ())
+            ),
         }
         server.abort();
     }
@@ -4761,7 +5423,9 @@ pub(crate) mod tests {
     async fn a_socket_upgraded_during_a_drain_never_joins_its_room() {
         let hub = RelayHub::new();
         let code = "astation-late";
-        hub.ensure_room(code, "host", chrono::Utc::now().timestamp()).await.unwrap();
+        hub.ensure_room(code, "host", chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
         hub.drain(std::time::Duration::from_millis(10)).await;
 
         let late_hub = hub.clone();
@@ -4770,9 +5434,20 @@ pub(crate) mod tests {
             axum::routing::get(move |ws: WebSocketUpgrade| async move {
                 let identity: Arc<dyn IdentityStore> =
                     Arc::new(crate::identity_store::InMemoryIdentityStore::new());
-                let permit = late_hub.ws_limiter().try_acquire("127.0.0.1").expect("permit");
+                let permit = late_hub
+                    .ws_limiter()
+                    .try_acquire("127.0.0.1")
+                    .expect("permit");
                 ws.on_upgrade(move |socket| {
-                    handle_ws(late_hub, identity, code.to_string(), "atem".into(), "atem-late".into(), socket, permit)
+                    handle_ws(
+                        late_hub,
+                        identity,
+                        code.to_string(),
+                        "atem".into(),
+                        "atem-late".into(),
+                        socket,
+                        permit,
+                    )
                 })
             }),
         );
@@ -4787,7 +5462,11 @@ pub(crate) mod tests {
             .expect("upgrade");
         assert_eq!(close_code(&mut atem).await, 1012);
         let room = hub.room(code).await.unwrap().expect("room kept");
-        assert!(room.atems.is_empty(), "a late socket must not join: {:?}", room.atems);
+        assert!(
+            room.atems.is_empty(),
+            "a late socket must not join: {:?}",
+            room.atems
+        );
         assert!(hub.local().is_empty());
         server.abort();
     }
@@ -4803,9 +5482,10 @@ pub(crate) mod tests {
         for _ in 0..MAX_PENDING_ASTATIONS_PER_ROOM {
             pending.push(connect_astation(&base_url, code).await);
         }
-        let (mut fifth, _) = tokio_tungstenite::connect_async(format!("{base_url}?role=astation&code={code}"))
-            .await
-            .expect("upgrade");
+        let (mut fifth, _) =
+            tokio_tungstenite::connect_async(format!("{base_url}?role=astation&code={code}"))
+                .await
+                .expect("upgrade");
         assert_eq!(close_code(&mut fifth).await, 1013);
         assert_eq!(MAX_PENDING_ASTATIONS_PER_ROOM, 4);
         server.abort();
@@ -4820,18 +5500,27 @@ pub(crate) mod tests {
         let (base_url, server) = spawn_relay(state.clone()).await;
         let first = connect_astation(&base_url, "astation-ip-1").await;
         let _second = connect_astation(&base_url, "astation-ip-2").await;
-        match tokio_tungstenite::connect_async(format!("{base_url}?role=astation&code=astation-ip-3")).await {
+        match tokio_tungstenite::connect_async(format!(
+            "{base_url}?role=astation&code=astation-ip-3"
+        ))
+        .await
+        {
             Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
                 assert_eq!(response.status().as_u16(), 429)
             }
-            other => panic!("a third socket from one IP was accepted: {:?}", other.map(|_| ())),
+            other => panic!(
+                "a third socket from one IP was accepted: {:?}",
+                other.map(|_| ())
+            ),
         }
         drop(first);
         let mut admitted = false;
         for _ in 0..100 {
-            if tokio_tungstenite::connect_async(format!("{base_url}?role=astation&code=astation-ip-4"))
-                .await
-                .is_ok()
+            if tokio_tungstenite::connect_async(format!(
+                "{base_url}?role=astation&code=astation-ip-4"
+            ))
+            .await
+            .is_ok()
             {
                 admitted = true;
                 break;
@@ -4851,11 +5540,17 @@ pub(crate) mod tests {
     ) -> Result<TestSocket, tokio_tungstenite::tungstenite::Error> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let mut request = format!("{base_url}?{query}").into_client_request().unwrap();
-        request.headers_mut().insert("cf-connecting-ip", ip.parse().unwrap());
+        request
+            .headers_mut()
+            .insert("cf-connecting-ip", ip.parse().unwrap());
         if let Some(forwarded) = forwarded_for {
-            request.headers_mut().insert("x-forwarded-for", forwarded.parse().unwrap());
+            request
+                .headers_mut()
+                .insert("x-forwarded-for", forwarded.parse().unwrap());
         }
-        tokio_tungstenite::connect_async(request).await.map(|(socket, _)| socket)
+        tokio_tungstenite::connect_async(request)
+            .await
+            .map(|(socket, _)| socket)
     }
 
     #[tokio::test]
@@ -4865,9 +5560,14 @@ pub(crate) mod tests {
             ..memory_identity_state()
         };
         let (base_url, server) = spawn_relay(state.clone()).await;
-        let _held = connect_from(&base_url, "role=astation&code=astation-cf-1", "203.0.113.1", None)
-            .await
-            .expect("first socket");
+        let _held = connect_from(
+            &base_url,
+            "role=astation&code=astation-cf-1",
+            "203.0.113.1",
+            None,
+        )
+        .await
+        .expect("first socket");
         // A forged X-Forwarded-For does not move the socket to another bucket.
         match connect_from(
             &base_url,
@@ -4884,11 +5584,19 @@ pub(crate) mod tests {
                     Some(&b"Too many WebSocket connections from this address"[..])
                 );
             }
-            other => panic!("a second socket from one IP was accepted: {:?}", other.map(|_| ())),
+            other => panic!(
+                "a second socket from one IP was accepted: {:?}",
+                other.map(|_| ())
+            ),
         }
-        let _other = connect_from(&base_url, "role=astation&code=astation-cf-3", "203.0.113.2", None)
-            .await
-            .expect("another IP is unaffected");
+        let _other = connect_from(
+            &base_url,
+            "role=astation&code=astation-cf-3",
+            "203.0.113.2",
+            None,
+        )
+        .await
+        .expect("another IP is unaffected");
         assert_eq!(state.relay.ws_limiter().open("203.0.113.1"), 1);
         assert_eq!(state.relay.ws_limiter().open("203.0.113.2"), 1);
         server.abort();

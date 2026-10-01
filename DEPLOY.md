@@ -187,7 +187,7 @@ queue stays full for 10 s is closed with code `1013` (try again later).
 connections per client IP (`RELAY_WS_MAX_PER_IP`, raise it for load tests);
 the next upgrade gets `429`. The count is per replica, so with N replicas one
 IP can hold up to about N × the limit. The client IP is `CF-Connecting-IP`
-(set by Cloudflare, which overwrites any client-sent value), then the first
+(set by Cloudflare on the edge-to-origin hop), then the first
 `X-Forwarded-For` entry, then `X-Real-IP`, then the peer address. Production
 traffic always comes through the Cloudflare tunnel, so the limit can't be
 dodged with forged headers there; keep the relay and webapp ports private (a

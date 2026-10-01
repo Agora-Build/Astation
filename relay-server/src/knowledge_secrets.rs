@@ -42,10 +42,13 @@ fn entropy(s: &str) -> f64 {
     for c in s.chars() {
         *counts.entry(c).or_insert(0) += 1;
     }
-    counts.values().map(|&c| {
-        let p = c as f64 / n;
-        -p * p.log2()
-    }).sum()
+    counts
+        .values()
+        .map(|&c| {
+            let p = c as f64 / n;
+            -p * p.log2()
+        })
+        .sum()
 }
 
 fn classify(tok: &str) -> Option<&'static str> {
@@ -53,15 +56,26 @@ fn classify(tok: &str) -> Option<&'static str> {
     if tok.starts_with("sk-") && len >= 20 {
         return Some("api key (sk-)");
     }
-    if tok.starts_with("AKIA") && len == 20
-        && tok[4..].chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    if tok.starts_with("AKIA")
+        && len == 20
+        && tok[4..]
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
     {
         return Some("aws access key");
     }
-    if ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"].iter().any(|p| tok.starts_with(p)) && len >= 30 {
+    if ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"]
+        .iter()
+        .any(|p| tok.starts_with(p))
+        && len >= 30
+    {
         return Some("github token");
     }
-    if ["xoxb-", "xoxp-", "xoxa-", "xoxs-", "xoxr-"].iter().any(|p| tok.starts_with(p)) && len >= 20 {
+    if ["xoxb-", "xoxp-", "xoxa-", "xoxs-", "xoxr-"]
+        .iter()
+        .any(|p| tok.starts_with(p))
+        && len >= 20
+    {
         return Some("slack token");
     }
     if tok.starts_with("eyJ") && len >= 30 {
@@ -95,9 +109,13 @@ fn url_passwords(line: &str) -> Vec<&str> {
     let mut out = Vec::new();
     for (i, _) in line.match_indices("://") {
         let rest = &line[i + 3..];
-        let end = rest.find(|c: char| c.is_whitespace() || c == '/').unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == '/')
+            .unwrap_or(rest.len());
         let authority = &rest[..end];
-        let Some(at) = authority.rfind('@') else { continue };
+        let Some(at) = authority.rfind('@') else {
+            continue;
+        };
         if let Some((_, password)) = authority[..at].split_once(':') {
             if !password.is_empty() {
                 out.push(password);
@@ -112,7 +130,9 @@ fn slack_webhook_secret(line: &str) -> Option<&str> {
     const HOOK: &str = "hooks.slack.com/services/";
     let i = line.find(HOOK)?;
     let rest = &line[i + HOOK.len()..];
-    let end = rest.find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | '>' | '`')).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | '>' | '`'))
+        .unwrap_or(rest.len());
     let segs: Vec<&str> = rest[..end].split('/').collect();
     (segs.len() >= 3 && segs[..3].iter().all(|s| !s.is_empty())).then(|| segs[2])
 }
@@ -122,27 +142,47 @@ pub fn find_secrets(text: &str) -> Vec<SecretFinding> {
     for (i, line) in text.lines().enumerate() {
         let lineno = i + 1;
         if line.contains("-----BEGIN") && line.contains("PRIVATE KEY") {
-            out.push(SecretFinding { kind: "private key", masked: "-----BEGIN …PRIVATE KEY-----".into(), line: lineno });
+            out.push(SecretFinding {
+                kind: "private key",
+                masked: "-----BEGIN …PRIVATE KEY-----".into(),
+                line: lineno,
+            });
             continue;
         }
         for pw in url_passwords(line) {
-            out.push(SecretFinding { kind: "credentials in URL", masked: mask(pw), line: lineno });
+            out.push(SecretFinding {
+                kind: "credentials in URL",
+                masked: mask(pw),
+                line: lineno,
+            });
         }
         if let Some(secret) = slack_webhook_secret(line) {
-            out.push(SecretFinding { kind: "slack webhook", masked: mask(secret), line: lineno });
+            out.push(SecretFinding {
+                kind: "slack webhook",
+                masked: mask(secret),
+                line: lineno,
+            });
         }
         for tok in line.split(|c: char| !is_token_char(c)) {
             if tok.is_empty() {
                 continue;
             }
             if let Some(kind) = classify(tok) {
-                out.push(SecretFinding { kind, masked: mask(tok), line: lineno });
+                out.push(SecretFinding {
+                    kind,
+                    masked: mask(tok),
+                    line: lineno,
+                });
             }
             if is_path_like(tok) {
                 // A key can hide in a URL path or userinfo: check each segment.
                 for seg in tok.split(['/', '@']).filter(|s| !s.is_empty()) {
                     if let Some(kind) = classify(seg) {
-                        out.push(SecretFinding { kind, masked: mask(seg), line: lineno });
+                        out.push(SecretFinding {
+                            kind,
+                            masked: mask(seg),
+                            line: lineno,
+                        });
                     }
                 }
             }
@@ -156,7 +196,11 @@ pub fn find_secrets(text: &str) -> Vec<SecretFinding> {
 pub fn check_bytes(bytes: &[u8]) -> Vec<SecretFinding> {
     match std::str::from_utf8(bytes) {
         Ok(text) => find_secrets(text),
-        Err(_) => vec![SecretFinding { kind: "unreadable (binary)", masked: String::new(), line: 0 }],
+        Err(_) => vec![SecretFinding {
+            kind: "unreadable (binary)",
+            masked: String::new(),
+            line: 0,
+        }],
     }
 }
 
@@ -182,10 +226,22 @@ mod tests {
 
     #[test]
     fn flags_aws_github_slack_jwt() {
-        assert_eq!(find_secrets("AKIAIOSFODNN7EXAMPLE")[0].kind, "aws access key");
-        assert_eq!(find_secrets("token ghp_abcdefghijklmnopqrstuvwxyz0123456789")[0].kind, "github token");
-        assert_eq!(find_secrets("xoxb-1234567890-abcdefghij")[0].kind, "slack token");
-        assert_eq!(find_secrets("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abc123def456")[0].kind, "jwt");
+        assert_eq!(
+            find_secrets("AKIAIOSFODNN7EXAMPLE")[0].kind,
+            "aws access key"
+        );
+        assert_eq!(
+            find_secrets("token ghp_abcdefghijklmnopqrstuvwxyz0123456789")[0].kind,
+            "github token"
+        );
+        assert_eq!(
+            find_secrets("xoxb-1234567890-abcdefghij")[0].kind,
+            "slack token"
+        );
+        assert_eq!(
+            find_secrets("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abc123def456")[0].kind,
+            "jwt"
+        );
     }
 
     #[test]
@@ -205,9 +261,14 @@ mod tests {
     fn ignores_hashes_uuids_and_memory_ids() {
         assert!(find_secrets("commit 3f5a9c1e2b4d6f8091a2b3c4d5e6f708192a3b4c").is_empty());
         assert!(find_secrets("instance 550e8400-e29b-41d4-a716-446655440000").is_empty());
-        assert!(find_secrets("a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90").is_empty());
+        assert!(
+            find_secrets("a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90")
+                .is_empty()
+        );
         assert!(find_secrets("mem_0f8fad5bd9cb469fa16570867728950e").is_empty());
-        assert!(find_secrets("/home/guohai/Dev/Agora.Build/Atem/designs/atem-memory.md").is_empty());
+        assert!(
+            find_secrets("/home/guohai/Dev/Agora.Build/Atem/designs/atem-memory.md").is_empty()
+        );
     }
 
     #[test]
@@ -232,20 +293,33 @@ mod tests {
 
     #[test]
     fn assignment_forms_are_detected() {
-        assert_eq!(find_secrets("AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE")[0].kind, "aws access key");
-        assert_eq!(find_secrets("OPENAI_API_KEY=sk-proj-abcdef1234567890ABCDEF")[0].kind, "api key (sk-)");
+        assert_eq!(
+            find_secrets("AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE")[0].kind,
+            "aws access key"
+        );
+        assert_eq!(
+            find_secrets("OPENAI_API_KEY=sk-proj-abcdef1234567890ABCDEF")[0].kind,
+            "api key (sk-)"
+        );
     }
 
     #[test]
     fn paths_and_urls_with_digits_pass() {
         assert!(find_secrets("/home/guohai/Dev/Agora.Build/Atem/designs/atem-memory-implementation-plan/task-3-report.md").is_empty());
-        assert!(find_secrets("https://api.example.com/v2/projects/12345/deployments/abcdef").is_empty());
-        assert!(find_secrets("https://github.com/Agora-Build/Atem/commit/3f5a9c1e2b4d6f8091a2b3c4d5e6f708192a3b4c").is_empty());
+        assert!(
+            find_secrets("https://api.example.com/v2/projects/12345/deployments/abcdef").is_empty()
+        );
+        assert!(find_secrets(
+            "https://github.com/Agora-Build/Atem/commit/3f5a9c1e2b4d6f8091a2b3c4d5e6f708192a3b4c"
+        )
+        .is_empty());
     }
 
     #[test]
     fn token_inside_url_userinfo_is_detected() {
-        let f = find_secrets("git remote https://ghp_abcdefghijklmnopqrstuvwxyz0123456789@github.com/o/r");
+        let f = find_secrets(
+            "git remote https://ghp_abcdefghijklmnopqrstuvwxyz0123456789@github.com/o/r",
+        );
         assert!(f.iter().any(|x| x.kind == "github token"), "{:?}", f);
         assert!(f.iter().all(|x| !x.masked.contains("abcdefghijklmnop")));
     }
@@ -253,7 +327,10 @@ mod tests {
     #[test]
     fn url_password_is_detected() {
         let f = find_secrets("https://alice:hunter2pass@example.com/x");
-        let hit = f.iter().find(|x| x.kind == "credentials in URL").expect("finding");
+        let hit = f
+            .iter()
+            .find(|x| x.kind == "credentials in URL")
+            .expect("finding");
         assert_eq!(hit.masked, "hun…pass");
         assert!(find_secrets("https://alice@example.com/x").is_empty());
         assert!(find_secrets("ssh://git@github.com:22/o/r").is_empty());
@@ -262,7 +339,12 @@ mod tests {
     #[test]
     fn slack_webhook_is_detected() {
         // Built at runtime so the fixture isn't a literal webhook URL (GitHub push protection).
-        let url = format!("https://hooks.slack.com/services/{}/{}/{}", "T00000000", "B00000000", "X".repeat(24));
+        let url = format!(
+            "https://hooks.slack.com/services/{}/{}/{}",
+            "T00000000",
+            "B00000000",
+            "X".repeat(24)
+        );
         let f = find_secrets(&url);
         assert!(f.iter().any(|x| x.kind == "slack webhook"), "{:?}", f);
         assert!(find_secrets("see https://hooks.slack.com/services/ for docs").is_empty());

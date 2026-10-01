@@ -75,7 +75,6 @@ pub fn voice_reply_channel(id: &str) -> String {
     format!("{VOICE_REPLY_CHANNEL_PREFIX}{}", part(id))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,7 +89,10 @@ mod tests {
         assert_eq!(voice("v-1"), "relay:voice:v-1");
         assert_eq!(voice_reply("v-1"), "relay:voice:v-1:reply");
         assert_eq!(rtc("r-1"), "relay:rtc:r-1");
-        assert_eq!(rate("grant", "203.0.113.9", 28_333_333), "relay:rl:grant:203.0.113.9:28333333");
+        assert_eq!(
+            rate("grant", "203.0.113.9", 28_333_333),
+            "relay:rl:grant:203.0.113.9:28333333"
+        );
         assert_eq!(inbox_channel("a1b2"), "relay:inbox:a1b2");
         assert_eq!(BROADCAST_CHANNEL, "relay:broadcast");
         assert_eq!(voice_reply_channel("v-1"), "relay:voice-reply:v-1");

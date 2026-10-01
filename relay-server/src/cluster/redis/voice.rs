@@ -86,7 +86,9 @@ fn parse_state(name: &str) -> Option<VoiceSessionState> {
 }
 
 fn parse_time(value: Option<&String>) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value?).ok().map(|time| time.with_timezone(&Utc))
+    DateTime::parse_from_rfc3339(value?)
+        .ok()
+        .map(|time| time.with_timezone(&Utc))
 }
 
 fn parse_buffer(raw: &str) -> Vec<String> {
@@ -102,8 +104,14 @@ fn session_fields(session: &VoiceSession) -> Vec<(&'static str, String)> {
         ("atem_id", session.atem_id.clone()),
         ("channel", session.channel.clone()),
         ("state", state_name(&session.state).to_string()),
-        ("buffer", serde_json::to_string(&session.buffer).unwrap_or_else(|_| "[]".to_string())),
-        ("has_response", if session.response.is_some() { "1" } else { "0" }.to_string()),
+        (
+            "buffer",
+            serde_json::to_string(&session.buffer).unwrap_or_else(|_| "[]".to_string()),
+        ),
+        (
+            "has_response",
+            if session.response.is_some() { "1" } else { "0" }.to_string(),
+        ),
         ("response", session.response.clone().unwrap_or_default()),
         ("created_at", session.created_at.to_rfc3339()),
         ("last_activity", session.last_activity.to_rfc3339()),
@@ -122,7 +130,10 @@ fn session_from_hash(map: &HashMap<String, String>) -> Option<VoiceSession> {
             .then(|| map.get("response").cloned().unwrap_or_default()),
         created_at: parse_time(map.get("created_at"))?,
         last_activity: parse_time(map.get("last_activity"))?,
-        request_count: map.get("request_count").and_then(|v| v.parse().ok()).unwrap_or(0),
+        request_count: map
+            .get("request_count")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
     })
 }
 
@@ -147,7 +158,12 @@ impl RedisVoiceBackend {
         }
     }
 
-    async fn eval<T>(&self, script: &Script, keys: Vec<String>, args: Vec<String>) -> Result<T, StoreError>
+    async fn eval<T>(
+        &self,
+        script: &Script,
+        keys: Vec<String>,
+        args: Vec<String>,
+    ) -> Result<T, StoreError>
     where
         T: redis::FromRedisValue + Send,
     {
@@ -236,10 +252,18 @@ impl VoiceBackend for RedisVoiceBackend {
             .conn
             .run(|mut c| async move { redis::cmd("HGETALL").arg(&key).query_async(&mut c).await })
             .await?;
-        Ok(if map.is_empty() { None } else { session_from_hash(&map) })
+        Ok(if map.is_empty() {
+            None
+        } else {
+            session_from_hash(&map)
+        })
     }
 
-    async fn add_transcription(&self, session_id: &str, text: String) -> Result<Option<()>, StoreError> {
+    async fn add_transcription(
+        &self,
+        session_id: &str,
+        text: String,
+    ) -> Result<Option<()>, StoreError> {
         let added: i64 = self
             .eval(
                 &self.add_transcription,
@@ -266,7 +290,11 @@ impl VoiceBackend for RedisVoiceBackend {
         Ok(buffer.map(|raw| parse_buffer(&raw).join(" ")))
     }
 
-    async fn set_response(&self, session_id: &str, response: String) -> Result<Option<()>, StoreError> {
+    async fn set_response(
+        &self,
+        session_id: &str,
+        response: String,
+    ) -> Result<Option<()>, StoreError> {
         let stored: i64 = self
             .eval(
                 &self.set_response,
@@ -281,7 +309,10 @@ impl VoiceBackend for RedisVoiceBackend {
             )
             .await?;
         if stored != 1 {
-            tracing::warn!("Attempted to set response for nonexistent session: {}", session_id);
+            tracing::warn!(
+                "Attempted to set response for nonexistent session: {}",
+                session_id
+            );
         }
         Ok((stored == 1).then_some(()))
     }
@@ -297,7 +328,13 @@ impl VoiceBackend for RedisVoiceBackend {
         let key = keys::voice(session_id);
         let state: Option<String> = self
             .conn
-            .run(|mut c| async move { redis::cmd("HGET").arg(&key).arg("state").query_async(&mut c).await })
+            .run(|mut c| async move {
+                redis::cmd("HGET")
+                    .arg(&key)
+                    .arg("state")
+                    .query_async(&mut c)
+                    .await
+            })
             .await?;
         Ok(state.as_deref().and_then(parse_state))
     }
@@ -306,7 +343,11 @@ impl VoiceBackend for RedisVoiceBackend {
         let (key, reply) = (keys::voice(session_id), keys::voice_reply(session_id));
         self.conn
             .run(|mut c| async move {
-                redis::cmd("DEL").arg(&key).arg(&reply).query_async::<()>(&mut c).await
+                redis::cmd("DEL")
+                    .arg(&key)
+                    .arg(&reply)
+                    .query_async::<()>(&mut c)
+                    .await
             })
             .await
     }
@@ -331,7 +372,11 @@ impl VoiceBackend for RedisVoiceBackend {
         self.scan_ids().await
     }
 
-    async fn wait_reply(&self, session_id: &str, timeout: Duration) -> Result<WaitOutcome, StoreError> {
+    async fn wait_reply(
+        &self,
+        session_id: &str,
+        timeout: Duration,
+    ) -> Result<WaitOutcome, StoreError> {
         // The bus already listens on relay:voice-reply:* (pattern), so
         // registering the waiter is subscribing; it happens before the
         // stored answer is read, so an answer can't slip through between.
@@ -348,7 +393,9 @@ impl VoiceBackend for RedisVoiceBackend {
                 Ok(Some(reply)) => break Ok(WaitOutcome::Reply(reply)),
                 Ok(None) => {}
                 Err(error) if first_check => break Err(error),
-                Err(error) => tracing::debug!("Voice reply poll failed for {}: {}", session_id, error),
+                Err(error) => {
+                    tracing::debug!("Voice reply poll failed for {}: {}", session_id, error)
+                }
             }
             first_check = false;
             let now = tokio::time::Instant::now();
@@ -381,7 +428,10 @@ mod tests {
     use std::sync::Arc;
 
     /// A replica's voice store plus the bus wiring that wakes its waiters.
-    async fn replica(conn: &RedisConn, id: &str) -> (VoiceSessionStore, ReplyWaiters, tokio::task::JoinHandle<()>) {
+    async fn replica(
+        conn: &RedisConn,
+        id: &str,
+    ) -> (VoiceSessionStore, ReplyWaiters, tokio::task::JoinHandle<()>) {
         let waiters = ReplyWaiters::default();
         let (_bus, mut events, bus_task) = RedisBus::start(conn.clone(), id).await.unwrap();
         let wake = waiters.clone();
@@ -392,11 +442,18 @@ mod tests {
                 }
             }
         });
-        let store = VoiceSessionStore::with_backend(Arc::new(RedisVoiceBackend::new(conn.clone(), waiters.clone())));
-        (store, waiters, tokio::spawn(async move {
-            let _ = forward.await;
-            bus_task.abort();
-        }))
+        let store = VoiceSessionStore::with_backend(Arc::new(RedisVoiceBackend::new(
+            conn.clone(),
+            waiters.clone(),
+        )));
+        (
+            store,
+            waiters,
+            tokio::spawn(async move {
+                let _ = forward.await;
+                bus_task.abort();
+            }),
+        )
     }
 
     #[tokio::test]
@@ -405,29 +462,59 @@ mod tests {
         let _guard = REDIS_LOCK.lock().await;
         let conn = fresh_conn().await;
         let (store, _waiters, _task) = replica(&conn, "voice-a").await;
-        let created = store.create("v-1".into(), "atem-1".into(), "ch".into()).await.unwrap();
+        let created = store
+            .create("v-1".into(), "atem-1".into(), "ch".into())
+            .await
+            .unwrap();
         let loaded = store.get("v-1").await.unwrap().unwrap();
         assert_eq!(loaded.session_id, created.session_id);
         assert_eq!(loaded.atem_id, "atem-1");
         assert_eq!(loaded.state, VoiceSessionState::Accumulating);
         assert_eq!(store.increment_requests("v-1").await.unwrap(), Some(1));
         assert_eq!(store.increment_requests("v-1").await.unwrap(), Some(2));
-        assert_eq!(store.add_transcription("v-1", "Create".into()).await.unwrap(), Some(()));
-        assert_eq!(store.add_transcription("v-1", "a function".into()).await.unwrap(), Some(()));
-        assert_eq!(store.trigger("v-1").await.unwrap().as_deref(), Some("Create a function"));
-        assert_eq!(store.get_state("v-1").await.unwrap(), Some(VoiceSessionState::Triggered));
-        assert_eq!(store.set_response("v-1", "done".into()).await.unwrap(), Some(()));
+        assert_eq!(
+            store
+                .add_transcription("v-1", "Create".into())
+                .await
+                .unwrap(),
+            Some(())
+        );
+        assert_eq!(
+            store
+                .add_transcription("v-1", "a function".into())
+                .await
+                .unwrap(),
+            Some(())
+        );
+        assert_eq!(
+            store.trigger("v-1").await.unwrap().as_deref(),
+            Some("Create a function")
+        );
+        assert_eq!(
+            store.get_state("v-1").await.unwrap(),
+            Some(VoiceSessionState::Triggered)
+        );
+        assert_eq!(
+            store.set_response("v-1", "done".into()).await.unwrap(),
+            Some(())
+        );
         let ready = store.get("v-1").await.unwrap().unwrap();
         assert_eq!(ready.state, VoiceSessionState::ResponseReady);
         assert_eq!(ready.response.as_deref(), Some("done"));
         assert_eq!(ready.request_count, 2);
-        assert_eq!(store.list_session_ids().await.unwrap(), vec!["v-1".to_string()]);
+        assert_eq!(
+            store.list_session_ids().await.unwrap(),
+            vec!["v-1".to_string()]
+        );
         assert_eq!(store.get_by_atem("atem-1").await.unwrap().len(), 1);
         assert!(store.get_by_atem("atem-2").await.unwrap().is_empty());
         store.delete("v-1").await.unwrap();
         assert!(store.get("v-1").await.unwrap().is_none());
         assert_eq!(store.trigger("missing").await.unwrap(), None);
-        assert_eq!(store.set_response("missing", "x".into()).await.unwrap(), None);
+        assert_eq!(
+            store.set_response("missing", "x".into()).await.unwrap(),
+            None
+        );
         assert_eq!(store.increment_requests("missing").await.unwrap(), None);
     }
 
@@ -440,9 +527,15 @@ mod tests {
 
     async fn lower_ttl(conn: &RedisConn, key: &str) {
         let key = key.to_string();
-        conn.run(|mut c| async move { redis::cmd("EXPIRE").arg(&key).arg(5).query_async::<()>(&mut c).await })
-            .await
-            .unwrap();
+        conn.run(|mut c| async move {
+            redis::cmd("EXPIRE")
+                .arg(&key)
+                .arg(5)
+                .query_async::<()>(&mut c)
+                .await
+        })
+        .await
+        .unwrap();
     }
 
     /// Each write refreshes the 60 s idle TTL; the stored answer lives 30 s.
@@ -452,14 +545,20 @@ mod tests {
         let _guard = REDIS_LOCK.lock().await;
         let conn = fresh_conn().await;
         let (store, _waiters, _task) = replica(&conn, "voice-ttl").await;
-        store.create("v-ttl".into(), "atem".into(), "ch".into()).await.unwrap();
+        store
+            .create("v-ttl".into(), "atem".into(), "ch".into())
+            .await
+            .unwrap();
         let key = keys::voice("v-ttl");
         let reply = keys::voice_reply("v-ttl");
         let near_idle = |ttl: i64| (55..=60).contains(&ttl);
 
         assert!(near_idle(raw_ttl(&conn, &key).await));
         lower_ttl(&conn, &key).await;
-        store.add_transcription("v-ttl", "hello".into()).await.unwrap();
+        store
+            .add_transcription("v-ttl", "hello".into())
+            .await
+            .unwrap();
         let ttl = raw_ttl(&conn, &key).await;
         assert!(near_idle(ttl), "add_transcription ttl {ttl}");
 
@@ -482,10 +581,16 @@ mod tests {
         let _guard = REDIS_LOCK.lock().await;
         let conn = fresh_conn().await;
         let (store, _waiters, _task) = replica(&conn, "voice-a").await;
-        store.create("v-cap".into(), "atem".into(), "ch".into()).await.unwrap();
+        store
+            .create("v-cap".into(), "atem".into(), "ch".into())
+            .await
+            .unwrap();
         let chunk = "x".repeat(1024);
         for _ in 0..70 {
-            store.add_transcription("v-cap", chunk.clone()).await.unwrap();
+            store
+                .add_transcription("v-cap", chunk.clone())
+                .await
+                .unwrap();
         }
         let session = store.get("v-cap").await.unwrap().unwrap();
         assert_eq!(session.buffer.len(), 64);
@@ -499,33 +604,50 @@ mod tests {
         let conn = fresh_conn().await;
         let (one, _w1, _t1) = replica(&conn, "voice-1").await;
         let (two, _w2, _t2) = replica(&conn, "voice-2").await;
-        one.create("v-x".into(), "atem".into(), "ch".into()).await.unwrap();
+        one.create("v-x".into(), "atem".into(), "ch".into())
+            .await
+            .unwrap();
         one.trigger("v-x").await.unwrap();
 
         // Answered on replica two while replica one waits.
         let waiting = tokio::spawn({
             let one = one.clone();
-            async move { one.wait_reply("v-x", std::time::Duration::from_secs(5)).await.unwrap() }
+            async move {
+                one.wait_reply("v-x", std::time::Duration::from_secs(5))
+                    .await
+                    .unwrap()
+            }
         });
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         two.set_response("v-x", "from two".into()).await.unwrap();
-        assert_eq!(waiting.await.unwrap(), WaitOutcome::Reply("from two".into()));
+        assert_eq!(
+            waiting.await.unwrap(),
+            WaitOutcome::Reply("from two".into())
+        );
 
         // An answer that arrived before the wait is found at once.
-        one.create("v-early".into(), "atem".into(), "ch".into()).await.unwrap();
+        one.create("v-early".into(), "atem".into(), "ch".into())
+            .await
+            .unwrap();
         two.set_response("v-early", "early".into()).await.unwrap();
         let started = std::time::Instant::now();
         assert_eq!(
-            one.wait_reply("v-early", std::time::Duration::from_secs(5)).await.unwrap(),
+            one.wait_reply("v-early", std::time::Duration::from_secs(5))
+                .await
+                .unwrap(),
             WaitOutcome::Reply("early".into())
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
 
         // No answer: the wait times out.
-        one.create("v-silent".into(), "atem".into(), "ch".into()).await.unwrap();
+        one.create("v-silent".into(), "atem".into(), "ch".into())
+            .await
+            .unwrap();
         let started = std::time::Instant::now();
         assert_eq!(
-            one.wait_reply("v-silent", std::time::Duration::from_secs(1)).await.unwrap(),
+            one.wait_reply("v-silent", std::time::Duration::from_secs(1))
+                .await
+                .unwrap(),
             WaitOutcome::TimedOut
         );
         assert!(started.elapsed() >= std::time::Duration::from_secs(1));
@@ -566,6 +688,10 @@ mod tests {
         let conn = fresh_conn().await;
         let (store, _waiters, _task) = replica(&conn, "voice-t").await;
         assert_eq!(crate::llm_proxy::LLM_WAIT_SECS, 30);
-        scenarios::wait_times_out_after(store, Duration::from_secs(crate::llm_proxy::LLM_WAIT_SECS)).await;
+        scenarios::wait_times_out_after(
+            store,
+            Duration::from_secs(crate::llm_proxy::LLM_WAIT_SECS),
+        )
+        .await;
     }
 }

@@ -3,7 +3,6 @@
 //! trait with an in-memory version (tests, single instance, local dev) and
 //! a Redis version (production, `REDIS_URL`).
 
-
 pub mod bus;
 pub mod directory;
 pub mod health;
@@ -72,7 +71,10 @@ mod tests {
     #[test]
     fn conn_ref_round_trips() {
         let conn = ConnRef::new("43c8a181-6567-49ae-9191-8e103a66cc55", "a1b2c3d4e5f6");
-        assert_eq!(conn.encode(), "43c8a181-6567-49ae-9191-8e103a66cc55|a1b2c3d4e5f6");
+        assert_eq!(
+            conn.encode(),
+            "43c8a181-6567-49ae-9191-8e103a66cc55|a1b2c3d4e5f6"
+        );
         assert_eq!(ConnRef::decode(&conn.encode()), Some(conn));
         assert_eq!(ConnRef::decode("no-separator"), None);
         assert_eq!(ConnRef::decode("|replica"), None);
@@ -83,7 +85,9 @@ mod tests {
     fn replica_ids_are_short_random_hex() {
         let a = new_replica_id();
         assert_eq!(a.len(), 12);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_ne!(a, new_replica_id());
     }
 }

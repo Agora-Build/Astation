@@ -201,8 +201,7 @@ impl VaultStore for InMemoryVaultStore {
         let mut out: Vec<(i64, VaultListItem)> = vaults
             .iter()
             .filter(|(_, v)| {
-                v.work_session_id == work_session_id
-                    || v.writer_list.iter().any(|w| w == client_id)
+                v.work_session_id == work_session_id || v.writer_list.iter().any(|w| w == client_id)
             })
             .map(|(id, v)| {
                 let first_seq = v.entries.first().map(|e| e.seq).unwrap_or(i64::MAX);
@@ -535,13 +534,12 @@ impl VaultStore for PgVaultStore {
     }
 
     async fn get_meta(&self, vault_id: &str) -> Result<Option<VaultMeta>, VaultError> {
-        let row: Option<(String, Vec<String>)> = sqlx::query_as(
-            "SELECT work_session_id, writer_list FROM vaults WHERE vault_id = $1",
-        )
-        .bind(vault_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
+        let row: Option<(String, Vec<String>)> =
+            sqlx::query_as("SELECT work_session_id, writer_list FROM vaults WHERE vault_id = $1")
+                .bind(vault_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
         Ok(row.map(|(work_session_id, writer_list)| VaultMeta {
             work_session_id,
             writer_list,
@@ -596,14 +594,23 @@ mod tests {
     #[tokio::test]
     async fn append_then_read_current_and_history() {
         let store = InMemoryVaultStore::new();
-        let id = store.create_vault("ws-1", "client-a", "auth refactor").await.unwrap();
+        let id = store
+            .create_vault("ws-1", "client-a", "auth refactor")
+            .await
+            .unwrap();
 
-        let w1 = store.append(&id, "client-a", "decided: JWT in cookie").await.unwrap();
+        let w1 = store
+            .append(&id, "client-a", "decided: JWT in cookie")
+            .await
+            .unwrap();
         assert_eq!(w1.entry_no, 1);
         assert_eq!(w1.version, 1);
 
         // Override entry 1 → version 2.
-        let w2 = store.override_entry(&id, 1, "client-a", "JWT, 15m exp").await.unwrap();
+        let w2 = store
+            .override_entry(&id, 1, "client-a", "JWT, 15m exp")
+            .await
+            .unwrap();
         assert_eq!(w2.entry_no, 1);
         assert_eq!(w2.version, 2);
 
@@ -654,7 +661,10 @@ mod tests {
         assert_eq!(in_session.len(), 1);
 
         // Out-of-session past writer sees it.
-        let past = store.list_readable("ws-other", "past-writer").await.unwrap();
+        let past = store
+            .list_readable("ws-other", "past-writer")
+            .await
+            .unwrap();
         assert_eq!(past.len(), 1);
 
         // Out-of-session stranger does not.
@@ -712,11 +722,26 @@ mod tests {
     #[tokio::test]
     async fn operations_on_missing_vault_return_not_found() {
         let store = InMemoryVaultStore::new();
-        assert!(matches!(store.read("nope", None, false).await, Err(VaultError::NotFound)));
-        assert!(matches!(store.append("nope", "a", "x").await, Err(VaultError::NotFound)));
-        assert!(matches!(store.override_entry("nope", 1, "a", "x").await, Err(VaultError::NotFound)));
-        assert!(matches!(store.set_summary("nope", "x").await, Err(VaultError::NotFound)));
-        assert!(matches!(store.add_writer("nope", "a").await, Err(VaultError::NotFound)));
+        assert!(matches!(
+            store.read("nope", None, false).await,
+            Err(VaultError::NotFound)
+        ));
+        assert!(matches!(
+            store.append("nope", "a", "x").await,
+            Err(VaultError::NotFound)
+        ));
+        assert!(matches!(
+            store.override_entry("nope", 1, "a", "x").await,
+            Err(VaultError::NotFound)
+        ));
+        assert!(matches!(
+            store.set_summary("nope", "x").await,
+            Err(VaultError::NotFound)
+        ));
+        assert!(matches!(
+            store.add_writer("nope", "a").await,
+            Err(VaultError::NotFound)
+        ));
         assert!(store.get_meta("nope").await.unwrap().is_none());
     }
 

@@ -77,7 +77,9 @@ impl RedisBus {
             Ok(Ok(())) => Ok((Self::publisher(conn, replica_id), events_rx, task)),
             _ => {
                 task.abort();
-                Err(StoreError::Unavailable("relay bus subscription failed".to_string()))
+                Err(StoreError::Unavailable(
+                    "relay bus subscription failed".to_string(),
+                ))
             }
         }
     }
@@ -119,12 +121,20 @@ impl ReplicaBus for RedisBus {
     async fn broadcast(&self, message: BroadcastMessage) -> Result<(), StoreError> {
         let payload = serde_json::to_string(&message)
             .map_err(|error| StoreError::Unavailable(error.to_string()))?;
-        tracing::trace!("Replica {} broadcasting {} bytes", self.replica_id, payload.len());
-        self.publish(keys::BROADCAST_CHANNEL.to_string(), payload).await
+        tracing::trace!(
+            "Replica {} broadcasting {} bytes",
+            self.replica_id,
+            payload.len()
+        );
+        self.publish(keys::BROADCAST_CHANNEL.to_string(), payload)
+            .await
     }
 }
 
-async fn subscribe(client: &redis::Client, replica_id: &str) -> Result<redis::aio::PubSub, StoreError> {
+async fn subscribe(
+    client: &redis::Client,
+    replica_id: &str,
+) -> Result<redis::aio::PubSub, StoreError> {
     let subscribing = async {
         let mut pubsub = client.get_async_pubsub().await?;
         pubsub.subscribe(keys::inbox_channel(replica_id)).await?;
@@ -135,7 +145,9 @@ async fn subscribe(client: &redis::Client, replica_id: &str) -> Result<redis::ai
     match tokio::time::timeout(REDIS_TIMEOUT, subscribing).await {
         Ok(Ok(pubsub)) => Ok(pubsub),
         Ok(Err(error)) => Err(redis_error(error)),
-        Err(_) => Err(StoreError::Unavailable("redis subscribe timed out".to_string())),
+        Err(_) => Err(StoreError::Unavailable(
+            "redis subscribe timed out".to_string(),
+        )),
     }
 }
 
@@ -151,7 +163,12 @@ enum Decoded {
 fn is_heartbeat(payload: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(payload)
         .ok()
-        .and_then(|value| value.get("type").and_then(|kind| kind.as_str()).map(|kind| kind == "heartbeat"))
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(|kind| kind.as_str())
+                .map(|kind| kind == "heartbeat")
+        })
         .unwrap_or(false)
 }
 
@@ -212,7 +229,10 @@ async fn heartbeat_loop(conn: RedisConn, replica_id: String, interval: Duration)
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        if let Err(error) = bus.publish(channel.clone(), HEARTBEAT_PAYLOAD.to_string()).await {
+        if let Err(error) = bus
+            .publish(channel.clone(), HEARTBEAT_PAYLOAD.to_string())
+            .await
+        {
             tracing::warn!("Relay bus heartbeat publish failed: {}", error);
         }
     }
@@ -255,7 +275,12 @@ async fn subscriber_loop(
                 }
                 let mut stream = Box::pin(pubsub.into_on_message());
                 loop {
-                    let message = match tokio::time::timeout(timing.heartbeat_timeout, stream.next()).await {
+                    let message = match tokio::time::timeout(
+                        timing.heartbeat_timeout,
+                        stream.next(),
+                    )
+                    .await
+                    {
                         Ok(Some(message)) => message,
                         Ok(None) => {
                             tracing::warn!("Relay bus subscription lost; reconnecting");
@@ -315,8 +340,10 @@ mod tests {
     async fn redis_bus_delivers_inbox_broadcast_and_voice_replies() {
         let _guard = REDIS_LOCK.lock().await;
         let conn = fresh_conn().await;
-        let (bus_a, mut events_a, task_a) = RedisBus::start(conn.clone(), "replica-a").await.unwrap();
-        let (bus_b, mut events_b, task_b) = RedisBus::start(conn.clone(), "replica-b").await.unwrap();
+        let (bus_a, mut events_a, task_a) =
+            RedisBus::start(conn.clone(), "replica-a").await.unwrap();
+        let (bus_b, mut events_b, task_b) =
+            RedisBus::start(conn.clone(), "replica-b").await.unwrap();
         assert_eq!(bus_a.backend_name(), "redis");
 
         // Inbox: only the addressed replica gets it, in publish order.
@@ -324,7 +351,10 @@ mod tests {
             bus_a
                 .send_inbox(
                     "replica-b",
-                    InboxMessage::Deliver { connection_ids: vec!["c1".into()], frame: format!("{n}") },
+                    InboxMessage::Deliver {
+                        connection_ids: vec!["c1".into()],
+                        frame: format!("{n}"),
+                    },
                 )
                 .await
                 .unwrap();
@@ -340,10 +370,18 @@ mod tests {
         }
 
         // Broadcast: everyone, including the sender.
-        let message = BroadcastMessage::KeyChanged { astation_id: "astation-x".into() };
+        let message = BroadcastMessage::KeyChanged {
+            astation_id: "astation-x".into(),
+        };
         bus_b.broadcast(message.clone()).await.unwrap();
-        assert_eq!(next_event(&mut events_a).await, BusEvent::Broadcast(message.clone()));
-        assert_eq!(next_event(&mut events_b).await, BusEvent::Broadcast(message));
+        assert_eq!(
+            next_event(&mut events_a).await,
+            BusEvent::Broadcast(message.clone())
+        );
+        assert_eq!(
+            next_event(&mut events_b).await,
+            BusEvent::Broadcast(message)
+        );
 
         // Voice replies arrive on every replica, id unescaped.
         conn.run(|mut c| async move {
@@ -355,19 +393,26 @@ mod tests {
         })
         .await
         .unwrap();
-        let expected = BusEvent::VoiceReply { session_id: "v:1".into(), reply: "the answer".into() };
+        let expected = BusEvent::VoiceReply {
+            session_id: "v:1".into(),
+            reply: "the answer".into(),
+        };
         assert_eq!(next_event(&mut events_a).await, expected);
         assert_eq!(next_event(&mut events_b).await, expected);
 
         // A publisher-only bus (admin) reaches subscribers too.
         let admin = RedisBus::publisher(conn.clone(), "admin");
         admin
-            .broadcast(BroadcastMessage::RoomChanged { code: "ROOM".into() })
+            .broadcast(BroadcastMessage::RoomChanged {
+                code: "ROOM".into(),
+            })
             .await
             .unwrap();
         assert_eq!(
             next_event(&mut events_a).await,
-            BusEvent::Broadcast(BroadcastMessage::RoomChanged { code: "ROOM".into() })
+            BusEvent::Broadcast(BroadcastMessage::RoomChanged {
+                code: "ROOM".into()
+            })
         );
         task_a.abort();
         task_b.abort();
@@ -400,9 +445,16 @@ mod tests {
         let message = BroadcastMessage::RoomChanged { code: "R".into() };
         bus.broadcast(message.clone()).await.unwrap();
         assert_eq!(next_event(&mut events).await, BusEvent::Broadcast(message));
-        bus.send_inbox("replica-r", InboxMessage::Close { connection_id: "c".into(), code: None, reason: String::new() })
-            .await
-            .unwrap();
+        bus.send_inbox(
+            "replica-r",
+            InboxMessage::Close {
+                connection_id: "c".into(),
+                code: None,
+                reason: String::new(),
+            },
+        )
+        .await
+        .unwrap();
         assert!(matches!(next_event(&mut events).await, BusEvent::Inbox(_)));
         task.abort();
     }
@@ -414,7 +466,14 @@ mod tests {
         let client = redis::Client::open("redis://127.0.0.1:1/").unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
-        let task = tokio::spawn(subscriber_loop(client, None, "x".into(), tx, Some(ready_tx), fast_timing()));
+        let task = tokio::spawn(subscriber_loop(
+            client,
+            None,
+            "x".into(),
+            tx,
+            Some(ready_tx),
+            fast_timing(),
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert!(!task.is_finished(), "subscriber loop gave up");
         assert!(rx.try_recv().is_err());
@@ -472,7 +531,10 @@ mod tests {
         // Subscribe failed: keep doubling.
         assert_eq!(next_backoff(ms(400), None, &timing), ms(800));
         // Up long enough: start again from the initial delay.
-        assert_eq!(next_backoff(ms(5000), Some(Duration::from_secs(30)), &timing), ms(100));
+        assert_eq!(
+            next_backoff(ms(5000), Some(Duration::from_secs(30)), &timing),
+            ms(100)
+        );
     }
 
     async fn kill_pubsub_clients(conn: &RedisConn) {
@@ -494,7 +556,9 @@ mod tests {
         let _guard = REDIS_LOCK.lock().await;
         let conn = fresh_conn().await;
         let (_bus, mut events, task) =
-            RedisBus::start_with(conn.clone(), "replica-k", fast_timing()).await.unwrap();
+            RedisBus::start_with(conn.clone(), "replica-k", fast_timing())
+                .await
+                .unwrap();
         let mut delays = Vec::new();
         for _ in 0..3 {
             let kicked = std::time::Instant::now();
@@ -514,7 +578,9 @@ mod tests {
         let _guard = REDIS_LOCK.lock().await;
         let conn = fresh_conn().await;
         let (_bus, mut events, task) =
-            RedisBus::start_with(conn.clone(), "replica-h", fast_timing()).await.unwrap();
+            RedisBus::start_with(conn.clone(), "replica-h", fast_timing())
+                .await
+                .unwrap();
 
         // Healthy and idle: heartbeats keep the subscription alive well past
         // the timeout, and none of them surface as events.
@@ -526,17 +592,30 @@ mod tests {
         // on the stream after heartbeat_timeout and resubscribes.
         let paused = std::time::Instant::now();
         conn.run(|mut c| async move {
-            redis::cmd("CLIENT").arg("PAUSE").arg(3000).arg("WRITE").query_async::<()>(&mut c).await
+            redis::cmd("CLIENT")
+                .arg("PAUSE")
+                .arg(3000)
+                .arg("WRITE")
+                .query_async::<()>(&mut c)
+                .await
         })
         .await
         .unwrap();
         let event = next_event(&mut events).await;
         let elapsed = paused.elapsed();
-        conn.run(|mut c| async move { redis::cmd("CLIENT").arg("UNPAUSE").query_async::<()>(&mut c).await })
-            .await
-            .unwrap();
+        conn.run(|mut c| async move {
+            redis::cmd("CLIENT")
+                .arg("UNPAUSE")
+                .query_async::<()>(&mut c)
+                .await
+        })
+        .await
+        .unwrap();
         assert_eq!(event, BusEvent::Resubscribed);
-        assert!(elapsed >= Duration::from_millis(700), "resubscribed after {elapsed:?}");
+        assert!(
+            elapsed >= Duration::from_millis(700),
+            "resubscribed after {elapsed:?}"
+        );
         assert!(!task.is_finished());
         task.abort();
     }

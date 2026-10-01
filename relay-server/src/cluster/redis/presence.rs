@@ -69,10 +69,23 @@ impl RedisHealth {
             .run(|mut c| async move {
                 redis::pipe()
                     .atomic()
-                    .cmd("SET").arg(&presence).arg(started_at).arg("EX").arg(PRESENCE_TTL_SECS)
-                    .cmd("ZADD").arg(keys::REPLICAS_INDEX).arg(expires).arg(&id)
-                    .cmd("ZREMRANGEBYSCORE").arg(keys::REPLICAS_INDEX).arg("-inf").arg(format!("({now}"))
-                    .cmd("ZRANGEBYSCORE").arg(keys::REPLICAS_INDEX).arg(now).arg("+inf")
+                    .cmd("SET")
+                    .arg(&presence)
+                    .arg(started_at)
+                    .arg("EX")
+                    .arg(PRESENCE_TTL_SECS)
+                    .cmd("ZADD")
+                    .arg(keys::REPLICAS_INDEX)
+                    .arg(expires)
+                    .arg(&id)
+                    .cmd("ZREMRANGEBYSCORE")
+                    .arg(keys::REPLICAS_INDEX)
+                    .arg("-inf")
+                    .arg(format!("({now}"))
+                    .cmd("ZRANGEBYSCORE")
+                    .arg(keys::REPLICAS_INDEX)
+                    .arg(now)
+                    .arg("+inf")
                     .query_async(&mut c)
                     .await
             })
@@ -87,7 +100,8 @@ impl RedisHealth {
     pub fn spawn_refresh(&self) -> JoinHandle<()> {
         let health = self.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(PRESENCE_REFRESH_SECS));
+            let mut tick =
+                tokio::time::interval(std::time::Duration::from_secs(PRESENCE_REFRESH_SECS));
             loop {
                 tick.tick().await;
                 if let Err(error) = health.refresh().await {
@@ -127,8 +141,11 @@ impl ClusterHealth for RedisHealth {
         self.conn
             .run(|mut c| async move {
                 redis::pipe()
-                    .cmd("DEL").arg(&presence)
-                    .cmd("ZREM").arg(keys::REPLICAS_INDEX).arg(&id)
+                    .cmd("DEL")
+                    .arg(&presence)
+                    .cmd("ZREM")
+                    .arg(keys::REPLICAS_INDEX)
+                    .arg(&id)
                     .query_async::<()>(&mut c)
                     .await
             })
@@ -155,7 +172,12 @@ mod tests {
         assert!(!a.is_live("replica-gone"));
         assert_eq!(a.redis_status().await, "ok");
         let ttl: i64 = conn
-            .run(|mut c| async move { redis::cmd("TTL").arg("relay:replica:replica-a").query_async(&mut c).await })
+            .run(|mut c| async move {
+                redis::cmd("TTL")
+                    .arg("relay:replica:replica-a")
+                    .query_async(&mut c)
+                    .await
+            })
             .await
             .unwrap();
         assert!((1..=PRESENCE_TTL_SECS as i64).contains(&ttl), "ttl {ttl}");
@@ -176,7 +198,12 @@ mod tests {
         b.refresh().await.unwrap();
         assert_eq!(a.refresh().await.unwrap(), 1);
         let exists: i64 = conn
-            .run(|mut c| async move { redis::cmd("EXISTS").arg("relay:replica:replica-b").query_async(&mut c).await })
+            .run(|mut c| async move {
+                redis::cmd("EXISTS")
+                    .arg("relay:replica:replica-b")
+                    .query_async(&mut c)
+                    .await
+            })
             .await
             .unwrap();
         assert_eq!(exists, 0);

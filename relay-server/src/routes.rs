@@ -58,14 +58,18 @@ fn store_unavailable(error: StoreError) -> (StatusCode, Json<ErrorResponse>) {
     tracing::error!("Session store unavailable: {}", error);
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(ErrorResponse { error: "Temporarily unavailable".to_string() }),
+        Json(ErrorResponse {
+            error: "Temporarily unavailable".to_string(),
+        }),
     )
 }
 
 fn not_found() -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::NOT_FOUND,
-        Json(ErrorResponse { error: "Session not found".to_string() }),
+        Json(ErrorResponse {
+            error: "Session not found".to_string(),
+        }),
     )
 }
 
@@ -129,13 +133,12 @@ pub async fn get_session_status_handler(
         Err(error) => return Err(store_unavailable(error)),
     };
     // Check if session has expired
-    let status = if session.status == SessionStatus::Pending
-        && chrono::Utc::now() > session.expires_at
-    {
-        SessionStatus::Expired
-    } else {
-        session.status.clone()
-    };
+    let status =
+        if session.status == SessionStatus::Pending && chrono::Utc::now() > session.expires_at {
+            SessionStatus::Expired
+        } else {
+            session.status.clone()
+        };
     let token = if status == SessionStatus::Granted {
         session.token.clone()
     } else {
@@ -161,11 +164,15 @@ pub async fn grant_session_handler(
         Ok(GrantOutcome::NotPending(status)) => Err(already(&status)),
         Ok(GrantOutcome::Expired) => Err((
             StatusCode::GONE,
-            Json(ErrorResponse { error: "Session has expired".to_string() }),
+            Json(ErrorResponse {
+                error: "Session has expired".to_string(),
+            }),
         )),
         Ok(GrantOutcome::InvalidOtp) => Err((
             StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse { error: "Invalid OTP".to_string() }),
+            Json(ErrorResponse {
+                error: "Invalid OTP".to_string(),
+            }),
         )),
         Ok(GrantOutcome::Granted(session)) => Ok(Json(SessionStatusResponse {
             id: session.id,
@@ -766,8 +773,7 @@ mod tests {
         let session_id = created.id;
 
         // First deny
-        app
-            .clone()
+        app.clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -834,8 +840,7 @@ mod tests {
         let otp = created.otp;
 
         // Deny first
-        app
-            .clone()
+        app.clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -881,8 +886,8 @@ mod tests {
 
         // Should reject invalid JSON
         assert!(
-            response.status() == StatusCode::BAD_REQUEST ||
-            response.status() == StatusCode::UNPROCESSABLE_ENTITY
+            response.status() == StatusCode::BAD_REQUEST
+                || response.status() == StatusCode::UNPROCESSABLE_ENTITY
         );
     }
 

@@ -30,7 +30,13 @@ pub trait SharedRateLimiter: Send + Sync {
     fn backend_name(&self) -> &'static str;
     /// Count one request from `ip` in `bucket` for the minute containing
     /// `now` (unix seconds).
-    async fn hit(&self, bucket: &str, ip: &str, limit: u64, now: i64) -> Result<RateDecision, StoreError>;
+    async fn hit(
+        &self,
+        bucket: &str,
+        ip: &str,
+        limit: u64,
+        now: i64,
+    ) -> Result<RateDecision, StoreError>;
 }
 
 /// Single instance: the per-replica governor is the whole limit.
@@ -42,7 +48,13 @@ impl SharedRateLimiter for NoopRateLimiter {
         "memory"
     }
 
-    async fn hit(&self, _bucket: &str, _ip: &str, _limit: u64, _now: i64) -> Result<RateDecision, StoreError> {
+    async fn hit(
+        &self,
+        _bucket: &str,
+        _ip: &str,
+        _limit: u64,
+        _now: i64,
+    ) -> Result<RateDecision, StoreError> {
         Ok(RateDecision::Allowed)
     }
 }
@@ -68,17 +80,31 @@ pub struct SharedLimit {
     pub burst: u64,
 }
 
-pub async fn shared_rate_limit(State(limit): State<SharedLimit>, request: Request, next: Next) -> Response {
+pub async fn shared_rate_limit(
+    State(limit): State<SharedLimit>,
+    request: Request,
+    next: Next,
+) -> Response {
     let ip = SmartIpKeyExtractor
         .extract(&request)
         .map(|ip| ip.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
     let now = chrono::Utc::now().timestamp();
-    match limit.hub.rate_limiter().hit(limit.bucket, &ip, limit.limit, now).await {
+    match limit
+        .hub
+        .rate_limiter()
+        .hit(limit.bucket, &ip, limit.limit, now)
+        .await
+    {
         Ok(RateDecision::Allowed) => next.run(request).await,
-        Ok(RateDecision::Limited { retry_after_secs }) => too_many_requests(retry_after_secs, limit.burst),
+        Ok(RateDecision::Limited { retry_after_secs }) => {
+            too_many_requests(retry_after_secs, limit.burst)
+        }
         Err(error) => {
-            tracing::debug!("Shared rate limit unavailable, per-replica limit applies: {}", error);
+            tracing::debug!(
+                "Shared rate limit unavailable, per-replica limit applies: {}",
+                error
+            );
             next.run(request).await
         }
     }
@@ -114,7 +140,9 @@ mod tests {
         assert_eq!(window_decision(60, 60, now), RateDecision::Allowed);
         assert_eq!(
             window_decision(61, 60, now),
-            RateDecision::Limited { retry_after_secs: 50 }
+            RateDecision::Limited {
+                retry_after_secs: 50
+            }
         );
     }
 
@@ -126,7 +154,9 @@ mod tests {
             "limited"
         }
         async fn hit(&self, _: &str, _: &str, _: u64, _: i64) -> Result<RateDecision, StoreError> {
-            Ok(RateDecision::Limited { retry_after_secs: 7 })
+            Ok(RateDecision::Limited {
+                retry_after_secs: 7,
+            })
         }
     }
 
@@ -151,7 +181,10 @@ mod tests {
         };
         Router::new()
             .route("/limited", get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn_with_state(limit, shared_rate_limit))
+            .layer(axum::middleware::from_fn_with_state(
+                limit,
+                shared_rate_limit,
+            ))
     }
 
     async fn call(app: Router) -> axum::response::Response {
@@ -180,7 +213,10 @@ mod tests {
 
     #[tokio::test]
     async fn memory_limiter_and_a_broken_backend_let_requests_through() {
-        assert_eq!(call(app(Arc::new(NoopRateLimiter))).await.status(), StatusCode::OK);
+        assert_eq!(
+            call(app(Arc::new(NoopRateLimiter))).await.status(),
+            StatusCode::OK
+        );
         assert_eq!(call(app(Arc::new(Broken))).await.status(), StatusCode::OK);
     }
 }

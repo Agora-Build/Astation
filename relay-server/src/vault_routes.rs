@@ -144,7 +144,10 @@ pub async fn read_vault_handler(
     let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
     let meta = load_meta(&state, &vault_id).await?;
     if !can_read(&meta, &caller) {
-        return Err(err(StatusCode::FORBIDDEN, "not authorized to read this vault"));
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "not authorized to read this vault",
+        ));
     }
     let entries = state
         .vault
@@ -172,7 +175,10 @@ pub async fn write_vault_handler(
     let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
     let meta = load_meta(&state, &vault_id).await?;
     if !can_write(&meta, &caller) {
-        return Err(err(StatusCode::FORBIDDEN, "not authorized to write this vault"));
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "not authorized to write this vault",
+        ));
     }
 
     let result = if let Some(entry_no) = body.entry_id {
@@ -276,14 +282,22 @@ pub(crate) mod tests {
 
     fn app(state: AppState) -> Router {
         Router::new()
-            .route("/api/vault", post(create_vault_handler).get(list_vaults_handler))
-            .route("/api/vault/:id", get(read_vault_handler).post(write_vault_handler))
+            .route(
+                "/api/vault",
+                post(create_vault_handler).get(list_vaults_handler),
+            )
+            .route(
+                "/api/vault/:id",
+                get(read_vault_handler).post(write_vault_handler),
+            )
             .route("/api/vault/:id/summary", post(set_summary_handler))
             .with_state(state)
     }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
     }
 
@@ -302,25 +316,49 @@ pub(crate) mod tests {
         let (state, sess) = test_state("ws-1").await;
         let app = app(state);
 
-        let resp = app.clone()
-            .oneshot(req("POST", "/api/vault?id=client-a", &sess, r#"{"summary":"auth refactor"}"#))
-            .await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/vault?id=client-a",
+                &sess,
+                r#"{"summary":"auth refactor"}"#,
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let vault_id = body_json(resp).await["vault_id"].as_str().unwrap().to_string();
+        let vault_id = body_json(resp).await["vault_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         // Write an entry.
-        let resp = app.clone()
-            .oneshot(req("POST", &format!("/api/vault/{}?id=client-a", vault_id), &sess, r#"{"text":"decided: JWT in cookie"}"#))
-            .await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/api/vault/{}?id=client-a", vault_id),
+                &sess,
+                r#"{"text":"decided: JWT in cookie"}"#,
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let w = body_json(resp).await;
         assert_eq!(w["entry_no"], 1);
         assert_eq!(w["version"], 1);
 
         // Read current view.
-        let resp = app.clone()
-            .oneshot(req("GET", &format!("/api/vault/{}?id=client-a", vault_id), &sess, ""))
-            .await.unwrap();
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/api/vault/{}?id=client-a", vault_id),
+                &sess,
+                "",
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let entries = body_json(resp).await;
         assert_eq!(entries.as_array().unwrap().len(), 1);
@@ -332,21 +370,65 @@ pub(crate) mod tests {
         let (state, sess) = test_state("ws-1").await;
         let app = app(state);
         let vault_id = {
-            let resp = app.clone()
-                .oneshot(req("POST", "/api/vault?id=a", &sess, r#"{}"#)).await.unwrap();
-            body_json(resp).await["vault_id"].as_str().unwrap().to_string()
+            let resp = app
+                .clone()
+                .oneshot(req("POST", "/api/vault?id=a", &sess, r#"{}"#))
+                .await
+                .unwrap();
+            body_json(resp).await["vault_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
         };
 
-        app.clone().oneshot(req("POST", &format!("/api/vault/{}?id=a", vault_id), &sess, r#"{"text":"v1"}"#)).await.unwrap();
-        app.clone().oneshot(req("POST", &format!("/api/vault/{}?id=a", vault_id), &sess, r#"{"text":"v2","entry_id":1}"#)).await.unwrap();
+        app.clone()
+            .oneshot(req(
+                "POST",
+                &format!("/api/vault/{}?id=a", vault_id),
+                &sess,
+                r#"{"text":"v1"}"#,
+            ))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(req(
+                "POST",
+                &format!("/api/vault/{}?id=a", vault_id),
+                &sess,
+                r#"{"text":"v2","entry_id":1}"#,
+            ))
+            .await
+            .unwrap();
 
         // Current view: only v2.
-        let current = body_json(app.clone().oneshot(req("GET", &format!("/api/vault/{}?id=a", vault_id), &sess, "")).await.unwrap()).await;
+        let current = body_json(
+            app.clone()
+                .oneshot(req(
+                    "GET",
+                    &format!("/api/vault/{}?id=a", vault_id),
+                    &sess,
+                    "",
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(current.as_array().unwrap().len(), 1);
         assert_eq!(current[0]["version"], 2);
 
         // History: v1 + v2.
-        let history = body_json(app.clone().oneshot(req("GET", &format!("/api/vault/{}?id=a&history=true", vault_id), &sess, "")).await.unwrap()).await;
+        let history = body_json(
+            app.clone()
+                .oneshot(req(
+                    "GET",
+                    &format!("/api/vault/{}?id=a&history=true", vault_id),
+                    &sess,
+                    "",
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(history.as_array().unwrap().len(), 2);
     }
 
@@ -354,12 +436,51 @@ pub(crate) mod tests {
     async fn since_filters() {
         let (state, sess) = test_state("ws-1").await;
         let app = app(state);
-        let vault_id = body_json(app.clone().oneshot(req("POST", "/api/vault?id=a", &sess, r#"{}"#)).await.unwrap()).await["vault_id"].as_str().unwrap().to_string();
-        let w1 = body_json(app.clone().oneshot(req("POST", &format!("/api/vault/{}?id=a", vault_id), &sess, r#"{"text":"first"}"#)).await.unwrap()).await;
-        app.clone().oneshot(req("POST", &format!("/api/vault/{}?id=a", vault_id), &sess, r#"{"text":"second"}"#)).await.unwrap();
+        let vault_id = body_json(
+            app.clone()
+                .oneshot(req("POST", "/api/vault?id=a", &sess, r#"{}"#))
+                .await
+                .unwrap(),
+        )
+        .await["vault_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let w1 = body_json(
+            app.clone()
+                .oneshot(req(
+                    "POST",
+                    &format!("/api/vault/{}?id=a", vault_id),
+                    &sess,
+                    r#"{"text":"first"}"#,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        app.clone()
+            .oneshot(req(
+                "POST",
+                &format!("/api/vault/{}?id=a", vault_id),
+                &sess,
+                r#"{"text":"second"}"#,
+            ))
+            .await
+            .unwrap();
         let seq1 = w1["seq"].as_i64().unwrap();
 
-        let after = body_json(app.clone().oneshot(req("GET", &format!("/api/vault/{}?id=a&history=true&since={}", vault_id, seq1), &sess, "")).await.unwrap()).await;
+        let after = body_json(
+            app.clone()
+                .oneshot(req(
+                    "GET",
+                    &format!("/api/vault/{}?id=a&history=true&since={}", vault_id, seq1),
+                    &sess,
+                    "",
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(after.as_array().unwrap().len(), 1);
         assert_eq!(after[0]["content"], "second");
     }
@@ -372,20 +493,64 @@ pub(crate) mod tests {
         let sess2 = bind_session(&state, "ws-2").await;
 
         let app = app(state);
-        let vault_id = body_json(app.clone().oneshot(req("POST", "/api/vault?id=client-a", &sess1, r#"{}"#)).await.unwrap()).await["vault_id"].as_str().unwrap().to_string();
+        let vault_id = body_json(
+            app.clone()
+                .oneshot(req("POST", "/api/vault?id=client-a", &sess1, r#"{}"#))
+                .await
+                .unwrap(),
+        )
+        .await["vault_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         // client-a writes → becomes a past writer.
-        app.clone().oneshot(req("POST", &format!("/api/vault/{}?id=client-a", vault_id), &sess1, r#"{"text":"x"}"#)).await.unwrap();
+        app.clone()
+            .oneshot(req(
+                "POST",
+                &format!("/api/vault/{}?id=client-a", vault_id),
+                &sess1,
+                r#"{"text":"x"}"#,
+            ))
+            .await
+            .unwrap();
 
         // Out-of-session (ws-2) but past-writer client-a: read OK.
-        let read = app.clone().oneshot(req("GET", &format!("/api/vault/{}?id=client-a", vault_id), &sess2, "")).await.unwrap();
+        let read = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/api/vault/{}?id=client-a", vault_id),
+                &sess2,
+                "",
+            ))
+            .await
+            .unwrap();
         assert_eq!(read.status(), StatusCode::OK);
 
         // Out-of-session past-writer: write FORBIDDEN.
-        let write = app.clone().oneshot(req("POST", &format!("/api/vault/{}?id=client-a", vault_id), &sess2, r#"{"text":"y"}"#)).await.unwrap();
+        let write = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/api/vault/{}?id=client-a", vault_id),
+                &sess2,
+                r#"{"text":"y"}"#,
+            ))
+            .await
+            .unwrap();
         assert_eq!(write.status(), StatusCode::FORBIDDEN);
 
         // Stranger (ws-2, not a writer): read FORBIDDEN.
-        let stranger = app.clone().oneshot(req("GET", &format!("/api/vault/{}?id=stranger", vault_id), &sess2, "")).await.unwrap();
+        let stranger = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/api/vault/{}?id=stranger", vault_id),
+                &sess2,
+                "",
+            ))
+            .await
+            .unwrap();
         assert_eq!(stranger.status(), StatusCode::FORBIDDEN);
     }
 
@@ -393,14 +558,17 @@ pub(crate) mod tests {
     async fn missing_session_is_401() {
         let (state, _sess) = test_state("ws-1").await;
         let app = app(state);
-        let resp = app.oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/vault?id=a")
-                .header("content-type", "application/json")
-                .body(Body::from("{}"))
-                .unwrap(),
-        ).await.unwrap();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/vault?id=a")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -408,11 +576,40 @@ pub(crate) mod tests {
     async fn set_summary_ok() {
         let (state, sess) = test_state("ws-1").await;
         let app = app(state);
-        let vault_id = body_json(app.clone().oneshot(req("POST", "/api/vault?id=a", &sess, r#"{"summary":"old"}"#)).await.unwrap()).await["vault_id"].as_str().unwrap().to_string();
-        let resp = app.clone().oneshot(req("POST", &format!("/api/vault/{}/summary?id=a", vault_id), &sess, r#"{"text":"new summary"}"#)).await.unwrap();
+        let vault_id = body_json(
+            app.clone()
+                .oneshot(req(
+                    "POST",
+                    "/api/vault?id=a",
+                    &sess,
+                    r#"{"summary":"old"}"#,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await["vault_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let resp = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/api/vault/{}/summary?id=a", vault_id),
+                &sess,
+                r#"{"text":"new summary"}"#,
+            ))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let list = body_json(app.clone().oneshot(req("GET", "/api/vault?id=a", &sess, "")).await.unwrap()).await;
+        let list = body_json(
+            app.clone()
+                .oneshot(req("GET", "/api/vault?id=a", &sess, ""))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(list[0]["summary"], "new summary");
     }
 
@@ -420,7 +617,10 @@ pub(crate) mod tests {
     async fn read_missing_vault_is_404() {
         let (state, sess) = test_state("ws-1").await;
         let app = app(state);
-        let resp = app.oneshot(req("GET", "/api/vault/v-doesnotexist?id=a", &sess, "")).await.unwrap();
+        let resp = app
+            .oneshot(req("GET", "/api/vault/v-doesnotexist?id=a", &sess, ""))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -429,7 +629,10 @@ pub(crate) mod tests {
         let (state, sess) = test_state("ws-1").await;
         let app = app(state);
         // No ?id= query param.
-        let resp = app.oneshot(req("POST", "/api/vault", &sess, r#"{"summary":"x"}"#)).await.unwrap();
+        let resp = app
+            .oneshot(req("POST", "/api/vault", &sess, r#"{"summary":"x"}"#))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -455,7 +658,10 @@ pub(crate) mod tests {
         session.astation_id = Some("ws-1".to_string());
         let sess = session.id.clone();
         state.sessions.create(session).await.unwrap();
-        let resp = app(state).oneshot(req("POST", "/api/vault?id=a", &sess, r#"{}"#)).await.unwrap();
+        let resp = app(state)
+            .oneshot(req("POST", "/api/vault?id=a", &sess, r#"{}"#))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -482,7 +688,10 @@ pub(crate) mod tests {
         let state = unbound_state();
         let session_id = bind_session(&state, "ws-1").await;
         assert!(state.identity.unbind(&session_id, "ws-1").await.unwrap());
-        let resp = app(state).oneshot(req("GET", "/api/vault?id=a", &session_id, "")).await.unwrap();
+        let resp = app(state)
+            .oneshot(req("GET", "/api/vault?id=a", &session_id, ""))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -539,7 +748,10 @@ pub(crate) mod tests {
     async fn identity_store_error_is_503() {
         let mut state = unbound_state();
         state.identity = Arc::new(FailingIdentity);
-        let resp = app(state).oneshot(req("GET", "/api/vault?id=a", "some-session", "")).await.unwrap();
+        let resp = app(state)
+            .oneshot(req("GET", "/api/vault?id=a", "some-session", ""))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -551,14 +763,42 @@ pub(crate) mod tests {
         let app = app(state);
 
         // Create one vault in each work session.
-        app.clone().oneshot(req("POST", "/api/vault?id=a", &sess1, r#"{"summary":"in-ws1"}"#)).await.unwrap();
-        app.clone().oneshot(req("POST", "/api/vault?id=b", &sess2, r#"{"summary":"in-ws2"}"#)).await.unwrap();
+        app.clone()
+            .oneshot(req(
+                "POST",
+                "/api/vault?id=a",
+                &sess1,
+                r#"{"summary":"in-ws1"}"#,
+            ))
+            .await
+            .unwrap();
+        app.clone()
+            .oneshot(req(
+                "POST",
+                "/api/vault?id=b",
+                &sess2,
+                r#"{"summary":"in-ws2"}"#,
+            ))
+            .await
+            .unwrap();
 
-        let list1 = body_json(app.clone().oneshot(req("GET", "/api/vault?id=a", &sess1, "")).await.unwrap()).await;
+        let list1 = body_json(
+            app.clone()
+                .oneshot(req("GET", "/api/vault?id=a", &sess1, ""))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(list1.as_array().unwrap().len(), 1);
         assert_eq!(list1[0]["summary"], "in-ws1");
 
-        let list2 = body_json(app.clone().oneshot(req("GET", "/api/vault?id=b", &sess2, "")).await.unwrap()).await;
+        let list2 = body_json(
+            app.clone()
+                .oneshot(req("GET", "/api/vault?id=b", &sess2, ""))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(list2.as_array().unwrap().len(), 1);
         assert_eq!(list2[0]["summary"], "in-ws2");
     }
@@ -567,10 +807,41 @@ pub(crate) mod tests {
     async fn append_returns_incrementing_entry_nos_over_http() {
         let (state, sess) = test_state("ws-1").await;
         let app = app(state);
-        let vault_id = body_json(app.clone().oneshot(req("POST", "/api/vault?id=a", &sess, r#"{}"#)).await.unwrap()).await["vault_id"].as_str().unwrap().to_string();
+        let vault_id = body_json(
+            app.clone()
+                .oneshot(req("POST", "/api/vault?id=a", &sess, r#"{}"#))
+                .await
+                .unwrap(),
+        )
+        .await["vault_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
-        let w1 = body_json(app.clone().oneshot(req("POST", &format!("/api/vault/{}?id=a", vault_id), &sess, r#"{"text":"one"}"#)).await.unwrap()).await;
-        let w2 = body_json(app.clone().oneshot(req("POST", &format!("/api/vault/{}?id=a", vault_id), &sess, r#"{"text":"two"}"#)).await.unwrap()).await;
+        let w1 = body_json(
+            app.clone()
+                .oneshot(req(
+                    "POST",
+                    &format!("/api/vault/{}?id=a", vault_id),
+                    &sess,
+                    r#"{"text":"one"}"#,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let w2 = body_json(
+            app.clone()
+                .oneshot(req(
+                    "POST",
+                    &format!("/api/vault/{}?id=a", vault_id),
+                    &sess,
+                    r#"{"text":"two"}"#,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(w1["entry_no"], 1);
         assert_eq!(w2["entry_no"], 2);
     }

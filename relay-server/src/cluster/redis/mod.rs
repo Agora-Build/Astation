@@ -122,7 +122,9 @@ impl RedisConn {
             .set_number_of_retries(0);
         let connecting = async {
             let mut manager = client.get_connection_manager_with_config(config).await?;
-            redis::cmd("PING").query_async::<String>(&mut manager).await?;
+            redis::cmd("PING")
+                .query_async::<String>(&mut manager)
+                .await?;
             Ok::<_, redis::RedisError>(manager)
         };
         let manager = tokio::time::timeout(REDIS_TIMEOUT, connecting)
@@ -151,7 +153,10 @@ impl RedisConn {
 
     pub async fn ping(&self) -> Result<(), StoreError> {
         self.run(|mut c| async move {
-            redis::cmd("PING").query_async::<String>(&mut c).await.map(|_| ())
+            redis::cmd("PING")
+                .query_async::<String>(&mut c)
+                .await
+                .map(|_| ())
         })
         .await
     }
@@ -195,7 +200,14 @@ pub async fn connect_cluster(
     identity: Arc<dyn IdentityStore>,
     auth_timeout: Duration,
 ) -> Result<RedisCluster, StoreError> {
-    Ok(connect_cluster_with_keys(url, identity, KeyCache::new(), auth_timeout).await?)
+    Ok(connect_cluster_with_keys(
+        url,
+        identity,
+        KeyCache::new(),
+        auth_timeout,
+        crate::cluster::limits::DEFAULT_WS_MAX_PER_IP,
+    )
+    .await?)
 }
 
 /// Build a replica on Redis around `keys` (already loaded by the caller):
@@ -208,6 +220,7 @@ pub async fn connect_cluster_with_keys(
     identity: Arc<dyn IdentityStore>,
     keys: KeyCache,
     auth_timeout: Duration,
+    ws_max_per_ip: usize,
 ) -> Result<RedisCluster, ConnectError> {
     let conn = RedisConn::connect_checked(url).await?;
     let replica_id = new_replica_id();
@@ -217,15 +230,21 @@ pub async fn connect_cluster_with_keys(
         Err(error) => {
             // Don't leave a presence key behind for a replica that never ran.
             if let Err(withdraw_error) = health.withdraw().await {
-                tracing::debug!("Could not withdraw replica {}: {}", replica_id, withdraw_error);
+                tracing::debug!(
+                    "Could not withdraw replica {}: {}",
+                    replica_id,
+                    withdraw_error
+                );
             }
             return Err(error.into());
         }
     };
     let waiters = ReplyWaiters::default();
-    let directory: Arc<dyn RoomDirectory> = Arc::new(directory::RedisRoomDirectory::new(conn.clone()));
+    let directory: Arc<dyn RoomDirectory> =
+        Arc::new(directory::RedisRoomDirectory::new(conn.clone()));
     let bus: Arc<dyn ReplicaBus> = Arc::new(bus);
-    let rate_limiter: Arc<dyn SharedRateLimiter> = Arc::new(ratelimit::RedisRateLimiter::new(conn.clone()));
+    let rate_limiter: Arc<dyn SharedRateLimiter> =
+        Arc::new(ratelimit::RedisRateLimiter::new(conn.clone()));
     tracing::info!(
         "Relay replica {} backends: rooms={}, bus={}, rate limits={}",
         replica_id,
@@ -243,13 +262,15 @@ pub async fn connect_cluster_with_keys(
         health: Arc::new(health.clone()),
         cache_rooms: true,
         auth_timeout,
-        ws_limiter: crate::cluster::limits::WsConnLimiter::from_env(),
+        ws_limiter: crate::cluster::limits::WsConnLimiter::new(ws_max_per_ip),
     });
     let dispatcher = relay.spawn_bus_dispatcher(identity, waiters.clone(), events);
     let presence_task = health.spawn_refresh();
     tracing::info!("Relay replica {} joined the cluster", replica_id);
     Ok(RedisCluster {
-        sessions: SessionStore::with_backend(Arc::new(sessions::RedisSessionBackend::new(conn.clone()))),
+        sessions: SessionStore::with_backend(Arc::new(sessions::RedisSessionBackend::new(
+            conn.clone(),
+        ))),
         voice_sessions: VoiceSessionStore::with_backend(Arc::new(voice::RedisVoiceBackend::new(
             conn.clone(),
             waiters,
@@ -293,8 +314,8 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn test_url() -> String {
-        let url = std::env::var("TEST_REDIS_URL")
-            .expect("set TEST_REDIS_URL to run the Redis tests");
+        let url =
+            std::env::var("TEST_REDIS_URL").expect("set TEST_REDIS_URL to run the Redis tests");
         assert!(
             is_local_redis_url(&url),
             "TEST_REDIS_URL must point at localhost; the tests empty the database"
@@ -304,7 +325,9 @@ pub(crate) mod test_support {
 
     /// Empty the test database.
     pub(crate) async fn flush() {
-        let conn = RedisConn::connect(&test_url()).await.expect("connect TEST_REDIS_URL");
+        let conn = RedisConn::connect(&test_url())
+            .await
+            .expect("connect TEST_REDIS_URL");
         conn.run(|mut c| async move { redis::cmd("FLUSHDB").query_async::<()>(&mut c).await })
             .await
             .expect("FLUSHDB");
@@ -313,7 +336,9 @@ pub(crate) mod test_support {
     /// An empty database and a connection to it.
     pub(crate) async fn fresh_conn() -> RedisConn {
         flush().await;
-        RedisConn::connect(&test_url()).await.expect("connect TEST_REDIS_URL")
+        RedisConn::connect(&test_url())
+            .await
+            .expect("connect TEST_REDIS_URL")
     }
 }
 
@@ -329,7 +354,9 @@ mod tests {
         assert!(is_local_redis_url("redis://:pw@[::1]:6379"));
         assert!(!is_local_redis_url("redis://valkey.internal:6379"));
         assert!(!is_local_redis_url("redis://localhost.evil.com:6379"));
-        assert!(!is_local_redis_url("redis://localhost@prod.example.com:6379"));
+        assert!(!is_local_redis_url(
+            "redis://localhost@prod.example.com:6379"
+        ));
         assert!(!is_local_redis_url("rediss://127.0.0.1:6379"));
         assert!(!is_local_redis_url("redis://evil.com#@localhost"));
         assert!(!is_local_redis_url("redis://127.0.0.1.evil.com"));
@@ -342,9 +369,16 @@ mod tests {
     #[tokio::test]
     async fn unreachable_redis_is_a_store_error() {
         let started = std::time::Instant::now();
-        let error = RedisConn::connect("redis://127.0.0.1:1/").await.err().expect("no server on port 1");
+        let error = RedisConn::connect("redis://127.0.0.1:1/")
+            .await
+            .err()
+            .expect("no server on port 1");
         assert!(matches!(error, StoreError::Unavailable(_)));
-        assert!(started.elapsed() < REDIS_TIMEOUT, "took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < REDIS_TIMEOUT,
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -354,10 +388,22 @@ mod tests {
         let timed_out = RedisError::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
         assert!(!is_permanent_connect_error(&refused));
         assert!(!is_permanent_connect_error(&timed_out));
-        assert!(!is_permanent_connect_error(&RedisError::from((ErrorKind::BusyLoadingError, "loading"))));
-        assert!(!is_permanent_connect_error(&RedisError::from((ErrorKind::TryAgain, "try again"))));
-        assert!(is_permanent_connect_error(&RedisError::from((ErrorKind::InvalidClientConfig, "bad url"))));
-        assert!(is_permanent_connect_error(&RedisError::from((ErrorKind::AuthenticationFailed, "wrong password"))));
+        assert!(!is_permanent_connect_error(&RedisError::from((
+            ErrorKind::BusyLoadingError,
+            "loading"
+        ))));
+        assert!(!is_permanent_connect_error(&RedisError::from((
+            ErrorKind::TryAgain,
+            "try again"
+        ))));
+        assert!(is_permanent_connect_error(&RedisError::from((
+            ErrorKind::InvalidClientConfig,
+            "bad url"
+        ))));
+        assert!(is_permanent_connect_error(&RedisError::from((
+            ErrorKind::AuthenticationFailed,
+            "wrong password"
+        ))));
         for code in ["NOAUTH", "WRONGPASS"] {
             // A server error reply with a code redis-rs has no kind for.
             let reply = format!("-{code} authentication problem\r\n");
@@ -373,7 +419,11 @@ mod tests {
 
     #[tokio::test]
     async fn bad_redis_url_is_permanent_and_never_echoed() {
-        for url in ["not a url", "redis://:hunter2@127.0.0.1:notaport/", "http://:hunter2@127.0.0.1/"] {
+        for url in [
+            "not a url",
+            "redis://:hunter2@127.0.0.1:notaport/",
+            "http://:hunter2@127.0.0.1/",
+        ] {
             match RedisConn::connect_checked(url).await {
                 Err(ConnectError::Permanent(message)) => {
                     assert!(!message.contains("hunter2"), "{message}");
@@ -387,7 +437,10 @@ mod tests {
 
     #[tokio::test]
     async fn refused_redis_is_retryable() {
-        let error = RedisConn::connect_checked("redis://127.0.0.1:1/").await.err().expect("no server on port 1");
+        let error = RedisConn::connect_checked("redis://127.0.0.1:1/")
+            .await
+            .err()
+            .expect("no server on port 1");
         assert!(matches!(error, ConnectError::Retryable(_)), "{error}");
     }
 
@@ -399,13 +452,20 @@ mod tests {
         let identity: std::sync::Arc<dyn crate::identity_store::IdentityStore> =
             std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new());
         let timeout = std::time::Duration::from_secs(10);
-        let one = connect_cluster(&test_url(), identity.clone(), timeout).await.unwrap();
-        let two = connect_cluster(&test_url(), identity, timeout).await.unwrap();
+        let one = connect_cluster(&test_url(), identity.clone(), timeout)
+            .await
+            .unwrap();
+        let two = connect_cluster(&test_url(), identity, timeout)
+            .await
+            .unwrap();
         assert_ne!(one.relay.replica_id(), two.relay.replica_id());
         assert_eq!(one.health.refresh().await.unwrap(), 2);
         assert_eq!(one.relay.redis_status().await, "ok");
         assert_eq!(one.relay.replica_count(), 2);
-        one.relay.create_room("ROOM-C", "h", 1_700_000_000).await.unwrap();
+        one.relay
+            .create_room("ROOM-C", "h", 1_700_000_000)
+            .await
+            .unwrap();
         assert!(two.relay.room("ROOM-C").await.unwrap().is_some());
         one.abort();
         two.abort();
@@ -418,12 +478,21 @@ mod tests {
         let conn = fresh_conn().await;
         conn.ping().await.unwrap();
         conn.run(|mut c| async move {
-            redis::cmd("SET").arg("relay:test").arg("v").query_async::<()>(&mut c).await
+            redis::cmd("SET")
+                .arg("relay:test")
+                .arg("v")
+                .query_async::<()>(&mut c)
+                .await
         })
         .await
         .unwrap();
         let value: Option<String> = conn
-            .run(|mut c| async move { redis::cmd("GET").arg("relay:test").query_async(&mut c).await })
+            .run(|mut c| async move {
+                redis::cmd("GET")
+                    .arg("relay:test")
+                    .query_async(&mut c)
+                    .await
+            })
             .await
             .unwrap();
         assert_eq!(value.as_deref(), Some("v"));

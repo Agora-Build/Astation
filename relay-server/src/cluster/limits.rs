@@ -1,6 +1,8 @@
 //! Connection admission (spec: "Connection limits"): at most
 //! RELAY_WS_MAX_PER_IP concurrent `/ws` connections per client IP on each
-//! replica. (The pending-Astation cap per room lives in the directory.)
+//! replica. The key is the raw header string (no IP normalization), so
+//! without Cloudflare in front a client can vary it, and IPv6 clients can
+//! rotate addresses within their /64. (The pending-Astation cap per room lives in the directory.)
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -42,13 +44,18 @@ impl WsConnLimiter {
         }
     }
 
-    pub fn from_env() -> Self {
-        let max = std::env::var("RELAY_WS_MAX_PER_IP")
-            .ok()
-            .and_then(|value| value.trim().parse().ok())
-            .filter(|max: &usize| *max > 0)
-            .unwrap_or(DEFAULT_WS_MAX_PER_IP);
-        Self::new(max)
+    /// RELAY_WS_MAX_PER_IP: unset or blank means the default; anything else
+    /// must be a positive integer.
+    pub fn parse_max(value: Option<&str>) -> Result<usize, String> {
+        match value.map(str::trim) {
+            None | Some("") => Ok(DEFAULT_WS_MAX_PER_IP),
+            Some(raw) => match raw.parse::<usize>() {
+                Ok(max) if max > 0 => Ok(max),
+                _ => Err(format!(
+                    "RELAY_WS_MAX_PER_IP must be a positive integer (WebSockets allowed per client IP), got {raw:?}"
+                )),
+            },
+        }
     }
 
     pub fn try_acquire(&self, ip: &str) -> Option<WsPermit> {
@@ -108,6 +115,20 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_max_is_strict() {
+        assert_eq!(WsConnLimiter::parse_max(None), Ok(DEFAULT_WS_MAX_PER_IP));
+        assert_eq!(
+            WsConnLimiter::parse_max(Some("  ")),
+            Ok(DEFAULT_WS_MAX_PER_IP)
+        );
+        assert_eq!(WsConnLimiter::parse_max(Some(" 50 ")), Ok(50));
+        for bad in ["0", "-1", "abc", "1.5"] {
+            let message = WsConnLimiter::parse_max(Some(bad)).unwrap_err();
+            assert!(message.contains("RELAY_WS_MAX_PER_IP"), "{message}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -115,7 +136,10 @@ mod tests {
         let limiter = WsConnLimiter::new(2);
         let a1 = limiter.try_acquire("203.0.113.1").expect("first");
         let _a2 = limiter.try_acquire("203.0.113.1").expect("second");
-        assert!(limiter.try_acquire("203.0.113.1").is_none(), "third is over the cap");
+        assert!(
+            limiter.try_acquire("203.0.113.1").is_none(),
+            "third is over the cap"
+        );
         let _b1 = limiter.try_acquire("203.0.113.2").expect("another IP");
         assert_eq!(limiter.open("203.0.113.1"), 2);
         drop(a1);
@@ -130,8 +154,14 @@ mod tests {
         let held: Vec<_> = (0..200)
             .map(|_| limiter.try_acquire("203.0.113.1").expect("within the cap"))
             .collect();
-        assert!(limiter.try_acquire("203.0.113.1").is_none(), "201st is refused");
-        assert!(limiter.try_acquire("203.0.113.2").is_some(), "other IPs are unaffected");
+        assert!(
+            limiter.try_acquire("203.0.113.1").is_none(),
+            "201st is refused"
+        );
+        assert!(
+            limiter.try_acquire("203.0.113.2").is_some(),
+            "other IPs are unaffected"
+        );
         drop(held);
         assert_eq!(limiter.open("203.0.113.1"), 0);
     }

@@ -25,7 +25,13 @@ impl SharedRateLimiter for RedisRateLimiter {
         "redis"
     }
 
-    async fn hit(&self, bucket: &str, ip: &str, limit: u64, now: i64) -> Result<RateDecision, StoreError> {
+    async fn hit(
+        &self,
+        bucket: &str,
+        ip: &str,
+        limit: u64,
+        now: i64,
+    ) -> Result<RateDecision, StoreError> {
         let key = keys::rate(bucket, ip, now.div_euclid(60));
         // INCR and EXPIRE in one MULTI/EXEC: a counter never exists without its expiry.
         let (count,): (u64,) = self
@@ -57,15 +63,32 @@ mod tests {
         let one = RedisRateLimiter::new(conn.clone());
         let two = RedisRateLimiter::new(conn.clone()); // another replica
         let now = 1_699_999_990; // 10 s into its minute
-        assert_eq!(one.hit("grant", "203.0.113.5", 2, now).await.unwrap(), RateDecision::Allowed);
-        assert_eq!(two.hit("grant", "203.0.113.5", 2, now).await.unwrap(), RateDecision::Allowed);
         assert_eq!(
             one.hit("grant", "203.0.113.5", 2, now).await.unwrap(),
-            RateDecision::Limited { retry_after_secs: 50 }
+            RateDecision::Allowed
         );
-        assert_eq!(one.hit("grant", "203.0.113.6", 2, now).await.unwrap(), RateDecision::Allowed);
-        assert_eq!(one.hit("general", "203.0.113.5", 2, now).await.unwrap(), RateDecision::Allowed);
-        assert_eq!(one.hit("grant", "203.0.113.5", 2, now + 60).await.unwrap(), RateDecision::Allowed);
+        assert_eq!(
+            two.hit("grant", "203.0.113.5", 2, now).await.unwrap(),
+            RateDecision::Allowed
+        );
+        assert_eq!(
+            one.hit("grant", "203.0.113.5", 2, now).await.unwrap(),
+            RateDecision::Limited {
+                retry_after_secs: 50
+            }
+        );
+        assert_eq!(
+            one.hit("grant", "203.0.113.6", 2, now).await.unwrap(),
+            RateDecision::Allowed
+        );
+        assert_eq!(
+            one.hit("general", "203.0.113.5", 2, now).await.unwrap(),
+            RateDecision::Allowed
+        );
+        assert_eq!(
+            one.hit("grant", "203.0.113.5", 2, now + 60).await.unwrap(),
+            RateDecision::Allowed
+        );
         let key = keys::rate("grant", "203.0.113.5", now / 60);
         let ttl: i64 = conn
             .run(|mut c| async move { redis::cmd("TTL").arg(&key).query_async(&mut c).await })
