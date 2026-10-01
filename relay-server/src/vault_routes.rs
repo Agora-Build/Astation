@@ -77,9 +77,12 @@ pub(crate) async fn resolve_caller(
     })
 }
 
+/// Same account only. `client_id` is the caller's own `?id=` claim, which the
+/// relay can't verify, so it labels who wrote an entry but never grants
+/// access: honoring it here let any session read another account's vaults by
+/// claiming a past writer's id.
 fn can_read(meta: &VaultMeta, caller: &Caller) -> bool {
     caller.work_session_id == meta.work_session_id
-        || meta.writer_list.iter().any(|w| w == &caller.client_id)
 }
 
 fn can_write(meta: &VaultMeta, caller: &Caller) -> bool {
@@ -128,7 +131,7 @@ pub async fn list_vaults_handler(
     let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
     let items = state
         .vault
-        .list_readable(&caller.work_session_id, &caller.client_id)
+        .list_readable(&caller.work_session_id)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     Ok(Json(serde_json::to_value(items).unwrap()))
@@ -365,7 +368,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn authz_out_of_session_past_writer_read_only() {
+    async fn authz_other_account_cannot_read_by_claiming_a_writer_id() {
         // Vault created in ws-1 by client-a, who becomes a writer.
         let (state, sess1) = test_state("ws-1").await;
         // Add a second session bound to a different work session ws-2.
@@ -376,11 +379,15 @@ pub(crate) mod tests {
         // client-a writes → becomes a past writer.
         app.clone().oneshot(req("POST", &format!("/api/vault/{}?id=client-a", vault_id), &sess1, r#"{"text":"x"}"#)).await.unwrap();
 
-        // Out-of-session (ws-2) but past-writer client-a: read OK.
+        // Another account (ws-2) claiming writer client-a's id: read FORBIDDEN.
         let read = app.clone().oneshot(req("GET", &format!("/api/vault/{}?id=client-a", vault_id), &sess2, "")).await.unwrap();
-        assert_eq!(read.status(), StatusCode::OK);
+        assert_eq!(read.status(), StatusCode::FORBIDDEN);
 
-        // Out-of-session past-writer: write FORBIDDEN.
+        // ...and it isn't listed for them either.
+        let list = body_json(app.clone().oneshot(req("GET", "/api/vault?id=client-a", &sess2, "")).await.unwrap()).await;
+        assert_eq!(list, serde_json::json!([]));
+
+        // Same claim: write FORBIDDEN.
         let write = app.clone().oneshot(req("POST", &format!("/api/vault/{}?id=client-a", vault_id), &sess2, r#"{"text":"y"}"#)).await.unwrap();
         assert_eq!(write.status(), StatusCode::FORBIDDEN);
 

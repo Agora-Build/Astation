@@ -83,10 +83,10 @@ pub trait VaultStore: Send + Sync {
         summary: &str,
     ) -> Result<String, VaultError>;
 
+    /// Vaults in this account (work session).
     async fn list_readable(
         &self,
         work_session_id: &str,
-        client_id: &str,
     ) -> Result<Vec<VaultListItem>, VaultError>;
 
     async fn read(
@@ -195,15 +195,11 @@ impl VaultStore for InMemoryVaultStore {
     async fn list_readable(
         &self,
         work_session_id: &str,
-        client_id: &str,
     ) -> Result<Vec<VaultListItem>, VaultError> {
         let vaults = self.vaults.read().await;
         let mut out: Vec<(i64, VaultListItem)> = vaults
             .iter()
-            .filter(|(_, v)| {
-                v.work_session_id == work_session_id
-                    || v.writer_list.iter().any(|w| w == client_id)
-            })
+            .filter(|(_, v)| v.work_session_id == work_session_id)
             .map(|(id, v)| {
                 let first_seq = v.entries.first().map(|e| e.seq).unwrap_or(i64::MAX);
                 (
@@ -402,15 +398,13 @@ impl VaultStore for PgVaultStore {
     async fn list_readable(
         &self,
         work_session_id: &str,
-        client_id: &str,
     ) -> Result<Vec<VaultListItem>, VaultError> {
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT vault_id, summary FROM vaults \
-             WHERE work_session_id = $1 OR $2 = ANY(writer_list) \
+             WHERE work_session_id = $1 \
              ORDER BY created_at ASC",
         )
         .bind(work_session_id)
-        .bind(client_id)
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
@@ -644,22 +638,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_readable_in_session_and_past_writer() {
+    async fn list_readable_is_this_account_only() {
         let store = InMemoryVaultStore::new();
         let id = store.create_vault("ws-1", "a", "vault one").await.unwrap();
         store.add_writer(&id, "past-writer").await.unwrap();
 
-        // In-session caller sees it.
-        let in_session = store.list_readable("ws-1", "anyone").await.unwrap();
-        assert_eq!(in_session.len(), 1);
-
-        // Out-of-session past writer sees it.
-        let past = store.list_readable("ws-other", "past-writer").await.unwrap();
-        assert_eq!(past.len(), 1);
-
-        // Out-of-session stranger does not.
-        let stranger = store.list_readable("ws-other", "stranger").await.unwrap();
-        assert_eq!(stranger.len(), 0);
+        assert_eq!(store.list_readable("ws-1").await.unwrap().len(), 1);
+        // Having written to it doesn't list it in another account.
+        assert_eq!(store.list_readable("ws-other").await.unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -739,7 +725,7 @@ mod tests {
         let store = InMemoryVaultStore::new();
         let id = store.create_vault("ws-1", "a", "old").await.unwrap();
         store.set_summary(&id, "new").await.unwrap();
-        let items = store.list_readable("ws-1", "a").await.unwrap();
+        let items = store.list_readable("ws-1").await.unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].summary, "new");
     }
