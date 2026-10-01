@@ -35,6 +35,7 @@ use crate::AppState;
 
 /// A TCP forwarder in front of Valkey. `cut()` drops every link and
 /// refuses new ones: that replica loses Redis, the other doesn't.
+/// `restore()` lets new connections through again.
 struct CutProxy {
     port: u16,
     cut: Arc<AtomicBool>,
@@ -76,6 +77,11 @@ impl CutProxy {
         for link in self.links.lock().unwrap().drain(..) {
             link.abort();
         }
+    }
+
+    /// Redis is back: new connections pass again (cut links stay cut).
+    fn restore(&self) {
+        self.cut.store(false, Ordering::SeqCst);
     }
 }
 
@@ -122,7 +128,6 @@ struct Replica {
     cluster: RedisCluster,
     /// ws://127.0.0.1:<port>/ws
     ws: String,
-    #[allow(dead_code)] // used from Task 23 (Redis outage) and Task 25 (drain)
     proxy: CutProxy,
     server: JoinHandle<()>,
     /// The 60 s sweeps `main` runs (sessions, rooms, RTC, voice).
@@ -144,7 +149,6 @@ impl Replica {
 
     /// Crash: Redis goes first (so nothing is cleaned up), then every
     /// socket drops and the replica's tasks stop.
-    #[allow(dead_code)] // used from Task 23 (Redis outage) and Task 25 (drain)
     fn crash(&self) {
         self.proxy.cut();
         self.stop_tasks();
@@ -252,7 +256,6 @@ async fn wait_closed(socket: &mut TestSocket) {
 }
 
 /// The close code the relay sent (0: closed without one).
-#[allow(dead_code)] // used from Task 23 (Redis outage) and Task 25 (drain)
 async fn expect_close_code(socket: &mut TestSocket) -> u16 {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -268,7 +271,6 @@ async fn expect_close_code(socket: &mut TestSocket) -> u16 {
 }
 
 /// The HTTP status a refused WebSocket upgrade got.
-#[allow(dead_code)] // used from Task 23 (Redis outage) and Task 25 (drain)
 async fn refused_status(url: String) -> u16 {
     match tokio_tungstenite::connect_async(url).await {
         Err(tokio_tungstenite::tungstenite::Error::Http(response)) => response.status().as_u16(),
@@ -648,4 +650,217 @@ async fn redis_concurrent_rtc_joins_across_replicas_hold_the_cap() {
     let mut stored_uids: Vec<u32> = stored.participants.iter().map(|p| p.uid).collect();
     stored_uids.sort();
     assert_eq!(stored_uids, uids, "replica 2 sees exactly the uids handed out");
+}
+
+#[tokio::test]
+async fn cut_proxy_refuses_while_cut_and_passes_again_after_restore() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // An echo server stands in for Valkey.
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = echo.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = echo.accept().await {
+            tokio::spawn(async move {
+                let (mut read, mut write) = socket.split();
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    });
+    let proxy = CutProxy::start(target).await;
+    // Ok(true): echoed; Ok(false): the proxy closed the connection.
+    let round_trip = |port: u16| async move {
+        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        if socket.write_all(b"ping").await.is_err() {
+            return false;
+        }
+        let mut buf = [0u8; 4];
+        let read = tokio::time::timeout(Duration::from_secs(5), socket.read_exact(&mut buf))
+            .await
+            .expect("no answer and no close within 5 s");
+        read.is_ok() && &buf == b"ping"
+    };
+    assert!(round_trip(proxy.port).await, "passes before the cut");
+    let mut held = tokio::net::TcpStream::connect(("127.0.0.1", proxy.port)).await.unwrap();
+    held.write_all(b"ping").await.unwrap();
+    let mut buf = [0u8; 4];
+    held.read_exact(&mut buf).await.unwrap();
+
+    proxy.cut();
+    assert!(!round_trip(proxy.port).await, "refused while cut");
+    let mut rest = Vec::new();
+    let dropped = tokio::time::timeout(Duration::from_secs(5), held.read_to_end(&mut rest)).await;
+    assert!(dropped.is_ok(), "the open link is dropped by the cut");
+
+    proxy.restore();
+    assert!(round_trip(proxy.port).await, "passes again after restore");
+    proxy.cut();
+    assert!(!round_trip(proxy.port).await, "can be cut again");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn redis_a_crashed_replica_is_recovered_by_reconnecting_clients() {
+    let _guard = REDIS_LOCK.lock().await;
+    let (_shared, one, two) = two_replicas().await;
+    let code = "astation-crash";
+    let key = TestKey::generate();
+    let mut astation = verified_astation(&one.ws, code, &key, "registered").await;
+    let mut atem = connect_atem(&two.ws, code, "atem-a").await;
+    assert_eq!(next_client_json(&mut astation).await["relay_event"], "connected");
+    eventually("replica 2 knows the key", || two.state.relay.keys().contains(code)).await;
+
+    one.crash();
+    wait_closed(&mut astation).await;
+
+    // The Astation reconnects to the healthy replica; its promotion
+    // replaces the owner entry the dead replica left behind.
+    let mut astation = verified_astation(&two.ws, code, &key, "verified").await;
+    let connected = next_client_json(&mut astation).await;
+    assert_eq!(connected["relay_event"], "connected");
+    assert_eq!(connected["atem_id"], "atem-a");
+    send_json(&mut atem, serde_json::json!({"probe": "after-crash"})).await;
+    assert_eq!(next_client_json(&mut astation).await["payload"]["probe"], "after-crash");
+    send_json(&mut astation, serde_json::json!({"probe": "to-atem"})).await;
+    assert_eq!(next_client_json(&mut atem).await["probe"], "to-atem");
+
+    let (status, pair) = http(&two.state, "GET", &format!("/api/pair/{code}"), "", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(pair["astation_connected"], true);
+    assert_eq!(pair["paired"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn redis_down_means_503s_but_vault_and_memory_keep_working() {
+    let _guard = REDIS_LOCK.lock().await;
+    let (shared, one, two) = two_replicas().await;
+    let now = chrono::Utc::now().timestamp();
+    shared.identity.bind("sess-down", "astation-down", now).await.unwrap();
+
+    one.proxy.cut();
+
+    for (method, uri, body) in [
+        ("POST", "/api/pair", r#"{"hostname":"h"}"#),
+        ("POST", "/api/sessions", r#"{"hostname":"h"}"#),
+        ("POST", "/api/rtc-sessions", r#"{"app_id":"a","channel":"c","token":"t","host_uid":1}"#),
+        ("POST", "/api/voice-sessions", r#"{"atem_id":"a","channel":"c"}"#),
+    ] {
+        let (status, _) = http(&one.state, method, uri, body, &[]).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{method} {uri}");
+    }
+    let (status, health) = http(&one.state, "GET", "/health", "", &[]).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(health["redis"], "unavailable");
+    assert_eq!(
+        refused_status(format!("{}?role=astation&code=astation-down", one.ws)).await,
+        503
+    );
+
+    // Vault and Atem Memory only need Postgres.
+    let auth = [("authorization", "session sess-down")];
+    let (status, _) = http(&one.state, "POST", "/api/vault?id=atem-a", r#"{"summary":"x"}"#, &auth).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = http(&one.state, "GET", "/api/memory?id=atem-a", "", &auth).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The other replica is unaffected.
+    let (status, health) = http(&two.state, "GET", "/health", "", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["redis"], "ok");
+}
+
+/// Poll an async check every 100 ms for up to 10 s.
+async fn eventually_async<F, Fut>(what: &str, check: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..100 {
+        if check().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("timed out waiting until {what}");
+}
+
+/// Subscribers on a replica's bus inbox, asked of Valkey directly.
+async fn inbox_subscribers(replica: &Replica) -> i64 {
+    let conn = crate::cluster::redis::RedisConn::connect(&crate::cluster::redis::test_support::test_url())
+        .await
+        .expect("connect TEST_REDIS_URL");
+    let channel = crate::cluster::redis::keys::inbox_channel(replica.id());
+    let counts: Vec<(String, i64)> = conn
+        .run(|mut c| async move { redis::cmd("PUBSUB").arg("NUMSUB").arg(channel).query_async(&mut c).await })
+        .await
+        .unwrap();
+    counts.first().map(|(_, count)| *count).unwrap_or(0)
+}
+
+/// An outage that starts after a WebSocket was upgraded closes it with 1013
+/// (try again later); when Redis returns, the replica serves again and
+/// rooms rebuild as clients reconnect, with nothing durable lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn redis_outage_closes_with_1013_and_the_replica_recovers_when_redis_returns() {
+    let _guard = REDIS_LOCK.lock().await;
+    let (shared, one, two) = two_replicas().await;
+    let code = "astation-outage";
+    let key = TestKey::generate();
+    let now = chrono::Utc::now().timestamp();
+    shared.identity.bind("sess-outage", code, now).await.unwrap();
+    let auth = [("authorization", "session sess-outage")];
+    let (status, created) =
+        http(&one.state, "POST", "/api/vault?id=atem-a", r#"{"summary":"before"}"#, &auth).await;
+    assert_eq!(status, StatusCode::OK);
+    let vault_id = created["vault_id"].as_str().unwrap().to_string();
+    let mut owner = verified_astation(&one.ws, code, &key, "registered").await;
+
+    // Upgraded before the outage, proving its key during it: the promotion
+    // needs Redis, so the relay closes the socket with 1013.
+    let (mut late, challenge) = connect_astation(&one.ws, code).await;
+    one.proxy.cut();
+    let result = authenticate(&mut late, &key, code, &challenge).await;
+    assert_eq!(result["status"], "verified", "{result}");
+    assert_eq!(expect_close_code(&mut late).await, 1013);
+    assert_eq!(refused_status(format!("{}?role=atem&code={code}&atem_id=atem-a", one.ws)).await, 503);
+
+    // Keep Redis away until replica one's bus has lost its subscription
+    // and failed to resubscribe a few times (backoff 0.1 s, 0.2 s, 0.4 s).
+    eventually_async("replica one's bus lost Redis", || async { inbox_subscribers(&one).await == 0 }).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    one.proxy.restore();
+    eventually_async("/health recovers", || async {
+        let (status, health) = http(&one.state, "GET", "/health", "", &[]).await;
+        status == StatusCode::OK && health["redis"] == "ok"
+    })
+    .await;
+    let (status, _) = http(&one.state, "POST", "/api/pair", r#"{"hostname":"h"}"#, &[]).await;
+    assert_eq!(status, StatusCode::CREATED);
+    // Frames to replica one need its bus back (the subscriber retries with backoff).
+    eventually_async("replica one's bus resubscribes", || async { inbox_subscribers(&one).await == 1 }).await;
+
+    // The room rebuilds: the key survived (verified, not registered again),
+    // the new promotion evicts the owner from before the outage, and an
+    // Atem on the other replica reaches the new owner both ways.
+    let mut astation = verified_astation(&one.ws, code, &key, "verified").await;
+    wait_closed(&mut owner).await;
+    let mut atem = connect_atem(&two.ws, code, "atem-a").await;
+    let connected = next_client_json(&mut astation).await;
+    assert_eq!(connected["relay_event"], "connected");
+    assert_eq!(connected["atem_id"], "atem-a");
+    send_json(&mut atem, serde_json::json!({"probe": "after-outage"})).await;
+    assert_eq!(next_client_json(&mut astation).await["payload"]["probe"], "after-outage");
+    send_json(&mut astation, serde_json::json!({"probe": "to-atem"})).await;
+    assert_eq!(next_client_json(&mut atem).await["probe"], "to-atem");
+
+    // Nothing durable was lost.
+    let (status, vaults) = http(&one.state, "GET", "/api/vault?id=atem-a", "", &auth).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        vaults.as_array().unwrap().iter().any(|v| v["vault_id"] == vault_id.as_str()),
+        "{vaults}"
+    );
 }
