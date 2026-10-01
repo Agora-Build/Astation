@@ -190,10 +190,21 @@ Vault). All requests require `Authorization: session <session_id>` and
 astation_id) — atems paired to different astations never see each other's
 memories or skills.
 
-- `POST /api/memory/batch {ops: [...]}` → `{"results": [OpResult]}` - Batch add/delete memory ops (body limit 2 MB, at most 64 ops)
+- `POST /api/memory/batch {ops: [...]}` → `{"results": [OpResult]}` - Batch add/delete/invalidate memory ops (body limit 2 MB, at most 64 ops)
 - `GET /api/memory [?since=<seq>&limit=<n>]` → `{"memories": [MemoryRow]}` - Pull memories (default `since=0`, `limit=200`, capped at 500). There is no `next_since`: the next cursor is the highest `seq` in the page.
 - `POST /api/skills/batch {ops: [...]}` → `{"results": [OpResult]}` - Batch push/delete/purge skill ops (body limit 16 MB, at most 16 ops)
 - `GET /api/skills [?since=<seq>&limit=<n>]` → `{"skills": [SkillRow]}` - Pull skills (default `since=0`, `limit=200`, capped at 500; no `next_since`)
+- `GET /api/skills/versions?scope=&project=&name=` → `{"versions": [{version, created_at, source_agent, source_machine, file_count, deleted, purged}]}` - One skill's history, newest first, no file contents (unknown skill → empty list)
+- `GET /api/skills/version?scope=&project=&name=&version=<n>` → `{"skill": SkillRow}` - One version with its files. 404 `no such skill version` (unknown, or another account's), 410 `skill version purged`; a delete marker comes back as `deleted: true` with `files: {}`. A bad scope/name → 400 `invalid skill`, no `version` → 400 `missing version`
+
+Memory ops and validity (Atem Memory 1.1, migration 0004):
+
+- `{"op":"add","memory":MemoryRow}` — the row may carry `valid_at` (when the fact became true; must be > 0). The client's `deleted`, `deleted_at`, `invalid_at`, `superseded_by` and `seq` are ignored.
+- `{"op":"delete","id"}` — blanks the text and sets `deleted_at` (the first deletion time is kept).
+- `{"op":"invalidate","id","invalid_at","superseded_by"?}` — marks a fact outdated without touching its text; `invalid_at` must be > 0. **Final:** once set it never changes. A repeat, or an unknown, deleted or other-account id, is `{ok:true, seq:0}` (no change). A change takes a new `seq`, so every atem pulls it. `superseded_by` is only a hint: it is not checked for existence or account.
+- Within one batch, a `delete`/`invalidate` whose `id` or `superseded_by` names an id an earlier `add` was deduplicated onto is rewritten to that `canonical_id`.
+- Memory rows carry `deleted` (computed from `deleted_at`, for older atems), `deleted_at`, `valid_at`, `invalid_at` and `superseded_by`. The dedup index covers only rows that are neither deleted nor invalid, so a fact that becomes true again is a new memory.
+- `purge` also sets `skill_versions.purged` (migration 0005); that's the `purged` flag in skill history. Versions purged before 0005 report as `deleted`.
 
 Batch requests are authenticated before the body is read (so an
 unauthenticated client can't make the relay buffer a large body), then:
@@ -209,7 +220,7 @@ unauthenticated client can't make the relay buffer a large body), then:
 | Per-op input problem | 200, that op's result is `{ok:false,error:"..."}`; the rest still apply |
 
 A 503 is transient: atem keeps every op queued and retries, which is safe
-(add is idempotent by id, delete/purge are idempotent, a retried skill push
+(add is idempotent by id, delete/invalidate/purge are idempotent, a retried skill push
 appends a harmless duplicate version). Per-op refusals are permanent (atem
 acks them), so they are only ever input problems:
 
@@ -218,8 +229,9 @@ acks them), so they are only ever input problems:
   `reserved token` (memories) / `possible credential: <path>: reserved token`
   (skill files);
 - an invalid scope, or a NUL (`\u0000`, which Postgres can't store) in any
-  memory string field → `invalid memory`; in a skill's name/project/source/
-  hash or a file relpath → `invalid skill`;
+  memory string field, an invalidate `id`/`superseded_by`, an `invalid_at`
+  or `valid_at` that isn't positive → `invalid memory`; in a skill's
+  name/project/source/hash or a file relpath → `invalid skill`;
 - skill file bytes that aren't canonical standard base64 → `invalid base64`;
 - a memory id owned by another account → `id conflict`.
 
@@ -230,6 +242,12 @@ implemented by `KnowledgeStore` (`knowledge_store.rs`).
 
 Production nginx (`webapp/nginx.conf`) raises its 1 MB body cap to 16 MB for
 `/api/skills/batch` and 2 MB for `/api/memory/batch` only.
+The skill-history GETs need no nginx change: they fall under `location /api/`, and the body cap applies to requests only.
+
+Rollback: after migration 0004 the `memories.deleted` column is gone, so a
+relay binary built before it can't write memories. Roll back by restoring a
+database backup, not by redeploying the old image, and deploy as a
+single-instance swap (no old and new relay running against one database).
 
 ## Astation Integration
 
@@ -275,7 +293,7 @@ RUST_LOG=debug
 ## Testing
 
 ```bash
-cargo test  # unit + in-memory integration suites
+cargo test  # unit + in-memory integration suites (auth, sessions, relay + relay identity, RTC, Voice, Vault, Knowledge sync, validation)
 # Postgres suites are #[ignore]d; run each against a throwaway local database:
 #   docker run --rm -d --name relay-test-pg -e POSTGRES_PASSWORD=pw -p 55433:5432 postgres:16
 #   IDENTITY_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test identity_store -- --ignored

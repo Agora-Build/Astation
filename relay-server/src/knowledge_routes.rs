@@ -18,8 +18,11 @@
 //!    (permanent: atem acks them). A backing-store failure stops the batch and
 //!    returns 503 `{"error":"temporarily unavailable"}` for the whole request
 //!    (transient: atem keeps every op queued and retries — add is idempotent
-//!    by id, delete/purge are idempotent, a retried skill push appends a
-//!    harmless duplicate version).
+//!    by id, delete/invalidate/purge are idempotent, a retried skill push appends a
+//!    harmless duplicate version). An invalidate's `superseded_by` is only a
+//!    hint: the relay doesn't check that it exists or belongs to the account.
+
+use std::collections::HashMap;
 
 use axum::{
     body::Body,
@@ -250,12 +253,31 @@ fn is_valid_skill_scope(s: &str) -> bool {
 pub(crate) enum MemoryOp {
     Add { memory: MemoryRow },
     Delete { id: String },
+    /// Final and idempotent; never changes content.
+    Invalidate {
+        id: String,
+        invalid_at: i64,
+        #[serde(default)]
+        superseded_by: Option<String>,
+    },
 }
 
-async fn apply_memory_op(state: &AppState, account: &str, op: MemoryOp) -> Result<Value, ErrResp> {
+/// `canon` maps an id the client sent to the canonical id an earlier `add`
+/// in the same batch was deduplicated onto, so a later `delete`/`invalidate`
+/// in the batch (as `id` or `superseded_by`) names a row that exists.
+async fn apply_memory_op(
+    state: &AppState,
+    account: &str,
+    op: MemoryOp,
+    canon: &mut HashMap<String, String>,
+) -> Result<Value, ErrResp> {
+    let mapped = |canon: &HashMap<String, String>, id: &str| canon.get(id).cloned().unwrap_or_else(|| id.to_string());
     match op {
         MemoryOp::Add { memory } => {
-            if !is_valid_memory_scope(&memory.scope) || memory_has_nul(&memory) {
+            if !is_valid_memory_scope(&memory.scope)
+                || memory_has_nul(&memory)
+                || memory.valid_at.is_some_and(|v| v <= 0)
+            {
                 return Ok(op_err("invalid memory"));
             }
             if contains_reserved(&memory.content) {
@@ -264,7 +286,13 @@ async fn apply_memory_op(state: &AppState, account: &str, op: MemoryOp) -> Resul
             if let Some(f) = find_secrets(&memory.content).first() {
                 return Ok(op_err(format!("possible credential: {}", f.kind)));
             }
-            store_result(state.knowledge.add_memory(account, memory).await, |o| {
+            let r = state.knowledge.add_memory(account, memory).await;
+            if let Ok(o) = &r {
+                if let Some(cid) = &o.canonical_id {
+                    canon.insert(o.id.clone(), cid.clone());
+                }
+            }
+            store_result(r, |o| {
                 let mut v = json!({ "ok": true, "id": o.id, "seq": o.seq });
                 if let Some(cid) = o.canonical_id {
                     v["canonical_id"] = json!(cid);
@@ -276,9 +304,28 @@ async fn apply_memory_op(state: &AppState, account: &str, op: MemoryOp) -> Resul
             if has_nul(&[&id]) {
                 return Ok(op_err("invalid memory"));
             }
-            store_result(state.knowledge.delete_memory(account, &id).await, |seq| {
+            let target = mapped(canon, &id);
+            store_result(state.knowledge.delete_memory(account, &target).await, |seq| {
                 json!({ "ok": true, "id": id, "seq": seq })
             })
+        }
+        MemoryOp::Invalidate { id, invalid_at, superseded_by } => {
+            if invalid_at <= 0
+                || has_nul(&[&id])
+                || superseded_by.as_deref().is_some_and(|s| s.contains('\0'))
+            {
+                return Ok(op_err("invalid memory"));
+            }
+            let target = mapped(canon, &id);
+            // `superseded_by` is a hint: not checked for existence or ownership.
+            let successor = superseded_by.map(|s| mapped(canon, &s));
+            store_result(
+                state
+                    .knowledge
+                    .invalidate_memory(account, &target, invalid_at, successor.as_deref())
+                    .await,
+                |seq| json!({ "ok": true, "id": id, "seq": seq }),
+            )
         }
     }
 }
@@ -293,8 +340,9 @@ pub async fn memory_batch_handler(
     let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
     let ops: Vec<MemoryOp> = read_batch(body, MEMORY_BATCH_BODY_LIMIT, MEMORY_BATCH_MAX_OPS).await?;
     let mut results = Vec::with_capacity(ops.len());
+    let mut canon = HashMap::new();
     for op in ops {
-        results.push(apply_memory_op(&state, &caller.work_session_id, op).await?);
+        results.push(apply_memory_op(&state, &caller.work_session_id, op, &mut canon).await?);
     }
     Ok(Json(json!({ "results": results })))
 }
@@ -451,12 +499,74 @@ pub async fn skills_pull_handler(
     Ok(Json(json!({ "skills": rows })))
 }
 
+// ─────────────────────────── skill history ───────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SkillKeyQuery {
+    id: Option<String>,
+    scope: Option<String>,
+    #[serde(default)]
+    project: String,
+    name: Option<String>,
+    version: Option<i64>,
+}
+
+/// `(scope, project, name)` from the query, or 400 `invalid skill`.
+fn skill_key(q: &SkillKeyQuery) -> Result<(String, String, String), ErrResp> {
+    let scope = q.scope.clone().unwrap_or_default();
+    let name = q.name.clone().unwrap_or_default();
+    if !is_valid_skill_scope(&scope) || name.is_empty() || has_nul(&[&q.project, &name]) {
+        return Err(err(StatusCode::BAD_REQUEST, "invalid skill"));
+    }
+    Ok((scope, q.project.clone(), name))
+}
+
+/// GET /api/skills/versions ?scope&project&name -> {versions:[…]} (newest first, no files)
+pub async fn skill_versions_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SkillKeyQuery>,
+) -> Result<Json<Value>, ErrResp> {
+    let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
+    let (scope, project, name) = skill_key(&query)?;
+    let versions = state
+        .knowledge
+        .skill_versions(&caller.work_session_id, &scope, &project, &name)
+        .await
+        .map_err(unavailable)?;
+    Ok(Json(json!({ "versions": versions })))
+}
+
+/// GET /api/skills/version ?scope&project&name&version -> {skill} | 404 | 410 (purged)
+pub async fn skill_version_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SkillKeyQuery>,
+) -> Result<Json<Value>, ErrResp> {
+    let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
+    let (scope, project, name) = skill_key(&query)?;
+    let version = query
+        .version
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "missing version"))?;
+    match state
+        .knowledge
+        .skill_version(&caller.work_session_id, &scope, &project, &name, version)
+        .await
+        .map_err(unavailable)?
+    {
+        None => Err(err(StatusCode::NOT_FOUND, "no such skill version")),
+        Some(row) if row.purged => Err(err(StatusCode::GONE, "skill version purged")),
+        Some(row) => Ok(Json(json!({ "skill": row }))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::vault_routes::tests::bind_session;
     use crate::knowledge_store::{
         InMemoryKnowledgeStore, KnowledgeStore, MemoryAddOutcome, SkillPushOutcome,
+        SkillVersionInfo,
     };
     use crate::relay::RelayHub;
     use crate::rtc_session::RtcSessionStore;
@@ -492,6 +602,8 @@ mod tests {
             .route("/api/memory", get(memory_pull_handler))
             .route("/api/skills/batch", post(skills_batch_handler))
             .route("/api/skills", get(skills_pull_handler))
+            .route("/api/skills/versions", get(skill_versions_handler))
+            .route("/api/skills/version", get(skill_version_handler))
             .with_state(state)
     }
 
@@ -980,6 +1092,9 @@ mod tests {
         async fn add_memory(&self, _: &str, _: MemoryRow) -> Result<MemoryAddOutcome, KnowledgeError> {
             Err(KnowledgeError::Db("connection reset".into()))
         }
+        async fn invalidate_memory(&self, _: &str, _: &str, _: i64, _: Option<&str>) -> Result<i64, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
         async fn delete_memory(&self, _: &str, _: &str) -> Result<i64, KnowledgeError> {
             Err(KnowledgeError::Db("connection reset".into()))
         }
@@ -998,6 +1113,12 @@ mod tests {
         async fn pull_skills(&self, _: &str, _: i64, _: i64) -> Result<Vec<SkillRow>, KnowledgeError> {
             Err(KnowledgeError::Db("connection reset".into()))
         }
+        async fn skill_versions(&self, _: &str, _: &str, _: &str, _: &str) -> Result<Vec<SkillVersionInfo>, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
+        async fn skill_version(&self, _: &str, _: &str, _: &str, _: &str, _: i64) -> Result<Option<SkillRow>, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
     }
 
     #[tokio::test]
@@ -1008,6 +1129,7 @@ mod tests {
         let cases = [
             ("/api/memory/batch?id=a", json!({"ops": [{"op": "add", "memory": sample_memory("mem_1", "x")}]})),
             ("/api/memory/batch?id=a", json!({"ops": [{"op": "delete", "id": "mem_1"}]})),
+            ("/api/memory/batch?id=a", json!({"ops": [{"op": "invalidate", "id": "mem_1", "invalid_at": 5}]})),
             ("/api/skills/batch?id=a", json!({"ops": [{"op": "push", "skill": sample_skill("x", json!({"SKILL.md": b64("# hi")})), "base_version": 0}]})),
             ("/api/skills/batch?id=a", json!({"ops": [{"op": "delete", "scope": "global", "project": "", "name": "x"}]})),
             ("/api/skills/batch?id=a", json!({"ops": [{"op": "purge", "scope": "global", "project": "", "name": "x", "versions": null}]})),
@@ -1019,7 +1141,12 @@ mod tests {
             assert_eq!(v, json!({"error": "temporarily unavailable"}));
             assert!(!v.to_string().contains("connection reset"));
         }
-        for uri in ["/api/memory?id=a", "/api/skills?id=a"] {
+        for uri in [
+            "/api/memory?id=a",
+            "/api/skills?id=a",
+            "/api/skills/versions?id=a&scope=global&name=x",
+            "/api/skills/version?id=a&scope=global&name=x&version=1",
+        ] {
             let resp = app.clone().oneshot(req("GET", uri, &sess, "")).await.unwrap();
             assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{}", uri);
         }
@@ -1437,5 +1564,235 @@ mod tests {
         let rows = pulled["skills"].as_array().unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r["deleted"] == true));
+    }
+
+    // ─────────────────────────── invalidate + validity ───────────────────────────
+
+    async fn call(app: &Router, method: &str, uri: &str, session: &str, body: Option<Value>) -> (StatusCode, Value) {
+        let b = body.map(|v| v.to_string()).unwrap_or_default();
+        let resp = app.clone().oneshot(req(method, uri, session, &b)).await.unwrap();
+        let status = resp.status();
+        (status, body_json(resp).await)
+    }
+
+    fn add_op(id: &str, content: &str) -> Value {
+        json!({"op": "add", "memory": sample_memory(id, content)})
+    }
+
+    async fn pull_row(app: &Router, sess: &str, id: &str) -> Value {
+        let (_, v) = call(app, "GET", "/api/memory?id=a", sess, None).await;
+        v["memories"].as_array().unwrap().iter().find(|r| r["id"] == id).cloned().unwrap_or(Value::Null)
+    }
+
+    const MEM_BATCH: &str = "/api/memory/batch?id=a";
+
+    #[tokio::test]
+    async fn invalidate_marks_fact_invalid_and_keeps_content() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [add_op("mem_old", "port 8765"), add_op("mem_new", "port 9000")]}))).await;
+        let (st, v) = call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [
+            {"op": "invalidate", "id": "mem_old", "invalid_at": 1_790_000_000, "superseded_by": "mem_new"},
+        ]}))).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["results"][0]["ok"], true, "{v}");
+        assert!(v["results"][0]["seq"].as_i64().unwrap() > 0);
+        let row = pull_row(&app, &sess, "mem_old").await;
+        assert_eq!(row["content"], "port 8765");
+        assert_eq!(row["invalid_at"], 1_790_000_000);
+        assert_eq!(row["superseded_by"], "mem_new");
+        assert_eq!(row["deleted"], false);
+        assert_eq!(row["deleted_at"], Value::Null);
+        assert_eq!(pull_row(&app, &sess, "mem_new").await["invalid_at"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn invalidate_is_final_and_unknown_or_foreign_ids_are_ok() {
+        let (state, sess) = test_state("ws-1").await;
+        let sess2 = bind_session(&state, "ws-2").await;
+        let app = app(state);
+        call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [add_op("mem_1", "x")]}))).await;
+        let inv = |id: &str, at: i64| json!({"op": "invalidate", "id": id, "invalid_at": at});
+        let (_, v) = call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [inv("mem_1", 100), inv("mem_1", 200), inv("mem_unknown", 100)]}))).await;
+        let r = v["results"].as_array().unwrap();
+        assert!(r.iter().all(|x| x["ok"] == true), "{v}");
+        assert!(r[0]["seq"].as_i64().unwrap() > 0);
+        assert_eq!((r[1]["seq"].clone(), r[2]["seq"].clone()), (json!(0), json!(0)));
+        // Another account can't touch it, and can't tell that it exists.
+        let (_, v2) = call(&app, "POST", MEM_BATCH, &sess2, Some(json!({"ops": [inv("mem_1", 300)]}))).await;
+        assert_eq!(v2["results"][0], json!({"ok": true, "id": "mem_1", "seq": 0}));
+        assert_eq!(pull_row(&app, &sess, "mem_1").await["invalid_at"], 100);
+    }
+
+    #[tokio::test]
+    async fn invalidate_input_problems_are_refused_per_op() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [add_op("mem_1", "x")]}))).await;
+        let (st, v) = call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [
+            {"op": "invalidate", "id": "mem_1", "invalid_at": 0},
+            {"op": "invalidate", "id": "mem_1", "invalid_at": -5},
+            {"op": "invalidate", "id": "mem\u{0}1", "invalid_at": 5},
+            {"op": "invalidate", "id": "mem_1", "invalid_at": 5, "superseded_by": "mem\u{0}2"},
+        ]}))).await;
+        assert_eq!(st, StatusCode::OK);
+        for x in v["results"].as_array().unwrap() {
+            assert_eq!(x, &json!({"ok": false, "error": "invalid memory"}));
+        }
+        assert_eq!(pull_row(&app, &sess, "mem_1").await["invalid_at"], Value::Null);
+        // A missing invalid_at is a malformed op: the whole batch is 400.
+        let (st, _) = call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [{"op": "invalidate", "id": "mem_1"}]}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn invalidate_follows_a_canonical_id_from_the_same_batch() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [add_op("mem_old", "port 8765"), add_op("mem_canon", "port 9000")]}))).await;
+        // Another machine replaced mem_old with the same text mem_canon already has.
+        let (_, v) = call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [
+            add_op("mem_new", "port 9000"),
+            {"op": "invalidate", "id": "mem_old", "invalid_at": 5, "superseded_by": "mem_new"},
+        ]}))).await;
+        assert_eq!(v["results"][0]["canonical_id"], "mem_canon");
+        assert_eq!(v["results"][1]["ok"], true);
+        assert_eq!(pull_row(&app, &sess, "mem_old").await["superseded_by"], "mem_canon");
+    }
+
+    #[tokio::test]
+    async fn add_carries_valid_at_and_refuses_non_positive() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        let mut m = sample_memory("mem_1", "x");
+        m["valid_at"] = json!(1_690_000_000);
+        let mut bad = sample_memory("mem_2", "y");
+        bad["valid_at"] = json!(0);
+        let (_, v) = call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [
+            {"op": "add", "memory": m}, {"op": "add", "memory": bad},
+        ]}))).await;
+        assert_eq!(v["results"][0]["ok"], true);
+        assert_eq!(v["results"][1], json!({"ok": false, "error": "invalid memory"}));
+        assert_eq!(pull_row(&app, &sess, "mem_1").await["valid_at"], 1_690_000_000);
+        assert_eq!(pull_row(&app, &sess, "mem_2").await, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn deleted_rows_carry_deleted_at_and_the_legacy_flag() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [add_op("mem_1", "x")]}))).await;
+        call(&app, "POST", MEM_BATCH, &sess, Some(json!({"ops": [{"op": "delete", "id": "mem_1"}]}))).await;
+        let row = pull_row(&app, &sess, "mem_1").await;
+        assert_eq!(row["deleted"], true);
+        assert!(row["deleted_at"].as_i64().unwrap() > 1_700_000_000);
+        assert_eq!(row["content"], "");
+    }
+
+    // ─────────────────────────── skill history ───────────────────────────
+
+    async fn skill_op(app: &Router, sess: &str, op: Value) {
+        let (st, v) = call(app, "POST", "/api/skills/batch?id=a", sess, Some(json!({"ops": [op]}))).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["results"][0]["ok"], true, "{v}");
+    }
+
+    fn push_op(name: &str, body: &str) -> Value {
+        json!({"op": "push", "skill": sample_skill(name, json!({"SKILL.md": b64(body)})), "base_version": 0})
+    }
+
+    const X_KEY: &str = "scope=global&project=&name=x";
+
+    #[tokio::test]
+    async fn skill_versions_lists_history_without_files() {
+        let (state, sess) = test_state("ws-1").await;
+        let sess2 = bind_session(&state, "ws-2").await;
+        let app = app(state);
+        skill_op(&app, &sess, push_op("x", "v1")).await;
+        skill_op(&app, &sess, push_op("x", "v2")).await;
+        skill_op(&app, &sess, json!({"op": "delete", "scope": "global", "project": "", "name": "x"})).await;
+        skill_op(&app, &sess, json!({"op": "purge", "scope": "global", "project": "", "name": "x", "versions": [1]})).await;
+        let (st, v) = call(&app, "GET", &format!("/api/skills/versions?id=a&{X_KEY}"), &sess, None).await;
+        assert_eq!(st, StatusCode::OK);
+        let vs = v["versions"].as_array().unwrap();
+        let got: Vec<(i64, bool, bool, i64)> = vs.iter().map(|r| (
+            r["version"].as_i64().unwrap(), r["deleted"].as_bool().unwrap(),
+            r["purged"].as_bool().unwrap(), r["file_count"].as_i64().unwrap(),
+        )).collect();
+        assert_eq!(got, vec![(3, true, false, 0), (2, false, false, 1), (1, true, true, 0)]);
+        assert!(vs.iter().all(|r| r.get("files").is_none()));
+        assert_eq!(vs[1]["source_agent"], "claude");
+        assert_eq!(vs[1]["source_machine"], "m1");
+        assert_eq!(vs[1]["created_at"], 1_700_000_000);
+        // Another account sees an empty history.
+        let (st2, v2) = call(&app, "GET", &format!("/api/skills/versions?id=a&{X_KEY}"), &sess2, None).await;
+        assert_eq!((st2, v2), (StatusCode::OK, json!({"versions": []})));
+    }
+
+    #[tokio::test]
+    async fn skill_version_returns_files_404_and_410() {
+        let (state, sess) = test_state("ws-1").await;
+        let sess2 = bind_session(&state, "ws-2").await;
+        let app = app(state);
+        skill_op(&app, &sess, push_op("x", "v1")).await;
+        skill_op(&app, &sess, push_op("x", "v2")).await;
+        skill_op(&app, &sess, json!({"op": "delete", "scope": "global", "project": "", "name": "x"})).await;
+        skill_op(&app, &sess, json!({"op": "purge", "scope": "global", "project": "", "name": "x", "versions": [1]})).await;
+        let get = |v: i64| format!("/api/skills/version?id=a&{X_KEY}&version={v}");
+        let (st, v) = call(&app, "GET", &get(2), &sess, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["skill"]["version"], 2);
+        assert_eq!(v["skill"]["files"], json!({"SKILL.md": b64("v2")}));
+        assert!(v["skill"].get("purged").is_none());
+        let (st, v) = call(&app, "GET", &get(3), &sess, None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!((v["skill"]["deleted"].clone(), v["skill"]["files"].clone()), (json!(true), json!({})));
+        let (st, v) = call(&app, "GET", &get(1), &sess, None).await;
+        assert_eq!((st, v), (StatusCode::GONE, json!({"error": "skill version purged"})));
+        let (st, v) = call(&app, "GET", &get(9), &sess, None).await;
+        assert_eq!((st, v), (StatusCode::NOT_FOUND, json!({"error": "no such skill version"})));
+        let (st, _) = call(&app, "GET", &get(2), &sess2, None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn skill_history_bad_queries_are_400_and_auth_is_required() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = app(state);
+        for uri in [
+            "/api/skills/versions?id=a&scope=machine&name=x",
+            "/api/skills/versions?id=a&scope=global",
+            "/api/skills/versions?id=a&scope=global&name=x%00y",
+            "/api/skills/version?id=a&scope=global&name=x",
+            "/api/skills/version?id=a&scope=global&name=x&version=abc",
+        ] {
+            let (st, _) = call(&app, "GET", uri, &sess, None).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{uri}");
+        }
+        let resp = app
+            .oneshot(req_no_auth("GET", "/api/skills/versions?id=a&scope=global&name=x", ""))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn skill_history_routes_are_mounted_in_the_production_router() {
+        let (state, sess) = test_state("ws-1").await;
+        let app = crate::router(state);
+        let get = |uri: &str| {
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("authorization", format!("session {}", sess))
+                .header("x-forwarded-for", "203.0.113.50")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let resp = app.clone().oneshot(get("/api/skills/versions?id=a&scope=global&name=x")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = app.oneshot(get("/api/skills/version?id=a&scope=global&name=x&version=1")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(resp).await, json!({"error": "no such skill version"}));
     }
 }

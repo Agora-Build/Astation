@@ -394,6 +394,11 @@ image: `DELETE FROM _sqlx_migrations WHERE version = 3;` lets it start (the
 tables stay and are ignored; a later deploy re-applies `0003`, which is
 `CREATE … IF NOT EXISTS`).
 
+Memory rollback caveat: after migration `0004` (Atem Memory 1.1) the previous
+relay binary can't write memories (the `memories.deleted` column is gone). Roll
+back by restoring a database backup, not by redeploying the old image, and
+deploy as a single-instance swap (never old and new relays on one database).
+
 ### Option 1: Docker Compose (Recommended)
 
 Create `docker-compose.yml`:

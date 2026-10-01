@@ -16,8 +16,10 @@ use tokio::sync::Mutex;
 /// Max rows returned by one pull, regardless of the requested limit.
 pub const PULL_LIMIT_CAP: i64 = 500;
 
-/// One memory. Also the wire `Memory` (see the plan's "Wire contract").
-/// The client's `seq` and `deleted` are ignored on input.
+/// One memory. Also the wire `Memory`. The client's `seq`, `deleted`,
+/// `deleted_at`, `invalid_at` and `superseded_by` are ignored on input
+/// (`valid_at` is kept). `deleted` is derived from `deleted_at` (Postgres
+/// computes it in `MEMORY_COLS`) and stays on the wire for older atems.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct MemoryRow {
     pub id: String,
@@ -34,6 +36,18 @@ pub struct MemoryRow {
     pub created_at: i64,
     #[serde(default)]
     pub deleted: bool,
+    /// When it was deleted (unix seconds); `None` = not deleted.
+    #[serde(default)]
+    pub deleted_at: Option<i64>,
+    /// When the fact became true; `None` = `created_at`.
+    #[serde(default)]
+    pub valid_at: Option<i64>,
+    /// When it stopped being true; `None` = still valid. Final once set.
+    #[serde(default)]
+    pub invalid_at: Option<i64>,
+    /// The memory that replaced it, if any.
+    #[serde(default)]
+    pub superseded_by: Option<String>,
     #[serde(default)]
     pub seq: i64,
 }
@@ -55,6 +69,9 @@ pub struct SkillRow {
     pub created_at: i64,
     #[serde(default)]
     pub deleted: bool,
+    /// Set by `purge`: this version's files were erased. Not on the wire.
+    #[serde(skip)]
+    pub purged: bool,
     #[serde(default)]
     pub seq: i64,
 }
@@ -75,6 +92,18 @@ pub struct SkillPushOutcome {
     pub version: i64,
     pub seq: i64,
     pub superseded_concurrent: bool,
+}
+
+/// One entry of a skill's history (`GET /api/skills/versions`). No files.
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+pub struct SkillVersionInfo {
+    pub version: i64,
+    pub created_at: i64,
+    pub source_agent: String,
+    pub source_machine: String,
+    pub file_count: i64,
+    pub deleted: bool,
+    pub purged: bool,
 }
 
 #[derive(Debug)]
@@ -109,17 +138,30 @@ pub trait KnowledgeStore: Send + Sync {
     /// Verify that the backing store can serve requests.
     async fn health_check(&self) -> Result<(), KnowledgeError>;
 
-    /// Idempotent by id; dedups onto a live row with the same
-    /// `(account, scope, project, machine, content_hash)`; else inserts.
+    /// Idempotent by id; dedups onto a valid, undeleted row with the same
+    /// `(account, scope, project, machine, content_hash)`; else inserts
+    /// (keeping the client's `valid_at`).
     async fn add_memory(
         &self,
         account: &str,
         m: MemoryRow,
     ) -> Result<MemoryAddOutcome, KnowledgeError>;
 
-    /// Blank + tombstone the memory, returning its new seq. Unknown id, or an
-    /// id owned by another account → `Ok(0)` (no change, no existence oracle).
+    /// Blank + tombstone the memory (`deleted_at`, first deletion time kept),
+    /// returning its new seq. Unknown id, or an id owned by another account →
+    /// `Ok(0)` (no change, no existence oracle).
     async fn delete_memory(&self, account: &str, id: &str) -> Result<i64, KnowledgeError>;
+
+    /// Mark a valid memory invalid (never touches `content`), returning its
+    /// new seq. Final: an id that is already invalid, deleted, unknown, or
+    /// owned by another account → `Ok(0)`, no change.
+    async fn invalidate_memory(
+        &self,
+        account: &str,
+        id: &str,
+        invalid_at: i64,
+        superseded_by: Option<&str>,
+    ) -> Result<i64, KnowledgeError>;
 
     /// Rows with `seq > since`, ascending, at most `min(limit, 500)`. Includes tombstones.
     async fn pull_memories(
@@ -156,6 +198,27 @@ pub trait KnowledgeStore: Send + Sync {
         name: &str,
         versions: Option<Vec<i64>>,
     ) -> Result<u64, KnowledgeError>;
+
+    /// Every version of one skill, newest first, without files. An unknown
+    /// skill (or another account's) -> empty.
+    async fn skill_versions(
+        &self,
+        account: &str,
+        scope: &str,
+        project: &str,
+        name: &str,
+    ) -> Result<Vec<SkillVersionInfo>, KnowledgeError>;
+
+    /// One version with its files; `None` when it doesn't exist (or is
+    /// another account's).
+    async fn skill_version(
+        &self,
+        account: &str,
+        scope: &str,
+        project: &str,
+        name: &str,
+        version: i64,
+    ) -> Result<Option<SkillRow>, KnowledgeError>;
 
     /// Rows with `seq > since`, ascending, at most `min(limit, 500)`. Includes tombstones.
     async fn pull_skills(
@@ -236,7 +299,8 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
         }
         if let Some((_, row)) = st.memories.iter().find(|(acct, r)| {
             acct == account
-                && !r.deleted
+                && r.deleted_at.is_none()
+                && r.invalid_at.is_none()
                 && r.scope == m.scope
                 && r.project == m.project
                 && r.machine == m.machine
@@ -254,6 +318,9 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
             account.to_string(),
             MemoryRow {
                 deleted: false,
+                deleted_at: None,
+                invalid_at: None,
+                superseded_by: None,
                 seq,
                 ..m
             },
@@ -276,11 +343,35 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
             None => return Ok(0),
             Some(i) => i,
         };
+        let now = now_secs();
         let seq = st.next_seq();
         let row = &mut st.memories[idx].1;
         row.content.clear();
         row.content_hash.clear();
         row.deleted = true;
+        row.deleted_at.get_or_insert(now);
+        row.seq = seq;
+        Ok(seq)
+    }
+
+    async fn invalidate_memory(
+        &self,
+        account: &str,
+        id: &str,
+        invalid_at: i64,
+        superseded_by: Option<&str>,
+    ) -> Result<i64, KnowledgeError> {
+        let mut st = self.state.lock().await;
+        let idx = match st.memories.iter().position(|(acct, r)| {
+            acct == account && r.id == id && r.deleted_at.is_none() && r.invalid_at.is_none()
+        }) {
+            None => return Ok(0),
+            Some(i) => i,
+        };
+        let seq = st.next_seq();
+        let row = &mut st.memories[idx].1;
+        row.invalid_at = Some(invalid_at);
+        row.superseded_by = superseded_by.map(str::to_string);
         row.seq = seq;
         Ok(seq)
     }
@@ -326,6 +417,7 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
             SkillRow {
                 version,
                 deleted: false,
+                purged: false,
                 seq,
                 ..s
             },
@@ -377,6 +469,7 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
                 source_machine: latest.source_machine,
                 created_at: now_secs(),
                 deleted: true,
+                purged: false,
                 seq,
             },
         ));
@@ -413,9 +506,54 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
             row.files = serde_json::json!({});
             row.content_hash.clear();
             row.deleted = true;
+            row.purged = true;
             row.seq = seq;
         }
         Ok(idxs.len() as u64)
+    }
+
+    async fn skill_versions(
+        &self,
+        account: &str,
+        scope: &str,
+        project: &str,
+        name: &str,
+    ) -> Result<Vec<SkillVersionInfo>, KnowledgeError> {
+        let st = self.state.lock().await;
+        let mut out: Vec<SkillVersionInfo> = st
+            .skills
+            .iter()
+            .filter(|(acct, r)| skill_key_matches(acct, r, account, scope, project, name))
+            .map(|(_, r)| SkillVersionInfo {
+                version: r.version,
+                created_at: r.created_at,
+                source_agent: r.source_agent.clone(),
+                source_machine: r.source_machine.clone(),
+                file_count: r.files.as_object().map_or(0, |o| o.len() as i64),
+                deleted: r.deleted,
+                purged: r.purged,
+            })
+            .collect();
+        out.sort_by(|a, b| b.version.cmp(&a.version));
+        Ok(out)
+    }
+
+    async fn skill_version(
+        &self,
+        account: &str,
+        scope: &str,
+        project: &str,
+        name: &str,
+        version: i64,
+    ) -> Result<Option<SkillRow>, KnowledgeError> {
+        let st = self.state.lock().await;
+        Ok(st
+            .skills
+            .iter()
+            .find(|(acct, r)| {
+                skill_key_matches(acct, r, account, scope, project, name) && r.version == version
+            })
+            .map(|(_, r)| r.clone()))
     }
 
     async fn pull_skills(
@@ -466,9 +604,10 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 }
 
 const MEMORY_COLS: &str = "id, scope, project, machine, content, content_hash, confidence, \
-     source_agent, source_machine, created_at, deleted, seq";
+     source_agent, source_machine, created_at, (deleted_at IS NOT NULL) AS deleted, deleted_at, \
+     valid_at, invalid_at, superseded_by, seq";
 const SKILL_COLS: &str = "scope, project, name, version, files::text AS files, content_hash, \
-     source_agent, source_machine, created_at, deleted, seq";
+     source_agent, source_machine, created_at, deleted, purged, seq";
 const SKILL_KEY: &str = "account_id = $1 AND scope = $2 AND project = $3 AND name = $4";
 
 /// Serialize every write transaction of one account; call it FIRST in each
@@ -523,7 +662,7 @@ async fn existing_memory_outcome(
     }
     let dup: Option<(String, i64)> = sqlx::query_as(
         "SELECT id, seq FROM memories WHERE account_id = $1 AND scope = $2 AND project = $3 \
-         AND machine = $4 AND content_hash = $5 AND NOT deleted",
+         AND machine = $4 AND content_hash = $5 AND deleted_at IS NULL AND invalid_at IS NULL",
     )
     .bind(account)
     .bind(&m.scope)
@@ -553,6 +692,7 @@ struct PgSkillRow {
     source_machine: String,
     created_at: i64,
     deleted: bool,
+    purged: bool,
     seq: i64,
 }
 
@@ -571,6 +711,7 @@ impl TryFrom<PgSkillRow> for SkillRow {
             source_machine: r.source_machine,
             created_at: r.created_at,
             deleted: r.deleted,
+            purged: r.purged,
             seq: r.seq,
         })
     }
@@ -603,8 +744,8 @@ impl KnowledgeStore for PgKnowledgeStore {
         }
         let inserted: Result<i64, sqlx::Error> = sqlx::query_scalar(
             "INSERT INTO memories (id, account_id, scope, project, machine, content, content_hash, \
-             confidence, source_agent, source_machine, created_at, deleted) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, false) RETURNING seq",
+             confidence, source_agent, source_machine, created_at, valid_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING seq",
         )
         .bind(&m.id)
         .bind(account)
@@ -617,6 +758,7 @@ impl KnowledgeStore for PgKnowledgeStore {
         .bind(&m.source_agent)
         .bind(&m.source_machine)
         .bind(m.created_at)
+        .bind(m.valid_at)
         .fetch_one(&mut *tx)
         .await;
         match inserted {
@@ -652,11 +794,41 @@ impl KnowledgeStore for PgKnowledgeStore {
         // Scoped to the account: an id owned by another account matches no row
         // and is indistinguishable from an unknown id (Ok(0), no existence oracle).
         let seq: Option<i64> = sqlx::query_scalar(
-            "UPDATE memories SET content = '', content_hash = '', deleted = true, \
-             seq = nextval('knowledge_seq') WHERE id = $1 AND account_id = $2 RETURNING seq",
+            "UPDATE memories SET content = '', content_hash = '', \
+             deleted_at = COALESCE(deleted_at, $3), seq = nextval('knowledge_seq') \
+             WHERE id = $1 AND account_id = $2 RETURNING seq",
         )
         .bind(id)
         .bind(account)
+        .bind(now_secs())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(seq.unwrap_or(0))
+    }
+
+    async fn invalidate_memory(
+        &self,
+        account: &str,
+        id: &str,
+        invalid_at: i64,
+        superseded_by: Option<&str>,
+    ) -> Result<i64, KnowledgeError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        lock_account(&mut tx, account).await?;
+        // Final and account-scoped: an invalid, deleted, unknown or foreign id
+        // matches no row → Ok(0).
+        let seq: Option<i64> = sqlx::query_scalar(
+            "UPDATE memories SET invalid_at = $3, superseded_by = $4, \
+             seq = nextval('knowledge_seq') \
+             WHERE id = $1 AND account_id = $2 AND deleted_at IS NULL AND invalid_at IS NULL \
+             RETURNING seq",
+        )
+        .bind(id)
+        .bind(account)
+        .bind(invalid_at)
+        .bind(superseded_by)
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -806,7 +978,7 @@ impl KnowledgeStore for PgKnowledgeStore {
                ORDER BY version \
              ) \
              UPDATE skill_versions sv SET files = '{{}}'::jsonb, content_hash = '', \
-               deleted = true, seq = renum.new_seq \
+               deleted = true, purged = true, seq = renum.new_seq \
              FROM renum WHERE sv.account_id = $1 AND sv.scope = $2 AND sv.project = $3 \
                AND sv.name = $4 AND sv.version = renum.version"
         ))
@@ -820,6 +992,49 @@ impl KnowledgeStore for PgKnowledgeStore {
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(res.rows_affected())
+    }
+
+    async fn skill_versions(
+        &self,
+        account: &str,
+        scope: &str,
+        project: &str,
+        name: &str,
+    ) -> Result<Vec<SkillVersionInfo>, KnowledgeError> {
+        sqlx::query_as::<_, SkillVersionInfo>(&format!(
+            "SELECT version, created_at, source_agent, source_machine, \
+             (SELECT count(*) FROM jsonb_object_keys(files))::bigint AS file_count, \
+             deleted, purged FROM skill_versions WHERE {SKILL_KEY} ORDER BY version DESC"
+        ))
+        .bind(account)
+        .bind(scope)
+        .bind(project)
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
+    async fn skill_version(
+        &self,
+        account: &str,
+        scope: &str,
+        project: &str,
+        name: &str,
+        version: i64,
+    ) -> Result<Option<SkillRow>, KnowledgeError> {
+        let row: Option<PgSkillRow> = sqlx::query_as(&format!(
+            "SELECT {SKILL_COLS} FROM skill_versions WHERE {SKILL_KEY} AND version = $5"
+        ))
+        .bind(account)
+        .bind(scope)
+        .bind(project)
+        .bind(name)
+        .bind(version)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(SkillRow::try_from).transpose()
     }
 
     async fn pull_skills(
@@ -864,6 +1079,10 @@ mod tests {
             source_machine: "m1".to_string(),
             created_at: 1_700_000_000,
             deleted: false,
+            deleted_at: None,
+            valid_at: None,
+            invalid_at: None,
+            superseded_by: None,
             seq: 0,
         }
     }
@@ -880,6 +1099,7 @@ mod tests {
             source_machine: "m1".to_string(),
             created_at: 1_700_000_000,
             deleted: false,
+            purged: false,
             seq: 0,
         }
     }
@@ -1159,12 +1379,14 @@ mod tests {
             assert_ne!(rows[0].seq, rows[1].seq);
             for r in &rows {
                 assert!(r.deleted);
+                assert!(r.purged);
                 assert_eq!(r.files, json!({}));
                 assert_eq!(r.content_hash, "");
             }
             let all = s.pull_skills(A, 0, 100).await.unwrap();
             let v2 = all.iter().find(|r| r.version == 2).unwrap();
             assert!(!v2.deleted);
+            assert!(!v2.purged);
             assert_eq!(v2.files, json!({"SKILL.md": "v2"}));
 
             let n = s.purge_skill(A, "global", "", "x", None).await.unwrap();
@@ -1200,6 +1422,7 @@ mod tests {
             let purged = s.pull_skills(A, 0, 100).await.unwrap();
             seqs.push(purged.iter().find(|r| r.version == 1).unwrap().seq);
             seqs.push(s.add_memory(A, mem("m3", "three")).await.unwrap().seq);
+            seqs.push(s.invalidate_memory(A, "m3", 5, None).await.unwrap());
             assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
         }
 
@@ -1332,6 +1555,147 @@ mod tests {
             );
         }
 
+        pub async fn invalidate_is_final_and_keeps_content(s: &dyn KnowledgeStore) {
+            let a = s.add_memory(A, mem("mem_1", "port 8765")).await.unwrap();
+            let b = s.add_memory(A, mem("mem_2", "port 9000")).await.unwrap();
+            let i = s
+                .invalidate_memory(A, "mem_1", 1_790_000_000, Some("mem_2"))
+                .await
+                .unwrap();
+            assert!(i > a.seq && i > b.seq);
+            let rows = s.pull_memories(A, 0, 100).await.unwrap();
+            let r1 = rows.iter().find(|r| r.id == "mem_1").unwrap().clone();
+            assert_eq!(r1.content, "port 8765");
+            assert_eq!(r1.content_hash, "h:port 8765");
+            assert_eq!(
+                (r1.invalid_at, r1.superseded_by.as_deref(), r1.seq),
+                (Some(1_790_000_000), Some("mem_2"), i)
+            );
+            assert!(!r1.deleted && r1.deleted_at.is_none());
+            // Final: a repeat (with any values) changes nothing and takes no seq.
+            assert_eq!(
+                s.invalidate_memory(A, "mem_1", 1_800_000_000, Some("mem_3")).await.unwrap(),
+                0
+            );
+            assert_eq!(s.invalidate_memory(A, "mem_1", 1_800_000_000, None).await.unwrap(), 0);
+            let again = s.pull_memories(A, 0, 100).await.unwrap();
+            assert_eq!(again.iter().find(|r| r.id == "mem_1").unwrap(), &r1);
+            // A cursor past mem_2's add sees exactly the invalidation.
+            let after = s.pull_memories(A, b.seq, 100).await.unwrap();
+            assert_eq!(after.len(), 1);
+            assert_eq!(after[0].id, "mem_1");
+            // Without a successor.
+            let j = s.invalidate_memory(A, "mem_2", 1_790_000_100, None).await.unwrap();
+            assert!(j > i);
+            let r2 = s.pull_memories(A, i, 100).await.unwrap();
+            assert_eq!((r2[0].invalid_at, r2[0].superseded_by.clone()), (Some(1_790_000_100), None));
+        }
+
+        pub async fn invalidate_unknown_deleted_or_foreign_is_a_noop(s: &dyn KnowledgeStore) {
+            s.add_memory(A, mem("mem_1", "a")).await.unwrap();
+            s.add_memory(A, mem("mem_2", "b")).await.unwrap();
+            let d = s.delete_memory(A, "mem_2").await.unwrap();
+            assert_eq!(s.invalidate_memory(A, "mem_nope", 5, None).await.unwrap(), 0);
+            assert_eq!(s.invalidate_memory(A, "mem_2", 5, None).await.unwrap(), 0);
+            assert_eq!(s.invalidate_memory(B, "mem_1", 5, None).await.unwrap(), 0);
+            let rows = s.pull_memories(A, 0, 100).await.unwrap();
+            assert!(rows.iter().all(|r| r.invalid_at.is_none()));
+            assert_eq!(rows.iter().map(|r| r.seq).max().unwrap(), d);
+            assert!(s.pull_memories(B, 0, 100).await.unwrap().is_empty());
+        }
+
+        pub async fn dedup_ignores_invalid_rows(s: &dyn KnowledgeStore) {
+            let o1 = s.add_memory(A, mem("mem_1", "port 8765")).await.unwrap();
+            s.invalidate_memory(A, "mem_1", 10, None).await.unwrap();
+            // The fact became true again: a new memory, not a dedup onto the invalid one.
+            let o2 = s.add_memory(A, mem("mem_2", "port 8765")).await.unwrap();
+            assert_eq!(o2.canonical_id, None);
+            assert!(o2.seq > o1.seq);
+            // Now the valid mem_2 is the dedup target.
+            let o3 = s.add_memory(A, mem("mem_3", "port 8765")).await.unwrap();
+            assert_eq!(o3.canonical_id.as_deref(), Some("mem_2"));
+            // Idempotent by id still holds for an invalid row.
+            let again = s.add_memory(A, mem("mem_1", "port 8765")).await.unwrap();
+            assert_eq!((again.id.as_str(), again.canonical_id), ("mem_1", None));
+        }
+
+        pub async fn add_keeps_valid_at_and_ignores_client_state(s: &dyn KnowledgeStore) {
+            let mut m = mem("mem_1", "port 8765");
+            m.valid_at = Some(1_700_000_500);
+            m.deleted = true;
+            m.deleted_at = Some(9);
+            m.invalid_at = Some(9);
+            m.superseded_by = Some("mem_x".into());
+            s.add_memory(A, m).await.unwrap();
+            let r = s.pull_memories(A, 0, 100).await.unwrap().remove(0);
+            assert_eq!(r.valid_at, Some(1_700_000_500));
+            assert!(!r.deleted);
+            assert_eq!((r.deleted_at, r.invalid_at, r.superseded_by), (None, None, None));
+        }
+
+        pub async fn skill_versions_list_newest_first_without_files(s: &dyn KnowledgeStore) {
+            for v in 1..=3 {
+                s.push_skill(A, skill("x", &format!("v{v}")), v - 1).await.unwrap();
+            }
+            s.delete_skill(A, "global", "", "x").await.unwrap(); // v4: delete marker
+            s.purge_skill(A, "global", "", "x", Some(vec![1])).await.unwrap();
+            s.push_skill(B, skill("x", "b"), 0).await.unwrap();
+            let vs = s.skill_versions(A, "global", "", "x").await.unwrap();
+            let got: Vec<(i64, i64, bool, bool)> =
+                vs.iter().map(|v| (v.version, v.file_count, v.deleted, v.purged)).collect();
+            assert_eq!(
+                got,
+                vec![(4, 0, true, false), (3, 1, false, false), (2, 1, false, false), (1, 0, true, true)]
+            );
+            assert_eq!(
+                (vs[1].source_agent.as_str(), vs[1].source_machine.as_str(), vs[1].created_at),
+                ("claude", "m1", 1_700_000_000)
+            );
+            assert!(s.skill_versions(A, "global", "", "nope").await.unwrap().is_empty());
+            assert!(s.skill_versions(A, "project", "", "x").await.unwrap().is_empty());
+            assert_eq!(s.skill_versions(B, "global", "", "x").await.unwrap().len(), 1);
+        }
+
+        pub async fn skill_version_returns_one_version(s: &dyn KnowledgeStore) {
+            s.push_skill(A, skill("x", "v1"), 0).await.unwrap();
+            s.push_skill(A, skill("x", "v2"), 1).await.unwrap();
+            s.delete_skill(A, "global", "", "x").await.unwrap(); // v3
+            s.purge_skill(A, "global", "", "x", Some(vec![1])).await.unwrap();
+            let v2 = s.skill_version(A, "global", "", "x", 2).await.unwrap().unwrap();
+            assert_eq!((v2.version, v2.deleted, v2.purged), (2, false, false));
+            assert_eq!(v2.files, json!({"SKILL.md": "v2"}));
+            let v1 = s.skill_version(A, "global", "", "x", 1).await.unwrap().unwrap();
+            assert!(v1.purged && v1.deleted && v1.files == json!({}));
+            let v3 = s.skill_version(A, "global", "", "x", 3).await.unwrap().unwrap();
+            assert!(v3.deleted && !v3.purged && v3.files == json!({}));
+            assert!(s.skill_version(A, "global", "", "x", 9).await.unwrap().is_none());
+            assert!(s.skill_version(B, "global", "", "x", 2).await.unwrap().is_none());
+        }
+
+        pub async fn delete_records_deleted_at(s: &dyn KnowledgeStore) {
+            s.add_memory(A, mem("mem_1", "x")).await.unwrap();
+            let before = chrono::Utc::now().timestamp();
+            s.delete_memory(A, "mem_1").await.unwrap();
+            let r = s.pull_memories(A, 0, 100).await.unwrap().remove(0);
+            let at = r.deleted_at.expect("deleted_at set");
+            assert!(r.deleted && at >= before && at <= before + 5);
+            // A repeat delete keeps the first deletion time.
+            s.delete_memory(A, "mem_1").await.unwrap();
+            assert_eq!(s.pull_memories(A, 0, 100).await.unwrap()[0].deleted_at, Some(at));
+            // Deleting an invalidated fact clears its text too.
+            s.add_memory(A, mem("mem_2", "y")).await.unwrap();
+            s.invalidate_memory(A, "mem_2", 7, None).await.unwrap();
+            s.delete_memory(A, "mem_2").await.unwrap();
+            let r2 = s
+                .pull_memories(A, 0, 100)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.id == "mem_2")
+                .unwrap();
+            assert!(r2.deleted && r2.content.is_empty() && r2.deleted_at.is_some());
+        }
+
         pub async fn concurrent_dedup_adds_converge(s: Arc<dyn KnowledgeStore>) {
             let mut handles = Vec::new();
             for i in 0..10 {
@@ -1409,6 +1773,13 @@ mod tests {
         delete_skill_appends_tombstone,
         purge_selected_and_all_versions,
         seq_is_global_and_monotonic,
+        invalidate_is_final_and_keeps_content,
+        invalidate_unknown_deleted_or_foreign_is_a_noop,
+        dedup_ignores_invalid_rows,
+        add_keeps_valid_at_and_ignores_client_state,
+        delete_records_deleted_at,
+        skill_versions_list_newest_first_without_files,
+        skill_version_returns_one_version,
     );
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1522,7 +1893,81 @@ mod tests {
         delete_skill_appends_tombstone,
         purge_selected_and_all_versions,
         seq_is_global_and_monotonic,
+        invalidate_is_final_and_keeps_content,
+        invalidate_unknown_deleted_or_foreign_is_a_noop,
+        dedup_ignores_invalid_rows,
+        add_keeps_valid_at_and_ignores_client_state,
+        delete_records_deleted_at,
+        skill_versions_list_newest_first_without_files,
+        skill_version_returns_one_version,
     );
+
+    /// 0004 on pre-1.1 data: deleted rows get `deleted_at` (the migration
+    /// time), live rows stay NULL, `deleted` is gone, and the dedup index
+    /// only covers valid, undeleted rows.
+    #[tokio::test]
+    #[ignore]
+    async fn pg_migration_0004_backfills_deleted_at_and_drops_deleted() {
+        use sqlx::Executor;
+        let _g = PG_LOCK.lock().await;
+        let url = std::env::var("KNOWLEDGE_TEST_DATABASE_URL")
+            .expect("set KNOWLEDGE_TEST_DATABASE_URL to run the Postgres tests");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .unwrap();
+        for stmt in [
+            "DROP TABLE IF EXISTS memories",
+            "DROP TABLE IF EXISTS skill_versions",
+            "DROP SEQUENCE IF EXISTS knowledge_seq",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.unwrap();
+        }
+        pool.execute(include_str!("../migrations/0002_knowledge.sql")).await.unwrap();
+        pool.execute(
+            "INSERT INTO memories (id, account_id, scope, content, content_hash, source_agent, \
+             source_machine, created_at, deleted) VALUES \
+             ('m_live', 'acct', 'global', 'x', 'hx', 'cli', 'm', 1, false), \
+             ('m_gone', 'acct', 'global', '', '', 'cli', 'm', 1, true)",
+        )
+        .await
+        .unwrap();
+        let before = chrono::Utc::now().timestamp();
+        pool.execute(include_str!("../migrations/0004_memory_validity.sql")).await.unwrap();
+        let rows: Vec<(String, Option<i64>, Option<i64>, Option<i64>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT id, deleted_at, valid_at, invalid_at, superseded_by FROM memories ORDER BY id",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows[0].0, "m_gone");
+        assert!(rows[0].1.unwrap() >= before - 5, "{:?}", rows[0]);
+        assert_eq!(rows[1], ("m_live".to_string(), None, None, None, None));
+        let has_deleted: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
+             WHERE table_name = 'memories' AND column_name = 'deleted')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!has_deleted);
+        let pred: String = sqlx::query_scalar(
+            "SELECT pg_get_expr(indpred, indrelid) FROM pg_index \
+             WHERE indexrelid = 'memories_dedup'::regclass",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            pred.contains("deleted_at IS NULL") && pred.contains("invalid_at IS NULL"),
+            "{pred}"
+        );
+        drop(pool);
+        // Leave the shared database fully migrated for the other suites.
+        fresh_pg().await;
+    }
 
     #[tokio::test]
     async fn in_memory_backend_name_and_health() {
@@ -1544,6 +1989,10 @@ mod tests {
             (m.project.as_str(), m.machine.as_str(), m.deleted, m.seq),
             ("", "", false, 0)
         );
+        assert_eq!(
+            (m.deleted_at, m.valid_at, m.invalid_at, m.superseded_by.clone()),
+            (None, None, None, None)
+        );
         let v = serde_json::to_value(&m).unwrap();
         let mut keys: Vec<&String> = v.as_object().unwrap().keys().collect();
         keys.sort();
@@ -1555,13 +2004,17 @@ mod tests {
                 "content_hash",
                 "created_at",
                 "deleted",
+                "deleted_at",
                 "id",
+                "invalid_at",
                 "machine",
                 "project",
                 "scope",
                 "seq",
                 "source_agent",
-                "source_machine"
+                "source_machine",
+                "superseded_by",
+                "valid_at"
             ]
         );
 
@@ -1575,6 +2028,7 @@ mod tests {
             (s.project.as_str(), s.deleted, s.seq, s.version),
             ("", false, 0, 3)
         );
+        assert!(!s.purged, "purged is never read from the wire");
         assert_eq!(s.files, json!({"SKILL.md": "aGk=", "a/b.sh": ""}));
         let v = serde_json::to_value(&s).unwrap();
         let mut keys: Vec<&String> = v.as_object().unwrap().keys().collect();
