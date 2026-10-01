@@ -10,6 +10,9 @@ pub mod keys;
 pub mod bus;
 #[allow(dead_code)]
 pub mod presence;
+// Consumer lands in Task 19 (connect_cluster); drop the allow then.
+#[allow(dead_code)]
+pub mod directory;
 
 use std::future::Future;
 use std::time::Duration;

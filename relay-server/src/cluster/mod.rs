@@ -46,14 +46,10 @@ impl ConnRef {
         }
     }
 
-    // Task 13 (RedisRoomDirectory) stores ConnRefs as strings.
-    #[allow(dead_code)]
     pub fn encode(&self) -> String {
         format!("{}|{}", self.conn, self.replica)
     }
 
-    // Task 13 (RedisRoomDirectory) stores ConnRefs as strings.
-    #[allow(dead_code)]
     pub fn decode(value: &str) -> Option<Self> {
         let (conn, replica) = value.split_once('|')?;
         (!conn.is_empty() && !replica.is_empty()).then(|| Self::new(conn, replica))
