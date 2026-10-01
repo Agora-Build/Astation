@@ -59,6 +59,7 @@ pub fn create_session(hostname: &str) -> Session {
 
 /// Validate an OTP against a session.
 /// Returns true if the OTP matches and the session has not expired.
+#[cfg(test)]
 pub fn validate_otp(session: &Session, otp: &str) -> bool {
     if session.otp != otp {
         return false;

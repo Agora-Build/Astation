@@ -6,7 +6,21 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use crate::AppState;
-use crate::voice_session::VoiceSessionState;
+use crate::voice_session::{VoiceSession, VoiceSessionState};
+use crate::cluster::StoreError;
+use crate::voice_session::WaitOutcome;
+
+/// How long a Triggered request waits for the Atem's answer.
+pub const LLM_WAIT_SECS: u64 = 30;
+
+fn voice_unavailable(session_id: &str, error: StoreError) -> Response {
+    tracing::error!("Voice store unavailable for session {}: {}", session_id, error);
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "Temporarily unavailable"})),
+    )
+        .into_response()
+}
 
 /// OpenAI-compatible chat completion request format
 #[derive(Debug, Deserialize)]
@@ -81,75 +95,80 @@ pub async fn llm_chat_handler(
 
     // Get last user message for logging
     let last_message = req.messages.last().map(|m| m.content.clone()).unwrap_or_default();
-    tracing::info!("Session {}: User message: {}", session_id, last_message);
+    tracing::info!("Session {}: user message received ({} bytes)", session_id, last_message.len());
 
-    // Increment request counter
-    state.voice_sessions.increment_requests(&session_id).await;
-
-    // Add transcription to buffer
-    state.voice_sessions.add_transcription(&session_id, last_message).await;
-
-    // Get session state
-    let session_state = state.voice_sessions.get_state(&session_id).await;
+    let voice = &state.voice_sessions;
+    if let Err(error) = voice.increment_requests(&session_id).await {
+        return voice_unavailable(&session_id, error);
+    }
+    if let Err(error) = voice.add_transcription(&session_id, last_message).await {
+        return voice_unavailable(&session_id, error);
+    }
+    let session_state = match voice.get_state(&session_id).await {
+        Ok(session_state) => session_state,
+        Err(error) => return voice_unavailable(&session_id, error),
+    };
 
     match session_state {
         Some(VoiceSessionState::Accumulating) => {
-            // Return empty response immediately
             tracing::debug!("Session {} in Accumulating state - returning empty response", session_id);
-            return create_empty_response().into_response();
+            create_empty_response().into_response()
         }
         Some(VoiceSessionState::Triggered) => {
-            // Block and wait for Atem response
             tracing::info!("Session {} in Triggered state - blocking for Atem response", session_id);
-            let waiter = state.voice_sessions.register_waiter(session_id.clone()).await;
-
-            // Wait for response with timeout (30 seconds)
-            match tokio::time::timeout(
-                tokio::time::Duration::from_secs(30),
-                waiter
-            ).await {
-                Ok(Ok(response_text)) => {
+            match voice
+                .wait_reply(&session_id, std::time::Duration::from_secs(LLM_WAIT_SECS))
+                .await
+            {
+                Ok(WaitOutcome::Reply(response_text)) => {
                     tracing::info!("Session {}: Received response from Atem", session_id);
-                    return create_response(response_text).into_response();
+                    create_response(response_text).into_response()
                 }
-                Ok(Err(_)) => {
+                Ok(WaitOutcome::Closed) => {
                     tracing::error!("Session {}: Waiter channel closed", session_id);
-                    return (
+                    (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": "Response channel closed"}))
-                    ).into_response();
+                        Json(serde_json::json!({"error": "Response channel closed"})),
+                    )
+                        .into_response()
                 }
-                Err(_) => {
+                Ok(WaitOutcome::TimedOut) => {
                     tracing::error!("Session {}: Timeout waiting for Atem response", session_id);
-                    return (
+                    (
                         StatusCode::GATEWAY_TIMEOUT,
-                        Json(serde_json::json!({"error": "Timeout waiting for Atem response"}))
-                    ).into_response();
+                        Json(serde_json::json!({"error": "Timeout waiting for Atem response"})),
+                    )
+                        .into_response()
                 }
+                Err(error) => voice_unavailable(&session_id, error),
             }
         }
-        Some(VoiceSessionState::ResponseReady) => {
-            // Return cached response
-            if let Some(session) = state.voice_sessions.get(&session_id).await {
-                if let Some(response_text) = session.response {
-                    tracing::debug!("Session {} in ResponseReady state - returning cached response", session_id);
-                    // Clean up session after delivering response
-                    state.voice_sessions.delete(&session_id).await;
-                    return create_response(response_text).into_response();
+        Some(VoiceSessionState::ResponseReady) => match voice.get(&session_id).await {
+            Err(error) => voice_unavailable(&session_id, error),
+            Ok(Some(VoiceSession { response: Some(response_text), .. })) => {
+                tracing::debug!("Session {} in ResponseReady state - returning cached response", session_id);
+                // Clean up session after delivering response
+                if let Err(error) = voice.delete(&session_id).await {
+                    tracing::warn!("Could not delete voice session {}: {}", session_id, error);
                 }
+                create_response(response_text).into_response()
             }
-            tracing::error!("Session {} in ResponseReady but no cached response", session_id);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Response ready but not found"}))
-            ).into_response();
-        }
+            Ok(_) => {
+                tracing::error!("Session {} in ResponseReady but no cached response", session_id);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Response ready but not found"})),
+                )
+                    .into_response()
+            }
+        },
         None => {
             tracing::warn!("Session {} not found", session_id);
-            return (
+            (
                 StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Session not found"}))
-            ).into_response();
+                Json(serde_json::json!({"error": "Session not found"})),
+            )
+                .into_response()
         }
     }
 }
@@ -251,7 +270,7 @@ mod tests {
             "test-123".to_string(),
             "atem-1".to_string(),
             "channel-1".to_string(),
-        ).await;
+        ).await.unwrap();
 
         let req = ChatCompletionRequest {
             messages: vec![ChatMessage {
@@ -274,7 +293,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
 
         // Verify session is still in Accumulating state
-        let session = state.voice_sessions.get("test-123").await.unwrap();
+        let session = state.voice_sessions.get("test-123").await.unwrap().unwrap();
         assert_eq!(session.state, VoiceSessionState::Accumulating);
     }
 
@@ -285,10 +304,10 @@ mod tests {
             "test-123".to_string(),
             "atem-1".to_string(),
             "channel-1".to_string(),
-        ).await;
+        ).await.unwrap();
 
         // Trigger the session
-        state.voice_sessions.trigger("test-123").await;
+        state.voice_sessions.trigger("test-123").await.unwrap();
 
         let req = ChatCompletionRequest {
             messages: vec![ChatMessage {
@@ -307,7 +326,7 @@ mod tests {
             state_clone.voice_sessions.set_response(
                 "test-123",
                 "Here's the function implementation...".to_string(),
-            ).await;
+            ).await.unwrap();
         });
 
         let response = llm_chat_handler(
@@ -377,13 +396,13 @@ mod tests {
             "test-ready".to_string(),
             "atem-1".to_string(),
             "channel-1".to_string(),
-        ).await;
+        ).await.unwrap();
 
         // Set response directly (simulating Atem already replied)
         state.voice_sessions.set_response(
             "test-ready",
             "Here is the implementation".to_string(),
-        ).await;
+        ).await.unwrap();
 
         let req = ChatCompletionRequest {
             messages: vec![ChatMessage {
@@ -405,7 +424,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         // Session should be cleaned up after delivering response
-        let session = state.voice_sessions.get("test-ready").await;
+        let session = state.voice_sessions.get("test-ready").await.unwrap();
         assert!(session.is_none());
     }
 
@@ -416,7 +435,7 @@ mod tests {
             "test-buf".to_string(),
             "atem-1".to_string(),
             "channel-1".to_string(),
-        ).await;
+        ).await.unwrap();
 
         let req = ChatCompletionRequest {
             messages: vec![ChatMessage {
@@ -438,7 +457,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         // Verify transcription was buffered
-        let session = state.voice_sessions.get("test-buf").await.unwrap();
+        let session = state.voice_sessions.get("test-buf").await.unwrap().unwrap();
         assert_eq!(session.buffer.len(), 1);
         assert!(session.get_accumulated_text().contains("First chunk"));
     }
@@ -450,7 +469,7 @@ mod tests {
             "test-fallback".to_string(),
             "atem-1".to_string(),
             "channel-1".to_string(),
-        ).await;
+        ).await.unwrap();
 
         let req = ChatCompletionRequest {
             messages: vec![ChatMessage {
@@ -480,7 +499,7 @@ mod tests {
             "query-sess".to_string(),
             "atem-1".to_string(),
             "channel-1".to_string(),
-        ).await;
+        ).await.unwrap();
 
         let req = ChatCompletionRequest {
             messages: vec![ChatMessage {
@@ -502,7 +521,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         // Verify transcription was buffered in the correct session
-        let session = state.voice_sessions.get("query-sess").await.unwrap();
+        let session = state.voice_sessions.get("query-sess").await.unwrap().unwrap();
         assert!(session.get_accumulated_text().contains("Hello via query param"));
     }
 
@@ -514,12 +533,12 @@ mod tests {
             "from-query".to_string(),
             "atem-1".to_string(),
             "channel-1".to_string(),
-        ).await;
+        ).await.unwrap();
         state.voice_sessions.create(
             "from-header".to_string(),
             "atem-1".to_string(),
             "channel-1".to_string(),
-        ).await;
+        ).await.unwrap();
 
         let req = ChatCompletionRequest {
             messages: vec![ChatMessage {
@@ -542,10 +561,34 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         // Verify text went to the query param session, not the header session
-        let query_session = state.voice_sessions.get("from-query").await.unwrap();
+        let query_session = state.voice_sessions.get("from-query").await.unwrap().unwrap();
         assert!(query_session.get_accumulated_text().contains("Which session?"));
 
-        let header_session = state.voice_sessions.get("from-header").await.unwrap();
+        let header_session = state.voice_sessions.get("from-header").await.unwrap().unwrap();
         assert!(header_session.get_accumulated_text().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_triggered_times_out_with_504() {
+        let state = create_test_state();
+        state.voice_sessions.create(
+            "test-timeout".to_string(),
+            "atem-1".to_string(),
+            "channel-1".to_string(),
+        ).await.unwrap();
+        state.voice_sessions.trigger("test-timeout").await.unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-voice-session-id", "test-timeout".parse().unwrap());
+        let started = tokio::time::Instant::now();
+        let response = llm_chat_handler(
+            State(state),
+            Query(LlmChatQuery { session_id: None }),
+            headers,
+            Json(ChatCompletionRequest {
+                messages: vec![ChatMessage { role: "user".to_string(), content: "go".to_string() }],
+            }),
+        ).await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(started.elapsed() >= std::time::Duration::from_secs(30));
     }
 }

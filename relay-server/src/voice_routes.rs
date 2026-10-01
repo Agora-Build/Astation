@@ -8,6 +8,12 @@ use crate::voice_session::{
     CreateVoiceSessionRequest, CreateVoiceSessionResponse,
     TriggerResponse, AtemResponseRequest, AtemResponseResponse,
 };
+use crate::cluster::StoreError;
+
+fn unavailable(error: StoreError) -> StatusCode {
+    tracing::error!("Voice store unavailable: {}", error);
+    StatusCode::SERVICE_UNAVAILABLE
+}
 
 /// POST /api/voice-sessions
 ///
@@ -22,7 +28,7 @@ pub async fn create_voice_session_handler(
         session_id.clone(),
         req.atem_id.clone(),
         req.channel.clone(),
-    ).await;
+    ).await.map_err(unavailable)?;
 
     tracing::info!(
         "Created voice session {} for Atem {} in channel {}",
@@ -51,15 +57,17 @@ pub async fn trigger_voice_session_handler(
     Path(session_id): Path<String>,
 ) -> Result<Json<TriggerResponse>, StatusCode> {
     let accumulated_text = state.voice_sessions.trigger(&session_id).await
+        .map_err(unavailable)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
     let session = state.voice_sessions.get(&session_id).await
+        .map_err(unavailable)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
     tracing::info!(
-        "Triggered session {}: accumulated_text = \"{}\"",
+        "Triggered session {}: {} bytes accumulated",
         session_id,
-        accumulated_text
+        accumulated_text.len()
     );
 
     Ok(Json(TriggerResponse {
@@ -78,10 +86,11 @@ pub async fn atem_response_handler(
     Json(req): Json<AtemResponseRequest>,
 ) -> Result<Json<AtemResponseResponse>, StatusCode> {
     state.voice_sessions.set_response(&req.session_id, req.response.clone()).await
+        .map_err(unavailable)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
     tracing::info!(
-        "Received response for session {}: {} chars",
+        "Received response for session {}: {} bytes",
         req.session_id,
         req.response.len()
     );
@@ -100,6 +109,7 @@ pub async fn get_voice_session_handler(
     Path(session_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let session = state.voice_sessions.get(&session_id).await
+        .map_err(unavailable)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(serde_json::json!({
@@ -123,7 +133,7 @@ pub async fn delete_voice_session_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    state.voice_sessions.delete(&session_id).await;
+    state.voice_sessions.delete(&session_id).await.map_err(unavailable)?;
     tracing::info!("Deleted voice session {}", session_id);
     Ok(StatusCode::OK)
 }
@@ -134,7 +144,7 @@ pub async fn delete_voice_session_handler(
 pub async fn list_voice_sessions_handler(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let session_ids = state.voice_sessions.list_session_ids().await;
+    let session_ids = state.voice_sessions.list_session_ids().await.map_err(unavailable)?;
 
     Ok(Json(serde_json::json!({
         "sessions": session_ids,
@@ -185,9 +195,9 @@ mod tests {
             "test-123".to_string(),
             "atem-456".to_string(),
             "channel-789".to_string(),
-        ).await;
+        ).await.unwrap();
 
-        state.voice_sessions.add_transcription("test-123", "Hello world".to_string()).await;
+        state.voice_sessions.add_transcription("test-123", "Hello world".to_string()).await.unwrap();
 
         let result = trigger_voice_session_handler(
             State(state),
@@ -206,7 +216,7 @@ mod tests {
             "test-123".to_string(),
             "atem-456".to_string(),
             "channel-789".to_string(),
-        ).await;
+        ).await.unwrap();
 
         let req = AtemResponseRequest {
             session_id: "test-123".to_string(),
@@ -216,7 +226,7 @@ mod tests {
         let result = atem_response_handler(State(state.clone()), Json(req)).await;
         assert!(result.is_ok());
 
-        let session = state.voice_sessions.get("test-123").await.unwrap();
+        let session = state.voice_sessions.get("test-123").await.unwrap().unwrap();
         assert_eq!(session.response, Some("Here's the implementation...".to_string()));
     }
 
@@ -227,7 +237,7 @@ mod tests {
             "test-123".to_string(),
             "atem-456".to_string(),
             "channel-789".to_string(),
-        ).await;
+        ).await.unwrap();
 
         let result = get_voice_session_handler(
             State(state),
@@ -247,7 +257,7 @@ mod tests {
             "test-123".to_string(),
             "atem-456".to_string(),
             "channel-789".to_string(),
-        ).await;
+        ).await.unwrap();
 
         let result = delete_voice_session_handler(
             State(state.clone()),
@@ -257,15 +267,15 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify session is deleted
-        let session = state.voice_sessions.get("test-123").await;
+        let session = state.voice_sessions.get("test-123").await.unwrap();
         assert!(session.is_none());
     }
 
     #[tokio::test]
     async fn test_list_voice_sessions() {
         let state = create_test_state();
-        state.voice_sessions.create("test-1".to_string(), "atem".to_string(), "ch".to_string()).await;
-        state.voice_sessions.create("test-2".to_string(), "atem".to_string(), "ch".to_string()).await;
+        state.voice_sessions.create("test-1".to_string(), "atem".to_string(), "ch".to_string()).await.unwrap();
+        state.voice_sessions.create("test-2".to_string(), "atem".to_string(), "ch".to_string()).await.unwrap();
 
         let result = list_voice_sessions_handler(State(state)).await;
         assert!(result.is_ok());
@@ -322,7 +332,7 @@ mod tests {
             "test-empty".to_string(),
             "atem-1".to_string(),
             "channel-1".to_string(),
-        ).await;
+        ).await.unwrap();
 
         // Trigger with no transcriptions added
         let result = trigger_voice_session_handler(
@@ -342,15 +352,15 @@ mod tests {
             "test-state".to_string(),
             "atem-1".to_string(),
             "channel-1".to_string(),
-        ).await;
+        ).await.unwrap();
 
-        state.voice_sessions.add_transcription("test-state", "Hello".to_string()).await;
+        state.voice_sessions.add_transcription("test-state", "Hello".to_string()).await.unwrap();
         let _ = trigger_voice_session_handler(
             State(state.clone()),
             Path("test-state".to_string()),
         ).await.unwrap();
 
-        let session = state.voice_sessions.get("test-state").await.unwrap();
+        let session = state.voice_sessions.get("test-state").await.unwrap().unwrap();
         assert_eq!(session.state, crate::voice_session::VoiceSessionState::Triggered);
     }
 
@@ -361,7 +371,7 @@ mod tests {
             "test-resp".to_string(),
             "atem-1".to_string(),
             "channel-1".to_string(),
-        ).await;
+        ).await.unwrap();
 
         let req = AtemResponseRequest {
             session_id: "test-resp".to_string(),
@@ -369,7 +379,7 @@ mod tests {
         };
         let _ = atem_response_handler(State(state.clone()), Json(req)).await.unwrap();
 
-        let session = state.voice_sessions.get("test-resp").await.unwrap();
+        let session = state.voice_sessions.get("test-resp").await.unwrap().unwrap();
         assert_eq!(session.state, crate::voice_session::VoiceSessionState::ResponseReady);
         assert_eq!(session.response, Some("Done!".to_string()));
     }
@@ -381,11 +391,11 @@ mod tests {
             "test-multi".to_string(),
             "atem-1".to_string(),
             "channel-1".to_string(),
-        ).await;
+        ).await.unwrap();
 
-        state.voice_sessions.add_transcription("test-multi", "Please".to_string()).await;
-        state.voice_sessions.add_transcription("test-multi", "create".to_string()).await;
-        state.voice_sessions.add_transcription("test-multi", "a function".to_string()).await;
+        state.voice_sessions.add_transcription("test-multi", "Please".to_string()).await.unwrap();
+        state.voice_sessions.add_transcription("test-multi", "create".to_string()).await.unwrap();
+        state.voice_sessions.add_transcription("test-multi", "a function".to_string()).await.unwrap();
 
         let result = trigger_voice_session_handler(
             State(state),

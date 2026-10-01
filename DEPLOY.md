@@ -27,48 +27,109 @@ This triggers `.github/workflows/release.yml` which:
 ### Station on Volumetric (Coolify)
 
 Every push to `main` runs `.github/workflows/deploy-station.yml`. It builds both
-Linux AMD64 images, publishes `:main` and `:sha-<commit>` tags to GHCR, deploys
-the relay followed by the webapp, and waits for each Coolify deployment to finish.
-The final check requires public HTTPS, `/health`, and an identity WebSocket
-connection to `wss://station.agora.build/ws` to succeed. The workflow can also
-be run manually on `main` from GitHub Actions.
+Linux AMD64 images, publishes `:main` and `:sha-<commit>` tags to GHCR, then
+deploys one application at a time, waiting for each Coolify deployment to
+finish:
+
+1. relay-a, then wait until `https://station.agora.build/health` is healthy
+   (polled every 5 s, up to 36 times);
+2. relay-b, only if the `COOLIFY_RELAY_B_WEBHOOK_URL` secret is set, then wait
+   for health again;
+3. the webapp;
+4. the final check: public HTTPS, a healthy `/health` (Postgres knowledge
+   store; Redis `ok` and at least `STATION_MIN_REPLICAS` live replicas when
+   those checks are switched on, see below), and an identity WebSocket
+   connection to `wss://station.agora.build/ws`.
+
+The workflow can also be run manually on `main` from GitHub Actions.
 
 Release tags continue to publish versioned and `:latest` images and the macOS
 installer. They do not deploy production; Coolify tracks `:main` so publishing
 an older release tag cannot roll production back.
 
-The existing Coolify applications on Volumetric are:
+The Coolify resources on Volumetric are:
 
-| Application | Coolify UUID | Image | Host port |
+| Resource | Coolify UUID | Image | Host port |
 | --- | --- | --- | --- |
-| Relay | `oss4444o8ss40ckgwc40og4c` | `ghcr.io/agora-build/station-relay-server:main` | `3000` |
+| Relay A (`relay-a`, the original relay) | `oss4444o8ss40ckgwc40og4c` | `ghcr.io/agora-build/station-relay-server:main` | `3000` |
+| Relay B (`relay-b`) | set when created | `ghcr.io/agora-build/station-relay-server:main` | none |
+| Valkey (relay live state) | set when created | `valkey/valkey:8` | none |
 | Webapp | `c0wwgk4c0owk0w4gsww4k0ss` | `ghcr.io/agora-build/station-webapp:main` | `3010` |
 
 Required GitHub Actions secrets:
 
 - `COOLIFY_API_TOKEN`: Coolify token with `deploy` and `read` permissions.
-- `COOLIFY_RELAY_SERVER_WEBHOOK_URL`: `https://smt.agora.build/api/v1/deploy?uuid=oss4444o8ss40ckgwc40og4c&force=false`.
+- `COOLIFY_RELAY_SERVER_WEBHOOK_URL`: relay-a,
+  `https://smt.agora.build/api/v1/deploy?uuid=oss4444o8ss40ckgwc40og4c&force=false`.
+- `COOLIFY_RELAY_B_WEBHOOK_URL`: relay-b,
+  `https://smt.agora.build/api/v1/deploy?uuid=<relay-b uuid>&force=false`.
+  Optional: while it is unset the workflow skips relay-b.
 - `COOLIFY_WEBAPP_WEBHOOK_URL`: `https://smt.agora.build/api/v1/deploy?uuid=c0wwgk4c0owk0w4gsww4k0ss&force=false`.
+
+GitHub Actions repository variables (both checks are **off while unset**, so
+a single relay without Redis still deploys):
+
+- `STATION_REQUIRE_REDIS`: `1` makes the health waits and the final check
+  require `"redis":"ok"`. Any other value, or unset, skips the check.
+- `STATION_MIN_REPLICAS`: the minimum live relay replicas (`"replicas"` in
+  `/health`) the health waits and the final check require: `1` with relay-a
+  only, `2` once relay-b exists. Unset or `0` skips the check.
+
+Set both explicitly (`STATION_REQUIRE_REDIS=1`, `STATION_MIN_REPLICAS=2`) in
+the same change that adds relay-b. Otherwise a deploy can pass with Redis
+down or with a replica missing.
 
 Runtime configuration:
 
-- Relay: `PUBLIC_BASE_URL=https://station.agora.build`,
-  `CORS_ORIGIN=https://station.agora.build`, `PORT=3000`, and the existing
-  PostgreSQL `DATABASE_URL`. Keep its `station-relay-server` network alias.
-- Webapp: `STATION_RELAY_UPSTREAM=station-relay-server:3000`. Both containers
-  must use the `coolify` Docker network. nginx uses Docker DNS to refresh the
-  relay address when Coolify replaces its container.
+- Relay (relay-a and relay-b, identical): `PUBLIC_BASE_URL=https://station.agora.build`,
+  `CORS_ORIGIN=https://station.agora.build`, `PORT=3000`, `RUST_LOG=info`, the
+  existing PostgreSQL `DATABASE_URL`, `REDIS_URL` (Valkey, a Coolify secret),
+  and `RELAY_REPLICAS_EXPECTED` (`1` with relay-a only, `2` with relay-b). The
+  last one is a guard: above 1 without `REDIS_URL` the relay refuses to start
+  (exit 1), and a value that isn't a positive integer also exits 1. Both apps
+  carry the `station-relay-server` network alias, so nginx sees every replica.
+  Health check `GET /health` on port 3000.
+- Webapp: `STATION_RELAY_UPSTREAM=station-relay-server:3000`. All containers
+  must use the `coolify` Docker network. nginx re-resolves the alias through
+  Docker DNS every 10 s and spreads requests across every address it returns,
+  so replaced and added relay containers are picked up.
 - Cloudflare: publish `station.agora.build` on the existing Volumetric tunnel
   with origin `http://10.0.0.1:3010` and a proxied CNAME to that tunnel's
   `<tunnel-id>.cfargotunnel.com`. TLS terminates at Cloudflare; the tunnel
   forwards `/`, `/health`, `/api/*`, and `/ws` to the webapp. `localhost` inside
   the cloudflared container refers to that container, not Volumetric.
 
+Metrics: each relay serves Prometheus text at `GET :3000/metrics`. The
+endpoint is unauthenticated and relies on network isolation: the webapp nginx
+answers 404 for `/metrics` on purpose, so scrape each relay container directly
+on the coolify network (never through the public hostname).
+
+Shutdown (Coolify redeploy or stop, i.e. SIGTERM): the relay drains. `/health`
+and new `/ws` upgrades get `503` (nginx then retries another replica), every
+WebSocket is closed with code `1012` (clients reconnect, landing on another
+replica), the relay waits up to 5 s for its sockets to leave their rooms,
+withdraws its presence (a Valkey call, up to 3 s), and in-flight HTTP requests
+get at most 5 s more before the relay exits. A long voice request
+(`/api/llm/chat`, which can wait up to 30 s) still running then is abandoned.
+With nothing in flight the drain takes well under a second; the worst case is
+about 13 s (5 + 3 + 5). Docker's default stop timeout is 10 s, so a stuck
+drain may be SIGKILLed; its presence then ages out within 30 s and the other
+replicas ignore its leftover room entries. A second SIGTERM during the drain
+exits at once (code 143, or 130 for SIGINT).
+
 Verification:
 
 ```bash
 # Node.js 22 or newer; checks HTTPS, relay health, and WebSocket upgrade.
 node .github/scripts/verify-station.mjs
+# The same checks as the deploy workflow with two relays:
+STATION_REQUIRE_REDIS=1 STATION_MIN_REPLICAS=2 node .github/scripts/verify-station.mjs
+# Just poll /health until it passes (what the workflow does after each relay):
+STATION_REQUIRE_REDIS=1 STATION_MIN_REPLICAS=2 node .github/scripts/verify-station.mjs --wait-health
+
+# What /health reports (any replica answers):
+curl -s https://station.agora.build/health
+# {"knowledge_store":"postgres","redis":"ok","replicas":2,"status":"ok","vault_store":"postgres"}
 
 # Inspect deployment history in GitHub Actions.
 gh run list --workflow deploy-station.yml
@@ -79,6 +140,200 @@ If `/health` returns `502` while `http://127.0.0.1:3000/health` works on
 Volumetric, check the webapp's relay upstream and Docker DNS resolution.
 A successful deployment webhook only means the deployment was queued; the
 workflow also checks the final deployment status and public endpoints.
+
+#### Relay replicas and Valkey
+
+Each relay replica keeps only its own WebSockets. Rooms, pairing/OTP
+sessions, voice and RTC sessions, and the shared rate-limit counters live in
+Valkey (`REDIS_URL`), and replicas deliver frames to each other through Valkey
+pub/sub. Postgres stays the only durable store. Design:
+`docs/specs/2026-09-30-relay-multi-replica.md`.
+
+`/health` (any replica answers it):
+
+| Field / status | Meaning |
+| --- | --- |
+| `"redis":"disabled"` | No `REDIS_URL`: in-memory mode, one replica |
+| `"redis":"ok"` | Valkey reachable |
+| `"replicas":<n>` | Live relay replicas as this replica last saw them: its cached copy of the `relay:replicas` presence index, refreshed every 10 s, so it can lag a change by up to 10 s (`1` in in-memory mode) |
+| `503 {"status":"unhealthy","redis":"unavailable"}` | This replica can't reach Valkey |
+| `503 {"status":"draining"}` | This replica is shutting down (nginx retries another) |
+| `503 {"status":"unhealthy"}` | The Postgres store failed its check |
+
+nginx (`webapp/nginx.conf`) retries `/ws` and `/health` on another replica
+after a connection error, a timeout, a `502` or a `503` (at most 3 tries), and
+skips a replica that failed that way for about 10 s. `502`/`503` are retried
+only on these two locations. Everything else (`/api/*`, `/pair`, `/auth`)
+uses nginx's default: retry only on a connection error or timeout, and never
+retry a request with a non-idempotent method (POST) once it has been sent to a
+relay.
+
+**Valkey resource:** on the private `coolify` network only (no public port),
+password protected (the password lives only in the `REDIS_URL` Coolify
+secret; the relay never logs it), `maxmemory-policy noeviction` (live state
+must never be dropped silently: if memory runs out, writes fail loudly), no
+persistence, no backups. It holds only live state; Postgres holds everything
+durable. **It is sensitive**: it holds pairing session ids, and a pending one
+can authorize a WebSocket. Restrict access like the database.
+
+**Startup.** A relay with `REDIS_URL` tries Valkey 10 times, 3 s apart (each
+attempt bounded at 3 s), then exits 1 and Coolify restarts it: about 27 s when
+connections are refused, up to about 57 s when Valkey doesn't answer at all. A
+permanent error (a malformed URL, a wrong password) exits 1 at once: check
+`REDIS_URL`. If one of a replica's background tasks (bus subscriber, presence,
+sweeps) ever dies, the replica drains as on SIGTERM and exits 1, so it is
+restarted instead of looking healthy while broken.
+
+**Per-connection send queue:** each WebSocket's outgoing queue holds at most
+1,000 frames or 4 MB. A frame that doesn't fit is dropped, and a client whose
+queue stays full for 10 s is closed with code `1013` (try again later).
+
+**Connection limits:** each replica accepts at most 200 concurrent `/ws`
+connections per client IP (`RELAY_WS_MAX_PER_IP`, raise it for load tests);
+the next upgrade gets `429`. The count is per replica, so with N replicas one
+IP can hold up to about N × the limit. The client IP is `CF-Connecting-IP`
+(set by Cloudflare on the edge-to-origin hop), then the first
+`X-Forwarded-For` entry, then `X-Real-IP`, then the peer address. Production
+traffic always comes through the Cloudflare tunnel, so the limit can't be
+dodged with forged headers there; keep the relay and webapp ports private (a
+client reaching nginx directly could forge `X-Forwarded-For`). A room holds at
+most 2 pending (not yet verified) Astation sockets from one client IP and 32
+in all; one more is closed with `1013`. The per-IP cap keeps one address from
+filling a room's pending slots and locking its owner's reconnects out.
+
+**If Valkey is unreachable:** new WebSockets are refused (`503`), the pairing,
+voice and RTC endpoints return `503`, and `/health` returns `503`. Vault and
+Atem Memory keep working (Postgres only). Shared rate limits fall back to each
+replica's own limit. Nothing durable is lost; rooms rebuild as clients
+reconnect. Known behaviors:
+
+- An outage longer than about 9 minutes lets live rooms expire in Valkey
+  (10 min TTL, refreshed every minute); their sockets are then closed and the
+  clients reconnect, recreating them.
+- After a quiet outage the first Valkey call on a replica can fail once while
+  the connection is re-established (the 10 s presence refresh usually absorbs
+  it).
+- A Valkey restart drops all live state: everyone reconnects.
+- Frames between replicas go over pub/sub and are best effort, like frames to
+  a socket that is dropping: one published while a replica is resubscribing is
+  lost.
+- A replaced socket whose close message was lost is closed at its next frame
+  (each frame's sender is checked against the room; a cached room view that
+  missed the change too can delay this by up to 30 s).
+
+**Sizing:** each replica opens up to 5 Postgres connections, and
+`admin forget-key` one more. Rule: Postgres `max_connections` must exceed
+replicas × 5 (× 2 while a rolling redeploy briefly runs the old and new
+container of the same app) + 1 (admin) + `superuser_reserved_connections`
+(default 3). Two replicas: above 2 × 5 × 2 + 1 + 3 = 24, plus anything else
+using that database.
+
+**Rollout,** each step reversible:
+
+1. Deploy Valkey (checklist below).
+2. Set `REDIS_URL` on relay-a and deploy it, still one instance; verify
+   `/health` shows `"redis":"ok"` and `"replicas":1`.
+3. Add relay-b, set `RELAY_REPLICAS_EXPECTED=2` on both relays, the
+   `COOLIFY_RELAY_B_WEBHOOK_URL` secret, and the variables
+   `STATION_REQUIRE_REDIS=1` and `STATION_MIN_REPLICAS=2`; verify
+   `"replicas":2`.
+
+**Rollback,** in this order:
+
+1. Remove relay-b: delete the `COOLIFY_RELAY_B_WEBHOOK_URL` secret, set
+   `STATION_MIN_REPLICAS=1`, stop and delete relay-b in Coolify.
+2. If Valkey itself is the problem: on relay-a set `RELAY_REPLICAS_EXPECTED=1`
+   **first** (above 1 without `REDIS_URL` refuses to start), then remove
+   `REDIS_URL`, delete the `STATION_REQUIRE_REDIS` variable, and redeploy
+   relay-a. It is back to in-memory mode, exactly the single-relay behavior
+   from before this change.
+
+The Postgres schema doesn't change in either direction, and any relay image
+from before this change still runs against the same database.
+
+#### Manual Coolify checklist (two relays + Valkey)
+
+Do these in order; each step is reversible (see "Rollback" above). Record the
+new Coolify UUIDs in the resource table at the top of this section.
+
+1. **Create Valkey.** Coolify → Projects → Station → + New → Database → Redis.
+   - Image: `valkey/valkey:8`.
+   - Password: generate a strong one. Keep "Make it publicly available"
+     **off** (no host port). Network: the default `coolify` network.
+   - Custom configuration (Redis configuration / command arguments):
+     `maxmemory 512mb`, `maxmemory-policy noeviction`, `save ""`,
+     `appendonly no`. Keep Valkey's default
+     `client-output-buffer-limit pubsub 32mb 8mb 60`: a relay's bus
+     subscriber that falls more than 32 MB behind (or 8 MB for 60 s) is
+     disconnected and loses every cross-replica frame until it resubscribes.
+     So the relay never publishes a message over 8 MiB to another replica
+     (`BUS_MAX_FRAME_BYTES`): a bigger client frame whose target socket is on
+     another replica is dropped with a warning and counted in
+     `relay_bus_oversize_dropped_total`. Frames between sockets on the same
+     replica are not limited this way. Don't lower the pubsub limit below
+     about 4 × 8 MiB.
+   - Backups: none. Start it and copy its internal URL,
+     `redis://default:<password>@<valkey container name>:6379`.
+   - Check in the Valkey container's terminal:
+     `valkey-cli -a '<password>' CONFIG GET maxmemory-policy` → `noeviction`,
+     and `CONFIG GET save` → empty.
+2. **Point relay-a at Valkey.** Relay app `oss4444o8ss40ckgwc40og4c` (rename
+   it `relay-a` if you like). Environment: add `REDIS_URL` = the internal URL
+   above, marked as a secret, and `RELAY_REPLICAS_EXPECTED=1`.
+   **URL-encode** any special characters in the password (`@`, `:`, `/`, `#`,
+   `%`, …), or the URL is malformed and the relay exits at once. Health check:
+   **enabled**, path `/health`, port 3000, so Coolify keeps the old container
+   serving until the new one is healthy. Keep its `station-relay-server`
+   network alias. Redeploy relay-a. **If it doesn't become healthy, remove
+   `REDIS_URL` at once and redeploy** (that is the rollback), then read the
+   relay log.
+   **Close host port 3000:** relay-a publishes `3000` on the host, which
+   bypasses Cloudflare: anyone reaching it can read the unauthenticated
+   `/metrics` and forge `X-Forwarded-For` past the per-IP WebSocket and
+   pending-Astation caps. Remove the host port mapping (nginx reaches relays
+   by the `station-relay-server` alias on the `coolify` network), or bind it
+   to `127.0.0.1`, or firewall it so only the host can connect. Check from
+   another machine: `curl -m 5 http://<server ip>:3000/health` must fail.
+3. **Verify one relay with Redis** (these checks apply once the multi-replica
+   relay image has been deployed from `main`; an older image reports no
+   `redis`/`replicas`). `curl -s https://station.agora.build/health` shows
+   `"redis":"ok"` and `"replicas":1`. The relay log shows, once at startup,
+   `Shared relay state ready (Redis); replica <id>, 1 live replica(s)`.
+   Optionally set the repository variables `STATION_REQUIRE_REDIS=1` and
+   `STATION_MIN_REPLICAS=1` now and re-run "Deploy Station" on `main`.
+4. **Create relay-b.** + New → Application → Docker Image
+   `ghcr.io/agora-build/station-relay-server:main`, on the `coolify` network,
+   **no host port** (relay-a already uses 3000), the same
+   `station-relay-server` network alias as relay-a (set the same way), health
+   check `/health` on port 3000, and the same environment as relay-a
+   (`DATABASE_URL`, `REDIS_URL` as a secret, `CORS_ORIGIN`, `PUBLIC_BASE_URL`,
+   `PORT=3000`, `RUST_LOG=info`). Set `RELAY_REPLICAS_EXPECTED=2` on **both**
+   relays. Deploy relay-b, then redeploy relay-a.
+   Check that the alias reaches both relays from the webapp container:
+   `docker exec <webapp container> getent hosts station-relay-server` must
+   print **two** addresses. A missing alias on relay-b still makes `/health`
+   report `"replicas":2` (presence is in Valkey), but nginx would never route
+   to relay-b.
+5. **GitHub.** Add the secret `COOLIFY_RELAY_B_WEBHOOK_URL`
+   (`https://smt.agora.build/api/v1/deploy?uuid=<relay-b uuid>&force=false`)
+   and set the repository variables `STATION_REQUIRE_REDIS=1` and
+   `STATION_MIN_REPLICAS=2` (explicitly; unset means "not checked"). Re-run
+   "Deploy Station" on `main`: relay-a, health, relay-b, health, webapp,
+   verify.
+6. **Verify two replicas.** `/health` shows `"replicas":2` (repeat the curl a
+   few times: either replica answers, and each one's count can lag up to 10 s
+   after a replica starts or stops). The startup log line of the replica that
+   started second says `2 live replica(s)`; the first one's said 1 and is not
+   printed again.
+7. **Postgres.** `SHOW max_connections;` on the relay database is above 24
+   (see "Sizing" above).
+8. **Failover drill.** With an Astation and an Atem connected and chatting,
+   stop relay-a in Coolify. Expect: their sockets close with 1012 and
+   reconnect within seconds to relay-b, chat keeps working, `/health` stays
+   `200` (now `"replicas":1`). Start relay-a again, wait for `"replicas":2`,
+   then repeat with relay-b.
+9. **Rollback drill (optional).** Follow "Rollback" above on a quiet day and
+   then roll forward again.
 
 #### Relay identity (Astation keys + session bindings)
 
@@ -104,30 +359,61 @@ short as possible; see "First-use squatting" in `relay-server/SECURITY.md`):
    (the relay no longer derives bindings from auth traffic) until they update.
    Atems keep their changes queued meanwhile.
 
-The relay loads all registered keys into memory at startup (logged as
-`Loaded N Astation relay key(s)`) and serves connects and verifications from
-that cache, so a database outage does not lock registered Astations out of
-relay chat.
+Each relay replica loads all registered keys into memory at startup (logged
+as `Loaded N Astation relay key(s)`) and serves connects and verifications
+from that cache, so a database outage does not lock registered Astations out
+of relay chat. With `REDIS_URL`, a key change on one replica (a registration,
+a re-read that finds a new key, or `admin forget-key`) is announced on Valkey
+and every replica re-reads that key. If that re-read fails, the replica keeps
+the id as a stale placeholder, so its connects stay pending and must prove the
+key against Postgres (fail closed). After a Valkey resubscribe each replica
+reloads every key, retrying with backoff (1 s doubling to 30 s) until it
+succeeds. Room ownership in Valkey is authoritative: a socket without a key
+proof never displaces a verified owner, even on a replica whose cache missed
+the key; it waits as pending instead.
 
-Admin reset, for a lost or replaced Mac (its Astation reports "Relay rejected
-this Astation's key"). Relay logs show only the first 4 characters of an id, so
-look it up first:
+Admin reset, for a lost, stolen or replaced Mac (its Astation reports "Relay
+rejected this Astation's key"). Relay logs show only the first 4 characters of
+an id, so look it up first:
 
 ```sql
 SELECT astation_id, registered_at, last_verified_at FROM astation_keys
  WHERE astation_id LIKE '<first chars>%';
-DELETE FROM astation_keys WHERE astation_id = '<id>';
 ```
 
-Bindings are kept. The next connect with a new key for that id registers it
-(the mismatch makes the relay re-read the stored key). Until then the relay's
-in-memory cache still accepts the old key, so **restart the relay after the
-`DELETE` if the old key must be revoked immediately** (e.g. a stolen Mac). A
-reset done while the relay can't reach the database is likewise picked up only
-by a later re-read or a restart.
+Then, in any relay container (Coolify → relay-a → Terminal, or
+`docker exec -it <relay container> sh`):
+
+```bash
+station-relay-server admin forget-key <astation_id>
+# Deleted the relay key of <astation_id>.
+# Announced on relay:broadcast: every relay replica drops its cached key now.
+```
+
+It uses the container's `DATABASE_URL` (required) and `REDIS_URL`
+(optional). It connects to both first: if `REDIS_URL` is set but Valkey is
+unreachable it exits 1 **without deleting the key** (fix Valkey and retry).
+It deletes the key in Postgres, then announces the change on
+Valkey: every replica drops its cached key at once **and disconnects that
+Astation's live verified socket**, so a stolen Mac is revoked immediately,
+without a restart. Exit codes: `0` done (also when no key was registered),
+`1` a database or Valkey error (including "the key was deleted, but
+announcing it failed": then restart the relay replicas), `2` bad arguments.
+Without `REDIS_URL` (in-memory mode) it only deletes the key and says so:
+restart the relay to drop its cached key. Deleting the row by hand in SQL
+still works, but likewise needs a restart of every relay replica.
+
+Bindings are kept. Then get the replacement (or recovered) Mac online: its
+Astation connects with its new key, which registers by trust on first use, and
+it pushes its sessions again. After `forget-key` the **first** key to connect
+wins (trust on first use), so the replacement Mac must connect before the
+stolen one does: a stolen Mac that is still online reconnects on its own and
+would re-register its old key. Do this promptly, since until then anyone holding
+the room code could register first (see "First-use squatting" in
+`relay-server/SECURITY.md`).
 
 `DELETE /api/pair/:code` is refused with `409` for a code that has a registered
-key; use the SQL above, not the API, to manage such rooms.
+key; use `admin forget-key`, not the API, to manage such rooms.
 
 Rollback caveat: once `0003` has been applied, a relay image built before it
 fails at startup (`sqlx` migrate error `VersionMissing(3)`: the database has a
@@ -217,9 +503,9 @@ metadata:
   name: relay-server
   namespace: astation
 spec:
-  replicas: 1  # must stay 1: rooms and the Astation key cache are in memory (see Scaling)
+  replicas: 1  # more than 1 needs REDIS_URL (see Scaling)
   strategy:
-    type: Recreate  # never run two relay pods at once, even during a rollout
+    type: Recreate  # RollingUpdate is safe once REDIS_URL is set
   selector:
     matchLabels:
       app: relay-server
@@ -538,40 +824,20 @@ sudo tail -f /var/log/nginx/access.log
 
 ## Scaling
 
-### The relay runs as exactly one instance
+### Relay replicas
 
-Do not scale the relay beyond one instance. It keeps state in memory that
-every connection for an account must share:
+With `REDIS_URL` set, the relay runs as any number of replicas behind the
+webapp: any replica serves any request, and an Astation and its Atems may be
+on different replicas. Without `REDIS_URL` it keeps rooms and sessions in
+memory and must run as exactly one instance (`RELAY_REPLICAS_EXPECTED` above
+1 without `REDIS_URL` refuses to start). See "Relay replicas and Valkey" above
+for Valkey, sizing, rollout and rollback.
 
-- **Rooms.** An Astation and its Atems meet in an in-memory room keyed by the
-  Astation's code. With two instances, an Astation on one and an Atem on the
-  other never meet, so chat, remote control and pairing break.
-- **The Astation key cache.** Relay identity keys are loaded into memory at
-  startup and updated as Astations register (see "Relay identity" above). A
-  key registered on one instance is unknown to another, which would treat
-  that Astation as unregistered.
-
-Sticky sessions don't fix this: the Astation and its Atems are separate
-clients, so a load balancer can send them to different instances. Running
-more than one relay would need shared room state and cache invalidation,
-which the relay doesn't have.
-
-Postgres data (vault, Atem Memory, keys, bindings) is already shared and
-isn't the limit.
-
-**If failover is ever needed** (not built): route by room code. Every relay
-WebSocket carries it (`/ws?role=astation&code=<id>`, `/ws?role=atem&code=<id>`),
-so nginx can hash on it (`hash $arg_code consistent;`), and send
-`/api/pair/:code` the same way. An Astation and its Atems then always reach
-the same instance. It still needs two changes:
-
-- every instance learns about key changes (Postgres `LISTEN/NOTIFY`, or a
-  rate-limited re-read on a cache miss);
-- voice and RTC sessions are routed by their id or moved to Postgres.
-
-This gives failover, since only a failed instance's rooms reconnect, not
-more capacity per room. A single relay handles many thousands of idle
-WebSockets, so capacity isn't the reason to add one.
+Replicas find each other only through Valkey; there is no leader. Each one
+keeps a presence key alive (refreshed every 10 s, expiring after 30 s). A
+crashed replica's clients reconnect to the others within seconds, and its
+leftover room entries are ignored once its presence key expires. Redis keys
+and channels: `docs/specs/2026-09-30-relay-multi-replica.md`, "Redis keys".
 
 ### Scaling the webapp
 
@@ -590,16 +856,17 @@ kubectl scale deployment webapp --replicas=10 -n astation
 ### Load Balancing
 
 Put the load balancer in front of the webapp only; the webapp proxies
-`/api/*` and `/ws` to the single relay. Configure health checks on
+`/api/*` and `/ws` to the relay replicas. Configure health checks on
 `/health`.
 
 ## Security
 
 1. **HTTPS Required** - Microphone access requires HTTPS (except localhost)
 2. **CORS** - Set `CORS_ORIGIN` to the public webapp origin in production
-3. **Rate Limiting** - REST APIs are limited per client IP behind the trusted proxy
-4. **Firewall** - Restrict access to port 3000 (API should only be accessed via nginx proxy)
+3. **Rate Limiting** - REST APIs are limited per client IP behind the trusted proxy; `/ws` allows 200 concurrent connections per client IP per replica (`RELAY_WS_MAX_PER_IP`), keyed on Cloudflare's `CF-Connecting-IP`
+4. **Firewall** - Restrict access to port 3000 (API should only be accessed via nginx proxy). The docker-compose example publishes `3000:3000`, which also exposes the unauthenticated `/metrics`: firewall it or publish `127.0.0.1:3000:3000` instead
 5. **Token Validation** - Ensure Agora tokens have appropriate expiry times
+6. **Valkey** - Private network only, password in the `REDIS_URL` secret; it holds pairing session ids, so restrict it like the database
 
 ## Troubleshooting
 
@@ -631,9 +898,10 @@ Put the load balancer in front of the webapp only; the webapp proxies
 # Pull latest images
 docker compose pull
 
-# Restart services. The relay restart drops every WebSocket for a few
-# seconds; Astations and Atems reconnect on their own. Vault and Atem Memory
-# data is in Postgres and survives.
+# Restart services. With one relay the restart drops every WebSocket for
+# a few seconds; with several (REDIS_URL) update them one at a time and
+# clients move to the others (close code 1012). Astations and Atems reconnect
+# on their own. Vault and Atem Memory data is in Postgres and survives.
 docker compose up -d
 
 # Verify new version
@@ -652,8 +920,8 @@ losing it loses every account's data:
 | `astation_keys` | Registered Astation relay keys | Every Astation re-registers on its next connect by trust on first use, which reopens the squatting window (`relay-server/SECURITY.md`) |
 | `session_bindings` | Which pairing sessions each Astation authorized | Vault and Memory return 401 until each Astation reconnects and resyncs its sessions |
 
-Everything else (rooms, WebSockets, the key cache) is in memory and rebuilt on
-restart.
+Everything else (rooms, sessions, WebSockets, the key cache) is live state in
+memory or Valkey and is rebuilt as clients reconnect; Valkey is not backed up.
 
 **On Volumetric (Coolify):** enable scheduled backups on the Postgres resource
 the relay's `DATABASE_URL` points to (Coolify → the database → Backups), with

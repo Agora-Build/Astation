@@ -85,6 +85,16 @@ jobs:
   test-relay-server:
     name: Relay Server Tests
     runs-on: ubuntu-latest
+    services:
+      valkey:
+        image: valkey/valkey:8
+        ports:
+          - 56379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -97,12 +107,21 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             relay-server/target
-          key: ${{ runner.os }}-cargo-relay-${{ hashFiles('relay-server/Cargo.lock') }}
+            relay-server/loadtest/target
+          key: ${{ runner.os }}-cargo-relay-${{ hashFiles('relay-server/Cargo.lock', 'relay-server/loadtest/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-relay-
       - name: Run relay server tests
         working-directory: relay-server
         run: cargo test
+      - name: Run relay Redis (Valkey) suites
+        working-directory: relay-server
+        env:
+          TEST_REDIS_URL: redis://127.0.0.1:56379/
+        run: cargo test redis -- --ignored --test-threads=1
+      - name: Test relay load test client
+        working-directory: relay-server/loadtest
+        run: cargo test --locked
       - name: Build relay server container
         run: docker build --tag station-relay-server:ci relay-server
 

@@ -1,6 +1,9 @@
 # Relay multi-replica design
 
-Status: design, approved in discussion 2026-09-30; not built.
+Status: design, approved in discussion 2026-09-30. Steps 1–5 built
+(`feat/relay-multi-replica`); step 6 (10k+ readiness): bounded send queues
+built, the rest not yet.
+Operations: `DEPLOY.md`, "Relay replicas and Valkey".
 
 ## Goal
 
@@ -103,10 +106,11 @@ if ever needed.
 | Key | Type | Contents | Expiry |
 |---|---|---|---|
 | `relay:replica:<replica_id>` | string | started-at | 30 s, refreshed every 10 s |
+| `relay:replicas` | sorted set | Presence index: member `replica_id`, score = its expiry (unix seconds). Replicas list peers from it instead of scanning `relay:replica:*` | Entries past their score are ignored and trimmed on refresh |
 | `relay:room:<code>` | hash | `owner_conn`, `owner_replica`, `verified`, `hostname`, `created_at`, `paired` | 10 min while unpaired (today's `ROOM_EXPIRY_SECS`); refreshed by heartbeats once connected |
 | `relay:room:<code>:atems` | hash | `atem_id` → `connection_id\|replica_id` | Same as the room |
-| `relay:room:<code>:pending` | hash | `connection_id` → `replica_id` | Same as the room |
-| `relay:session:<id>` | hash | Pairing/OTP session fields | 5 min (today's TTL) |
+| `relay:room:<code>:pending` | hash | `connection_id` → `replica_id\|client_ip` (the IP feeds the per-IP pending cap) | Same as the room |
+| `relay:session:<id>` | hash | Pairing/OTP session fields | Pending: until its 5-min `expires_at` + 60 s (clients still see `expired`/`410`); granted or denied: 7 days, refreshed on each `?session=` connect |
 | `relay:voice:<id>` | hash | Status, bounded text buffer, last activity | 60 s of inactivity |
 | `relay:voice:<id>:reply` | string | The Atem's answer, if it arrived before anyone waited | 30 s |
 | `relay:rtc:<id>` | hash | Session, participants (JSON), `next_uid` | 4 h |
@@ -116,7 +120,7 @@ Channels:
 
 | Channel | Carries |
 |---|---|
-| `relay:inbox:<replica_id>` | `deliver {connection_id, frame}`, `close {connection_id, code, reason}` |
+| `relay:inbox:<replica_id>` | `deliver {connection_ids, frame}` (one per target replica, fanned out locally), `close {connection_id, code, reason}` |
 | `relay:voice-reply:<id>` | The Atem's answer for a waiting voice request |
 | `relay:broadcast` | `key-changed {astation_id}`, `room-changed {code}` |
 
@@ -213,8 +217,10 @@ uid.
   Other replicas re-read that one key from Postgres.
 - This fixes a known issue: after an admin reset, the old key kept verifying
   until the relay restarted. Now every replica drops it immediately.
-- New admin command `relay-server admin forget-key <astation_id>`: deletes
-  the key in Postgres and publishes `key-changed`. The runbook uses it.
+- New admin command `station-relay-server admin forget-key <astation_id>`:
+  deletes the key in Postgres and publishes `key-changed`; every replica
+  drops the key and disconnects that Astation's live verified socket. The
+  runbook uses it.
   Deleting the row by hand in SQL still works, but then the replicas must be
   restarted.
 

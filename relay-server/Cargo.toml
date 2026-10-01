@@ -16,6 +16,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 futures-util = "0.3"
 urlencoding = "2.1"
+url = "2.5"
 tower_governor = "0.4"
 governor = "0.6"
 validator = { version = "0.18", features = ["derive"] }
@@ -23,7 +24,11 @@ sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio",
 async-trait = "0.1"
 # Astation relay-identity proofs (ECDSA P-256); already in the tree via rustls.
 ring = "0.17"
+# Shared relay state across replicas (REDIS_URL): commands with automatic
+# reconnect, pub/sub, Lua scripts. Valkey-compatible.
+redis = { version = "0.27", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "keep-alive"] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = "0.24"
