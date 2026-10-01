@@ -243,6 +243,7 @@ pub async fn connect_cluster_with_keys(
         health: Arc::new(health.clone()),
         cache_rooms: true,
         auth_timeout,
+        ws_limiter: crate::cluster::limits::WsConnLimiter::from_env(),
     });
     let dispatcher = relay.spawn_bus_dispatcher(identity, waiters.clone(), events);
     let presence_task = health.spawn_refresh();

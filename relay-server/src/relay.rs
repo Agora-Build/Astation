@@ -26,6 +26,7 @@ use crate::cluster::directory::{
 };
 use crate::cluster::health::{ClusterHealth, SingleInstance};
 use crate::cluster::keys::KeyCache;
+use crate::cluster::limits::{client_ip, WsConnLimiter, WsPermit};
 use crate::cluster::local::{LocalSockets, SocketOutbox, SocketRole};
 use crate::cluster::ratelimit::{NoopRateLimiter, SharedRateLimiter};
 use crate::cluster::{ConnRef, StoreError, SINGLE_REPLICA_ID};
@@ -73,8 +74,8 @@ const MAX_PAIR_CODE_ATTEMPTS: usize = 10;
 /// A key reload after a bus resubscribe gives up after this long.
 pub(crate) const KEY_RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Pending Astation sockets allowed per room (0 = no cap).
-pub(crate) const MAX_PENDING_ASTATIONS_PER_ROOM: usize = 0;
+/// Pending Astation sockets allowed per room.
+pub(crate) const MAX_PENDING_ASTATIONS_PER_ROOM: usize = 4;
 
 /// Close code on drain (RFC 6455 "service restart"): reconnect elsewhere.
 pub(crate) const CLOSE_SERVICE_RESTART: u16 = 1012;
@@ -170,6 +171,7 @@ pub(crate) struct HubParts {
     pub auth_timeout: Duration,
     /// Cache routing lookups (Redis mode; one replica reads its own memory).
     pub cache_rooms: bool,
+    pub ws_limiter: WsConnLimiter,
 }
 
 impl HubParts {
@@ -187,6 +189,7 @@ impl HubParts {
             health: Arc::new(SingleInstance),
             auth_timeout,
             cache_rooms: false,
+            ws_limiter: WsConnLimiter::from_env(),
         }
     }
 }
@@ -203,6 +206,7 @@ struct HubInner {
     room_cache: Option<RoomCache>,
     draining: AtomicBool,
     active_sockets: AtomicUsize,
+    ws_limiter: WsConnLimiter,
 }
 
 /// The relay: this replica's sockets plus the shared room directory, the
@@ -250,8 +254,21 @@ impl RelayHub {
                 room_cache: parts.cache_rooms.then(RoomCache::default),
                 draining: AtomicBool::new(false),
                 active_sockets: AtomicUsize::new(0),
+                ws_limiter: parts.ws_limiter,
             }),
         }
+    }
+
+    pub(crate) fn ws_limiter(&self) -> &WsConnLimiter {
+        &self.inner.ws_limiter
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_ws_limit(max_per_ip: usize, auth_timeout: Duration) -> Self {
+        Self::from_parts(HubParts {
+            ws_limiter: WsConnLimiter::new(max_per_ip),
+            ..HubParts::single_instance(InMemoryRoomDirectory::new(), auth_timeout)
+        })
     }
 
     #[cfg(test)]
@@ -975,11 +992,22 @@ pub async fn delete_pair_handler(
 pub async fn ws_handler(
     State(state): State<AppState>,
     Query(params): Query<WsQuery>,
+    headers: axum::http::HeaderMap,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     if state.relay.is_draining() {
         return (StatusCode::SERVICE_UNAVAILABLE, "Relay is restarting, reconnect").into_response();
     }
+    let ip = client_ip(&headers, peer.map(|axum::extract::ConnectInfo(address)| address));
+    let Some(permit) = state.relay.ws_limiter().try_acquire(&ip) else {
+        tracing::warn!(
+            "Refused a WebSocket: {} connections already open from one address",
+            state.relay.ws_limiter().open(&ip)
+        );
+        return (StatusCode::TOO_MANY_REQUESTS, "Too many WebSocket connections from this address")
+            .into_response();
+    };
     let hub = state.relay.clone();
     let now = chrono::Utc::now().timestamp();
 
@@ -1003,7 +1031,7 @@ pub async fn ws_handler(
                 let atem_id = params.atem_id.clone().unwrap_or_else(|| "session-atem".to_string());
                 let identity = state.identity.clone();
                 return ws
-                    .on_upgrade(move |socket| handle_ws(hub, identity, code, role, atem_id, socket))
+                    .on_upgrade(move |socket| handle_ws(hub, identity, code, role, atem_id, socket, permit))
                     .into_response();
             }
             _ => {
@@ -1048,7 +1076,7 @@ pub async fn ws_handler(
     let atem_id = sanitize_atem_id(params.atem_id.as_deref());
 
     let identity = state.identity.clone();
-    ws.on_upgrade(move |socket| handle_ws(hub, identity, code, role, atem_id, socket))
+    ws.on_upgrade(move |socket| handle_ws(hub, identity, code, role, atem_id, socket, permit))
         .into_response()
 }
 
@@ -1729,6 +1757,7 @@ async fn handle_ws(
     role: String,
     atem_id: String,
     socket: WebSocket,
+    _permit: WsPermit,
 ) {
     let _active = ActiveSocket::new(&hub);
     let socket_role = match role.as_str() {
@@ -4741,8 +4770,9 @@ pub(crate) mod tests {
             axum::routing::get(move |ws: WebSocketUpgrade| async move {
                 let identity: Arc<dyn IdentityStore> =
                     Arc::new(crate::identity_store::InMemoryIdentityStore::new());
+                let permit = late_hub.ws_limiter().try_acquire("127.0.0.1").expect("permit");
                 ws.on_upgrade(move |socket| {
-                    handle_ws(late_hub, identity, code.to_string(), "atem".into(), "atem-late".into(), socket)
+                    handle_ws(late_hub, identity, code.to_string(), "atem".into(), "atem-late".into(), socket, permit)
                 })
             }),
         );
@@ -4759,6 +4789,163 @@ pub(crate) mod tests {
         let room = hub.room(code).await.unwrap().expect("room kept");
         assert!(room.atems.is_empty(), "a late socket must not join: {:?}", room.atems);
         assert!(hub.local().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_room_takes_at_most_four_pending_astations() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let code = "astation-crowd";
+        let key = TestKey::generate();
+        let _owner = verified_astation(&base_url, code, &key, "registered").await;
+        let mut pending = Vec::new();
+        for _ in 0..MAX_PENDING_ASTATIONS_PER_ROOM {
+            pending.push(connect_astation(&base_url, code).await);
+        }
+        let (mut fifth, _) = tokio_tungstenite::connect_async(format!("{base_url}?role=astation&code={code}"))
+            .await
+            .expect("upgrade");
+        assert_eq!(close_code(&mut fifth).await, 1013);
+        assert_eq!(MAX_PENDING_ASTATIONS_PER_ROOM, 4);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn websocket_connections_are_capped_per_client_ip() {
+        let state = crate::AppState {
+            relay: RelayHub::with_ws_limit(2, TEST_AUTH_TIMEOUT),
+            ..memory_identity_state()
+        };
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let first = connect_astation(&base_url, "astation-ip-1").await;
+        let _second = connect_astation(&base_url, "astation-ip-2").await;
+        match tokio_tungstenite::connect_async(format!("{base_url}?role=astation&code=astation-ip-3")).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status().as_u16(), 429)
+            }
+            other => panic!("a third socket from one IP was accepted: {:?}", other.map(|_| ())),
+        }
+        drop(first);
+        let mut admitted = false;
+        for _ in 0..100 {
+            if tokio_tungstenite::connect_async(format!("{base_url}?role=astation&code=astation-ip-4"))
+                .await
+                .is_ok()
+            {
+                admitted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(admitted, "a closed socket frees its slot");
+        server.abort();
+    }
+
+    /// Open a `/ws` socket as if Cloudflare had forwarded it from `ip`.
+    async fn connect_from(
+        base_url: &str,
+        query: &str,
+        ip: &str,
+        forwarded_for: Option<&str>,
+    ) -> Result<TestSocket, tokio_tungstenite::tungstenite::Error> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = format!("{base_url}?{query}").into_client_request().unwrap();
+        request.headers_mut().insert("cf-connecting-ip", ip.parse().unwrap());
+        if let Some(forwarded) = forwarded_for {
+            request.headers_mut().insert("x-forwarded-for", forwarded.parse().unwrap());
+        }
+        tokio_tungstenite::connect_async(request).await.map(|(socket, _)| socket)
+    }
+
+    #[tokio::test]
+    async fn the_per_ip_cap_keys_on_cloudflares_address_and_leaves_other_ips_alone() {
+        let state = crate::AppState {
+            relay: RelayHub::with_ws_limit(1, TEST_AUTH_TIMEOUT),
+            ..memory_identity_state()
+        };
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let _held = connect_from(&base_url, "role=astation&code=astation-cf-1", "203.0.113.1", None)
+            .await
+            .expect("first socket");
+        // A forged X-Forwarded-For does not move the socket to another bucket.
+        match connect_from(
+            &base_url,
+            "role=astation&code=astation-cf-2",
+            "203.0.113.1",
+            Some("198.51.100.99"),
+        )
+        .await
+        {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status().as_u16(), 429);
+                assert_eq!(
+                    response.body().as_deref(),
+                    Some(&b"Too many WebSocket connections from this address"[..])
+                );
+            }
+            other => panic!("a second socket from one IP was accepted: {:?}", other.map(|_| ())),
+        }
+        let _other = connect_from(&base_url, "role=astation&code=astation-cf-3", "203.0.113.2", None)
+            .await
+            .expect("another IP is unaffected");
+        assert_eq!(state.relay.ws_limiter().open("203.0.113.1"), 1);
+        assert_eq!(state.relay.ws_limiter().open("203.0.113.2"), 1);
+        server.abort();
+    }
+
+    /// A socket refused before or after the upgrade gives its slot back.
+    #[tokio::test]
+    async fn refused_and_closed_sockets_release_their_slot() {
+        let state = crate::AppState {
+            relay: RelayHub::with_ws_limit(1, TEST_AUTH_TIMEOUT),
+            ..memory_identity_state()
+        };
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let ip = "203.0.113.9";
+        // Refused before the upgrade: an Atem for a room that does not exist.
+        match connect_from(&base_url, "role=atem&code=NOPE42&atem_id=a", ip, None).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status().as_u16(), 404)
+            }
+            other => panic!("expected 404: {:?}", other.map(|_| ())),
+        }
+        assert_eq!(state.relay.ws_limiter().open(ip), 0);
+        // Upgraded, then closed by the relay: an unknown role ends handle_ws.
+        state
+            .relay
+            .ensure_room("astation-odd", "host", chrono::Utc::now().timestamp())
+            .await
+            .unwrap();
+        let _odd = connect_from(&base_url, "role=bogus&code=astation-odd", ip, None)
+            .await
+            .expect("upgrade");
+        let mut freed = false;
+        for _ in 0..100 {
+            if state.relay.ws_limiter().open(ip) == 0 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(freed, "a socket the relay ended gives its slot back");
+        // Closed by the auth timeout: a pending socket (the room's key is
+        // registered, from another address) that never answers.
+        let key = TestKey::generate();
+        let _owner = verified_astation(&base_url, "astation-silent", &key, "registered").await;
+        let mut silent = connect_from(&base_url, "role=astation&code=astation-silent", ip, None)
+            .await
+            .expect("slot is free again");
+        let _ = close_code(&mut silent).await;
+        let mut freed = false;
+        for _ in 0..100 {
+            if state.relay.ws_limiter().open(ip) == 0 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(freed, "a timed-out socket gives its slot back");
         server.abort();
     }
 }
