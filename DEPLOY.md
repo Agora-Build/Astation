@@ -183,6 +183,18 @@ restarted instead of looking healthy while broken.
 1,000 frames or 4 MB. A frame that doesn't fit is dropped, and a client whose
 queue stays full for 10 s is closed with code `1013` (try again later).
 
+**Connection limits:** each replica accepts at most 200 concurrent `/ws`
+connections per client IP (`RELAY_WS_MAX_PER_IP`, raise it for load tests);
+the next upgrade gets `429`. The count is per replica, so with N replicas one
+IP can hold up to about N × the limit. The client IP is `CF-Connecting-IP`
+(set by Cloudflare, which overwrites any client-sent value), then the first
+`X-Forwarded-For` entry, then `X-Real-IP`, then the peer address. Production
+traffic always comes through the Cloudflare tunnel, so the limit can't be
+dodged with forged headers there; keep the relay and webapp ports private (a
+client reaching nginx directly could forge `X-Forwarded-For`). A room holds at
+most 4 pending (not yet verified) Astation sockets; a fifth is closed with
+`1013`.
+
 **If Valkey is unreachable:** new WebSockets are refused (`503`), the pairing,
 voice and RTC endpoints return `503`, and `/health` returns `503`. Vault and
 Atem Memory keep working (Postgres only). Shared rate limits fall back to each
@@ -812,7 +824,7 @@ Put the load balancer in front of the webapp only; the webapp proxies
 
 1. **HTTPS Required** - Microphone access requires HTTPS (except localhost)
 2. **CORS** - Set `CORS_ORIGIN` to the public webapp origin in production
-3. **Rate Limiting** - REST APIs are limited per client IP behind the trusted proxy
+3. **Rate Limiting** - REST APIs are limited per client IP behind the trusted proxy; `/ws` allows 200 concurrent connections per client IP per replica (`RELAY_WS_MAX_PER_IP`), keyed on Cloudflare's `CF-Connecting-IP`
 4. **Firewall** - Restrict access to port 3000 (API should only be accessed via nginx proxy)
 5. **Token Validation** - Ensure Agora tokens have appropriate expiry times
 6. **Valkey** - Private network only, password in the `REDIS_URL` secret; it holds pairing session ids, so restrict it like the database

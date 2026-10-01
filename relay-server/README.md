@@ -25,6 +25,17 @@ Each WebSocket's send queue holds at most 1,000 frames or 4 MB
 that doesn't fit is dropped, and a client whose queue stays full for 10 s is
 closed with `1013`.
 
+Each replica accepts at most 200 concurrent `/ws` connections per client IP
+(`RELAY_WS_MAX_PER_IP`); the next upgrade gets `429` "Too many WebSocket
+connections from this address" until one closes. The count is per replica, so
+behind N replicas one IP can hold up to about N × the limit. The client IP is
+`CF-Connecting-IP`, then the first `X-Forwarded-For` entry, then `X-Real-IP`,
+then the peer address. Cloudflare sets `CF-Connecting-IP` itself, so in
+production it can't be forged; a relay reachable without Cloudflare in front
+trusts client-sent `X-Forwarded-For`/`X-Real-IP` and its per-IP limit can be
+dodged. A room holds at most 4 pending (not yet verified) Astation sockets; a
+fifth is closed with `1013`.
+
 ---
 
 ## Quick Start
@@ -229,6 +240,7 @@ Config: Set `relay_url` and `ws_url` in `.atem/config.toml`
 | `PORT` | `3000` | Server port |
 | `RUST_LOG` | `info` | Log level (error, warn, info, debug, trace) |
 | `REDIS_URL` | _(unset)_ | Redis/Valkey for shared relay state: rooms, pairing/OTP, voice and RTC sessions, shared rate-limit counters, replica-to-replica delivery. Required to run more than one replica. Unset: in-memory, one replica only. At startup Redis is tried 10 times, 3 s apart (about 27 s if refused, up to about 57 s if it doesn't answer), then the relay exits 1; a malformed URL or wrong password exits 1 at once. The URL (and its password) is never logged. |
+| `RELAY_WS_MAX_PER_IP` | `200` | Concurrent `/ws` connections allowed per client IP on each replica; over it the upgrade gets `429`. Raise it for load tests that open many sockets from one machine. A value that isn't a positive integer is ignored (default used). |
 | `RELAY_REPLICAS_EXPECTED` | `1` | How many relay replicas the deployment runs. Above 1 without `REDIS_URL`, the relay refuses to start (exit 1); a value that isn't a positive integer also exits 1. |
 | `DATABASE_URL` | _(unset)_ | Postgres connection string shared by **vault**, **knowledge sync (Atem Memory)**, and **relay identity** (Astation keys + session bindings) storage (e.g. `postgres://vault:vault@localhost:5432/vault`), one pool for all. When unset, all fall back to **in-memory** (non-durable: bindings and registered keys are lost on restart) and log a warning. Migrations in `migrations/` run automatically at startup. |
 
@@ -311,6 +323,7 @@ disconnect that Astation's verified socket at once (runbook: `../DEPLOY.md`,
 
 - **CORS errors**: Set `CORS_ORIGIN` env var to match your domain
 - **429 Rate limit**: Normal - client exceeded 60/600 req/min limit
+- **429 on `/ws` "Too many WebSocket connections from this address"**: that IP already has `RELAY_WS_MAX_PER_IP` (200) sockets open on the replica; raise it for load tests
 - **404 Session not found**: Session expired, or the relay restarted in in-memory mode (or Valkey restarted)
 - **503 "Relay state unavailable"**: the relay can't reach Redis (`REDIS_URL`); `/health` shows `"redis":"unavailable"`
 
