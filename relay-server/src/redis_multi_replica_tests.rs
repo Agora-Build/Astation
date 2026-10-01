@@ -1098,3 +1098,54 @@ async fn redis_a_squatter_on_a_replica_without_the_key_cannot_displace_the_verif
     assert_eq!(next_client_json(&mut moved).await["relay_event"], "connected");
     wait_closed(&mut owner).await;
 }
+
+/// Final review I2: a socket replaced in the directory whose bus close was
+/// lost keeps its local registration. Its next frame is checked against the
+/// room (a fresh read when the cached view disagrees): dropped, and the
+/// socket closed, in both directions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn redis_a_replaced_socket_whose_bus_close_was_lost_stops_relaying() {
+    let _guard = REDIS_LOCK.lock().await;
+    let (_shared, one, two) = two_replicas().await;
+    let code = "astation-lost";
+    let key = TestKey::generate();
+    let mut owner = verified_astation(&one.ws, code, &key, "registered").await;
+    let mut atem = connect_atem(&two.ws, code, "atem-a").await;
+    let atem_conn = next_client_json(&mut owner).await["connection_id"].as_str().unwrap().to_string();
+    // Warm replica 1's room cache with the owner as current.
+    send_json(&mut owner, serde_json::json!({"probe": "warm"})).await;
+    assert_eq!(next_client_json(&mut atem).await["probe"], "warm");
+
+    // Replica 2 promotes another connection; the close to replica 1 is "lost"
+    // (never sent), only room-changed goes out.
+    let ghost = crate::cluster::ConnRef::new("ghost-owner", two.id());
+    let directory = two.state.relay.directory();
+    let caps = crate::cluster::directory::PendingCaps::NONE;
+    directory.add_pending(code, &ghost, "192.0.2.1", 1, caps).await.unwrap();
+    directory.promote(code, &ghost, true).await.unwrap();
+    two.state.relay.room_changed(code).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!one.state.relay.local().is_empty(), "the old owner is still registered on replica 1");
+    send_json(
+        &mut owner,
+        serde_json::json!({"atem_id": "atem-a", "connection_id": atem_conn, "payload": {"probe": "stale-owner"}}),
+    )
+    .await;
+    wait_closed(&mut owner).await;
+    assert_silent(&mut atem, 200).await;
+
+    // The Atem side: a new owner, then the Atem replaced on replica 1 with
+    // its close to replica 2 lost.
+    let mut owner = verified_astation(&one.ws, code, &key, "verified").await;
+    assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+    send_json(&mut atem, serde_json::json!({"probe": "warm"})).await;
+    assert_eq!(next_client_json(&mut owner).await["payload"]["probe"], "warm");
+    let ghost_atem = crate::cluster::ConnRef::new("ghost-atem", one.id());
+    one.state.relay.directory().join_atem(code, "atem-a", &ghost_atem).await.unwrap();
+    one.state.relay.room_changed(code).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    send_json(&mut atem, serde_json::json!({"probe": "stale-atem"})).await;
+    wait_closed(&mut atem).await;
+    assert_silent(&mut owner, 200).await;
+}

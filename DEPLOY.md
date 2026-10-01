@@ -217,6 +217,9 @@ reconnect. Known behaviors:
 - Frames between replicas go over pub/sub and are best effort, like frames to
   a socket that is dropping: one published while a replica is resubscribing is
   lost.
+- A replaced socket whose close message was lost is closed at its next frame
+  (each frame's sender is checked against the room; a cached room view that
+  missed the change too can delay this by up to 30 s).
 
 **Sizing:** each replica opens up to 5 Postgres connections, and
 `admin forget-key` one more. Rule: Postgres `max_connections` must exceed

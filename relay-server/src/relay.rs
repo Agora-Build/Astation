@@ -175,6 +175,14 @@ impl RoomCache {
     }
 }
 
+/// `RelayHub::check_sender`'s answer.
+enum SenderCheck {
+    /// Still current; the room view the check used.
+    Current(RoomInfo),
+    /// Replaced or removed: drop the frame and close the socket.
+    Stale,
+}
+
 /// What a hub is built from: in-memory parts by default, Redis-backed
 /// parts when REDIS_URL is set.
 pub(crate) struct HubParts {
@@ -542,6 +550,29 @@ impl RelayHub {
         self.inner.room_cache.as_ref()?;
         self.invalidate_room(code);
         self.route_view(code).await.ok().and_then(lookup)
+    }
+
+    /// Whether the sending socket is still current in its room (`is_current`:
+    /// the owner for an Astation, its Atem entry for an Atem). A socket
+    /// replaced elsewhere whose eviction never arrived (a lost bus close)
+    /// must not keep relaying. The cached view answers in the steady state
+    /// (no I/O); a view that disagrees is re-read once from the directory.
+    async fn check_sender(
+        &self,
+        code: &str,
+        is_current: impl Fn(&RoomInfo) -> bool,
+    ) -> Result<SenderCheck, StoreError> {
+        if let Some(room) = self.route_view(code).await?.filter(|room| is_current(room)) {
+            return Ok(SenderCheck::Current(room));
+        }
+        // Without a cache the read above was already fresh.
+        if self.inner.room_cache.is_some() {
+            self.invalidate_room(code);
+            if let Some(room) = self.route_view(code).await?.filter(|room| is_current(room)) {
+                return Ok(SenderCheck::Current(room));
+            }
+        }
+        Ok(SenderCheck::Stale)
     }
 
     pub(crate) fn invalidate_room(&self, code: &str) {
@@ -1979,12 +2010,26 @@ async fn handle_ws(
                         break;
                     }
                     log_atem_auth_attempt(&code, &atem_id, &text);
-                    match hub.route_view(&code).await {
-                        Ok(Some(RoomInfo { owner: Some(owner), .. })) => {
+                    let is_current = |room: &RoomInfo| {
+                        room.atems
+                            .get(&atem_id)
+                            .is_some_and(|current| current.conn == connection_id)
+                    };
+                    match hub.check_sender(&code, is_current).await {
+                        Ok(SenderCheck::Current(RoomInfo { owner: Some(owner), .. })) => {
                             hub.deliver(&owner, atem_envelope(&atem_id, &connection_id, &text))
                                 .await;
                         }
-                        Ok(_) => {}
+                        Ok(SenderCheck::Current(_)) => {}
+                        Ok(SenderCheck::Stale) => {
+                            // Replaced elsewhere, its eviction lost: leave.
+                            tracing::debug!(
+                                "Closing an Atem socket its room no longer lists: code={} atem_id={}",
+                                mask_code(&code),
+                                atem_id
+                            );
+                            break;
+                        }
                         Err(error) => tracing::debug!(
                             "Dropped an Atem frame for {}: {}",
                             mask_code(&code),
@@ -2030,6 +2075,28 @@ async fn handle_ws(
                     let Some(envelope) = parsed else {
                         continue;
                     };
+                    // Replaced elsewhere with the eviction lost: leave.
+                    let is_owner = |room: &RoomInfo| {
+                        room.owner.as_ref().is_some_and(|owner| owner.conn == connection_id)
+                    };
+                    let room = match hub.check_sender(&code, is_owner).await {
+                        Ok(SenderCheck::Current(room)) => room,
+                        Ok(SenderCheck::Stale) => {
+                            tracing::debug!(
+                                "Closing an Astation socket that no longer owns room {}",
+                                mask_code(&code)
+                            );
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                "Dropped an Astation frame for {}: {}",
+                                mask_code(&code),
+                                error
+                            );
+                            continue;
+                        }
+                    };
                     if let Some(target_id) = envelope.get("atem_id").and_then(|v| v.as_str()) {
                         let Some(requested_connection_id) = envelope
                             .get("connection_id")
@@ -2055,18 +2122,7 @@ async fn handle_ws(
                             ),
                         }
                     } else {
-                        let targets = match hub.route_view(&code).await {
-                            Ok(Some(room)) => room.atems.into_values().collect(),
-                            Ok(None) => Vec::new(),
-                            Err(error) => {
-                                tracing::debug!(
-                                    "Dropped a broadcast for {}: {}",
-                                    mask_code(&code),
-                                    error
-                                );
-                                Vec::new()
-                            }
-                        };
+                        let targets = room.atems.into_values().collect();
                         hub.deliver_many(targets, text.to_string()).await;
                     }
                 }
@@ -2778,6 +2834,31 @@ pub(crate) mod tests {
         directory.join_atem(code, "atem-a", &test_conn("t-new")).await.unwrap();
         assert_eq!(hub.find_atem(code, "atem-a", "t-new").await, Some(test_conn("t-new")));
         assert_eq!(hub.find_atem(code, "atem-a", "t-stale").await, None);
+    }
+
+    /// The sender check reads the cache when it agrees (no directory read
+    /// per frame) and re-reads once when it doesn't.
+    #[tokio::test]
+    async fn sender_check_uses_the_cache_and_rereads_only_on_a_mismatch() {
+        let directory = InMemoryRoomDirectory::new();
+        let hub = RelayHub::from_parts(HubParts {
+            cache_rooms: true,
+            ..HubParts::single_instance(directory.clone(), TEST_AUTH_TIMEOUT)
+        });
+        let code = "astation-sender";
+        let caps = PendingCaps::NONE;
+        directory.claim_owner(code, &test_conn("owner-1"), "192.0.2.1", now(), caps).await.unwrap();
+        let owned_by = |conn: &'static str| move |room: &RoomInfo| {
+            room.owner.as_ref().is_some_and(|owner| owner.conn == conn)
+        };
+        assert!(matches!(hub.check_sender(code, owned_by("owner-1")).await, Ok(SenderCheck::Current(_))));
+        // Changed behind the cache: a matching cached view is trusted as is …
+        directory.claim_owner(code, &test_conn("owner-2"), "192.0.2.1", now(), caps).await.unwrap();
+        assert!(matches!(hub.check_sender(code, owned_by("owner-1")).await, Ok(SenderCheck::Current(_))));
+        // … a disagreeing one is re-read (and refreshes the cache).
+        assert!(matches!(hub.check_sender(code, owned_by("owner-2")).await, Ok(SenderCheck::Current(_))));
+        assert!(matches!(hub.check_sender(code, owned_by("owner-1")).await, Ok(SenderCheck::Stale)));
+        assert!(matches!(hub.check_sender("no-room", owned_by("owner-1")).await, Ok(SenderCheck::Stale)));
     }
 
     #[tokio::test]
@@ -4591,6 +4672,56 @@ pub(crate) mod tests {
         let mut again = verified_astation(&base_url, code, &key, "verified").await;
         assert_eq!(next_client_json(&mut again).await["relay_event"], "connected");
         assert_closed(&mut owner).await;
+        server.abort();
+    }
+
+    /// A socket replaced in the directory whose eviction never arrived (a
+    /// lost bus close) must stop relaying: its frames are dropped and it is
+    /// closed, on both directions and for broadcast and targeted frames.
+    #[tokio::test]
+    async fn a_replaced_socket_whose_close_was_lost_stops_relaying() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let hub = state.relay.clone();
+        let ghost = |conn: &str| ConnRef::new(conn, "elsewhere");
+
+        // Astation side, broadcast.
+        let code = "astation-lost-close";
+        let key = TestKey::generate();
+        let mut owner = verified_astation(&base_url, code, &key, "registered").await;
+        let mut atem = connect_atem(&base_url, code, "atem-a").await;
+        assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+        let caps = PendingCaps::NONE;
+        hub.directory().add_pending(code, &ghost("new-owner"), "192.0.2.1", now(), caps).await.unwrap();
+        hub.directory().promote(code, &ghost("new-owner"), true).await.unwrap();
+        send_json(&mut owner, serde_json::json!({"probe": "broadcast"})).await;
+        assert_closed(&mut owner).await;
+        assert_silent(&mut atem, 150).await;
+
+        // Astation side, targeted.
+        let code = "astation-lost-close-2";
+        let mut owner = verified_astation(&base_url, code, &TestKey::generate(), "registered").await;
+        let mut atem = connect_atem(&base_url, code, "atem-a").await;
+        let atem_conn_2 = next_client_json(&mut owner).await["connection_id"].as_str().unwrap().to_string();
+        hub.directory().add_pending(code, &ghost("new-owner"), "192.0.2.1", now(), caps).await.unwrap();
+        hub.directory().promote(code, &ghost("new-owner"), true).await.unwrap();
+        send_json(
+            &mut owner,
+            serde_json::json!({"atem_id": "atem-a", "connection_id": atem_conn_2, "payload": {"probe": "targeted"}}),
+        )
+        .await;
+        assert_closed(&mut owner).await;
+        assert_silent(&mut atem, 150).await;
+
+        // Atem side: replaced by a connection elsewhere.
+        let code = "astation-lost-close-3";
+        let mut owner = verified_astation(&base_url, code, &TestKey::generate(), "registered").await;
+        let mut atem = connect_atem(&base_url, code, "atem-a").await;
+        assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+        hub.directory().join_atem(code, "atem-a", &ghost("new-atem")).await.unwrap();
+        send_json(&mut atem, serde_json::json!({"probe": "from-old-atem"})).await;
+        assert_closed(&mut atem).await;
+        assert_silent(&mut owner, 150).await;
         server.abort();
     }
 
