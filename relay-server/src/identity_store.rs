@@ -20,6 +20,12 @@ pub const BINDING_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 /// `resolve` refreshes `last_used_at` only once it is at least this old.
 pub const BINDING_TOUCH_INTERVAL_SECS: i64 = 60 * 60;
 
+/// Stored in place of a public key when an Astation is removed from an Agora
+/// account. Keeping a non-key marker makes reconnects enter proof-of-possession
+/// instead of the trust-on-first-use path, where the removed key could register
+/// itself again.
+pub const REVOKED_PUBLIC_KEY: &str = "revoked";
+
 /// Result of `register_key_if_absent`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegisterOutcome {
@@ -114,6 +120,19 @@ pub trait IdentityStore: Send + Sync {
     /// whether a key was deleted. Stores that can't delete keep the default.
     async fn delete_key(&self, _astation_id: &str) -> Result<bool, IdentityError> {
         Err(IdentityError::Db("this identity store cannot delete keys".to_string()))
+    }
+
+    /// Revoke an Astation and every durable session it owns. Unlike
+    /// `delete_key`, this deliberately leaves a non-verifying key marker so
+    /// the same device cannot reclaim its id through trust on first use.
+    async fn revoke_astation(
+        &self,
+        _astation_id: &str,
+        _now: i64,
+    ) -> Result<u64, IdentityError> {
+        Err(IdentityError::Db(
+            "this identity store cannot revoke Astations".to_string(),
+        ))
     }
 
     /// Bind `session_id` to `astation_id` (or refresh `last_used_at` if this
@@ -241,6 +260,25 @@ impl IdentityStore for InMemoryIdentityStore {
         Ok(self.state.lock().await.keys.remove(astation_id).is_some())
     }
 
+    async fn revoke_astation(
+        &self,
+        astation_id: &str,
+        now: i64,
+    ) -> Result<u64, IdentityError> {
+        let mut st = self.state.lock().await;
+        st.keys.insert(
+            astation_id.to_string(),
+            KeyRec {
+                public_key: REVOKED_PUBLIC_KEY.to_string(),
+                registered_at: now,
+                last_verified_at: now,
+            },
+        );
+        let before = st.bindings.len();
+        st.bindings.retain(|_, binding| binding.astation_id != astation_id);
+        Ok((before - st.bindings.len()) as u64)
+    }
+
     async fn list_keys(&self) -> Result<Vec<(String, String)>, IdentityError> {
         let st = self.state.lock().await;
         Ok(st
@@ -264,7 +302,15 @@ impl IdentityStore for InMemoryIdentityStore {
         astation_id: &str,
         now: i64,
     ) -> Result<BindOutcome, IdentityError> {
-        Ok(self.state.lock().await.bind(session_id, astation_id, now))
+        let mut st = self.state.lock().await;
+        if st
+            .keys
+            .get(astation_id)
+            .is_some_and(|key| key.public_key == REVOKED_PUBLIC_KEY)
+        {
+            return Err(IdentityError::Db("Astation identity is revoked".to_string()));
+        }
+        Ok(st.bind(session_id, astation_id, now))
     }
 
     async fn unbind(&self, session_id: &str, astation_id: &str) -> Result<bool, IdentityError> {
@@ -287,6 +333,13 @@ impl IdentityStore for InMemoryIdentityStore {
         let listed = dedup_sessions(sessions);
         let keep: HashSet<&str> = listed.iter().map(|s| s.as_str()).collect();
         let mut st = self.state.lock().await;
+        if st
+            .keys
+            .get(astation_id)
+            .is_some_and(|key| key.public_key == REVOKED_PUBLIC_KEY)
+        {
+            return Err(IdentityError::Db("Astation identity is revoked".to_string()));
+        }
         let before = st.bindings.len();
         st.bindings
             .retain(|sid, b| b.astation_id != astation_id || keep.contains(sid.as_str()));
@@ -353,6 +406,24 @@ async fn lock_astation(
         .execute(conn)
         .await
         .map_err(db_err)?;
+    Ok(())
+}
+
+async fn ensure_not_revoked(
+    conn: &mut sqlx::PgConnection,
+    astation_id: &str,
+) -> Result<(), IdentityError> {
+    let revoked: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM astation_keys WHERE astation_id = $1 AND public_key = $2)",
+    )
+    .bind(astation_id)
+    .bind(REVOKED_PUBLIC_KEY)
+    .fetch_one(conn)
+    .await
+    .map_err(db_err)?;
+    if revoked {
+        return Err(IdentityError::Db("Astation identity is revoked".to_string()));
+    }
     Ok(())
 }
 
@@ -432,6 +503,36 @@ impl IdentityStore for PgIdentityStore {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn revoke_astation(
+        &self,
+        astation_id: &str,
+        now: i64,
+    ) -> Result<u64, IdentityError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        lock_astation(&mut tx, astation_id).await?;
+        let removed = sqlx::query("DELETE FROM session_bindings WHERE astation_id = $1")
+            .bind(astation_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .rows_affected();
+        sqlx::query(
+            "INSERT INTO astation_keys \
+               (astation_id, public_key, registered_at, last_verified_at) \
+             VALUES ($1, $2, $3, $3) \
+             ON CONFLICT (astation_id) DO UPDATE SET \
+               public_key = EXCLUDED.public_key, last_verified_at = EXCLUDED.last_verified_at",
+        )
+        .bind(astation_id)
+        .bind(REVOKED_PUBLIC_KEY)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(removed)
+    }
+
     async fn list_keys(&self) -> Result<Vec<(String, String)>, IdentityError> {
         sqlx::query_as("SELECT astation_id, public_key FROM astation_keys")
             .fetch_all(&self.pool)
@@ -457,6 +558,7 @@ impl IdentityStore for PgIdentityStore {
     ) -> Result<BindOutcome, IdentityError> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         lock_astation(&mut tx, astation_id).await?;
+        ensure_not_revoked(&mut tx, astation_id).await?;
         let ok = upsert_owned_binding(&mut tx, session_id, astation_id, now).await?;
         tx.commit().await.map_err(db_err)?;
         Ok(if ok {
@@ -489,6 +591,7 @@ impl IdentityStore for PgIdentityStore {
         let listed = dedup_sessions(sessions);
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         lock_astation(&mut tx, astation_id).await?;
+        ensure_not_revoked(&mut tx, astation_id).await?;
         let removed = sqlx::query(
             "DELETE FROM session_bindings \
              WHERE astation_id = $1 AND NOT (session_id = ANY($2))",
@@ -605,6 +708,36 @@ pub(crate) mod tests {
             // The next key registers.
             assert_eq!(
                 s.register_key_if_absent(A, KEY2, T0 + 2).await.unwrap(),
+                RegisterOutcome::Registered
+            );
+        }
+
+        pub async fn revoke_removes_bindings_and_blocks_tofu(s: &dyn IdentityStore) {
+            s.register_key_if_absent(A, KEY1, T0).await.unwrap();
+            s.bind("s1", A, T0).await.unwrap();
+            s.bind("s2", A, T0).await.unwrap();
+            s.bind("other", B, T0).await.unwrap();
+
+            assert_eq!(s.revoke_astation(A, T0 + 1).await.unwrap(), 2);
+            assert_eq!(
+                s.get_key(A).await.unwrap().as_deref(),
+                Some(REVOKED_PUBLIC_KEY)
+            );
+            assert_eq!(s.resolve("s1", T0 + 2).await.unwrap(), None);
+            assert_eq!(s.resolve("s2", T0 + 2).await.unwrap(), None);
+            assert_eq!(s.resolve("other", T0 + 2).await.unwrap().as_deref(), Some(B));
+            assert!(s.bind("late", A, T0 + 2).await.is_err());
+            assert!(s.replace_all(A, &["late".to_string()], T0 + 2).await.is_err());
+            assert_eq!(s.resolve("late", T0 + 2).await.unwrap(), None);
+            assert_eq!(
+                s.register_key_if_absent(A, KEY1, T0 + 2).await.unwrap(),
+                RegisterOutcome::Existing(REVOKED_PUBLIC_KEY.to_string())
+            );
+
+            // An explicit admin reset remains the recovery path.
+            assert!(s.delete_key(A).await.unwrap());
+            assert_eq!(
+                s.register_key_if_absent(A, KEY2, T0 + 3).await.unwrap(),
                 RegisterOutcome::Registered
             );
         }
@@ -833,6 +966,7 @@ pub(crate) mod tests {
 
     mem_tests!(
         delete_key_removes_only_that_key,
+        revoke_removes_bindings_and_blocks_tofu,
         tofu_first_key_wins,
         list_keys_returns_all,
         touch_key_never_registers,
@@ -999,6 +1133,7 @@ pub(crate) mod tests {
 
     pg_tests!(
         delete_key_removes_only_that_key,
+        revoke_removes_bindings_and_blocks_tofu,
         tofu_first_key_wins,
         list_keys_returns_all,
         touch_key_never_registers,

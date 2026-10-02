@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::identity_store::REVOKED_PUBLIC_KEY;
 use crate::knowledge_store::KnowledgeStore;
 use crate::vault_store::VaultStore;
 
@@ -180,6 +181,7 @@ pub enum AccountError {
     NotRegistered,
     NotSameUser,
     AlreadyGrouped,
+    WouldOrphanGroup,
     InvalidRequest,
     RequestExpired,
 }
@@ -191,6 +193,10 @@ impl std::fmt::Display for AccountError {
             Self::NotRegistered => write!(f, "Astation is not registered to an Agora account"),
             Self::NotSameUser => write!(f, "Astations are not registered to the same Agora account"),
             Self::AlreadyGrouped => write!(f, "Astations already share a data account"),
+            Self::WouldOrphanGroup => write!(
+                f,
+                "the last Astation in a shared group cannot leave or be removed"
+            ),
             Self::InvalidRequest => write!(f, "merge request is not pending for this Astation"),
             Self::RequestExpired => write!(f, "merge request expired"),
         }
@@ -257,6 +263,7 @@ pub trait AccountStore: Send + Sync {
         &self,
         requester: &str,
         target: &str,
+        now: i64,
     ) -> Result<(), AccountError>;
 }
 
@@ -385,6 +392,24 @@ impl InMemoryAccountStore {
             astation_ids,
         })
     }
+
+    async fn complete_available_requests(
+        &self,
+        request_ids: Vec<String>,
+        now: i64,
+    ) -> Result<Vec<MergeOutcome>, AccountError> {
+        let mut outcomes = Vec::new();
+        for id in request_ids {
+            match self.complete_request(&id, None, now).await {
+                Ok(outcome) => outcomes.push(outcome),
+                // Another task may cancel or expire a request after the due
+                // list is captured. Keep processing the independent entries.
+                Err(AccountError::InvalidRequest | AccountError::RequestExpired) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(outcomes)
+    }
 }
 
 impl Default for InMemoryAccountStore {
@@ -479,28 +504,39 @@ impl AccountStore for InMemoryAccountStore {
         now: i64,
     ) -> Result<(), AccountError> {
         let mut state = self.state.lock().await;
-        match state.accounts.get_mut(astation_id) {
-            Some(account) => {
-                if account.agora_user != agora_user {
-                    account.data_account = astation_id.to_string();
-                    account.registered_at = now;
-                }
-                account.agora_user = agora_user.to_string();
-                account.label = label.to_string();
-                account.last_seen_at = now;
+        if let Some(existing) = state.accounts.get(astation_id) {
+            let account_changed = existing.agora_user != agora_user;
+            let data_account = existing.data_account.clone();
+            if account_changed
+                && data_account.starts_with("group-")
+                && state
+                    .accounts
+                    .values()
+                    .filter(|candidate| candidate.data_account == data_account)
+                    .count()
+                    == 1
+            {
+                return Err(AccountError::WouldOrphanGroup);
             }
-            None => {
-                state.accounts.insert(
-                    astation_id.to_string(),
-                    AccountRec {
-                        agora_user: agora_user.to_string(),
-                        label: label.to_string(),
-                        data_account: astation_id.to_string(),
-                        registered_at: now,
-                        last_seen_at: now,
-                    },
-                );
+            let account = state.accounts.get_mut(astation_id).expect("account checked above");
+            if account_changed {
+                account.data_account = astation_id.to_string();
+                account.registered_at = now;
             }
+            account.agora_user = agora_user.to_string();
+            account.label = label.to_string();
+            account.last_seen_at = now;
+        } else {
+            state.accounts.insert(
+                astation_id.to_string(),
+                AccountRec {
+                    agora_user: agora_user.to_string(),
+                    label: label.to_string(),
+                    data_account: astation_id.to_string(),
+                    registered_at: now,
+                    last_seen_at: now,
+                },
+            );
         }
         Ok(())
     }
@@ -604,7 +640,7 @@ impl AccountStore for InMemoryAccountStore {
     }
 
     async fn complete_due_merges(&self, now: i64) -> Result<Vec<MergeOutcome>, AccountError> {
-        let ids: Vec<String> = {
+        let mut ids: Vec<String> = {
             let mut state = self.state.lock().await;
             for request in state.requests.values_mut() {
                 if request.status == "pending" && now >= request.request.expires_at {
@@ -622,16 +658,29 @@ impl AccountStore for InMemoryAccountStore {
                 .map(|request| request.request.request_id.clone())
                 .collect()
         };
-        let mut outcomes = Vec::new();
-        for id in ids {
-            outcomes.push(self.complete_request(&id, None, now).await?);
-        }
-        Ok(outcomes)
+        ids.sort();
+        self.complete_available_requests(ids, now).await
     }
 
     async fn leave_group(&self, astation_id: &str) -> Result<(), AccountError> {
         let mut state = self.state.lock().await;
-        let account = state.accounts.get_mut(astation_id).ok_or(AccountError::NotRegistered)?;
+        let data_account = state
+            .accounts
+            .get(astation_id)
+            .ok_or(AccountError::NotRegistered)?
+            .data_account
+            .clone();
+        if data_account.starts_with("group-")
+            && state
+                .accounts
+                .values()
+                .filter(|account| account.data_account == data_account)
+                .count()
+                == 1
+        {
+            return Err(AccountError::WouldOrphanGroup);
+        }
+        let account = state.accounts.get_mut(astation_id).expect("account checked above");
         account.data_account = astation_id.to_string();
         Ok(())
     }
@@ -640,6 +689,7 @@ impl AccountStore for InMemoryAccountStore {
         &self,
         requester: &str,
         target: &str,
+        _now: i64,
     ) -> Result<(), AccountError> {
         if requester == target {
             return Err(AccountError::InvalidRequest);
@@ -659,6 +709,21 @@ impl AccountStore for InMemoryAccountStore {
             .clone();
         if requester_user != target_user {
             return Err(AccountError::NotSameUser);
+        }
+        let target_data_account = &state
+            .accounts
+            .get(target)
+            .expect("target checked above")
+            .data_account;
+        if target_data_account.starts_with("group-")
+            && state
+                .accounts
+                .values()
+                .filter(|account| &account.data_account == target_data_account)
+                .count()
+                == 1
+        {
+            return Err(AccountError::WouldOrphanGroup);
         }
         state.accounts.remove(target);
         state.requests.retain(|_, request| {
@@ -717,6 +782,10 @@ impl PgAccountStore {
             return Err(AccountError::InvalidRequest);
         }
 
+        // Every mapping mutation for one Agora user takes this lock before
+        // row locks. This prevents reverse-order merge/remove requests from
+        // deadlocking while they touch overlapping Astation rows.
+        lock_agora_user(&mut tx, &request.agora_user).await?;
         let requester: PgAccount = load_account(&mut tx, &request.requester_astation_id).await?;
         let target: PgAccount = load_account(&mut tx, &request.target_astation_id).await?;
         if requester.agora_user != target.agora_user || requester.agora_user != request.agora_user {
@@ -849,6 +918,82 @@ async fn load_account(
     .await
     .map_err(db_err)?
     .ok_or(AccountError::NotRegistered)
+}
+
+async fn read_account(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    astation_id: &str,
+) -> Result<PgAccount, AccountError> {
+    sqlx::query_as(
+        "SELECT agora_user, data_account FROM astation_accounts WHERE astation_id = $1",
+    )
+    .bind(astation_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_err)?
+    .ok_or(AccountError::NotRegistered)
+}
+
+async fn lock_agora_user(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    agora_user: &str,
+) -> Result<(), AccountError> {
+    let key = serde_json::to_string(&["agora-user", agora_user])
+        .map_err(|error| AccountError::Db(error.to_string()))?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(key)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+async fn lock_account_registration(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    astation_id: &str,
+) -> Result<(), AccountError> {
+    let key = serde_json::to_string(&["account-registration", astation_id])
+        .map_err(|error| AccountError::Db(error.to_string()))?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(key)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+async fn lock_astation_bindings(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    astation_id: &str,
+) -> Result<(), AccountError> {
+    let key = serde_json::to_string(&["astation-bindings", astation_id])
+        .map_err(|error| AccountError::Db(error.to_string()))?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(key)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+async fn ensure_group_will_remain(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    data_account: &str,
+) -> Result<(), AccountError> {
+    if !data_account.starts_with("group-") {
+        return Ok(());
+    }
+    let members: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM astation_accounts WHERE data_account = $1",
+    )
+    .bind(data_account)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    if members <= 1 {
+        return Err(AccountError::WouldOrphanGroup);
+    }
+    Ok(())
 }
 
 async fn lock_data_account(
@@ -999,27 +1144,59 @@ impl AccountStore for PgAccountStore {
         label: &str,
         now: i64,
     ) -> Result<(), AccountError> {
-        sqlx::query(
-            "INSERT INTO astation_accounts \
-               (astation_id, agora_user, label, data_account, registered_at, last_seen_at) \
-             VALUES ($1, $2, $3, $1, $4, $4) \
-             ON CONFLICT (astation_id) DO UPDATE SET \
-               data_account = CASE \
-                 WHEN astation_accounts.agora_user = EXCLUDED.agora_user \
-                 THEN astation_accounts.data_account ELSE EXCLUDED.astation_id END, \
-               registered_at = CASE \
-                 WHEN astation_accounts.agora_user = EXCLUDED.agora_user \
-                 THEN astation_accounts.registered_at ELSE EXCLUDED.registered_at END, \
-               agora_user = EXCLUDED.agora_user, label = EXCLUDED.label, \
-               last_seen_at = EXCLUDED.last_seen_at",
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        lock_account_registration(&mut tx, astation_id).await?;
+        let existing: Option<PgAccount> = sqlx::query_as(
+            "SELECT agora_user, data_account FROM astation_accounts WHERE astation_id = $1",
         )
         .bind(astation_id)
-        .bind(agora_user)
-        .bind(label)
-        .bind(now)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
+        if let Some(snapshot) = existing {
+            lock_agora_user(&mut tx, &snapshot.agora_user).await?;
+            let current = load_account(&mut tx, astation_id).await?;
+            if current.agora_user != agora_user {
+                ensure_group_will_remain(&mut tx, &current.data_account).await?;
+                sqlx::query(
+                    "UPDATE astation_accounts SET agora_user = $2, label = $3, \
+                       data_account = astation_id, registered_at = $4, last_seen_at = $4 \
+                     WHERE astation_id = $1",
+                )
+                .bind(astation_id)
+                .bind(agora_user)
+                .bind(label)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            } else {
+                sqlx::query(
+                    "UPDATE astation_accounts SET label = $2, last_seen_at = $3 \
+                     WHERE astation_id = $1",
+                )
+                .bind(astation_id)
+                .bind(label)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            }
+        } else {
+            sqlx::query(
+                "INSERT INTO astation_accounts \
+                   (astation_id, agora_user, label, data_account, registered_at, last_seen_at) \
+                 VALUES ($1, $2, $3, $1, $4, $4)",
+            )
+            .bind(astation_id)
+            .bind(agora_user)
+            .bind(label)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -1079,6 +1256,8 @@ impl AccountStore for PgAccountStore {
         now: i64,
     ) -> Result<MergeRequest, AccountError> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let snapshot = read_account(&mut tx, requester).await?;
+        lock_agora_user(&mut tx, &snapshot.agora_user).await?;
         let requester_account = load_account(&mut tx, requester).await?;
         let target_account = load_account(&mut tx, target).await?;
         if requester_account.agora_user != target_account.agora_user {
@@ -1169,16 +1348,19 @@ impl AccountStore for PgAccountStore {
     }
 
     async fn leave_group(&self, astation_id: &str) -> Result<(), AccountError> {
-        let result = sqlx::query(
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let snapshot = read_account(&mut tx, astation_id).await?;
+        lock_agora_user(&mut tx, &snapshot.agora_user).await?;
+        let account = load_account(&mut tx, astation_id).await?;
+        ensure_group_will_remain(&mut tx, &account.data_account).await?;
+        sqlx::query(
             "UPDATE astation_accounts SET data_account = astation_id WHERE astation_id = $1",
         )
         .bind(astation_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        if result.rows_affected() == 0 {
-            return Err(AccountError::NotRegistered);
-        }
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -1186,16 +1368,21 @@ impl AccountStore for PgAccountStore {
         &self,
         requester: &str,
         target: &str,
+        now: i64,
     ) -> Result<(), AccountError> {
         if requester == target {
             return Err(AccountError::InvalidRequest);
         }
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let snapshot = read_account(&mut tx, requester).await?;
+        lock_agora_user(&mut tx, &snapshot.agora_user).await?;
         let requester_account = load_account(&mut tx, requester).await?;
         let target_account = load_account(&mut tx, target).await?;
         if requester_account.agora_user != target_account.agora_user {
             return Err(AccountError::NotSameUser);
         }
+        ensure_group_will_remain(&mut tx, &target_account.data_account).await?;
+        lock_astation_bindings(&mut tx, target).await?;
         sqlx::query(
             "DELETE FROM account_merge_requests \
              WHERE requester_astation_id = $1 OR target_astation_id = $1",
@@ -1204,13 +1391,26 @@ impl AccountStore for PgAccountStore {
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+        sqlx::query("DELETE FROM session_bindings WHERE astation_id = $1")
+            .bind(target)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
         sqlx::query("DELETE FROM astation_accounts WHERE astation_id = $1")
             .bind(target)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-        sqlx::query("DELETE FROM astation_keys WHERE astation_id = $1")
+        sqlx::query(
+            "INSERT INTO astation_keys \
+               (astation_id, public_key, registered_at, last_verified_at) \
+             VALUES ($1, $2, $3, $3) \
+             ON CONFLICT (astation_id) DO UPDATE SET \
+               public_key = EXCLUDED.public_key, last_verified_at = EXCLUDED.last_verified_at",
+        )
             .bind(target)
+            .bind(REVOKED_PUBLIC_KEY)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -1332,6 +1532,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_invalid_due_request_does_not_block_the_rest_of_the_batch() {
+        let (_, _, store) = stores();
+        store.register("a", "user-1", "A", 1).await.unwrap();
+        store.register("b", "user-1", "B", 1).await.unwrap();
+        let request = store.start_merge("a", "b", MergeMode::Delayed, 10).await.unwrap();
+        let outcomes = store
+            .complete_available_requests(
+                vec!["cancelled-between-list-and-run".to_string(), request.request_id],
+                10 + DELAYED_MERGE_WAIT_SECS,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].astation_ids, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
     async fn account_change_never_carries_a_group_to_another_user() {
         let (_, _, store) = stores();
         store.register("a", "user-1", "A", 1).await.unwrap();
@@ -1340,6 +1557,40 @@ mod tests {
         store.approve_merge("b", &request.request_id, 3).await.unwrap();
         store.register("a", "user-2", "A", 4).await.unwrap();
         assert_eq!(store.resolve_data_account("a").await.unwrap(), "a");
+        assert!(matches!(
+            store.list_for_astation("a").await.unwrap().0.as_slice(),
+            [AccountDevice { astation_id, .. }] if astation_id == "a"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_shared_group_always_keeps_at_least_one_registered_member() {
+        let (_, _, store) = stores();
+        store.register("a", "user-1", "A", 1).await.unwrap();
+        store.register("b", "user-1", "B", 1).await.unwrap();
+        let request = store.start_merge("a", "b", MergeMode::Online, 2).await.unwrap();
+        let group = store.approve_merge("b", &request.request_id, 3).await.unwrap().data_account;
+
+        store.leave_group("a").await.unwrap();
+        assert_eq!(store.resolve_data_account("a").await.unwrap(), "a");
+        assert_eq!(store.resolve_data_account("b").await.unwrap(), group);
+        assert!(matches!(
+            store.leave_group("b").await,
+            Err(AccountError::WouldOrphanGroup)
+        ));
+        assert!(matches!(
+            store.remove_astation("a", "b", 4).await,
+            Err(AccountError::WouldOrphanGroup)
+        ));
+        assert!(matches!(
+            store.register("b", "user-2", "B", 4).await,
+            Err(AccountError::WouldOrphanGroup)
+        ));
+
+        let request = store.start_merge("a", "b", MergeMode::Online, 5).await.unwrap();
+        store.approve_merge("b", &request.request_id, 6).await.unwrap();
+        store.remove_astation("a", "b", 7).await.unwrap();
+        assert_eq!(store.resolve_data_account("a").await.unwrap(), group);
         assert!(matches!(
             store.list_for_astation("a").await.unwrap().0.as_slice(),
             [AccountDevice { astation_id, .. }] if astation_id == "a"
@@ -1396,6 +1647,30 @@ mod tests {
         let store = PgAccountStore::new(pool.clone());
         store.register("a", "user-1", "Mac A", 1).await.unwrap();
         store.register("b", "user-1", "Mac B", 1).await.unwrap();
+
+        // Reverse requests used to take requester/target row locks in the
+        // opposite order. The per-user advisory lock serializes them before
+        // either transaction locks account rows.
+        store.register("c", "user-deadlock", "Mac C", 1).await.unwrap();
+        store.register("d", "user-deadlock", "Mac D", 1).await.unwrap();
+        let cd = store.start_merge("c", "d", MergeMode::Online, 2).await.unwrap();
+        let dc = store.start_merge("d", "c", MergeMode::Online, 2).await.unwrap();
+        let left = PgAccountStore::new(pool.clone());
+        let right = PgAccountStore::new(pool.clone());
+        let (left_result, right_result) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            async {
+                tokio::join!(
+                    left.approve_merge("d", &cd.request_id, 3),
+                    right.approve_merge("c", &dc.request_id, 3),
+                )
+            },
+        )
+        .await
+        .expect("reverse merge requests deadlocked");
+        left_result.unwrap();
+        right_result.unwrap();
+
         for (id, account, content) in [("m-a", "a", "first"), ("m-b", "b", "second")] {
             sqlx::query(
                 "INSERT INTO memories (id, account_id, scope, project, machine, content, \
@@ -1476,12 +1751,16 @@ mod tests {
                 .unwrap();
         assert_eq!(vault_account, outcome.data_account);
         let mappings: Vec<String> = sqlx::query_scalar(
-            "SELECT data_account FROM astation_accounts ORDER BY astation_id",
+            "SELECT data_account FROM astation_accounts \
+             WHERE agora_user = 'user-1' ORDER BY astation_id",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(mappings, vec![outcome.data_account.clone(), outcome.data_account]);
+        assert_eq!(
+            mappings,
+            vec![outcome.data_account.clone(), outcome.data_account.clone()]
+        );
         let status: String = sqlx::query_scalar(
             "SELECT status FROM account_merge_requests WHERE request_id = $1",
         )
@@ -1490,5 +1769,67 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(status, "completed");
+
+        // A client that had already synced either source sees the complete,
+        // renumbered skill history because every moved row has a fresh seq.
+        let changed_skill_hashes: Vec<String> = sqlx::query_scalar(
+            "SELECT content_hash FROM skill_versions \
+             WHERE account_id = $1 AND seq > $2 ORDER BY version",
+        )
+        .bind(&outcome.data_account)
+        .bind(pre_merge_seq)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(changed_skill_hashes, vec!["hb1", "ha1", "ha2"]);
+
+        // Leaving/removal may reduce a group to one member, but that final
+        // member cannot orphan the group's data. Rejoining restores the
+        // normal removal path.
+        store.leave_group("a").await.unwrap();
+        assert!(matches!(
+            store.leave_group("b").await,
+            Err(AccountError::WouldOrphanGroup)
+        ));
+        assert!(matches!(
+            store.remove_astation("a", "b", 20).await,
+            Err(AccountError::WouldOrphanGroup)
+        ));
+        assert!(matches!(
+            store.register("b", "user-2", "Mac B", 20).await,
+            Err(AccountError::WouldOrphanGroup)
+        ));
+        let regroup = store.start_merge("a", "b", MergeMode::Online, 21).await.unwrap();
+        store.approve_merge("b", &regroup.request_id, 22).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO astation_keys \
+               (astation_id, public_key, registered_at, last_verified_at) \
+             VALUES ('b', '04bb', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO session_bindings (session_id, astation_id, created_at, last_used_at) \
+             VALUES ('session-b', 'b', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        store.remove_astation("a", "b", 23).await.unwrap();
+        let binding_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM session_bindings WHERE astation_id = 'b'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(binding_count, 0);
+        let stored_key: String =
+            sqlx::query_scalar("SELECT public_key FROM astation_keys WHERE astation_id = 'b'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_key, REVOKED_PUBLIC_KEY);
+        assert_eq!(store.resolve_data_account("a").await.unwrap(), outcome.data_account);
     }
 }

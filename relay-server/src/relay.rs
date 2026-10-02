@@ -34,7 +34,9 @@ use crate::cluster::{ConnRef, StoreError, SINGLE_REPLICA_ID};
 use crate::account_store::{
     AccountError, AccountStore, MergeMode, FRESH_SIGN_IN_SECS, ONLINE_WINDOW_SECS,
 };
-use crate::identity_store::{BindOutcome, IdentityError, IdentityStore, RegisterOutcome};
+use crate::identity_store::{
+    BindOutcome, IdentityError, IdentityStore, RegisterOutcome, REVOKED_PUBLIC_KEY,
+};
 use crate::voice_session::ReplyWaiters;
 use crate::AppState;
 
@@ -1693,14 +1695,23 @@ async fn apply_account_message(
                 hub.local().send(connection_id, relay_ack_err(kind, "invalid target Astation"));
                 return;
             };
-            match accounts.remove_astation(code, target).await {
+            match accounts.remove_astation(code, target, now).await {
                 Ok(()) => {
-                    if let Err(error) = identity.delete_key(target).await {
-                        tracing::warn!("Could not delete removed Astation key: {}", error);
+                    if let Err(error) = identity.revoke_astation(target, now).await {
+                        // PgAccountStore performs the same revocation in its
+                        // account transaction; this remains important for the
+                        // in-memory backend and reports unexpected divergence.
+                        tracing::error!("Could not revoke removed Astation identity: {}", error);
                     }
-                    hub.keys().forget(target);
+                    hub.keys().set(target, REVOKED_PUBLIC_KEY);
                     hub.announce_key_change(target).await;
-                    hub.drop_verified_owner_if_key_forgotten(target).await;
+                    if let Err(error) = hub.close_room(target).await {
+                        tracing::error!(
+                            "Could not close the room of removed Astation {}: {}",
+                            mask_code(target),
+                            error
+                        );
+                    }
                     hub.local().send(connection_id, relay_ack_ok(kind));
                     send_account_state(hub, accounts, connection_id, code).await;
                 }
@@ -1941,6 +1952,28 @@ async fn apply_binding_message(
     }
 }
 
+async fn is_current_verified_owner(
+    hub: &RelayHub,
+    code: &str,
+    connection_id: &str,
+    auth: &AstationAuth,
+) -> bool {
+    if auth.state != AuthState::Verified || !hub.local().contains(connection_id) {
+        return false;
+    }
+    let owns_verified_room = |room: &RoomInfo| {
+        room.verified
+            && room
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.conn == connection_id)
+    };
+    matches!(
+        hub.check_sender(code, owns_verified_room).await,
+        Ok(SenderCheck::Current(_))
+    )
+}
+
 /// Handle a relay-auth frame from an Astation. Returns `false` when the
 /// connection must be closed (its rejection has been queued).
 async fn handle_astation_control(
@@ -1999,24 +2032,17 @@ async fn handle_astation_control(
             }
         }
         "relaySessions" | "relayBind" | "relayUnbind" => {
-            // An evicted socket (replaced, or its key forgotten) may still be
-            // read until the client goes: it no longer speaks for the room.
-            let ack = if !hub.local().contains(connection_id) {
+            // A replaced/removed socket may still be read if its cross-replica
+            // close was lost. The shared directory is authoritative.
+            let ack = if !is_current_verified_owner(hub, code, connection_id, auth).await {
                 tracing::debug!(
-                    "Refused {} from an evicted Astation socket {}",
+                    "Refused {} from a stale or unverified Astation socket {}",
                     kind,
                     mask_code(code)
                 );
                 relay_ack_err(kind, "not verified")
-            } else if auth.state == AuthState::Verified {
-                apply_binding_message(identity.as_ref(), code, kind, message, now).await
             } else {
-                tracing::debug!(
-                    "Refused {} from unverified Astation {}",
-                    kind,
-                    mask_code(code)
-                );
-                relay_ack_err(kind, "not verified")
+                apply_binding_message(identity.as_ref(), code, kind, message, now).await
             };
             hub.local().send(connection_id, ack);
             true
@@ -2028,7 +2054,7 @@ async fn handle_astation_control(
         | "relayMergeCancel"
         | "relayLeaveGroup"
         | "relayRemoveAstation" => {
-            if !hub.local().contains(connection_id) || auth.state != AuthState::Verified {
+            if !is_current_verified_owner(hub, code, connection_id, auth).await {
                 hub.local().send(connection_id, relay_ack_err(kind, "not verified"));
                 return true;
             }
@@ -4156,6 +4182,44 @@ pub(crate) mod tests {
         ))
     }
 
+    struct TestAccountVerifier {
+        responses: std::collections::HashMap<String, crate::account_store::VerifiedAgoraAccount>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::account_store::AccountIdentityVerifier for TestAccountVerifier {
+        async fn verify(
+            &self,
+            access_token: &str,
+        ) -> Result<crate::account_store::VerifiedAgoraAccount, crate::account_store::VerifyError>
+        {
+            self.responses
+                .get(access_token)
+                .cloned()
+                .ok_or(crate::account_store::VerifyError::Rejected)
+        }
+    }
+
+    fn account_verifier_state(verifier: TestAccountVerifier) -> crate::AppState {
+        let knowledge = std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new());
+        let vault = std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new());
+        let accounts = crate::account_store::InMemoryAccountStore::with_verifier(
+            knowledge.clone(),
+            vault.clone(),
+            std::sync::Arc::new(verifier),
+        );
+        crate::AppState {
+            sessions: crate::session_store::SessionStore::new(),
+            relay: RelayHub::with_auth_timeout(TEST_AUTH_TIMEOUT),
+            rtc_sessions: crate::rtc_session::RtcSessionStore::new(),
+            voice_sessions: VoiceSessionStore::new(),
+            vault,
+            knowledge,
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(accounts),
+        }
+    }
+
     /// Serve the production router on an ephemeral port; returns the ws base URL.
     pub(crate) async fn spawn_relay(state: crate::AppState) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -5235,6 +5299,137 @@ pub(crate) mod tests {
         let b_account = state.accounts.resolve_data_account("astation-group-b").await.unwrap();
         assert_eq!(a_account, b_account);
         assert!(a_account.starts_with("group-"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn removing_an_astation_revokes_sessions_socket_and_key() {
+        let state = memory_identity_state();
+        let now = chrono::Utc::now().timestamp();
+        let requester_id = "astation-remove-a";
+        let removed_id = "astation-remove-b";
+        state.accounts.register(requester_id, "agora-user", "Mac A", now).await.unwrap();
+        state.accounts.register(removed_id, "agora-user", "Mac B", now).await.unwrap();
+
+        let mut granted = crate::auth::create_session("removed-session");
+        granted.status = crate::auth::SessionStatus::Granted;
+        let session_id = granted.id.clone();
+        state.sessions.create(granted).await.unwrap();
+
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let requester_key = TestKey::generate();
+        let removed_key = TestKey::generate();
+        let mut requester =
+            verified_astation(&base_url, requester_id, &requester_key, "registered").await;
+        let mut removed =
+            verified_astation(&base_url, removed_id, &removed_key, "registered").await;
+        let mut removed_viewer = connect_atem(&base_url, removed_id, "atem-removed").await;
+        assert_eq!(next_client_json(&mut removed).await["relay_event"], "connected");
+        let ack = control(
+            &mut removed,
+            serde_json::json!({"type":"relayBind","session_id":session_id}),
+        )
+        .await;
+        assert_eq!(ack["ok"], true);
+        assert_routes(&state, &session_id, HttpStatusCode::OK).await;
+
+        let ack = control(
+            &mut requester,
+            serde_json::json!({
+                "type": "relayRemoveAstation",
+                "target_astation_id": removed_id,
+            }),
+        )
+        .await;
+        assert_eq!(ack["ok"], true);
+        assert_eq!(next_client_json(&mut requester).await["type"], "relayAccountState");
+        assert_closed(&mut removed).await;
+        assert_closed(&mut removed_viewer).await;
+
+        assert_eq!(resolve(&state, &session_id).await, None);
+        assert_routes(&state, &session_id, HttpStatusCode::UNAUTHORIZED).await;
+        assert_eq!(
+            state.identity.get_key(removed_id).await.unwrap().as_deref(),
+            Some(REVOKED_PUBLIC_KEY)
+        );
+        assert!(state.accounts.subject_for_astation(removed_id).await.unwrap().is_none());
+
+        let (mut retry, challenge) = connect_astation(&base_url, removed_id).await;
+        let result = authenticate(&mut retry, &removed_key, removed_id, &challenge).await;
+        assert_eq!(result["status"], "rejected", "{result}");
+        assert_closed(&mut retry).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delayed_merge_requires_a_recent_matching_sign_in() {
+        let now = chrono::Utc::now().timestamp();
+        let verified = |subject: &str, authenticated_at: Option<i64>| {
+            crate::account_store::VerifiedAgoraAccount {
+                subject: subject.to_string(),
+                authenticated_at,
+            }
+        };
+        let state = account_verifier_state(TestAccountVerifier {
+            responses: std::collections::HashMap::from([
+                ("missing".into(), verified("agora-user", None)),
+                (
+                    "stale".into(),
+                    verified("agora-user", Some(now - FRESH_SIGN_IN_SECS - 30)),
+                ),
+                ("future".into(), verified("agora-user", Some(now + 300))),
+                ("mismatch".into(), verified("another-user", Some(now))),
+                ("recent".into(), verified("agora-user", Some(now))),
+            ]),
+        });
+        let requester_id = "astation-delayed-a";
+        let target_id = "astation-delayed-b";
+        state.accounts.register(requester_id, "agora-user", "Mac A", now).await.unwrap();
+        state
+            .accounts
+            .register(target_id, "agora-user", "Mac B", now - ONLINE_WINDOW_SECS - 30)
+            .await
+            .unwrap();
+
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let mut requester = verified_astation(
+            &base_url,
+            requester_id,
+            &TestKey::generate(),
+            "registered",
+        )
+        .await;
+        for token in ["missing", "stale", "future", "mismatch"] {
+            let ack = control(
+                &mut requester,
+                serde_json::json!({
+                    "type": "relayMergeRequest",
+                    "target_astation_id": target_id,
+                    "fresh_sso_access_token": token,
+                }),
+            )
+            .await;
+            assert_eq!(ack["ok"], false, "token {token}: {ack}");
+        }
+        assert!(state.accounts.list_for_astation(requester_id).await.unwrap().1.is_empty());
+
+        let ack = control(
+            &mut requester,
+            serde_json::json!({
+                "type": "relayMergeRequest",
+                "target_astation_id": target_id,
+                "fresh_sso_access_token": "recent",
+            }),
+        )
+        .await;
+        assert_eq!(ack["ok"], true, "{ack}");
+        let requests = state.accounts.list_for_astation(requester_id).await.unwrap().1;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].mode, "delayed");
+        assert_eq!(
+            requests[0].ready_at,
+            Some(requests[0].created_at + crate::account_store::DELAYED_MERGE_WAIT_SECS)
+        );
         server.abort();
     }
 
