@@ -160,6 +160,32 @@ final class RelayIdentityTests: XCTestCase {
         XCTAssertEqual(unbind["session_id"] as? String, "session-1")
     }
 
+    func testAccountControlMessages() throws {
+        let registration = try object(RelayIdentityProtocol.registerAccountMessage(
+            accessToken: "token-value",
+            label: "MacBook Pro"
+        ))
+        XCTAssertEqual(registration["type"] as? String, "relayRegisterAccount")
+        XCTAssertEqual(registration["sso_access_token"] as? String, "token-value")
+        XCTAssertEqual(registration["label"] as? String, "MacBook Pro")
+
+        let merge = try object(RelayIdentityProtocol.mergeRequestMessage(
+            targetAstationId: "astation-b",
+            freshAccessToken: "fresh-token"
+        ))
+        XCTAssertEqual(merge["type"] as? String, "relayMergeRequest")
+        XCTAssertEqual(merge["target_astation_id"] as? String, "astation-b")
+        XCTAssertEqual(merge["fresh_sso_access_token"] as? String, "fresh-token")
+        XCTAssertEqual(
+            try object(RelayIdentityProtocol.mergeApprovalMessage(requestId: "r1"))["request_id"] as? String,
+            "r1"
+        )
+        XCTAssertEqual(
+            try object(RelayIdentityProtocol.removeAstationMessage(astationId: "astation-b"))["type"] as? String,
+            "relayRemoveAstation"
+        )
+    }
+
     // MARK: Inbound control frames
 
     func testParsesChallenge() {
@@ -193,6 +219,38 @@ final class RelayIdentityTests: XCTestCase {
         XCTAssertEqual(
             RelayIdentityProtocol.parseControlFrame("{\"type\":\"relayAck\",\"for\":\"relayBind\",\"ok\":false,\"message\":\"owned\"}"),
             RelayControlFrame.ack(forType: "relayBind", ok: false, message: "owned")
+        )
+    }
+
+    func testParsesAccountStateAndMergeApproval() {
+        let state = """
+        {"type":"relayAccountState","devices":[{"astation_id":"astation-a","label":"Mac A","data_account":"astation-a","registered_at":1,"last_seen_at":2,"online":true}],"requests":[]}
+        """
+        XCTAssertEqual(
+            RelayIdentityProtocol.parseControlFrame(state),
+            .accountState(
+                devices: [RelayAccountDevice(
+                    astationId: "astation-a",
+                    label: "Mac A",
+                    dataAccount: "astation-a",
+                    registeredAt: 1,
+                    lastSeenAt: 2,
+                    online: true
+                )],
+                requests: []
+            )
+        )
+        let approval = """
+        {"type":"relayMergeApproval","request_id":"r1","requester_astation_id":"astation-a","requester_label":"Mac A","expires_at":99}
+        """
+        XCTAssertEqual(
+            RelayIdentityProtocol.parseControlFrame(approval),
+            .mergeApproval(RelayMergeApproval(
+                requestId: "r1",
+                requesterAstationId: "astation-a",
+                requesterLabel: "Mac A",
+                expiresAt: 99
+            ))
         )
     }
 

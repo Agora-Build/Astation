@@ -65,6 +65,9 @@ class AstationHubManager: ObservableObject {
     private var sessionExpiryTimer: Timer?
     /// Relay identity problem shown in the menu (nil when fine).
     @Published var relayIdentityStatusMessage: String?
+    @Published private(set) var relayAccountDevices: [RelayAccountDevice] = []
+    @Published private(set) var relayMergeRequests: [RelayMergeRequest] = []
+    @Published private(set) var relayAccountStatusMessage: String?
 
     /// Station relay URL. Priority: test override > ASTATION_RELAY_URL env var > UserDefaults > default.
     var stationRelayUrl: String {
@@ -255,6 +258,7 @@ class AstationHubManager: ObservableObject {
         checkSessionStatus()
         refreshProjects()
         broadcastCredentials()
+        registerRelayAccountIfPossible()
     }
 
     /// Broadcast a refreshed-on-use credentialSync to every connected Atem.
@@ -1394,9 +1398,35 @@ class AstationHubManager: ObservableObject {
         case .ack(let forType, let ok, let message):
             if ok {
                 Log.debug("[RelayIdentity] Relay acknowledged \(forType)")
+                if forType.hasPrefix("relayMerge") ||
+                    forType == "relayLeaveGroup" ||
+                    forType == "relayRemoveAstation" ||
+                    forType == "relayRegisterAccount" {
+                    relayAccountStatusMessage = "Account change accepted by the relay."
+                    NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
+                }
             } else {
                 Log.warn("[RelayIdentity] Relay refused \(forType): \(message ?? "no message")")
+                if forType.hasPrefix("relayMerge") ||
+                    forType == "relayLeaveGroup" ||
+                    forType == "relayRemoveAstation" ||
+                    forType == "relayRegisterAccount" ||
+                    forType == "relayAccountList" {
+                    relayAccountStatusMessage = message ?? "The relay refused the account change."
+                    NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
+                }
             }
+        case .accountState(let devices, let requests):
+            relayAccountDevices = devices
+            relayMergeRequests = requests
+            relayAccountStatusMessage = nil
+            NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
+        case .mergeApproval(let approval):
+            showMergeApproval(approval)
+        case .accountChanged(let reason, _):
+            relayAccountStatusMessage = Self.accountChangeMessage(reason)
+            NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
+            requestRelayAccountState()
         }
     }
 
@@ -1499,6 +1529,8 @@ class AstationHubManager: ObservableObject {
             relayIdentityStatusMessage = nil
             Log.info("[RelayIdentity] Relay \(status) this Astation's key")
             sendRelaySessionsResync()
+            requestRelayAccountState()
+            registerRelayAccountIfPossible()
         case RelayIdentityProtocol.statusRejected:
             identityRelayVerified = false
             relayIdentityStatusMessage = RelayIdentityProtocol.rejectedMenuMessage
@@ -1513,6 +1545,84 @@ class AstationHubManager: ObservableObject {
         let sessionIds = deviceSessionStore.getAllActive().map { $0.id }
         guard let text = RelayIdentityProtocol.sessionsMessage(sessionIds: sessionIds) else { return }
         sendRelayIdentityControl(text, label: "relaySessions(\(sessionIds.count))")
+    }
+
+    func requestRelayAccountState() {
+        guard let text = RelayIdentityProtocol.accountListMessage() else { return }
+        sendRelayIdentityControl(text, label: "relayAccountList")
+    }
+
+    func requestRelayMerge(targetAstationId: String, freshAccessToken: String? = nil) {
+        guard let text = RelayIdentityProtocol.mergeRequestMessage(
+            targetAstationId: targetAstationId,
+            freshAccessToken: freshAccessToken
+        ) else { return }
+        relayAccountStatusMessage = "Requesting merge…"
+        NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
+        sendRelayIdentityControl(text, label: "relayMergeRequest")
+    }
+
+    func cancelRelayMerge(requestId: String) {
+        guard let text = RelayIdentityProtocol.mergeCancelMessage(requestId: requestId) else { return }
+        sendRelayIdentityControl(text, label: "relayMergeCancel")
+    }
+
+    func leaveRelayAccountGroup() {
+        guard let text = RelayIdentityProtocol.leaveGroupMessage() else { return }
+        sendRelayIdentityControl(text, label: "relayLeaveGroup")
+    }
+
+    func removeRelayAstation(astationId: String) {
+        guard let text = RelayIdentityProtocol.removeAstationMessage(astationId: astationId) else { return }
+        sendRelayIdentityControl(text, label: "relayRemoveAstation")
+    }
+
+    private func registerRelayAccountIfPossible() {
+        guard identityRelayVerified else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await tokenProvider.validToken()
+                guard let session = sessionStore.load() else { return }
+                let rawLabel = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+                let label = DeviceAuthentication.deviceLabel(rawLabel)
+                guard let text = RelayIdentityProtocol.registerAccountMessage(
+                    accessToken: session.accessToken,
+                    label: label
+                ) else { return }
+                await MainActor.run {
+                    self.sendRelayIdentityControl(text, label: "relayRegisterAccount")
+                }
+            } catch {
+                Log.debug("[RelayAccount] Registration deferred: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func showMergeApproval(_ approval: RelayMergeApproval) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let alert = NSAlert()
+        alert.messageText = "Merge Astation data?"
+        alert.informativeText = "\(approval.requesterLabel) wants to merge its memories, skills and vaults with this Mac. Both Astations will then use one shared data account."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Approve Merge")
+        alert.addButton(withTitle: "Cancel Request")
+        let approved = alert.runModal() == .alertFirstButtonReturn
+        let text = approved
+            ? RelayIdentityProtocol.mergeApprovalMessage(requestId: approval.requestId)
+            : RelayIdentityProtocol.mergeCancelMessage(requestId: approval.requestId)
+        if let text {
+            sendRelayIdentityControl(text, label: approved ? "relayMergeApprove" : "relayMergeCancel")
+        }
+    }
+
+    private static func accountChangeMessage(_ reason: String) -> String {
+        switch reason {
+        case "merge_completed": return "Astation data accounts were merged."
+        case "merge_cancelled": return "The pending merge was cancelled."
+        case "delayed_merge_pending": return "A delayed merge is pending for 24 hours."
+        default: return "The account changed on another Astation."
+        }
     }
 
     /// Bind a granted pairing session on the relay (any grant path: relay, LAN, loopback).

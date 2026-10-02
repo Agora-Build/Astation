@@ -61,7 +61,7 @@ pub(crate) async fn resolve_caller(
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "missing ?id=<client_id>"))?
         .to_string();
 
-    let work_session_id = state
+    let astation_id = state
         .identity
         .resolve(session_id, chrono::Utc::now().timestamp())
         .await
@@ -70,6 +70,15 @@ pub(crate) async fn resolve_caller(
             err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable")
         })?
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid or unbound session"))?;
+
+    let work_session_id = state
+        .accounts
+        .resolve_data_account(&astation_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("Account store error resolving data account: {}", e);
+            err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable")
+        })?;
 
     Ok(Caller {
         work_session_id,
@@ -272,6 +281,7 @@ pub(crate) mod tests {
             vault: Arc::new(InMemoryVaultStore::new()),
             knowledge: Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         let session_id = bind_session(&state, astation_id).await;
         (state, session_id)
@@ -449,6 +459,7 @@ pub(crate) mod tests {
             vault: Arc::new(InMemoryVaultStore::new()),
             knowledge: Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: Arc::new(crate::account_store::InMemoryAccountStore::default()),
         }
     }
 

@@ -1,4 +1,5 @@
 mod admin;
+mod account_store;
 mod auth;
 mod cluster;
 mod identity_store;
@@ -50,6 +51,8 @@ pub struct AppState {
     pub knowledge: Arc<dyn knowledge_store::KnowledgeStore>,
     /// Astation keys + durable session bindings (Postgres when DATABASE_URL is set).
     pub identity: Arc<dyn identity_store::IdentityStore>,
+    /// Optional Agora-account registration and Astation-to-data-account mapping.
+    pub accounts: Arc<dyn account_store::AccountStore>,
 }
 
 fn redis_url() -> Option<String> {
@@ -265,6 +268,7 @@ fn spawn_upkeep(
     sessions: &SessionStore,
     rtc_sessions: &RtcSessionStore,
     voice_sessions: &VoiceSessionStore,
+    accounts: &Arc<dyn account_store::AccountStore>,
 ) -> Vec<NamedTask> {
     // Spawn background cleanup for expired sessions
     let cleanup_sessions = sessions.clone();
@@ -333,12 +337,47 @@ fn spawn_upkeep(
             sweep_slow.local().sweep_slow();
         }
     });
+    let merge_accounts = accounts.clone();
+    let merge_relay = relay.clone();
+    let account_merge_sweep = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            match merge_accounts
+                .complete_due_merges(chrono::Utc::now().timestamp())
+                .await
+            {
+                Ok(outcomes) => {
+                    for outcome in outcomes {
+                        let frame = serde_json::json!({
+                            "type": "relayAccountChanged",
+                            "reason": "merge_completed",
+                            "request_id": outcome.request_id,
+                            "data_account": outcome.data_account,
+                        })
+                        .to_string();
+                        for astation_id in outcome.astation_ids {
+                            relay::deliver_to_verified_astation(
+                                &merge_relay,
+                                &astation_id,
+                                frame.clone(),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!("Delayed account merge sweep failed: {}", error),
+            }
+        }
+    });
     vec![
         ("session sweep", sessions_sweep),
         ("room keep-alive", rooms_sweep),
         ("RTC session sweep", rtc_sweep),
         ("voice session sweep", voice_sweep),
         ("slow-client sweep", slow_sweep),
+        ("account merge sweep", account_merge_sweep),
     ]
 }
 
@@ -657,10 +696,11 @@ async fn serve() {
     // Vault + knowledge (Atem Memory) + identity stores: Postgres, sharing one
     // pool, when DATABASE_URL is set (the durable path), else in-memory
     // fallbacks so the rest of the server still runs without a DB.
-    let (vault, knowledge, identity): (
+    let (vault, knowledge, identity, accounts): (
         Arc<dyn vault_store::VaultStore>,
         Arc<dyn knowledge_store::KnowledgeStore>,
         Arc<dyn identity_store::IdentityStore>,
+        Arc<dyn account_store::AccountStore>,
     ) = match std::env::var("DATABASE_URL") {
         Ok(url) if !url.is_empty() => {
             tracing::info!("Connecting to Postgres for vault + knowledge storage...");
@@ -677,7 +717,8 @@ async fn serve() {
             (
                 Arc::new(vault_store::PgVaultStore::new(pool.clone())),
                 Arc::new(knowledge_store::PgKnowledgeStore::new(pool.clone())),
-                Arc::new(identity_store::PgIdentityStore::new(pool)),
+                Arc::new(identity_store::PgIdentityStore::new(pool.clone())),
+                Arc::new(account_store::PgAccountStore::new(pool)),
             )
         }
         _ => {
@@ -685,10 +726,18 @@ async fn serve() {
                 "DATABASE_URL not set — vault + knowledge + identity storage is IN-MEMORY \
                  (not durable). Set DATABASE_URL to enable persistent storage."
             );
+            let vault: Arc<dyn vault_store::VaultStore> =
+                Arc::new(vault_store::InMemoryVaultStore::new());
+            let knowledge: Arc<dyn knowledge_store::KnowledgeStore> =
+                Arc::new(knowledge_store::InMemoryKnowledgeStore::new());
+            let accounts: Arc<dyn account_store::AccountStore> = Arc::new(
+                account_store::InMemoryAccountStore::new(knowledge.clone(), vault.clone()),
+            );
             (
-                Arc::new(vault_store::InMemoryVaultStore::new()),
-                Arc::new(knowledge_store::InMemoryKnowledgeStore::new()),
+                vault,
+                knowledge,
                 Arc::new(identity_store::InMemoryIdentityStore::new()),
+                accounts,
             )
         }
     };
@@ -754,7 +803,13 @@ async fn serve() {
     // Background tasks run for the life of the process; one that stops
     // outside a drain stops the relay (exit 1) so it is restarted.
     let mut background = cluster_tasks;
-    background.extend(spawn_upkeep(&relay, &sessions, &rtc_sessions, &voice_sessions));
+    background.extend(spawn_upkeep(
+        &relay,
+        &sessions,
+        &rtc_sessions,
+        &voice_sessions,
+        &accounts,
+    ));
     tokio::spawn(run_supervisor(background, relay.clone(), relay::DRAIN_GRACE, |_| {
         std::process::exit(1)
     }));
@@ -767,6 +822,7 @@ async fn serve() {
         vault,
         knowledge,
         identity,
+        accounts,
     };
 
     let shutdown_hub = state.relay.clone();
@@ -821,6 +877,10 @@ mod tests {
             vault: Arc::new(vault_store::InMemoryVaultStore::new()),
             knowledge: Arc::new(knowledge_store::InMemoryKnowledgeStore::new()),
             identity: Arc::new(identity_store::InMemoryIdentityStore::new()),
+            accounts: Arc::new(account_store::InMemoryAccountStore::new(
+                Arc::new(knowledge_store::InMemoryKnowledgeStore::new()),
+                Arc::new(vault_store::InMemoryVaultStore::new()),
+            )),
         }
     }
 
@@ -972,7 +1032,15 @@ mod tests {
         for n in 0..=MAX_QUEUED_FRAMES {
             hub.local().send("stuck", format!("{n}"));
         }
-        let tasks = spawn_upkeep(&hub, &SessionStore::new(), &RtcSessionStore::new(), &VoiceSessionStore::new());
+        let accounts: Arc<dyn account_store::AccountStore> =
+            Arc::new(account_store::InMemoryAccountStore::default());
+        let tasks = spawn_upkeep(
+            &hub,
+            &SessionStore::new(),
+            &RtcSessionStore::new(),
+            &VoiceSessionStore::new(),
+            &accounts,
+        );
         tokio::time::sleep(SLOW_CLIENT_TIMEOUT + std::time::Duration::from_secs(2)).await;
         assert!(!hub.local().contains("stuck"));
         assert!(outbox.close.changed().await.is_ok());

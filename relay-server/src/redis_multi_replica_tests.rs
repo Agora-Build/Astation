@@ -120,14 +120,21 @@ struct Shared {
     identity: Arc<dyn IdentityStore>,
     vault: Arc<dyn VaultStore>,
     knowledge: Arc<dyn KnowledgeStore>,
+    accounts: Arc<dyn crate::account_store::AccountStore>,
 }
 
 impl Shared {
     fn new() -> Self {
+        let vault: Arc<dyn VaultStore> = Arc::new(InMemoryVaultStore::new());
+        let knowledge: Arc<dyn KnowledgeStore> = Arc::new(InMemoryKnowledgeStore::new());
         Self {
             identity: Arc::new(InMemoryIdentityStore::new()),
-            vault: Arc::new(InMemoryVaultStore::new()),
-            knowledge: Arc::new(InMemoryKnowledgeStore::new()),
+            accounts: Arc::new(crate::account_store::InMemoryAccountStore::new(
+                knowledge.clone(),
+                vault.clone(),
+            )),
+            vault,
+            knowledge,
         }
     }
 }
@@ -194,6 +201,7 @@ async fn start_replica(shared: &Shared) -> Replica {
         &cluster.sessions,
         &cluster.rtc_sessions,
         &cluster.voice_sessions,
+        &shared.accounts,
     );
     let state = AppState {
         sessions: cluster.sessions.clone(),
@@ -203,6 +211,7 @@ async fn start_replica(shared: &Shared) -> Replica {
         vault: shared.vault.clone(),
         knowledge: shared.knowledge.clone(),
         identity: shared.identity.clone(),
+        accounts: shared.accounts.clone(),
     };
     let (ws, server) = spawn_relay(state.clone()).await;
     Replica { state, cluster, ws, proxy, server, upkeep }
