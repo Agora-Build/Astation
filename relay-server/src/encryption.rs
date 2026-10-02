@@ -97,11 +97,12 @@ pub fn transition(
     counts: EncryptionCounts,
 ) -> Result<EncryptionState, String> {
     let requested_kid = requested_kid.map(str::to_ascii_lowercase);
-    let same_kid = || {
-        requested_kid
-            .clone()
-            .or_else(|| current.kid.clone())
-            .unwrap_or_default()
+    let current_kid = || {
+        let kid = current.kid.clone().ok_or_else(|| "encryption key is missing".to_string())?;
+        if requested_kid.as_deref().is_some_and(|requested| requested != kid) {
+            return Err("requested encryption key does not match the active migration key".to_string());
+        }
+        Ok(kid)
     };
     let (kid, enabled_at) = match (current.mode.as_str(), requested_mode) {
         ("off", "enabling") => {
@@ -119,9 +120,9 @@ pub fn transition(
                     counts.plaintext, counts.obsolete
                 ));
             }
-            (same_kid(), Some(current.enabled_at.unwrap_or(now)))
+            (current_kid()?, Some(current.enabled_at.unwrap_or(now)))
         }
-        ("on", "disabling") => (same_kid(), current.enabled_at),
+        ("on", "disabling") => (current_kid()?, current.enabled_at),
         ("on", "enabling") => {
             let kid = requested_kid.as_deref().filter(|kid| valid_kid(kid))
                 .ok_or_else(|| "key rotation requires a new valid kid".to_string())?;
@@ -181,7 +182,7 @@ pub fn classify_envelope(value: &str, kid: Option<&str>) -> EncryptionCounts {
             ciphertext: 1,
             ..Default::default()
         },
-        (Some(_), _) | (None, _) if value.starts_with("e1.") => EncryptionCounts {
+        (Some(_), _) => EncryptionCounts {
             obsolete: 1,
             ..Default::default()
         },
@@ -201,7 +202,7 @@ pub fn classify_hash(value: &str, kid: Option<&str>) -> EncryptionCounts {
             ciphertext: 1,
             ..Default::default()
         },
-        (Some(_), _) | (None, _) if value.starts_with("h1.") => EncryptionCounts {
+        (Some(_), _) => EncryptionCounts {
             obsolete: 1,
             ..Default::default()
         },
@@ -232,7 +233,7 @@ mod tests {
         let value = format!("h1.0123abcd.{}", "a".repeat(64));
         assert!(valid_hash(&value, "0123abcd"));
         assert!(!valid_hash(&value, "89abcdef"));
-        assert_eq!(classify_hash("h1.0123abcd.no", Some("0123abcd")).obsolete, 1);
+        assert_eq!(classify_hash("h1.0123abcd.no", Some("0123abcd")).plaintext, 1);
     }
 
     #[test]
@@ -283,8 +284,30 @@ mod tests {
     }
 
     #[test]
-    fn prefixes_alone_never_count_as_ciphertext() {
-        assert_eq!(classify_envelope("e1.", Some("0123abcd")).obsolete, 1);
-        assert_eq!(classify_hash("h1.0123abcd.no", Some("0123abcd")).obsolete, 1);
+    fn transitions_cannot_replace_the_migration_key() {
+        let enabling = transition(
+            &EncryptionState::off("a"),
+            "enabling",
+            Some("0123abcd"),
+            1,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(transition(&enabling, "on", Some("89abcdef"), 2, Default::default()).is_err());
+        let on = transition(&enabling, "on", Some("0123abcd"), 2, Default::default()).unwrap();
+        assert!(transition(&on, "disabling", Some("89abcdef"), 3, Default::default()).is_err());
+        assert_eq!(
+            transition(&on, "disabling", Some("0123abcd"), 3, Default::default())
+                .unwrap()
+                .kid
+                .as_deref(),
+            Some("0123abcd")
+        );
+    }
+
+    #[test]
+    fn malformed_prefixes_are_plaintext_not_obsolete_ciphertext() {
+        assert_eq!(classify_envelope("e1.", Some("0123abcd")).plaintext, 1);
+        assert_eq!(classify_hash("h1.0123abcd.no", Some("0123abcd")).plaintext, 1);
     }
 }

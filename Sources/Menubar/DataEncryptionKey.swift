@@ -67,50 +67,20 @@ final class DataEncryptionKeyManager {
             try store(value, dataAccount: dataAccount)
             return
         }
-        if let value = try loadAny(kid: kid) {
-            try store(value, dataAccount: dataAccount)
-            return
-        }
         throw DataEncryptionKeyError.invalidKey
     }
 
     private func value(from stored: Stored, kid requestedKid: String?) throws -> AccountDataKey? {
         let candidates = [StoredKey(kid: stored.kid, key: stored.key)] + (stored.previous ?? [])
-        guard let candidate = requestedKid.flatMap({ kid in
+        let candidate = requestedKid.flatMap { kid in
             candidates.first(where: { $0.kid == kid })
-        }) ?? (requestedKid == nil ? candidates.first : nil),
-              Self.validKid(candidate.kid),
+        } ?? (requestedKid == nil ? candidates.first : nil)
+        guard let candidate else { return nil }
+        guard Self.validKid(candidate.kid),
               let key = Data(base64Encoded: candidate.key), key.count == 32 else {
             throw DataEncryptionKeyError.invalidKey
         }
         return AccountDataKey(kid: candidate.kid, key: key)
-    }
-
-    private func loadAny(kid: String) throws -> AccountDataKey? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.service,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitAll
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess else { throw DataEncryptionKeyError.keychain(status) }
-        let values: [Data]
-        if let all = item as? [Data] {
-            values = all
-        } else if let one = item as? Data {
-            values = [one]
-        } else {
-            throw DataEncryptionKeyError.invalidKey
-        }
-        for data in values {
-            guard let stored = try? JSONDecoder().decode(Stored.self, from: data),
-                  stored.version == 1 || stored.version == 2 else { continue }
-            if let value = try value(from: stored, kid: kid) { return value }
-        }
-        return nil
     }
 
     private func readStored(dataAccount: String) throws -> Stored? {
@@ -231,8 +201,12 @@ final class DataEncryptionKeyManager {
 
     static func fingerprint(publicKeyBase64: String) -> String? {
         guard let key = Data(base64Encoded: publicKeyBase64), key.count == 32 else { return nil }
-        let hex = SHA256.hash(data: key).prefix(4).map { String(format: "%02X", $0) }.joined()
-        return "\(hex.prefix(4))-\(hex.suffix(4))"
+        let hex = SHA256.hash(data: key).prefix(8).map { String(format: "%02X", $0) }.joined()
+        return stride(from: 0, to: hex.count, by: 4).map { offset in
+            let start = hex.index(hex.startIndex, offsetBy: offset)
+            let end = hex.index(start, offsetBy: min(4, hex.count - offset))
+            return String(hex[start..<end])
+        }.joined(separator: "-")
     }
 
     private func store(_ value: AccountDataKey, dataAccount: String) throws {

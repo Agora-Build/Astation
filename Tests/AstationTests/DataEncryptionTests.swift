@@ -39,6 +39,24 @@ final class DataEncryptionTests: XCTestCase {
         XCTAssertEqual(try ChaChaPoly.open(box, using: wrappingKey, authenticating: aad), account.key)
     }
 
+    func testDeviceFingerprintUses64Bits() throws {
+        let publicKey = Data(repeating: 5, count: 32)
+        let expected = SHA256.hash(data: publicKey).prefix(8)
+            .map { String(format: "%02X", $0) }
+            .joined()
+        let grouped = stride(from: 0, to: expected.count, by: 4).map { offset in
+            let start = expected.index(expected.startIndex, offsetBy: offset)
+            let end = expected.index(start, offsetBy: 4)
+            return String(expected[start..<end])
+        }.joined(separator: "-")
+
+        XCTAssertEqual(
+            DataEncryptionKeyManager.fingerprint(publicKeyBase64: publicKey.base64EncodedString()),
+            grouped
+        )
+        XCTAssertEqual(grouped.count, 19)
+    }
+
     func testEncryptionMessagesRoundTrip() throws {
         let messages: [AstationMessage] = [
             .encryptionMode(

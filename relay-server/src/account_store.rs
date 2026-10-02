@@ -2261,6 +2261,14 @@ mod tests {
         let kid2 = "89abcdef";
         accounts.set_encryption_state("a", "enabling", Some(kid2), 3).await.unwrap();
         assert!(matches!(
+            knowledge.add_memory("a", memory("m-rotation-plain", "late plaintext")).await,
+            Err(KnowledgeError::EncryptionConflict)
+        ));
+        assert!(matches!(
+            vault.append("a", &vault_id, "atem", "late plaintext").await,
+            Err(VaultError::EncryptionConflict)
+        ));
+        assert!(matches!(
             accounts.set_encryption_state("a", "on", Some(kid2), 4).await,
             Err(AccountError::InvalidEncryption(_))
         ));
