@@ -294,6 +294,22 @@ container of the same app) + 1 (admin) + `superuser_reserved_connections`
 (default 3). Two replicas: above 2 × 5 × 2 + 1 + 3 = 24, plus anything else
 using that database.
 
+**Load test record** (`relay-server/README.md`, "Load test"):
+
+| | 2026-10-02, local, production-like |
+|---|---|
+| Commit | `8c4f6ff` (main) |
+| Setup | 2 relays (`REDIS_URL`, `RELAY_REPLICAS_EXPECTED=2`, `RELAY_WS_MAX_PER_IP=20000`) + Valkey 8 (`maxmemory 512mb`, `noeviction`), all on one Linux host (16 cores, 38 GB) with the load client; loopback, so no TLS or Cloudflare |
+| Run | defaults: 10,000 rooms × (Astation + 2 Atems) = 30,000 sockets, ramp 60 s, 30 min of traffic every 5 s |
+| `total:` | 21,599,994 samples, p50 0.2 ms, p99 41.0 ms, max 44.0 ms; lost frames 0 (up, bcast, uni); seq gaps 0; duplicates/reordered 0; connect errors 0; auth errors 0; incomplete rooms 0; dropped sockets 0. **PASS** |
+| Relay memory (RSS) | relay-a 269 → 336 MB, relay-b 268 → 330 MB (2 min after the ramp → end). Growth slowed through the run (+37 MB, then +18 MB, then about 0 in the last 6 minutes), so it looks like warm-up, not a leak; a longer soak would confirm. About 22 KB per socket. |
+| Valkey | 6.7 MB, flat |
+
+Still to do before a 10k claim on the real deployment: the same run against
+production-like hardware through Cloudflare (needs a planned window, a
+temporary `RELAY_WS_MAX_PER_IP` raise, and `forget-key` cleanup of the
+`astation-lt-*` keys).
+
 **Rollout,** each step reversible:
 
 1. Deploy Valkey (checklist below).
