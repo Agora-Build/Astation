@@ -195,6 +195,28 @@ class SessionStore {
         }
     }
 
+    /// Remove every local pairing before changing this Mac to another
+    /// Astation identity. This is synchronous so quitting cannot leave old
+    /// bearer tokens on disk under the restored account.
+    func deleteAll() throws {
+        let removedIds = try queue.sync(flags: .barrier) { () throws -> [String] in
+            let previous = sessions
+            let ids = Array(previous.keys)
+            sessions.removeAll()
+            do {
+                try persistToDisk()
+                return ids
+            } catch {
+                sessions = previous
+                throw error
+            }
+        }
+        if !removedIds.isEmpty {
+            Log.info("🗑️ Deleted all \(removedIds.count) paired device session(s)")
+            notifyRemoved(removedIds)
+        }
+    }
+
     /// Get session info if valid.
     func get(sessionId: String) -> SessionInfo? {
         return queue.sync {
@@ -249,18 +271,21 @@ class SessionStore {
     private func saveToDisk() {
         // Must be called from queue with barrier
         do {
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = .prettyPrinted
-
-            let data = try encoder.encode(sessions)
-            try data.write(to: storePath, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storePath.path)
-
+            try persistToDisk()
             Log.debug("💾 Sessions saved to disk (\(sessions.count) total)")
         } catch {
             Log.error("Failed to save sessions: \(error)")
         }
+    }
+
+    private func persistToDisk() throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = .prettyPrinted
+
+        let data = try encoder.encode(sessions)
+        try data.write(to: storePath, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storePath.path)
     }
 
     private func loadFromDisk() {

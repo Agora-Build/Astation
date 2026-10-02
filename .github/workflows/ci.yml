@@ -61,8 +61,8 @@ jobs:
       - name: Build Swift package
         run: swift build -c release
 
-      - name: Run relay identity tests
-        run: swift test --filter RelayIdentityTests
+      - name: Run relay identity and recovery kit tests
+        run: swift test --filter "RelayIdentityTests|RecoveryKitTests"
 
   test-webapp:
     name: Webapp Tests
