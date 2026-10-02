@@ -2,6 +2,7 @@ mod admin;
 mod account_store;
 mod auth;
 mod cluster;
+mod encryption;
 mod identity_store;
 mod knowledge_routes;
 mod knowledge_secrets;
@@ -553,6 +554,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/vault/:id/summary",
             post(vault_routes::set_summary_handler),
+        )
+        .route(
+            "/api/vault/:id/encryption",
+            post(vault_routes::rewrite_encryption_handler),
         )
         // Atem Memory API routes (knowledge sync)
         .route(
