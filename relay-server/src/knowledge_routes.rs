@@ -796,7 +796,7 @@ mod tests {
     use crate::relay::RelayHub;
     use crate::rtc_session::RtcSessionStore;
     use crate::session_store::SessionStore;
-    use crate::vault_store::InMemoryVaultStore;
+    use crate::vault_store::{InMemoryVaultStore, VaultStore};
     use crate::voice_session::VoiceSessionStore;
     use axum::body::Body;
     use axum::http::Request;
@@ -1419,6 +1419,21 @@ mod tests {
         b.body(body).unwrap()
     }
 
+    async fn prod_post_json(
+        app: &Router,
+        uri: &str,
+        session: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(prod_req(uri, Some(session), Body::from(body.to_string())))
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, body_json(response).await)
+    }
+
     /// An unauthenticated caller can't make the relay buffer a large body:
     /// auth runs first and the body is never polled.
     #[tokio::test]
@@ -1567,6 +1582,301 @@ mod tests {
             .await;
             assert_eq!(response["results"][0]["ok"], false, "{id}: {response}");
         }
+    }
+
+    #[tokio::test]
+    async fn production_routes_complete_encryption_and_decryption_migrations() {
+        let knowledge = Arc::new(InMemoryKnowledgeStore::new());
+        let vault = Arc::new(InMemoryVaultStore::new());
+        let accounts = Arc::new(InMemoryAccountStore::new(knowledge.clone(), vault.clone()));
+        let state = AppState {
+            sessions: SessionStore::new(),
+            relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
+            voice_sessions: VoiceSessionStore::new(),
+            vault: vault.clone(),
+            knowledge: knowledge.clone(),
+            identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: accounts.clone(),
+        };
+        let session = bind_session(&state, "ws-1").await;
+        let app = crate::router(state);
+
+        let mut memory = sample_memory("mem-migrate", "plain memory");
+        memory["scope"] = json!("project");
+        memory["project"] = json!("project-x");
+        let (status, response) = prod_post_json(
+            &app,
+            "/api/memory/batch?id=atem-a",
+            &session,
+            json!({"ops": [{"op": "add", "memory": memory}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["results"][0]["ok"], true, "{response}");
+
+        for (base_version, body) in [(0, "skill v1"), (1, "skill v2")] {
+            let mut skill = sample_skill("migrate", json!({"SKILL.md": b64(body)}));
+            skill["scope"] = json!("project");
+            skill["project"] = json!("project-x");
+            skill["content_hash"] = json!(format!("hash-{body}"));
+            let (status, response) = prod_post_json(
+                &app,
+                "/api/skills/batch?id=atem-a",
+                &session,
+                json!({"ops": [{"op": "push", "skill": skill, "base_version": base_version}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(response["results"][0]["ok"], true, "{response}");
+            assert_eq!(response["results"][0]["version"], base_version + 1);
+        }
+
+        let (status, created) = prod_post_json(
+            &app,
+            "/api/vault?id=atem-a",
+            &session,
+            json!({"summary": "plain summary"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let vault_id = created["vault_id"].as_str().unwrap().to_string();
+        for body in [json!({"text": "vault v1"}), json!({"text": "vault v2", "entry_id": 1})] {
+            let (status, response) = prod_post_json(
+                &app,
+                &format!("/api/vault/{vault_id}?id=atem-a"),
+                &session,
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+        }
+
+        let kid = "0123abcd";
+        accounts
+            .set_encryption_state("ws-1", "enabling", Some(kid), 1)
+            .await
+            .unwrap();
+        assert!(accounts
+            .set_encryption_state("ws-1", "on", Some(kid), 2)
+            .await
+            .is_err());
+        let envelope = |marker: char| format!("e1.{kid}.{}", b64(&marker.to_string().repeat(40)));
+        let hash = |marker: char| format!("h1.{kid}.{}", marker.to_string().repeat(64));
+        let encrypted_project = hash('a');
+        let encrypted_path = envelope('p');
+        let encrypted_files = |marker: char| {
+            Value::Object(
+                [(
+                    encrypted_path.clone(),
+                    Value::String(b64(&envelope(marker))),
+                )]
+                .into_iter()
+                .collect(),
+            )
+        };
+
+        let encrypted_memory = envelope('m');
+        let (status, response) = prod_post_json(
+            &app,
+            "/api/memory/batch?id=atem-a",
+            &session,
+            json!({"ops": [{
+                "op": "rewrite",
+                "id": "mem-migrate",
+                "project": encrypted_project,
+                "content": encrypted_memory,
+                "content_hash": hash('b')
+            }]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["results"][0]["ok"], true, "{response}");
+
+        let (status, response) = prod_post_json(
+            &app,
+            "/api/skills/batch?id=atem-a",
+            &session,
+            json!({"ops": [
+                {
+                    "op": "rewrite", "scope": "project", "old_project": "project-x",
+                    "name": "migrate", "version": 1, "project": encrypted_project,
+                    "files": encrypted_files('1'), "content_hash": hash('c')
+                },
+                {
+                    "op": "rewrite", "scope": "project", "old_project": "project-x",
+                    "name": "migrate", "version": 2, "project": encrypted_project,
+                    "files": encrypted_files('2'), "content_hash": hash('d')
+                }
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(response["results"].as_array().unwrap().iter().all(|item| item["ok"] == true));
+
+        let encrypted_summary = envelope('s');
+        let encrypted_vault_v1 = envelope('v');
+        let encrypted_vault_v2 = envelope('w');
+        let (status, response) = prod_post_json(
+            &app,
+            &format!("/api/vault/{vault_id}/encryption?id=atem-a"),
+            &session,
+            json!({
+                "summary": encrypted_summary,
+                "entries": [
+                    {"entry_no": 1, "version": 1, "content": encrypted_vault_v1},
+                    {"entry_no": 1, "version": 2, "content": encrypted_vault_v2}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+
+        let enabled = accounts
+            .set_encryption_state("ws-1", "on", Some(kid), 3)
+            .await
+            .unwrap();
+        assert_eq!((enabled.plaintext_fields, enabled.ciphertext_fields, enabled.obsolete_fields), (0, 14, 0));
+
+        let memories = knowledge.pull_memories("ws-1", 0, 10).await.unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].content, encrypted_memory);
+        for version in 1..=2 {
+            let skill = knowledge
+                .skill_version("ws-1", "project", &encrypted_project, "migrate", version)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(skill.files, encrypted_files(char::from_digit(version as u32, 10).unwrap()));
+        }
+        assert_eq!(vault.list_readable("ws-1").await.unwrap()[0].summary, encrypted_summary);
+        let encrypted_history = vault.read(&vault_id, None, true).await.unwrap();
+        assert_eq!(encrypted_history.len(), 2);
+        assert!(encrypted_history.iter().all(|entry| entry.content.starts_with("e1.0123abcd.")));
+
+        let mut plain_memory = sample_memory("plain-rejected", "plaintext after enable");
+        plain_memory["scope"] = json!("project");
+        plain_memory["project"] = json!("project-x");
+        let (_, response) = prod_post_json(
+            &app,
+            "/api/memory/batch?id=atem-a",
+            &session,
+            json!({"ops": [{"op": "add", "memory": plain_memory}]}),
+        )
+        .await;
+        assert_eq!(response["results"][0]["ok"], false, "{response}");
+        let (_, response) = prod_post_json(
+            &app,
+            "/api/skills/batch?id=atem-a",
+            &session,
+            json!({"ops": [{"op": "push", "skill": sample_skill(
+                "plain-rejected", json!({"SKILL.md": b64("plaintext after enable")})
+            ), "base_version": 0}]}),
+        )
+        .await;
+        assert_eq!(response["results"][0]["ok"], false, "{response}");
+        let (status, _) = prod_post_json(
+            &app,
+            &format!("/api/vault/{vault_id}?id=atem-a"),
+            &session,
+            json!({"text": "plaintext after enable"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        accounts
+            .set_encryption_state("ws-1", "disabling", Some(kid), 4)
+            .await
+            .unwrap();
+        let (_, response) = prod_post_json(
+            &app,
+            "/api/memory/batch?id=atem-a",
+            &session,
+            json!({"ops": [{
+                "op": "rewrite", "id": "mem-migrate", "project": "project-x",
+                "content": "plain memory", "content_hash": "h:plain memory"
+            }]}),
+        )
+        .await;
+        assert_eq!(response["results"][0]["ok"], true, "{response}");
+        let (_, response) = prod_post_json(
+            &app,
+            "/api/skills/batch?id=atem-a",
+            &session,
+            json!({"ops": [
+                {
+                    "op": "rewrite", "scope": "project", "old_project": encrypted_project,
+                    "name": "migrate", "version": 1, "project": "project-x",
+                    "files": {"SKILL.md": b64("skill v1")}, "content_hash": "hash-skill v1"
+                },
+                {
+                    "op": "rewrite", "scope": "project", "old_project": encrypted_project,
+                    "name": "migrate", "version": 2, "project": "project-x",
+                    "files": {"SKILL.md": b64("skill v2")}, "content_hash": "hash-skill v2"
+                }
+            ]}),
+        )
+        .await;
+        assert!(response["results"].as_array().unwrap().iter().all(|item| item["ok"] == true));
+        let (status, response) = prod_post_json(
+            &app,
+            &format!("/api/vault/{vault_id}/encryption?id=atem-a"),
+            &session,
+            json!({
+                "summary": "plain summary",
+                "entries": [
+                    {"entry_no": 1, "version": 1, "content": "vault v1"},
+                    {"entry_no": 1, "version": 2, "content": "vault v2"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+
+        let disabled = accounts
+            .set_encryption_state("ws-1", "off", Some(kid), 5)
+            .await
+            .unwrap();
+        assert_eq!((disabled.plaintext_fields, disabled.ciphertext_fields, disabled.obsolete_fields), (14, 0, 0));
+        assert_eq!(
+            knowledge
+                .skill_version("ws-1", "project", "project-x", "migrate", 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .files,
+            json!({"SKILL.md": b64("skill v1")})
+        );
+        assert_eq!(vault.read(&vault_id, None, true).await.unwrap()[0].content, "vault v1");
+
+        let mut stale_memory = sample_memory("stale-ciphertext", &envelope('z'));
+        stale_memory["content_hash"] = json!(hash('z'));
+        let (_, response) = prod_post_json(
+            &app,
+            "/api/memory/batch?id=atem-a",
+            &session,
+            json!({"ops": [{"op": "add", "memory": stale_memory}]}),
+        )
+        .await;
+        assert_eq!(response["results"][0]["ok"], false, "{response}");
+        let mut stale_skill = sample_skill("stale-ciphertext", encrypted_files('z'));
+        stale_skill["content_hash"] = json!(hash('z'));
+        let (_, response) = prod_post_json(
+            &app,
+            "/api/skills/batch?id=atem-a",
+            &session,
+            json!({"ops": [{"op": "push", "skill": stale_skill, "base_version": 0}]}),
+        )
+        .await;
+        assert_eq!(response["results"][0]["ok"], false, "{response}");
+        let (status, _) = prod_post_json(
+            &app,
+            &format!("/api/vault/{vault_id}?id=atem-a"),
+            &session,
+            json!({"text": envelope('z')}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]
