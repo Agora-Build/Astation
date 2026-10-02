@@ -591,6 +591,7 @@ mod tests {
             vault: Arc::new(InMemoryVaultStore::new()),
             knowledge: Arc::new(InMemoryKnowledgeStore::new()),
             identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         let session_id = bind_session(&state, astation_id).await;
         (state, session_id)

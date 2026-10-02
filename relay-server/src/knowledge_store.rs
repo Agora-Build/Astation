@@ -227,6 +227,21 @@ pub trait KnowledgeStore: Send + Sync {
         since: i64,
         limit: i64,
     ) -> Result<Vec<SkillRow>, KnowledgeError>;
+
+    /// Move all knowledge from `sources` into `target`, assigning fresh
+    /// sequence numbers so every connected Atem observes the merged data.
+    /// Production performs this inside the account-store transaction; this
+    /// hook keeps the DB-less in-memory server behavior equivalent.
+    async fn merge_accounts(
+        &self,
+        _sources: &[String],
+        _target: &str,
+        _preferred_source: &str,
+    ) -> Result<(), KnowledgeError> {
+        Err(KnowledgeError::Db(
+            "account merge must be coordinated by the durable account store".to_string(),
+        ))
+    }
 }
 
 // ─────────────────────────── In-memory implementation ───────────────────────────
@@ -572,6 +587,117 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
         rows.sort_by_key(|r| r.seq);
         rows.truncate(clamp_limit(limit) as usize);
         Ok(rows)
+    }
+
+    async fn merge_accounts(
+        &self,
+        sources: &[String],
+        target: &str,
+        preferred_source: &str,
+    ) -> Result<(), KnowledgeError> {
+        let source_set: std::collections::HashSet<&str> =
+            sources.iter().map(String::as_str).collect();
+        let mut st = self.state.lock().await;
+
+        // Keep one live copy of a duplicate fact and turn the rest into
+        // tombstones, so clients that knew the duplicate ids also converge.
+        let mut memory_indexes: Vec<usize> = st
+            .memories
+            .iter()
+            .enumerate()
+            .filter(|(_, (account, _))| source_set.contains(account.as_str()))
+            .map(|(index, _)| index)
+            .collect();
+        memory_indexes.sort_by(|left, right| {
+            let (_, a) = &st.memories[*left];
+            let (_, b) = &st.memories[*right];
+            (
+                &a.scope,
+                &a.project,
+                &a.machine,
+                &a.content_hash,
+                a.created_at,
+                &a.id,
+            )
+                .cmp(&(
+                    &b.scope,
+                    &b.project,
+                    &b.machine,
+                    &b.content_hash,
+                    b.created_at,
+                    &b.id,
+                ))
+        });
+        let mut live_keys = std::collections::HashSet::new();
+        for index in memory_indexes {
+            let duplicate = {
+                let row = &st.memories[index].1;
+                row.deleted_at.is_none()
+                    && row.invalid_at.is_none()
+                    && !live_keys.insert((
+                        row.scope.clone(),
+                        row.project.clone(),
+                        row.machine.clone(),
+                        row.content_hash.clone(),
+                    ))
+            };
+            let seq = st.next_seq();
+            let (account, row) = &mut st.memories[index];
+            *account = target.to_string();
+            if duplicate {
+                row.content.clear();
+                row.content_hash.clear();
+                row.deleted = true;
+                row.deleted_at = Some(now_secs());
+            }
+            row.seq = seq;
+        }
+
+        // Histories with the same key are concatenated deterministically.
+        let mut skill_indexes: Vec<usize> = st
+            .skills
+            .iter()
+            .enumerate()
+            .filter(|(_, (account, _))| source_set.contains(account.as_str()))
+            .map(|(index, _)| index)
+            .collect();
+        skill_indexes.sort_by(|left, right| {
+            let (aa, a) = &st.skills[*left];
+            let (ba, b) = &st.skills[*right];
+            (
+                &a.scope,
+                &a.project,
+                &a.name,
+                if aa == preferred_source { 0 } else { 1 },
+                a.version,
+                a.created_at,
+            )
+                .cmp(&(
+                    &b.scope,
+                    &b.project,
+                    &b.name,
+                    if ba == preferred_source { 0 } else { 1 },
+                    b.version,
+                    b.created_at,
+                ))
+        });
+        let mut versions: std::collections::HashMap<(String, String, String), i64> =
+            std::collections::HashMap::new();
+        for index in skill_indexes {
+            let key = {
+                let row = &st.skills[index].1;
+                (row.scope.clone(), row.project.clone(), row.name.clone())
+            };
+            let version = versions.entry(key).or_insert(0);
+            *version += 1;
+            let assigned_version = *version;
+            let seq = st.next_seq();
+            let (account, row) = &mut st.skills[index];
+            *account = target.to_string();
+            row.version = assigned_version;
+            row.seq = seq;
+        }
+        Ok(())
     }
 }
 

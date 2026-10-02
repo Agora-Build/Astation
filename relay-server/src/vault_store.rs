@@ -118,6 +118,18 @@ pub trait VaultStore: Send + Sync {
     async fn get_meta(&self, vault_id: &str) -> Result<Option<VaultMeta>, VaultError>;
 
     async fn add_writer(&self, vault_id: &str, client_id: &str) -> Result<(), VaultError>;
+
+    /// DB-less account merge hook. The Postgres account store updates vaults
+    /// in the same transaction as account membership and knowledge rows.
+    async fn merge_accounts(
+        &self,
+        _sources: &[String],
+        _target: &str,
+    ) -> Result<(), VaultError> {
+        Err(VaultError::Db(
+            "account merge must be coordinated by the durable account store".to_string(),
+        ))
+    }
 }
 
 // ─────────────────────────── In-memory implementation ───────────────────────────
@@ -335,6 +347,22 @@ impl VaultStore for InMemoryVaultStore {
         let row = vaults.get_mut(vault_id).ok_or(VaultError::NotFound)?;
         if !row.writer_list.iter().any(|w| w == client_id) {
             row.writer_list.push(client_id.to_string());
+        }
+        Ok(())
+    }
+
+    async fn merge_accounts(
+        &self,
+        sources: &[String],
+        target: &str,
+    ) -> Result<(), VaultError> {
+        let source_set: std::collections::HashSet<&str> =
+            sources.iter().map(String::as_str).collect();
+        let mut vaults = self.vaults.write().await;
+        for vault in vaults.values_mut() {
+            if source_set.contains(vault.work_session_id.as_str()) {
+                vault.work_session_id = target.to_string();
+            }
         }
         Ok(())
     }

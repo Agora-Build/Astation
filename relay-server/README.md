@@ -282,7 +282,10 @@ Config: Set `relay_url` and `ws_url` in `.atem/config.toml`
 | `REDIS_URL` | _(unset)_ | Redis/Valkey for shared relay state: rooms, pairing/OTP, voice and RTC sessions, shared rate-limit counters, replica-to-replica delivery. Required to run more than one replica. Unset: in-memory, one replica only. At startup Redis is tried 10 times, 3 s apart (about 27 s if refused, up to about 57 s if it doesn't answer), then the relay exits 1; a malformed URL or wrong password exits 1 at once. The URL (and its password) is never logged. |
 | `RELAY_WS_MAX_PER_IP` | `200` | Concurrent `/ws` connections allowed per client IP on each replica; over it the upgrade gets `429`. Raise it for load tests that open many sockets from one machine. Blank means unset (default `200`); any other value that isn't a positive integer exits 1 at startup. |
 | `RELAY_REPLICAS_EXPECTED` | `1` | How many relay replicas the deployment runs. Above 1 without `REDIS_URL`, the relay refuses to start (exit 1); a value that isn't a positive integer also exits 1. |
-| `DATABASE_URL` | _(unset)_ | Postgres connection string shared by **vault**, **knowledge sync (Atem Memory)**, and **relay identity** (Astation keys + session bindings) storage (e.g. `postgres://vault:vault@localhost:5432/vault`), one pool for all. When unset, all fall back to **in-memory** (non-durable: bindings and registered keys are lost on restart) and log a warning. Migrations in `migrations/` run automatically at startup. |
+| `DATABASE_URL` | _(unset)_ | Postgres connection string shared by **vault**, **knowledge sync (Atem Memory)**, **relay identity**, and optional Agora account grouping (e.g. `postgres://vault:vault@localhost:5432/vault`), one pool for all. When unset, all fall back to **in-memory** (non-durable: bindings, registered keys, and account groups are lost on restart) and log a warning. Migrations in `migrations/` run automatically at startup. |
+| `AGORA_ACCOUNT_USERINFO_URL` | _(unset)_ | Server-side endpoint that accepts the Agora SSO bearer token and returns the stable account subject. Account registration fails closed when this or `AGORA_ACCOUNT_SUBJECT_FIELD` is unset. Do not configure this with an endpoint whose identity changes between sign-ins. |
+| `AGORA_ACCOUNT_SUBJECT_FIELD` | _(unset)_ | Top-level JSON field in the user-info response containing the permanent Agora account subject (for example `sub`, once confirmed by the SSO service owner). Email and the observed rotating `loginId` are unsafe. |
+| `AGORA_ACCOUNT_AUTH_TIME_FIELD` | _(unset)_ | Optional top-level integer Unix-time field recording when the user most recently authenticated. Required for the lost/offline-Mac merge path; without it, online approval still works. |
 
 **Production:**
 ```bash
@@ -310,6 +313,7 @@ cargo test  # unit + in-memory integration suites (auth, sessions, relay + relay
 #   IDENTITY_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test identity_store -- --ignored
 #   IDENTITY_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test relay:: -- --ignored
 #   KNOWLEDGE_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test knowledge_store -- --ignored
+#   ACCOUNT_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test postgres_merge_moves_all_data_atomically -- --ignored
 #   docker rm -f relay-test-pg
 # Redis suites (every Redis unit + two relays in one process) are #[ignore]d
 # too; CI runs them against a Valkey service. TEST_REDIS_URL must point at

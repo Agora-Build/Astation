@@ -30,6 +30,9 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var serverStatusLabel: NSTextField!
     private var serverInfoLabel: NSTextField!
     private var recoveryStatusLabel: NSTextField?
+    private var relayAccountStack: NSStackView?
+    private var relayAccountStatusLabel: NSTextField?
+    private var leaveGroupButton: NSButton?
 
     init(hubManager: AstationHubManager, hotkeyManager: HotkeyManager) {
         self.hubManager = hubManager
@@ -41,6 +44,9 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         NotificationCenter.default.addObserver(
             self, selector: #selector(sessionChanged),
             name: .credentialsChanged, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(relayAccountChanged),
+            name: .relayAccountChanged, object: nil)
     }
 
     deinit {
@@ -50,6 +56,8 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     func showWindow() {
         if let existingWindow = window {
             shortcutsController.refresh()
+            renderRelayAccountState()
+            hubManager.requestRelayAccountState()
             existingWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -316,70 +324,294 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         }
     }
 
-    // MARK: - Security (account recovery)
+    // MARK: - Security
 
     private func makeSecurityView() -> NSView {
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 450, height: 440))
+        let container = NSView()
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        let document = FlippedSettingsView()
+        let content = NSStackView()
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 10
+        content.edgeInsets = NSEdgeInsets(top: 24, left: 20, bottom: 24, right: 20)
+        document.addSubview(content)
+        scroll.documentView = document
+        container.addSubview(scroll)
+        for view in [scroll, document, content] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+        }
+        NSLayoutConstraint.activate([
+            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: container.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            document.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+            document.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            content.leadingAnchor.constraint(greaterThanOrEqualTo: document.leadingAnchor),
+            content.trailingAnchor.constraint(lessThanOrEqualTo: document.trailingAnchor),
+            content.centerXAnchor.constraint(equalTo: document.centerXAnchor),
+            content.topAnchor.constraint(equalTo: document.topAnchor),
+            content.bottomAnchor.constraint(equalTo: document.bottomAnchor),
+            content.widthAnchor.constraint(equalToConstant: 450)
+        ])
 
-        let title = NSTextField(labelWithString: "Account Recovery")
-        title.font = NSFont.boldSystemFont(ofSize: 14)
-        title.frame = NSRect(x: 20, y: 395, width: 410, height: 24)
-        content.addSubview(title)
+        let accountTitle = sectionTitle("Astations on Your Agora Account")
+        content.addArrangedSubview(accountTitle)
+        content.addArrangedSubview(wrappingInfo(
+            "Each Mac keeps separate data until you choose Merge. An online Mac must approve; a lost or offline Mac requires a fresh Agora sign-in and a notified 24-hour wait."
+        ))
+        let accountStack = NSStackView()
+        accountStack.orientation = .vertical
+        accountStack.alignment = .leading
+        accountStack.spacing = 8
+        accountStack.translatesAutoresizingMaskIntoConstraints = false
+        accountStack.widthAnchor.constraint(equalToConstant: 410).isActive = true
+        content.addArrangedSubview(accountStack)
+        relayAccountStack = accountStack
 
-        let info = NSTextField(wrappingLabelWithString:
-            "The relay stores your memories, skills and vaults under this Astation's ID. Save the recovery kit somewhere off this Mac, such as a password manager, so you can get them back if this Mac is lost.")
-        info.font = NSFont.systemFont(ofSize: 11)
-        info.textColor = .secondaryLabelColor
-        info.frame = NSRect(x: 20, y: 335, width: 410, height: 56)
-        content.addSubview(info)
+        let accountActions = NSStackView()
+        accountActions.orientation = .horizontal
+        accountActions.spacing = 8
+        let refresh = NSButton(title: "Refresh", target: self, action: #selector(refreshRelayAccount))
+        refresh.bezelStyle = .rounded
+        let leave = NSButton(title: "Leave Shared Group…", target: self, action: #selector(leaveRelayGroup))
+        leave.bezelStyle = .rounded
+        leaveGroupButton = leave
+        accountActions.addArrangedSubview(refresh)
+        accountActions.addArrangedSubview(leave)
+        content.addArrangedSubview(accountActions)
 
+        let accountStatus = NSTextField(wrappingLabelWithString: "")
+        accountStatus.font = .systemFont(ofSize: 11)
+        accountStatus.textColor = .secondaryLabelColor
+        accountStatus.translatesAutoresizingMaskIntoConstraints = false
+        accountStatus.widthAnchor.constraint(equalToConstant: 410).isActive = true
+        relayAccountStatusLabel = accountStatus
+        content.addArrangedSubview(accountStatus)
+        content.addArrangedSubview(separator())
+
+        content.addArrangedSubview(sectionTitle("Account Recovery"))
+        content.addArrangedSubview(wrappingInfo(
+            "Save the recovery kit somewhere off this Mac. It remains the fallback for an Astation that was never registered to an Agora account."
+        ))
         let idLabel = NSTextField(labelWithString: "Astation ID: \(RecoveryKit.masked(AstationIdentity.shared.id))")
         idLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        idLabel.frame = NSRect(x: 20, y: 305, width: 410, height: 22)
-        content.addSubview(idLabel)
-
+        content.addArrangedSubview(idLabel)
         let showButton = NSButton(title: "Show Recovery Kit…", target: self, action: #selector(showRecoveryKit))
         showButton.bezelStyle = .rounded
-        showButton.frame = NSRect(x: 20, y: 265, width: 180, height: 32)
-        content.addSubview(showButton)
+        content.addArrangedSubview(showButton)
+        content.addArrangedSubview(separator())
 
-        let separator = NSBox(frame: NSRect(x: 20, y: 250, width: 410, height: 1))
-        separator.boxType = .separator
-        content.addSubview(separator)
-
-        let restoreTitle = NSTextField(labelWithString: "Restore on a New Mac")
-        restoreTitle.font = NSFont.boldSystemFont(ofSize: 14)
-        restoreTitle.frame = NSRect(x: 20, y: 215, width: 410, height: 24)
-        content.addSubview(restoreTitle)
-
-        let restoreInfo = NSTextField(wrappingLabelWithString:
-            "Replace this Astation's ID with the one in your recovery kit. Astation quits; open it again to finish. Atems paired with the current ID will need to pair again.")
-        restoreInfo.font = NSFont.systemFont(ofSize: 11)
-        restoreInfo.textColor = .secondaryLabelColor
-        restoreInfo.frame = NSRect(x: 20, y: 160, width: 410, height: 50)
-        content.addSubview(restoreInfo)
-
+        content.addArrangedSubview(sectionTitle("Restore on a New Mac"))
+        content.addArrangedSubview(wrappingInfo(
+            "Replace this Astation's ID with the one in your recovery kit. Astation quits; open it again to finish. Atems paired with the current ID will need to pair again."
+        ))
         let restoreButton = NSButton(title: "Restore Account…", target: self, action: #selector(restoreAccount))
         restoreButton.bezelStyle = .rounded
-        restoreButton.frame = NSRect(x: 20, y: 120, width: 180, height: 32)
-        content.addSubview(restoreButton)
-
+        content.addArrangedSubview(restoreButton)
         let status = NSTextField(wrappingLabelWithString: "")
         status.font = NSFont.systemFont(ofSize: 11)
-        status.frame = NSRect(x: 20, y: 70, width: 410, height: 40)
-        content.addSubview(status)
+        status.translatesAutoresizingMaskIntoConstraints = false
+        status.widthAnchor.constraint(equalToConstant: 410).isActive = true
+        content.addArrangedSubview(status)
         recoveryStatusLabel = status
 
-        let container = NSView()
-        container.addSubview(content)
-        content.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            content.widthAnchor.constraint(equalToConstant: 450),
-            content.heightAnchor.constraint(equalToConstant: 440),
-            content.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-            content.topAnchor.constraint(equalTo: container.topAnchor, constant: 16)
-        ])
+        renderRelayAccountState()
+        hubManager.requestRelayAccountState()
         return container
+    }
+
+    private func sectionTitle(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.boldSystemFont(ofSize: 14)
+        return label
+    }
+
+    private func wrappingInfo(_ text: String) -> NSTextField {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = NSFont.systemFont(ofSize: 11)
+        label.textColor = .secondaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.widthAnchor.constraint(equalToConstant: 410).isActive = true
+        return label
+    }
+
+    private func separator() -> NSBox {
+        let separator = NSBox()
+        separator.boxType = .separator
+        separator.translatesAutoresizingMaskIntoConstraints = false
+        separator.widthAnchor.constraint(equalToConstant: 410).isActive = true
+        separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        return separator
+    }
+
+    @objc private func relayAccountChanged() {
+        DispatchQueue.main.async { [weak self] in self?.renderRelayAccountState() }
+    }
+
+    @objc private func refreshRelayAccount() {
+        hubManager.requestRelayAccountState()
+    }
+
+    private func renderRelayAccountState() {
+        guard let stack = relayAccountStack else { return }
+        for view in stack.arrangedSubviews {
+            stack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        let currentId = AstationIdentity.shared.id
+        let devices = hubManager.relayAccountDevices
+        guard !devices.isEmpty else {
+            stack.addArrangedSubview(wrappingInfo(
+                hubManager.currentSession() == nil
+                    ? "Sign in with Agora in General to register this Mac."
+                    : "Waiting for the relay to register this Mac…"
+            ))
+            leaveGroupButton?.isEnabled = false
+            relayAccountStatusLabel?.stringValue = hubManager.relayAccountStatusMessage ?? ""
+            return
+        }
+
+        let current = devices.first { $0.astationId == currentId }
+        leaveGroupButton?.isEnabled = current.map { $0.dataAccount != currentId } ?? false
+        for device in devices {
+            stack.addArrangedSubview(accountDeviceRow(device, current: device.astationId == currentId))
+        }
+        for request in hubManager.relayMergeRequests {
+            stack.addArrangedSubview(mergeRequestRow(request))
+        }
+        relayAccountStatusLabel?.stringValue = hubManager.relayAccountStatusMessage ?? ""
+    }
+
+    private func accountDeviceRow(_ device: RelayAccountDevice, current: Bool) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: 410).isActive = true
+
+        let state = current ? "This Mac" : (device.online ? "Online" : "Last seen \(relativeTime(device.lastSeenAt))")
+        let text = NSTextField(wrappingLabelWithString:
+            "\(device.label)  ·  \(state)\n\(RecoveryKit.masked(device.astationId))  ·  \(device.dataAccount.hasPrefix("group-") ? "shared data" : "own data")")
+        text.font = .systemFont(ofSize: 11)
+        text.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(text)
+
+        if !current {
+            let mine = hubManager.relayAccountDevices.first { $0.astationId == AstationIdentity.shared.id }
+            if mine?.dataAccount != device.dataAccount {
+                let merge = SettingsActionButton(title: "Merge…", target: self, action: #selector(mergeRelayAstation(_:)))
+                merge.bezelStyle = .rounded
+                merge.payload = device.astationId
+                row.addArrangedSubview(merge)
+            }
+            if !device.online {
+                let remove = SettingsActionButton(title: "Remove…", target: self, action: #selector(removeRelayAstation(_:)))
+                remove.bezelStyle = .rounded
+                remove.payload = device.astationId
+                row.addArrangedSubview(remove)
+            }
+        }
+        return row
+    }
+
+    private func mergeRequestRow(_ request: RelayMergeRequest) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: 410).isActive = true
+        let detail: String
+        if let readyAt = request.readyAt {
+            detail = "Delayed merge pending until \(Date(timeIntervalSince1970: TimeInterval(readyAt)).formatted(date: .abbreviated, time: .shortened))"
+        } else {
+            detail = "Waiting for approval on the other Mac"
+        }
+        let label = NSTextField(wrappingLabelWithString: detail)
+        label.font = .systemFont(ofSize: 11)
+        label.textColor = .secondaryLabelColor
+        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(label)
+        let cancel = SettingsActionButton(title: "Cancel", target: self, action: #selector(cancelRelayMerge(_:)))
+        cancel.bezelStyle = .rounded
+        cancel.payload = request.requestId
+        row.addArrangedSubview(cancel)
+        return row
+    }
+
+    private func relativeTime(_ seconds: Int64) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter.localizedString(for: Date(timeIntervalSince1970: TimeInterval(seconds)), relativeTo: Date())
+    }
+
+    @objc private func mergeRelayAstation(_ sender: SettingsActionButton) {
+        guard let id = sender.payload,
+              let device = hubManager.relayAccountDevices.first(where: { $0.astationId == id }) else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Merge memories, skills and vaults?"
+        alert.informativeText = device.online
+            ? "\(device.label) will be asked to approve. After approval, both Macs use one shared data account."
+            : "\(device.label) is offline. Continue with a fresh Agora sign-in; all registered Macs are notified, and the merge waits 24 hours so any of them can cancel."
+        alert.addButton(withTitle: device.online ? "Request Approval" : "Sign In and Start Wait")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        if device.online {
+            hubManager.requestRelayMerge(targetAstationId: id)
+            return
+        }
+        Task { @MainActor in
+            do {
+                let manager = SsoAuthManager(ssoUrl: SsoConfig.currentSsoUrl)
+                let session = try await manager.runLoginFlow()
+                try hubManager.sessionStore.save(session)
+                NotificationCenter.default.post(name: .credentialsChanged, object: nil)
+                hubManager.requestRelayMerge(
+                    targetAstationId: id,
+                    freshAccessToken: session.accessToken
+                )
+            } catch {
+                relayAccountStatusLabel?.stringValue = error.localizedDescription
+                relayAccountStatusLabel?.textColor = .systemRed
+            }
+        }
+    }
+
+    @objc private func cancelRelayMerge(_ sender: SettingsActionButton) {
+        guard let id = sender.payload else { return }
+        hubManager.cancelRelayMerge(requestId: id)
+    }
+
+    @objc private func leaveRelayGroup() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Leave the shared data group?"
+        alert.informativeText = "This Mac starts with an empty personal data account. The group's existing data stays with the other Macs."
+        alert.addButton(withTitle: "Leave Group")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        hubManager.leaveRelayAccountGroup()
+    }
+
+    @objc private func removeRelayAstation(_ sender: SettingsActionButton) {
+        guard let id = sender.payload,
+              let device = hubManager.relayAccountDevices.first(where: { $0.astationId == id }) else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Remove \(device.label)?"
+        alert.informativeText = "The relay revokes this Astation's device key and disconnects it. Its copy of already-downloaded data is not erased."
+        alert.addButton(withTitle: "Remove Device")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        hubManager.removeRelayAstation(astationId: id)
     }
 
     private func setRecoveryStatus(_ message: String, isError: Bool) {
@@ -614,7 +846,16 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     }
 }
 
+private final class FlippedSettingsView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+private final class SettingsActionButton: NSButton {
+    var payload: String?
+}
+
 extension Notification.Name {
     static let serverInfoChanged = Notification.Name("AstationServerInfoChanged")
     static let credentialsChanged = Notification.Name("AstationCredentialsChanged")
+    static let relayAccountChanged = Notification.Name("AstationRelayAccountChanged")
 }
