@@ -410,9 +410,11 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
                 self.setRecoveryStatus("Not authenticated, so the recovery kit wasn't shown.", isError: true)
                 return
             }
+            let relayURL = StationRelayURL.validatedBase(SettingsWindowController.currentAstationRelayUrl)
+                ?? SettingsWindowController.defaultStationURL
             let kit = RecoveryKit(
                 astationId: AstationIdentity.shared.id,
-                relayURL: SettingsWindowController.currentAstationRelayUrl
+                relayURL: relayURL
             )
             let text = kit.text()
             let alert = NSAlert()
@@ -440,8 +442,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         panel.nameFieldStringValue = "Astation Recovery Kit.txt"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
-            try text.write(to: url, atomically: true, encoding: .utf8)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            try RecoveryKit.save(text, to: url)
             setRecoveryStatus("Saved to \(url.path).", isError: false)
         } catch {
             setRecoveryStatus("Couldn't save the recovery kit: \(error.localizedDescription)", isError: true)
@@ -466,11 +467,11 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
             guard input.runModal() == .alertFirstButtonReturn else { return }
 
             guard let kit = RecoveryKit.parse(textView.string) else {
-                self.setRecoveryStatus("No Astation ID found in what you pasted.", isError: true)
+                self.setRecoveryStatus("The recovery kit needs a valid Astation ID and relay URL.", isError: true)
                 return
             }
             let current = AstationIdentity.shared.id
-            guard kit.astationId != current else {
+            guard !RecoveryKit.identifiesSameAstation(kit.astationId, current) else {
                 self.setRecoveryStatus("This Mac already uses that Astation ID.", isError: false)
                 return
             }
@@ -492,13 +493,14 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
             guard confirm.runModal() == .alertFirstButtonReturn else { return }
 
             do {
+                try self.hubManager.deviceSessionStore.deleteAll()
                 try AstationIdentity.restore(kit.astationId)
             } catch {
                 self.setRecoveryStatus(error.localizedDescription, isError: true)
                 return
             }
             if !kit.relayURL.isEmpty {
-                UserDefaults.standard.set(StationRelayURL.normalizedBase(kit.relayURL), forKey: SettingsWindowController.astationRelayUrlKey)
+                UserDefaults.standard.set(kit.relayURL, forKey: SettingsWindowController.astationRelayUrlKey)
             }
             NSApp.terminate(nil)
         }

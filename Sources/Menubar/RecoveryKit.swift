@@ -15,9 +15,20 @@ struct RecoveryKit: Equatable {
     private static let relayLabel = "Relay:"
 
     /// `astation-` followed by a UUID, the form `AstationIdentity` generates.
+    static func canonicalAstationId(_ id: String) -> String? {
+        guard id.lowercased().hasPrefix(idPrefix),
+              let uuid = UUID(uuidString: String(id.dropFirst(idPrefix.count))) else { return nil }
+        return "\(idPrefix)\(uuid.uuidString)"
+    }
+
     static func isValidAstationId(_ id: String) -> Bool {
-        guard id.hasPrefix(idPrefix) else { return false }
-        return UUID(uuidString: String(id.dropFirst(idPrefix.count))) != nil
+        canonicalAstationId(id) != nil
+    }
+
+    static func identifiesSameAstation(_ lhs: String, _ rhs: String) -> Bool {
+        guard let left = canonicalAstationId(lhs),
+              let right = canonicalAstationId(rhs) else { return false }
+        return left == right
     }
 
     /// The text the user saves (password manager, file, paper).
@@ -38,12 +49,14 @@ struct RecoveryKit: Equatable {
     /// own. Returns nil when no valid Astation ID is found.
     static func parse(_ text: String) -> RecoveryKit? {
         var id: String?
-        var relay = ""
+        var relay: String?
         for raw in text.split(whereSeparator: \.isNewline) {
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.hasPrefix(idLabel) {
+                guard id == nil else { return nil }
                 id = line.dropFirst(idLabel.count).trimmingCharacters(in: .whitespaces)
             } else if line.hasPrefix(relayLabel) {
+                guard relay == nil else { return nil }
                 relay = line.dropFirst(relayLabel.count).trimmingCharacters(in: .whitespaces)
             }
         }
@@ -51,8 +64,35 @@ struct RecoveryKit: Equatable {
             let bare = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if isValidAstationId(bare) { id = bare }
         }
-        guard let id, isValidAstationId(id) else { return nil }
-        return RecoveryKit(astationId: id, relayURL: relay)
+        guard let id, let canonicalId = canonicalAstationId(id) else { return nil }
+        let normalizedRelay: String
+        if let relay {
+            guard let validated = StationRelayURL.validatedBase(relay) else { return nil }
+            normalizedRelay = validated
+        } else {
+            normalizedRelay = ""
+        }
+        return RecoveryKit(astationId: canonicalId, relayURL: normalizedRelay)
+    }
+
+    /// Writes sensitive recovery material and fails closed if the resulting
+    /// file cannot be restricted to the current user.
+    static func save(_ text: String, to url: URL) throws {
+        do {
+            try text.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: url.path
+            )
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard let permissions = attributes[.posixPermissions] as? NSNumber,
+                  permissions.intValue & 0o777 == 0o600 else {
+                throw CocoaError(.fileWriteNoPermission)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
     }
 
     /// `astation-4630…7279625`: enough to recognize the account, shown

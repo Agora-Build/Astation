@@ -55,20 +55,18 @@ class AstationIdentity {
 
     /// Replaces the saved identity with `id` from a recovery kit. It takes
     /// effect the next time Astation starts; `shared.id` is unchanged until then.
-    static func restore(_ id: String) throws {
-        guard RecoveryKit.isValidAstationId(id) else { throw RestoreError.invalidId }
-        let path = identityPath()
+    static func restore(_ id: String, at overridePath: URL? = nil) throws {
+        guard let canonicalId = RecoveryKit.canonicalAstationId(id) else {
+            throw RestoreError.invalidId
+        }
+        let path = overridePath ?? identityPath()
         try FileManager.default.createDirectory(
             at: path.deletingLastPathComponent(),
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        try id.write(to: path, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o600],
-            ofItemAtPath: path.path
-        )
-        Log.info("Restored Astation identity from a recovery kit: \(id) (takes effect on restart)")
+        try RecoveryKit.save(canonicalId, to: path)
+        Log.info("Restored Astation identity from a recovery kit: \(canonicalId) (takes effect on restart)")
     }
 
     /// Path to identity file: ~/Library/Application Support/Astation/identity.txt
