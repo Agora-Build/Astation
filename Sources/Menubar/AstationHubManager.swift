@@ -68,6 +68,9 @@ class AstationHubManager: ObservableObject {
     @Published private(set) var relayAccountDevices: [RelayAccountDevice] = []
     @Published private(set) var relayMergeRequests: [RelayMergeRequest] = []
     @Published private(set) var relayAccountStatusMessage: String?
+    @Published private(set) var relayEncryptionState: RelayEncryptionState?
+    @Published var relayEncryptionStatusMessage: String?
+    private var encryptionMigrationRetryDelay: TimeInterval = 1
 
     /// Station relay URL. Priority: test override > ASTATION_RELAY_URL env var > UserDefaults > default.
     var stationRelayUrl: String {
@@ -466,6 +469,8 @@ class AstationHubManager: ObservableObject {
             self.connectedClients.append(client)
             Log.info(" Client connected: \(client.id) (\(client.clientType))")
 
+            self.sendEncryptionMode(to: client.id, relayConnectionId: relayConnectionId)
+
             // Send credentials immediately after connection
             self.sendCredentials(
                 toClientId: client.id,
@@ -616,6 +621,18 @@ class AstationHubManager: ObservableObject {
         case .voiceResponse(let sessionId, let success, let message):
             Log.info("[AstationHub] Voice response from \(clientId.prefix(8))…: session=\(sessionId) success=\(success)")
             voiceCodingManager.handleVoiceResponse(sessionId: sessionId, success: success, message: message)
+            return nil
+
+        case .keyRequest(let publicKey):
+            handleEncryptionKeyRequest(
+                publicKey: publicKey,
+                clientId: clientId,
+                relayConnectionId: relayConnectionId
+            )
+            return nil
+
+        case .encryptionMigrationComplete(let mode, let kid):
+            handleEncryptionMigrationComplete(mode: mode, kid: kid)
             return nil
 
         default:
@@ -1404,6 +1421,10 @@ class AstationHubManager: ObservableObject {
                     forType == "relayRegisterAccount" {
                     relayAccountStatusMessage = "Account change accepted by the relay."
                     NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
+                } else if forType == "relayEncryptionSet" {
+                    encryptionMigrationRetryDelay = 1
+                    relayEncryptionStatusMessage = "Encryption change accepted; waiting for migration status."
+                    NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
                 }
             } else {
                 Log.warn("[RelayIdentity] Relay refused \(forType): \(message ?? "no message")")
@@ -1414,6 +1435,13 @@ class AstationHubManager: ObservableObject {
                     forType == "relayAccountList" {
                     relayAccountStatusMessage = message ?? "The relay refused the account change."
                     NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
+                } else if forType == "relayEncryptionSet" || forType == "relayEncryptionGet" {
+                    relayEncryptionStatusMessage = message ?? "The relay refused the encryption change."
+                    NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
+                    if forType == "relayEncryptionSet",
+                       message?.contains("migration is incomplete") == true {
+                        scheduleEncryptionMigrationRetry()
+                    }
                 }
             }
         case .accountState(let devices, let requests):
@@ -1421,12 +1449,41 @@ class AstationHubManager: ObservableObject {
             relayMergeRequests = requests
             relayAccountStatusMessage = nil
             NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
+            requestRelayEncryptionState()
         case .mergeApproval(let approval):
             showMergeApproval(approval)
         case .accountChanged(let reason, _):
             relayAccountStatusMessage = Self.accountChangeMessage(reason)
             NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
             requestRelayAccountState()
+            requestRelayEncryptionState()
+        case .encryptionState(let state):
+            let previousState = relayEncryptionState
+            relayEncryptionState = state
+            relayEncryptionStatusMessage = nil
+            do {
+                if state.mode == "off" {
+                    try DataEncryptionKeyManager.shared.delete(dataAccount: state.dataAccount)
+                } else if let kid = state.kid {
+                    try DataEncryptionKeyManager.shared.makeAvailable(
+                        dataAccount: state.dataAccount,
+                        kid: kid,
+                        preferredDataAccount: previousState?.dataAccount
+                    )
+                    if state.mode == "on" {
+                        try DataEncryptionKeyManager.shared.retainOnly(
+                            kid: kid,
+                            dataAccount: state.dataAccount
+                        )
+                    }
+                }
+            } catch {
+                relayEncryptionStatusMessage = error.localizedDescription
+            }
+            broadcastEncryptionMode(state)
+            NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
+        case .encryptionChanged:
+            requestRelayEncryptionState()
         }
     }
 
@@ -1530,6 +1587,7 @@ class AstationHubManager: ObservableObject {
             Log.info("[RelayIdentity] Relay \(status) this Astation's key")
             sendRelaySessionsResync()
             requestRelayAccountState()
+            requestRelayEncryptionState()
             registerRelayAccountIfPossible()
         case RelayIdentityProtocol.statusRejected:
             identityRelayVerified = false
@@ -1550,6 +1608,172 @@ class AstationHubManager: ObservableObject {
     func requestRelayAccountState() {
         guard let text = RelayIdentityProtocol.accountListMessage() else { return }
         sendRelayIdentityControl(text, label: "relayAccountList")
+    }
+
+    func requestRelayEncryptionState() {
+        guard let text = RelayIdentityProtocol.encryptionStateMessage() else { return }
+        sendRelayIdentityControl(text, label: "relayEncryptionGet")
+    }
+
+    func setRelayEncryption(mode: String, kid: String?) {
+        guard let text = RelayIdentityProtocol.encryptionSetMessage(mode: mode, kid: kid) else { return }
+        relayEncryptionStatusMessage = "Updating encryption…"
+        NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
+        sendRelayIdentityControl(text, label: "relayEncryptionSet")
+    }
+
+    private func scheduleEncryptionMigrationRetry() {
+        let delay = encryptionMigrationRetryDelay
+        encryptionMigrationRetryDelay = min(delay * 2, 30)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.identityRelayVerified else { return }
+            self.requestRelayEncryptionState()
+        }
+    }
+
+    func prepareEncryptionKeyForCurrentAccount(reuseExisting: Bool) throws -> (AccountDataKey, String) {
+        let account = relayEncryptionState?.dataAccount ?? currentDataAccount
+        let value = if reuseExisting,
+                       let existing = try DataEncryptionKeyManager.shared.load(dataAccount: account) {
+            existing
+        } else {
+            try DataEncryptionKeyManager.shared.generate()
+        }
+        return (value, try DataEncryptionKeyManager.shared.recoveryKey(for: value))
+    }
+
+    func installEncryptionKey(_ value: AccountDataKey) throws {
+        try DataEncryptionKeyManager.shared.install(
+            value,
+            dataAccount: relayEncryptionState?.dataAccount ?? currentDataAccount
+        )
+    }
+
+    func encryptionRecoveryKey() throws -> String {
+        let account = relayEncryptionState?.dataAccount ?? currentDataAccount
+        guard let value = try DataEncryptionKeyManager.shared.load(
+            dataAccount: account,
+            kid: relayEncryptionState?.kid
+        ) else {
+            throw DataEncryptionKeyError.invalidKey
+        }
+        return try DataEncryptionKeyManager.shared.recoveryKey(for: value)
+    }
+
+    func restoreEncryptionKey(_ text: String) throws {
+        let account = relayEncryptionState?.dataAccount ?? currentDataAccount
+        let value = try DataEncryptionKeyManager.decodeRecoveryKey(text)
+        if let state = relayEncryptionState, state.kid != nil, state.kid != value.kid {
+            throw DataEncryptionKeyError.invalidRecoveryKey
+        }
+        try DataEncryptionKeyManager.shared.install(value, dataAccount: account)
+        if let state = relayEncryptionState, state.mode == "off" {
+            setRelayEncryption(mode: "enabling", kid: value.kid)
+        } else if let state = relayEncryptionState {
+            broadcastEncryptionMode(state)
+        }
+    }
+
+    func discardEncryptionKeyForCurrentAccount() throws {
+        try DataEncryptionKeyManager.shared.delete(
+            dataAccount: relayEncryptionState?.dataAccount ?? currentDataAccount
+        )
+    }
+
+    private var currentDataAccount: String {
+        relayAccountDevices
+            .first(where: { $0.astationId == AstationIdentity.shared.id })?
+            .dataAccount ?? AstationIdentity.shared.id
+    }
+
+    private func broadcastEncryptionMode(_ state: RelayEncryptionState) {
+        let message = AstationMessage.encryptionMode(
+            mode: state.mode,
+            kid: state.kid,
+            dataAccount: state.dataAccount,
+            astationId: AstationIdentity.shared.id
+        )
+        broadcastHandler?(message)
+        broadcastToAuthenticatedIdentityRelayClients(message)
+    }
+
+    private func sendEncryptionMode(to clientId: String, relayConnectionId: String?) {
+        guard let state = relayEncryptionState else { return }
+        sendMessage(
+            .encryptionMode(
+                mode: state.mode,
+                kid: state.kid,
+                dataAccount: state.dataAccount,
+                astationId: AstationIdentity.shared.id
+            ),
+            to: clientId,
+            expectedRelayConnectionId: relayConnectionId
+        )
+    }
+
+    private func handleEncryptionKeyRequest(
+        publicKey: String,
+        clientId: String,
+        relayConnectionId: String?
+    ) {
+        guard let state = relayEncryptionState,
+              state.mode != "off",
+              let kid = state.kid,
+              let fingerprint = DataEncryptionKeyManager.fingerprint(publicKeyBase64: publicKey) else {
+            sendMessage(.error(message: "Encryption key request is invalid"),
+                        to: clientId, expectedRelayConnectionId: relayConnectionId)
+            return
+        }
+        var trusted = UserDefaults.standard.dictionary(forKey: "AstationEncryptionFingerprints") as? [String: String] ?? [:]
+        if trusted[clientId] != fingerprint {
+            let alert = NSAlert()
+            alert.messageText = trusted[clientId] == nil
+                ? "Verify Atem Encryption Key"
+                : "Atem Encryption Key Changed"
+            alert.informativeText = "Compare this fingerprint with the one printed by atem pair:\n\n\(fingerprint)\n\nDevice: \(clientId)"
+            alert.alertStyle = trusted[clientId] == nil ? .informational : .warning
+            alert.addButton(withTitle: "Fingerprint Matches")
+            alert.addButton(withTitle: "Deny")
+            guard alert.runModal() == .alertFirstButtonReturn else {
+                sendMessage(.error(message: "Encryption fingerprint was not approved"),
+                            to: clientId, expectedRelayConnectionId: relayConnectionId)
+                return
+            }
+            trusted[clientId] = fingerprint
+            UserDefaults.standard.set(trusted, forKey: "AstationEncryptionFingerprints")
+        }
+        do {
+            guard let value = try DataEncryptionKeyManager.shared.load(
+                dataAccount: state.dataAccount,
+                kid: kid
+            ) else {
+                throw DataEncryptionKeyError.invalidKey
+            }
+            let grant = try DataEncryptionKeyManager.shared.wrap(
+                value,
+                to: publicKey,
+                dataAccount: state.dataAccount
+            )
+            sendMessage(
+                .keyGrant(kid: grant.kid, wrappedKey: grant.wrappedKey, dataAccount: state.dataAccount),
+                to: clientId,
+                expectedRelayConnectionId: relayConnectionId
+            )
+        } catch {
+            relayEncryptionStatusMessage = error.localizedDescription
+            NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
+            sendMessage(.error(message: "Astation cannot access the account encryption key"),
+                        to: clientId, expectedRelayConnectionId: relayConnectionId)
+        }
+    }
+
+    private func handleEncryptionMigrationComplete(mode: String, kid: String) {
+        guard let state = relayEncryptionState, state.kid == kid else { return }
+        if state.mode == "enabling", mode == "on" {
+            setRelayEncryption(mode: "on", kid: kid)
+        } else if state.mode == "disabling", mode == "off" {
+            setRelayEncryption(mode: "off", kid: kid)
+        }
     }
 
     func requestRelayMerge(targetAstationId: String, freshAccessToken: String? = nil) {

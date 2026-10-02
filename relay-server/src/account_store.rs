@@ -11,8 +11,13 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::identity_store::REVOKED_PUBLIC_KEY;
-use crate::knowledge_store::KnowledgeStore;
-use crate::vault_store::VaultStore;
+use crate::encryption::{transition, EncryptionCounts, EncryptionState};
+use crate::knowledge_store::{
+    postgres_encryption_counts as postgres_knowledge_counts, KnowledgeStore, PgKnowledgeStore,
+};
+use crate::vault_store::{
+    postgres_encryption_counts as postgres_vault_counts, PgVaultStore, VaultStore,
+};
 
 pub const ONLINE_WINDOW_SECS: i64 = 10 * 60;
 pub const ONLINE_REQUEST_TTL_SECS: i64 = 10 * 60;
@@ -184,6 +189,8 @@ pub enum AccountError {
     WouldOrphanGroup,
     InvalidRequest,
     RequestExpired,
+    EncryptionMismatch,
+    InvalidEncryption(String),
 }
 
 impl std::fmt::Display for AccountError {
@@ -199,6 +206,11 @@ impl std::fmt::Display for AccountError {
             ),
             Self::InvalidRequest => write!(f, "merge request is not pending for this Astation"),
             Self::RequestExpired => write!(f, "merge request expired"),
+            Self::EncryptionMismatch => write!(
+                f,
+                "data accounts use different encryption modes or keys; reconcile them before merging"
+            ),
+            Self::InvalidEncryption(message) => write!(f, "{message}"),
         }
     }
 }
@@ -265,6 +277,19 @@ pub trait AccountStore: Send + Sync {
         target: &str,
         now: i64,
     ) -> Result<(), AccountError>;
+
+    async fn encryption_state(
+        &self,
+        data_account: &str,
+    ) -> Result<EncryptionState, AccountError>;
+
+    async fn set_encryption_state(
+        &self,
+        data_account: &str,
+        mode: &str,
+        kid: Option<&str>,
+        now: i64,
+    ) -> Result<EncryptionState, AccountError>;
 }
 
 #[derive(Clone)]
@@ -287,6 +312,7 @@ struct RequestRec {
 struct InMemoryState {
     accounts: HashMap<String, AccountRec>,
     requests: HashMap<String, RequestRec>,
+    encryption: HashMap<String, EncryptionState>,
 }
 
 pub struct InMemoryAccountStore {
@@ -354,6 +380,10 @@ impl InMemoryAccountStore {
                 return Err(AccountError::InvalidRequest);
             }
             let destination = choose_group(&target.data_account, &requester.data_account);
+            ensure_encryption_compatible(&state.encryption, &[
+                requester.data_account.clone(),
+                target.data_account.clone(),
+            ])?;
             (
                 dedup_strings(vec![requester.data_account.clone(), target.data_account.clone()]),
                 destination,
@@ -372,6 +402,14 @@ impl InMemoryAccountStore {
             .map_err(|error| AccountError::Db(error.to_string()))?;
 
         let mut state = self.state.lock().await;
+        let encryption = compatible_encryption_state(&state.encryption, &sources)?;
+        for source in &sources {
+            state.encryption.remove(source);
+        }
+        if let Some(mut encryption) = encryption {
+            encryption.data_account = target_account.clone();
+            state.encryption.insert(target_account.clone(), encryption);
+        }
         for account in state.accounts.values_mut() {
             if account.agora_user == user && sources.contains(&account.data_account) {
                 account.data_account = target_account.clone();
@@ -435,6 +473,36 @@ fn dedup_strings(mut values: Vec<String>) -> Vec<String> {
     values.sort();
     values.dedup();
     values
+}
+
+fn compatible_encryption_state(
+    encryption: &HashMap<String, EncryptionState>,
+    sources: &[String],
+) -> Result<Option<EncryptionState>, AccountError> {
+    let mut expected: Option<(String, Option<String>)> = None;
+    let mut encrypted = None;
+    for source in sources {
+        let state = encryption
+            .get(source)
+            .cloned()
+            .unwrap_or_else(|| EncryptionState::off(source));
+        let identity = (state.mode.clone(), state.kid.clone());
+        if expected.as_ref().is_some_and(|value| value != &identity) {
+            return Err(AccountError::EncryptionMismatch);
+        }
+        expected = Some(identity);
+        if state.mode != "off" {
+            encrypted = Some(state);
+        }
+    }
+    Ok(encrypted)
+}
+
+fn ensure_encryption_compatible(
+    encryption: &HashMap<String, EncryptionState>,
+    sources: &[String],
+) -> Result<(), AccountError> {
+    compatible_encryption_state(encryption, sources).map(|_| ())
 }
 
 fn new_request(
@@ -732,6 +800,59 @@ impl AccountStore for InMemoryAccountStore {
         });
         Ok(())
     }
+
+    async fn encryption_state(
+        &self,
+        data_account: &str,
+    ) -> Result<EncryptionState, AccountError> {
+        let mut encryption = self
+            .state
+            .lock()
+            .await
+            .encryption
+            .get(data_account)
+            .cloned()
+            .unwrap_or_else(|| EncryptionState::off(data_account));
+        let mut counts = self
+            .knowledge
+            .encryption_counts(data_account, encryption.kid.as_deref())
+            .await
+            .map_err(|error| AccountError::Db(error.to_string()))?;
+        counts.add(
+            self.vault
+                .encryption_counts(data_account, encryption.kid.as_deref())
+                .await
+                .map_err(|error| AccountError::Db(error.to_string()))?,
+        );
+        encryption.plaintext_fields = counts.plaintext;
+        encryption.ciphertext_fields = counts.ciphertext;
+        encryption.obsolete_fields = counts.obsolete;
+        Ok(encryption)
+    }
+
+    async fn set_encryption_state(
+        &self,
+        data_account: &str,
+        mode: &str,
+        kid: Option<&str>,
+        now: i64,
+    ) -> Result<EncryptionState, AccountError> {
+        let current = self.encryption_state(data_account).await?;
+        let counts = EncryptionCounts {
+            plaintext: current.plaintext_fields,
+            ciphertext: current.ciphertext_fields,
+            obsolete: current.obsolete_fields,
+        };
+        let mut state = self.state.lock().await;
+        let next = transition(&current, mode, kid, now, counts)
+            .map_err(AccountError::InvalidEncryption)?;
+        if next.mode == "off" {
+            state.encryption.remove(data_account);
+        } else {
+            state.encryption.insert(data_account.to_string(), next.clone());
+        }
+        Ok(next)
+    }
 }
 
 pub struct PgAccountStore {
@@ -807,6 +928,7 @@ impl PgAccountStore {
         for source in &sources {
             lock_data_account(&mut tx, source).await?;
         }
+        merge_postgres_encryption(&mut tx, &sources, &destination).await?;
         merge_postgres_data(
             &mut tx,
             &sources,
@@ -874,6 +996,30 @@ struct PgMergeRequest {
     created_at: i64,
     ready_at: Option<i64>,
     expires_at: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct PgEncryptionState {
+    data_account: String,
+    mode: String,
+    kid: String,
+    enabled_at: Option<i64>,
+    updated_at: i64,
+}
+
+impl From<PgEncryptionState> for EncryptionState {
+    fn from(state: PgEncryptionState) -> Self {
+        Self {
+            data_account: state.data_account,
+            mode: state.mode,
+            kid: Some(state.kid),
+            enabled_at: state.enabled_at,
+            updated_at: state.updated_at,
+            plaintext_fields: 0,
+            ciphertext_fields: 0,
+            obsolete_fields: 0,
+        }
+    }
 }
 
 impl PgMergeRequest {
@@ -1007,6 +1153,51 @@ async fn lock_data_account(
         .execute(&mut **tx)
         .await
         .map_err(db_err)?;
+    Ok(())
+}
+
+async fn merge_postgres_encryption(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sources: &[String],
+    destination: &str,
+) -> Result<(), AccountError> {
+    let rows: Vec<PgEncryptionState> = sqlx::query_as(
+        "SELECT data_account, mode, kid, enabled_at, updated_at \
+         FROM data_account_encryption WHERE data_account = ANY($1) FOR UPDATE",
+    )
+    .bind(sources)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    let by_account: HashMap<String, EncryptionState> = rows
+        .into_iter()
+        .map(|row| {
+            let state = EncryptionState::from(row);
+            (state.data_account.clone(), state)
+        })
+        .collect();
+    let state = compatible_encryption_state(&by_account, sources)?;
+
+    sqlx::query("DELETE FROM data_account_encryption WHERE data_account = ANY($1)")
+        .bind(sources)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    if let Some(state) = state {
+        sqlx::query(
+            "INSERT INTO data_account_encryption \
+               (data_account, mode, kid, enabled_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(destination)
+        .bind(state.mode)
+        .bind(state.kid.unwrap_or_default())
+        .bind(state.enabled_at)
+        .bind(state.updated_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    }
     Ok(())
 }
 
@@ -1417,6 +1608,103 @@ impl AccountStore for PgAccountStore {
         tx.commit().await.map_err(db_err)?;
         Ok(())
     }
+
+    async fn encryption_state(
+        &self,
+        data_account: &str,
+    ) -> Result<EncryptionState, AccountError> {
+        let state: Option<PgEncryptionState> = sqlx::query_as(
+            "SELECT data_account, mode, kid, enabled_at, updated_at \
+             FROM data_account_encryption WHERE data_account = $1",
+        )
+        .bind(data_account)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut encryption = state
+            .map(EncryptionState::from)
+            .unwrap_or_else(|| EncryptionState::off(data_account));
+        let knowledge = PgKnowledgeStore::new(self.pool.clone());
+        let vault = PgVaultStore::new(self.pool.clone());
+        let mut counts = knowledge
+            .encryption_counts(data_account, encryption.kid.as_deref())
+            .await
+            .map_err(|error| AccountError::Db(error.to_string()))?;
+        counts.add(
+            vault
+                .encryption_counts(data_account, encryption.kid.as_deref())
+                .await
+                .map_err(|error| AccountError::Db(error.to_string()))?,
+        );
+        encryption.plaintext_fields = counts.plaintext;
+        encryption.ciphertext_fields = counts.ciphertext;
+        encryption.obsolete_fields = counts.obsolete;
+        Ok(encryption)
+    }
+
+    async fn set_encryption_state(
+        &self,
+        data_account: &str,
+        mode: &str,
+        kid: Option<&str>,
+        now: i64,
+    ) -> Result<EncryptionState, AccountError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        lock_data_account(&mut tx, data_account).await?;
+        let locked: Option<PgEncryptionState> = sqlx::query_as(
+            "SELECT data_account, mode, kid, enabled_at, updated_at \
+             FROM data_account_encryption WHERE data_account = $1 FOR UPDATE",
+        )
+        .bind(data_account)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let locked = locked
+            .map(EncryptionState::from)
+            .unwrap_or_else(|| EncryptionState::off(data_account));
+        // Count in this transaction only after taking the same account lock
+        // as every content write, so finalization and uploads are atomic.
+        let mut counts = postgres_knowledge_counts(
+            &mut tx,
+            data_account,
+            locked.kid.as_deref(),
+        )
+        .await
+        .map_err(|error| AccountError::Db(error.to_string()))?;
+        counts.add(
+            postgres_vault_counts(&mut tx, data_account, locked.kid.as_deref())
+                .await
+                .map_err(|error| AccountError::Db(error.to_string()))?,
+        );
+        let next = transition(&locked, mode, kid, now, counts)
+            .map_err(AccountError::InvalidEncryption)?;
+        if next.mode == "off" {
+            sqlx::query("DELETE FROM data_account_encryption WHERE data_account = $1")
+                .bind(data_account)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        } else {
+            sqlx::query(
+                "INSERT INTO data_account_encryption \
+                   (data_account, mode, kid, enabled_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (data_account) DO UPDATE SET mode = EXCLUDED.mode, \
+                   kid = EXCLUDED.kid, enabled_at = EXCLUDED.enabled_at, \
+                   updated_at = EXCLUDED.updated_at",
+            )
+            .bind(data_account)
+            .bind(&next.mode)
+            .bind(next.kid.as_deref().unwrap_or_default())
+            .bind(next.enabled_at)
+            .bind(next.updated_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)?;
+        Ok(next)
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -1443,8 +1731,12 @@ impl From<PgAccountDevice> for AccountDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge_store::{InMemoryKnowledgeStore, KnowledgeStore, MemoryRow};
-    use crate::vault_store::{InMemoryVaultStore, VaultStore};
+    use crate::knowledge_store::{
+        InMemoryKnowledgeStore, KnowledgeError, KnowledgeStore, MemoryRow,
+    };
+    use crate::vault_store::{
+        InMemoryVaultStore, VaultError, VaultRewriteEntry, VaultStore,
+    };
 
     fn stores() -> (
         Arc<InMemoryKnowledgeStore>,
@@ -1597,6 +1889,65 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn encryption_transitions_wait_for_every_store_and_rotation_key() {
+        use base64::Engine;
+
+        let (knowledge, vault, store) = stores();
+        knowledge.add_memory("a", memory("m-a", "plain")).await.unwrap();
+        let vault_id = vault.create_vault("a", "writer", "plain summary").await.unwrap();
+        let kid1 = "0123abcd";
+        store.set_encryption_state("a", "enabling", Some(kid1), 1).await.unwrap();
+        assert!(store.set_encryption_state("a", "on", Some(kid1), 2).await.is_err());
+
+        let envelope = |kid: &str| {
+            format!(
+                "e1.{kid}.{}",
+                base64::engine::general_purpose::STANDARD.encode([0_u8; 40])
+            )
+        };
+        let hash = |kid: &str| format!("h1.{kid}.{}", "a".repeat(64));
+        knowledge
+            .rewrite_memory_fields("a", "m-a", "", &envelope(kid1), &hash(kid1))
+            .await
+            .unwrap();
+        vault
+            .rewrite_encrypted_fields("a", &vault_id, &envelope(kid1), &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.set_encryption_state("a", "on", Some(kid1), 3).await.unwrap().mode,
+            "on"
+        );
+
+        let kid2 = "89abcdef";
+        store.set_encryption_state("a", "enabling", Some(kid2), 4).await.unwrap();
+        assert!(store.set_encryption_state("a", "on", Some(kid2), 5).await.is_err());
+        knowledge
+            .rewrite_memory_fields("a", "m-a", "", &envelope(kid2), &hash(kid2))
+            .await
+            .unwrap();
+        vault
+            .rewrite_encrypted_fields("a", &vault_id, &envelope(kid2), &[])
+            .await
+            .unwrap();
+        store.set_encryption_state("a", "on", Some(kid2), 6).await.unwrap();
+
+        store.set_encryption_state("a", "disabling", Some(kid2), 7).await.unwrap();
+        knowledge
+            .rewrite_memory_fields("a", "m-a", "", "plain", "plain-hash")
+            .await
+            .unwrap();
+        vault
+            .rewrite_encrypted_fields("a", &vault_id, "plain summary", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.set_encryption_state("a", "off", Some(kid2), 8).await.unwrap().mode,
+            "off"
+        );
+    }
+
     fn is_local_db_url(url: &str) -> bool {
         let rest = match url.split_once("://") {
             Some((scheme, rest)) if scheme == "postgres" || scheme == "postgresql" => rest,
@@ -1610,6 +1961,25 @@ mod tests {
             hostport.split(':').next().unwrap_or("")
         };
         matches!(host, "localhost" | "127.0.0.1" | "::1")
+    }
+
+    async fn reset_account_test_database(pool: &sqlx::PgPool) {
+        for statement in [
+            "DROP TABLE IF EXISTS data_account_encryption",
+            "DROP TABLE IF EXISTS account_merge_requests",
+            "DROP TABLE IF EXISTS astation_accounts",
+            "DROP TABLE IF EXISTS session_bindings",
+            "DROP TABLE IF EXISTS astation_keys",
+            "DROP TABLE IF EXISTS vault_entries",
+            "DROP TABLE IF EXISTS vaults",
+            "DROP TABLE IF EXISTS memories",
+            "DROP TABLE IF EXISTS skill_versions",
+            "DROP SEQUENCE IF EXISTS knowledge_seq",
+            "DROP TABLE IF EXISTS _sqlx_migrations",
+        ] {
+            sqlx::query(statement).execute(pool).await.unwrap();
+        }
+        sqlx::migrate!("./migrations").run(pool).await.unwrap();
     }
 
     /// Exercises the transactional path that cannot be represented by the
@@ -1628,21 +1998,7 @@ mod tests {
             .connect(&url)
             .await
             .expect("connect ACCOUNT_TEST_DATABASE_URL");
-        for statement in [
-            "DROP TABLE IF EXISTS account_merge_requests",
-            "DROP TABLE IF EXISTS astation_accounts",
-            "DROP TABLE IF EXISTS session_bindings",
-            "DROP TABLE IF EXISTS astation_keys",
-            "DROP TABLE IF EXISTS vault_entries",
-            "DROP TABLE IF EXISTS vaults",
-            "DROP TABLE IF EXISTS memories",
-            "DROP TABLE IF EXISTS skill_versions",
-            "DROP SEQUENCE IF EXISTS knowledge_seq",
-            "DROP TABLE IF EXISTS _sqlx_migrations",
-        ] {
-            sqlx::query(statement).execute(&pool).await.unwrap();
-        }
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        reset_account_test_database(&pool).await;
 
         let store = PgAccountStore::new(pool.clone());
         store.register("a", "user-1", "Mac A", 1).await.unwrap();
@@ -1831,5 +2187,183 @@ mod tests {
                 .unwrap();
         assert_eq!(stored_key, REVOKED_PUBLIC_KEY);
         assert_eq!(store.resolve_data_account("a").await.unwrap(), outcome.data_account);
+    }
+
+    /// Covers the durable state machine and its shared advisory-lock barrier.
+    /// The URL must be an isolated local-forwarded database because this test
+    /// recreates the relay schema.
+    #[tokio::test]
+    #[ignore]
+    async fn postgres_encryption_transitions_and_write_barrier() {
+        use base64::Engine;
+        use tokio::time::{timeout, Duration};
+
+        let url = std::env::var("ACCOUNT_TEST_DATABASE_URL")
+            .expect("set ACCOUNT_TEST_DATABASE_URL to run the Postgres encryption test");
+        assert!(
+            is_local_db_url(&url),
+            "ACCOUNT_TEST_DATABASE_URL must point at localhost; the test empties tables"
+        );
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(6)
+            .connect(&url)
+            .await
+            .expect("connect ACCOUNT_TEST_DATABASE_URL");
+        reset_account_test_database(&pool).await;
+
+        let accounts = PgAccountStore::new(pool.clone());
+        let knowledge = PgKnowledgeStore::new(pool.clone());
+        let vault = PgVaultStore::new(pool.clone());
+        let vault_id = vault.create_vault("a", "atem", "plain summary").await.unwrap();
+        let first_entry = vault.append("a", &vault_id, "atem", "plain entry").await.unwrap();
+        knowledge.add_memory("a", memory("m-a", "plain memory")).await.unwrap();
+
+        let envelope = |kid: &str| {
+            format!(
+                "e1.{kid}.{}",
+                base64::engine::general_purpose::STANDARD.encode([0_u8; 40])
+            )
+        };
+        let hash = |kid: &str| format!("h1.{kid}.{}", "a".repeat(64));
+        let kid1 = "0123abcd";
+
+        accounts.set_encryption_state("a", "enabling", Some(kid1), 1).await.unwrap();
+        assert!(matches!(
+            knowledge.add_memory("a", memory("m-plain", "late plaintext")).await,
+            Err(KnowledgeError::EncryptionConflict)
+        ));
+        knowledge
+            .rewrite_memory_fields("a", "m-a", "", &envelope(kid1), &hash(kid1))
+            .await
+            .unwrap();
+        vault
+            .rewrite_encrypted_fields(
+                "a",
+                &vault_id,
+                &envelope(kid1),
+                &[VaultRewriteEntry {
+                    entry_no: first_entry.entry_no,
+                    version: first_entry.version,
+                    content: envelope(kid1),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            accounts.set_encryption_state("a", "on", Some(kid1), 2).await.unwrap().mode,
+            "on"
+        );
+        assert!(matches!(
+            vault.append("a", &vault_id, "atem", "late plaintext").await,
+            Err(VaultError::EncryptionConflict)
+        ));
+
+        let kid2 = "89abcdef";
+        accounts.set_encryption_state("a", "enabling", Some(kid2), 3).await.unwrap();
+        assert!(matches!(
+            accounts.set_encryption_state("a", "on", Some(kid2), 4).await,
+            Err(AccountError::InvalidEncryption(_))
+        ));
+        knowledge
+            .rewrite_memory_fields("a", "m-a", "", &envelope(kid2), &hash(kid2))
+            .await
+            .unwrap();
+        vault
+            .rewrite_encrypted_fields(
+                "a",
+                &vault_id,
+                &envelope(kid2),
+                &[VaultRewriteEntry {
+                    entry_no: first_entry.entry_no,
+                    version: first_entry.version,
+                    content: envelope(kid2),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            accounts.set_encryption_state("a", "on", Some(kid2), 5).await.unwrap().mode,
+            "on"
+        );
+
+        accounts.set_encryption_state("a", "disabling", Some(kid2), 6).await.unwrap();
+        knowledge
+            .rewrite_memory_fields("a", "m-a", "", "plain memory", "plain hash")
+            .await
+            .unwrap();
+        vault
+            .rewrite_encrypted_fields(
+                "a",
+                &vault_id,
+                "plain summary",
+                &[VaultRewriteEntry {
+                    entry_no: first_entry.entry_no,
+                    version: first_entry.version,
+                    content: "plain entry".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // Hold the same account lock as a content write, commit a ciphertext
+        // row, then prove finalization waits and observes that row.
+        let mut writer = pool.begin().await.unwrap();
+        let lock_key = serde_json::to_string(&["acct", "a"]).unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(lock_key)
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO vault_entries (vault_id, entry_no, version, kind, writer_id, content) \
+             VALUES ($1, 999, 1, 'content', 'atem-racing', $2)",
+        )
+        .bind(&vault_id)
+        .bind(envelope(kid2))
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+
+        let finalizer_pool = pool.clone();
+        let mut finalizer = tokio::spawn(async move {
+            PgAccountStore::new(finalizer_pool)
+                .set_encryption_state("a", "off", Some(kid2), 7)
+                .await
+        });
+        assert!(timeout(Duration::from_millis(100), &mut finalizer).await.is_err());
+        writer.commit().await.unwrap();
+        assert!(matches!(
+            finalizer.await.unwrap(),
+            Err(AccountError::InvalidEncryption(_))
+        ));
+
+        vault
+            .rewrite_encrypted_fields(
+                "a",
+                &vault_id,
+                "plain summary",
+                &[
+                    VaultRewriteEntry {
+                        entry_no: first_entry.entry_no,
+                        version: first_entry.version,
+                        content: "plain entry".to_string(),
+                    },
+                    VaultRewriteEntry {
+                        entry_no: 999,
+                        version: 1,
+                        content: "plain racing entry".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            accounts.set_encryption_state("a", "off", Some(kid2), 8).await.unwrap().mode,
+            "off"
+        );
+        assert!(matches!(
+            vault.append("a", &vault_id, "atem", &envelope(kid2)).await,
+            Err(VaultError::EncryptionConflict)
+        ));
     }
 }

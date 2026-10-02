@@ -34,6 +34,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::encryption::{valid_envelope, valid_hash, EncryptionState};
 use crate::knowledge_secrets::{check_bytes, contains_reserved, find_secrets};
 use crate::knowledge_store::{KnowledgeError, MemoryRow, SkillRow};
 use crate::vault_routes::{err, resolve_caller};
@@ -79,7 +80,9 @@ fn unavailable(e: KnowledgeError) -> ErrResp {
 fn store_result<T>(r: Result<T, KnowledgeError>, ok: impl FnOnce(T) -> Value) -> Result<Value, ErrResp> {
     match r {
         Ok(t) => Ok(ok(t)),
-        Err(e @ KnowledgeError::IdConflict) => Ok(op_err(e.to_string())),
+        Err(e @ (KnowledgeError::IdConflict | KnowledgeError::EncryptionConflict)) => {
+            Ok(op_err(e.to_string()))
+        }
         Err(e @ KnowledgeError::Db(_)) => Err(unavailable(e)),
     }
 }
@@ -260,6 +263,57 @@ pub(crate) enum MemoryOp {
         #[serde(default)]
         superseded_by: Option<String>,
     },
+    Rewrite {
+        id: String,
+        #[serde(default)]
+        project: String,
+        content: String,
+        content_hash: String,
+    },
+}
+
+fn encrypted_prefix(value: &str, hash: bool) -> bool {
+    value.starts_with(if hash { "h1." } else { "e1." })
+}
+
+fn allowed_field(value: &str, encryption: &EncryptionState, hash: bool) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    let valid = encryption.kid.as_deref().is_some_and(|kid| {
+        if hash {
+            valid_hash(value, kid)
+        } else {
+            valid_envelope(value, kid)
+        }
+    });
+    match encryption.mode.as_str() {
+        "off" => !encrypted_prefix(value, hash),
+        "enabling" | "on" => valid,
+        "disabling" => valid || !encrypted_prefix(value, hash),
+        _ => false,
+    }
+}
+
+fn migration_field(value: &str, encryption: &EncryptionState, hash: bool) -> bool {
+    match encryption.mode.as_str() {
+        "enabling" => encryption.kid.as_deref().is_some_and(|kid| {
+            if hash {
+                value.is_empty() || valid_hash(value, kid)
+            } else {
+                value.is_empty() || valid_envelope(value, kid)
+            }
+        }),
+        "disabling" => !encrypted_prefix(value, hash),
+        _ => false,
+    }
+}
+
+async fn encryption_state(state: &AppState, account: &str) -> Result<EncryptionState, ErrResp> {
+    state.accounts.encryption_state(account).await.map_err(|error| {
+        tracing::error!("account encryption state error: {}", error);
+        err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable")
+    })
 }
 
 /// `canon` maps an id the client sent to the canonical id an earlier `add`
@@ -268,6 +322,7 @@ pub(crate) enum MemoryOp {
 async fn apply_memory_op(
     state: &AppState,
     account: &str,
+    encryption: &EncryptionState,
     op: MemoryOp,
     canon: &mut HashMap<String, String>,
 ) -> Result<Value, ErrResp> {
@@ -280,11 +335,23 @@ async fn apply_memory_op(
             {
                 return Ok(op_err("invalid memory"));
             }
-            if contains_reserved(&memory.content) {
+            if !allowed_field(&memory.project, encryption, true)
+                || !allowed_field(&memory.content, encryption, false)
+                || !allowed_field(&memory.content_hash, encryption, true)
+            {
+                return Ok(op_err("memory does not match the account encryption mode"));
+            }
+            let encrypted_content = encryption
+                .kid
+                .as_deref()
+                .is_some_and(|kid| valid_envelope(&memory.content, kid));
+            if !encrypted_content && contains_reserved(&memory.content) {
                 return Ok(op_err("reserved token"));
             }
-            if let Some(f) = find_secrets(&memory.content).first() {
-                return Ok(op_err(format!("possible credential: {}", f.kind)));
+            if !encrypted_content {
+                if let Some(f) = find_secrets(&memory.content).first() {
+                    return Ok(op_err(format!("possible credential: {}", f.kind)));
+                }
             }
             let r = state.knowledge.add_memory(account, memory).await;
             if let Ok(o) = &r {
@@ -327,6 +394,34 @@ async fn apply_memory_op(
                 |seq| json!({ "ok": true, "id": id, "seq": seq }),
             )
         }
+        MemoryOp::Rewrite { id, project, content, content_hash } => {
+            if has_nul(&[&id, &project, &content, &content_hash])
+                || !migration_field(&project, encryption, true)
+                || !migration_field(&content, encryption, false)
+                || !migration_field(&content_hash, encryption, true)
+            {
+                return Ok(op_err("invalid encryption migration"));
+            }
+            let encrypted_content = encryption
+                .kid
+                .as_deref()
+                .is_some_and(|kid| valid_envelope(&content, kid));
+            if !encrypted_content && contains_reserved(&content) {
+                return Ok(op_err("reserved token"));
+            }
+            if !encrypted_content {
+                if let Some(finding) = find_secrets(&content).first() {
+                    return Ok(op_err(format!("possible credential: {}", finding.kind)));
+                }
+            }
+            store_result(
+                state
+                    .knowledge
+                    .rewrite_memory_fields(account, &id, &project, &content, &content_hash)
+                    .await,
+                |seq| json!({ "ok": seq != 0, "id": id, "seq": seq }),
+            )
+        }
     }
 }
 
@@ -339,10 +434,13 @@ pub async fn memory_batch_handler(
 ) -> Result<Json<Value>, ErrResp> {
     let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
     let ops: Vec<MemoryOp> = read_batch(body, MEMORY_BATCH_BODY_LIMIT, MEMORY_BATCH_MAX_OPS).await?;
+    let encryption = encryption_state(&state, &caller.work_session_id).await?;
     let mut results = Vec::with_capacity(ops.len());
     let mut canon = HashMap::new();
     for op in ops {
-        results.push(apply_memory_op(&state, &caller.work_session_id, op, &mut canon).await?);
+        results.push(
+            apply_memory_op(&state, &caller.work_session_id, &encryption, op, &mut canon).await?,
+        );
     }
     Ok(Json(json!({ "results": results })))
 }
@@ -422,16 +520,98 @@ pub(crate) enum SkillOp {
         #[serde(default)]
         versions: Option<Vec<i64>>,
     },
+    Rewrite {
+        scope: String,
+        #[serde(default)]
+        old_project: String,
+        name: String,
+        version: i64,
+        #[serde(default)]
+        project: String,
+        files: Value,
+        content_hash: String,
+    },
 }
 
-async fn apply_skill_op(state: &AppState, account: &str, op: SkillOp) -> Result<Value, ErrResp> {
+fn skill_files_match_mode(files: &Value, encryption: &EncryptionState, migration: bool) -> bool {
+    let Some(files) = files.as_object() else {
+        return false;
+    };
+    files.iter().all(|(path, encoded)| {
+        let Some(encoded) = encoded.as_str() else {
+            return false;
+        };
+        let Ok(bytes) = base64_decode(encoded) else {
+            return false;
+        };
+        let Ok(content) = std::str::from_utf8(&bytes) else {
+            return matches!(encryption.mode.as_str(), "off" | "disabling");
+        };
+        if migration {
+            migration_field(path, encryption, false)
+                && migration_field(content, encryption, false)
+        } else {
+            allowed_field(path, encryption, false)
+                && allowed_field(content, encryption, false)
+        }
+    })
+}
+
+fn skill_files_have_valid_base64(files: &Value) -> bool {
+    files.as_object().is_some_and(|files| {
+        files.values().all(|encoded| {
+            encoded
+                .as_str()
+                .is_some_and(|encoded| base64_decode(encoded).is_ok())
+        })
+    })
+}
+
+fn skill_files_are_encrypted(files: &Value, kid: &str) -> bool {
+    let Some(files) = files.as_object() else {
+        return false;
+    };
+    files.iter().all(|(path, encoded)| {
+        let Some(encoded) = encoded.as_str() else {
+            return false;
+        };
+        let Ok(bytes) = base64_decode(encoded) else {
+            return false;
+        };
+        let Ok(content) = std::str::from_utf8(&bytes) else {
+            return false;
+        };
+        valid_envelope(path, kid) && valid_envelope(content, kid)
+    })
+}
+
+async fn apply_skill_op(
+    state: &AppState,
+    account: &str,
+    encryption: &EncryptionState,
+    op: SkillOp,
+) -> Result<Value, ErrResp> {
     match op {
         SkillOp::Push { skill, base_version } => {
             if !is_valid_skill_scope(&skill.scope) || skill_has_nul(&skill) {
                 return Ok(op_err("invalid skill"));
             }
-            if let Err(bad) = check_skill_files(&skill.files) {
-                return Ok(bad);
+            if !skill_files_have_valid_base64(&skill.files) {
+                return Ok(op_err("invalid base64"));
+            }
+            if !allowed_field(&skill.project, encryption, true)
+                || !allowed_field(&skill.content_hash, encryption, true)
+                || !skill_files_match_mode(&skill.files, encryption, false)
+            {
+                return Ok(op_err("skill does not match the account encryption mode"));
+            }
+            let files_encrypted = encryption.kid.as_deref().is_some_and(|kid| {
+                skill_files_are_encrypted(&skill.files, kid)
+            });
+            if !files_encrypted {
+                if let Err(bad) = check_skill_files(&skill.files) {
+                    return Ok(bad);
+                }
             }
             store_result(state.knowledge.push_skill(account, skill, base_version).await, |o| {
                 json!({
@@ -463,6 +643,49 @@ async fn apply_skill_op(state: &AppState, account: &str, op: SkillOp) -> Result<
                 |_| json!({ "ok": true }),
             )
         }
+        SkillOp::Rewrite {
+            scope,
+            old_project,
+            name,
+            version,
+            project,
+            files,
+            content_hash,
+        } => {
+            if !is_valid_skill_scope(&scope)
+                || has_nul(&[&old_project, &name, &project, &content_hash])
+                || !migration_field(&project, encryption, true)
+                || !migration_field(&content_hash, encryption, true)
+                || !skill_files_match_mode(&files, encryption, true)
+            {
+                return Ok(op_err("invalid encryption migration"));
+            }
+            let files_encrypted = encryption
+                .kid
+                .as_deref()
+                .is_some_and(|kid| skill_files_are_encrypted(&files, kid));
+            if !files_encrypted {
+                if let Err(bad) = check_skill_files(&files) {
+                    return Ok(bad);
+                }
+            }
+            store_result(
+                state
+                    .knowledge
+                    .rewrite_skill_fields(
+                        account,
+                        &scope,
+                        &old_project,
+                        &name,
+                        version,
+                        &project,
+                        files,
+                        &content_hash,
+                    )
+                    .await,
+                |seq| json!({ "ok": seq != 0, "version": version, "seq": seq }),
+            )
+        }
     }
 }
 
@@ -475,9 +698,10 @@ pub async fn skills_batch_handler(
 ) -> Result<Json<Value>, ErrResp> {
     let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
     let ops: Vec<SkillOp> = read_batch(body, SKILLS_BATCH_BODY_LIMIT, SKILLS_BATCH_MAX_OPS).await?;
+    let encryption = encryption_state(&state, &caller.work_session_id).await?;
     let mut results = Vec::with_capacity(ops.len());
     for op in ops {
-        results.push(apply_skill_op(&state, &caller.work_session_id, op).await?);
+        results.push(apply_skill_op(&state, &caller.work_session_id, &encryption, op).await?);
     }
     Ok(Json(json!({ "results": results })))
 }
@@ -563,6 +787,7 @@ pub async fn skill_version_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account_store::{AccountStore, InMemoryAccountStore};
     use crate::vault_routes::tests::bind_session;
     use crate::knowledge_store::{
         InMemoryKnowledgeStore, KnowledgeStore, MemoryAddOutcome, SkillPushOutcome,
@@ -1120,6 +1345,32 @@ mod tests {
         async fn skill_version(&self, _: &str, _: &str, _: &str, _: &str, _: i64) -> Result<Option<SkillRow>, KnowledgeError> {
             Err(KnowledgeError::Db("connection reset".into()))
         }
+        async fn encryption_counts(&self, _: &str, _: Option<&str>) -> Result<crate::encryption::EncryptionCounts, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
+        async fn rewrite_memory_fields(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<i64, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
+        async fn rewrite_skill_fields(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: &str,
+            _: Value,
+            _: &str,
+        ) -> Result<i64, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
     }
 
     #[tokio::test]
@@ -1255,6 +1506,67 @@ mod tests {
         )
         .await;
         assert_eq!(pulled["memories"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn encrypted_account_accepts_only_structurally_valid_current_key_fields() {
+        use base64::Engine;
+
+        let accounts = Arc::new(InMemoryAccountStore::default());
+        let state = AppState {
+            sessions: SessionStore::new(),
+            relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
+            voice_sessions: VoiceSessionStore::new(),
+            vault: Arc::new(InMemoryVaultStore::new()),
+            knowledge: Arc::new(InMemoryKnowledgeStore::new()),
+            identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: accounts.clone(),
+        };
+        let session = bind_session(&state, "ws-1").await;
+        accounts
+            .set_encryption_state("ws-1", "enabling", Some("0123abcd"), 1)
+            .await
+            .unwrap();
+        let app = app(state);
+        let payload = base64::engine::general_purpose::STANDARD.encode([0_u8; 40]);
+        let mut valid = sample_memory("mem-valid", &format!("e1.0123abcd.{payload}"));
+        valid["content_hash"] = json!(format!("h1.0123abcd.{}", "a".repeat(64)));
+        let response = body_json(
+            app.clone()
+                .oneshot(req(
+                    "POST",
+                    "/api/memory/batch?id=a",
+                    &session,
+                    &json!({"ops": [{"op": "add", "memory": valid}]}).to_string(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response["results"][0]["ok"], true, "{response}");
+
+        for (id, content) in [
+            ("mem-plain", "AKIAIOSFODNN7EXAMPLE".to_string()),
+            ("mem-malformed", "e1.0123abcd.not-base64".to_string()),
+            ("mem-obsolete", format!("e1.89abcdef.{payload}")),
+        ] {
+            let mut memory = sample_memory(id, &content);
+            memory["content_hash"] = json!(format!("h1.0123abcd.{}", "b".repeat(64)));
+            let response = body_json(
+                app.clone()
+                    .oneshot(req(
+                        "POST",
+                        "/api/memory/batch?id=a",
+                        &session,
+                        &json!({"ops": [{"op": "add", "memory": memory}]}).to_string(),
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response["results"][0]["ok"], false, "{id}: {response}");
+        }
     }
 
     #[tokio::test]

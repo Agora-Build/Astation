@@ -1334,12 +1334,16 @@ fn relay_control_type(message: &serde_json::Value) -> Option<&str> {
             | "relayMergeCancel"
             | "relayLeaveGroup"
             | "relayRemoveAstation"
+            | "relayEncryptionGet"
+            | "relayEncryptionSet"
             | "relayAuthChallenge"
             | "relayAuthResult"
             | "relayAck"
             | "relayAccountState"
             | "relayMergeApproval"
             | "relayAccountChanged"
+            | "relayEncryptionState"
+            | "relayEncryptionChanged"
     )
     .then_some(kind)
 }
@@ -1431,6 +1435,33 @@ async fn send_account_state(
     hub.local().send(connection_id, frame);
 }
 
+async fn send_encryption_state(
+    hub: &RelayHub,
+    accounts: &dyn AccountStore,
+    connection_id: &str,
+    astation_id: &str,
+) {
+    let frame = match accounts.resolve_data_account(astation_id).await {
+        Ok(data_account) => match accounts.encryption_state(&data_account).await {
+            Ok(state) => serde_json::json!({
+                "type": "relayEncryptionState",
+                "data_account": state.data_account,
+                "mode": state.mode,
+                "kid": state.kid,
+                "enabled_at": state.enabled_at,
+                "updated_at": state.updated_at,
+                "plaintext_fields": state.plaintext_fields,
+                "ciphertext_fields": state.ciphertext_fields,
+                "obsolete_fields": state.obsolete_fields,
+            })
+            .to_string(),
+            Err(error) => relay_ack_err("relayEncryptionGet", &error.to_string()),
+        },
+        Err(error) => relay_ack_err("relayEncryptionGet", &error.to_string()),
+    };
+    hub.local().send(connection_id, frame);
+}
+
 pub(crate) async fn deliver_to_verified_astation(
     hub: &RelayHub,
     astation_id: &str,
@@ -1517,6 +1548,52 @@ async fn apply_account_message(
         }
         "relayAccountList" => {
             send_account_state(hub, accounts, connection_id, code).await;
+        }
+        "relayEncryptionGet" => {
+            send_encryption_state(hub, accounts, connection_id, code).await;
+        }
+        "relayEncryptionSet" => {
+            let Some(mode) = message
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .filter(|mode| matches!(*mode, "off" | "enabling" | "on" | "disabling"))
+            else {
+                hub.local().send(connection_id, relay_ack_err(kind, "invalid encryption mode"));
+                return;
+            };
+            let kid = message.get("kid").and_then(serde_json::Value::as_str);
+            let data_account = match accounts.resolve_data_account(code).await {
+                Ok(data_account) => data_account,
+                Err(error) => {
+                    hub.local().send(connection_id, account_error_frame(kind, error));
+                    return;
+                }
+            };
+            match accounts
+                .set_encryption_state(&data_account, mode, kid, now)
+                .await
+            {
+                Ok(state) => {
+                    hub.local().send(connection_id, relay_ack_ok(kind));
+                    send_encryption_state(hub, accounts, connection_id, code).await;
+                    notify_account_devices(
+                        hub,
+                        accounts,
+                        code,
+                        serde_json::json!({
+                            "type": "relayEncryptionChanged",
+                            "data_account": state.data_account,
+                            "mode": state.mode,
+                            "kid": state.kid,
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    hub.local().send(connection_id, account_error_frame(kind, error));
+                }
+            }
         }
         "relayMergeRequest" => {
             let Some(target) = message
@@ -2012,6 +2089,9 @@ async fn handle_astation_control(
                     let was_pending = auth.state == AuthState::Pending;
                     auth.state = AuthState::Verified;
                     touch_account_in_background(accounts, code, now);
+                    // Mode always follows auth before room events, so clients
+                    // can configure storage before processing Atem traffic.
+                    send_encryption_state(hub, accounts.as_ref(), connection_id, code).await;
                     if let Err(error) = hub.promote_verified(code, connection_id, was_pending).await {
                         tracing::error!(
                             "Relay state unavailable promoting Astation {}: {}",
@@ -2053,7 +2133,9 @@ async fn handle_astation_control(
         | "relayMergeApprove"
         | "relayMergeCancel"
         | "relayLeaveGroup"
-        | "relayRemoveAstation" => {
+        | "relayRemoveAstation"
+        | "relayEncryptionGet"
+        | "relayEncryptionSet" => {
             if !is_current_verified_owner(hub, code, connection_id, auth).await {
                 hub.local().send(connection_id, relay_ack_err(kind, "not verified"));
                 return true;
@@ -2929,7 +3011,7 @@ pub(crate) mod tests {
         assert_eq!(mask_code("日本語テキスト"), "日本語テ…");
     }
 
-    pub(crate) async fn next_client_json(socket: &mut TestSocket) -> serde_json::Value {
+    pub(crate) async fn next_client_json_raw(socket: &mut TestSocket) -> serde_json::Value {
         loop {
             let frame = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
                 .await
@@ -2944,6 +3026,15 @@ pub(crate) mod tests {
                     panic!("WebSocket closed unexpectedly: {frame:?}");
                 }
                 _ => {}
+            }
+        }
+    }
+
+    pub(crate) async fn next_client_json(socket: &mut TestSocket) -> serde_json::Value {
+        loop {
+            let value = next_client_json_raw(socket).await;
+            if value["type"] != "relayEncryptionState" {
+                return value;
             }
         }
     }
@@ -4279,6 +4370,10 @@ pub(crate) mod tests {
         send_json(socket, key.relay_auth(challenge, code)).await;
         let result = next_client_json(socket).await;
         assert_eq!(result["type"], "relayAuthResult");
+        if result["status"] != "rejected" {
+            let encryption = next_client_json_raw(socket).await;
+            assert_eq!(encryption["type"], "relayEncryptionState");
+        }
         result
     }
 
