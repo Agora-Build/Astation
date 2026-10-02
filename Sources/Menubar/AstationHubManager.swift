@@ -39,6 +39,10 @@ class AstationHubManager: ObservableObject {
 
     /// Guards against concurrent identity relay reconnect attempts.
     private var identityRelayActive = false
+    /// Backoff is reset only after the relay verifies this Astation's key.
+    private var identityRelayReconnectPolicy = IdentityRelayReconnectPolicy()
+    /// Invalidates delayed retries left behind by an older socket generation.
+    private var identityRelayReconnectGeneration = 0
     /// NWPathMonitor for the identity relay — fires when network becomes available,
     /// enabling immediate reconnect without polling. Created once and reused.
     private var identityRelayPathMonitor: NWPathMonitor?
@@ -46,6 +50,8 @@ class AstationHubManager: ObservableObject {
     /// The current identity relay socket. Relay control frames are only
     /// accepted from, and binding messages only sent on, this socket. Main thread.
     private var identityRelayTask: URLSessionWebSocketTask?
+    /// Installed once; relay sends resolve identityRelayTask when they execute.
+    private var identityRelaySendHandlerInstalled = false
     /// True once the relay answered `relayAuthResult` registered|verified on
     /// `identityRelayTask`. Binding messages are only sent while verified. Main thread.
     private(set) var identityRelayVerified = false
@@ -1143,6 +1149,7 @@ class AstationHubManager: ObservableObject {
     func startIdentityRelay() {
         guard !identityRelayActive else { return }
         identityRelayActive = true
+        identityRelayReconnectGeneration &+= 1
 
         // Start NWPathMonitor once — fires when network comes back, enabling
         // immediate reconnect without polling. No battery overhead while offline.
@@ -1162,16 +1169,22 @@ class AstationHubManager: ObservableObject {
         pendingRelayChallenge = nil
         startSessionExpiryTimerIfNeeded()
         preloadRelayIdentityKeyIfNeeded()
+        installIdentityRelaySendHandlerIfNeeded()
 
-        // Wire sendHandler: route messages whose clientId starts with "relay-" through
-        // the identity relay WS with the current Atem socket generation.
-        // Multiple Atems can be connected simultaneously; each has its own "relay-<id>" clientId.
-        let originalSend = sendHandler
-        sendHandler = { [weak self, weak task] message, targetId in
+        Log.info("[AstationHub] Identity relay connecting: \(url.absoluteString)")
+        readIdentityRelayMessages(task: task)
+    }
+
+    private func installIdentityRelaySendHandlerIfNeeded() {
+        guard !identityRelaySendHandlerInstalled else { return }
+        identityRelaySendHandlerInstalled = true
+        let localSend = sendHandler
+        sendHandler = { [weak self] message, targetId in
             if targetId.hasPrefix("relay-") {
-                let sendToRelay = { [weak self, weak task] in
+                let sendToRelay = { [weak self] in
                     let atemId = String(targetId.dropFirst(6)) // strip "relay-" prefix
                     guard let self,
+                          let task = self.identityRelayTask,
                           let connectionId = self.identityRelayAuthentication.connectionId(for: targetId) else {
                         Log.warn("[AstationHub] Cannot route to relay client without an active connection")
                         return
@@ -1192,7 +1205,7 @@ class AstationHubManager: ObservableObject {
                           ]),
                           let envelopeStr = String(data: envelope, encoding: .utf8) else { return }
                     NetworkDebugLogger.logWebSocket(direction: "send", context: "identity-relay:\(atemId)", message: envelopeStr)
-                    task?.send(.string(envelopeStr)) { _ in }
+                    task.send(.string(envelopeStr)) { _ in }
                 }
                 if Thread.isMainThread {
                     sendToRelay()
@@ -1200,12 +1213,9 @@ class AstationHubManager: ObservableObject {
                     DispatchQueue.main.async(execute: sendToRelay)
                 }
             } else {
-                originalSend?(message, targetId)
+                localSend?(message, targetId)
             }
         }
-
-        Log.info("[AstationHub] Identity relay connecting: \(url.absoluteString)")
-        readIdentityRelayMessages(task: task)
     }
 
     /// Start the network path monitor if not already running.
@@ -1252,7 +1262,11 @@ class AstationHubManager: ObservableObject {
                         let relayClientId = "relay-\(atemId)"
                         if let event = envelope["relay_event"] as? String {
                             DispatchQueue.main.async {
-                                self?.handleIdentityRelayConnectionEvent(
+                                guard let self, self.identityRelayTask === task else {
+                                    Log.debug("[AstationHub] Ignored event from a replaced identity relay socket")
+                                    return
+                                }
+                                self.handleIdentityRelayConnectionEvent(
                                     event,
                                     clientId: relayClientId,
                                     connectionId: connectionId
@@ -1262,7 +1276,11 @@ class AstationHubManager: ObservableObject {
                                   let payloadData = try? JSONSerialization.data(withJSONObject: payloadObj),
                                   let msg = try? JSONDecoder().decode(AstationMessage.self, from: payloadData) {
                             DispatchQueue.main.async {
-                                self?.handleIdentityRelayMessage(
+                                guard let self, self.identityRelayTask === task else {
+                                    Log.debug("[AstationHub] Ignored message from a replaced identity relay socket")
+                                    return
+                                }
+                                self.handleIdentityRelayMessage(
                                     msg,
                                     clientId: relayClientId,
                                     connectionId: connectionId
@@ -1276,30 +1294,87 @@ class AstationHubManager: ObservableObject {
                 self?.readIdentityRelayMessages(task: task)
 
             case .failure(let error):
-                Log.info("[AstationHub] Identity relay disconnected: \(error)")
+                let closeCode = Self.usableRelayCloseCode(task.closeCode)
+                let closeReason = task.closeReason
+                    .flatMap { String(data: $0, encoding: .utf8) }
+                    .flatMap { $0.isEmpty ? nil : $0 }
                 DispatchQueue.main.async {
-                    // Remove all relay-connected Atem clients (their WS is gone)
-                    self?.connectedClients
-                        .filter { $0.id.hasPrefix("relay-") }
-                        .forEach { self?.removeClient(withId: $0.id) }
-                    self?.identityRelayAuthentication.removeAll()
-                    if self?.identityRelayTask === task {
-                        self?.identityRelayTask = nil
-                        self?.identityRelayVerified = false
-                        self?.pendingRelayChallenge = nil
-                    }
-                    self?.identityRelayActive = false
-                }
-                // Schedule a 30s fallback retry (only if network is still up).
-                // NWPathMonitor handles the "network-was-down" case: it will fire
-                // startIdentityRelay() immediately when connectivity is restored.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 30.0) {
-                    guard let self = self, !self.identityRelayActive else { return }
-                    guard self.identityRelayPathMonitor?.currentPath.status == .satisfied else { return }
-                    Log.info("[AstationHub] Retrying identity relay after 30s")
-                    self.startIdentityRelay()
+                    self?.handleIdentityRelayDisconnect(
+                        task: task,
+                        error: error,
+                        closeCode: closeCode,
+                        closeReason: closeReason
+                    )
                 }
             }
+        }
+    }
+
+    private func handleIdentityRelayDisconnect(
+        task: URLSessionWebSocketTask,
+        error: Error?,
+        closeCode: Int?,
+        closeReason: String?
+    ) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard identityRelayTask === task else {
+            Log.debug("[AstationHub] Ignored disconnect from a replaced identity relay socket")
+            return
+        }
+
+        let closeDescription = closeCode.map(String.init) ?? "none"
+        let reasonDescription = closeReason.map { " reason=\($0)" } ?? ""
+        let errorDescription = error.map { " error=\($0)" } ?? ""
+        Log.info(
+            "[AstationHub] Identity relay disconnected: " +
+                "code=\(closeDescription)\(reasonDescription)\(errorDescription)"
+        )
+
+        connectedClients
+            .filter { $0.id.hasPrefix("relay-") }
+            .forEach { removeClient(withId: $0.id) }
+        identityRelayAuthentication.removeAll()
+        let wasVerified = identityRelayVerified
+        identityRelayTask = nil
+        identityRelayVerified = false
+        pendingRelayChallenge = nil
+        identityRelayActive = false
+
+        // CFNetwork commonly reports peer close frames as 1005/invalid. An
+        // established, verified socket gets the prompt restart path; a socket
+        // that failed before verification gets the try-again backoff path.
+        let delay = identityRelayReconnectPolicy.delay(
+            observedCloseCode: closeCode,
+            wasVerified: wasVerified,
+            unitJitter: Double.random(in: 0...1)
+        )
+        identityRelayReconnectGeneration &+= 1
+        let generation = identityRelayReconnectGeneration
+        Log.info(
+            "[AstationHub] Identity relay retry scheduled in \(String(format: "%.1f", delay))s " +
+                "after close code \(closeDescription) (wasVerified=\(wasVerified))"
+        )
+
+        // NWPathMonitor starts immediately when connectivity returns. This timer
+        // covers relay failures that happen while the network path stays online.
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self = self,
+                  self.identityRelayReconnectGeneration == generation,
+                  !self.identityRelayActive else { return }
+            guard self.identityRelayPathMonitor?.currentPath.status == .satisfied else { return }
+            Log.info("[AstationHub] Retrying identity relay")
+            self.startIdentityRelay()
+        }
+    }
+
+    private static func usableRelayCloseCode(
+        _ closeCode: URLSessionWebSocketTask.CloseCode
+    ) -> Int? {
+        switch closeCode {
+        case .invalid, .noStatusReceived:
+            return nil
+        default:
+            return Int(closeCode.rawValue)
         }
     }
 
@@ -1420,6 +1495,7 @@ class AstationHubManager: ObservableObject {
         switch status {
         case RelayIdentityProtocol.statusRegistered, RelayIdentityProtocol.statusVerified:
             identityRelayVerified = true
+            identityRelayReconnectPolicy.reset()
             relayIdentityStatusMessage = nil
             Log.info("[RelayIdentity] Relay \(status) this Astation's key")
             sendRelaySessionsResync()
