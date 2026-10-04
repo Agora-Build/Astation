@@ -472,7 +472,7 @@ final class AudioTranscriptionManagerTests: XCTestCase {
         manager.start(); try await waitUntil { manager.state == .running }
         capture.feed(0.25)
         try await waitUntil { manager.state == .failed }
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await Task.sleep(nanoseconds: 150_000_000)
         XCTAssertEqual(manager.state, .failed)
         XCTAssertTrue(manager.message?.contains("Inference failed") == true)
         XCTAssertTrue(recorder.isRecording)
@@ -484,10 +484,22 @@ final class AudioTranscriptionManagerTests: XCTestCase {
         let track = try XCTUnwrap(manifest.tracks.first)
         XCTAssertEqual(track.sampleRate, 48_000)
         XCTAssertEqual(manifest.status, "completed")
+        XCTAssertTrue(track.gaps.contains { $0.reason == "source silent or unavailable at session end" && $0.frameCount > 0 })
         let file = try AVAudioFile(forReading: folder.appendingPathComponent(track.segments[0].file))
         let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length))!
         try file.read(into: buffer)
-        XCTAssertEqual(buffer.floatChannelData![0][Int(buffer.frameLength) - 1], 0.25)
+        // Slow runners can legitimately pad the session after the fake source's
+        // 100 ms packet. Check every original sample, excluding documented gaps.
+        let samples = UnsafeBufferPointer(start: buffer.floatChannelData![0], count: Int(buffer.frameLength))
+        let gaps = track.gaps.map { $0.startFrame..<($0.startFrame + $0.frameCount) }
+        let original = samples.enumerated().filter { sample in
+            !gaps.contains { $0.contains(Int64(sample.offset)) }
+        }
+        XCTAssertEqual(original.count, 4_800)
+        XCTAssertTrue(original.allSatisfy { $0.element == 0.25 })
+        XCTAssertTrue(samples.enumerated().allSatisfy { sample in
+            !gaps.contains { $0.contains(Int64(sample.offset)) } || sample.element == 0
+        })
     }
     func testOnlySelectedSourceReachesTranscriber() async throws {
         let mic = CaptionTestCapture(), system = CaptionTestCapture(), engine = CaptionTestEngine(), defaults = defaults()

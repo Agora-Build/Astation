@@ -443,15 +443,22 @@ final class KeyboardShortcutTests: XCTestCase {
         window.isReleasedWhenClosed = false
         defer { window.close() }
         window.contentViewController = controller
-        controller.view.layoutSubtreeIfNeeded()
         let scroll = try XCTUnwrap(controller.view as? NSScrollView)
         let document = try XCTUnwrap(scroll.documentView)
-        XCTAssertFalse(document.hasAmbiguousLayout)
-        XCTAssertEqual(document.frame.width, scroll.contentSize.width, accuracy: 1)
-        XCTAssertGreaterThan(document.frame.height, scroll.contentSize.height)
-        document.scroll(NSPoint(x: 0, y: 100))
-        controller.view.layoutSubtreeIfNeeded()
-        XCTAssertGreaterThan(scroll.contentView.bounds.origin.y, 0)
+        for style in [NSScroller.Style.overlay, .legacy] {
+            scroll.scrollerStyle = style
+            controller.view.layoutSubtreeIfNeeded()
+            scroll.tile()
+            controller.view.layoutSubtreeIfNeeded()
+            XCTAssertFalse(document.hasAmbiguousLayout)
+            // Use the laid-out clip viewport, not contentSize's proposed size
+            // before AppKit settles legacy/autohiding scrollbar geometry.
+            XCTAssertEqual(document.frame.width, scroll.contentView.bounds.width, accuracy: 1)
+            XCTAssertGreaterThan(document.frame.height, scroll.contentView.bounds.height)
+            document.scroll(NSPoint(x: 0, y: 100))
+            controller.view.layoutSubtreeIfNeeded()
+            XCTAssertGreaterThan(scroll.contentView.bounds.origin.y, 0)
+        }
     }
 
     private func event(_ type: NSEvent.EventType, key: UInt16, flags: NSEvent.ModifierFlags) throws -> NSEvent {
