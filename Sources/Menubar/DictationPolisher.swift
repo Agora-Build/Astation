@@ -131,7 +131,8 @@ actor DictationPolisher {
                 do {
                     guard input.utf8.count <= 4_000 else { throw DictationError.message("Use a shorter utterance with Apple's local model (up to 4 KB of transcript).") }
                     let session = LanguageModelSession(model: SystemLanguageModel.default, instructions: DictationPolishing.instructions)
-                    let response = try await session.respond(to: input, options: GenerationOptions(samplingMode: .greedy, maximumResponseTokens: 2_048))
+                    // The sampling argument was renamed in newer Apple SDKs.
+                    let response = try await session.respond(to: input, options: GenerationOptions(temperature: 0, maximumResponseTokens: 2_048))
                     try Task.checkCancellation()
                     return try DictationPolishing.output(response.content)
                 } catch {
