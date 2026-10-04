@@ -37,8 +37,11 @@ struct ScreenShareSource {
 /// Audio frames received from the RTC engine are forwarded via `onAudioFrame`.
 class RTCManager {
     private var engine: OpaquePointer?
+    private(set) var appId: String?
     private var _isMicMuted: Bool = false
     private var _isScreenSharing: Bool = false
+    private var screenCapture: ScreenShareCapture?
+    var isScreenShareStarting: Bool { screenCapture != nil && !_isScreenSharing }
     private var _isInChannel: Bool = false
     private var _currentChannel: String?
     private var _currentUid: UInt32 = 0
@@ -61,18 +64,22 @@ class RTCManager {
 
     /// Called when a remote user leaves the channel.
     var onUserLeft: ((_ uid: UInt32) -> Void)?
+    var onTokenRenewalNeeded: (() -> Void)?
 
     var isMicMuted: Bool { return _isMicMuted }
     var isScreenSharing: Bool { return _isScreenSharing }
     var isInChannel: Bool { return _isInChannel }
     var currentChannel: String? { return _currentChannel }
     var currentUid: UInt32 { return _currentUid }
+    var screenCaptureStatistics: ScreenShareCapture.Statistics? { screenCapture?.snapshotStatistics() }
 
     deinit {
+        screenCapture?.stop()
         if engine != nil {
             astation_rtc_destroy(engine)
             engine = nil
         }
+
     }
 
     // MARK: - Lifecycle
@@ -80,11 +87,17 @@ class RTCManager {
     /// Initialize the RTC engine with the given App ID.
     /// Must be called before joinChannel / leaveChannel / etc.
     func initialize(appId: String, geoFence: RTCGeoFence = .noFence) throws {
+        stopScreenShare()
         // Tear down previous engine if any
         if engine != nil {
             astation_rtc_destroy(engine)
             engine = nil
         }
+
+        self.appId = nil
+        _isInChannel = false
+        _currentChannel = nil
+        _currentUid = 0
 
         let ctx = Unmanaged.passUnretained(self).toOpaque()
 
@@ -122,8 +135,8 @@ class RTCManager {
                 guard let ctx = ctx else { return }
                 let mgr = Unmanaged<RTCManager>.fromOpaque(ctx).takeUnretainedValue()
                 DispatchQueue.main.async {
+                    mgr.stopScreenShare()
                     mgr._isInChannel = false
-                    mgr._isScreenSharing = false
                     mgr._currentChannel = nil
                     mgr._currentUid = 0
                     mgr.onLeave?()
@@ -151,6 +164,11 @@ class RTCManager {
                     mgr.onUserLeft?(uid)
                 }
             }
+            callbacks.on_token_expiring = { ctx in
+                guard let ctx else { return }
+                let mgr = Unmanaged<RTCManager>.fromOpaque(ctx).takeUnretainedValue()
+                DispatchQueue.main.async { mgr.onTokenRenewalNeeded?() }
+            }
 
             return astation_rtc_create(config, callbacks, ctx)
         }
@@ -159,10 +177,18 @@ class RTCManager {
             throw RTCError.engineCreationFailed
         }
         engine = created
+        self.appId = appId
+        if _isMicMuted { muteMic(true) }
         Log.info("[RTCManager] Engine initialized with appId=\(appId) geoFence=\(geoFence.title)")
     }
 
     // MARK: - Channel
+
+    func renewToken(_ token: String) {
+        guard let engine else { return }
+        let result = token.withCString { astation_rtc_renew_token(engine, $0) }
+        if result != 0 { onError?(Int(result), "Agora token renewal failed.") }
+    }
 
     /// Join an RTC channel with the given token, channel name, and uid.
     func joinChannel(
@@ -202,9 +228,8 @@ class RTCManager {
             Log.info("[RTCManager] Cannot leave: engine not initialized")
             return
         }
+        stopScreenShare()
         let result = astation_rtc_leave(engine)
-        _isScreenSharing = false
-        ScreenRegionSelector.hideOverlay()
         if result != 0 {
             Log.info("[RTCManager] Leave failed with code \(result)")
         }
@@ -226,20 +251,30 @@ class RTCManager {
 
     // MARK: - Screen Share
 #if os(macOS)
+    @MainActor
     private func ensureScreenSharePermission() -> Bool {
         if CGPreflightScreenCaptureAccess() {
             return true
         }
-        Log.info("[RTCManager] Screen recording permission not granted. Requesting access...")
+        NSApp.activate(ignoringOtherApps: true)
+        let identity = Bundle.main.bundleIdentifier ?? "unbundled executable"
+        Log.info("[RTCManager] Screen recording permission not granted. Requesting access for \(identity)...")
         let granted = CGRequestScreenCaptureAccess()
+        Log.info("[RTCManager] Screen recording permission request returned: \(granted)")
         if !granted {
-            for _ in 0..<2 {
-                let alert = NSAlert()
-                alert.messageText = "Screen Recording Permission Required"
-                alert.informativeText =
-                    "Enable Screen Recording for Astation in System Settings > Privacy & Security > Screen Recording, then relaunch."
-                alert.addButton(withTitle: "Grant Permission First")
-                alert.runModal()
+            let alert = NSAlert()
+            alert.messageText = "Screen Recording Permission Required"
+            alert.informativeText =
+                "Allow Astation in System Settings > Privacy & Security > Screen & System Audio Recording " +
+                "(called Screen Recording on older macOS versions), then quit and reopen Astation. " +
+                "macOS may not show another permission prompt after access was denied."
+            alert.addButton(withTitle: "Open System Settings")
+            alert.addButton(withTitle: "Cancel")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.window.makeKeyAndOrderFront(nil)
+            if alert.runModal() == .alertFirstButtonReturn,
+               let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+                NSWorkspace.shared.open(url)
             }
         }
         return granted
@@ -247,97 +282,68 @@ class RTCManager {
 #endif
 
     func screenSources() -> [ScreenShareSource] {
-        guard let engine = engine else {
-            Log.info("[RTCManager] Cannot list screens: engine not initialized")
-            return []
-        }
-        let count = Int(astation_rtc_get_screen_sources(engine, nil, 0))
-        if count <= 0 {
-            return []
-        }
-        var sources = Array(
-            repeating: AstationScreenSource(
-                source_id: 0,
-                is_screen: 0,
-                is_primary: 0,
-                x: 0,
-                y: 0,
-                width: 0,
-                height: 0
-            ),
-            count: count
-        )
-        let filled = sources.withUnsafeMutableBufferPointer { buf -> Int in
-            guard let base = buf.baseAddress else { return 0 }
-            return Int(astation_rtc_get_screen_sources(engine, base, Int32(buf.count)))
-        }
-        if filled <= 0 {
-            return []
-        }
-        return sources.prefix(filled).map { source in
-            ScreenShareSource(
-                id: source.source_id,
-                isPrimary: source.is_primary != 0,
-                rectPixels: CGRect(
-                    x: CGFloat(source.x),
-                    y: CGFloat(source.y),
-                    width: CGFloat(source.width),
-                    height: CGFloat(source.height)
-                )
+        NSScreen.screens.compactMap { screen in
+            guard let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+                  let mode = CGDisplayCopyDisplayMode(id.uint32Value) else { return nil }
+            return ScreenShareSource(
+                id: id.int64Value,
+                isPrimary: id.uint32Value == CGMainDisplayID(),
+                rectPixels: CGRect(x: 0, y: 0, width: mode.pixelWidth, height: mode.pixelHeight)
             )
         }
     }
 
-    /// Start screen sharing on the given display.
+    @MainActor
     @discardableResult
-    func startScreenShare(displayId: Int64) -> Bool {
-        startScreenShare(displayId: displayId, regionPixels: nil)
-    }
-
-    /// Start screen sharing on a display with an optional capture region (pixels).
-    @discardableResult
-    func startScreenShare(displayId: Int64, regionPixels: CGRect?) -> Bool {
-        guard let engine = engine else {
-            Log.info("[RTCManager] Cannot screen share: engine not initialized")
+    func startScreenShare(displayId: Int64, regionPixels: CGRect? = nil,
+                          options: ScreenShareOptions = .load()) async -> Bool {
+        guard let engine, _isInChannel else {
+            onError?(-1, "Join an Agora channel before sharing your screen.")
             return false
         }
-        #if os(macOS)
-        guard ensureScreenSharePermission() else {
-            Log.info("[RTCManager] Screen recording permission denied")
+        guard screenCapture == nil else { return _isScreenSharing }
+        guard ensureScreenSharePermission() else { return false }
+        guard displayId <= Int64(UInt32.max) else {
+            onError?(-1, "Invalid display ID.")
             return false
         }
-        #else
-        let _ = displayId
-        #endif
-        let result: Int32
-        if let region = regionPixels {
-            let x = Int32(region.origin.x)
-            let y = Int32(region.origin.y)
-            let w = Int32(region.size.width)
-            let h = Int32(region.size.height)
-            result = astation_rtc_enable_screen_share_region(engine, Int32(displayId), x, y, w, h)
-        } else {
-            result = astation_rtc_enable_screen_share(engine, Int32(displayId))
+        let displayID = displayId > 0 ? CGDirectDisplayID(displayId) : CGMainDisplayID()
+        let capture = ScreenShareCapture(engine: engine)
+        screenCapture = capture
+        capture.onStop = { [weak self] error in
+            self?.stopScreenShare()
+            self?.onError?(-1, "Screen capture stopped: \(error.localizedDescription)")
         }
-        if result == 0 {
+        do {
+            try await capture.start(displayID: displayID, region: regionPixels, options: options) { layout in
+                let result = astation_rtc_start_external_screen_share(
+                    engine, Int32(layout.width), Int32(layout.height), Int32(options.frameRate),
+                    options.captureAudio ? 1 : 0
+                )
+                guard result == 0 else { throw ScreenShareCaptureError.publicationFailed(result) }
+            }
+            guard screenCapture === capture else { return false }
             _isScreenSharing = true
             return true
+        } catch {
+            // A cancelled start must not tear down a newer capture or a replacement engine.
+            if screenCapture === capture {
+                stopScreenShare()
+                onError?(-1, "Screen sharing failed: \(error.localizedDescription)")
+            }
+            return false
         }
-        return false
     }
 
-    /// Stop screen sharing.
     func stopScreenShare() {
-        guard let engine = engine else {
-            Log.info("[RTCManager] Cannot stop screen share: engine not initialized")
-            return
+        screenCapture?.stop()
+        screenCapture = nil
+        if let engine {
+            let result = astation_rtc_stop_screen_share(engine)
+            if result != 0 { Log.error("[RTCManager] Stop screen share failed: \(result)") }
         }
-        let result = astation_rtc_stop_screen_share(engine)
         _isScreenSharing = false
         ScreenRegionSelector.hideOverlay()
-        if result != 0 {
-            Log.info("[RTCManager] Stop screen share failed with code \(result)")
-        }
     }
 
     private func configureEncryption(_ encryption: RTCEncryptionConfiguration?) -> Int32 {

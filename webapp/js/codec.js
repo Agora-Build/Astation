@@ -1,5 +1,5 @@
 (function(root) {
-    const preferredCodec = "av1";
+    const preferredCodec = "h264";
     const fallbackCodec = "vp8";
 
     function pickCodec(preferred, supported) {

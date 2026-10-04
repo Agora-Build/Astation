@@ -22,6 +22,9 @@ local raw = redis.call('HGET', KEYS[1], 'participants') or '[]'
 local participants = cjson.decode(raw)
 if #participants >= tonumber(ARGV[3]) then return {'full', tostring(#participants)} end
 local uid = redis.call('HINCRBY', KEYS[1], 'next_uid', 1) - 1
+if uid == tonumber(redis.call('HGET', KEYS[1], 'host_uid')) then
+  uid = redis.call('HINCRBY', KEYS[1], 'next_uid', 1) - 1
+end
 table.insert(participants, {uid = uid, display_name = ARGV[1], joined_at = ARGV[2]})
 redis.call('HSET', KEYS[1], 'participants', cjson.encode(participants))
 return {'joined', tostring(uid), redis.call('HGET', KEYS[1], 'app_id'),
@@ -175,6 +178,20 @@ mod tests {
     use crate::cluster::redis::test_support::{fresh_conn, REDIS_LOCK};
     use crate::rtc_session::{RtcBackend, RtcSession, RtcSessionStore, RTC_FIRST_UID};
     use std::sync::Arc;
+
+    #[tokio::test]
+    #[ignore]
+    async fn redis_browser_and_screen_uids_skip_the_host() {
+        let _guard = REDIS_LOCK.lock().await;
+        let conn = fresh_conn().await;
+        let store = RtcSessionStore::with_backend(Arc::new(RedisRtcBackend::new(conn)));
+        store.create("screen-uids".into(), "app".into(), "room".into(), "token".into(), RTC_FIRST_UID + 1)
+            .await.unwrap();
+        let browser = store.join("screen-uids", "Browser".into()).await.unwrap();
+        let screen = store.join("screen-uids", "Browser (screen)".into()).await.unwrap();
+        assert_eq!(browser.uid, RTC_FIRST_UID);
+        assert_eq!(screen.uid, RTC_FIRST_UID + 2);
+    }
 
     #[tokio::test]
     #[ignore]

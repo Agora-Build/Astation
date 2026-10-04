@@ -520,12 +520,12 @@ body {
 }
 
 /* Mic Button Active State */
-.btn-icon:not(.mic-muted) {
+#mic-btn:not(.mic-muted) {
     background: var(--success);
     color: white;
 }
 
-.btn-icon:not(.mic-muted):hover {
+#mic-btn:not(.mic-muted):hover {
     background: #16a34a;
 }
 
@@ -535,4 +535,45 @@ body {
 
 .mic-muted:hover {
     background: var(--danger-hover);
+}
+
+.video-main.native-size {
+    display: block;
+    overflow: auto;
+}
+
+.video-main.native-size video {
+    max-width: none;
+    max-height: none;
+}
+
+.share-audio-option {
+    font-size: 13px;
+}
+
+.media-message {
+    position: fixed;
+    left: 16px;
+    top: 16px;
+    max-width: min(420px, calc(100vw - 32px));
+    padding: 12px 16px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    z-index: 101;
+}
+
+.play-audio-btn {
+    position: fixed;
+    left: 16px;
+    bottom: 100px;
+    z-index: 101;
+}
+
+[hidden] { display: none !important; }
+
+@media (max-width: 768px) {
+    .bottom-bar { flex-wrap: wrap; gap: 8px; }
+    .bottom-center { order: 3; width: 100%; flex-wrap: wrap; gap: 8px; }
+    .share-audio-option { max-width: 100px; }
 }
