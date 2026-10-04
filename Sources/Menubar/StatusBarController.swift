@@ -7,23 +7,38 @@ class StatusBarController: NSObject, NSMenuDelegate {
     private let webSocketServer: AstationWebSocketServer
     private let androidDeviceManager: AndroidDeviceManager
     private var statusMenu: NSMenu!
-    private lazy var settingsWindowController = SettingsWindowController(hubManager: hubManager, hotkeyManager: hotkeyManager)
+    private lazy var settingsWindowController = SettingsWindowController(hubManager: hubManager, hotkeyManager: hotkeyManager,
+                                                                         recordingManager: recordingManager, dictationManager: dictationManager)
     private lazy var devConsoleController = DevConsoleController(hubManager: hubManager)
     private lazy var projectsWindowController = ProjectsWindowController(hubManager: hubManager)
     private lazy var joinChannelWindowController = JoinChannelWindowController(hubManager: hubManager)
     private lazy var connectionsWindowController = ConnectionsWindowController(hubManager: hubManager, androidDeviceManager: androidDeviceManager)
     let hotkeyManager: HotkeyManager
+    let recordingManager: AudioRecordingManager
+    let dictationManager: VoiceDictationManager
     private var headerTapCount = 0
     private var lastHeaderTapTime: Date?
 
     init(hubManager: AstationHubManager, webSocketServer: AstationWebSocketServer, androidDeviceManager: AndroidDeviceManager,
-         hotkeyManager: HotkeyManager) {
+         hotkeyManager: HotkeyManager, recordingManager: AudioRecordingManager = AudioRecordingManager(),
+         dictationManager: VoiceDictationManager? = nil) {
         self.hubManager = hubManager
         self.webSocketServer = webSocketServer
         self.androidDeviceManager = androidDeviceManager
         self.hotkeyManager = hotkeyManager
+        self.recordingManager = recordingManager
+        self.dictationManager = dictationManager ?? VoiceDictationManager(transcription: recordingManager.transcription,
+            resolveTarget: { [weak hubManager] in hubManager?.routeToFocusedAtem() },
+            sendText: { [weak hubManager] text, target in
+                guard let hubManager, hubManager.connectedClients.contains(where: { $0.id == target && $0.clientType == "Atem" }),
+                      let send = hubManager.sendHandler else { return false }
+                send(.voiceCommand(text: text, isFinal: true), target)
+                return true
+            })
+        hubManager.rtcManager.microphoneDeviceUID = { [weak recordingManager] in recordingManager?.settings.microphoneUID }
         super.init()
         setupStatusBar()
+        recordingManager.onStateChanged = { [weak self] in self?.updateRecordingIndicator() }
         hotkeyManager.additionalMenus = { [weak self] in
             guard let menu = self?.statusMenu else { return [] }
             // Reserve contextual commands even while their menu items are hidden.
@@ -122,21 +137,49 @@ class StatusBarController: NSObject, NSMenuDelegate {
         
         statusMenu.addItem(NSMenuItem.separator())
 
-        // Voice Coding Section
-        let vcm = hubManager.voiceCodingManager
-        let voiceCodingHeader = NSMenuItem(title: "Voice Coding", action: nil, keyEquivalent: "")
-        voiceCodingHeader.isEnabled = false
-        statusMenu.addItem(voiceCodingHeader)
+        // Local audio recording
+        let recordingItem = NSMenuItem(title: recordingManager.isRecording ? "Stop Audio Recording" : "Start Audio Recording",
+                                       action: #selector(toggleAudioRecording), keyEquivalent: "")
+        recordingItem.target = self
+        recordingItem.isEnabled = recordingManager.state != .starting
+        recordingItem.image = NSImage(systemSymbolName: recordingManager.isRecording ? "stop.circle.fill" : "record.circle", accessibilityDescription: "Audio Recording")
+        statusMenu.addItem(recordingItem)
+        if recordingManager.isRecording {
+            let pause = NSMenuItem(title: recordingManager.state == .paused ? "Resume Audio Recording" : "Pause Audio Recording",
+                                   action: #selector(pauseAudioRecording), keyEquivalent: "")
+            pause.target = self
+            statusMenu.addItem(pause)
+        }
+        let audioSettings = NSMenuItem(title: "Audio & Recording...", action: #selector(openRecordingSettings), keyEquivalent: "")
+        audioSettings.target = self
+        statusMenu.addItem(audioSettings)
+        statusMenu.addItem(.separator())
+
+        // Voice Dictation Section
+        let vcm = dictationManager
+        let voiceDictationHeader = NSMenuItem(title: "Voice Dictation", action: nil, keyEquivalent: "")
+        voiceDictationHeader.isEnabled = false
+        statusMenu.addItem(voiceDictationHeader)
+
+        let captionsTitle = recordingManager.transcription.floatingCaptionsVisible ? "Hide Floating Captions" : "Show Floating Captions"
+        let showCaptions = NSMenuItem(title: captionsTitle, action: #selector(toggleFloatingCaptions), keyEquivalent: "")
+        showCaptions.target = self
+        showCaptions.image = NSImage(systemSymbolName: "captions.bubble", accessibilityDescription: "Floating Captions")
+        statusMenu.addItem(showCaptions)
+        let dictationSettings = NSMenuItem(title: "Voice Dictation Settings...", action: #selector(openDictationSettings), keyEquivalent: "")
+        dictationSettings.target = self
+        statusMenu.addItem(dictationSettings)
 
         switch vcm.mode {
         case .off:
             let voiceOffItem = NSMenuItem(
-                title: "Voice (\(hotkeyManager.shortcutLabel(for: .voice))): Off",
+                title: vcm.isAvailable ? "Dictation (\(hotkeyManager.shortcutLabel(for: .voice))): Off" : "Dictation: Disabled during mic transcription",
                 action: nil,
                 keyEquivalent: ""
             )
             voiceOffItem.image = NSImage(systemSymbolName: "mic.slash", accessibilityDescription: "Voice Off")
             voiceOffItem.isEnabled = false
+            voiceOffItem.toolTip = vcm.unavailableReason
             statusMenu.addItem(voiceOffItem)
 
             if hotkeyManager.voiceHotkeyFailed {
@@ -152,11 +195,13 @@ class StatusBarController: NSObject, NSMenuDelegate {
             )
             handsFreeItem.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Hands-Free")
             handsFreeItem.target = self
+            handsFreeItem.isEnabled = vcm.isAvailable
+            handsFreeItem.toolTip = vcm.unavailableReason ?? "Listen to the local microphone continuously. Destination: \(vcm.settings.destination.title)."
             statusMenu.addItem(handsFreeItem)
 
         case .ptt:
             let pttItem = NSMenuItem(
-                title: vcm.isWaitingForResponse ? "Voice (PTT): Waiting for Claude..." : "Voice (PTT): Active",
+                title: vcm.isPolishing ? "Dictation (PTT): Polishing..." : vcm.isWaitingForResponse ? "Dictation (PTT): Finishing..." : "Dictation (PTT): Listening",
                 action: nil,
                 keyEquivalent: ""
             )
@@ -166,7 +211,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
 
         case .handsFree:
             let hfItem = NSMenuItem(
-                title: vcm.isWaitingForResponse ? "Voice (Hands-Free): Waiting for Claude..." : "Voice (Hands-Free): Active",
+                title: vcm.isWaitingForResponse ? "Hands-Free Dictation: Finishing..." : "Hands-Free Dictation: Listening",
                 action: nil,
                 keyEquivalent: ""
             )
@@ -243,16 +288,43 @@ class StatusBarController: NSObject, NSMenuDelegate {
         rtcHeader.isEnabled = false
         statusMenu.addItem(rtcHeader)
 
-        let micStatus = hubManager.rtcManager.isMicMuted ? "Muted" : "Active"
+        let rtc = hubManager.rtcManager
+        let micStatus = rtc.isMicMuted ? "Not publishing" : rtc.microphonePublisher.isCapturing
+            ? (rtc.isInChannel ? "Publishing" : "Listening (RTC disconnected)") : "Off"
         let micIndicator = hubManager.rtcManager.isMicMuted ? "mic.slash" : "mic.fill"
         let micItem = NSMenuItem(
-            title: "Mic: \(micStatus)",
+            title: "RTC Mic: \(micStatus)",
             action: nil,
             keyEquivalent: ""
         )
         micItem.image = NSImage(systemSymbolName: micIndicator, accessibilityDescription: "Microphone")
         micItem.isEnabled = false
         statusMenu.addItem(micItem)
+
+        let rtcMicToggle = NSMenuItem(title: rtc.isMicMuted || !rtc.microphonePublisher.isCapturing ? "Enable RTC Mic Publishing" : "Mute RTC Mic Publishing",
+            action: #selector(toggleMic), keyEquivalent: "m")
+        rtcMicToggle.target = self
+        rtcMicToggle.toolTip = "Only changes RTC publishing. Local transcription and original recording continue."
+        statusMenu.addItem(rtcMicToggle)
+        if rtc.microphonePublisher.isCapturing || rtc.microphonePublisher.isPreparing {
+            let stopCapture = NSMenuItem(title: "Release RTC Microphone", action: #selector(releaseRTCMicrophone), keyEquivalent: "")
+            stopCapture.target = self
+            stopCapture.toolTip = "Release RTC's microphone capture. Other audio features retain their own capture."
+            statusMenu.addItem(stopCapture)
+        }
+        let noise = NSMenuItem(title: "RTC Noise Reduction", action: nil, keyEquivalent: "")
+        let noiseMenu = NSMenu()
+        for mode in RTCNoiseReduction.allCases {
+            let option = NSMenuItem(title: mode.title, action: #selector(changeRTCNoiseReduction(_:)), keyEquivalent: "")
+            option.target = self; option.tag = Int(mode.rawValue)
+            option.state = mode == rtc.noiseReduction ? .on : .off
+            noiseMenu.addItem(option)
+        }
+        noise.submenu = noiseMenu; statusMenu.addItem(noise)
+        if let message = rtc.audioProcessingMessage {
+            let warning = NSMenuItem(title: message, action: nil, keyEquivalent: "")
+            warning.isEnabled = false; statusMenu.addItem(warning)
+        }
 
         let screenStatus = hubManager.rtcManager.isScreenSharing ? "Sharing" : "Off"
         let screenIndicator = hubManager.rtcManager.isScreenSharing ? "rectangle.inset.filled.and.person.filled" : "rectangle.on.rectangle"
@@ -285,15 +357,6 @@ class StatusBarController: NSObject, NSMenuDelegate {
             )
             leaveItem.target = self
             statusMenu.addItem(leaveItem)
-
-            let toggleMicTitle = hubManager.rtcManager.isMicMuted ? "Unmute Mic" : "Mute Mic"
-            let toggleMicItem = NSMenuItem(
-                title: toggleMicTitle,
-                action: #selector(toggleMic),
-                keyEquivalent: "m"
-            )
-            toggleMicItem.target = self
-            statusMenu.addItem(toggleMicItem)
 
             if hubManager.rtcManager.isScreenSharing {
                 let stopShareItem = NSMenuItem(
@@ -573,9 +636,15 @@ class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func toggleMic() {
-        let newState = !hubManager.rtcManager.isMicMuted
+        let newState = !hubManager.rtcManager.isMicMuted && hubManager.rtcManager.microphonePublisher.isCapturing
         hubManager.rtcManager.muteMic(newState)
         setupMenu()
+    }
+
+    @objc private func releaseRTCMicrophone() { hubManager.rtcManager.stopMicrophoneCapture(); setupMenu() }
+    @objc private func changeRTCNoiseReduction(_ sender: NSMenuItem) {
+        guard let mode = RTCNoiseReduction(rawValue: Int32(sender.tag)) else { return }
+        hubManager.rtcManager.setNoiseReduction(mode); setupMenu()
     }
 
     @objc private func startScreenShare() {
@@ -795,12 +864,12 @@ class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func startHandsFreeMode() {
-        hubManager.voiceCodingManager.startHandsFree()
+        dictationManager.startHandsFree()
         setupMenu()
     }
 
     @objc private func stopHandsFreeMode() {
-        hubManager.voiceCodingManager.stopHandsFree()
+        dictationManager.stopHandsFree()
         setupMenu()
     }
 
@@ -844,6 +913,24 @@ class StatusBarController: NSObject, NSMenuDelegate {
 
     @objc private func openSettings() {
         settingsWindowController.showWindow()
+    }
+
+    @objc private func openRecordingSettings() { settingsWindowController.showRecording() }
+    @objc private func openDictationSettings() { settingsWindowController.showDictation() }
+    @objc private func toggleFloatingCaptions() { recordingManager.transcription.toggleFloatingCaptions() }
+    @objc private func toggleAudioRecording() {
+        if recordingManager.isRecording { recordingManager.stopRecording() }
+        else { settingsWindowController.showRecording(); recordingManager.startRecording() }
+        setupMenu()
+    }
+    @objc private func pauseAudioRecording() { recordingManager.togglePause(); setupMenu() }
+
+    private func updateRecordingIndicator() {
+        guard let button = statusItem.button else { return }
+        let recording = recordingManager.isRecording
+        button.image = NSImage(systemSymbolName: recording ? "record.circle.fill" : "antenna.radiowaves.left.and.right", accessibilityDescription: recording ? "Astation recording audio" : "Astation")
+        button.contentTintColor = recording ? (recordingManager.state == .paused ? .systemOrange : .systemRed) : nil
+        button.toolTip = recording ? "Astation - audio recording \(recordingManager.state == .paused ? "paused" : "active")" : "Astation - AI Work Suite Hub"
     }
 
     @objc private func quitApplication() {

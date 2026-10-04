@@ -10,6 +10,7 @@
 #include "astation_screen_capture.h"
 
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
@@ -43,6 +44,8 @@ struct AStationRtcEngineImpl
     uint32_t area_code{0};
     int enable_audio{1};
     int enable_video{0};
+    bool custom_audio{false};
+    agora::rtc::track_id_t audio_track{UINT32_MAX};
 
     // User-provided C callbacks + context
     AStationRtcCallbacks callbacks{};
@@ -52,8 +55,8 @@ struct AStationRtcEngineImpl
     std::mutex mtx;
 
     // Local state
-    bool joined{false};
-    bool mic_muted{false};
+    std::atomic<bool> joined{false};
+    std::atomic<bool> mic_muted{false};
     bool screen_sharing{false};
 
     explicit AStationRtcEngineImpl(
@@ -67,6 +70,7 @@ struct AStationRtcEngineImpl
           area_code(config.area_code),
           enable_audio(config.enable_audio),
           enable_video(config.enable_video),
+          custom_audio(config.custom_audio != 0),
           callbacks(cb),
           callback_ctx(ctx) {}
 
@@ -172,6 +176,9 @@ struct AStationRtcEngineImpl
         if (rtc_engine) {
             // Unregister audio observer before releasing
             if (media_engine) {
+                if (audio_track != UINT32_MAX) {
+                    media_engine->destroyCustomAudioTrack(audio_track);
+                }
                 media_engine->registerAudioFrameObserver(nullptr);
                 media_engine = nullptr;
             }
@@ -211,7 +218,11 @@ struct AStationRtcEngineImpl
         // Enable audio subsystem
         if (enable_audio) {
             rtc_engine->enableAudio();
-            refresh_recording_device("engine_init");
+            if (custom_audio) {
+                rtc_engine->enableLocalAudio(false);
+            } else {
+                refresh_recording_device("engine_init");
+            }
         }
 
         // Enable video subsystem so screen sharing can publish video.
@@ -228,9 +239,21 @@ struct AStationRtcEngineImpl
             media_engine =
                 static_cast<agora::media::IMediaEngine*>(media_ptr);
             media_engine->registerAudioFrameObserver(this);
+            if (custom_audio && enable_audio) {
+                agora::rtc::AudioTrackConfig audio{};
+                audio.enableLocalPlayback = false;
+                // Direct custom mic input otherwise defaults to bypassing AEC/ANS/AGC.
+                audio.enableAudioProcessing = true;
+                audio_track = media_engine->createCustomAudioTrack(agora::rtc::AUDIO_TRACK_DIRECT, audio);
+                if (audio_track == UINT32_MAX) {
+                    std::fprintf(stderr, "[AStationRtc] Cannot create processed custom microphone track\n");
+                    return false;
+                }
+            }
         } else {
             std::fprintf(stderr,
                 "[AStationRtc] Warning: could not obtain IMediaEngine\n");
+            if (custom_audio) return false;
         }
 
         std::fprintf(stderr,
@@ -702,7 +725,7 @@ int astation_rtc_join(AStationRtcEngine* engine) {
         impl->uid,
         impl->token.empty() ? "(none)" : "(set)");
 
-    if (impl->enable_audio) {
+    if (impl->enable_audio && !impl->custom_audio) {
         impl->refresh_recording_device("join_channel");
     }
 
@@ -712,7 +735,12 @@ int astation_rtc_join(AStationRtcEngine* engine) {
         impl->uid,
         [&]() {
             agora::rtc::ChannelMediaOptions options{};
-            options.publishMicrophoneTrack = (impl->enable_audio != 0);
+            options.publishMicrophoneTrack = impl->enable_audio && !impl->custom_audio && !impl->mic_muted;
+            if (impl->custom_audio && impl->audio_track != UINT32_MAX) {
+                options.publishCustomAudioTrack = !impl->mic_muted;
+                options.publishCustomAudioTrackId = impl->audio_track;
+                options.enableAudioRecordingOrPlayout = true;
+            }
             options.publishCameraTrack = false;
             options.publishScreenTrack = impl->screen_sharing;
             options.autoSubscribeAudio = true;
@@ -771,11 +799,22 @@ int astation_rtc_mute_mic(AStationRtcEngine* engine, int mute) {
         return -1;
     }
 
-    if (impl->enable_audio && mute == 0) {
+    if (impl->enable_audio && !impl->custom_audio && mute == 0) {
         impl->refresh_recording_device("unmute_mic");
     }
 
-    int ret = impl->rtc_engine->muteLocalAudioStream(mute != 0);
+    int ret = 0;
+    if (impl->custom_audio) {
+        if (impl->joined) {
+            agora::rtc::ChannelMediaOptions options{};
+            options.publishMicrophoneTrack = false;
+            options.publishCustomAudioTrack = (mute == 0);
+            options.publishCustomAudioTrackId = impl->audio_track;
+            ret = impl->rtc_engine->updateChannelMediaOptions(options);
+        }
+    } else {
+        ret = impl->rtc_engine->muteLocalAudioStream(mute != 0);
+    }
     if (ret == 0) {
         impl->mic_muted = (mute != 0);
         std::fprintf(stderr,
@@ -786,6 +825,27 @@ int astation_rtc_mute_mic(AStationRtcEngine* engine, int mute) {
             "[AStationRtc] muteLocalAudioStream() failed: %d\n", ret);
     }
     return ret;
+}
+
+int astation_rtc_push_microphone_audio(AStationRtcEngine* engine, const int16_t* samples, int count) {
+    if (!engine || !samples || count != 480) return -2;
+    auto* impl = reinterpret_cast<AStationRtcEngineImpl*>(engine);
+    if (!impl->custom_audio || !impl->media_engine || impl->audio_track == UINT32_MAX) return -7;
+    agora::media::IAudioFrameObserverBase::AudioFrame frame{};
+    frame.samplesPerChannel = count;
+    frame.bytesPerSample = agora::rtc::TWO_BYTES_PER_SAMPLE;
+    frame.channels = 1;
+    frame.samplesPerSec = 48000;
+    frame.buffer = const_cast<int16_t*>(samples);
+    frame.renderTimeMs = impl->rtc_engine->getCurrentMonotonicTimeInMs();
+    return impl->media_engine->pushAudioFrame(&frame, impl->audio_track);
+}
+
+int astation_rtc_set_noise_reduction(AStationRtcEngine* engine, int mode) {
+    if (!engine || mode < -1 || mode > 2) return -2;
+    auto* impl = reinterpret_cast<AStationRtcEngineImpl*>(engine);
+    if (!impl->rtc_engine) return -7;
+    return impl->rtc_engine->setAINSMode(mode >= 0, static_cast<agora::rtc::AUDIO_AINS_MODE>(mode >= 0 ? mode : 0));
 }
 
 int astation_rtc_enable_screen_share(AStationRtcEngine* engine,

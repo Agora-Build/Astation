@@ -25,11 +25,14 @@ concurrency:
 jobs:
   build-macos:
     name: Build macOS
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.head_sha || '' }}
+
+      - name: Select Xcode 26.2 (Foundation Models SDK)
+        run: sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
 
       - name: Cache Agora SDK
         uses: actions/cache@v4
@@ -61,8 +64,8 @@ jobs:
       - name: Build Swift package
         run: swift build -c release
 
-      - name: Run relay identity and recovery kit tests
-        run: swift test --filter "RelayIdentityTests|RecoveryKitTests"
+      - name: Run Swift tests (no live audio or paid services)
+        run: swift test
 
   test-webapp:
     name: Webapp Tests

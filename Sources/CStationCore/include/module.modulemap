@@ -1,4 +1,6 @@
 module CStationCore {
+    header "astation_audio_queue.h"
+    header "astation_transcription.h"
     header "astation_screen_capture.h"
     header "astation_rtc.h"
     header "astation_core.h"

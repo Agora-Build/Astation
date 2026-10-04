@@ -74,6 +74,10 @@ final class HotkeyManager {
     var onVoiceKeyDown: (() -> Void)?
     var onVoiceKeyUp: (() -> Void)?
     var onVideoToggle: (() -> Void)?
+    var onRecordingToggle: (() -> Void)?
+    var onRecordingPause: (() -> Void)?
+    var onFloatingCaptionsToggle: (() -> Void)?
+    var onHandsFreeDictationToggle: (() -> Void)?
     var additionalMenus: (() -> [NSMenu])?
 
     private(set) var bindings: ShortcutBindings
@@ -102,7 +106,7 @@ final class HotkeyManager {
         if let data = defaults.data(forKey: Self.defaultsKey),
            let saved = try? JSONDecoder().decode(ShortcutBindings.self, from: data),
            ShortcutAction.allCases.allSatisfy({ saved[$0]?.validationError == nil }),
-           saved.voice == nil || saved.voice != saved.video {
+           !saved.hasDuplicates {
             bindings = saved
         } else {
             bindings = .defaults
@@ -150,8 +154,8 @@ final class HotkeyManager {
 
     private func apply(_ proposed: ShortcutBindings, updating actions: Set<ShortcutAction>) -> String? {
         guard !isSuspended else { return "Finish recording before changing shortcuts." }
-        if let voice = proposed.voice, voice == proposed.video {
-            return "\(voice.displayName) is already assigned to another Astation action. Each action needs a different shortcut."
+        if proposed.hasDuplicates {
+            return "This shortcut is already assigned to another Astation action. Each action needs a different shortcut."
         }
         for action in ShortcutAction.allCases where actions.contains(action) {
             if let shortcut = proposed[action], let error = conflict(for: shortcut) { return error }
@@ -221,7 +225,14 @@ final class HotkeyManager {
         guard !isSuspended, let action = registrations.first(where: { $0.value.id == id })?.key else { return }
         if pressed {
             guard pressedActions.insert(action).inserted else { return }
-            if action == .voice { onVoiceKeyDown?() } else { onVideoToggle?() }
+            switch action {
+            case .voice: onVoiceKeyDown?()
+            case .video: onVideoToggle?()
+            case .recording: onRecordingToggle?()
+            case .recordingPause: onRecordingPause?()
+            case .floatingCaptions: onFloatingCaptionsToggle?()
+            case .handsFreeDictation: onHandsFreeDictationToggle?()
+            }
         } else {
             release(action)
         }

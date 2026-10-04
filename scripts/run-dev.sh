@@ -9,7 +9,8 @@ Usage: ./scripts/run-dev.sh [--force-build] [--build-only]
   --build-only   Build both components without launching Astation.
   -h, --help     Show this help.
 
-Without options, incrementally build Swift, then run. Build C++ if missing.
+Without options, incrementally build Swift, package and open Astation Dev.app.
+Build C++ if missing. Quit Astation from its menu to stop it.
 Downloaded dependencies and SDKs are retained during a forced rebuild.
 
 Build prerequisites: macOS 14+, Xcode Command Line Tools, CMake (brew install cmake).
@@ -31,7 +32,6 @@ done
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
-binary="$repo_dir/.build/debug/astation"
 
 if [[ "$(uname -s)" != Darwin ]]; then
     printf 'The Astation menubar app requires macOS 14 or later.\n' >&2
@@ -80,11 +80,17 @@ if [[ "$force_build" == true ]]; then
 fi
 printf 'Building Swift app...\n'
 swift build --configuration debug --product astation
+bash "$repo_dir/scripts/package-dev-app.sh"
 
 if [[ "$build_only" == true ]]; then
-    printf 'Build complete: %s\n' "$binary"
+    printf 'Build complete: %s\n' "$repo_dir/.build/Astation Dev.app"
     exit 0
 fi
 
-printf 'Starting Astation (menu bar app). Press Ctrl+C to stop.\n'
-exec "$binary"
+printf 'Starting Astation Dev (menu bar app). Quit from its menu to stop.\n'
+launch_args=(-W -n)
+for variable in ASTATION_RELAY_URL ASTATION_SSO_URL ASTATION_BFF_URL ASTATION_NETWORK_DEBUG; do
+    if [[ -n "${!variable:-}" ]]; then launch_args+=(--env "$variable=${!variable}"); fi
+done
+# LaunchServices gives capture permission to Astation rather than the terminal.
+exec /usr/bin/open "${launch_args[@]}" "$repo_dir/.build/Astation Dev.app"

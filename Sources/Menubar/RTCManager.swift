@@ -36,6 +36,12 @@ struct ScreenShareSource {
 /// Manages the engine lifecycle, channel join/leave, mic mute, and screen sharing.
 /// Audio frames received from the RTC engine are forwarded via `onAudioFrame`.
 class RTCManager {
+    private let audioWork = DispatchQueue(label: "build.agora.astation.rtc-engine-audio")
+    let microphonePublisher: RTCMicrophonePublisher
+    var microphoneDeviceUID: (() -> String?)?
+    private let defaults: UserDefaults
+    private(set) var noiseReduction: RTCNoiseReduction
+    private(set) var audioProcessingMessage: String?
     private var engine: OpaquePointer?
     private var _isMicMuted: Bool = false
     private var _isScreenSharing: Bool = false
@@ -68,9 +74,29 @@ class RTCManager {
     var currentChannel: String? { return _currentChannel }
     var currentUid: UInt32 { return _currentUid }
 
+    init(microphonePublisher: RTCMicrophonePublisher = RTCMicrophonePublisher(), defaults: UserDefaults = .standard) {
+        self.microphonePublisher = microphonePublisher; self.defaults = defaults
+        noiseReduction = RTCNoiseReduction(rawValue: (defaults.object(forKey: "AstationRTCNoiseReduction") as? NSNumber)?.int32Value ?? 0) ?? .balanced
+        microphonePublisher.onPush = { [weak self] samples in
+            guard let self else { return }
+            try self.audioWork.sync {
+                guard let engine = self.engine else { return }
+                let result = samples.withUnsafeBufferPointer { astation_rtc_push_microphone_audio(engine, $0.baseAddress!, Int32($0.count)) }
+                if result != 0 { throw AudioCaptureError.message("RTC microphone publishing failed (\(result)).") }
+            }
+        }
+        microphonePublisher.onError = { [weak self] error in
+            guard let self else { return }
+            self.muteMic(true)
+            self.audioProcessingMessage = error.localizedDescription
+            self.onError?(-1, error.localizedDescription)
+        }
+    }
+
     deinit {
+        microphonePublisher.stop()
         if engine != nil {
-            astation_rtc_destroy(engine)
+            audioWork.sync { astation_rtc_destroy(engine) }
             engine = nil
         }
     }
@@ -82,8 +108,8 @@ class RTCManager {
     func initialize(appId: String, geoFence: RTCGeoFence = .noFence) throws {
         // Tear down previous engine if any
         if engine != nil {
-            astation_rtc_destroy(engine)
-            engine = nil
+            microphonePublisher.setConnected(false)
+            audioWork.sync { astation_rtc_destroy(engine); engine = nil }
         }
 
         let ctx = Unmanaged.passUnretained(self).toOpaque()
@@ -99,6 +125,7 @@ class RTCManager {
             config.area_code = geoFence.rawValue
             config.enable_audio = 1
             config.enable_video = 0
+            config.custom_audio = 1
 
             var callbacks = AStationRtcCallbacks()
             callbacks.on_audio_frame = { data, samples, channels, sampleRate, ctx in
@@ -115,6 +142,7 @@ class RTCManager {
                     mgr._isInChannel = true
                     mgr._currentChannel = channelStr
                     mgr._currentUid = uid
+                    mgr.microphonePublisher.setConnected(true)
                     mgr.onJoinSuccess?(channelStr, uid)
                 }
             }
@@ -126,6 +154,7 @@ class RTCManager {
                     mgr._isScreenSharing = false
                     mgr._currentChannel = nil
                     mgr._currentUid = 0
+                    mgr.microphonePublisher.setConnected(false)
                     mgr.onLeave?()
                 }
             }
@@ -158,7 +187,9 @@ class RTCManager {
         guard let created = newEngine else {
             throw RTCError.engineCreationFailed
         }
-        engine = created
+        audioWork.sync { engine = created }
+        _ = astation_rtc_mute_mic(created, _isMicMuted ? 1 : 0)
+        applyNoiseReduction()
         Log.info("[RTCManager] Engine initialized with appId=\(appId) geoFence=\(geoFence.title)")
     }
 
@@ -191,6 +222,7 @@ class RTCManager {
             return
         }
         let result = astation_rtc_join(engine)
+        if result == 0 && !_isMicMuted { microphonePublisher.start(deviceUID: microphoneDeviceUID?()) }
         if result != 0 {
             Log.info("[RTCManager] Join failed with code \(result)")
         }
@@ -198,6 +230,7 @@ class RTCManager {
 
     /// Leave the current RTC channel.
     func leaveChannel() {
+        microphonePublisher.setConnected(false)
         guard let engine = engine else {
             Log.info("[RTCManager] Cannot leave: engine not initialized")
             return
@@ -214,6 +247,9 @@ class RTCManager {
 
     /// Mute or unmute the local microphone.
     func muteMic(_ mute: Bool) {
+        microphonePublisher.setMuted(mute)
+        _isMicMuted = mute
+        if !mute { microphonePublisher.start(deviceUID: microphoneDeviceUID?()) }
         guard let engine = engine else {
             Log.info("[RTCManager] Cannot mute: engine not initialized")
             return
@@ -222,6 +258,21 @@ class RTCManager {
         if result == 0 {
             _isMicMuted = mute
         }
+    }
+
+    /// Explicitly release RTC's mic lease; other consumers retain their own capture.
+    func stopMicrophoneCapture() { muteMic(true); microphonePublisher.stop() }
+
+    func setNoiseReduction(_ mode: RTCNoiseReduction) {
+        noiseReduction = mode
+        defaults.set(mode.rawValue, forKey: "AstationRTCNoiseReduction")
+        applyNoiseReduction()
+    }
+
+    private func applyNoiseReduction() {
+        guard let engine else { return }
+        let result = astation_rtc_set_noise_reduction(engine, noiseReduction.rawValue)
+        audioProcessingMessage = result == 0 ? nil : "AI noise reduction could not be enabled (\(result)). Standard voice processing remains active."
     }
 
     // MARK: - Screen Share

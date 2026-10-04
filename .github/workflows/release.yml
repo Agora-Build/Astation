@@ -12,9 +12,12 @@ permissions:
 jobs:
   build-core:
     name: Build C++ Core Library
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select Xcode 26.2 (Foundation Models SDK)
+        run: sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
 
       - name: Cache Agora SDK
         uses: actions/cache@v4
@@ -52,9 +55,12 @@ jobs:
   build-app:
     name: Build macOS App
     needs: build-core
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select Xcode 26.2 (Foundation Models SDK)
+        run: sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
 
       - name: Download core library
         uses: actions/download-artifact@v4
@@ -93,6 +99,12 @@ jobs:
           mkdir -p "$APP_DIR/Frameworks"
 
           cp .build/release/astation "$APP_DIR/MacOS/Astation"
+
+          # SwiftPM model manifests and FluidAudio resources must ship with the app.
+          for resource in .build/release/*.bundle; do
+            [ -d "$resource" ] || continue
+            ditto "$resource" "$APP_DIR/Resources/$(basename "$resource")"
+          done
 
           # Bundle Agora RTC SDK frameworks into the app
           AGORA_LIBS="third_party/agora/rtc_mac"
@@ -140,6 +152,12 @@ jobs:
             <string>14.0</string>
             <key>LSUIElement</key>
             <true/>
+            <key>NSMicrophoneUsageDescription</key>
+            <string>Record and preview your selected microphone, and use voice features when you enable them.</string>
+            <key>NSAudioCaptureUsageDescription</key>
+            <string>Record and preview audio from the applications or system output you select.</string>
+            <key>NSCameraUsageDescription</key>
+            <string>Share camera video when you enable video features.</string>
             <key>CFBundleURLTypes</key>
             <array>
               <dict>

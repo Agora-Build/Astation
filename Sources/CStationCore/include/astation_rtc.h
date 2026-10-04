@@ -18,6 +18,7 @@ struct AStationRtcConfig {
     uint32_t area_code;
     int enable_audio;
     int enable_video;
+    int custom_audio;
 };
 
 typedef struct {
@@ -34,6 +35,8 @@ void astation_rtc_destroy(AStationRtcEngine* engine);
 int astation_rtc_join(AStationRtcEngine* engine);
 int astation_rtc_leave(AStationRtcEngine* engine);
 int astation_rtc_mute_mic(AStationRtcEngine* engine, int mute);
+int astation_rtc_push_microphone_audio(AStationRtcEngine* engine, const int16_t* samples, int count);
+int astation_rtc_set_noise_reduction(AStationRtcEngine* engine, int mode);
 int astation_rtc_enable_screen_share(AStationRtcEngine* engine, int display_id);
 int astation_rtc_enable_screen_share_region(AStationRtcEngine* engine,
                                             int display_id,

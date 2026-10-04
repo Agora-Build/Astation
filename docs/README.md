@@ -6,6 +6,8 @@ work. Completed implementation checklists are available in Git history.
 | Document | Why it is retained |
 | --- | --- |
 | [Android device sharing](android-device-sharing.md) | Connection model, setup, lifecycle, and pending phone/IDE validation |
+| [Local audio recording](audio-recording.md) | Capture sources, original tracks, permissions, and practical Mac validation |
+| [Live transcription](live-transcription.md) | Local/cloud captions, draggable floating window, model downloads, privacy, and validation |
 | [SSO authentication design](sso-authentication.md) | Browser login, token refresh, encrypted session storage, and credential consumers |
 | [Vault storage design](vault-storage.md) | Storage semantics, persistence, caller resolution, and concurrency boundaries |
 | [Device Authentication v2](specs/2026-07-21-device-authentication-v2.md) | Wire protocol shared with Atem and unresolved production blockers |
