@@ -11,10 +11,32 @@ let sessionId = null;
 let currentUid = null;
 let currentName = null;
 let remoteUsers = new Map(); // uid -> { name, audioTrack, videoTrack }
+let activeVideoUid = null;
+let nativeVideoSize = false;
+const screenPublisher = new AstationScreenShare.ScreenPublisher(AgoraRTC, async () => {
+    const response = await fetch(`/api/rtc-sessions/${sessionId}/join`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: `${currentName} (screen)` })
+    });
+    if (!response.ok) throw new Error("Unable to allocate a screen-share identity. The session may be full or expired.");
+    return response.json();
+}, (state, audioUnavailable) => {
+    const button = document.getElementById("share-btn");
+    button.textContent = state === "stopped" ? "Share screen" : state === "stopping" ? "Stopping..." : "Stop sharing";
+    button.disabled = state === "stopping";
+    document.getElementById("share-audio-input").disabled = state !== "stopped";
+    if (audioUnavailable) showMediaMessage("Your browser did not provide audio for this source. In Chrome or Edge, try sharing a tab and enable its audio in the picker.");
+});
 
 // --- Init ---
 
 document.addEventListener("DOMContentLoaded", () => {
+    AgoraRTC.onAutoplayFailed = () => {
+        document.getElementById("play-audio-btn").hidden = false;
+    };
+    new MutationObserver(updateVideoSize).observe(document.getElementById("video-main"), { childList: true, subtree: true });
+    window.addEventListener("resize", updateVideoSize);
     sessionId = extractSessionId();
     if (!sessionId) {
         showError("Invalid session URL.");
@@ -168,25 +190,38 @@ async function handleJoin() {
 // --- Agora SDK ---
 
 async function joinChannel(appId, channel, token, uid, micEnabled = true) {
-    const preferredCodec = (window.AstationCodec && window.AstationCodec.preferredCodec) || "av1";
+    const preferredCodec = (window.AstationCodec && window.AstationCodec.preferredCodec) || "h264";
     const fallbackCodec = (window.AstationCodec && window.AstationCodec.fallbackCodec) || "vp8";
 
     const createClientWithCodec = async (codec) => {
-        const newClient = AgoraRTC.createClient({ mode: "rtc", codec });
+        const newClient = AgoraRTC.createClient({ mode: "live", codec });
 
-        newClient.on("user-published", handleUserPublished);
+        newClient.on("user-published", (user, mediaType) => handleUserPublished(user, mediaType, newClient));
         newClient.on("user-unpublished", handleUserUnpublished);
         newClient.on("user-joined", handleUserJoined);
         newClient.on("user-left", handleUserLeft);
+        newClient.on("token-privilege-will-expire", () => {
+            showMediaMessage("Session access expires soon. Ask the host for a new share link to continue.");
+        });
+        newClient.on("token-privilege-did-expire", async () => {
+            await disconnectMedia();
+            showError("Session access has expired. Open a new share link from the host.");
+        });
 
-        await newClient.join(appId, channel, token, uid);
-        return newClient;
+        try {
+            await newClient.setClientRole("host");
+            await newClient.join(appId, channel, token, uid);
+            return newClient;
+        } catch (error) {
+            await newClient.leave();
+            throw error;
+        }
     };
 
     try {
         client = await createClientWithCodec(preferredCodec);
     } catch (err) {
-        console.warn(`AV1 join failed, falling back to ${fallbackCodec}:`, err);
+        console.warn(`${preferredCodec} join failed, falling back to ${fallbackCodec}:`, err);
         client = await createClientWithCodec(fallbackCodec);
     }
 
@@ -198,6 +233,10 @@ async function joinChannel(appId, channel, token, uid, micEnabled = true) {
             isMicMuted = false;
         } catch (err) {
             console.warn("Microphone access denied:", err);
+            localAudioTrack?.stop();
+            localAudioTrack?.close();
+            localAudioTrack = null;
+            isMicMuted = true;
         }
     } else {
         isMicMuted = true;
@@ -211,25 +250,28 @@ async function joinChannel(appId, channel, token, uid, micEnabled = true) {
     updateParticipantCount();
 }
 
-async function handleUserPublished(user, mediaType) {
+async function handleUserPublished(user, mediaType, subscriber = client) {
+    if (user.uid === screenPublisher.uid) return;
+    if (!remoteUsers.has(user.uid)) handleUserJoined(user);
     try {
-        await client.subscribe(user, mediaType);
+        await subscriber.subscribe(user, mediaType);
 
         // Set high quality stream for video
         if (mediaType === "video") {
-            await client.setRemoteVideoStreamType(user.uid, 0); // 0 = high quality
+            try {
+                await subscriber.setRemoteVideoStreamType(user.uid, 0); // 0 = high quality
+            } catch (error) {
+                console.warn("High-stream selection unavailable:", error);
+            }
         }
 
         if (mediaType === "video") {
             const videoMain = document.getElementById("video-main");
             videoMain.innerHTML = "";
 
-            // Get codec info for logging
-            const codecType = user.videoTrack?._videoTrack?.getCodecType?.() || "unknown";
-            console.log(`Receiving video from UID ${user.uid} with codec: ${codecType}`);
-
             // Play with fit mode to maintain aspect ratio and quality
             user.videoTrack.play(videoMain, { fit: "contain" });
+            activeVideoUid = user.uid;
 
             // Track the video
             if (remoteUsers.has(user.uid)) {
@@ -252,8 +294,7 @@ async function handleUserPublished(user, mediaType) {
 
 function handleUserUnpublished(user, mediaType) {
     if (mediaType === "video") {
-        const videoMain = document.getElementById("video-main");
-        videoMain.innerHTML = '<div class="video-placeholder"><p>Waiting for screen share...</p></div>';
+        if (activeVideoUid === user.uid) clearVideo();
 
         if (remoteUsers.has(user.uid)) {
             remoteUsers.get(user.uid).videoTrack = null;
@@ -268,6 +309,7 @@ function handleUserUnpublished(user, mediaType) {
 }
 
 function handleUserJoined(user) {
+    if (user.uid === screenPublisher.uid || remoteUsers.has(user.uid)) return;
     remoteUsers.set(user.uid, {
         name: `User ${user.uid}`,
         audioTrack: null,
@@ -278,6 +320,7 @@ function handleUserJoined(user) {
 }
 
 function handleUserLeft(user) {
+    if (activeVideoUid === user.uid) clearVideo();
     remoteUsers.delete(user.uid);
     removeUserFromList(user.uid);
     updateParticipantCount();
@@ -346,11 +389,14 @@ async function toggleMic() {
             isMicMuted = false;
         } catch (err) {
             console.error("Failed to create microphone track:", err);
+            localAudioTrack?.stop();
+            localAudioTrack?.close();
+            localAudioTrack = null;
             return;
         }
     } else {
         isMicMuted = !isMicMuted;
-        localAudioTrack.setEnabled(!isMicMuted);
+        await localAudioTrack.setEnabled(!isMicMuted);
     }
 
     updateMicButton();
@@ -363,7 +409,8 @@ async function toggleMic() {
     }
 }
 
-async function leave() {
+async function disconnectMedia() {
+    await screenPublisher.stop();
     if (localAudioTrack) {
         localAudioTrack.stop();
         localAudioTrack.close();
@@ -375,7 +422,56 @@ async function leave() {
         client = null;
     }
 
+}
+
+async function leave() {
+    await disconnectMedia();
     window.location.href = "/";
+}
+
+async function toggleScreenShare() {
+    document.getElementById("media-message").hidden = true;
+    try {
+        if (screenPublisher.active) await screenPublisher.stop();
+        else await screenPublisher.start(document.getElementById("share-audio-input").checked);
+    } catch (error) {
+        showMediaMessage(`Screen sharing failed: ${error.message}`);
+    }
+}
+
+function showMediaMessage(message) {
+    const element = document.getElementById("media-message");
+    element.textContent = message;
+    element.hidden = false;
+}
+
+function resumeRemoteAudio() {
+    for (const user of remoteUsers.values()) user.audioTrack?.play();
+    document.getElementById("play-audio-btn").hidden = true;
+}
+
+function clearVideo() {
+    activeVideoUid = null;
+    document.getElementById("video-main").innerHTML = '<div class="video-placeholder"><p>Waiting for screen share...</p></div>';
+}
+
+function toggleVideoSize() {
+    nativeVideoSize = !nativeVideoSize;
+    document.getElementById("video-size-btn").textContent = nativeVideoSize ? "Fit to window" : "1:1 size";
+    updateVideoSize();
+}
+
+function updateVideoSize() {
+    const container = document.getElementById("video-main");
+    container.classList.toggle("native-size", nativeVideoSize);
+    const video = container.querySelector("video");
+    if (!video) return;
+    video.onloadedmetadata = updateVideoSize;
+    video.onresize = updateVideoSize;
+    const player = container.firstElementChild;
+    const pixelRatio = window.devicePixelRatio || 1;
+    player.style.width = nativeVideoSize && video.videoWidth ? `${video.videoWidth / pixelRatio}px` : "100%";
+    player.style.height = nativeVideoSize && video.videoHeight ? `${video.videoHeight / pixelRatio}px` : "100%";
 }
 
 function toggleSidebar() {

@@ -30,7 +30,7 @@
     <key>NSMicrophoneUsageDescription</key>
     <string>Record and preview your selected microphone, and use voice features when you enable them.</string>
     <key>NSAudioCaptureUsageDescription</key>
-    <string>Record and preview audio from the applications or system output you select.</string>
+    <string>Record, transcribe, preview, or share audio from the applications or system output you select.</string>
     <key>NSCameraUsageDescription</key>
     <string>Share camera video when you enable video features.</string>
 </dict>

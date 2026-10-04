@@ -195,7 +195,11 @@ RTC uses a separate converted 48 kHz mono PCM16 branch and Agora's direct custom
 track with `enableAudioProcessing = true`, retaining Agora playback as the echo
 reference. AEC, standard noise suppression, and gain control are enabled on this RTC
 branch; optional Agora AI noise-reduction modes are available in the menu. None of
-these modify original recordings. Actual speaker/microphone echo quality and AI
+these modify original recordings. When screen sharing includes system audio,
+Agora's explicit local audio mixer publishes the microphone and stereo screen
+track together; mic mute removes only the mic from that mix. Stopping screen
+sharing restores direct mic publication without releasing native capture.
+Actual speaker/microphone echo quality and AI
 noise suppression still need a live Mac call check; unit tests prove lifecycle and
 packet routing, not acoustic quality or SDK processing equivalence.
 

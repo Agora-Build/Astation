@@ -38,8 +38,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: third_party/agora
-          key: agora-sdk-macos-4.6.2
-          restore-keys: agora-sdk-macos-
+          key: agora-sdk-macos-4.7.0-sck
 
       - name: Configure C++ core (download SDK if needed)
         run: |
@@ -67,6 +66,11 @@ jobs:
       - name: Run Swift tests (no live audio or paid services)
         run: swift test
 
+      - name: Verify development app bundle
+        run: |
+          swift build --product astation
+          bash scripts/package-dev-app.sh
+
   test-webapp:
     name: Webapp Tests
     runs-on: ubuntu-latest
@@ -81,6 +85,7 @@ jobs:
         run: |
           node webapp/tests/codec.test.js
           node webapp/tests/nginx.test.js
+          node --test webapp/tests/screen-share.test.js
 
       - name: Test AI review tooling
         run: node --test .github/scripts/*.test.mjs

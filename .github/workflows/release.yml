@@ -23,8 +23,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: third_party/agora
-          key: agora-sdk-macos-4.6.2
-          restore-keys: agora-sdk-macos-
+          key: agora-sdk-macos-4.7.0-sck
 
       - name: Configure astation_core (download SDK if needed)
         run: |
@@ -72,8 +71,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: third_party/agora
-          key: agora-sdk-macos-4.6.2
-          restore-keys: agora-sdk-macos-
+          key: agora-sdk-macos-4.7.0-sck
 
       - name: Download Agora SDK for bundling (if needed)
         run: |
@@ -131,47 +129,9 @@ jobs:
             -add_rpath "@executable_path/../Frameworks" \
             "$APP_DIR/MacOS/Astation"
 
-          cat > "$APP_DIR/Info.plist" << 'PLIST'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleExecutable</key>
-            <string>Astation</string>
-            <key>CFBundleIdentifier</key>
-            <string>build.agora.astation</string>
-            <key>CFBundleName</key>
-            <string>Astation</string>
-            <key>CFBundleVersion</key>
-            <string>${{ github.ref_name }}</string>
-            <key>CFBundleShortVersionString</key>
-            <string>${{ github.ref_name }}</string>
-            <key>CFBundlePackageType</key>
-            <string>APPL</string>
-            <key>LSMinimumSystemVersion</key>
-            <string>14.0</string>
-            <key>LSUIElement</key>
-            <true/>
-            <key>NSMicrophoneUsageDescription</key>
-            <string>Record and preview your selected microphone, and use voice features when you enable them.</string>
-            <key>NSAudioCaptureUsageDescription</key>
-            <string>Record and preview audio from the applications or system output you select.</string>
-            <key>NSCameraUsageDescription</key>
-            <string>Share camera video when you enable video features.</string>
-            <key>CFBundleURLTypes</key>
-            <array>
-              <dict>
-                <key>CFBundleURLName</key>
-                <string>build.agora.astation</string>
-                <key>CFBundleURLSchemes</key>
-                <array>
-                  <string>astation</string>
-                </array>
-              </dict>
-            </array>
-          </dict>
-          </plist>
-          PLIST
+          cp Config/Info.plist "$APP_DIR/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.ref_name }}" "$APP_DIR/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ github.ref_name }}" "$APP_DIR/Info.plist"
 
       - name: Smoke-test packaged app
         run: |

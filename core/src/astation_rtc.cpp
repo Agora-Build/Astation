@@ -8,9 +8,11 @@
 #include "AgoraBase.h"
 #include "AgoraMediaBase.h"
 #include "astation_screen_capture.h"
+#include "astation_rtc_audio_plan.h"
 
 #include <array>
 #include <atomic>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
@@ -21,6 +23,7 @@
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
+#include <CoreVideo/CoreVideo.h>
 #endif
 
 // ---------------------------------------------------------------------------
@@ -58,6 +61,12 @@ struct AStationRtcEngineImpl
     std::atomic<bool> joined{false};
     std::atomic<bool> mic_muted{false};
     bool screen_sharing{false};
+    std::atomic<bool> external_screen{false};
+    std::atomic<bool> screen_audio{false};
+    bool audio_mixer{false};
+    agora::rtc::video_track_id_t screen_video_track{0xffffffff};
+    agora::rtc::track_id_t screen_audio_track{0xffffffff};
+    std::vector<uint8_t> screen_video_buffer;
 
     explicit AStationRtcEngineImpl(
         const AStationRtcConfig& config,
@@ -174,10 +183,17 @@ struct AStationRtcEngineImpl
 
     ~AStationRtcEngineImpl() {
         if (rtc_engine) {
+            if (audio_mixer) rtc_engine->stopLocalAudioMixer();
+            if (screen_video_track != 0xffffffff) {
+                rtc_engine->destroyCustomVideoTrack(screen_video_track);
+            }
             // Unregister audio observer before releasing
             if (media_engine) {
                 if (audio_track != UINT32_MAX) {
                     media_engine->destroyCustomAudioTrack(audio_track);
+                }
+                if (screen_audio_track != 0xffffffff) {
+                    media_engine->destroyCustomAudioTrack(screen_audio_track);
                 }
                 media_engine->registerAudioFrameObserver(nullptr);
                 media_engine = nullptr;
@@ -250,6 +266,16 @@ struct AStationRtcEngineImpl
                     return false;
                 }
             }
+            // Create custom tracks before joining. Start/stop only changes publication.
+            screen_video_track = rtc_engine->createCustomVideoTrack();
+            if (screen_video_track == 0xffffffff) {
+                return false;
+            }
+            agora::rtc::AudioTrackConfig audio_config;
+            audio_config.enableLocalPlayback = false;
+            screen_audio_track = media_engine->createCustomAudioTrack(
+                agora::rtc::AUDIO_TRACK_MIXABLE, audio_config);
+            rtc_engine->setAudioProfile(agora::rtc::AUDIO_PROFILE_MUSIC_HIGH_QUALITY_STEREO);
         } else {
             std::fprintf(stderr,
                 "[AStationRtc] Warning: could not obtain IMediaEngine\n");
@@ -260,6 +286,40 @@ struct AStationRtcEngineImpl
             "[AStationRtc] Engine initialized (appId=%.8s... audio=%d video=%d areaCode=0x%08x)\n",
             app_id.c_str(), enable_audio, enable_video, ctx.areaCode);
         return true;
+    }
+
+    void audio_options(agora::rtc::ChannelMediaOptions& options, bool screen, bool muted) {
+        const auto plan = astation_rtc_audio_plan(enable_audio != 0, custom_audio, muted,
+                                                  screen, audio_track, screen_audio_track);
+        options.publishMicrophoneTrack = plan.microphone;
+        options.publishCustomAudioTrack = plan.custom;
+        options.publishCustomAudioTrackId = plan.custom_track;
+        options.publishMixedAudioTrack = plan.mixed;
+        options.enableAudioRecordingOrPlayout = true;
+    }
+
+    int configure_audio_mixer(bool screen, bool muted) {
+        const auto plan = astation_rtc_audio_plan(enable_audio != 0, custom_audio, muted,
+                                                  screen, audio_track, screen_audio_track);
+        if (!plan.mixed) {
+            if (!audio_mixer) return 0;
+            const int ret = rtc_engine->stopLocalAudioMixer();
+            if (ret == 0) audio_mixer = false;
+            return ret;
+        }
+        agora::rtc::MixedAudioStream sources[] = {
+            {agora::rtc::AUDIO_SOURCE_CUSTOM, screen_audio_track},
+            {agora::rtc::AUDIO_SOURCE_CUSTOM, audio_track}
+        };
+        agora::rtc::LocalAudioMixerConfiguration config;
+        config.audioInputStreams = sources;
+        config.streamCount = plan.mix_microphone ? 2 : 1;
+        // Native microphone capture is disabled; clock the mixer independently.
+        config.syncWithLocalMic = false;
+        const int ret = audio_mixer ? rtc_engine->updateLocalAudioMixerConfiguration(config)
+                                    : rtc_engine->startLocalAudioMixer(config);
+        if (ret == 0) audio_mixer = true;
+        return ret;
     }
 
     // -----------------------------------------------------------------------
@@ -308,6 +368,14 @@ struct AStationRtcEngineImpl
         if (callbacks.on_user_joined) {
             callbacks.on_user_joined(static_cast<uint32_t>(u), callback_ctx);
         }
+    }
+
+    void onTokenPrivilegeWillExpire(const char* /*token*/) override {
+        if (callbacks.on_token_expiring) callbacks.on_token_expiring(callback_ctx);
+    }
+
+    void onRequestToken() override {
+        if (callbacks.on_token_expiring) callbacks.on_token_expiring(callback_ctx);
     }
 
     void onUserOffline(agora::rtc::uid_t u,
@@ -548,7 +616,7 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
             agora::rtc::ChannelMediaOptions options{};
             options.publishScreenTrack = true;
             options.publishCameraTrack = false;
-            options.publishMicrophoneTrack = (impl->enable_audio != 0);
+            impl->audio_options(options, impl->screen_audio, impl->mic_muted);
             int opt_ret = impl->rtc_engine->updateChannelMediaOptions(options);
             if (opt_ret != 0) {
                 const char* desc = impl->rtc_engine->getErrorDescription(opt_ret);
@@ -588,7 +656,7 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
                     agora::rtc::ChannelMediaOptions options{};
                     options.publishScreenTrack = true;
                     options.publishCameraTrack = false;
-                    options.publishMicrophoneTrack = (impl->enable_audio != 0);
+                    impl->audio_options(options, impl->screen_audio, impl->mic_muted);
                     int opt_ret = impl->rtc_engine->updateChannelMediaOptions(options);
                     if (opt_ret != 0) {
                         const char* retry_desc = impl->rtc_engine->getErrorDescription(opt_ret);
@@ -625,7 +693,7 @@ static int start_screen_share_internal(AStationRtcEngineImpl* impl,
                     agora::rtc::ChannelMediaOptions options{};
                     options.publishScreenTrack = true;
                     options.publishCameraTrack = false;
-                    options.publishMicrophoneTrack = (impl->enable_audio != 0);
+                    impl->audio_options(options, impl->screen_audio, impl->mic_muted);
                     int opt_ret = impl->rtc_engine->updateChannelMediaOptions(options);
                     if (opt_ret != 0) {
                         const char* retry_desc = impl->rtc_engine->getErrorDescription(opt_ret);
@@ -735,14 +803,11 @@ int astation_rtc_join(AStationRtcEngine* engine) {
         impl->uid,
         [&]() {
             agora::rtc::ChannelMediaOptions options{};
-            options.publishMicrophoneTrack = impl->enable_audio && !impl->custom_audio && !impl->mic_muted;
-            if (impl->custom_audio && impl->audio_track != UINT32_MAX) {
-                options.publishCustomAudioTrack = !impl->mic_muted;
-                options.publishCustomAudioTrackId = impl->audio_track;
-                options.enableAudioRecordingOrPlayout = true;
-            }
+            impl->audio_options(options, impl->screen_audio, impl->mic_muted);
             options.publishCameraTrack = false;
-            options.publishScreenTrack = impl->screen_sharing;
+            options.publishScreenTrack = impl->screen_sharing && !impl->external_screen;
+            options.publishCustomVideoTrack = impl->screen_sharing && impl->external_screen;
+            options.customVideoTrackId = impl->screen_video_track;
             options.autoSubscribeAudio = true;
             options.autoSubscribeVideo = true;
             return options;
@@ -755,6 +820,13 @@ int astation_rtc_join(AStationRtcEngine* engine) {
             ret, desc ? desc : "unknown");
     }
     return ret;
+}
+
+int astation_rtc_renew_token(AStationRtcEngine* engine, const char* token) {
+    if (!engine || !token || !token[0]) return -1;
+    auto* impl = reinterpret_cast<AStationRtcEngineImpl*>(engine);
+    if (!impl->rtc_engine) return -1;
+    return impl->rtc_engine->renewToken(token);
 }
 
 int astation_rtc_leave(AStationRtcEngine* engine) {
@@ -775,11 +847,7 @@ int astation_rtc_leave(AStationRtcEngine* engine) {
         "[AStationRtc] Leaving channel=%s\n", impl->channel.c_str());
 
     if (impl->screen_sharing) {
-        agora::rtc::ChannelMediaOptions options{};
-        options.publishScreenTrack = false;
-        impl->rtc_engine->updateChannelMediaOptions(options);
-        impl->rtc_engine->stopScreenCapture();
-        impl->screen_sharing = false;
+        astation_rtc_stop_screen_share(engine);
     }
 
     int ret = impl->rtc_engine->leaveChannel();
@@ -803,18 +871,13 @@ int astation_rtc_mute_mic(AStationRtcEngine* engine, int mute) {
         impl->refresh_recording_device("unmute_mic");
     }
 
-    int ret = 0;
-    if (impl->custom_audio) {
-        if (impl->joined) {
-            agora::rtc::ChannelMediaOptions options{};
-            options.publishMicrophoneTrack = false;
-            options.publishCustomAudioTrack = (mute == 0);
-            options.publishCustomAudioTrackId = impl->audio_track;
-            ret = impl->rtc_engine->updateChannelMediaOptions(options);
-        }
-    } else {
-        ret = impl->rtc_engine->muteLocalAudioStream(mute != 0);
-    }
+    // Muting the microphone must leave the independently selected system audio audible.
+    agora::rtc::ChannelMediaOptions options{};
+    int ret = impl->configure_audio_mixer(impl->screen_audio, mute != 0);
+    if (ret != 0) return ret;
+    impl->audio_options(options, impl->screen_audio, mute != 0);
+    ret = impl->joined ? impl->rtc_engine->updateChannelMediaOptions(options) : 0;
+    if (ret != 0) impl->configure_audio_mixer(impl->screen_audio, impl->mic_muted);
     if (ret == 0) {
         impl->mic_muted = (mute != 0);
         std::fprintf(stderr,
@@ -925,10 +988,15 @@ int astation_rtc_stop_screen_share(AStationRtcEngine* engine) {
     }
 
 #if (defined(__APPLE__) && TARGET_OS_MAC && !TARGET_OS_IPHONE) || defined(_WIN32)
+    if (!impl->screen_sharing && !impl->external_screen && !impl->screen_audio) return 0;
+    int publish_ret = 0;
     if (impl->joined) {
         agora::rtc::ChannelMediaOptions options{};
         options.publishScreenTrack = false;
+        options.publishCustomVideoTrack = false;
+        impl->audio_options(options, false, impl->mic_muted);
         int opt_ret = impl->rtc_engine->updateChannelMediaOptions(options);
+        publish_ret = opt_ret;
         if (opt_ret != 0) {
             const char* desc = impl->rtc_engine->getErrorDescription(opt_ret);
             std::fprintf(stderr,
@@ -936,7 +1004,7 @@ int astation_rtc_stop_screen_share(AStationRtcEngine* engine) {
                 opt_ret, desc ? desc : "unknown");
         }
     }
-    int ret = impl->rtc_engine->stopScreenCapture();
+    int ret = impl->external_screen ? 0 : impl->rtc_engine->stopScreenCapture();
     if (ret != 0) {
         const char* desc = impl->rtc_engine->getErrorDescription(ret);
         std::fprintf(stderr,
@@ -946,12 +1014,125 @@ int astation_rtc_stop_screen_share(AStationRtcEngine* engine) {
         std::fprintf(stderr, "[AStationRtc] Screen sharing stopped\n");
     }
     impl->screen_sharing = false;
-    return ret;
+    impl->external_screen = false;
+    impl->screen_audio = false;
+    const int mixer_ret = impl->configure_audio_mixer(false, impl->mic_muted);
+    if (publish_ret == 0) publish_ret = mixer_ret;
+    return ret != 0 ? ret : publish_ret;
 #else
     std::fprintf(stderr,
         "[AStationRtc] Screen sharing not available on this platform\n");
     return -1;
 #endif
+}
+
+int astation_rtc_start_external_screen_share(AStationRtcEngine* engine,
+                                             int width, int height, int fps,
+                                             int capture_audio) {
+    if (!engine || width < 2 || height < 2 || fps < 1 || fps > 60) return -1;
+    auto* impl = reinterpret_cast<AStationRtcEngineImpl*>(engine);
+    if (!impl->rtc_engine || !impl->media_engine || !impl->joined) return -1;
+    if (impl->screen_video_track == 0xffffffff) return -1;
+    if (capture_audio && impl->screen_audio_track == 0xffffffff) return -1;
+
+    agora::rtc::VideoEncoderConfiguration config;
+    config.codecType = agora::rtc::VIDEO_CODEC_H264;
+    config.dimensions = agora::rtc::VideoDimensions(width, height);
+    config.frameRate = fps;
+    config.bitrate = static_cast<int>(std::clamp(
+        static_cast<double>(width) * height * fps * 0.1 / 1000.0, 4000.0, 50000.0));
+    config.degradationPreference = agora::rtc::MAINTAIN_QUALITY;
+    config.advanceOptions.encodingPreference = agora::rtc::PREFER_HARDWARE;
+    int ret = impl->rtc_engine->setVideoEncoderConfiguration(config);
+    if (ret != 0) return ret;
+
+    agora::rtc::ChannelMediaOptions options{};
+    options.publishCameraTrack = false;
+    options.publishScreenTrack = false;
+    options.publishCustomVideoTrack = true;
+    options.customVideoTrackId = impl->screen_video_track;
+    ret = impl->configure_audio_mixer(capture_audio != 0, impl->mic_muted);
+    if (ret != 0) return ret;
+    impl->audio_options(options, capture_audio != 0, impl->mic_muted);
+    ret = impl->rtc_engine->updateChannelMediaOptions(options);
+    if (ret != 0) {
+        impl->configure_audio_mixer(impl->screen_audio, impl->mic_muted);
+        return ret;
+    }
+    impl->screen_sharing = true;
+    impl->external_screen = true;
+    impl->screen_audio = capture_audio != 0;
+    std::fprintf(stderr,
+        "[AStationRtc] ScreenCaptureKit publication: %dx%d target=%dfps bitrate=%dkbps audio=%d\n",
+        width, height, fps, config.bitrate, capture_audio);
+    return 0;
+}
+
+int astation_rtc_push_screen_video(AStationRtcEngine* engine, void* pixel_buffer,
+                                    int width, int height, int64_t timestamp_ms) {
+    if (!engine || !pixel_buffer || width < 2 || height < 2) return -1;
+    auto* impl = reinterpret_cast<AStationRtcEngineImpl*>(engine);
+    if (!impl->external_screen || !impl->media_engine) return -1;
+#ifdef __APPLE__
+    auto buffer = static_cast<CVPixelBufferRef>(pixel_buffer);
+    if (CVPixelBufferGetPixelFormatType(buffer) != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+        CVPixelBufferGetPlaneCount(buffer) != 2 ||
+        CVPixelBufferGetWidth(buffer) != static_cast<size_t>(width) ||
+        CVPixelBufferGetHeight(buffer) != static_cast<size_t>(height) ||
+        width % 2 != 0 || height % 2 != 0) return -1;
+    if (CVPixelBufferLockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) return -1;
+    auto* y = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(buffer, 0));
+    auto* uv = static_cast<uint8_t*>(CVPixelBufferGetBaseAddressOfPlane(buffer, 1));
+    const size_t y_stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0);
+    const size_t uv_stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1);
+    agora::media::base::ExternalVideoFrame frame;
+    frame.format = agora::media::base::VIDEO_PIXEL_NV12;
+    frame.height = height;
+    frame.timestamp = timestamp_ms;
+    int result = -1;
+    // The C++ SDK accepts raw NV12, not the CVPixelBuffer formats of the Swift SDK.
+    if (y && uv && y_stride == uv_stride && y_stride >= static_cast<size_t>(width) &&
+        uv == y + y_stride * height) {
+        frame.buffer = y;
+        frame.stride = static_cast<int>(y_stride);
+        frame.cropRight = frame.stride - width;
+        result = impl->media_engine->pushVideoFrame(&frame, impl->screen_video_track);
+    } else {
+        impl->screen_video_buffer.resize(static_cast<size_t>(width) * height * 3 / 2);
+        if (astation_copy_nv12_planes(impl->screen_video_buffer.data(), impl->screen_video_buffer.size(),
+                                     y, y_stride, uv, uv_stride, width, height) == 0) {
+            frame.buffer = impl->screen_video_buffer.data();
+            frame.stride = width;
+            result = impl->media_engine->pushVideoFrame(&frame, impl->screen_video_track);
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(buffer, kCVPixelBufferLock_ReadOnly);
+    return result;
+#else
+    (void)timestamp_ms;
+    return -1;
+#endif
+}
+
+int astation_rtc_push_screen_audio(AStationRtcEngine* engine, const int16_t* data,
+                                    int samples_per_channel, int64_t timestamp_ms) {
+    if (!engine || !data || samples_per_channel != 480) return -1;
+    auto* impl = reinterpret_cast<AStationRtcEngineImpl*>(engine);
+    if (!impl->screen_audio || !impl->media_engine) return -1;
+    agora::media::IAudioFrameObserverBase::AudioFrame frame;
+    frame.samplesPerChannel = samples_per_channel;
+    frame.bytesPerSample = agora::rtc::TWO_BYTES_PER_SAMPLE;
+    frame.channels = 2;
+    frame.samplesPerSec = 48000;
+    frame.buffer = const_cast<int16_t*>(data);
+    frame.renderTimeMs = timestamp_ms;
+    return impl->media_engine->pushAudioFrame(&frame, impl->screen_audio_track);
+}
+
+int64_t astation_rtc_monotonic_time_ms(AStationRtcEngine* engine) {
+    if (!engine) return 0;
+    auto* impl = reinterpret_cast<AStationRtcEngineImpl*>(engine);
+    return impl->rtc_engine ? impl->rtc_engine->getCurrentMonotonicTimeInMs() : 0;
 }
 
 int astation_rtc_get_screen_sources(AStationRtcEngine* engine,

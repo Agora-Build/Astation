@@ -5,6 +5,7 @@ repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="$repo_dir/.build/debug"
 app_bundle="${ASTATION_DEV_BUNDLE_DIR:-$repo_dir/.build/Astation Dev.app}"
 app_executable="$app_bundle/Contents/MacOS/Astation"
+signing_requirement='designated => identifier "build.agora.astation"'
 
 if [[ ! -x "$build_dir/astation" ]]; then
     printf 'Build the Swift app first: swift build\n' >&2
@@ -38,8 +39,9 @@ for resource in "$build_dir"/*.bundle; do
 done
 # Replace atomically: a pending privacy check may still hold the old file open.
 install_name_tool -add_rpath '@executable_path/../Frameworks' "$staged_executable"
-codesign --force --sign - --identifier build.agora.astation "$staged_executable"
+# Keep the development permission identity stable across rebuilds.
+codesign --force --sign - --identifier build.agora.astation --requirements "=$signing_requirement" "$staged_executable"
 mv -f "$staged_executable" "$app_executable"
-codesign --force --sign - --identifier build.agora.astation "$app_bundle"
+codesign --force --sign - --identifier build.agora.astation --requirements "=$signing_requirement" "$app_bundle"
 codesign --verify --deep --strict "$app_bundle"
 printf 'Development bundle: %s\n' "$app_bundle"

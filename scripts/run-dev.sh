@@ -9,7 +9,7 @@ Usage: ./scripts/run-dev.sh [--force-build] [--build-only]
   --build-only   Build both components without launching Astation.
   -h, --help     Show this help.
 
-Without options, incrementally build Swift, package and open Astation Dev.app.
+Without options, incrementally build Swift, then launch a signed development app.
 Build C++ if missing. Quit Astation from its menu to stop it.
 Downloaded dependencies and SDKs are retained during a forced rebuild.
 
@@ -81,9 +81,10 @@ fi
 printf 'Building Swift app...\n'
 swift build --configuration debug --product astation
 bash "$repo_dir/scripts/package-dev-app.sh"
+app_bundle="${ASTATION_DEV_BUNDLE_DIR:-$repo_dir/.build/Astation Dev.app}"
 
 if [[ "$build_only" == true ]]; then
-    printf 'Build complete: %s\n' "$repo_dir/.build/Astation Dev.app"
+    printf 'Build complete: %s\n' "$app_bundle"
     exit 0
 fi
 
@@ -92,5 +93,5 @@ launch_args=(-W -n)
 for variable in ASTATION_RELAY_URL ASTATION_SSO_URL ASTATION_BFF_URL ASTATION_NETWORK_DEBUG; do
     if [[ -n "${!variable:-}" ]]; then launch_args+=(--env "$variable=${!variable}"); fi
 done
-# LaunchServices gives capture permission to Astation rather than the terminal.
-exec /usr/bin/open "${launch_args[@]}" "$repo_dir/.build/Astation Dev.app"
+# LaunchServices attributes screen/audio permission to Astation rather than the terminal.
+exec /usr/bin/open "${launch_args[@]}" "$app_bundle"
