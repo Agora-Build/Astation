@@ -27,8 +27,8 @@ swift build -c release
 ```
 
 **What happens during build:**
-- CMake detects missing Agora SDK and downloads 7 xcframeworks from `https://download.agora.io/swiftpm/AgoraRtcEngine_macOS/4.6.2/`
-- Swift Package Manager resolves `AgoraRtcEngine_macOS` dependency automatically
+- CMake detects missing Agora SDK and downloads 7 xcframeworks from `https://download.agora.io/swiftpm/AgoraRtcEngine_macOS/4.7.0/`
+- CMake and Swift Package Manager use the same Agora SDK version (4.7.0).
 - No manual SDK downloads needed!
 
 **Troubleshooting:**
@@ -322,8 +322,10 @@ invoke it using its absolute path. Install CMake with `brew install cmake`, or s
 `CMAKE=/path/to/cmake`. Existing CMake SDK settings are preserved; optional
 `AGORA_SDK_DIR` and `AGORA_SKIP_DOWNLOAD` environment variables override them.
 Quit any existing Astation instance before launching the development build.
-Astation appears in the macOS menu bar; press Ctrl+C in the launching terminal to
-stop it. A failed build stops the script without launching an older executable.
+The script creates a signed `.build/Astation Dev.app` and launches it through
+LaunchServices so macOS attributes screen/audio permission to Astation. Quit
+from Astation's menu to stop it; Ctrl+C only stops the launcher.
+A failed build stops the script without launching an older executable.
 
 ```bash
 # Run these from the repo root after building both components.

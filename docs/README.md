@@ -6,6 +6,7 @@ work. Completed implementation checklists are available in Git history.
 | Document | Why it is retained |
 | --- | --- |
 | [Android device sharing](android-device-sharing.md) | Connection model, setup, lifecycle, and pending phone/IDE validation |
+| [Screen sharing](screen-sharing.md) | ScreenCaptureKit capture, Agora publication, optional system audio, browser controls, and verification |
 | [SSO authentication design](sso-authentication.md) | Browser login, token refresh, encrypted session storage, and credential consumers |
 | [Vault storage design](vault-storage.md) | Storage semantics, persistence, caller resolution, and concurrency boundaries |
 | [Device Authentication v2](specs/2026-07-21-device-authentication-v2.md) | Wire protocol shared with Atem and unresolved production blockers |

@@ -31,21 +31,19 @@ class SessionLinkManager {
         }
 
         let hostUid = Int(hubManager.rtcManager.currentUid)
+        guard let appId = hubManager.rtcManager.appId else {
+            throw SessionLinkError.noProject
+        }
 
         // Generate a uid=0 wildcard publisher token
         let tokenResponse = await hubManager.generateRTCToken(
             channel: channel,
-            uid: 0
+            uid: 0,
+            projectId: appId
         )
 
         guard !tokenResponse.token.isEmpty else {
             throw SessionLinkError.tokenGenerationFailed
-        }
-
-        // Find the project to get appId
-        let appId = hubManager.getProjects().first?.vendorKey ?? ""
-        guard !appId.isEmpty else {
-            throw SessionLinkError.noProject
         }
 
         // POST to api-server
