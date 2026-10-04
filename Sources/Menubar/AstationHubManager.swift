@@ -196,7 +196,7 @@ class AstationHubManager: ObservableObject {
             Log.info("Remote user left: \(uid)")
         }
         rtcManager.onTokenRenewalNeeded = { [weak self] in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self, let channel = self.rtcManager.currentChannel,
                       let appId = self.rtcManager.appId else { return }
                 let uid = self.rtcManager.currentUid
