@@ -55,6 +55,11 @@ enum AstationMessage: Codable {
     // Remote agent control (Astation → Atem): text or key input to the agent PTY.
     case agentInput(agentId: String?, kind: String, text: String?, key: String?)
 
+    case encryptionMode(mode: String, kid: String?, dataAccount: String, astationId: String)
+    case keyRequest(publicKey: String)
+    case keyGrant(kid: String, wrappedKey: String, dataAccount: String)
+    case encryptionMigrationComplete(mode: String, kid: String)
+
     // Custom encoding/decoding to handle the enum cases
     private enum CodingKeys: String, CodingKey {
         case type
@@ -91,6 +96,10 @@ enum AstationMessage: Codable {
         case agentListResponse
         case credentialSync
         case agentInput
+        case encryptionMode
+        case keyRequest
+        case keyGrant
+        case encryptionMigrationComplete
     }
     
     func encode(to encoder: Encoder) throws {
@@ -269,6 +278,32 @@ enum AstationMessage: Codable {
             try dc.encode(kind, forKey: .kind)
             try dc.encodeIfPresent(text, forKey: .text)
             try dc.encodeIfPresent(key, forKey: .key)
+
+        case .encryptionMode(let mode, let kid, let dataAccount, let astationId):
+            try container.encode(MessageType.encryptionMode, forKey: .type)
+            var dc = container.nestedContainer(keyedBy: EncryptionKeys.self, forKey: .data)
+            try dc.encode(mode, forKey: .mode)
+            try dc.encodeIfPresent(kid, forKey: .kid)
+            try dc.encode(dataAccount, forKey: .dataAccount)
+            try dc.encode(astationId, forKey: .astationId)
+
+        case .keyRequest(let publicKey):
+            try container.encode(MessageType.keyRequest, forKey: .type)
+            var dc = container.nestedContainer(keyedBy: EncryptionKeys.self, forKey: .data)
+            try dc.encode(publicKey, forKey: .publicKey)
+
+        case .keyGrant(let kid, let wrappedKey, let dataAccount):
+            try container.encode(MessageType.keyGrant, forKey: .type)
+            var dc = container.nestedContainer(keyedBy: EncryptionKeys.self, forKey: .data)
+            try dc.encode(kid, forKey: .kid)
+            try dc.encode(wrappedKey, forKey: .wrappedKey)
+            try dc.encode(dataAccount, forKey: .dataAccount)
+
+        case .encryptionMigrationComplete(let mode, let kid):
+            try container.encode(MessageType.encryptionMigrationComplete, forKey: .type)
+            var dc = container.nestedContainer(keyedBy: EncryptionKeys.self, forKey: .data)
+            try dc.encode(mode, forKey: .mode)
+            try dc.encode(kid, forKey: .kid)
         }
     }
 
@@ -286,6 +321,14 @@ enum AstationMessage: Codable {
         case kind
         case text
         case key
+    }
+
+    private enum EncryptionKeys: String, CodingKey {
+        case mode, kid
+        case dataAccount = "data_account"
+        case astationId = "astation_id"
+        case publicKey = "public_key"
+        case wrappedKey = "wrapped_key"
     }
     
     init(from decoder: Decoder) throws {
@@ -472,6 +515,34 @@ enum AstationMessage: Codable {
             let text = try dc.decodeIfPresent(String.self, forKey: .text)
             let key = try dc.decodeIfPresent(String.self, forKey: .key)
             self = .agentInput(agentId: agentId, kind: kind, text: text, key: key)
+
+        case .encryptionMode:
+            let dc = try container.nestedContainer(keyedBy: EncryptionKeys.self, forKey: .data)
+            self = .encryptionMode(
+                mode: try dc.decode(String.self, forKey: .mode),
+                kid: try dc.decodeIfPresent(String.self, forKey: .kid),
+                dataAccount: try dc.decode(String.self, forKey: .dataAccount),
+                astationId: try dc.decode(String.self, forKey: .astationId)
+            )
+
+        case .keyRequest:
+            let dc = try container.nestedContainer(keyedBy: EncryptionKeys.self, forKey: .data)
+            self = .keyRequest(publicKey: try dc.decode(String.self, forKey: .publicKey))
+
+        case .keyGrant:
+            let dc = try container.nestedContainer(keyedBy: EncryptionKeys.self, forKey: .data)
+            self = .keyGrant(
+                kid: try dc.decode(String.self, forKey: .kid),
+                wrappedKey: try dc.decode(String.self, forKey: .wrappedKey),
+                dataAccount: try dc.decode(String.self, forKey: .dataAccount)
+            )
+
+        case .encryptionMigrationComplete:
+            let dc = try container.nestedContainer(keyedBy: EncryptionKeys.self, forKey: .data)
+            self = .encryptionMigrationComplete(
+                mode: try dc.decode(String.self, forKey: .mode),
+                kid: try dc.decode(String.self, forKey: .kid)
+            )
         }
     }
 }

@@ -223,6 +223,29 @@ enum RelayControlFrame: Equatable {
     case accountState(devices: [RelayAccountDevice], requests: [RelayMergeRequest])
     case mergeApproval(RelayMergeApproval)
     case accountChanged(reason: String, requestId: String?)
+    case encryptionState(RelayEncryptionState)
+    case encryptionChanged(mode: String, kid: String?)
+}
+
+struct RelayEncryptionState: Codable, Equatable {
+    let dataAccount: String
+    let mode: String
+    let kid: String?
+    let enabledAt: Int64?
+    let updatedAt: Int64
+    let plaintextFields: Int64
+    let ciphertextFields: Int64
+    let obsoleteFields: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case dataAccount = "data_account"
+        case mode, kid
+        case enabledAt = "enabled_at"
+        case updatedAt = "updated_at"
+        case plaintextFields = "plaintext_fields"
+        case ciphertextFields = "ciphertext_fields"
+        case obsoleteFields = "obsolete_fields"
+    }
 }
 
 struct RelayAccountDevice: Codable, Equatable {
@@ -325,6 +348,12 @@ enum RelayIdentityProtocol {
         case "relayAccountChanged":
             guard let reason = object["reason"] as? String else { return nil }
             return .accountChanged(reason: reason, requestId: object["request_id"] as? String)
+        case "relayEncryptionState":
+            guard let state = decode(RelayEncryptionState.self, from: object) else { return nil }
+            return .encryptionState(state)
+        case "relayEncryptionChanged":
+            guard let mode = object["mode"] as? String else { return nil }
+            return .encryptionChanged(mode: mode, kid: object["kid"] as? String)
         default:
             return nil
         }
@@ -400,6 +429,16 @@ enum RelayIdentityProtocol {
 
     static func removeAstationMessage(astationId: String) -> String? {
         encode(["type": "relayRemoveAstation", "target_astation_id": astationId])
+    }
+
+    static func encryptionStateMessage() -> String? {
+        encode(["type": "relayEncryptionGet"])
+    }
+
+    static func encryptionSetMessage(mode: String, kid: String?) -> String? {
+        var object = ["type": "relayEncryptionSet", "mode": mode]
+        if let kid { object["kid"] = kid }
+        return encode(object)
     }
 
     private static func decode<T: Decodable>(_ type: T.Type, from object: Any?) -> T? {
