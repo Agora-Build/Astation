@@ -39,6 +39,78 @@ final class KeyboardShortcutTests: XCTestCase {
     private let customVoice = KeyboardShortcut(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(controlKey | optionKey))
     private let customVideo = KeyboardShortcut(keyCode: UInt32(kVK_ANSI_B), modifiers: UInt32(controlKey | optionKey))
 
+    func testLegacyBindingsMigrateWithRecordingUnbound() throws {
+        let storage = defaults()
+        let legacy = "{\"voice\":{\"keyCode\":9,\"modifiers\":4096},\"video\":{\"keyCode\":9,\"modifiers\":4608}}"
+        storage.set(Data(legacy.utf8), forKey: HotkeyManager.defaultsKey)
+        let manager = manager(FakeHotkeyRegistrar(), defaults: storage)
+        XCTAssertEqual(manager.bindings.voice?.keyCode, 9)
+        XCTAssertEqual(manager.bindings.voice?.modifiers, 4096)
+        XCTAssertNil(manager.bindings.recording)
+        XCTAssertNil(manager.bindings.recordingPause)
+        XCTAssertNil(manager.bindings.floatingCaptions)
+        XCTAssertNil(manager.bindings.handsFreeDictation)
+    }
+    func testHandsFreeDictationBindingPersistsChecksConflictsAndSuppressesRepeat() throws {
+        let storage = defaults(), registrar = FakeHotkeyRegistrar(), manager = manager(registrar, defaults: storage)
+        manager.registerHotkeys()
+        XCTAssertNotNil(manager.setShortcut(manager.bindings.voice, for: .handsFreeDictation))
+        XCTAssertNil(manager.setShortcut(customVoice, for: .handsFreeDictation))
+        XCTAssertNotNil(manager.setShortcut(customVoice, for: .floatingCaptions))
+        var toggles = 0; manager.onHandsFreeDictationToggle = { toggles += 1 }
+        let id = registrar.id(for: customVoice)
+        registrar.onEvent?(id, true); registrar.onEvent?(id, true); XCTAssertEqual(toggles, 1)
+        registrar.onEvent?(id, false); registrar.onEvent?(id, true); XCTAssertEqual(toggles, 2)
+        let restored = try JSONDecoder().decode(ShortcutBindings.self, from: XCTUnwrap(storage.data(forKey: HotkeyManager.defaultsKey)))
+        XCTAssertEqual(restored.handsFreeDictation, customVoice)
+    }
+
+    func testRecordingActionsUseConflictChecksAndSuppressRepeatedPresses() {
+        let registrar = FakeHotkeyRegistrar()
+        let manager = manager(registrar)
+        manager.registerHotkeys()
+        XCTAssertNotNil(manager.setShortcut(manager.bindings.voice, for: .recording))
+        XCTAssertNil(manager.setShortcut(customVoice, for: .recording))
+        XCTAssertNotNil(manager.setShortcut(customVoice, for: .recordingPause))
+        XCTAssertNil(manager.setShortcut(customVideo, for: .recordingPause))
+        var toggles = 0
+        var pauses = 0
+        manager.onRecordingToggle = { toggles += 1 }
+        manager.onRecordingPause = { pauses += 1 }
+        let id = registrar.id(for: customVoice)
+        registrar.onEvent?(id, true)
+        registrar.onEvent?(id, true)
+        registrar.onEvent?(id, false)
+        registrar.onEvent?(id, true)
+        registrar.onEvent?(registrar.id(for: customVideo), true)
+        XCTAssertEqual(toggles, 2)
+        XCTAssertEqual(pauses, 1)
+    }
+    func testFloatingCaptionsShortcutPersistsChecksConflictsAndSuppressesHeldKey() throws {
+        _ = NSApplication.shared
+        let storage = defaults(), registrar = FakeHotkeyRegistrar()
+        let shortcuts = manager(registrar, defaults: storage)
+        shortcuts.registerHotkeys()
+        XCTAssertNotNil(shortcuts.setShortcut(shortcuts.bindings.voice, for: .floatingCaptions))
+        XCTAssertNil(shortcuts.setShortcut(customVoice, for: .floatingCaptions))
+        var toggles = 0
+        shortcuts.onFloatingCaptionsToggle = { toggles += 1 }
+        let id = registrar.id(for: customVoice)
+        registrar.onEvent?(id, true); registrar.onEvent?(id, true)
+        XCTAssertEqual(toggles, 1)
+        registrar.onEvent?(id, false); registrar.onEvent?(id, true)
+        XCTAssertEqual(toggles, 2)
+        let restored = try JSONDecoder().decode(ShortcutBindings.self, from: XCTUnwrap(storage.data(forKey: HotkeyManager.defaultsKey)))
+        XCTAssertEqual(restored.floatingCaptions, customVoice)
+        let controller = KeyboardShortcutsViewController(manager: shortcuts)
+        func views(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { views($0) } }
+        let binding = views(controller.view).compactMap { $0 as? NSButton }
+            .first { $0.accessibilityLabel() == "Toggle Floating Captions shortcut" }
+        XCTAssertEqual(binding?.title, customVoice.displayName)
+        XCTAssertNil(shortcuts.setShortcut(nil, for: .floatingCaptions))
+        registrar.onEvent?(id, true); XCTAssertEqual(toggles, 2)
+    }
+
     func testBindingValidationAndModifierNormalization() throws {
         XCTAssertNotNil(KeyboardShortcut(keyCode: UInt32(kVK_ANSI_A), modifiers: 0).validationError)
         XCTAssertNotNil(KeyboardShortcut(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(shiftKey)).validationError)
@@ -371,15 +443,22 @@ final class KeyboardShortcutTests: XCTestCase {
         window.isReleasedWhenClosed = false
         defer { window.close() }
         window.contentViewController = controller
-        controller.view.layoutSubtreeIfNeeded()
         let scroll = try XCTUnwrap(controller.view as? NSScrollView)
         let document = try XCTUnwrap(scroll.documentView)
-        XCTAssertFalse(document.hasAmbiguousLayout)
-        XCTAssertEqual(document.frame.width, scroll.contentSize.width, accuracy: 1)
-        XCTAssertGreaterThan(document.frame.height, scroll.contentSize.height)
-        document.scroll(NSPoint(x: 0, y: 100))
-        controller.view.layoutSubtreeIfNeeded()
-        XCTAssertGreaterThan(scroll.contentView.bounds.origin.y, 0)
+        for style in [NSScroller.Style.overlay, .legacy] {
+            scroll.scrollerStyle = style
+            controller.view.layoutSubtreeIfNeeded()
+            scroll.tile()
+            controller.view.layoutSubtreeIfNeeded()
+            XCTAssertFalse(document.hasAmbiguousLayout)
+            // Use the laid-out clip viewport, not contentSize's proposed size
+            // before AppKit settles legacy/autohiding scrollbar geometry.
+            XCTAssertEqual(document.frame.width, scroll.contentView.bounds.width, accuracy: 1)
+            XCTAssertGreaterThan(document.frame.height, scroll.contentView.bounds.height)
+            document.scroll(NSPoint(x: 0, y: 100))
+            controller.view.layoutSubtreeIfNeeded()
+            XCTAssertGreaterThan(scroll.contentView.bounds.origin.y, 0)
+        }
     }
 
     private func event(_ type: NSEvent.EventType, key: UInt16, flags: NSEvent.ModifierFlags) throws -> NSEvent {

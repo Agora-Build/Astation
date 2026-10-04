@@ -1,6 +1,7 @@
 import Cocoa
 import Foundation
 import NIO
+import CStationCore
 
 struct StartupFailureAlertContent: Equatable {
     let title: String
@@ -41,6 +42,9 @@ class AstationApp: NSObject, NSApplicationDelegate {
     private var authGrantController: AuthGrantController?
     private var hotkeyManager: HotkeyManager?
     private var androidDeviceManager: AndroidDeviceManager?
+    private var audioRecordingManager: AudioRecordingManager?
+    private var transcriptionToast: TranscriptionToastController?
+    private var voiceDictationManager: VoiceDictationManager?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.info("Initializing Astation components...")
@@ -90,8 +94,40 @@ class AstationApp: NSObject, NSApplicationDelegate {
         androidDeviceManager = androidDevices
         let shortcuts = HotkeyManager()
         hotkeyManager = shortcuts
+        let recorder = AudioRecordingManager()
+        audioRecordingManager = recorder
+        transcriptionToast = TranscriptionToastController(manager: recorder.transcription)
+        recorder.transcription.cloudEngineFactory = { [weak hubManager] settings in
+            guard let hubManager, let project = hubManager.effectiveProject, !project.signKey.isEmpty else {
+                throw TranscriptionError.message("Sign in and select an Agora project with an App Certificate and Real-Time STT enabled.")
+            }
+            let channel = "astation-caption-\(UUID().uuidString)"
+            let projectID = project.id
+            let hubReference = WeakTranscriptionHub(hubManager)
+            return AgoraCloudTranscriber(settings: settings, tokenProvider: {
+                try await MainActor.run {
+                    guard let hubManager = hubReference.value, let project = hubManager.getProjects().first(where: { $0.id == projectID }), !project.signKey.isEmpty else {
+                        throw TranscriptionError.message("Agora project access expired. Sign in again.")
+                    }
+                    func token(uid: UInt32) throws -> String {
+                        guard let ptr = astation_rtc_build_token(project.vendorKey, project.signKey, channel, uid, 1, 3600, 3600) else {
+                            throw TranscriptionError.message("Could not generate an Agora caption token.")
+                        }
+                        defer { astation_token_free(ptr) }
+                        let value = String(cString: ptr)
+                        guard value.hasPrefix("007") else { throw TranscriptionError.message("Agora caption token generation failed.") }
+                        return value
+                    }
+                    return AgoraTranscriptionTokens(appID: project.vendorKey, channel: channel, publisherUID: 101,
+                                                     botUID: 201, publisherToken: try token(uid: 101), botToken: try token(uid: 201))
+                }
+            })
+        }
         statusBarController = StatusBarController(hubManager: hubManager, webSocketServer: webSocketServer,
-                                                androidDeviceManager: androidDevices, hotkeyManager: shortcuts)
+                                                androidDeviceManager: androidDevices, hotkeyManager: shortcuts,
+                                                recordingManager: recorder)
+        voiceDictationManager = statusBarController.dictationManager
+        transcriptionToast?.attachDictation(statusBarController.dictationManager)
         
         // One listener supports offline loopback and authenticated LAN clients concurrently.
         let webSocketPort = 8080
@@ -125,14 +161,14 @@ class AstationApp: NSObject, NSApplicationDelegate {
 
         // Connect the saved global shortcuts to voice and video actions.
         hotkeyManager?.onVoiceKeyDown = { [weak self] in
-            let vcm = self?.hubManager.voiceCodingManager
+            let vcm = self?.voiceDictationManager
             if vcm?.mode == .off {
                 vcm?.startPTT()
             }
             self?.statusBarController.showStatus()
         }
         hotkeyManager?.onVoiceKeyUp = { [weak self] in
-            let vcm = self?.hubManager.voiceCodingManager
+            let vcm = self?.voiceDictationManager
             if vcm?.mode == .ptt {
                 vcm?.stopPTT()
             }
@@ -143,13 +179,21 @@ class AstationApp: NSObject, NSApplicationDelegate {
             self?.statusBarController.showStatus()
         }
         hotkeyManager?.registerHotkeys()
+        hotkeyManager?.onRecordingToggle = { [weak recorder] in recorder?.toggleRecording() }
+        hotkeyManager?.onRecordingPause = { [weak recorder] in recorder?.togglePause() }
+        hotkeyManager?.onFloatingCaptionsToggle = { [weak recorder] in recorder?.transcription.toggleFloatingCaptions() }
+        hotkeyManager?.onHandsFreeDictationToggle = { [weak self] in
+            guard let manager = self?.voiceDictationManager else { return }
+            if manager.mode == .handsFree { manager.stopHandsFree() }
+            else if manager.mode == .off { manager.startHandsFree() }
+        }
 
         // Connect to relay using this Astation's identity, so Atem TUI can auto-reconnect
         // after the first `atem pair` without needing to pair again.
         hubManager.startIdentityRelay()
 
         Log.info("Astation fully operational!")
-        Log.info("Global hotkeys: \(shortcuts.shortcutLabel(for: .voice)) (PTT voice coding), \(shortcuts.shortcutLabel(for: .video)) (video)")
+        Log.info("Global hotkeys: \(shortcuts.shortcutLabel(for: .voice)) (PTT voice dictation), \(shortcuts.shortcutLabel(for: .video)) (video)")
         Log.info("Log file: \(Log.logFile.path)")
     }
 
@@ -217,6 +261,9 @@ class AstationApp: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         Log.info("Shutting down Astation...")
         hotkeyManager?.unregisterAll()
+        voiceDictationManager?.cancel()
+        hubManager?.rtcManager.stopMicrophoneCapture()
+        audioRecordingManager?.shutdown()
         androidDeviceManager?.shutdown()
         webSocketServer?.stop()
         Log.info("Astation terminated")
@@ -300,4 +347,10 @@ class AstationApp: NSObject, NSApplicationDelegate {
         Log.info(" Pair deep link received with code: \(code)")
         hubManager?.connectToRelay(code: code)
     }
+}
+
+/// The reference is only read on MainActor when refreshing cloud credentials.
+private final class WeakTranscriptionHub: @unchecked Sendable {
+    weak var value: AstationHubManager?
+    init(_ value: AstationHubManager) { self.value = value }
 }

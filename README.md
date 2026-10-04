@@ -233,9 +233,94 @@ The `agentInput` payload contains `agentId`, `kind` (`text` or `key`), and the
 corresponding `text` or `key` field. Relay routing identifiers belong to the
 transport envelope. Voice continues through the existing voice-coding flow.
 
-### Voice-Driven Coding
+### Local Audio Recording
 
-Astation captures mic audio via AVAudioEngine, runs WebRTC VAD, streams through Agora RTC, and pushes transcriptions via Agora RTM to the active Atem instance. See `designs/data-flow-between-atem-and-astation.md` in the Atem repo.
+Open **Settings > Audio & Recording** to select a microphone, selected
+applications, or all system audio. A microphone can accompany either output
+mode. Application capture records all associated audio, including browser tabs.
+System mode excludes Astation's own playback.
+System and application capture require macOS 14.2 or later; microphone capture
+works on macOS 14.
+
+Use **Start Preview** to check each source's real waveform, RMS/peak levels, and
+clipping indicator before recording. Preview is visual only and creates no files.
+Closing the page stops preview, but an active recording continues with a red
+menu-bar indicator. **Pause** keeps preview live while excluding paused audio
+from the recording.
+
+Recordings are local, separate original Float PCM tracks in CAF or WAV. Choose
+the output folder and 15/30/60 minute file splitting. Each session includes a
+`session.json` manifest describing native formats, timing gaps, dropped frames,
+and completion or failure. Use **Show Recording** to open the session folder.
+No Agora account, RTC channel, SoX, or virtual audio device is needed.
+
+Start/stop and pause/resume shortcuts can be bound in **Keyboard Shortcuts**;
+they start unbound and use the same conflict checks as voice/video shortcuts.
+Filters, AI noise removal, a virtual microphone, and an OBS filter are later
+milestones; originals are currently saved without Astation processing.
+
+See [audio recording validation](docs/audio-recording.md) for native capture
+checks and the [implementation plan](docs/plans/2026-10-03-audio-recording.md).
+
+### Live Transcription
+
+**Settings > Live Transcription** is a standalone page with three downloadable
+on-device models: Parakeet EOU (low-latency English, about 224 MB), Whisper large-v3
+Turbo (faster multilingual, 1.64 GB), and full Whisper large-v3 (accuracy-oriented,
+3.09 GB). Switch models in settings; these labels describe tradeoffs, not
+guaranteed benchmark rankings.
+Enable sources in **Audio & Recording**, then check mic, system audio, or one or
+more selected apps for transcription. Mic can run alongside system audio or apps;
+all-system and selected-app capture are alternative modes. Download the model
+once, then transcribe offline with separate labeled captions per source.
+Each source uses additional processing and memory. Original tracks are unchanged.
+
+Record without captions, transcribe without saving audio, or run both together.
+Their Start/Stop controls are independent: stopping one leaves the other running.
+
+Floating captions support multiple lines and a rolling **20-second** history.
+Drag the window anywhere, including an external monitor; updates keep its position
+without stealing keyboard focus. Turn floating captions on or off in settings.
+New speech restores the toast after automatic timeout. After Hide, use
+**Show Floating Captions** in the Astation menu or settings. Bind **Toggle Floating
+Captions** in **Keyboard Shortcuts** for global show/hide control (unbound by default).
+Copy or save the session transcript as TXT or JSON. Optional auto-save keeps
+finalized TXT and live JSONL history in `~/Documents/Astation/Transcripts`,
+independently of audio recording.
+
+For other languages or live translation, choose **Agora cloud** and explicitly
+approve sending the checked sources to Agora. This uses the signed-in project
+with Real-Time STT enabled; each source starts a separate potentially billed
+cloud session. **Custom - OpenAI-compatible HTTP** supports your own full
+`/v1/audio/transcriptions` endpoint, model name, optional Keychain API key, and
+5/10/15-second speech upload windows. Remote modes require explicit audio-upload
+consent. See the
+[transcription guide](docs/live-transcription.md) for privacy, model mirrors,
+publishing, and validation details.
+
+### Voice Dictation
+
+**Settings > Voice Dictation** configures local-microphone push-to-talk and Hands-Free
+dictation, independently of RTC. It uses the installed local ASR profile selected
+in Live Transcription. Mic transcription disables both dictation modes; system/app-only
+transcription can run alongside them.
+
+The **Polish** dial in settings and floating captions optionally adds an ASR-to-LLM
+editing step. Choose Apple on-device, local Qwen through Ollama/llama.cpp, OpenAI
+cloud, or a custom OpenAI-compatible endpoint. Polishing defaults off; remote text
+uploads require endpoint-specific consent and API keys stay in Keychain. Local
+Qwen requires a separately installed runtime/model; there is no silent cloud fallback.
+
+Choose captions only, explicit typing into the original active text field
+(Accessibility permission required; no Return/key/clipboard injection), or the active
+connected Atem. If polishing fails or the destination changes focus, text stays
+local instead of being silently sent elsewhere. See the
+[dictation guide](docs/live-transcription.md#voice-dictation-and-optional-llm-polishing).
+
+RTC and local recording/dictation share native microphone capture by device but
+use separate branches. RTC join/leave and mute gate publishing, not local capture;
+Agora audio processing is enabled on RTC's custom track, while original recordings
+stay unprocessed. Release RTC Microphone explicitly to relinquish its capture lease.
 
 ## Architecture
 
@@ -323,7 +408,7 @@ invoke it using its absolute path. Install CMake with `brew install cmake`, or s
 `AGORA_SDK_DIR` and `AGORA_SKIP_DOWNLOAD` environment variables override them.
 Quit any existing Astation instance before launching the development build.
 The script creates a signed `.build/Astation Dev.app` and launches it through
-LaunchServices so macOS attributes screen/audio permission to Astation. Quit
+LaunchServices so macOS attributes microphone/screen/audio permissions to Astation. Quit
 from Astation's menu to stop it; Ctrl+C only stops the launcher.
 A failed build stops the script without launching an older executable.
 

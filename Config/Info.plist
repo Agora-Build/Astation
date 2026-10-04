@@ -28,9 +28,9 @@
         </dict>
     </array>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Use your microphone in Agora calls when you enable it.</string>
+    <string>Record and preview your selected microphone, and use voice features when you enable them.</string>
     <key>NSAudioCaptureUsageDescription</key>
-    <string>Share audio from other apps when you include system audio in screen sharing.</string>
+    <string>Record, transcribe, preview, or share audio from the applications or system output you select.</string>
     <key>NSCameraUsageDescription</key>
     <string>Share camera video when you enable video features.</string>
 </dict>

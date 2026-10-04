@@ -22,6 +22,9 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var sidebarTable: NSTableView?
     private let hubManager: AstationHubManager
     private let shortcutsController: KeyboardShortcutsViewController
+    private let recordingController: AudioRecordingViewController
+    private let transcriptionController: TranscriptionViewController
+    private let dictationController: VoiceDictationViewController?
     private var statusLabel: NSTextField!
     private var signInButton: NSButton!
     private var signOutButton: NSButton!
@@ -43,10 +46,18 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var pendingEncryptionKid: String?
     private var pendingEncryptionKey: AccountDataKey?
 
-    init(hubManager: AstationHubManager, hotkeyManager: HotkeyManager) {
+    init(hubManager: AstationHubManager, hotkeyManager: HotkeyManager,
+         recordingManager: AudioRecordingManager = AudioRecordingManager(), dictationManager: VoiceDictationManager? = nil) {
         self.hubManager = hubManager
         self.shortcutsController = KeyboardShortcutsViewController(manager: hotkeyManager)
+        self.recordingController = AudioRecordingViewController(manager: recordingManager, hotkeys: hotkeyManager)
+        self.transcriptionController = TranscriptionViewController(recorder: recordingManager)
+        self.dictationController = dictationManager.map { VoiceDictationViewController(manager: $0) }
         super.init()
+        transcriptionController.onConfigureSources = { [weak self] in
+            self?.tabView?.selectTabViewItem(withIdentifier: "recording")
+        }
+        dictationController?.onConfigureTranscription = { [weak self] in self?.tabView?.selectTabViewItem(withIdentifier: "transcription") }
         NotificationCenter.default.addObserver(
             self, selector: #selector(networkChanged),
             name: .networkChanged, object: nil)
@@ -194,6 +205,14 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         shortcuts.label = "Keyboard Shortcuts"
         shortcuts.viewController = shortcutsController
         tabs.addTabViewItem(shortcuts)
+        for item in Self.audioTabItems(recording: recordingController, transcription: transcriptionController) {
+            tabs.addTabViewItem(item)
+        }
+        if let dictationController {
+            let dictation = NSTabViewItem(identifier: "dictation")
+            dictation.label = "Voice Dictation"; dictation.viewController = dictationController
+            tabs.addTabViewItem(dictation)
+        }
         let security = NSTabViewItem(identifier: "security")
         security.label = "Security"
         security.view = makeSecurityView()
@@ -1050,7 +1069,24 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
 
     // MARK: - NSWindowDelegate
 
+    static func audioTabItems(recording: AudioRecordingViewController, transcription: TranscriptionViewController) -> [NSTabViewItem] {
+        let audio = NSTabViewItem(identifier: "recording")
+        audio.label = "Audio & Recording"
+        audio.viewController = recording
+        let captions = NSTabViewItem(identifier: "transcription")
+        captions.label = "Live Transcription"
+        captions.viewController = transcription
+        return [audio, captions]
+    }
+
+    func showRecording() {
+        showWindow()
+        tabView?.selectTabViewItem(withIdentifier: "recording")
+    }
+    func showDictation() { showWindow(); tabView?.selectTabViewItem(withIdentifier: "dictation") }
+
     func windowWillClose(_ notification: Notification) {
+        recordingController.setPageVisible(false)
         shortcutsController.cancelRecording()
         tabView = nil
         sidebarTable = nil
@@ -1064,6 +1100,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
 
     func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
         guard let tabViewItem else { return }
+        recordingController.setPageVisible((tabViewItem.identifier as? String) == "recording")
         let index = tabView.indexOfTabViewItem(tabViewItem)
         if sidebarTable?.selectedRow != index {
             sidebarTable?.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
@@ -1091,6 +1128,9 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         switch item.identifier as? String {
         case "general": symbol = "gearshape"
         case "security": symbol = "lock.shield"
+        case "recording": symbol = "waveform"
+        case "transcription": symbol = "captions.bubble"
+        case "dictation": symbol = "mic.badge.plus"
         default: symbol = "keyboard"
         }
         let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil)!)

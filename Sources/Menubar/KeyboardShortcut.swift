@@ -4,18 +4,30 @@ import Carbon.HIToolbox
 enum ShortcutAction: String, CaseIterable {
     case voice
     case video
+    case recording
+    case recordingPause
+    case floatingCaptions
+    case handsFreeDictation
 
     var title: String {
         switch self {
-        case .voice: return "Push-to-Talk Voice"
+        case .voice: return "Push-to-Talk Dictation"
         case .video: return "Toggle Video Sharing"
+        case .recording: return "Start / Stop Audio Recording"
+        case .recordingPause: return "Pause / Resume Audio Recording"
+        case .floatingCaptions: return "Toggle Floating Captions"
+        case .handsFreeDictation: return "Toggle Hands-Free Dictation"
         }
     }
 
     var detail: String {
         switch self {
-        case .voice: return "Hold to speak. Release to send your voice request."
+        case .voice: return "Hold to dictate from the mic; release to finish. Disabled during mic transcription."
         case .video: return "Press to start or stop screen sharing."
+        case .recording: return "Record the sources configured in Audio & Recording."
+        case .recordingPause: return "Pause saving audio while keeping source preview live."
+        case .floatingCaptions: return "Show or hide the caption window without stopping transcription."
+        case .handsFreeDictation: return "Keep the mic listening until stopped. Disabled during mic transcription."
         }
     }
 }
@@ -118,6 +130,15 @@ struct KeyboardShortcut: Codable, Hashable {
 struct ShortcutBindings: Codable, Equatable {
     var voice: KeyboardShortcut?
     var video: KeyboardShortcut?
+    var recording: KeyboardShortcut? = nil
+    var recordingPause: KeyboardShortcut? = nil
+    var floatingCaptions: KeyboardShortcut? = nil
+    var handsFreeDictation: KeyboardShortcut? = nil
+
+    var hasDuplicates: Bool {
+        let values = ShortcutAction.allCases.compactMap { self[$0] }
+        return Set(values).count != values.count
+    }
 
     static let defaults = ShortcutBindings(
         voice: KeyboardShortcut(keyCode: UInt32(kVK_ANSI_V), modifiers: UInt32(controlKey)),
@@ -125,9 +146,25 @@ struct ShortcutBindings: Codable, Equatable {
     )
 
     subscript(action: ShortcutAction) -> KeyboardShortcut? {
-        get { action == .voice ? voice : video }
+        get {
+            switch action {
+            case .voice: return voice
+            case .video: return video
+            case .recording: return recording
+            case .recordingPause: return recordingPause
+            case .floatingCaptions: return floatingCaptions
+            case .handsFreeDictation: return handsFreeDictation
+            }
+        }
         set {
-            if action == .voice { voice = newValue } else { video = newValue }
+            switch action {
+            case .voice: voice = newValue
+            case .video: video = newValue
+            case .recording: recording = newValue
+            case .recordingPause: recordingPause = newValue
+            case .floatingCaptions: floatingCaptions = newValue
+            case .handsFreeDictation: handsFreeDictation = newValue
+            }
         }
     }
 }
