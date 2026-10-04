@@ -473,6 +473,7 @@ final class AudioRecordingManager: NSObject {
             try drain()
             let newSession = try AudioRecordingSession(settings: settings, startTime: Self.hostSeconds)
             session = newSession
+            checkpointTicks = 0
             elapsedLock.lock()
             lastElapsed = 0
             elapsedLock.unlock()
@@ -492,10 +493,12 @@ final class AudioRecordingManager: NSObject {
             guard let self else { return }
             do {
                 try self.drain()
-                self.checkpointTicks += 1
-                if self.checkpointTicks >= 150 {
-                    self.checkpointTicks = 0
-                    try self.session?.checkpoint(at: Self.hostSeconds)
+                if let session = self.session {
+                    self.checkpointTicks += 1
+                    if self.checkpointTicks >= 150 {
+                        self.checkpointTicks = 0
+                        try session.checkpoint(at: Self.hostSeconds)
+                    }
                 }
             } catch {
                 let message = error.localizedDescription

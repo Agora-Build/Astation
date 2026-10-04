@@ -70,6 +70,10 @@ jobs:
         run: |
           swift build --product astation
           bash scripts/package-dev-app.sh
+          app_executable="$PWD/.build/Astation Dev.app/Contents/MacOS/Astation"
+          cd "$(mktemp -d)"
+          env -u PACKAGE_RESOURCE_BUNDLE_PATH -u PACKAGE_RESOURCE_BUNDLE_URL \
+            "$app_executable" --bundled-resources-check
 
   test-webapp:
     name: Webapp Tests

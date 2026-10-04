@@ -436,6 +436,24 @@ final class AudioRecordingTests: XCTestCase {
         astation_audio_queue_push(queue, input.audioBufferList, 2, 100, 48_000)
         XCTAssertEqual(astation_audio_queue_dropped_frames(queue), 2)
     }
+
+    func testUndersizedQueueReadLeavesOriginalAudioAvailableForAFullRead() throws {
+        let queue = try XCTUnwrap(astation_audio_queue_create(1, 4, 2))
+        defer { astation_audio_queue_destroy(queue) }
+        let input = AVAudioPCMBuffer(pcmFormat: AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!, frameCapacity: 4)!
+        input.frameLength = 4
+        input.floatChannelData![0].update(from: [1, 2, 3, 4], count: 4)
+        astation_audio_queue_push(queue, input.audioBufferList, 4, 100, 48_000)
+        var output = [Float](repeating: -1, count: 4)
+        var time: UInt64 = 0
+        XCTAssertEqual(output.withUnsafeMutableBufferPointer { astation_audio_queue_pop(queue, $0.baseAddress!, 2, &time) }, 0)
+        XCTAssertEqual(output, [-1, -1, -1, -1])
+        XCTAssertEqual(time, 0)
+        XCTAssertEqual(astation_audio_queue_dropped_frames(queue), 0)
+        XCTAssertEqual(output.withUnsafeMutableBufferPointer { astation_audio_queue_pop(queue, $0.baseAddress!, 4, &time) }, 4)
+        XCTAssertEqual(output, [1, 2, 3, 4])
+        XCTAssertEqual(time, 100)
+    }
 }
 
 @MainActor

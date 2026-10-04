@@ -91,6 +91,18 @@ final class AgoraTranscriptionTests: XCTestCase {
         XCTAssertFalse(spanish.isFinal)
         XCTAssertEqual(segments.first { $0.language == "fr-FR" }?.isFinal, true)
     }
+
+    func testMissingAndEmptyTranslationResultsNeverEmitAFinalSegment() throws {
+        for results in ["", ",\"results\":[]"] {
+            let payload = data("{\"translation\":{\"uid\":101,\"sentenceId\":8,\"isFinal\":true\(results)}}")
+            XCTAssertTrue(try AgoraCaptionDecoder.decode(payload, sourceID: "app", publisherUID: 101).isEmpty)
+        }
+        let fallback = data("{\"translation\":{\"uid\":101,\"sentenceId\":8,\"isFinal\":true,\"results0\":{\"language\":\"es-ES\",\"texts\":[\"Hola.\"]}}}")
+        let segment = try XCTUnwrap(AgoraCaptionDecoder.decode(fallback, sourceID: "app", publisherUID: 101).first)
+        XCTAssertEqual(segment.text, "Hola.")
+        XCTAssertTrue(segment.isFinal)
+        XCTAssertTrue(segment.isTranslation)
+    }
     func testJoinBodyAndAccessTokenAuthenticationOnlySubscribeToSelectedPublisher() async throws {
         let requests = CaptionRequests()
         let client = client { request in requests.record(request); return (200, Data("{\"agent_id\":\"test-agent\"}".utf8)) }

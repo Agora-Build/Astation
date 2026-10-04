@@ -6,6 +6,9 @@ if CommandLine.arguments.contains("--cloud-transcription-worker") {
 }
 
 #if DEBUG
+if CommandLine.arguments.contains("--bundled-resources-check") {
+    exit(TranscriptionValidation.checkBundledResources())
+}
 if CommandLine.arguments.contains("--transcription-check") {
     exit(TranscriptionValidation.run())
 }

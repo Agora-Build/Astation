@@ -3,6 +3,23 @@ import AVFoundation
 
 /// Explicit, file-only inference check: never asks for capture permission or joins RTC.
 enum TranscriptionValidation {
+    static func checkBundledResources() -> Int32 {
+        do {
+            for model in LocalTranscriptionModel.allCases {
+                let manifest = try TranscriptionModelManifest.bundled(for: model)
+                try manifest.validate()
+                guard manifest.id == model.id else {
+                    throw TranscriptionError.message("The bundled manifest does not match \(model.name).")
+                }
+                print("PASS: bundled \(model.name) manifest.")
+            }
+            return 0
+        } catch {
+            print("FAIL: \(error.localizedDescription)")
+            return 1
+        }
+    }
+
     static func run() -> Int32 {
         func argument(_ name: String) -> String? {
             guard let index = CommandLine.arguments.firstIndex(of: name), index + 1 < CommandLine.arguments.count else { return nil }
