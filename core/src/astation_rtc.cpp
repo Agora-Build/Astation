@@ -293,7 +293,7 @@ struct AStationRtcEngineImpl
                                                   screen, audio_track, screen_audio_track);
         options.publishMicrophoneTrack = plan.microphone;
         options.publishCustomAudioTrack = plan.custom;
-        options.publishCustomAudioTrackId = plan.custom_track;
+        if (plan.custom) options.publishCustomAudioTrackId = plan.custom_track;
         options.publishMixedAudioTrack = plan.mixed;
         options.enableAudioRecordingOrPlayout = true;
     }
