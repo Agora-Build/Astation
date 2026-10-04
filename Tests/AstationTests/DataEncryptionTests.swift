@@ -3,6 +3,51 @@ import XCTest
 @testable import Menubar
 
 final class DataEncryptionTests: XCTestCase {
+    func testDisablingEncryptionWaitsForOwnerAuthenticationAndDenialDoesNothing() {
+        var completeAuthentication: ((Bool) -> Void)?
+        var confirmed = false
+        var disabled = false
+        EncryptionDisableAction.request(
+            authenticate: { completeAuthentication = $0 },
+            confirm: { confirmed = true; return true },
+            disable: { disabled = true }
+        )
+        XCTAssertNotNil(completeAuthentication)
+        XCTAssertFalse(confirmed)
+        XCTAssertFalse(disabled)
+
+        completeAuthentication?(false)
+        XCTAssertFalse(confirmed)
+        XCTAssertFalse(disabled)
+    }
+
+    func testDisablingEncryptionStillRequiresConfirmationAfterAuthentication() {
+        var completeAuthentication: ((Bool) -> Void)?
+        var confirmed = false
+        var disabled = false
+        EncryptionDisableAction.request(
+            authenticate: { completeAuthentication = $0 },
+            confirm: { confirmed = true; return false },
+            disable: { disabled = true }
+        )
+        completeAuthentication?(true)
+        XCTAssertTrue(confirmed)
+        XCTAssertFalse(disabled)
+    }
+
+    func testDisablingEncryptionRunsOnlyAfterAuthenticationAndConfirmation() {
+        var completeAuthentication: ((Bool) -> Void)?
+        var events: [String] = []
+        EncryptionDisableAction.request(
+            authenticate: { events.append("authenticate"); completeAuthentication = $0 },
+            confirm: { events.append("confirm"); return true },
+            disable: { events.append("disable") }
+        )
+        XCTAssertEqual(events, ["authenticate"])
+        completeAuthentication?(true)
+        XCTAssertEqual(events, ["authenticate", "confirm", "disable"])
+    }
+
     func testRecoveryKeyRoundTripAndChecksumFailure() throws {
         let value = try DataEncryptionKeyManager.shared.generate()
         let recovery = try DataEncryptionKeyManager.shared.recoveryKey(for: value)

@@ -538,6 +538,14 @@ fn skill_files_match_mode(files: &Value, encryption: &EncryptionState, migration
         return false;
     };
     files.iter().all(|(path, encoded)| {
+        let path_allowed = if migration {
+            migration_field(path, encryption, false)
+        } else {
+            allowed_field(path, encryption, false)
+        };
+        if !path_allowed {
+            return false;
+        }
         let Some(encoded) = encoded.as_str() else {
             return false;
         };
@@ -548,11 +556,9 @@ fn skill_files_match_mode(files: &Value, encryption: &EncryptionState, migration
             return matches!(encryption.mode.as_str(), "off" | "disabling");
         };
         if migration {
-            migration_field(path, encryption, false)
-                && migration_field(content, encryption, false)
+            migration_field(content, encryption, false)
         } else {
-            allowed_field(path, encryption, false)
-                && allowed_field(content, encryption, false)
+            allowed_field(content, encryption, false)
         }
     })
 }
@@ -1581,6 +1587,107 @@ mod tests {
             )
             .await;
             assert_eq!(response["results"][0]["ok"], false, "{id}: {response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_skill_paths_are_validated_for_push_and_disable_migration() {
+        use base64::Engine;
+
+        let payload = base64::engine::general_purpose::STANDARD.encode([0_u8; 40]);
+        let current_path = format!("e1.0123abcd.{payload}");
+        let obsolete_path = format!("e1.89abcdef.{payload}");
+        let binary = base64::engine::general_purpose::STANDARD.encode([0xff_u8, 0xfe]);
+        let plain_files = json!({"SKILL.md": b64("# Binary skill"), "asset.txt": b64("plain asset")});
+
+        for mode in ["off", "disabling"] {
+            let (mut state, session) = test_state("ws-binary").await;
+            let accounts = Arc::new(InMemoryAccountStore::new(state.knowledge.clone(), state.vault.clone()));
+            state.accounts = accounts.clone();
+            if mode == "disabling" {
+                for requested in ["enabling", "on", "disabling"] {
+                    accounts.set_encryption_state("ws-binary", requested, Some("0123abcd"), 1)
+                        .await.unwrap();
+                }
+            }
+            let knowledge = state.knowledge.clone();
+            let app = crate::router(state);
+            let (_, response) = prod_post_json(
+                &app, "/api/skills/batch?id=atem-binary", &session,
+                json!({"ops": [{"op": "push", "skill": sample_skill("binary", plain_files.clone()), "base_version": 0}]}),
+            ).await;
+            assert_eq!(response["results"][0]["ok"], true, "{mode}: {response}");
+
+            let (_, response) = prod_post_json(
+                &app, "/api/skills/batch?id=atem-binary", &session,
+                json!({"ops": [{"op": "push", "skill": sample_skill(
+                    "binary-refused", json!({"SKILL.md": b64("# Binary skill"), "asset.bin": binary})
+                ), "base_version": 0}]}),
+            ).await;
+            assert_eq!(response["results"][0]["ok"], false, "{mode}: {response}");
+            assert!(response["results"][0]["error"].as_str().unwrap().contains("unreadable (binary)"));
+
+            let refused_paths = if mode == "off" {
+                vec![&current_path, &obsolete_path]
+            } else {
+                vec![&obsolete_path]
+            };
+            for path in refused_paths {
+                let files = json!({"SKILL.md": b64("# Binary skill"), path: binary});
+                let (_, response) = prod_post_json(
+                    &app, "/api/skills/batch?id=atem-binary", &session,
+                    json!({"ops": [{"op": "push", "skill": sample_skill("refused", files), "base_version": 0}]}),
+                ).await;
+                assert_eq!(response["results"][0]["ok"], false, "{mode}: {response}");
+                assert_eq!(response["results"][0]["error"], "skill does not match the account encryption mode");
+            }
+
+            if mode == "disabling" {
+                for path in [&current_path, &obsolete_path] {
+                    let (_, response) = prod_post_json(
+                        &app, "/api/skills/batch?id=atem-binary", &session,
+                        json!({"ops": [{
+                            "op": "rewrite", "scope": "global", "old_project": "", "project": "",
+                            "name": "binary", "version": 1, "content_hash": "h",
+                            "files": {"SKILL.md": b64("# Binary skill"), path: binary}
+                        }]}),
+                    ).await;
+                    assert_eq!(response["results"][0]["ok"], false, "{response}");
+                    assert_eq!(response["results"][0]["error"], "invalid encryption migration");
+                }
+            }
+            let rows = knowledge.pull_skills("ws-binary", 0, 100).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].files, plain_files);
+        }
+    }
+
+    #[test]
+    fn binary_skill_content_requires_a_mode_appropriate_path() {
+        use base64::Engine;
+
+        let payload = base64::engine::general_purpose::STANDARD.encode([0_u8; 40]);
+        let current_path = format!("e1.0123abcd.{payload}");
+        let obsolete_path = format!("e1.89abcdef.{payload}");
+        let binary = base64::engine::general_purpose::STANDARD.encode([0xff_u8, 0xfe]);
+        for mode in ["off", "enabling", "on", "disabling"] {
+            let state = EncryptionState {
+                mode: mode.to_string(), kid: Some("0123abcd".to_string()),
+                ..EncryptionState::off("a")
+            };
+            for migration in [false, true] {
+                assert!(!skill_files_match_mode(&json!({obsolete_path.clone(): binary}), &state, migration));
+                assert_eq!(
+                    skill_files_match_mode(&json!({current_path.clone(): binary}), &state, migration),
+                    mode == "disabling" && !migration,
+                    "{mode}, migration={migration}"
+                );
+                assert_eq!(
+                    skill_files_match_mode(&json!({"asset.bin": binary}), &state, migration),
+                    mode == "disabling" || (mode == "off" && !migration),
+                    "{mode}, migration={migration}"
+                );
+            }
         }
     }
 

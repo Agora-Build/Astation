@@ -131,8 +131,9 @@ pub fn transition(
             }
             (kid.to_string(), current.enabled_at)
         }
-        ("disabling", "disabling") => (current.kid.clone().unwrap(), current.enabled_at),
+        ("disabling", "disabling") => (current_kid()?, current.enabled_at),
         ("disabling", "off") => {
+            current_kid()?;
             if counts.ciphertext != 0 || counts.obsolete != 0 {
                 return Err(format!(
                     "decryption migration is incomplete ({} ciphertext, {} obsolete fields remain)",
@@ -303,6 +304,26 @@ mod tests {
                 .as_deref(),
             Some("0123abcd")
         );
+    }
+
+    #[test]
+    fn disable_finalization_and_retries_reject_a_different_key() {
+        let disabling = EncryptionState {
+            mode: "disabling".to_string(),
+            kid: Some("0123abcd".to_string()),
+            enabled_at: Some(1),
+            ..EncryptionState::off("a")
+        };
+        for mode in ["disabling", "off"] {
+            assert!(transition(&disabling, mode, Some("89abcdef"), 2, Default::default()).is_err());
+            for kid in [None, Some("0123abcd"), Some("0123ABCD")] {
+                let updated = transition(&disabling, mode, kid, 2, Default::default()).unwrap();
+                assert_eq!(updated.mode, mode);
+                assert_eq!(updated.kid.as_deref(), if mode == "off" { None } else { Some("0123abcd") });
+            }
+            let missing_key = EncryptionState { kid: None, ..disabling.clone() };
+            assert!(transition(&missing_key, mode, None, 2, Default::default()).is_err());
+        }
     }
 
     #[test]

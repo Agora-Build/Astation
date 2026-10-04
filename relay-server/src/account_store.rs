@@ -2365,6 +2365,15 @@ mod tests {
             )
             .await
             .unwrap();
+        for mode in ["disabling", "off"] {
+            assert!(matches!(
+                accounts.set_encryption_state("a", mode, Some(kid1), 8).await,
+                Err(AccountError::InvalidEncryption(_))
+            ));
+            let unchanged = accounts.encryption_state("a").await.unwrap();
+            assert_eq!(unchanged.mode, "disabling");
+            assert_eq!(unchanged.kid.as_deref(), Some(kid2));
+        }
         assert_eq!(
             accounts.set_encryption_state("a", "off", Some(kid2), 8).await.unwrap().mode,
             "off"

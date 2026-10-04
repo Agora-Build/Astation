@@ -60,8 +60,8 @@ jobs:
       - name: Build Swift package
         run: swift build -c release
 
-      - name: Run relay identity, recovery kit, and screen capture tests
-        run: swift test --filter "RelayIdentityTests|RecoveryKitTests|ScreenShareCaptureTests"
+      - name: Run relay identity, recovery kit, screen capture, and encryption tests
+        run: swift test --filter "RelayIdentityTests|RecoveryKitTests|ScreenShareCaptureTests|DataEncryptionTests"
 
       - name: Verify development app bundle
         run: |

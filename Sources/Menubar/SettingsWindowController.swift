@@ -647,15 +647,28 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     }
 
     @objc private func turnOffEncryption() {
-        guard let state = hubManager.relayEncryptionState, let kid = state.kid else { return }
-        let alert = NSAlert()
-        alert.messageText = "Turn Off End-to-End Encryption?"
-        alert.informativeText = "A paired Atem will decrypt and rewrite all memory, skill, and vault history. The server will be able to read that data again."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Turn Off")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        hubManager.setRelayEncryption(mode: "disabling", kid: kid)
+        guard let state = hubManager.relayEncryptionState,
+              state.mode == "on", let kid = state.kid else { return }
+        let stillCurrent = { [weak self] in
+            guard let current = self?.hubManager.relayEncryptionState else { return false }
+            return current.mode == "on" && current.dataAccount == state.dataAccount && current.kid == kid
+        }
+        EncryptionDisableAction.request(
+            confirm: {
+                guard stillCurrent() else { return false }
+                let alert = NSAlert()
+                alert.messageText = "Turn Off End-to-End Encryption?"
+                alert.informativeText = "A paired Atem will decrypt and rewrite all memory, skill, and vault history. The server will be able to read that data again."
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "Turn Off")
+                alert.addButton(withTitle: "Cancel")
+                return alert.runModal() == .alertFirstButtonReturn
+            },
+            disable: { [weak self] in
+                guard stillCurrent() else { return }
+                self?.hubManager.setRelayEncryption(mode: "disabling", kid: kid)
+            }
+        )
     }
 
     @objc private func showEncryptionRecoveryKey() {
