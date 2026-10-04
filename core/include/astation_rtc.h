@@ -27,6 +27,7 @@ typedef struct {
     void (*on_error)(int code, const char* msg, void* ctx);
     void (*on_user_joined)(uint32_t uid, void* ctx);
     void (*on_user_left)(uint32_t uid, void* ctx);
+    void (*on_token_expiring)(void* ctx);
 } AStationRtcCallbacks;
 
 AStationRtcEngine* astation_rtc_create(struct AStationRtcConfig config, AStationRtcCallbacks cb, void* ctx);
@@ -44,10 +45,20 @@ int astation_rtc_enable_screen_share_region(AStationRtcEngine* engine,
 int astation_rtc_set_screen_share_exclude_window(AStationRtcEngine* engine,
                                                  int64_t window_id);
 int astation_rtc_stop_screen_share(AStationRtcEngine* engine);
+// ScreenCaptureKit supplies native-resolution NV12 CVPixelBuffers and 48 kHz stereo PCM.
+int astation_rtc_start_external_screen_share(AStationRtcEngine* engine,
+                                             int width, int height, int fps,
+                                             int capture_audio);
+int astation_rtc_push_screen_video(AStationRtcEngine* engine, void* pixel_buffer,
+                                    int width, int height, int64_t timestamp_ms);
+int astation_rtc_push_screen_audio(AStationRtcEngine* engine, const int16_t* data,
+                                    int samples_per_channel, int64_t timestamp_ms);
+int64_t astation_rtc_monotonic_time_ms(AStationRtcEngine* engine);
 int astation_rtc_get_screen_sources(AStationRtcEngine* engine,
                                     AstationScreenSource* out_sources,
                                     int max_count);
 int astation_rtc_set_token(AStationRtcEngine* engine, const char* token);
+int astation_rtc_renew_token(AStationRtcEngine* engine, const char* token);
 int astation_rtc_set_channel(AStationRtcEngine* engine, const char* channel, uint32_t uid);
 int astation_rtc_configure_encryption(AStationRtcEngine* engine,
                                       int enabled,

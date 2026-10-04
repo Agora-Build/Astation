@@ -198,6 +198,17 @@ class AstationHubManager: ObservableObject {
         rtcManager.onUserLeft = { uid in
             Log.info("Remote user left: \(uid)")
         }
+        rtcManager.onTokenRenewalNeeded = { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, let channel = self.rtcManager.currentChannel,
+                      let appId = self.rtcManager.appId else { return }
+                let uid = self.rtcManager.currentUid
+                let response = await self.generateRTCToken(channel: channel, uid: Int(uid), projectId: appId)
+                guard self.rtcManager.currentChannel == channel, self.rtcManager.currentUid == uid,
+                      self.rtcManager.appId == appId else { return }
+                self.rtcManager.renewToken(response.token)
+            }
+        }
     }
 
     /// Initialize the RTC engine using the App ID from the first available project.
@@ -773,19 +784,16 @@ class AstationHubManager: ObservableObject {
 
     /// Toggle video (screen share) and broadcast state to all connected Atems.
     func toggleVideo() {
-        videoActive.toggle()
-
-        if rtcManager.isInChannel {
-            if videoActive {
-                rtcManager.startScreenShare(displayId: 0)
-            } else {
+        Task { @MainActor in
+            if rtcManager.isScreenSharing || rtcManager.isScreenShareStarting {
                 rtcManager.stopScreenShare()
+            } else if rtcManager.isInChannel {
+                await rtcManager.startScreenShare(displayId: 0)
             }
+            videoActive = rtcManager.isScreenSharing
+            broadcastHandler?(.videoToggle(active: videoActive))
+            Log.info("[AstationHub] Video toggled: \(videoActive ? "sharing" : "off")")
         }
-
-        let message = AstationMessage.videoToggle(active: videoActive)
-        broadcastHandler?(message)
-        Log.info("[AstationHub] Video toggled: \(videoActive ? "sharing" : "off")")
     }
 
     // MARK: - Atem Instance Management
@@ -1055,10 +1063,12 @@ class AstationHubManager: ObservableObject {
             switch mode {
             case "on":
                 let displayId = parts.count >= 4 ? Int64(parts[3]) ?? 0 : 0
-                rtcManager.startScreenShare(displayId: displayId)
-                return "RTC: screen share started (displayId=\(displayId))"
+                Task { @MainActor in
+                    await rtcManager.startScreenShare(displayId: displayId)
+                }
+                return "RTC: starting screen share (displayId=\(displayId))"
             case "off":
-                rtcManager.stopScreenShare()
+                Task { @MainActor in rtcManager.stopScreenShare() }
                 return "RTC: screen share stopped"
             default:
                 return "RTC: usage /rtc screen on|off [displayId]"

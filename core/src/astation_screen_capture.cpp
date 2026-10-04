@@ -1,4 +1,23 @@
 #include "astation_screen_capture.h"
+#include <cstring>
+
+int astation_copy_nv12_planes(uint8_t* output, size_t output_size,
+                               const uint8_t* y, size_t y_stride,
+                               const uint8_t* uv, size_t uv_stride,
+                               int width, int height) {
+    if (!output || !y || !uv || width <= 0 || height <= 0 ||
+        width % 2 != 0 || height % 2 != 0 ||
+        y_stride < static_cast<size_t>(width) || uv_stride < static_cast<size_t>(width)) return -1;
+    const size_t y_size = static_cast<size_t>(width) * height;
+    if (output_size < y_size + y_size / 2) return -1;
+    for (int row = 0; row < height; ++row) {
+        std::memcpy(output + static_cast<size_t>(row) * width, y + row * y_stride, width);
+    }
+    for (int row = 0; row < height / 2; ++row) {
+        std::memcpy(output + y_size + static_cast<size_t>(row) * width, uv + row * uv_stride, width);
+    }
+    return 0;
+}
 
 int64_t astation_select_screen_source(const AstationScreenSource* sources,
                                       size_t count,

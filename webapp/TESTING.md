@@ -60,6 +60,9 @@ Visit: `http://localhost:8080/session/abc-123`
 
 ### 4. Test Screen Share Display
 
+See [Screen sharing](../docs/screen-sharing.md) for native resolution, frame-rate,
+system-audio, browser publishing, and live validation details.
+
 **Prerequisites:** Host must be sharing screen via Astation
 
 When the host (Astation) starts screen sharing:
@@ -180,6 +183,6 @@ services:
 - Participant tracking with display names
 
 ✅ **Codec Fallback**
-- Tries AV1 first (best quality)
-- Falls back to VP8 if AV1 fails
+- Uses H.264 to match the native publisher and support hardware encoding
+- Falls back to VP8 if H.264 joining fails
 - Configurable via codec.js module

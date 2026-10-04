@@ -254,7 +254,8 @@ class StatusBarController: NSObject, NSMenuDelegate {
         micItem.isEnabled = false
         statusMenu.addItem(micItem)
 
-        let screenStatus = hubManager.rtcManager.isScreenSharing ? "Sharing" : "Off"
+        let screenStatus = hubManager.rtcManager.isScreenSharing ? "Sharing" :
+            (hubManager.rtcManager.isScreenShareStarting ? "Starting..." : "Off")
         let screenIndicator = hubManager.rtcManager.isScreenSharing ? "rectangle.inset.filled.and.person.filled" : "rectangle.on.rectangle"
         let screenItem = NSMenuItem(
             title: "Screen Share: \(screenStatus)",
@@ -295,7 +296,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
             toggleMicItem.target = self
             statusMenu.addItem(toggleMicItem)
 
-            if hubManager.rtcManager.isScreenSharing {
+            if hubManager.rtcManager.isScreenSharing || hubManager.rtcManager.isScreenShareStarting {
                 let stopShareItem = NSMenuItem(
                     title: "Stop Screen Share",
                     action: #selector(stopScreenShare),
@@ -579,7 +580,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func startScreenShare() {
-        promptForScreenShareOptions { [weak self] source, useRegion in
+        promptForScreenShareOptions { [weak self] source, useRegion, options in
             guard let self = self else { return }
             if useRegion {
                 guard let screen = self.matchNSScreen(for: source) else {
@@ -602,18 +603,22 @@ class StatusBarController: NSObject, NSMenuDelegate {
                         displayId: source.id,
                         rectPoints: regionPoints
                     )
-                    let started = self.hubManager.rtcManager.startScreenShare(
-                        displayId: source.id,
-                        regionPixels: regionPixels
-                    )
-                    if !started {
-                        ScreenRegionSelector.hideOverlay()
+                    Task { @MainActor in
+                        let started = await self.hubManager.rtcManager.startScreenShare(
+                            displayId: source.id, regionPixels: regionPixels, options: options
+                        )
+                        if !started, !self.hubManager.rtcManager.isScreenSharing,
+                           !self.hubManager.rtcManager.isScreenShareStarting {
+                            ScreenRegionSelector.hideOverlay()
+                        }
+                        self.setupMenu()
                     }
-                    self.setupMenu()
                 }
             } else {
-                self.hubManager.rtcManager.startScreenShare(displayId: source.id)
-                self.setupMenu()
+                Task { @MainActor in
+                    await self.hubManager.rtcManager.startScreenShare(displayId: source.id, options: options)
+                    self.setupMenu()
+                }
             }
         }
     }
@@ -623,7 +628,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
         setupMenu()
     }
 
-    private func promptForScreenShareOptions(completion: @escaping (ScreenShareSource, Bool) -> Void) {
+    private func promptForScreenShareOptions(completion: @escaping (ScreenShareSource, Bool, ScreenShareOptions) -> Void) {
         let sources = hubManager.rtcManager.screenSources()
         guard !sources.isEmpty else {
             let alert = NSAlert()
@@ -636,10 +641,11 @@ class StatusBarController: NSObject, NSMenuDelegate {
 
         let alert = NSAlert()
         alert.messageText = "Start Screen Share"
-        alert.informativeText = "Choose a display and optionally share a region."
+        alert.informativeText = "Share at native resolution. 60 fps targets smoother motion; actual frame rate depends on your Mac and connection."
 
         let accessoryWidth: CGFloat = 320
-        let accessoryHeight: CGFloat = 54
+        let accessoryHeight: CGFloat = 118
+        let savedOptions = ScreenShareOptions.load()
         let popup = NSPopUpButton(frame: NSRect(x: 0, y: accessoryHeight - 24, width: accessoryWidth, height: 24))
         popup.controlSize = .regular
         let primaryIndex = sources.firstIndex { $0.isPrimary } ?? 0
@@ -657,31 +663,42 @@ class StatusBarController: NSObject, NSMenuDelegate {
 
         let checkbox = NSButton(checkboxWithTitle: "Share region only", target: nil, action: nil)
         checkbox.state = .off
-        checkbox.frame = NSRect(x: 0, y: 0, width: accessoryWidth, height: 18)
+        checkbox.frame = NSRect(x: 0, y: 66, width: accessoryWidth, height: 18)
+
+        let audioCheckbox = NSButton(checkboxWithTitle: "Include system audio", target: nil, action: nil)
+        audioCheckbox.state = savedOptions.captureAudio ? .on : .off
+        audioCheckbox.frame = NSRect(x: 0, y: 40, width: accessoryWidth, height: 18)
+        audioCheckbox.toolTip = "Shares other apps' audio. Your microphone has a separate mute control."
+        let frameRateLabel = NSTextField(labelWithString: "Frame rate:")
+        frameRateLabel.frame = NSRect(x: 0, y: 3, width: 90, height: 20)
+        let frameRatePopup = NSPopUpButton(frame: NSRect(x: 92, y: 0, width: 220, height: 26))
+        frameRatePopup.addItems(withTitles: ["60 fps", "30 fps"])
+        frameRatePopup.selectItem(at: savedOptions.frameRate == 30 ? 1 : 0)
 
         let container = NSView(frame: NSRect(x: 0, y: 0, width: accessoryWidth, height: accessoryHeight))
         popup.autoresizingMask = [.width]
         checkbox.autoresizingMask = [.width]
         container.addSubview(popup)
         container.addSubview(checkbox)
+        container.addSubview(audioCheckbox)
+        container.addSubview(frameRateLabel)
+        container.addSubview(frameRatePopup)
 
         alert.accessoryView = container
         alert.addButton(withTitle: "Start")
         alert.addButton(withTitle: "Cancel")
 
         if alert.runModal() == .alertFirstButtonReturn {
-            completion(sources[popup.indexOfSelectedItem], checkbox.state == .on)
+            let options = ScreenShareOptions(
+                captureAudio: audioCheckbox.state == .on,
+                frameRate: frameRatePopup.indexOfSelectedItem == 1 ? 30 : 60
+            )
+            options.save()
+            completion(sources[popup.indexOfSelectedItem], checkbox.state == .on, options)
         }
     }
 
     private func displayPixelSize(for source: ScreenShareSource) -> CGSize? {
-        if let screen = screenForDisplayId(source.id) {
-            let scale = screen.backingScaleFactor
-            return CGSize(
-                width: screen.frame.size.width * scale,
-                height: screen.frame.size.height * scale
-            )
-        }
         if source.rectPixels.width > 0 && source.rectPixels.height > 0 {
             return source.rectPixels.size
         }

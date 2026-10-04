@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>Astation</string>
+    <key>CFBundleIdentifier</key>
+    <string>build.agora.astation</string>
+    <key>CFBundleName</key>
+    <string>Astation</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleVersion</key>
+    <string>0.0.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.0.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>build.agora.astation</string>
+            <key>CFBundleURLSchemes</key>
+            <array><string>astation</string></array>
+        </dict>
+    </array>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Use your microphone in Agora calls when you enable it.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Share audio from other apps when you include system audio in screen sharing.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Share camera video when you enable video features.</string>
+</dict>
+</plist>
