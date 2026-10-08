@@ -47,7 +47,8 @@ private final class RecoveryFixture {
     var repairs = 0
     var recordWasSavedBeforeRepair = false
 
-    init(pending: Bool = false, loadFailure: RelayIdentityKeyError? = nil, unsavable: Bool = false) throws {
+    init(pending: Bool = false, loadFailure: RelayIdentityKeyError? = nil, unsavable: Bool = false,
+         deferKeyLoad: Bool = false) throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent("relay-recovery-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         suite = "Astation.relay-recovery-test.\(UUID().uuidString)"
@@ -69,7 +70,10 @@ private final class RecoveryFixture {
             self.recordWasSavedBeforeRepair = self.defaults.dictionary(forKey: RelayIdentityKeyRepairRecord.defaultsKey) != nil
             if let failure = self.repairFailure { throw failure }
             return self.key
-        }, perform: { $0() }, deliver: { $0() }, schedule: { _, _ in })
+        }, perform: {
+            if deferKeyLoad { DispatchQueue.main.async(execute: $0) }
+            else { $0() }
+        }, deliver: { $0() }, schedule: { _, _ in })
         let sessions = SessionStore(storageURL: directory.appendingPathComponent("sessions.json"))
         _ = sessions.createTest(id: "existing-pairing", hostname: "test", lastActivity: Date())
         hub = AstationHubManager(skipProjectLoad: true, deviceSessionStore: sessions,
@@ -102,6 +106,41 @@ final class RelayIdentityRecoveryLifecycleTests: XCTestCase {
         XCTAssertTrue(fixture.hub.relayIdentityKeyCanReconnectAfterRepair)
         XCTAssertTrue(fixture.sockets.isEmpty)
         XCTAssertEqual(fixture.reads, [false])
+    }
+
+    func testAnAsynchronousKeyLoadFinishesBeforeTheRelaySocketOpens() async throws {
+        let fixture = try RecoveryFixture(deferKeyLoad: true)
+        fixture.hub.startIdentityRelay()
+        for _ in 0..<10 { fixture.hub.startIdentityRelay() }
+        XCTAssertTrue(fixture.hub.relayIdentityKeyIsBusy)
+        XCTAssertTrue(fixture.sockets.isEmpty)
+        await drainMainQueue()
+        XCTAssertFalse(fixture.hub.relayIdentityKeyIsBusy)
+        XCTAssertEqual(fixture.reads, [false])
+        XCTAssertEqual(fixture.sockets.count, 1)
+    }
+
+    func testVerificationCannotCompleteANewerPersistedRecoveryOperation() async throws {
+        for status in [RelayIdentityProtocol.statusRegistered, RelayIdentityProtocol.statusVerified] {
+            let fixture = try RecoveryFixture(pending: true)
+            fixture.hub.startIdentityRelay()
+            fixture.hub.reconnectAfterRelayIdentityKeyRepair()
+            let socket = try XCTUnwrap(fixture.sockets.first)
+            let newer = RelayIdentityKeyRepairRecord(astationId: AstationIdentity.shared.id,
+                relayURL: fixture.hub.stationRelayUrl)
+            XCTAssertTrue(newer.save(to: fixture.defaults))
+            socket.emit("{\"type\":\"relayAuthResult\",\"status\":\"\(status)\"}")
+            await drainMainQueue()
+            XCTAssertTrue(socket.wasCancelled)
+            XCTAssertFalse(fixture.hub.identityRelayVerified)
+            XCTAssertTrue(fixture.hub.relayIdentityKeyRepairPending)
+            XCTAssertTrue(socket.sent.isEmpty)
+            XCTAssertEqual(RelayIdentityKeyRepairRecord.load(astationId: newer.astationId,
+                relayURL: newer.relayURL, defaults: fixture.defaults), newer)
+            fixture.hub.startIdentityRelay()
+            fixture.hub.reconnectAfterRelayIdentityKeyRepair()
+            XCTAssertEqual(fixture.sockets.count, 1)
+        }
     }
 
     func testVerificationClearsTheRecoveryPauseAndResynchronizesExistingPairings() async throws {

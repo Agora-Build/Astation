@@ -45,6 +45,8 @@ the key, Astation stays paused so the reset can be completed without a
 reconnection loop.
 If another repair is attempted while recovery is pending, a failed update
 keeps the existing recovery pause.
+Verification also checks that the saved recovery operation still matches.
+If another process changes it, Astation stays paused and asks you to reopen.
 
 If a readable key is rejected, **Recover Relay Trust** prepares the same
 administrator reset workflow while keeping that key. This covers a lost

@@ -1216,7 +1216,7 @@ class AstationHubManager: ObservableObject {
         relayIdentityKeyManager.loadIfNeeded()
         guard !identityRelayActive,
               !relayIdentityKeyRepairPending || relayIdentityRepairReconnectRequested else { return }
-        if case .failed = relayIdentityKeyManager.state { return }
+        guard case .loaded = relayIdentityKeyManager.state else { return }
         identityRelayActive = true
         identityRelayReconnectGeneration &+= 1
 
@@ -1701,16 +1701,28 @@ class AstationHubManager: ObservableObject {
         dispatchPrecondition(condition: .onQueue(.main))
         switch status {
         case RelayIdentityProtocol.statusRegistered, RelayIdentityProtocol.statusVerified:
-            relayIdentityKeyRejected = false
-            identityRelayVerified = true
-            identityRelayReconnectPolicy.reset()
-            relayIdentityStatusMessage = nil
             if relayIdentityKeyRepairPending {
-                relayIdentityKeyRepairRecord?.clear(from: relayIdentityRepairDefaults)
+                // Verification completes only the recovery operation this socket started.
+                guard let record = relayIdentityKeyRepairRecord,
+                      RelayIdentityKeyRepairRecord.load(
+                        astationId: AstationIdentity.shared.id, relayURL: stationRelayUrl,
+                        defaults: relayIdentityRepairDefaults
+                      ) == record,
+                      record.clear(from: relayIdentityRepairDefaults) else {
+                    relayIdentityRepairReconnectRequested = false
+                    pauseIdentityRelay()
+                    relayIdentityStatusMessage = "Device key recovery changed or could not be completed. Reopen Astation before reconnecting."
+                    NotificationCenter.default.post(name: .relayIdentityKeyChanged, object: nil)
+                    return
+                }
                 relayIdentityKeyRepairRecord = nil
                 relayIdentityKeyRepairPending = false
                 relayIdentityRepairReconnectRequested = false
             }
+            relayIdentityKeyRejected = false
+            identityRelayVerified = true
+            identityRelayReconnectPolicy.reset()
+            relayIdentityStatusMessage = nil
             NotificationCenter.default.post(name: .relayIdentityKeyChanged, object: nil)
             Log.info("[RelayIdentity] Relay \(status) this Astation's key")
             sendRelaySessionsResync()
