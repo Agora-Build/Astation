@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::encryption::{
+    classify_envelope, classify_hash, valid_envelope, valid_hash, EncryptionCounts,
+};
+
 /// Max rows returned by one pull, regardless of the requested limit.
 pub const PULL_LIMIT_CAP: i64 = 500;
 
@@ -110,6 +114,7 @@ pub struct SkillVersionInfo {
 pub enum KnowledgeError {
     /// The memory id exists under a different account.
     IdConflict,
+    EncryptionConflict,
     Db(String),
 }
 
@@ -117,6 +122,9 @@ impl std::fmt::Display for KnowledgeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             KnowledgeError::IdConflict => write!(f, "id conflict"),
+            KnowledgeError::EncryptionConflict => {
+                write!(f, "content does not match the account encryption mode")
+            }
             KnowledgeError::Db(s) => write!(f, "database error: {}", s),
         }
     }
@@ -227,6 +235,49 @@ pub trait KnowledgeStore: Send + Sync {
         since: i64,
         limit: i64,
     ) -> Result<Vec<SkillRow>, KnowledgeError>;
+
+    /// Move all knowledge from `sources` into `target`, assigning fresh
+    /// sequence numbers so every connected Atem observes the merged data.
+    /// Production performs this inside the account-store transaction; this
+    /// hook keeps the DB-less in-memory server behavior equivalent.
+    async fn merge_accounts(
+        &self,
+        _sources: &[String],
+        _target: &str,
+        _preferred_source: &str,
+    ) -> Result<(), KnowledgeError> {
+        Err(KnowledgeError::Db(
+            "account merge must be coordinated by the durable account store".to_string(),
+        ))
+    }
+
+    async fn encryption_counts(
+        &self,
+        account: &str,
+        kid: Option<&str>,
+    ) -> Result<EncryptionCounts, KnowledgeError>;
+
+    async fn rewrite_memory_fields(
+        &self,
+        account: &str,
+        id: &str,
+        project: &str,
+        content: &str,
+        content_hash: &str,
+    ) -> Result<i64, KnowledgeError>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn rewrite_skill_fields(
+        &self,
+        account: &str,
+        scope: &str,
+        old_project: &str,
+        name: &str,
+        version: i64,
+        project: &str,
+        files: serde_json::Value,
+        content_hash: &str,
+    ) -> Result<i64, KnowledgeError>;
 }
 
 // ─────────────────────────── In-memory implementation ───────────────────────────
@@ -573,6 +624,211 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
         rows.truncate(clamp_limit(limit) as usize);
         Ok(rows)
     }
+
+    async fn merge_accounts(
+        &self,
+        sources: &[String],
+        target: &str,
+        preferred_source: &str,
+    ) -> Result<(), KnowledgeError> {
+        let source_set: std::collections::HashSet<&str> =
+            sources.iter().map(String::as_str).collect();
+        let mut st = self.state.lock().await;
+
+        // Keep one live copy of a duplicate fact and turn the rest into
+        // tombstones, so clients that knew the duplicate ids also converge.
+        let mut memory_indexes: Vec<usize> = st
+            .memories
+            .iter()
+            .enumerate()
+            .filter(|(_, (account, _))| source_set.contains(account.as_str()))
+            .map(|(index, _)| index)
+            .collect();
+        memory_indexes.sort_by(|left, right| {
+            let (_, a) = &st.memories[*left];
+            let (_, b) = &st.memories[*right];
+            (
+                &a.scope,
+                &a.project,
+                &a.machine,
+                &a.content_hash,
+                a.created_at,
+                &a.id,
+            )
+                .cmp(&(
+                    &b.scope,
+                    &b.project,
+                    &b.machine,
+                    &b.content_hash,
+                    b.created_at,
+                    &b.id,
+                ))
+        });
+        let mut live_keys = std::collections::HashSet::new();
+        for index in memory_indexes {
+            let duplicate = {
+                let row = &st.memories[index].1;
+                row.deleted_at.is_none()
+                    && row.invalid_at.is_none()
+                    && !live_keys.insert((
+                        row.scope.clone(),
+                        row.project.clone(),
+                        row.machine.clone(),
+                        row.content_hash.clone(),
+                    ))
+            };
+            let seq = st.next_seq();
+            let (account, row) = &mut st.memories[index];
+            *account = target.to_string();
+            if duplicate {
+                row.content.clear();
+                row.content_hash.clear();
+                row.deleted = true;
+                row.deleted_at = Some(now_secs());
+            }
+            row.seq = seq;
+        }
+
+        // Histories with the same key are concatenated deterministically.
+        let mut skill_indexes: Vec<usize> = st
+            .skills
+            .iter()
+            .enumerate()
+            .filter(|(_, (account, _))| source_set.contains(account.as_str()))
+            .map(|(index, _)| index)
+            .collect();
+        skill_indexes.sort_by(|left, right| {
+            let (aa, a) = &st.skills[*left];
+            let (ba, b) = &st.skills[*right];
+            (
+                &a.scope,
+                &a.project,
+                &a.name,
+                if aa == preferred_source { 0 } else { 1 },
+                a.version,
+                a.created_at,
+            )
+                .cmp(&(
+                    &b.scope,
+                    &b.project,
+                    &b.name,
+                    if ba == preferred_source { 0 } else { 1 },
+                    b.version,
+                    b.created_at,
+                ))
+        });
+        let mut versions: std::collections::HashMap<(String, String, String), i64> =
+            std::collections::HashMap::new();
+        for index in skill_indexes {
+            let key = {
+                let row = &st.skills[index].1;
+                (row.scope.clone(), row.project.clone(), row.name.clone())
+            };
+            let version = versions.entry(key).or_insert(0);
+            *version += 1;
+            let assigned_version = *version;
+            let seq = st.next_seq();
+            let (account, row) = &mut st.skills[index];
+            *account = target.to_string();
+            row.version = assigned_version;
+            row.seq = seq;
+        }
+        Ok(())
+    }
+
+    async fn encryption_counts(
+        &self,
+        account: &str,
+        kid: Option<&str>,
+    ) -> Result<EncryptionCounts, KnowledgeError> {
+        use base64::Engine;
+        let st = self.state.lock().await;
+        let mut counts = EncryptionCounts::default();
+        for (owner, row) in &st.memories {
+            if owner != account {
+                continue;
+            }
+            counts.add(classify_envelope(&row.content, kid));
+            counts.add(classify_hash(&row.project, kid));
+            counts.add(classify_hash(&row.content_hash, kid));
+        }
+        for (owner, row) in &st.skills {
+            if owner != account {
+                continue;
+            }
+            counts.add(classify_hash(&row.project, kid));
+            counts.add(classify_hash(&row.content_hash, kid));
+            if let Some(files) = row.files.as_object() {
+                for (path, encoded) in files {
+                    counts.add(classify_envelope(path, kid));
+                    let value = encoded
+                        .as_str()
+                        .and_then(|value| base64::engine::general_purpose::STANDARD.decode(value).ok())
+                        .and_then(|bytes| String::from_utf8(bytes).ok());
+                    match value {
+                        Some(value) => counts.add(classify_envelope(&value, kid)),
+                        None => counts.obsolete += 1,
+                    }
+                }
+            }
+        }
+        Ok(counts)
+    }
+
+    async fn rewrite_memory_fields(
+        &self,
+        account: &str,
+        id: &str,
+        project: &str,
+        content: &str,
+        content_hash: &str,
+    ) -> Result<i64, KnowledgeError> {
+        let mut st = self.state.lock().await;
+        let Some(index) = st
+            .memories
+            .iter()
+            .position(|(owner, row)| owner == account && row.id == id)
+        else {
+            return Ok(0);
+        };
+        let seq = st.next_seq();
+        let row = &mut st.memories[index].1;
+        row.project = project.to_string();
+        row.content = content.to_string();
+        row.content_hash = content_hash.to_string();
+        row.seq = seq;
+        Ok(seq)
+    }
+
+    async fn rewrite_skill_fields(
+        &self,
+        account: &str,
+        scope: &str,
+        old_project: &str,
+        name: &str,
+        version: i64,
+        project: &str,
+        files: serde_json::Value,
+        content_hash: &str,
+    ) -> Result<i64, KnowledgeError> {
+        let mut st = self.state.lock().await;
+        let Some(index) = st.skills.iter().position(|(owner, row)| {
+            owner == account
+                && row.scope == scope
+                && row.project == old_project
+                && row.name == name
+                && row.version == version
+        }) else {
+            return Ok(0);
+        };
+        let seq = st.next_seq();
+        let row = &mut st.skills[index].1;
+        row.project = project.to_string();
+        row.files = files;
+        row.content_hash = content_hash.to_string();
+        row.seq = seq;
+        Ok(seq)
+    }
 }
 
 // ─────────────────────────── Postgres implementation ───────────────────────────
@@ -635,6 +891,169 @@ async fn lock_account(conn: &mut sqlx::PgConnection, account: &str) -> Result<()
         .await
         .map_err(db_err)?;
     Ok(())
+}
+
+async fn encryption_mode(
+    conn: &mut sqlx::PgConnection,
+    account: &str,
+) -> Result<(String, Option<String>), KnowledgeError> {
+    let state: Option<(String, String)> = sqlx::query_as(
+        "SELECT mode, kid FROM data_account_encryption WHERE data_account = $1",
+    )
+    .bind(account)
+    .fetch_optional(conn)
+    .await
+    .map_err(db_err)?;
+    Ok(state
+        .map(|(mode, kid)| (mode, Some(kid)))
+        .unwrap_or_else(|| ("off".to_string(), None)))
+}
+
+fn encryption_field_allowed(
+    value: &str,
+    mode: &str,
+    kid: Option<&str>,
+    hash: bool,
+    migration: bool,
+) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    let prefix = if hash { "h1." } else { "e1." };
+    let valid = kid.is_some_and(|current| {
+        if hash {
+            valid_hash(value, current)
+        } else {
+            valid_envelope(value, current)
+        }
+    });
+    if migration {
+        match mode {
+            "enabling" => valid,
+            "disabling" => !value.starts_with(prefix),
+            _ => false,
+        }
+    } else {
+        match mode {
+            "off" => !value.starts_with(prefix),
+            "enabling" | "on" => valid,
+            "disabling" => valid || !value.starts_with(prefix),
+            _ => false,
+        }
+    }
+}
+
+fn skill_files_allowed(
+    files: &serde_json::Value,
+    mode: &str,
+    kid: Option<&str>,
+    migration: bool,
+) -> bool {
+    use base64::Engine;
+    let Some(files) = files.as_object() else {
+        return false;
+    };
+    files.iter().all(|(path, encoded)| {
+        let Some(encoded) = encoded.as_str() else {
+            return false;
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+            return false;
+        };
+        if !encryption_field_allowed(path, mode, kid, false, migration) {
+            return false;
+        }
+        match std::str::from_utf8(&bytes) {
+            Ok(content) => encryption_field_allowed(content, mode, kid, false, migration),
+            Err(_) => matches!(mode, "off" | "disabling"),
+        }
+    })
+}
+
+async fn validate_memory_encryption(
+    conn: &mut sqlx::PgConnection,
+    account: &str,
+    project: &str,
+    content: &str,
+    content_hash: &str,
+    migration: bool,
+) -> Result<(), KnowledgeError> {
+    let (mode, kid) = encryption_mode(conn, account).await?;
+    if encryption_field_allowed(project, &mode, kid.as_deref(), true, migration)
+        && encryption_field_allowed(content, &mode, kid.as_deref(), false, migration)
+        && encryption_field_allowed(content_hash, &mode, kid.as_deref(), true, migration)
+    {
+        Ok(())
+    } else {
+        Err(KnowledgeError::EncryptionConflict)
+    }
+}
+
+async fn validate_skill_encryption(
+    conn: &mut sqlx::PgConnection,
+    account: &str,
+    project: &str,
+    files: &serde_json::Value,
+    content_hash: &str,
+    migration: bool,
+) -> Result<(), KnowledgeError> {
+    let (mode, kid) = encryption_mode(conn, account).await?;
+    if encryption_field_allowed(project, &mode, kid.as_deref(), true, migration)
+        && encryption_field_allowed(content_hash, &mode, kid.as_deref(), true, migration)
+        && skill_files_allowed(files, &mode, kid.as_deref(), migration)
+    {
+        Ok(())
+    } else {
+        Err(KnowledgeError::EncryptionConflict)
+    }
+}
+
+pub(crate) async fn postgres_encryption_counts(
+    conn: &mut sqlx::PgConnection,
+    account: &str,
+    kid: Option<&str>,
+) -> Result<EncryptionCounts, KnowledgeError> {
+    use base64::Engine;
+    let memories: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT project, content, content_hash FROM memories WHERE account_id = $1",
+    )
+    .bind(account)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    let skills: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT project, files::text, content_hash FROM skill_versions WHERE account_id = $1",
+    )
+    .bind(account)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    let mut counts = EncryptionCounts::default();
+    for (project, content, content_hash) in memories {
+        counts.add(classify_hash(&project, kid));
+        counts.add(classify_envelope(&content, kid));
+        counts.add(classify_hash(&content_hash, kid));
+    }
+    for (project, files, content_hash) in skills {
+        counts.add(classify_hash(&project, kid));
+        counts.add(classify_hash(&content_hash, kid));
+        let files: serde_json::Value = serde_json::from_str(&files)
+            .map_err(|error| KnowledgeError::Db(error.to_string()))?;
+        if let Some(files) = files.as_object() {
+            for (path, encoded) in files {
+                counts.add(classify_envelope(path, kid));
+                let value = encoded
+                    .as_str()
+                    .and_then(|value| base64::engine::general_purpose::STANDARD.decode(value).ok())
+                    .and_then(|bytes| String::from_utf8(bytes).ok());
+                match value {
+                    Some(value) => counts.add(classify_envelope(&value, kid)),
+                    None => counts.obsolete += 1,
+                }
+            }
+        }
+    }
+    Ok(counts)
 }
 
 /// The no-insert outcomes of `add_memory`: the id already exists (own account
@@ -738,6 +1157,15 @@ impl KnowledgeStore for PgKnowledgeStore {
     ) -> Result<MemoryAddOutcome, KnowledgeError> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         lock_account(&mut tx, account).await?;
+        validate_memory_encryption(
+            &mut tx,
+            account,
+            &m.project,
+            &m.content,
+            &m.content_hash,
+            false,
+        )
+        .await?;
         if let Some(o) = existing_memory_outcome(&mut tx, account, &m).await? {
             tx.commit().await.map_err(db_err)?;
             return Ok(o);
@@ -865,6 +1293,15 @@ impl KnowledgeStore for PgKnowledgeStore {
             serde_json::to_string(&s.files).map_err(|e| KnowledgeError::Db(e.to_string()))?;
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         lock_account(&mut tx, account).await?;
+        validate_skill_encryption(
+            &mut tx,
+            account,
+            &s.project,
+            &s.files,
+            &s.content_hash,
+            false,
+        )
+        .await?;
         let (cur, cur_live): (i64, i64) = sqlx::query_as(&format!(
             "SELECT COALESCE(MAX(version), 0)::bigint, \
              COALESCE(MAX(version) FILTER (WHERE NOT deleted), 0)::bigint \
@@ -1055,6 +1492,94 @@ impl KnowledgeStore for PgKnowledgeStore {
             .await
             .map_err(db_err)?;
         rows.into_iter().map(SkillRow::try_from).collect()
+    }
+
+    async fn encryption_counts(
+        &self,
+        account: &str,
+        kid: Option<&str>,
+    ) -> Result<EncryptionCounts, KnowledgeError> {
+        let mut conn = self.pool.acquire().await.map_err(db_err)?;
+        postgres_encryption_counts(&mut conn, account, kid).await
+    }
+
+    async fn rewrite_memory_fields(
+        &self,
+        account: &str,
+        id: &str,
+        project: &str,
+        content: &str,
+        content_hash: &str,
+    ) -> Result<i64, KnowledgeError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        lock_account(&mut tx, account).await?;
+        validate_memory_encryption(
+            &mut tx,
+            account,
+            project,
+            content,
+            content_hash,
+            true,
+        )
+        .await?;
+        let seq: Option<i64> = sqlx::query_scalar(
+            "UPDATE memories SET project = $3, content = $4, content_hash = $5, \
+               seq = nextval('knowledge_seq') WHERE account_id = $1 AND id = $2 RETURNING seq",
+        )
+        .bind(account)
+        .bind(id)
+        .bind(project)
+        .bind(content)
+        .bind(content_hash)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(seq.unwrap_or(0))
+    }
+
+    async fn rewrite_skill_fields(
+        &self,
+        account: &str,
+        scope: &str,
+        old_project: &str,
+        name: &str,
+        version: i64,
+        project: &str,
+        files: serde_json::Value,
+        content_hash: &str,
+    ) -> Result<i64, KnowledgeError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        lock_account(&mut tx, account).await?;
+        validate_skill_encryption(
+            &mut tx,
+            account,
+            project,
+            &files,
+            content_hash,
+            true,
+        )
+        .await?;
+        let files = serde_json::to_string(&files)
+            .map_err(|error| KnowledgeError::Db(error.to_string()))?;
+        let seq: Option<i64> = sqlx::query_scalar(
+            "UPDATE skill_versions SET project = $6, files = $7::jsonb, content_hash = $8, \
+               seq = nextval('knowledge_seq') WHERE account_id = $1 AND scope = $2 \
+               AND project = $3 AND name = $4 AND version = $5 RETURNING seq",
+        )
+        .bind(account)
+        .bind(scope)
+        .bind(old_project)
+        .bind(name)
+        .bind(version)
+        .bind(project)
+        .bind(files)
+        .bind(content_hash)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(seq.unwrap_or(0))
     }
 }
 

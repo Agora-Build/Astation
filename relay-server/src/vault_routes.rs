@@ -6,13 +6,28 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::vault_store::VaultMeta;
+use crate::encryption::{valid_envelope, EncryptionState};
+use crate::vault_store::{VaultError, VaultMeta, VaultRewriteEntry};
 use crate::AppState;
 
 pub(crate) type ErrResp = (StatusCode, Json<serde_json::Value>);
 
 pub(crate) fn err(status: StatusCode, msg: &str) -> ErrResp {
     (status, Json(json!({ "error": msg })))
+}
+
+fn vault_write_error(error: VaultError) -> ErrResp {
+    match error {
+        VaultError::NotFound => err(StatusCode::NOT_FOUND, "vault not found"),
+        VaultError::EncryptionConflict => err(
+            StatusCode::CONFLICT,
+            "vault content does not match the account encryption mode",
+        ),
+        VaultError::Db(message) => {
+            tracing::error!("vault store error: {}", message);
+            err(StatusCode::INTERNAL_SERVER_ERROR, "temporarily unavailable")
+        }
+    }
 }
 
 /// The authenticated caller of a vault (or knowledge) request.
@@ -61,7 +76,7 @@ pub(crate) async fn resolve_caller(
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "missing ?id=<client_id>"))?
         .to_string();
 
-    let work_session_id = state
+    let astation_id = state
         .identity
         .resolve(session_id, chrono::Utc::now().timestamp())
         .await
@@ -71,15 +86,27 @@ pub(crate) async fn resolve_caller(
         })?
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "invalid or unbound session"))?;
 
+    let work_session_id = state
+        .accounts
+        .resolve_data_account(&astation_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("Account store error resolving data account: {}", e);
+            err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable")
+        })?;
+
     Ok(Caller {
         work_session_id,
         client_id,
     })
 }
 
+/// Same account only. `client_id` is the caller's own `?id=` claim, which the
+/// relay can't verify, so it labels who wrote an entry but never grants
+/// access: honoring it here let any session read another account's vaults by
+/// claiming a past writer's id.
 fn can_read(meta: &VaultMeta, caller: &Caller) -> bool {
     caller.work_session_id == meta.work_session_id
-        || meta.writer_list.iter().any(|w| w == &caller.client_id)
 }
 
 fn can_write(meta: &VaultMeta, caller: &Caller) -> bool {
@@ -93,6 +120,40 @@ async fn load_meta(state: &AppState, vault_id: &str) -> Result<VaultMeta, ErrRes
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "vault not found"))
+}
+
+async fn encryption_state(state: &AppState, account: &str) -> Result<EncryptionState, ErrResp> {
+    state.accounts.encryption_state(account).await.map_err(|error| {
+        tracing::error!("account encryption state error: {}", error);
+        err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable")
+    })
+}
+
+fn allowed_content(value: &str, encryption: &EncryptionState) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    let valid = encryption
+        .kid
+        .as_deref()
+        .is_some_and(|kid| valid_envelope(value, kid));
+    match encryption.mode.as_str() {
+        "off" => !value.starts_with("e1."),
+        "enabling" | "on" => valid,
+        "disabling" => valid || !value.starts_with("e1."),
+        _ => false,
+    }
+}
+
+fn migration_content(value: &str, encryption: &EncryptionState) -> bool {
+    match encryption.mode.as_str() {
+        "enabling" => encryption
+            .kid
+            .as_deref()
+            .is_some_and(|kid| value.is_empty() || valid_envelope(value, kid)),
+        "disabling" => !value.starts_with("e1."),
+        _ => false,
+    }
 }
 
 // ─────────────────────────── Handlers ───────────────────────────
@@ -111,11 +172,18 @@ pub async fn create_vault_handler(
     Json(body): Json<CreateVaultRequest>,
 ) -> Result<Json<serde_json::Value>, ErrResp> {
     let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
+    let encryption = encryption_state(&state, &caller.work_session_id).await?;
+    if !allowed_content(&body.summary, &encryption) {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "vault summary does not match the account encryption mode",
+        ));
+    }
     let vault_id = state
         .vault
         .create_vault(&caller.work_session_id, &caller.client_id, &body.summary)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        .map_err(vault_write_error)?;
     Ok(Json(json!({ "vault_id": vault_id })))
 }
 
@@ -128,7 +196,7 @@ pub async fn list_vaults_handler(
     let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
     let items = state
         .vault
-        .list_readable(&caller.work_session_id, &caller.client_id)
+        .list_readable(&caller.work_session_id)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     Ok(Json(serde_json::to_value(items).unwrap()))
@@ -174,19 +242,37 @@ pub async fn write_vault_handler(
     if !can_write(&meta, &caller) {
         return Err(err(StatusCode::FORBIDDEN, "not authorized to write this vault"));
     }
+    let encryption = encryption_state(&state, &caller.work_session_id).await?;
+    if !allowed_content(&body.text, &encryption) {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "vault entry does not match the account encryption mode",
+        ));
+    }
 
     let result = if let Some(entry_no) = body.entry_id {
         state
             .vault
-            .override_entry(&vault_id, entry_no, &caller.client_id, &body.text)
+            .override_entry(
+                &caller.work_session_id,
+                &vault_id,
+                entry_no,
+                &caller.client_id,
+                &body.text,
+            )
             .await
     } else {
         state
             .vault
-            .append(&vault_id, &caller.client_id, &body.text)
+            .append(
+                &caller.work_session_id,
+                &vault_id,
+                &caller.client_id,
+                &body.text,
+            )
             .await
     }
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    .map_err(vault_write_error)?;
 
     // Record the content writer (dedup).
     state
@@ -221,11 +307,61 @@ pub async fn set_summary_handler(
     if !can_read(&meta, &caller) {
         return Err(err(StatusCode::FORBIDDEN, "not authorized for this vault"));
     }
+    let encryption = encryption_state(&state, &caller.work_session_id).await?;
+    if !allowed_content(&body.text, &encryption) {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "vault summary does not match the account encryption mode",
+        ));
+    }
     state
         .vault
-        .set_summary(&vault_id, &body.text)
+        .set_summary(&caller.work_session_id, &vault_id, &body.text)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        .map_err(vault_write_error)?;
+    Ok(Json(json!({})))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RewriteVaultRequest {
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub entries: Vec<VaultRewriteEntry>,
+}
+
+/// POST /api/vault/:id/encryption rewrites summary and exact history rows.
+pub async fn rewrite_encryption_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(vault_id): Path<String>,
+    Query(query): Query<VaultQuery>,
+    Json(body): Json<RewriteVaultRequest>,
+) -> Result<Json<serde_json::Value>, ErrResp> {
+    let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
+    let meta = load_meta(&state, &vault_id).await?;
+    if !can_write(&meta, &caller) {
+        return Err(err(StatusCode::FORBIDDEN, "not authorized to rewrite this vault"));
+    }
+    let encryption = encryption_state(&state, &caller.work_session_id).await?;
+    if !migration_content(&body.summary, &encryption)
+        || body
+            .entries
+            .iter()
+            .any(|entry| !migration_content(&entry.content, &encryption))
+    {
+        return Err(err(StatusCode::CONFLICT, "invalid encryption migration"));
+    }
+    state
+        .vault
+        .rewrite_encrypted_fields(
+            &caller.work_session_id,
+            &vault_id,
+            &body.summary,
+            &body.entries,
+        )
+        .await
+        .map_err(vault_write_error)?;
     Ok(Json(json!({})))
 }
 
@@ -269,6 +405,7 @@ pub(crate) mod tests {
             vault: Arc::new(InMemoryVaultStore::new()),
             knowledge: Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         let session_id = bind_session(&state, astation_id).await;
         (state, session_id)
@@ -365,7 +502,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn authz_out_of_session_past_writer_read_only() {
+    async fn authz_other_account_cannot_read_by_claiming_a_writer_id() {
         // Vault created in ws-1 by client-a, who becomes a writer.
         let (state, sess1) = test_state("ws-1").await;
         // Add a second session bound to a different work session ws-2.
@@ -376,11 +513,15 @@ pub(crate) mod tests {
         // client-a writes → becomes a past writer.
         app.clone().oneshot(req("POST", &format!("/api/vault/{}?id=client-a", vault_id), &sess1, r#"{"text":"x"}"#)).await.unwrap();
 
-        // Out-of-session (ws-2) but past-writer client-a: read OK.
+        // Another account (ws-2) claiming writer client-a's id: read FORBIDDEN.
         let read = app.clone().oneshot(req("GET", &format!("/api/vault/{}?id=client-a", vault_id), &sess2, "")).await.unwrap();
-        assert_eq!(read.status(), StatusCode::OK);
+        assert_eq!(read.status(), StatusCode::FORBIDDEN);
 
-        // Out-of-session past-writer: write FORBIDDEN.
+        // ...and it isn't listed for them either.
+        let list = body_json(app.clone().oneshot(req("GET", "/api/vault?id=client-a", &sess2, "")).await.unwrap()).await;
+        assert_eq!(list, serde_json::json!([]));
+
+        // Same claim: write FORBIDDEN.
         let write = app.clone().oneshot(req("POST", &format!("/api/vault/{}?id=client-a", vault_id), &sess2, r#"{"text":"y"}"#)).await.unwrap();
         assert_eq!(write.status(), StatusCode::FORBIDDEN);
 
@@ -442,6 +583,7 @@ pub(crate) mod tests {
             vault: Arc::new(InMemoryVaultStore::new()),
             knowledge: Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: Arc::new(crate::account_store::InMemoryAccountStore::default()),
         }
     }
 

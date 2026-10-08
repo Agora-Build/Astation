@@ -39,6 +39,10 @@ class AstationHubManager: ObservableObject {
 
     /// Guards against concurrent identity relay reconnect attempts.
     private var identityRelayActive = false
+    /// Backoff is reset only after the relay verifies this Astation's key.
+    private var identityRelayReconnectPolicy = IdentityRelayReconnectPolicy()
+    /// Invalidates delayed retries left behind by an older socket generation.
+    private var identityRelayReconnectGeneration = 0
     /// NWPathMonitor for the identity relay — fires when network becomes available,
     /// enabling immediate reconnect without polling. Created once and reused.
     private var identityRelayPathMonitor: NWPathMonitor?
@@ -46,6 +50,8 @@ class AstationHubManager: ObservableObject {
     /// The current identity relay socket. Relay control frames are only
     /// accepted from, and binding messages only sent on, this socket. Main thread.
     private var identityRelayTask: URLSessionWebSocketTask?
+    /// Installed once; relay sends resolve identityRelayTask when they execute.
+    private var identityRelaySendHandlerInstalled = false
     /// True once the relay answered `relayAuthResult` registered|verified on
     /// `identityRelayTask`. Binding messages are only sent while verified. Main thread.
     private(set) var identityRelayVerified = false
@@ -59,6 +65,12 @@ class AstationHubManager: ObservableObject {
     private var sessionExpiryTimer: Timer?
     /// Relay identity problem shown in the menu (nil when fine).
     @Published var relayIdentityStatusMessage: String?
+    @Published private(set) var relayAccountDevices: [RelayAccountDevice] = []
+    @Published private(set) var relayMergeRequests: [RelayMergeRequest] = []
+    @Published private(set) var relayAccountStatusMessage: String?
+    @Published private(set) var relayEncryptionState: RelayEncryptionState?
+    @Published var relayEncryptionStatusMessage: String?
+    private var encryptionMigrationRetryDelay: TimeInterval = 1
 
     /// Station relay URL. Priority: test override > ASTATION_RELAY_URL env var > UserDefaults > default.
     var stationRelayUrl: String {
@@ -186,6 +198,17 @@ class AstationHubManager: ObservableObject {
         rtcManager.onUserLeft = { uid in
             Log.info("Remote user left: \(uid)")
         }
+        rtcManager.onTokenRenewalNeeded = { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, let channel = self.rtcManager.currentChannel,
+                      let appId = self.rtcManager.appId else { return }
+                let uid = self.rtcManager.currentUid
+                let response = await self.generateRTCToken(channel: channel, uid: Int(uid), projectId: appId)
+                guard self.rtcManager.currentChannel == channel, self.rtcManager.currentUid == uid,
+                      self.rtcManager.appId == appId else { return }
+                self.rtcManager.renewToken(response.token)
+            }
+        }
     }
 
     /// Initialize the RTC engine using the App ID from the first available project.
@@ -249,6 +272,7 @@ class AstationHubManager: ObservableObject {
         checkSessionStatus()
         refreshProjects()
         broadcastCredentials()
+        registerRelayAccountIfPossible()
     }
 
     /// Broadcast a refreshed-on-use credentialSync to every connected Atem.
@@ -456,6 +480,8 @@ class AstationHubManager: ObservableObject {
             self.connectedClients.append(client)
             Log.info(" Client connected: \(client.id) (\(client.clientType))")
 
+            self.sendEncryptionMode(to: client.id, relayConnectionId: relayConnectionId)
+
             // Send credentials immediately after connection
             self.sendCredentials(
                 toClientId: client.id,
@@ -608,6 +634,18 @@ class AstationHubManager: ObservableObject {
             voiceCodingManager.handleVoiceResponse(sessionId: sessionId, success: success, message: message)
             return nil
 
+        case .keyRequest(let publicKey):
+            handleEncryptionKeyRequest(
+                publicKey: publicKey,
+                clientId: clientId,
+                relayConnectionId: relayConnectionId
+            )
+            return nil
+
+        case .encryptionMigrationComplete(let mode, let kid):
+            handleEncryptionMigrationComplete(mode: mode, kid: kid)
+            return nil
+
         default:
             Log.debug(" Unhandled message type from client: \(clientId)")
             return nil
@@ -746,19 +784,16 @@ class AstationHubManager: ObservableObject {
 
     /// Toggle video (screen share) and broadcast state to all connected Atems.
     func toggleVideo() {
-        videoActive.toggle()
-
-        if rtcManager.isInChannel {
-            if videoActive {
-                rtcManager.startScreenShare(displayId: 0)
-            } else {
+        Task { @MainActor in
+            if rtcManager.isScreenSharing || rtcManager.isScreenShareStarting {
                 rtcManager.stopScreenShare()
+            } else if rtcManager.isInChannel {
+                await rtcManager.startScreenShare(displayId: 0)
             }
+            videoActive = rtcManager.isScreenSharing
+            broadcastHandler?(.videoToggle(active: videoActive))
+            Log.info("[AstationHub] Video toggled: \(videoActive ? "sharing" : "off")")
         }
-
-        let message = AstationMessage.videoToggle(active: videoActive)
-        broadcastHandler?(message)
-        Log.info("[AstationHub] Video toggled: \(videoActive ? "sharing" : "off")")
     }
 
     // MARK: - Atem Instance Management
@@ -1028,10 +1063,12 @@ class AstationHubManager: ObservableObject {
             switch mode {
             case "on":
                 let displayId = parts.count >= 4 ? Int64(parts[3]) ?? 0 : 0
-                rtcManager.startScreenShare(displayId: displayId)
-                return "RTC: screen share started (displayId=\(displayId))"
+                Task { @MainActor in
+                    await rtcManager.startScreenShare(displayId: displayId)
+                }
+                return "RTC: starting screen share (displayId=\(displayId))"
             case "off":
-                rtcManager.stopScreenShare()
+                Task { @MainActor in rtcManager.stopScreenShare() }
                 return "RTC: screen share stopped"
             default:
                 return "RTC: usage /rtc screen on|off [displayId]"
@@ -1143,6 +1180,7 @@ class AstationHubManager: ObservableObject {
     func startIdentityRelay() {
         guard !identityRelayActive else { return }
         identityRelayActive = true
+        identityRelayReconnectGeneration &+= 1
 
         // Start NWPathMonitor once — fires when network comes back, enabling
         // immediate reconnect without polling. No battery overhead while offline.
@@ -1162,16 +1200,22 @@ class AstationHubManager: ObservableObject {
         pendingRelayChallenge = nil
         startSessionExpiryTimerIfNeeded()
         preloadRelayIdentityKeyIfNeeded()
+        installIdentityRelaySendHandlerIfNeeded()
 
-        // Wire sendHandler: route messages whose clientId starts with "relay-" through
-        // the identity relay WS with the current Atem socket generation.
-        // Multiple Atems can be connected simultaneously; each has its own "relay-<id>" clientId.
-        let originalSend = sendHandler
-        sendHandler = { [weak self, weak task] message, targetId in
+        Log.info("[AstationHub] Identity relay connecting: \(url.absoluteString)")
+        readIdentityRelayMessages(task: task)
+    }
+
+    private func installIdentityRelaySendHandlerIfNeeded() {
+        guard !identityRelaySendHandlerInstalled else { return }
+        identityRelaySendHandlerInstalled = true
+        let localSend = sendHandler
+        sendHandler = { [weak self] message, targetId in
             if targetId.hasPrefix("relay-") {
-                let sendToRelay = { [weak self, weak task] in
+                let sendToRelay = { [weak self] in
                     let atemId = String(targetId.dropFirst(6)) // strip "relay-" prefix
                     guard let self,
+                          let task = self.identityRelayTask,
                           let connectionId = self.identityRelayAuthentication.connectionId(for: targetId) else {
                         Log.warn("[AstationHub] Cannot route to relay client without an active connection")
                         return
@@ -1192,7 +1236,7 @@ class AstationHubManager: ObservableObject {
                           ]),
                           let envelopeStr = String(data: envelope, encoding: .utf8) else { return }
                     NetworkDebugLogger.logWebSocket(direction: "send", context: "identity-relay:\(atemId)", message: envelopeStr)
-                    task?.send(.string(envelopeStr)) { _ in }
+                    task.send(.string(envelopeStr)) { _ in }
                 }
                 if Thread.isMainThread {
                     sendToRelay()
@@ -1200,12 +1244,9 @@ class AstationHubManager: ObservableObject {
                     DispatchQueue.main.async(execute: sendToRelay)
                 }
             } else {
-                originalSend?(message, targetId)
+                localSend?(message, targetId)
             }
         }
-
-        Log.info("[AstationHub] Identity relay connecting: \(url.absoluteString)")
-        readIdentityRelayMessages(task: task)
     }
 
     /// Start the network path monitor if not already running.
@@ -1252,7 +1293,11 @@ class AstationHubManager: ObservableObject {
                         let relayClientId = "relay-\(atemId)"
                         if let event = envelope["relay_event"] as? String {
                             DispatchQueue.main.async {
-                                self?.handleIdentityRelayConnectionEvent(
+                                guard let self, self.identityRelayTask === task else {
+                                    Log.debug("[AstationHub] Ignored event from a replaced identity relay socket")
+                                    return
+                                }
+                                self.handleIdentityRelayConnectionEvent(
                                     event,
                                     clientId: relayClientId,
                                     connectionId: connectionId
@@ -1262,7 +1307,11 @@ class AstationHubManager: ObservableObject {
                                   let payloadData = try? JSONSerialization.data(withJSONObject: payloadObj),
                                   let msg = try? JSONDecoder().decode(AstationMessage.self, from: payloadData) {
                             DispatchQueue.main.async {
-                                self?.handleIdentityRelayMessage(
+                                guard let self, self.identityRelayTask === task else {
+                                    Log.debug("[AstationHub] Ignored message from a replaced identity relay socket")
+                                    return
+                                }
+                                self.handleIdentityRelayMessage(
                                     msg,
                                     clientId: relayClientId,
                                     connectionId: connectionId
@@ -1276,30 +1325,87 @@ class AstationHubManager: ObservableObject {
                 self?.readIdentityRelayMessages(task: task)
 
             case .failure(let error):
-                Log.info("[AstationHub] Identity relay disconnected: \(error)")
+                let closeCode = Self.usableRelayCloseCode(task.closeCode)
+                let closeReason = task.closeReason
+                    .flatMap { String(data: $0, encoding: .utf8) }
+                    .flatMap { $0.isEmpty ? nil : $0 }
                 DispatchQueue.main.async {
-                    // Remove all relay-connected Atem clients (their WS is gone)
-                    self?.connectedClients
-                        .filter { $0.id.hasPrefix("relay-") }
-                        .forEach { self?.removeClient(withId: $0.id) }
-                    self?.identityRelayAuthentication.removeAll()
-                    if self?.identityRelayTask === task {
-                        self?.identityRelayTask = nil
-                        self?.identityRelayVerified = false
-                        self?.pendingRelayChallenge = nil
-                    }
-                    self?.identityRelayActive = false
-                }
-                // Schedule a 30s fallback retry (only if network is still up).
-                // NWPathMonitor handles the "network-was-down" case: it will fire
-                // startIdentityRelay() immediately when connectivity is restored.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 30.0) {
-                    guard let self = self, !self.identityRelayActive else { return }
-                    guard self.identityRelayPathMonitor?.currentPath.status == .satisfied else { return }
-                    Log.info("[AstationHub] Retrying identity relay after 30s")
-                    self.startIdentityRelay()
+                    self?.handleIdentityRelayDisconnect(
+                        task: task,
+                        error: error,
+                        closeCode: closeCode,
+                        closeReason: closeReason
+                    )
                 }
             }
+        }
+    }
+
+    private func handleIdentityRelayDisconnect(
+        task: URLSessionWebSocketTask,
+        error: Error?,
+        closeCode: Int?,
+        closeReason: String?
+    ) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard identityRelayTask === task else {
+            Log.debug("[AstationHub] Ignored disconnect from a replaced identity relay socket")
+            return
+        }
+
+        let closeDescription = closeCode.map(String.init) ?? "none"
+        let reasonDescription = closeReason.map { " reason=\($0)" } ?? ""
+        let errorDescription = error.map { " error=\($0)" } ?? ""
+        Log.info(
+            "[AstationHub] Identity relay disconnected: " +
+                "code=\(closeDescription)\(reasonDescription)\(errorDescription)"
+        )
+
+        connectedClients
+            .filter { $0.id.hasPrefix("relay-") }
+            .forEach { removeClient(withId: $0.id) }
+        identityRelayAuthentication.removeAll()
+        let wasVerified = identityRelayVerified
+        identityRelayTask = nil
+        identityRelayVerified = false
+        pendingRelayChallenge = nil
+        identityRelayActive = false
+
+        // CFNetwork commonly reports peer close frames as 1005/invalid. An
+        // established, verified socket gets the prompt restart path; a socket
+        // that failed before verification gets the try-again backoff path.
+        let delay = identityRelayReconnectPolicy.delay(
+            observedCloseCode: closeCode,
+            wasVerified: wasVerified,
+            unitJitter: Double.random(in: 0...1)
+        )
+        identityRelayReconnectGeneration &+= 1
+        let generation = identityRelayReconnectGeneration
+        Log.info(
+            "[AstationHub] Identity relay retry scheduled in \(String(format: "%.1f", delay))s " +
+                "after close code \(closeDescription) (wasVerified=\(wasVerified))"
+        )
+
+        // NWPathMonitor starts immediately when connectivity returns. This timer
+        // covers relay failures that happen while the network path stays online.
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self = self,
+                  self.identityRelayReconnectGeneration == generation,
+                  !self.identityRelayActive else { return }
+            guard self.identityRelayPathMonitor?.currentPath.status == .satisfied else { return }
+            Log.info("[AstationHub] Retrying identity relay")
+            self.startIdentityRelay()
+        }
+    }
+
+    private static func usableRelayCloseCode(
+        _ closeCode: URLSessionWebSocketTask.CloseCode
+    ) -> Int? {
+        switch closeCode {
+        case .invalid, .noStatusReceived:
+            return nil
+        default:
+            return Int(closeCode.rawValue)
         }
     }
 
@@ -1319,9 +1425,75 @@ class AstationHubManager: ObservableObject {
         case .ack(let forType, let ok, let message):
             if ok {
                 Log.debug("[RelayIdentity] Relay acknowledged \(forType)")
+                if forType.hasPrefix("relayMerge") ||
+                    forType == "relayLeaveGroup" ||
+                    forType == "relayRemoveAstation" ||
+                    forType == "relayRegisterAccount" {
+                    relayAccountStatusMessage = "Account change accepted by the relay."
+                    NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
+                } else if forType == "relayEncryptionSet" {
+                    encryptionMigrationRetryDelay = 1
+                    relayEncryptionStatusMessage = "Encryption change accepted; waiting for migration status."
+                    NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
+                }
             } else {
                 Log.warn("[RelayIdentity] Relay refused \(forType): \(message ?? "no message")")
+                if forType.hasPrefix("relayMerge") ||
+                    forType == "relayLeaveGroup" ||
+                    forType == "relayRemoveAstation" ||
+                    forType == "relayRegisterAccount" ||
+                    forType == "relayAccountList" {
+                    relayAccountStatusMessage = message ?? "The relay refused the account change."
+                    NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
+                } else if forType == "relayEncryptionSet" || forType == "relayEncryptionGet" {
+                    relayEncryptionStatusMessage = message ?? "The relay refused the encryption change."
+                    NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
+                    if forType == "relayEncryptionSet",
+                       message?.contains("migration is incomplete") == true {
+                        scheduleEncryptionMigrationRetry()
+                    }
+                }
             }
+        case .accountState(let devices, let requests):
+            relayAccountDevices = devices
+            relayMergeRequests = requests
+            relayAccountStatusMessage = nil
+            NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
+            requestRelayEncryptionState()
+        case .mergeApproval(let approval):
+            showMergeApproval(approval)
+        case .accountChanged(let reason, _):
+            relayAccountStatusMessage = Self.accountChangeMessage(reason)
+            NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
+            requestRelayAccountState()
+            requestRelayEncryptionState()
+        case .encryptionState(let state):
+            let previousState = relayEncryptionState
+            relayEncryptionState = state
+            relayEncryptionStatusMessage = nil
+            do {
+                if state.mode == "off" {
+                    try DataEncryptionKeyManager.shared.delete(dataAccount: state.dataAccount)
+                } else if let kid = state.kid {
+                    try DataEncryptionKeyManager.shared.makeAvailable(
+                        dataAccount: state.dataAccount,
+                        kid: kid,
+                        preferredDataAccount: previousState?.dataAccount
+                    )
+                    if state.mode == "on" {
+                        try DataEncryptionKeyManager.shared.retainOnly(
+                            kid: kid,
+                            dataAccount: state.dataAccount
+                        )
+                    }
+                }
+            } catch {
+                relayEncryptionStatusMessage = error.localizedDescription
+            }
+            broadcastEncryptionMode(state)
+            NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
+        case .encryptionChanged:
+            requestRelayEncryptionState()
         }
     }
 
@@ -1420,9 +1592,13 @@ class AstationHubManager: ObservableObject {
         switch status {
         case RelayIdentityProtocol.statusRegistered, RelayIdentityProtocol.statusVerified:
             identityRelayVerified = true
+            identityRelayReconnectPolicy.reset()
             relayIdentityStatusMessage = nil
             Log.info("[RelayIdentity] Relay \(status) this Astation's key")
             sendRelaySessionsResync()
+            requestRelayAccountState()
+            requestRelayEncryptionState()
+            registerRelayAccountIfPossible()
         case RelayIdentityProtocol.statusRejected:
             identityRelayVerified = false
             relayIdentityStatusMessage = RelayIdentityProtocol.rejectedMenuMessage
@@ -1437,6 +1613,250 @@ class AstationHubManager: ObservableObject {
         let sessionIds = deviceSessionStore.getAllActive().map { $0.id }
         guard let text = RelayIdentityProtocol.sessionsMessage(sessionIds: sessionIds) else { return }
         sendRelayIdentityControl(text, label: "relaySessions(\(sessionIds.count))")
+    }
+
+    func requestRelayAccountState() {
+        guard let text = RelayIdentityProtocol.accountListMessage() else { return }
+        sendRelayIdentityControl(text, label: "relayAccountList")
+    }
+
+    func requestRelayEncryptionState() {
+        guard let text = RelayIdentityProtocol.encryptionStateMessage() else { return }
+        sendRelayIdentityControl(text, label: "relayEncryptionGet")
+    }
+
+    func setRelayEncryption(mode: String, kid: String?) {
+        guard let text = RelayIdentityProtocol.encryptionSetMessage(mode: mode, kid: kid) else { return }
+        relayEncryptionStatusMessage = "Updating encryption…"
+        NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
+        sendRelayIdentityControl(text, label: "relayEncryptionSet")
+    }
+
+    private func scheduleEncryptionMigrationRetry() {
+        let delay = encryptionMigrationRetryDelay
+        encryptionMigrationRetryDelay = min(delay * 2, 30)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.identityRelayVerified else { return }
+            self.requestRelayEncryptionState()
+        }
+    }
+
+    func prepareEncryptionKeyForCurrentAccount(reuseExisting: Bool) throws -> (AccountDataKey, String) {
+        let account = relayEncryptionState?.dataAccount ?? currentDataAccount
+        let value = if reuseExisting,
+                       let existing = try DataEncryptionKeyManager.shared.load(dataAccount: account) {
+            existing
+        } else {
+            try DataEncryptionKeyManager.shared.generate()
+        }
+        return (value, try DataEncryptionKeyManager.shared.recoveryKey(for: value))
+    }
+
+    func installEncryptionKey(_ value: AccountDataKey) throws {
+        try DataEncryptionKeyManager.shared.install(
+            value,
+            dataAccount: relayEncryptionState?.dataAccount ?? currentDataAccount
+        )
+    }
+
+    func encryptionRecoveryKey() throws -> String {
+        let account = relayEncryptionState?.dataAccount ?? currentDataAccount
+        guard let value = try DataEncryptionKeyManager.shared.load(
+            dataAccount: account,
+            kid: relayEncryptionState?.kid
+        ) else {
+            throw DataEncryptionKeyError.invalidKey
+        }
+        return try DataEncryptionKeyManager.shared.recoveryKey(for: value)
+    }
+
+    func restoreEncryptionKey(_ text: String) throws {
+        let account = relayEncryptionState?.dataAccount ?? currentDataAccount
+        let value = try DataEncryptionKeyManager.decodeRecoveryKey(text)
+        if let state = relayEncryptionState, state.kid != nil, state.kid != value.kid {
+            throw DataEncryptionKeyError.invalidRecoveryKey
+        }
+        try DataEncryptionKeyManager.shared.install(value, dataAccount: account)
+        if let state = relayEncryptionState, state.mode == "off" {
+            setRelayEncryption(mode: "enabling", kid: value.kid)
+        } else if let state = relayEncryptionState {
+            broadcastEncryptionMode(state)
+        }
+    }
+
+    func discardEncryptionKeyForCurrentAccount() throws {
+        try DataEncryptionKeyManager.shared.delete(
+            dataAccount: relayEncryptionState?.dataAccount ?? currentDataAccount
+        )
+    }
+
+    private var currentDataAccount: String {
+        relayAccountDevices
+            .first(where: { $0.astationId == AstationIdentity.shared.id })?
+            .dataAccount ?? AstationIdentity.shared.id
+    }
+
+    private func broadcastEncryptionMode(_ state: RelayEncryptionState) {
+        let message = AstationMessage.encryptionMode(
+            mode: state.mode,
+            kid: state.kid,
+            dataAccount: state.dataAccount,
+            astationId: AstationIdentity.shared.id
+        )
+        broadcastHandler?(message)
+        broadcastToAuthenticatedIdentityRelayClients(message)
+    }
+
+    private func sendEncryptionMode(to clientId: String, relayConnectionId: String?) {
+        guard let state = relayEncryptionState else { return }
+        sendMessage(
+            .encryptionMode(
+                mode: state.mode,
+                kid: state.kid,
+                dataAccount: state.dataAccount,
+                astationId: AstationIdentity.shared.id
+            ),
+            to: clientId,
+            expectedRelayConnectionId: relayConnectionId
+        )
+    }
+
+    private func handleEncryptionKeyRequest(
+        publicKey: String,
+        clientId: String,
+        relayConnectionId: String?
+    ) {
+        guard let state = relayEncryptionState,
+              state.mode != "off",
+              let kid = state.kid,
+              let fingerprint = DataEncryptionKeyManager.fingerprint(publicKeyBase64: publicKey) else {
+            sendMessage(.error(message: "Encryption key request is invalid"),
+                        to: clientId, expectedRelayConnectionId: relayConnectionId)
+            return
+        }
+        var trusted = UserDefaults.standard.dictionary(forKey: "AstationEncryptionFingerprints") as? [String: String] ?? [:]
+        if trusted[clientId] != fingerprint {
+            let alert = NSAlert()
+            alert.messageText = trusted[clientId] == nil
+                ? "Verify Atem Encryption Key"
+                : "Atem Encryption Key Changed"
+            alert.informativeText = "Compare this fingerprint with the one printed by atem pair:\n\n\(fingerprint)\n\nDevice: \(clientId)"
+            alert.alertStyle = trusted[clientId] == nil ? .informational : .warning
+            alert.addButton(withTitle: "Fingerprint Matches")
+            alert.addButton(withTitle: "Deny")
+            guard alert.runModal() == .alertFirstButtonReturn else {
+                sendMessage(.error(message: "Encryption fingerprint was not approved"),
+                            to: clientId, expectedRelayConnectionId: relayConnectionId)
+                return
+            }
+            trusted[clientId] = fingerprint
+            UserDefaults.standard.set(trusted, forKey: "AstationEncryptionFingerprints")
+        }
+        do {
+            guard let value = try DataEncryptionKeyManager.shared.load(
+                dataAccount: state.dataAccount,
+                kid: kid
+            ) else {
+                throw DataEncryptionKeyError.invalidKey
+            }
+            let grant = try DataEncryptionKeyManager.shared.wrap(
+                value,
+                to: publicKey,
+                dataAccount: state.dataAccount
+            )
+            sendMessage(
+                .keyGrant(kid: grant.kid, wrappedKey: grant.wrappedKey, dataAccount: state.dataAccount),
+                to: clientId,
+                expectedRelayConnectionId: relayConnectionId
+            )
+        } catch {
+            relayEncryptionStatusMessage = error.localizedDescription
+            NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
+            sendMessage(.error(message: "Astation cannot access the account encryption key"),
+                        to: clientId, expectedRelayConnectionId: relayConnectionId)
+        }
+    }
+
+    private func handleEncryptionMigrationComplete(mode: String, kid: String) {
+        guard let state = relayEncryptionState, state.kid == kid else { return }
+        if state.mode == "enabling", mode == "on" {
+            setRelayEncryption(mode: "on", kid: kid)
+        } else if state.mode == "disabling", mode == "off" {
+            setRelayEncryption(mode: "off", kid: kid)
+        }
+    }
+
+    func requestRelayMerge(targetAstationId: String, freshAccessToken: String? = nil) {
+        guard let text = RelayIdentityProtocol.mergeRequestMessage(
+            targetAstationId: targetAstationId,
+            freshAccessToken: freshAccessToken
+        ) else { return }
+        relayAccountStatusMessage = "Requesting merge…"
+        NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
+        sendRelayIdentityControl(text, label: "relayMergeRequest")
+    }
+
+    func cancelRelayMerge(requestId: String) {
+        guard let text = RelayIdentityProtocol.mergeCancelMessage(requestId: requestId) else { return }
+        sendRelayIdentityControl(text, label: "relayMergeCancel")
+    }
+
+    func leaveRelayAccountGroup() {
+        guard let text = RelayIdentityProtocol.leaveGroupMessage() else { return }
+        sendRelayIdentityControl(text, label: "relayLeaveGroup")
+    }
+
+    func removeRelayAstation(astationId: String) {
+        guard let text = RelayIdentityProtocol.removeAstationMessage(astationId: astationId) else { return }
+        sendRelayIdentityControl(text, label: "relayRemoveAstation")
+    }
+
+    private func registerRelayAccountIfPossible() {
+        guard identityRelayVerified else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await tokenProvider.validToken()
+                guard let session = sessionStore.load() else { return }
+                let rawLabel = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+                let label = DeviceAuthentication.deviceLabel(rawLabel)
+                guard let text = RelayIdentityProtocol.registerAccountMessage(
+                    accessToken: session.accessToken,
+                    label: label
+                ) else { return }
+                await MainActor.run {
+                    self.sendRelayIdentityControl(text, label: "relayRegisterAccount")
+                }
+            } catch {
+                Log.debug("[RelayAccount] Registration deferred: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func showMergeApproval(_ approval: RelayMergeApproval) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let alert = NSAlert()
+        alert.messageText = "Merge Astation data?"
+        alert.informativeText = "\(approval.requesterLabel) wants to merge its memories, skills and vaults with this Mac. Both Astations will then use one shared data account."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Approve Merge")
+        alert.addButton(withTitle: "Cancel Request")
+        let approved = alert.runModal() == .alertFirstButtonReturn
+        let text = approved
+            ? RelayIdentityProtocol.mergeApprovalMessage(requestId: approval.requestId)
+            : RelayIdentityProtocol.mergeCancelMessage(requestId: approval.requestId)
+        if let text {
+            sendRelayIdentityControl(text, label: approved ? "relayMergeApprove" : "relayMergeCancel")
+        }
+    }
+
+    private static func accountChangeMessage(_ reason: String) -> String {
+        switch reason {
+        case "merge_completed": return "Astation data accounts were merged."
+        case "merge_cancelled": return "The pending merge was cancelled."
+        case "delayed_merge_pending": return "A delayed merge is pending for 24 hours."
+        default: return "The account changed on another Astation."
+        }
     }
 
     /// Bind a granted pairing session on the relay (any grant path: relay, LAN, loopback).

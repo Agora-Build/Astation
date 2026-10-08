@@ -34,6 +34,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::encryption::{valid_envelope, valid_hash, EncryptionState};
 use crate::knowledge_secrets::{check_bytes, contains_reserved, find_secrets};
 use crate::knowledge_store::{KnowledgeError, MemoryRow, SkillRow};
 use crate::vault_routes::{err, resolve_caller};
@@ -79,7 +80,9 @@ fn unavailable(e: KnowledgeError) -> ErrResp {
 fn store_result<T>(r: Result<T, KnowledgeError>, ok: impl FnOnce(T) -> Value) -> Result<Value, ErrResp> {
     match r {
         Ok(t) => Ok(ok(t)),
-        Err(e @ KnowledgeError::IdConflict) => Ok(op_err(e.to_string())),
+        Err(e @ (KnowledgeError::IdConflict | KnowledgeError::EncryptionConflict)) => {
+            Ok(op_err(e.to_string()))
+        }
         Err(e @ KnowledgeError::Db(_)) => Err(unavailable(e)),
     }
 }
@@ -260,6 +263,57 @@ pub(crate) enum MemoryOp {
         #[serde(default)]
         superseded_by: Option<String>,
     },
+    Rewrite {
+        id: String,
+        #[serde(default)]
+        project: String,
+        content: String,
+        content_hash: String,
+    },
+}
+
+fn encrypted_prefix(value: &str, hash: bool) -> bool {
+    value.starts_with(if hash { "h1." } else { "e1." })
+}
+
+fn allowed_field(value: &str, encryption: &EncryptionState, hash: bool) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    let valid = encryption.kid.as_deref().is_some_and(|kid| {
+        if hash {
+            valid_hash(value, kid)
+        } else {
+            valid_envelope(value, kid)
+        }
+    });
+    match encryption.mode.as_str() {
+        "off" => !encrypted_prefix(value, hash),
+        "enabling" | "on" => valid,
+        "disabling" => valid || !encrypted_prefix(value, hash),
+        _ => false,
+    }
+}
+
+fn migration_field(value: &str, encryption: &EncryptionState, hash: bool) -> bool {
+    match encryption.mode.as_str() {
+        "enabling" => encryption.kid.as_deref().is_some_and(|kid| {
+            if hash {
+                value.is_empty() || valid_hash(value, kid)
+            } else {
+                value.is_empty() || valid_envelope(value, kid)
+            }
+        }),
+        "disabling" => !encrypted_prefix(value, hash),
+        _ => false,
+    }
+}
+
+async fn encryption_state(state: &AppState, account: &str) -> Result<EncryptionState, ErrResp> {
+    state.accounts.encryption_state(account).await.map_err(|error| {
+        tracing::error!("account encryption state error: {}", error);
+        err(StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable")
+    })
 }
 
 /// `canon` maps an id the client sent to the canonical id an earlier `add`
@@ -268,6 +322,7 @@ pub(crate) enum MemoryOp {
 async fn apply_memory_op(
     state: &AppState,
     account: &str,
+    encryption: &EncryptionState,
     op: MemoryOp,
     canon: &mut HashMap<String, String>,
 ) -> Result<Value, ErrResp> {
@@ -280,11 +335,23 @@ async fn apply_memory_op(
             {
                 return Ok(op_err("invalid memory"));
             }
-            if contains_reserved(&memory.content) {
+            if !allowed_field(&memory.project, encryption, true)
+                || !allowed_field(&memory.content, encryption, false)
+                || !allowed_field(&memory.content_hash, encryption, true)
+            {
+                return Ok(op_err("memory does not match the account encryption mode"));
+            }
+            let encrypted_content = encryption
+                .kid
+                .as_deref()
+                .is_some_and(|kid| valid_envelope(&memory.content, kid));
+            if !encrypted_content && contains_reserved(&memory.content) {
                 return Ok(op_err("reserved token"));
             }
-            if let Some(f) = find_secrets(&memory.content).first() {
-                return Ok(op_err(format!("possible credential: {}", f.kind)));
+            if !encrypted_content {
+                if let Some(f) = find_secrets(&memory.content).first() {
+                    return Ok(op_err(format!("possible credential: {}", f.kind)));
+                }
             }
             let r = state.knowledge.add_memory(account, memory).await;
             if let Ok(o) = &r {
@@ -327,6 +394,34 @@ async fn apply_memory_op(
                 |seq| json!({ "ok": true, "id": id, "seq": seq }),
             )
         }
+        MemoryOp::Rewrite { id, project, content, content_hash } => {
+            if has_nul(&[&id, &project, &content, &content_hash])
+                || !migration_field(&project, encryption, true)
+                || !migration_field(&content, encryption, false)
+                || !migration_field(&content_hash, encryption, true)
+            {
+                return Ok(op_err("invalid encryption migration"));
+            }
+            let encrypted_content = encryption
+                .kid
+                .as_deref()
+                .is_some_and(|kid| valid_envelope(&content, kid));
+            if !encrypted_content && contains_reserved(&content) {
+                return Ok(op_err("reserved token"));
+            }
+            if !encrypted_content {
+                if let Some(finding) = find_secrets(&content).first() {
+                    return Ok(op_err(format!("possible credential: {}", finding.kind)));
+                }
+            }
+            store_result(
+                state
+                    .knowledge
+                    .rewrite_memory_fields(account, &id, &project, &content, &content_hash)
+                    .await,
+                |seq| json!({ "ok": seq != 0, "id": id, "seq": seq }),
+            )
+        }
     }
 }
 
@@ -339,10 +434,13 @@ pub async fn memory_batch_handler(
 ) -> Result<Json<Value>, ErrResp> {
     let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
     let ops: Vec<MemoryOp> = read_batch(body, MEMORY_BATCH_BODY_LIMIT, MEMORY_BATCH_MAX_OPS).await?;
+    let encryption = encryption_state(&state, &caller.work_session_id).await?;
     let mut results = Vec::with_capacity(ops.len());
     let mut canon = HashMap::new();
     for op in ops {
-        results.push(apply_memory_op(&state, &caller.work_session_id, op, &mut canon).await?);
+        results.push(
+            apply_memory_op(&state, &caller.work_session_id, &encryption, op, &mut canon).await?,
+        );
     }
     Ok(Json(json!({ "results": results })))
 }
@@ -422,16 +520,104 @@ pub(crate) enum SkillOp {
         #[serde(default)]
         versions: Option<Vec<i64>>,
     },
+    Rewrite {
+        scope: String,
+        #[serde(default)]
+        old_project: String,
+        name: String,
+        version: i64,
+        #[serde(default)]
+        project: String,
+        files: Value,
+        content_hash: String,
+    },
 }
 
-async fn apply_skill_op(state: &AppState, account: &str, op: SkillOp) -> Result<Value, ErrResp> {
+fn skill_files_match_mode(files: &Value, encryption: &EncryptionState, migration: bool) -> bool {
+    let Some(files) = files.as_object() else {
+        return false;
+    };
+    files.iter().all(|(path, encoded)| {
+        let path_allowed = if migration {
+            migration_field(path, encryption, false)
+        } else {
+            allowed_field(path, encryption, false)
+        };
+        if !path_allowed {
+            return false;
+        }
+        let Some(encoded) = encoded.as_str() else {
+            return false;
+        };
+        let Ok(bytes) = base64_decode(encoded) else {
+            return false;
+        };
+        let Ok(content) = std::str::from_utf8(&bytes) else {
+            return matches!(encryption.mode.as_str(), "off" | "disabling");
+        };
+        if migration {
+            migration_field(content, encryption, false)
+        } else {
+            allowed_field(content, encryption, false)
+        }
+    })
+}
+
+fn skill_files_have_valid_base64(files: &Value) -> bool {
+    files.as_object().is_some_and(|files| {
+        files.values().all(|encoded| {
+            encoded
+                .as_str()
+                .is_some_and(|encoded| base64_decode(encoded).is_ok())
+        })
+    })
+}
+
+fn skill_files_are_encrypted(files: &Value, kid: &str) -> bool {
+    let Some(files) = files.as_object() else {
+        return false;
+    };
+    files.iter().all(|(path, encoded)| {
+        let Some(encoded) = encoded.as_str() else {
+            return false;
+        };
+        let Ok(bytes) = base64_decode(encoded) else {
+            return false;
+        };
+        let Ok(content) = std::str::from_utf8(&bytes) else {
+            return false;
+        };
+        valid_envelope(path, kid) && valid_envelope(content, kid)
+    })
+}
+
+async fn apply_skill_op(
+    state: &AppState,
+    account: &str,
+    encryption: &EncryptionState,
+    op: SkillOp,
+) -> Result<Value, ErrResp> {
     match op {
         SkillOp::Push { skill, base_version } => {
             if !is_valid_skill_scope(&skill.scope) || skill_has_nul(&skill) {
                 return Ok(op_err("invalid skill"));
             }
-            if let Err(bad) = check_skill_files(&skill.files) {
-                return Ok(bad);
+            if !skill_files_have_valid_base64(&skill.files) {
+                return Ok(op_err("invalid base64"));
+            }
+            if !allowed_field(&skill.project, encryption, true)
+                || !allowed_field(&skill.content_hash, encryption, true)
+                || !skill_files_match_mode(&skill.files, encryption, false)
+            {
+                return Ok(op_err("skill does not match the account encryption mode"));
+            }
+            let files_encrypted = encryption.kid.as_deref().is_some_and(|kid| {
+                skill_files_are_encrypted(&skill.files, kid)
+            });
+            if !files_encrypted {
+                if let Err(bad) = check_skill_files(&skill.files) {
+                    return Ok(bad);
+                }
             }
             store_result(state.knowledge.push_skill(account, skill, base_version).await, |o| {
                 json!({
@@ -463,6 +649,49 @@ async fn apply_skill_op(state: &AppState, account: &str, op: SkillOp) -> Result<
                 |_| json!({ "ok": true }),
             )
         }
+        SkillOp::Rewrite {
+            scope,
+            old_project,
+            name,
+            version,
+            project,
+            files,
+            content_hash,
+        } => {
+            if !is_valid_skill_scope(&scope)
+                || has_nul(&[&old_project, &name, &project, &content_hash])
+                || !migration_field(&project, encryption, true)
+                || !migration_field(&content_hash, encryption, true)
+                || !skill_files_match_mode(&files, encryption, true)
+            {
+                return Ok(op_err("invalid encryption migration"));
+            }
+            let files_encrypted = encryption
+                .kid
+                .as_deref()
+                .is_some_and(|kid| skill_files_are_encrypted(&files, kid));
+            if !files_encrypted {
+                if let Err(bad) = check_skill_files(&files) {
+                    return Ok(bad);
+                }
+            }
+            store_result(
+                state
+                    .knowledge
+                    .rewrite_skill_fields(
+                        account,
+                        &scope,
+                        &old_project,
+                        &name,
+                        version,
+                        &project,
+                        files,
+                        &content_hash,
+                    )
+                    .await,
+                |seq| json!({ "ok": seq != 0, "version": version, "seq": seq }),
+            )
+        }
     }
 }
 
@@ -475,9 +704,10 @@ pub async fn skills_batch_handler(
 ) -> Result<Json<Value>, ErrResp> {
     let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
     let ops: Vec<SkillOp> = read_batch(body, SKILLS_BATCH_BODY_LIMIT, SKILLS_BATCH_MAX_OPS).await?;
+    let encryption = encryption_state(&state, &caller.work_session_id).await?;
     let mut results = Vec::with_capacity(ops.len());
     for op in ops {
-        results.push(apply_skill_op(&state, &caller.work_session_id, op).await?);
+        results.push(apply_skill_op(&state, &caller.work_session_id, &encryption, op).await?);
     }
     Ok(Json(json!({ "results": results })))
 }
@@ -563,6 +793,7 @@ pub async fn skill_version_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account_store::{AccountStore, InMemoryAccountStore};
     use crate::vault_routes::tests::bind_session;
     use crate::knowledge_store::{
         InMemoryKnowledgeStore, KnowledgeStore, MemoryAddOutcome, SkillPushOutcome,
@@ -571,7 +802,7 @@ mod tests {
     use crate::relay::RelayHub;
     use crate::rtc_session::RtcSessionStore;
     use crate::session_store::SessionStore;
-    use crate::vault_store::InMemoryVaultStore;
+    use crate::vault_store::{InMemoryVaultStore, VaultStore};
     use crate::voice_session::VoiceSessionStore;
     use axum::body::Body;
     use axum::http::Request;
@@ -591,6 +822,7 @@ mod tests {
             vault: Arc::new(InMemoryVaultStore::new()),
             knowledge: Arc::new(InMemoryKnowledgeStore::new()),
             identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         let session_id = bind_session(&state, astation_id).await;
         (state, session_id)
@@ -1119,6 +1351,32 @@ mod tests {
         async fn skill_version(&self, _: &str, _: &str, _: &str, _: &str, _: i64) -> Result<Option<SkillRow>, KnowledgeError> {
             Err(KnowledgeError::Db("connection reset".into()))
         }
+        async fn encryption_counts(&self, _: &str, _: Option<&str>) -> Result<crate::encryption::EncryptionCounts, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
+        async fn rewrite_memory_fields(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<i64, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
+        async fn rewrite_skill_fields(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: &str,
+            _: Value,
+            _: &str,
+        ) -> Result<i64, KnowledgeError> {
+            Err(KnowledgeError::Db("connection reset".into()))
+        }
     }
 
     #[tokio::test]
@@ -1165,6 +1423,21 @@ mod tests {
             b = b.header("authorization", format!("session {}", s));
         }
         b.body(body).unwrap()
+    }
+
+    async fn prod_post_json(
+        app: &Router,
+        uri: &str,
+        session: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(prod_req(uri, Some(session), Body::from(body.to_string())))
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, body_json(response).await)
     }
 
     /// An unauthenticated caller can't make the relay buffer a large body:
@@ -1254,6 +1527,463 @@ mod tests {
         )
         .await;
         assert_eq!(pulled["memories"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn encrypted_account_accepts_only_structurally_valid_current_key_fields() {
+        use base64::Engine;
+
+        let accounts = Arc::new(InMemoryAccountStore::default());
+        let state = AppState {
+            sessions: SessionStore::new(),
+            relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
+            voice_sessions: VoiceSessionStore::new(),
+            vault: Arc::new(InMemoryVaultStore::new()),
+            knowledge: Arc::new(InMemoryKnowledgeStore::new()),
+            identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: accounts.clone(),
+        };
+        let session = bind_session(&state, "ws-1").await;
+        accounts
+            .set_encryption_state("ws-1", "enabling", Some("0123abcd"), 1)
+            .await
+            .unwrap();
+        let app = app(state);
+        let payload = base64::engine::general_purpose::STANDARD.encode([0_u8; 40]);
+        let mut valid = sample_memory("mem-valid", &format!("e1.0123abcd.{payload}"));
+        valid["content_hash"] = json!(format!("h1.0123abcd.{}", "a".repeat(64)));
+        let response = body_json(
+            app.clone()
+                .oneshot(req(
+                    "POST",
+                    "/api/memory/batch?id=a",
+                    &session,
+                    &json!({"ops": [{"op": "add", "memory": valid}]}).to_string(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response["results"][0]["ok"], true, "{response}");
+
+        for (id, content) in [
+            ("mem-plain", "AKIAIOSFODNN7EXAMPLE".to_string()),
+            ("mem-malformed", "e1.0123abcd.not-base64".to_string()),
+            ("mem-obsolete", format!("e1.89abcdef.{payload}")),
+        ] {
+            let mut memory = sample_memory(id, &content);
+            memory["content_hash"] = json!(format!("h1.0123abcd.{}", "b".repeat(64)));
+            let response = body_json(
+                app.clone()
+                    .oneshot(req(
+                        "POST",
+                        "/api/memory/batch?id=a",
+                        &session,
+                        &json!({"ops": [{"op": "add", "memory": memory}]}).to_string(),
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response["results"][0]["ok"], false, "{id}: {response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_skill_paths_are_validated_for_push_and_disable_migration() {
+        use base64::Engine;
+
+        let payload = base64::engine::general_purpose::STANDARD.encode([0_u8; 40]);
+        let current_path = format!("e1.0123abcd.{payload}");
+        let obsolete_path = format!("e1.89abcdef.{payload}");
+        let binary = base64::engine::general_purpose::STANDARD.encode([0xff_u8, 0xfe]);
+        let plain_files = json!({"SKILL.md": b64("# Binary skill"), "asset.txt": b64("plain asset")});
+
+        for mode in ["off", "disabling"] {
+            let (mut state, session) = test_state("ws-binary").await;
+            let accounts = Arc::new(InMemoryAccountStore::new(state.knowledge.clone(), state.vault.clone()));
+            state.accounts = accounts.clone();
+            if mode == "disabling" {
+                for requested in ["enabling", "on", "disabling"] {
+                    accounts.set_encryption_state("ws-binary", requested, Some("0123abcd"), 1)
+                        .await.unwrap();
+                }
+            }
+            let knowledge = state.knowledge.clone();
+            let app = crate::router(state);
+            let (_, response) = prod_post_json(
+                &app, "/api/skills/batch?id=atem-binary", &session,
+                json!({"ops": [{"op": "push", "skill": sample_skill("binary", plain_files.clone()), "base_version": 0}]}),
+            ).await;
+            assert_eq!(response["results"][0]["ok"], true, "{mode}: {response}");
+
+            let (_, response) = prod_post_json(
+                &app, "/api/skills/batch?id=atem-binary", &session,
+                json!({"ops": [{"op": "push", "skill": sample_skill(
+                    "binary-refused", json!({"SKILL.md": b64("# Binary skill"), "asset.bin": binary})
+                ), "base_version": 0}]}),
+            ).await;
+            assert_eq!(response["results"][0]["ok"], false, "{mode}: {response}");
+            assert!(response["results"][0]["error"].as_str().unwrap().contains("unreadable (binary)"));
+
+            let refused_paths = if mode == "off" {
+                vec![&current_path, &obsolete_path]
+            } else {
+                vec![&obsolete_path]
+            };
+            for path in refused_paths {
+                let files = json!({"SKILL.md": b64("# Binary skill"), path: binary});
+                let (_, response) = prod_post_json(
+                    &app, "/api/skills/batch?id=atem-binary", &session,
+                    json!({"ops": [{"op": "push", "skill": sample_skill("refused", files), "base_version": 0}]}),
+                ).await;
+                assert_eq!(response["results"][0]["ok"], false, "{mode}: {response}");
+                assert_eq!(response["results"][0]["error"], "skill does not match the account encryption mode");
+            }
+
+            if mode == "disabling" {
+                for path in [&current_path, &obsolete_path] {
+                    let (_, response) = prod_post_json(
+                        &app, "/api/skills/batch?id=atem-binary", &session,
+                        json!({"ops": [{
+                            "op": "rewrite", "scope": "global", "old_project": "", "project": "",
+                            "name": "binary", "version": 1, "content_hash": "h",
+                            "files": {"SKILL.md": b64("# Binary skill"), path: binary}
+                        }]}),
+                    ).await;
+                    assert_eq!(response["results"][0]["ok"], false, "{response}");
+                    assert_eq!(response["results"][0]["error"], "invalid encryption migration");
+                }
+            }
+            let rows = knowledge.pull_skills("ws-binary", 0, 100).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].files, plain_files);
+        }
+    }
+
+    #[test]
+    fn binary_skill_content_requires_a_mode_appropriate_path() {
+        use base64::Engine;
+
+        let payload = base64::engine::general_purpose::STANDARD.encode([0_u8; 40]);
+        let current_path = format!("e1.0123abcd.{payload}");
+        let obsolete_path = format!("e1.89abcdef.{payload}");
+        let binary = base64::engine::general_purpose::STANDARD.encode([0xff_u8, 0xfe]);
+        for mode in ["off", "enabling", "on", "disabling"] {
+            let state = EncryptionState {
+                mode: mode.to_string(), kid: Some("0123abcd".to_string()),
+                ..EncryptionState::off("a")
+            };
+            for migration in [false, true] {
+                assert!(!skill_files_match_mode(&json!({obsolete_path.clone(): binary}), &state, migration));
+                assert_eq!(
+                    skill_files_match_mode(&json!({current_path.clone(): binary}), &state, migration),
+                    mode == "disabling" && !migration,
+                    "{mode}, migration={migration}"
+                );
+                assert_eq!(
+                    skill_files_match_mode(&json!({"asset.bin": binary}), &state, migration),
+                    mode == "disabling" || (mode == "off" && !migration),
+                    "{mode}, migration={migration}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn production_routes_complete_encryption_and_decryption_migrations() {
+        let knowledge = Arc::new(InMemoryKnowledgeStore::new());
+        let vault = Arc::new(InMemoryVaultStore::new());
+        let accounts = Arc::new(InMemoryAccountStore::new(knowledge.clone(), vault.clone()));
+        let state = AppState {
+            sessions: SessionStore::new(),
+            relay: RelayHub::new(),
+            rtc_sessions: RtcSessionStore::new(),
+            voice_sessions: VoiceSessionStore::new(),
+            vault: vault.clone(),
+            knowledge: knowledge.clone(),
+            identity: Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: accounts.clone(),
+        };
+        let session = bind_session(&state, "ws-1").await;
+        let app = crate::router(state);
+
+        let mut memory = sample_memory("mem-migrate", "plain memory");
+        memory["scope"] = json!("project");
+        memory["project"] = json!("project-x");
+        let (status, response) = prod_post_json(
+            &app,
+            "/api/memory/batch?id=atem-a",
+            &session,
+            json!({"ops": [{"op": "add", "memory": memory}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["results"][0]["ok"], true, "{response}");
+
+        for (base_version, body) in [(0, "skill v1"), (1, "skill v2")] {
+            let mut skill = sample_skill("migrate", json!({"SKILL.md": b64(body)}));
+            skill["scope"] = json!("project");
+            skill["project"] = json!("project-x");
+            skill["content_hash"] = json!(format!("hash-{body}"));
+            let (status, response) = prod_post_json(
+                &app,
+                "/api/skills/batch?id=atem-a",
+                &session,
+                json!({"ops": [{"op": "push", "skill": skill, "base_version": base_version}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(response["results"][0]["ok"], true, "{response}");
+            assert_eq!(response["results"][0]["version"], base_version + 1);
+        }
+
+        let (status, created) = prod_post_json(
+            &app,
+            "/api/vault?id=atem-a",
+            &session,
+            json!({"summary": "plain summary"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let vault_id = created["vault_id"].as_str().unwrap().to_string();
+        for body in [json!({"text": "vault v1"}), json!({"text": "vault v2", "entry_id": 1})] {
+            let (status, response) = prod_post_json(
+                &app,
+                &format!("/api/vault/{vault_id}?id=atem-a"),
+                &session,
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+        }
+
+        let kid = "0123abcd";
+        accounts
+            .set_encryption_state("ws-1", "enabling", Some(kid), 1)
+            .await
+            .unwrap();
+        assert!(accounts
+            .set_encryption_state("ws-1", "on", Some(kid), 2)
+            .await
+            .is_err());
+        let envelope = |marker: char| format!("e1.{kid}.{}", b64(&marker.to_string().repeat(40)));
+        let hash = |marker: char| format!("h1.{kid}.{}", marker.to_string().repeat(64));
+        let encrypted_project = hash('a');
+        let encrypted_path = envelope('p');
+        let encrypted_files = |marker: char| {
+            Value::Object(
+                [(
+                    encrypted_path.clone(),
+                    Value::String(b64(&envelope(marker))),
+                )]
+                .into_iter()
+                .collect(),
+            )
+        };
+
+        let encrypted_memory = envelope('m');
+        let (status, response) = prod_post_json(
+            &app,
+            "/api/memory/batch?id=atem-a",
+            &session,
+            json!({"ops": [{
+                "op": "rewrite",
+                "id": "mem-migrate",
+                "project": encrypted_project,
+                "content": encrypted_memory,
+                "content_hash": hash('b')
+            }]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["results"][0]["ok"], true, "{response}");
+
+        let (status, response) = prod_post_json(
+            &app,
+            "/api/skills/batch?id=atem-a",
+            &session,
+            json!({"ops": [
+                {
+                    "op": "rewrite", "scope": "project", "old_project": "project-x",
+                    "name": "migrate", "version": 1, "project": encrypted_project,
+                    "files": encrypted_files('1'), "content_hash": hash('c')
+                },
+                {
+                    "op": "rewrite", "scope": "project", "old_project": "project-x",
+                    "name": "migrate", "version": 2, "project": encrypted_project,
+                    "files": encrypted_files('2'), "content_hash": hash('d')
+                }
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(response["results"].as_array().unwrap().iter().all(|item| item["ok"] == true));
+
+        let encrypted_summary = envelope('s');
+        let encrypted_vault_v1 = envelope('v');
+        let encrypted_vault_v2 = envelope('w');
+        let (status, response) = prod_post_json(
+            &app,
+            &format!("/api/vault/{vault_id}/encryption?id=atem-a"),
+            &session,
+            json!({
+                "summary": encrypted_summary,
+                "entries": [
+                    {"entry_no": 1, "version": 1, "content": encrypted_vault_v1},
+                    {"entry_no": 1, "version": 2, "content": encrypted_vault_v2}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+
+        let enabled = accounts
+            .set_encryption_state("ws-1", "on", Some(kid), 3)
+            .await
+            .unwrap();
+        assert_eq!((enabled.plaintext_fields, enabled.ciphertext_fields, enabled.obsolete_fields), (0, 14, 0));
+
+        let memories = knowledge.pull_memories("ws-1", 0, 10).await.unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].content, encrypted_memory);
+        for version in 1..=2 {
+            let skill = knowledge
+                .skill_version("ws-1", "project", &encrypted_project, "migrate", version)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(skill.files, encrypted_files(char::from_digit(version as u32, 10).unwrap()));
+        }
+        assert_eq!(vault.list_readable("ws-1").await.unwrap()[0].summary, encrypted_summary);
+        let encrypted_history = vault.read(&vault_id, None, true).await.unwrap();
+        assert_eq!(encrypted_history.len(), 2);
+        assert!(encrypted_history.iter().all(|entry| entry.content.starts_with("e1.0123abcd.")));
+
+        let mut plain_memory = sample_memory("plain-rejected", "plaintext after enable");
+        plain_memory["scope"] = json!("project");
+        plain_memory["project"] = json!("project-x");
+        let (_, response) = prod_post_json(
+            &app,
+            "/api/memory/batch?id=atem-a",
+            &session,
+            json!({"ops": [{"op": "add", "memory": plain_memory}]}),
+        )
+        .await;
+        assert_eq!(response["results"][0]["ok"], false, "{response}");
+        let (_, response) = prod_post_json(
+            &app,
+            "/api/skills/batch?id=atem-a",
+            &session,
+            json!({"ops": [{"op": "push", "skill": sample_skill(
+                "plain-rejected", json!({"SKILL.md": b64("plaintext after enable")})
+            ), "base_version": 0}]}),
+        )
+        .await;
+        assert_eq!(response["results"][0]["ok"], false, "{response}");
+        let (status, _) = prod_post_json(
+            &app,
+            &format!("/api/vault/{vault_id}?id=atem-a"),
+            &session,
+            json!({"text": "plaintext after enable"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        accounts
+            .set_encryption_state("ws-1", "disabling", Some(kid), 4)
+            .await
+            .unwrap();
+        let (_, response) = prod_post_json(
+            &app,
+            "/api/memory/batch?id=atem-a",
+            &session,
+            json!({"ops": [{
+                "op": "rewrite", "id": "mem-migrate", "project": "project-x",
+                "content": "plain memory", "content_hash": "h:plain memory"
+            }]}),
+        )
+        .await;
+        assert_eq!(response["results"][0]["ok"], true, "{response}");
+        let (_, response) = prod_post_json(
+            &app,
+            "/api/skills/batch?id=atem-a",
+            &session,
+            json!({"ops": [
+                {
+                    "op": "rewrite", "scope": "project", "old_project": encrypted_project,
+                    "name": "migrate", "version": 1, "project": "project-x",
+                    "files": {"SKILL.md": b64("skill v1")}, "content_hash": "hash-skill v1"
+                },
+                {
+                    "op": "rewrite", "scope": "project", "old_project": encrypted_project,
+                    "name": "migrate", "version": 2, "project": "project-x",
+                    "files": {"SKILL.md": b64("skill v2")}, "content_hash": "hash-skill v2"
+                }
+            ]}),
+        )
+        .await;
+        assert!(response["results"].as_array().unwrap().iter().all(|item| item["ok"] == true));
+        let (status, response) = prod_post_json(
+            &app,
+            &format!("/api/vault/{vault_id}/encryption?id=atem-a"),
+            &session,
+            json!({
+                "summary": "plain summary",
+                "entries": [
+                    {"entry_no": 1, "version": 1, "content": "vault v1"},
+                    {"entry_no": 1, "version": 2, "content": "vault v2"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+
+        let disabled = accounts
+            .set_encryption_state("ws-1", "off", Some(kid), 5)
+            .await
+            .unwrap();
+        assert_eq!((disabled.plaintext_fields, disabled.ciphertext_fields, disabled.obsolete_fields), (14, 0, 0));
+        assert_eq!(
+            knowledge
+                .skill_version("ws-1", "project", "project-x", "migrate", 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .files,
+            json!({"SKILL.md": b64("skill v1")})
+        );
+        assert_eq!(vault.read(&vault_id, None, true).await.unwrap()[0].content, "vault v1");
+
+        let mut stale_memory = sample_memory("stale-ciphertext", &envelope('z'));
+        stale_memory["content_hash"] = json!(hash('z'));
+        let (_, response) = prod_post_json(
+            &app,
+            "/api/memory/batch?id=atem-a",
+            &session,
+            json!({"ops": [{"op": "add", "memory": stale_memory}]}),
+        )
+        .await;
+        assert_eq!(response["results"][0]["ok"], false, "{response}");
+        let mut stale_skill = sample_skill("stale-ciphertext", encrypted_files('z'));
+        stale_skill["content_hash"] = json!(hash('z'));
+        let (_, response) = prod_post_json(
+            &app,
+            "/api/skills/batch?id=atem-a",
+            &session,
+            json!({"ops": [{"op": "push", "skill": stale_skill, "base_version": 0}]}),
+        )
+        .await;
+        assert_eq!(response["results"][0]["ok"], false, "{response}");
+        let (status, _) = prod_post_json(
+            &app,
+            &format!("/api/vault/{vault_id}?id=atem-a"),
+            &session,
+            json!({"text": envelope('z')}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]

@@ -247,6 +247,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -311,6 +312,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -413,6 +415,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -485,6 +488,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         let mut session = create_session("late-host");
         session.expires_at = chrono::Utc::now() - chrono::Duration::minutes(1);
@@ -527,6 +531,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -617,6 +622,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         let session = create_session("my-machine");
         let session_id = session.id.clone();
@@ -672,6 +678,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -739,6 +746,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -805,6 +813,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -915,6 +924,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         let app = Router::new()
             .route("/api/sessions", post(create_session_handler))
@@ -982,6 +992,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
 
         // Create an expired session manually

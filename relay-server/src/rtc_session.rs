@@ -302,6 +302,10 @@ impl RtcBackend for InMemoryRtcBackend {
             tracing::warn!("Session {} is full ({} participants)", id, current_count);
             return Ok(JoinOutcome::Full);
         }
+        // A browser or its screen client must never displace the native host in Agora.
+        if session.uid_counter_value == session.host_uid {
+            session.uid_counter_value += 1;
+        }
         let uid = session.uid_counter_value;
         session.uid_counter_value += 1;
         session.participants.push(Participant {
@@ -558,6 +562,17 @@ mod tests {
     use crate::voice_session::VoiceSessionStore;
     use tower::ServiceExt;
 
+    #[tokio::test]
+    async fn browser_and_screen_uids_skip_the_host() {
+        let store = RtcSessionStore::new();
+        store.create("screen-uids".into(), "app".into(), "room".into(), "token".into(), RTC_FIRST_UID + 1)
+            .await.unwrap();
+        let browser = store.join("screen-uids", "Browser".into()).await.unwrap();
+        let screen = store.join("screen-uids", "Browser (screen)".into()).await.unwrap();
+        assert_eq!(browser.uid, RTC_FIRST_UID);
+        assert_eq!(screen.uid, RTC_FIRST_UID + 2);
+    }
+
     fn create_test_app() -> Router {
         let state = AppState {
             sessions: SessionStore::new(),
@@ -567,6 +582,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         Router::new()
             .route("/api/rtc-sessions", post(create_rtc_session_handler))
@@ -919,6 +935,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         state
             .rtc_sessions
@@ -977,6 +994,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         state
             .rtc_sessions
@@ -1044,6 +1062,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         state
             .rtc_sessions
@@ -1100,6 +1119,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         let app = Router::new()
             .route("/api/rtc-sessions", post(create_rtc_session_handler))
@@ -1226,6 +1246,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         state
             .rtc_sessions

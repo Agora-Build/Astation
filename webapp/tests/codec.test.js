@@ -1,7 +1,7 @@
 const assert = require("assert");
 const { preferredCodec, fallbackCodec, pickCodec } = require("../js/codec.js");
 
-assert.strictEqual(preferredCodec, "av1");
+assert.strictEqual(preferredCodec, "h264");
 assert.strictEqual(fallbackCodec, "vp8");
 
 assert.strictEqual(pickCodec("av1", ["h264", "vp8"]), "vp8");

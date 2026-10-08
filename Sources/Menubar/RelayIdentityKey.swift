@@ -220,6 +220,84 @@ enum RelayControlFrame: Equatable {
     case authChallenge(challenge: String)
     case authResult(status: String, message: String?)
     case ack(forType: String, ok: Bool, message: String?)
+    case accountState(devices: [RelayAccountDevice], requests: [RelayMergeRequest])
+    case mergeApproval(RelayMergeApproval)
+    case accountChanged(reason: String, requestId: String?)
+    case encryptionState(RelayEncryptionState)
+    case encryptionChanged(mode: String, kid: String?)
+}
+
+struct RelayEncryptionState: Codable, Equatable {
+    let dataAccount: String
+    let mode: String
+    let kid: String?
+    let enabledAt: Int64?
+    let updatedAt: Int64
+    let plaintextFields: Int64
+    let ciphertextFields: Int64
+    let obsoleteFields: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case dataAccount = "data_account"
+        case mode, kid
+        case enabledAt = "enabled_at"
+        case updatedAt = "updated_at"
+        case plaintextFields = "plaintext_fields"
+        case ciphertextFields = "ciphertext_fields"
+        case obsoleteFields = "obsolete_fields"
+    }
+}
+
+struct RelayAccountDevice: Codable, Equatable {
+    let astationId: String
+    let label: String
+    let dataAccount: String
+    let registeredAt: Int64
+    let lastSeenAt: Int64
+    let online: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case astationId = "astation_id"
+        case label
+        case dataAccount = "data_account"
+        case registeredAt = "registered_at"
+        case lastSeenAt = "last_seen_at"
+        case online
+    }
+}
+
+struct RelayMergeRequest: Codable, Equatable {
+    let requestId: String
+    let requesterAstationId: String
+    let targetAstationId: String
+    let mode: String
+    let createdAt: Int64
+    let readyAt: Int64?
+    let expiresAt: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case requestId = "request_id"
+        case requesterAstationId = "requester_astation_id"
+        case targetAstationId = "target_astation_id"
+        case mode
+        case createdAt = "created_at"
+        case readyAt = "ready_at"
+        case expiresAt = "expires_at"
+    }
+}
+
+struct RelayMergeApproval: Codable, Equatable {
+    let requestId: String
+    let requesterAstationId: String
+    let requesterLabel: String
+    let expiresAt: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case requestId = "request_id"
+        case requesterAstationId = "requester_astation_id"
+        case requesterLabel = "requester_label"
+        case expiresAt = "expires_at"
+    }
 }
 
 enum RelayIdentityProtocol {
@@ -258,6 +336,24 @@ enum RelayIdentityProtocol {
                 return nil
             }
             return .ack(forType: forType, ok: ok, message: object["message"] as? String)
+        case "relayAccountState":
+            guard let devices = decode([RelayAccountDevice].self, from: object["devices"]),
+                  let requests = decode([RelayMergeRequest].self, from: object["requests"]) else {
+                return nil
+            }
+            return .accountState(devices: devices, requests: requests)
+        case "relayMergeApproval":
+            guard let approval = decode(RelayMergeApproval.self, from: object) else { return nil }
+            return .mergeApproval(approval)
+        case "relayAccountChanged":
+            guard let reason = object["reason"] as? String else { return nil }
+            return .accountChanged(reason: reason, requestId: object["request_id"] as? String)
+        case "relayEncryptionState":
+            guard let state = decode(RelayEncryptionState.self, from: object) else { return nil }
+            return .encryptionState(state)
+        case "relayEncryptionChanged":
+            guard let mode = object["mode"] as? String else { return nil }
+            return .encryptionChanged(mode: mode, kid: object["kid"] as? String)
         default:
             return nil
         }
@@ -294,6 +390,63 @@ enum RelayIdentityProtocol {
 
     static func unbindMessage(sessionId: String) -> String? {
         encode(["type": "relayUnbind", "session_id": sessionId])
+    }
+
+    static func registerAccountMessage(accessToken: String, label: String) -> String? {
+        encode([
+            "type": "relayRegisterAccount",
+            "sso_access_token": accessToken,
+            "label": label
+        ])
+    }
+
+    static func accountListMessage() -> String? {
+        encode(["type": "relayAccountList"])
+    }
+
+    static func mergeRequestMessage(targetAstationId: String, freshAccessToken: String?) -> String? {
+        var object = [
+            "type": "relayMergeRequest",
+            "target_astation_id": targetAstationId
+        ]
+        if let freshAccessToken {
+            object["fresh_sso_access_token"] = freshAccessToken
+        }
+        return encode(object)
+    }
+
+    static func mergeApprovalMessage(requestId: String) -> String? {
+        encode(["type": "relayMergeApprove", "request_id": requestId])
+    }
+
+    static func mergeCancelMessage(requestId: String) -> String? {
+        encode(["type": "relayMergeCancel", "request_id": requestId])
+    }
+
+    static func leaveGroupMessage() -> String? {
+        encode(["type": "relayLeaveGroup"])
+    }
+
+    static func removeAstationMessage(astationId: String) -> String? {
+        encode(["type": "relayRemoveAstation", "target_astation_id": astationId])
+    }
+
+    static func encryptionStateMessage() -> String? {
+        encode(["type": "relayEncryptionGet"])
+    }
+
+    static func encryptionSetMessage(mode: String, kid: String?) -> String? {
+        var object = ["type": "relayEncryptionSet", "mode": mode]
+        if let kid { object["kid"] = kid }
+        return encode(object)
+    }
+
+    private static func decode<T: Decodable>(_ type: T.Type, from object: Any?) -> T? {
+        guard let object, JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(type, from: data)
     }
 
     private static func encode(_ object: [String: Any]) -> String? {

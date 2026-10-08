@@ -12,16 +12,18 @@ permissions:
 jobs:
   build-core:
     name: Build C++ Core Library
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select Xcode 26.2 (Foundation Models SDK)
+        run: sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
 
       - name: Cache Agora SDK
         uses: actions/cache@v4
         with:
           path: third_party/agora
-          key: agora-sdk-macos-4.6.2
-          restore-keys: agora-sdk-macos-
+          key: agora-sdk-macos-4.7.0-sck
 
       - name: Configure astation_core (download SDK if needed)
         run: |
@@ -52,9 +54,12 @@ jobs:
   build-app:
     name: Build macOS App
     needs: build-core
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select Xcode 26.2 (Foundation Models SDK)
+        run: sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
 
       - name: Download core library
         uses: actions/download-artifact@v4
@@ -66,8 +71,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: third_party/agora
-          key: agora-sdk-macos-4.6.2
-          restore-keys: agora-sdk-macos-
+          key: agora-sdk-macos-4.7.0-sck
 
       - name: Download Agora SDK for bundling (if needed)
         run: |
@@ -94,6 +98,12 @@ jobs:
 
           cp .build/release/astation "$APP_DIR/MacOS/Astation"
 
+          # SwiftPM model manifests and FluidAudio resources must ship with the app.
+          for resource in .build/release/*.bundle; do
+            [ -d "$resource" ] || continue
+            ditto "$resource" "$APP_DIR/Resources/$(basename "$resource")"
+          done
+
           # Bundle Agora RTC SDK frameworks into the app
           AGORA_LIBS="third_party/agora/rtc_mac"
           PLATFORM="macos-arm64_x86_64"
@@ -119,41 +129,9 @@ jobs:
             -add_rpath "@executable_path/../Frameworks" \
             "$APP_DIR/MacOS/Astation"
 
-          cat > "$APP_DIR/Info.plist" << 'PLIST'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleExecutable</key>
-            <string>Astation</string>
-            <key>CFBundleIdentifier</key>
-            <string>build.agora.astation</string>
-            <key>CFBundleName</key>
-            <string>Astation</string>
-            <key>CFBundleVersion</key>
-            <string>${{ github.ref_name }}</string>
-            <key>CFBundleShortVersionString</key>
-            <string>${{ github.ref_name }}</string>
-            <key>CFBundlePackageType</key>
-            <string>APPL</string>
-            <key>LSMinimumSystemVersion</key>
-            <string>14.0</string>
-            <key>LSUIElement</key>
-            <true/>
-            <key>CFBundleURLTypes</key>
-            <array>
-              <dict>
-                <key>CFBundleURLName</key>
-                <string>build.agora.astation</string>
-                <key>CFBundleURLSchemes</key>
-                <array>
-                  <string>astation</string>
-                </array>
-              </dict>
-            </array>
-          </dict>
-          </plist>
-          PLIST
+          cp Config/Info.plist "$APP_DIR/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.ref_name }}" "$APP_DIR/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ github.ref_name }}" "$APP_DIR/Info.plist"
 
       - name: Smoke-test packaged app
         run: |

@@ -78,11 +78,13 @@ API; do not describe it as cryptographically bound to the requester.
 | Caller relationship | Read | Write content | Update summary |
 | --- | --- | --- | --- |
 | Same work session as the vault | Yes | Yes | Yes |
-| Recorded past content writer from another work session | Yes | No | Yes |
-| Neither | No | No | No |
+| Any other work session | No | No | No |
 
-The summary endpoint uses the read predicate. Thus, describing past writers as
-strictly read-only would miss their current summary-update permission.
+Because the client ID is self-reported, it only labels who wrote an entry
+(`writer_list`, `writer_id`) and never grants access. Earlier versions let a
+recorded past writer from another work session read the vault; that let any
+valid session read another account's vaults by claiming a writer's ID, so it
+was removed. Cross-account sharing needs a verifiable atem identity first.
 
 Vault HTTP authentication still needs the authenticated-device-session work
 listed in [Device Authentication v2](specs/2026-07-21-device-authentication-v2.md#remaining-production-blockers).

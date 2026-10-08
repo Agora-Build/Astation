@@ -1,11 +1,13 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rand::Rng;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+use crate::encryption::{classify_envelope, valid_envelope, EncryptionCounts};
 
 /// One row in a vault. Field names/types must match the atem client
 /// (`Atem/src/vault_client.rs::VaultEntry`) exactly.
@@ -42,9 +44,17 @@ pub struct VaultMeta {
     pub writer_list: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct VaultRewriteEntry {
+    pub entry_no: i32,
+    pub version: i32,
+    pub content: String,
+}
+
 #[derive(Debug)]
 pub enum VaultError {
     NotFound,
+    EncryptionConflict,
     Db(String),
 }
 
@@ -52,6 +62,9 @@ impl std::fmt::Display for VaultError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VaultError::NotFound => write!(f, "vault not found"),
+            VaultError::EncryptionConflict => {
+                write!(f, "vault content does not match the account encryption mode")
+            }
             VaultError::Db(s) => write!(f, "database error: {}", s),
         }
     }
@@ -83,10 +96,10 @@ pub trait VaultStore: Send + Sync {
         summary: &str,
     ) -> Result<String, VaultError>;
 
+    /// Vaults in this account (work session).
     async fn list_readable(
         &self,
         work_session_id: &str,
-        client_id: &str,
     ) -> Result<Vec<VaultListItem>, VaultError>;
 
     async fn read(
@@ -99,6 +112,7 @@ pub trait VaultStore: Send + Sync {
     /// Append a new content entry (version = 1, fresh entry_no).
     async fn append(
         &self,
+        account: &str,
         vault_id: &str,
         writer_id: &str,
         text: &str,
@@ -107,17 +121,49 @@ pub trait VaultStore: Send + Sync {
     /// Override an existing entry_no with a new version (max version + 1).
     async fn override_entry(
         &self,
+        account: &str,
         vault_id: &str,
         entry_no: i32,
         writer_id: &str,
         text: &str,
     ) -> Result<WriteResult, VaultError>;
 
-    async fn set_summary(&self, vault_id: &str, text: &str) -> Result<(), VaultError>;
+    async fn set_summary(
+        &self,
+        account: &str,
+        vault_id: &str,
+        text: &str,
+    ) -> Result<(), VaultError>;
 
     async fn get_meta(&self, vault_id: &str) -> Result<Option<VaultMeta>, VaultError>;
 
     async fn add_writer(&self, vault_id: &str, client_id: &str) -> Result<(), VaultError>;
+
+    /// DB-less account merge hook. The Postgres account store updates vaults
+    /// in the same transaction as account membership and knowledge rows.
+    async fn merge_accounts(
+        &self,
+        _sources: &[String],
+        _target: &str,
+    ) -> Result<(), VaultError> {
+        Err(VaultError::Db(
+            "account merge must be coordinated by the durable account store".to_string(),
+        ))
+    }
+
+    async fn encryption_counts(
+        &self,
+        account: &str,
+        kid: Option<&str>,
+    ) -> Result<EncryptionCounts, VaultError>;
+
+    async fn rewrite_encrypted_fields(
+        &self,
+        account: &str,
+        vault_id: &str,
+        summary: &str,
+        entries: &[VaultRewriteEntry],
+    ) -> Result<(), VaultError>;
 }
 
 // ─────────────────────────── In-memory implementation ───────────────────────────
@@ -195,15 +241,11 @@ impl VaultStore for InMemoryVaultStore {
     async fn list_readable(
         &self,
         work_session_id: &str,
-        client_id: &str,
     ) -> Result<Vec<VaultListItem>, VaultError> {
         let vaults = self.vaults.read().await;
         let mut out: Vec<(i64, VaultListItem)> = vaults
             .iter()
-            .filter(|(_, v)| {
-                v.work_session_id == work_session_id
-                    || v.writer_list.iter().any(|w| w == client_id)
-            })
+            .filter(|(_, v)| v.work_session_id == work_session_id)
             .map(|(id, v)| {
                 let first_seq = v.entries.first().map(|e| e.seq).unwrap_or(i64::MAX);
                 (
@@ -258,6 +300,7 @@ impl VaultStore for InMemoryVaultStore {
 
     async fn append(
         &self,
+        account: &str,
         vault_id: &str,
         writer_id: &str,
         text: &str,
@@ -265,6 +308,9 @@ impl VaultStore for InMemoryVaultStore {
         let seq = self.next_seq();
         let mut vaults = self.vaults.write().await;
         let row = vaults.get_mut(vault_id).ok_or(VaultError::NotFound)?;
+        if row.work_session_id != account {
+            return Err(VaultError::NotFound);
+        }
         let entry_no = row.next_entry_no;
         row.next_entry_no += 1;
         let entry = VaultEntry {
@@ -286,6 +332,7 @@ impl VaultStore for InMemoryVaultStore {
 
     async fn override_entry(
         &self,
+        account: &str,
         vault_id: &str,
         entry_no: i32,
         writer_id: &str,
@@ -294,6 +341,9 @@ impl VaultStore for InMemoryVaultStore {
         let seq = self.next_seq();
         let mut vaults = self.vaults.write().await;
         let row = vaults.get_mut(vault_id).ok_or(VaultError::NotFound)?;
+        if row.work_session_id != account {
+            return Err(VaultError::NotFound);
+        }
         let max_version = row
             .entries
             .iter()
@@ -319,9 +369,17 @@ impl VaultStore for InMemoryVaultStore {
         })
     }
 
-    async fn set_summary(&self, vault_id: &str, text: &str) -> Result<(), VaultError> {
+    async fn set_summary(
+        &self,
+        account: &str,
+        vault_id: &str,
+        text: &str,
+    ) -> Result<(), VaultError> {
         let mut vaults = self.vaults.write().await;
         let row = vaults.get_mut(vault_id).ok_or(VaultError::NotFound)?;
+        if row.work_session_id != account {
+            return Err(VaultError::NotFound);
+        }
         row.summary = text.to_string();
         Ok(())
     }
@@ -339,6 +397,63 @@ impl VaultStore for InMemoryVaultStore {
         let row = vaults.get_mut(vault_id).ok_or(VaultError::NotFound)?;
         if !row.writer_list.iter().any(|w| w == client_id) {
             row.writer_list.push(client_id.to_string());
+        }
+        Ok(())
+    }
+
+    async fn merge_accounts(
+        &self,
+        sources: &[String],
+        target: &str,
+    ) -> Result<(), VaultError> {
+        let source_set: std::collections::HashSet<&str> =
+            sources.iter().map(String::as_str).collect();
+        let mut vaults = self.vaults.write().await;
+        for vault in vaults.values_mut() {
+            if source_set.contains(vault.work_session_id.as_str()) {
+                vault.work_session_id = target.to_string();
+            }
+        }
+        Ok(())
+    }
+
+    async fn encryption_counts(
+        &self,
+        account: &str,
+        kid: Option<&str>,
+    ) -> Result<EncryptionCounts, VaultError> {
+        let vaults = self.vaults.read().await;
+        let mut counts = EncryptionCounts::default();
+        for vault in vaults.values().filter(|vault| vault.work_session_id == account) {
+            counts.add(classify_envelope(&vault.summary, kid));
+            for entry in &vault.entries {
+                counts.add(classify_envelope(&entry.content, kid));
+            }
+        }
+        Ok(counts)
+    }
+
+    async fn rewrite_encrypted_fields(
+        &self,
+        account: &str,
+        vault_id: &str,
+        summary: &str,
+        entries: &[VaultRewriteEntry],
+    ) -> Result<(), VaultError> {
+        let mut vaults = self.vaults.write().await;
+        let vault = vaults.get_mut(vault_id).ok_or(VaultError::NotFound)?;
+        if vault.work_session_id != account {
+            return Err(VaultError::NotFound);
+        }
+        vault.summary = summary.to_string();
+        for rewrite in entries {
+            let entry = vault
+                .entries
+                .iter_mut()
+                .find(|entry| entry.entry_no == rewrite.entry_no && entry.version == rewrite.version)
+                .ok_or(VaultError::NotFound)?;
+            entry.content = rewrite.content.clone();
+            entry.seq = self.next_seq();
         }
         Ok(())
     }
@@ -364,6 +479,98 @@ fn db_err(e: sqlx::Error) -> VaultError {
     VaultError::Db(e.to_string())
 }
 
+async fn lock_account(
+    conn: &mut sqlx::PgConnection,
+    account: &str,
+) -> Result<(), VaultError> {
+    let key = serde_json::to_string(&["acct", account])
+        .map_err(|error| VaultError::Db(error.to_string()))?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(key)
+        .execute(conn)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+async fn validate_encryption_content<'a>(
+    conn: &mut sqlx::PgConnection,
+    account: &str,
+    values: impl IntoIterator<Item = &'a str>,
+    migration: bool,
+) -> Result<(), VaultError> {
+    lock_account(conn, account).await?;
+    let state: Option<(String, String)> = sqlx::query_as(
+        "SELECT mode, kid FROM data_account_encryption WHERE data_account = $1",
+    )
+    .bind(account)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    let (mode, kid) = state
+        .map(|(mode, kid)| (mode, Some(kid)))
+        .unwrap_or_else(|| ("off".to_string(), None));
+
+    let allowed = values.into_iter().all(|value| {
+        if value.is_empty() {
+            return true;
+        }
+        let valid = kid
+            .as_deref()
+            .is_some_and(|current| valid_envelope(value, current));
+        if migration {
+            match mode.as_str() {
+                "enabling" => valid,
+                "disabling" => !value.starts_with("e1."),
+                _ => false,
+            }
+        } else {
+            match mode.as_str() {
+                "off" => !value.starts_with("e1."),
+                "enabling" | "on" => valid,
+                "disabling" => valid || !value.starts_with("e1."),
+                _ => false,
+            }
+        }
+    });
+    if allowed {
+        Ok(())
+    } else {
+        Err(VaultError::EncryptionConflict)
+    }
+}
+
+pub(crate) async fn postgres_encryption_counts(
+    conn: &mut sqlx::PgConnection,
+    account: &str,
+    kid: Option<&str>,
+) -> Result<EncryptionCounts, VaultError> {
+    let summaries: Vec<String> = sqlx::query_scalar(
+        "SELECT summary FROM vaults WHERE work_session_id = $1",
+    )
+    .bind(account)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    let entries: Vec<String> = sqlx::query_scalar(
+        "SELECT e.content FROM vault_entries e JOIN vaults v ON v.vault_id = e.vault_id \
+         WHERE v.work_session_id = $1",
+    )
+    .bind(account)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_err)?;
+
+    let mut counts = EncryptionCounts::default();
+    for summary in summaries {
+        counts.add(classify_envelope(&summary, kid));
+    }
+    for content in entries {
+        counts.add(classify_envelope(&content, kid));
+    }
+    Ok(counts)
+}
+
 #[async_trait]
 impl VaultStore for PgVaultStore {
     fn backend_name(&self) -> &'static str {
@@ -385,6 +592,8 @@ impl VaultStore for PgVaultStore {
         summary: &str,
     ) -> Result<String, VaultError> {
         let vault_id = generate_vault_id();
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        validate_encryption_content(&mut tx, work_session_id, [summary], false).await?;
         sqlx::query(
             "INSERT INTO vaults (vault_id, summary, work_session_id, created_by) \
              VALUES ($1, $2, $3, $4)",
@@ -393,24 +602,23 @@ impl VaultStore for PgVaultStore {
         .bind(summary)
         .bind(work_session_id)
         .bind(created_by)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         Ok(vault_id)
     }
 
     async fn list_readable(
         &self,
         work_session_id: &str,
-        client_id: &str,
     ) -> Result<Vec<VaultListItem>, VaultError> {
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT vault_id, summary FROM vaults \
-             WHERE work_session_id = $1 OR $2 = ANY(writer_list) \
+             WHERE work_session_id = $1 \
              ORDER BY created_at ASC",
         )
         .bind(work_session_id)
-        .bind(client_id)
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
@@ -446,17 +654,20 @@ impl VaultStore for PgVaultStore {
 
     async fn append(
         &self,
+        account: &str,
         vault_id: &str,
         writer_id: &str,
         text: &str,
     ) -> Result<WriteResult, VaultError> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        validate_encryption_content(&mut tx, account, [text], false).await?;
         // Allocate entry_no atomically.
         let entry_no: i32 = sqlx::query_scalar(
             "UPDATE vaults SET next_entry_no = next_entry_no + 1 \
-             WHERE vault_id = $1 RETURNING next_entry_no - 1",
+             WHERE vault_id = $1 AND work_session_id = $2 RETURNING next_entry_no - 1",
         )
         .bind(vault_id)
+        .bind(account)
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?
@@ -484,12 +695,25 @@ impl VaultStore for PgVaultStore {
 
     async fn override_entry(
         &self,
+        account: &str,
         vault_id: &str,
         entry_no: i32,
         writer_id: &str,
         text: &str,
     ) -> Result<WriteResult, VaultError> {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
+        validate_encryption_content(&mut tx, account, [text], false).await?;
+        let owns_vault: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM vaults WHERE vault_id = $1 AND work_session_id = $2)",
+        )
+        .bind(vault_id)
+        .bind(account)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if !owns_vault {
+            return Err(VaultError::NotFound);
+        }
         let max_version: Option<i32> = sqlx::query_scalar(
             "SELECT MAX(version) FROM vault_entries WHERE vault_id = $1 AND entry_no = $2",
         )
@@ -521,16 +745,27 @@ impl VaultStore for PgVaultStore {
         })
     }
 
-    async fn set_summary(&self, vault_id: &str, text: &str) -> Result<(), VaultError> {
-        let res = sqlx::query("UPDATE vaults SET summary = $1 WHERE vault_id = $2")
+    async fn set_summary(
+        &self,
+        account: &str,
+        vault_id: &str,
+        text: &str,
+    ) -> Result<(), VaultError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        validate_encryption_content(&mut tx, account, [text], false).await?;
+        let res = sqlx::query(
+            "UPDATE vaults SET summary = $1 WHERE vault_id = $2 AND work_session_id = $3",
+        )
             .bind(text)
             .bind(vault_id)
-            .execute(&self.pool)
+            .bind(account)
+            .execute(&mut *tx)
             .await
             .map_err(db_err)?;
         if res.rows_affected() == 0 {
             return Err(VaultError::NotFound);
         }
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -559,6 +794,65 @@ impl VaultStore for PgVaultStore {
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn encryption_counts(
+        &self,
+        account: &str,
+        kid: Option<&str>,
+    ) -> Result<EncryptionCounts, VaultError> {
+        let mut conn = self.pool.acquire().await.map_err(db_err)?;
+        postgres_encryption_counts(&mut conn, account, kid).await
+    }
+
+    async fn rewrite_encrypted_fields(
+        &self,
+        account: &str,
+        vault_id: &str,
+        summary: &str,
+        entries: &[VaultRewriteEntry],
+    ) -> Result<(), VaultError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        validate_encryption_content(
+            &mut tx,
+            account,
+            std::iter::once(summary).chain(entries.iter().map(|entry| entry.content.as_str())),
+            true,
+        )
+        .await?;
+        let updated = sqlx::query(
+            "UPDATE vaults SET summary = $3 \
+             WHERE vault_id = $1 AND work_session_id = $2",
+        )
+        .bind(vault_id)
+        .bind(account)
+        .bind(summary)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        if updated.rows_affected() == 0 {
+            return Err(VaultError::NotFound);
+        }
+
+        for rewrite in entries {
+            let updated = sqlx::query(
+                "UPDATE vault_entries SET content = $4, \
+                 seq = nextval(pg_get_serial_sequence('vault_entries', 'seq')) \
+                 WHERE vault_id = $1 AND entry_no = $2 AND version = $3",
+            )
+            .bind(vault_id)
+            .bind(rewrite.entry_no)
+            .bind(rewrite.version)
+            .bind(&rewrite.content)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            if updated.rows_affected() == 0 {
+                return Err(VaultError::NotFound);
+            }
+        }
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 }
@@ -598,12 +892,12 @@ mod tests {
         let store = InMemoryVaultStore::new();
         let id = store.create_vault("ws-1", "client-a", "auth refactor").await.unwrap();
 
-        let w1 = store.append(&id, "client-a", "decided: JWT in cookie").await.unwrap();
+        let w1 = store.append("ws-1", &id, "client-a", "decided: JWT in cookie").await.unwrap();
         assert_eq!(w1.entry_no, 1);
         assert_eq!(w1.version, 1);
 
         // Override entry 1 → version 2.
-        let w2 = store.override_entry(&id, 1, "client-a", "JWT, 15m exp").await.unwrap();
+        let w2 = store.override_entry("ws-1", &id, 1, "client-a", "JWT, 15m exp").await.unwrap();
         assert_eq!(w2.entry_no, 1);
         assert_eq!(w2.version, 2);
 
@@ -624,8 +918,8 @@ mod tests {
     async fn since_filters_by_seq() {
         let store = InMemoryVaultStore::new();
         let id = store.create_vault("ws-1", "a", "").await.unwrap();
-        let w1 = store.append(&id, "a", "first").await.unwrap();
-        let _w2 = store.append(&id, "a", "second").await.unwrap();
+        let w1 = store.append("ws-1", &id, "a", "first").await.unwrap();
+        let _w2 = store.append("ws-1", &id, "a", "second").await.unwrap();
 
         let after_first = store.read(&id, Some(w1.seq), true).await.unwrap();
         assert_eq!(after_first.len(), 1);
@@ -644,31 +938,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_readable_in_session_and_past_writer() {
+    async fn list_readable_is_this_account_only() {
         let store = InMemoryVaultStore::new();
         let id = store.create_vault("ws-1", "a", "vault one").await.unwrap();
         store.add_writer(&id, "past-writer").await.unwrap();
 
-        // In-session caller sees it.
-        let in_session = store.list_readable("ws-1", "anyone").await.unwrap();
-        assert_eq!(in_session.len(), 1);
-
-        // Out-of-session past writer sees it.
-        let past = store.list_readable("ws-other", "past-writer").await.unwrap();
-        assert_eq!(past.len(), 1);
-
-        // Out-of-session stranger does not.
-        let stranger = store.list_readable("ws-other", "stranger").await.unwrap();
-        assert_eq!(stranger.len(), 0);
+        assert_eq!(store.list_readable("ws-1").await.unwrap().len(), 1);
+        // Having written to it doesn't list it in another account.
+        assert_eq!(store.list_readable("ws-other").await.unwrap().len(), 0);
     }
 
     #[tokio::test]
     async fn multiple_appends_increment_entry_no_and_seq() {
         let store = InMemoryVaultStore::new();
         let id = store.create_vault("ws-1", "a", "").await.unwrap();
-        let w1 = store.append(&id, "a", "one").await.unwrap();
-        let w2 = store.append(&id, "a", "two").await.unwrap();
-        let w3 = store.append(&id, "a", "three").await.unwrap();
+        let w1 = store.append("ws-1", &id, "a", "one").await.unwrap();
+        let w2 = store.append("ws-1", &id, "a", "two").await.unwrap();
+        let w3 = store.append("ws-1", &id, "a", "three").await.unwrap();
         assert_eq!((w1.entry_no, w2.entry_no, w3.entry_no), (1, 2, 3));
         assert!(w1.seq < w2.seq && w2.seq < w3.seq);
         // All version 1 (distinct entries).
@@ -682,10 +968,10 @@ mod tests {
     async fn overrides_are_isolated_per_entry_no() {
         let store = InMemoryVaultStore::new();
         let id = store.create_vault("ws-1", "a", "").await.unwrap();
-        store.append(&id, "a", "e1v1").await.unwrap(); // entry 1
-        store.append(&id, "a", "e2v1").await.unwrap(); // entry 2
-        let o1 = store.override_entry(&id, 1, "a", "e1v2").await.unwrap();
-        let o2 = store.override_entry(&id, 1, "a", "e1v3").await.unwrap();
+        store.append("ws-1", &id, "a", "e1v1").await.unwrap(); // entry 1
+        store.append("ws-1", &id, "a", "e2v1").await.unwrap(); // entry 2
+        let o1 = store.override_entry("ws-1", &id, 1, "a", "e1v2").await.unwrap();
+        let o2 = store.override_entry("ws-1", &id, 1, "a", "e1v3").await.unwrap();
         assert_eq!(o1.version, 2);
         assert_eq!(o2.version, 3);
 
@@ -704,7 +990,7 @@ mod tests {
         let store = InMemoryVaultStore::new();
         let id = store.create_vault("ws-1", "a", "").await.unwrap();
         // Override an entry_no that was never appended.
-        let w = store.override_entry(&id, 7, "a", "ghost").await.unwrap();
+        let w = store.override_entry("ws-1", &id, 7, "a", "ghost").await.unwrap();
         assert_eq!(w.entry_no, 7);
         assert_eq!(w.version, 1);
     }
@@ -713,9 +999,9 @@ mod tests {
     async fn operations_on_missing_vault_return_not_found() {
         let store = InMemoryVaultStore::new();
         assert!(matches!(store.read("nope", None, false).await, Err(VaultError::NotFound)));
-        assert!(matches!(store.append("nope", "a", "x").await, Err(VaultError::NotFound)));
-        assert!(matches!(store.override_entry("nope", 1, "a", "x").await, Err(VaultError::NotFound)));
-        assert!(matches!(store.set_summary("nope", "x").await, Err(VaultError::NotFound)));
+        assert!(matches!(store.append("ws-1", "nope", "a", "x").await, Err(VaultError::NotFound)));
+        assert!(matches!(store.override_entry("ws-1", "nope", 1, "a", "x").await, Err(VaultError::NotFound)));
+        assert!(matches!(store.set_summary("ws-1", "nope", "x").await, Err(VaultError::NotFound)));
         assert!(matches!(store.add_writer("nope", "a").await, Err(VaultError::NotFound)));
         assert!(store.get_meta("nope").await.unwrap().is_none());
     }
@@ -726,7 +1012,7 @@ mod tests {
         let a = store.create_vault("ws-1", "x", "A").await.unwrap();
         let b = store.create_vault("ws-1", "x", "B").await.unwrap();
         assert_ne!(a, b);
-        store.append(&a, "x", "in-a").await.unwrap();
+        store.append("ws-1", &a, "x", "in-a").await.unwrap();
 
         let a_entries = store.read(&a, None, true).await.unwrap();
         let b_entries = store.read(&b, None, true).await.unwrap();
@@ -738,8 +1024,8 @@ mod tests {
     async fn set_summary_updates_list_view() {
         let store = InMemoryVaultStore::new();
         let id = store.create_vault("ws-1", "a", "old").await.unwrap();
-        store.set_summary(&id, "new").await.unwrap();
-        let items = store.list_readable("ws-1", "a").await.unwrap();
+        store.set_summary("ws-1", &id, "new").await.unwrap();
+        let items = store.list_readable("ws-1").await.unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].summary, "new");
     }

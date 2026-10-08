@@ -31,7 +31,12 @@ use crate::cluster::limits::{client_ip, WsConnLimiter, WsPermit, DEFAULT_WS_MAX_
 use crate::cluster::local::{LocalSockets, SocketOutbox, SocketRole};
 use crate::cluster::ratelimit::{NoopRateLimiter, SharedRateLimiter};
 use crate::cluster::{ConnRef, StoreError, SINGLE_REPLICA_ID};
-use crate::identity_store::{BindOutcome, IdentityError, IdentityStore, RegisterOutcome};
+use crate::account_store::{
+    AccountError, AccountStore, MergeMode, FRESH_SIGN_IN_SECS, ONLINE_WINDOW_SECS,
+};
+use crate::identity_store::{
+    BindOutcome, IdentityError, IdentityStore, RegisterOutcome, REVOKED_PUBLIC_KEY,
+};
 use crate::voice_session::ReplyWaiters;
 use crate::AppState;
 
@@ -1095,8 +1100,11 @@ pub async fn ws_handler(
                 }
                 let atem_id = params.atem_id.clone().unwrap_or_else(|| "session-atem".to_string());
                 let identity = state.identity.clone();
+                let accounts = state.accounts.clone();
                 return ws
-                    .on_upgrade(move |socket| handle_ws(hub, identity, code, role, atem_id, socket, permit))
+                    .on_upgrade(move |socket| {
+                        handle_ws(hub, identity, accounts, code, role, atem_id, socket, permit)
+                    })
                     .into_response();
             }
             _ => {
@@ -1141,7 +1149,10 @@ pub async fn ws_handler(
     let atem_id = sanitize_atem_id(params.atem_id.as_deref());
 
     let identity = state.identity.clone();
-    ws.on_upgrade(move |socket| handle_ws(hub, identity, code, role, atem_id, socket, permit))
+    let accounts = state.accounts.clone();
+    ws.on_upgrade(move |socket| {
+        handle_ws(hub, identity, accounts, code, role, atem_id, socket, permit)
+    })
         .into_response()
 }
 
@@ -1316,9 +1327,23 @@ fn relay_control_type(message: &serde_json::Value) -> Option<&str> {
             | "relaySessions"
             | "relayBind"
             | "relayUnbind"
+            | "relayRegisterAccount"
+            | "relayAccountList"
+            | "relayMergeRequest"
+            | "relayMergeApprove"
+            | "relayMergeCancel"
+            | "relayLeaveGroup"
+            | "relayRemoveAstation"
+            | "relayEncryptionGet"
+            | "relayEncryptionSet"
             | "relayAuthChallenge"
             | "relayAuthResult"
             | "relayAck"
+            | "relayAccountState"
+            | "relayMergeApproval"
+            | "relayAccountChanged"
+            | "relayEncryptionState"
+            | "relayEncryptionChanged"
     )
     .then_some(kind)
 }
@@ -1359,6 +1384,421 @@ fn touch_key_in_background(identity: &Arc<dyn IdentityStore>, astation_id: &str,
             );
         }
     });
+}
+
+fn touch_account_in_background(accounts: &Arc<dyn AccountStore>, astation_id: &str, now: i64) {
+    let accounts = accounts.clone();
+    let astation_id = astation_id.to_string();
+    tokio::spawn(async move {
+        if let Err(error) = accounts.touch(&astation_id, now).await {
+            tracing::warn!(
+                "Could not record account activity for Astation {}: {}",
+                mask_code(&astation_id),
+                error
+            );
+        }
+    });
+}
+
+async fn send_account_state(
+    hub: &RelayHub,
+    accounts: &dyn AccountStore,
+    connection_id: &str,
+    astation_id: &str,
+) {
+    let frame = match accounts.list_for_astation(astation_id).await {
+        Ok((devices, requests)) => {
+            let mut visible = Vec::with_capacity(devices.len());
+            for device in devices {
+                let online = match hub.room(&device.astation_id).await {
+                    Ok(Some(room)) => room.verified && room.owner.is_some(),
+                    _ => false,
+                };
+                visible.push(serde_json::json!({
+                    "astation_id": device.astation_id,
+                    "label": device.label,
+                    "data_account": device.data_account,
+                    "registered_at": device.registered_at,
+                    "last_seen_at": device.last_seen_at,
+                    "online": online,
+                }));
+            }
+            serde_json::json!({
+                "type": "relayAccountState",
+                "devices": visible,
+                "requests": requests,
+            })
+            .to_string()
+        }
+        Err(error) => relay_ack_err("relayAccountList", &error.to_string()),
+    };
+    hub.local().send(connection_id, frame);
+}
+
+async fn send_encryption_state(
+    hub: &RelayHub,
+    accounts: &dyn AccountStore,
+    connection_id: &str,
+    astation_id: &str,
+) {
+    let frame = match accounts.resolve_data_account(astation_id).await {
+        Ok(data_account) => match accounts.encryption_state(&data_account).await {
+            Ok(state) => serde_json::json!({
+                "type": "relayEncryptionState",
+                "data_account": state.data_account,
+                "mode": state.mode,
+                "kid": state.kid,
+                "enabled_at": state.enabled_at,
+                "updated_at": state.updated_at,
+                "plaintext_fields": state.plaintext_fields,
+                "ciphertext_fields": state.ciphertext_fields,
+                "obsolete_fields": state.obsolete_fields,
+            })
+            .to_string(),
+            Err(error) => relay_ack_err("relayEncryptionGet", &error.to_string()),
+        },
+        Err(error) => relay_ack_err("relayEncryptionGet", &error.to_string()),
+    };
+    hub.local().send(connection_id, frame);
+}
+
+pub(crate) async fn deliver_to_verified_astation(
+    hub: &RelayHub,
+    astation_id: &str,
+    frame: String,
+) -> bool {
+    let room = match hub.room(astation_id).await {
+        Ok(Some(room)) => room,
+        _ => return false,
+    };
+    if !room.verified {
+        return false;
+    }
+    let Some(owner) = room.owner else {
+        return false;
+    };
+    hub.deliver(&owner, frame).await;
+    true
+}
+
+async fn notify_account_devices(
+    hub: &RelayHub,
+    accounts: &dyn AccountStore,
+    astation_id: &str,
+    frame: String,
+) {
+    let Ok((devices, _)) = accounts.list_for_astation(astation_id).await else {
+        return;
+    };
+    for device in devices {
+        deliver_to_verified_astation(hub, &device.astation_id, frame.clone()).await;
+    }
+}
+
+fn account_error_frame(kind: &str, error: AccountError) -> String {
+    relay_ack_err(kind, &error.to_string())
+}
+
+async fn apply_account_message(
+    hub: &RelayHub,
+    identity: &dyn IdentityStore,
+    accounts: &dyn AccountStore,
+    code: &str,
+    connection_id: &str,
+    kind: &str,
+    message: &serde_json::Value,
+    now: i64,
+) {
+    match kind {
+        "relayRegisterAccount" => {
+            let token = message
+                .get("sso_access_token")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= 16 * 1024);
+            let label = message
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && value.len() <= 128);
+            let (Some(token), Some(label)) = (token, label) else {
+                hub.local().send(connection_id, relay_ack_err(kind, "invalid account registration"));
+                return;
+            };
+            let verified = match accounts.verify_access_token(token).await {
+                Ok(verified) => verified,
+                Err(error) => {
+                    tracing::warn!(
+                        "Account registration failed for Astation {}: {}",
+                        mask_code(code),
+                        error
+                    );
+                    hub.local().send(connection_id, relay_ack_err(kind, &error.to_string()));
+                    return;
+                }
+            };
+            match accounts.register(code, &verified.subject, label, now).await {
+                Ok(()) => {
+                    hub.local().send(connection_id, relay_ack_ok(kind));
+                    send_account_state(hub, accounts, connection_id, code).await;
+                }
+                Err(error) => {
+                    hub.local().send(connection_id, account_error_frame(kind, error));
+                }
+            }
+        }
+        "relayAccountList" => {
+            send_account_state(hub, accounts, connection_id, code).await;
+        }
+        "relayEncryptionGet" => {
+            send_encryption_state(hub, accounts, connection_id, code).await;
+        }
+        "relayEncryptionSet" => {
+            let Some(mode) = message
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .filter(|mode| matches!(*mode, "off" | "enabling" | "on" | "disabling"))
+            else {
+                hub.local().send(connection_id, relay_ack_err(kind, "invalid encryption mode"));
+                return;
+            };
+            let kid = message.get("kid").and_then(serde_json::Value::as_str);
+            let data_account = match accounts.resolve_data_account(code).await {
+                Ok(data_account) => data_account,
+                Err(error) => {
+                    hub.local().send(connection_id, account_error_frame(kind, error));
+                    return;
+                }
+            };
+            match accounts
+                .set_encryption_state(&data_account, mode, kid, now)
+                .await
+            {
+                Ok(state) => {
+                    hub.local().send(connection_id, relay_ack_ok(kind));
+                    send_encryption_state(hub, accounts, connection_id, code).await;
+                    notify_account_devices(
+                        hub,
+                        accounts,
+                        code,
+                        serde_json::json!({
+                            "type": "relayEncryptionChanged",
+                            "data_account": state.data_account,
+                            "mode": state.mode,
+                            "kid": state.kid,
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    hub.local().send(connection_id, account_error_frame(kind, error));
+                }
+            }
+        }
+        "relayMergeRequest" => {
+            let Some(target) = message
+                .get("target_astation_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= 128 && *value != code)
+            else {
+                hub.local().send(connection_id, relay_ack_err(kind, "invalid target Astation"));
+                return;
+            };
+            let (devices, _) = match accounts.list_for_astation(code).await {
+                Ok(state) => state,
+                Err(error) => {
+                    hub.local().send(connection_id, account_error_frame(kind, error));
+                    return;
+                }
+            };
+            let Some(requester) = devices.iter().find(|device| device.astation_id == code) else {
+                hub.local().send(connection_id, relay_ack_err(kind, "Astation is not registered"));
+                return;
+            };
+            let Some(target_device) = devices.iter().find(|device| device.astation_id == target) else {
+                hub.local().send(connection_id, relay_ack_err(kind, "target is not on this Agora account"));
+                return;
+            };
+            let online = match hub.room(target).await {
+                Ok(Some(room)) => room.verified && room.owner.is_some(),
+                _ => false,
+            };
+            let mode = if online {
+                MergeMode::Online
+            } else {
+                if now.saturating_sub(target_device.last_seen_at) < ONLINE_WINDOW_SECS {
+                    hub.local().send(
+                        connection_id,
+                        relay_ack_err(kind, "target was recently online; wait 10 minutes or approve there"),
+                    );
+                    return;
+                }
+                let Some(token) = message
+                    .get("fresh_sso_access_token")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty() && value.len() <= 16 * 1024)
+                else {
+                    hub.local().send(connection_id, relay_ack_err(kind, "a fresh Agora sign-in is required"));
+                    return;
+                };
+                let verified = match accounts.verify_access_token(token).await {
+                    Ok(verified) => verified,
+                    Err(error) => {
+                        hub.local().send(connection_id, relay_ack_err(kind, &error.to_string()));
+                        return;
+                    }
+                };
+                let subject = match accounts.subject_for_astation(code).await {
+                    Ok(Some(subject)) => subject,
+                    Ok(None) => {
+                        hub.local().send(connection_id, relay_ack_err(kind, "Astation is not registered"));
+                        return;
+                    }
+                    Err(error) => {
+                        hub.local().send(connection_id, account_error_frame(kind, error));
+                        return;
+                    }
+                };
+                let fresh = verified
+                    .authenticated_at
+                    .is_some_and(|authenticated_at| {
+                        authenticated_at <= now + 60
+                            && now.saturating_sub(authenticated_at) <= FRESH_SIGN_IN_SECS
+                    });
+                if verified.subject != subject || !fresh {
+                    hub.local().send(
+                        connection_id,
+                        relay_ack_err(kind, "fresh sign-in could not be verified for this Agora account"),
+                    );
+                    return;
+                }
+                MergeMode::Delayed
+            };
+            match accounts.start_merge(code, target, mode, now).await {
+                Ok(request) => {
+                    hub.local().send(connection_id, relay_ack_ok(kind));
+                    let frame = if mode == MergeMode::Online {
+                        serde_json::json!({
+                            "type": "relayMergeApproval",
+                            "request_id": request.request_id,
+                            "requester_astation_id": code,
+                            "requester_label": requester.label,
+                            "expires_at": request.expires_at,
+                        })
+                    } else {
+                        serde_json::json!({
+                            "type": "relayAccountChanged",
+                            "reason": "delayed_merge_pending",
+                            "request_id": request.request_id,
+                            "ready_at": request.ready_at,
+                        })
+                    }
+                    .to_string();
+                    if mode == MergeMode::Online {
+                        deliver_to_verified_astation(hub, target, frame).await;
+                    } else {
+                        notify_account_devices(hub, accounts, code, frame).await;
+                    }
+                    send_account_state(hub, accounts, connection_id, code).await;
+                }
+                Err(error) => {
+                    hub.local().send(connection_id, account_error_frame(kind, error));
+                }
+            }
+        }
+        "relayMergeApprove" => {
+            let Some(request_id) = message.get("request_id").and_then(serde_json::Value::as_str) else {
+                hub.local().send(connection_id, relay_ack_err(kind, "missing request_id"));
+                return;
+            };
+            match accounts.approve_merge(code, request_id, now).await {
+                Ok(outcome) => {
+                    hub.local().send(connection_id, relay_ack_ok(kind));
+                    let frame = serde_json::json!({
+                        "type": "relayAccountChanged",
+                        "reason": "merge_completed",
+                        "request_id": outcome.request_id,
+                        "data_account": outcome.data_account,
+                    })
+                    .to_string();
+                    notify_account_devices(hub, accounts, code, frame).await;
+                }
+                Err(error) => {
+                    hub.local().send(connection_id, account_error_frame(kind, error));
+                }
+            }
+        }
+        "relayMergeCancel" => {
+            let Some(request_id) = message.get("request_id").and_then(serde_json::Value::as_str) else {
+                hub.local().send(connection_id, relay_ack_err(kind, "missing request_id"));
+                return;
+            };
+            match accounts.cancel_merge(code, request_id).await {
+                Ok(()) => {
+                    hub.local().send(connection_id, relay_ack_ok(kind));
+                    notify_account_devices(
+                        hub,
+                        accounts,
+                        code,
+                        serde_json::json!({
+                            "type": "relayAccountChanged",
+                            "reason": "merge_cancelled",
+                            "request_id": request_id,
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    hub.local().send(connection_id, account_error_frame(kind, error));
+                }
+            }
+        }
+        "relayLeaveGroup" => match accounts.leave_group(code).await {
+            Ok(()) => {
+                hub.local().send(connection_id, relay_ack_ok(kind));
+                send_account_state(hub, accounts, connection_id, code).await;
+            }
+            Err(error) => {
+                hub.local().send(connection_id, account_error_frame(kind, error));
+            }
+        },
+        "relayRemoveAstation" => {
+            let Some(target) = message
+                .get("target_astation_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|target| *target != code)
+            else {
+                hub.local().send(connection_id, relay_ack_err(kind, "invalid target Astation"));
+                return;
+            };
+            match accounts.remove_astation(code, target, now).await {
+                Ok(()) => {
+                    if let Err(error) = identity.revoke_astation(target, now).await {
+                        // PgAccountStore performs the same revocation in its
+                        // account transaction; this remains important for the
+                        // in-memory backend and reports unexpected divergence.
+                        tracing::error!("Could not revoke removed Astation identity: {}", error);
+                    }
+                    hub.keys().set(target, REVOKED_PUBLIC_KEY);
+                    hub.announce_key_change(target).await;
+                    if let Err(error) = hub.close_room(target).await {
+                        tracing::error!(
+                            "Could not close the room of removed Astation {}: {}",
+                            mask_code(target),
+                            error
+                        );
+                    }
+                    hub.local().send(connection_id, relay_ack_ok(kind));
+                    send_account_state(hub, accounts, connection_id, code).await;
+                }
+                Err(error) => {
+                    hub.local().send(connection_id, account_error_frame(kind, error));
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 const KEY_MISMATCH: &str = "public_key does not match the key registered for this astation_id";
@@ -1589,11 +2029,34 @@ async fn apply_binding_message(
     }
 }
 
+async fn is_current_verified_owner(
+    hub: &RelayHub,
+    code: &str,
+    connection_id: &str,
+    auth: &AstationAuth,
+) -> bool {
+    if auth.state != AuthState::Verified || !hub.local().contains(connection_id) {
+        return false;
+    }
+    let owns_verified_room = |room: &RoomInfo| {
+        room.verified
+            && room
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.conn == connection_id)
+    };
+    matches!(
+        hub.check_sender(code, owns_verified_room).await,
+        Ok(SenderCheck::Current(_))
+    )
+}
+
 /// Handle a relay-auth frame from an Astation. Returns `false` when the
 /// connection must be closed (its rejection has been queued).
 async fn handle_astation_control(
     hub: &RelayHub,
     identity: &Arc<dyn IdentityStore>,
+    accounts: &Arc<dyn AccountStore>,
     code: &str,
     connection_id: &str,
     auth: &mut AstationAuth,
@@ -1625,6 +2088,10 @@ async fn handle_astation_control(
                     hub.local().send(connection_id, relay_auth_result_frame(status, message));
                     let was_pending = auth.state == AuthState::Pending;
                     auth.state = AuthState::Verified;
+                    touch_account_in_background(accounts, code, now);
+                    // Mode always follows auth before room events, so clients
+                    // can configure storage before processing Atem traffic.
+                    send_encryption_state(hub, accounts.as_ref(), connection_id, code).await;
                     if let Err(error) = hub.promote_verified(code, connection_id, was_pending).await {
                         tracing::error!(
                             "Relay state unavailable promoting Astation {}: {}",
@@ -1645,26 +2112,45 @@ async fn handle_astation_control(
             }
         }
         "relaySessions" | "relayBind" | "relayUnbind" => {
-            // An evicted socket (replaced, or its key forgotten) may still be
-            // read until the client goes: it no longer speaks for the room.
-            let ack = if !hub.local().contains(connection_id) {
+            // A replaced/removed socket may still be read if its cross-replica
+            // close was lost. The shared directory is authoritative.
+            let ack = if !is_current_verified_owner(hub, code, connection_id, auth).await {
                 tracing::debug!(
-                    "Refused {} from an evicted Astation socket {}",
+                    "Refused {} from a stale or unverified Astation socket {}",
                     kind,
                     mask_code(code)
                 );
                 relay_ack_err(kind, "not verified")
-            } else if auth.state == AuthState::Verified {
-                apply_binding_message(identity.as_ref(), code, kind, message, now).await
             } else {
-                tracing::debug!(
-                    "Refused {} from unverified Astation {}",
-                    kind,
-                    mask_code(code)
-                );
-                relay_ack_err(kind, "not verified")
+                apply_binding_message(identity.as_ref(), code, kind, message, now).await
             };
             hub.local().send(connection_id, ack);
+            true
+        }
+        "relayRegisterAccount"
+        | "relayAccountList"
+        | "relayMergeRequest"
+        | "relayMergeApprove"
+        | "relayMergeCancel"
+        | "relayLeaveGroup"
+        | "relayRemoveAstation"
+        | "relayEncryptionGet"
+        | "relayEncryptionSet" => {
+            if !is_current_verified_owner(hub, code, connection_id, auth).await {
+                hub.local().send(connection_id, relay_ack_err(kind, "not verified"));
+                return true;
+            }
+            apply_account_message(
+                hub,
+                identity.as_ref(),
+                accounts.as_ref(),
+                code,
+                connection_id,
+                kind,
+                message,
+                now,
+            )
+            .await;
             true
         }
         // Relay → Astation frame types echoed back: dropped.
@@ -1845,6 +2331,7 @@ where
 async fn handle_ws(
     hub: RelayHub,
     identity: Arc<dyn IdentityStore>,
+    accounts: Arc<dyn AccountStore>,
     code: String,
     role: String,
     atem_id: String,
@@ -2053,6 +2540,7 @@ async fn handle_ws(
                             let keep_open = handle_astation_control(
                                 &hub,
                                 &identity,
+                                &accounts,
                                 &code,
                                 &connection_id,
                                 auth,
@@ -2523,7 +3011,7 @@ pub(crate) mod tests {
         assert_eq!(mask_code("日本語テキスト"), "日本語テ…");
     }
 
-    pub(crate) async fn next_client_json(socket: &mut TestSocket) -> serde_json::Value {
+    pub(crate) async fn next_client_json_raw(socket: &mut TestSocket) -> serde_json::Value {
         loop {
             let frame = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
                 .await
@@ -2538,6 +3026,15 @@ pub(crate) mod tests {
                     panic!("WebSocket closed unexpectedly: {frame:?}");
                 }
                 _ => {}
+            }
+        }
+    }
+
+    pub(crate) async fn next_client_json(socket: &mut TestSocket) -> serde_json::Value {
+        loop {
+            let value = next_client_json_raw(socket).await;
+            if value["type"] != "relayEncryptionState" {
+                return value;
             }
         }
     }
@@ -3119,6 +3616,7 @@ pub(crate) mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
         Router::new()
             .route("/api/pair", axum::routing::post(create_pair_handler))
@@ -3590,6 +4088,7 @@ pub(crate) mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         };
 
         // Create pair
@@ -3764,6 +4263,7 @@ pub(crate) mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity,
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         }
     }
 
@@ -3771,6 +4271,44 @@ pub(crate) mod tests {
         identity_state(std::sync::Arc::new(
             crate::identity_store::InMemoryIdentityStore::new(),
         ))
+    }
+
+    struct TestAccountVerifier {
+        responses: std::collections::HashMap<String, crate::account_store::VerifiedAgoraAccount>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::account_store::AccountIdentityVerifier for TestAccountVerifier {
+        async fn verify(
+            &self,
+            access_token: &str,
+        ) -> Result<crate::account_store::VerifiedAgoraAccount, crate::account_store::VerifyError>
+        {
+            self.responses
+                .get(access_token)
+                .cloned()
+                .ok_or(crate::account_store::VerifyError::Rejected)
+        }
+    }
+
+    fn account_verifier_state(verifier: TestAccountVerifier) -> crate::AppState {
+        let knowledge = std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new());
+        let vault = std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new());
+        let accounts = crate::account_store::InMemoryAccountStore::with_verifier(
+            knowledge.clone(),
+            vault.clone(),
+            std::sync::Arc::new(verifier),
+        );
+        crate::AppState {
+            sessions: crate::session_store::SessionStore::new(),
+            relay: RelayHub::with_auth_timeout(TEST_AUTH_TIMEOUT),
+            rtc_sessions: crate::rtc_session::RtcSessionStore::new(),
+            voice_sessions: VoiceSessionStore::new(),
+            vault,
+            knowledge,
+            identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(accounts),
+        }
     }
 
     /// Serve the production router on an ephemeral port; returns the ws base URL.
@@ -3832,6 +4370,10 @@ pub(crate) mod tests {
         send_json(socket, key.relay_auth(challenge, code)).await;
         let result = next_client_json(socket).await;
         assert_eq!(result["type"], "relayAuthResult");
+        if result["status"] != "rejected" {
+            let encryption = next_client_json_raw(socket).await;
+            assert_eq!(encryption["type"], "relayEncryptionState");
+        }
         result
     }
 
@@ -4747,6 +5289,7 @@ pub(crate) mod tests {
         let hub = state.relay.clone();
         let connection_id = hub.room(code).await.unwrap().unwrap().owner.unwrap().conn;
         let identity: Arc<dyn IdentityStore> = Arc::new(flaky.clone());
+        let accounts = state.accounts.clone();
         let mut auth = AstationAuth {
             challenge: String::new(),
             deadline: Instant::now() + Duration::from_secs(10),
@@ -4756,7 +5299,16 @@ pub(crate) mod tests {
 
         // Still registered: applied.
         assert!(
-            handle_astation_control(&hub, &identity, code, &connection_id, &mut auth, "relayBind", &bind("s-live"))
+            handle_astation_control(
+                &hub,
+                &identity,
+                &accounts,
+                code,
+                &connection_id,
+                &mut auth,
+                "relayBind",
+                &bind("s-live"),
+            )
                 .await
         );
         assert_eq!(resolve(&state, "s-live").await.as_deref(), Some(code));
@@ -4771,10 +5323,238 @@ pub(crate) mod tests {
             ("relayUnbind", serde_json::json!({"type": "relayUnbind", "session_id": "s-live"})),
             ("relaySessions", serde_json::json!({"type": "relaySessions", "sessions": ["s-evicted"]})),
         ] {
-            handle_astation_control(&hub, &identity, code, &connection_id, &mut auth, kind, &message).await;
+            handle_astation_control(
+                &hub,
+                &identity,
+                &accounts,
+                code,
+                &connection_id,
+                &mut auth,
+                kind,
+                &message,
+            )
+            .await;
         }
         assert_eq!(resolve(&state, "s-evicted").await, None);
         assert_eq!(resolve(&state, "s-live").await.as_deref(), Some(code), "unbind was refused");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn verified_astations_can_approve_an_account_merge() {
+        let state = memory_identity_state();
+        state.accounts.register("astation-group-a", "agora-user", "Mac A", now()).await.unwrap();
+        state.accounts.register("astation-group-b", "agora-user", "Mac B", now()).await.unwrap();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let mut a = verified_astation(
+            &base_url,
+            "astation-group-a",
+            &TestKey::generate(),
+            "registered",
+        )
+        .await;
+        let mut b = verified_astation(
+            &base_url,
+            "astation-group-b",
+            &TestKey::generate(),
+            "registered",
+        )
+        .await;
+
+        let ack = control(
+            &mut a,
+            serde_json::json!({
+                "type": "relayMergeRequest",
+                "target_astation_id": "astation-group-b"
+            }),
+        )
+        .await;
+        assert_eq!(ack["for"], "relayMergeRequest");
+        assert_eq!(ack["ok"], true);
+        let state_frame = next_client_json(&mut a).await;
+        assert_eq!(state_frame["type"], "relayAccountState");
+        let approval = next_client_json(&mut b).await;
+        assert_eq!(approval["type"], "relayMergeApproval");
+        assert_eq!(approval["requester_label"], "Mac A");
+
+        let ack = control(
+            &mut b,
+            serde_json::json!({
+                "type": "relayMergeApprove",
+                "request_id": approval["request_id"]
+            }),
+        )
+        .await;
+        assert_eq!(ack["ok"], true);
+        let changed_b = next_client_json(&mut b).await;
+        let changed_a = next_client_json(&mut a).await;
+        assert_eq!(changed_b["reason"], "merge_completed");
+        assert_eq!(changed_a["reason"], "merge_completed");
+        let a_account = state.accounts.resolve_data_account("astation-group-a").await.unwrap();
+        let b_account = state.accounts.resolve_data_account("astation-group-b").await.unwrap();
+        assert_eq!(a_account, b_account);
+        assert!(a_account.starts_with("group-"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn removing_an_astation_revokes_sessions_socket_and_key() {
+        let state = memory_identity_state();
+        let now = chrono::Utc::now().timestamp();
+        let requester_id = "astation-remove-a";
+        let removed_id = "astation-remove-b";
+        state.accounts.register(requester_id, "agora-user", "Mac A", now).await.unwrap();
+        state.accounts.register(removed_id, "agora-user", "Mac B", now).await.unwrap();
+
+        let mut granted = crate::auth::create_session("removed-session");
+        granted.status = crate::auth::SessionStatus::Granted;
+        let session_id = granted.id.clone();
+        state.sessions.create(granted).await.unwrap();
+
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let requester_key = TestKey::generate();
+        let removed_key = TestKey::generate();
+        let mut requester =
+            verified_astation(&base_url, requester_id, &requester_key, "registered").await;
+        let mut removed =
+            verified_astation(&base_url, removed_id, &removed_key, "registered").await;
+        let mut removed_viewer = connect_atem(&base_url, removed_id, "atem-removed").await;
+        assert_eq!(next_client_json(&mut removed).await["relay_event"], "connected");
+        let ack = control(
+            &mut removed,
+            serde_json::json!({"type":"relayBind","session_id":session_id}),
+        )
+        .await;
+        assert_eq!(ack["ok"], true);
+        assert_routes(&state, &session_id, HttpStatusCode::OK).await;
+
+        let ack = control(
+            &mut requester,
+            serde_json::json!({
+                "type": "relayRemoveAstation",
+                "target_astation_id": removed_id,
+            }),
+        )
+        .await;
+        assert_eq!(ack["ok"], true);
+        assert_eq!(next_client_json(&mut requester).await["type"], "relayAccountState");
+        assert_closed(&mut removed).await;
+        assert_closed(&mut removed_viewer).await;
+
+        assert_eq!(resolve(&state, &session_id).await, None);
+        assert_routes(&state, &session_id, HttpStatusCode::UNAUTHORIZED).await;
+        assert_eq!(
+            state.identity.get_key(removed_id).await.unwrap().as_deref(),
+            Some(REVOKED_PUBLIC_KEY)
+        );
+        assert!(state.accounts.subject_for_astation(removed_id).await.unwrap().is_none());
+
+        let (mut retry, challenge) = connect_astation(&base_url, removed_id).await;
+        let result = authenticate(&mut retry, &removed_key, removed_id, &challenge).await;
+        assert_eq!(result["status"], "rejected", "{result}");
+        assert_closed(&mut retry).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delayed_merge_requires_a_recent_matching_sign_in() {
+        let now = chrono::Utc::now().timestamp();
+        let verified = |subject: &str, authenticated_at: Option<i64>| {
+            crate::account_store::VerifiedAgoraAccount {
+                subject: subject.to_string(),
+                authenticated_at,
+            }
+        };
+        let state = account_verifier_state(TestAccountVerifier {
+            responses: std::collections::HashMap::from([
+                ("missing".into(), verified("agora-user", None)),
+                (
+                    "stale".into(),
+                    verified("agora-user", Some(now - FRESH_SIGN_IN_SECS - 30)),
+                ),
+                ("future".into(), verified("agora-user", Some(now + 300))),
+                ("mismatch".into(), verified("another-user", Some(now))),
+                ("recent".into(), verified("agora-user", Some(now))),
+            ]),
+        });
+        let requester_id = "astation-delayed-a";
+        let target_id = "astation-delayed-b";
+        state.accounts.register(requester_id, "agora-user", "Mac A", now).await.unwrap();
+        state
+            .accounts
+            .register(target_id, "agora-user", "Mac B", now - ONLINE_WINDOW_SECS - 30)
+            .await
+            .unwrap();
+
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let mut requester = verified_astation(
+            &base_url,
+            requester_id,
+            &TestKey::generate(),
+            "registered",
+        )
+        .await;
+        for token in ["missing", "stale", "future", "mismatch"] {
+            let ack = control(
+                &mut requester,
+                serde_json::json!({
+                    "type": "relayMergeRequest",
+                    "target_astation_id": target_id,
+                    "fresh_sso_access_token": token,
+                }),
+            )
+            .await;
+            assert_eq!(ack["ok"], false, "token {token}: {ack}");
+        }
+        assert!(state.accounts.list_for_astation(requester_id).await.unwrap().1.is_empty());
+
+        let ack = control(
+            &mut requester,
+            serde_json::json!({
+                "type": "relayMergeRequest",
+                "target_astation_id": target_id,
+                "fresh_sso_access_token": "recent",
+            }),
+        )
+        .await;
+        assert_eq!(ack["ok"], true, "{ack}");
+        let requests = state.accounts.list_for_astation(requester_id).await.unwrap().1;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].mode, "delayed");
+        assert_eq!(
+            requests[0].ready_at,
+            Some(requests[0].created_at + crate::account_store::DELAYED_MERGE_WAIT_SECS)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn account_registration_fails_closed_without_a_verifier() {
+        let state = memory_identity_state();
+        let (base_url, server) = spawn_relay(state.clone()).await;
+        let mut astation = verified_astation(
+            &base_url,
+            "astation-no-verifier",
+            &TestKey::generate(),
+            "registered",
+        )
+        .await;
+        let ack = control(
+            &mut astation,
+            serde_json::json!({
+                "type": "relayRegisterAccount",
+                "sso_access_token": "secret-token",
+                "label": "Mac"
+            }),
+        )
+        .await;
+        assert_eq!(ack["for"], "relayRegisterAccount");
+        assert_eq!(ack["ok"], false);
+        assert!(!ack.to_string().contains("secret-token"));
+        assert_eq!(
+            state.accounts.subject_for_astation("astation-no-verifier").await.unwrap(),
+            None
+        );
         server.abort();
     }
 
@@ -5117,9 +5897,20 @@ pub(crate) mod tests {
             axum::routing::get(move |ws: WebSocketUpgrade| async move {
                 let identity: Arc<dyn IdentityStore> =
                     Arc::new(crate::identity_store::InMemoryIdentityStore::new());
+                let accounts: Arc<dyn AccountStore> =
+                    Arc::new(crate::account_store::InMemoryAccountStore::default());
                 let permit = late_hub.ws_limiter().try_acquire("127.0.0.1").expect("permit");
                 ws.on_upgrade(move |socket| {
-                    handle_ws(late_hub, identity, code.to_string(), "atem".into(), "atem-late".into(), socket, permit)
+                    handle_ws(
+                        late_hub,
+                        identity,
+                        accounts,
+                        code.to_string(),
+                        "atem".into(),
+                        "atem-late".into(),
+                        socket,
+                        permit,
+                    )
                 })
             }),
         );

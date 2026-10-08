@@ -169,6 +169,7 @@ mod tests {
             vault: std::sync::Arc::new(crate::vault_store::InMemoryVaultStore::new()),
             knowledge: std::sync::Arc::new(crate::knowledge_store::InMemoryKnowledgeStore::new()),
             identity: std::sync::Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+            accounts: std::sync::Arc::new(crate::account_store::InMemoryAccountStore::default()),
         }
     }
 

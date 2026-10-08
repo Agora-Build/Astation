@@ -22,6 +22,9 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var sidebarTable: NSTableView?
     private let hubManager: AstationHubManager
     private let shortcutsController: KeyboardShortcutsViewController
+    private let recordingController: AudioRecordingViewController
+    private let transcriptionController: TranscriptionViewController
+    private let dictationController: VoiceDictationViewController?
     private var statusLabel: NSTextField!
     private var signInButton: NSButton!
     private var signOutButton: NSButton!
@@ -29,17 +32,44 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var stationUrlField: NSTextField!
     private var serverStatusLabel: NSTextField!
     private var serverInfoLabel: NSTextField!
+    private var recoveryStatusLabel: NSTextField?
+    private var relayAccountStack: NSStackView?
+    private var relayAccountStatusLabel: NSTextField?
+    private var leaveGroupButton: NSButton?
+    private var encryptionStatusLabel: NSTextField?
+    private var encryptionOnButton: NSButton?
+    private var encryptionOffButton: NSButton?
+    private var encryptionRotateButton: NSButton?
+    private var encryptionShowButton: NSButton?
+    private weak var pendingEncryptionAlert: NSAlert?
+    private var pendingEncryptionRecoveryKey: String?
+    private var pendingEncryptionKid: String?
+    private var pendingEncryptionKey: AccountDataKey?
 
-    init(hubManager: AstationHubManager, hotkeyManager: HotkeyManager) {
+    init(hubManager: AstationHubManager, hotkeyManager: HotkeyManager,
+         recordingManager: AudioRecordingManager = AudioRecordingManager(), dictationManager: VoiceDictationManager? = nil) {
         self.hubManager = hubManager
         self.shortcutsController = KeyboardShortcutsViewController(manager: hotkeyManager)
+        self.recordingController = AudioRecordingViewController(manager: recordingManager, hotkeys: hotkeyManager)
+        self.transcriptionController = TranscriptionViewController(recorder: recordingManager)
+        self.dictationController = dictationManager.map { VoiceDictationViewController(manager: $0) }
         super.init()
+        transcriptionController.onConfigureSources = { [weak self] in
+            self?.tabView?.selectTabViewItem(withIdentifier: "recording")
+        }
+        dictationController?.onConfigureTranscription = { [weak self] in self?.tabView?.selectTabViewItem(withIdentifier: "transcription") }
         NotificationCenter.default.addObserver(
             self, selector: #selector(networkChanged),
             name: .networkChanged, object: nil)
         NotificationCenter.default.addObserver(
             self, selector: #selector(sessionChanged),
             name: .credentialsChanged, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(relayAccountChanged),
+            name: .relayAccountChanged, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(relayEncryptionChanged),
+            name: .relayEncryptionChanged, object: nil)
     }
 
     deinit {
@@ -49,6 +79,10 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     func showWindow() {
         if let existingWindow = window {
             shortcutsController.refresh()
+            renderRelayAccountState()
+            hubManager.requestRelayAccountState()
+            renderEncryptionState()
+            hubManager.requestRelayEncryptionState()
             existingWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -171,6 +205,18 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         shortcuts.label = "Keyboard Shortcuts"
         shortcuts.viewController = shortcutsController
         tabs.addTabViewItem(shortcuts)
+        for item in Self.audioTabItems(recording: recordingController, transcription: transcriptionController) {
+            tabs.addTabViewItem(item)
+        }
+        if let dictationController {
+            let dictation = NSTabViewItem(identifier: "dictation")
+            dictation.label = "Voice Dictation"; dictation.viewController = dictationController
+            tabs.addTabViewItem(dictation)
+        }
+        let security = NSTabViewItem(identifier: "security")
+        security.label = "Security"
+        security.view = makeSecurityView()
+        tabs.addTabViewItem(security)
         let sidebar = NSVisualEffectView()
         sidebar.material = .sidebar
         sidebar.blendingMode = .behindWindow
@@ -311,6 +357,674 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         }
     }
 
+    // MARK: - Security
+
+    private func makeSecurityView() -> NSView {
+        let container = NSView()
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        let document = FlippedSettingsView()
+        let content = NSStackView()
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 10
+        content.edgeInsets = NSEdgeInsets(top: 24, left: 20, bottom: 24, right: 20)
+        document.addSubview(content)
+        scroll.documentView = document
+        container.addSubview(scroll)
+        for view in [scroll, document, content] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+        }
+        NSLayoutConstraint.activate([
+            scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: container.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            document.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+            document.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            content.leadingAnchor.constraint(greaterThanOrEqualTo: document.leadingAnchor),
+            content.trailingAnchor.constraint(lessThanOrEqualTo: document.trailingAnchor),
+            content.centerXAnchor.constraint(equalTo: document.centerXAnchor),
+            content.topAnchor.constraint(equalTo: document.topAnchor),
+            content.bottomAnchor.constraint(equalTo: document.bottomAnchor),
+            content.widthAnchor.constraint(equalToConstant: 450)
+        ])
+
+        content.addArrangedSubview(sectionTitle("End-to-End Encryption"))
+        content.addArrangedSubview(wrappingInfo(
+            "Encrypt memory, skill files, and vault content before it reaches the relay. Only this Mac, paired Atems, and your separate encryption recovery key can unlock it."
+        ))
+        let encryptionStatus = NSTextField(wrappingLabelWithString: "Loading encryption state…")
+        encryptionStatus.font = .systemFont(ofSize: 12, weight: .medium)
+        encryptionStatus.translatesAutoresizingMaskIntoConstraints = false
+        encryptionStatus.widthAnchor.constraint(equalToConstant: 410).isActive = true
+        content.addArrangedSubview(encryptionStatus)
+        encryptionStatusLabel = encryptionStatus
+
+        let encryptionActions = NSStackView()
+        encryptionActions.orientation = .horizontal
+        encryptionActions.spacing = 8
+        let turnOn = NSButton(title: "Turn On…", target: self, action: #selector(turnOnEncryption))
+        let turnOff = NSButton(title: "Turn Off…", target: self, action: #selector(turnOffEncryption))
+        let rotate = NSButton(title: "Rotate Key…", target: self, action: #selector(rotateEncryptionKey))
+        let show = NSButton(title: "Show Recovery Key…", target: self, action: #selector(showEncryptionRecoveryKey))
+        for button in [turnOn, turnOff, rotate, show] {
+            button.bezelStyle = .rounded
+            encryptionActions.addArrangedSubview(button)
+        }
+        encryptionOnButton = turnOn
+        encryptionOffButton = turnOff
+        encryptionRotateButton = rotate
+        encryptionShowButton = show
+        content.addArrangedSubview(encryptionActions)
+
+        let restoreEncryption = NSButton(
+            title: "Restore Encryption Key…",
+            target: self,
+            action: #selector(restoreEncryptionKey)
+        )
+        restoreEncryption.bezelStyle = .rounded
+        content.addArrangedSubview(restoreEncryption)
+        content.addArrangedSubview(separator())
+
+        let accountTitle = sectionTitle("Astations on Your Agora Account")
+        content.addArrangedSubview(accountTitle)
+        content.addArrangedSubview(wrappingInfo(
+            "Each Mac keeps separate data until you choose Merge. An online Mac must approve; a lost or offline Mac requires a fresh Agora sign-in and a notified 24-hour wait."
+        ))
+        let accountStack = NSStackView()
+        accountStack.orientation = .vertical
+        accountStack.alignment = .leading
+        accountStack.spacing = 8
+        accountStack.translatesAutoresizingMaskIntoConstraints = false
+        accountStack.widthAnchor.constraint(equalToConstant: 410).isActive = true
+        content.addArrangedSubview(accountStack)
+        relayAccountStack = accountStack
+
+        let accountActions = NSStackView()
+        accountActions.orientation = .horizontal
+        accountActions.spacing = 8
+        let refresh = NSButton(title: "Refresh", target: self, action: #selector(refreshRelayAccount))
+        refresh.bezelStyle = .rounded
+        let leave = NSButton(title: "Leave Shared Group…", target: self, action: #selector(leaveRelayGroup))
+        leave.bezelStyle = .rounded
+        leaveGroupButton = leave
+        accountActions.addArrangedSubview(refresh)
+        accountActions.addArrangedSubview(leave)
+        content.addArrangedSubview(accountActions)
+
+        let accountStatus = NSTextField(wrappingLabelWithString: "")
+        accountStatus.font = .systemFont(ofSize: 11)
+        accountStatus.textColor = .secondaryLabelColor
+        accountStatus.translatesAutoresizingMaskIntoConstraints = false
+        accountStatus.widthAnchor.constraint(equalToConstant: 410).isActive = true
+        relayAccountStatusLabel = accountStatus
+        content.addArrangedSubview(accountStatus)
+        content.addArrangedSubview(separator())
+
+        content.addArrangedSubview(sectionTitle("Account Recovery"))
+        content.addArrangedSubview(wrappingInfo(
+            "Save the recovery kit somewhere off this Mac. It remains the fallback for an Astation that was never registered to an Agora account."
+        ))
+        let idLabel = NSTextField(labelWithString: "Astation ID: \(RecoveryKit.masked(AstationIdentity.shared.id))")
+        idLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        content.addArrangedSubview(idLabel)
+        let showButton = NSButton(title: "Show Recovery Kit…", target: self, action: #selector(showRecoveryKit))
+        showButton.bezelStyle = .rounded
+        content.addArrangedSubview(showButton)
+        content.addArrangedSubview(separator())
+
+        content.addArrangedSubview(sectionTitle("Restore on a New Mac"))
+        content.addArrangedSubview(wrappingInfo(
+            "Replace this Astation's ID with the one in your recovery kit. Astation quits; open it again to finish. Atems paired with the current ID will need to pair again."
+        ))
+        let restoreButton = NSButton(title: "Restore Account…", target: self, action: #selector(restoreAccount))
+        restoreButton.bezelStyle = .rounded
+        content.addArrangedSubview(restoreButton)
+        let status = NSTextField(wrappingLabelWithString: "")
+        status.font = NSFont.systemFont(ofSize: 11)
+        status.translatesAutoresizingMaskIntoConstraints = false
+        status.widthAnchor.constraint(equalToConstant: 410).isActive = true
+        content.addArrangedSubview(status)
+        recoveryStatusLabel = status
+
+        renderRelayAccountState()
+        hubManager.requestRelayAccountState()
+        renderEncryptionState()
+        hubManager.requestRelayEncryptionState()
+        return container
+    }
+
+    private func sectionTitle(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.boldSystemFont(ofSize: 14)
+        return label
+    }
+
+    private func wrappingInfo(_ text: String) -> NSTextField {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = NSFont.systemFont(ofSize: 11)
+        label.textColor = .secondaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.widthAnchor.constraint(equalToConstant: 410).isActive = true
+        return label
+    }
+
+    private func separator() -> NSBox {
+        let separator = NSBox()
+        separator.boxType = .separator
+        separator.translatesAutoresizingMaskIntoConstraints = false
+        separator.widthAnchor.constraint(equalToConstant: 410).isActive = true
+        separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        return separator
+    }
+
+    @objc private func relayEncryptionChanged() {
+        DispatchQueue.main.async { [weak self] in self?.renderEncryptionState() }
+    }
+
+    private func renderEncryptionState() {
+        guard let label = encryptionStatusLabel else { return }
+        guard let state = hubManager.relayEncryptionState else {
+            label.stringValue = hubManager.relayEncryptionStatusMessage ?? "Encryption state unavailable."
+            encryptionOnButton?.isEnabled = false
+            encryptionOffButton?.isEnabled = false
+            encryptionRotateButton?.isEnabled = false
+            encryptionShowButton?.isEnabled = false
+            return
+        }
+        let remaining = "\(state.plaintextFields) plaintext, \(state.ciphertextFields) encrypted, \(state.obsoleteFields) obsolete fields"
+        switch state.mode {
+        case "off": label.stringValue = "Off — stored data is readable by the relay."
+        case "enabling": label.stringValue = "Turning on — \(remaining). Keep an Atem connected to finish migration."
+        case "on":
+            let date = state.enabledAt.map { Date(timeIntervalSince1970: TimeInterval($0)).formatted() } ?? "unknown date"
+            label.stringValue = "On since \(date) — key \(state.kid ?? "unknown")."
+        case "disabling": label.stringValue = "Turning off — \(remaining). Keep an Atem connected to finish migration."
+        default: label.stringValue = "Unknown encryption state."
+        }
+        if let message = hubManager.relayEncryptionStatusMessage { label.stringValue += "\n\(message)" }
+        encryptionOnButton?.isEnabled = state.mode == "off"
+        encryptionOffButton?.isEnabled = state.mode == "on"
+        encryptionRotateButton?.isEnabled = state.mode == "on"
+        encryptionShowButton?.isEnabled = state.mode != "off"
+    }
+
+    @objc private func turnOnEncryption() {
+        beginEncryptionKeyChange(
+            reason: "turn on end-to-end encryption",
+            actionTitle: "Turn On",
+            reuseExisting: true
+        )
+    }
+
+    @objc private func rotateEncryptionKey() {
+        beginEncryptionKeyChange(
+            reason: "rotate your encryption key",
+            actionTitle: "Rotate Key",
+            reuseExisting: false
+        )
+    }
+
+    private func beginEncryptionKeyChange(
+        reason: String,
+        actionTitle: String,
+        reuseExisting: Bool
+    ) {
+        DeviceOwnerAuth.authenticate(reason: reason) { [weak self] ok in
+            guard let self, ok else { return }
+            do {
+                let (key, recovery) = try self.hubManager.prepareEncryptionKeyForCurrentAccount(
+                    reuseExisting: reuseExisting
+                )
+                self.pendingEncryptionKey = key
+                self.pendingEncryptionKid = key.kid
+                self.pendingEncryptionRecoveryKey = recovery
+                self.showEncryptionRecoveryConfirmation(actionTitle: actionTitle)
+            } catch {
+                self.hubManager.relayEncryptionStatusMessage = error.localizedDescription
+                self.renderEncryptionState()
+            }
+        }
+    }
+
+    private func showEncryptionRecoveryConfirmation(actionTitle: String) {
+        guard let recovery = pendingEncryptionRecoveryKey,
+              let key = pendingEncryptionKey else { return }
+        let alert = NSAlert()
+        alert.messageText = "Save Your Encryption Recovery Key"
+        alert.informativeText = "If you lose this Mac and every paired Atem, nobody — including the server operator — can recover your encrypted data without this separate key."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: actionTitle)
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons[0].isEnabled = false
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        let keyLabel = NSTextField(wrappingLabelWithString: recovery)
+        keyLabel.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
+        keyLabel.isSelectable = true
+        keyLabel.translatesAutoresizingMaskIntoConstraints = false
+        keyLabel.widthAnchor.constraint(equalToConstant: 430).isActive = true
+        stack.addArrangedSubview(keyLabel)
+        let actions = NSStackView()
+        actions.orientation = .horizontal
+        actions.spacing = 8
+        actions.addArrangedSubview(NSButton(title: "Copy", target: self, action: #selector(copyPendingEncryptionRecoveryKey)))
+        actions.addArrangedSubview(NSButton(title: "Save to File…", target: self, action: #selector(savePendingEncryptionRecoveryKey)))
+        stack.addArrangedSubview(actions)
+        let saved = NSButton(
+            checkboxWithTitle: "I've saved my encryption recovery key somewhere safe",
+            target: self,
+            action: #selector(encryptionRecoveryConfirmationChanged(_:))
+        )
+        stack.addArrangedSubview(saved)
+        alert.accessoryView = stack
+        pendingEncryptionAlert = alert
+
+        let response = alert.runModal()
+        pendingEncryptionAlert = nil
+        if response == .alertFirstButtonReturn {
+            do {
+                try hubManager.installEncryptionKey(key)
+                hubManager.setRelayEncryption(mode: "enabling", kid: key.kid)
+            } catch {
+                hubManager.relayEncryptionStatusMessage = error.localizedDescription
+            }
+        }
+        pendingEncryptionRecoveryKey = nil
+        pendingEncryptionKid = nil
+        pendingEncryptionKey = nil
+        renderEncryptionState()
+    }
+
+    @objc private func encryptionRecoveryConfirmationChanged(_ sender: NSButton) {
+        pendingEncryptionAlert?.buttons.first?.isEnabled = sender.state == .on
+    }
+
+    @objc private func copyPendingEncryptionRecoveryKey() {
+        guard let value = pendingEncryptionRecoveryKey else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+    }
+
+    @objc private func savePendingEncryptionRecoveryKey() {
+        guard let value = pendingEncryptionRecoveryKey else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "Astation Encryption Recovery Key.txt"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try value.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            hubManager.relayEncryptionStatusMessage = "Couldn't save the encryption key: \(error.localizedDescription)"
+        }
+    }
+
+    @objc private func turnOffEncryption() {
+        guard let state = hubManager.relayEncryptionState,
+              state.mode == "on", let kid = state.kid else { return }
+        let stillCurrent = { [weak self] in
+            guard let current = self?.hubManager.relayEncryptionState else { return false }
+            return current.mode == "on" && current.dataAccount == state.dataAccount && current.kid == kid
+        }
+        EncryptionDisableAction.request(
+            confirm: {
+                guard stillCurrent() else { return false }
+                let alert = NSAlert()
+                alert.messageText = "Turn Off End-to-End Encryption?"
+                alert.informativeText = "A paired Atem will decrypt and rewrite all memory, skill, and vault history. The server will be able to read that data again."
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "Turn Off")
+                alert.addButton(withTitle: "Cancel")
+                return alert.runModal() == .alertFirstButtonReturn
+            },
+            disable: { [weak self] in
+                guard stillCurrent() else { return }
+                self?.hubManager.setRelayEncryption(mode: "disabling", kid: kid)
+            }
+        )
+    }
+
+    @objc private func showEncryptionRecoveryKey() {
+        DeviceOwnerAuth.authenticate(reason: "show your encryption recovery key") { [weak self] ok in
+            guard let self, ok else { return }
+            do {
+                let recovery = try self.hubManager.encryptionRecoveryKey()
+                self.pendingEncryptionRecoveryKey = recovery
+                let alert = NSAlert()
+                alert.messageText = "Encryption Recovery Key"
+                alert.informativeText = recovery
+                alert.addButton(withTitle: "Copy")
+                alert.addButton(withTitle: "Done")
+                if alert.runModal() == .alertFirstButtonReturn {
+                    self.copyPendingEncryptionRecoveryKey()
+                }
+                self.pendingEncryptionRecoveryKey = nil
+            } catch {
+                self.hubManager.relayEncryptionStatusMessage = error.localizedDescription
+                self.renderEncryptionState()
+            }
+        }
+    }
+
+    @objc private func restoreEncryptionKey() {
+        DeviceOwnerAuth.authenticate(reason: "restore your encryption key") { [weak self] ok in
+            guard let self, ok else { return }
+            let alert = NSAlert()
+            alert.messageText = "Restore Encryption Key"
+            alert.informativeText = "Paste the separate AEK1 encryption recovery key. This is not the Astation Account Recovery Kit."
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 430, height: 48))
+            field.placeholderString = "AEK1-…"
+            alert.accessoryView = field
+            alert.addButton(withTitle: "Restore")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            do {
+                try self.hubManager.restoreEncryptionKey(field.stringValue)
+                self.hubManager.relayEncryptionStatusMessage =
+                    self.hubManager.relayEncryptionState?.mode == "off"
+                    ? "Encryption key restored; turning encryption on."
+                    : "Encryption key restored."
+            } catch {
+                self.hubManager.relayEncryptionStatusMessage = error.localizedDescription
+            }
+            self.renderEncryptionState()
+        }
+    }
+
+    @objc private func relayAccountChanged() {
+        DispatchQueue.main.async { [weak self] in self?.renderRelayAccountState() }
+    }
+
+    @objc private func refreshRelayAccount() {
+        hubManager.requestRelayAccountState()
+    }
+
+    private func renderRelayAccountState() {
+        guard let stack = relayAccountStack else { return }
+        for view in stack.arrangedSubviews {
+            stack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        let currentId = AstationIdentity.shared.id
+        let devices = hubManager.relayAccountDevices
+        guard !devices.isEmpty else {
+            stack.addArrangedSubview(wrappingInfo(
+                hubManager.currentSession() == nil
+                    ? "Sign in with Agora in General to register this Mac."
+                    : "Waiting for the relay to register this Mac…"
+            ))
+            leaveGroupButton?.isEnabled = false
+            relayAccountStatusLabel?.stringValue = hubManager.relayAccountStatusMessage ?? ""
+            return
+        }
+
+        let current = devices.first { $0.astationId == currentId }
+        leaveGroupButton?.isEnabled = current.map { $0.dataAccount != currentId } ?? false
+        for device in devices {
+            stack.addArrangedSubview(accountDeviceRow(device, current: device.astationId == currentId))
+        }
+        for request in hubManager.relayMergeRequests {
+            stack.addArrangedSubview(mergeRequestRow(request))
+        }
+        relayAccountStatusLabel?.stringValue = hubManager.relayAccountStatusMessage ?? ""
+    }
+
+    private func accountDeviceRow(_ device: RelayAccountDevice, current: Bool) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: 410).isActive = true
+
+        let state = current ? "This Mac" : (device.online ? "Online" : "Last seen \(relativeTime(device.lastSeenAt))")
+        let text = NSTextField(wrappingLabelWithString:
+            "\(device.label)  ·  \(state)\n\(RecoveryKit.masked(device.astationId))  ·  \(device.dataAccount.hasPrefix("group-") ? "shared data" : "own data")")
+        text.font = .systemFont(ofSize: 11)
+        text.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(text)
+
+        if !current {
+            let mine = hubManager.relayAccountDevices.first { $0.astationId == AstationIdentity.shared.id }
+            if mine?.dataAccount != device.dataAccount {
+                let merge = SettingsActionButton(title: "Merge…", target: self, action: #selector(mergeRelayAstation(_:)))
+                merge.bezelStyle = .rounded
+                merge.payload = device.astationId
+                row.addArrangedSubview(merge)
+            }
+            if !device.online {
+                let remove = SettingsActionButton(title: "Remove…", target: self, action: #selector(removeRelayAstation(_:)))
+                remove.bezelStyle = .rounded
+                remove.payload = device.astationId
+                row.addArrangedSubview(remove)
+            }
+        }
+        return row
+    }
+
+    private func mergeRequestRow(_ request: RelayMergeRequest) -> NSView {
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.widthAnchor.constraint(equalToConstant: 410).isActive = true
+        let detail: String
+        if let readyAt = request.readyAt {
+            detail = "Delayed merge pending until \(Date(timeIntervalSince1970: TimeInterval(readyAt)).formatted(date: .abbreviated, time: .shortened))"
+        } else {
+            detail = "Waiting for approval on the other Mac"
+        }
+        let label = NSTextField(wrappingLabelWithString: detail)
+        label.font = .systemFont(ofSize: 11)
+        label.textColor = .secondaryLabelColor
+        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        row.addArrangedSubview(label)
+        let cancel = SettingsActionButton(title: "Cancel", target: self, action: #selector(cancelRelayMerge(_:)))
+        cancel.bezelStyle = .rounded
+        cancel.payload = request.requestId
+        row.addArrangedSubview(cancel)
+        return row
+    }
+
+    private func relativeTime(_ seconds: Int64) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter.localizedString(for: Date(timeIntervalSince1970: TimeInterval(seconds)), relativeTo: Date())
+    }
+
+    @objc private func mergeRelayAstation(_ sender: SettingsActionButton) {
+        guard let id = sender.payload,
+              let device = hubManager.relayAccountDevices.first(where: { $0.astationId == id }) else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Merge memories, skills and vaults?"
+        alert.informativeText = device.online
+            ? "\(device.label) will be asked to approve. After approval, both Macs use one shared data account."
+            : "\(device.label) is offline. Continue with a fresh Agora sign-in; all registered Macs are notified, and the merge waits 24 hours so any of them can cancel."
+        alert.addButton(withTitle: device.online ? "Request Approval" : "Sign In and Start Wait")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        if device.online {
+            hubManager.requestRelayMerge(targetAstationId: id)
+            return
+        }
+        Task { @MainActor in
+            do {
+                let manager = SsoAuthManager(ssoUrl: SsoConfig.currentSsoUrl)
+                let session = try await manager.runLoginFlow()
+                try hubManager.sessionStore.save(session)
+                NotificationCenter.default.post(name: .credentialsChanged, object: nil)
+                hubManager.requestRelayMerge(
+                    targetAstationId: id,
+                    freshAccessToken: session.accessToken
+                )
+            } catch {
+                relayAccountStatusLabel?.stringValue = error.localizedDescription
+                relayAccountStatusLabel?.textColor = .systemRed
+            }
+        }
+    }
+
+    @objc private func cancelRelayMerge(_ sender: SettingsActionButton) {
+        guard let id = sender.payload else { return }
+        hubManager.cancelRelayMerge(requestId: id)
+    }
+
+    @objc private func leaveRelayGroup() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Leave the shared data group?"
+        alert.informativeText = "This Mac starts with an empty personal data account. The group's existing data stays with the other Macs."
+        alert.addButton(withTitle: "Leave Group")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        hubManager.leaveRelayAccountGroup()
+    }
+
+    @objc private func removeRelayAstation(_ sender: SettingsActionButton) {
+        guard let id = sender.payload,
+              let device = hubManager.relayAccountDevices.first(where: { $0.astationId == id }) else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Remove \(device.label)?"
+        alert.informativeText = "The relay revokes this Astation's device key and disconnects it. Its copy of already-downloaded data is not erased."
+        alert.addButton(withTitle: "Remove Device")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        hubManager.removeRelayAstation(astationId: id)
+    }
+
+    private func setRecoveryStatus(_ message: String, isError: Bool) {
+        recoveryStatusLabel?.stringValue = message
+        recoveryStatusLabel?.textColor = isError ? .systemRed : .secondaryLabelColor
+    }
+
+    /// A monospaced text box for an alert's accessory view.
+    private static func textBox(_ text: String, editable: Bool) -> (NSScrollView, NSTextView) {
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 420, height: 130))
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        let textView = NSTextView(frame: NSRect(origin: .zero, size: scroll.contentSize))
+        textView.isEditable = editable
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView.string = text
+        textView.autoresizingMask = [.width]
+        scroll.documentView = textView
+        return (scroll, textView)
+    }
+
+    @objc private func showRecoveryKit() {
+        DeviceOwnerAuth.authenticate(reason: "show your Astation recovery kit") { [weak self] ok in
+            guard let self else { return }
+            guard ok else {
+                self.setRecoveryStatus("Not authenticated, so the recovery kit wasn't shown.", isError: true)
+                return
+            }
+            let relayURL = StationRelayURL.validatedBase(SettingsWindowController.currentAstationRelayUrl)
+                ?? SettingsWindowController.defaultStationURL
+            let kit = RecoveryKit(
+                astationId: AstationIdentity.shared.id,
+                relayURL: relayURL
+            )
+            let text = kit.text()
+            let alert = NSAlert()
+            alert.messageText = "Astation Recovery Kit"
+            alert.informativeText = "Save this somewhere off this Mac, such as a password manager. You need it to get your memories, skills and vaults back if this Mac is lost."
+            alert.accessoryView = Self.textBox(text, editable: false).0
+            alert.addButton(withTitle: "Copy")
+            alert.addButton(withTitle: "Save to File…")
+            alert.addButton(withTitle: "Done")
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+                self.setRecoveryStatus("Recovery kit copied to the clipboard.", isError: false)
+            case .alertSecondButtonReturn:
+                self.saveRecoveryKit(text)
+            default:
+                break
+            }
+        }
+    }
+
+    private func saveRecoveryKit(_ text: String) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "Astation Recovery Kit.txt"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try RecoveryKit.save(text, to: url)
+            setRecoveryStatus("Saved to \(url.path).", isError: false)
+        } catch {
+            setRecoveryStatus("Couldn't save the recovery kit: \(error.localizedDescription)", isError: true)
+        }
+    }
+
+    @objc private func restoreAccount() {
+        DeviceOwnerAuth.authenticate(reason: "restore an Astation account") { [weak self] ok in
+            guard let self else { return }
+            guard ok else {
+                self.setRecoveryStatus("Not authenticated, so nothing was restored.", isError: true)
+                return
+            }
+            let input = NSAlert()
+            input.messageText = "Restore Account"
+            input.informativeText = "Paste your recovery kit, or just the Astation ID."
+            let (box, textView) = Self.textBox("", editable: true)
+            input.accessoryView = box
+            input.addButton(withTitle: "Continue")
+            input.addButton(withTitle: "Cancel")
+            input.window.initialFirstResponder = textView
+            guard input.runModal() == .alertFirstButtonReturn else { return }
+
+            guard let kit = RecoveryKit.parse(textView.string) else {
+                self.setRecoveryStatus("The recovery kit needs a valid Astation ID and relay URL.", isError: true)
+                return
+            }
+            let current = AstationIdentity.shared.id
+            guard !RecoveryKit.identifiesSameAstation(kit.astationId, current) else {
+                self.setRecoveryStatus("This Mac already uses that Astation ID.", isError: false)
+                return
+            }
+
+            let confirm = NSAlert()
+            confirm.alertStyle = .warning
+            confirm.messageText = "Replace this Astation's ID?"
+            confirm.informativeText = """
+            Current: \(current)
+            New: \(kit.astationId)
+
+            Astation will quit; open it again to finish. Atems paired with the current ID will need to pair again.
+
+            The relay still trusts the old Mac's device key for this ID. Once, on the relay server, run:
+            station-relay-server admin forget-key \(kit.astationId)
+            """
+            confirm.addButton(withTitle: "Replace and Quit")
+            confirm.addButton(withTitle: "Cancel")
+            guard confirm.runModal() == .alertFirstButtonReturn else { return }
+
+            do {
+                try self.hubManager.deviceSessionStore.deleteAll()
+                try AstationIdentity.restore(kit.astationId)
+            } catch {
+                self.setRecoveryStatus(error.localizedDescription, isError: true)
+                return
+            }
+            if !kit.relayURL.isEmpty {
+                UserDefaults.standard.set(kit.relayURL, forKey: SettingsWindowController.astationRelayUrlKey)
+            }
+            NSApp.terminate(nil)
+        }
+    }
+
     // MARK: - Helper Methods
 
     /// Get the local network IP address (e.g., 192.168.1.5) for LAN connections.
@@ -355,7 +1069,24 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
 
     // MARK: - NSWindowDelegate
 
+    static func audioTabItems(recording: AudioRecordingViewController, transcription: TranscriptionViewController) -> [NSTabViewItem] {
+        let audio = NSTabViewItem(identifier: "recording")
+        audio.label = "Audio & Recording"
+        audio.viewController = recording
+        let captions = NSTabViewItem(identifier: "transcription")
+        captions.label = "Live Transcription"
+        captions.viewController = transcription
+        return [audio, captions]
+    }
+
+    func showRecording() {
+        showWindow()
+        tabView?.selectTabViewItem(withIdentifier: "recording")
+    }
+    func showDictation() { showWindow(); tabView?.selectTabViewItem(withIdentifier: "dictation") }
+
     func windowWillClose(_ notification: Notification) {
+        recordingController.setPageVisible(false)
         shortcutsController.cancelRecording()
         tabView = nil
         sidebarTable = nil
@@ -369,6 +1100,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
 
     func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
         guard let tabViewItem else { return }
+        recordingController.setPageVisible((tabViewItem.identifier as? String) == "recording")
         let index = tabView.indexOfTabViewItem(tabViewItem)
         if sidebarTable?.selectedRow != index {
             sidebarTable?.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
@@ -392,7 +1124,15 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         let cell = NSTableCellView()
         let label = NSTextField(labelWithString: item.label)
         label.font = .systemFont(ofSize: 13)
-        let symbol = (item.identifier as? String) == "general" ? "gearshape" : "keyboard"
+        let symbol: String
+        switch item.identifier as? String {
+        case "general": symbol = "gearshape"
+        case "security": symbol = "lock.shield"
+        case "recording": symbol = "waveform"
+        case "transcription": symbol = "captions.bubble"
+        case "dictation": symbol = "mic.badge.plus"
+        default: symbol = "keyboard"
+        }
         let icon = NSImageView(image: NSImage(systemSymbolName: symbol, accessibilityDescription: nil)!)
         icon.contentTintColor = .secondaryLabelColor
         for child in [icon, label] as [NSView] {
@@ -414,7 +1154,17 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     }
 }
 
+private final class FlippedSettingsView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+private final class SettingsActionButton: NSButton {
+    var payload: String?
+}
+
 extension Notification.Name {
     static let serverInfoChanged = Notification.Name("AstationServerInfoChanged")
     static let credentialsChanged = Notification.Name("AstationCredentialsChanged")
+    static let relayAccountChanged = Notification.Name("AstationRelayAccountChanged")
+    static let relayEncryptionChanged = Notification.Name("AstationRelayEncryptionChanged")
 }

@@ -1,10 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(AstationCore LANGUAGES C CXX)
-
-if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+if(CMAKE_HOST_APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum macOS deployment target")
 endif()
+
+project(AstationCore LANGUAGES C CXX)
 
 add_library(astation_core STATIC
     core/src/astation_core.cpp
@@ -27,7 +27,7 @@ target_include_directories(astation_core PRIVATE
 # On Linux/Windows: Look for manually extracted SDK
 option(AGORA_SKIP_DOWNLOAD "Skip auto-download of Agora SDK (use local AGORA_SDK_DIR)" OFF)
 set(AGORA_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/agora" CACHE PATH "Path to Agora SDK root (contains rtc_mac/rtc_linux/rtc_win)")
-set(AGORA_VERSION "4.6.2")
+set(AGORA_VERSION "4.7.0")
 
 if(APPLE)
     set(AGORA_HEADERS "${AGORA_SDK_DIR}/rtc_mac/AgoraRtcKit.xcframework/macos-arm64_x86_64/AgoraRtcKit.framework/Headers")
@@ -48,7 +48,7 @@ if(APPLE AND NOT EXISTS "${AGORA_HEADERS}" AND NOT AGORA_SKIP_DOWNLOAD)
         "Agoraffmpeg"
         "AgoraSoundTouch"
         "video_dec"
-        "AgoraScreenCaptureExtension"
+        "AgoraVideoEncoderExtension"
         "AgoraAiNoiseSuppressionExtension"
     )
 
@@ -154,6 +154,9 @@ target_compile_features(astation_core PUBLIC cxx_std_17)
 
 find_package(ZLIB REQUIRED)
 target_link_libraries(astation_core PRIVATE ZLIB::ZLIB)
+if(APPLE)
+    target_link_libraries(astation_core PRIVATE "-framework CoreVideo")
+endif()
 
 if(NOT APPLE)
     find_package(OpenSSL REQUIRED)
