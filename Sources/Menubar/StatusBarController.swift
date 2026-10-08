@@ -63,6 +63,8 @@ class StatusBarController: NSObject, NSMenuDelegate {
         
         // Create menu (rebuilt on every open via NSMenuDelegate)
         statusMenu = NSMenu()
+        // Availability depends on capture/RTC state, not just the presence of an action.
+        statusMenu.autoenablesItems = false
         statusMenu.delegate = self
         setupMenu()
         statusItem.menu = statusMenu
@@ -172,15 +174,8 @@ class StatusBarController: NSObject, NSMenuDelegate {
 
         switch vcm.mode {
         case .off:
-            let voiceOffItem = NSMenuItem(
-                title: vcm.isAvailable ? "Dictation (\(hotkeyManager.shortcutLabel(for: .voice))): Off" : "Dictation: Disabled during mic transcription",
-                action: nil,
-                keyEquivalent: ""
-            )
-            voiceOffItem.image = NSImage(systemSymbolName: "mic.slash", accessibilityDescription: "Voice Off")
-            voiceOffItem.isEnabled = false
-            voiceOffItem.toolTip = vcm.unavailableReason
-            statusMenu.addItem(voiceOffItem)
+            statusMenu.addItem(StatusBarMediaMenu.dictationHint(shortcut: hotkeyManager.bindings.voice?.displayName,
+                                                              unavailableReason: vcm.unavailableReason))
 
             if hotkeyManager.voiceHotkeyFailed {
                 let warn = NSMenuItem(title: "  ⚠ \(hotkeyManager.shortcutLabel(for: .voice)) unavailable - check Settings", action: nil, keyEquivalent: "")
@@ -196,7 +191,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
             handsFreeItem.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Hands-Free")
             handsFreeItem.target = self
             handsFreeItem.isEnabled = vcm.isAvailable
-            handsFreeItem.toolTip = vcm.unavailableReason ?? "Listen to the local microphone continuously. Destination: \(vcm.settings.destination.title)."
+            handsFreeItem.toolTip = vcm.unavailableReason ?? "Listen to the local microphone continuously. Outputs: \(vcm.settings.outputSummary)."
             statusMenu.addItem(handsFreeItem)
 
         case .ptt:
@@ -226,24 +221,6 @@ class StatusBarController: NSObject, NSMenuDelegate {
             )
             stopItem.target = self
             statusMenu.addItem(stopItem)
-        }
-
-        // Video hotkey
-        let videoState = hubManager.videoActive ? "Sharing" : "Off"
-        let videoIcon = hubManager.videoActive ? "video.fill" : "video.slash"
-        let videoItem = NSMenuItem(
-            title: "Video (\(hotkeyManager.shortcutLabel(for: .video))): \(videoState)",
-            action: #selector(toggleVideoHotkey),
-            keyEquivalent: ""
-        )
-        videoItem.image = NSImage(systemSymbolName: videoIcon, accessibilityDescription: "Video")
-        videoItem.target = self
-        statusMenu.addItem(videoItem)
-
-        if hotkeyManager.videoHotkeyFailed {
-            let warn = NSMenuItem(title: "  ⚠ \(hotkeyManager.shortcutLabel(for: .video)) unavailable - check Settings", action: nil, keyEquivalent: "")
-            warn.isEnabled = false
-            statusMenu.addItem(warn)
         }
 
         statusMenu.addItem(NSMenuItem.separator())
@@ -326,17 +303,15 @@ class StatusBarController: NSObject, NSMenuDelegate {
             warning.isEnabled = false; statusMenu.addItem(warning)
         }
 
-        let screenStatus = hubManager.rtcManager.isScreenSharing ? "Sharing" :
-            (hubManager.rtcManager.isScreenShareStarting ? "Starting..." : "Off")
-        let screenIndicator = hubManager.rtcManager.isScreenSharing ? "rectangle.inset.filled.and.person.filled" : "rectangle.on.rectangle"
-        let screenItem = NSMenuItem(
-            title: "Screen Share: \(screenStatus)",
-            action: nil,
-            keyEquivalent: ""
-        )
-        screenItem.image = NSImage(systemSymbolName: screenIndicator, accessibilityDescription: "Screen Share")
-        screenItem.isEnabled = false
-        statusMenu.addItem(screenItem)
+        statusMenu.addItem(StatusBarMediaMenu.screenShareItem(shortcut: hotkeyManager.bindings.video?.displayName,
+            isInChannel: rtc.isInChannel, isSharing: rtc.isScreenSharing, isStarting: rtc.isScreenShareStarting,
+            target: self, startAction: #selector(startScreenShare), stopAction: #selector(stopScreenShare)))
+        if hotkeyManager.videoHotkeyFailed {
+            let warn = NSMenuItem(title: "Screen Share shortcut (\(hotkeyManager.shortcutLabel(for: .video))) unavailable - check Settings",
+                                  action: nil, keyEquivalent: "")
+            warn.isEnabled = false
+            statusMenu.addItem(warn)
+        }
 
         let channelStatus = hubManager.rtcManager.isInChannel ? "Connected" : "Not Connected"
         let channelIndicator = hubManager.rtcManager.isInChannel ? "phone.fill" : "phone"
@@ -358,24 +333,6 @@ class StatusBarController: NSObject, NSMenuDelegate {
             )
             leaveItem.target = self
             statusMenu.addItem(leaveItem)
-
-            if hubManager.rtcManager.isScreenSharing || hubManager.rtcManager.isScreenShareStarting {
-                let stopShareItem = NSMenuItem(
-                    title: "Stop Screen Share",
-                    action: #selector(stopScreenShare),
-                    keyEquivalent: ""
-                )
-                stopShareItem.target = self
-                statusMenu.addItem(stopShareItem)
-            } else {
-                let startShareItem = NSMenuItem(
-                    title: "Start Screen Share…",
-                    action: #selector(startScreenShare),
-                    keyEquivalent: ""
-                )
-                startShareItem.target = self
-                statusMenu.addItem(startShareItem)
-            }
 
             // Share Session Section
             let linkManager = hubManager.sessionLinkManager
@@ -887,11 +844,6 @@ class StatusBarController: NSObject, NSMenuDelegate {
 
     @objc private func stopHandsFreeMode() {
         dictationManager.stopHandsFree()
-        setupMenu()
-    }
-
-    @objc private func toggleVideoHotkey() {
-        hubManager.toggleVideo()
         setupMenu()
     }
 

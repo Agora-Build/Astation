@@ -40,10 +40,18 @@ private actor CaptionTestEngine: LiveTranscribing {
     var throwOnStart = false
     var delayStart = false
     var finishCount = 0
+    var cancellationStarted = false
+    private var holdCancellation = false
+    private var cancellation: CheckedContinuation<Void, Never>?
     init(sourceID: String = "microphone") { self.sourceID = sourceID }
     func configureFailure() { throwOnConsume = true }
     func configureStartFailure() { throwOnStart = true }
     func configureDelay() { delayStart = true }
+    func configureCancellationGate() { holdCancellation = true }
+    func releaseCancellation() {
+        holdCancellation = false
+        cancellation?.resume(); cancellation = nil
+    }
     func start(onSegment: @escaping @Sendable (TranscriptSegment) -> Void) async throws {
         started = true; callback = onSegment
         if throwOnStart { throw TranscriptionError.message("Source could not start") }
@@ -58,7 +66,11 @@ private actor CaptionTestEngine: LiveTranscribing {
         finishCount += 1
         callback?(TranscriptSegment(id: "one", sourceID: sourceID, language: "en-US", text: "hello\nworld", isFinal: true, offset: 0))
     }
-    func cancel() { cancelled = true }
+    func cancel() async {
+        cancellationStarted = true
+        if holdCancellation { await withCheckedContinuation { cancellation = $0 } }
+        cancelled = true
+    }
     func emit(_ text: String, id: String = "one", final: Bool = false) {
         callback?(TranscriptSegment(id: id, sourceID: sourceID, language: "en-US", text: text, isFinal: final, offset: 0))
     }
@@ -244,6 +256,9 @@ final class AudioTranscriptionManagerTests: XCTestCase {
         manager.stop(); try await waitUntil { manager.state == .idle }
         XCTAssertTrue(recorder.isRecording)
         XCTAssertTrue(captures.values.allSatisfy { !$0.stopped })
+        // Finish after the 100 ms fake packets to exercise trailing silence metadata.
+        let paddingDeadline = recorder.elapsed + 0.2
+        try await waitUntil { recorder.elapsed >= paddingDeadline }
         recorder.stopRecording()
         let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
         let session = try XCTUnwrap(recorder.lastSessionFolder)
@@ -252,12 +267,24 @@ final class AudioTranscriptionManagerTests: XCTestCase {
         XCTAssertEqual(Set(manifest.tracks.map(\.sourceID)), Set(captures.keys))
         let levels: [String: Float] = ["microphone": 0.25, "test.selected-app": 0.5, "test.other-app": 0.9]
         for track in manifest.tracks {
+            XCTAssertTrue(track.gaps.contains { $0.reason == "source silent or unavailable at session end" && $0.frameCount > 0 })
             let file = try AVAudioFile(forReading: session.appendingPathComponent(track.segments[0].file))
             let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length))!
             try file.read(into: buffer)
             XCTAssertEqual(track.sampleRate, 48_000)
             XCTAssertGreaterThan(buffer.frameLength, 0)
-            XCTAssertEqual(buffer.floatChannelData![0][Int(buffer.frameLength) - 1], try XCTUnwrap(levels[track.sourceID]))
+            // Slow runners can finish after the fake packet's end, adding declared silence.
+            let samples = UnsafeBufferPointer(start: buffer.floatChannelData![0], count: Int(buffer.frameLength))
+            let gaps = track.gaps.map { $0.startFrame..<($0.startFrame + $0.frameCount) }
+            let original = samples.enumerated().filter { sample in
+                !gaps.contains { $0.contains(Int64(sample.offset)) }
+            }
+            let level = try XCTUnwrap(levels[track.sourceID])
+            XCTAssertEqual(original.count, 4_800)
+            XCTAssertTrue(original.allSatisfy { $0.element == level })
+            XCTAssertTrue(samples.enumerated().allSatisfy { sample in
+                !gaps.contains { $0.contains(Int64(sample.offset)) } || sample.element == 0
+            })
         }
     }
     func testSystemAndAppOnlyTranscriptionNeedNoMicrophonePermission() async throws {
@@ -500,6 +527,28 @@ final class AudioTranscriptionManagerTests: XCTestCase {
         XCTAssertTrue(samples.enumerated().allSatisfy { sample in
             !gaps.contains { $0.contains(Int64(sample.offset)) } || sample.element == 0
         })
+    }
+    func testInferenceFailureSurvivesAudioArrivingDuringEngineCancellation() async throws {
+        let capture = CaptionTestCapture(), engine = CaptionTestEngine(), storage = defaults()
+        await engine.configureFailure(); await engine.configureCancellationGate()
+        addTeardownBlock { await engine.releaseCancellation() }
+        let recorder = AudioRecordingManager(defaults: storage, captureFactory: { _ in capture }, microphonePermission: { true })
+        defer { recorder.shutdown() }
+        var settings = recorder.settings; settings.folderPath = try folder().path; recorder.updateSettings(settings)
+        recorder.startRecording(); try await waitUntil { recorder.isRecording }
+        let manager = AudioTranscriptionManager(recorder: recorder, defaults: storage, engineFactory: { _ in engine })
+        manager.start(); try await waitUntil { manager.state == .running }
+        capture.feed(0.25)
+        try await waitUntilAsync { await engine.cancellationStarted }
+        XCTAssertTrue(recorder.isRecording); XCTAssertFalse(capture.stopped)
+        // Flush another packet while cancellation is suspended to expose late inbox writes.
+        capture.feed(0.5); recorder.stopRecording()
+        try await waitUntil { manager.state == .failed }
+        XCTAssertEqual(manager.message, "Inference failed; original is safe")
+        await engine.releaseCancellation()
+        try await waitUntilAsync { await engine.cancelled }
+        XCTAssertEqual(manager.state, .failed)
+        XCTAssertEqual(manager.message, "Inference failed; original is safe")
     }
     func testOnlySelectedSourceReachesTranscriber() async throws {
         let mic = CaptionTestCapture(), system = CaptionTestCapture(), engine = CaptionTestEngine(), defaults = defaults()

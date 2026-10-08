@@ -39,6 +39,8 @@ function createPatch(filename) {
   const patchPath = path.join(repo, "change.patch");
   fs.writeFileSync(patchPath, git(repo, ["diff", "--binary", "--full-index", "HEAD"]));
   fs.writeFileSync(fullPath, "before\n");
+  // Match the fixture's index metadata to its restored contents before --index apply.
+  git(repo, ["update-index", "--refresh"]);
   return { patchPath, repo };
 }
 

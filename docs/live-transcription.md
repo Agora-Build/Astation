@@ -158,19 +158,32 @@ namespace separate from ASR keys, never preferences or logs. Redirects, automati
 retries, tools, and streaming responses are disabled. Requests have a 30-second
 timeout and 35-second resource deadline; response bodies are bounded to 1 MB.
 Polishing accepts up to 8 KB of ASR text (Apple local: 4 KB), with bounded output.
+It is a copy-editing task, not a conversation: greetings and questions remain
+greetings and questions, and commands remain dictated commands rather than being
+carried out. For example, "hello how are you" becomes "Hello, how are you?".
+All providers receive an explicit editing task with JSON-escaped transcript data
+and examples. Apple uses guided generation of a transcript-text field instead of
+free-form chat output. Polishing does not change the chosen provider/model or enabled outputs.
 Empty, refused, truncated, malformed, or nonempty thinking-block responses are not
 used. An empty leading Qwen thinking-mode marker is removed before using the text.
 Provider retention policies and charges still apply.
 
-Choose the output destination:
+Choose independent outputs in **Use result**:
 
-- Floating captions only: display the result without typing or sending.
-- Active text field + captions: explicitly opt in and grant Accessibility access.
+- **Type in active text field** (default on): requires Accessibility access.
   Astation captures the original editable non-password field and verifies its focus,
   contents, and cursor before replacing its selected text. It never presses Return,
-  pastes via the clipboard, or sends keystrokes. Unsupported fields use captions instead.
-- Active Atem + captions (default): send a final `voice_command` only if the original
+  pastes via the clipboard, or sends keystrokes. Missing permission or an unsupported
+  or changed field keeps captions available and does not block selected Atem delivery.
+- **Send to active Atem** (default off): send a final `voice_command` only if the original
   target is still connected and active. A focus change never reroutes a late result.
+  Failed or unavailable Atem delivery does not block typing.
+
+Enable both to use the same result in the text field and Atem; polishing runs once
+before delivery to either. Floating captions always receive the result. Turn both
+outputs off for transcription/captions only, without typing or sending. Existing
+saved single-destination preferences migrate to matching switches without opting
+users into another output. Changing outputs during dictation cancels pending delivery.
 
 Polishing failure retains raw captions locally and reports the error; raw text is
 never automatically typed/sent as a fallback. Hands-Free polishing is serialized
@@ -340,6 +353,16 @@ target protection, synchronized Polish controls, and settings/panel snapshots.
 Shared-microphone tests cover native sample/rate/channel/timestamp preservation,
 reference-counted leases, drop/error propagation, bounded recovery, preview format
 replacement, RTC mute/leave/rejoin, and no pre-unmute audio replay.
+
+To test real Apple on-device polishing without capture, typing, or cloud requests
+(requires macOS 26+, Apple Intelligence enabled, and the local model ready):
+
+```sh
+ASTATION_TEST_APPLE_POLISH=1 swift test --filter AppleDictationPolishingIntegrationTests
+```
+
+This opt-in check verifies that greetings, questions, and requests are edited
+rather than answered or carried out. Normal CI skips this on-device check.
 
 ### Live Mac checklist
 

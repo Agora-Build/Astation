@@ -311,6 +311,11 @@ final class AudioTranscriptionManager {
                 guard self.token == identifier else { return }
                 self.complete()
             } catch {
+                if let self, self.token == identifier, self.state != .failed, !Task.isCancelled {
+                    // Invalidate capture callbacks before closing inboxes so late audio
+                    // cannot replace the original error with an overload failure.
+                    self.fail(error.localizedDescription)
+                }
                 for source in sources { source.inbox.finish(); await source.engine.cancel() }
                 guard let self, self.token == identifier else { return }
                 if self.state == .failed { self.clearWork() }

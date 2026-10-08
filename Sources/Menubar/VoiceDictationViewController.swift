@@ -5,7 +5,8 @@ private final class DictationSettingsDocument: NSView { override var isFlipped: 
 final class VoiceDictationViewController: NSViewController, NSTextFieldDelegate {
     private let manager: VoiceDictationManager
     let polishKnob = PolishKnob(frame: .zero)
-    private let destination = NSPopUpButton()
+    private let typeInActiveTextField = NSButton(checkboxWithTitle: "Type in active text field", target: nil, action: nil)
+    private let sendToAtem = NSButton(checkboxWithTitle: "Send to active Atem", target: nil, action: nil)
     private let provider = NSPopUpButton()
     private let remoteControls = NSStackView()
     private let endpoint = NSTextField()
@@ -52,10 +53,15 @@ final class VoiceDictationViewController: NSViewController, NSTextFieldDelegate 
         stack.addArrangedSubview(label("Dictation uses the installed local ASR model selected in Live Transcription. System/app captions and RTC remain independent. Mic transcription disables dictation."))
         let asr = NSButton(title: "Choose / Download Speech Model...", target: self, action: #selector(configureASR)); asr.bezelStyle = .rounded
         stack.addArrangedSubview(asr)
-        destination.addItems(withTitles: DictationDestination.allCases.map(\.title))
-        destination.target = self; destination.action = #selector(changeSettings)
-        stack.addArrangedSubview(row("Use result", destination))
-        stack.addArrangedSubview(label("Typing is opt-in, requires Accessibility permission, and never presses Return. Atem delivery requires the original Atem to remain active and connected. Results also appear in floating captions."))
+        stack.addArrangedSubview(label("Use result", size: 12, weight: .medium))
+        let outputs = NSStackView(views: [typeInActiveTextField, sendToAtem])
+        outputs.orientation = .vertical; outputs.alignment = .leading; outputs.spacing = 8
+        stack.addArrangedSubview(outputs)
+        for control in [typeInActiveTextField, sendToAtem] {
+            control.target = self; control.action = #selector(changeOutputs)
+            control.setAccessibilityLabel(control.title)
+        }
+        stack.addArrangedSubview(label("Typing is on by default and requires Accessibility permission; it never presses Return. Enable either or both outputs. Results always appear in floating captions; turn both off for transcription only. Atem delivery requires the original Atem to remain active and connected."))
         let accessibility = NSButton(title: "Allow Accessibility for Typing...", target: self, action: #selector(allowAccessibility)); accessibility.bezelStyle = .rounded
         stack.addArrangedSubview(accessibility)
         let divider = NSBox(); divider.boxType = .separator; stack.addArrangedSubview(divider)
@@ -97,7 +103,8 @@ final class VoiceDictationViewController: NSViewController, NSTextFieldDelegate 
         guard isViewLoaded else { return }
         let settings = manager.settings
         polishKnob.state = settings.polishing ? .on : .off
-        destination.selectItem(at: DictationDestination.allCases.firstIndex(of: settings.destination)!)
+        typeInActiveTextField.state = settings.typeInActiveTextField ? .on : .off
+        sendToAtem.state = settings.sendToAtem ? .on : .off
         provider.selectItem(at: DictationLLMProvider.allCases.firstIndex(of: settings.provider)!)
         // Preserve edits while ASR/status events arrive.
         if renderedSettings?.provider != settings.provider || renderedSettings?.endpoint != settings.endpoint || renderedSettings?.model != settings.model {
@@ -128,6 +135,12 @@ final class VoiceDictationViewController: NSViewController, NSTextFieldDelegate 
         status.stringValue = manager.unavailableReason ?? manager.message ?? "Ready. Configure shortcuts in Keyboard Shortcuts."
     }
     @objc private func togglePolish() { manager.setPolishing(polishKnob.state == .on) }
+    @objc private func changeOutputs() {
+        var settings = manager.settings
+        settings.typeInActiveTextField = typeInActiveTextField.state == .on
+        settings.sendToAtem = sendToAtem.state == .on
+        manager.updateSettings(settings)
+    }
     @objc private func changeSettings() {
         var settings = manager.settings
         let selectedProvider = DictationLLMProvider.allCases[max(0, provider.indexOfSelectedItem)]
@@ -145,7 +158,6 @@ final class VoiceDictationViewController: NSViewController, NSTextFieldDelegate 
             if settings.consentEndpoint != settings.endpoint { settings.consentEndpoint = nil }
         }
         settings.provider = selectedProvider
-        settings.destination = DictationDestination.allCases[max(0, destination.indexOfSelectedItem)]
         manager.updateSettings(settings)
     }
     @objc private func confirmConsent() {

@@ -12,21 +12,11 @@ enum DictationLLMProvider: String, Codable, CaseIterable {
     }
 }
 
-enum DictationDestination: String, Codable, CaseIterable {
-    case captions, activeText, atem
-    var title: String {
-        switch self {
-        case .captions: return "Floating captions only"
-        case .activeText: return "Type in the active text field + captions"
-        case .atem: return "Send to the active Atem + captions"
-        }
-    }
-}
-
 struct DictationSettings: Codable, Equatable {
     var polishing = false
     var provider: DictationLLMProvider = .local
-    var destination: DictationDestination = .atem
+    var typeInActiveTextField = true
+    var sendToAtem = false
     var cloudModel = "gpt-4.1-mini"
     var localEndpoint = "http://localhost:11434/v1/chat/completions"
     var localModel = "qwen3:4b"
@@ -54,6 +44,46 @@ struct DictationSettings: Codable, Equatable {
         return !["localhost", "127.0.0.1", "::1", "[::1]"].contains(host.lowercased())
     }
     var hasUploadConsent: Bool { !requiresUploadConsent || consentEndpoint == endpoint }
+    var outputSummary: String {
+        var outputs = [String]()
+        if typeInActiveTextField { outputs.append("Active text field") }
+        if sendToAtem { outputs.append("Active Atem") }
+        outputs.append("Floating captions")
+        return outputs.joined(separator: " + ")
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case polishing, provider, typeInActiveTextField, sendToAtem
+        case cloudModel, localEndpoint, localModel, customEndpoint, customModel, consentEndpoint
+    }
+    private enum LegacyCodingKeys: String, CodingKey { case destination }
+    private enum LegacyDestination: String, Decodable { case captions, activeText, atem }
+}
+
+extension DictationSettings {
+    init(from decoder: Decoder) throws {
+        self.init()
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        polishing = try values.decodeIfPresent(Bool.self, forKey: .polishing) ?? polishing
+        provider = try values.decodeIfPresent(DictationLLMProvider.self, forKey: .provider) ?? provider
+        if values.contains(.typeInActiveTextField) || values.contains(.sendToAtem) {
+            typeInActiveTextField = try values.decodeIfPresent(Bool.self, forKey: .typeInActiveTextField) ?? typeInActiveTextField
+            sendToAtem = try values.decodeIfPresent(Bool.self, forKey: .sendToAtem) ?? sendToAtem
+        } else {
+            // Preserve the old output choice without opting existing users into another output.
+            let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
+            if let destination = try legacy.decodeIfPresent(LegacyDestination.self, forKey: .destination) {
+                typeInActiveTextField = destination == .activeText
+                sendToAtem = destination == .atem
+            }
+        }
+        cloudModel = try values.decodeIfPresent(String.self, forKey: .cloudModel) ?? cloudModel
+        localEndpoint = try values.decodeIfPresent(String.self, forKey: .localEndpoint) ?? localEndpoint
+        localModel = try values.decodeIfPresent(String.self, forKey: .localModel) ?? localModel
+        customEndpoint = try values.decodeIfPresent(String.self, forKey: .customEndpoint) ?? customEndpoint
+        customModel = try values.decodeIfPresent(String.self, forKey: .customModel) ?? customModel
+        consentEndpoint = try values.decodeIfPresent(String.self, forKey: .consentEndpoint)
+    }
 }
 
 enum DictationError: LocalizedError {
