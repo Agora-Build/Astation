@@ -10,11 +10,17 @@ publish and receive media in the same channel.
 
 ## Mac controls
 
-Join an Agora channel, then choose **Start Screen Share** from the menu bar.
+Join an Agora channel, then choose **RTC Media > Start Screen Share** from the menu bar.
 Choose a display, optionally select **Share region only**, and choose a frame
 rate. **Include system audio** shares audio from other apps; it is off by
 default. The audio and frame-rate choices are remembered for hotkey and console
 starts. Microphone mute is independent of system audio.
+
+The same menu control changes to **Stop Screen Share** while sharing, or
+**Cancel Screen Share** while capture starts. Starting is unavailable until a
+channel is joined. **Ctrl+Shift+V** toggles the primary display without the
+display picker; customize it with **Toggle RTC Screen Sharing** in Keyboard
+Shortcuts. Neither this shortcut nor the menu control enables a camera.
 
 Capture uses the display mode's native pixel dimensions, including Retina and
 scaled display modes. Region coordinates are converted from pixels to

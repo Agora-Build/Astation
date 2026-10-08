@@ -12,7 +12,7 @@ enum ShortcutAction: String, CaseIterable {
     var title: String {
         switch self {
         case .voice: return "Push-to-Talk Dictation"
-        case .video: return "Toggle Video Sharing"
+        case .video: return "Toggle RTC Screen Sharing"
         case .recording: return "Start / Stop Audio Recording"
         case .recordingPause: return "Pause / Resume Audio Recording"
         case .floatingCaptions: return "Toggle Floating Captions"
@@ -23,7 +23,7 @@ enum ShortcutAction: String, CaseIterable {
     var detail: String {
         switch self {
         case .voice: return "Hold to dictate from the mic; release to finish. Disabled during mic transcription."
-        case .video: return "Press to start or stop screen sharing."
+        case .video: return "Press to start or stop screen sharing in a joined RTC channel. Does not use the camera."
         case .recording: return "Record the sources configured in Audio & Recording."
         case .recordingPause: return "Pause saving audio while keeping source preview live."
         case .floatingCaptions: return "Show or hide the caption window without stopping transcription."

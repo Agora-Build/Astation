@@ -161,16 +161,18 @@ for architecture, lifecycle behavior, and remaining hardware checks.
 
 ### Keyboard Shortcuts
 
-Open **Settings > Keyboard Shortcuts** to bind keys for push-to-talk voice and
-video sharing. Click a binding, press a combination, and release the key to save.
+Open **Settings > Keyboard Shortcuts** to bind keys for push-to-talk dictation and
+RTC screen sharing. Click a binding, press a combination, and release the key to save.
 Use Control, Option, or Command with a key, or a function key (F1-F20). Press
 Escape or click **Cancel Recording** to cancel. Shortcuts pause during recording
 and resume when you finish, switch tabs, close settings, or switch windows.
 
 Bindings apply immediately and persist across launches. **Clear** removes a
-binding; **Restore Defaults** restores **Ctrl+V** for voice and **Ctrl+Shift+V**
-for video. Hold the voice shortcut to speak and release it to send; the video
-shortcut toggles sharing. The menu displays your current bindings.
+binding; **Restore Defaults** restores **Ctrl+V** for dictation and **Ctrl+Shift+V**
+for RTC screen sharing. Hold the dictation shortcut to speak and release it to
+finish; the screen-sharing shortcut toggles the primary display in a joined RTC
+channel, not the camera. Screen-sharing controls and the current binding appear
+under **RTC Media** in the menu.
 
 Astation rejects duplicate bindings, conflicts with its menu commands, enabled
 macOS keyboard shortcuts, and combinations already registered by another app.
@@ -311,10 +313,12 @@ cloud, or a custom OpenAI-compatible endpoint. Polishing defaults off; remote te
 uploads require endpoint-specific consent and API keys stay in Keychain. Local
 Qwen requires a separately installed runtime/model; there is no silent cloud fallback.
 
-Choose captions only, explicit typing into the original active text field
-(Accessibility permission required; no Return/key/clipboard injection), or the active
-connected Atem. If polishing fails or the destination changes focus, text stays
-local instead of being silently sent elsewhere. See the
+Choose independent outputs: typing into the original active text field (default on,
+Accessibility permission required; no Return/key/clipboard injection) and sending
+to the active connected Atem (default off). Enable both to use the same result in
+both places, or turn both off for captions only. Results always remain in floating
+captions. If an output becomes unavailable, the other still works; polishing failure
+keeps raw text local without typing or sending it. See the
 [dictation guide](docs/live-transcription.md#voice-dictation-and-optional-llm-polishing).
 
 RTC and local recording/dictation share native microphone capture by device but

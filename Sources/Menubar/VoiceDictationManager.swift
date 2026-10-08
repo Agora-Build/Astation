@@ -41,6 +41,7 @@ final class VoiceDictationManager {
     private var generation = UUID()
     private var target: String?
     private var textTarget: DictationTextTarget?
+    private var textTargetError: String?
     private var sentKeys = Set<String>()
     private struct Delivery {
         let segment: TranscriptSegment
@@ -76,9 +77,9 @@ final class VoiceDictationManager {
     deinit { task?.cancel(); worker?.cancel(); deliveryTask?.cancel(); inbox?.finish(); stream?.stop() }
 
     func updateSettings(_ value: DictationSettings) {
-        if mode != .off && (value.destination != settings.destination || value.provider != settings.provider
+        if mode != .off && (value.typeInActiveTextField != settings.typeInActiveTextField || value.sendToAtem != settings.sendToAtem || value.provider != settings.provider
             || value.endpoint != settings.endpoint || value.model != settings.model) {
-            cancel(message: "Dictation stopped because its model or destination changed. Start again with the new settings.")
+            cancel(message: "Dictation stopped because its model or outputs changed. Start again with the new settings.")
         }
         settings = value; keyMessage = nil
         if let data = try? JSONEncoder().encode(value) { defaults.set(data, forKey: Self.defaultsKey) }
@@ -108,15 +109,17 @@ final class VoiceDictationManager {
             do { try DictationPolishing.validate(settings) }
             catch { setMessage(error.localizedDescription); return }
         }
-        if settings.destination == .activeText {
+        textTarget = nil; textTargetError = nil
+        if settings.typeInActiveTextField {
             do { textTarget = try captureTextTarget() }
-            catch { setMessage(error.localizedDescription); return }
-        } else { textTarget = nil }
+            catch { textTargetError = error.localizedDescription }
+        }
         let id = UUID(); generation = id
-        mode = requested; isWaitingForResponse = false; target = resolveTarget(); sentKeys.removeAll()
+        mode = requested; isWaitingForResponse = false; target = settings.sendToAtem ? resolveTarget() : nil; sentKeys.removeAll()
         lastDictationText = ""
         lastRawDictationText = ""; lastPolishedDictationText = nil; captureComplete = false
-        setMessage(requested == .ptt ? "Dictation: hold to speak." : "Hands-Free Dictation: microphone listening.")
+        let listeningMessage = requested == .ptt ? "Dictation: hold to speak." : "Hands-Free Dictation: microphone listening."
+        setMessage(listeningMessage + (textTargetError.map { " Typing unavailable: \($0)" } ?? ""))
         let inbox = TranscriptionInbox(); self.inbox = inbox
         let results = DictationResults(), uid = transcription.microphoneDeviceUID
         let factory = captureFactory, permission = permission, makeEngine = engineFactory
@@ -240,17 +243,7 @@ final class VoiceDictationManager {
                     let final = TranscriptSegment(id: delivery.segment.id, sourceID: "microphone", language: delivery.segment.language,
                         text: result, isFinal: true, offset: delivery.segment.offset)
                     self.transcription.displayDictationCaption(final, replacingKeys: delivery.replacingKeys, refreshReceipt: true)
-                    switch delivery.settings.destination {
-                    case .captions: self.setMessage("Dictation ready in floating captions.")
-                    case .atem:
-                        if let target = self.target, self.resolveTarget() == target, self.sendText(result, target) {
-                            self.setMessage("Dictation sent to the active Atem.")
-                        } else { self.setMessage("The original Atem is no longer active or connected. Result kept in captions.") }
-                    case .activeText:
-                        guard let textTarget = self.textTarget else { throw DictationError.message("No original text field is available. Result kept in captions.") }
-                        try textTarget.insert(result)
-                        self.setMessage("Dictation inserted in the original text field.")
-                    }
+                    self.deliverResult(result, settings: delivery.settings)
                 } catch {
                     guard self.generation == id, !Task.isCancelled else { return }
                     self.lastDictationText = self.lastPolishedDictationText ?? raw
@@ -267,8 +260,27 @@ final class VoiceDictationManager {
             if self.captureComplete { self.finishDelivery() }
         }
     }
+    private func deliverResult(_ result: String, settings: DictationSettings) {
+        var outcomes = [String]()
+        // Each selected output is attempted independently after polishing succeeds.
+        if settings.typeInActiveTextField {
+            do {
+                guard let textTarget else {
+                    throw DictationError.message(textTargetError ?? "No original text field is available. Result kept in captions.")
+                }
+                try textTarget.insert(result)
+                outcomes.append("Dictation inserted in the original text field.")
+            } catch { outcomes.append(error.localizedDescription) }
+        }
+        if settings.sendToAtem {
+            if let target, resolveTarget() == target, sendText(result, target) {
+                outcomes.append("Dictation sent to the active Atem.")
+            } else { outcomes.append("The original Atem is no longer active or connected. Result kept in captions.") }
+        }
+        setMessage(outcomes.isEmpty ? "Dictation ready in floating captions." : outcomes.joined(separator: " "))
+    }
     private func finishDelivery() {
-        mode = .off; isWaitingForResponse = false; isPolishing = false; textTarget = nil; target = nil; notify()
+        mode = .off; isWaitingForResponse = false; isPolishing = false; textTarget = nil; textTargetError = nil; target = nil; notify()
     }
 
     /// Mode switches discard unfinished speech; they never silently submit it to Atem.
@@ -277,7 +289,7 @@ final class VoiceDictationManager {
         task?.cancel(); worker?.cancel(); inbox?.finish(); stream?.stop()
         deliveryTask?.cancel(); deliveryTask = nil; deliveries.removeAll(); isPolishing = false
         stream = nil; inbox = nil; task = nil; worker = nil
-        mode = .off; isWaitingForResponse = false; target = nil; textTarget = nil
+        mode = .off; isWaitingForResponse = false; target = nil; textTarget = nil; textTargetError = nil
         if let message { setMessage(message) } else { notify() }
     }
     private func setMessage(_ text: String) { message = text; showStatus(text); notify() }
