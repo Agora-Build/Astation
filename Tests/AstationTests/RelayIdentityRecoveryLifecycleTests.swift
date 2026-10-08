@@ -226,4 +226,18 @@ final class RelayIdentityRecoveryLifecycleTests: XCTestCase {
         XCTAssertTrue(fixture.sockets.isEmpty)
         XCTAssertEqual(fixture.hub.deviceSessionStore.getAllActive().map(\.id), ["existing-pairing"])
     }
+
+    func testFailedSecondRepairPreservesAnExistingRecoveryPause() throws {
+        let fixture = try RecoveryFixture(pending: true, loadFailure: .undecodableStoredKey)
+        fixture.repairFailure = .keychain(errSecAuthFailed)
+        fixture.hub.startIdentityRelay()
+        fixture.hub.repairRelayIdentityKey { XCTAssertEqual($0, .keychain(errSecAuthFailed)) }
+        XCTAssertTrue(fixture.hub.relayIdentityKeyRepairPending)
+        XCTAssertNotNil(fixture.defaults.dictionary(forKey: RelayIdentityKeyRepairRecord.defaultsKey))
+        fixture.loadFailure = nil
+        fixture.hub.retryRelayIdentityKey()
+        fixture.hub.startIdentityRelay()
+        XCTAssertTrue(fixture.sockets.isEmpty)
+        XCTAssertTrue(fixture.hub.relayIdentityKeyCanReconnectAfterRepair)
+    }
 }

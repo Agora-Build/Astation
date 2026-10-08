@@ -43,6 +43,8 @@ Network events cannot bypass it. Starting a connection does not clear the
 pause: the relay must return `registered` or `verified`. If the relay rejects
 the key, Astation stays paused so the reset can be completed without a
 reconnection loop.
+If another repair is attempted while recovery is pending, a failed update
+keeps the existing recovery pause.
 
 If a readable key is rejected, **Recover Relay Trust** prepares the same
 administrator reset workflow while keeping that key. This covers a lost

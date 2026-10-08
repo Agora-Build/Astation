@@ -1558,14 +1558,16 @@ class AstationHubManager: ObservableObject {
 
     func repairRelayIdentityKey(completion: @escaping (RelayIdentityKeyError?) -> Void) {
         guard relayIdentityKeyCanRepair else { completion(.repairNotNeeded); return }
+        let recoveryWasAlreadyPending = relayIdentityKeyRepairPending
         let record: RelayIdentityKeyRepairRecord
         switch beginRelayIdentityKeyRecoveryPause() {
         case .success(let saved): record = saved
         case .failure(let failure): completion(failure); return
         }
         relayIdentityKeyManager.repair { [weak self] failure in
-            if let self, failure != nil {
-                record.clear(from: self.relayIdentityRepairDefaults)
+            if let self, failure != nil, !recoveryWasAlreadyPending,
+               self.relayIdentityKeyRepairRecord == record,
+               record.clear(from: self.relayIdentityRepairDefaults) {
                 self.relayIdentityKeyRepairRecord = nil
                 self.relayIdentityKeyRepairPending = false
                 NotificationCenter.default.post(name: .relayIdentityKeyChanged, object: nil)
