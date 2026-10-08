@@ -40,10 +40,18 @@ private actor CaptionTestEngine: LiveTranscribing {
     var throwOnStart = false
     var delayStart = false
     var finishCount = 0
+    var cancellationStarted = false
+    private var holdCancellation = false
+    private var cancellation: CheckedContinuation<Void, Never>?
     init(sourceID: String = "microphone") { self.sourceID = sourceID }
     func configureFailure() { throwOnConsume = true }
     func configureStartFailure() { throwOnStart = true }
     func configureDelay() { delayStart = true }
+    func configureCancellationGate() { holdCancellation = true }
+    func releaseCancellation() {
+        holdCancellation = false
+        cancellation?.resume(); cancellation = nil
+    }
     func start(onSegment: @escaping @Sendable (TranscriptSegment) -> Void) async throws {
         started = true; callback = onSegment
         if throwOnStart { throw TranscriptionError.message("Source could not start") }
@@ -58,7 +66,11 @@ private actor CaptionTestEngine: LiveTranscribing {
         finishCount += 1
         callback?(TranscriptSegment(id: "one", sourceID: sourceID, language: "en-US", text: "hello\nworld", isFinal: true, offset: 0))
     }
-    func cancel() { cancelled = true }
+    func cancel() async {
+        cancellationStarted = true
+        if holdCancellation { await withCheckedContinuation { cancellation = $0 } }
+        cancelled = true
+    }
     func emit(_ text: String, id: String = "one", final: Bool = false) {
         callback?(TranscriptSegment(id: id, sourceID: sourceID, language: "en-US", text: text, isFinal: final, offset: 0))
     }
@@ -500,6 +512,28 @@ final class AudioTranscriptionManagerTests: XCTestCase {
         XCTAssertTrue(samples.enumerated().allSatisfy { sample in
             !gaps.contains { $0.contains(Int64(sample.offset)) } || sample.element == 0
         })
+    }
+    func testInferenceFailureSurvivesAudioArrivingDuringEngineCancellation() async throws {
+        let capture = CaptionTestCapture(), engine = CaptionTestEngine(), storage = defaults()
+        await engine.configureFailure(); await engine.configureCancellationGate()
+        addTeardownBlock { await engine.releaseCancellation() }
+        let recorder = AudioRecordingManager(defaults: storage, captureFactory: { _ in capture }, microphonePermission: { true })
+        defer { recorder.shutdown() }
+        var settings = recorder.settings; settings.folderPath = try folder().path; recorder.updateSettings(settings)
+        recorder.startRecording(); try await waitUntil { recorder.isRecording }
+        let manager = AudioTranscriptionManager(recorder: recorder, defaults: storage, engineFactory: { _ in engine })
+        manager.start(); try await waitUntil { manager.state == .running }
+        capture.feed(0.25)
+        try await waitUntilAsync { await engine.cancellationStarted }
+        XCTAssertTrue(recorder.isRecording); XCTAssertFalse(capture.stopped)
+        // Flush another packet while cancellation is suspended to expose late inbox writes.
+        capture.feed(0.5); recorder.stopRecording()
+        try await waitUntil { manager.state == .failed }
+        XCTAssertEqual(manager.message, "Inference failed; original is safe")
+        await engine.releaseCancellation()
+        try await waitUntilAsync { await engine.cancelled }
+        XCTAssertEqual(manager.state, .failed)
+        XCTAssertEqual(manager.message, "Inference failed; original is safe")
     }
     func testOnlySelectedSourceReachesTranscriber() async throws {
         let mic = CaptionTestCapture(), system = CaptionTestCapture(), engine = CaptionTestEngine(), defaults = defaults()
