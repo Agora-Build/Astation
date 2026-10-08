@@ -256,6 +256,9 @@ final class AudioTranscriptionManagerTests: XCTestCase {
         manager.stop(); try await waitUntil { manager.state == .idle }
         XCTAssertTrue(recorder.isRecording)
         XCTAssertTrue(captures.values.allSatisfy { !$0.stopped })
+        // Finish after the 100 ms fake packets to exercise trailing silence metadata.
+        let paddingDeadline = recorder.elapsed + 0.2
+        try await waitUntil { recorder.elapsed >= paddingDeadline }
         recorder.stopRecording()
         let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
         let session = try XCTUnwrap(recorder.lastSessionFolder)
@@ -264,12 +267,24 @@ final class AudioTranscriptionManagerTests: XCTestCase {
         XCTAssertEqual(Set(manifest.tracks.map(\.sourceID)), Set(captures.keys))
         let levels: [String: Float] = ["microphone": 0.25, "test.selected-app": 0.5, "test.other-app": 0.9]
         for track in manifest.tracks {
+            XCTAssertTrue(track.gaps.contains { $0.reason == "source silent or unavailable at session end" && $0.frameCount > 0 })
             let file = try AVAudioFile(forReading: session.appendingPathComponent(track.segments[0].file))
             let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length))!
             try file.read(into: buffer)
             XCTAssertEqual(track.sampleRate, 48_000)
             XCTAssertGreaterThan(buffer.frameLength, 0)
-            XCTAssertEqual(buffer.floatChannelData![0][Int(buffer.frameLength) - 1], try XCTUnwrap(levels[track.sourceID]))
+            // Slow runners can finish after the fake packet's end, adding declared silence.
+            let samples = UnsafeBufferPointer(start: buffer.floatChannelData![0], count: Int(buffer.frameLength))
+            let gaps = track.gaps.map { $0.startFrame..<($0.startFrame + $0.frameCount) }
+            let original = samples.enumerated().filter { sample in
+                !gaps.contains { $0.contains(Int64(sample.offset)) }
+            }
+            let level = try XCTUnwrap(levels[track.sourceID])
+            XCTAssertEqual(original.count, 4_800)
+            XCTAssertTrue(original.allSatisfy { $0.element == level })
+            XCTAssertTrue(samples.enumerated().allSatisfy { sample in
+                !gaps.contains { $0.contains(Int64(sample.offset)) } || sample.element == 0
+            })
         }
     }
     func testSystemAndAppOnlyTranscriptionNeedNoMicrophonePermission() async throws {
