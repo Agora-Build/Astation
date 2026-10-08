@@ -33,6 +33,13 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var serverStatusLabel: NSTextField!
     private var serverInfoLabel: NSTextField!
     private var recoveryStatusLabel: NSTextField?
+    private var relayIdentityKeyStatusLabel: NSTextField?
+    private var relayIdentityKeyRetryButton: NSButton?
+    private var relayIdentityKeyRepairButton: NSButton?
+    private var relayIdentityTrustResetButton: NSButton?
+    private var relayIdentityKeyReconnectButton: NSButton?
+    private var relayIdentityKeyAuthorizationPending = false
+    private var relayIdentityKeyActionMessage: String?
     private var relayAccountStack: NSStackView?
     private var relayAccountStatusLabel: NSTextField?
     private var leaveGroupButton: NSButton?
@@ -70,6 +77,9 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         NotificationCenter.default.addObserver(
             self, selector: #selector(relayEncryptionChanged),
             name: .relayEncryptionChanged, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(relayIdentityKeyChanged),
+            name: .relayIdentityKeyChanged, object: nil)
     }
 
     deinit {
@@ -82,6 +92,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
             renderRelayAccountState()
             hubManager.requestRelayAccountState()
             renderEncryptionState()
+            renderRelayIdentityKeyState()
             hubManager.requestRelayEncryptionState()
             existingWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
@@ -393,6 +404,40 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
             content.widthAnchor.constraint(equalToConstant: 450)
         ])
 
+        content.addArrangedSubview(sectionTitle("Relay Device Key"))
+        content.addArrangedSubview(wrappingInfo(
+            "This Mac uses its device key to verify with the relay. Repair is available only when the stored key cannot be used; it keeps your Astation ID, pairings, and account data."
+        ))
+        let keyStatus = NSTextField(wrappingLabelWithString: "")
+        keyStatus.font = .systemFont(ofSize: 12, weight: .medium)
+        keyStatus.translatesAutoresizingMaskIntoConstraints = false
+        keyStatus.widthAnchor.constraint(equalToConstant: 410).isActive = true
+        relayIdentityKeyStatusLabel = keyStatus
+        content.addArrangedSubview(keyStatus)
+        let keyActions = NSStackView()
+        keyActions.orientation = .horizontal
+        keyActions.spacing = 8
+        let retryKey = NSButton(title: "Retry Key Access", target: self, action: #selector(retryRelayIdentityKey))
+        let repairKey = NSButton(title: "Repair Device Key...", target: self, action: #selector(repairRelayIdentityKey))
+        for button in [retryKey, repairKey] {
+            button.bezelStyle = .rounded
+            keyActions.addArrangedSubview(button)
+        }
+        relayIdentityKeyRetryButton = retryKey
+        relayIdentityKeyRepairButton = repairKey
+        content.addArrangedSubview(keyActions)
+        let resetTrust = NSButton(title: "Recover Relay Trust...", target: self,
+                                  action: #selector(resetRelayIdentityTrust))
+        resetTrust.bezelStyle = .rounded
+        relayIdentityTrustResetButton = resetTrust
+        content.addArrangedSubview(resetTrust)
+        let reconnectKey = NSButton(title: "Complete Relay Reset...", target: self,
+                                    action: #selector(reconnectAfterRelayIdentityKeyRepair))
+        reconnectKey.bezelStyle = .rounded
+        relayIdentityKeyReconnectButton = reconnectKey
+        content.addArrangedSubview(reconnectKey)
+        content.addArrangedSubview(separator())
+
         content.addArrangedSubview(sectionTitle("End-to-End Encryption"))
         content.addArrangedSubview(wrappingInfo(
             "Encrypt memory, skill files, and vault content before it reaches the relay. Only this Mac, paired Atems, and your separate encryption recovery key can unlock it."
@@ -491,11 +536,115 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         content.addArrangedSubview(status)
         recoveryStatusLabel = status
 
+        renderRelayIdentityKeyState()
         renderRelayAccountState()
         hubManager.requestRelayAccountState()
         renderEncryptionState()
         hubManager.requestRelayEncryptionState()
         return container
+    }
+
+    @objc private func relayIdentityKeyChanged() {
+        relayIdentityKeyActionMessage = nil
+        renderRelayIdentityKeyState()
+    }
+
+    private func renderRelayIdentityKeyState() {
+        relayIdentityKeyStatusLabel?.stringValue = relayIdentityKeyActionMessage ?? hubManager.relayIdentityStatusMessage
+            ?? (hubManager.identityRelayVerified ? "This Mac's relay device key is verified." : "Waiting for relay verification.")
+        let busy = relayIdentityKeyAuthorizationPending || hubManager.relayIdentityKeyIsBusy
+        relayIdentityKeyRetryButton?.isEnabled = !busy
+        relayIdentityKeyRepairButton?.isEnabled = !busy && hubManager.relayIdentityKeyCanRepair
+        relayIdentityTrustResetButton?.isHidden = !hubManager.relayIdentityKeyCanResetRelayTrust
+        relayIdentityTrustResetButton?.isEnabled = !busy && hubManager.relayIdentityKeyCanResetRelayTrust
+        relayIdentityKeyReconnectButton?.isHidden = !hubManager.relayIdentityKeyRepairPending
+        relayIdentityKeyReconnectButton?.isEnabled = !busy && hubManager.relayIdentityKeyCanReconnectAfterRepair
+    }
+
+    @objc private func retryRelayIdentityKey() { hubManager.retryRelayIdentityKey() }
+
+    @objc private func repairRelayIdentityKey() {
+        requestRelayDeviceKeyRecovery(replaceKey: true)
+    }
+
+    @objc private func resetRelayIdentityTrust() {
+        requestRelayDeviceKeyRecovery(replaceKey: false)
+    }
+
+    private func requestRelayDeviceKeyRecovery(replaceKey: Bool) {
+        let record = RelayIdentityKeyRepairRecord(astationId: AstationIdentity.shared.id, relayURL: hubManager.stationRelayUrl)
+        relayIdentityKeyAuthorizationPending = true
+        renderRelayIdentityKeyState()
+        RelayIdentityKeyRepairAction.request(
+            authenticate: {
+                DeviceOwnerAuth.authenticate(reason: replaceKey ? "repair this Mac's relay device key" : "prepare relay device key recovery", completion: $0)
+            },
+            canRepair: { [weak self] in
+                guard let self else { return false }
+                return (replaceKey ? self.hubManager.relayIdentityKeyCanRepair : self.hubManager.relayIdentityKeyCanResetRelayTrust)
+                    && AstationIdentity.shared.id == record.astationId
+                    && self.hubManager.stationRelayUrl == record.relayURL
+            },
+            confirm: { [weak self] in
+                guard self != nil else { return false }
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = replaceKey ? "Repair this Mac's relay device key?" : "Recover relay trust for this Mac?"
+                alert.informativeText = replaceKey
+                    ? "This replaces the unusable device key and pauses relay connections. Your Astation ID, paired Atems, and account data stay the same. You will need administrator access to the relay to reset its trust before reconnecting."
+                    : "The relay trusts a different key for this Astation ID. Your current key will be kept and relay connections will pause. Confirm that this ID belongs to you, then ask the relay administrator to reset its trust before reconnecting."
+                let (box, _) = Self.textBox("Relay: \(record.relayURL)\n\n\(record.resetCommand)", editable: false)
+                alert.accessoryView = box
+                alert.addButton(withTitle: replaceKey ? "Repair Key" : "Prepare Recovery")
+                alert.addButton(withTitle: "Cancel")
+                return alert.runModal() == .alertFirstButtonReturn
+            },
+            repair: { [weak self] in
+                guard let self else { return }
+                self.relayIdentityKeyAuthorizationPending = false
+                let finished: (RelayIdentityKeyError?) -> Void = { [weak self] failure in
+                    guard let self else { return }
+                    self.renderRelayIdentityKeyState()
+                    if failure == nil { self.showRelayResetInstructions(record: record, reconnect: false) }
+                }
+                if replaceKey { self.hubManager.repairRelayIdentityKey(completion: finished) }
+                else { finished(self.hubManager.prepareRelayIdentityTrustReset()) }
+            },
+            cancelled: { [weak self] reason in
+                guard let self else { return }
+                self.relayIdentityKeyAuthorizationPending = false
+                if case .notAuthenticated = reason {
+                    self.relayIdentityKeyActionMessage = "Not authenticated, so the device key was not changed."
+                } else if case .unavailable = reason {
+                    self.relayIdentityKeyActionMessage = "The device key or relay changed. Nothing was replaced; retry key access."
+                }
+                self.renderRelayIdentityKeyState()
+            }
+        )
+    }
+
+    @objc private func reconnectAfterRelayIdentityKeyRepair() {
+        let record = RelayIdentityKeyRepairRecord(astationId: AstationIdentity.shared.id, relayURL: hubManager.stationRelayUrl)
+        showRelayResetInstructions(record: record, reconnect: true)
+    }
+
+    private func showRelayResetInstructions(record: RelayIdentityKeyRepairRecord, reconnect: Bool) {
+        let alert = NSAlert()
+        alert.messageText = "Complete the Relay Trust Reset"
+        alert.informativeText = "On \(record.relayURL), ask the relay administrator to run this command. Then use Complete Relay Reset to reconnect this Mac promptly. Astation keeps relay connections paused until you choose to reconnect."
+        let (box, _) = Self.textBox(record.resetCommand, editable: false)
+        alert.accessoryView = box
+        alert.addButton(withTitle: reconnect ? "Reset Is Done - Reconnect" : "Copy Reset Command")
+        alert.addButton(withTitle: reconnect ? "Cancel" : "Done")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        if reconnect {
+            guard AstationIdentity.shared.id == record.astationId,
+                  hubManager.stationRelayUrl == record.relayURL else { return }
+            hubManager.reconnectAfterRelayIdentityKeyRepair()
+        } else {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(record.resetCommand, forType: .string)
+        }
     }
 
     private func sectionTitle(_ text: String) -> NSTextField {
@@ -1084,6 +1233,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         tabView?.selectTabViewItem(withIdentifier: "recording")
     }
     func showDictation() { showWindow(); tabView?.selectTabViewItem(withIdentifier: "dictation") }
+    func showSecurity() { showWindow(); tabView?.selectTabViewItem(withIdentifier: "security") }
 
     func windowWillClose(_ notification: Notification) {
         recordingController.setPageVisible(false)
@@ -1167,4 +1317,5 @@ extension Notification.Name {
     static let credentialsChanged = Notification.Name("AstationCredentialsChanged")
     static let relayAccountChanged = Notification.Name("AstationRelayAccountChanged")
     static let relayEncryptionChanged = Notification.Name("AstationRelayEncryptionChanged")
+    static let relayIdentityKeyChanged = Notification.Name("AstationRelayIdentityKeyChanged")
 }

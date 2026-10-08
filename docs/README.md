@@ -12,6 +12,7 @@ work. Completed implementation checklists are available in Git history.
 | [SSO authentication design](sso-authentication.md) | Browser login, token refresh, encrypted session storage, and credential consumers |
 | [Vault storage design](vault-storage.md) | Storage semantics, persistence, caller resolution, and concurrency boundaries |
 | [Device Authentication v2](specs/2026-07-21-device-authentication-v2.md) | Wire protocol shared with Atem and unresolved production blockers |
+| [Relay device key recovery](relay-device-key-recovery.md) | Keychain access retries, authenticated signing-key repair, and the relay trust reset workflow |
 
 For local builds and user setup, start with the [project README](../README.md).
 For relay deployment and API configuration, use the
