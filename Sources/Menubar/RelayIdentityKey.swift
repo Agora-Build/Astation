@@ -16,6 +16,70 @@ enum RelayIdentityKeyError: Error, Equatable {
     case undecodableStoredKey
     /// `SecAccessControlCreateWithFlags` returned nil for the Secure Enclave key.
     case accessControlUnavailable
+    case unexpected(domain: String, code: Int)
+    case repairNotNeeded
+    case repairStateUnavailable
+}
+
+extension RelayIdentityKeyError: LocalizedError {
+    static func capture(_ error: Error) -> RelayIdentityKeyError {
+        if let error = error as? RelayIdentityKeyError { return error }
+        if let error = error as? CryptoKitError,
+           case .underlyingCoreCryptoError(let status) = error {
+            return .keychain(status)
+        }
+        let error = error as NSError
+        if error.domain == NSOSStatusErrorDomain {
+            return .keychain(OSStatus(error.code))
+        }
+        return .unexpected(domain: error.domain, code: error.code)
+    }
+
+    var retriesAutomatically: Bool {
+        guard case .keychain(let status) = self else { return false }
+        return status == errSecInteractionNotAllowed || status == errSecNotAvailable
+    }
+
+    var allowsRepair: Bool {
+        self == .undecodableStoredKey || self == .secureEnclaveUnavailable
+    }
+
+    var menuDescription: String {
+        switch self {
+        case .undecodableStoredKey: return "Stored relay device key needs repair"
+        case .secureEnclaveUnavailable: return "Secure Enclave device key is unavailable"
+        case .keychain(errSecInteractionNotAllowed), .keychain(errSecNotAvailable):
+            return "Relay device key access is restricted; retry in Security settings"
+        case .keychain(errSecAuthFailed), .keychain(errSecUserCanceled):
+            return "Relay device key access was denied; retry in Security settings"
+        default: return "Relay device key needs attention in Security settings"
+        }
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .keychain(errSecInteractionNotAllowed):
+            return "Device key access is restricted. Retrying automatically; use Retry Key Access in Settings > Security to allow a Keychain prompt. Relay access is unavailable."
+        case .keychain(errSecNotAvailable):
+            return "Keychain is temporarily unavailable. Retrying automatically. Relay access is unavailable."
+        case .keychain(errSecAuthFailed), .keychain(errSecUserCanceled):
+            return "Device key access was denied or cancelled. Use Retry Key Access in Settings > Security. Relay access is unavailable."
+        case .keychain(let status):
+            return "Device key access failed (Keychain error \(status)). Use Retry Key Access in Settings > Security. Relay access is unavailable."
+        case .undecodableStoredKey:
+            return "The stored device key cannot be decoded. Repair it in Settings > Security. Relay access is unavailable."
+        case .secureEnclaveUnavailable:
+            return "This Mac cannot use the stored Secure Enclave key. Repair it in Settings > Security. Relay access is unavailable."
+        case .accessControlUnavailable:
+            return "Device key access control is unavailable. Retry key access in Settings > Security."
+        case .unexpected(let domain, let code):
+            return "Device key access failed (\(domain), \(code)). Retry key access in Settings > Security. Relay access is unavailable."
+        case .repairNotNeeded:
+            return "The device key changed or is readable again. It was not replaced. Retry key access in Settings > Security."
+        case .repairStateUnavailable:
+            return "The recovery pause could not be saved. The device key was not changed. Check this Mac's available storage and try again."
+        }
+    }
 }
 
 /// Result of reading the persisted key material.
@@ -30,16 +94,21 @@ enum RelayIdentityKeyReadResult {
 protocol RelayIdentityKeyStorage {
     func read() -> RelayIdentityKeyReadResult
     func write(_ data: Data) -> OSStatus
+    func replace(_ data: Data) -> OSStatus
 }
 
 /// Keychain generic-password storage:
 /// service `build.agora.astation.relay-identity`, account `astation-relay-key-v1`.
 struct KeychainRelayIdentityKeyStorage: RelayIdentityKeyStorage {
+    var allowAuthenticationUI = false
+    var service = RelayIdentityKey.keychainService
+    var account = RelayIdentityKey.keychainAccount
+
     private func baseQuery() -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: RelayIdentityKey.keychainService,
-            kSecAttrAccount as String: RelayIdentityKey.keychainAccount
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
         ]
     }
 
@@ -47,26 +116,30 @@ struct KeychainRelayIdentityKeyStorage: RelayIdentityKeyStorage {
         var query = baseQuery()
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
+        query[kSecUseAuthenticationUI as String] = allowAuthenticationUI
+            ? kSecUseAuthenticationUIAllow : kSecUseAuthenticationUIFail
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecItemNotFound {
             return .notFound
         }
-        guard status == errSecSuccess, let data = item as? Data else {
+        guard status == errSecSuccess else {
             return .failed(status)
         }
+        guard let data = item as? Data else { return .failed(errSecDecode) }
         return .found(data)
     }
 
     func write(_ data: Data) -> OSStatus {
-        let deleteStatus = SecItemDelete(baseQuery() as CFDictionary)
-        guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
-            return deleteStatus
-        }
         var attributes = baseQuery()
         attributes[kSecValueData as String] = data
         attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         return SecItemAdd(attributes as CFDictionary, nil)
+    }
+
+    func replace(_ data: Data) -> OSStatus {
+        // An explicit repair updates atomically; a failed update keeps the old item.
+        SecItemUpdate(baseQuery() as CFDictionary, [kSecValueData as String: data] as CFDictionary)
     }
 }
 
@@ -152,10 +225,43 @@ final class RelayIdentityKey {
 
         let (key, material) = generate(preferSecureEnclave: preferSecureEnclave)
         let status = storage.write(material)
+        if status == errSecDuplicateItem {
+            // Another instance created a key after our read. Keep its registered key.
+            switch storage.read() {
+            case .found(let stored): return try decode(stored)
+            case .failed(let status): throw RelayIdentityKeyError.keychain(status)
+            case .notFound: throw RelayIdentityKeyError.keychain(errSecItemNotFound)
+            }
+        }
         guard status == errSecSuccess else {
             throw RelayIdentityKeyError.keychain(status)
         }
         Log.info("[RelayIdentity] Created relay identity key (secureEnclave=\(key.isHardwareBacked))")
+        return key
+    }
+
+    /// Called only after device-owner authentication and explicit repair confirmation.
+    static func repair(
+        storage: RelayIdentityKeyStorage = KeychainRelayIdentityKeyStorage(allowAuthenticationUI: true),
+        preferSecureEnclave: Bool = SecureEnclave.isAvailable
+    ) throws -> RelayIdentityKey {
+        switch storage.read() {
+        case .found(let data):
+            do {
+                _ = try decode(data)
+                throw RelayIdentityKeyError.repairNotNeeded
+            } catch {
+                let failure = RelayIdentityKeyError.capture(error)
+                guard failure.allowsRepair else { throw failure }
+            }
+        case .notFound:
+            throw RelayIdentityKeyError.repairNotNeeded
+        case .failed(let status):
+            throw RelayIdentityKeyError.keychain(status)
+        }
+        let (key, material) = generate(preferSecureEnclave: preferSecureEnclave)
+        let status = storage.replace(material)
+        guard status == errSecSuccess else { throw RelayIdentityKeyError.keychain(status) }
         return key
     }
 
@@ -179,7 +285,12 @@ final class RelayIdentityKey {
             let key = try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: data)
             return RelayIdentityKey(secureEnclaveKey: key)
         } catch {
-            Log.error("[RelayIdentity] Stored Secure Enclave relay key is undecodable (left in place): \(error)")
+            let failure = RelayIdentityKeyError.capture(error)
+            if case .keychain(let status) = failure,
+               [errSecInteractionNotAllowed, errSecNotAvailable, errSecAuthFailed, errSecUserCanceled].contains(status) {
+                throw failure
+            }
+            Log.error("[RelayIdentity] Stored Secure Enclave relay key is undecodable (left in place)")
             throw RelayIdentityKeyError.undecodableStoredKey
         }
     }
@@ -305,8 +416,7 @@ enum RelayIdentityProtocol {
     static let statusRegistered = "registered"
     static let statusVerified = "verified"
     static let statusRejected = "rejected"
-    static let rejectedMenuMessage = "Relay rejected this Astation's key"
-    static let keyUnavailableMenuMessage = "Relay identity key unreadable — relay works, vault/memory unavailable"
+    static let rejectedMenuMessage = "The relay rejected this Mac's device key. Relay access is unavailable; see Settings > Security."
 
     /// Parse a raw identity-socket frame as a relay control frame.
     /// Returns nil for Atem envelopes and anything unrecognised, so existing
