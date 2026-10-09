@@ -9,6 +9,9 @@ private final class MemoryRelayIdentityKeyStorage: RelayIdentityKeyStorage {
     var stored: Data?
     var readFailure: OSStatus?
     var writeCount = 0
+    var replaceCount = 0
+    var replacementFailure: OSStatus?
+    var keyCreatedDuringWrite: Data?
 
     func read() -> RelayIdentityKeyReadResult {
         if let failure = readFailure {
@@ -21,8 +24,17 @@ private final class MemoryRelayIdentityKeyStorage: RelayIdentityKeyStorage {
     }
 
     func write(_ data: Data) -> OSStatus {
-        stored = data
         writeCount += 1
+        if let racedKey = keyCreatedDuringWrite { stored = racedKey; return errSecDuplicateItem }
+        guard stored == nil else { return errSecDuplicateItem }
+        stored = data
+        return errSecSuccess
+    }
+
+    func replace(_ data: Data) -> OSStatus {
+        replaceCount += 1
+        if let failure = replacementFailure { return failure }
+        stored = data
         return errSecSuccess
     }
 }
@@ -121,6 +133,59 @@ final class RelayIdentityTests: XCTestCase {
         }
         XCTAssertEqual(storage.writeCount, 0)
         XCTAssertEqual(storage.stored, corrupt)
+    }
+
+    func testConcurrentCreationKeepsTheOtherInstancesKey() throws {
+        let storage = MemoryRelayIdentityKeyStorage()
+        let existing = P256.Signing.PrivateKey()
+        storage.keyCreatedDuringWrite = existing.rawRepresentation
+        let key = try RelayIdentityKey.loadOrCreate(storage: storage, preferSecureEnclave: false)
+        XCTAssertEqual(key.publicKeyHex, RelayIdentityKey.hex(existing.publicKey.x963Representation))
+        XCTAssertEqual(storage.stored, existing.rawRepresentation)
+        XCTAssertEqual(storage.replaceCount, 0)
+    }
+
+    func testExplicitRepairReplacesOnlyUnusableMaterial() throws {
+        let storage = MemoryRelayIdentityKeyStorage()
+        storage.stored = Data([0x00])
+        let repaired = try RelayIdentityKey.repair(storage: storage, preferSecureEnclave: false)
+        let reloaded = try RelayIdentityKey.loadOrCreate(storage: storage, preferSecureEnclave: false)
+        XCTAssertEqual(repaired.publicKeyHex, reloaded.publicKeyHex)
+        XCTAssertEqual(storage.replaceCount, 1)
+        XCTAssertEqual(storage.writeCount, 0)
+    }
+
+    func testFailedRepairPreservesOriginalMaterial() {
+        let storage = MemoryRelayIdentityKeyStorage()
+        let original = Data([0x00])
+        storage.stored = original
+        storage.replacementFailure = errSecAuthFailed
+        XCTAssertThrowsError(try RelayIdentityKey.repair(storage: storage, preferSecureEnclave: false)) { error in
+            XCTAssertEqual(error as? RelayIdentityKeyError, .keychain(errSecAuthFailed))
+        }
+        XCTAssertEqual(storage.stored, original)
+        XCTAssertEqual(storage.writeCount, 0)
+    }
+
+    func testRepairDoesNotReplaceAKeyThatBecameReadable() throws {
+        let storage = MemoryRelayIdentityKeyStorage()
+        let original = P256.Signing.PrivateKey().rawRepresentation
+        storage.stored = original
+        XCTAssertThrowsError(try RelayIdentityKey.repair(storage: storage, preferSecureEnclave: false)) { error in
+            XCTAssertEqual(error as? RelayIdentityKeyError, .repairNotNeeded)
+        }
+        XCTAssertEqual(storage.stored, original)
+        XCTAssertEqual(storage.replaceCount, 0)
+    }
+
+    func testRepairDoesNotReplaceOnDeniedReadOrMissingItem() {
+        for status: OSStatus? in [errSecAuthFailed, nil] {
+            let storage = MemoryRelayIdentityKeyStorage()
+            storage.readFailure = status
+            XCTAssertThrowsError(try RelayIdentityKey.repair(storage: storage, preferSecureEnclave: false))
+            XCTAssertEqual(storage.replaceCount, 0)
+            XCTAssertEqual(storage.writeCount, 0)
+        }
     }
 
     // MARK: Outbound JSON

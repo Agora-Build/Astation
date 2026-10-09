@@ -103,13 +103,13 @@ class StatusBarController: NSObject, NSMenuDelegate {
         statusItem.isEnabled = false
         statusMenu.addItem(statusItem)
 
-        if let relayIdentityWarning = hubManager.relayIdentityStatusMessage {
+        if let relayIdentityWarning = hubManager.relayIdentityMenuMessage {
             let relayIdentityItem = NSMenuItem(
                 title: "⚠️ \(relayIdentityWarning)",
-                action: nil,
+                action: #selector(openSecuritySettings),
                 keyEquivalent: ""
             )
-            relayIdentityItem.isEnabled = false
+            relayIdentityItem.target = self
             statusMenu.addItem(relayIdentityItem)
         }
 
@@ -885,6 +885,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func openRecordingSettings() { settingsWindowController.showRecording() }
+    @objc private func openSecuritySettings() { settingsWindowController.showSecurity() }
     @objc private func openDictationSettings() { settingsWindowController.showDictation() }
     @objc private func toggleFloatingCaptions() { recordingManager.transcription.toggleFloatingCaptions() }
     @objc private func toggleAudioRecording() {
