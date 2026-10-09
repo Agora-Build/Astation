@@ -1,6 +1,6 @@
 # Relay Identity and Durable Pairing
 
-Reviewed on 2026-10-08 against `main` at `b2db3cc`. Relay identity is
+Reviewed on 2026-10-08 against `main` at `5460de4`. Relay identity is
 implemented, built, tested, and deployed. Remaining work lives in the
 [current agent handoff](agent-handoff.md). This document preserves the
 protocol and operational references from the original implementation handoff.
@@ -33,12 +33,18 @@ Implementation: `Sources/Menubar/RelayIdentityKey.swift`.
   includes `.privateKeyUsage`.
 - Generate a new key only when the Keychain item does not exist. Read errors,
   an unavailable Secure Enclave for an existing key, and undecodable material
-  leave the stored item untouched.
+  leave the stored item untouched. Settings > Security can repair an unusable
+  key after device-owner authentication and confirmation, using an atomic
+  update that refuses to replace a key that has become readable.
 - Preload off the main queue before answering challenges. The challenge path
   uses the cached key; a challenge received while loading waits for the result.
 
 The Account Recovery Kit preserves the ID and relay URL, not this signing
 key. Account-data encryption uses a separate key and recovery format.
+Temporary key-access failures have bounded noninteractive retries; denied,
+cancelled, or permanent failures require explicit retry or repair.
+See [device key recovery](relay-device-key-recovery.md) for the recovery
+pause, trust recovery, and administrator coordination implemented in PR #36.
 
 ## Base protocol: relay-auth-1
 
@@ -105,6 +111,9 @@ failures. Missing CFNetwork close codes use the prior verification state.
 Successful verification resets the failure count and resynchronizes sessions.
 Callbacks and outbound routing check the current socket, so replaced sockets
 cannot continue handling traffic.
+Recovery saves a pause before replacing or resetting trust in the local key.
+It survives relaunch, remains active after rejection, and clears only after
+`registered` or `verified` for that recovery operation.
 
 Settings > Security provides removal of another offline device registered
 under the same Agora account. Relay removal revokes its signing identity and
