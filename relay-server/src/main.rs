@@ -21,6 +21,9 @@ mod web;
 #[cfg(test)]
 mod redis_multi_replica_tests;
 
+#[cfg(test)]
+mod test_database;
+
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::IntoResponse;
@@ -389,11 +392,21 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
+// Embedded in the binary so container environment changes cannot mask a stale build.
+const BUILD_COMMIT: &str = match option_env!("ASTATION_BUILD_COMMIT") {
+    Some(commit) if !commit.is_empty() => commit,
+    _ => "unknown",
+};
+
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     if state.relay.is_draining() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "status": "draining" })),
+            Json(serde_json::json!({
+                "status": "draining",
+                "version": env!("CARGO_PKG_VERSION"),
+                "build_commit": BUILD_COMMIT,
+            })),
         );
     }
     let redis = state.relay.redis_status().await;
@@ -402,6 +415,8 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
             StatusCode::OK,
             Json(serde_json::json!({
                 "status": "ok",
+                "version": env!("CARGO_PKG_VERSION"),
+                "build_commit": BUILD_COMMIT,
                 "vault_store": state.vault.backend_name(),
                 "knowledge_store": state.knowledge.backend_name(),
                 "redis": redis,
@@ -412,14 +427,20 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
             tracing::error!("Health check failed: Redis unavailable");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "status": "unhealthy", "redis": redis })),
+                Json(serde_json::json!({
+                    "status": "unhealthy", "redis": redis,
+                    "version": env!("CARGO_PKG_VERSION"), "build_commit": BUILD_COMMIT,
+                })),
             )
         }
         Err(error) => {
             tracing::error!("Health check failed: {}", error);
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "status": "unhealthy" })),
+                Json(serde_json::json!({
+                    "status": "unhealthy",
+                    "version": env!("CARGO_PKG_VERSION"), "build_commit": BUILD_COMMIT,
+                })),
             )
         }
     }
@@ -937,8 +958,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(
-            body.as_ref(),
-            br#"{"knowledge_store":"memory","redis":"disabled","replicas":1,"status":"ok","vault_store":"memory"}"#
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "knowledge_store": "memory", "redis": "disabled", "replicas": 1,
+                "status": "ok", "vault_store": "memory",
+                "version": env!("CARGO_PKG_VERSION"), "build_commit": BUILD_COMMIT,
+            })
         );
     }
 
@@ -972,7 +997,13 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(body.as_ref(), br#"{"redis":"unavailable","status":"unhealthy"}"#);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "redis": "unavailable", "status": "unhealthy",
+                "version": env!("CARGO_PKG_VERSION"), "build_commit": BUILD_COMMIT,
+            })
+        );
     }
 
     /// Runs `run_supervisor` with an injected exit; returns the task it
@@ -1109,7 +1140,13 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(body.as_ref(), br#"{"status":"draining"}"#);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "status": "draining",
+                "version": env!("CARGO_PKG_VERSION"), "build_commit": BUILD_COMMIT,
+            })
+        );
     }
 
     #[tokio::test]

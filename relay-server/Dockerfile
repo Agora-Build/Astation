@@ -17,8 +17,9 @@ COPY src/ src/
 # migrations/ is read at compile time by sqlx::migrate!("./migrations"),
 # so it must be present for the real build.
 COPY migrations/ migrations/
+ARG ASTATION_BUILD_COMMIT=unknown
 # Touch main.rs so cargo knows it changed (avoids "nothing to compile").
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && ASTATION_BUILD_COMMIT="$ASTATION_BUILD_COMMIT" cargo build --release
 
 FROM debian:bookworm-slim
 

@@ -1020,45 +1020,12 @@ pub(crate) mod tests {
     //   cargo test identity_store -- --ignored
     // docker rm -f id-test-pg
 
-    /// True only for a URL whose host is the local machine. The Pg harness
-    /// empties tables, so it refuses to touch anything else.
-    fn is_local_db_url(url: &str) -> bool {
-        let rest = match url.split_once("://") {
-            Some((scheme, rest)) if scheme == "postgres" || scheme == "postgresql" => rest,
-            _ => return false,
-        };
-        let authority = rest.split(['/', '?']).next().unwrap_or("");
-        let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-        let host = if let Some(stripped) = hostport.strip_prefix('[') {
-            stripped.split(']').next().unwrap_or("")
-        } else {
-            hostport.split(':').next().unwrap_or("")
-        };
-        matches!(host, "localhost" | "127.0.0.1" | "::1")
-    }
+    use crate::test_database::{is_local_db_url, TestDatabase};
 
-    /// Pg tests share one database, so they run one at a time.
-    pub(crate) static PG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    /// Run the migrations, then empty the identity tables (local DB only).
-    pub(crate) async fn fresh_pg() -> PgIdentityStore {
-        let url = std::env::var("IDENTITY_TEST_DATABASE_URL")
-            .expect("set IDENTITY_TEST_DATABASE_URL to run the Postgres tests");
-        assert!(
-            is_local_db_url(&url),
-            "IDENTITY_TEST_DATABASE_URL must point at localhost; the tests empty tables"
-        );
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(20)
-            .connect(&url)
-            .await
-            .expect("connect IDENTITY_TEST_DATABASE_URL");
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        sqlx::query("TRUNCATE astation_keys, session_bindings")
-            .execute(&pool)
-            .await
-            .unwrap();
-        PgIdentityStore::new(pool)
+    pub(crate) async fn fresh_pg() -> (TestDatabase, PgIdentityStore) {
+        let database = TestDatabase::migrated("IDENTITY_TEST_DATABASE_URL", 20).await;
+        let store = PgIdentityStore::new(database.pool.clone());
+        (database, store)
     }
 
     macro_rules! pg_tests {
@@ -1069,53 +1036,47 @@ pub(crate) mod tests {
                     #[tokio::test]
                     #[ignore]
                     async fn $name() {
-                        let _g = PG_LOCK.lock().await;
-                        let s = fresh_pg().await;
+                        let (database, s) = fresh_pg().await;
                         scenarios::$name(&s).await;
+                        database.cleanup().await;
                     }
                 )*
 
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 #[ignore]
                 async fn concurrent_tofu_has_one_winner() {
-                    let _g = PG_LOCK.lock().await;
-                    let s = fresh_pg().await;
+                    let (database, s) = fresh_pg().await;
                     scenarios::concurrent_tofu_has_one_winner(Arc::new(s)).await;
+                    database.cleanup().await;
                 }
 
                 #[tokio::test]
                 #[ignore]
                 async fn pg_backend_name() {
-                    let _g = PG_LOCK.lock().await;
-                    let s = fresh_pg().await;
+                    let (database, s) = fresh_pg().await;
                     assert_eq!(s.backend_name(), "postgres");
+                    database.cleanup().await;
                 }
 
                 /// Bindings and keys outlive the store instance (a relay restart).
                 #[tokio::test]
                 #[ignore]
                 async fn pg_state_survives_new_store() {
-                    let _g = PG_LOCK.lock().await;
-                    let s = fresh_pg().await;
+                    let (database, s) = fresh_pg().await;
                     s.register_key_if_absent(A, KEY1, T0).await.unwrap();
                     s.bind("s1", A, T0).await.unwrap();
-                    let url = std::env::var("IDENTITY_TEST_DATABASE_URL").unwrap();
-                    let pool = sqlx::postgres::PgPoolOptions::new()
-                        .max_connections(2)
-                        .connect(&url)
-                        .await
-                        .unwrap();
+                    let pool = database.reconnect(2).await;
                     let s2 = PgIdentityStore::new(pool);
                     assert_eq!(s2.get_key(A).await.unwrap().as_deref(), Some(KEY1));
                     assert_eq!(s2.resolve("s1", T0 + 1).await.unwrap().as_deref(), Some(A));
+                    database.cleanup().await;
                 }
 
                 /// `touch_key` writes `last_verified_at` (not observable via the trait).
                 #[tokio::test]
                 #[ignore]
                 async fn pg_touch_key_updates_last_verified() {
-                    let _g = PG_LOCK.lock().await;
-                    let s = fresh_pg().await;
+                    let (database, s) = fresh_pg().await;
                     s.register_key_if_absent(A, KEY1, T0).await.unwrap();
                     s.touch_key(A, T0 + 99).await.unwrap();
                     let (reg, ver): (i64, i64) = sqlx::query_as(
@@ -1126,6 +1087,7 @@ pub(crate) mod tests {
                     .await
                     .unwrap();
                     assert_eq!((reg, ver), (T0, T0 + 99));
+                    database.cleanup().await;
                 }
             }
         };

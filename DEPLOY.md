@@ -74,8 +74,12 @@ the health wait right after a trigger can pass against the old, still-healthy
 container while the new one is still starting. On other platforms rely on the
 platform's own rolling deploy and health check (it keeps the old container
 until the new one passes `/health`), or use a hook that returns only once the
-deploy is done. A possible improvement: have `/health` report the running
-commit, so the workflow can wait until that relay serves this run's commit.
+deploy is done. `/health` reports the running commit, and the final workflow
+check requires the commit built by this run. Intermediate health waits do not
+require it because old and new replicas coexist during a rolling deploy.
+A public health request identifies only the replica that answers; it cannot
+prove that every replica has updated. Coolify deployment completion remains
+the per-application rollout check.
 
 `RELAY_DEPLOY_HOOKS` is required: if it is empty or unset the run fails
 before calling anything. One relay is one line.
@@ -101,7 +105,8 @@ finish:
 2. the webapp;
 3. the final check: public HTTPS, a healthy `/health` (Postgres knowledge
    store; Redis `ok` and at least `STATION_MIN_REPLICAS` live replicas when
-   those checks are switched on, see below), and an identity WebSocket
+   those checks are switched on, see below), the expected relay build commit,
+   and an identity WebSocket
    connection to `wss://station.agora.build/ws`.
 
 The workflow can also be run manually on `main` from GitHub Actions.
@@ -144,6 +149,16 @@ a single relay without Redis still deploys):
 Set both explicitly (`STATION_REQUIRE_REDIS=1`, `STATION_MIN_REPLICAS=2`) in
 the same change that adds relay-b. Otherwise a deploy can pass with Redis
 down or with a replica missing.
+
+The relay image embeds `ASTATION_BUILD_COMMIT` from the Docker build argument.
+Deploy and release workflows pass the full Git commit; manual image builds
+can use `docker build --build-arg ASTATION_BUILD_COMMIT="$(git rev-parse HEAD)" relay-server`.
+Without the argument, `/health` reports `build_commit: unknown`.
+The final deployment check sets `STATION_EXPECTED_COMMIT` from the workflow's
+commit automatically. For manual verification, this optional environment
+variable must be a full 40-character Git commit; a missing or different
+reported commit fails the check. Leave it unset for readiness-only checks
+during a rolling deploy.
 
 Runtime configuration:
 
@@ -189,13 +204,13 @@ Verification:
 # Node.js 22 or newer; checks HTTPS, relay health, and WebSocket upgrade.
 node .github/scripts/verify-station.mjs
 # The same checks as the deploy workflow with two relays:
-STATION_REQUIRE_REDIS=1 STATION_MIN_REPLICAS=2 node .github/scripts/verify-station.mjs
+STATION_REQUIRE_REDIS=1 STATION_MIN_REPLICAS=2 STATION_EXPECTED_COMMIT="$(git rev-parse HEAD)" node .github/scripts/verify-station.mjs
 # Just poll /health until it passes (what the workflow does after each relay):
 STATION_REQUIRE_REDIS=1 STATION_MIN_REPLICAS=2 node .github/scripts/verify-station.mjs --wait-health
 
 # What /health reports (any replica answers):
 curl -s https://station.agora.build/health
-# {"knowledge_store":"postgres","redis":"ok","replicas":2,"status":"ok","vault_store":"postgres"}
+# {"build_commit":"<full Git commit>","knowledge_store":"postgres","redis":"ok","replicas":2,"status":"ok","vault_store":"postgres","version":"0.1.0"}
 
 # Inspect deployment history in GitHub Actions.
 gh run list --workflow deploy-station.yml
@@ -219,6 +234,8 @@ pub/sub. Postgres stays the only durable store. Design:
 
 | Field / status | Meaning |
 | --- | --- |
+| `"version":"<package version>"` | Relay Cargo package version, included on healthy and unhealthy responses |
+| `"build_commit":"<full Git commit>"` | Commit embedded in the relay binary, or `unknown` when built without metadata; included on every response |
 | `"redis":"disabled"` | No `REDIS_URL`: in-memory mode, one replica |
 | `"redis":"ok"` | Valkey reachable |
 | `"replicas":<n>` | Live relay replicas as this replica last saw them: its cached copy of the `relay:replicas` presence index, refreshed every 10 s, so it can lag a change by up to 10 s (`1` in in-memory mode) |
