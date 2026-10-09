@@ -4872,7 +4872,7 @@ pub(crate) mod tests {
     /// authorizing them. Run with IDENTITY_TEST_DATABASE_URL (see identity_store).
     #[tokio::test]
     #[ignore]
-    async fn pg_bindings_survive_a_new_app_state() {
+    async fn postgres_bindings_survive_a_new_app_state() {
         let (database, store) = crate::identity_store::tests::fresh_pg().await;
         let state = identity_state(std::sync::Arc::new(store));
         let (base_url, server) = spawn_relay(state.clone()).await;

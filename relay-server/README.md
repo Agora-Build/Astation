@@ -320,7 +320,7 @@ docker run --rm -d --name relay-test-pg -e POSTGRES_PASSWORD=pw -p 127.0.0.1:554
 export IDENTITY_TEST_DATABASE_URL=postgres://postgres:pw@127.0.0.1:55433/postgres
 export KNOWLEDGE_TEST_DATABASE_URL="$IDENTITY_TEST_DATABASE_URL"
 export ACCOUNT_TEST_DATABASE_URL="$IDENTITY_TEST_DATABASE_URL"
-cargo test --locked -- --ignored --skip redis --test-threads=4
+cargo test --locked postgres -- --ignored --test-threads=4
 docker rm -f relay-test-pg
 # Redis suites (every Redis unit + two relays in one process) are #[ignore]d
 # too; CI runs them against a Valkey service. TEST_REDIS_URL must point at
@@ -338,6 +338,8 @@ the guard checks SQLx's parsed host, including query-string overrides. Successfu
 tests drop their own schemas. A failed assertion can leave its isolated schema
 for diagnosis; discard the test server afterward. CI runs all Postgres suites
 together with four test threads.
+Postgres test modules or names include `postgres`, so the CI selector runs
+these suites without including unrelated ignored tests.
 
 ### Load test
 

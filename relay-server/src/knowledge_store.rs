@@ -2346,7 +2346,7 @@ mod tests {
 
     macro_rules! pg_tests {
         ($($name:ident),* $(,)?) => {
-            mod pg {
+            mod postgres {
                 use super::*;
                 $(
                     #[tokio::test]
@@ -2420,7 +2420,7 @@ mod tests {
     /// only covers valid, undeleted rows.
     #[tokio::test]
     #[ignore]
-    async fn pg_migration_0004_backfills_deleted_at_and_drops_deleted() {
+    async fn postgres_migration_0004_backfills_deleted_at_and_drops_deleted() {
         use sqlx::Executor;
         let database = TestDatabase::new("KNOWLEDGE_TEST_DATABASE_URL", 2).await;
         let pool = database.pool.clone();

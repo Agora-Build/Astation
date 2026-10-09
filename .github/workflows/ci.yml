@@ -143,7 +143,7 @@ jobs:
           IDENTITY_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:55433/postgres
           KNOWLEDGE_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:55433/postgres
           ACCOUNT_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:55433/postgres
-        run: cargo test --locked -- --ignored --skip redis --test-threads=4
+        run: cargo test --locked postgres -- --ignored --test-threads=4
       - name: Run relay Redis (Valkey) suites
         working-directory: relay-server
         env:

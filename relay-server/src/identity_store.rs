@@ -1030,7 +1030,7 @@ pub(crate) mod tests {
 
     macro_rules! pg_tests {
         ($($name:ident),* $(,)?) => {
-            mod pg {
+            mod postgres {
                 use super::*;
                 $(
                     #[tokio::test]
