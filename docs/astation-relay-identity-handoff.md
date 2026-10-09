@@ -1,277 +1,150 @@
-# Handoff: Astation relay identity + durable pairing (macOS build)
+# Relay Identity and Durable Pairing
 
-**For:** an agent or developer on **macOS** with Xcode / Swift 5.9+. The Swift code
-below was written on a Linux machine with **no Swift toolchain**. It has been
-reviewed carefully by reading, but **it has never been compiled or run.** Your job
-is to build it, test it, verify it on a real Mac, and get it released **before**
-the relay is deployed.
+Reviewed on 2026-10-08 against `main` at `5460de4`. Relay identity is
+implemented, built, tested, and deployed. Remaining work lives in the
+[current agent handoff](agent-handoff.md). This document preserves the
+protocol and operational references from the original implementation handoff.
 
-Status as of 2026-09-30.
+## Purpose and current behavior
 
----
+Astation proves possession of a P-256 signing key before it can grant
+relay-side vault, memory, and skill access to pairing sessions. The verified
+Astation owns the pairing bindings; knowing its room code alone is insufficient
+to bind a session.
 
-## 1. Why this exists
+An identity with a registered key stays pending until its proof verifies.
+A wrong proof or a missed authentication deadline is rejected and closed.
+A keyless identity can relay in legacy mode, but cannot bind sessions until
+its first valid proof registers a key by trust on first use (TOFU). Thus
+"legacy mode" is not a fallback guarantee after failure of a registered key.
 
-The Station relay (`relay-server/`) never verified that a connecting Astation was
-genuine. Anyone who knew an Astation's room code (its `astation-<UUID>` id, which
-every paired atem stores in `~/.config/atem/config.toml` as `astation_relay_code`)
-could connect as that Astation and approve their own session. That gave them the
-account's **vault** and **Atem Memory** (memories + skills, and skills are
-auto-applied to coding agents). This was `relay-server/SECURITY.md` blocker #1.
+First-use and session-squatting risks are documented in the
+[relay security notes](../relay-server/SECURITY.md).
 
-Product rule (from the user): **Astation is the control plane.**
-- `atem login` unlocks only a limited set of functions.
-- Pairing with Astation unlocks the full set: vault, memory, skills and sync.
+## Signing key
 
-So Astation must *prove* its identity to the relay. The relay must then learn
-"which sessions belong to which Astation" **from the verified Astation**, durably.
+Implementation: `Sources/Menubar/RelayIdentityKey.swift`.
 
-### Decisions already made with the user
+- Prefer a Secure Enclave P-256 signing key, with software P-256 fallback
+  when creating a key.
+- Persist in Keychain service `build.agora.astation.relay-identity`,
+  account `astation-relay-key-v1`, using
+  `AfterFirstUnlockThisDeviceOnly`. The Secure Enclave access control
+  includes `.privateKeyUsage`.
+- Generate a new key only when the Keychain item does not exist. Read errors,
+  an unavailable Secure Enclave for an existing key, and undecodable material
+  leave the stored item untouched. Settings > Security can repair an unusable
+  key after device-owner authentication and confirmation, using an atomic
+  update that refuses to replace a key that has become readable.
+- Preload off the main queue before answering challenges. The challenge path
+  uses the cached key; a challenge received while loading waits for the result.
 
-- **Key:** a P-256 signing key held by Astation, in the Secure Enclave when
-  available and a software key otherwise, persisted via the Keychain.
-- **First registration:** trust-on-first-use (TOFU). The first key that proves
-  possession for an id is registered. A lost or replaced Mac needs an admin reset
-  on the relay.
-- **Old Astation versions:** they keep relaying chat and remote control, but only
-  a **verified** Astation can grant vault/memory access. Users must update.
-- **Bindings:** durable, stored in Postgres on the relay, and pushed by the
-  verified Astation. They survive relay restarts, cover local-only pairings,
-  are revoked when Astation removes a session, and slide on use (7 days).
+The Account Recovery Kit preserves the ID and relay URL, not this signing
+key. Account-data encryption uses a separate key and recovery format.
+Temporary key-access failures have bounded noninteractive retries; denied,
+cancelled, or permanent failures require explicit retry or repair.
+See [device key recovery](relay-device-key-recovery.md) for the recovery
+pause, trust recovery, and administrator coordination implemented in PR #36.
 
----
+## Base protocol: relay-auth-1
 
-## 2. Where the code is
+These are raw JSON text frames on the identity WebSocket:
+`wss://<relay>/ws?role=astation&code=<astation_id>`.
 
-| Repo / branch | What | Head |
-|---|---|---|
-| Astation `feat/relay-identity-swift` (this branch) | Swift: identity key + relay protocol + tests + CI step + this doc | `3050545` (+ this doc) |
-| Astation `feat/knowledge-sync` | Relay: knowledge-sync endpoints, identity store, proof-of-possession, docs. `feat/relay-identity-swift` was branched from it at `6e2f5d9` | `8729cb8`, relay work complete and reviewed |
-| Atem `feat/memory-pairing-auth` | atem client: sync via the pairing session, tier gates, docs | `46f86df` |
+Relay to Astation, immediately after the socket opens:
 
-Binding plan (all tasks, exact contract): `docs/knowledge-sync-plan.md`. The
-relevant part is "Extension: Astation proof-of-possession + durable pairing".
-When `feat/knowledge-sync` lands, `relay-server/README.md` documents the exact
-frames and acks.
-
----
-
-## 3. The protocol (exact — the relay depends on it)
-
-All frames are JSON text on the existing **relay identity WebSocket**
-(`wss://<relay>/ws?role=astation&code=<astation_id>`).
-
-**Relay → Astation.** Sent raw, immediately after the socket opens:
 ```json
 {"type":"relayAuthChallenge","protocol":"relay-auth-1","challenge":"<64 lowercase hex>"}
 ```
 
-**Astation → relay.** The relay intercepts these and never forwards them to
-Atems:
+Astation to relay:
+
 ```json
 {"type":"relayAuth","astation_id":"<room code>","public_key":"<hex>","signature":"<hex>"}
 ```
-- `public_key`: P-256 **X9.63 uncompressed**, 65 bytes, lowercase hex (130
-  chars, starts with `04`).
-- `signature`: ECDSA over SHA-256, **DER** encoded, lowercase hex.
-- Signed message: the UTF-8 string `station-relay-auth-v1\n<challenge>\n<astation_id>`.
-  `astation_id` must equal the room `code` of this socket.
-- The relay verifies with `ring` `ECDSA_P256_SHA256_ASN1`.
 
-**Relay → Astation:**
+The relay intercepts this frame instead of forwarding it to Atems.
+
+- `astation_id` must equal the socket's room code.
+- `public_key` is the X9.63 uncompressed P-256 key: 65 bytes, lowercase hex
+  (130 characters, starting with `04`).
+- `signature` is DER-encoded ECDSA P-256/SHA-256 over the exact UTF-8 message
+  `station-relay-auth-v1\n<challenge>\n<astation_id>`.
+- The authentication deadline is 10 seconds. Field names, encodings, signing
+  domain, and Keychain names are compatibility contracts.
+
+Relay to Astation:
+
 ```json
 {"type":"relayAuthResult","status":"registered|verified|rejected","message":"<text>"}
 ```
 
-**Only after `registered` or `verified`,** Astation → relay:
+Only after `registered` or `verified`, Astation may send:
+
 ```json
-{"type":"relaySessions","sessions":["<session_id>", …]}   // full resync, sent after every successful verification (≤ 1000 ids)
-{"type":"relayBind","session_id":"<id>"}                  // a session was granted (any path)
-{"type":"relayUnbind","session_id":"<id>"}                // a session was deleted or expired
+{"type":"relaySessions","sessions":["<session_id>"]}
+{"type":"relayBind","session_id":"<id>"}
+{"type":"relayUnbind","session_id":"<id>"}
 ```
 
-**Relay → Astation ack:**
+`relaySessions` resynchronizes all active sessions after each successful
+verification (at most 1,000 IDs). Grant hooks bind relay, LAN, and loopback
+sessions; removal and expiry hooks unbind them. Postgres bindings survive
+relay restarts and slide on use for seven days.
+
+The relay acknowledges each operation:
+
 ```json
-{"type":"relayAck","for":"relaySessions|relayBind|relayUnbind","ok":true|false, …}
+{"type":"relayAck","for":"relaySessions|relayBind|relayUnbind","ok":true}
 ```
-Astation only checks `ok`.
 
-**Relay rules you'll observe:**
-- The challenge must be answered within **10 s**. A wrong or missing proof for
-  a registered id gets `rejected`, and the socket is closed.
-- A registered id's new connection is **pending**. It does not replace the
-  current owner or receive Atem traffic until it verifies.
-- Ids with no registered key stay in **legacy mode**: relaying works, but no
-  bindings are possible.
+Failed acknowledgements use `ok: false` and may include `message`.
+Account grouping and encryption add control frames; their encoders/parsers
+are in `RelayIdentityKey.swift`, with relay handlers in
+`relay-server/src/relay.rs`.
 
----
+## Reconnection and revocation
 
-## 4. What the Swift change does (`feat/relay-identity-swift`)
+`IdentityRelayReconnectPolicy.swift` supplies prompt, bounded retry after
+1012 service restart and jittered exponential backoff after 1013 or ordinary
+failures. Missing CFNetwork close codes use the prior verification state.
+Successful verification resets the failure count and resynchronizes sessions.
+Callbacks and outbound routing check the current socket, so replaced sockets
+cannot continue handling traffic.
+Recovery saves a pause before replacing or resetting trust in the local key.
+It survives relaunch, remains active after rejection, and clears only after
+`registered` or `verified` for that recovery operation.
 
-**Files:**
-- `Sources/Menubar/RelayIdentityKey.swift` (new):
-  - Loads or creates the key.
-  - Keychain generic password: service `build.agora.astation.relay-identity`,
-    account `astation-relay-key-v1`, accessible `AfterFirstUnlockThisDeviceOnly`.
-  - Prefers a Secure Enclave key (`SecureEnclave.P256.Signing.PrivateKey`),
-    created with access control `AfterFirstUnlockThisDeviceOnly` +
-    `.privateKeyUsage` so it can sign while the screen is locked. Falls back to
-    a software `P256.Signing.PrivateKey`.
-  - **A new key is generated ONLY when no Keychain item exists.** If an item
-    exists but can't be decoded, loading throws `.undecodableStoredKey`, logs the
-    cause, and **never overwrites**. Overwriting a TOFU-registered key would lock
-    the Astation out permanently.
-  - Provides `publicKeyHex`, `sign(challenge:astationId:)`, and
-    `static signingMessage(challenge:astationId:)`.
-- `Sources/Menubar/AstationHubManager.swift`:
-  - The key is preloaded once on a background queue when the identity relay
-    starts. There is **no Keychain work** in the 10 s challenge window.
-  - It handles raw `relayAuthChallenge` / `relayAuthResult` / `relayAck` frames
-    on the identity socket (frames without `atem_id`/`connection_id` and with a
-    known `type`). Atem traffic handling is unchanged.
-  - On `registered`/`verified` it marks the socket verified and sends
-    `relaySessions` from `SessionStore.getAllActive()`.
-  - On `rejected` or a key-load failure it stays in legacy mode and shows a menu
-    status:
-    - "Relay rejected this Astation's key"
-    - "Relay identity key unreadable — relay works, vault/memory unavailable"
-  - Frames from a replaced socket are ignored, and the verified state resets on
-    disconnect.
-- `Sources/Menubar/SessionStore.swift`: grant hooks (`create`, `authenticate`,
-  `createOrRefreshLocal`) → `relayBind`. Delete and expiry → `relayUnbind`,
-  plus an hourly sweep. Hooks fire on main, outside the store's barrier. This
-  covers relay, LAN and local/loopback pairing in one place.
-- `Tests/AstationTests/RelayIdentityTests.swift` (new): 17 tests covering:
-  - the signing-message format and hex;
-  - sign → verify with a software key;
-  - load/create with fake storage, including "never replaces an undecodable
-    stored key";
-  - the four outbound message JSONs;
-  - relay message parsing;
-  - the SessionStore bind/unbind hooks.
-- `.github/workflows/ci.yml`: adds `swift test --filter RelayIdentityTests`
-  after the Swift build. **This is the first time CI runs `swift test`**, so the
-  whole existing test target must now compile and link.
+Settings > Security provides removal of another offline device registered
+under the same Agora account. Relay removal revokes its signing identity and
+sessions, announces the key change to replicas, and disconnects its socket.
+This differs from a recovery reset: removal prevents TOFU re-registration.
 
-**APIs that were never compiled (check these first if the build fails):**
-- **CryptoKit:**
-  - `SecureEnclave.isAvailable`
-  - `SecureEnclave.P256.Signing.PrivateKey(accessControl:)` and `(dataRepresentation:)`, plus `.dataRepresentation`
-  - `P256.Signing.PrivateKey()` and `(rawRepresentation:)`
-  - `.publicKey.x963Representation`
-  - `.signature(for:)` → `.derRepresentation`
-  - `P256.Signing.PublicKey(x963Representation:)` / `ECDSASignature(derRepresentation:)` / `isValidSignature(_:for:)` (tests)
-- **Security:** `SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly, .privateKeyUsage, nil)`, `SecItemAdd`, `SecItemCopyMatching`, `SecItemDelete`.
-- **Tests:** `@testable import Menubar` and XCTest.
+For a lost or replaced Mac, use the [admin-reset runbook](../DEPLOY.md) and
+`station-relay-server admin forget-key <astation_id>`. With `REDIS_URL`,
+the reset evicts cached keys and disconnects the verified socket across
+replicas. A reset retains bindings and reopens TOFU; coordinate the replacement
+Mac's connection because the first valid key to reconnect registers.
+Use the runbook rather than the old handoff's SQL-only reset instructions.
 
----
+## Verification entry points
 
-## 5. Your tasks (macOS)
+On macOS, after building the C++ core as described in
+[README.md](../README.md):
 
-### 5.1 Build and unit-test
 ```bash
-git fetch && git checkout feat/relay-identity-swift
-swift build -c release
-swift test --filter RelayIdentityTests
-swift test                      # whole target — see note
+swift test --filter "RelayIdentityTests|IdentityRelayReconnectPolicyTests|DeviceAuthenticationTests|RecoveryKitTests"
 ```
-- **Fix compile errors without changing the protocol** (§3): no field names,
-  encodings, the signed-message string, or the Keychain names.
-- If unrelated pre-existing tests in `AstationTests` fail to compile or run,
-  don't delete them. Fix them if trivial. Otherwise report them and keep the CI
-  step scoped to `RelayIdentityTests`.
 
-### 5.2 Run a local relay to test against
-Checkout `feat/knowledge-sync` (in another directory or a worktree):
+For relay unit and WebSocket tests:
+
 ```bash
-docker run --rm -d --name station-pg -e POSTGRES_PASSWORD=pw -p 55432:5432 postgres:16
-cd relay-server
-DATABASE_URL=postgres://postgres:pw@localhost:55432/postgres cargo run --release
-# relay listens on :3000 (check main.rs / README for the port)
+cargo test --manifest-path relay-server/Cargo.toml
 ```
-Point Astation at it: `ASTATION_RELAY_URL=http://127.0.0.1:3000 swift run astation`,
-or set the relay URL in Settings.
 
-### 5.3 Manual verification checklist (on a real Mac)
-1. **First connect:** the relay logs `registered`; `SELECT * FROM astation_keys;` shows one row whose `public_key` equals the app's key.
-2. **Restart Astation:** the relay logs `verified`, and the same key is reused (no new row, no Keychain prompt loop).
-3. **Pair an atem** (`atem pair`, relay path) and pair one locally: `SELECT * FROM session_bindings;` lists both sessions, including the local-only pairing.
-4. **Durability:** restart the relay (keep Postgres). With **no** atem TUI running, `atem memory add "test fact" && atem sync` and `atem vault list` succeed (no 401).
-5. **Revocation:** let a session expire, or remove it, and confirm the binding disappears and that atem gets 401.
-6. **Locked screen:** lock the Mac, restart the relay, wait more than 30 s, unlock. While it was locked the Astation should have reconnected and verified (check the relay log). Relay chat and remote control must keep working.
-7. **Rejection UI:** `DELETE FROM astation_keys` and insert a different key for this id. Astation gets `rejected`, shows "Relay rejected this Astation's key", and relaying falls back to legacy. Then restore it (admin reset = `DELETE FROM astation_keys WHERE astation_id='<id>'`, and the next connect re-registers).
-8. **Keychain:** after re-signing or rebuilding the app, note any "Astation wants to use confidential information" prompt. Denying it must leave legacy mode, and the stored key must not be overwritten.
-9. **Old relay compatibility:** point the new Astation at the current production relay (`https://station.agora.build`). Everything must work exactly as before. The new code only reacts to `relayAuthChallenge`, which the old relay never sends.
-
-### 5.4 Integrate
-- Merge `feat/relay-identity-swift` into `feat/knowledge-sync`, or open a PR from
-  it, so the Astation PR contains relay and Swift together. The PR's macOS CI
-  (`ci.yml`) must be green.
-- Report back: build fixes made, checklist results, and any deviations.
-
-### 5.5 Release (needs the user's go-ahead: it's a public release)
-- Releases build from a pushed tag matching `v*` (`.github/workflows/release.yml`).
-- **The Astation release must ship BEFORE the relay deploy** (§6).
-
----
-
-## 6. Deployment order (important)
-
-1. **Ship the Astation update first.** It is inert against the old relay.
-2. Users install and launch it. With the old relay it behaves exactly as before.
-3. **Then deploy the relay** by merging `feat/knowledge-sync` to Astation `main`.
-   `deploy-station.yml` builds GHCR images, deploys relay + webapp via Coolify,
-   and verifies `/health` (it now requires `knowledge_store: "postgres"`) and a
-   raw `role=astation` WebSocket open.
-4. The relay restart makes updated Astations reconnect and **register within
-   seconds**. That closes the TOFU window, where someone who knows a room code
-   could register first.
-5. Un-updated Astations keep relaying but can't grant vault/memory. atem shows:
-   "The relay doesn't recognize this machine's Astation session. Make sure your
-   Astation (latest version) is running and connected to the relay, then sync
-   again. Changes stay queued."
-
-**Rollback caveat:** a relay binary built before migration `0003` fails to start
-against a DB that has it (sqlx `VersionMissing`).
-
-**Admin reset** (lost or replaced Mac):
-`DELETE FROM astation_keys WHERE astation_id = '<id>';`. The next verified
-connect registers the new key. The relay caches keys in memory, so for a
-**stolen Mac** restart the relay right after the DELETE; otherwise the old key
-keeps verifying. Even then the id is keyless until the new Mac connects, and
-whoever connects first registers by TOFU. So have the replacement Mac online
-when you reset. Key pinning is a follow-up. The key cache assumes a single
-relay instance.
-
----
-
-## 7. Known limitations and follow-ups (not blockers)
-
-- No in-app "revoke device" action. Revocation currently happens through session
-  expiry (Astation's 7-day window). The relay's binding expiry slides on use
-  independently.
-- A failed key load is retried on every reconnect, about every 30 s. For a legacy
-  (file) Keychain ACL prompt this could re-prompt. Consider backing off, or not
-  retrying `.undecodableStoredKey`.
-- No in-app recovery for an undecodable key. The manual path is to delete the
-  Keychain item (`security delete-generic-password -s build.agora.astation.relay-identity -a astation-relay-key-v1`)
-  and then do a relay admin reset.
-- The menu text says "unreadable" for every key-load failure, including transient
-  ones.
-- Session squatting remains a residual risk: a verified Astation that learns
-  another Astation's UUIDv4 session id before its owner binds it could claim it.
-  It needs prior knowledge of that session id.
-- Relay-side follow-ups: per-IP rate limits on `/ws`, and isolating each Postgres
-  test harness in its own schema.
-
----
-
-## 8. Contract checklist for reviewers
-
-- [ ] The §3 JSON field names, types, lowercase hex, the `protocol` value and the signed-message string are unchanged.
-- [ ] The Keychain service and account names are unchanged.
-- [ ] A stored key is never overwritten.
-- [ ] No Keychain I/O on main inside the challenge path.
-- [ ] `relayBind`/`relayUnbind` are only sent while verified. `relaySessions` is sent after every `registered`/`verified`.
-- [ ] Atem traffic handling is unchanged. The new code only reacts to known raw control `type`s.
-- [ ] The CI `swift test --filter RelayIdentityTests` step is green.
+See the [relay README](../relay-server/README.md) for the Valkey and Postgres
+test setup and a local two-relay environment. Keep failure, revocation, and
+restore experiments isolated from the user's production identity. The
+[current handoff](agent-handoff.md) lists the specific manual results still
+missing; completed build, integration, release, and rollout checklists are
+preserved in Git history and the task vault.
