@@ -11,6 +11,12 @@ and identifies the active store as `memory` or `postgres`. It also reports
 `redis` (`disabled`, `ok`, `unavailable`) and `replicas` (live relay replicas),
 and returns `503` while Redis is unreachable (`{"status":"unhealthy","redis":"unavailable"}`)
 or the relay is draining (`{"status":"draining"}`).
+Every response includes `version` (the Cargo package version) and
+`build_commit` (the full Git commit embedded at compile time, or `unknown`
+for builds without metadata). The deployment and release workflows set
+the Docker build argument `ASTATION_BUILD_COMMIT`; for a local Cargo build,
+set that environment variable when compiling. Changing a running container's
+environment does not change its reported commit.
 
 The relay runs as one instance with everything in memory, or, with
 `REDIS_URL`, as several replicas sharing rooms, sessions and rate limits
@@ -307,14 +313,15 @@ RUST_LOG=debug
 ## Testing
 
 ```bash
-cargo test  # unit + in-memory integration suites (auth, sessions, relay + relay identity, RTC, Voice, Vault, Knowledge sync, validation)
-# Postgres suites are #[ignore]d; run each against a throwaway local database:
-#   docker run --rm -d --name relay-test-pg -e POSTGRES_PASSWORD=pw -p 55433:5432 postgres:16
-#   IDENTITY_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test identity_store -- --ignored
-#   IDENTITY_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test relay:: -- --ignored
-#   KNOWLEDGE_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test knowledge_store -- --ignored
-#   ACCOUNT_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test postgres_merge_moves_all_data_atomically -- --ignored
-#   docker rm -f relay-test-pg
+cargo test --locked  # unit + in-memory integration suites
+# All Postgres suites are #[ignore]d; run them together on a disposable local server:
+docker run --rm -d --name relay-test-pg -e POSTGRES_PASSWORD=pw -p 127.0.0.1:55433:5432 postgres:16
+# Wait for Postgres readiness before running:
+export IDENTITY_TEST_DATABASE_URL=postgres://postgres:pw@127.0.0.1:55433/postgres
+export KNOWLEDGE_TEST_DATABASE_URL="$IDENTITY_TEST_DATABASE_URL"
+export ACCOUNT_TEST_DATABASE_URL="$IDENTITY_TEST_DATABASE_URL"
+cargo test --locked postgres -- --ignored --test-threads=4
+docker rm -f relay-test-pg
 # Redis suites (every Redis unit + two relays in one process) are #[ignore]d
 # too; CI runs them against a Valkey service. TEST_REDIS_URL must point at
 # localhost (the harness runs FLUSHDB):
@@ -322,6 +329,17 @@ cargo test  # unit + in-memory integration suites (auth, sessions, relay + relay
 #   TEST_REDIS_URL=redis://127.0.0.1:56379/ cargo test redis -- --ignored --test-threads=1
 #   docker rm -f relay-test-valkey
 ```
+
+Each Postgres test creates its own `relay_test_<uuid>` schema and sets that
+schema as its only search path, including reconnects. Tests can run concurrently
+without truncating or dropping shared tables. The configured user needs permission
+to create and drop schemas. All three URL variables must resolve to a local host;
+the guard checks SQLx's parsed host, including query-string overrides. Successful
+tests drop their own schemas. A failed assertion can leave its isolated schema
+for diagnosis; discard the test server afterward. CI runs all Postgres suites
+together with four test threads.
+Postgres test modules or names include `postgres`, so the CI selector runs
+these suites without including unrelated ignored tests.
 
 ### Load test
 

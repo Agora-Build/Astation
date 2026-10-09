@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 
-export function healthProblems(health, { minReplicas = 0, requireRedis = false } = {}) {
+export function healthProblems(health, { minReplicas = 0, requireRedis = false, expectedCommit = null } = {}) {
   const problems = [];
   if (health.status !== 'ok') problems.push(`relay status is ${health.status}`);
   // Atem Memory sync must be durable in production: an in-memory store
@@ -18,6 +18,9 @@ export function healthProblems(health, { minReplicas = 0, requireRedis = false }
   if (minReplicas > 0 && replicas < minReplicas) {
     problems.push(`relay reports ${replicas} live replica(s), expected at least ${minReplicas}`);
   }
+  if (expectedCommit && health.build_commit !== expectedCommit) {
+    problems.push(`relay build commit is ${health.build_commit ?? 'missing'}, expected ${expectedCommit}`);
+  }
   return problems;
 }
 
@@ -27,10 +30,15 @@ export function settingsFromEnv(env = process.env) {
   if (!Number.isInteger(minReplicas) || minReplicas < 0) {
     throw new Error(`STATION_MIN_REPLICAS must be a non-negative integer, got ${raw}`);
   }
+  const expectedCommit = env.STATION_EXPECTED_COMMIT?.trim().toLowerCase() || null;
+  if (expectedCommit && !/^[0-9a-f]{40}$/.test(expectedCommit)) {
+    throw new Error('STATION_EXPECTED_COMMIT must be a full 40-character Git commit');
+  }
   return {
     origin: env.STATION_URL || 'https://station.agora.build',
     minReplicas,
     requireRedis: env.STATION_REQUIRE_REDIS === '1',
+    expectedCommit,
   };
 }
 
@@ -45,6 +53,7 @@ export async function waitForHealth({
   origin,
   minReplicas,
   requireRedis,
+  expectedCommit = null,
   fetchImpl = fetch,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   log = console.log,
@@ -55,10 +64,10 @@ export async function waitForHealth({
     try {
       const { ok, status, health } = await fetchHealth(origin, fetchImpl);
       const problems = ok
-        ? healthProblems(health, { minReplicas, requireRedis })
+        ? healthProblems(health, { minReplicas, requireRedis, expectedCommit })
         : [`/health returned HTTP ${status}`];
       if (problems.length === 0) {
-        log(`Relay healthy: redis ${health.redis ?? 'n/a'}, ${health.replicas ?? 'n/a'} live replica(s)`);
+        log(`Relay healthy: redis ${health.redis ?? 'n/a'}, ${health.replicas ?? 'n/a'} live replica(s), build ${health.build_commit ?? 'unknown'}`);
         return health;
       }
       last = problems.join('; ');
@@ -71,17 +80,18 @@ export async function waitForHealth({
   throw new Error(`Relay did not become healthy: ${last}`);
 }
 
-export async function verifyStation({ origin, minReplicas, requireRedis }) {
+export async function verifyStation({ origin, minReplicas, requireRedis, expectedCommit = null }) {
   for (const path of ['/', '/health']) {
     const response = await fetch(new URL(path, origin), { signal: AbortSignal.timeout(30_000) });
     if (!response.ok) throw new Error(`${path} returned HTTP ${response.status}`);
     if (path === '/health') {
       const health = await response.json();
-      const problems = healthProblems(health, { minReplicas, requireRedis });
+      const problems = healthProblems(health, { minReplicas, requireRedis, expectedCommit });
       if (problems.length) throw new Error(`Relay health: ${problems.join('; ')}`);
       console.log(
         `Relay health: ${health.status}; vault store: ${health.vault_store}; ` +
-          `knowledge store: ${health.knowledge_store}; redis: ${health.redis ?? 'n/a'}; replicas: ${health.replicas ?? 'n/a'}`,
+          `knowledge store: ${health.knowledge_store}; redis: ${health.redis ?? 'n/a'}; replicas: ${health.replicas ?? 'n/a'}; ` +
+          `version: ${health.version ?? 'unknown'}; build: ${health.build_commit ?? 'unknown'}`,
       );
     } else if (!(await response.text()).toLowerCase().includes('<!doctype html>')) {
       throw new Error('Station did not return the webapp HTML');

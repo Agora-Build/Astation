@@ -1948,57 +1948,15 @@ mod tests {
         );
     }
 
-    fn is_local_db_url(url: &str) -> bool {
-        let rest = match url.split_once("://") {
-            Some((scheme, rest)) if scheme == "postgres" || scheme == "postgresql" => rest,
-            _ => return false,
-        };
-        let authority = rest.split(['/', '?']).next().unwrap_or("");
-        let hostport = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
-        let host = if let Some(stripped) = hostport.strip_prefix('[') {
-            stripped.split(']').next().unwrap_or("")
-        } else {
-            hostport.split(':').next().unwrap_or("")
-        };
-        matches!(host, "localhost" | "127.0.0.1" | "::1")
-    }
-
-    async fn reset_account_test_database(pool: &sqlx::PgPool) {
-        for statement in [
-            "DROP TABLE IF EXISTS data_account_encryption",
-            "DROP TABLE IF EXISTS account_merge_requests",
-            "DROP TABLE IF EXISTS astation_accounts",
-            "DROP TABLE IF EXISTS session_bindings",
-            "DROP TABLE IF EXISTS astation_keys",
-            "DROP TABLE IF EXISTS vault_entries",
-            "DROP TABLE IF EXISTS vaults",
-            "DROP TABLE IF EXISTS memories",
-            "DROP TABLE IF EXISTS skill_versions",
-            "DROP SEQUENCE IF EXISTS knowledge_seq",
-            "DROP TABLE IF EXISTS _sqlx_migrations",
-        ] {
-            sqlx::query(statement).execute(pool).await.unwrap();
-        }
-        sqlx::migrate!("./migrations").run(pool).await.unwrap();
-    }
+    use crate::test_database::TestDatabase;
 
     /// Exercises the transactional path that cannot be represented by the
     /// separate in-memory knowledge and vault stores.
     #[tokio::test]
     #[ignore]
     async fn postgres_merge_moves_all_data_atomically() {
-        let url = std::env::var("ACCOUNT_TEST_DATABASE_URL")
-            .expect("set ACCOUNT_TEST_DATABASE_URL to run the Postgres account test");
-        assert!(
-            is_local_db_url(&url),
-            "ACCOUNT_TEST_DATABASE_URL must point at localhost; the test empties tables"
-        );
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&url)
-            .await
-            .expect("connect ACCOUNT_TEST_DATABASE_URL");
-        reset_account_test_database(&pool).await;
+        let database = TestDatabase::migrated("ACCOUNT_TEST_DATABASE_URL", 4).await;
+        let pool = database.pool.clone();
 
         let store = PgAccountStore::new(pool.clone());
         store.register("a", "user-1", "Mac A", 1).await.unwrap();
@@ -2187,29 +2145,19 @@ mod tests {
                 .unwrap();
         assert_eq!(stored_key, REVOKED_PUBLIC_KEY);
         assert_eq!(store.resolve_data_account("a").await.unwrap(), outcome.data_account);
+        database.cleanup().await;
     }
 
     /// Covers the durable state machine and its shared advisory-lock barrier.
-    /// The URL must be an isolated local-forwarded database because this test
-    /// recreates the relay schema.
+    /// Each run owns an isolated schema on the configured local database.
     #[tokio::test]
     #[ignore]
     async fn postgres_encryption_transitions_and_write_barrier() {
         use base64::Engine;
         use tokio::time::{timeout, Duration};
 
-        let url = std::env::var("ACCOUNT_TEST_DATABASE_URL")
-            .expect("set ACCOUNT_TEST_DATABASE_URL to run the Postgres encryption test");
-        assert!(
-            is_local_db_url(&url),
-            "ACCOUNT_TEST_DATABASE_URL must point at localhost; the test empties tables"
-        );
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(6)
-            .connect(&url)
-            .await
-            .expect("connect ACCOUNT_TEST_DATABASE_URL");
-        reset_account_test_database(&pool).await;
+        let database = TestDatabase::migrated("ACCOUNT_TEST_DATABASE_URL", 6).await;
+        let pool = database.pool.clone();
 
         let accounts = PgAccountStore::new(pool.clone());
         let knowledge = PgKnowledgeStore::new(pool.clone());
@@ -2382,5 +2330,6 @@ mod tests {
             vault.append("a", &vault_id, "atem", &envelope(kid2)).await,
             Err(VaultError::EncryptionConflict)
         ));
+        database.cleanup().await;
     }
 }
