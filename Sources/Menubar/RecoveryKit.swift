@@ -1,5 +1,6 @@
 import Foundation
 import LocalAuthentication
+import Darwin
 
 /// What a user saves off this Mac to get the Astation account back on another
 /// one: the Astation ID (the account the relay files memory, skills and vaults
@@ -9,6 +10,13 @@ import LocalAuthentication
 struct RecoveryKit: Equatable {
     let astationId: String
     let relayURL: String
+    let recoveryKey: String?
+
+    init(astationId: String, relayURL: String, recoveryKey: String? = nil) {
+        self.astationId = astationId
+        self.relayURL = relayURL
+        self.recoveryKey = recoveryKey
+    }
 
     static let idPrefix = "astation-"
     private static let idLabel = "Astation ID:"
@@ -34,7 +42,7 @@ struct RecoveryKit: Equatable {
     /// The text the user saves (password manager, file, paper).
     func text(createdAt: Date = Date()) -> String {
         let date = ISO8601DateFormatter.string(from: createdAt, timeZone: TimeZone(identifier: "UTC")!, formatOptions: [.withFullDate])
-        return """
+        let text = """
         Astation recovery kit
         Keep this somewhere off this Mac, for example in a password manager.
         On a new Mac: Astation Settings → Security → Restore Account…
@@ -43,6 +51,7 @@ struct RecoveryKit: Equatable {
         \(Self.relayLabel) \(relayURL)
         Created: \(date)
         """
+        return recoveryKey.map { text + "\nRecovery key: " + $0 } ?? text
     }
 
     /// Reads a kit back from its saved text, or from the bare ID pasted on its
@@ -50,6 +59,7 @@ struct RecoveryKit: Equatable {
     static func parse(_ text: String) -> RecoveryKit? {
         var id: String?
         var relay: String?
+        var recovery: String?
         for raw in text.split(whereSeparator: \.isNewline) {
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.hasPrefix(idLabel) {
@@ -58,6 +68,13 @@ struct RecoveryKit: Equatable {
             } else if line.hasPrefix(relayLabel) {
                 guard relay == nil else { return nil }
                 relay = line.dropFirst(relayLabel.count).trimmingCharacters(in: .whitespaces)
+            } else if line.hasPrefix("Recovery key:") {
+                guard recovery == nil else { return nil }
+                let value = line.dropFirst("Recovery key:".count).trimmingCharacters(in: .whitespaces)
+                let compact = value.filter { $0 != "-" }
+                guard compact.count == 52, compact.allSatisfy({ "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".contains($0) }),
+                      compact.last == "A" || compact.last == "Q" else { return nil }
+                recovery = value
             }
         }
         if id == nil {
@@ -72,27 +89,33 @@ struct RecoveryKit: Equatable {
         } else {
             normalizedRelay = ""
         }
-        return RecoveryKit(astationId: canonicalId, relayURL: normalizedRelay)
+        return RecoveryKit(astationId: canonicalId, relayURL: normalizedRelay, recoveryKey: recovery)
     }
 
     /// Writes sensitive recovery material and fails closed if the resulting
     /// file cannot be restricted to the current user.
     static func save(_ text: String, to url: URL) throws {
-        do {
-            try text.write(to: url, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: url.path
-            )
-            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-            guard let permissions = attributes[.posixPermissions] as? NSNumber,
-                  permissions.intValue & 0o777 == 0o600 else {
-                throw CocoaError(.fileWriteNoPermission)
+        let temporary = url.deletingLastPathComponent().appendingPathComponent(".astation-recovery-" + UUID().uuidString)
+        let descriptor = open(temporary.path, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0o600)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        defer { close(descriptor); unlink(temporary.path) }
+        guard fchmod(descriptor, 0o600) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        // Restrict the temporary file before writing any recovery secret, then replace atomically.
+        try Data(text.utf8).withUnsafeBytes { bytes in
+            var offset = 0
+            while offset < bytes.count {
+                let count = Darwin.write(descriptor, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+                if count < 0 && errno == EINTR { continue }
+                guard count > 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                offset += count
             }
-        } catch {
-            try? FileManager.default.removeItem(at: url)
-            throw error
         }
+        guard fsync(descriptor) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        var attributes = stat()
+        guard fstat(descriptor, &attributes) == 0, attributes.st_mode & 0o777 == 0o600 else {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        guard rename(temporary.path, url.path) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
     }
 
     /// `astation-4630…7279625`: enough to recognize the account, shown

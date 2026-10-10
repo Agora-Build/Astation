@@ -104,14 +104,12 @@ final class DataEncryptionTests: XCTestCase {
 
     func testEncryptionMessagesRoundTrip() throws {
         let messages: [AstationMessage] = [
-            .encryptionMode(
-                mode: "enabling",
-                kid: "0123abcd",
-                dataAccount: "group-1",
-                astationId: "astation-1"
-            ),
+            .encryptionMode(accountState: AtemSignedWire(statement: Data([1]), signature: Data([2]))),
             .keyRequest(publicKey: Data(repeating: 1, count: 32).base64EncodedString()),
-            .keyGrant(kid: "0123abcd", wrappedKey: "wrapped", dataAccount: "group-1"),
+            .keyGrant(grant: AtemGrantWire(
+                signed: AtemSignedWire(statement: Data([1]), signature: Data([2])),
+                encappedKey: Data(repeating: 3, count: 32), ciphertext: Data(repeating: 4, count: 48)
+            )),
             .encryptionMigrationComplete(mode: "on", kid: "0123abcd"),
         ]
 

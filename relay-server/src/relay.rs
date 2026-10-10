@@ -4390,6 +4390,49 @@ pub(crate) mod tests {
         socket
     }
 
+    #[tokio::test]
+    async fn e2e_verification_frames_are_forwarded_unchanged_on_the_bound_connection() {
+        let (base_url, server) = spawn_relay(memory_identity_state()).await;
+        let code = "astation-e2e-forwarding";
+        let device_id = "atem-e2e-device";
+        let mut astation = verified_astation(&base_url, code, &TestKey::generate(), "registered").await;
+        let mut atem = connect_atem(&base_url, code, device_id).await;
+        let connected = next_client_json(&mut astation).await;
+        let connection_id = connected["connection_id"].as_str().unwrap();
+
+        // Cryptographic values are opaque to the relay; it must retain the exact payload.
+        for payload in [
+            serde_json::json!({"type":"verifyCommit","data":{"device_id":device_id,"commitment":"AQIDBA=="}}),
+            serde_json::json!({"type":"verifyReveal","data":{"device_pub":"AQ==","device_sign_pub":"Ag==","unlock_auth_pub":"Aw==","nonce":"BA=="}}),
+            serde_json::json!({"type":"verifyAbort","data":{"reason":"device declined"}}),
+            serde_json::json!({"type":"keyRequest","data":{"public_key":"AQ=="}}),
+        ] {
+            send_json(&mut atem, payload.clone()).await;
+            let frame = next_client_json(&mut astation).await;
+            assert_eq!(frame["atem_id"], device_id);
+            assert_eq!(frame["connection_id"], connection_id);
+            assert_eq!(frame["payload"], payload);
+        }
+
+        let signed = serde_json::json!({"statement":"AAE=","signature":"AgM="});
+        let grant = serde_json::json!({"signed":signed,"encapped_key":"AQ==","ciphertext":"Ag=="});
+        for payload in [
+            serde_json::json!({"type":"verifyKeys","data":{"sign_pub":"AQ==","enc_pub":"Ag==","recovery_sign_pub":"Aw==","nonce":"BA=="}}),
+            serde_json::json!({"type":"deviceVerified","data":{"device_verified":signed,"account_state":signed,"grants":[grant]}}),
+            serde_json::json!({"type":"verifyAbort","data":{"reason":"Mac declined"}}),
+            serde_json::json!({"type":"encryptionMode","data":{"account_state":signed}}),
+            serde_json::json!({"type":"keyGrant","data":{"grant":grant}}),
+        ] {
+            send_json(&mut astation, serde_json::json!({
+                "atem_id":device_id,"connection_id":connection_id,"payload":payload,
+            })).await;
+            assert_eq!(next_client_json(&mut atem).await, payload);
+        }
+        atem.close(None).await.unwrap();
+        astation.close(None).await.unwrap();
+        server.abort();
+    }
+
     /// Send a control message and return the relay's ack.
     pub(crate) async fn control(socket: &mut TestSocket, value: serde_json::Value) -> serde_json::Value {
         let kind = value["type"].as_str().unwrap().to_string();

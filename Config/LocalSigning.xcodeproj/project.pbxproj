@@ -1,0 +1,21 @@
+// !$*UTF8*$!
+{
+archiveVersion = 1;
+classes = {};
+objectVersion = 56;
+objects = {
+000000000000000000000001 = {isa = PBXProject; attributes = {LastUpgradeCheck = 2700; TargetAttributes = {000000000000000000000002 = {CreatedOnToolsVersion = 27.0; ProvisioningStyle = Automatic; }; }; }; buildConfigurationList = 000000000000000000000003; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; knownRegions = (en, Base); mainGroup = 000000000000000000000004; productRefGroup = 000000000000000000000005; projectDirPath = ""; projectRoot = ""; targets = (000000000000000000000002); };
+000000000000000000000002 = {isa = PBXNativeTarget; buildConfigurationList = 000000000000000000000006; buildPhases = (000000000000000000000007); buildRules = (); dependencies = (); name = AstationLocalSigning; productName = AstationLocalSigning; productReference = 000000000000000000000008; productType = "com.apple.product-type.application"; };
+000000000000000000000003 = {isa = XCConfigurationList; buildConfigurations = (000000000000000000000009); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
+000000000000000000000004 = {isa = PBXGroup; children = (00000000000000000000000B,000000000000000000000005); sourceTree = "<group>"; };
+000000000000000000000005 = {isa = PBXGroup; children = (000000000000000000000008); name = Products; sourceTree = "<group>"; };
+000000000000000000000006 = {isa = XCConfigurationList; buildConfigurations = (00000000000000000000000A); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
+000000000000000000000007 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (00000000000000000000000C); runOnlyForDeploymentPostprocessing = 0; };
+000000000000000000000008 = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AstationLocalSigning.app; sourceTree = BUILT_PRODUCTS_DIR; };
+000000000000000000000009 = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; }; name = Debug; };
+00000000000000000000000A = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; CODE_SIGN_IDENTITY = "Apple Development"; CODE_SIGN_ENTITLEMENTS = LocalSigning.entitlements; ENABLE_APP_SANDBOX = NO; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; }; name = Debug; };
+00000000000000000000000B = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalSigningProbe.swift; sourceTree = "<group>"; };
+00000000000000000000000C = {isa = PBXBuildFile; fileRef = 00000000000000000000000B; };
+};
+rootObject = 000000000000000000000001;
+}

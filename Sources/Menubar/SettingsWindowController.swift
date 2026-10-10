@@ -808,7 +808,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         panel.nameFieldStringValue = "Astation Encryption Recovery Key.txt"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
-            try value.write(to: url, atomically: true, encoding: .utf8)
+            try RecoveryKit.save(value, to: url)
         } catch {
             hubManager.relayEncryptionStatusMessage = "Couldn't save the encryption key: \(error.localizedDescription)"
         }
@@ -1080,11 +1080,13 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
             }
             let relayURL = StationRelayURL.validatedBase(SettingsWindowController.currentAstationRelayUrl)
                 ?? SettingsWindowController.defaultStationURL
-            let kit = RecoveryKit(
-                astationId: AstationIdentity.shared.id,
-                relayURL: relayURL
-            )
-            let text = kit.text()
+            let text: String
+            do {
+                text = try self.hubManager.atemE2EIdentity.recoveryKit(astationId: AstationIdentity.shared.id, relayURL: relayURL)
+            } catch {
+                self.setRecoveryStatus(error.localizedDescription, isError: true)
+                return
+            }
             let alert = NSAlert()
             alert.messageText = "Astation Recovery Kit"
             alert.informativeText = "Save this somewhere off this Mac, such as a password manager. You need it to get your memories, skills and vaults back if this Mac is lost."
@@ -1136,6 +1138,10 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
 
             guard let kit = RecoveryKit.parse(textView.string) else {
                 self.setRecoveryStatus("The recovery kit needs a valid Astation ID and relay URL.", isError: true)
+                return
+            }
+            guard kit.recoveryKey == nil else {
+                self.setRecoveryStatus("This kit contains an E2E recovery key. This version cannot restore the verification identity. Keep the complete kit; the account was not changed.", isError: true)
                 return
             }
             let current = AstationIdentity.shared.id
