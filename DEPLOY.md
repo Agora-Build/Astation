@@ -115,8 +115,8 @@ The Coolify resources on Volumetric are:
 | Resource | Coolify UUID | Image | Host port |
 | --- | --- | --- | --- |
 | Relay A (`relay-a`, the original relay) | `oss4444o8ss40ckgwc40og4c` | `ghcr.io/agora-build/station-relay-server:main` | `3000` |
-| Relay B (`relay-b`) | set when created | `ghcr.io/agora-build/station-relay-server:main` | none |
-| Valkey (relay live state) | set when created | `valkey/valkey:8` | none |
+| Relay B (`relay-b`) | `am8lrcacts572trbli1bmvnu` | `ghcr.io/agora-build/station-relay-server:main` | none |
+| Valkey (relay live state) | `minf9gdzuc2fwzxoq188eiw8` | `valkey/valkey:8` | none |
 | Webapp | `c0wwgk4c0owk0w4gsww4k0ss` | `ghcr.io/agora-build/station-webapp:main` | `3010` |
 
 Required GitHub Actions secrets:
@@ -126,7 +126,7 @@ Required GitHub Actions secrets:
   relay-a first:
   ```
   https://smt.agora.build/api/v1/deploy?uuid=oss4444o8ss40ckgwc40og4c&force=false
-  https://smt.agora.build/api/v1/deploy?uuid=<relay-b uuid>&force=false
+  https://smt.agora.build/api/v1/deploy?uuid=am8lrcacts572trbli1bmvnu&force=false
   ```
   With one relay, only the first line. Required: there is no fallback to the
   older per-relay secrets, which are no longer read and can be deleted.
@@ -155,6 +155,10 @@ Runtime configuration:
   (exit 1), and a value that isn't a positive integer also exits 1. Both apps
   carry the `station-relay-server` network alias, so nginx sees every replica.
   Health check `GET /health` on port 3000.
+- Optional Agora account registration: both relays need the same
+  `AGORA_ACCOUNT_USERINFO_URL`, `AGORA_ACCOUNT_SUBJECT_FIELD`, and, for
+  offline-Mac grouping, `AGORA_ACCOUNT_AUTH_TIME_FIELD`. See the configuration
+  and acceptance checks below before enabling this feature.
 - Webapp: `STATION_RELAY_UPSTREAM=station-relay-server:3000`. All containers
   must use the `coolify` Docker network. nginx re-resolves the alias through
   Docker DNS every 10 s and spreads requests across every address it returns,
@@ -206,6 +210,107 @@ If `/health` returns `502` while `http://127.0.0.1:3000/health` works on
 Volumetric, check the webapp's relay upstream and Docker DNS resolution.
 A successful deployment webhook only means the deployment was queued; the
 workflow also checks the final deployment status and public endpoints.
+
+#### Optional Agora account registration
+
+Account registration links Astations to a verified Agora account so they can
+request explicit data grouping. It is separate from relay device authentication.
+When registration is disabled, unregistered Astations use their own Astation ID
+as the data account. Ordinary pairing, memory/skills/vault sync, and E2EE do not
+require this optional SSO integration. Registration does not merge data by itself.
+
+On October 10, 2026, neither production relay had `AGORA_ACCOUNT_*` configured.
+That is a supported mode: account registration fails closed while ordinary
+relay operation continues. A log message saying
+`AGORA_ACCOUNT_USERINFO_URL and AGORA_ACCOUNT_SUBJECT_FIELD are not configured`
+means account registration is unavailable. It does not mean that the identity
+WebSocket disconnected, and does not by itself explain an encryption migration
+failure. Check relay authentication and migration status separately.
+
+`/health` and `verify-station.mjs` check infrastructure availability, not SSO
+account registration. A healthy deployment can still reject registration.
+If account grouping is a production requirement, include its acceptance check
+in the release checklist; infrastructure checks alone are insufficient.
+
+**Identity-provider contract.** Before enabling registration, obtain the
+approved endpoint and permanent account-ID field from the SSO service owner.
+Use HTTPS in production. The relay's request and response contract is:
+
+| Setting | Required contract |
+| --- | --- |
+| `AGORA_ACCOUNT_USERINFO_URL` | An HTTPS endpoint accepting `GET` with `Authorization: Bearer <Agora SSO access token>`. Valid tokens return successful JSON; invalid/expired tokens return HTTP 401 or 403. |
+| `AGORA_ACCOUNT_SUBJECT_FIELD` | A top-level JSON field containing a permanent account ID as a string. After trimming, it must be nonempty and at most 512 UTF-8 bytes. The ID must remain the same across sign-ins and token refreshes, and differ for different accounts. Nested fields and numeric IDs are unsupported. |
+| `AGORA_ACCOUNT_AUTH_TIME_FIELD` | Optional top-level integer Unix timestamp in seconds for the most recent user authentication. Required for the delayed/offline-Mac grouping path, which checks a fresh sign-in within five minutes (allowing up to 60 seconds of future clock skew). Token refresh time is not authentication time. Without this field, online approval can still work. |
+
+Use exact field names without surrounding whitespace. Email and the rotating
+`loginId` in the OAuth token response are unsuitable account IDs. Locally
+decoded token claims are not an independently verified identity. The app's
+best-effort display-name request to `/api/v0/oauth/userinfo` does not establish
+the account-verification contract: during the October 10 investigation that
+endpoint returned 401 even with a freshly refreshed, working Agora CLI token.
+Do not configure it with a guessed subject field.
+
+**Preflight.** With Node.js 22 or newer, set the non-secret verifier settings
+locally and pipe a current SSO access token into the check. For example, copy
+the token from the approved credential source, then run:
+
+```bash
+export AGORA_ACCOUNT_USERINFO_URL='https://<approved-sso-host>/<approved-path>'
+export AGORA_ACCOUNT_SUBJECT_FIELD='<confirmed-permanent-id-field>'
+# Only when the provider supports the authentication-time contract:
+# export AGORA_ACCOUNT_AUTH_TIME_FIELD='<confirmed-authentication-time-field>'
+
+pbpaste | node .github/scripts/check-account-verifier.mjs
+```
+
+The token is read from standard input; keep it out of command arguments,
+shell history, Coolify environment variables, and logs. Clear the clipboard
+after use. The check first requires rejection of a randomly generated invalid
+token, then checks the real token and response field types. It uses bounded
+requests, refuses redirects, and prints neither tokens, account IDs, nor
+response bodies. When authentication time is configured, it checks its type;
+the offline grouping flow still requires a fresh sign-in. A passing preflight
+does not establish ID permanence: confirm that in the provider contract and
+across independent sign-ins, including a different test account. This check
+does not register an Astation or change production state.
+
+**Coolify rollout.** Log in to `https://smt.agora.build` and open both relay
+applications on Volumetric. Save identical verifier settings as **runtime**
+environment variables, with build-time injection disabled. The relay loads
+them at startup, so saving variables without redeploying does not activate
+them. Astation supplies the user's SSO token at registration time; never store
+a user's token in the relay configuration.
+
+1. Record the previous verifier settings for rollback, including whether they
+   were absent. Run the preflight against the approved provider.
+2. Save the settings on Relay A and Relay B. Deploy Relay A first; wait for
+   Coolify to report `finished`, confirm the new container is healthy, then
+   run the two-replica public health check above. Public health alone can be
+   answered by Relay B and does not prove Relay A finished deploying.
+3. Deploy Relay B, waiting for deployment completion and health in the same
+   way. Stop on any failure. Inspect the saved runtime settings on each app;
+   successful registration through one replica cannot establish that the
+   other replica has identical configuration.
+4. Reconnect a signed-in Astation. Confirm relay device authentication succeeds
+   and `relayRegisterAccount` receives `relayAck` with `ok: true`. Check that
+   the account-device list includes this Mac. Use parsed status/UI information
+   rather than dumping raw WebSocket frames, which can contain credentials.
+5. Verify ordinary pairing and data sync still work. If delayed/offline-Mac
+   grouping is required, test it with a fresh sign-in and disposable accounts
+   before attempting to group real data.
+
+**Rollback and troubleshooting.** If registration fails, check the provider's
+status, response contract, and both replicas' runtime settings. HTTP 401/403
+means the provider rejected the token; setting a different subject field
+cannot repair that. Restore the previous verifier settings and redeploy each
+relay sequentially if necessary. Removing the URL or subject field disables
+new registration; it does not undo registrations or data groups already stored
+in Postgres. Account grouping changes need their own recovery plan and backups.
+
+The SSO provider establishes the account subject; Astation's device keys and
+proof of possession establish device identity. Configuring SSO must not bypass
+device verification or make the relay authoritative for E2EE keys or migration
+completion.
 
 #### Relay replicas and Valkey
 
