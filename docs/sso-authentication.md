@@ -4,6 +4,11 @@ This document describes the implemented account login architecture. Device
 pairing is a separate protocol documented in
 [Device Authentication v2](specs/2026-07-21-device-authentication-v2.md).
 
+The planned successor is [unified agora.build identity](specs/2026-10-10-unified-agora-build-identity.md),
+with agora.build accounts and linked GitHub, Google, Apple, and Agora sign-in
+providers. That architecture is not implemented; the behavior described here
+is the current Agora-specific integration.
+
 ## Architecture
 
 ```text

@@ -213,6 +213,15 @@ workflow also checks the final deployment status and public endpoints.
 
 #### Optional Agora account registration
 
+**Product direction:** the planned identity service is owned by agora.build,
+with GitHub, Google, Apple, and Agora as upstream sign-in providers. See
+[Unified agora.build Identity](docs/specs/2026-10-10-unified-agora-build-identity.md).
+Leave this legacy Agora-specific registration disabled while the unified
+service is being designed. The settings and preflight below describe the
+current compatibility implementation; they are not the configuration of the
+future service. The relay will need issuer-aware verification before accepting
+unified account tokens, and changing only the userinfo URL is insufficient.
+
 Account registration links Astations to a verified Agora account so they can
 request explicit data grouping. It is separate from relay device authentication.
 When registration is disabled, unregistered Astations use their own Astation ID
