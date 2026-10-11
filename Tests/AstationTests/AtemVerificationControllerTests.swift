@@ -13,6 +13,9 @@ private final class VerificationHarness {
     var messages: [AstationMessage] = []
     var approvals: [(Bool) -> Void] = []
     var recoveryApprovals: [(Bool) -> Void] = []
+    var approvalCancellations = 0
+    var recoveryCancellations = 0
+    var synchronousApproval: Bool?
     var key: AccountDataKey?
     lazy var identity = AtemE2EIdentity(storage: storage, crypto: crypto)
     lazy var reveal = AtemVerifyReveal(
@@ -33,10 +36,19 @@ private final class VerificationHarness {
             XCTAssertEqual(request.deviceName, "Test Mac")
             XCTAssertEqual(request.safetyCode.count, 14)
             approvals.append(callback)
+            if let synchronousApproval { callback(synchronousApproval) }
+            return { [unowned self] in
+                approvalCancellations += 1
+                callback(false)
+            }
         },
         saveRecovery: { [unowned self] text, callback in
             XCTAssertTrue(text.contains("Recovery key:"))
             recoveryApprovals.append(callback)
+            return { [unowned self] in
+                recoveryCancellations += 1
+                callback(false)
+            }
         },
         kit: { [unowned self] in try identity.recoveryKit(astationId: "astation-00000000-0000-0000-0000-000000000001", relayURL: "https://station.agora.build") },
         now: { [unowned self] in time }
@@ -139,6 +151,7 @@ final class AtemVerificationControllerTests: XCTestCase {
         try h.begin()
         try XCTUnwrap(h.approvals.last)(true)
         h.controller.cancel(route: h.route)
+        XCTAssertEqual(h.recoveryCancellations, 1)
         try XCTUnwrap(h.recoveryApprovals.last)(true)
         XCTAssertFalse(try h.identity.recoveryIsSaved())
         XCTAssertTrue(h.certificates.isEmpty)
@@ -159,12 +172,48 @@ final class AtemVerificationControllerTests: XCTestCase {
         try h.begin()
         let callback = try XCTUnwrap(h.approvals.last)
         h.controller.cancel(route: h.route)
+        XCTAssertEqual(h.approvalCancellations, 1)
         try h.begin()
+        XCTAssertEqual(h.approvals.count, 2)
         callback(true)
         XCTAssertTrue(h.certificates.isEmpty)
+        try XCTUnwrap(h.approvals.last)(true)
+        XCTAssertEqual(h.recoveryApprovals.count, 1)
         let nonces = h.messages.compactMap { if case .verifyKeys(let keys) = $0 { return keys.nonce }; return nil }
         XCTAssertEqual(nonces.count, 2)
         XCTAssertNotEqual(nonces[0], nonces[1])
+    }
+
+    func testDisconnectDismissesPromptAndAllowsImmediateRetry() throws {
+        let h = VerificationHarness()
+        try h.begin()
+        h.controller.disconnect(clientId: h.route.clientId)
+        XCTAssertEqual(h.approvalCancellations, 1)
+        XCTAssertTrue(h.aborts.isEmpty)
+        try h.begin()
+        XCTAssertEqual(h.approvals.count, 2)
+        XCTAssertTrue(h.certificates.isEmpty)
+    }
+
+    func testExpiryDismissesPromptBeforeStartingAnotherCeremony() throws {
+        let h = VerificationHarness()
+        try h.begin()
+        h.time = h.time.addingTimeInterval(181)
+        try h.begin()
+        XCTAssertEqual(h.approvalCancellations, 1)
+        XCTAssertEqual(h.aborts.count, 1)
+        XCTAssertEqual(h.approvals.count, 2)
+    }
+
+    func testSynchronousApprovalDoesNotReplaceRecoveryCancellation() throws {
+        let h = VerificationHarness()
+        h.synchronousApproval = true
+        try h.begin()
+        XCTAssertEqual(h.recoveryApprovals.count, 1)
+        h.controller.cancel(route: h.route)
+        XCTAssertEqual(h.recoveryCancellations, 1)
+        XCTAssertTrue(h.certificates.isEmpty)
+        XCTAssertFalse(try h.identity.recoveryIsSaved())
     }
 
     func testKeyRequestRejectsUnverifiedAndChangedKeyThenReturnsSignedGrant() throws {

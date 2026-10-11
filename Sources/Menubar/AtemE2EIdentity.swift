@@ -7,6 +7,7 @@ enum AtemIdentityError: LocalizedError {
     case keychain(OSStatus)
     case secureEnclaveUnavailable
     case invalidStoredIdentity
+    case newerStoredIdentity(Int)
     case recoveryNotSaved
     case identityChanged
     case unverifiedDevice
@@ -19,6 +20,7 @@ enum AtemIdentityError: LocalizedError {
         case .keychain(let status): return "Astation's verification keys are unavailable (\(status)). Unlock this Mac and retry."
         case .secureEnclaveUnavailable: return "Device verification requires this Mac's Secure Enclave."
         case .invalidStoredIdentity: return "Astation's stored verification identity is unreadable. Its keys were retained."
+        case .newerStoredIdentity(let version): return "This identity needs a newer Astation build (format \(version)). Update Astation; its keys were retained."
         case .recoveryNotSaved: return "Save the Astation recovery kit before verifying a device."
         case .identityChanged: return "The verification identity changed. Start verification again."
         case .unverifiedDevice: return "Verify this device's safety code before requesting an encryption key."
@@ -87,6 +89,7 @@ protocol AtemIdentityCryptography {
     func signingPublicKey(_ material: AtemIdentityMaterial) throws -> Data
     func validate(_ material: AtemIdentityMaterial) throws
     func sign(_ message: Data, material: AtemIdentityMaterial) throws -> Data
+    func openStorageKey(_ sealed: AtemHPKESealedKey, info: Data, material: AtemIdentityMaterial) throws -> Data
 }
 
 struct AtemSecureEnclaveCryptography: AtemIdentityCryptography {
@@ -116,6 +119,11 @@ struct AtemSecureEnclaveCryptography: AtemIdentityCryptography {
 
     func validate(_ material: AtemIdentityMaterial) throws {
         guard material.recoverySecret.count == 32 else { throw AtemIdentityError.invalidStoredIdentity }
+        _ = try encryptionKey(material)
+        _ = try signingPublicKey(material)
+    }
+
+    private func encryptionKey(_ material: AtemIdentityMaterial) throws -> Curve25519.KeyAgreement.PrivateKey {
         let sealing = try SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: material.sealingKey)
         let ephemeral = try P256.KeyAgreement.PublicKey(x963Representation: material.sealingPublicKey)
         let shared = try sealing.sharedSecretFromKeyAgreement(with: ephemeral)
@@ -124,7 +132,18 @@ struct AtemSecureEnclaveCryptography: AtemIdentityCryptography {
         guard encryption.publicKey.rawRepresentation == material.encryptionPublicKey else {
             throw AtemIdentityError.invalidStoredIdentity
         }
-        _ = try signingPublicKey(material)
+        return encryption
+    }
+
+    func openStorageKey(_ sealed: AtemHPKESealedKey, info: Data, material: AtemIdentityMaterial) throws -> Data {
+        _ = try AtemE2ECrypto.sealedKeyDigest(sealed)
+        var recipient = try HPKE.Recipient(
+            privateKey: encryptionKey(material), ciphersuite: .Curve25519_SHA256_ChachaPoly,
+            info: info, encapsulatedKey: sealed.encapsulatedKey
+        )
+        let key = try recipient.open(sealed.ciphertext, authenticating: Data())
+        guard key.count == 32 else { throw AtemStorageKeyError.invalidStatement }
+        return key
     }
 
     func sign(_ message: Data, material: AtemIdentityMaterial) throws -> Data {
@@ -160,13 +179,50 @@ struct AtemDevicePin: Codable, Equatable {
 }
 
 final class AtemE2EIdentity {
+    static let storedVersion = 3
+
     private struct Stored: Codable {
-        var version = 1
+        var version = AtemE2EIdentity.storedVersion
         let material: AtemIdentityMaterial
         var recoverySaved = false
         var epoch: UInt64 = 0
         var accounts: [String: AtemAccountState] = [:]
         var devices: [String: AtemDevicePin] = [:]
+        var storageKeys: [String: AtemDeviceStorageKeys] = [:]
+        var deviceVerificationEpochs: [String: UInt64] = [:]
+        var migrations: [String: AtemEncryptionMigration] = [:]
+
+        init(material: AtemIdentityMaterial) { self.material = material }
+
+        enum CodingKeys: String, CodingKey {
+            case version, material, recoverySaved, epoch, accounts, devices, storageKeys, deviceVerificationEpochs, migrations
+        }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            version = try values.decode(Int.self, forKey: .version)
+            // Inspect the format before decoding fields an older build cannot understand.
+            if version > AtemE2EIdentity.storedVersion { throw AtemIdentityError.newerStoredIdentity(version) }
+            guard version >= 1 else { throw AtemIdentityError.invalidStoredIdentity }
+            material = try values.decode(AtemIdentityMaterial.self, forKey: .material)
+            recoverySaved = try values.decode(Bool.self, forKey: .recoverySaved)
+            epoch = try values.decode(UInt64.self, forKey: .epoch)
+            accounts = try values.decode([String: AtemAccountState].self, forKey: .accounts)
+            devices = try values.decode([String: AtemDevicePin].self, forKey: .devices)
+            // Step-1 identities remain readable without replacing any key material.
+            if version == 1 {
+                storageKeys = try values.decodeIfPresent([String: AtemDeviceStorageKeys].self, forKey: .storageKeys) ?? [:]
+            } else {
+                storageKeys = try values.decode([String: AtemDeviceStorageKeys].self, forKey: .storageKeys)
+            }
+            if version < 3 {
+                deviceVerificationEpochs = [:]
+                migrations = [:]
+            } else {
+                deviceVerificationEpochs = try values.decode([String: UInt64].self, forKey: .deviceVerificationEpochs)
+                migrations = try values.decode([String: AtemEncryptionMigration].self, forKey: .migrations)
+            }
+        }
 
         mutating func advance() throws -> UInt64 {
             guard epoch < UInt64.max else { throw AtemIdentityError.epochExhausted }
@@ -186,11 +242,37 @@ final class AtemE2EIdentity {
 
     private func read(create: Bool = true) throws -> Stored? {
         if let data = try storage.read() {
-            guard let record = try? JSONDecoder().decode(Stored.self, from: data), record.version == 1,
-                  record.material.recoverySecret.count == 32,
+            let record: Stored
+            do {
+                record = try JSONDecoder().decode(Stored.self, from: data)
+            } catch let error as AtemIdentityError {
+                throw error
+            } catch {
+                throw AtemIdentityError.invalidStoredIdentity
+            }
+            guard record.material.recoverySecret.count == 32,
                   record.accounts.values.allSatisfy({ Self.validState($0.mode, $0.kid) && $0.epoch <= record.epoch }),
                   record.devices.values.allSatisfy({ $0.devicePub.count == 32 && $0.deviceSignPub.count == 32 && $0.unlockAuthPub.count == 32 }) else {
                 throw AtemIdentityError.invalidStoredIdentity
+            }
+            if !record.storageKeys.isEmpty {
+                let signingPublicKey = try crypto.signingPublicKey(record.material)
+                for (binding, keys) in record.storageKeys {
+                    guard try binding == AtemDeviceStorageKeys.binding(deviceId: keys.deviceId, devicePub: keys.devicePub) else {
+                        throw AtemIdentityError.invalidStoredIdentity
+                    }
+                    try keys.validate(signingPublicKey: signingPublicKey)
+                }
+            }
+            guard record.deviceVerificationEpochs.values.allSatisfy({ $0 <= record.epoch }) else {
+                throw AtemIdentityError.invalidStoredIdentity
+            }
+            if !record.migrations.isEmpty {
+                let publicKey = try crypto.signingPublicKey(record.material)
+                for (account, migration) in record.migrations {
+                    guard let state = record.accounts[account] else { throw AtemIdentityError.invalidStoredIdentity }
+                    try migration.validate(account: account, state: state, signingPublicKey: publicKey)
+                }
             }
             return record
         }
@@ -201,7 +283,10 @@ final class AtemE2EIdentity {
     }
 
     private func save(_ record: Stored) throws {
-        try storage.write(JSONEncoder().encode(record), creating: false)
+        var upgraded = record
+        // Older builds refuse this format instead of erasing escrow or migration journals.
+        upgraded.version = Self.storedVersion
+        try storage.write(JSONEncoder().encode(upgraded), creating: false)
     }
 
     func verificationKeys(nonce: Data) throws -> AtemVerifyKeys {
@@ -247,12 +332,14 @@ final class AtemE2EIdentity {
     @discardableResult
     func setState(account: String, mode: String, kid: String?) throws -> AtemSignedWire {
         lock.lock(); defer { lock.unlock() }
-        guard !account.isEmpty, Self.validState(mode, kid), var record = try read() else {
+        guard !account.isEmpty, ["enabling", "disabling"].contains(mode),
+              Self.validState(mode, kid), var record = try read() else {
             throw AtemIdentityError.invalidState
         }
         let state = AtemAccountState(mode: mode, kid: kid, epoch: try record.advance())
         let signed = try sign(AtemStatements.accountState(account: account, mode: mode, kid: kid, epoch: state.epoch), record: record)
         record.accounts[account] = state
+        record.migrations[account] = AtemEncryptionMigration(state: state)
         try save(record)
         return signed
     }
@@ -274,8 +361,9 @@ final class AtemE2EIdentity {
         guard try crypto.signingPublicKey(record.material) == expectedSigningKey else { throw AtemIdentityError.identityChanged }
         _ = try reveal.commitment()
         guard transcript.count == 32, !account.isEmpty, !deviceId.isEmpty else { throw AtemIdentityError.invalidState }
+        let verificationEpoch = try record.advance()
         let certificate = try sign(AtemStatements.deviceVerified(
-            account: account, deviceId: deviceId, reveal: reveal, transcript: transcript, epoch: record.advance()
+            account: account, deviceId: deviceId, reveal: reveal, transcript: transcript, epoch: verificationEpoch
         ), record: record)
         let accountState = try signState(account: account, key: key, record: &record)
         var grants: [AtemGrantWire] = []
@@ -285,6 +373,7 @@ final class AtemE2EIdentity {
         record.devices[deviceId] = AtemDevicePin(
             account: account, devicePub: reveal.devicePub, deviceSignPub: reveal.deviceSignPub, unlockAuthPub: reveal.unlockAuthPub
         )
+        record.deviceVerificationEpochs[deviceId] = verificationEpoch
         // Pins, account state and epochs commit together, only after every signature succeeds.
         try save(record)
         return AtemDeviceVerified(deviceVerified: certificate, accountState: accountState, grants: grants)
@@ -307,15 +396,240 @@ final class AtemE2EIdentity {
         return try read(create: false)?.devices[deviceId]?.account == account
     }
 
+    /// Authenticates and journals the message while its transport identity is still available.
+    func acceptMigrationCompletion(
+        _ completion: AtemSignedWire?, mode: String, kid: String,
+        account: String, route: AtemVerificationRoute, key: AccountDataKey?
+    ) throws -> AtemMigrationCommit? {
+        lock.lock(); defer { lock.unlock() }
+        guard let completion, var record = try read(create: false), record.recoverySaved,
+              let pin = record.devices[route.deviceId], pin.account == account else {
+            throw AtemMigrationError.invalidCompletion
+        }
+        try AtemStatementReader.verify(completion, publicKey: pin.deviceSignPub)
+        let report = try AtemMigrationCompletion(completion)
+        guard report.account == account, report.deviceId == route.deviceId,
+              report.target == mode, report.kid == kid else { throw AtemMigrationError.invalidCompletion }
+        let verificationEpoch = record.deviceVerificationEpochs[route.deviceId] ?? 0
+        // Reusing keys in a new verification must not renew an old report's authorization.
+        guard report.stateEpoch >= verificationEpoch else { throw AtemMigrationError.staleMigration }
+        try report.verifyKey(key)
+        try crypto.validate(record.material)
+        guard let state = record.accounts[account] else { throw AtemMigrationError.staleMigration }
+        var migration = record.migrations[account] ?? AtemEncryptionMigration(state: state)
+        guard migration.kid == kid, migration.target == mode,
+              report.stateEpoch >= migration.startEpoch, report.stateEpoch <= state.epoch else {
+            throw AtemMigrationError.staleMigration
+        }
+        if let final = migration.finalState {
+            guard state.mode == mode, state.kid == (mode == "off" ? nil : kid) else {
+                throw AtemMigrationError.staleMigration
+            }
+            return AtemMigrationCommit(account: account, target: mode, kid: kid, signedState: final)
+        }
+        guard state.mode == (mode == "on" ? "enabling" : "disabling"), state.kid == kid else {
+            throw AtemMigrationError.staleMigration
+        }
+        let accepted = AtemAcceptedMigration(completion: completion, pin: pin,
+            verificationEpoch: verificationEpoch,
+            signingPublicKey: try crypto.signingPublicKey(record.material), route: route)
+        if migration.accepted == accepted { return nil }
+        migration.accepted = accepted
+        record.migrations[account] = migration
+        try save(record)
+        return nil
+    }
+
+    func pendingMigrationAccounts() throws -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        return try read(create: false)?.migrations.filter {
+            $0.value.accepted != nil && $0.value.finalState == nil
+        }.map(\.key) ?? []
+    }
+
+    func currentMigrationCommit(account: String) throws -> AtemMigrationCommit? {
+        lock.lock(); defer { lock.unlock() }
+        guard let migration = try read(create: false)?.migrations[account], let signed = migration.finalState else { return nil }
+        return AtemMigrationCommit(account: account, target: migration.target, kid: migration.kid, signedState: signed)
+    }
+
+    /// Revocation, final state and the journal serialize under the same identity lock.
+    func finishAcceptedMigration(account: String, key: AccountDataKey?) throws -> AtemMigrationCommit? {
+        lock.lock(); defer { lock.unlock() }
+        guard var record = try read(create: false), var migration = record.migrations[account],
+              migration.finalState == nil, let accepted = migration.accepted else { return nil }
+        let deviceId = accepted.route.deviceId
+        guard record.devices[deviceId] == accepted.pin,
+              (record.deviceVerificationEpochs[deviceId] ?? 0) == accepted.verificationEpoch else {
+            migration.accepted = nil
+            record.migrations[account] = migration
+            try save(record)
+            throw AtemMigrationError.revokedDevice
+        }
+        guard record.recoverySaved,
+              try crypto.signingPublicKey(record.material) == accepted.signingPublicKey,
+              let state = record.accounts[account], state.kid == migration.kid,
+              state.mode == (migration.target == "on" ? "enabling" : "disabling") else {
+            throw AtemMigrationError.staleMigration
+        }
+        try crypto.validate(record.material)
+        try AtemStatementReader.verify(accepted.completion, publicKey: accepted.pin.deviceSignPub)
+        let report = try AtemMigrationCompletion(accepted.completion)
+        guard report.account == account, report.deviceId == deviceId,
+              report.target == migration.target, report.kid == migration.kid,
+              report.stateEpoch >= migration.startEpoch, report.stateEpoch >= accepted.verificationEpoch,
+              report.stateEpoch <= state.epoch else {
+            throw AtemMigrationError.staleMigration
+        }
+        try report.verifyKey(key)
+        let final = AtemAccountState(mode: migration.target, kid: migration.target == "off" ? nil : migration.kid,
+            epoch: try record.advance())
+        let signed = try sign(AtemStatements.accountState(account: account, mode: final.mode, kid: final.kid,
+            epoch: final.epoch), record: record)
+        migration.finalState = signed
+        record.accounts[account] = final
+        record.migrations[account] = migration
+        try save(record)
+        return AtemMigrationCommit(account: account, target: migration.target, kid: migration.kid, signedState: signed)
+    }
+
+    func prepareUnlock(_ wire: AtemUnlockRequestWire, account: String, deviceId: String, now: Date) throws -> AtemUnlockAuthorization {
+        lock.lock(); defer { lock.unlock() }
+        guard let record = try read(create: false), let pin = record.devices[deviceId], pin.account == account else {
+            throw AtemStorageKeyError.unverifiedDevice
+        }
+        try AtemStatementReader.verify(wire.signed, publicKey: pin.unlockAuthPub)
+        let request = try AtemUnlockRequest(statement: wire.request)
+        guard request.account == account, request.deviceId == deviceId else { throw AtemStorageKeyError.wrongDevice }
+        guard abs(TimeInterval(request.time) - now.timeIntervalSince1970) <= 300 else { throw AtemStorageKeyError.staleRequest }
+        let binding = try AtemDeviceStorageKeys.binding(deviceId: deviceId, devicePub: pin.devicePub)
+        guard let keys = record.storageKeys[binding], keys.account == account, keys.held(kid: request.storageKid) != nil else {
+            throw AtemStorageKeyError.unavailableKey
+        }
+        // Reject unusable X25519 points before asking the user to approve.
+        let ephemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: request.ephemeralPublicKey)
+        _ = try Curve25519.KeyAgreement.PrivateKey().sharedSecretFromKeyAgreement(with: ephemeral)
+        return AtemUnlockAuthorization(
+            wire: wire, request: request, pin: pin,
+            signingPublicKey: try crypto.signingPublicKey(record.material), lastUnlock: keys.lastUnlock
+        )
+    }
+
+    func unlockGrant(_ authorization: AtemUnlockAuthorization, now: Date) throws -> AtemUnlockGrantWire {
+        lock.lock(); defer { lock.unlock() }
+        guard var record = try read(create: false), let pin = record.devices[authorization.request.deviceId],
+              pin.account == authorization.request.account else { throw AtemStorageKeyError.unverifiedDevice }
+        guard pin == authorization.pin, try crypto.signingPublicKey(record.material) == authorization.signingPublicKey else {
+            throw AtemStorageKeyError.identityChanged
+        }
+        let request = authorization.request
+        let binding = try AtemDeviceStorageKeys.binding(deviceId: request.deviceId, devicePub: authorization.pin.devicePub)
+        guard var keys = record.storageKeys[binding], keys.account == request.account,
+              let held = keys.held(kid: request.storageKid) else { throw AtemStorageKeyError.unavailableKey }
+        let requestHash = Data(SHA256.hash(data: authorization.wire.request))
+        let sealed = try AtemE2ECrypto.sealKey(held.key, to: request.ephemeralPublicKey, info: AtemStatements.unlockInfo(
+            account: request.account, deviceId: request.deviceId, kid: request.storageKid, requestHash: requestHash
+        ))
+        let grant = try sign(AtemStatements.unlockGrant(
+            account: request.account, deviceId: request.deviceId, kid: request.storageKid,
+            requestHash: requestHash, sealedHash: AtemE2ECrypto.sealedKeyDigest(sealed)
+        ), record: record)
+        if keys.pending?.held.kid == request.storageKid { keys.promotePending() }
+        guard now.timeIntervalSince1970.isFinite, now.timeIntervalSince1970 >= 0,
+              let timestamp = UInt64(exactly: now.timeIntervalSince1970.rounded(.down)) else { throw AtemStorageKeyError.invalidStatement }
+        keys.lastUnlock = timestamp
+        record.storageKeys[binding] = keys
+        // Promotion and last-unlock metadata must persist before a grant leaves this Mac.
+        try save(record)
+        return AtemUnlockGrantWire(grant: grant, encappedKey: sealed.encapsulatedKey, ciphertext: sealed.ciphertext)
+    }
+
+    func rotateStorageKey(_ wire: AtemStorageRotateWire, account: String, deviceId: String) throws -> AtemSignedWire {
+        lock.lock(); defer { lock.unlock() }
+        guard var record = try read(create: false), let pin = record.devices[deviceId], pin.account == account else {
+            throw AtemStorageKeyError.wrongDevice
+        }
+        try AtemStatementReader.verify(wire.rotate, publicKey: pin.deviceSignPub)
+        let rotate = try AtemStorageRotate(statement: wire.rotate.statement)
+        guard rotate.account == account, rotate.deviceId == deviceId else { throw AtemStorageKeyError.wrongDevice }
+        guard try AtemE2ECrypto.sealedKeyDigest(wire.sealed) == rotate.sealedHash else { throw AtemStorageKeyError.invalidStatement }
+        let binding = try AtemDeviceStorageKeys.binding(deviceId: deviceId, devicePub: pin.devicePub)
+        var keys = record.storageKeys[binding] ?? AtemDeviceStorageKeys(account: account, deviceId: deviceId, devicePub: pin.devicePub)
+        guard keys.account == account else { throw AtemStorageKeyError.wrongDevice }
+        if let pending = keys.pending, pending.held.kid == rotate.newKid {
+            guard pending.rotateStatement == wire.rotate.statement else { throw AtemStorageKeyError.pendingKey(pending.held.kid) }
+            return pending.ack
+        }
+        if keys.pending?.held.kid == rotate.oldKid {
+            keys.promotePending()
+            record.storageKeys[binding] = keys
+            // Naming the pending key confirms it even if the next rotation is refused.
+            try save(record)
+        }
+        if let pending = keys.pending { throw AtemStorageKeyError.pendingKey(pending.held.kid) }
+        guard !keys.acked.contains(rotate.newKid), keys.current?.kid != rotate.newKid else { throw AtemStorageKeyError.replayedKey }
+        guard rotate.oldKid == (keys.current?.kid ?? "") else { throw AtemStorageKeyError.wrongCurrentKey }
+        let key = try crypto.openStorageKey(wire.sealed, info: AtemStatements.storageKeyInfo(
+            account: account, deviceId: deviceId, kid: rotate.newKid
+        ), material: record.material)
+        guard key.count == 32 else { throw AtemStorageKeyError.invalidStatement }
+        let ack = try sign(AtemStatements.storageAck(account: account, deviceId: deviceId, kid: rotate.newKid), record: record)
+        keys.pending = AtemPendingStorageKey(held: AtemHeldStorageKey(kid: rotate.newKid, key: key), rotateStatement: wire.rotate.statement, ack: ack)
+        keys.acked.insert(rotate.newKid)
+        record.storageKeys[binding] = keys
+        try save(record)
+        return ack
+    }
+
+    func settleStorageKey(_ signed: AtemSignedWire, account: String, deviceId: String, abandoning: Bool) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard var record = try read(create: false), let pin = record.devices[deviceId], pin.account == account else {
+            throw AtemStorageKeyError.wrongDevice
+        }
+        try AtemStatementReader.verify(signed, publicKey: pin.deviceSignPub)
+        let settlement = try AtemStorageSettlement(statement: signed.statement, abandoning: abandoning)
+        guard settlement.account == account, settlement.deviceId == deviceId else { throw AtemStorageKeyError.wrongDevice }
+        let binding = try AtemDeviceStorageKeys.binding(deviceId: deviceId, devicePub: pin.devicePub)
+        guard var keys = record.storageKeys[binding], keys.account == account, keys.pending?.held.kid == settlement.kid else { return }
+        if abandoning { keys.pending = nil } else { keys.promotePending() }
+        record.storageKeys[binding] = keys
+        try save(record)
+    }
+
+    func revokeDevice(_ authorization: AtemUnlockAuthorization) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard var record = try read(create: false), let pin = record.devices[authorization.request.deviceId],
+              pin.account == authorization.request.account else { throw AtemStorageKeyError.unverifiedDevice }
+        guard pin == authorization.pin, try crypto.signingPublicKey(record.material) == authorization.signingPublicKey else {
+            throw AtemStorageKeyError.identityChanged
+        }
+        record.devices.removeValue(forKey: authorization.request.deviceId)
+        record.deviceVerificationEpochs.removeValue(forKey: authorization.request.deviceId)
+        _ = try record.advance()
+        try save(record)
+    }
+
+    func storageKeyStatus(account: String, deviceId: String) throws -> AtemStorageKeyStatus? {
+        lock.lock(); defer { lock.unlock() }
+        guard let record = try read(create: false), let pin = record.devices[deviceId], pin.account == account,
+              let keys = try record.storageKeys[AtemDeviceStorageKeys.binding(deviceId: deviceId, devicePub: pin.devicePub)],
+              keys.account == account else { return nil }
+        return AtemStorageKeyStatus(currentKid: keys.current?.kid, pendingKid: keys.pending?.held.kid, lastUnlock: keys.lastUnlock)
+    }
+
     private func sign(_ statement: Data, record: Stored) throws -> AtemSignedWire {
         AtemSignedWire(statement: statement, signature: try crypto.sign(statement, material: record.material))
     }
 
     private func signState(account: String, key: AccountDataKey?, record: inout Stored) throws -> AtemSignedWire {
-        var state = record.accounts[account] ?? AtemAccountState(mode: key == nil ? "off" : "on", kid: key?.kid, epoch: 0)
+        // A legacy local key alone cannot attest that the remote data was migrated.
+        var state = record.accounts[account] ?? AtemAccountState(mode: key == nil ? "off" : "enabling", kid: key?.kid, epoch: 0)
         guard Self.validState(state.mode, state.kid),
               state.mode == "off" || key?.kid == state.kid else { throw AtemIdentityError.invalidState }
         state.epoch = try record.advance()
+        if (state.mode == "enabling" || state.mode == "disabling"), record.migrations[account] == nil {
+            record.migrations[account] = AtemEncryptionMigration(state: state)
+        }
         let result = try sign(AtemStatements.accountState(account: account, mode: state.mode, kid: state.kid, epoch: state.epoch), record: record)
         record.accounts[account] = state
         return result

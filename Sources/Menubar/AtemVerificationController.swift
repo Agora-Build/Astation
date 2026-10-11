@@ -1,6 +1,6 @@
 import Foundation
 
-struct AtemVerificationRoute: Hashable {
+struct AtemVerificationRoute: Hashable, Codable {
     let clientId: String
     let connectionId: String
     let deviceId: String
@@ -38,12 +38,14 @@ final class AtemVerificationController {
     private let key: (String, String?) throws -> AccountDataKey?
     private let isCurrent: (AtemVerificationRoute) -> Bool
     private let send: (AstationMessage, AtemVerificationRoute) -> Void
-    private let approve: (AtemVerificationApproval, @escaping (Bool) -> Void) -> Void
-    private let saveRecovery: (String, @escaping (Bool) -> Void) -> Void
+    private let approve: (AtemVerificationApproval, @escaping (Bool) -> Void) -> (() -> Void)
+    private let saveRecovery: (String, @escaping (Bool) -> Void) -> (() -> Void)
     private let kit: () throws -> String
     private let now: () -> Date
     private var attempts: [AtemVerificationRoute: Attempt] = [:]
     private var approvalInFlight: UUID?
+    private var promptId: UUID?
+    private var cancelPrompt: (() -> Void)?
     private let timeout: TimeInterval = 180
 
     init(
@@ -51,8 +53,8 @@ final class AtemVerificationController {
         key: @escaping (String, String?) throws -> AccountDataKey?,
         isCurrent: @escaping (AtemVerificationRoute) -> Bool,
         send: @escaping (AstationMessage, AtemVerificationRoute) -> Void,
-        approve: @escaping (AtemVerificationApproval, @escaping (Bool) -> Void) -> Void,
-        saveRecovery: @escaping (String, @escaping (Bool) -> Void) -> Void,
+        approve: @escaping (AtemVerificationApproval, @escaping (Bool) -> Void) -> (() -> Void),
+        saveRecovery: @escaping (String, @escaping (Bool) -> Void) -> (() -> Void),
         kit: @escaping () throws -> String, now: @escaping () -> Date = Date.init
     ) {
         self.identity = identity
@@ -111,7 +113,7 @@ final class AtemVerificationController {
             attempts[route]?.approving = true
             approvalInFlight = attempt.id
             let approval = AtemVerificationApproval(deviceName: route.deviceName, safetyCode: try reveal.safetyCode(keys: attempt.keys))
-            approve(approval) { [weak self] accepted in
+            presentPrompt({ self.approve(approval, $0) }) { [weak self] accepted in
                 guard let self else { return }
                 guard self.current(attempt) else { self.finishApproval(attempt); return }
                 guard accepted else {
@@ -124,7 +126,8 @@ final class AtemVerificationController {
                         self.finish(attempt, reveal: reveal)
                         self.finishApproval(attempt)
                     } else {
-                        self.saveRecovery(try self.kit()) { [weak self] saved in
+                        let kit = try self.kit()
+                        self.presentPrompt({ self.saveRecovery(kit, $0) }) { [weak self] saved in
                             guard let self else { return }
                             defer { self.finishApproval(attempt) }
                             guard self.current(attempt) else { return }
@@ -145,12 +148,12 @@ final class AtemVerificationController {
 
     func cancel(route: AtemVerificationRoute) {
         dispatchPrecondition(condition: .onQueue(.main))
-        attempts.removeValue(forKey: route)
+        if let attempt = attempts.removeValue(forKey: route) { finishApproval(attempt) }
     }
 
     func disconnect(clientId: String) {
         dispatchPrecondition(condition: .onQueue(.main))
-        attempts = attempts.filter { $0.key.clientId != clientId }
+        for route in Array(attempts.keys) where route.clientId == clientId { cancel(route: route) }
     }
 
     func requestKey(publicKey: String, route: AtemVerificationRoute) {
@@ -172,7 +175,28 @@ final class AtemVerificationController {
     }
 
     private func finishApproval(_ attempt: Attempt) {
-        if approvalInFlight == attempt.id { approvalInFlight = nil }
+        guard approvalInFlight == attempt.id else { return }
+        approvalInFlight = nil
+        promptId = nil
+        let cancel = cancelPrompt
+        cancelPrompt = nil
+        cancel?()
+    }
+
+    private func presentPrompt(
+        _ present: (@escaping (Bool) -> Void) -> (() -> Void),
+        completion: @escaping (Bool) -> Void
+    ) {
+        let id = UUID()
+        promptId = id
+        let cancel = present { [weak self] accepted in
+            guard let self, self.promptId == id else { return }
+            self.promptId = nil
+            self.cancelPrompt = nil
+            completion(accepted)
+        }
+        // A presenter may complete synchronously or be cancelled while opening.
+        if promptId == id { cancelPrompt = cancel } else { cancel() }
     }
 
     private func finish(_ attempt: Attempt, reveal: AtemVerifyReveal) {
@@ -190,7 +214,7 @@ final class AtemVerificationController {
     }
 
     private func abort(_ route: AtemVerificationRoute, reason: String) {
-        attempts.removeValue(forKey: route)
+        cancel(route: route)
         if isCurrent(route) { send(.verifyAbort(reason: reason), route) }
     }
 

@@ -120,7 +120,7 @@ enum AtemStatements {
         ])
     }
 
-    private static func number(_ value: UInt64) -> Data {
+    static func number(_ value: UInt64) -> Data {
         var bigEndian = value.bigEndian
         return withUnsafeBytes(of: &bigEndian) { Data($0) }
     }

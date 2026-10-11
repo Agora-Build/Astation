@@ -1,8 +1,49 @@
+import AppKit
 import CryptoKit
 import XCTest
 @testable import Menubar
 
 final class DataEncryptionTests: XCTestCase {
+    func testEncryptionRecoveryKeyAndSaveControlsFitInAlertBeforeConfirmation() throws {
+        _ = NSApplication.shared
+        let recovery = try DataEncryptionKeyManager.shared.recoveryKey(
+            for: AccountDataKey(kid: "0123abcd", key: Data(repeating: 7, count: 32))
+        )
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            for action in ["Turn On", "Rotate Key"] {
+                let alert = SettingsWindowController.encryptionRecoveryConfirmationAlert(
+                    recovery: recovery, actionTitle: action, target: nil
+                )
+                alert.window.appearance = NSAppearance(named: appearance)
+                alert.layout()
+                alert.window.makeKeyAndOrderFront(nil)
+                defer { alert.window.close() }
+                let stack = try XCTUnwrap(alert.accessoryView as? NSStackView)
+                XCTAssertGreaterThanOrEqual(stack.frame.width, 430)
+                XCTAssertGreaterThan(stack.frame.height, 80)
+                let key = try XCTUnwrap(stack.arrangedSubviews.first as? NSTextField)
+                XCTAssertEqual(key.stringValue, recovery)
+                XCTAssertTrue(key.isSelectable)
+                let textSize = try XCTUnwrap(key.cell).cellSize(forBounds: key.bounds)
+                XCTAssertLessThanOrEqual(textSize.height, key.bounds.height)
+                let actions = try XCTUnwrap(stack.arrangedSubviews[1] as? NSStackView)
+                XCTAssertEqual(actions.arrangedSubviews.compactMap { ($0 as? NSButton)?.title }, ["Copy", "Save to File\u{2026}"])
+                let saved = try XCTUnwrap(stack.arrangedSubviews[2] as? NSButton)
+                XCTAssertEqual(saved.state, .off)
+                XCTAssertNotNil(saved.action)
+                XCTAssertEqual(alert.buttons[0].title, action)
+                XCTAssertFalse(alert.buttons[0].isEnabled)
+                let content = try XCTUnwrap(alert.window.contentView)
+                for view in stack.arrangedSubviews + actions.arrangedSubviews {
+                    let frame = content.convert(view.bounds, from: view)
+                    XCTAssertGreaterThan(frame.width, 0)
+                    XCTAssertGreaterThan(frame.height, 0)
+                    XCTAssertTrue(content.bounds.contains(frame), "Encryption recovery control is clipped: \(type(of: view))")
+                }
+            }
+        }
+    }
+
     func testDisablingEncryptionWaitsForOwnerAuthenticationAndDenialDoesNothing() {
         var completeAuthentication: ((Bool) -> Void)?
         var confirmed = false

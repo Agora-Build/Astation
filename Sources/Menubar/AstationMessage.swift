@@ -63,7 +63,15 @@ enum AstationMessage: Codable {
     case verifyReveal(AtemVerifyReveal)
     case deviceVerified(AtemDeviceVerified)
     case verifyAbort(reason: String)
-    case encryptionMigrationComplete(mode: String, kid: String)
+    case unlockRequest(AtemUnlockRequestWire)
+    case unlockGrant(AtemUnlockGrantWire)
+    case unlockDenied(reason: String, revoked: Bool = false)
+    case storageKeyRotate(AtemStorageRotateWire)
+    case storageKeyAck(ack: AtemSignedWire)
+    case storageKeyRejected(reason: String, pendingKid: String?)
+    case storageKeyConfirm(confirm: AtemSignedWire)
+    case storageKeyAbandon(abandon: AtemSignedWire)
+    case encryptionMigrationComplete(mode: String, kid: String, completion: AtemSignedWire? = nil)
 
     // Custom encoding/decoding to handle the enum cases
     private enum CodingKeys: String, CodingKey {
@@ -105,6 +113,8 @@ enum AstationMessage: Codable {
         case keyRequest
         case keyGrant
         case verifyCommit, verifyKeys, verifyReveal, deviceVerified, verifyAbort
+        case unlockRequest, unlockGrant, unlockDenied
+        case storageKeyRotate, storageKeyAck, storageKeyRejected, storageKeyConfirm, storageKeyAbandon
         case encryptionMigrationComplete
     }
     
@@ -317,11 +327,44 @@ enum AstationMessage: Codable {
             var dc = container.nestedContainer(keyedBy: EncryptionKeys.self, forKey: .data)
             try dc.encode(reason, forKey: .reason)
 
-        case .encryptionMigrationComplete(let mode, let kid):
+        case .unlockRequest(let value):
+            try container.encode(MessageType.unlockRequest, forKey: .type)
+            try container.encode(value, forKey: .data)
+        case .unlockGrant(let value):
+            try container.encode(MessageType.unlockGrant, forKey: .type)
+            try container.encode(value, forKey: .data)
+        case .unlockDenied(let reason, let revoked):
+            try container.encode(MessageType.unlockDenied, forKey: .type)
+            var dc = container.nestedContainer(keyedBy: StorageKeyCodingKeys.self, forKey: .data)
+            try dc.encode(reason, forKey: .reason)
+            if revoked { try dc.encode(true, forKey: .revoked) }
+        case .storageKeyRotate(let value):
+            try container.encode(MessageType.storageKeyRotate, forKey: .type)
+            try container.encode(value, forKey: .data)
+        case .storageKeyAck(let ack):
+            try container.encode(MessageType.storageKeyAck, forKey: .type)
+            var dc = container.nestedContainer(keyedBy: StorageKeyCodingKeys.self, forKey: .data)
+            try dc.encode(ack, forKey: .ack)
+        case .storageKeyRejected(let reason, let pendingKid):
+            try container.encode(MessageType.storageKeyRejected, forKey: .type)
+            var dc = container.nestedContainer(keyedBy: StorageKeyCodingKeys.self, forKey: .data)
+            try dc.encode(reason, forKey: .reason)
+            try dc.encodeIfPresent(pendingKid, forKey: .pendingKid)
+        case .storageKeyConfirm(let confirm):
+            try container.encode(MessageType.storageKeyConfirm, forKey: .type)
+            var dc = container.nestedContainer(keyedBy: StorageKeyCodingKeys.self, forKey: .data)
+            try dc.encode(confirm, forKey: .confirm)
+        case .storageKeyAbandon(let abandon):
+            try container.encode(MessageType.storageKeyAbandon, forKey: .type)
+            var dc = container.nestedContainer(keyedBy: StorageKeyCodingKeys.self, forKey: .data)
+            try dc.encode(abandon, forKey: .abandon)
+
+        case .encryptionMigrationComplete(let mode, let kid, let completion):
             try container.encode(MessageType.encryptionMigrationComplete, forKey: .type)
             var dc = container.nestedContainer(keyedBy: EncryptionKeys.self, forKey: .data)
             try dc.encode(mode, forKey: .mode)
             try dc.encode(kid, forKey: .kid)
+            try dc.encodeIfPresent(completion, forKey: .completion)
         }
     }
 
@@ -342,7 +385,7 @@ enum AstationMessage: Codable {
     }
 
     private enum EncryptionKeys: String, CodingKey {
-        case mode, kid
+        case mode, kid, completion
         case accountState = "account_state"
         case grant, reason
         case publicKey = "public_key"
@@ -561,17 +604,51 @@ enum AstationMessage: Codable {
             let dc = try container.nestedContainer(keyedBy: EncryptionKeys.self, forKey: .data)
             self = .verifyAbort(reason: try dc.decode(String.self, forKey: .reason))
 
+        case .unlockRequest:
+            // Invalid request bodies still reach the authenticated controller for a denial.
+            self = .unlockRequest((try? container.decode(AtemUnlockRequestWire.self, forKey: .data)) ??
+                                  AtemUnlockRequestWire(request: Data(), signature: Data()))
+        case .unlockGrant:
+            self = .unlockGrant(try container.decode(AtemUnlockGrantWire.self, forKey: .data))
+        case .unlockDenied:
+            let dc = try container.nestedContainer(keyedBy: StorageKeyCodingKeys.self, forKey: .data)
+            self = .unlockDenied(reason: try dc.decode(String.self, forKey: .reason),
+                                 revoked: try dc.decodeIfPresent(Bool.self, forKey: .revoked) ?? false)
+        case .storageKeyRotate:
+            self = .storageKeyRotate((try? container.decode(AtemStorageRotateWire.self, forKey: .data)) ??
+                                     AtemStorageRotateWire(rotate: AtemSignedWire(statement: Data(), signature: Data()),
+                                                          encappedKey: Data(), ciphertext: Data()))
+        case .storageKeyAck:
+            let dc = try container.nestedContainer(keyedBy: StorageKeyCodingKeys.self, forKey: .data)
+            self = .storageKeyAck(ack: try dc.decode(AtemSignedWire.self, forKey: .ack))
+        case .storageKeyRejected:
+            let dc = try container.nestedContainer(keyedBy: StorageKeyCodingKeys.self, forKey: .data)
+            self = .storageKeyRejected(reason: try dc.decode(String.self, forKey: .reason),
+                                       pendingKid: try dc.decodeIfPresent(String.self, forKey: .pendingKid))
+        case .storageKeyConfirm:
+            let dc = try container.nestedContainer(keyedBy: StorageKeyCodingKeys.self, forKey: .data)
+            self = .storageKeyConfirm(confirm: try dc.decode(AtemSignedWire.self, forKey: .confirm))
+        case .storageKeyAbandon:
+            let dc = try container.nestedContainer(keyedBy: StorageKeyCodingKeys.self, forKey: .data)
+            self = .storageKeyAbandon(abandon: try dc.decode(AtemSignedWire.self, forKey: .abandon))
+
         case .encryptionMigrationComplete:
             let dc = try container.nestedContainer(keyedBy: EncryptionKeys.self, forKey: .data)
             self = .encryptionMigrationComplete(
                 mode: try dc.decode(String.self, forKey: .mode),
-                kid: try dc.decode(String.self, forKey: .kid)
+                kid: try dc.decode(String.self, forKey: .kid),
+                completion: try dc.decodeIfPresent(AtemSignedWire.self, forKey: .completion)
             )
         }
     }
 }
 
 // MARK: - Nested CodingKeys for different message types
+
+private enum StorageKeyCodingKeys: String, CodingKey {
+    case reason, revoked, ack, confirm, abandon
+    case pendingKid = "pending_kid"
+}
 
 private enum ProjectListKeys: String, CodingKey {
     case projects

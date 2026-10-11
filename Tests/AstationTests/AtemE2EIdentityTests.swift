@@ -24,10 +24,16 @@ final class TestAtemStorage: AtemIdentityStorage {
 }
 
 final class TestAtemCryptography: AtemIdentityCryptography {
-    let signing = P256.Signing.PrivateKey()
-    let encryption = Curve25519.KeyAgreement.PrivateKey()
+    let signing: P256.Signing.PrivateKey
+    let encryption: Curve25519.KeyAgreement.PrivateKey
     var failSign = false
     var creates = 0
+
+    init(signing: P256.Signing.PrivateKey = P256.Signing.PrivateKey(),
+         encryption: Curve25519.KeyAgreement.PrivateKey = Curve25519.KeyAgreement.PrivateKey()) {
+        self.signing = signing
+        self.encryption = encryption
+    }
 
     func create() throws -> AtemIdentityMaterial {
         creates += 1
@@ -50,6 +56,12 @@ final class TestAtemCryptography: AtemIdentityCryptography {
     func sign(_ message: Data, material: AtemIdentityMaterial) throws -> Data {
         if failSign { throw AtemIdentityError.keychain(errSecAuthFailed) }
         return try AtemE2ECrypto.normalizedP256Signature(P256.Signing.PrivateKey(rawRepresentation: material.signingKey).signature(for: message).rawRepresentation)
+    }
+
+    func openStorageKey(_ sealed: AtemHPKESealedKey, info: Data, material: AtemIdentityMaterial) throws -> Data {
+        var recipient = try HPKE.Recipient(privateKey: encryption, ciphersuite: .Curve25519_SHA256_ChachaPoly,
+                                          info: info, encapsulatedKey: sealed.encapsulatedKey)
+        return try recipient.open(sealed.ciphertext, authenticating: Data())
     }
 }
 
@@ -191,16 +203,16 @@ final class AtemE2EIdentityTests: XCTestCase {
     func testModeChangeRequiresSuccessfulSigningAndKeepsTheOldStateOnFailure() throws {
         let storage = TestAtemStorage(), crypto = TestAtemCryptography()
         let id = identity(storage, crypto)
-        try id.setState(account: account, mode: "on", kid: key.kid)
+        try id.setState(account: account, mode: "enabling", kid: key.kid)
         let before = storage.data
         crypto.failSign = true
-        XCTAssertThrowsError(try id.setState(account: account, mode: "off", kid: nil))
+        XCTAssertThrowsError(try id.setState(account: account, mode: "disabling", kid: key.kid))
         XCTAssertEqual(storage.data, before)
-        XCTAssertEqual(try id.state(account: account)?.mode, "on")
+        XCTAssertEqual(try id.state(account: account)?.mode, "enabling")
         let untrusted = RelayEncryptionState(dataAccount: account, mode: "off", kid: nil,
             enabledAt: nil, updatedAt: 0, plaintextFields: 0, ciphertextFields: 0, obsoleteFields: 0)
         let local = try XCTUnwrap(id.state(account: account))
-        XCTAssertEqual(untrusted.withEncryptionState(local).mode, "on")
+        XCTAssertEqual(untrusted.withEncryptionState(local).mode, "enabling")
         XCTAssertEqual(untrusted.withEncryptionState(local).kid, key.kid)
     }
 
@@ -270,7 +282,7 @@ final class AtemE2EIdentityTests: XCTestCase {
         XCTAssertEqual(try second.recoveryKit(astationId: astationId, relayURL: "http://127.0.0.1:1"), kit)
         XCTAssertTrue(try second.recoveryIsSaved())
         XCTAssertTrue(try second.isVerified(account: account, deviceId: deviceId))
-        XCTAssertEqual(try second.state(account: account)?.mode, "on")
+        XCTAssertEqual(try second.state(account: account)?.mode, "enabling")
         func storedEpoch() throws -> UInt64 {
             let record = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(storage.read())) as? [String: Any])
             return try XCTUnwrap(record["epoch"] as? NSNumber).uint64Value
@@ -300,5 +312,99 @@ final class AtemE2EIdentityTests: XCTestCase {
         XCTAssertEqual(material.recoverySecret.count, 32)
         let signature = try crypto.sign(key.key, material: material)
         XCTAssertTrue(AtemE2ECrypto.verifyP256Signature(signature, message: key.key, publicKey: try crypto.signingPublicKey(material)))
+    }
+
+    func testRealProtectedMigrationJournalRecoversAndCommitsOnceAfterIdentityReload() throws {
+        guard SecureEnclave.isAvailable else { throw XCTSkip("Secure Enclave unavailable") }
+        let account = "atem-migration-test-" + UUID().uuidString
+        let storage = AtemIdentityKeychainStorage(astationId: account)
+        defer {
+            SecItemDelete([kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: "build.agora.astation.atem-e2e-v1",
+                kSecAttrAccount as String: account, kSecUseDataProtectionKeychain as String: true] as CFDictionary)
+        }
+        let first = AtemE2EIdentity(storage: storage)
+        let keys: AtemVerifyKeys
+        do { keys = try first.verificationKeys(nonce: Data(repeating: 8, count: 32)) }
+        catch { try rethrowStorageError(error) }
+        try first.markRecoverySaved(signingPublicKey: keys.signPub)
+        let signing = Curve25519.Signing.PrivateKey()
+        _ = try first.completeVerification(account: account, deviceId: deviceId, reveal: AtemVerifyReveal(
+            devicePub: device.publicKey.rawRepresentation, deviceSignPub: signing.publicKey.rawRepresentation,
+            unlockAuthPub: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation, nonce: Data(repeating: 4, count: 32)),
+            transcript: Data(repeating: 9, count: 32), expectedSigningKey: keys.signPub, key: key)
+        let epoch = try XCTUnwrap(first.state(account: account)).epoch
+        let fields = [Data("atem-migration-complete-v1".utf8), Data(account.utf8), AtemStatements.number(1),
+            Data(deviceId.utf8), Data("on".utf8), Data(key.kid.utf8), AtemStatements.number(epoch),
+            AtemStatements.number(7), AtemStatements.number(0)]
+        let proofKey = HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: key.key),
+            salt: Data(), info: Data("atem-migration-proof-v1".utf8), outputByteCount: 32)
+        let proof = Data(HMAC<SHA256>.authenticationCode(for: try AtemE2ECrypto.encode(fields), using: proofKey))
+        let statement = try AtemE2ECrypto.encode(fields + [proof])
+        let report = AtemSignedWire(statement: statement, signature: try signing.signature(for: statement))
+        let route = AtemVerificationRoute(clientId: "disconnected-client", connectionId: "original-generation",
+            deviceId: deviceId, deviceName: "Migration integration test")
+        _ = try first.acceptMigrationCompletion(report, mode: "on", kid: key.kid, account: account, route: route, key: key)
+        let second = AtemE2EIdentity(storage: storage)
+        XCTAssertEqual(try second.pendingMigrationAccounts(), [account])
+        let committed = try XCTUnwrap(second.finishAcceptedMigration(account: account, key: key))
+        let third = AtemE2EIdentity(storage: storage)
+        XCTAssertEqual(try third.state(account: account)?.mode, "on")
+        XCTAssertTrue(AtemE2ECrypto.verifyP256Signature(committed.signedState.signature,
+            message: committed.signedState.statement, publicKey: keys.signPub))
+        let before = try storage.read()
+        let duplicate = try XCTUnwrap(third.acceptMigrationCompletion(report, mode: "on", kid: key.kid,
+            account: account, route: route, key: key))
+        XCTAssertEqual(duplicate.signedState, committed.signedState)
+        XCTAssertEqual(try storage.read(), before)
+    }
+
+    func testRealProtectedStorageKeyEscrowRestartUnlockAndReplayRejection() throws {
+        guard SecureEnclave.isAvailable else { throw XCTSkip("Secure Enclave unavailable") }
+        let astationId = "atem-storage-test-" + UUID().uuidString
+        let storage = AtemIdentityKeychainStorage(astationId: astationId)
+        defer {
+            SecItemDelete([kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: "build.agora.astation.atem-e2e-v1",
+                kSecAttrAccount as String: astationId, kSecUseDataProtectionKeychain as String: true] as CFDictionary)
+        }
+        let first = AtemE2EIdentity(storage: storage)
+        let keys: AtemVerifyKeys
+        do { keys = try first.verificationKeys(nonce: Data(repeating: 8, count: 32)) }
+        catch { try rethrowStorageError(error) }
+        try first.markRecoverySaved(signingPublicKey: keys.signPub)
+        let deviceSigning = Curve25519.Signing.PrivateKey(), unlockSigning = Curve25519.Signing.PrivateKey()
+        _ = try first.completeVerification(account: account, deviceId: deviceId, reveal: AtemVerifyReveal(
+            devicePub: device.publicKey.rawRepresentation, deviceSignPub: deviceSigning.publicKey.rawRepresentation,
+            unlockAuthPub: unlockSigning.publicKey.rawRepresentation, nonce: Data(repeating: 4, count: 32)
+        ), transcript: Data(repeating: 9, count: 32), expectedSigningKey: keys.signPub, key: nil)
+        let storageKey = Data(repeating: 0xee, count: 32), kid = "0a1b2c3d"
+        let sealed = try AtemE2ECrypto.sealKey(storageKey, to: keys.encPub,
+            info: AtemStatements.storageKeyInfo(account: account, deviceId: deviceId, kid: kid))
+        let statement = try AtemStatements.storageRotate(account: account, deviceId: deviceId, oldKid: "", newKid: kid,
+            sealedHash: AtemE2ECrypto.sealedKeyDigest(sealed))
+        let wire = AtemStorageRotateWire(rotate: AtemSignedWire(statement: statement, signature: try deviceSigning.signature(for: statement)),
+            encappedKey: sealed.encapsulatedKey, ciphertext: sealed.ciphertext)
+        let ack = try first.rotateStorageKey(wire, account: account, deviceId: deviceId)
+        let second = AtemE2EIdentity(storage: storage)
+        XCTAssertEqual(try second.rotateStorageKey(wire, account: account, deviceId: deviceId), ack)
+        XCTAssertEqual(try second.storageKeyStatus(account: account, deviceId: deviceId)?.pendingKid, kid)
+        let ephemeral = Curve25519.KeyAgreement.PrivateKey()
+        let time = Date()
+        let request = try AtemStatements.unlockRequest(account: account, deviceId: deviceId, bootId: "signed-test",
+            ephemeralPublicKey: ephemeral.publicKey.rawRepresentation, nonce: Data(repeating: 0xbb, count: 32),
+            time: UInt64(time.timeIntervalSince1970), storageKid: kid)
+        let authorization = try second.prepareUnlock(AtemUnlockRequestWire(request: request, signature: unlockSigning.signature(for: request)),
+            account: account, deviceId: deviceId, now: time)
+        let grant = try second.unlockGrant(authorization, now: time)
+        XCTAssertTrue(AtemE2ECrypto.verifyP256Signature(grant.grant.signature, message: grant.grant.statement, publicKey: keys.signPub))
+        var recipient = try HPKE.Recipient(privateKey: ephemeral, ciphersuite: .Curve25519_SHA256_ChachaPoly,
+            info: AtemStatements.unlockInfo(account: account, deviceId: deviceId, kid: kid, requestHash: Data(SHA256.hash(data: request))),
+            encapsulatedKey: grant.encappedKey)
+        XCTAssertEqual(try recipient.open(grant.ciphertext, authenticating: Data()), storageKey)
+        let third = AtemE2EIdentity(storage: storage)
+        XCTAssertEqual(try third.storageKeyStatus(account: account, deviceId: deviceId)?.currentKid, kid)
+        XCTAssertNil(try third.storageKeyStatus(account: account, deviceId: deviceId)?.pendingKid)
+        XCTAssertThrowsError(try third.rotateStorageKey(wire, account: account, deviceId: deviceId))
     }
 }

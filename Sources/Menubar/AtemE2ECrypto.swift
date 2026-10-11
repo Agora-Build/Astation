@@ -46,6 +46,23 @@ enum AtemE2ECrypto {
         return result
     }
 
+    static func decode(_ bytes: Data, maximumFields: Int) throws -> [Data] {
+        let raw = Array(bytes)
+        var offset = 0
+        var fields: [Data] = []
+        while offset < raw.count {
+            guard fields.count < maximumFields, raw.count - offset >= 4 else {
+                throw AtemE2ECryptoError.invalidFieldLength
+            }
+            let length = raw[offset..<offset + 4].reduce(0) { ($0 << 8) | Int($1) }
+            offset += 4
+            guard length <= raw.count - offset else { throw AtemE2ECryptoError.invalidFieldLength }
+            fields.append(Data(raw[offset..<offset + length]))
+            offset += length
+        }
+        return fields
+    }
+
     static func commitment(
         devicePublicKey: Data,
         deviceSigningPublicKey: Data,

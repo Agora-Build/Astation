@@ -688,11 +688,11 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         let remaining = "\(state.plaintextFields) plaintext, \(state.ciphertextFields) encrypted, \(state.obsoleteFields) obsolete fields"
         switch state.mode {
         case "off": label.stringValue = "Off — stored data is readable by the relay."
-        case "enabling": label.stringValue = "Turning on — \(remaining). Keep an Atem connected to finish migration."
+        case "enabling": label.stringValue = "Turning on — \(remaining). Run an updated, unlocked Atem command to migrate data."
         case "on":
             let date = state.enabledAt.map { Date(timeIntervalSince1970: TimeInterval($0)).formatted() } ?? "unknown date"
             label.stringValue = "On since \(date) — key \(state.kid ?? "unknown")."
-        case "disabling": label.stringValue = "Turning off — \(remaining). Keep an Atem connected to finish migration."
+        case "disabling": label.stringValue = "Turning off — \(remaining). Run an updated, unlocked Atem command to migrate data."
         default: label.stringValue = "Unknown encryption state."
         }
         if let message = hubManager.relayEncryptionStatusMessage { label.stringValue += "\n\(message)" }
@@ -743,37 +743,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private func showEncryptionRecoveryConfirmation(actionTitle: String) {
         guard let recovery = pendingEncryptionRecoveryKey,
               let key = pendingEncryptionKey else { return }
-        let alert = NSAlert()
-        alert.messageText = "Save Your Encryption Recovery Key"
-        alert.informativeText = "If you lose this Mac and every paired Atem, nobody — including the server operator — can recover your encrypted data without this separate key."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: actionTitle)
-        alert.addButton(withTitle: "Cancel")
-        alert.buttons[0].isEnabled = false
-
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 10
-        let keyLabel = NSTextField(wrappingLabelWithString: recovery)
-        keyLabel.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
-        keyLabel.isSelectable = true
-        keyLabel.translatesAutoresizingMaskIntoConstraints = false
-        keyLabel.widthAnchor.constraint(equalToConstant: 430).isActive = true
-        stack.addArrangedSubview(keyLabel)
-        let actions = NSStackView()
-        actions.orientation = .horizontal
-        actions.spacing = 8
-        actions.addArrangedSubview(NSButton(title: "Copy", target: self, action: #selector(copyPendingEncryptionRecoveryKey)))
-        actions.addArrangedSubview(NSButton(title: "Save to File…", target: self, action: #selector(savePendingEncryptionRecoveryKey)))
-        stack.addArrangedSubview(actions)
-        let saved = NSButton(
-            checkboxWithTitle: "I've saved my encryption recovery key somewhere safe",
-            target: self,
-            action: #selector(encryptionRecoveryConfirmationChanged(_:))
-        )
-        stack.addArrangedSubview(saved)
-        alert.accessoryView = stack
+        let alert = Self.encryptionRecoveryConfirmationAlert(recovery: recovery, actionTitle: actionTitle, target: self)
         pendingEncryptionAlert = alert
 
         let response = alert.runModal()
@@ -790,6 +760,44 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         pendingEncryptionKid = nil
         pendingEncryptionKey = nil
         renderEncryptionState()
+    }
+
+    static func encryptionRecoveryConfirmationAlert(recovery: String, actionTitle: String, target: AnyObject?) -> NSAlert {
+        let alert = NSAlert()
+        alert.messageText = "Save Your Encryption Recovery Key"
+        alert.informativeText = "If you lose this Mac and every paired Atem, nobody — including the server operator — can recover your encrypted data without this separate key."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: actionTitle)
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons[0].isEnabled = false
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        let keyLabel = NSTextField(wrappingLabelWithString: recovery)
+        keyLabel.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
+        keyLabel.isSelectable = true
+        keyLabel.preferredMaxLayoutWidth = 430
+        keyLabel.translatesAutoresizingMaskIntoConstraints = false
+        keyLabel.widthAnchor.constraint(equalToConstant: 430).isActive = true
+        stack.addArrangedSubview(keyLabel)
+        let actions = NSStackView()
+        actions.orientation = .horizontal
+        actions.spacing = 8
+        actions.addArrangedSubview(NSButton(title: "Copy", target: target, action: #selector(copyPendingEncryptionRecoveryKey)))
+        actions.addArrangedSubview(NSButton(title: "Save to File…", target: target, action: #selector(savePendingEncryptionRecoveryKey)))
+        stack.addArrangedSubview(actions)
+        let saved = NSButton(
+            checkboxWithTitle: "I've saved my encryption recovery key somewhere safe",
+            target: target,
+            action: #selector(encryptionRecoveryConfirmationChanged(_:))
+        )
+        stack.addArrangedSubview(saved)
+        // NSAlert sizes its accessory from the frame, not its Auto Layout constraints.
+        stack.setFrameSize(stack.fittingSize)
+        alert.accessoryView = stack
+        return alert
     }
 
     @objc private func encryptionRecoveryConfirmationChanged(_ sender: NSButton) {
