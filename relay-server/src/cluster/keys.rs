@@ -30,7 +30,7 @@ pub struct CachedKey {
 #[derive(Default)]
 struct Inner {
     keys: HashMap<String, CachedKey>,
-    /// Bumped on every `set` and `forget` (even of an absent id, so a
+    /// Bumped on every `set`, `forget`, and stale mark (even of an absent id, so a
     /// forget leaves a tombstone). A slow read applies its result only if
     /// the generation it started from is unchanged.
     generations: HashMap<String, u64>,
@@ -130,6 +130,7 @@ impl KeyCache {
         if inner.generation(astation_id) != generation {
             return;
         }
+        inner.bump(astation_id);
         inner
             .keys
             .entry(astation_id.to_string())
@@ -480,6 +481,24 @@ mod tests {
         assert!(!cache.contains("astation-b"));
         // Untouched and not listed: dropped by the reload.
         assert!(!cache.contains("astation-c"));
+    }
+
+    #[tokio::test]
+    async fn an_inflight_load_preserves_a_new_stale_key_or_placeholder() {
+        for id in ["astation-a", "astation-unknown"] {
+            let (store, entered, release) = slow("04aa");
+            let cache = KeyCache::new();
+            cache.set("astation-a", "04bb");
+            let loading_cache = cache.clone();
+            let task = tokio::spawn(async move { loading_cache.load(&store).await.unwrap() });
+            entered.notified().await;
+            cache.reload_one(&DownStore, id).await;
+            let stale = cache.get(id).unwrap();
+            assert!(stale.stale);
+            release.notify_one();
+            task.await.unwrap();
+            assert_eq!(cache.get(id), Some(stale), "a later failed re-read must stay fail-closed");
+        }
     }
 
     #[tokio::test]

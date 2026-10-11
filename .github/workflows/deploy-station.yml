@@ -45,6 +45,8 @@ jobs:
           context: ${{ matrix.context }}
           platforms: linux/amd64
           push: true
+          build-args: |
+            ASTATION_BUILD_COMMIT=${{ github.sha }}
           tags: |
             ghcr.io/${{ steps.meta.outputs.owner }}/${{ matrix.image }}:main
             ghcr.io/${{ steps.meta.outputs.owner }}/${{ matrix.image }}:sha-${{ github.sha }}
@@ -100,4 +102,5 @@ jobs:
         env:
           STATION_MIN_REPLICAS: ${{ vars.STATION_MIN_REPLICAS }}
           STATION_REQUIRE_REDIS: ${{ vars.STATION_REQUIRE_REDIS }}
+          STATION_EXPECTED_COMMIT: ${{ github.sha }}
         run: node .github/scripts/verify-station.mjs

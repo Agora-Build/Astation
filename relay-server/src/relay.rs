@@ -4872,9 +4872,8 @@ pub(crate) mod tests {
     /// authorizing them. Run with IDENTITY_TEST_DATABASE_URL (see identity_store).
     #[tokio::test]
     #[ignore]
-    async fn pg_bindings_survive_a_new_app_state() {
-        let _guard = crate::identity_store::tests::PG_LOCK.lock().await;
-        let store = crate::identity_store::tests::fresh_pg().await;
+    async fn postgres_bindings_survive_a_new_app_state() {
+        let (database, store) = crate::identity_store::tests::fresh_pg().await;
         let state = identity_state(std::sync::Arc::new(store));
         let (base_url, server) = spawn_relay(state.clone()).await;
         let code = "astation-pg-restart";
@@ -4884,12 +4883,7 @@ pub(crate) mod tests {
         assert_eq!(ack["ok"], true);
         server.abort();
 
-        let url = std::env::var("IDENTITY_TEST_DATABASE_URL").unwrap();
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .unwrap();
+        let pool = database.reconnect(2).await;
         let restarted = identity_state(std::sync::Arc::new(
             crate::identity_store::PgIdentityStore::new(pool),
         ));
@@ -4902,6 +4896,7 @@ pub(crate) mod tests {
         let (base_url, server) = spawn_relay(restarted).await;
         verified_astation(&base_url, code, &key, "verified").await;
         server.abort();
+        database.cleanup().await;
     }
 
     // ─────────────── Key cache, DB outages, admin reset, DELETE ───────────────
@@ -5871,7 +5866,13 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(response.status(), HttpStatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(body.as_ref(), br#"{"status":"draining"}"#);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "status": "draining", "version": env!("CARGO_PKG_VERSION"),
+                "build_commit": crate::BUILD_COMMIT,
+            })
+        );
 
         match tokio_tungstenite::connect_async(format!("{base_url}?role=astation&code=late")).await {
             Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {

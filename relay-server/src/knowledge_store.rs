@@ -1612,13 +1612,18 @@ mod tests {
         }
     }
 
+    fn skill_files(body: &str) -> serde_json::Value {
+        use base64::Engine;
+        json!({ "SKILL.md": base64::engine::general_purpose::STANDARD.encode(body) })
+    }
+
     fn skill(name: &str, body: &str) -> SkillRow {
         SkillRow {
             scope: "global".to_string(),
             project: String::new(),
             name: name.to_string(),
             version: 0,
-            files: json!({ "SKILL.md": body }),
+            files: skill_files(body),
             content_hash: format!("h:{}", body),
             source_agent: "claude".to_string(),
             source_machine: "m1".to_string(),
@@ -1763,10 +1768,10 @@ mod tests {
             let sk = s.pull_skills(A, 0, 100).await.unwrap();
             let names: Vec<&str> = sk.iter().map(|r| r.name.as_str()).collect();
             assert_eq!(names, vec!["x", "y"]);
-            assert!(sk.iter().all(|r| r.files == json!({"SKILL.md": "a"})));
+            assert!(sk.iter().all(|r| r.files == skill_files("a")));
             let sk = s.pull_skills(B, 0, 100).await.unwrap();
             assert_eq!(sk.len(), 1);
-            assert_eq!(sk[0].files, json!({"SKILL.md": "b"}));
+            assert_eq!(sk[0].files, skill_files("b"));
         }
 
         pub async fn pull_respects_since_and_limit_cap(s: &dyn KnowledgeStore) {
@@ -1854,7 +1859,7 @@ mod tests {
             assert_eq!(versions, (1..=9).collect::<Vec<_>>());
             let v9 = rows.iter().find(|r| r.version == 9).unwrap();
             assert!(!v9.deleted);
-            assert_eq!(v9.files, json!({"SKILL.md": "v9"}));
+            assert_eq!(v9.files, skill_files("v9"));
             assert_eq!(v9.content_hash, "h:v9");
         }
 
@@ -1872,7 +1877,7 @@ mod tests {
             assert_eq!(t.content_hash, "");
             assert_eq!(t.source_agent, "claude");
             // v1 is untouched.
-            assert_eq!(rows[0].files, json!({"SKILL.md": "v1"}));
+            assert_eq!(rows[0].files, skill_files("v1"));
             assert!(!rows[0].deleted);
             // Unknown skill (or another account's) → 0/0, nothing appended.
             let u = s.delete_skill(A, "global", "", "nope").await.unwrap();
@@ -1912,7 +1917,7 @@ mod tests {
             let v2 = all.iter().find(|r| r.version == 2).unwrap();
             assert!(!v2.deleted);
             assert!(!v2.purged);
-            assert_eq!(v2.files, json!({"SKILL.md": "v2"}));
+            assert_eq!(v2.files, skill_files("v2"));
 
             let n = s.purge_skill(A, "global", "", "x", None).await.unwrap();
             assert_eq!(n, 3);
@@ -1929,7 +1934,7 @@ mod tests {
             let b = s.pull_skills(B, 0, 100).await.unwrap();
             assert_eq!(b.len(), 1);
             assert!(!b[0].deleted);
-            assert_eq!(b[0].files, json!({"SKILL.md": "b"}));
+            assert_eq!(b[0].files, skill_files("b"));
         }
 
         pub async fn seq_is_global_and_monotonic(s: &dyn KnowledgeStore) {
@@ -2188,7 +2193,7 @@ mod tests {
             s.purge_skill(A, "global", "", "x", Some(vec![1])).await.unwrap();
             let v2 = s.skill_version(A, "global", "", "x", 2).await.unwrap().unwrap();
             assert_eq!((v2.version, v2.deleted, v2.purged), (2, false, false));
-            assert_eq!(v2.files, json!({"SKILL.md": "v2"}));
+            assert_eq!(v2.files, skill_files("v2"));
             let v1 = s.skill_version(A, "global", "", "x", 1).await.unwrap().unwrap();
             assert!(v1.purged && v1.deleted && v1.files == json!({}));
             let v3 = s.skill_version(A, "global", "", "x", 3).await.unwrap().unwrap();
@@ -2331,76 +2336,59 @@ mod tests {
     // KNOWLEDGE_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55432/postgres \
     //   cargo test knowledge_store -- --ignored
 
-    /// Pg tests share one database, so they run one at a time.
-    static PG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    use crate::test_database::TestDatabase;
 
-    /// Drop and recreate the knowledge tables, then run the migrations.
-    async fn fresh_pg() -> PgKnowledgeStore {
-        let url = std::env::var("KNOWLEDGE_TEST_DATABASE_URL")
-            .expect("set KNOWLEDGE_TEST_DATABASE_URL to run the Postgres tests");
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(12)
-            .connect(&url)
-            .await
-            .expect("connect KNOWLEDGE_TEST_DATABASE_URL");
-        for stmt in [
-            "DROP TABLE IF EXISTS memories",
-            "DROP TABLE IF EXISTS skill_versions",
-            "DROP SEQUENCE IF EXISTS knowledge_seq",
-            // Forget applied migrations so 0002 runs again (0001 is IF NOT EXISTS).
-            "DROP TABLE IF EXISTS _sqlx_migrations",
-        ] {
-            sqlx::query(stmt).execute(&pool).await.unwrap();
-        }
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        PgKnowledgeStore::new(pool)
+    async fn fresh_pg() -> (TestDatabase, PgKnowledgeStore) {
+        let database = TestDatabase::migrated("KNOWLEDGE_TEST_DATABASE_URL", 12).await;
+        let store = PgKnowledgeStore::new(database.pool.clone());
+        (database, store)
     }
 
     macro_rules! pg_tests {
         ($($name:ident),* $(,)?) => {
-            mod pg {
+            mod postgres {
                 use super::*;
                 $(
                     #[tokio::test]
                     #[ignore]
                     async fn $name() {
-                        let _g = PG_LOCK.lock().await;
-                        let s = fresh_pg().await;
+                        let (database, s) = fresh_pg().await;
                         scenarios::$name(&s).await;
+                        database.cleanup().await;
                     }
                 )*
 
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 #[ignore]
                 async fn concurrent_skill_pushes_get_distinct_versions() {
-                    let _g = PG_LOCK.lock().await;
-                    let s = fresh_pg().await;
+                    let (database, s) = fresh_pg().await;
                     scenarios::concurrent_skill_pushes_get_distinct_versions(Arc::new(s)).await;
+                    database.cleanup().await;
                 }
 
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 #[ignore]
                 async fn cursor_pull_never_skips_rows() {
-                    let _g = PG_LOCK.lock().await;
-                    let s = fresh_pg().await;
+                    let (database, s) = fresh_pg().await;
                     scenarios::cursor_pull_never_skips_rows(Arc::new(s)).await;
+                    database.cleanup().await;
                 }
 
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 #[ignore]
                 async fn concurrent_dedup_adds_converge() {
-                    let _g = PG_LOCK.lock().await;
-                    let s = fresh_pg().await;
+                    let (database, s) = fresh_pg().await;
                     scenarios::concurrent_dedup_adds_converge(Arc::new(s)).await;
+                    database.cleanup().await;
                 }
 
                 #[tokio::test]
                 #[ignore]
                 async fn pg_backend_name_and_health() {
-                    let _g = PG_LOCK.lock().await;
-                    let s = fresh_pg().await;
+                    let (database, s) = fresh_pg().await;
                     assert_eq!(s.backend_name(), "postgres");
                     assert!(s.health_check().await.is_ok());
+                    database.cleanup().await;
                 }
             }
         };
@@ -2432,23 +2420,10 @@ mod tests {
     /// only covers valid, undeleted rows.
     #[tokio::test]
     #[ignore]
-    async fn pg_migration_0004_backfills_deleted_at_and_drops_deleted() {
+    async fn postgres_migration_0004_backfills_deleted_at_and_drops_deleted() {
         use sqlx::Executor;
-        let _g = PG_LOCK.lock().await;
-        let url = std::env::var("KNOWLEDGE_TEST_DATABASE_URL")
-            .expect("set KNOWLEDGE_TEST_DATABASE_URL to run the Postgres tests");
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
-            .await
-            .unwrap();
-        for stmt in [
-            "DROP TABLE IF EXISTS memories",
-            "DROP TABLE IF EXISTS skill_versions",
-            "DROP SEQUENCE IF EXISTS knowledge_seq",
-        ] {
-            sqlx::query(stmt).execute(&pool).await.unwrap();
-        }
+        let database = TestDatabase::new("KNOWLEDGE_TEST_DATABASE_URL", 2).await;
+        let pool = database.pool.clone();
         pool.execute(include_str!("../migrations/0002_knowledge.sql")).await.unwrap();
         pool.execute(
             "INSERT INTO memories (id, account_id, scope, content, content_hash, source_agent, \
@@ -2472,7 +2447,7 @@ mod tests {
         assert_eq!(rows[1], ("m_live".to_string(), None, None, None, None));
         let has_deleted: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
-             WHERE table_name = 'memories' AND column_name = 'deleted')",
+             WHERE table_schema = current_schema() AND table_name = 'memories' AND column_name = 'deleted')",
         )
         .fetch_one(&pool)
         .await
@@ -2489,9 +2464,7 @@ mod tests {
             pred.contains("deleted_at IS NULL") && pred.contains("invalid_at IS NULL"),
             "{pred}"
         );
-        drop(pool);
-        // Leave the shared database fully migrated for the other suites.
-        fresh_pg().await;
+        database.cleanup().await;
     }
 
     #[tokio::test]
