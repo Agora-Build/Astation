@@ -288,19 +288,21 @@ final class TranscriptionSettingsTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(buttons.first { $0.title == "Stop Transcription" }).isEnabled)
         XCTAssertEqual(recorder.state, .idle)
     }
-    func testEmptyAndStaleSourcesShowGuidanceWithoutStartingCapture() throws {
+    func testIndependentSourcesAndStaleAppShowGuidanceWithoutStartingCapture() throws {
         _ = NSApplication.shared
         let defaults = defaults(), recorder = AudioRecordingManager(defaults: defaults)
         var config = recorder.settings; config.microphoneEnabled = false; recorder.updateSettings(config)
         let controller = TranscriptionViewController(recorder: recorder)
         controller.loadViewIfNeeded()
         let fields = descendants(controller.view).compactMap { $0 as? NSTextField }
-        XCTAssertTrue(fields.contains { $0.stringValue.hasPrefix("No sources enabled.") })
-        XCTAssertTrue(fields.contains { $0.stringValue.hasPrefix("A previously selected source") })
+        let sources = descendants(controller.view).compactMap { $0 as? NSButton }.filter { $0.identifier?.rawValue.hasPrefix("transcription-source-") == true }
+        XCTAssertEqual(sources.count, 2, "Mic and System remain available independently of recording settings")
+        XCTAssertFalse(fields.contains { $0.stringValue.hasPrefix("A previously selected source") })
         config.microphoneEnabled = true; config.outputMode = .applications; config.applicationBundleIDs = ["test.current-app"]
         recorder.updateSettings(config)
         var settings = recorder.transcription.settings; settings.sourceID = "test.previous-app"
         recorder.transcription.updateSettings(settings)
+        XCTAssertTrue(fields.contains { $0.stringValue.hasPrefix("A previously selected source") })
         let current = try XCTUnwrap(descendants(controller.view).compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "transcription-source-test.current-app" })
         current.performClick(nil)
         XCTAssertEqual(recorder.transcription.settings.selectedSourceIDs, ["test.current-app"])
@@ -326,10 +328,10 @@ final class TranscriptionSettingsTests: XCTestCase {
         XCTAssertEqual(TranscriptionToastController.captionText([original, translation]).string, "First line\nSecond line\nes-ES  Hola")
     }
     func testToastTextLabelsConcurrentSourcesAndTranslations() {
-        let original = TranscriptSegment(id: "1", sourceID: "mic", language: "en-US", text: "First line\nSecond line", isFinal: true, offset: 0)
+        let original = TranscriptSegment(id: "1", sourceID: "microphone", language: "en-US", text: "First line\nSecond line", isFinal: true, offset: 0)
         let translation = TranscriptSegment(id: "1", sourceID: "app", language: "es-ES", text: "Hola", isFinal: true, offset: 0, isTranslation: true)
-        XCTAssertEqual(TranscriptionToastController.captionText([original, translation], sourceTitles: ["mic": "Microphone", "app": "Music"]).string,
-                       "Microphone  First line\nSecond line\nMusic  es-ES  Hola")
+        XCTAssertEqual(TranscriptionToastController.captionText([original, translation], sourceTitles: ["microphone": "Microphone", "app": "Music"]).string,
+                       "First line\nSecond line\nMusic  es-ES  Hola")
     }
     func testCaptionSelectionSurvivesAppendFinalizationAndEarlierExpiry() throws {
         let old = TranscriptionToastController.captionText([segment("Earlier line", id: "old"), segment("Hello caf\u{00E9} \u{1F44B}", id: "selected")])

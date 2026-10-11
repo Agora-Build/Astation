@@ -17,6 +17,9 @@ struct DictationSettings: Codable, Equatable {
     var provider: DictationLLMProvider = .local
     var typeInActiveTextField = true
     var sendToAtem = false
+    var saveToFiles = false
+    var folderPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        .appendingPathComponent("Astation/Dictation", isDirectory: true).path
     var cloudModel = "gpt-4.1-mini"
     var localEndpoint = "http://localhost:11434/v1/chat/completions"
     var localModel = "qwen3:4b"
@@ -48,12 +51,13 @@ struct DictationSettings: Codable, Equatable {
         var outputs = [String]()
         if typeInActiveTextField { outputs.append("Active text field") }
         if sendToAtem { outputs.append("Active Atem") }
+        if saveToFiles { outputs.append("Files") }
         outputs.append("Floating captions")
         return outputs.joined(separator: " + ")
     }
 
     private enum CodingKeys: String, CodingKey {
-        case polishing, provider, typeInActiveTextField, sendToAtem
+        case polishing, provider, typeInActiveTextField, sendToAtem, saveToFiles, folderPath
         case cloudModel, localEndpoint, localModel, customEndpoint, customModel, consentEndpoint
     }
     private enum LegacyCodingKeys: String, CodingKey { case destination }
@@ -66,6 +70,8 @@ extension DictationSettings {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         polishing = try values.decodeIfPresent(Bool.self, forKey: .polishing) ?? polishing
         provider = try values.decodeIfPresent(DictationLLMProvider.self, forKey: .provider) ?? provider
+        saveToFiles = try values.decodeIfPresent(Bool.self, forKey: .saveToFiles) ?? false
+        folderPath = try values.decodeIfPresent(String.self, forKey: .folderPath) ?? folderPath
         if values.contains(.typeInActiveTextField) || values.contains(.sendToAtem) {
             typeInActiveTextField = try values.decodeIfPresent(Bool.self, forKey: .typeInActiveTextField) ?? typeInActiveTextField
             sendToAtem = try values.decodeIfPresent(Bool.self, forKey: .sendToAtem) ?? sendToAtem

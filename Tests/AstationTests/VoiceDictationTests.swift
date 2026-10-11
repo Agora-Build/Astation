@@ -47,6 +47,12 @@ final class VoiceDictationTests: XCTestCase {
     private func segment(_ text: String, id: String = "one", final: Bool = true) -> TranscriptSegment {
         TranscriptSegment(id: id, sourceID: "microphone", language: "en-US", text: text, isFinal: final, offset: 0)
     }
+    private func fileFolder() throws -> URL {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("astation-dictation-files-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        return root
+    }
     private func waitUntil(_ predicate: () -> Bool) async throws {
         for _ in 0..<200 { if predicate() { return }; try await Task.sleep(nanoseconds: 10_000_000) }
         XCTFail("Dictation state did not settle")
@@ -241,6 +247,98 @@ final class VoiceDictationTests: XCTestCase {
         XCTAssertEqual(captions.floatingCaptionBuffer.lines.map(\.segment.text), ["hello"])
         XCTAssertTrue(dictation.message?.contains("inserted in the original text field") == true)
     }
+    func testAllThreeOutputCombinationsIncludeFileOnlyWithoutAccessingDisabledTargets() async throws {
+        for typing in [false, true] {
+            for atem in [false, true] {
+                for files in [false, true] {
+                    let engine = DictationTestEngine(), recorder = AudioRecordingManager(defaults: defaults())
+                    let field = DictationTestTextTarget(), root = try fileFolder()
+                    var captures = 0, resolutions = 0, sends = 0
+                    await engine.setFinish([segment("Save this dictation")])
+                    let voice = VoiceDictationManager(transcription: transcription(recorder), captureFactory: { _ in SharedTestMicrophone() },
+                        permission: { true }, engineFactory: { engine }, resolveTarget: { resolutions += 1; return "atem-1" },
+                        sendText: { _, _ in sends += 1; return true }, showStatus: { _ in }, defaults: outputDefaults(typing: typing, atem: atem),
+                        captureTextTarget: { captures += 1; return field })
+                    var settings = voice.settings; settings.saveToFiles = files; settings.folderPath = root.path; voice.updateSettings(settings)
+                    voice.startPTT(); try await waitUntilAsync { await engine.started }
+                    voice.stopPTT(); try await waitUntil { voice.mode == .off }
+                    XCTAssertEqual(captures, typing ? 1 : 0); XCTAssertEqual(resolutions, atem ? 2 : 0)
+                    XCTAssertEqual(sends, atem ? 1 : 0); XCTAssertEqual(field.inserted, typing ? ["Save this dictation"] : [])
+                    if files {
+                        let saved = try XCTUnwrap(voice.lastDictationFolder)
+                        let text = try String(contentsOf: saved.appendingPathComponent("transcript.txt"), encoding: .utf8)
+                        XCTAssertTrue(text.contains("Save this dictation"))
+                        let metadata = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: saved.appendingPathComponent("session.json"))) as? [String: Any])
+                        XCTAssertEqual(metadata["kind"] as? String, "dictation")
+                        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: saved.appendingPathComponent("transcript.txt").path)[.posixPermissions] as? Int, 0o600)
+                    } else {
+                        XCTAssertNil(voice.lastDictationFolder)
+                        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: root.path).isEmpty)
+                    }
+                }
+            }
+        }
+    }
+    func testFileCreationFailureDoesNotBlockTypingOrAtem() async throws {
+        let engine = DictationTestEngine(), recorder = AudioRecordingManager(defaults: defaults()), field = DictationTestTextTarget()
+        let blocked = try fileFolder().appendingPathComponent("not-a-directory"); try Data().write(to: blocked)
+        var sends = 0
+        await engine.setFinish([segment("Deliver despite file failure")])
+        let voice = VoiceDictationManager(transcription: transcription(recorder), captureFactory: { _ in SharedTestMicrophone() },
+            permission: { true }, engineFactory: { engine }, resolveTarget: { "atem-1" }, sendText: { _, _ in sends += 1; return true },
+            showStatus: { _ in }, defaults: outputDefaults(typing: true, atem: true), captureTextTarget: { field })
+        var settings = voice.settings; settings.saveToFiles = true; settings.folderPath = blocked.path; voice.updateSettings(settings)
+        voice.startPTT(); try await waitUntilAsync { await engine.started }; voice.stopPTT()
+        try await waitUntil { voice.mode == .off }
+        XCTAssertEqual(sends, 1); XCTAssertEqual(field.inserted, ["Deliver despite file failure"])
+        XCTAssertTrue(voice.fileMessage?.contains("could not be created") == true)
+    }
+    func testDictationMetadataDoesNotCopyUnrelatedRemoteConfiguration() async throws {
+        let engine = DictationTestEngine(), recorder = AudioRecordingManager(defaults: defaults())
+        let captions = transcription(recorder)
+        var profile = captions.settings; profile.customEndpoint = "https://speech.example.test/?token=test-only-secret"
+        captions.updateSettings(profile)
+        await engine.setFinish([segment("Local dictation")])
+        let voice = VoiceDictationManager(transcription: captions, captureFactory: { _ in SharedTestMicrophone() }, permission: { true },
+            engineFactory: { engine }, showStatus: { _ in }, defaults: outputDefaults(atem: false))
+        var settings = voice.settings; settings.saveToFiles = true; settings.folderPath = try fileFolder().path; voice.updateSettings(settings)
+        voice.startPTT(); try await waitUntilAsync { await engine.started }; voice.stopPTT(); try await waitUntil { voice.mode == .off }
+        let saved = try XCTUnwrap(voice.lastDictationFolder)
+        let data = try Data(contentsOf: saved.appendingPathComponent("session.json"))
+        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("test-only-secret"))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let stored = try XCTUnwrap(object["settings"] as? [String: Any])
+        XCTAssertEqual(stored["provider"] as? String, "local"); XCTAssertEqual(stored["customEndpoint"] as? String, "")
+    }
+    func testHandsFreeFilesDeduplicateFinalsAndSaveRawOnPolishingFailure() async throws {
+        let engine = DictationTestEngine(), recorder = AudioRecordingManager(defaults: defaults())
+        let voice = VoiceDictationManager(transcription: transcription(recorder), captureFactory: { _ in SharedTestMicrophone() },
+            permission: { true }, engineFactory: { engine }, showStatus: { _ in }, defaults: outputDefaults(atem: false),
+            polish: { _, _ in throw DictationError.message("Polishing failed") })
+        var settings = voice.settings; settings.saveToFiles = true; settings.folderPath = try fileFolder().path; settings.polishing = true
+        voice.updateSettings(settings)
+        voice.startHandsFree(); try await waitUntilAsync { await engine.started }
+        await engine.emit(segment("Keep raw locally")); await engine.emit(segment("Keep raw locally"))
+        try await waitUntil { voice.lastDictationText == "Keep raw locally" }
+        voice.stopHandsFree(); try await waitUntil { voice.mode == .off }
+        let saved = try XCTUnwrap(voice.lastDictationFolder)
+        let lines = try String(contentsOf: saved.appendingPathComponent("transcript.txt"), encoding: .utf8).split(separator: "\n")
+        XCTAssertEqual(lines.count, 1); XCTAssertTrue(lines[0].contains("Keep raw locally"))
+    }
+    func testRecognitionCompletionReleasesTranscriptionBeforeSlowPolishing() async throws {
+        let recorder = AudioRecordingManager(defaults: defaults(), captureFactory: { _ in SharedTestMicrophone() }, microphonePermission: { true })
+        let captions = transcription(recorder), engine = DictationTestEngine(), pending = PendingDictationPolish()
+        captions.start(); try await waitUntil { captions.state == .running }
+        await engine.setFinish([segment("A slow output")])
+        let voice = VoiceDictationManager(transcription: captions, captureFactory: { _ in SharedTestMicrophone() }, permission: { true },
+            engineFactory: { engine }, showStatus: { _ in }, defaults: outputDefaults(atem: false), polish: { text, _ in await pending.polish(text) })
+        voice.setPolishing(true); voice.startPTT(); try await waitUntilAsync { await engine.started }
+        voice.stopPTT(); try await waitUntilAsync { await pending.texts.count == 1 }
+        try await waitUntil { captions.state == .running }
+        XCTAssertTrue(voice.isPolishing); XCTAssertFalse(captions.isDictating)
+        await pending.resolve("A slow output."); try await waitUntil { voice.mode == .off }
+        captions.stop(); try await waitUntil { captions.state == .idle }
+    }
     func testChangingOutputsDuringPolishingCancelsLateDeliveryToBothOutputs() async throws {
         let engine = DictationTestEngine(), pending = PendingDictationPolish(), recorder = AudioRecordingManager(defaults: defaults())
         let captions = transcription(recorder), field = DictationTestTextTarget(); var sends = 0
@@ -269,7 +367,7 @@ final class VoiceDictationTests: XCTestCase {
         XCTAssertNil(object["destination"])
         XCTAssertEqual(try JSONDecoder().decode(DictationSettings.self, from: stored), settings)
     }
-    func testMicTranscriptionCancelsDictationAndBlocksBothModesWhileSystemAllowsThem() async throws {
+    func testDictationKeepsPriorityWhenTranscriptionStartsAndOffPreventsResume() async throws {
         let mic = SharedTestMicrophone(), engine = DictationTestEngine()
         let recorder = AudioRecordingManager(defaults: defaults(), captureFactory: { _ in SharedTestMicrophone() }, microphonePermission: { true })
         var recording = recorder.settings; recording.outputMode = .system; recorder.updateSettings(recording)
@@ -277,9 +375,11 @@ final class VoiceDictationTests: XCTestCase {
         let dictation = VoiceDictationManager(transcription: captions, captureFactory: { _ in mic }, permission: { true }, engineFactory: { engine },
             sendText: { _, _ in sends += 1; return true }, showStatus: { _ in }, defaults: outputDefaults(atem: false))
         dictation.startPTT(); try await waitUntilAsync { await engine.started }; await engine.emit(segment("discard this", final: false))
-        captions.start(); XCTAssertEqual(dictation.mode, .off); XCTAssertFalse(dictation.isAvailable)
-        dictation.startPTT(); XCTAssertEqual(dictation.mode, .off); dictation.startHandsFree(); XCTAssertEqual(dictation.mode, .off)
+        captions.start(); XCTAssertEqual(dictation.mode, .ptt); XCTAssertTrue(dictation.isAvailable)
+        XCTAssertFalse(captions.isActive); XCTAssertTrue(captions.wantsTranscription)
+        dictation.startHandsFree(); XCTAssertEqual(dictation.mode, .ptt)
         XCTAssertEqual(sends, 0); captions.stop(); try await waitUntil { !captions.isActive }
+        dictation.cancel()
         var settings = captions.settings; settings.sourceID = "system"; captions.updateSettings(settings)
         captions.start(); XCTAssertTrue(dictation.isAvailable)
         dictation.startHandsFree(); XCTAssertEqual(dictation.mode, .handsFree)
@@ -306,10 +406,14 @@ final class VoiceDictationTests: XCTestCase {
         dictation.startPTT(); try await waitUntilAsync { await engine.started }; dictation.stopPTT(); try await waitUntil { dictation.mode == .off }
         XCTAssertEqual(sends, 0); XCTAssertEqual(dictation.lastDictationText, "captions only")
     }
-    func testSettingsAndFloatingPanelKnobsStayInSyncAndRender() throws {
+    func testSettingsAndFloatingPanelKnobsStayInSyncAndRender() async throws {
         _ = NSApplication.shared
         let recorder = AudioRecordingManager(defaults: defaults()), storage = defaults(), captions = transcription(recorder)
-        let dictation = VoiceDictationManager(transcription: captions, showStatus: { _ in }, defaults: storage)
+        let engine = DictationTestEngine()
+        let dictation = VoiceDictationManager(transcription: captions, captureFactory: { _ in SharedTestMicrophone() },
+            permission: { true }, engineFactory: { engine }, showStatus: { _ in }, defaults: storage)
+        defer { dictation.cancel() }
+        var config = dictation.settings; config.typeInActiveTextField = false; dictation.updateSettings(config)
         let settings = VoiceDictationViewController(manager: dictation)
         let toast = TranscriptionToastController(manager: captions, showWindow: false)
         toast.attachDictation(dictation)
@@ -318,8 +422,11 @@ final class VoiceDictationTests: XCTestCase {
         window.contentView = settings.view
         window.contentView?.layoutSubtreeIfNeeded()
         XCTAssertEqual(settings.polishKnob.state, .off); XCTAssertEqual(toast.polishKnob.state, .off)
+        XCTAssertTrue(toast.polishKnob.isHidden)
         settings.polishKnob.performClick(nil)
         XCTAssertTrue(dictation.settings.polishing); XCTAssertEqual(toast.polishKnob.state, .on)
+        dictation.startHandsFree(); try await waitUntilAsync { await engine.started }
+        XCTAssertFalse(toast.polishKnob.isHidden)
         toast.polishKnob.performClick(nil)
         XCTAssertFalse(dictation.settings.polishing); XCTAssertEqual(settings.polishKnob.state, .off)
         dictation.setPolishing(true)

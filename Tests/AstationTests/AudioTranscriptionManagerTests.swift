@@ -216,7 +216,8 @@ final class AudioTranscriptionManagerTests: XCTestCase {
         XCTAssertEqual(Set(manager.transcript.segments.map(\.sourceID)), ["microphone", "system"])
         XCTAssertEqual(manager.floatingCaptionBuffer.lines.count, 2)
         let text = TranscriptionToastController.captionText(manager.transcript.segments, sourceTitles: manager.sourceTitles).string
-        XCTAssertTrue(text.contains("Microphone  hello\nworld"))
+        XCTAssertTrue(text.contains("hello\nworld"))
+        XCTAssertFalse(text.contains("Microphone  "))
         XCTAssertTrue(text.contains("All System Audio  hello\nworld"))
         XCTAssertTrue(manager.transcript.text.contains("microphone en-US"))
         XCTAssertTrue(manager.transcript.text.contains("system en-US"))
@@ -293,7 +294,7 @@ final class AudioTranscriptionManagerTests: XCTestCase {
             var micPermissions = 0
             let recorder = AudioRecordingManager(defaults: defaults, captureFactory: { _ in capture }, microphonePermission: { micPermissions += 1; return false })
             var recording = recorder.settings
-            recording.microphoneEnabled = false; recording.outputMode = mode; recording.applicationBundleIDs = [id]
+            recording.microphoneEnabled = true; recording.outputMode = mode; recording.applicationBundleIDs = [id]
             recorder.updateSettings(recording)
             let manager = AudioTranscriptionManager(recorder: recorder, defaults: defaults, engineFactory: { settings in
                 XCTAssertEqual(settings.sourceID, id); return engine
@@ -370,7 +371,7 @@ final class AudioTranscriptionManagerTests: XCTestCase {
         let manager = AudioTranscriptionManager(recorder: recorder, defaults: defaults, engineFactory: { _ in
             factories += 1; return CaptionTestEngine()
         })
-        for ids in [[], ["system"], ["microphone", "not-enabled"]] as [[String]] {
+        for ids in [[], ["not-enabled"], ["microphone", "not-enabled"]] as [[String]] {
             var settings = manager.settings; settings.sourceID = ids.first ?? ""; settings.additionalSourceIDs = Array(ids.dropFirst())
             manager.updateSettings(settings); manager.start()
             XCTAssertEqual(manager.state, .failed)
@@ -840,7 +841,7 @@ final class AudioTranscriptionManagerTests: XCTestCase {
         manager.stop(); try await waitUntil { manager.state == .idle }
     }
 
-    func testNewSpeechReopensToastAfterAutomaticExpiryWithoutTogglingPreference() async throws {
+    func testCaptionExpiryKeepsSourceControlAndNewSpeechUsesSamePanel() async throws {
         _ = NSApplication.shared
         let storage = defaults(), capture = CaptionTestCapture(), engine = CaptionTestEngine()
         let recorder = AudioRecordingManager(defaults: storage, captureFactory: { _ in capture }, microphonePermission: { true })
@@ -853,11 +854,11 @@ final class AudioTranscriptionManagerTests: XCTestCase {
         let moved = NSPoint(x: -1_000, y: 900); panel.setFrameOrigin(moved)
         manager.expireFloatingCaptions(now: ProcessInfo.processInfo.systemUptime + 21)
         toast.refresh()
-        XCTAssertFalse(manager.floatingCaptionsVisible)
+        XCTAssertTrue(manager.floatingCaptionsVisible)
         XCTAssertTrue(manager.settings.floatingCaptions)
         XCTAssertEqual(manager.state, .running)
         XCTAssertTrue(toast.isMonitoringCaptions)
-        // The same words in a NEW utterance must wake the panel after its expiry timer stopped.
+        // Expired text clears, while the source control and panel position survive.
         await engine.emit("Repeated sentence", id: "second", final: true)
         try await waitUntil { manager.floatingCaptionsVisible }
         XCTAssertTrue(toast.panel === panel); XCTAssertEqual(panel.frame.origin, moved)
@@ -907,7 +908,7 @@ final class AudioTranscriptionManagerTests: XCTestCase {
         XCTAssertTrue(recorder.isRecording); recorder.stopRecording()
     }
 
-    func testToggleAfterAutoHideShowsWaitingWindowInsteadOfDisablingCaptions() async throws {
+    func testToggleAfterCaptionExpiryHidesAndRestoresTheControl() async throws {
         _ = NSApplication.shared
         let storage = defaults(), capture = CaptionTestCapture(), engine = CaptionTestEngine()
         let recorder = AudioRecordingManager(defaults: storage, captureFactory: { _ in capture }, microphonePermission: { true })
@@ -917,7 +918,9 @@ final class AudioTranscriptionManagerTests: XCTestCase {
         await engine.emit("First caption", final: true)
         try await waitUntil { manager.floatingCaptionsVisible }
         manager.expireFloatingCaptions(now: ProcessInfo.processInfo.systemUptime + 21); toast.refresh()
-        XCTAssertFalse(manager.floatingCaptionsVisible); XCTAssertTrue(manager.settings.floatingCaptions)
+        XCTAssertTrue(manager.floatingCaptionsVisible); XCTAssertTrue(manager.settings.floatingCaptions)
+        manager.toggleFloatingCaptions()
+        XCTAssertFalse(manager.floatingCaptionsVisible); XCTAssertFalse(manager.settings.floatingCaptions)
         manager.toggleFloatingCaptions()
         XCTAssertTrue(manager.floatingCaptionsVisible); XCTAssertTrue(manager.settings.floatingCaptions)
         let text = try XCTUnwrap(toastViews(toast.panel!.contentView!).compactMap { $0 as? NSTextView }.first)

@@ -80,11 +80,13 @@ final class AudioRecordingManager: NSObject {
     }
     var onStateChanged: (() -> Void)?
     var onCaptureStopped: (() -> Void)?
+    var onShutdown: (() -> Void)?
     var retainCaptureForTranscription: (() -> Bool)?
     lazy var transcription = AudioTranscriptionManager(recorder: self, defaults: defaults)
 
     private let defaults: UserDefaults
     private let captureFactory: ((AudioSourceSelection) throws -> NativeAudioCapturing)?
+    private let applicationCatalog: (() -> [RecordingApplication])?
     private let microphonePermission: () async -> Bool
     private let ioQueue = DispatchQueue(label: "build.agora.astation.audio-recording", qos: .userInitiated)
     private let setupQueue = DispatchQueue(label: "build.agora.astation.audio-capture-setup", qos: .userInitiated)
@@ -102,6 +104,28 @@ final class AudioRecordingManager: NSObject {
     private var microphoneRecoveryTimes: [String: [TimeInterval]] = [:]
     private var observers: [NSObjectProtocol] = []
     private var audioConsumer: ((AudioSourceSelection, TranscriptionPCM) -> Void)?
+    private var previewSources: [AudioSourceSelection]?
+
+    var activeSources: [AudioSourceSelection] { previewSources ?? selectedSources }
+
+    func makeTranscriptionCapture() -> AudioRecordingManager {
+        AudioRecordingManager(defaults: defaults, captureFactory: captureFactory, microphonePermission: microphonePermission,
+            applicationCatalog: applicationCatalog)
+    }
+
+    var transcriptionSources: [AudioSourceSelection] {
+        let name = microphones.first { $0.uid == settings.microphoneUID }?.name ?? "System Default Microphone"
+        return [AudioSourceSelection(id: "microphone", title: name, kind: .microphone(settings.microphoneUID)),
+                AudioSourceSelection(id: "system", title: "All System Audio", kind: .system)]
+            + selectedApplicationIDs.map { identity in
+                AudioSourceSelection(id: identity, title: applications.first { $0.bundleID == identity }?.name ?? identity,
+                                     kind: .application(identity))
+            }
+    }
+    var selectedApplicationIDs: [String] {
+        var seen = Set<String>()
+        return settings.applicationBundleIDs.filter { !["microphone", "system", ""].contains($0) && seen.insert($0).inserted }
+    }
 
     func setAudioConsumer(_ consumer: ((AudioSourceSelection, TranscriptionPCM) -> Void)?) {
         ioQueue.sync { audioConsumer = consumer }
@@ -109,10 +133,12 @@ final class AudioRecordingManager: NSObject {
 
     init(defaults: UserDefaults = .standard,
          captureFactory: ((AudioSourceSelection) throws -> NativeAudioCapturing)? = nil,
-         microphonePermission: @escaping () async -> Bool = { await AVCaptureDevice.requestAccess(for: .audio) }) {
+         microphonePermission: @escaping () async -> Bool = { await AVCaptureDevice.requestAccess(for: .audio) },
+         applicationCatalog: (() -> [RecordingApplication])? = nil) {
         self.defaults = defaults
         self.captureFactory = captureFactory
         self.microphonePermission = microphonePermission
+        self.applicationCatalog = applicationCatalog
         if let data = defaults.data(forKey: Self.defaultsKey),
            let saved = try? JSONDecoder().decode(AudioRecordingSettings.self, from: data) {
             settings = saved
@@ -187,10 +213,11 @@ final class AudioRecordingManager: NSObject {
 
     func refreshSources() {
         microphones = AudioSourceCatalog.microphones()
-        if #available(macOS 14.2, *) { applications = AudioSourceCatalog.applications() }
+        if let applicationCatalog { applications = applicationCatalog() }
+        else if #available(macOS 14.2, *) { applications = AudioSourceCatalog.applications() }
     }
 
-    func startPreview() { startCapture(record: false) }
+    func startPreview(sources: [AudioSourceSelection]? = nil) { startCapture(record: false, sources: sources) }
 
     func startRecording() {
         guard !isReconnectingMicrophone else { return }
@@ -257,15 +284,19 @@ final class AudioRecordingManager: NSObject {
     }
 
     func shutdown() {
+        onShutdown?()
         if isRecording { stopRecording(keepTranscription: false) } else { stopPreview() }
     }
 
-    private func startCapture(record: Bool) {
+    private func startCapture(record: Bool, sources requested: [AudioSourceSelection]? = nil) {
         guard !isCapturing, state != .starting else { return }
-        if let error = settings.validationError { failAndStop(error); return }
-        if settings.outputMode != .none {
+        if requested == nil, let error = settings.validationError { failAndStop(error); return }
+        let sources = requested ?? selectedSources
+        guard !sources.isEmpty else { failAndStop("Select at least one audio source."); return }
+        if sources.contains(where: { if case .microphone = $0.kind { return false }; return true }) {
             guard #available(macOS 14.2, *) else { failAndStop("System and application audio require macOS 14.2 or later."); return }
         }
+        previewSources = requested
         state = .starting
         errorMessage = nil
         let token = UUID()
@@ -273,7 +304,7 @@ final class AudioRecordingManager: NSObject {
         notify()
         Task { @MainActor [weak self] in
             guard let self else { return }
-            if self.settings.microphoneEnabled {
+            if sources.contains(where: { $0.id == "microphone" }) {
                 let granted = await self.microphonePermission()
                 guard self.operation == token else { return }
                 if !granted { self.failAndStop("Microphone permission is required. Enable Astation in System Settings > Privacy & Security > Microphone."); return }
@@ -283,7 +314,6 @@ final class AudioRecordingManager: NSObject {
                 self.refreshSources()
                 self.startWorker()
                 // Creating a process-tap aggregate can reconfigure I/O. Bring microphones up last.
-                let sources = self.selectedSources
                 let captureOrder = sources.filter { if case .microphone = $0.kind { return false }; return true }
                     + sources.filter { if case .microphone = $0.kind { return true }; return false }
                 for source in captureOrder {
@@ -443,7 +473,7 @@ final class AudioRecordingManager: NSObject {
         guard isCapturing else { return }
         refreshSources()
         do {
-            for source in selectedSources {
+            for source in activeSources {
                 switch source.kind {
                 case .microphone(let uid):
                     if let uid, !microphones.contains(where: { $0.uid == uid }) {
@@ -549,6 +579,7 @@ final class AudioRecordingManager: NSObject {
     private func stopCapture() {
         operation = UUID()
         onCaptureStopped?()
+        previewSources = nil
         pendingSources.removeAll()
         recoveringMicrophones.removeAll()
         microphoneRecoveryTimes.removeAll()

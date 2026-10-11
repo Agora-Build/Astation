@@ -1,8 +1,8 @@
 # Live transcription and floating captions
 
-Live Transcription is its own Settings sidebar item. Enable audio sources in
-Settings > Audio & Recording (or use Configure Audio Sources), then check one or
-more sources in Settings > Live Transcription:
+Live Transcription is its own Settings sidebar item. Choose the microphone/system
+sources there, and configure selected apps in Settings > Audio & Recording
+(or use Configure Audio Sources). Check one or more sources:
 
 - Microphone only, system audio only, or a specific app only.
 - Microphone plus all system audio.
@@ -10,7 +10,10 @@ more sources in Settings > Live Transcription:
 
 All system audio and selected-app capture remain alternative output modes. Each
 checked source gets a separate engine and labeled captions, not a mixed audio
-stream. Unchecked enabled sources can still be recorded, but are never sent to a
+stream. Transcription capture follows only the checked sources, independently of
+recording settings. System/app-only transcription does not request microphone
+permission or acquire microphone capture. Unchecked recording sources can still
+be recorded, but are never sent to a
 transcription engine. Original recording files retain their native sample rate,
 channels, and samples; each transcription branch converts to 16 kHz mono.
 
@@ -19,8 +22,10 @@ alone creates no audio files. Start/Stop Transcription does not stop an existing
 recording. Stop Recording finalizes the original files but keeps capture running
 if captions still need it; Stop Transcription then releases that retained capture.
 Stopping captions over an independently started preview leaves that preview
-running. Changing the shared source configuration, capture failure, sleep, or
-app shutdown stops both.
+running. Capture is shared when an existing recording/preview already supplies
+the selected sources; otherwise transcription owns a separate capture. Independent
+recordings continue when transcription changes sources or dictation pauses it.
+Sleep and app shutdown stop capture.
 
 ## Local models
 
@@ -78,10 +83,57 @@ Floating captions are enabled by default. The nonactivating window supports
 wrapped and explicit multiline text, original and translated captions, and a
 rolling 20-second history. Partial captions update in place. Each source retains
 its own caption identities, even when providers reuse sentence IDs. When multiple
-sources are selected, captions show their source name. A changed caption starts
+sources are selected, system/app captions show their source name; microphone
+captions omit that prefix. A changed caption starts
 its own 20-second lifetime; duplicate packets do not extend it. Completed
-captions remain after Stop until they expire. The window automatically hides when
-empty but keeps watching while transcription is live; new speech brings it back.
+captions remain after Stop until they expire. The window keeps its controls visible
+when text expires, including when transcription is Off, until you choose Hide.
+
+Scrolling away from the bottom pauses caption display updates and auto-scrolling
+for **15 seconds after the last scroll**. The displayed snapshot stays stable for
+reading and copying while speech capture, transcription and file saving continue.
+Further scrolling resets the delay; returning to the bottom resumes live following
+immediately. Trackpad, wheel, scrollbar dragging and keyboard navigation use the
+same behavior. After the timeout, active transcription or dictation follows the
+latest text even if no new caption arrives at that moment. Stopping capture prevents
+a timeout jump, and Hide clears the reading pause.
+
+The compact source button cycles **Off / Mic / System / All / Apps**, without a
+dropdown. All means microphone plus all system audio; Apps means saved selected
+applications without microphone. Scrolling highlights a source, then applies it
+one second after the last scroll input, without a click. Each step requires 60
+points of trackpad travel or three mouse-wheel notches. Trackpad momentum changes
+neither the highlight nor the delay. Escape cancels a pending change; external
+source changes also cancel it. Keyboard arrows choose a source with the same
+one-second delay, and clicking anywhere on the button applies it immediately or
+advances to the next mode.
+The idle hint reads "Pick a source; it starts after one second". During Push-to-Talk
+or Hands-Free dictation, the source button hides and any open app picker closes.
+Its place shows a microphone icon and **Dictation** status pill, without source
+switching actions.
+The button returns with the remembered source when dictation releases audio.
+Scrolling to Apps with no saved application selection opens a compact app picker.
+Choose one or more apps and click **Use Apps** to save the selection and apply Apps
+mode; an empty selection never starts capture. Existing selections skip the picker
+and show app icons on the 92-point-wide button, with full names in its tooltip.
+Right-click or Control-click the Apps button to reopen the picker with the current
+apps checked. Capture continues with the existing sources while you edit; **Use
+Apps** applies the replacement, and Cancel keeps the current selection.
+Microphone captions omit the Microphone prefix in every mode, including System,
+All and Apps when earlier microphone captions are still visible. System and app
+source labels remain available when multiple sources are present.
+The picker saves transcription's app selection independently of recording settings;
+initial selection falls back to apps saved in Audio & Recording. Choosing apps
+does not interrupt an ongoing recording.
+Manual Mic-plus-Apps selections in settings are labeled **Apps + Mic** so the
+floating control explicitly shows microphone capture; selecting Apps on the button
+always uses apps without microphone.
+Remote transcription prompts for consent before uploading newly selected sources;
+consent is bound to provider, endpoint/model, languages, and the selected source set.
+The floating **Polish** switch appears only during Push-to-Talk or Hands-Free
+dictation and hides when transcription resumes. It never polishes transcription.
+Dictation's completion message says **Dictation ready.** when no output destination
+is enabled, regardless of whether the floating window is visible.
 
 Drag the background or header to any position on any connected
 display, including external monitors. Caption updates preserve the chosen window
@@ -102,7 +154,7 @@ hidden. It does not replay expired captions. The header simply reads LIVE CAPTIO
 
 Bind Toggle Floating Captions in Settings > Keyboard Shortcuts to show/hide from
 any app. It starts unbound and uses the same conflict checks as other shortcuts.
-Toggling after automatic timeout shows the window, rather than disabling captions.
+Toggling hides or restores the controls without replaying expired captions.
 Holding the key triggers only once until release. Showing again retains the last
 dragged position, including on an external monitor.
 Placement is retained within the current app session, not persisted across restarts.
@@ -118,10 +170,17 @@ Dictation uses the installed local ASR profile and input language selected in Li
 Transcription, even if live captions use Agora/custom transcription. No extra RTC
 channel or cloud speech session is created for dictation.
 
-Dictation is available when transcription is off, or when only system/app sources
-are being transcribed. If live transcription includes the microphone, both dictation
-modes are disabled. Switching to mic transcription cancels unfinished dictation
-and pending polishing; cancelled text is never silently submitted.
+Push-to-Talk and Hands-Free both take priority over every transcription mode.
+Starting dictation detaches transcription audio and cancels its workers before
+opening the dictation microphone. Hands-Free retains priority during silence;
+Push-to-Talk retains it until recognition finishes after release. Output delivery
+and polishing do not hold microphone priority once recognition releases capture.
+The previous transcription selection resumes automatically, preserving transcript
+and saved history with fresh capture and utterance identities. Audio received during
+the pause is never replayed. The source button shows a paused indication; changing
+it updates the pending source, and Off prevents resumption. Permission/setup failure
+or cancellation releases priority and resumes the remembered source. Original
+audio recording and RTC continue independently.
 
 The teal **Polish** dial in Voice Dictation settings and the floating-caption header
 controls the same persisted on/off option. It is a binary toggle, not a strength
@@ -178,15 +237,21 @@ Choose independent outputs in **Use result**:
 - **Send to active Atem** (default off): send a final `voice_command` only if the original
   target is still connected and active. A focus change never reroutes a late result.
   Failed or unavailable Atem delivery does not block typing.
+- **Save dictation to files** (default off): save final text as TXT and JSONL in
+  separate session folders, with `session.json` identifying dictation. Default:
+  `~/Documents/Astation/Dictation`. Choose another folder or show saved files in
+  settings. Files/folders use private permissions. Saving failures do not block
+  selected typing/Atem outputs, and those outputs' failures do not block files.
 
-Enable both to use the same result in the text field and Atem; polishing runs once
-before delivery to either. Floating captions always receive the result. Turn both
-outputs off for transcription/captions only, without typing or sending. Existing
+Enable any combination, including files only; polishing runs once before delivery
+to the selected outputs. Floating captions always receive the result. Turn all three
+outputs off for captions only, without typing, sending, or saving. Existing
 saved single-destination preferences migrate to matching switches without opting
 users into another output. Changing outputs during dictation cancels pending delivery.
 
 Polishing failure retains raw captions locally and reports the error; raw text is
-never automatically typed/sent as a fallback. Hands-Free polishing is serialized
+never automatically typed/sent as a fallback. If file saving is selected, that raw
+text is retained in the local dictation files as well. Hands-Free polishing is serialized
 and bounded to 16 waiting utterances; overload cancels dictation instead of growing
 memory without limit. Dictation captions share the floating 20-second history but
 are not added to the independent Live Transcription session's export/auto-save files.
@@ -346,10 +411,12 @@ join cancellation, 20-second expiry, duplicates, and floating-window coordinates
 They do not collect live audio or call paid services.
 
 Dictation tests cover PTT final aggregation, Hands-Free ordered/deduplicated delivery,
-mic-transcription exclusion/cancellation, key release during setup, raw versus polished
+dictation priority across all sources, suspension/resumption and late-result rejection,
+rapid source changes, key release during setup, raw versus polished
 text, all provider request schemas/limits, endpoint-bound consent and Keychain isolation,
 failure without external fallback, late-result cancellation, original Atem/text-field
-target protection, synchronized Polish controls, and settings/panel snapshots.
+target protection, independent file/typing/Atem combinations and failure handling,
+source-bound upload consent, synchronized Polish controls, and settings/panel snapshots.
 Shared-microphone tests cover native sample/rate/channel/timestamp preservation,
 reference-counted leases, drop/error propagation, bounded recovery, preview format
 replacement, RTC mute/leave/rejoin, and no pre-unmute audio replay.
@@ -370,8 +437,11 @@ rather than answered or carried out. Normal CI skips this on-device check.
    and local dictation do not restart or disappear. Mute RTC and confirm original
    recordings/captions remain audible. Release RTC Microphone and confirm other leases
    still work; the macOS mic privacy indicator should stop only after the last consumer.
-2. Transcribe system/app audio and test both dictation shortcuts. Then select mic
-   transcription while holding PTT: unfinished dictation must be cancelled, not sent.
+2. Test both dictation shortcuts over Mic, System, All and Apps transcription.
+   Other transcription must pause until recognition finishes, then resume without
+   replay. Change the source while dictating; only the pending selection resumes.
+   Choose Off and confirm there is no resumption. Scroll previews must never open
+   capture; System/Apps alone must not show a microphone permission prompt.
 3. Try Polish with Apple Intelligence enabled/model ready, then with a separately
    installed Qwen local server. Disconnect the network for the local checks. Check names,
    numbers, punctuation, language, and latency; no model is guaranteed to edit perfectly.

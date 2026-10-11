@@ -93,7 +93,7 @@ final class TranscriptionViewController: NSViewController {
         stack.addArrangedSubview(title)
         stack.addArrangedSubview(label("Read your selected sources in real time. Drag floating captions anywhere, including another monitor."))
         stack.addArrangedSubview(label("Transcribe without saving audio, record without captions, or run both together. Each feature has its own Start and Stop controls."))
-        stack.addArrangedSubview(label("Enable sources in Audio & Recording, then check the ones to transcribe here. You do not need to start recording."))
+        stack.addArrangedSubview(label("Check the sources to transcribe here; choose apps in Audio & Recording. Transcription sources are independent of recording sources."))
         let configure = NSButton(title: "Configure Audio Sources...", target: self, action: #selector(configureSources))
         configure.bezelStyle = .rounded
         stack.addArrangedSubview(configure)
@@ -215,7 +215,9 @@ final class TranscriptionViewController: NSViewController {
         let custom = settings.provider == .custom
         let englishOnly = local && settings.localModel.isEnglishOnly
         providerPicker.selectItem(at: TranscriptionProvider.allCases.firstIndex(of: settings.provider) ?? 0)
-        let sources = recorder.selectedSources
+        let useApps = settings.selectedSourceIDs.contains { !["microphone", "system"].contains($0) }
+            || (recorder.settings.outputMode == .applications && !settings.selectedSourceIDs.contains("system"))
+        let sources = manager.availableSources.filter { $0.id == "microphone" || (useApps ? $0.id != "system" : $0.id == "system") }
         let identities = sources.map(\.id)
         if sources != renderedSources {
             for child in sourceStack.arrangedSubviews { sourceStack.removeArrangedSubview(child); child.removeFromSuperview() }
@@ -231,7 +233,6 @@ final class TranscriptionViewController: NSViewController {
                 sourceButtons.append(button); sourceStack.addArrangedSubview(button)
                 button.widthAnchor.constraint(equalTo: sourceStack.widthAnchor).isActive = true
             }
-            if sources.isEmpty { sourceStack.addArrangedSubview(label("No sources enabled. Configure Audio & Recording to add a microphone, system audio, or apps.")) }
             renderedSources = sources
         }
         for button in sourceButtons {
@@ -271,7 +272,7 @@ final class TranscriptionViewController: NSViewController {
         downloadButton.isEnabled = !manager.isActive
         progress.isHidden = manager.downloadProgress == nil
         progress.doubleValue = manager.downloadProgress ?? 0
-        startButton.title = manager.isActive ? "Stop Transcription" : "Start Transcription"
+        startButton.title = manager.isActive || manager.wantsTranscription ? "Stop Transcription" : "Start Transcription"
         let validSources = !settings.selectedSourceIDs.isEmpty && settings.selectedSourceIDs.allSatisfy { identities.contains($0) }
         startButton.isEnabled = manager.state != .stopping && manager.downloadProgress == nil
             && (manager.isActive || (validSources && (!local || installed) && (!custom || CustomTranscriptionHTTP.endpoint(settings.customEndpoint) != nil)))
@@ -286,8 +287,8 @@ final class TranscriptionViewController: NSViewController {
         showSavedButton.isEnabled = manager.lastTranscriptFolder != nil
         let missingSources = settings.selectedSourceIDs.contains { !identities.contains($0) }
         statusLabel.stringValue = manager.message ?? (missingSources
-            ? "A previously selected source is no longer enabled. Check the sources to use, or configure Audio & Recording."
-            : "Captions are off. Check one or more enabled sources to start.")
+            ? "A previously selected source is no longer available. Check the sources to use, or configure Audio & Recording."
+            : "Captions are off. Check one or more sources to start.")
         statusLabel.textColor = manager.state == .failed ? .systemRed : .secondaryLabelColor
     }
     @objc private func configureSources() { onConfigureSources?() }
@@ -321,7 +322,7 @@ final class TranscriptionViewController: NSViewController {
         else { changeSettings(); manager.downloadModel() }
     }
     @objc private func toggleTranscription() {
-        if manager.isActive { manager.stop(); return }
+        if manager.isActive || manager.wantsTranscription { manager.stop(); return }
         changeSettings()
         if manager.settings.provider != .local {
             let alert = NSAlert()

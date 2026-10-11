@@ -43,6 +43,15 @@ final class DictationSettingsTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(DictationSettings.self, from: Data("{}".utf8)), DictationSettings())
         let settings = try JSONDecoder().decode(DictationSettings.self, from: Data(#"{"typeInActiveTextField":false}"#.utf8))
         XCTAssertFalse(settings.typeInActiveTextField); XCTAssertFalse(settings.sendToAtem)
+        XCTAssertFalse(settings.saveToFiles)
+    }
+    func testFileOutputPersistsIndependentlyAndOldSettingsKeepItOff() throws {
+        var settings = DictationSettings(); settings.typeInActiveTextField = false; settings.sendToAtem = false
+        settings.saveToFiles = true; settings.folderPath = "/tmp/dictation-test-folder"
+        XCTAssertEqual(try JSONDecoder().decode(DictationSettings.self, from: JSONEncoder().encode(settings)), settings)
+        XCTAssertEqual(settings.outputSummary, "Files + Floating captions")
+        let legacy = try JSONDecoder().decode(DictationSettings.self, from: Data(#"{"destination":"atem"}"#.utf8))
+        XCTAssertTrue(legacy.sendToAtem); XCTAssertFalse(legacy.saveToFiles)
     }
 
     func testOutputSummaryIncludesAllEnabledOutputsAndAlwaysCaptions() {

@@ -32,8 +32,11 @@ final class VoiceDictationManager {
     private(set) var isWaitingForResponse = false
     private(set) var message: String?
     private(set) var lastDictationText = ""
-    var isAvailable: Bool { !transcription.isTranscribingMicrophone }
-    var unavailableReason: String? { isAvailable ? nil : "Mic transcription is active. Stop it or select system/app audio only to use dictation." }
+    var isAvailable: Bool { true }
+    var unavailableReason: String? { nil }
+    private(set) var fileMessage: String?
+    private(set) var lastDictationFolder: URL?
+    private var fileSaver: TranscriptAutoSaver?
     private var stream: MicrophonePCMStream?
     private var inbox: TranscriptionInbox?
     private var task: Task<Void, Never>?
@@ -70,14 +73,15 @@ final class VoiceDictationManager {
         settings = defaults.data(forKey: Self.defaultsKey).flatMap { try? JSONDecoder().decode(DictationSettings.self, from: $0) } ?? DictationSettings()
         let polisher = DictationPolisher(secrets: secrets)
         self.polish = polish ?? { try await polisher.polish($0, settings: $1) }
-        transcription.onBeforeMicrophoneTranscription = { [weak self] in
-            self?.cancel(message: "Dictation stopped: switching to microphone transcription.")
-        }
     }
-    deinit { task?.cancel(); worker?.cancel(); deliveryTask?.cancel(); inbox?.finish(); stream?.stop() }
+    deinit {
+        task?.cancel(); worker?.cancel(); deliveryTask?.cancel(); inbox?.finish(); stream?.stop(); fileSaver?.finish()
+        if mode != .off && !captureComplete { transcription.setDictationActive(false) }
+    }
 
     func updateSettings(_ value: DictationSettings) {
-        if mode != .off && (value.typeInActiveTextField != settings.typeInActiveTextField || value.sendToAtem != settings.sendToAtem || value.provider != settings.provider
+        if mode != .off && (value.typeInActiveTextField != settings.typeInActiveTextField || value.sendToAtem != settings.sendToAtem
+            || value.saveToFiles != settings.saveToFiles || value.folderPath != settings.folderPath || value.provider != settings.provider
             || value.endpoint != settings.endpoint || value.model != settings.model) {
             cancel(message: "Dictation stopped because its model or outputs changed. Start again with the new settings.")
         }
@@ -118,6 +122,25 @@ final class VoiceDictationManager {
         mode = requested; isWaitingForResponse = false; target = settings.sendToAtem ? resolveTarget() : nil; sentKeys.removeAll()
         lastDictationText = ""
         lastRawDictationText = ""; lastPolishedDictationText = nil; captureComplete = false
+        fileMessage = nil; fileSaver?.finish(); fileSaver = nil
+        if settings.saveToFiles {
+            do {
+                guard settings.folderPath.hasPrefix("/") else { throw DictationError.message("Choose an absolute dictation folder.") }
+                var profile = TranscriptionSettings()
+                profile.localModel = transcription.settings.localModel; profile.language = transcription.settings.language
+                profile.autoSaveTranscript = true; profile.transcriptFolderPath = settings.folderPath
+                let saver = try TranscriptAutoSaver(root: URL(fileURLWithPath: settings.folderPath, isDirectory: true),
+                    settings: profile, startedAt: Date(), kind: "dictation") { [weak self] _ in
+                    DispatchQueue.main.async {
+                        guard let self, self.generation == id else { return }
+                        self.fileMessage = "Dictation file saving failed. Results remain in captions; other selected outputs continue."
+                        self.notify()
+                    }
+                }
+                fileSaver = saver; lastDictationFolder = saver.folder
+                fileMessage = "Saving dictation to TXT and JSONL files."
+            } catch { fileMessage = "Dictation files could not be created. Choose another folder. Other selected outputs continue." }
+        }
         let listeningMessage = requested == .ptt ? "Dictation: hold to speak." : "Hands-Free Dictation: microphone listening."
         setMessage(listeningMessage + (textTargetError.map { " Typing unavailable: \($0)" } ?? ""))
         let inbox = TranscriptionInbox(); self.inbox = inbox
@@ -126,6 +149,8 @@ final class VoiceDictationManager {
         task = Task { @MainActor [weak self] in
             var engine: LiveTranscribing?
             do {
+                await self?.transcription.waitForDictationPriority()
+                try Task.checkCancellation()
                 guard await permission() else { throw AudioCaptureError.message("Microphone permission is required for dictation.") }
                 try Task.checkCancellation()
                 guard let self, self.generation == id else { return }
@@ -207,6 +232,8 @@ final class VoiceDictationManager {
         }
         stream?.stop(); stream = nil; inbox = nil; task = nil; worker = nil
         captureComplete = true
+        // Recognition has released the microphone. Output/LLM latency must not hold capture priority.
+        notify()
         if deliveryTask == nil { finishDelivery() }
     }
 
@@ -243,13 +270,14 @@ final class VoiceDictationManager {
                     let final = TranscriptSegment(id: delivery.segment.id, sourceID: "microphone", language: delivery.segment.language,
                         text: result, isFinal: true, offset: delivery.segment.offset)
                     self.transcription.displayDictationCaption(final, replacingKeys: delivery.replacingKeys, refreshReceipt: true)
-                    self.deliverResult(result, settings: delivery.settings)
+                    self.deliverResult(final, settings: delivery.settings)
                 } catch {
                     guard self.generation == id, !Task.isCancelled else { return }
                     self.lastDictationText = self.lastPolishedDictationText ?? raw
                     // Retain raw locally, but never bypass checked polishing on failure.
                     if self.lastPolishedDictationText == nil {
                         self.transcription.displayDictationCaption(delivery.segment, replacingKeys: delivery.replacingKeys, refreshReceipt: true)
+                        if delivery.settings.saveToFiles { self.fileSaver?.append(delivery.segment) }
                     }
                     self.setMessage(error.localizedDescription)
                 }
@@ -260,7 +288,8 @@ final class VoiceDictationManager {
             if self.captureComplete { self.finishDelivery() }
         }
     }
-    private func deliverResult(_ result: String, settings: DictationSettings) {
+    private func deliverResult(_ segment: TranscriptSegment, settings: DictationSettings) {
+        let result = segment.text
         var outcomes = [String]()
         // Each selected output is attempted independently after polishing succeeds.
         if settings.typeInActiveTextField {
@@ -277,9 +306,14 @@ final class VoiceDictationManager {
                 outcomes.append("Dictation sent to the active Atem.")
             } else { outcomes.append("The original Atem is no longer active or connected. Result kept in captions.") }
         }
-        setMessage(outcomes.isEmpty ? "Dictation ready in floating captions." : outcomes.joined(separator: " "))
+        if settings.saveToFiles {
+            fileSaver?.append(segment)
+            outcomes.append(fileMessage ?? "Dictation file saving is unavailable. Result kept in captions.")
+        }
+        setMessage(outcomes.isEmpty ? "Dictation ready." : outcomes.joined(separator: " "))
     }
     private func finishDelivery() {
+        fileSaver?.finish(); fileSaver = nil
         mode = .off; isWaitingForResponse = false; isPolishing = false; textTarget = nil; textTargetError = nil; target = nil; notify()
     }
 
@@ -289,12 +323,13 @@ final class VoiceDictationManager {
         task?.cancel(); worker?.cancel(); inbox?.finish(); stream?.stop()
         deliveryTask?.cancel(); deliveryTask = nil; deliveries.removeAll(); isPolishing = false
         stream = nil; inbox = nil; task = nil; worker = nil
+        fileSaver?.finish(); fileSaver = nil
         mode = .off; isWaitingForResponse = false; target = nil; textTarget = nil; textTargetError = nil
         if let message { setMessage(message) } else { notify() }
     }
     private func setMessage(_ text: String) { message = text; showStatus(text); notify() }
     private func notify() {
-        transcription.setDictationActive(mode != .off)
+        transcription.setDictationActive(mode != .off && !captureComplete)
         NotificationCenter.default.post(name: .voiceDictationChanged, object: self)
     }
 }

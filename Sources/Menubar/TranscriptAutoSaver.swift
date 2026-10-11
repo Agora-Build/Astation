@@ -11,7 +11,7 @@ final class TranscriptAutoSaver: @unchecked Sendable {
     private var seenOrder: [String] = []
     private var failed = false
     private var closed = false
-    init(root: URL, settings: TranscriptionSettings, startedAt: Date, onError: @escaping @Sendable (String) -> Void) throws {
+    init(root: URL, settings: TranscriptionSettings, startedAt: Date, kind: String = "transcription", onError: @escaping @Sendable (String) -> Void) throws {
         self.onError = onError
         let formatter = DateFormatter(); formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         folder = root.appendingPathComponent("\(formatter.string(from: startedAt))_\(UUID().uuidString.prefix(8))", isDirectory: true)
@@ -24,9 +24,9 @@ final class TranscriptAutoSaver: @unchecked Sendable {
             }
         }
         textFile = try FileHandle(forWritingTo: textURL); eventsFile = try FileHandle(forWritingTo: eventsURL)
-        struct Metadata: Encodable { let schemaVersion = 1; let startedAt: Date; let settings: TranscriptionSettings }
+        struct Metadata: Encodable { let schemaVersion = 1; let kind: String; let startedAt: Date; let settings: TranscriptionSettings }
         let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601; encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(Metadata(startedAt: startedAt, settings: settings)).write(to: folder.appendingPathComponent("session.json"), options: .atomic)
+        try encoder.encode(Metadata(kind: kind, startedAt: startedAt, settings: settings)).write(to: folder.appendingPathComponent("session.json"), options: .atomic)
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: folder.appendingPathComponent("session.json").path)
     }
     deinit { try? textFile.close(); try? eventsFile.close() }
