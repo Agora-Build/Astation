@@ -94,6 +94,9 @@ jobs:
       - name: Test AI review tooling
         run: node --test .github/scripts/*.test.mjs
 
+      - name: Test release signing validation
+        run: python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'
+
   test-relay-server:
     name: Relay Server Tests
     runs-on: ubuntu-latest

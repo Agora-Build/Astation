@@ -6,6 +6,11 @@ macOS menubar hub that coordinates between [Chisel](https://github.com/Agora-Bui
 
 Download the `.pkg` installer from [Releases](https://github.com/Agora-Build/Astation/releases), or build from source.
 
+Credentials and E2EE verification require a provisioned build. Public releases
+need Developer ID signing, an authorized distribution profile and notarization.
+See [release readiness and setup](docs/releases.md); personal-team local signing
+is available for local verification.
+
 ### Build from source
 
 Prerequisites: macOS 14+, Xcode Command Line Tools, CMake.
