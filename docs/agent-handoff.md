@@ -182,7 +182,13 @@ required work:
   Astation permission model and a separately agreed product scope. Check the
   current Atem implementation before treating the original feature list as
   missing work.
-- **Credentials vault:** a dedicated credential store has a separate product
-  scope from the shared-notes vault and account-data encryption. Check the
-  current Atem capabilities before proposing implementation. Keep credential
-  values out of memory, skills, and handoffs.
+- **Credential service:** the local Settings > Credentials editor now stores
+  named secrets in the protected Mac Keychain, with project/global scopes and
+  Touch ID for save/update/delete/copy. See [credentials](credentials.md).
+  Its project picker includes encrypted reports from updated, unlocked Atem
+  devices and saved scopes; manual Git-remote entry remains available. This
+  reporting requires the companion Atem credential-project-reporting change.
+  The designed Atem get/list integration, signed manifests and scope grants
+  remain separate work; current Atem does not implement those commands. Local
+  credentials are not published to the relay. Keep values out of memory,
+  skills and handoffs; the shared-notes vault is separate.

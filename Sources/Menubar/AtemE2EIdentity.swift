@@ -90,6 +90,13 @@ protocol AtemIdentityCryptography {
     func validate(_ material: AtemIdentityMaterial) throws
     func sign(_ message: Data, material: AtemIdentityMaterial) throws -> Data
     func openStorageKey(_ sealed: AtemHPKESealedKey, info: Data, material: AtemIdentityMaterial) throws -> Data
+    func openProjectReport(_ report: AtemProjectReportWire, info: Data, material: AtemIdentityMaterial) throws -> Data
+}
+
+extension AtemIdentityCryptography {
+    func openProjectReport(_ report: AtemProjectReportWire, info: Data, material: AtemIdentityMaterial) throws -> Data {
+        throw AtemIdentityError.invalidState
+    }
 }
 
 struct AtemSecureEnclaveCryptography: AtemIdentityCryptography {
@@ -149,6 +156,12 @@ struct AtemSecureEnclaveCryptography: AtemIdentityCryptography {
     func sign(_ message: Data, material: AtemIdentityMaterial) throws -> Data {
         let key = try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: material.signingKey)
         return try AtemE2ECrypto.normalizedP256Signature(key.signature(for: message).rawRepresentation)
+    }
+
+    func openProjectReport(_ report: AtemProjectReportWire, info: Data, material: AtemIdentityMaterial) throws -> Data {
+        var recipient = try HPKE.Recipient(privateKey: encryptionKey(material),
+            ciphersuite: .Curve25519_SHA256_ChachaPoly, info: info, encapsulatedKey: report.encappedKey)
+        return try recipient.open(report.ciphertext, authenticating: Data())
     }
 
     private func wrappingKey(_ secret: SharedSecret) -> SymmetricKey {
@@ -394,6 +407,23 @@ final class AtemE2EIdentity {
     func isVerified(account: String, deviceId: String) throws -> Bool {
         lock.lock(); defer { lock.unlock() }
         return try read(create: false)?.devices[deviceId]?.account == account
+    }
+
+    func credentialProjectPin(account: String, deviceId: String) throws -> AtemDevicePin? {
+        lock.lock(); defer { lock.unlock() }
+        guard let pin = try read(create: false)?.devices[deviceId], pin.account == account else { return nil }
+        return pin
+    }
+
+    func openCredentialProjects(_ report: AtemProjectReportWire, account: String, deviceId: String, now: Date = Date()) throws -> AtemReportedProjects {
+        lock.lock(); defer { lock.unlock() }
+        guard let record = try read(create: false), let pin = record.devices[deviceId], pin.account == account else {
+            throw AtemIdentityError.unverifiedDevice
+        }
+        let fields = try AtemCredentialProjects.checkedFields(report, account: account, deviceId: deviceId, pin: pin, now: now)
+        let plain = try crypto.openProjectReport(report, info: fields.info, material: record.material)
+        return AtemReportedProjects(account: account, deviceId: deviceId, pin: pin, time: fields.time,
+            projects: try AtemCredentialProjects.projects(plain))
     }
 
     /// Authenticates and journals the message while its transport identity is still available.

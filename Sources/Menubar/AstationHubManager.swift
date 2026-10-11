@@ -18,6 +18,8 @@ class AstationHubManager: ObservableObject {
 
     /// Agents reported by each Atem, keyed by clientId.
     @Published var agentsByClientId: [String: [AtemAgentInfo]] = [:]
+    @Published private(set) var credentialProjectSuggestions: [String] = []
+    private var credentialProjectReports: [String: AtemReportedProjects] = [:]
     /// User-pinned active client ID. Overrides focus-based routing when set.
     @Published var pinnedClientId: String?
 
@@ -701,6 +703,22 @@ class AstationHubManager: ObservableObject {
             }
             return nil
 
+        case .credentialProjectListResponse(let report):
+            guard let context = captureMigrationContext(clientId: clientId, relayConnectionId: relayConnectionId) else { return nil }
+            DispatchQueue.main.async {
+                do {
+                    let value = try self.atemE2EIdentity.openCredentialProjects(report, account: context.account, deviceId: context.route.deviceId)
+                    guard self.e2eDataAccount == value.account else { return }
+                    let key = value.account + "\0" + value.deviceId
+                    if let old = self.credentialProjectReports[key], old.pin == value.pin, old.time > value.time { return }
+                    self.credentialProjectReports[key] = value
+                    self.refreshCredentialProjectSuggestions()
+                } catch {
+                    Log.warn("[AstationHub] Rejected credential project report")
+                }
+            }
+            return nil
+
         case .commandResponse(let output, let success, _):
             Log.info("[AstationHub] Command response from \(clientId.prefix(8))…: success=\(success)")
             // Post notification so Dev Console can display the response
@@ -1018,6 +1036,27 @@ class AstationHubManager: ObservableObject {
     }
 
     // MARK: - Client & Agent Management
+
+    private func refreshCredentialProjectSuggestions() {
+        let account = e2eDataAccount
+        credentialProjectReports = credentialProjectReports.filter { _, report in
+            report.account == account && (try? atemE2EIdentity.credentialProjectPin(account: account, deviceId: report.deviceId)) == report.pin
+        }
+        let projects = Array(Set(credentialProjectReports.values.flatMap(\.projects))).sorted()
+        if projects != credentialProjectSuggestions { credentialProjectSuggestions = projects }
+    }
+
+    func requestCredentialProjects() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        refreshCredentialProjectSuggestions()
+        for client in connectedClients {
+            let connection = identityRelayAuthentication.connectionId(for: client.id)
+            guard let route = verificationRoute(clientId: client.id, relayConnectionId: connection),
+                  (try? atemE2EIdentity.isVerified(account: e2eDataAccount, deviceId: route.deviceId)) == true else { continue }
+            sendMessage(.credentialProjectListRequest, to: route.clientId,
+                expectedRelayConnectionId: client.id.hasPrefix("relay-") ? route.connectionId : nil)
+        }
+    }
 
     /// Explicitly pin a client as the active routing target.
     func pinClient(id: String) {

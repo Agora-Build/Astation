@@ -43,6 +43,8 @@ enum AstationMessage: Codable {
     // Agent hub (Astation ↔ Atem)
     case agentListRequest
     case agentListResponse(agents: [AtemAgentInfo])
+    case credentialProjectListRequest
+    case credentialProjectListResponse(report: AtemProjectReportWire)
     case credentialSync(
         accessToken: String,
         refreshToken: String,
@@ -107,6 +109,7 @@ enum AstationMessage: Codable {
         case markTaskResult
         case agentListRequest
         case agentListResponse
+        case credentialProjectListRequest, credentialProjectListResponse
         case credentialSync
         case agentInput
         case encryptionMode
@@ -271,6 +274,13 @@ enum AstationMessage: Codable {
 
         case .agentListRequest:
             try container.encode(MessageType.agentListRequest, forKey: .type)
+
+        case .credentialProjectListRequest:
+            try container.encode(MessageType.credentialProjectListRequest, forKey: .type)
+
+        case .credentialProjectListResponse(let report):
+            try container.encode(MessageType.credentialProjectListResponse, forKey: .type)
+            try container.encode(["report": report], forKey: .data)
 
         case .agentListResponse(let agents):
             try container.encode(MessageType.agentListResponse, forKey: .type)
@@ -551,6 +561,14 @@ enum AstationMessage: Codable {
 
         case .agentListRequest:
             self = .agentListRequest
+
+        case .credentialProjectListRequest:
+            self = .credentialProjectListRequest
+
+        case .credentialProjectListResponse:
+            let data = try container.decode([String: AtemProjectReportWire].self, forKey: .data)
+            guard let report = data["report"] else { throw AtemIdentityError.invalidState }
+            self = .credentialProjectListResponse(report: report)
 
         case .agentListResponse:
             let dataContainer = try container.nestedContainer(keyedBy: AgentListKeys.self, forKey: .data)

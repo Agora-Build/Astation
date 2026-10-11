@@ -367,6 +367,12 @@ relay-server/
 
 ## Configuration
 
+Settings > Credentials manages named API keys and passwords in this Mac's
+protected Keychain, with Global or Git-project scopes and Touch ID for saves,
+updates, copies and deletion. Credentials remain local; Atem credential retrieval
+is separate from the existing device-unlock flow. See the
+[credentials guide](docs/credentials.md) for setup and current availability.
+
 Sign in through Astation's menu or Settings. The app opens a browser for OAuth
 2.0 + PKCE login and receives the callback on a local loopback listener. Its SSO
 session is stored in `~/Library/Application Support/Astation/credentials.enc`

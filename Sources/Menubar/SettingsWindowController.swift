@@ -25,6 +25,11 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private let recordingController: AudioRecordingViewController
     private let transcriptionController: TranscriptionViewController
     private let dictationController: VoiceDictationViewController?
+    private lazy var credentialsController = CredentialsViewController(
+        reportedProjects: { [weak self] in self?.hubManager.credentialProjectSuggestions ?? [] },
+        requestProjects: { [weak self] in self?.hubManager.requestCredentialProjects() },
+        projectUpdates: hubManager.$credentialProjectSuggestions.eraseToAnyPublisher()
+    )
     private var statusLabel: NSTextField!
     private var signInButton: NSButton!
     private var signOutButton: NSButton!
@@ -89,6 +94,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     func showWindow() {
         if let existingWindow = window {
             shortcutsController.refresh()
+            if tabView?.selectedTabViewItem?.identifier as? String == "credentials" { credentialsController.refreshForDisplay() }
             renderRelayAccountState()
             hubManager.requestRelayAccountState()
             renderEncryptionState()
@@ -212,6 +218,10 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         ])
         general.view = generalContainer
         tabs.addTabViewItem(general)
+        let credentials = NSTabViewItem(identifier: "credentials")
+        credentials.label = "Credentials"
+        credentials.viewController = credentialsController
+        tabs.addTabViewItem(credentials)
         let shortcuts = NSTabViewItem(identifier: "shortcuts")
         shortcuts.label = "Keyboard Shortcuts"
         shortcuts.viewController = shortcutsController
@@ -1251,6 +1261,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     func showSecurity() { showWindow(); tabView?.selectTabViewItem(withIdentifier: "security") }
 
     func windowWillClose(_ notification: Notification) {
+        credentialsController.cancelPending()
         recordingController.setPageVisible(false)
         shortcutsController.cancelRecording()
         tabView = nil
@@ -1259,12 +1270,14 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     }
 
     func tabView(_ tabView: NSTabView, willSelect tabViewItem: NSTabViewItem?) {
+        if tabViewItem?.identifier as? String != "credentials" { credentialsController.cancelPending() }
         shortcutsController.cancelRecording()
         shortcutsController.refresh()
     }
 
     func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
         guard let tabViewItem else { return }
+        if tabViewItem.identifier as? String == "credentials" { credentialsController.refreshForDisplay() }
         recordingController.setPageVisible((tabViewItem.identifier as? String) == "recording")
         let index = tabView.indexOfTabViewItem(tabViewItem)
         if sidebarTable?.selectedRow != index {
@@ -1293,6 +1306,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         switch item.identifier as? String {
         case "general": symbol = "gearshape"
         case "security": symbol = "lock.shield"
+        case "credentials": symbol = "key"
         case "recording": symbol = "waveform"
         case "transcription": symbol = "captions.bubble"
         case "dictation": symbol = "mic.badge.plus"
