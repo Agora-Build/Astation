@@ -5,7 +5,7 @@ work. Completed implementation checklists are available in Git history.
 
 | Document | Why it is retained |
 | --- | --- |
-| [Agent handoff](agent-handoff.md) | Audited remaining identity work, validation gaps, and conditional operations follow-ups |
+| [Agent handoff](agent-handoff.md) | Remaining work, encryption publication, SSO direction, and validation/operations follow-ups |
 | [Relay identity](astation-relay-identity-handoff.md) | Signing-key contract, durable pairing protocol, reconnect behavior, and recovery runbooks |
 | [Android device sharing](android-device-sharing.md) | Connection model, setup, lifecycle, and pending phone/IDE validation |
 | [Local audio recording](audio-recording.md) | Capture sources, original tracks, permissions, and practical Mac validation |

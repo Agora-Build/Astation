@@ -1,6 +1,6 @@
 # Relay Identity and Durable Pairing
 
-Reviewed on 2026-10-08 against `main` at `5460de4`. Relay identity is
+Reviewed on 2026-10-10 against `main` at `d09f854`. Relay identity is
 implemented, built, tested, and deployed. Remaining work lives in the
 [current agent handoff](agent-handoff.md). This document preserves the
 protocol and operational references from the original implementation handoff.

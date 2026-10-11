@@ -1,19 +1,21 @@
 # Astation Agent Handoff
 
-Reviewed on 2026-10-08 against `main` at `5460de4`, merged PRs, the task
-vault (`v-8ut37j7X`), and read-only production checks. Relay hardening is now
-in review in PR #37. This is the current
-follow-up list; implementation and deployment history remain in Git and the
-vault. Read local `AGENTS.md` instructions when present, then
+Updated on 2026-10-10 against `main` at `d09f854`, open PRs, worktree state, and
+production verification. The original 2026-10-08 audit also checked the task
+vault (`v-8ut37j7X`). This is the current follow-up list; implementation and
+deployment history remain in Git and the vault. Read local `AGENTS.md`
+instructions when present, then
 [CLAUDE.md](../CLAUDE.md), [README.md](../README.md), and
 [DEPLOY.md](../DEPLOY.md) for repository rules and runbooks.
 
 ## Current baseline
 
-Production uses two relay replicas with Postgres and Valkey. On 2026-10-08,
+Production uses two relay replicas with Postgres and Valkey. After PR #38
+deployed on 2026-10-10 as `28c6320` (Deploy Station run `38104654861`),
+HTTPS and both identity WebSocket paths passed verification, and
 the public `/health` returned `status: ok`, `redis: ok`, `replicas: 2`, and
-Postgres knowledge/vault stores. A read-only `CONFIG GET` on the production
-Valkey container confirmed `maxmemory: 536870912` (512 MiB) and
+Postgres knowledge/vault stores. On 2026-10-08, a read-only `CONFIG GET` on
+the production Valkey container confirmed `maxmemory: 536870912` (512 MiB) and
 `maxmemory-policy: noeviction`. Relay-a's host port 3000 is closed; its removal
 was recorded in vault entry e5 and direct access was rechecked during this
 audit. GitHub's secret inventory no longer contains
@@ -72,10 +74,11 @@ a deployment that predates relay identity; production already supports it.
   clean up test identities as described in [DEPLOY.md](../DEPLOY.md).
   The local test does not need repeating merely to close the old checklist.
 
-## Relay hardening in review
+## Relay hardening merged
 
-[PR #37](https://github.com/Agora-Build/Astation/pull/37) implements these
-follow-ups in branch `fix/relay-hardening`; they are not yet merged or deployed:
+[PR #37](https://github.com/Agora-Build/Astation/pull/37) was squash-merged
+as `d09f854` after review found no critical issues and CI passed on the final
+head `f999a1c`. These follow-ups are implemented and no longer pending tasks:
 
 - **Version visibility:** every health response includes the package version
   and embedded build commit. Image workflows supply the commit, final deploy
@@ -91,8 +94,63 @@ follow-ups in branch `fix/relay-hardening`; they are not yet merged or deployed:
 
 Local validation passes: 445 relay tests, all 45 Postgres tests together,
 59 Node tooling tests, a release build, and a live health metadata check.
-A clean database run leaves no test schemas. Hosted CI checks the Linux
-container metadata and Valkey suites. Use the PR's current checks for status.
+A clean database run leaves no test schemas. CI run `38105747186` passed
+macOS builds/tests/app packaging, web/tooling tests, all relay/Postgres/Valkey
+suites, and the Linux container metadata check. The resulting production
+rollout is recorded in Deploy Station run `38106294228`; use its completion
+and public health/build-commit checks to confirm deployment.
+
+## Active encryption work: not merged
+
+Branch `feat/atem-e2e-verification` has a pushed device-verification commit
+and substantial uncommitted storage-key and migration changes in its worktree.
+It has no open PR. Preserve that work and review the complete implementation
+before shipping it; a locally built Astation Local.app does not establish that
+the same implementation is on `main` or deployed.
+
+The local migration implementation captures authenticated device and connection
+context before dispatch, journals accepted reports, and commits completion
+durably and idempotently after migration and cryptographic validation. Its
+lifecycle and security invariants are documented in `designs/e2e-encryption.md`
+on that branch. The relay must never establish device identity or authorize
+encryption state. Retain the design and regressions with the implementation.
+
+Atem memory records a provisioned 636-test Swift run with six expected skips,
+including 26 migration regressions and real Keychain/Secure Enclave recovery.
+Immediate disconnection, delayed execution, duplicates, reconnects, interrupted
+recovery, and revocation races have regression coverage. Live lock/unlock,
+approval, denial, revocation, storage-key rotation, re-pairing, and migration
+to ON were subsequently confirmed with Genie. Atem PRs #40 and #41 are merged.
+Those completed checks are not pending build tasks.
+
+Remaining work is review and publication of the complete Astation branch and
+live verification of OFF and OFF-then-ON. Currently an updated, unlocked
+`atem cred unlock` or `atem pair` finishes a pending migration; `atem sync`
+talks only to the relay. Making sync connect to Astation to finish migration
+is a proposed behavior change, not an approved requirement.
+
+A separate observed relay issue also remains unresolved: an Atem connection
+received HTTP 404 "Room not found" while Astation was running. Relaunching
+Astation recreated the room and restored access. The reason the room vanished
+has not been established; reproduce it and inspect room ownership/heartbeat
+refresh before declaring it fixed. The optional account verifier warnings do
+not establish the cause of this 404.
+
+## Unified agora.build SSO: approved direction
+
+PR #38 records the product requirements in the
+[unified identity specification](specs/2026-10-10-unified-agora-build-identity.md).
+The agora.build/portal project is to implement shared accounts for Astation,
+Atem, Vox, and future products, with GitHub, Google, Apple, and Agora as linked
+sign-in providers. The proposed SSO service and hostname are not deployed.
+
+Keep `AGORA_ACCOUNT_USERINFO_URL`, `AGORA_ACCOUNT_SUBJECT_FIELD`, and
+`AGORA_ACCOUNT_AUTH_TIME_FIELD` unset in the current deployment. They are an
+optional legacy Agora account verifier, not prerequisites for pairing, sync,
+E2EE, or the future SSO. Retain the compatibility code until the replacement
+integration and migration are tested. Permanent account IDs, validated token
+issuer/audience, provider linking, separate Agora resource credentials, and
+Astation's independent E2EE approval boundary remain requirements.
 
 ## Deferred ideas
 
@@ -107,10 +165,11 @@ required work:
 
 ## Product ideas requiring a separate decision
 
-- **Agent-link:** cross-machine peer discovery and agent messaging remain
-  absent from Atem's CLI and need an Astation permission model. Start only
-  when requested.
-- **Credentials vault:** optional encryption of memory, skills, and vault
-  history is already implemented. A dedicated credential store and
-  `atem vault get <name>` remain absent; current vault commands manage
-  shared notes. Keep credential values out of memory, skills, and handoffs.
+- **Agent-link:** cross-machine peer discovery and agent messaging need an
+  Astation permission model and a separately agreed product scope. Check the
+  current Atem implementation before treating the original feature list as
+  missing work.
+- **Credentials vault:** a dedicated credential store has a separate product
+  scope from the shared-notes vault and account-data encryption. Check the
+  current Atem capabilities before proposing implementation. Keep credential
+  values out of memory, skills, and handoffs.
