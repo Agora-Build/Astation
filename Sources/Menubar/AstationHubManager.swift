@@ -5,7 +5,9 @@ import Network
 
 // Hub Manager - Contains all business logic for Agora projects, tokens, etc.
 class AstationHubManager: ObservableObject {
-    @Published var connectedClients: [ConnectedClient] = []
+    @Published var connectedClients: [ConnectedClient] = [] {
+        didSet { refreshDirectMigrationContexts() }
+    }
     @Published var projects: [AgoraProject] = []
     @Published var selectedProject: AgoraProject?
     @Published var isClaudeRunning = false
@@ -71,12 +73,53 @@ class AstationHubManager: ObservableObject {
     private var sessionExpiryTimer: Timer?
     /// Relay identity problem shown in the menu (nil when fine).
     @Published var relayIdentityStatusMessage: String?
-    @Published private(set) var relayAccountDevices: [RelayAccountDevice] = []
+    @Published private(set) var relayAccountDevices: [RelayAccountDevice] = [] {
+        didSet { refreshDirectMigrationContexts() }
+    }
     @Published private(set) var relayMergeRequests: [RelayMergeRequest] = []
     @Published private(set) var relayAccountStatusMessage: String?
-    @Published private(set) var relayEncryptionState: RelayEncryptionState?
+    @Published private(set) var relayEncryptionState: RelayEncryptionState? {
+        didSet { refreshDirectMigrationContexts() }
+    }
     @Published var relayEncryptionStatusMessage: String?
     private var encryptionMigrationRetryDelay: TimeInterval = 1
+    private var encryptionMigrationRetryScheduled = false
+    private let loadMigrationKey: (String, String?) throws -> AccountDataKey?
+    private let dispatchMigration: (@escaping () -> Void) -> Void
+    private struct MigrationContext {
+        let account: String
+        let route: AtemVerificationRoute
+    }
+    private let migrationContextLock = NSLock()
+    private var directMigrationContexts: [String: MigrationContext] = [:]
+    let atemE2EIdentity: AtemE2EIdentity
+    private lazy var atemVerification = AtemVerificationController(
+        identity: atemE2EIdentity,
+        account: { [weak self] in self?.e2eDataAccount ?? "" },
+        key: { account, kid in try DataEncryptionKeyManager.shared.load(dataAccount: account, kid: kid) },
+        isCurrent: { [weak self] route in self?.verificationRoute(clientId: route.clientId, relayConnectionId: self?.identityRelayAuthentication.connectionId(for: route.clientId)) == route },
+        send: { [weak self] message, route in
+            self?.sendMessage(message, to: route.clientId, expectedRelayConnectionId: route.clientId.hasPrefix("relay-") ? route.connectionId : nil)
+            if case .deviceVerified = message { self?.requestRelayEncryptionState() }
+        },
+        approve: AtemVerificationUI.approve,
+        saveRecovery: AtemVerificationUI.saveRecovery,
+        kit: { [weak self] in
+            guard let self else { throw AtemIdentityError.identityChanged }
+            return try self.atemE2EIdentity.recoveryKit(astationId: AstationIdentity.shared.id, relayURL: self.stationRelayUrl)
+        }
+    )
+    private lazy var atemStorageKeys = AtemStorageKeyController(
+        identity: atemE2EIdentity,
+        account: { [weak self] in self?.e2eDataAccount ?? "" },
+        isCurrent: { [weak self] route in
+            self?.verificationRoute(clientId: route.clientId, relayConnectionId: self?.identityRelayAuthentication.connectionId(for: route.clientId)) == route
+        },
+        send: { [weak self] message, route in
+            self?.sendMessage(message, to: route.clientId, expectedRelayConnectionId: route.clientId.hasPrefix("relay-") ? route.connectionId : nil)
+        },
+        approve: AtemVerificationUI.unlock
+    )
 
     /// Station relay URL. Priority: test override > ASTATION_RELAY_URL env var > UserDefaults > default.
     var stationRelayUrl: String {
@@ -97,6 +140,11 @@ class AstationHubManager: ObservableObject {
         sessionStore: SsoSessionStore = SsoSessionStore(),
         relayIdentityKeyManager: RelayIdentityKeyManager = RelayIdentityKeyManager(),
         relayIdentityRepairDefaults: UserDefaults = .standard,
+        atemE2EIdentity: AtemE2EIdentity? = nil,
+        loadMigrationKey: @escaping (String, String?) throws -> AccountDataKey? = {
+            try DataEncryptionKeyManager.shared.load(dataAccount: $0, kid: $1)
+        },
+        dispatchMigration: @escaping (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) },
         makeIdentityRelayTask: @escaping (URL) -> IdentityRelaySocket = { URLSession.shared.webSocketTask(with: $0) }
     ) {
         self.deviceSessionStore = deviceSessionStore
@@ -104,6 +152,9 @@ class AstationHubManager: ObservableObject {
         self.makeIdentityRelayTask = makeIdentityRelayTask
         self.relayIdentityKeyManager = relayIdentityKeyManager
         self.relayIdentityRepairDefaults = relayIdentityRepairDefaults
+        self.atemE2EIdentity = atemE2EIdentity ?? AtemE2EIdentity(storage: AtemIdentityKeychainStorage(astationId: AstationIdentity.shared.id))
+        self.loadMigrationKey = loadMigrationKey
+        self.dispatchMigration = dispatchMigration
         self.tokenProvider = SsoTokenProvider(
             store: sessionStore,
             refresher: SsoNetworkRefresher(),
@@ -139,6 +190,7 @@ class AstationHubManager: ObservableObject {
         if relayIdentityKeyRepairPending {
             relayIdentityStatusMessage = "Device key recovery is paused. Complete the relay reset in Settings > Security, then reconnect."
         }
+        dispatchMigration { [weak self] in self?.resumeAcceptedEncryptionMigrations() }
     }
 
     @objc private func handleCredentialsChanged() {
@@ -524,6 +576,8 @@ class AstationHubManager: ObservableObject {
 
     func removeClient(withId clientId: String) {
         DispatchQueue.main.async {
+            self.atemVerification.disconnect(clientId: clientId)
+            self.atemStorageKeys.disconnect(clientId: clientId)
             self.connectedClients.removeAll { $0.id == clientId }
             self.agentsByClientId.removeValue(forKey: clientId)
             // If the pinned client disconnected, clear the pin
@@ -665,15 +719,80 @@ class AstationHubManager: ObservableObject {
             return nil
 
         case .keyRequest(let publicKey):
-            handleEncryptionKeyRequest(
-                publicKey: publicKey,
-                clientId: clientId,
-                relayConnectionId: relayConnectionId
-            )
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let route = self.verificationRoute(clientId: clientId, relayConnectionId: relayConnectionId) else { return }
+                self.atemVerification.requestKey(publicKey: publicKey, route: route)
+            }
             return nil
 
-        case .encryptionMigrationComplete(let mode, let kid):
-            handleEncryptionMigrationComplete(mode: mode, kid: kid)
+        case .verifyCommit(let commit):
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let route = self.verificationRoute(clientId: clientId, relayConnectionId: relayConnectionId) else { return }
+                self.atemVerification.start(commit, route: route)
+            }
+            return nil
+
+        case .verifyReveal(let reveal):
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let route = self.verificationRoute(clientId: clientId, relayConnectionId: relayConnectionId) else { return }
+                self.atemVerification.reveal(reveal, route: route)
+            }
+            return nil
+
+        case .verifyAbort:
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let route = self.verificationRoute(clientId: clientId, relayConnectionId: relayConnectionId) else { return }
+                self.atemVerification.cancel(route: route)
+            }
+            return nil
+
+        case .unlockRequest(let wire):
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let route = self.verificationRoute(clientId: clientId, relayConnectionId: relayConnectionId) else { return }
+                self.atemStorageKeys.unlock(wire, route: route)
+            }
+            return nil
+
+        case .storageKeyRotate(let wire):
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let route = self.verificationRoute(clientId: clientId, relayConnectionId: relayConnectionId) else { return }
+                self.atemStorageKeys.rotate(wire, route: route)
+            }
+            return nil
+
+        case .storageKeyConfirm(let signed):
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let route = self.verificationRoute(clientId: clientId, relayConnectionId: relayConnectionId) else { return }
+                self.atemStorageKeys.settle(signed, abandoning: false, route: route)
+            }
+            return nil
+
+        case .storageKeyAbandon(let signed):
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let route = self.verificationRoute(clientId: clientId, relayConnectionId: relayConnectionId) else { return }
+                self.atemStorageKeys.settle(signed, abandoning: true, route: route)
+            }
+            return nil
+
+        case .encryptionMigrationComplete(let mode, let kid, let completion):
+            // Freeze and persist authorization before a disconnect/reconnect can remove the route.
+            guard let context = captureMigrationContext(clientId: clientId, relayConnectionId: relayConnectionId) else { return nil }
+            do {
+                let committed = try atemE2EIdentity.acceptMigrationCompletion(completion,
+                    mode: mode, kid: kid, account: context.account, route: context.route,
+                    key: loadMigrationKey(context.account, kid))
+                dispatchMigration { [weak self] in
+                    if let committed { self?.publishMigrationCommit(committed) }
+                    self?.resumeAcceptedEncryptionMigrations()
+                }
+            } catch {
+                let showError = { [weak self] in
+                    self?.relayEncryptionStatusMessage = error.localizedDescription
+                    Log.warn("[AstationHub] Rejected encryption migration completion: \(error.localizedDescription)")
+                    NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
+                }
+                if Thread.isMainThread { showError() } else { DispatchQueue.main.async(execute: showError) }
+            }
             return nil
 
         default:
@@ -1501,29 +1620,26 @@ class AstationHubManager: ObservableObject {
             requestRelayAccountState()
             requestRelayEncryptionState()
         case .encryptionState(let state):
-            let previousState = relayEncryptionState
+            let previous = relayEncryptionState
             relayEncryptionState = state
             relayEncryptionStatusMessage = nil
             do {
-                if state.mode == "off" {
-                    try DataEncryptionKeyManager.shared.delete(dataAccount: state.dataAccount)
-                } else if let kid = state.kid {
-                    try DataEncryptionKeyManager.shared.makeAvailable(
-                        dataAccount: state.dataAccount,
-                        kid: kid,
-                        preferredDataAccount: previousState?.dataAccount
-                    )
-                    if state.mode == "on" {
-                        try DataEncryptionKeyManager.shared.retainOnly(
-                            kid: kid,
-                            dataAccount: state.dataAccount
-                        )
+                if let local = try atemE2EIdentity.state(account: state.dataAccount) {
+                    relayEncryptionState = state.withEncryptionState(local)
+                    if local.mode != state.mode || local.kid != state.kid {
+                        relayEncryptionStatusMessage = "The relay's encryption mode differs from this Mac's approved state. The local state is retained."
+                        replicateLocalEncryptionState(account: state.dataAccount, state: local, reported: state)
+                        scheduleEncryptionMigrationRetry()
                     }
+                } else {
+                    relayEncryptionState = state.withUnavailableEncryptionState()
                 }
             } catch {
+                relayEncryptionState = previous?.dataAccount == state.dataAccount ? previous : state.withUnavailableEncryptionState()
                 relayEncryptionStatusMessage = error.localizedDescription
             }
             broadcastEncryptionMode(state)
+            resumeAcceptedEncryptionMigrations()
             NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
         case .encryptionChanged:
             requestRelayEncryptionState()
@@ -1726,6 +1842,7 @@ class AstationHubManager: ObservableObject {
             NotificationCenter.default.post(name: .relayIdentityKeyChanged, object: nil)
             Log.info("[RelayIdentity] Relay \(status) this Astation's key")
             sendRelaySessionsResync()
+            resumeAcceptedEncryptionMigrations()
             requestRelayAccountState()
             requestRelayEncryptionState()
             registerRelayAccountIfPossible()
@@ -1762,18 +1879,44 @@ class AstationHubManager: ObservableObject {
     }
 
     func setRelayEncryption(mode: String, kid: String?) {
+        // Final modes are committed only by a validated, journaled device report.
+        guard mode == "enabling" || mode == "disabling" else {
+            relayEncryptionStatusMessage = AtemMigrationError.invalidCompletion.localizedDescription
+            return
+        }
         guard let text = RelayIdentityProtocol.encryptionSetMessage(mode: mode, kid: kid) else { return }
+        do {
+            let account = e2eDataAccount
+            if try DataEncryptionKeyManager.shared.load(dataAccount: account, kid: kid) == nil {
+                throw AtemIdentityError.invalidState
+            }
+            let signed = try atemE2EIdentity.setState(account: account, mode: mode, kid: kid)
+            if let reported = relayEncryptionState, let saved = try atemE2EIdentity.state(account: account) {
+                relayEncryptionState = reported.withEncryptionState(saved)
+            }
+            let message = AstationMessage.encryptionMode(accountState: signed)
+            broadcastHandler?(message)
+            broadcastToAuthenticatedIdentityRelayClients(message)
+        } catch {
+            relayEncryptionStatusMessage = error.localizedDescription
+            NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
+            return
+        }
         relayEncryptionStatusMessage = "Updating encryption…"
         NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
         sendRelayIdentityControl(text, label: "relayEncryptionSet")
     }
 
     private func scheduleEncryptionMigrationRetry() {
+        guard !encryptionMigrationRetryScheduled else { return }
+        encryptionMigrationRetryScheduled = true
         let delay = encryptionMigrationRetryDelay
         encryptionMigrationRetryDelay = min(delay * 2, 30)
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self, self.identityRelayVerified else { return }
-            self.requestRelayEncryptionState()
+            guard let self else { return }
+            self.encryptionMigrationRetryScheduled = false
+            self.resumeAcceptedEncryptionMigrations()
+            if self.identityRelayVerified { self.requestRelayEncryptionState() }
         }
     }
 
@@ -1832,94 +1975,132 @@ class AstationHubManager: ObservableObject {
             .dataAccount ?? AstationIdentity.shared.id
     }
 
-    private func broadcastEncryptionMode(_ state: RelayEncryptionState) {
-        let message = AstationMessage.encryptionMode(
-            mode: state.mode,
-            kid: state.kid,
-            dataAccount: state.dataAccount,
-            astationId: AstationIdentity.shared.id
+    private var e2eDataAccount: String { relayEncryptionState?.dataAccount ?? currentDataAccount }
+
+    private static func directVerificationRoute(_ client: ConnectedClient) -> AtemVerificationRoute? {
+        guard let deviceId = client.atemId else { return nil }
+        return AtemVerificationRoute(clientId: client.id, connectionId: client.id,
+            deviceId: deviceId, deviceName: DeviceAuthentication.deviceLabel(client.hostname))
+    }
+
+    private func refreshDirectMigrationContexts() {
+        let account = e2eDataAccount
+        var contexts: [String: MigrationContext] = [:]
+        for client in connectedClients where !client.id.hasPrefix("relay-") {
+            if let route = Self.directVerificationRoute(client) {
+                contexts[client.id] = MigrationContext(account: account, route: route)
+            }
+        }
+        migrationContextLock.lock()
+        directMigrationContexts = contexts
+        migrationContextLock.unlock()
+    }
+
+    private func captureMigrationContext(clientId: String, relayConnectionId: String?) -> MigrationContext? {
+        if Thread.isMainThread {
+            guard let route = verificationRoute(clientId: clientId, relayConnectionId: relayConnectionId) else { return nil }
+            return MigrationContext(account: e2eDataAccount, route: route)
+        }
+        // Main may be waiting for this socket's event loop; never synchronously hop back.
+        guard !clientId.hasPrefix("relay-"), relayConnectionId == nil else { return nil }
+        migrationContextLock.lock(); defer { migrationContextLock.unlock() }
+        return directMigrationContexts[clientId]
+    }
+
+    private func verificationRoute(clientId: String, relayConnectionId: String?) -> AtemVerificationRoute? {
+        guard let client = connectedClients.first(where: { $0.id == clientId }), let deviceId = client.atemId else { return nil }
+        guard clientId.hasPrefix("relay-") else { return Self.directVerificationRoute(client) }
+        guard identityRelayVerified, let relayConnectionId,
+              identityRelayAuthentication.isAuthenticated(clientId: clientId, connectionId: relayConnectionId) else { return nil }
+        return AtemVerificationRoute(
+            clientId: clientId, connectionId: relayConnectionId,
+            deviceId: deviceId, deviceName: DeviceAuthentication.deviceLabel(client.hostname)
         )
-        broadcastHandler?(message)
-        broadcastToAuthenticatedIdentityRelayClients(message)
+    }
+
+    private func broadcastEncryptionMode(_ state: RelayEncryptionState) {
+        do {
+            guard let local = try atemE2EIdentity.state(account: state.dataAccount) else { return }
+            let signed = try atemE2EIdentity.signedState(
+                account: state.dataAccount,
+                key: DataEncryptionKeyManager.shared.load(dataAccount: state.dataAccount, kid: local.kid)
+            )
+            let message = AstationMessage.encryptionMode(accountState: signed)
+            broadcastHandler?(message)
+            broadcastToAuthenticatedIdentityRelayClients(message)
+        } catch {
+            relayEncryptionStatusMessage = error.localizedDescription
+        }
     }
 
     private func sendEncryptionMode(to clientId: String, relayConnectionId: String?) {
-        guard let state = relayEncryptionState else { return }
-        sendMessage(
-            .encryptionMode(
-                mode: state.mode,
-                kid: state.kid,
-                dataAccount: state.dataAccount,
-                astationId: AstationIdentity.shared.id
-            ),
-            to: clientId,
-            expectedRelayConnectionId: relayConnectionId
-        )
-    }
-
-    private func handleEncryptionKeyRequest(
-        publicKey: String,
-        clientId: String,
-        relayConnectionId: String?
-    ) {
-        guard let state = relayEncryptionState,
-              state.mode != "off",
-              let kid = state.kid,
-              let fingerprint = DataEncryptionKeyManager.fingerprint(publicKeyBase64: publicKey) else {
-            sendMessage(.error(message: "Encryption key request is invalid"),
-                        to: clientId, expectedRelayConnectionId: relayConnectionId)
-            return
-        }
-        var trusted = UserDefaults.standard.dictionary(forKey: "AstationEncryptionFingerprints") as? [String: String] ?? [:]
-        if trusted[clientId] != fingerprint {
-            let alert = NSAlert()
-            alert.messageText = trusted[clientId] == nil
-                ? "Verify Atem Encryption Key"
-                : "Atem Encryption Key Changed"
-            alert.informativeText = "Compare this fingerprint with the one printed by atem pair:\n\n\(fingerprint)\n\nDevice: \(clientId)"
-            alert.alertStyle = trusted[clientId] == nil ? .informational : .warning
-            alert.addButton(withTitle: "Fingerprint Matches")
-            alert.addButton(withTitle: "Deny")
-            guard alert.runModal() == .alertFirstButtonReturn else {
-                sendMessage(.error(message: "Encryption fingerprint was not approved"),
-                            to: clientId, expectedRelayConnectionId: relayConnectionId)
-                return
-            }
-            trusted[clientId] = fingerprint
-            UserDefaults.standard.set(trusted, forKey: "AstationEncryptionFingerprints")
-        }
         do {
-            guard let value = try DataEncryptionKeyManager.shared.load(
-                dataAccount: state.dataAccount,
-                kid: kid
-            ) else {
-                throw DataEncryptionKeyError.invalidKey
-            }
-            let grant = try DataEncryptionKeyManager.shared.wrap(
-                value,
-                to: publicKey,
-                dataAccount: state.dataAccount
+            guard let local = try atemE2EIdentity.state(account: e2eDataAccount) else { return }
+            let signed = try atemE2EIdentity.signedState(
+                account: e2eDataAccount,
+                key: DataEncryptionKeyManager.shared.load(dataAccount: e2eDataAccount, kid: local.kid)
             )
-            sendMessage(
-                .keyGrant(kid: grant.kid, wrappedKey: grant.wrappedKey, dataAccount: state.dataAccount),
-                to: clientId,
-                expectedRelayConnectionId: relayConnectionId
-            )
+            sendMessage(.encryptionMode(accountState: signed), to: clientId, expectedRelayConnectionId: relayConnectionId)
         } catch {
             relayEncryptionStatusMessage = error.localizedDescription
-            NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
-            sendMessage(.error(message: "Astation cannot access the account encryption key"),
-                        to: clientId, expectedRelayConnectionId: relayConnectionId)
         }
     }
 
-    private func handleEncryptionMigrationComplete(mode: String, kid: String) {
-        guard let state = relayEncryptionState, state.kid == kid else { return }
-        if state.mode == "enabling", mode == "on" {
-            setRelayEncryption(mode: "on", kid: kid)
-        } else if state.mode == "disabling", mode == "off" {
-            setRelayEncryption(mode: "off", kid: kid)
+    private func resumeAcceptedEncryptionMigrations() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        do {
+            var needsRetry = false
+            for account in try atemE2EIdentity.pendingMigrationAccounts() {
+                do {
+                    let state = try atemE2EIdentity.state(account: account)
+                    if let committed = try atemE2EIdentity.finishAcceptedMigration(account: account,
+                        key: loadMigrationKey(account, state?.kid)) {
+                        publishMigrationCommit(committed)
+                    }
+                } catch {
+                    needsRetry = true
+                    relayEncryptionStatusMessage = error.localizedDescription
+                    NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
+                }
+            }
+            if needsRetry { scheduleEncryptionMigrationRetry() }
+        } catch {
+            relayEncryptionStatusMessage = error.localizedDescription
+            scheduleEncryptionMigrationRetry()
         }
+    }
+
+    private func publishMigrationCommit(_ committed: AtemMigrationCommit) {
+        guard let current = try? atemE2EIdentity.currentMigrationCommit(account: committed.account),
+              current.signedState == committed.signedState,
+              committed.account == e2eDataAccount else { return }
+        let message = AstationMessage.encryptionMode(accountState: committed.signedState)
+        broadcastHandler?(message)
+        broadcastToAuthenticatedIdentityRelayClients(message)
+        if let reported = relayEncryptionState, reported.dataAccount == committed.account,
+           let local = try? atemE2EIdentity.state(account: committed.account) {
+            relayEncryptionState = reported.withEncryptionState(local)
+        }
+        relayEncryptionStatusMessage = nil
+        NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
+        if let text = RelayIdentityProtocol.encryptionSetMessage(mode: committed.target, kid: committed.kid) {
+            sendRelayIdentityControl(text, label: "relayEncryptionSet")
+        }
+    }
+
+    private func replicateLocalEncryptionState(account: String, state: AtemAccountState, reported: RelayEncryptionState) {
+        guard account == e2eDataAccount else { return }
+        var mode = state.mode
+        var kid = state.kid
+        // Recover a missed replica transition without regressing the authoritative local state.
+        if state.mode == "on", reported.mode == "off" || (reported.mode == "on" && reported.kid != state.kid) {
+            mode = "enabling"
+        } else if state.mode == "off", reported.mode == "on" {
+            mode = "disabling"
+            kid = (try? atemE2EIdentity.currentMigrationCommit(account: account))?.kid
+        }
+        guard let text = RelayIdentityProtocol.encryptionSetMessage(mode: mode, kid: kid) else { return }
+        sendRelayIdentityControl(text, label: "relayEncryptionSet")
     }
 
     func requestRelayMerge(targetAstationId: String, freshAccessToken: String? = nil) {

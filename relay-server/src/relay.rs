@@ -4390,6 +4390,89 @@ pub(crate) mod tests {
         socket
     }
 
+    #[tokio::test]
+    async fn e2e_verification_frames_are_forwarded_unchanged_on_the_bound_connection() {
+        let (base_url, server) = spawn_relay(memory_identity_state()).await;
+        let code = "astation-e2e-forwarding";
+        let device_id = "atem-e2e-device";
+        let mut astation = verified_astation(&base_url, code, &TestKey::generate(), "registered").await;
+        let mut atem = connect_atem(&base_url, code, device_id).await;
+        let connected = next_client_json(&mut astation).await;
+        let connection_id = connected["connection_id"].as_str().unwrap();
+        let signed = serde_json::json!({"statement":"AAE=","signature":"AgM="});
+
+        // Cryptographic values are opaque to the relay; it must retain the exact payload.
+        for payload in [
+            serde_json::json!({"type":"verifyCommit","data":{"device_id":device_id,"commitment":"AQIDBA=="}}),
+            serde_json::json!({"type":"verifyReveal","data":{"device_pub":"AQ==","device_sign_pub":"Ag==","unlock_auth_pub":"Aw==","nonce":"BA=="}}),
+            serde_json::json!({"type":"verifyAbort","data":{"reason":"device declined"}}),
+            serde_json::json!({"type":"keyRequest","data":{"public_key":"AQ=="}}),
+            serde_json::json!({"type":"unlockRequest","data":{"request":"AQID","signature":"AgM="}}),
+            serde_json::json!({"type":"storageKeyRotate","data":{"rotate":signed,"encapped_key":"AQ==","ciphertext":"Ag=="}}),
+            serde_json::json!({"type":"storageKeyConfirm","data":{"confirm":signed}}),
+            serde_json::json!({"type":"storageKeyAbandon","data":{"abandon":signed}}),
+            serde_json::json!({"type":"encryptionMigrationComplete","data":{"mode":"on","kid":"0123abcd","completion":signed}}),
+        ] {
+            send_json(&mut atem, payload.clone()).await;
+            let frame = next_client_json(&mut astation).await;
+            assert_eq!(frame["atem_id"], device_id);
+            assert_eq!(frame["connection_id"], connection_id);
+            assert_eq!(frame["payload"], payload);
+        }
+
+        let grant = serde_json::json!({"signed":signed,"encapped_key":"AQ==","ciphertext":"Ag=="});
+        for payload in [
+            serde_json::json!({"type":"verifyKeys","data":{"sign_pub":"AQ==","enc_pub":"Ag==","recovery_sign_pub":"Aw==","nonce":"BA=="}}),
+            serde_json::json!({"type":"deviceVerified","data":{"device_verified":signed,"account_state":signed,"grants":[grant]}}),
+            serde_json::json!({"type":"verifyAbort","data":{"reason":"Mac declined"}}),
+            serde_json::json!({"type":"encryptionMode","data":{"account_state":signed}}),
+            serde_json::json!({"type":"keyGrant","data":{"grant":grant}}),
+            serde_json::json!({"type":"unlockGrant","data":{"grant":signed,"encapped_key":"AQ==","ciphertext":"Ag=="}}),
+            serde_json::json!({"type":"unlockDenied","data":{"reason":"Mac declined"}}),
+            serde_json::json!({"type":"storageKeyAck","data":{"ack":signed}}),
+            serde_json::json!({"type":"storageKeyRejected","data":{"reason":"rotation pending","pending_kid":"0a1b2c3d"}}),
+        ] {
+            send_json(&mut astation, serde_json::json!({
+                "atem_id":device_id,"connection_id":connection_id,"payload":payload,
+            })).await;
+            assert_eq!(next_client_json(&mut atem).await, payload);
+        }
+        // Abandon immediately followed by rotate must retain arrival order.
+        let abandon = serde_json::json!({"type":"storageKeyAbandon","data":{"abandon":signed}});
+        let rotate = serde_json::json!({"type":"storageKeyRotate","data":{"rotate":signed,"encapped_key":"Aw==","ciphertext":"BA=="}});
+        send_json(&mut atem, abandon.clone()).await;
+        send_json(&mut atem, rotate.clone()).await;
+        assert_eq!(next_client_json(&mut astation).await["payload"], abandon);
+        assert_eq!(next_client_json(&mut astation).await["payload"], rotate);
+
+        let mut replacement = connect_atem(&base_url, code, device_id).await;
+        let replaced = next_client_json(&mut astation).await;
+        let replacement_id = replaced["connection_id"].as_str().unwrap();
+        assert_ne!(replacement_id, connection_id);
+        for payload in [
+            serde_json::json!({"type":"unlockGrant","data":{"grant":signed,"encapped_key":"AQ==","ciphertext":"Ag=="}}),
+            serde_json::json!({"type":"unlockDenied","data":{"reason":"denied"}}),
+            serde_json::json!({"type":"storageKeyAck","data":{"ack":signed}}),
+            serde_json::json!({"type":"storageKeyRejected","data":{"reason":"pending","pending_kid":"0a1b2c3d"}}),
+        ] {
+            send_json(&mut astation, serde_json::json!({
+                "atem_id":device_id,"connection_id":connection_id,"payload":payload,
+            })).await;
+        }
+        assert_silent(&mut replacement, 150).await;
+        let ack = serde_json::json!({"type":"storageKeyAck","data":{"ack":signed}});
+        send_json(&mut astation, serde_json::json!({
+            "atem_id":device_id,"connection_id":replacement_id,"payload":ack,
+        })).await;
+        assert_eq!(next_client_json(&mut replacement).await, ack);
+        let completion = serde_json::json!({"type":"encryptionMigrationComplete","data":{"mode":"on","kid":"0123abcd","completion":signed}});
+        send_json(&mut replacement, completion.clone()).await;
+        replacement.close(None).await.unwrap();
+        assert_eq!(next_client_json(&mut astation).await["payload"], completion);
+        astation.close(None).await.unwrap();
+        server.abort();
+    }
+
     /// Send a control message and return the relay's ack.
     pub(crate) async fn control(socket: &mut TestSocket, value: serde_json::Value) -> serde_json::Value {
         let kind = value["type"].as_str().unwrap().to_string();

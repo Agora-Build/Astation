@@ -348,6 +348,20 @@ struct RelayEncryptionState: Codable, Equatable {
     let ciphertextFields: Int64
     let obsoleteFields: Int64
 
+    func withEncryptionState(_ local: AtemAccountState) -> RelayEncryptionState {
+        RelayEncryptionState(
+            dataAccount: dataAccount, mode: local.mode, kid: local.kid,
+            enabledAt: enabledAt, updatedAt: updatedAt, plaintextFields: plaintextFields,
+            ciphertextFields: ciphertextFields, obsoleteFields: obsoleteFields
+        )
+    }
+
+    func withUnavailableEncryptionState() -> RelayEncryptionState {
+        RelayEncryptionState(dataAccount: dataAccount, mode: "unavailable", kid: nil,
+            enabledAt: nil, updatedAt: updatedAt, plaintextFields: plaintextFields,
+            ciphertextFields: ciphertextFields, obsoleteFields: obsoleteFields)
+    }
+
     enum CodingKeys: String, CodingKey {
         case dataAccount = "data_account"
         case mode, kid

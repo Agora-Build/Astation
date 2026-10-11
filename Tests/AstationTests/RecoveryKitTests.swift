@@ -72,6 +72,31 @@ final class RecoveryKitTests: XCTestCase {
         XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
     }
 
+    func testRecoverySaveReplacesSymlinkWithoutWritingThroughIt() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let original = directory.appendingPathComponent("original.txt")
+        let target = directory.appendingPathComponent("recovery.txt")
+        try "original".write(to: original, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(at: target, withDestinationURL: original)
+        try RecoveryKit.save("recovery secret", to: target)
+        XCTAssertEqual(try String(contentsOf: original, encoding: .utf8), "original")
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "recovery secret")
+        let attributes = try FileManager.default.attributesOfItem(atPath: target.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+    }
+
+    func testFailedRecoverySaveRetainsDestinationAndCleansTemporaryFile() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("existing-directory", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        XCTAssertThrowsError(try RecoveryKit.save("secret", to: destination))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["existing-directory"])
+    }
+
     func testRestoresCanonicalIdentityWithOwnerOnlyPermissions() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

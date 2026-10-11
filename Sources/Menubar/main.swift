@@ -24,6 +24,8 @@ if CommandLine.arguments.contains("--audio-capture-check") {
 Log.setup()
 
 Log.info("Starting Astation - AI-powered work suite hub")
+Log.info("App bundle: \(Bundle.main.bundleURL.path)")
+Log.info("Atem E2E: verification and storage-key unlock; identity formats 1-\(AtemE2EIdentity.storedVersion)")
 
 // Create and configure the application
 let app = NSApplication.shared

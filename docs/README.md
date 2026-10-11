@@ -6,6 +6,8 @@ work. Completed implementation checklists are available in Git history.
 | Document | Why it is retained |
 | --- | --- |
 | [Agent handoff](agent-handoff.md) | Remaining work, encryption publication, SSO direction, and validation/operations follow-ups |
+| [Atem device verification](atem-device-verification.md) | Safety codes, protected key escrow, Touch ID unlock, personal-team signing, and cross-machine tests |
+| [Encryption migration lifecycle](../designs/e2e-encryption.md) | Durable completion, retries, revocation ordering, and the local encryption authority boundary |
 | [Relay identity](astation-relay-identity-handoff.md) | Signing-key contract, durable pairing protocol, reconnect behavior, and recovery runbooks |
 | [Android device sharing](android-device-sharing.md) | Connection model, setup, lifecycle, and pending phone/IDE validation |
 | [Local audio recording](audio-recording.md) | Capture sources, original tracks, permissions, and practical Mac validation |

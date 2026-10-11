@@ -688,18 +688,19 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         let remaining = "\(state.plaintextFields) plaintext, \(state.ciphertextFields) encrypted, \(state.obsoleteFields) obsolete fields"
         switch state.mode {
         case "off": label.stringValue = "Off — stored data is readable by the relay."
-        case "enabling": label.stringValue = "Turning on — \(remaining). Keep an Atem connected to finish migration."
+        case "enabling": label.stringValue = "Turning on — \(remaining). Run an updated, unlocked Atem command to migrate data."
         case "on":
             let date = state.enabledAt.map { Date(timeIntervalSince1970: TimeInterval($0)).formatted() } ?? "unknown date"
             label.stringValue = "On since \(date) — key \(state.kid ?? "unknown")."
-        case "disabling": label.stringValue = "Turning off — \(remaining). Keep an Atem connected to finish migration."
+        case "disabling": label.stringValue = "Turning off — \(remaining). Run an updated, unlocked Atem command to migrate data."
+        case "unavailable": label.stringValue = "Encryption state unavailable. This Mac has no approved state for this account. Verify an Atem device before changing encryption."
         default: label.stringValue = "Unknown encryption state."
         }
         if let message = hubManager.relayEncryptionStatusMessage { label.stringValue += "\n\(message)" }
         encryptionOnButton?.isEnabled = state.mode == "off"
         encryptionOffButton?.isEnabled = state.mode == "on"
         encryptionRotateButton?.isEnabled = state.mode == "on"
-        encryptionShowButton?.isEnabled = state.mode != "off"
+        encryptionShowButton?.isEnabled = ["enabling", "on", "disabling"].contains(state.mode)
     }
 
     @objc private func turnOnEncryption() {
@@ -743,37 +744,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private func showEncryptionRecoveryConfirmation(actionTitle: String) {
         guard let recovery = pendingEncryptionRecoveryKey,
               let key = pendingEncryptionKey else { return }
-        let alert = NSAlert()
-        alert.messageText = "Save Your Encryption Recovery Key"
-        alert.informativeText = "If you lose this Mac and every paired Atem, nobody — including the server operator — can recover your encrypted data without this separate key."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: actionTitle)
-        alert.addButton(withTitle: "Cancel")
-        alert.buttons[0].isEnabled = false
-
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 10
-        let keyLabel = NSTextField(wrappingLabelWithString: recovery)
-        keyLabel.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
-        keyLabel.isSelectable = true
-        keyLabel.translatesAutoresizingMaskIntoConstraints = false
-        keyLabel.widthAnchor.constraint(equalToConstant: 430).isActive = true
-        stack.addArrangedSubview(keyLabel)
-        let actions = NSStackView()
-        actions.orientation = .horizontal
-        actions.spacing = 8
-        actions.addArrangedSubview(NSButton(title: "Copy", target: self, action: #selector(copyPendingEncryptionRecoveryKey)))
-        actions.addArrangedSubview(NSButton(title: "Save to File…", target: self, action: #selector(savePendingEncryptionRecoveryKey)))
-        stack.addArrangedSubview(actions)
-        let saved = NSButton(
-            checkboxWithTitle: "I've saved my encryption recovery key somewhere safe",
-            target: self,
-            action: #selector(encryptionRecoveryConfirmationChanged(_:))
-        )
-        stack.addArrangedSubview(saved)
-        alert.accessoryView = stack
+        let alert = Self.encryptionRecoveryConfirmationAlert(recovery: recovery, actionTitle: actionTitle, target: self)
         pendingEncryptionAlert = alert
 
         let response = alert.runModal()
@@ -792,6 +763,44 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         renderEncryptionState()
     }
 
+    static func encryptionRecoveryConfirmationAlert(recovery: String, actionTitle: String, target: AnyObject?) -> NSAlert {
+        let alert = NSAlert()
+        alert.messageText = "Save Your Encryption Recovery Key"
+        alert.informativeText = "If you lose this Mac and every paired Atem, nobody — including the server operator — can recover your encrypted data without this separate key."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: actionTitle)
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons[0].isEnabled = false
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        let keyLabel = NSTextField(wrappingLabelWithString: recovery)
+        keyLabel.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
+        keyLabel.isSelectable = true
+        keyLabel.preferredMaxLayoutWidth = 430
+        keyLabel.translatesAutoresizingMaskIntoConstraints = false
+        keyLabel.widthAnchor.constraint(equalToConstant: 430).isActive = true
+        stack.addArrangedSubview(keyLabel)
+        let actions = NSStackView()
+        actions.orientation = .horizontal
+        actions.spacing = 8
+        actions.addArrangedSubview(NSButton(title: "Copy", target: target, action: #selector(copyPendingEncryptionRecoveryKey)))
+        actions.addArrangedSubview(NSButton(title: "Save to File…", target: target, action: #selector(savePendingEncryptionRecoveryKey)))
+        stack.addArrangedSubview(actions)
+        let saved = NSButton(
+            checkboxWithTitle: "I've saved my encryption recovery key somewhere safe",
+            target: target,
+            action: #selector(encryptionRecoveryConfirmationChanged(_:))
+        )
+        stack.addArrangedSubview(saved)
+        // NSAlert sizes its accessory from the frame, not its Auto Layout constraints.
+        stack.setFrameSize(stack.fittingSize)
+        alert.accessoryView = stack
+        return alert
+    }
+
     @objc private func encryptionRecoveryConfirmationChanged(_ sender: NSButton) {
         pendingEncryptionAlert?.buttons.first?.isEnabled = sender.state == .on
     }
@@ -808,7 +817,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         panel.nameFieldStringValue = "Astation Encryption Recovery Key.txt"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
-            try value.write(to: url, atomically: true, encoding: .utf8)
+            try RecoveryKit.save(value, to: url)
         } catch {
             hubManager.relayEncryptionStatusMessage = "Couldn't save the encryption key: \(error.localizedDescription)"
         }
@@ -1080,11 +1089,13 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
             }
             let relayURL = StationRelayURL.validatedBase(SettingsWindowController.currentAstationRelayUrl)
                 ?? SettingsWindowController.defaultStationURL
-            let kit = RecoveryKit(
-                astationId: AstationIdentity.shared.id,
-                relayURL: relayURL
-            )
-            let text = kit.text()
+            let text: String
+            do {
+                text = try self.hubManager.atemE2EIdentity.recoveryKit(astationId: AstationIdentity.shared.id, relayURL: relayURL)
+            } catch {
+                self.setRecoveryStatus(error.localizedDescription, isError: true)
+                return
+            }
             let alert = NSAlert()
             alert.messageText = "Astation Recovery Kit"
             alert.informativeText = "Save this somewhere off this Mac, such as a password manager. You need it to get your memories, skills and vaults back if this Mac is lost."
@@ -1136,6 +1147,10 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
 
             guard let kit = RecoveryKit.parse(textView.string) else {
                 self.setRecoveryStatus("The recovery kit needs a valid Astation ID and relay URL.", isError: true)
+                return
+            }
+            guard kit.recoveryKey == nil else {
+                self.setRecoveryStatus("This kit contains an E2E recovery key. This version cannot restore the verification identity. Keep the complete kit; the account was not changed.", isError: true)
                 return
             }
             let current = AstationIdentity.shared.id

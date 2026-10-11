@@ -12,6 +12,7 @@ Usage: ./scripts/run-dev.sh [--force-build] [--build-only]
 Without options, incrementally build Swift, then launch a signed development app.
 Build C++ if missing. Quit Astation from its menu to stop it.
 Downloaded dependencies and SDKs are retained during a forced rebuild.
+For provisioned Keychain verification: bash scripts/verify-local-signing.sh PERSONAL_TEAM_ID.
 
 Build prerequisites: macOS 14+, Xcode Command Line Tools, CMake (brew install cmake).
 Optional environment: CMAKE=/path/to/cmake, AGORA_SDK_DIR=/path/to/sdk,
