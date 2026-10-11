@@ -5,21 +5,29 @@ enum AtemVerificationUI {
     private static var activePrompt: UUID?
 
     static func approve(_ request: AtemVerificationApproval, completion: @escaping (Bool) -> Void) -> (() -> Void) {
+        approve(request, context: LAContext(), completion: completion)
+    }
+
+    static func approve(_ request: AtemVerificationApproval, context: LAContext,
+                        completion: @escaping (Bool) -> Void) -> (() -> Void) {
         guard activePrompt == nil else { completion(false); return {} }
         let id = UUID()
         activePrompt = id
-        let alert = NSAlert()
-        alert.messageText = "Verify Atem Safety Code"
-        alert.informativeText = "Device: \(request.deviceName)\n\n\(request.safetyCode)\n\nCompare this code with the code shown by atem pair. Approve only when both codes match."
-        alert.addButton(withTitle: "Codes Match")
-        alert.addButton(withTitle: "Deny")
-        let prompt = AtemVerificationDialog(alert: alert) { accepted in
+        let prompt = AtemSafetyCodePrompt(request: request, context: context) { accepted in
             if activePrompt == id { activePrompt = nil }
             completion(accepted)
         }
-        prompt.confirm = { $0.authenticate() }
         prompt.show()
         return { prompt.finish(false) }
+    }
+
+    static func verificationAlert(_ request: AtemVerificationApproval) -> NSAlert {
+        let alert = NSAlert()
+        alert.messageText = "Verify Atem Safety Code"
+        alert.informativeText = "Device: \(displayText(request.deviceName))"
+        alert.addButton(withTitle: "Codes Match")
+        alert.addButton(withTitle: "Deny")
+        return alert
     }
 
     static func saveRecovery(_ text: String, completion: @escaping (Bool) -> Void) -> (() -> Void) {
@@ -72,9 +80,7 @@ enum AtemVerificationUI {
 // Modeless alerts keep the main queue free to handle a peer's verifyAbort.
 final class AtemVerificationDialog: NSObject, NSWindowDelegate {
     let alert: NSAlert
-    var confirm: ((AtemVerificationDialog) -> Void)?
     private var completion: ((Bool) -> Void)?
-    private var authentication: LAContext?
     var isActive: Bool { completion != nil }
 
     init(alert: NSAlert, completion: @escaping (Bool) -> Void) {
@@ -95,38 +101,12 @@ final class AtemVerificationDialog: NSObject, NSWindowDelegate {
         alert.window.makeKeyAndOrderFront(nil)
     }
 
-    @objc private func accept() {
-        guard isActive else { return }
-        if let confirm { confirm(self) } else { finish(true) }
-    }
-
+    @objc private func accept() { finish(true) }
     @objc private func deny() { finish(false) }
-
-    func authenticate(reason: String = "verify this Atem's safety code") {
-        guard isActive, authentication == nil else { return }
-        let context = LAContext()
-        context.localizedFallbackTitle = ""
-        var error: NSError?
-        guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
-            alert.messageText = "Touch ID Is Required"
-            alert.informativeText = "Unlock this Mac and enable Touch ID to approve this request."
-            alert.buttons[0].title = "OK"
-            alert.buttons[1].isHidden = true
-            confirm = { $0.finish(false) }
-            return
-        }
-        authentication = context
-        alert.window.orderOut(nil)
-        context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { [weak self] ok, _ in
-            DispatchQueue.main.async { self?.finish(ok) }
-        }
-    }
 
     func finish(_ accepted: Bool) {
         guard let callback = completion else { return }
         completion = nil
-        authentication?.invalidate()
-        authentication = nil
         alert.window.close()
         callback(accepted)
     }

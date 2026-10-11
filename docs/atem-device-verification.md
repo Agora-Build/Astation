@@ -24,9 +24,17 @@ Astations bind attempts to the authenticated Atem ID, the connection
 generation, the data account, and a fresh 32-byte nonce. Attempts expire
 after three minutes. The revealed keys must match the original commitment
 before the Mac displays a safety code. Approval requires matching codes
-and Touch ID. The first verification also requires confirmation that the
+and Touch ID. One window displays the safety code and the embedded system
+Touch ID control. After comparing both codes, click **Codes Match**, then use
+Touch ID in that window. The code remains visible; Codes Match alone cannot
+approve the device, and biometrics do not start before confirmation. There is
+no separate authentication alert or password fallback. The first verification
+also requires confirmation that the
 complete recovery kit was saved. Denial, abort, expiry, and connection
 replacement invalidate pending approvals.
+
+See [the verification UI design](../designs/atem-verification-ui.md) for the
+code-comparison gate and biometric lifecycle/security invariants.
 
 Safety-code and recovery dialogs run without blocking the main queue.
 A peer abort, disconnect, or timeout dismisses the active dialog and

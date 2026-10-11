@@ -4,7 +4,7 @@ import XCTest
 @testable import Menubar
 
 final class AtemVerificationUITests: XCTestCase {
-    private final class UnlockContext: LAContext, @unchecked Sendable {
+    private final class AuthenticationContext: LAContext, @unchecked Sendable {
         var available = true
         var preflightPolicies: [LAPolicy] = []
         var policies: [LAPolicy] = []
@@ -29,6 +29,10 @@ final class AtemVerificationUITests: XCTestCase {
 
     private var unlockRequest: AtemUnlockApproval {
         AtemUnlockApproval(deviceName: "Test Device", bootId: "test-boot", requestTime: Date(), lastUnlock: nil)
+    }
+
+    private var verificationRequest: AtemVerificationApproval {
+        AtemVerificationApproval(deviceName: "Test Device", safetyCode: "ABCD-EFGH-IJKL")
     }
 
     private func drainMainQueue() {
@@ -58,12 +62,10 @@ final class AtemVerificationUITests: XCTestCase {
         }
     }
 
-    func testPeerCancellationDismissesAlertAndIgnoresLateAuthenticationResult() {
+    func testPeerCancellationDismissesAlertAndIgnoresLateCompletion() {
         var results: [Bool] = []
         let prompt = dialog { results.append($0) }
-        prompt.confirm = { _ in }
         prompt.show()
-        prompt.alert.buttons[0].performClick(nil)
         XCTAssertTrue(prompt.isActive)
         prompt.finish(false)
         prompt.finish(true)
@@ -115,6 +117,219 @@ final class AtemVerificationUITests: XCTestCase {
         XCTAssertEqual(results, [true])
     }
 
+    func testSafetyCodeAndTouchIDStayInOneWindowAndWaitForCodeConfirmation() throws {
+        _ = NSApplication.shared
+        let context = AuthenticationContext()
+        context.localizedFallbackTitle = "Use Password"
+        context.touchIDAuthenticationAllowableReuseDuration = 60
+        let request = AtemVerificationApproval(deviceName: "Mac\nForged\u{202e}\u{200b}", safetyCode: verificationRequest.safetyCode)
+        var results: [Bool] = []
+        let prompt = AtemSafetyCodePrompt(request: request, context: context) { results.append($0) }
+        defer { prompt.finish(false) }
+        prompt.show()
+        prompt.show()
+        drainMainQueue()
+        XCTAssertTrue(context.preflightPolicies.isEmpty)
+        XCTAssertTrue(context.policies.isEmpty)
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertEqual(prompt.alert.informativeText, "Device: MacForged")
+        XCTAssertEqual(prompt.alert.buttons.map(\.title), ["Codes Match", "Deny"])
+        XCTAssertEqual(prompt.safetyCode.stringValue, request.safetyCode)
+        XCTAssertTrue(prompt.safetyCode.isSelectable)
+        XCTAssertEqual(prompt.safetyCode.font?.pointSize, 26)
+        XCTAssertTrue(prompt.authenticationView.context === context)
+        XCTAssertTrue(prompt.authenticationView.window === prompt.alert.window)
+        XCTAssertEqual(context.localizedFallbackTitle, "")
+        XCTAssertEqual(context.touchIDAuthenticationAllowableReuseDuration, 0)
+        let content = try XCTUnwrap(prompt.alert.window.contentView)
+        for view in [prompt.safetyCode, prompt.authenticationView, prompt.status] + prompt.alert.buttons {
+            let frame = content.convert(view.bounds, from: view)
+            XCTAssertGreaterThan(frame.height, 0)
+            XCTAssertGreaterThan(frame.width, 0)
+            XCTAssertTrue(content.bounds.contains(frame), "Verification control is clipped: \(type(of: view))")
+        }
+        prompt.alert.buttons[0].performClick(nil)
+        prompt.alert.buttons[0].performClick(nil)
+        XCTAssertFalse(prompt.alert.buttons[0].isEnabled)
+        XCTAssertTrue(context.policies.isEmpty)
+        drainMainQueue()
+        XCTAssertEqual(context.preflightPolicies, [.deviceOwnerAuthenticationWithBiometrics])
+        XCTAssertEqual(context.policies, [.deviceOwnerAuthenticationWithBiometrics])
+        XCTAssertEqual(context.reasons, ["verify this Atem's safety code"])
+        XCTAssertTrue(prompt.alert.window.isVisible)
+        XCTAssertEqual(prompt.safetyCode.stringValue, request.safetyCode)
+        XCTAssertTrue(prompt.alert.buttons[1].isEnabled)
+        XCTAssertTrue(results.isEmpty)
+        context.replies[0](true, nil)
+        drainMainQueue()
+        XCTAssertEqual(results, [true])
+        XCTAssertEqual(context.invalidations, 1)
+        XCTAssertFalse(prompt.alert.window.isVisible)
+        context.replies[0](true, nil)
+        drainMainQueue()
+        XCTAssertEqual(results, [true])
+    }
+
+    func testSafetyCodeDenialBeforeConfirmationNeverStartsBiometrics() {
+        _ = NSApplication.shared
+        let context = AuthenticationContext()
+        var results: [Bool] = []
+        let prompt = AtemSafetyCodePrompt(request: verificationRequest, context: context) { results.append($0) }
+        prompt.show()
+        prompt.alert.buttons[1].performClick(nil)
+        drainMainQueue()
+        XCTAssertEqual(results, [false])
+        XCTAssertTrue(context.preflightPolicies.isEmpty)
+        XCTAssertTrue(context.policies.isEmpty)
+        XCTAssertEqual(context.invalidations, 1)
+    }
+
+    func testSafetyCodeApprovalCannotSkipCodeComparison() {
+        _ = NSApplication.shared
+        let context = AuthenticationContext()
+        var results: [Bool] = []
+        let prompt = AtemSafetyCodePrompt(request: verificationRequest, context: context) { results.append($0) }
+        prompt.show()
+        prompt.finish(true)
+        XCTAssertEqual(results, [false])
+        XCTAssertTrue(context.policies.isEmpty)
+    }
+
+    func testSafetyCodeCancellationAfterConfirmationPreventsQueuedBiometrics() {
+        _ = NSApplication.shared
+        let context = AuthenticationContext()
+        var results: [Bool] = []
+        let prompt = AtemSafetyCodePrompt(request: verificationRequest, context: context) { results.append($0) }
+        prompt.show()
+        prompt.alert.buttons[0].performClick(nil)
+        prompt.finish(false)
+        drainMainQueue()
+        XCTAssertEqual(results, [false])
+        XCTAssertTrue(context.preflightPolicies.isEmpty)
+        XCTAssertTrue(context.policies.isEmpty)
+        XCTAssertEqual(context.invalidations, 1)
+    }
+
+    func testSafetyCodeDenialCloseAndCancellationIgnoreBiometricSuccess() {
+        _ = NSApplication.shared
+        for action in 0..<3 {
+            let context = AuthenticationContext()
+            var results: [Bool] = []
+            let prompt = AtemSafetyCodePrompt(request: verificationRequest, context: context) { results.append($0) }
+            prompt.show()
+            prompt.alert.buttons[0].performClick(nil)
+            drainMainQueue()
+            if action == 0 { prompt.alert.buttons[1].performClick(nil) }
+            if action == 1 { prompt.alert.window.close() }
+            if action == 2 {
+                context.replies[0](true, nil)
+                prompt.finish(false)
+            }
+            context.replies[0](true, nil)
+            drainMainQueue()
+            XCTAssertEqual(results, [false])
+            XCTAssertEqual(context.invalidations, 1)
+            XCTAssertFalse(prompt.alert.window.isVisible)
+        }
+    }
+
+    func testSafetyCodeUnavailableTouchIDKeepsTheCodeVisibleAndCannotApprove() throws {
+        _ = NSApplication.shared
+        let context = AuthenticationContext()
+        context.available = false
+        var results: [Bool] = []
+        let prompt = AtemSafetyCodePrompt(request: verificationRequest, context: context) { results.append($0) }
+        defer { prompt.finish(false) }
+        prompt.show()
+        drainMainQueue()
+        XCTAssertTrue(context.preflightPolicies.isEmpty)
+        prompt.alert.buttons[0].performClick(nil)
+        drainMainQueue()
+        XCTAssertEqual(context.preflightPolicies, [.deviceOwnerAuthenticationWithBiometrics])
+        XCTAssertTrue(context.policies.isEmpty)
+        XCTAssertTrue(prompt.alert.window.isVisible)
+        XCTAssertEqual(prompt.safetyCode.stringValue, verificationRequest.safetyCode)
+        XCTAssertTrue(prompt.status.stringValue.contains("Touch ID is unavailable"))
+        XCTAssertFalse(prompt.alert.buttons[0].isEnabled)
+        XCTAssertTrue(results.isEmpty)
+        let textSize = try XCTUnwrap(prompt.status.cell).cellSize(forBounds: prompt.status.bounds)
+        XCTAssertLessThanOrEqual(textSize.height, prompt.status.bounds.height)
+        prompt.alert.buttons[1].performClick(nil)
+        XCTAssertEqual(results, [false])
+    }
+
+    func testFailedSafetyCodeBiometricsNeverApprove() {
+        _ = NSApplication.shared
+        for code in [LAError.Code.authenticationFailed, .userCancel, .systemCancel, .userFallback, .biometryLockout] {
+            let context = AuthenticationContext()
+            var results: [Bool] = []
+            let prompt = AtemSafetyCodePrompt(request: verificationRequest, context: context) { results.append($0) }
+            prompt.show()
+            prompt.alert.buttons[0].performClick(nil)
+            drainMainQueue()
+            context.replies[0](false, NSError(domain: LAError.errorDomain, code: code.rawValue))
+            drainMainQueue()
+            XCTAssertEqual(results, [false])
+            XCTAssertEqual(context.invalidations, 1)
+            XCTAssertFalse(prompt.alert.window.isVisible)
+        }
+    }
+
+    func testSafetyCodeBackgroundBiometricsCompleteOnMain() {
+        _ = NSApplication.shared
+        let context = AuthenticationContext()
+        let completed = expectation(description: "verification approval delivered on main")
+        let prompt = AtemSafetyCodePrompt(request: verificationRequest, context: context) { accepted in
+            XCTAssertTrue(Thread.isMainThread)
+            XCTAssertTrue(accepted)
+            completed.fulfill()
+        }
+        prompt.show()
+        prompt.alert.buttons[0].performClick(nil)
+        drainMainQueue()
+        let reply = context.replies[0]
+        DispatchQueue.global().async { reply(true, nil) }
+        wait(for: [completed], timeout: 2)
+        XCTAssertEqual(context.invalidations, 1)
+    }
+
+    func testSafetyCodePromptGateSurvivesCancellationAndLatePreviousApproval() throws {
+        _ = NSApplication.shared
+        let context = AuthenticationContext()
+        var results: [Bool] = []
+        let cancel = AtemVerificationUI.approve(verificationRequest, context: context) { results.append($0) }
+        defer { cancel() }
+        func matchButton(in view: NSView) -> NSButton? {
+            if let button = view as? NSButton, button.title == "Codes Match" { return button }
+            return view.subviews.compactMap { matchButton(in: $0) }.first
+        }
+        let button = try XCTUnwrap(NSApp.windows.filter(\.isVisible).compactMap { window in
+            window.contentView.flatMap { matchButton(in: $0) }
+        }.first)
+        button.performClick(nil)
+        drainMainQueue()
+        var recovery: [Bool] = []
+        let cancelRecovery = AtemVerificationUI.saveRecovery("synthetic") { recovery.append($0) }
+        cancelRecovery()
+        XCTAssertEqual(recovery, [false])
+        cancel()
+        let nextContext = AuthenticationContext()
+        var nextResults: [Bool] = []
+        let cancelNext = AtemVerificationUI.approve(verificationRequest, context: nextContext) { nextResults.append($0) }
+        defer { cancelNext() }
+        context.replies[0](true, nil)
+        drainMainQueue()
+        XCTAssertEqual(results, [false])
+        XCTAssertTrue(nextResults.isEmpty)
+        var unlock: [AtemUnlockDecision] = []
+        let cancelUnlock = AtemVerificationUI.unlock(unlockRequest, context: AuthenticationContext()) { unlock.append($0) }
+        cancelUnlock()
+        XCTAssertEqual(unlock, [.deny])
+        XCTAssertTrue(nextContext.policies.isEmpty)
+        cancelNext()
+        XCTAssertEqual(nextResults, [false])
+    }
+
     func testUnlockPromptShowsMetadataAndStripsUntrustedFormatting() {
         _ = NSApplication.shared
         let request = AtemUnlockApproval(deviceName: "Mac\nForged", bootId: "boot\u{202e}\u{200b}\n-1",
@@ -131,7 +346,7 @@ final class AtemVerificationUITests: XCTestCase {
 
     func testUnlockEmbedsTouchIDAndStartsWithoutAnApproveClick() throws {
         _ = NSApplication.shared
-        let context = UnlockContext()
+        let context = AuthenticationContext()
         context.localizedFallbackTitle = "Use Password"
         context.touchIDAuthenticationAllowableReuseDuration = 60
         var decisions: [AtemUnlockDecision] = []
@@ -173,7 +388,7 @@ final class AtemVerificationUITests: XCTestCase {
     func testUnlockDenyAndRevokeRemainExplicitAndIgnoreLateBiometrics() {
         _ = NSApplication.shared
         for (index, decision) in [AtemUnlockDecision.deny, .revoke].enumerated() {
-            let context = UnlockContext()
+            let context = AuthenticationContext()
             var decisions: [AtemUnlockDecision] = []
             let prompt = AtemUnlockPrompt(request: unlockRequest, context: context) { decisions.append($0) }
             prompt.show()
@@ -190,7 +405,7 @@ final class AtemVerificationUITests: XCTestCase {
 
     func testUnlockCancellationBeforeDisplayCallbackNeverStartsBiometrics() {
         _ = NSApplication.shared
-        let context = UnlockContext()
+        let context = AuthenticationContext()
         var decisions: [AtemUnlockDecision] = []
         let prompt = AtemUnlockPrompt(request: unlockRequest, context: context) { decisions.append($0) }
         prompt.show()
@@ -205,7 +420,7 @@ final class AtemVerificationUITests: XCTestCase {
 
     func testUnlockWindowCloseDeniesOnceAndIgnoresLateBiometrics() {
         _ = NSApplication.shared
-        let context = UnlockContext()
+        let context = AuthenticationContext()
         var decisions: [AtemUnlockDecision] = []
         let prompt = AtemUnlockPrompt(request: unlockRequest, context: context) { decisions.append($0) }
         prompt.show()
@@ -220,7 +435,7 @@ final class AtemVerificationUITests: XCTestCase {
 
     func testQueuedBiometricSuccessCannotOverrideCancellation() {
         _ = NSApplication.shared
-        let context = UnlockContext()
+        let context = AuthenticationContext()
         var decisions: [AtemUnlockDecision] = []
         let prompt = AtemUnlockPrompt(request: unlockRequest, context: context) { decisions.append($0) }
         prompt.show()
@@ -234,7 +449,7 @@ final class AtemVerificationUITests: XCTestCase {
 
     func testBackgroundBiometricReplyCompletesOnTheMainThread() {
         _ = NSApplication.shared
-        let context = UnlockContext()
+        let context = AuthenticationContext()
         let completed = expectation(description: "biometric approval delivered on main")
         let prompt = AtemUnlockPrompt(request: unlockRequest, context: context) { decision in
             XCTAssertTrue(Thread.isMainThread)
@@ -252,7 +467,7 @@ final class AtemVerificationUITests: XCTestCase {
 
     func testUnavailableTouchIDShowsGuidanceWithoutEvaluatingAnotherPolicy() throws {
         _ = NSApplication.shared
-        let context = UnlockContext()
+        let context = AuthenticationContext()
         context.available = false
         var decisions: [AtemUnlockDecision] = []
         let prompt = AtemUnlockPrompt(request: unlockRequest, context: context) { decisions.append($0) }
@@ -272,7 +487,7 @@ final class AtemVerificationUITests: XCTestCase {
     func testFailedOrCancelledBiometricsNeverApproveOrRevoke() {
         _ = NSApplication.shared
         for code in [LAError.Code.authenticationFailed, .userCancel, .systemCancel, .userFallback, .biometryLockout] {
-            let context = UnlockContext()
+            let context = AuthenticationContext()
             var decisions: [AtemUnlockDecision] = []
             let prompt = AtemUnlockPrompt(request: unlockRequest, context: context) { decisions.append($0) }
             prompt.show()
@@ -287,7 +502,7 @@ final class AtemVerificationUITests: XCTestCase {
 
     func testUnlockRevokeButtonAndSinglePromptGate() throws {
         _ = NSApplication.shared
-        let context = UnlockContext()
+        let context = AuthenticationContext()
         var decisions: [AtemUnlockDecision] = []
         let cancel = AtemVerificationUI.unlock(unlockRequest, context: context) { decisions.append($0) }
         defer { cancel() }
@@ -306,7 +521,7 @@ final class AtemVerificationUITests: XCTestCase {
         XCTAssertEqual(decisions, [.revoke])
         cancel()
         XCTAssertEqual(decisions, [.revoke])
-        let nextContext = UnlockContext()
+        let nextContext = AuthenticationContext()
         let cancelNext = AtemVerificationUI.unlock(unlockRequest, context: nextContext) { decisions.append($0) }
         cancelNext()
         XCTAssertEqual(decisions, [.revoke, .deny])
