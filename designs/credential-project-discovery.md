@@ -20,6 +20,40 @@ It contains at most 256 names and 64 KiB. Reports always use HPKE
 X25519/HKDF-SHA256/ChaCha20-Poly1305, including when memory encryption is OFF.
 The recipient is the Astation encryption key pinned during verification.
 
+## Project spelling and compatibility
+
+Project identity remains the lowercase canonical key. Display and saved scopes
+retain the original spelling of a sanitized Git remote, such as
+`github.com/Agora-Build/Atem`; protocols, credentials and `.git` are removed.
+Case variants identify one scope and appear once in suggestions. A label never
+changes authorization, memory project keys or keyed hashes. Previously stored
+lowercase names remain readable; capitalization that was discarded cannot be
+reconstructed.
+
+An updated key agent adds an optional `labels` envelope to the existing report.
+It has `signed`, `encapped_key` and `ciphertext`, like the original envelope.
+Its encrypted JSON array contains `{key, label}` entries for exactly the
+canonical keys in the original payload. Both arrays together are limited to
+64 KiB and 256 projects. The label must be a sanitized spelling whose lowercase
+canonical identity equals `key`. Neither spelling nor identity is plaintext
+on the relay. Older Astation builds ignore the extension and read the original
+array; older key agents omit it. No capability round trip or live connection
+is required. Unlocked older agents are never restarted automatically.
+
+The extension uses `atem-credential-project-labels-info-v1` for HPKE info and
+`atem-credential-project-labels-v1` for its signed statement, followed by the
+same account/device/generation/time fields and its own ciphertext digest.
+Astation verifies both envelopes with the current pin and requires identical
+identity, report time and canonical project sets before accepting labels. A
+malformed extension rejects the report. Removing it can only remove display
+spelling; it cannot change project identity or grant access. For reports at
+the same time, a labeled report takes precedence over a legacy report.
+
+Local credential format 1 retains its canonical `project` field and gains an
+optional `projectLabel` field. Readers validate its canonical binding before
+displaying it; records without the field use `project`. Saves and updates
+retain spelling while duplicate checks continue to use the canonical key.
+
 Using the existing length-prefixed field encoding and big-endian u64 fields:
 
 - HPKE info: `atem-credential-projects-info-v1`, account, device ID, signing

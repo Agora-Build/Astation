@@ -8,6 +8,10 @@ encrypted metadata protocol and its separate permission boundary.
 Each credential belongs to this Astation identity and either Global or a
 normalized Git project. Names match case-insensitively within a scope; values
 retain their exact whitespace and may contain up to 64 KiB of UTF-8 text.
+Project identity is case-insensitive, while display and saved metadata retain
+the sanitized remote's spelling. Format 1 keeps a canonical `project` and an
+optional `projectLabel` whose canonical identity must match. Existing records
+without labels remain valid. Case-only variants cannot create duplicate scopes.
 
 The editor uses a separate Data Protection Keychain item with
 WhenUnlockedThisDeviceOnly accessibility. It never writes secret values into

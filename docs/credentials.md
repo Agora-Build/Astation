@@ -18,6 +18,12 @@ The Keychain item requires an unlocked Mac and is not synced through iCloud.
 4. Click **Save with Touch ID** and approve. The credential appears in the list
    only after the Keychain write succeeds.
 
+Project spelling is retained for display and saving: `github.com/Agora-Build/Atem`
+stays capitalized. Project comparisons and credential names are case-insensitive,
+so case variants share one scope and appear once in suggestions. Existing
+lowercase records remain readable; their original spelling can only be restored
+when a Git remote or a manually entered spelling supplies it.
+
 Names match case-insensitively within a scope. Global `openai` and project
 `openai` can have different values. To replace one, select its row and click
 **Update**. The saved value is not displayed in the editor; enter a replacement.
@@ -35,10 +41,12 @@ connects. Astation also requests an update when opening Credentials, opening an
 editor or clicking Refresh. New suggestions do not replace the project or value
 you are editing. A repo with no usable Git remote is not a project scope.
 
-Older Atem builds and key agents do not implement reporting. After updating,
-restart an older key-agent process and unlock it using the updated Atem, then
-run `atem cred projects` in your repository or use the Atem TUI. `atem cred lock`
-wipes keys from memory but does not restart the daemon. Reporting does
+Older builds may report lowercase project names or lack reporting entirely.
+After updating, run `atem cred lock` and `atem cred unlock` with the updated
+binary to replace an older unlocked key agent, then run `atem cred projects`
+in your repository or use the Atem TUI. The lock command wipes keys and stops
+the agent; unlock starts the updated agent and asks this Mac for approval.
+An older unlocked agent is never replaced automatically. Reporting does
 not prompt for Touch ID or unlock keys automatically. Accepted suggestions can
 remain available after a short-lived CLI disconnects, until Astation quits;
 saved scopes remain available after relaunch.

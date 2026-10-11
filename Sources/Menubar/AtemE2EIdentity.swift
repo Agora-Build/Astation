@@ -422,8 +422,17 @@ final class AtemE2EIdentity {
         }
         let fields = try AtemCredentialProjects.checkedFields(report, account: account, deviceId: deviceId, pin: pin, now: now)
         let plain = try crypto.openProjectReport(report, info: fields.info, material: record.material)
+        var projects = try AtemCredentialProjects.projects(plain)
+        if let labels = report.labels {
+            let labelFields = try AtemCredentialProjects.checkedFields(labels.report, account: account, deviceId: deviceId,
+                pin: pin, now: now, domain: "atem-credential-project-labels")
+            guard labelFields.time == fields.time else { throw AtemIdentityError.invalidState }
+            let labelPlain = try crypto.openProjectReport(labels.report, info: labelFields.info, material: record.material)
+            guard plain.count + labelPlain.count <= AtemCredentialProjects.maximumBytes else { throw AtemIdentityError.invalidState }
+            projects = try AtemCredentialProjects.labels(labelPlain, projects: projects)
+        }
         return AtemReportedProjects(account: account, deviceId: deviceId, pin: pin, time: fields.time,
-            projects: try AtemCredentialProjects.projects(plain))
+            projects: projects, hasLabels: report.labels != nil)
     }
 
     /// Authenticates and journals the message while its transport identity is still available.
