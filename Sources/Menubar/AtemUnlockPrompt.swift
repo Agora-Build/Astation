@@ -6,14 +6,14 @@ final class AtemUnlockPrompt: NSObject, NSWindowDelegate {
     let alert: NSAlert
     let authenticationView: LAAuthenticationView
     let status = NSTextField(wrappingLabelWithString:
-        "Use Touch ID to approve this device's unlock request. Deny and Revoke requires the device to verify again.")
+        "Place your finger on Touch ID to unlock this device's storage key.")
     private let context: LAContext
     private var completion: ((AtemUnlockDecision) -> Void)?
     private var shown = false
     var isActive: Bool { completion != nil }
 
     init(request: AtemUnlockApproval, context: LAContext, completion: @escaping (AtemUnlockDecision) -> Void) {
-        alert = AtemVerificationUI.unlockAlert(request)
+        alert = AtemVerificationUI.unlockAlert()
         self.context = context
         self.completion = completion
         context.localizedFallbackTitle = ""
@@ -21,18 +21,20 @@ final class AtemUnlockPrompt: NSObject, NSWindowDelegate {
         authenticationView = LAAuthenticationView(context: context, controlSize: .regular)
         super.init()
 
-        let size = authenticationView.fittingSize
-        authenticationView.widthAnchor.constraint(equalToConstant: size.width).isActive = true
-        authenticationView.heightAnchor.constraint(equalToConstant: size.height).isActive = true
-        status.font = .systemFont(ofSize: 13)
-        status.preferredMaxLayoutWidth = 350
-        status.widthAnchor.constraint(equalToConstant: 350).isActive = true
-        let row = NSStackView(views: [authenticationView, status])
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 12
-        row.setFrameSize(row.fittingSize)
-        alert.accessoryView = row
+        let requested = DateFormatter.localizedString(from: request.requestTime, dateStyle: .medium, timeStyle: .medium)
+        let last = request.lastUnlock.map {
+            DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .medium)
+        } ?? "Never"
+        alert.accessoryView = AtemAuthenticationLayout.content([
+            AtemAuthenticationLayout.details([
+                ("Device", AtemVerificationUI.displayText(request.deviceName)),
+                ("Requested", requested),
+                ("Last unlock", last),
+                ("Boot ID", AtemVerificationUI.displayText(request.bootId))
+            ]),
+            AtemAuthenticationLayout.touchID(authenticationView, status: status),
+            AtemAuthenticationLayout.note("Deny and Revoke removes this device's verification.")
+        ])
     }
 
     func show() {

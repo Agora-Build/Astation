@@ -21,10 +21,9 @@ enum AtemVerificationUI {
         return { prompt.finish(false) }
     }
 
-    static func verificationAlert(_ request: AtemVerificationApproval) -> NSAlert {
-        let alert = NSAlert()
-        alert.messageText = "Verify Atem Safety Code"
-        alert.informativeText = "Device: \(displayText(request.deviceName))"
+    static func verificationAlert() -> NSAlert {
+        let alert = authenticationAlert(title: "Verify Atem Safety Code",
+            message: "Compare the safety code with the one shown by atem pair.")
         alert.addButton(withTitle: "Codes Match")
         alert.addButton(withTitle: "Deny")
         return alert
@@ -59,18 +58,26 @@ enum AtemVerificationUI {
         return { prompt.finish(.deny) }
     }
 
-    static func unlockAlert(_ request: AtemUnlockApproval) -> NSAlert {
-        let alert = NSAlert()
-        alert.messageText = "Unlock Atem Storage Key"
-        let requested = DateFormatter.localizedString(from: request.requestTime, dateStyle: .medium, timeStyle: .medium)
-        let last = request.lastUnlock.map { DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .medium) } ?? "Never"
-        alert.informativeText = "Device: \(displayText(request.deviceName))\nBoot ID: \(displayText(request.bootId))\nRequested: \(requested)\nLast unlock: \(last)"
+    static func unlockAlert() -> NSAlert {
+        let alert = authenticationAlert(title: "Unlock Atem Storage Key",
+            message: "Approve access to encrypted data for this verified device.")
         alert.addButton(withTitle: "Deny")
         alert.addButton(withTitle: "Deny and Revoke")
+        alert.buttons[1].hasDestructiveAction = true
         return alert
     }
 
-    private static func displayText(_ value: String) -> String {
+    private static func authenticationAlert(title: String, message: String) -> NSAlert {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.icon = NSImage(systemSymbolName: "lock.shield", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 42, weight: .light)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [.controlAccentColor])))
+        return alert
+    }
+
+    static func displayText(_ value: String) -> String {
         String(String.UnicodeScalarView(value.unicodeScalars.filter {
             !CharacterSet.controlCharacters.contains($0) && $0.properties.generalCategory != .format
         }).prefix(200))

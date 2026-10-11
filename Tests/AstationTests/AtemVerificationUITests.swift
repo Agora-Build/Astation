@@ -41,6 +41,10 @@ final class AtemVerificationUITests: XCTestCase {
         wait(for: [drained], timeout: 2)
     }
 
+    private func textFields(in view: NSView) -> [NSTextField] {
+        (view as? NSTextField).map { [$0] } ?? view.subviews.flatMap { textFields(in: $0) }
+    }
+
     private func dialog(completion: @escaping (Bool) -> Void) -> AtemVerificationDialog {
         _ = NSApplication.shared
         let alert = NSAlert()
@@ -132,7 +136,7 @@ final class AtemVerificationUITests: XCTestCase {
         XCTAssertTrue(context.preflightPolicies.isEmpty)
         XCTAssertTrue(context.policies.isEmpty)
         XCTAssertTrue(results.isEmpty)
-        XCTAssertEqual(prompt.alert.informativeText, "Device: MacForged")
+        XCTAssertTrue(textFields(in: try XCTUnwrap(prompt.alert.accessoryView)).contains { $0.stringValue == "MacForged" })
         XCTAssertEqual(prompt.alert.buttons.map(\.title), ["Codes Match", "Deny"])
         XCTAssertEqual(prompt.safetyCode.stringValue, request.safetyCode)
         XCTAssertTrue(prompt.safetyCode.isSelectable)
@@ -334,14 +338,47 @@ final class AtemVerificationUITests: XCTestCase {
         _ = NSApplication.shared
         let request = AtemUnlockApproval(deviceName: "Mac\nForged", bootId: "boot\u{202e}\u{200b}\n-1",
             requestTime: Date(timeIntervalSince1970: 1_760_000_000), lastUnlock: nil)
-        let alert = AtemVerificationUI.unlockAlert(request)
+        let prompt = AtemUnlockPrompt(request: request, context: AuthenticationContext()) { _ in }
+        defer { prompt.finish(.deny) }
+        let alert = prompt.alert
         XCTAssertEqual(alert.buttons.map(\.title), ["Deny", "Deny and Revoke"])
-        XCTAssertTrue(alert.informativeText.contains("Device: MacForged"))
-        XCTAssertTrue(alert.informativeText.contains("Boot ID: boot-1"))
-        XCTAssertTrue(alert.informativeText.contains("Requested:"))
-        XCTAssertTrue(alert.informativeText.contains("Last unlock: Never"))
-        XCTAssertFalse(alert.informativeText.contains("\u{202e}"))
-        XCTAssertFalse(alert.informativeText.contains("\u{200b}"))
+        let fields = textFields(in: alert.accessoryView!)
+        let values = fields.map(\.stringValue)
+        XCTAssertTrue(values.contains("MacForged"))
+        XCTAssertTrue(values.contains("boot-1"))
+        XCTAssertTrue(values.contains("Requested"))
+        XCTAssertTrue(values.contains("Last unlock"))
+        XCTAssertTrue(values.contains("Never"))
+        XCTAssertFalse(values.contains { $0.contains("\u{202e}") || $0.contains("\u{200b}") })
+        XCTAssertTrue(alert.buttons[1].hasDestructiveAction)
+    }
+
+    func testLongDeviceDetailsStayAlignedAndVisibleInLightAndDarkAppearance() throws {
+        _ = NSApplication.shared
+        for appearance in [NSAppearance.Name.aqua, .darkAqua] {
+            let request = AtemUnlockApproval(deviceName: String(repeating: "Remote Mac ", count: 25),
+                bootId: String(repeating: "0123456789abcdef", count: 20), requestTime: Date(), lastUnlock: Date())
+            let prompt = AtemUnlockPrompt(request: request, context: AuthenticationContext()) { _ in }
+            defer { prompt.finish(.deny) }
+            prompt.alert.window.appearance = NSAppearance(named: appearance)
+            prompt.show()
+            let accessory = try XCTUnwrap(prompt.alert.accessoryView as? NSStackView)
+            let content = try XCTUnwrap(prompt.alert.window.contentView)
+            let fields = textFields(in: accessory)
+            for field in fields {
+                let frame = content.convert(field.bounds, from: field)
+                XCTAssertTrue(content.bounds.contains(frame), "Device detail is clipped: \(field.stringValue)")
+                let textSize = try XCTUnwrap(field.cell).cellSize(forBounds: field.bounds)
+                XCTAssertLessThanOrEqual(textSize.height, field.bounds.height + 1)
+            }
+            let values = fields.filter { ["Remote Mac", "0123456789abcdef"].contains(where: $0.stringValue.hasPrefix) }
+            XCTAssertEqual(values.count, 2)
+            let origins = values.map { content.convert($0.bounds, from: $0).minX }
+            XCTAssertEqual(origins.first, origins.last)
+            let cards = accessory.arrangedSubviews.dropLast()
+            XCTAssertEqual(Set(cards.map { $0.frame.minX }).count, 1)
+            XCTAssertEqual(Set(cards.map { $0.frame.width }).count, 1)
+        }
     }
 
     func testUnlockEmbedsTouchIDAndStartsWithoutAnApproveClick() throws {

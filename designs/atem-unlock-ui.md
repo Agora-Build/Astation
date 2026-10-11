@@ -1,5 +1,11 @@
 # Atem Storage-Key Unlock UI
 
+The unlock prompt shares the verification prompt's 420-point card layout.
+Device, request time, last unlock and boot ID use aligned label/value rows,
+followed by an embedded Touch ID panel and concise revocation guidance.
+Long values wrap, native colors follow light/dark appearance and **Deny and
+Revoke** uses the system's destructive-action styling.
+
 An accepted unlock request opens one modeless window with the device name,
 boot ID, request time and last successful unlock. Apple's
 `LAAuthenticationView` embeds the system Touch ID control in this window.

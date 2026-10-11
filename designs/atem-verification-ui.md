@@ -7,6 +7,14 @@ selectable safety code, comparison instructions and Apple's embedded
 the code visible throughout authentication. It does not complete verification
 by itself. **Deny** remains available before and during authentication.
 
+Both biometric prompts share a 420-point content column, rounded detail cards
+and a consistently aligned Touch ID panel. Device details use labeled rows;
+the safety code has a distinct, softly accented card. Secondary guidance stays
+below the cards. Native semantic colors adapt to light and dark appearances,
+and long device labels wrap within the card instead of widening the window.
+The authentication panel reserves space for unavailable-Touch-ID guidance so
+the layout remains stable during evaluation.
+
 Unlike the [storage-key unlock prompt](atem-unlock-ui.md), verification must
 not start Touch ID automatically. An incidental biometric match before code
 comparison must never approve a device.

@@ -7,7 +7,7 @@ final class AtemSafetyCodePrompt: NSObject, NSWindowDelegate {
     let safetyCode: NSTextField
     let authenticationView: LAAuthenticationView
     let status = NSTextField(wrappingLabelWithString:
-        "Compare this code with atem pair. If both codes match, click Codes Match, then use Touch ID to verify this device.")
+        "After comparing the codes, click Codes Match to enable Touch ID.")
     private let context: LAContext
     private var completion: ((Bool) -> Void)?
     private var shown = false
@@ -15,7 +15,7 @@ final class AtemSafetyCodePrompt: NSObject, NSWindowDelegate {
     var isActive: Bool { completion != nil }
 
     init(request: AtemVerificationApproval, context: LAContext, completion: @escaping (Bool) -> Void) {
-        alert = AtemVerificationUI.verificationAlert(request)
+        alert = AtemVerificationUI.verificationAlert()
         safetyCode = NSTextField(labelWithString: request.safetyCode)
         self.context = context
         self.completion = completion
@@ -28,23 +28,12 @@ final class AtemSafetyCodePrompt: NSObject, NSWindowDelegate {
         safetyCode.alignment = .center
         safetyCode.isSelectable = true
         safetyCode.setAccessibilityLabel("Atem safety code")
-        safetyCode.widthAnchor.constraint(equalToConstant: 450).isActive = true
-        let size = authenticationView.fittingSize
-        authenticationView.widthAnchor.constraint(equalToConstant: size.width).isActive = true
-        authenticationView.heightAnchor.constraint(equalToConstant: size.height).isActive = true
-        status.font = .systemFont(ofSize: 13)
-        status.preferredMaxLayoutWidth = 350
-        status.widthAnchor.constraint(equalToConstant: 350).isActive = true
-        let row = NSStackView(views: [authenticationView, status])
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 12
-        let stack = NSStackView(views: [safetyCode, row])
-        stack.orientation = .vertical
-        stack.alignment = .centerX
-        stack.spacing = 14
-        stack.setFrameSize(stack.fittingSize)
-        alert.accessoryView = stack
+        alert.accessoryView = AtemAuthenticationLayout.content([
+            AtemAuthenticationLayout.details([("Device", AtemVerificationUI.displayText(request.deviceName))]),
+            AtemAuthenticationLayout.code(safetyCode),
+            AtemAuthenticationLayout.touchID(authenticationView, status: status),
+            AtemAuthenticationLayout.note("If the codes differ, choose Deny and pair again.")
+        ])
     }
 
     func show() {
@@ -64,7 +53,7 @@ final class AtemSafetyCodePrompt: NSObject, NSWindowDelegate {
         guard isActive, shown, !codesMatched else { return }
         codesMatched = true
         alert.buttons[0].isEnabled = false
-        status.stringValue = "Use Touch ID to verify this device with the matching safety code."
+        status.stringValue = "Place your finger on Touch ID to verify this device."
         // Keep comparison explicit; evaluating on presentation could accept an incidental match.
         DispatchQueue.main.async { [weak self] in self?.authenticate() }
     }
