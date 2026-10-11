@@ -11,6 +11,12 @@ and identifies the active store as `memory` or `postgres`. It also reports
 `redis` (`disabled`, `ok`, `unavailable`) and `replicas` (live relay replicas),
 and returns `503` while Redis is unreachable (`{"status":"unhealthy","redis":"unavailable"}`)
 or the relay is draining (`{"status":"draining"}`).
+Every response includes `version` (the Cargo package version) and
+`build_commit` (the full Git commit embedded at compile time, or `unknown`
+for builds without metadata). The deployment and release workflows set
+the Docker build argument `ASTATION_BUILD_COMMIT`; for a local Cargo build,
+set that environment variable when compiling. Changing a running container's
+environment does not change its reported commit.
 
 The relay runs as one instance with everything in memory, or, with
 `REDIS_URL`, as several replicas sharing rooms, sessions and rate limits
@@ -267,7 +273,8 @@ The Astation macOS app uses this relay server for:
 2. **Pairing** - `AtemPairingManager.swift` connects WebSocket for Atem pairing
 3. **RTC Sessions** - `SessionLinkManager.swift` creates shareable screen sharing links
 
-Config: Set `relay_url` and `ws_url` in `.atem/config.toml`
+Atem stores the relay base URL in `astation_relay_url` and the direct
+WebSocket URL in `astation_ws`, in `~/.config/atem/config.toml`.
 
 ---
 
@@ -284,8 +291,16 @@ Config: Set `relay_url` and `ws_url` in `.atem/config.toml`
 | `RELAY_REPLICAS_EXPECTED` | `1` | How many relay replicas the deployment runs. Above 1 without `REDIS_URL`, the relay refuses to start (exit 1); a value that isn't a positive integer also exits 1. |
 | `DATABASE_URL` | _(unset)_ | Postgres connection string shared by **vault**, **knowledge sync (Atem Memory)**, **relay identity**, and optional Agora account grouping (e.g. `postgres://vault:vault@localhost:5432/vault`), one pool for all. When unset, all fall back to **in-memory** (non-durable: bindings, registered keys, and account groups are lost on restart) and log a warning. Migrations in `migrations/` run automatically at startup. |
 | `AGORA_ACCOUNT_USERINFO_URL` | _(unset)_ | Server-side endpoint that accepts the Agora SSO bearer token and returns the stable account subject. Account registration fails closed when this or `AGORA_ACCOUNT_SUBJECT_FIELD` is unset. Do not configure this with an endpoint whose identity changes between sign-ins. |
-| `AGORA_ACCOUNT_SUBJECT_FIELD` | _(unset)_ | Top-level JSON field in the user-info response containing the permanent Agora account subject (for example `sub`, once confirmed by the SSO service owner). Email and the observed rotating `loginId` are unsafe. |
+| `AGORA_ACCOUNT_SUBJECT_FIELD` | _(unset)_ | Top-level JSON string field in the user-info response containing the permanent Agora account subject, confirmed by the SSO service owner. Email and the observed rotating `loginId` are unsafe. |
 | `AGORA_ACCOUNT_AUTH_TIME_FIELD` | _(unset)_ | Optional top-level integer Unix-time field recording when the user most recently authenticated. Required for the lost/offline-Mac merge path; without it, online approval still works. |
+
+**Legacy account-verifier settings:** leave all three `AGORA_ACCOUNT_*`
+variables unset while building [unified agora.build identity](../docs/specs/2026-10-10-unified-agora-build-identity.md).
+They enable optional Agora-specific registration; ordinary pairing, sync, and
+E2EE do not require them. They are not prerequisites for the portal's new SSO.
+Replace them with the verified issuer/account integration and remove them only
+after a safe migration. See [the deployment guide](../DEPLOY.md#optional-agora-account-registration)
+for the current compatibility contract and disabled-mode behavior.
 
 **Production:**
 ```bash
@@ -307,14 +322,15 @@ RUST_LOG=debug
 ## Testing
 
 ```bash
-cargo test  # unit + in-memory integration suites (auth, sessions, relay + relay identity, RTC, Voice, Vault, Knowledge sync, validation)
-# Postgres suites are #[ignore]d; run each against a throwaway local database:
-#   docker run --rm -d --name relay-test-pg -e POSTGRES_PASSWORD=pw -p 55433:5432 postgres:16
-#   IDENTITY_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test identity_store -- --ignored
-#   IDENTITY_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test relay:: -- --ignored
-#   KNOWLEDGE_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test knowledge_store -- --ignored
-#   ACCOUNT_TEST_DATABASE_URL=postgres://postgres:pw@localhost:55433/postgres cargo test postgres_merge_moves_all_data_atomically -- --ignored
-#   docker rm -f relay-test-pg
+cargo test --locked  # unit + in-memory integration suites
+# All Postgres suites are #[ignore]d; run them together on a disposable local server:
+docker run --rm -d --name relay-test-pg -e POSTGRES_PASSWORD=pw -p 127.0.0.1:55433:5432 postgres:16
+# Wait for Postgres readiness before running:
+export IDENTITY_TEST_DATABASE_URL=postgres://postgres:pw@127.0.0.1:55433/postgres
+export KNOWLEDGE_TEST_DATABASE_URL="$IDENTITY_TEST_DATABASE_URL"
+export ACCOUNT_TEST_DATABASE_URL="$IDENTITY_TEST_DATABASE_URL"
+cargo test --locked postgres -- --ignored --test-threads=4
+docker rm -f relay-test-pg
 # Redis suites (every Redis unit + two relays in one process) are #[ignore]d
 # too; CI runs them against a Valkey service. TEST_REDIS_URL must point at
 # localhost (the harness runs FLUSHDB):
@@ -322,6 +338,17 @@ cargo test  # unit + in-memory integration suites (auth, sessions, relay + relay
 #   TEST_REDIS_URL=redis://127.0.0.1:56379/ cargo test redis -- --ignored --test-threads=1
 #   docker rm -f relay-test-valkey
 ```
+
+Each Postgres test creates its own `relay_test_<uuid>` schema and sets that
+schema as its only search path, including reconnects. Tests can run concurrently
+without truncating or dropping shared tables. The configured user needs permission
+to create and drop schemas. All three URL variables must resolve to a local host;
+the guard checks SQLx's parsed host, including query-string overrides. Successful
+tests drop their own schemas. A failed assertion can leave its isolated schema
+for diagnosis; discard the test server afterward. CI runs all Postgres suites
+together with four test threads.
+Postgres test modules or names include `postgres`, so the CI selector runs
+these suites without including unrelated ignored tests.
 
 ### Load test
 

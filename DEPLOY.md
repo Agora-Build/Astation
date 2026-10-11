@@ -74,8 +74,12 @@ the health wait right after a trigger can pass against the old, still-healthy
 container while the new one is still starting. On other platforms rely on the
 platform's own rolling deploy and health check (it keeps the old container
 until the new one passes `/health`), or use a hook that returns only once the
-deploy is done. A possible improvement: have `/health` report the running
-commit, so the workflow can wait until that relay serves this run's commit.
+deploy is done. `/health` reports the running commit, and the final workflow
+check requires the commit built by this run. Intermediate health waits do not
+require it because old and new replicas coexist during a rolling deploy.
+A public health request identifies only the replica that answers; it cannot
+prove that every replica has updated. Coolify deployment completion remains
+the per-application rollout check.
 
 `RELAY_DEPLOY_HOOKS` is required: if it is empty or unset the run fails
 before calling anything. One relay is one line.
@@ -101,7 +105,8 @@ finish:
 2. the webapp;
 3. the final check: public HTTPS, a healthy `/health` (Postgres knowledge
    store; Redis `ok` and at least `STATION_MIN_REPLICAS` live replicas when
-   those checks are switched on, see below), and an identity WebSocket
+   those checks are switched on, see below), the expected relay build commit,
+   and an identity WebSocket
    connection to `wss://station.agora.build/ws`.
 
 The workflow can also be run manually on `main` from GitHub Actions.
@@ -115,8 +120,8 @@ The Coolify resources on Volumetric are:
 | Resource | Coolify UUID | Image | Host port |
 | --- | --- | --- | --- |
 | Relay A (`relay-a`, the original relay) | `oss4444o8ss40ckgwc40og4c` | `ghcr.io/agora-build/station-relay-server:main` | `3000` |
-| Relay B (`relay-b`) | set when created | `ghcr.io/agora-build/station-relay-server:main` | none |
-| Valkey (relay live state) | set when created | `valkey/valkey:8` | none |
+| Relay B (`relay-b`) | `am8lrcacts572trbli1bmvnu` | `ghcr.io/agora-build/station-relay-server:main` | none |
+| Valkey (relay live state) | `minf9gdzuc2fwzxoq188eiw8` | `valkey/valkey:8` | none |
 | Webapp | `c0wwgk4c0owk0w4gsww4k0ss` | `ghcr.io/agora-build/station-webapp:main` | `3010` |
 
 Required GitHub Actions secrets:
@@ -126,7 +131,7 @@ Required GitHub Actions secrets:
   relay-a first:
   ```
   https://smt.agora.build/api/v1/deploy?uuid=oss4444o8ss40ckgwc40og4c&force=false
-  https://smt.agora.build/api/v1/deploy?uuid=<relay-b uuid>&force=false
+  https://smt.agora.build/api/v1/deploy?uuid=am8lrcacts572trbli1bmvnu&force=false
   ```
   With one relay, only the first line. Required: there is no fallback to the
   older per-relay secrets, which are no longer read and can be deleted.
@@ -138,23 +143,35 @@ a single relay without Redis still deploys):
 - `STATION_REQUIRE_REDIS`: `1` makes the health waits and the final check
   require `"redis":"ok"`. Any other value, or unset, skips the check.
 - `STATION_MIN_REPLICAS`: the minimum live relay replicas (`"replicas"` in
-  `/health`) the health waits and the final check require: `1` with relay-a
-  only, `2` once relay-b exists. Unset or `0` skips the check.
+  `/health`) the health waits and the final check require: `2` for the current
+  production deployment. Unset or `0` skips the check.
 
-Set both explicitly (`STATION_REQUIRE_REDIS=1`, `STATION_MIN_REPLICAS=2`) in
-the same change that adds relay-b. Otherwise a deploy can pass with Redis
-down or with a replica missing.
+Set both explicitly (`STATION_REQUIRE_REDIS=1`, `STATION_MIN_REPLICAS=2`) so a
+deploy cannot pass with Redis down or with a production replica missing.
+
+The relay image embeds `ASTATION_BUILD_COMMIT` from the Docker build argument.
+Deploy and release workflows pass the full Git commit; manual image builds
+can use `docker build --build-arg ASTATION_BUILD_COMMIT="$(git rev-parse HEAD)" relay-server`.
+Without the argument, `/health` reports `build_commit: unknown`.
+The final deployment check sets `STATION_EXPECTED_COMMIT` from the workflow's
+commit automatically. For manual verification, this optional environment
+variable must be a full 40-character Git commit; a missing or different
+reported commit fails the check. Leave it unset for readiness-only checks
+during a rolling deploy.
 
 Runtime configuration:
 
 - Relay (relay-a and relay-b, identical): `PUBLIC_BASE_URL=https://station.agora.build`,
   `CORS_ORIGIN=https://station.agora.build`, `PORT=3000`, `RUST_LOG=info`, the
   existing PostgreSQL `DATABASE_URL`, `REDIS_URL` (Valkey, a Coolify secret),
-  and `RELAY_REPLICAS_EXPECTED` (`1` with relay-a only, `2` with relay-b). The
-  last one is a guard: above 1 without `REDIS_URL` the relay refuses to start
+  and `RELAY_REPLICAS_EXPECTED=2`. Above 1 without `REDIS_URL` the relay refuses to start
   (exit 1), and a value that isn't a positive integer also exits 1. Both apps
   carry the `station-relay-server` network alias, so nginx sees every replica.
   Health check `GET /health` on port 3000.
+- Account registration: leave `AGORA_ACCOUNT_USERINFO_URL`,
+  `AGORA_ACCOUNT_SUBJECT_FIELD`, and `AGORA_ACCOUNT_AUTH_TIME_FIELD` unset
+  while unified agora.build SSO is built. See the account-registration section
+  below for the disabled-mode behavior and migration plan.
 - Webapp: `STATION_RELAY_UPSTREAM=station-relay-server:3000`. All containers
   must use the `coolify` Docker network. nginx re-resolves the alias through
   Docker DNS every 10 s and spreads requests across every address it returns,
@@ -189,13 +206,13 @@ Verification:
 # Node.js 22 or newer; checks HTTPS, relay health, and WebSocket upgrade.
 node .github/scripts/verify-station.mjs
 # The same checks as the deploy workflow with two relays:
-STATION_REQUIRE_REDIS=1 STATION_MIN_REPLICAS=2 node .github/scripts/verify-station.mjs
+STATION_REQUIRE_REDIS=1 STATION_MIN_REPLICAS=2 STATION_EXPECTED_COMMIT="$(git rev-parse HEAD)" node .github/scripts/verify-station.mjs
 # Just poll /health until it passes (what the workflow does after each relay):
 STATION_REQUIRE_REDIS=1 STATION_MIN_REPLICAS=2 node .github/scripts/verify-station.mjs --wait-health
 
 # What /health reports (any replica answers):
 curl -s https://station.agora.build/health
-# {"knowledge_store":"postgres","redis":"ok","replicas":2,"status":"ok","vault_store":"postgres"}
+# {"build_commit":"<full Git commit>","knowledge_store":"postgres","redis":"ok","replicas":2,"status":"ok","vault_store":"postgres","version":"0.1.0"}
 
 # Inspect deployment history in GitHub Actions.
 gh run list --workflow deploy-station.yml
@@ -206,6 +223,38 @@ If `/health` returns `502` while `http://127.0.0.1:3000/health` works on
 Volumetric, check the webapp's relay upstream and Docker DNS resolution.
 A successful deployment webhook only means the deployment was queued; the
 workflow also checks the final deployment status and public endpoints.
+
+#### Optional Agora account registration
+
+Leave `AGORA_ACCOUNT_USERINFO_URL`, `AGORA_ACCOUNT_SUBJECT_FIELD`, and
+`AGORA_ACCOUNT_AUTH_TIME_FIELD` unset while unified agora.build SSO is built.
+These settings enable optional Agora-specific registration and explicit data
+grouping. Ordinary pairing, memory/skills/vault sync, and E2EE do not require
+this feature; unregistered Astations keep using their Astation ID as the data
+account. Removing verifier configuration does not undo existing registrations
+or data groups in Postgres.
+
+A warning that the URL and subject field are not configured means account
+registration is unavailable. Check relay authentication and encryption
+migration status separately when diagnosing connection or migration failures.
+`/health` and `verify-station.mjs` verify infrastructure, not account login or
+registration.
+
+The planned replacement is [unified agora.build identity](docs/specs/2026-10-10-unified-agora-build-identity.md),
+with permanent agora.build accounts and linked GitHub, Google, Apple, and Agora
+sign-in providers. The portal team does not need these legacy settings to build
+that service. Product APIs will verify the trusted issuer and intended audience
+through signing keys/JWKS or supported token introspection. Sensitive actions
+may require fresh-authentication proof, separate from device approval and E2EE
+recovery. Changing only the current userinfo URL is insufficient.
+
+Keep the runtime compatibility implementation until the new integration and
+safe account/data migration are verified, then remove its settings and code.
+The [relay environment reference](relay-server/README.md#environment-variables)
+describes the existing verifier contract; the unified identity specification
+contains the migration and acceptance requirements. Any future authentication
+rollout must verify each replica's configuration and product login behavior in
+addition to infrastructure health.
 
 #### Relay replicas and Valkey
 
@@ -219,6 +268,8 @@ pub/sub. Postgres stays the only durable store. Design:
 
 | Field / status | Meaning |
 | --- | --- |
+| `"version":"<package version>"` | Relay Cargo package version, included on healthy and unhealthy responses |
+| `"build_commit":"<full Git commit>"` | Commit embedded in the relay binary, or `unknown` when built without metadata; included on every response |
 | `"redis":"disabled"` | No `REDIS_URL`: in-memory mode, one replica |
 | `"redis":"ok"` | Valkey reachable |
 | `"replicas":<n>` | Live relay replicas as this replica last saw them: its cached copy of the `relay:replicas` presence index, refreshed every 10 s, so it can lag a change by up to 10 s (`1` in in-memory mode) |
