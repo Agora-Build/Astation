@@ -22,7 +22,7 @@ test('redis and the replica count are checked', () => {
     'relay knowledge store is undefined, expected postgres',
     'relay reports 0 live replica(s), expected at least 1',
   ]);
-  // Defaults match today's production relay: no redis/replicas fields.
+  // Legacy health responses remain accepted when Redis and replica checks are disabled.
   assert.deepEqual(healthProblems({ status: 'ok', knowledge_store: 'postgres' }), []);
   assert.deepEqual(healthProblems({ ...healthy, redis: 'unavailable' }, { requireRedis: true }), [
     'relay redis is unavailable, expected ok',

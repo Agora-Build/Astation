@@ -115,8 +115,8 @@ The Coolify resources on Volumetric are:
 | Resource | Coolify UUID | Image | Host port |
 | --- | --- | --- | --- |
 | Relay A (`relay-a`, the original relay) | `oss4444o8ss40ckgwc40og4c` | `ghcr.io/agora-build/station-relay-server:main` | `3000` |
-| Relay B (`relay-b`) | set when created | `ghcr.io/agora-build/station-relay-server:main` | none |
-| Valkey (relay live state) | set when created | `valkey/valkey:8` | none |
+| Relay B (`relay-b`) | `am8lrcacts572trbli1bmvnu` | `ghcr.io/agora-build/station-relay-server:main` | none |
+| Valkey (relay live state) | `minf9gdzuc2fwzxoq188eiw8` | `valkey/valkey:8` | none |
 | Webapp | `c0wwgk4c0owk0w4gsww4k0ss` | `ghcr.io/agora-build/station-webapp:main` | `3010` |
 
 Required GitHub Actions secrets:
@@ -126,7 +126,7 @@ Required GitHub Actions secrets:
   relay-a first:
   ```
   https://smt.agora.build/api/v1/deploy?uuid=oss4444o8ss40ckgwc40og4c&force=false
-  https://smt.agora.build/api/v1/deploy?uuid=<relay-b uuid>&force=false
+  https://smt.agora.build/api/v1/deploy?uuid=am8lrcacts572trbli1bmvnu&force=false
   ```
   With one relay, only the first line. Required: there is no fallback to the
   older per-relay secrets, which are no longer read and can be deleted.
@@ -138,23 +138,25 @@ a single relay without Redis still deploys):
 - `STATION_REQUIRE_REDIS`: `1` makes the health waits and the final check
   require `"redis":"ok"`. Any other value, or unset, skips the check.
 - `STATION_MIN_REPLICAS`: the minimum live relay replicas (`"replicas"` in
-  `/health`) the health waits and the final check require: `1` with relay-a
-  only, `2` once relay-b exists. Unset or `0` skips the check.
+  `/health`) the health waits and the final check require: `2` for the current
+  production deployment. Unset or `0` skips the check.
 
-Set both explicitly (`STATION_REQUIRE_REDIS=1`, `STATION_MIN_REPLICAS=2`) in
-the same change that adds relay-b. Otherwise a deploy can pass with Redis
-down or with a replica missing.
+Set both explicitly (`STATION_REQUIRE_REDIS=1`, `STATION_MIN_REPLICAS=2`) so a
+deploy cannot pass with Redis down or with a production replica missing.
 
 Runtime configuration:
 
 - Relay (relay-a and relay-b, identical): `PUBLIC_BASE_URL=https://station.agora.build`,
   `CORS_ORIGIN=https://station.agora.build`, `PORT=3000`, `RUST_LOG=info`, the
   existing PostgreSQL `DATABASE_URL`, `REDIS_URL` (Valkey, a Coolify secret),
-  and `RELAY_REPLICAS_EXPECTED` (`1` with relay-a only, `2` with relay-b). The
-  last one is a guard: above 1 without `REDIS_URL` the relay refuses to start
+  and `RELAY_REPLICAS_EXPECTED=2`. Above 1 without `REDIS_URL` the relay refuses to start
   (exit 1), and a value that isn't a positive integer also exits 1. Both apps
   carry the `station-relay-server` network alias, so nginx sees every replica.
   Health check `GET /health` on port 3000.
+- Account registration: leave `AGORA_ACCOUNT_USERINFO_URL`,
+  `AGORA_ACCOUNT_SUBJECT_FIELD`, and `AGORA_ACCOUNT_AUTH_TIME_FIELD` unset
+  while unified agora.build SSO is built. See the account-registration section
+  below for the disabled-mode behavior and migration plan.
 - Webapp: `STATION_RELAY_UPSTREAM=station-relay-server:3000`. All containers
   must use the `coolify` Docker network. nginx re-resolves the alias through
   Docker DNS every 10 s and spreads requests across every address it returns,
@@ -206,6 +208,38 @@ If `/health` returns `502` while `http://127.0.0.1:3000/health` works on
 Volumetric, check the webapp's relay upstream and Docker DNS resolution.
 A successful deployment webhook only means the deployment was queued; the
 workflow also checks the final deployment status and public endpoints.
+
+#### Optional Agora account registration
+
+Leave `AGORA_ACCOUNT_USERINFO_URL`, `AGORA_ACCOUNT_SUBJECT_FIELD`, and
+`AGORA_ACCOUNT_AUTH_TIME_FIELD` unset while unified agora.build SSO is built.
+These settings enable optional Agora-specific registration and explicit data
+grouping. Ordinary pairing, memory/skills/vault sync, and E2EE do not require
+this feature; unregistered Astations keep using their Astation ID as the data
+account. Removing verifier configuration does not undo existing registrations
+or data groups in Postgres.
+
+A warning that the URL and subject field are not configured means account
+registration is unavailable. Check relay authentication and encryption
+migration status separately when diagnosing connection or migration failures.
+`/health` and `verify-station.mjs` verify infrastructure, not account login or
+registration.
+
+The planned replacement is [unified agora.build identity](docs/specs/2026-10-10-unified-agora-build-identity.md),
+with permanent agora.build accounts and linked GitHub, Google, Apple, and Agora
+sign-in providers. The portal team does not need these legacy settings to build
+that service. Product APIs will verify the trusted issuer and intended audience
+through signing keys/JWKS or supported token introspection. Sensitive actions
+may require fresh-authentication proof, separate from device approval and E2EE
+recovery. Changing only the current userinfo URL is insufficient.
+
+Keep the runtime compatibility implementation until the new integration and
+safe account/data migration are verified, then remove its settings and code.
+The [relay environment reference](relay-server/README.md#environment-variables)
+describes the existing verifier contract; the unified identity specification
+contains the migration and acceptance requirements. Any future authentication
+rollout must verify each replica's configuration and product login behavior in
+addition to infrastructure health.
 
 #### Relay replicas and Valkey
 
