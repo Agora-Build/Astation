@@ -114,11 +114,18 @@ device encryption key starts a separate binding without releasing old keys.
 Unlock validates the signature against the pinned unlock-auth Ed25519 key,
 the account and authenticated device ID, an empty ticket, a valid lowercase
 key ID, the ephemeral X25519 key, and a five-minute arrival-time window before
-opening a prompt. The prompt shows device name, boot ID, request time, and
-last unlock. Approve requires Touch ID with no password fallback. Deny and
+opening a prompt. One window shows device name, boot ID, request time, last
+unlock and Apple's embedded Touch ID control. Touch ID starts when the window
+opens; there is no extra Approve click or separate authentication alert.
+Approval requires a fresh Touch ID match with no password fallback or reuse
+of a recent Mac unlock. Deny and
 revoke removes the local E2E verification pin; the device must verify again
 before receiving further grants. Relay-wide signed device revocation is a
 later protocol step.
+
+The same window explains unavailable Touch ID without offering another way to
+approve. See [the unlock UI design](../designs/atem-unlock-ui.md) for embedded
+authentication, cancellation and lifecycle invariants.
 
 `unlockDenied` includes `revoked: true` after Deny and revoke has persisted,
 and when Astation no longer has a verification pin for the authenticated
