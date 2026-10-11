@@ -24,9 +24,17 @@ Astations bind attempts to the authenticated Atem ID, the connection
 generation, the data account, and a fresh 32-byte nonce. Attempts expire
 after three minutes. The revealed keys must match the original commitment
 before the Mac displays a safety code. Approval requires matching codes
-and Touch ID. The first verification also requires confirmation that the
+and Touch ID. One window displays the safety code and the embedded system
+Touch ID control. After comparing both codes, click **Codes Match**, then use
+Touch ID in that window. The code remains visible; Codes Match alone cannot
+approve the device, and biometrics do not start before confirmation. There is
+no separate authentication alert or password fallback. The first verification
+also requires confirmation that the
 complete recovery kit was saved. Denial, abort, expiry, and connection
 replacement invalidate pending approvals.
+
+See [the verification UI design](../designs/atem-verification-ui.md) for the
+code-comparison gate and biometric lifecycle/security invariants.
 
 Safety-code and recovery dialogs run without blocking the main queue.
 A peer abort, disconnect, or timeout dismisses the active dialog and
@@ -114,11 +122,18 @@ device encryption key starts a separate binding without releasing old keys.
 Unlock validates the signature against the pinned unlock-auth Ed25519 key,
 the account and authenticated device ID, an empty ticket, a valid lowercase
 key ID, the ephemeral X25519 key, and a five-minute arrival-time window before
-opening a prompt. The prompt shows device name, boot ID, request time, and
-last unlock. Approve requires Touch ID with no password fallback. Deny and
+opening a prompt. One window shows device name, boot ID, request time, last
+unlock and Apple's embedded Touch ID control. Touch ID starts when the window
+opens; there is no extra Approve click or separate authentication alert.
+Approval requires a fresh Touch ID match with no password fallback or reuse
+of a recent Mac unlock. Deny and
 revoke removes the local E2E verification pin; the device must verify again
 before receiving further grants. Relay-wide signed device revocation is a
 later protocol step.
+
+The same window explains unavailable Touch ID without offering another way to
+approve. See [the unlock UI design](../designs/atem-unlock-ui.md) for embedded
+authentication, cancellation and lifecycle invariants.
 
 `unlockDenied` includes `revoked: true` after Deny and revoke has persisted,
 and when Astation no longer has a verification pin for the authenticated

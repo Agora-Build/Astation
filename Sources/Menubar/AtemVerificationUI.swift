@@ -5,21 +5,28 @@ enum AtemVerificationUI {
     private static var activePrompt: UUID?
 
     static func approve(_ request: AtemVerificationApproval, completion: @escaping (Bool) -> Void) -> (() -> Void) {
+        approve(request, context: LAContext(), completion: completion)
+    }
+
+    static func approve(_ request: AtemVerificationApproval, context: LAContext,
+                        completion: @escaping (Bool) -> Void) -> (() -> Void) {
         guard activePrompt == nil else { completion(false); return {} }
         let id = UUID()
         activePrompt = id
-        let alert = NSAlert()
-        alert.messageText = "Verify Atem Safety Code"
-        alert.informativeText = "Device: \(request.deviceName)\n\n\(request.safetyCode)\n\nCompare this code with the code shown by atem pair. Approve only when both codes match."
-        alert.addButton(withTitle: "Codes Match")
-        alert.addButton(withTitle: "Deny")
-        let prompt = AtemVerificationDialog(alert: alert) { accepted in
+        let prompt = AtemSafetyCodePrompt(request: request, context: context) { accepted in
             if activePrompt == id { activePrompt = nil }
             completion(accepted)
         }
-        prompt.confirm = { $0.authenticate() }
         prompt.show()
         return { prompt.finish(false) }
+    }
+
+    static func verificationAlert() -> NSAlert {
+        let alert = authenticationAlert(title: "Verify Atem Safety Code",
+            message: "Compare the safety code with the one shown by atem pair.")
+        alert.addButton(withTitle: "Codes Match")
+        alert.addButton(withTitle: "Deny")
+        return alert
     }
 
     static func saveRecovery(_ text: String, completion: @escaping (Bool) -> Void) -> (() -> Void) {
@@ -35,34 +42,42 @@ enum AtemVerificationUI {
     }
 
     static func unlock(_ request: AtemUnlockApproval, completion: @escaping (AtemUnlockDecision) -> Void) -> (() -> Void) {
+        unlock(request, context: LAContext(), completion: completion)
+    }
+
+    static func unlock(_ request: AtemUnlockApproval, context: LAContext,
+                       completion: @escaping (AtemUnlockDecision) -> Void) -> (() -> Void) {
         guard activePrompt == nil else { completion(.deny); return {} }
         let id = UUID()
         activePrompt = id
-        let alert = unlockAlert(request)
-        var revoke = false
-        let prompt = AtemVerificationDialog(alert: alert) { accepted in
+        let prompt = AtemUnlockPrompt(request: request, context: context) { decision in
             if activePrompt == id { activePrompt = nil }
-            completion(accepted ? .approve : (revoke ? .revoke : .deny))
+            completion(decision)
         }
-        prompt.confirm = { $0.authenticate(reason: "unlock this Atem's storage key") }
-        prompt.alternate = { dialog in revoke = true; dialog.finish(false) }
         prompt.show()
-        return { prompt.finish(false) }
+        return { prompt.finish(.deny) }
     }
 
-    static func unlockAlert(_ request: AtemUnlockApproval) -> NSAlert {
-        let alert = NSAlert()
-        alert.messageText = "Unlock Atem Storage Key"
-        let requested = DateFormatter.localizedString(from: request.requestTime, dateStyle: .medium, timeStyle: .medium)
-        let last = request.lastUnlock.map { DateFormatter.localizedString(from: $0, dateStyle: .medium, timeStyle: .medium) } ?? "Never"
-        alert.informativeText = "Device: \(displayText(request.deviceName))\nBoot ID: \(displayText(request.bootId))\nRequested: \(requested)\nLast unlock: \(last)\n\nApprove with Touch ID to unlock this device's sealed keys. Deny and revoke requires the device to verify again."
-        alert.addButton(withTitle: "Approve")
+    static func unlockAlert() -> NSAlert {
+        let alert = authenticationAlert(title: "Unlock Atem Storage Key",
+            message: "Approve access to encrypted data for this verified device.")
         alert.addButton(withTitle: "Deny")
         alert.addButton(withTitle: "Deny and Revoke")
+        alert.buttons[1].hasDestructiveAction = true
         return alert
     }
 
-    private static func displayText(_ value: String) -> String {
+    private static func authenticationAlert(title: String, message: String) -> NSAlert {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.icon = NSImage(systemSymbolName: "lock.shield", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 42, weight: .light)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [.controlAccentColor])))
+        return alert
+    }
+
+    static func displayText(_ value: String) -> String {
         String(String.UnicodeScalarView(value.unicodeScalars.filter {
             !CharacterSet.controlCharacters.contains($0) && $0.properties.generalCategory != .format
         }).prefix(200))
@@ -72,10 +87,7 @@ enum AtemVerificationUI {
 // Modeless alerts keep the main queue free to handle a peer's verifyAbort.
 final class AtemVerificationDialog: NSObject, NSWindowDelegate {
     let alert: NSAlert
-    var confirm: ((AtemVerificationDialog) -> Void)?
-    var alternate: ((AtemVerificationDialog) -> Void)?
     private var completion: ((Bool) -> Void)?
-    private var authentication: LAContext?
     var isActive: Bool { completion != nil }
 
     init(alert: NSAlert, completion: @escaping (Bool) -> Void) {
@@ -91,49 +103,17 @@ final class AtemVerificationDialog: NSObject, NSWindowDelegate {
         alert.buttons[0].action = #selector(accept)
         alert.buttons[1].target = self
         alert.buttons[1].action = #selector(deny)
-        if alert.buttons.count > 2 {
-            alert.buttons[2].target = self
-            alert.buttons[2].action = #selector(alternateAction)
-        }
         alert.window.delegate = self
         NSApp.activate(ignoringOtherApps: true)
         alert.window.makeKeyAndOrderFront(nil)
     }
 
-    @objc private func accept() {
-        guard isActive else { return }
-        if let confirm { confirm(self) } else { finish(true) }
-    }
-
+    @objc private func accept() { finish(true) }
     @objc private func deny() { finish(false) }
-    @objc private func alternateAction() { alternate?(self) }
-
-    func authenticate(reason: String = "verify this Atem's safety code") {
-        guard isActive, authentication == nil else { return }
-        let context = LAContext()
-        context.localizedFallbackTitle = ""
-        var error: NSError?
-        guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
-            alert.messageText = "Touch ID Is Required"
-            alert.informativeText = "Unlock this Mac and enable Touch ID to approve this request."
-            alert.buttons[0].title = "OK"
-            alert.buttons[1].isHidden = true
-            if alert.buttons.count > 2 { alert.buttons[2].isHidden = true }
-            confirm = { $0.finish(false) }
-            return
-        }
-        authentication = context
-        alert.window.orderOut(nil)
-        context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { [weak self] ok, _ in
-            DispatchQueue.main.async { self?.finish(ok) }
-        }
-    }
 
     func finish(_ accepted: Bool) {
         guard let callback = completion else { return }
         completion = nil
-        authentication?.invalidate()
-        authentication = nil
         alert.window.close()
         callback(accepted)
     }
