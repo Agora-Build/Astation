@@ -369,9 +369,29 @@ relay-server/
 
 Settings > Credentials manages named API keys and passwords in this Mac's
 protected Keychain, with Global or Git-project scopes and Touch ID for saves,
-updates, copies and deletion. Credentials remain local; Atem credential retrieval
-is separate from the existing device-unlock flow. See the
+updates, copies and deletion. The project picker combines encrypted suggestions
+from verified, unlocked Atem devices with saved scopes; another Git remote can
+always be entered manually. Original capitalization is retained, while identity
+and duplicate checks ignore case. Credentials remain local; Atem credential
+retrieval is not implemented. See the
 [credentials guide](docs/credentials.md) for setup and current availability.
+
+Atem can run on another machine. Pair with `atem pair`, compare the safety code
+on both machines, then click **Codes Match** and approve Touch ID on the Mac.
+Check `atem cred status` for verification; a connected or SSO-paired session
+alone does not establish device trust. `atem cred unlock` requests key access
+from this Mac, and `atem cred projects` sends Git-project suggestions. Use a
+provisioned Astation build for protected storage; the ad hoc development app
+does not provide the required Keychain access. See
+[personal-team local signing](docs/atem-device-verification.md#personal-team-local-signing).
+
+Account-data encryption is controlled in Settings > Security > End-to-End
+Encryption. A **Turning on** or **Turning off** banner is still pending, even
+when its field counts show no remaining migration work. Run an updated,
+verified `atem cred unlock` to finish it, then confirm **On** or **Off** in
+Astation. The accepted completion is durable and does not require Atem to
+remain online. This setting does not change the local credential Keychain.
+See [migration completion](docs/credentials.md#complete-an-encryption-migration).
 
 Sign in through Astation's menu or Settings. The app opens a browser for OAuth
 2.0 + PKCE login and receives the callback on a local loopback listener. Its SSO

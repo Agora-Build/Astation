@@ -7,7 +7,7 @@ work. Completed implementation checklists are available in Git history.
 | --- | --- |
 | [Agent handoff](agent-handoff.md) | Remaining work, encryption publication, SSO direction, and validation/operations follow-ups |
 | [Atem device verification](atem-device-verification.md) | Safety codes, protected key escrow, Touch ID unlock, personal-team signing, and cross-machine tests |
-| [Credentials on this Mac](credentials.md) | Input UI, protected Keychain storage, Touch ID actions, project scopes, clipboard handling, and Atem integration boundary |
+| [Credentials on this Mac](credentials.md) | Keychain editor, remote Atem pairing/unlock, project suggestions and capitalization, migration status, and local signing |
 | [Credential project discovery](../designs/credential-project-discovery.md) | Editable picker, encrypted Atem project reports, account isolation, and metadata lifecycle |
 | [Encryption migration lifecycle](../designs/e2e-encryption.md) | Durable completion, retries, revocation ordering, and the local encryption authority boundary |
 | [Relay identity](astation-relay-identity-handoff.md) | Signing-key contract, durable pairing protocol, reconnect behavior, and recovery runbooks |
