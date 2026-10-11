@@ -67,6 +67,11 @@ It notarizes and staples both the app and installer, checks Gatekeeper, and
 uploads the packages and checksums as workflow artifacts. It publishes neither
 a GitHub release nor Docker images.
 
+The `--bundled-resources-check` command is available in Debug and Release builds
+and exits before app startup, permissions, logging or relay connections. CI runs
+the optimized executable's check and release packaging runs the signed app's
+check from an unrelated directory; both enforce a 30-second timeout.
+
 ```sh
 gh workflow run release.yml --ref main -f version=0.4.20
 ```

@@ -63,6 +63,13 @@ jobs:
       - name: Build Swift package
         run: swift build -c release
 
+      - name: Verify Release resource check exits without app startup
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          subprocess.run([".build/release/astation", "--bundled-resources-check"], check=True, timeout=30)
+          PY
+
       - name: Run Swift tests (no live audio or paid services)
         run: swift test
 

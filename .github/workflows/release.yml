@@ -190,7 +190,10 @@ jobs:
           app_executable="$PWD/Astation.app/Contents/MacOS/Astation"
           cd "$(mktemp -d)"
           env -u PACKAGE_RESOURCE_BUNDLE_PATH -u PACKAGE_RESOURCE_BUNDLE_URL \
-            "$app_executable" --bundled-resources-check
+            python3 - "$app_executable" <<'PY'
+          import subprocess, sys
+          subprocess.run([sys.argv[1], "--bundled-resources-check"], check=True, timeout=30)
+          PY
 
       - name: Smoke-test packaged app
         run: |
