@@ -91,7 +91,7 @@ final class CredentialEditor: NSObject {
     init(entry: LocalCredentialMetadata?, snapshot: LocalCredentialSnapshot, reportedProjects: [String] = []) {
         self.entry = entry
         revision = snapshot.revision
-        savedProjects = snapshot.entries.compactMap(\.project)
+        savedProjects = snapshot.entries.filter { $0.project != nil }.map(\.scopeLabel)
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 500, height: 550),
             styleMask: [.titled], backing: .buffered, defer: false)
         panel.title = entry == nil ? "Add Credential" : "Update Credential"
@@ -104,7 +104,7 @@ final class CredentialEditor: NSObject {
         projectField.isEditable = true
         updateProjectSuggestions(reportedProjects)
         nameField.stringValue = entry?.name ?? ""
-        projectField.stringValue = entry?.project ?? ""
+        projectField.stringValue = entry?.projectLabel ?? entry?.project ?? ""
         projectButton.state = entry?.project == nil ? .off : .on
         projectButton.target = self
         projectButton.action = #selector(scopeChanged)
@@ -144,9 +144,9 @@ final class CredentialEditor: NSObject {
 
     func updateProjectSuggestions(_ reported: [String]) {
         let value = projectField.stringValue
-        let projects = Set((savedProjects + reported).compactMap { try? LocalCredentialStore.project($0) })
+        let projects = LocalCredentialStore.projectLabels(savedProjects + reported)
         projectField.removeAllItems()
-        projectField.addItems(withObjectValues: projects.sorted())
+        projectField.addItems(withObjectValues: projects)
         projectField.stringValue = value
     }
     @objc private func save() { onSave?() }
@@ -154,7 +154,7 @@ final class CredentialEditor: NSObject {
 
     func validatedInput() throws -> (name: String, project: String?, value: String) {
         let name = try LocalCredentialStore.name(nameField.stringValue)
-        let project = try LocalCredentialStore.project(projectButton.state == .on ? projectField.stringValue : nil)
+        let project = try LocalCredentialStore.projectLabel(projectButton.state == .on ? projectField.stringValue : nil)
         if projectButton.state == .on && project == nil { throw LocalCredentialError.invalidProject }
         let value = input.value
         try LocalCredentialStore.validateValue(value)

@@ -73,6 +73,46 @@ final class LocalCredentialTests: XCTestCase {
         XCTAssertThrowsError(try LocalCredentialStore.validateValue(String(repeating: "\u{1F600}", count: 16_385)))
     }
 
+    func testProjectSpellingSurvivesReloadAndUpdateWithCanonicalIdentity() throws {
+        let storage = CredentialTestStorage(), store = LocalCredentialStore(account: "test", storage: storage)
+        try store.save(name: "Key", project: "git@github.com:Agora-Build/Atem.git", value: "synthetic", expectedRevision: nil)
+        let reloaded = LocalCredentialStore(account: "test", storage: storage)
+        let snapshot = try reloaded.snapshot(), entry = try XCTUnwrap(snapshot.entries.first)
+        XCTAssertEqual(entry.project, "github.com/agora-build/atem")
+        XCTAssertEqual(entry.scopeLabel, "github.com/Agora-Build/Atem")
+        XCTAssertThrowsError(try store.save(name: "KEY", project: "https://github.com/AGORA-BUILD/ATEM", value: "duplicate", expectedRevision: snapshot.revision))
+        let editor = CredentialEditor(entry: entry, snapshot: snapshot)
+        XCTAssertEqual(editor.projectField.stringValue, "github.com/Agora-Build/Atem")
+        editor.input.value = "replacement"
+        let input = try editor.validatedInput()
+        try reloaded.save(name: input.name, project: input.project, value: input.value, updating: entry.id, expectedRevision: snapshot.revision)
+        XCTAssertEqual(try store.snapshot().entries.first?.scopeLabel, "github.com/Agora-Build/Atem")
+        XCTAssertEqual(try LocalCredentialStore.projectLabel("https://user:synthetic@github.com/Agora-Build/Atem.GIT"), "github.com/Agora-Build/Atem")
+    }
+
+    func testLegacyMetadataLoadsAndInvalidLabelBindingsRetainSavedData() throws {
+        let storage = CredentialTestStorage(), store = LocalCredentialStore(account: "test", storage: storage)
+        try store.save(name: "Key", project: "github.com/org/repo", value: "synthetic", expectedRevision: nil)
+        var record = try XCTUnwrap(JSONSerialization.jsonObject(with: try XCTUnwrap(storage.data)) as? [String: Any])
+        var entries = try XCTUnwrap(record["entries"] as? [[String: Any]])
+        var metadata = try XCTUnwrap(entries[0]["metadata"] as? [String: Any])
+        metadata.removeValue(forKey: "projectLabel")
+        entries[0]["metadata"] = metadata
+        record["entries"] = entries
+        storage.data = try JSONSerialization.data(withJSONObject: record)
+        XCTAssertEqual(try store.snapshot().entries.first?.scopeLabel, "github.com/org/repo")
+        for label in ["github.com/Other/Repo", "https://user:synthetic@github.com/org/repo", "github.com/Org/Repo\u{202E}", ""] {
+            metadata["projectLabel"] = label
+            entries[0]["metadata"] = metadata
+            record["entries"] = entries
+            storage.data = try JSONSerialization.data(withJSONObject: record)
+            let before = storage.data
+            XCTAssertThrowsError(try store.snapshot())
+            XCTAssertThrowsError(try store.save(name: "Other", project: nil, value: "synthetic", expectedRevision: nil))
+            XCTAssertEqual(storage.data, before)
+        }
+    }
+
     func testStaleRevisionCannotReadUpdateOrDeleteAReplacedValue() throws {
         let store = LocalCredentialStore(account: "test", storage: CredentialTestStorage())
         try store.save(name: "Key", project: nil, value: "one", expectedRevision: nil)
@@ -225,7 +265,7 @@ final class LocalCredentialTests: XCTestCase {
         form.projectButton.state = .on
         XCTAssertThrowsError(try form.validatedInput())
         form.projectField.stringValue = "git@github.com:Owner/Repo.git"
-        XCTAssertEqual(try form.validatedInput().project, "github.com/owner/repo")
+        XCTAssertEqual(try form.validatedInput().project, "github.com/Owner/Repo")
         let existing = LocalCredentialMetadata(id: UUID(), name: "Key", project: "github.com/owner/repo", version: 2, updatedAt: Date())
         let update = CredentialEditor(entry: existing, snapshot: snapshot)
         XCTAssertFalse(update.nameField.isEnabled)
@@ -240,7 +280,7 @@ final class LocalCredentialTests: XCTestCase {
         let form = CredentialEditor(entry: nil, snapshot: LocalCredentialSnapshot(revision: nil, entries: [saved]),
             reportedProjects: ["github.com/Org/Reported", "git@github.com:Org/Saved.git", "not a project"])
         XCTAssertTrue(form.projectField.isEditable)
-        XCTAssertEqual(form.projectField.objectValues as? [String], ["github.com/org/reported", "github.com/org/saved"])
+        XCTAssertEqual(form.projectField.objectValues as? [String], ["github.com/Org/Reported", "github.com/Org/Saved"])
         form.nameField.stringValue = "Key"
         form.projectButton.state = .on
         form.projectField.selectItem(at: 0)
@@ -250,8 +290,19 @@ final class LocalCredentialTests: XCTestCase {
         form.projectField.stringValue = "git@github.com:Other/Manual.git"
         form.updateProjectSuggestions(["github.com/org/new"])
         XCTAssertEqual(form.projectField.stringValue, "git@github.com:Other/Manual.git")
-        XCTAssertEqual(try form.validatedInput().project, "github.com/other/manual")
+        XCTAssertEqual(try form.validatedInput().project, "github.com/Other/Manual")
         XCTAssertEqual(form.input.value, "synthetic")
+    }
+
+    func testProjectPickerDeduplicatesCaseVariantsAndKeepsSavedSpelling() throws {
+        let saved = LocalCredentialMetadata(id: UUID(), name: "Key", project: "github.com/org/repo", version: 1,
+            updatedAt: Date(), projectLabel: "github.com/Org/Repo")
+        let form = CredentialEditor(entry: nil, snapshot: LocalCredentialSnapshot(revision: nil, entries: [saved]),
+            reportedProjects: ["github.com/org/repo", "github.com/ORG/REPO", "github.com/Other/Project"])
+        XCTAssertEqual(form.projectField.objectValues as? [String], ["github.com/Org/Repo", "github.com/Other/Project"])
+        form.projectField.stringValue = "github.com/Manual/Project"
+        form.updateProjectSuggestions(["github.com/ORG/REPO"])
+        XCTAssertEqual(form.projectField.stringValue, "github.com/Manual/Project")
     }
 
     func testRealProtectedKeychainRoundTripAccessibilityAndAccountIsolation() throws {

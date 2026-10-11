@@ -710,7 +710,8 @@ class AstationHubManager: ObservableObject {
                     let value = try self.atemE2EIdentity.openCredentialProjects(report, account: context.account, deviceId: context.route.deviceId)
                     guard self.e2eDataAccount == value.account else { return }
                     let key = value.account + "\0" + value.deviceId
-                    if let old = self.credentialProjectReports[key], old.pin == value.pin, old.time > value.time { return }
+                    if let old = self.credentialProjectReports[key], old.pin == value.pin,
+                       old.time > value.time || (old.time == value.time && old.hasLabels && !value.hasLabels) { return }
                     self.credentialProjectReports[key] = value
                     self.refreshCredentialProjectSuggestions()
                 } catch {
@@ -1042,7 +1043,11 @@ class AstationHubManager: ObservableObject {
         credentialProjectReports = credentialProjectReports.filter { _, report in
             report.account == account && (try? atemE2EIdentity.credentialProjectPin(account: account, deviceId: report.deviceId)) == report.pin
         }
-        let projects = Array(Set(credentialProjectReports.values.flatMap(\.projects))).sorted()
+        let reports = credentialProjectReports.values.sorted {
+            if $0.time != $1.time { return $0.time > $1.time }
+            return $0.deviceId < $1.deviceId
+        }
+        let projects = LocalCredentialStore.projectLabels(reports.flatMap(\.projects))
         if projects != credentialProjectSuggestions { credentialProjectSuggestions = projects }
     }
 

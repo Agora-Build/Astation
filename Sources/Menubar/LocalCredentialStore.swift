@@ -75,8 +75,18 @@ struct LocalCredentialMetadata: Codable, Equatable {
     let project: String?
     let version: UInt64
     let updatedAt: Date
+    let projectLabel: String?
 
-    var scopeLabel: String { project ?? "Global" }
+    init(id: UUID, name: String, project: String?, version: UInt64, updatedAt: Date, projectLabel: String? = nil) {
+        self.id = id
+        self.name = name
+        self.project = project
+        self.version = version
+        self.updatedAt = updatedAt
+        self.projectLabel = projectLabel
+    }
+
+    var scopeLabel: String { projectLabel ?? project ?? "Global" }
 }
 
 struct LocalCredentialSnapshot {
@@ -115,6 +125,10 @@ final class LocalCredentialStore {
     }
 
     static func project(_ raw: String?) throws -> String? {
+        try projectLabel(raw)?.lowercased()
+    }
+
+    static func projectLabel(_ raw: String?) throws -> String? {
         guard var value = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
         guard value.utf8.count <= 1024 else { throw LocalCredentialError.invalidProject }
         if value.hasPrefix("git@"), let colon = value.firstIndex(of: ":") {
@@ -124,14 +138,24 @@ final class LocalCredentialStore {
                   let host = url.host, !url.path.isEmpty else { throw LocalCredentialError.invalidProject }
             value = host + url.path
         }
-        value = value.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        if value.hasSuffix(".git") { value.removeLast(4) }
+        value = value.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if value.lowercased().hasSuffix(".git") { value.removeLast(4) }
         let parts = value.split(separator: "/", omittingEmptySubsequences: false)
         guard parts.count >= 2, parts[0].contains("."),
               parts.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }),
-              !value.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) }),
+              !value.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) || $0.properties.generalCategory == .format }),
               !value.contains(where: { "@?#\\:".contains($0) }) else { throw LocalCredentialError.invalidProject }
         return value
+    }
+
+    static func projectLabels(_ names: [String]) -> [String] {
+        var labels: [String: String] = [:]
+        for raw in names {
+            guard let label = try? projectLabel(raw) else { continue }
+            let key = label.lowercased()
+            if labels[key] == nil || (labels[key] == key && label != key) { labels[key] = label }
+        }
+        return labels.keys.sorted().compactMap { labels[$0] }
     }
 
     static func validateValue(_ value: String) throws {
@@ -151,6 +175,10 @@ final class LocalCredentialStore {
                   entry.metadata.version > 0, entry.metadata.updatedAt.timeIntervalSince1970.isFinite,
                   ids.insert(entry.metadata.id).inserted,
                   names.insert(Self.binding(entry.metadata.name, entry.metadata.project)).inserted else { throw LocalCredentialError.corrupt }
+            if let label = entry.metadata.projectLabel {
+                guard (try? Self.projectLabel(label)) == label,
+                      (try? Self.project(label)) == entry.metadata.project else { throw LocalCredentialError.corrupt }
+            }
             do { try Self.validateValue(entry.value) } catch { throw LocalCredentialError.corrupt }
         }
         return record
@@ -164,11 +192,11 @@ final class LocalCredentialStore {
         lock.lock(); defer { lock.unlock() }
         let record = try read()
         return LocalCredentialSnapshot(revision: record?.revision,
-            entries: (record?.entries.map(\.metadata) ?? []).sorted { ($0.scopeLabel, $0.name.lowercased()) < ($1.scopeLabel, $1.name.lowercased()) })
+            entries: (record?.entries.map(\.metadata) ?? []).sorted { ($0.scopeLabel.lowercased(), $0.name.lowercased()) < ($1.scopeLabel.lowercased(), $1.name.lowercased()) })
     }
 
     func save(name: String, project: String?, value: String, updating id: UUID? = nil, expectedRevision: UUID?, now: Date = Date()) throws {
-        let name = try Self.name(name), project = try Self.project(project)
+        let name = try Self.name(name), label = try Self.projectLabel(project), project = label?.lowercased()
         try Self.validateValue(value)
         lock.lock(); defer { lock.unlock() }
         let existing = try read()
@@ -182,10 +210,10 @@ final class LocalCredentialStore {
             guard let index = record.entries.firstIndex(where: { $0.metadata.id == id }) else { throw LocalCredentialError.missing }
             let old = record.entries[index].metadata
             guard old.version < UInt64.max else { throw LocalCredentialError.changed }
-            metadata = LocalCredentialMetadata(id: id, name: name, project: project, version: old.version + 1, updatedAt: now)
+            metadata = LocalCredentialMetadata(id: id, name: name, project: project, version: old.version + 1, updatedAt: now, projectLabel: label)
             record.entries[index] = Entry(metadata: metadata, value: value)
         } else {
-            metadata = LocalCredentialMetadata(id: UUID(), name: name, project: project, version: 1, updatedAt: now)
+            metadata = LocalCredentialMetadata(id: UUID(), name: name, project: project, version: 1, updatedAt: now, projectLabel: label)
             record.entries.append(Entry(metadata: metadata, value: value))
         }
         record.revision = UUID()
