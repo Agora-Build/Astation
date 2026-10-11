@@ -9,7 +9,7 @@ The Keychain item requires an unlocked Mac and is not synced through iCloud.
 
 1. Click **Add Credential** and enter a name such as `OPENAI_API_KEY`.
 2. Leave **Use project scope** unchecked for Global. For a project credential,
-   check it and enter the Git remote or normalized key, such as
+   check it and choose a project from the editable list, or enter the Git remote or normalized key, such as
    `github.com/owner/repo`. HTTPS and `git@host:owner/repo.git` forms normalize
    to the same scope.
 3. Paste the value. **Show multiline value** opens a text editor for PEM, JSON
@@ -22,6 +22,31 @@ Names match case-insensitively within a scope. Global `openai` and project
 `openai` can have different values. To replace one, select its row and click
 **Update**. The saved value is not displayed in the editor; enter a replacement.
 The version increases after a successful save.
+
+## Project suggestions from Atem
+
+The project list combines repositories reported by verified Atem devices with
+scopes already used by saved credentials. You can always type another Git remote
+to add a credential for a project that is not listed; no connected Atem is needed.
+
+Use the updated Atem build with an unlocked key agent. Atem reports its current
+Git repository and the projects it has remembered for this account when it
+connects. Astation also requests an update when opening Credentials, opening an
+editor or clicking Refresh. New suggestions do not replace the project or value
+you are editing. A repo with no usable Git remote is not a project scope.
+
+Older Atem builds and key agents do not implement reporting. After updating,
+restart an older key-agent process and unlock it using the updated Atem, then
+run `atem cred projects` in your repository or use the Atem TUI. `atem cred lock`
+wipes keys from memory but does not restart the daemon. Reporting does
+not prompt for Touch ID or unlock keys automatically. Accepted suggestions can
+remain available after a short-lived CLI disconnects, until Astation quits;
+saved scopes remain available after relaunch.
+
+Project names are encrypted to the verified Astation even when memory encryption
+is off. They are suggestions, not device permissions. See the
+[discovery protocol](../designs/credential-project-discovery.md) for trust and
+revocation rules. Credential values remain local to this Mac.
 
 ## Copy and delete
 

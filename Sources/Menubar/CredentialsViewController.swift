@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 
 final class CredentialValueInput: NSStackView {
     let secureField = NSSecureTextField()
@@ -83,12 +84,14 @@ final class CredentialEditor: NSObject {
     let saveButton = NSButton(title: "Save with Touch ID", target: nil, action: nil)
     let entry: LocalCredentialMetadata?
     let revision: UUID?
+    private let savedProjects: [String]
     var onSave: (() -> Void)?
     var onCancel: (() -> Void)?
 
-    init(entry: LocalCredentialMetadata?, snapshot: LocalCredentialSnapshot) {
+    init(entry: LocalCredentialMetadata?, snapshot: LocalCredentialSnapshot, reportedProjects: [String] = []) {
         self.entry = entry
         revision = snapshot.revision
+        savedProjects = snapshot.entries.compactMap(\.project)
         panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 500, height: 550),
             styleMask: [.titled], backing: .buffered, defer: false)
         panel.title = entry == nil ? "Add Credential" : "Update Credential"
@@ -96,9 +99,10 @@ final class CredentialEditor: NSObject {
         super.init()
         nameField.placeholderString = "OPENAI_API_KEY"
         nameField.setAccessibilityLabel("Credential name")
-        projectField.placeholderString = "github.com/owner/repo or Git remote"
+        projectField.placeholderString = "Choose a project or enter a Git remote"
         projectField.setAccessibilityLabel("Credential project")
-        projectField.addItems(withObjectValues: Array(Set(snapshot.entries.compactMap(\.project))).sorted())
+        projectField.isEditable = true
+        updateProjectSuggestions(reportedProjects)
         nameField.stringValue = entry?.name ?? ""
         projectField.stringValue = entry?.project ?? ""
         projectButton.state = entry?.project == nil ? .off : .on
@@ -109,7 +113,7 @@ final class CredentialEditor: NSObject {
         projectField.isEnabled = entry == nil && projectButton.state == .on
         status.font = .systemFont(ofSize: 11)
         status.textColor = .secondaryLabelColor
-        status.stringValue = "Global credentials belong to this Mac. Values may contain up to 64 KiB; show multiline input for PEM or JSON."
+        status.stringValue = "Choose a project reported by Atem, reuse a saved scope, or enter another Git remote. Values may contain up to 64 KiB; show multiline input for PEM or JSON."
         saveButton.target = self
         saveButton.action = #selector(save)
         let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancel))
@@ -137,6 +141,14 @@ final class CredentialEditor: NSObject {
     }
 
     @objc private func scopeChanged() { projectField.isEnabled = projectButton.state == .on }
+
+    func updateProjectSuggestions(_ reported: [String]) {
+        let value = projectField.stringValue
+        let projects = Set((savedProjects + reported).compactMap { try? LocalCredentialStore.project($0) })
+        projectField.removeAllItems()
+        projectField.addItems(withObjectValues: projects.sorted())
+        projectField.stringValue = value
+    }
     @objc private func save() { onSave?() }
     @objc private func cancel() { onCancel?() }
 
@@ -156,6 +168,9 @@ final class CredentialsViewController: NSViewController, NSTableViewDataSource, 
     private let currentAccount: () -> String
     private let makeStore: (String) -> LocalCredentialStore
     private let actions: LocalCredentialActions
+    private let reportedProjects: () -> [String]
+    private let requestProjects: () -> Void
+    private var projectSubscription: AnyCancellable?
     private let presentConfirmation: (NSAlert, NSWindow, @escaping (NSApplication.ModalResponse) -> Void) -> Void
     private var store: LocalCredentialStore
     private var snapshot = LocalCredentialSnapshot(revision: nil, entries: [])
@@ -172,6 +187,9 @@ final class CredentialsViewController: NSViewController, NSTableViewDataSource, 
     init(account: @escaping () -> String = { AstationIdentity.shared.id },
          makeStore: @escaping (String) -> LocalCredentialStore = { LocalCredentialStore(account: $0) },
          authenticate: @escaping LocalCredentialActions.Authenticate = LocalCredentialActions.touchID,
+         reportedProjects: @escaping () -> [String] = { [] },
+         requestProjects: @escaping () -> Void = {},
+         projectUpdates: AnyPublisher<[String], Never>? = nil,
          presentConfirmation: @escaping (NSAlert, NSWindow, @escaping (NSApplication.ModalResponse) -> Void) -> Void = {
              alert, window, completion in alert.beginSheetModal(for: window, completionHandler: completion)
          }) {
@@ -179,8 +197,13 @@ final class CredentialsViewController: NSViewController, NSTableViewDataSource, 
         self.makeStore = makeStore
         store = makeStore(account())
         actions = LocalCredentialActions(account: account, authenticate: authenticate)
+        self.reportedProjects = reportedProjects
+        self.requestProjects = requestProjects
         self.presentConfirmation = presentConfirmation
         super.init(nibName: nil, bundle: nil)
+        projectSubscription = projectUpdates?.receive(on: DispatchQueue.main).sink { [weak self] projects in
+            self?.editor?.updateProjectSuggestions(projects)
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -213,7 +236,7 @@ final class CredentialsViewController: NSViewController, NSTableViewDataSource, 
         updateButton.target = self; updateButton.action = #selector(updateCredential)
         copyButton.target = self; copyButton.action = #selector(copyCredential)
         deleteButton.target = self; deleteButton.action = #selector(deleteCredential)
-        let refresh = NSButton(title: "Refresh", target: self, action: #selector(refreshCredentials))
+        let refresh = NSButton(title: "Refresh", target: self, action: #selector(refreshAll))
         let buttons = NSStackView(views: [updateButton, copyButton, deleteButton, refresh])
         buttons.orientation = .horizontal
         status.font = .systemFont(ofSize: 11)
@@ -243,6 +266,7 @@ final class CredentialsViewController: NSViewController, NSTableViewDataSource, 
 
     func refreshForDisplay() {
         if (editor == nil && pendingDeleteAlert == nil && !actions.isBusy) || store.account != currentAccount() { refreshCredentials() }
+        requestProjects()
     }
 
     func cancelPending() {
@@ -274,6 +298,8 @@ final class CredentialsViewController: NSViewController, NSTableViewDataSource, 
         updateButtons()
     }
 
+    @objc private func refreshAll() { refreshCredentials(); requestProjects() }
+
     private var selected: LocalCredentialMetadata? {
         snapshot.entries.indices.contains(table.selectedRow) ? snapshot.entries[table.selectedRow] : nil
     }
@@ -290,7 +316,7 @@ final class CredentialsViewController: NSViewController, NSTableViewDataSource, 
 
     private func openEditor(entry: LocalCredentialMetadata?) {
         guard editor == nil, pendingDeleteAlert == nil, !actions.isBusy, storageAvailable, let window = view.window else { return }
-        let form = CredentialEditor(entry: entry, snapshot: snapshot)
+        let form = CredentialEditor(entry: entry, snapshot: snapshot, reportedProjects: reportedProjects())
         editor = form
         form.onCancel = { [weak self] in self?.cancelPending() }
         form.onSave = { [weak self, weak form] in
@@ -315,6 +341,7 @@ final class CredentialsViewController: NSViewController, NSTableViewDataSource, 
         }
         window.beginSheet(form.panel)
         updateButtons()
+        requestProjects()
     }
 
     private func closeEditor() {

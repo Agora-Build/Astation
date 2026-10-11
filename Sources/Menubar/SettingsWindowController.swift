@@ -25,7 +25,11 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private let recordingController: AudioRecordingViewController
     private let transcriptionController: TranscriptionViewController
     private let dictationController: VoiceDictationViewController?
-    private lazy var credentialsController = CredentialsViewController()
+    private lazy var credentialsController = CredentialsViewController(
+        reportedProjects: { [weak self] in self?.hubManager.credentialProjectSuggestions ?? [] },
+        requestProjects: { [weak self] in self?.hubManager.requestCredentialProjects() },
+        projectUpdates: hubManager.$credentialProjectSuggestions.eraseToAnyPublisher()
+    )
     private var statusLabel: NSTextField!
     private var signInButton: NSButton!
     private var signOutButton: NSButton!

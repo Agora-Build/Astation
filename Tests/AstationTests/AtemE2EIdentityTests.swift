@@ -63,6 +63,12 @@ final class TestAtemCryptography: AtemIdentityCryptography {
                                           info: info, encapsulatedKey: sealed.encapsulatedKey)
         return try recipient.open(sealed.ciphertext, authenticating: Data())
     }
+
+    func openProjectReport(_ report: AtemProjectReportWire, info: Data, material: AtemIdentityMaterial) throws -> Data {
+        var recipient = try HPKE.Recipient(privateKey: encryption, ciphersuite: .Curve25519_SHA256_ChachaPoly,
+            info: info, encapsulatedKey: report.encappedKey)
+        return try recipient.open(report.ciphertext, authenticating: Data())
+    }
 }
 
 func atemStatementFields(_ signed: AtemSignedWire) -> [Data] {

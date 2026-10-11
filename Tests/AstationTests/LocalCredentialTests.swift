@@ -235,6 +235,25 @@ final class LocalCredentialTests: XCTestCase {
         XCTAssertTrue(form.input.value.isEmpty)
     }
 
+    func testProjectPickerIncludesAtemAndSavedScopesAndRetainsManualEntry() throws {
+        let saved = LocalCredentialMetadata(id: UUID(), name: "Key", project: "github.com/org/saved", version: 1, updatedAt: Date())
+        let form = CredentialEditor(entry: nil, snapshot: LocalCredentialSnapshot(revision: nil, entries: [saved]),
+            reportedProjects: ["github.com/Org/Reported", "git@github.com:Org/Saved.git", "not a project"])
+        XCTAssertTrue(form.projectField.isEditable)
+        XCTAssertEqual(form.projectField.objectValues as? [String], ["github.com/org/reported", "github.com/org/saved"])
+        form.nameField.stringValue = "Key"
+        form.projectButton.state = .on
+        form.projectField.selectItem(at: 0)
+        form.projectField.stringValue = "github.com/org/reported"
+        form.input.value = "synthetic"
+        XCTAssertEqual(try form.validatedInput().project, "github.com/org/reported")
+        form.projectField.stringValue = "git@github.com:Other/Manual.git"
+        form.updateProjectSuggestions(["github.com/org/new"])
+        XCTAssertEqual(form.projectField.stringValue, "git@github.com:Other/Manual.git")
+        XCTAssertEqual(try form.validatedInput().project, "github.com/other/manual")
+        XCTAssertEqual(form.input.value, "synthetic")
+    }
+
     func testRealProtectedKeychainRoundTripAccessibilityAndAccountIsolation() throws {
         let account = "credentials-test-\(UUID())", other = "credentials-test-\(UUID())"
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,

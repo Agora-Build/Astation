@@ -1,6 +1,10 @@
 # Local Credentials Editor
 
 Settings > Credentials manages named API keys and passwords on this Mac.
+The editable project picker combines verified Atem reports with saved scopes,
+and accepts another Git remote. Incoming suggestions preserve manual input.
+See [credential project discovery](credential-project-discovery.md) for the
+encrypted metadata protocol and its separate permission boundary.
 Each credential belongs to this Astation identity and either Global or a
 normalized Git project. Names match case-insensitively within a scope; values
 retain their exact whitespace and may contain up to 64 KiB of UTF-8 text.
