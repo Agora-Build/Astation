@@ -252,6 +252,8 @@ jobs:
           context: relay-server
           platforms: linux/amd64
           push: true
+          build-args: |
+            ASTATION_BUILD_COMMIT=${{ github.sha }}
           tags: |
             ghcr.io/${{ steps.version.outputs.owner }}/station-relay-server:${{ steps.version.outputs.version }}
             ghcr.io/${{ steps.version.outputs.owner }}/station-relay-server:latest

@@ -136,17 +136,14 @@ jobs:
             ${{ runner.os }}-cargo-relay-
       - name: Run relay server tests
         working-directory: relay-server
-        run: cargo test
-      - name: Run account grouping Postgres test
+        run: cargo test --locked
+      - name: Run isolated Postgres suites in parallel
         working-directory: relay-server
         env:
+          IDENTITY_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:55433/postgres
+          KNOWLEDGE_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:55433/postgres
           ACCOUNT_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:55433/postgres
-        run: cargo test postgres_merge_moves_all_data_atomically -- --ignored
-      - name: Run encryption Postgres test
-        working-directory: relay-server
-        env:
-          ACCOUNT_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:55433/postgres
-        run: cargo test postgres_encryption_transitions_and_write_barrier -- --ignored
+        run: cargo test --locked postgres -- --ignored --test-threads=4
       - name: Run relay Redis (Valkey) suites
         working-directory: relay-server
         env:
@@ -156,7 +153,25 @@ jobs:
         working-directory: relay-server/loadtest
         run: cargo test --locked
       - name: Build relay server container
-        run: docker build --tag station-relay-server:ci relay-server
+        env:
+          BUILD_COMMIT: ${{ inputs.head_sha || github.sha }}
+        run: docker build --build-arg ASTATION_BUILD_COMMIT="$BUILD_COMMIT" --tag station-relay-server:ci relay-server
+      - name: Verify container build metadata
+        env:
+          EXPECTED_COMMIT: ${{ inputs.head_sha || github.sha }}
+        run: |
+          trap 'docker rm -f relay-build-check >/dev/null 2>&1' EXIT
+          docker run --detach --name relay-build-check --publish 127.0.0.1:53000:3000 station-relay-server:ci
+          curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 \
+            http://127.0.0.1:53000/health > /tmp/relay-build-health.json
+          python3 - <<'PY'
+          import json, os
+          with open('/tmp/relay-build-health.json') as response:
+              health = json.load(response)
+          assert health['status'] == 'ok', health
+          assert health['build_commit'] == os.environ['EXPECTED_COMMIT'], health
+          assert health['version'] != '', health
+          PY
 
   record-dispatch-context:
     if: github.event_name == 'workflow_dispatch'
