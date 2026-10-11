@@ -356,6 +356,12 @@ struct RelayEncryptionState: Codable, Equatable {
         )
     }
 
+    func withUnavailableEncryptionState() -> RelayEncryptionState {
+        RelayEncryptionState(dataAccount: dataAccount, mode: "unavailable", kid: nil,
+            enabledAt: nil, updatedAt: updatedAt, plaintextFields: plaintextFields,
+            ciphertextFields: ciphertextFields, obsoleteFields: obsoleteFields)
+    }
+
     enum CodingKeys: String, CodingKey {
         case dataAccount = "data_account"
         case mode, kid

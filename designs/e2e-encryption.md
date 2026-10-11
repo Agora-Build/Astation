@@ -22,6 +22,13 @@ grants, escrow and recovery, is maintained in Atem's
    then durably saves the report with the exact pin, verification generation,
    Astation signing identity and captured route. A transport identity alone
    is insufficient authorization.
+   Direct socket handlers capture an immutable route/account snapshot under
+   a short lock, then journal on the calling thread. They never synchronously
+   dispatch to the main queue: the main thread may be waiting for that socket's
+   event loop during status queries or shutdown. The main thread refreshes
+   snapshots on connection/account changes. Direct connection generations use
+   the socket's unique client UUID; relay handlers already execute on main and
+   additionally validate their authenticated relay connection generation.
 4. Processing uses the durable report and captured context, independently
    of Atem's process, socket or replacement connection. Under the identity
    lock, it rechecks the current pin and verification generation, signing
@@ -76,8 +83,13 @@ operation cannot complete a new one. Unsigned legacy packets fail closed.
 - Astation's protected local state and pins authorize transitions. The relay
   is transport and storage; its device labels, connection events, counters,
   modes and acknowledgments cannot authorize `on` or override device pins.
-  Without an approved local state, the displayed mode defaults to `off`;
-  a relay claim alone cannot display approved encryption.
+  Without an approved local state, the UI displays `unavailable` and disables
+  encryption changes; it cannot claim either plaintext or encrypted storage.
+  Relay reports do not create a signed initial state. Owner-approved device
+  verification persists and returns the initial signed `off` state when no
+  local account key exists, or pending `enabling` when a legacy key exists.
+  Subsequent broadcasts use that locally committed state. The UI-only
+  `unavailable` value is never persisted or signed as a protocol mode.
 - Only a validated completion may create a final encryption mode. The
   generic state setter starts pending operations. Existing approved states
   survive reconnects and relay disagreement.
@@ -105,6 +117,11 @@ and commit. Re-verification tests reuse identical keys and reject old
 reports. Forged signatures, accounts, devices, keys, partial scans and key
 proofs fail closed. Relay `on` claims cannot change local state, and relay
 reconnect replicates committed results without a connected Atem.
+Background direct completion must return while main is blocked waiting for
+the socket handler, retaining the journal for delayed finalization. Missing
+local state remains unavailable for every relay mode, without emitting an
+unsigned or synthetic `off` state. Fresh owner-approved verification returns
+a durable signed `off` state even without an account key.
 
 Swift and Rust share a migration-proof known-answer vector. Atem tests
 exercise read-back rejection and a bounded flush before immediate shutdown.

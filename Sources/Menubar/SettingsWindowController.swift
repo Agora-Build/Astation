@@ -693,13 +693,14 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
             let date = state.enabledAt.map { Date(timeIntervalSince1970: TimeInterval($0)).formatted() } ?? "unknown date"
             label.stringValue = "On since \(date) — key \(state.kid ?? "unknown")."
         case "disabling": label.stringValue = "Turning off — \(remaining). Run an updated, unlocked Atem command to migrate data."
+        case "unavailable": label.stringValue = "Encryption state unavailable. This Mac has no approved state for this account. Verify an Atem device before changing encryption."
         default: label.stringValue = "Unknown encryption state."
         }
         if let message = hubManager.relayEncryptionStatusMessage { label.stringValue += "\n\(message)" }
         encryptionOnButton?.isEnabled = state.mode == "off"
         encryptionOffButton?.isEnabled = state.mode == "on"
         encryptionRotateButton?.isEnabled = state.mode == "on"
-        encryptionShowButton?.isEnabled = state.mode != "off"
+        encryptionShowButton?.isEnabled = ["enabling", "on", "disabling"].contains(state.mode)
     }
 
     @objc private func turnOnEncryption() {

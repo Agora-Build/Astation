@@ -100,12 +100,14 @@ suites, and the Linux container metadata check. The resulting production
 rollout is recorded in Deploy Station run `38106294228`; use its completion
 and public health/build-commit checks to confirm deployment.
 
-## Active encryption work: not merged
+## Encryption implementation: PR #39
 
-Branch `feat/atem-e2e-verification` now commits the complete device-verification,
-storage-key and migration implementation and includes current `main`. It is
-being published for PR review and user testing. Leave the PR unmerged until
-the user completes those tests; the feature is not on `main` or deployed.
+[PR #39](https://github.com/Agora-Build/Astation/pull/39) implements device
+verification, storage-key escrow/unlock and durable encryption migration.
+The user has authorized squash merge after final review and passing checks.
+Check the PR's merge status and its Deploy Station run for the integration and
+deployment result. Native app installation is separate from relay deployment;
+retain the feature worktree while the running Local.app resides there.
 See [device verification](atem-device-verification.md) for the protocol,
 personal-team signing and the live test checklist.
 
@@ -116,8 +118,8 @@ lifecycle and security invariants are documented in `designs/e2e-encryption.md`
 on that branch. The relay must never establish device identity or authorize
 encryption state. Retain the design and regressions with the implementation.
 
-Publication verification repeats the provisioned 636-test Swift run with six
-expected skips, including 26 migration regressions and real Keychain/Secure
+Final local verification passes the provisioned 638-test Swift run with six
+expected skips, including 28 migration regressions and real Keychain/Secure
 Enclave recovery. The release build, 446 relay tests, three core suites,
 59 Node tooling tests and web checks pass. All 48 protocol fixtures match
 Atem `main` at `b73add8` byte for byte.
@@ -127,8 +129,15 @@ approval, denial, revocation, storage-key rotation, re-pairing, and migration
 to ON were subsequently confirmed with Genie. Atem PRs #40 and #41 are merged.
 Those completed checks are not pending build tasks.
 
-Remaining work is PR review and user testing, especially live verification
-of OFF and OFF-then-ON. Currently an updated, unlocked
+Review fixes remove a direct-socket/main-thread deadlock: immutable authenticated
+route/account snapshots are captured under a short lock and accepted reports
+are journaled on the calling thread. Connection generations use socket UUIDs.
+An account without locally approved encryption state displays Unavailable and
+disables changes. Only owner-approved device verification establishes the
+initial signed Off state; a relay report cannot create it.
+
+Remaining live verification includes OFF and OFF-then-ON; these checks have not
+been recorded and must not be claimed complete. Currently an updated, unlocked
 `atem cred unlock` or `atem pair` finishes a pending migration; `atem sync`
 talks only to the relay. Making sync connect to Astation to finish migration
 is a proposed behavior change, not an approved requirement.

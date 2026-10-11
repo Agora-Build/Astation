@@ -82,6 +82,24 @@ private final class MigrationQueue {
     func drain() { while !work.isEmpty { work.removeFirst()() } }
 }
 
+private final class ConcurrentMigrationQueue: @unchecked Sendable {
+    private let lock = NSLock()
+    private var work: [() -> Void] = []
+
+    func append(_ operation: @escaping () -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        work.append(operation)
+    }
+
+    func drain() {
+        lock.lock()
+        let pending = work
+        work.removeAll()
+        lock.unlock()
+        pending.forEach { $0() }
+    }
+}
+
 private final class MigrationRelaySocket: IdentityRelaySocket, @unchecked Sendable {
     var sent: [String] = []
     var closeCode = URLSessionWebSocketTask.CloseCode.invalid
@@ -192,6 +210,36 @@ final class AtemEncryptionMigrationTests: XCTestCase {
         queue.drain()
         XCTAssertEqual(try f.identity.state(account: f.account)?.mode, "on")
         XCTAssertTrue(try f.identity.pendingMigrationAccounts().isEmpty)
+    }
+
+    func testDirectCompletionReturnsWhileMainWaitsAndRetainsItsConnectionSnapshot() throws {
+        let f = try MigrationFixture(), queue = ConcurrentMigrationQueue()
+        let hub = AstationHubManager(skipProjectLoad: true, atemE2EIdentity: f.identity,
+            loadMigrationKey: { _, _ in f.key }, dispatchMigration: { queue.append($0) })
+        let connectedAt = Date(timeIntervalSince1970: 100)
+        hub.connectedClients = [ConnectedClient(id: f.route.clientId, clientType: "Atem",
+            connectedAt: connectedAt, atemId: f.deviceId)]
+        queue.drain()
+        let report = try f.report(), returned = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            _ = hub.handleMessage(.encryptionMigrationComplete(mode: "on", kid: f.key.kid, completion: report),
+                from: f.route.clientId)
+            returned.signal()
+        }
+        // Models main's synchronous socket-count/shutdown wait while NIO handles a frame.
+        XCTAssertEqual(returned.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(try f.identity.pendingMigrationAccounts(), [f.account])
+        let record = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(f.storage.data)) as? [String: Any])
+        let migrations = try XCTUnwrap(record["migrations"] as? [String: [String: Any]])
+        let accepted = try XCTUnwrap(migrations[f.account]?["accepted"] as? [String: Any])
+        let route = try XCTUnwrap(accepted["route"] as? [String: Any])
+        XCTAssertEqual(route["connectionId"] as? String, f.route.clientId)
+
+        // Two sockets can have identical timestamps; their connection UUIDs stay distinct.
+        hub.connectedClients = [ConnectedClient(id: UUID().uuidString, clientType: "Atem",
+            connectedAt: connectedAt, atemId: f.deviceId)]
+        queue.drain()
+        XCTAssertEqual(try f.identity.state(account: f.account)?.mode, "on")
     }
 
     func testDuplicateDeliveryBeforeAndAfterCommitDoesNotAdvanceEpochOrRewriteJournal() throws {
@@ -448,7 +496,7 @@ final class AtemEncryptionMigrationTests: XCTestCase {
         XCTAssertEqual(try f.identity.state(account: f.account)?.mode, "on")
         XCTAssertNil(try f.identity.state(account: otherAccount))
         XCTAssertEqual(relay.hub.relayEncryptionState?.dataAccount, otherAccount)
-        XCTAssertEqual(relay.hub.relayEncryptionState?.mode, "off")
+        XCTAssertEqual(relay.hub.relayEncryptionState?.mode, "unavailable")
         XCTAssertTrue(published.isEmpty)
         XCTAssertTrue(relay.socket.sent.isEmpty)
         try relay.socket.emit(["type": "relayEncryptionState", "data_account": f.account, "mode": "enabling", "kid": f.key.kid,
@@ -479,12 +527,50 @@ final class AtemEncryptionMigrationTests: XCTestCase {
         f.storage.data = try JSONSerialization.data(withJSONObject: record)
         let before = f.storage.data, relay = try MigrationRelayFixture(f)
         try await relay.start(authenticate: false)
-        try relay.socket.emit(["type": "relayEncryptionState", "data_account": f.account, "mode": "on", "kid": f.key.kid,
-            "updated_at": 0, "plaintext_fields": 0, "ciphertext_fields": 10, "obsolete_fields": 0])
+        var broadcasts: [AstationMessage] = []
+        relay.hub.broadcastHandler = { broadcasts.append($0) }
+        for mode in ["on", "off", "enabling", "disabling"] {
+            try relay.socket.emit(["type": "relayEncryptionState", "data_account": f.account, "mode": mode, "kid": f.key.kid,
+                "updated_at": 0, "plaintext_fields": 0, "ciphertext_fields": 10, "obsolete_fields": 0])
+            await relay.drain()
+            XCTAssertEqual(relay.hub.relayEncryptionState?.mode, "unavailable")
+            XCTAssertNil(relay.hub.relayEncryptionState?.kid)
+            XCTAssertNil(try f.identity.state(account: f.account))
+            XCTAssertEqual(f.storage.data, before)
+        }
+        XCTAssertTrue(broadcasts.isEmpty)
+    }
+
+    func testOwnerVerifiedPlainAccountPersistsAndBroadcastsSignedOffState() async throws {
+        let f = try MigrationFixture(), relay = try MigrationRelayFixture(f)
+        let account = "plain-account-\(UUID().uuidString)"
+        try await relay.start(authenticate: false)
+        var broadcasts: [AstationMessage] = []
+        relay.hub.broadcastHandler = { broadcasts.append($0) }
+        let frame: [String: Any] = ["type": "relayEncryptionState", "data_account": account, "mode": "off",
+            "updated_at": 0, "plaintext_fields": 0, "ciphertext_fields": 0, "obsolete_fields": 0]
+        try relay.socket.emit(frame)
+        await relay.drain()
+        XCTAssertEqual(relay.hub.relayEncryptionState?.mode, "unavailable")
+        XCTAssertTrue(broadcasts.isEmpty)
+        let verified = try f.identity.completeVerification(account: account, deviceId: f.deviceId,
+            reveal: AtemVerifyReveal(devicePub: f.device.publicKey.rawRepresentation,
+                deviceSignPub: f.signing.publicKey.rawRepresentation, unlockAuthPub: f.unlockAuth.publicKey.rawRepresentation,
+                nonce: Data(repeating: 4, count: 32)), transcript: Data(repeating: 9, count: 32),
+            expectedSigningKey: f.keys.signPub, key: nil)
+        XCTAssertTrue(verified.grants.isEmpty)
+        XCTAssertEqual(atemStatementFields(verified.accountState)[3], Data("off".utf8))
+        let restarted = AtemE2EIdentity(storage: f.storage, crypto: f.crypto)
+        XCTAssertEqual(try restarted.state(account: account)?.mode, "off")
+        try relay.socket.emit(frame)
         await relay.drain()
         XCTAssertEqual(relay.hub.relayEncryptionState?.mode, "off")
-        XCTAssertNil(try f.identity.state(account: f.account))
-        XCTAssertEqual(f.storage.data, before)
+        guard case .encryptionMode(let signed) = try XCTUnwrap(broadcasts.last) else {
+            return XCTFail("Owner-verified plain account did not broadcast a signed state")
+        }
+        XCTAssertEqual(atemStatementFields(signed)[1], Data(account.utf8))
+        XCTAssertEqual(atemStatementFields(signed)[3], Data("off".utf8))
+        XCTAssertTrue(AtemE2ECrypto.verifyP256Signature(signed.signature, message: signed.statement, publicKey: f.keys.signPub))
     }
 
     func testRelayMissedPendingTransitionRecoversWithoutChangingLocalFinalState() async throws {

@@ -50,6 +50,10 @@ the specified length-prefixed `atem-grant-info-v1` context, and empty AAD.
 `encryptionMode` carries a signed state from this Mac's local approved
 state. Relay reports supply migration statistics; they cannot authorize a
 downgrade, overwrite a local mode/key ID, or delete local account keys.
+Without locally approved state, this Mac displays Unavailable and disables
+encryption changes. Owner-approved verification establishes and persists the
+initial signed Off state when no account key exists, or pending Enabling for
+a legacy key. Unavailable is a UI value, never a signed protocol mode.
 `keyRequest` needs the authenticated device's exact pinned public key.
 Legacy fingerprints and unsigned wrapped grants do not authorize access.
 
@@ -61,6 +65,11 @@ the authenticated device, connection generation and account, verifies the
 device-signed `atem-migration-complete-v1` and its account-key proof, and
 persists the accepted report before asynchronous dispatch. Completion uses
 that durable journal, so Atem can disconnect immediately after delivery.
+Direct socket handlers capture immutable authenticated route/account snapshots
+under a short lock and journal on the calling thread, avoiding a synchronous
+main-queue hop while main may be waiting for the socket event loop. Their
+connection generation is the socket's unique client UUID. Relay handlers run
+on main and additionally validate the authenticated relay connection generation.
 Final state, epoch and signature commit together before publication;
 duplicates reuse the committed result. Startup/reconnect resume accepted
 work and retry key-access, signing and persistence failures.
@@ -217,9 +226,9 @@ notarization before shipping this flow.
 
 ## Validation
 
-Local publication checks on 2026-10-10 pass: 636 provisioned Swift tests
+Local publication and review checks on 2026-10-10 pass: 638 provisioned Swift tests
 with six expected media/model skips and zero failures, including all
-26 migration regressions and the protected Keychain/Secure Enclave tests;
+28 migration regressions and the protected Keychain/Secure Enclave tests;
 the Swift release build; 446 relay tests (109 database/service tests deferred
 to CI); three core suites; 59 Node tooling tests; and web codec, proxy and
 screen-sharing checks. Shell syntax and patch whitespace checks pass.
@@ -260,6 +269,9 @@ grant, and checks replay rejection through the Secure Enclave identity.
 Migration tests cover immediate local/relay disconnect, delayed work,
 duplicates, restart, persistence/signing/key failures, reconnect, old-report
 replay after identical-key re-verification, and revocation around commit.
+They also cover direct completion while main waits for the handler, same-time
+connection replacement, unavailable state for every relay mode, and durable
+signed Off state after fresh owner-approved verification.
 Swift and Rust share an independently calculated migration-proof vector.
 
 Before release, complete a real `atem pair` against an isolated account,
@@ -278,11 +290,12 @@ connects to Astation and finishes a pending migration, including when the
 agent is already unlocked. Automated crypto/controller tests do not exercise
 the user's physical Touch ID interaction or production relay pairing.
 
-### Tests Before Squash Merge
+### Remaining Live Verification
 
 Live approval, denial, revocation, rotation, re-pairing and migration to ON
-have already passed with Genie. Keep this PR open while the user checks the
-remaining OFF and OFF-then-ON paths with the updated app and client:
+have already passed with Genie. The user has authorized squash merge after
+final review and passing checks. The following live OFF and OFF-then-ON checks
+remain unrecorded; run them with the updated app and client:
 
 1. Confirm Astation's relay/account status is connected and `atem cred status`
    on the other machine reports a verified device and an unlocked key agent.
