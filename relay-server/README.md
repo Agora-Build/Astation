@@ -287,6 +287,14 @@ Config: Set `relay_url` and `ws_url` in `.atem/config.toml`
 | `AGORA_ACCOUNT_SUBJECT_FIELD` | _(unset)_ | Top-level JSON field in the user-info response containing the permanent Agora account subject (for example `sub`, once confirmed by the SSO service owner). Email and the observed rotating `loginId` are unsafe. |
 | `AGORA_ACCOUNT_AUTH_TIME_FIELD` | _(unset)_ | Optional top-level integer Unix-time field recording when the user most recently authenticated. Required for the lost/offline-Mac merge path; without it, online approval still works. |
 
+**Legacy account-verifier settings:** leave all three `AGORA_ACCOUNT_*`
+variables unset while building [unified agora.build identity](../docs/specs/2026-10-10-unified-agora-build-identity.md).
+They enable optional Agora-specific registration; ordinary pairing, sync, and
+E2EE do not require them. They are not prerequisites for the portal's new SSO.
+Replace them with the verified issuer/account integration and remove them only
+after a safe migration. See [the deployment guide](../DEPLOY.md#optional-agora-account-registration)
+for the current compatibility contract and disabled-mode behavior.
+
 **Production:**
 ```bash
 CORS_ORIGIN=https://station.agora.build

@@ -118,6 +118,26 @@ recovery protocol remain authoritative for E2EE device trust and key access.
   login does not erase keys already held by an approved device; revocation
   must follow the E2EE protocol and its key-rotation rules.
 
+## Legacy configuration decision
+
+Leave `AGORA_ACCOUNT_USERINFO_URL`, `AGORA_ACCOUNT_SUBJECT_FIELD`, and
+`AGORA_ACCOUNT_AUTH_TIME_FIELD` unset while the unified service is built.
+They are optional Agora-specific relay settings, not requirements the portal
+team must satisfy to build agora.build SSO. Ordinary pairing, sync, and E2EE
+can operate without this registration feature.
+
+| Legacy setting | Intended replacement |
+| --- | --- |
+| `AGORA_ACCOUNT_USERINFO_URL` | Trusted agora.build issuer and API audience, with access-token validation through issuer signing keys/JWKS or supported introspection. |
+| `AGORA_ACCOUNT_SUBJECT_FIELD` | The permanent agora.build account identity defined by the new SSO contract; preserve issuer/subject namespaces when binding identities. |
+| `AGORA_ACCOUNT_AUTH_TIME_FIELD` | Fresh-authentication proof for sensitive actions that require it, using the new provider's documented semantics. Separate this from device approval and E2EE recovery. |
+
+Do not configure a guessed Agora userinfo endpoint as a temporary dependency.
+Retain the existing compatibility implementation until the replacement and
+data/account migration are verified, then remove its settings and code as part
+of that migration. The new configuration names and deployed issuer URL remain
+to be defined by the selected identity service.
+
 ## Migration from the current implementation
 
 Today Astation uses Agora-specific OAuth paths, client ID `atem`, and scopes

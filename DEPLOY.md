@@ -222,6 +222,17 @@ current compatibility implementation; they are not the configuration of the
 future service. The relay will need issuer-aware verification before accepting
 unified account tokens, and changing only the userinfo URL is insufficient.
 
+**Configuration decision:** leave `AGORA_ACCOUNT_USERINFO_URL`,
+`AGORA_ACCOUNT_SUBJECT_FIELD`, and `AGORA_ACCOUNT_AUTH_TIME_FIELD` all unset.
+These legacy settings are not prerequisites for ordinary pairing, sync, or
+E2EE, and the portal SSO team does not need to obtain them before building the
+unified identity service. Its integration will use a trusted agora.build
+issuer, audience-checked token verification through signing keys or
+introspection, and a permanent agora.build account identity. Sensitive actions
+may additionally require fresh-authentication proof; that never substitutes
+for E2EE device approval or cryptographic recovery. Replace and remove the
+legacy settings only after the new integration and safe migration are verified.
+
 Account registration links Astations to a verified Agora account so they can
 request explicit data grouping. It is separate from relay device authentication.
 When registration is disabled, unregistered Astations use their own Astation ID
@@ -241,7 +252,8 @@ account registration. A healthy deployment can still reject registration.
 If account grouping is a production requirement, include its acceptance check
 in the release checklist; infrastructure checks alone are insufficient.
 
-**Identity-provider contract.** Before enabling registration, obtain the
+**Legacy identity-provider contract (reference).** If enabling this compatibility
+feature before migration, obtain the
 approved endpoint and permanent account-ID field from the SSO service owner.
 Use HTTPS in production. The relay's request and response contract is:
 
@@ -259,8 +271,9 @@ the account-verification contract: during the October 10 investigation that
 endpoint returned 401 even with a freshly refreshed, working Agora CLI token.
 Do not configure it with a guessed subject field.
 
-**Preflight.** With Node.js 22 or newer, set the non-secret verifier settings
-locally and pipe a current SSO access token into the check. For example, copy
+**Legacy preflight (reference).** With Node.js 22 or newer, set the non-secret
+verifier settings locally and pipe a current SSO access token into the check.
+For example, copy
 the token from the approved credential source, then run:
 
 ```bash
