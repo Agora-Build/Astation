@@ -1,7 +1,8 @@
 # Astation Agent Handoff
 
-Updated on 2026-10-11 for merged encryption and credential UI work against
-`main` at `91d5a23`. The prior operational audit on 2026-10-10 checked `b426292`,
+Updated on 2026-10-11 for release preparation against `main` at `a174a41`,
+including merged encryption, credential UI and documentation work.
+The prior operational audit on 2026-10-10 checked `b426292`,
 open PRs, worktree state, and production verification. The original 2026-10-08
 audit also checked the task vault (`v-8ut37j7X`). This is the current follow-up
 list; implementation and deployment history remain in Git and the vault. Read local `AGENTS.md`
@@ -9,10 +10,23 @@ instructions when present, then
 [CLAUDE.md](../CLAUDE.md), [README.md](../README.md), and
 [DEPLOY.md](../DEPLOY.md) for repository rules and runbooks.
 
-## Current baseline
+## macOS release preparation
 
-PRs #39-#42 are merged. Production deployment of `91d5a23` passed in
-[Deploy Station run 38125486057](https://github.com/Agora-Build/Astation/actions/runs/38125486057);
+The user assigned Astation release preparation to this agent; the other agent
+owns Atem releases and reads shared Atem memory. The last Astation public
+release is `v0.4.19`; the next planned version is `v0.4.20`.
+The user confirmed on 2026-10-11 that the paid personal Apple Developer account
+is not available yet. Public release is blocked on Developer ID identities,
+the production bundle's distribution profile and notarization credentials.
+The current Local.app remains valid for local verification while its profile
+is current. Keep its existing identity; the enterprise account is outside scope.
+No release tag has been pushed. See the [release runbook](releases.md) for
+required secret names, rehearsal and the remaining real-Mac checks.
+
+## Deployed baseline
+
+PRs #39-#43 are merged. Production deployment of `a174a41` passed in
+[Deploy Station run 38158093318](https://github.com/Agora-Build/Astation/actions/runs/38158093318);
 public health and both identity WebSocket paths passed, with two relay replicas
 and healthy Redis/Postgres stores. Native app installation is separate from
 relay/webapp deployment. See the user-facing [credentials guide](credentials.md)

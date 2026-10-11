@@ -167,18 +167,17 @@ Atem ──WS markTaskResult──→ Astation
 
 ## Release Process
 
-Push a git tag to trigger GitHub Actions:
+Follow [the macOS release runbook](docs/releases.md) before creating a tag.
+Public distribution requires Developer ID Application/Installer identities,
+an authorized distribution profile for Keychain access, and notarization.
+The paid personal account is not available as of 2026-10-11, so release
+publication is blocked. Keep the existing provisioned Local.app for testing.
 
-```bash
-git tag v0.2.0
-git push origin v0.2.0
-```
-
-`.github/workflows/release.yml`:
-1. Builds C++ core library on macOS (arm64)
-2. Builds Swift package in release mode
-3. Creates .app bundle + .pkg installer
-4. Creates GitHub release with both artifacts
+`.github/workflows/release.yml` checks signing prerequisites, builds the C++
+core and Swift app, signs and notarizes the app and installer, and checks
+protected Keychain access and Gatekeeper. A manual rehearsal uploads artifacts
+without publishing; a verified `vX.Y.Z` tag publishes the release and any
+changed Docker images. See the runbook for secrets, validation and commands.
 
 ## Adding a New Message Type
 

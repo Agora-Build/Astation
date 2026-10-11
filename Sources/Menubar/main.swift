@@ -5,10 +5,10 @@ if CommandLine.arguments.contains("--cloud-transcription-worker") {
     exit(CloudTranscriptionWorker.run())
 }
 
-#if DEBUG
 if CommandLine.arguments.contains("--bundled-resources-check") {
     exit(TranscriptionValidation.checkBundledResources())
 }
+#if DEBUG
 if CommandLine.arguments.contains("--transcription-check") {
     exit(TranscriptionValidation.run())
 }

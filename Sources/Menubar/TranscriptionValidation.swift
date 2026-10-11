@@ -1,7 +1,6 @@
-#if DEBUG
 import AVFoundation
 
-/// Explicit, file-only inference check: never asks for capture permission or joins RTC.
+/// Resource validation exits before app startup; file-only inference remains Debug-only.
 enum TranscriptionValidation {
     static func checkBundledResources() -> Int32 {
         do {
@@ -20,6 +19,7 @@ enum TranscriptionValidation {
         }
     }
 
+    #if DEBUG
     static func run() -> Int32 {
         func argument(_ name: String) -> String? {
             guard let index = CommandLine.arguments.firstIndex(of: name), index + 1 < CommandLine.arguments.count else { return nil }
@@ -75,7 +75,9 @@ enum TranscriptionValidation {
         RunLoop.main.run()
         return 1
     }
+    #endif
 }
+#if DEBUG
 private final class ValidationTranscript: @unchecked Sendable {
     private let lock = NSLock()
     private var buffer = TranscriptBuffer()

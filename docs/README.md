@@ -6,6 +6,7 @@ work. Completed implementation checklists are available in Git history.
 | Document | Why it is retained |
 | --- | --- |
 | [Agent handoff](agent-handoff.md) | Remaining work, encryption publication, SSO direction, and validation/operations follow-ups |
+| [macOS releases](releases.md) | Paid personal signing prerequisites, Keychain authorization, notarization, rehearsal, publication and current release blocker |
 | [Atem device verification](atem-device-verification.md) | Safety codes, protected key escrow, Touch ID unlock, personal-team signing, and cross-machine tests |
 | [Credentials on this Mac](credentials.md) | Keychain editor, remote Atem pairing/unlock, project suggestions and capitalization, migration status, and local signing |
 | [Credential project discovery](../designs/credential-project-discovery.md) | Editable picker, encrypted Atem project reports, account isolation, and metadata lifecycle |

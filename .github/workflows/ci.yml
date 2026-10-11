@@ -63,6 +63,13 @@ jobs:
       - name: Build Swift package
         run: swift build -c release
 
+      - name: Verify Release resource check exits without app startup
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          subprocess.run([".build/release/astation", "--bundled-resources-check"], check=True, timeout=30)
+          PY
+
       - name: Run Swift tests (no live audio or paid services)
         run: swift test
 
@@ -93,6 +100,9 @@ jobs:
 
       - name: Test AI review tooling
         run: node --test .github/scripts/*.test.mjs
+
+      - name: Test release signing validation
+        run: python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'
 
   test-relay-server:
     name: Relay Server Tests
