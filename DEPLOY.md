@@ -138,27 +138,25 @@ a single relay without Redis still deploys):
 - `STATION_REQUIRE_REDIS`: `1` makes the health waits and the final check
   require `"redis":"ok"`. Any other value, or unset, skips the check.
 - `STATION_MIN_REPLICAS`: the minimum live relay replicas (`"replicas"` in
-  `/health`) the health waits and the final check require: `1` with relay-a
-  only, `2` once relay-b exists. Unset or `0` skips the check.
+  `/health`) the health waits and the final check require: `2` for the current
+  production deployment. Unset or `0` skips the check.
 
-Set both explicitly (`STATION_REQUIRE_REDIS=1`, `STATION_MIN_REPLICAS=2`) in
-the same change that adds relay-b. Otherwise a deploy can pass with Redis
-down or with a replica missing.
+Set both explicitly (`STATION_REQUIRE_REDIS=1`, `STATION_MIN_REPLICAS=2`) so a
+deploy cannot pass with Redis down or with a production replica missing.
 
 Runtime configuration:
 
 - Relay (relay-a and relay-b, identical): `PUBLIC_BASE_URL=https://station.agora.build`,
   `CORS_ORIGIN=https://station.agora.build`, `PORT=3000`, `RUST_LOG=info`, the
   existing PostgreSQL `DATABASE_URL`, `REDIS_URL` (Valkey, a Coolify secret),
-  and `RELAY_REPLICAS_EXPECTED` (`1` with relay-a only, `2` with relay-b). The
-  last one is a guard: above 1 without `REDIS_URL` the relay refuses to start
+  and `RELAY_REPLICAS_EXPECTED=2`. Above 1 without `REDIS_URL` the relay refuses to start
   (exit 1), and a value that isn't a positive integer also exits 1. Both apps
   carry the `station-relay-server` network alias, so nginx sees every replica.
   Health check `GET /health` on port 3000.
-- Optional Agora account registration: both relays need the same
-  `AGORA_ACCOUNT_USERINFO_URL`, `AGORA_ACCOUNT_SUBJECT_FIELD`, and, for
-  offline-Mac grouping, `AGORA_ACCOUNT_AUTH_TIME_FIELD`. See the configuration
-  and acceptance checks below before enabling this feature.
+- Account registration: leave `AGORA_ACCOUNT_USERINFO_URL`,
+  `AGORA_ACCOUNT_SUBJECT_FIELD`, and `AGORA_ACCOUNT_AUTH_TIME_FIELD` unset
+  while unified agora.build SSO is built. See the account-registration section
+  below for the disabled-mode behavior and migration plan.
 - Webapp: `STATION_RELAY_UPSTREAM=station-relay-server:3000`. All containers
   must use the `coolify` Docker network. nginx re-resolves the alias through
   Docker DNS every 10 s and spreads requests across every address it returns,
@@ -213,126 +211,35 @@ workflow also checks the final deployment status and public endpoints.
 
 #### Optional Agora account registration
 
-**Product direction:** the planned identity service is owned by agora.build,
-with GitHub, Google, Apple, and Agora as upstream sign-in providers. See
-[Unified agora.build Identity](docs/specs/2026-10-10-unified-agora-build-identity.md).
-Leave this legacy Agora-specific registration disabled while the unified
-service is being designed. The settings and preflight below describe the
-current compatibility implementation; they are not the configuration of the
-future service. The relay will need issuer-aware verification before accepting
-unified account tokens, and changing only the userinfo URL is insufficient.
+Leave `AGORA_ACCOUNT_USERINFO_URL`, `AGORA_ACCOUNT_SUBJECT_FIELD`, and
+`AGORA_ACCOUNT_AUTH_TIME_FIELD` unset while unified agora.build SSO is built.
+These settings enable optional Agora-specific registration and explicit data
+grouping. Ordinary pairing, memory/skills/vault sync, and E2EE do not require
+this feature; unregistered Astations keep using their Astation ID as the data
+account. Removing verifier configuration does not undo existing registrations
+or data groups in Postgres.
 
-**Configuration decision:** leave `AGORA_ACCOUNT_USERINFO_URL`,
-`AGORA_ACCOUNT_SUBJECT_FIELD`, and `AGORA_ACCOUNT_AUTH_TIME_FIELD` all unset.
-These legacy settings are not prerequisites for ordinary pairing, sync, or
-E2EE, and the portal SSO team does not need to obtain them before building the
-unified identity service. Its integration will use a trusted agora.build
-issuer, audience-checked token verification through signing keys or
-introspection, and a permanent agora.build account identity. Sensitive actions
-may additionally require fresh-authentication proof; that never substitutes
-for E2EE device approval or cryptographic recovery. Replace and remove the
-legacy settings only after the new integration and safe migration are verified.
+A warning that the URL and subject field are not configured means account
+registration is unavailable. Check relay authentication and encryption
+migration status separately when diagnosing connection or migration failures.
+`/health` and `verify-station.mjs` verify infrastructure, not account login or
+registration.
 
-Account registration links Astations to a verified Agora account so they can
-request explicit data grouping. It is separate from relay device authentication.
-When registration is disabled, unregistered Astations use their own Astation ID
-as the data account. Ordinary pairing, memory/skills/vault sync, and E2EE do not
-require this optional SSO integration. Registration does not merge data by itself.
+The planned replacement is [unified agora.build identity](docs/specs/2026-10-10-unified-agora-build-identity.md),
+with permanent agora.build accounts and linked GitHub, Google, Apple, and Agora
+sign-in providers. The portal team does not need these legacy settings to build
+that service. Product APIs will verify the trusted issuer and intended audience
+through signing keys/JWKS or supported token introspection. Sensitive actions
+may require fresh-authentication proof, separate from device approval and E2EE
+recovery. Changing only the current userinfo URL is insufficient.
 
-On October 10, 2026, neither production relay had `AGORA_ACCOUNT_*` configured.
-That is a supported mode: account registration fails closed while ordinary
-relay operation continues. A log message saying
-`AGORA_ACCOUNT_USERINFO_URL and AGORA_ACCOUNT_SUBJECT_FIELD are not configured`
-means account registration is unavailable. It does not mean that the identity
-WebSocket disconnected, and does not by itself explain an encryption migration
-failure. Check relay authentication and migration status separately.
-
-`/health` and `verify-station.mjs` check infrastructure availability, not SSO
-account registration. A healthy deployment can still reject registration.
-If account grouping is a production requirement, include its acceptance check
-in the release checklist; infrastructure checks alone are insufficient.
-
-**Legacy identity-provider contract (reference).** If enabling this compatibility
-feature before migration, obtain the
-approved endpoint and permanent account-ID field from the SSO service owner.
-Use HTTPS in production. The relay's request and response contract is:
-
-| Setting | Required contract |
-| --- | --- |
-| `AGORA_ACCOUNT_USERINFO_URL` | An HTTPS endpoint accepting `GET` with `Authorization: Bearer <Agora SSO access token>`. Valid tokens return successful JSON; invalid/expired tokens return HTTP 401 or 403. |
-| `AGORA_ACCOUNT_SUBJECT_FIELD` | A top-level JSON field containing a permanent account ID as a string. After trimming, it must be nonempty and at most 512 UTF-8 bytes. The ID must remain the same across sign-ins and token refreshes, and differ for different accounts. Nested fields and numeric IDs are unsupported. |
-| `AGORA_ACCOUNT_AUTH_TIME_FIELD` | Optional top-level integer Unix timestamp in seconds for the most recent user authentication. Required for the delayed/offline-Mac grouping path, which checks a fresh sign-in within five minutes (allowing up to 60 seconds of future clock skew). Token refresh time is not authentication time. Without this field, online approval can still work. |
-
-Use exact field names without surrounding whitespace. Email and the rotating
-`loginId` in the OAuth token response are unsuitable account IDs. Locally
-decoded token claims are not an independently verified identity. The app's
-best-effort display-name request to `/api/v0/oauth/userinfo` does not establish
-the account-verification contract: during the October 10 investigation that
-endpoint returned 401 even with a freshly refreshed, working Agora CLI token.
-Do not configure it with a guessed subject field.
-
-**Legacy preflight (reference).** With Node.js 22 or newer, set the non-secret
-verifier settings locally and pipe a current SSO access token into the check.
-For example, copy
-the token from the approved credential source, then run:
-
-```bash
-export AGORA_ACCOUNT_USERINFO_URL='https://<approved-sso-host>/<approved-path>'
-export AGORA_ACCOUNT_SUBJECT_FIELD='<confirmed-permanent-id-field>'
-# Only when the provider supports the authentication-time contract:
-# export AGORA_ACCOUNT_AUTH_TIME_FIELD='<confirmed-authentication-time-field>'
-
-pbpaste | node .github/scripts/check-account-verifier.mjs
-```
-
-The token is read from standard input; keep it out of command arguments,
-shell history, Coolify environment variables, and logs. Clear the clipboard
-after use. The check first requires rejection of a randomly generated invalid
-token, then checks the real token and response field types. It uses bounded
-requests, refuses redirects, and prints neither tokens, account IDs, nor
-response bodies. When authentication time is configured, it checks its type;
-the offline grouping flow still requires a fresh sign-in. A passing preflight
-does not establish ID permanence: confirm that in the provider contract and
-across independent sign-ins, including a different test account. This check
-does not register an Astation or change production state.
-
-**Coolify rollout.** Log in to `https://smt.agora.build` and open both relay
-applications on Volumetric. Save identical verifier settings as **runtime**
-environment variables, with build-time injection disabled. The relay loads
-them at startup, so saving variables without redeploying does not activate
-them. Astation supplies the user's SSO token at registration time; never store
-a user's token in the relay configuration.
-
-1. Record the previous verifier settings for rollback, including whether they
-   were absent. Run the preflight against the approved provider.
-2. Save the settings on Relay A and Relay B. Deploy Relay A first; wait for
-   Coolify to report `finished`, confirm the new container is healthy, then
-   run the two-replica public health check above. Public health alone can be
-   answered by Relay B and does not prove Relay A finished deploying.
-3. Deploy Relay B, waiting for deployment completion and health in the same
-   way. Stop on any failure. Inspect the saved runtime settings on each app;
-   successful registration through one replica cannot establish that the
-   other replica has identical configuration.
-4. Reconnect a signed-in Astation. Confirm relay device authentication succeeds
-   and `relayRegisterAccount` receives `relayAck` with `ok: true`. Check that
-   the account-device list includes this Mac. Use parsed status/UI information
-   rather than dumping raw WebSocket frames, which can contain credentials.
-5. Verify ordinary pairing and data sync still work. If delayed/offline-Mac
-   grouping is required, test it with a fresh sign-in and disposable accounts
-   before attempting to group real data.
-
-**Rollback and troubleshooting.** If registration fails, check the provider's
-status, response contract, and both replicas' runtime settings. HTTP 401/403
-means the provider rejected the token; setting a different subject field
-cannot repair that. Restore the previous verifier settings and redeploy each
-relay sequentially if necessary. Removing the URL or subject field disables
-new registration; it does not undo registrations or data groups already stored
-in Postgres. Account grouping changes need their own recovery plan and backups.
-
-The SSO provider establishes the account subject; Astation's device keys and
-proof of possession establish device identity. Configuring SSO must not bypass
-device verification or make the relay authoritative for E2EE keys or migration
-completion.
+Keep the runtime compatibility implementation until the new integration and
+safe account/data migration are verified, then remove its settings and code.
+The [relay environment reference](relay-server/README.md#environment-variables)
+describes the existing verifier contract; the unified identity specification
+contains the migration and acceptance requirements. Any future authentication
+rollout must verify each replica's configuration and product login behavior in
+addition to infrastructure health.
 
 #### Relay replicas and Valkey
 
