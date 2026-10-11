@@ -1,14 +1,22 @@
 # Astation Agent Handoff
 
-Updated on 2026-10-10 against `main` at `b426292`, open PRs, worktree state, and
-production verification. The original 2026-10-08 audit also checked the task
-vault (`v-8ut37j7X`). This is the current follow-up list; implementation and
-deployment history remain in Git and the vault. Read local `AGENTS.md`
+Updated on 2026-10-11 for merged encryption and credential UI work against
+`main` at `91d5a23`. The prior operational audit on 2026-10-10 checked `b426292`,
+open PRs, worktree state, and production verification. The original 2026-10-08
+audit also checked the task vault (`v-8ut37j7X`). This is the current follow-up
+list; implementation and deployment history remain in Git and the vault. Read local `AGENTS.md`
 instructions when present, then
 [CLAUDE.md](../CLAUDE.md), [README.md](../README.md), and
 [DEPLOY.md](../DEPLOY.md) for repository rules and runbooks.
 
 ## Current baseline
+
+PRs #39-#42 are merged. Production deployment of `91d5a23` passed in
+[Deploy Station run 38125486057](https://github.com/Agora-Build/Astation/actions/runs/38125486057);
+public health and both identity WebSocket paths passed, with two relay replicas
+and healthy Redis/Postgres stores. Native app installation is separate from
+relay/webapp deployment. See the user-facing [credentials guide](credentials.md)
+for current pairing, key-agent upgrade, project-picker and migration steps.
 
 Production uses two relay replicas with Postgres and Valkey. After PR #38
 deployed on 2026-10-10 as `28c6320` (Deploy Station run `38104654861`),
@@ -100,22 +108,19 @@ suites, and the Linux container metadata check. The resulting production
 rollout is recorded in Deploy Station run `38106294228`; use its completion
 and public health/build-commit checks to confirm deployment.
 
-## Encryption implementation: PR #39
+## Encryption implementation merged
 
-[PR #39](https://github.com/Agora-Build/Astation/pull/39) implements device
-verification, storage-key escrow/unlock and durable encryption migration.
-The user has authorized squash merge after final review and passing checks.
-Check the PR's merge status and its Deploy Station run for the integration and
-deployment result. Native app installation is separate from relay deployment;
-retain the feature worktree while the running Local.app resides there.
+[PR #39](https://github.com/Agora-Build/Astation/pull/39) merged as `f9c52dd`
+and implements device verification, storage-key escrow/unlock and durable encryption migration.
+Retain the app worktree while the running Local.app resides there.
 See [device verification](atem-device-verification.md) for the protocol,
 personal-team signing and the live test checklist.
 
 The local migration implementation captures authenticated device and connection
 context before dispatch, journals accepted reports, and commits completion
 durably and idempotently after migration and cryptographic validation. Its
-lifecycle and security invariants are documented in `designs/e2e-encryption.md`
-on that branch. The relay must never establish device identity or authorize
+lifecycle and security invariants are documented in [designs/e2e-encryption.md](../designs/e2e-encryption.md).
+The relay must never establish device identity or authorize
 encryption state. Retain the design and regressions with the implementation.
 
 Final local verification passes the provisioned 638-test Swift run with six
@@ -186,8 +191,10 @@ required work:
   named secrets in the protected Mac Keychain, with project/global scopes and
   Touch ID for save/update/delete/copy. See [credentials](credentials.md).
   Its project picker includes encrypted reports from updated, unlocked Atem
-  devices and saved scopes; manual Git-remote entry remains available. This
-  reporting requires the companion Atem credential-project-reporting change.
+  devices and saved scopes; manual Git-remote entry remains available.
+  Companion Atem reporting and original-case labels are merged in Atem PRs
+  #44 and #46; Astation PRs #40-#42 provide the editor, embedded Touch ID and
+  case-insensitive scope identity. Update both the CLI and its key agent.
   The designed Atem get/list integration, signed manifests and scope grants
   remain separate work; current Atem does not implement those commands. Local
   credentials are not published to the relay. Keep values out of memory,

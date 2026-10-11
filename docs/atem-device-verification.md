@@ -13,6 +13,10 @@ byte for byte. The migration-key proof also matches that client's Rust
 known-answer test. Use this client version or newer for live tests, including
 its running key agent; an old executable or agent cannot complete migration.
 
+For the current pairing, project-picker and migration steps, use the
+[credentials guide](credentials.md). Its Atem commands also work from another
+machine; Touch ID approval remains on the home Astation Mac.
+
 ## Protocol And Trust
 
 The existing authenticated WebSocket carries `verifyCommit`, `verifyKeys`,
@@ -222,11 +226,13 @@ message alone does not prove a signing mismatch. Current builds distinguish
 an unsupported newer format and tell you to update; all such failures retain
 the existing identity and device pins.
 
-Quit Astation before running the signing command: the packager refuses to
-replace a running bundle. For this feature worktree, launch the result with:
+Keep the same Personal Team and bundle identity when updating an existing
+installation so it retains access to its protected Keychain items. Quit Astation
+before running the signing command: the packager refuses to replace a running
+bundle. From that worktree, launch the result with:
 
 ```sh
-open "/Users/brent/Dev/Agora.Build/Astation-e2e-verification/.build/Astation Local.app"
+open ".build/Astation Local.app"
 ```
 
 `package-dev-app.sh` also accepts `ASTATION_SIGNING_IDENTITY` and
