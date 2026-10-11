@@ -267,7 +267,8 @@ The Astation macOS app uses this relay server for:
 2. **Pairing** - `AtemPairingManager.swift` connects WebSocket for Atem pairing
 3. **RTC Sessions** - `SessionLinkManager.swift` creates shareable screen sharing links
 
-Config: Set `relay_url` and `ws_url` in `.atem/config.toml`
+Atem stores the relay base URL in `astation_relay_url` and the direct
+WebSocket URL in `astation_ws`, in `~/.config/atem/config.toml`.
 
 ---
 
@@ -284,8 +285,16 @@ Config: Set `relay_url` and `ws_url` in `.atem/config.toml`
 | `RELAY_REPLICAS_EXPECTED` | `1` | How many relay replicas the deployment runs. Above 1 without `REDIS_URL`, the relay refuses to start (exit 1); a value that isn't a positive integer also exits 1. |
 | `DATABASE_URL` | _(unset)_ | Postgres connection string shared by **vault**, **knowledge sync (Atem Memory)**, **relay identity**, and optional Agora account grouping (e.g. `postgres://vault:vault@localhost:5432/vault`), one pool for all. When unset, all fall back to **in-memory** (non-durable: bindings, registered keys, and account groups are lost on restart) and log a warning. Migrations in `migrations/` run automatically at startup. |
 | `AGORA_ACCOUNT_USERINFO_URL` | _(unset)_ | Server-side endpoint that accepts the Agora SSO bearer token and returns the stable account subject. Account registration fails closed when this or `AGORA_ACCOUNT_SUBJECT_FIELD` is unset. Do not configure this with an endpoint whose identity changes between sign-ins. |
-| `AGORA_ACCOUNT_SUBJECT_FIELD` | _(unset)_ | Top-level JSON field in the user-info response containing the permanent Agora account subject (for example `sub`, once confirmed by the SSO service owner). Email and the observed rotating `loginId` are unsafe. |
+| `AGORA_ACCOUNT_SUBJECT_FIELD` | _(unset)_ | Top-level JSON string field in the user-info response containing the permanent Agora account subject, confirmed by the SSO service owner. Email and the observed rotating `loginId` are unsafe. |
 | `AGORA_ACCOUNT_AUTH_TIME_FIELD` | _(unset)_ | Optional top-level integer Unix-time field recording when the user most recently authenticated. Required for the lost/offline-Mac merge path; without it, online approval still works. |
+
+**Legacy account-verifier settings:** leave all three `AGORA_ACCOUNT_*`
+variables unset while building [unified agora.build identity](../docs/specs/2026-10-10-unified-agora-build-identity.md).
+They enable optional Agora-specific registration; ordinary pairing, sync, and
+E2EE do not require them. They are not prerequisites for the portal's new SSO.
+Replace them with the verified issuer/account integration and remove them only
+after a safe migration. See [the deployment guide](../DEPLOY.md#optional-agora-account-registration)
+for the current compatibility contract and disabled-mode behavior.
 
 **Production:**
 ```bash

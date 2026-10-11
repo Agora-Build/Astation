@@ -12,6 +12,7 @@ work. Completed implementation checklists are available in Git history.
 | [Live transcription](live-transcription.md) | Local/cloud captions, draggable floating window, model downloads, privacy, and validation |
 | [Screen sharing](screen-sharing.md) | ScreenCaptureKit capture, Agora publication, optional system audio, browser controls, and verification |
 | [SSO authentication design](sso-authentication.md) | Browser login, token refresh, encrypted session storage, and credential consumers |
+| [Unified agora.build identity](specs/2026-10-10-unified-agora-build-identity.md) | Proposed shared accounts for Astation, Atem, and Vox, provider linking, trust boundaries, and migration |
 | [Vault storage design](vault-storage.md) | Storage semantics, persistence, caller resolution, and concurrency boundaries |
 | [Device Authentication v2](specs/2026-07-21-device-authentication-v2.md) | Wire protocol shared with Atem and unresolved production blockers |
 | [Relay device key recovery](relay-device-key-recovery.md) | Keychain access retries, authenticated signing-key repair, and the relay trust reset workflow |
