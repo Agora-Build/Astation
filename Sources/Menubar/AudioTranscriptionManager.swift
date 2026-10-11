@@ -10,6 +10,27 @@ private struct TranscriptionSourceWorker: @unchecked Sendable {
     let inbox: TranscriptionInbox
 }
 
+private final class TranscriptionRunGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var open = true
+    func close() { lock.withLock { open = false } }
+    func accept(_ action: () -> Void) { lock.withLock { if open { action() } } }
+    var isOpen: Bool { lock.withLock { open } }
+}
+
+private struct TranscriptionUploadContext: Equatable {
+    let provider: TranscriptionProvider
+    let endpoint: String
+    let model: String
+    let language: String
+    let translation: String?
+    let sources: [String]
+    init(_ settings: TranscriptionSettings) {
+        provider = settings.provider; endpoint = settings.customEndpoint; model = settings.customModel
+        language = settings.language; translation = settings.translationLanguage; sources = settings.selectedSourceIDs.sorted()
+    }
+}
+
 /// State and controls live on the main thread; inference consumes a bounded worker inbox.
 final class AudioTranscriptionManager {
     enum State: Equatable { case idle, preparing, running, stopping, failed }
@@ -30,10 +51,42 @@ final class AudioTranscriptionManager {
     var cloudEngineFactory: ((TranscriptionSettings) throws -> LiveTranscribing)?
     var isActive: Bool { [.preparing, .running, .stopping].contains(state) }
     var isTranscribingMicrophone: Bool { isActive && settings.selectedSourceIDs.contains("microphone") }
-    var onBeforeMicrophoneTranscription: (() -> Void)?
+    private(set) var desiredMode: TranscriptionMode = .off
+    var wantsTranscription: Bool { desiredMode != .off }
+    var sourceButtonTitle: String {
+        let ids = (pendingSettings ?? settings).selectedSourceIDs
+        return desiredMode == .apps && ids.contains("microphone") ? "Apps + Mic" : desiredMode.title
+    }
+    var availableSources: [AudioSourceSelection] {
+        let sources = recorder?.transcriptionSources ?? []
+        let known = Set(sources.map(\.id))
+        return sources + selectedApplications.filter { !known.contains($0.bundleID) }.map {
+            AudioSourceSelection(id: $0.bundleID, title: $0.name, kind: .application($0.bundleID))
+        }
+    }
+    var selectedApplicationIDs: [String] { applicationSelection ?? recorder?.selectedApplicationIDs ?? [] }
+    var applicationChoices: [RecordingApplication] {
+        var apps = recorder?.applications ?? []
+        for id in selectedApplicationIDs where !apps.contains(where: { $0.bundleID == id }) {
+            let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id)
+            apps.append(RecordingApplication(bundleID: id, name: url?.deletingPathExtension().lastPathComponent ?? id,
+                icon: url.map { NSWorkspace.shared.icon(forFile: $0.path) }, processIDs: []))
+        }
+        return apps
+    }
+    var selectedApplications: [RecordingApplication] {
+        let choices = applicationChoices
+        let ids = desiredMode == .apps ? (pendingSettings ?? settings).selectedSourceIDs.filter { !["microphone", "system"].contains($0) }
+            : selectedApplicationIDs
+        return ids.map { id in
+            choices.first { $0.bundleID == id } ?? RecordingApplication(bundleID: id, name: id, icon: nil, processIDs: [])
+        }
+    }
     private(set) var isDictating = false
     var microphoneDeviceUID: String? { recorder?.settings.microphoneUID }
     private weak var recorder: AudioRecordingManager?
+    private weak var captureRecorder: AudioRecordingManager?
+    private var auxiliaryRecorder: AudioRecordingManager?
     private let defaults: UserDefaults
     private let engineFactory: ((TranscriptionSettings) async throws -> LiveTranscribing)?
     private let secretStore: TranscriptionSecretStoring
@@ -48,6 +101,15 @@ final class AudioTranscriptionManager {
     private var startedAt: Date?
     private var runSettings: TranscriptionSettings?
     private var observer: NSObjectProtocol?
+    private var transitionTask: Task<Void, Never>?
+    private var transition = UUID()
+    private var pendingSettings: TranscriptionSettings?
+    private var applicationSelection: [String]?
+    private static let applicationSelectionKey = "AstationTranscriptionApplications.v1"
+    private var approvedUpload: TranscriptionUploadContext?
+    private var preserveSessionOnStop = false
+    private var runGate: TranscriptionRunGate?
+    private var saverID = UUID()
 
     init(recorder: AudioRecordingManager, defaults: UserDefaults = .standard,
          modelStore: TranscriptionModelStore = TranscriptionModelStore(),
@@ -55,14 +117,17 @@ final class AudioTranscriptionManager {
          secretStore: TranscriptionSecretStoring = KeychainTranscriptionSecrets()) {
         self.recorder = recorder; self.defaults = defaults; self.modelStore = modelStore; self.engineFactory = engineFactory
         self.secretStore = secretStore
+        applicationSelection = defaults.stringArray(forKey: Self.applicationSelectionKey)
         settings = defaults.data(forKey: Self.defaultsKey).flatMap { try? JSONDecoder().decode(TranscriptionSettings.self, from: $0) }
             ?? TranscriptionSettings()
         recorder.onCaptureStopped = { [weak self] in
-            guard let self, self.state != .preparing else { return }
+            guard let self, self.captureRecorder === self.recorder, self.state == .running else { return }
             self.stop(stopOwnedPreview: false)
         }
+        recorder.onShutdown = { [weak self] in self?.stop() }
         recorder.retainCaptureForTranscription = { [weak self] in
-            guard let self, self.state == .preparing || self.state == .running else { return false }
+            guard let self, self.captureRecorder === self.recorder,
+                  self.state == .preparing || self.state == .running else { return false }
             // Once recording ends, captions own the retained capture and release it on Stop.
             self.ownsPreview = true
             return true
@@ -73,7 +138,9 @@ final class AudioTranscriptionManager {
         }
     }
     deinit {
+        transitionTask?.cancel(); runGate?.close()
         task?.cancel(); worker?.cancel(); downloadTask?.cancel(); inboxes.forEach { $0.finish() }
+        auxiliaryRecorder?.shutdown()
         autoSaver?.finish()
         if let observer { NotificationCenter.default.removeObserver(observer) }
     }
@@ -84,7 +151,12 @@ final class AudioTranscriptionManager {
                 fail("Use an HTTPS model manifest URL without embedded credentials or query parameters."); return
             }
         }
+        if self.settings.autoSaveTranscript != settings.autoSaveTranscript || self.settings.transcriptFolderPath != settings.transcriptFolderPath {
+            autoSaver?.finish(); autoSaver = nil; saverID = UUID()
+        }
+        if approvedUpload != TranscriptionUploadContext(settings) { approvedUpload = nil }
         self.settings = settings
+        if isDictating { pendingSettings = settings }
         downloadMessage = nil; customKeyMessage = nil
         if let data = try? JSONEncoder().encode(settings) { defaults.set(data, forKey: Self.defaultsKey) }
         message = nil; state = .idle; notify()
@@ -156,12 +228,83 @@ final class AudioTranscriptionManager {
     }
     func cancelDownload() { downloadTask?.cancel() }
 
-    func start(cloudConsent: Bool = false) {
+    func refreshApplicationChoices() { recorder?.refreshSources() }
+
+    @discardableResult
+    func saveApplicationSelection(_ ids: [String]) -> Bool {
+        let choices = Set(applicationChoices.map(\.bundleID))
+        var seen = Set<String>()
+        let selection = ids.filter { !["", "microphone", "system"].contains($0) && seen.insert($0).inserted }
+        guard !selection.isEmpty, selection.allSatisfy({ choices.contains($0) }) else { return false }
+        // Keep the running recording's source settings and tracks independent of this picker.
+        applicationSelection = selection
+        defaults.set(selection, forKey: Self.applicationSelectionKey)
+        notify()
+        return true
+    }
+
+    func settings(for mode: TranscriptionMode) throws -> TranscriptionSettings {
+        var value = pendingSettings ?? settings
+        let ids: [String]
+        switch mode {
+        case .off: ids = []
+        case .mic: ids = ["microphone"]
+        case .system: ids = ["system"]
+        case .all: ids = ["microphone", "system"]
+        case .apps:
+            ids = selectedApplicationIDs
+            guard !ids.isEmpty else {
+                throw TranscriptionError.message("Choose applications in Audio & Recording, then select Apps again.")
+            }
+        }
+        value.sourceID = ids.first ?? ""; value.additionalSourceIDs = Array(ids.dropFirst())
+        return value
+    }
+    func requiresConsent(for value: TranscriptionSettings) -> Bool {
+        value.provider != .local && approvedUpload != TranscriptionUploadContext(value)
+    }
+    func selectMode(_ mode: TranscriptionMode, cloudConsent: Bool = false) {
+        do {
+            let value = try settings(for: mode)
+            if mode != .off && requiresConsent(for: value) && !cloudConsent {
+                message = "Allow uploading the selected sources before starting remote transcription."; notify(); return
+            }
+            if cloudConsent { approvedUpload = TranscriptionUploadContext(value) }
+            desiredMode = mode; pendingSettings = value
+            setFloatingCaptions(true)
+            if mode == .off { stop(); return }
+            if isActive { stopRun(preserveSession: true, interrupt: true) }
+            if !isDictating { scheduleTransition() }
+            else { message = "\(mode.title) transcription is paused for dictation."; notify() }
+        } catch { message = error.localizedDescription; notify() }
+    }
+    private func scheduleTransition() {
+        transitionTask?.cancel()
+        let id = UUID(); transition = id
+        let previous = task
+        transitionTask = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self, self.transition == id, !Task.isCancelled, !self.isDictating else { return }
+            self.transitionTask = nil
+            guard self.wantsTranscription else { self.autoSaver?.finish(); return }
+            if let pending = self.pendingSettings {
+                self.updateSettings(pending); self.pendingSettings = nil
+            }
+            self.start(cloudConsent: !self.requiresConsent(for: self.settings), preservingTranscript: true)
+        }
+    }
+    @MainActor func waitForDictationPriority() async {
+        // Capture the task before suspension; completion clears it on the main actor.
+        guard let stoppingTask = task else { return }
+        await stoppingTask.value
+    }
+
+    func start(cloudConsent: Bool = false, preservingTranscript: Bool = false) {
         guard !isActive, downloadProgress == nil, let recorder else { return }
         let selectedIDs = settings.selectedSourceIDs
-        let available = recorder.selectedSources
+        let available = availableSources
         guard !selectedIDs.isEmpty, selectedIDs.allSatisfy({ id in available.contains { $0.id == id } }) else {
-            fail("Enable sources in Audio & Recording and select at least one for transcription."); return
+            fail("Enable sources in Audio & Recording and select at least one valid source for transcription."); return
         }
         if settings.provider != .local && !cloudConsent {
             fail("Remote transcription requires explicit permission to upload the selected sources."); return
@@ -179,30 +322,42 @@ final class AudioTranscriptionManager {
         if settings.translationLanguage == settings.language {
             fail("The translation language must differ from the input language."); return
         }
-        if selectedIDs.contains("microphone") { onBeforeMicrophoneTranscription?() }
+        if cloudConsent && settings.provider != .local { approvedUpload = TranscriptionUploadContext(settings) }
+        desiredMode = .selected(by: selectedIDs)
+        if isDictating {
+            pendingSettings = settings; message = "Transcription is paused for dictation."; notify(); return
+        }
         let identifier = UUID()
         token = identifier
+        preserveSessionOnStop = false
+        let gate = TranscriptionRunGate(); runGate = gate
         state = .preparing; message = "Preparing transcription..."
-        transcript = TranscriptBuffer(); floatingCaptionBuffer = FloatingCaptionBuffer()
-        startedAt = Date(); runSettings = settings
+        if !preservingTranscript {
+            transcript = TranscriptBuffer(); floatingCaptionBuffer = FloatingCaptionBuffer()
+            startedAt = Date(); runSettings = settings
+            autoSaver?.finish(); autoSaver = nil; autoSaveMessage = nil
+        }
+        if startedAt == nil { startedAt = Date(); runSettings = settings }
+        let offset = preservingTranscript ? Date().timeIntervalSince(startedAt!) : 0
         let selected = settings
-        sourceTitles = Dictionary(uniqueKeysWithValues: selectedIDs.compactMap { id in
+        let titles: [String: String] = Dictionary(uniqueKeysWithValues: selectedIDs.compactMap { id in
             guard let source = available.first(where: { $0.id == id }) else { return nil }
             return (source.id, source.id == "microphone" ? "Microphone" : source.title)
         })
+        if preservingTranscript { sourceTitles.merge(titles, uniquingKeysWith: { _, new in new }) }
+        else { sourceTitles = titles }
         let customFactory = engineFactory
         let cloudFactory = cloudEngineFactory
         let store = modelStore
         let secrets = secretStore
-        autoSaver?.finish()
-        autoSaveMessage = nil; autoSaver = nil
-        if selected.autoSaveTranscript {
+        if selected.autoSaveTranscript && autoSaver == nil {
             do {
+                let saveID = UUID(); saverID = saveID
                 guard selected.transcriptFolderPath.hasPrefix("/") else { throw TranscriptionError.message("Choose an absolute transcript folder.") }
                 let saver = try TranscriptAutoSaver(root: URL(fileURLWithPath: selected.transcriptFolderPath, isDirectory: true),
                     settings: selected, startedAt: startedAt ?? Date()) { [weak self] text in
                     DispatchQueue.main.async {
-                        guard let self, self.token == identifier else { return }
+                        guard let self, self.saverID == saveID else { return }
                         self.autoSaveMessage = text; self.notify()
                     }
                 }
@@ -214,8 +369,22 @@ final class AudioTranscriptionManager {
             }
         }
         let sessionSaver = autoSaver
+        let requested = selectedIDs.compactMap { id in available.first { $0.id == id } }
+        let activeIDs = Set(recorder.activeSources.map(\.id))
+        let canShare = (recorder.isCapturing || recorder.state == .starting) && Set(selectedIDs).isSubset(of: activeIDs)
+        let canOwn = !recorder.isCapturing && recorder.state != .starting && Set(selectedIDs) == Set(recorder.selectedSources.map(\.id))
+        let capture: AudioRecordingManager
+        if canShare || canOwn { capture = recorder }
+        else {
+            capture = recorder.makeTranscriptionCapture(); auxiliaryRecorder = capture
+            capture.onCaptureStopped = { [weak self] in
+                guard let self, self.state == .running else { return }
+                self.stop(stopOwnedPreview: false)
+            }
+        }
+        captureRecorder = capture
         notify()
-        task = Task { @MainActor [weak self, weak recorder] in
+        task = Task { @MainActor [weak self, weak capture] in
             var sources: [TranscriptionSourceWorker] = []
             do {
                 let directory = customFactory == nil && selected.provider == .local ? try await store.verifiedDirectory(for: selected.localModel) : nil
@@ -239,38 +408,46 @@ final class AudioTranscriptionManager {
                     sources.append(TranscriptionSourceWorker(sourceID: id, engine: engine, inbox: TranscriptionInbox()))
                 }
                 try Task.checkCancellation()
-                guard let self, let recorder, self.token == identifier else {
+                guard let self, let recorder = capture, self.token == identifier else {
                     for source in sources { await source.engine.cancel() }; return
                 }
                 self.inboxes = sources.map(\.inbox)
                 // Resolve capture permissions before starting a billable cloud session.
                 if !recorder.isCapturing && recorder.state != .starting {
-                    self.ownsPreview = true; recorder.startPreview()
+                    self.ownsPreview = true
+                    recorder.startPreview(sources: recorder === self.recorder ? nil : requested)
                 }
                 while recorder.state == .starting { try await Task.sleep(nanoseconds: 50_000_000) }
                 try Task.checkCancellation()
                 guard recorder.isCapturing else { throw TranscriptionError.message(recorder.errorMessage ?? "The audio source could not be started.") }
                 for source in sources {
                     try await source.engine.start { [weak self] segment in
-                        // Save at receipt, before the UI hop, so Stop can flush final callbacks reliably.
-                        sessionSaver?.append(segment)
-                        DispatchQueue.main.async {
-                            guard let self, self.token == identifier, self.state != .failed else { return }
-                            self.transcript.update(segment)
-                            self.floatingCaptionBuffer.update(segment, now: ProcessInfo.processInfo.systemUptime)
-                            self.notify()
+                        let segment = TranscriptSegment(id: preservingTranscript ? "\(identifier)-\(segment.id)" : segment.id, sourceID: segment.sourceID,
+                            language: segment.language, text: segment.text, isFinal: segment.isFinal,
+                            offset: segment.offset + offset, isTranslation: segment.isTranslation)
+                        gate.accept {
+                            // Normal Stop accepts final callbacks; suspension rejects all late results.
+                            sessionSaver?.append(segment)
+                            DispatchQueue.main.async {
+                                guard let self, self.token == identifier, gate.isOpen, self.state != .failed else { return }
+                                self.transcript.update(segment)
+                                self.floatingCaptionBuffer.update(segment, now: ProcessInfo.processInfo.systemUptime)
+                                self.notify()
+                            }
                         }
                     }
                     try Task.checkCancellation()
                 }
                 guard self.token == identifier else { for source in sources { await source.engine.cancel() }; return }
-                guard recorder.isCapturing, selectedIDs.allSatisfy({ id in recorder.selectedSources.contains { $0.id == id } }) else {
+                guard recorder.isCapturing, selectedIDs.allSatisfy({ id in recorder.activeSources.contains { $0.id == id } }) else {
                     throw TranscriptionError.message("The selected capture changed or stopped while preparing transcription.")
                 }
                 self.state = .running
                 let incoming = Dictionary(uniqueKeysWithValues: sources.map { ($0.sourceID, $0.inbox) })
+                let acceptAfter = mach_absolute_time()
                 recorder.setAudioConsumer { [weak self] source, pcm in
-                    guard let inbox = incoming[source.id] else { return }
+                    // Shared recordings keep draining during suspension. Never replay an older queued packet.
+                    guard pcm.hostTime >= acceptAfter, let inbox = incoming[source.id] else { return }
                     if !inbox.offer(pcm) {
                         DispatchQueue.main.async {
                             guard let self, self.token == identifier, self.state == .running else { return }
@@ -325,15 +502,28 @@ final class AudioTranscriptionManager {
         }
     }
     func stop(stopOwnedPreview: Bool = true) {
-        guard isActive, state != .stopping else { return }
+        desiredMode = .off; pendingSettings = nil
+        transition = UUID(); transitionTask?.cancel(); transitionTask = nil
+        if !isActive { autoSaver?.finish(); autoSaver = nil; notify(); return }
+        stopRun(preserveSession: false, interrupt: false, stopOwnedPreview: stopOwnedPreview)
+    }
+    private func stopRun(preserveSession: Bool, interrupt: Bool, stopOwnedPreview: Bool = true) {
+        if !preserveSession { preserveSessionOnStop = false }
+        guard isActive else { return }
+        if interrupt {
+            runGate?.close(); captureRecorder?.setAudioConsumer(nil)
+            task?.cancel(); worker?.cancel()
+        }
+        guard state != .stopping else { return }
+        preserveSessionOnStop = preserveSession
         let preparing = state == .preparing
         state = .stopping
-        recorder?.setAudioConsumer(nil)
+        captureRecorder?.setAudioConsumer(nil)
         inboxes.forEach { $0.finish() }
-        if preparing || settings.provider == .custom { task?.cancel(); worker?.cancel() }
-        let stopPreview = ownsPreview && stopOwnedPreview && recorder?.isRecording == false
+        if interrupt || preparing || settings.provider == .custom { task?.cancel(); worker?.cancel() }
+        let stopPreview = ownsPreview && stopOwnedPreview && captureRecorder?.isRecording == false
         ownsPreview = false
-        if stopPreview { recorder?.stopPreview() }
+        if stopPreview { captureRecorder?.stopPreview() }
         message = "Finishing transcription..."; notify()
     }
 
@@ -353,7 +543,14 @@ final class AudioTranscriptionManager {
 
     func setDictationActive(_ active: Bool) {
         guard isDictating != active else { return }
-        isDictating = active; notify()
+        isDictating = active
+        if active {
+            runGate?.close()
+            transitionTask?.cancel(); transition = UUID()
+            stopRun(preserveSession: true, interrupt: true)
+            message = wantsTranscription ? "\(desiredMode.title) transcription is paused for dictation." : message
+        } else if wantsTranscription { scheduleTransition() }
+        notify()
     }
     func displayDictationCaption(_ segment: TranscriptSegment, replacingKeys: Set<String> = [], refreshReceipt: Bool = false) {
         guard segment.sourceID == "microphone", !segment.isTranslation else { return }
@@ -363,28 +560,32 @@ final class AudioTranscriptionManager {
         notify()
     }
     private func complete() {
-        autoSaver?.finish()
+        if !preserveSessionOnStop { autoSaver?.finish(); autoSaver = nil }
+        else { autoSaver?.flush() }
         clearWork()
-        let stopPreview = ownsPreview && recorder?.isRecording == false
+        let stopPreview = ownsPreview && captureRecorder?.isRecording == false
         ownsPreview = false
-        state = .idle; message = "Transcription stopped."
-        if stopPreview { recorder?.stopPreview() }
+        state = .idle; message = isDictating && wantsTranscription ? "Transcription is paused for dictation." : "Transcription stopped."
+        if stopPreview { captureRecorder?.stopPreview() }
+        captureRecorder = nil; auxiliaryRecorder = nil
         notify()
     }
     private func fail(_ text: String) {
-        autoSaver?.finish()
+        autoSaver?.finish(); autoSaver = nil; desiredMode = .off
+        runGate?.close()
         token = UUID()
-        recorder?.setAudioConsumer(nil)
+        captureRecorder?.setAudioConsumer(nil)
         inboxes.forEach { $0.finish() }; task?.cancel(); worker?.cancel()
         inboxes = []; task = nil; worker = nil
-        let stopPreview = ownsPreview && recorder?.isRecording == false
+        let stopPreview = ownsPreview && captureRecorder?.isRecording == false
         ownsPreview = false
         state = .failed; message = text
-        if stopPreview { recorder?.stopPreview() }
+        if stopPreview { captureRecorder?.stopPreview() }
+        captureRecorder = nil; auxiliaryRecorder = nil
         notify()
     }
     private func clearWork() {
-        recorder?.setAudioConsumer(nil)
+        captureRecorder?.setAudioConsumer(nil)
         inboxes = []; task = nil; worker = nil
     }
     func export(to url: URL) throws {

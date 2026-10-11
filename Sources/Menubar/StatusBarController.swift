@@ -884,7 +884,8 @@ class StatusBarController: NSObject, NSMenuDelegate {
         settingsWindowController.showWindow()
     }
 
-    @objc private func openRecordingSettings() { settingsWindowController.showRecording() }
+    func showRecordingSettings() { settingsWindowController.showRecording() }
+    @objc private func openRecordingSettings() { showRecordingSettings() }
     @objc private func openSecuritySettings() { settingsWindowController.showSecurity() }
     @objc private func openDictationSettings() { settingsWindowController.showDictation() }
     @objc private func toggleFloatingCaptions() { recordingManager.transcription.toggleFloatingCaptions() }

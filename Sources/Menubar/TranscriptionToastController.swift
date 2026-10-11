@@ -7,8 +7,17 @@ final class TranscriptionCaptionPanel: NSPanel {
 }
 private final class CaptionTextView: NSTextView {
     var copyPasteboard: NSPasteboard = .general
+    var onUserScrollStarted: ((Bool) -> Void)?
+    var onUserScrollEnded: (() -> Void)?
     override var mouseDownCanMoveWindow: Bool { false }
     override var needsPanelToBecomeKey: Bool { true }
+
+    override func keyDown(with event: NSEvent) {
+        let navigation = [115, 116, 119, 121, 125, 126].contains(Int(event.keyCode))
+        if navigation { onUserScrollStarted?([119, 121, 125].contains(Int(event.keyCode))) }
+        super.keyDown(with: event)
+        if navigation { onUserScrollEnded?() }
+    }
 
     override func copy(_ sender: Any?) {
         let range = selectedRange()
@@ -40,41 +49,136 @@ private final class CaptionTextView: NSTextView {
     }
 }
 
+private final class CaptionScroller: NSScroller {
+    var onUserScrollStarted: (() -> Void)?
+    var onUserScrollEnded: (() -> Void)?
+    override func mouseDown(with event: NSEvent) {
+        onUserScrollStarted?()
+        defer { onUserScrollEnded?() }
+        super.mouseDown(with: event)
+    }
+}
+
+private final class CaptionScrollView: NSScrollView {
+    var onUserScrollStarted: (() -> Void)?
+    var onUserScrollEnded: (() -> Void)?
+    private(set) var isUserScrolling = false
+    private(set) var scrollingTowardBottom = false
+
+    func installTrackedScroller() {
+        let scroller = CaptionScroller()
+        scroller.onUserScrollStarted = { [weak self] in self?.beginUserScroll() }
+        scroller.onUserScrollEnded = { [weak self] in self?.endUserScroll() }
+        verticalScroller = scroller
+    }
+    override func scrollWheel(with event: NSEvent) {
+        guard event.scrollingDeltaY != 0 else { super.scrollWheel(with: event); return }
+        beginUserScroll(towardBottom: event.scrollingDeltaY < 0)
+        defer { endUserScroll() }
+        super.scrollWheel(with: event)
+    }
+    func beginUserScroll(towardBottom: Bool = false) {
+        scrollingTowardBottom = towardBottom
+        isUserScrolling = true; onUserScrollStarted?()
+    }
+    func endUserScroll() {
+        isUserScrolling = false; onUserScrollEnded?()
+        scrollingTowardBottom = false
+    }
+}
+
 /// A nonactivating caption surface. Only the initial placement is automatic;
 /// dragging, including between monitors, owns its position thereafter.
-final class TranscriptionToastController: NSObject, NSTextViewDelegate {
+final class TranscriptionToastController: NSObject, NSTextViewDelegate, NSPopoverDelegate {
     private static let segmentKey = NSAttributedString.Key("AstationCaptionSegmentKey")
     private weak var manager: AudioTranscriptionManager?
     private var observer: NSObjectProtocol?
+    private var sourceObserver: NSObjectProtocol?
     private weak var dictation: VoiceDictationManager?
     private var dictationObserver: NSObjectProtocol?
+    private var scrollObserver: NSObjectProtocol?
     let polishKnob = PolishKnob(frame: .zero)
+    let modeButton = TranscriptionModeButton(frame: .zero)
+    let dictationIndicator: NSStackView = {
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "Microphone")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .medium))
+        icon.contentTintColor = .systemTeal
+        let label = NSTextField(labelWithString: "Dictation")
+        label.font = .systemFont(ofSize: 10, weight: .semibold)
+        label.textColor = .white.withAlphaComponent(0.9)
+        let indicator = NSStackView(views: [icon, label])
+        indicator.spacing = 6
+        indicator.alignment = .centerY
+        indicator.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 8)
+        indicator.wantsLayer = true
+        indicator.layer?.cornerRadius = 14
+        indicator.layer?.backgroundColor = NSColor.systemTeal.withAlphaComponent(0.12).cgColor
+        indicator.layer?.borderColor = NSColor.systemTeal.withAlphaComponent(0.35).cgColor
+        indicator.layer?.borderWidth = 1
+        indicator.toolTip = "Microphone dictation is active. Transcription sources are paused."
+        indicator.isHidden = true
+        NSLayoutConstraint.activate([
+            indicator.widthAnchor.constraint(equalToConstant: 92),
+            indicator.heightAnchor.constraint(equalToConstant: 28),
+            icon.widthAnchor.constraint(equalToConstant: 13),
+            icon.heightAnchor.constraint(equalToConstant: 13)
+        ])
+        return indicator
+    }()
+    private(set) var appPicker: TranscriptionAppPickerController?
+    private var appPopover: NSPopover?
     private var timer: Timer?
     private(set) var panel: TranscriptionCaptionPanel?
     private let textView = CaptionTextView()
-    private let scroll = NSScrollView()
+    private let scroll = CaptionScrollView()
     private let copyButton = NSButton(title: "Copy", target: nil, action: nil)
     private var rendered: [TranscriptSegment] = []
     private var renderedWaitingMessage: String?
-    private var waitingForCaption = false
+    private var renderedSourceTitles: [String: String] = [:]
+    private var reviewUntil: TimeInterval?
+    private var reviewStartOrigin = NSPoint.zero
+    private var previousScrollOrigin = NSPoint.zero
+    private let clock: () -> TimeInterval
     private let showWindow: Bool
     var isMonitoringCaptions: Bool { timer != nil }
 
-    init(manager: AudioTranscriptionManager, showWindow: Bool = true, pasteboard: NSPasteboard = .general) {
+    init(manager: AudioTranscriptionManager, showWindow: Bool = true, pasteboard: NSPasteboard = .general,
+         clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.manager = manager
         self.showWindow = showWindow
+        self.clock = clock
         super.init()
+        scroll.onUserScrollStarted = { [weak self] in self?.beginCaptionReview() }
+        scroll.onUserScrollEnded = { [weak self] in self?.endCaptionReview() }
+        textView.onUserScrollStarted = { [weak self] towardBottom in self?.scroll.beginUserScroll(towardBottom: towardBottom) }
+        textView.onUserScrollEnded = { [weak self] in self?.scroll.endUserScroll() }
+        scroll.contentView.postsBoundsChangedNotifications = true
+        scrollObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification,
+            object: scroll.contentView, queue: .main) { [weak self] _ in self?.captionScrollBoundsChanged() }
+        modeButton.onSelect = { [weak self] mode in self?.selectMode(mode) }
+        modeButton.onReselectApps = { [weak self] in self?.showAppPicker() }
+        modeButton.canApplyPreview = { [weak self, weak manager] mode in
+            mode != .apps || (self?.appPicker == nil && manager?.selectedApplicationIDs.isEmpty == false)
+        }
+        modeButton.onPreview = { [weak self] mode in
+            guard let self else { return }
+            if mode == .apps { self.manager?.refreshApplicationChoices(); self.refresh() }
+            if mode == .apps, self.manager?.selectedApplicationIDs.isEmpty == true { self.showAppPicker() }
+            else if mode != .apps { self.dismissAppPicker() }
+        }
         polishKnob.compact = true; polishKnob.target = self; polishKnob.action = #selector(togglePolish)
         textView.copyPasteboard = pasteboard
-        observer = NotificationCenter.default.addObserver(forName: .transcriptionChanged, object: manager, queue: .main) { [weak self] notification in
-            if notification.userInfo?["showFloatingCaptions"] as? Bool == true { self?.waitingForCaption = true }
-            self?.refresh()
-        }
+        observer = NotificationCenter.default.addObserver(forName: .transcriptionChanged, object: manager, queue: .main) { [weak self] _ in self?.refresh() }
+        sourceObserver = NotificationCenter.default.addObserver(forName: .audioRecordingChanged, object: nil, queue: .main) { [weak self] _ in self?.refresh() }
     }
     deinit {
+        appPopover?.close()
         timer?.invalidate()
         if let observer { NotificationCenter.default.removeObserver(observer) }
+        if let sourceObserver { NotificationCenter.default.removeObserver(sourceObserver) }
         if let dictationObserver { NotificationCenter.default.removeObserver(dictationObserver) }
+        if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) }
         panel?.orderOut(nil)
         manager?.updateFloatingCaptionVisibility(false)
     }
@@ -86,23 +190,120 @@ final class TranscriptionToastController: NSObject, NSTextViewDelegate {
     }
     private func refreshPolishKnob() {
         polishKnob.state = dictation?.settings.polishing == true ? .on : .off
-        polishKnob.isHidden = dictation == nil
+        polishKnob.isHidden = dictation == nil || manager?.isDictating != true
+        polishKnob.isEnabled = !polishKnob.isHidden
         polishKnob.toolTip = dictation?.isPolishing == true ? "Polishing this utterance. Turning off affects the next finalized utterance."
             : "Polish microphone dictation with the selected LLM. Configure its model in Voice Dictation settings. Live system/app captions are unchanged."
     }
-    @objc private func togglePolish() { dictation?.setPolishing(polishKnob.state == .on) }
+    @objc private func togglePolish() {
+        guard manager?.isDictating == true else { return }
+        dictation?.setPolishing(polishKnob.state == .on)
+    }
+
+    private var captionsAtBottom: Bool { scroll.contentView.bounds.maxY >= textView.bounds.maxY - 1 }
+    private func beginCaptionReview() {
+        reviewStartOrigin = scroll.contentView.bounds.origin
+        reviewUntil = clock() + 15
+    }
+    private func endCaptionReview() {
+        let moved = scroll.contentView.bounds.origin.y != reviewStartOrigin.y
+        reviewUntil = captionsAtBottom && (moved || scroll.scrollingTowardBottom) ? nil : clock() + 15
+        refresh()
+    }
+    private func captionScrollBoundsChanged() {
+        let origin = scroll.contentView.bounds.origin
+        let moved = origin.y != previousScrollOrigin.y
+        previousScrollOrigin = origin
+        // Native wheel scrolling can update the clip bounds after scrollWheel returns.
+        if moved, reviewUntil != nil, !scroll.isUserScrolling, captionsAtBottom {
+            reviewUntil = nil
+            refresh()
+        }
+    }
+
+    private func showAppPicker() {
+        guard let manager, appPicker == nil else { return }
+        manager.refreshApplicationChoices()
+        let selected = manager.selectedApplications
+        var choices = manager.applicationChoices
+        for app in selected where !choices.contains(where: { $0.bundleID == app.bundleID }) { choices.append(app) }
+        let picker = TranscriptionAppPickerController(applications: choices, selectedIDs: selected.map(\.bundleID))
+        picker.onCancel = { [weak self] in self?.modeButton.cancelPreview(); self?.dismissAppPicker() }
+        picker.onRefresh = { [weak manager] in
+            manager?.refreshApplicationChoices()
+            return manager?.applicationChoices ?? []
+        }
+        picker.onApply = { [weak self, weak manager] ids in
+            guard let self, manager?.saveApplicationSelection(ids) == true else { return }
+            self.dismissAppPicker()
+            self.selectMode(.apps)
+        }
+        picker.loadViewIfNeeded()
+        appPicker = picker
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentViewController = picker
+        popover.delegate = self
+        appPopover = popover
+        if showWindow, modeButton.window != nil {
+            popover.show(relativeTo: modeButton.bounds, of: modeButton, preferredEdge: .maxY)
+        }
+    }
+
+    private func dismissAppPicker() {
+        let popover = appPopover
+        appPopover = nil; appPicker = nil
+        popover?.close()
+    }
+
+    func popoverDidClose(_ notification: Notification) { appPopover = nil; appPicker = nil }
+
+    private func selectMode(_ mode: TranscriptionMode) {
+        guard let manager else { return }
+        if mode == .apps && manager.selectedApplicationIDs.isEmpty { showAppPicker(); return }
+        let value: TranscriptionSettings
+        do { value = try manager.settings(for: mode) }
+        catch {
+            manager.selectMode(mode)
+            return
+        }
+        if mode != .off, manager.requiresConsent(for: value) {
+            let alert = NSAlert()
+            alert.messageText = "Upload \(value.selectedSourceIDs.count) source(s) for transcription?"
+            alert.informativeText = value.provider == .agora
+                ? "Selected audio will be uploaded to Agora in separate sessions, which may incur charges. Original recordings stay on this Mac."
+                : "Selected audio will be uploaded to \(value.customEndpoint). Service charges and retention depend on this provider."
+            alert.addButton(withTitle: "Allow and Start"); alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else {
+                modeButton.reflect(manager.desiredMode, title: manager.sourceButtonTitle, applications: manager.selectedApplications)
+                return
+            }
+            manager.selectMode(mode, cloudConsent: true)
+        } else { manager.selectMode(mode) }
+        modeButton.reflect(manager.desiredMode, title: manager.sourceButtonTitle, applications: manager.selectedApplications)
+    }
 
     func refresh() {
         guard let manager else { return }
+        modeButton.reflect(manager.desiredMode, title: manager.sourceButtonTitle, applications: manager.selectedApplications)
+        modeButton.isHidden = manager.isDictating
+        dictationIndicator.isHidden = !manager.isDictating
+        if modeButton.isHidden || modeButton.selection.displayed != .apps { dismissAppPicker() }
+        refreshPolishKnob()
+        modeButton.paused = manager.isDictating && manager.wantsTranscription
+        modeButton.changing = manager.state == .preparing || manager.state == .stopping
         manager.expireFloatingCaptions()
         let segments = manager.floatingCaptionBuffer.lines.map(\.segment)
-        if !manager.settings.floatingCaptions { waitingForCaption = false }
-        // An explicit Show must work even after every caption expired. Resume normal
-        // 20-second auto-hide as soon as a real caption is displayed.
-        if !segments.isEmpty { waitingForCaption = false }
+        let reviewing = scroll.isUserScrolling || reviewUntil.map { clock() < $0 } == true
+        let reviewExpired = reviewUntil != nil && !reviewing
+        if reviewExpired { reviewUntil = nil }
+        let speechOngoing = manager.isActive || manager.isDictating
+        // Text expires after 20 seconds; the source control remains available until Hide.
         updateRefreshTimer(shouldRun: manager.settings.floatingCaptions
-            && (manager.isActive || manager.isDictating || !segments.isEmpty || waitingForCaption))
-        guard manager.settings.floatingCaptions, !segments.isEmpty || waitingForCaption else {
+            && (speechOngoing || !segments.isEmpty || reviewing))
+        guard manager.settings.floatingCaptions else {
+            reviewUntil = nil
             panel?.orderOut(nil)
             textView.isSelectable = false
             textView.setSelectedRange(NSRange(location: 0, length: 0))
@@ -113,10 +314,12 @@ final class TranscriptionToastController: NSObject, NSTextViewDelegate {
         if panel == nil { createPanel() }
         let waitingMessage = segments.isEmpty ? (manager.isDictating ? "Listening for microphone dictation..." : manager.isActive
             ? "Waiting for speech from your selected sources..."
-            : "Transcription is off. Start it in Live Transcription settings.") : nil
-        if rendered != segments || renderedWaitingMessage != waitingMessage {
+            : manager.message ?? "Pick a source; it starts after one second") : nil
+        // Keep the displayed snapshot stable while reading; capture and saving continue.
+        if !reviewing && (rendered != segments || renderedWaitingMessage != waitingMessage || renderedSourceTitles != manager.sourceTitles) {
             rendered = segments
             renderedWaitingMessage = waitingMessage
+            renderedSourceTitles = manager.sourceTitles
             let content = waitingMessage.map { NSAttributedString(string: $0, attributes: [
                 .font: NSFont.systemFont(ofSize: 18, weight: .medium),
                 .foregroundColor: NSColor.white.withAlphaComponent(0.75)
@@ -128,10 +331,11 @@ final class TranscriptionToastController: NSObject, NSTextViewDelegate {
             textView.isSelectable = !segments.isEmpty
             textView.setSelectedRange(selection ?? NSRange(location: 0, length: 0))
             resizeToContent()
-            if selection == nil { textView.scrollToEndOfDocument(nil) }
+            if selection == nil && (!reviewExpired || speechOngoing) { textView.scrollToEndOfDocument(nil) }
         }
-        textView.isSelectable = !segments.isEmpty
-        copyButton.isEnabled = !segments.isEmpty
+        if reviewExpired && speechOngoing { textView.scrollToEndOfDocument(nil) }
+        textView.isSelectable = !rendered.isEmpty
+        copyButton.isEnabled = !rendered.isEmpty
         updateCopyTooltip()
         if showWindow { panel?.orderFrontRegardless() }
         manager.updateFloatingCaptionVisibility(true)
@@ -141,8 +345,7 @@ final class TranscriptionToastController: NSObject, NSTextViewDelegate {
         if !shouldRun {
             timer?.invalidate(); timer = nil
         } else if timer == nil {
-            // Keep watching while transcription is live, even when the empty panel is
-            // hidden, so subsequent speech can restore it without a manual toggle.
+            // Expire captions even when no new speech arrives.
             let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.refresh() }
             self.timer = timer
             RunLoop.main.add(timer, forMode: .common)
@@ -155,7 +358,8 @@ final class TranscriptionToastController: NSObject, NSTextViewDelegate {
         paragraph.lineSpacing = 5
         paragraph.paragraphSpacing = 10
         for (index, segment) in segments.enumerated() {
-            let source = sourceTitles.count > 1 ? "\(sourceTitles[segment.sourceID] ?? segment.sourceID)  " : ""
+            let showSource = sourceTitles.count > 1 && segment.sourceID != "microphone"
+            let source = showSource ? "\(sourceTitles[segment.sourceID] ?? segment.sourceID)  " : ""
             let prefix = source + (segment.isTranslation ? "\(segment.language)  " : "")
             if index > 0 { result.append(NSAttributedString(string: "\n")) }
             result.append(NSAttributedString(string: prefix + segment.text, attributes: [
@@ -247,10 +451,14 @@ final class TranscriptionToastController: NSObject, NSTextViewDelegate {
         polishKnob.compact = true
         polishKnob.target = self; polishKnob.action = #selector(togglePolish)
         refreshPolishKnob()
-        let top = NSStackView(views: [header, NSView(), polishKnob, copyButton, hide])
+        let top = NSStackView(views: [header, modeButton, dictationIndicator, NSView(), polishKnob, copyButton, hide])
         top.spacing = 10
+        top.alignment = .centerY
+        modeButton.setContentHuggingPriority(.required, for: .horizontal)
+        modeButton.setContentCompressionResistancePriority(.required, for: .horizontal)
         scroll.drawsBackground = false
         scroll.hasVerticalScroller = true
+        scroll.installTrackedScroller()
         scroll.autohidesScrollers = true
         textView.isEditable = false
         textView.isSelectable = true

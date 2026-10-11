@@ -7,6 +7,11 @@ final class VoiceDictationViewController: NSViewController, NSTextFieldDelegate 
     let polishKnob = PolishKnob(frame: .zero)
     private let typeInActiveTextField = NSButton(checkboxWithTitle: "Type in active text field", target: nil, action: nil)
     private let sendToAtem = NSButton(checkboxWithTitle: "Send to active Atem", target: nil, action: nil)
+    private let saveToFiles = NSButton(checkboxWithTitle: "Save dictation to files", target: nil, action: nil)
+    private let fileControls = NSStackView()
+    private let folder = NSTextField(labelWithString: "")
+    private let showFiles = NSButton(title: "Show Saved Dictation", target: nil, action: nil)
+    private let fileStatus = NSTextField(wrappingLabelWithString: "")
     private let provider = NSPopUpButton()
     private let remoteControls = NSStackView()
     private let endpoint = NSTextField()
@@ -50,18 +55,25 @@ final class VoiceDictationViewController: NSViewController, NSTextFieldDelegate 
         stack.addArrangedSubview(eyebrow)
         stack.addArrangedSubview(label("Voice Dictation", size: 24, weight: .semibold))
         stack.addArrangedSubview(label("Push-to-talk captures while you hold the shortcut; release to finish. Hands-Free listens continuously until you stop it. Both use only your local microphone."))
-        stack.addArrangedSubview(label("Dictation uses the installed local ASR model selected in Live Transcription. System/app captions and RTC remain independent. Mic transcription disables dictation."))
+        stack.addArrangedSubview(label("Dictation uses the installed local ASR model selected in Live Transcription. It pauses all other transcription sources while listening, then resumes your selection. Original audio recordings and RTC continue."))
         let asr = NSButton(title: "Choose / Download Speech Model...", target: self, action: #selector(configureASR)); asr.bezelStyle = .rounded
         stack.addArrangedSubview(asr)
         stack.addArrangedSubview(label("Use result", size: 12, weight: .medium))
-        let outputs = NSStackView(views: [typeInActiveTextField, sendToAtem])
+        let outputs = NSStackView(views: [typeInActiveTextField, sendToAtem, saveToFiles])
         outputs.orientation = .vertical; outputs.alignment = .leading; outputs.spacing = 8
         stack.addArrangedSubview(outputs)
-        for control in [typeInActiveTextField, sendToAtem] {
+        for control in [typeInActiveTextField, sendToAtem, saveToFiles] {
             control.target = self; control.action = #selector(changeOutputs)
             control.setAccessibilityLabel(control.title)
         }
-        stack.addArrangedSubview(label("Typing is on by default and requires Accessibility permission; it never presses Return. Enable either or both outputs. Results always appear in floating captions; turn both off for transcription only. Atem delivery requires the original Atem to remain active and connected."))
+        stack.addArrangedSubview(label("Choose any combination, including files only. Typing requires Accessibility permission and never presses Return. Results also appear in floating captions. Atem delivery requires the original Atem to remain active and connected. File saving is independent of live transcription saving."))
+        fileControls.orientation = .vertical; fileControls.alignment = .leading; fileControls.spacing = 8
+        folder.font = .systemFont(ofSize: 11); folder.lineBreakMode = .byTruncatingMiddle
+        let choose = NSButton(title: "Choose Dictation Folder...", target: self, action: #selector(chooseFolder)); choose.bezelStyle = .rounded
+        showFiles.target = self; showFiles.action = #selector(showSavedFiles); showFiles.bezelStyle = .rounded
+        fileControls.addArrangedSubview(folder)
+        fileControls.addArrangedSubview(NSStackView(views: [choose, showFiles]))
+        fileControls.addArrangedSubview(fileStatus); stack.addArrangedSubview(fileControls)
         let accessibility = NSButton(title: "Allow Accessibility for Typing...", target: self, action: #selector(allowAccessibility)); accessibility.bezelStyle = .rounded
         stack.addArrangedSubview(accessibility)
         let divider = NSBox(); divider.boxType = .separator; stack.addArrangedSubview(divider)
@@ -90,8 +102,8 @@ final class VoiceDictationViewController: NSViewController, NSTextFieldDelegate 
         remoteControls.addArrangedSubview(keyStatus); stack.addArrangedSubview(remoteControls)
         stack.addArrangedSubview(label("Polishing is optional and defaults off. If the selected model fails, raw ASR stays in captions; nothing is typed or sent as a fallback. The knob on floating captions controls this same setting."))
         stack.addArrangedSubview(status)
-        for field in [details, status, keyStatus] { field.font = .systemFont(ofSize: 11); field.textColor = .secondaryLabelColor }
-        for child in [details, remoteControls, status, keyStatus, polishRow, divider] {
+        for field in [details, status, keyStatus, fileStatus] { field.font = .systemFont(ofSize: 11); field.textColor = .secondaryLabelColor }
+        for child in [details, remoteControls, status, keyStatus, fileControls, polishRow, divider] {
             child.translatesAutoresizingMaskIntoConstraints = false
             child.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
@@ -105,6 +117,11 @@ final class VoiceDictationViewController: NSViewController, NSTextFieldDelegate 
         polishKnob.state = settings.polishing ? .on : .off
         typeInActiveTextField.state = settings.typeInActiveTextField ? .on : .off
         sendToAtem.state = settings.sendToAtem ? .on : .off
+        saveToFiles.state = settings.saveToFiles ? .on : .off
+        fileControls.isHidden = !settings.saveToFiles
+        folder.stringValue = settings.folderPath
+        fileStatus.stringValue = manager.fileMessage ?? "Final dictation is saved as TXT and JSONL, with private file permissions."
+        showFiles.isEnabled = manager.lastDictationFolder != nil
         provider.selectItem(at: DictationLLMProvider.allCases.firstIndex(of: settings.provider)!)
         // Preserve edits while ASR/status events arrive.
         if renderedSettings?.provider != settings.provider || renderedSettings?.endpoint != settings.endpoint || renderedSettings?.model != settings.model {
@@ -139,6 +156,7 @@ final class VoiceDictationViewController: NSViewController, NSTextFieldDelegate 
         var settings = manager.settings
         settings.typeInActiveTextField = typeInActiveTextField.state == .on
         settings.sendToAtem = sendToAtem.state == .on
+        settings.saveToFiles = saveToFiles.state == .on
         manager.updateSettings(settings)
     }
     @objc private func changeSettings() {
@@ -174,6 +192,13 @@ final class VoiceDictationViewController: NSViewController, NSTextFieldDelegate 
     @objc private func clearKey() { manager.saveKey(nil); key.stringValue = "" }
     @objc private func configureASR() { onConfigureTranscription?() }
     @objc private func allowAccessibility() { AccessibilityDictationTarget.requestPermission() }
+    @objc private func chooseFolder() {
+        let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false; panel.canCreateDirectories = true
+        panel.directoryURL = URL(fileURLWithPath: manager.settings.folderPath, isDirectory: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        var value = manager.settings; value.folderPath = url.path; manager.updateSettings(value)
+    }
+    @objc private func showSavedFiles() { if let url = manager.lastDictationFolder { NSWorkspace.shared.open(url) } }
     private func label(_ text: String, size: CGFloat = 11, weight: NSFont.Weight = .regular) -> NSTextField {
         let field = NSTextField(wrappingLabelWithString: text); field.font = .systemFont(ofSize: size, weight: weight)
         field.translatesAutoresizingMaskIntoConstraints = false

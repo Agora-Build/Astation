@@ -271,8 +271,8 @@ on-device models: Parakeet EOU (low-latency English, about 224 MB), Whisper larg
 Turbo (faster multilingual, 1.64 GB), and full Whisper large-v3 (accuracy-oriented,
 3.09 GB). Switch models in settings; these labels describe tradeoffs, not
 guaranteed benchmark rankings.
-Enable sources in **Audio & Recording**, then check mic, system audio, or one or
-more selected apps for transcription. Mic can run alongside system audio or apps;
+Choose mic/system sources in Live Transcription and configure selected apps in
+**Audio & Recording**. Mic can run alongside system audio or apps;
 all-system and selected-app capture are alternative modes. Download the model
 once, then transcribe offline with separate labeled captions per source.
 Each source uses additional processing and memory. Original tracks are unchanged.
@@ -283,7 +283,18 @@ Their Start/Stop controls are independent: stopping one leaves the other running
 Floating captions support multiple lines and a rolling **20-second** history.
 Drag the window anywhere, including an external monitor; updates keep its position
 without stealing keyboard focus. Turn floating captions on or off in settings.
-New speech restores the toast after automatic timeout. After Hide, use
+Caption text expires; the source control stays available until Hide. Its compact
+button cycles **Off / Mic / System / All / Apps**. Deliberate scrolling selects a
+mode and applies it automatically after one second; clicking advances immediately.
+Empty Apps selection opens an app picker; saved selections show app icons on the
+compact control. The floating Polish switch appears only during dictation.
+During Push-to-Talk and Hands-Free dictation, a microphone icon and **Dictation**
+status pill replace the source control; it returns when dictation releases audio.
+Microphone captions show speech without a source prefix in every mode.
+Scrolling through captions holds your reading position for 15 seconds after the
+last scroll, then follows the latest text while transcription or dictation runs.
+System and Apps do not open the microphone for transcription; Apps uses the saved
+application selection. After Hide, use
 **Show Floating Captions** in the Astation menu or settings. Bind **Toggle Floating
 Captions** in **Keyboard Shortcuts** for global show/hide control (unbound by default).
 Copy or save the session transcript as TXT or JSON. Optional auto-save keeps
@@ -304,8 +315,11 @@ publishing, and validation details.
 
 **Settings > Voice Dictation** configures local-microphone push-to-talk and Hands-Free
 dictation, independently of RTC. It uses the installed local ASR profile selected
-in Live Transcription. Mic transcription disables both dictation modes; system/app-only
-transcription can run alongside them.
+in Live Transcription. Both dictation modes take priority over every transcription
+source. Transcription pauses while dictation listens/finishes recognition, then
+resumes the remembered source without clearing history or replaying paused audio.
+Changing the source during dictation updates the pending selection; Off prevents
+resumption. Original recordings and RTC continue.
 
 The **Polish** dial in settings and floating captions optionally adds an ASR-to-LLM
 editing step. Choose Apple on-device, local Qwen through Ollama/llama.cpp, OpenAI
@@ -315,8 +329,10 @@ Qwen requires a separately installed runtime/model; there is no silent cloud fal
 
 Choose independent outputs: typing into the original active text field (default on,
 Accessibility permission required; no Return/key/clipboard injection) and sending
-to the active connected Atem (default off). Enable both to use the same result in
-both places, or turn both off for captions only. Results always remain in floating
+to the active connected Atem (default off), and saving to files (default off).
+Choose any combination, including file-only operation. Dictation TXT/JSONL files
+default to `~/Documents/Astation/Dictation`, independently of transcription saving.
+Turn all three off for captions only. Results always remain in floating
 captions. If an output becomes unavailable, the other still works; polishing failure
 keeps raw text local without typing or sending it. See the
 [dictation guide](docs/live-transcription.md#voice-dictation-and-optional-llm-polishing).
