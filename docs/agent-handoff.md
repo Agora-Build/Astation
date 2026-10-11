@@ -1,6 +1,6 @@
 # Astation Agent Handoff
 
-Updated on 2026-10-10 against `main` at `d09f854`, open PRs, worktree state, and
+Updated on 2026-10-10 against `main` at `b426292`, open PRs, worktree state, and
 production verification. The original 2026-10-08 audit also checked the task
 vault (`v-8ut37j7X`). This is the current follow-up list; implementation and
 deployment history remain in Git and the vault. Read local `AGENTS.md`
@@ -102,11 +102,12 @@ and public health/build-commit checks to confirm deployment.
 
 ## Active encryption work: not merged
 
-Branch `feat/atem-e2e-verification` has a pushed device-verification commit
-and substantial uncommitted storage-key and migration changes in its worktree.
-It has no open PR. Preserve that work and review the complete implementation
-before shipping it; a locally built Astation Local.app does not establish that
-the same implementation is on `main` or deployed.
+Branch `feat/atem-e2e-verification` now commits the complete device-verification,
+storage-key and migration implementation and includes current `main`. It is
+being published for PR review and user testing. Leave the PR unmerged until
+the user completes those tests; the feature is not on `main` or deployed.
+See [device verification](atem-device-verification.md) for the protocol,
+personal-team signing and the live test checklist.
 
 The local migration implementation captures authenticated device and connection
 context before dispatch, journals accepted reports, and commits completion
@@ -115,16 +116,19 @@ lifecycle and security invariants are documented in `designs/e2e-encryption.md`
 on that branch. The relay must never establish device identity or authorize
 encryption state. Retain the design and regressions with the implementation.
 
-Atem memory records a provisioned 636-test Swift run with six expected skips,
-including 26 migration regressions and real Keychain/Secure Enclave recovery.
+Publication verification repeats the provisioned 636-test Swift run with six
+expected skips, including 26 migration regressions and real Keychain/Secure
+Enclave recovery. The release build, 446 relay tests, three core suites,
+59 Node tooling tests and web checks pass. All 48 protocol fixtures match
+Atem `main` at `b73add8` byte for byte.
 Immediate disconnection, delayed execution, duplicates, reconnects, interrupted
 recovery, and revocation races have regression coverage. Live lock/unlock,
 approval, denial, revocation, storage-key rotation, re-pairing, and migration
 to ON were subsequently confirmed with Genie. Atem PRs #40 and #41 are merged.
 Those completed checks are not pending build tasks.
 
-Remaining work is review and publication of the complete Astation branch and
-live verification of OFF and OFF-then-ON. Currently an updated, unlocked
+Remaining work is PR review and user testing, especially live verification
+of OFF and OFF-then-ON. Currently an updated, unlocked
 `atem cred unlock` or `atem pair` finishes a pending migration; `atem sync`
 talks only to the relay. Making sync connect to Astation to finish migration
 is a proposed behavior change, not an approved requirement.

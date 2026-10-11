@@ -7,6 +7,12 @@ at `4e61b597`. Step 2a uses the storage-key/unlock contract and fixed
 vectors in the merged PR #38 design at `aedbb9d`. Atem also implements
 step 2b, keeping account keys in its key agent.
 
+Publication verification on 2026-10-10 compares all 48 named fixtures against
+Atem `main` at `b73add8a11eb1bac3946787646f5337ef87055be` (PR #41),
+byte for byte. The migration-key proof also matches that client's Rust
+known-answer test. Use this client version or newer for live tests, including
+its running key agent; an old executable or agent cannot complete migration.
+
 ## Protocol And Trust
 
 The existing authenticated WebSocket carries `verifyCommit`, `verifyKeys`,
@@ -192,6 +198,13 @@ message alone does not prove a signing mismatch. Current builds distinguish
 an unsupported newer format and tell you to update; all such failures retain
 the existing identity and device pins.
 
+Quit Astation before running the signing command: the packager refuses to
+replace a running bundle. For this feature worktree, launch the result with:
+
+```sh
+open "/Users/brent/Dev/Agora.Build/Astation-e2e-verification/.build/Astation Local.app"
+```
+
 `package-dev-app.sh` also accepts `ASTATION_SIGNING_IDENTITY` and
 `ASTATION_PROVISIONING_PROFILE` together, plus `ASTATION_DEV_BUNDLE_ID` and
 `ASTATION_DEV_BUNDLE_DIR`. It checks profile expiry, authorized bundle/group,
@@ -203,6 +216,17 @@ still needs an authorized distribution profile, certificate, and
 notarization before shipping this flow.
 
 ## Validation
+
+Local publication checks on 2026-10-10 pass: 636 provisioned Swift tests
+with six expected media/model skips and zero failures, including all
+26 migration regressions and the protected Keychain/Secure Enclave tests;
+the Swift release build; 446 relay tests (109 database/service tests deferred
+to CI); three core suites; 59 Node tooling tests; and web codec, proxy and
+screen-sharing checks. Shell syntax and patch whitespace checks pass.
+The existing Local.app passes signature and bundled-resource checks.
+It remains running; the refreshed test host runs the latest source without
+replacing that app bundle. Quit the app and rerun the signing helper before
+testing the updated packaged build.
 
 The Swift known-answer suite checks every public key, encoding, commitment,
 safety code, transcript, statement, sealed-output digest, signature, and
@@ -247,6 +271,33 @@ reports the storage key held by Astation. Then run `atem cred lock` and
 `atem cred unlock`, approve Touch ID on the Mac, and confirm storage-key
 rotation. Test Deny and a disconnected unlock before approving a fresh
 request. Relaunch Astation and repeat unlock to check persistence. Finally
-enable account encryption in Astation and run `atem sync` to verify that K
-stays in Atem's key agent. Automated crypto/controller tests do not exercise
+enable account encryption in Astation and run `atem cred unlock` to complete
+migration, then `atem sync` to verify that K stays in Atem's key agent.
+`atem sync` connects only to the relay; `atem cred unlock` or `atem pair`
+connects to Astation and finishes a pending migration, including when the
+agent is already unlocked. Automated crypto/controller tests do not exercise
 the user's physical Touch ID interaction or production relay pairing.
+
+### Tests Before Squash Merge
+
+Live approval, denial, revocation, rotation, re-pairing and migration to ON
+have already passed with Genie. Keep this PR open while the user checks the
+remaining OFF and OFF-then-ON paths with the updated app and client:
+
+1. Confirm Astation's relay/account status is connected and `atem cred status`
+   on the other machine reports a verified device and an unlocked key agent.
+2. In Astation, turn encryption off. Run `atem cred unlock` on the other
+   machine. Astation should reach Off after verified migration, and existing
+   memory, skills and vault data should remain readable.
+3. Turn encryption on again, save the encryption recovery key, and run
+   `atem cred unlock`. Astation should reach On; read existing data and sync
+   a disposable record. The plaintext and obsolete-field counts should reach
+   zero for the migrated records.
+4. During a pending migration on an isolated test account, interrupt Atem,
+   retry the command, and relaunch Astation. Work accepted before interruption
+   must resume without requiring a persistent client; otherwise sender retry
+   must safely finish it. Repeated commands must preserve the committed mode.
+
+Use a disposable account for interruption/revocation tests. This feature
+does not establish plaintext backup erasure, implement E2E identity restore,
+or provide production distribution signing and notarization.
