@@ -5,7 +5,7 @@ import XCTest
 
 final class TokenLibraryInteropTests: XCTestCase {
     func testTranscriptionDoesNotLinkAnAdditionalRustRuntime() {
-        XCTAssertFalse(TextNormalizer.isNativeAvailable,
+        XCTAssertFalse(TextNormalizer.shared.isNativeAvailable,
                        "FluidAudio's unused NeMo engine must remain disabled alongside Atem core.")
     }
 
