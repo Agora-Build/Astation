@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-// Builds an RTC token using Agora's AccessToken2 (C++ implementation).
+// Builds an RTC token using Agora's AccessToken2 (shared Atem library).
 // Returns a heap-allocated C string that must be freed with astation_token_free.
 char* astation_rtc_build_token(
     const char* app_id,
@@ -17,7 +17,7 @@ char* astation_rtc_build_token(
     uint32_t token_expire_seconds,
     uint32_t privilege_expire_seconds);
 
-// Builds an RTM token using Agora's AccessToken2 (C++ implementation).
+// Builds an RTM token using Agora's AccessToken2 (shared Atem library).
 // Returns a heap-allocated C string that must be freed with astation_token_free.
 char* astation_rtm_build_token(
     const char* app_id,

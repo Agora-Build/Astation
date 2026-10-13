@@ -117,6 +117,19 @@ void test_rtc_subscriber() {
     assert(service->privileges_.at(agora::tools::ServiceRtc::kPrivilegeJoinChannel) == privilege_expire);
 }
 
+void test_legacy_role_defaults_to_publisher() {
+    for (const int role : {0, -1, 99}) {
+        agora::tools::AccessToken2 parsed;
+        assert(parsed.FromString(build_rtc_token("legacy-role", 42, role, 600, 300)));
+        auto* service = require_rtc_service(parsed);
+        assert(service->privileges_.size() == 4);
+        assert(service->privileges_.at(agora::tools::ServiceRtc::kPrivilegeJoinChannel) == 300);
+        assert(service->privileges_.at(agora::tools::ServiceRtc::kPrivilegePublishAudioStream) == 300);
+        assert(service->privileges_.at(agora::tools::ServiceRtc::kPrivilegePublishVideoStream) == 300);
+        assert(service->privileges_.at(agora::tools::ServiceRtc::kPrivilegePublishDataStream) == 300);
+    }
+}
+
 void test_rtc_uid_zero() {
     const std::string channel = "uid-zero";
     std::string token = build_rtc_token(channel.c_str(), 0, 2, 60, 60);
@@ -191,6 +204,7 @@ void test_rtm_invalid_cert() {
 int main() {
     test_rtc_publisher();
     test_rtc_subscriber();
+    test_legacy_role_defaults_to_publisher();
     test_rtc_uid_zero();
     test_rtm_token();
     test_invalid_app_id();

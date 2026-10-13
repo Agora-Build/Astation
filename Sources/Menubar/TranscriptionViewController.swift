@@ -2,10 +2,8 @@ import AppKit
 import UniformTypeIdentifiers
 
 private final class TranscriptionDocumentView: NSView { override var isFlipped: Bool { true } }
-private final class TranscriptionSourceButton: NSButton { var sourceID = "" }
 
 final class TranscriptionViewController: NSViewController {
-    var onConfigureSources: (() -> Void)?
     static let languages: [(code: String, title: String)] = [
         ("en-US", "English (US)"), ("en-GB", "English (UK)"), ("zh-CN", "Chinese (Mandarin)"),
         ("zh-TW", "Chinese (Taiwan)"), ("zh-HK", "Chinese (Cantonese)"), ("ja-JP", "Japanese"),
@@ -18,12 +16,10 @@ final class TranscriptionViewController: NSViewController {
     private let providerPicker = NSPopUpButton()
     private let modelPicker = NSPopUpButton()
     private let modelDetails = NSTextField(wrappingLabelWithString: "")
-    private let sourceStack = NSStackView()
     private let languagePicker = NSPopUpButton()
     private let translationPicker = NSPopUpButton()
     private let manifestField = NSTextField()
     private let toastToggle = NSButton(checkboxWithTitle: "Floating captions - multiline, last 20 seconds", target: nil, action: nil)
-    private let showCaptionsButton = NSButton(title: "Show Floating Captions", target: nil, action: nil)
     private let downloadButton = NSButton(title: "Download Selected Model", target: nil, action: nil)
     private let startButton = NSButton(title: "Start Transcription", target: nil, action: nil)
     private let copyButton = NSButton(title: "Copy Transcript", target: nil, action: nil)
@@ -48,8 +44,6 @@ final class TranscriptionViewController: NSViewController {
     private let showSavedButton = NSButton(title: "Show Saved", target: nil, action: nil)
     private let autoSaveStatus = NSTextField(wrappingLabelWithString: "")
     private var observers: [NSObjectProtocol] = []
-    private var renderedSources: [AudioSourceSelection]?
-    private var sourceButtons: [TranscriptionSourceButton] = []
 
     init(recorder: AudioRecordingManager, manager: AudioTranscriptionManager? = nil) {
         self.recorder = recorder; self.manager = manager ?? recorder.transcription
@@ -93,22 +87,14 @@ final class TranscriptionViewController: NSViewController {
         stack.addArrangedSubview(title)
         stack.addArrangedSubview(label("Read your selected sources in real time. Drag floating captions anywhere, including another monitor."))
         stack.addArrangedSubview(label("Transcribe without saving audio, record without captions, or run both together. Each feature has its own Start and Stop controls."))
-        stack.addArrangedSubview(label("Check the sources to transcribe here; choose apps in Audio & Recording. Transcription sources are independent of recording sources."))
-        let configure = NSButton(title: "Configure Audio Sources...", target: self, action: #selector(configureSources))
-        configure.bezelStyle = .rounded
-        stack.addArrangedSubview(configure)
+        stack.addArrangedSubview(label("Choose Off, Mic, System, All, or Apps in the floating controls. Configure your microphone device in Audio & Recording."))
+        toastToggle.target = self; toastToggle.action = #selector(toggleToast)
+        stack.addArrangedSubview(toastToggle)
         providerPicker.addItems(withTitles: TranscriptionProvider.allCases.map(\.title))
         languagePicker.addItems(withTitles: Self.languages.map(\.title))
         translationPicker.addItems(withTitles: ["Off"] + Self.languages.map(\.title))
         stack.addArrangedSubview(row("Engine", control: providerPicker))
         providerPicker.target = self; providerPicker.action = #selector(changeSettings)
-        stack.addArrangedSubview(label("Listen to", size: 12, weight: .semibold))
-        sourceStack.orientation = .vertical
-        sourceStack.alignment = .leading
-        sourceStack.spacing = 6
-        sourceStack.setHuggingPriority(.required, for: .vertical)
-        stack.addArrangedSubview(sourceStack)
-        stack.addArrangedSubview(label("Select one or more sources. Each gets its own captions; originals are never mixed or modified. All system audio and selected-app capture are alternative modes."))
         for (name, control) in [("Input language", languagePicker), ("Translate to", translationPicker)] {
             stack.addArrangedSubview(row(name, control: control))
             control.target = self; control.action = #selector(changeSettings)
@@ -154,9 +140,6 @@ final class TranscriptionViewController: NSViewController {
         customControls.addArrangedSubview(label("OpenAI-compatible multipart uploads; the service must return JSON with a text field. This is short-window HTTP transcription, not a continuous WebSocket stream. HTTPS is required except on localhost. Keys are bound to the exact endpoint and never saved in transcript files."))
         stack.addArrangedSubview(customControls)
         for child in customControls.arrangedSubviews { child.widthAnchor.constraint(equalTo: customControls.widthAnchor).isActive = true }
-        toastToggle.target = self; toastToggle.action = #selector(toggleToast)
-        stack.addArrangedSubview(toastToggle)
-        stack.addArrangedSubview(showCaptionsButton)
         stack.addArrangedSubview(privacyLabel)
         autoSaveToggle.target = self; autoSaveToggle.action = #selector(changeSettings)
         stack.addArrangedSubview(autoSaveToggle)
@@ -177,7 +160,6 @@ final class TranscriptionViewController: NSViewController {
         for (button, action) in [(downloadButton, #selector(downloadModel)), (startButton, #selector(toggleTranscription)),
                                  (copyButton, #selector(copyTranscript)), (exportButton, #selector(exportTranscript)),
                                  (saveKeyButton, #selector(saveCustomKey)), (clearKeyButton, #selector(clearCustomKey)),
-                                 (showCaptionsButton, #selector(showCaptions)),
                                  (chooseTranscriptFolder, #selector(chooseFolder)), (showSavedButton, #selector(showSaved))] {
             button.bezelStyle = .rounded; button.target = self; button.action = action
         }
@@ -215,30 +197,7 @@ final class TranscriptionViewController: NSViewController {
         let custom = settings.provider == .custom
         let englishOnly = local && settings.localModel.isEnglishOnly
         providerPicker.selectItem(at: TranscriptionProvider.allCases.firstIndex(of: settings.provider) ?? 0)
-        let useApps = settings.selectedSourceIDs.contains { !["microphone", "system"].contains($0) }
-            || (recorder.settings.outputMode == .applications && !settings.selectedSourceIDs.contains("system"))
-        let sources = manager.availableSources.filter { $0.id == "microphone" || (useApps ? $0.id != "system" : $0.id == "system") }
-        let identities = sources.map(\.id)
-        if sources != renderedSources {
-            for child in sourceStack.arrangedSubviews { sourceStack.removeArrangedSubview(child); child.removeFromSuperview() }
-            sourceButtons = []
-            for source in sources {
-                let title = source.id == "microphone" ? "Microphone - \(source.title)" : source.title
-                let button = TranscriptionSourceButton(checkboxWithTitle: title, target: self, action: #selector(selectSources))
-                button.sourceID = source.id
-                button.identifier = NSUserInterfaceItemIdentifier("transcription-source-\(source.id)")
-                button.setAccessibilityLabel("Transcribe \(title)")
-                button.cell?.lineBreakMode = .byTruncatingTail
-                button.toolTip = title
-                sourceButtons.append(button); sourceStack.addArrangedSubview(button)
-                button.widthAnchor.constraint(equalTo: sourceStack.widthAnchor).isActive = true
-            }
-            renderedSources = sources
-        }
-        for button in sourceButtons {
-            button.state = settings.selectedSourceIDs.contains(button.sourceID) ? .on : .off
-            button.isEnabled = !locked
-        }
+        let identities = Set(manager.availableSources.map(\.id))
         languagePicker.selectItem(at: Self.languages.firstIndex { $0.code == settings.language } ?? 0)
         modelPicker.selectItem(at: LocalTranscriptionModel.allCases.firstIndex(of: settings.localModel) ?? 0)
         translationPicker.selectItem(at: settings.translationLanguage.flatMap { code in Self.languages.firstIndex { $0.code == code }.map { $0 + 1 } } ?? 0)
@@ -257,9 +216,9 @@ final class TranscriptionViewController: NSViewController {
         keyStatus.stringValue = manager.customKeyMessage ?? "Leave the key blank for servers without authentication; use Save Key to store a new key."
         toastToggle.state = settings.floatingCaptions ? .on : .off
         switch settings.provider {
-        case .local: privacyLabel.stringValue = "On-device captions. No audio uploads. Each checked source loads its own model instance, using more memory and processing. Download the chosen model once for all sources. Labels describe tradeoffs, not guaranteed benchmark rankings."
-        case .agora: privacyLabel.stringValue = "Agora Real-Time STT & Translation uploads only the checked sources. Each source uses a separate cloud session and may be billed."
-        case .custom: privacyLabel.stringValue = "Only checked sources are uploaded to your endpoint in separate audio windows. Service charges and retention depend on your provider."
+        case .local: privacyLabel.stringValue = "On-device captions. No audio uploads. Each selected source loads its own model instance, using more memory and processing. Download the chosen model once for all sources. Labels describe tradeoffs, not guaranteed benchmark rankings."
+        case .agora: privacyLabel.stringValue = "Agora Real-Time STT & Translation uploads only the selected sources. Each source uses a separate cloud session and may be billed."
+        case .custom: privacyLabel.stringValue = "Only selected sources are uploaded to your endpoint in separate audio windows. Service charges and retention depend on your provider."
         }
         privacyLabel.font = .systemFont(ofSize: 11)
         privacyLabel.textColor = local ? .secondaryLabelColor : .systemOrange
@@ -287,11 +246,10 @@ final class TranscriptionViewController: NSViewController {
         showSavedButton.isEnabled = manager.lastTranscriptFolder != nil
         let missingSources = settings.selectedSourceIDs.contains { !identities.contains($0) }
         statusLabel.stringValue = manager.message ?? (missingSources
-            ? "A previously selected source is no longer available. Check the sources to use, or configure Audio & Recording."
-            : "Captions are off. Check one or more sources to start.")
+            ? "A previously selected source is no longer available. Choose a source in the floating controls."
+            : "Captions are off. Choose a source in the floating controls to start.")
         statusLabel.textColor = manager.state == .failed ? .systemRed : .secondaryLabelColor
     }
-    @objc private func configureSources() { onConfigureSources?() }
     @objc private func changeSettings() {
         guard !manager.isActive, manager.downloadProgress == nil else { return }
         var settings = manager.settings
@@ -307,16 +265,7 @@ final class TranscriptionViewController: NSViewController {
         settings.autoSaveTranscript = autoSaveToggle.state == .on
         manager.updateSettings(settings)
     }
-    @objc private func selectSources() {
-        guard !manager.isActive, manager.downloadProgress == nil else { return }
-        let selected = sourceButtons.filter { $0.state == .on }.map(\.sourceID)
-        var settings = manager.settings
-        settings.sourceID = selected.first ?? ""
-        settings.additionalSourceIDs = Array(selected.dropFirst())
-        manager.updateSettings(settings)
-    }
     @objc private func toggleToast() { manager.setFloatingCaptions(toastToggle.state == .on) }
-    @objc private func showCaptions() { manager.setFloatingCaptions(true) }
     @objc private func downloadModel() {
         if manager.downloadProgress != nil { manager.cancelDownload() }
         else { changeSettings(); manager.downloadModel() }
@@ -329,8 +278,8 @@ final class TranscriptionViewController: NSViewController {
             let agora = manager.settings.provider == .agora
             alert.messageText = "Upload \(manager.settings.selectedSourceIDs.count) source(s) to \(agora ? "Agora" : "your endpoint")?"
             alert.informativeText = agora
-                ? "Audio from the checked sources will be uploaded for real-time transcription and optional translation. Each source starts a separate Agora session, so selecting more sources can increase charges. Original recordings stay on this Mac."
-                : "Audio from the checked sources will be sent in short WAV windows to \(manager.settings.customEndpoint). Provider charges and retention depend on this service. Original recordings stay on this Mac."
+                ? "Audio from the selected sources will be uploaded for real-time transcription and optional translation. Each source starts a separate Agora session, so selecting more sources can increase charges. Original recordings stay on this Mac."
+                : "Audio from the selected sources will be sent in short WAV windows to \(manager.settings.customEndpoint). Provider charges and retention depend on this service. Original recordings stay on this Mac."
             alert.addButton(withTitle: "Start Cloud Transcription")
             alert.addButton(withTitle: "Cancel")
             guard alert.runModal() == .alertFirstButtonReturn else { return }

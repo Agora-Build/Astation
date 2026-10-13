@@ -7,7 +7,7 @@ import zlib
 // MARK: - Token Decoder (for roundtrip verification)
 
 /// Minimal AccessToken2 decoder — mirrors Agora's AccessToken2 format.
-/// Used only in tests to verify the C++ token builder produces valid tokens.
+/// Used only in tests to verify the shared builder's wire format independently.
 private struct DecodedToken {
     let signature: Data
     let appId: String
@@ -458,7 +458,7 @@ final class AccessToken2Tests: XCTestCase {
 
     // MARK: - Edge cases
 
-    func testZeroExpiry() throws {
+    func testZeroExpiryIsRejected() {
         let token = buildRtcToken(
             channel: "ch",
             uid: 1,
@@ -466,12 +466,7 @@ final class AccessToken2Tests: XCTestCase {
             tokenExpireSeconds: 0,
             privilegeExpireSeconds: 0
         )
-        let decoded = try decodeToken(token)
-        XCTAssertEqual(decoded.expire, 0)
-        // Privileges should expire at issuedAt + 0 = issuedAt
-        for priv in decoded.services[0].privileges {
-            XCTAssertEqual(priv.value, 0)
-        }
+        XCTAssertTrue(token.isEmpty)
     }
 
     func testInvalidAppIdReturnsEmptyToken() {
@@ -504,7 +499,7 @@ final class AccessToken2Tests: XCTestCase {
 
     func testTokenNonEmptyWithValidCert() {
         let token = buildRtcToken(
-            channel: "",
+            channel: "one-second",
             uid: 0,
             role: .subscriber,
             tokenExpireSeconds: 1,

@@ -1,18 +1,28 @@
 # Live transcription and floating captions
 
-Live Transcription is its own Settings sidebar item. Choose the microphone/system
-sources there, and configure selected apps in Settings > Audio & Recording
-(or use Configure Audio Sources). Check one or more sources:
+Live Transcription is its own Settings sidebar item for the engine, model,
+languages, captions, and transcript saving. Choose the audio source with the
+floating **Off / Mic / System / All / Apps** button. Enable **Floating captions -
+multiline, last 20 seconds** at the top of settings, or use **Show Floating
+Captions** in the Astation menu to reopen it:
 
-- Microphone only, system audio only, or a specific app only.
-- Microphone plus all system audio.
-- One or more selected apps, optionally with the microphone.
+- **Off** stops transcription.
+- **Mic** transcribes the microphone; **System** transcribes all system audio.
+- **All** transcribes the microphone and all system audio.
+- **Apps** transcribes selected apps. Choose apps in the floating picker, or
+  right-click the Apps button to change an existing selection.
+
+Microphone-device configuration remains in Settings > Audio & Recording.
+Opening settings or showing the floating controls does not start capture or
+change the selected sources. Settings retain
+Start/Stop Transcription for the current selection without duplicate source
+checkboxes.
 
 All system audio and selected-app capture remain alternative output modes. Each
-checked source gets a separate engine and labeled captions, not a mixed audio
-stream. Transcription capture follows only the checked sources, independently of
+selected source gets a separate engine and labeled captions, not a mixed audio
+stream. Transcription capture follows only the selected sources, independently of
 recording settings. System/app-only transcription does not request microphone
-permission or acquire microphone capture. Unchecked recording sources can still
+permission or acquire microphone capture. Other recording sources can still
 be recorded, but are never sent to a
 transcription engine. Original recording files retain their native sample rate,
 channels, and samples; each transcription branch converts to 16 kHz mono.
@@ -26,6 +36,11 @@ running. Capture is shared when an existing recording/preview already supplies
 the selected sources; otherwise transcription owns a separate capture. Independent
 recordings continue when transcription changes sources or dictation pauses it.
 Sleep and app shutdown stop capture.
+
+Recording and caption sources can differ: record microphone-only audio while
+the floating **All** mode transcribes microphone and system audio. Changing the
+caption mode leaves the recording sources unchanged. Live Transcription settings
+provide no recording-source configuration button.
 
 ## Local models
 
@@ -125,9 +140,9 @@ source labels remain available when multiple sources are present.
 The picker saves transcription's app selection independently of recording settings;
 initial selection falls back to apps saved in Audio & Recording. Choosing apps
 does not interrupt an ongoing recording.
-Manual Mic-plus-Apps selections in settings are labeled **Apps + Mic** so the
-floating control explicitly shows microphone capture; selecting Apps on the button
-always uses apps without microphone.
+Existing saved Mic-plus-Apps selections are preserved and labeled **Apps + Mic**
+so the floating control explicitly shows microphone capture; selecting Apps on
+the button always uses apps without microphone.
 Remote transcription prompts for consent before uploading newly selected sources;
 consent is bound to provider, endpoint/model, languages, and the selected source set.
 The floating **Polish** switch appears only during Push-to-Talk or Hands-Free
@@ -145,9 +160,9 @@ currently displayed captions if nothing is selected (not the full session transc
 Selection survives new captions and updates outside the selected text, but clears
 if the selected words change or expire. The waiting-for-speech placeholder cannot
 be copied. Hide turns off floating captions without stopping transcription,
-transcript saving, or recording. Restore using Show Floating Captions in the
-Astation menu's Voice Dictation section or Live Transcription settings, or re-enable
-the settings checkbox.
+transcript saving, or recording. Restore using the Floating captions checkbox at
+the top of Live Transcription settings, or Show Floating Captions in the Astation
+menu, below Voice Dictation Settings.
 An explicit Show works even after all captions expired: it displays a waiting-for-
 speech message (or guidance to start transcription) instead of silently remaining
 hidden. It does not replay expired captions. The header simply reads LIVE CAPTIONS.
@@ -340,7 +355,7 @@ translation target in settings. This uses Agora's Real-Time STT product, not a
 generic cloud language model or Conversational AI agent.
 
 Start shows an explicit audio-upload and billing confirmation. Capture permission
-must succeed before cloud agents start. Only checked sources are published;
+must succeed before cloud agents start. Only selected sources are published;
 originals stay local. Each source has its own Agora session and isolated publisher,
 so selecting more sources can increase charges. Cloud service usage may be billed
 by Agora. Stopping captions does not stop an existing recording or an

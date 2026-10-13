@@ -95,13 +95,6 @@ class StatusBarController: NSObject, NSMenuDelegate {
         
         // System Status Section
         let systemStatus = hubManager.getSystemStatus()
-        let statusItem = NSMenuItem(
-            title: "📊 Status: \(webSocketServer.getConnectedClientsCount()) clients connected",
-            action: nil,
-            keyEquivalent: ""
-        )
-        statusItem.isEnabled = false
-        statusMenu.addItem(statusItem)
 
         if let relayIdentityWarning = hubManager.relayIdentityMenuMessage {
             let relayIdentityItem = NSMenuItem(
@@ -159,18 +152,16 @@ class StatusBarController: NSObject, NSMenuDelegate {
 
         // Voice Dictation Section
         let vcm = dictationManager
-        let voiceDictationHeader = NSMenuItem(title: "Voice Dictation", action: nil, keyEquivalent: "")
-        voiceDictationHeader.isEnabled = false
-        statusMenu.addItem(voiceDictationHeader)
+        let dictationSettings = NSMenuItem(title: "Voice Dictation Settings", action: #selector(openDictationSettings), keyEquivalent: "")
+        dictationSettings.target = self
+        dictationSettings.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: "Voice Dictation Settings")
+        statusMenu.addItem(dictationSettings)
 
         let captionsTitle = recordingManager.transcription.floatingCaptionsVisible ? "Hide Floating Captions" : "Show Floating Captions"
         let showCaptions = NSMenuItem(title: captionsTitle, action: #selector(toggleFloatingCaptions), keyEquivalent: "")
         showCaptions.target = self
         showCaptions.image = NSImage(systemSymbolName: "captions.bubble", accessibilityDescription: "Floating Captions")
         statusMenu.addItem(showCaptions)
-        let dictationSettings = NSMenuItem(title: "Voice Dictation Settings...", action: #selector(openDictationSettings), keyEquivalent: "")
-        dictationSettings.target = self
-        statusMenu.addItem(dictationSettings)
 
         switch vcm.mode {
         case .off:
@@ -225,43 +216,9 @@ class StatusBarController: NSObject, NSMenuDelegate {
 
         statusMenu.addItem(NSMenuItem.separator())
 
-        // Connected Atems Section
-        let atemHeader = NSMenuItem(title: "Connected Atems", action: nil, keyEquivalent: "")
-        atemHeader.isEnabled = false
-        statusMenu.addItem(atemHeader)
-
-        let atemClients = hubManager.connectedClients.filter { $0.clientType == "Atem" }
-        if atemClients.isEmpty {
-            let noneItem = NSMenuItem(title: "  (no Atem instances)", action: nil, keyEquivalent: "")
-            noneItem.isEnabled = false
-            statusMenu.addItem(noneItem)
-        } else {
-            for client in atemClients {
-                let isPinned = hubManager.pinnedClientId == client.id
-                let isActive = isPinned || (hubManager.pinnedClientId == nil && client.isFocused)
-                let indicator = isPinned ? "★" : (isActive ? "●" : "○")
-                let displayName = client.hostname == "unknown"
-                    ? String(client.id.prefix(8)) + "..."
-                    : client.hostname
-                let instanceItem = NSMenuItem(
-                    title: "  \(indicator) \(displayName)",
-                    action: #selector(showClientsAndAgents),
-                    keyEquivalent: ""
-                )
-                instanceItem.target = self
-                if isActive {
-                    instanceItem.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "Active")
-                } else {
-                    instanceItem.image = NSImage(systemSymbolName: "circle", accessibilityDescription: "Idle")
-                }
-                statusMenu.addItem(instanceItem)
-            }
-        }
-
-        statusMenu.addItem(NSMenuItem.separator())
-
         // RTC Status Section
         let rtcHeader = NSMenuItem(title: "RTC Media", action: nil, keyEquivalent: "")
+        rtcHeader.image = NSImage(systemSymbolName: "antenna.radiowaves.left.and.right", accessibilityDescription: "RTC Media")
         rtcHeader.isEnabled = false
         statusMenu.addItem(rtcHeader)
 
@@ -406,10 +363,11 @@ class StatusBarController: NSObject, NSMenuDelegate {
 
         statusMenu.addItem(NSMenuItem.separator())
 
-        // Actions Section
-        let actionsHeader = NSMenuItem(title: "Actions", action: nil, keyEquivalent: "")
-        actionsHeader.isEnabled = false
-        statusMenu.addItem(actionsHeader)
+        // Tools Section
+        let toolsHeader = NSMenuItem(title: "Tools", action: nil, keyEquivalent: "")
+        toolsHeader.image = NSImage(systemSymbolName: "wrench.and.screwdriver", accessibilityDescription: "Tools")
+        toolsHeader.isEnabled = false
+        statusMenu.addItem(toolsHeader)
 
         // Show Projects
         let showProjectsItem = NSMenuItem(
@@ -419,6 +377,10 @@ class StatusBarController: NSObject, NSMenuDelegate {
         )
         showProjectsItem.target = self
         statusMenu.addItem(showProjectsItem)
+
+        let tokenTools = NSMenuItem(title: "🔑 Token Tools...", action: #selector(openTokenTools), keyEquivalent: "")
+        tokenTools.target = self
+        statusMenu.addItem(tokenTools)
 
         // Show Clients & Agents
         let onlineCount = hubManager.connectedClients.filter { $0.clientType == "Atem" }.count
@@ -512,6 +474,10 @@ class StatusBarController: NSObject, NSMenuDelegate {
     @objc private func showClientsAndAgents() {
         Log.info(" Show clients & agents requested from status bar")
         connectionsWindowController.showAndFocus()
+    }
+
+    @objc private func openTokenTools() {
+        projectsWindowController.showTokenTools()
     }
     
     @objc private func pairRemoteAtem() {

@@ -1,8 +1,7 @@
 # Floating Speech Controls
 
-Status: implemented and locally verified in the feature worktree, 2026-10-11.
-Branch: `feat/floating-transcription-toggle`. Installed in the canonical Local.app
-on 2026-10-11; ready for pull-request review.
+Status: implemented and locally verified, 2026-10-13, including the settings
+source-selector simplification. Installed in the canonical `.build/Astation Local.app`.
 
 ![Floating source control and dictation polishing](floating-speech-controls.png)
 
@@ -47,6 +46,20 @@ Use a fixed-width rounded pill in the existing floating header, with a source
 icon and a short mode label. Preserve its dark translucent appearance and teal
 accent; Off is muted. The hit area is 92 points wide and 28 points high.
 The idle hint reads "Pick a source; it starts after one second".
+
+The floating button is the transcription source selector. Live Transcription
+settings keep engine/model, language, Start/Stop, captions and transcript-saving
+options without a duplicate "Listen to" checkbox section. The single
+"Floating captions - multiline, last 20 seconds" checkbox sits below the
+introduction, before Engine, replacing the settings Show Floating Captions button.
+Enabling it reopens the controls, including when transcription is Off, without
+starting capture or changing the saved source selection. The Astation menu retains
+Show Floating Captions.
+Recording sources and microphone-device settings stay in Audio & Recording;
+Live Transcription has no Configure Audio Sources shortcut to that page.
+App selection uses the floating Apps picker. Recording microphone-only audio
+while transcribing microphone and system audio together is supported.
+Previously saved source combinations remain intact.
 
 Scrolling the caption text away from the bottom keeps its displayed snapshot and
 viewport stable for 15 seconds after the last scroll. Incoming speech, processing
@@ -193,11 +206,21 @@ Recording settings are preserved, and System/Apps never acquire an unneeded mic.
 - Scroll-review tests exercise real native scrolling with a deterministic clock:
   the 15-second boundary, further-input reset, quiet timeout recovery, selection
   preservation, immediate following at the bottom, stopped capture and Hide.
+- Settings source-selector simplification and caption-checkbox placement: 81
+  focused transcription/settings/
+  floating-controls tests pass. Saved source combinations survive other settings
+  edits; enabling the checkbox while Off starts no capture. Hide updates the
+  checkbox, and enabling it restores expired captions without interrupting recording.
+  Missing and empty sources disable Start, and recording source configuration
+  remains independent. Narrow-window snapshots for all three providers fit.
 - Installed and restarted the new Debug build at the existing
-  `Astation-e2e-verification/.build/Astation Local.app` path. The signing identity,
+  `.build/Astation Local.app` path. The signing identity,
   bundle identifier and Keychain entitlements are preserved; strict signature and
   bundled-resource checks pass. Only this Astation instance is running. Startup
   completes, the existing Secure Enclave identity authenticates to the relay, and
   the local WebSocket server starts successfully.
+- Latest settings build restarted at 22:27 PDT on 2026-10-11, with the same signing
+  and Keychain entitlements. The relay verifies the existing identity; account
+  registration still reports missing Agora identity-verification configuration.
 - Real trackpad feel, live system/selected-app permissions and audio, Accessibility
   insertion and remote Atem delivery still need manual checks in the installed build.

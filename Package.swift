@@ -30,10 +30,12 @@ let package = Package(
             path: "Sources/CStationCore",
             publicHeadersPath: "include"
         ),
+        .target(name: "CAtemCore", path: "Sources/CAtemCore", publicHeadersPath: "include"),
         .executableTarget(
             name: "Menubar",
             dependencies: [
                 "CStationCore",
+                "CAtemCore",
                 .product(name: "WebSocketKit", package: "websocket-kit"),
                 .product(name: "NIO", package: "swift-nio"),
                 .product(name: "RtcBasic", package: "AgoraRtcEngine_macOS"),
@@ -52,6 +54,8 @@ let package = Package(
                               "-Xlinker", executableInfoPlist]),
                 .unsafeFlags(["-L", "build"]),
                 .linkedLibrary("astation_core"),
+                .linkedLibrary("atem_core_ffi"),
+                .linkedLibrary("iconv"),
                 .linkedLibrary("z"),
                 .linkedLibrary("c++"),
             ]
@@ -59,7 +63,8 @@ let package = Package(
         .testTarget(
             name: "AstationTests",
             dependencies: ["Menubar"],
-            path: "Tests/AstationTests"
+            path: "Tests/AstationTests",
+            resources: [.copy("Fixtures")]
         )
     ]
 )

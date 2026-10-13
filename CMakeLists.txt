@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.19)
 
 if(CMAKE_HOST_APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum macOS deployment target")
@@ -6,20 +6,45 @@ endif()
 
 project(AstationCore LANGUAGES C CXX)
 
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+find_program(CARGO_EXECUTABLE cargo REQUIRED)
+execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/setup-atem-core.py"
+    COMMAND_ERROR_IS_FATAL ANY)
+set(ATEM_CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/atem-core")
+if(WIN32)
+    set(ATEM_CORE_LIBRARY "${ATEM_CORE_DIR}/target/release/atem_core_ffi.lib")
+else()
+    set(ATEM_CORE_LIBRARY "${ATEM_CORE_DIR}/target/release/libatem_core_ffi.a")
+endif()
+add_custom_command(OUTPUT "${ATEM_CORE_LIBRARY}"
+    COMMAND "${CARGO_EXECUTABLE}" build --release --locked -p atem-core-ffi
+    WORKING_DIRECTORY "${ATEM_CORE_DIR}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/Config/atem-core.json"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Config/atem-core.Cargo.lock"
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/setup-atem-core.py"
+        "${ATEM_CORE_DIR}/crates/atem-core-ffi/Cargo.toml"
+    COMMENT "Building the shared Atem token library")
+add_custom_target(atem_core_build DEPENDS "${ATEM_CORE_LIBRARY}")
+add_library(atem_core_ffi STATIC IMPORTED GLOBAL)
+set_target_properties(atem_core_ffi PROPERTIES IMPORTED_LOCATION "${ATEM_CORE_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${ATEM_CORE_DIR}/crates/atem-core-ffi/include")
+add_dependencies(atem_core_ffi atem_core_build)
+configure_file("${ATEM_CORE_DIR}/crates/atem-core-ffi/include/atem_core.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Sources/CAtemCore/include/atem_core.h" COPYONLY)
+add_custom_command(TARGET atem_core_build POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${ATEM_CORE_LIBRARY}" "${CMAKE_BINARY_DIR}")
+
 add_library(astation_core STATIC
     core/src/astation_core.cpp
     core/src/astation_rtc.cpp
     core/src/astation_screen_capture.cpp
-    core/src/astation_token.cpp
+    core/src/astation_token_bridge.cpp
 )
 
 target_include_directories(astation_core
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/core/include>
         $<INSTALL_INTERFACE:include>
-)
-target_include_directories(astation_core PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/core/third_party/agora_token_builder
 )
 
 # Locate Agora RTC SDK headers per platform.
@@ -153,9 +178,15 @@ endif()
 target_compile_features(astation_core PUBLIC cxx_std_17)
 
 find_package(ZLIB REQUIRED)
-target_link_libraries(astation_core PRIVATE ZLIB::ZLIB)
+target_link_libraries(astation_core PRIVATE ZLIB::ZLIB PUBLIC atem_core_ffi)
 if(APPLE)
     target_link_libraries(astation_core PRIVATE "-framework CoreVideo")
+    target_link_libraries(atem_core_ffi INTERFACE iconv)
+elseif(WIN32)
+    target_link_libraries(atem_core_ffi INTERFACE ws2_32 userenv bcrypt ntdll)
+else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(atem_core_ffi INTERFACE Threads::Threads ${CMAKE_DL_LIBS} m)
 endif()
 
 if(NOT APPLE)

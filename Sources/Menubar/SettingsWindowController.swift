@@ -66,9 +66,6 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         self.transcriptionController = TranscriptionViewController(recorder: recordingManager)
         self.dictationController = dictationManager.map { VoiceDictationViewController(manager: $0) }
         super.init()
-        transcriptionController.onConfigureSources = { [weak self] in
-            self?.tabView?.selectTabViewItem(withIdentifier: "recording")
-        }
         dictationController?.onConfigureTranscription = { [weak self] in self?.tabView?.selectTabViewItem(withIdentifier: "transcription") }
         NotificationCenter.default.addObserver(
             self, selector: #selector(networkChanged),

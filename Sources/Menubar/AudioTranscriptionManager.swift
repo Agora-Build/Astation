@@ -304,7 +304,7 @@ final class AudioTranscriptionManager {
         let selectedIDs = settings.selectedSourceIDs
         let available = availableSources
         guard !selectedIDs.isEmpty, selectedIDs.allSatisfy({ id in available.contains { $0.id == id } }) else {
-            fail("Enable sources in Audio & Recording and select at least one valid source for transcription."); return
+            fail("Choose a valid source in the floating controls to start transcription."); return
         }
         if settings.provider != .local && !cloudConsent {
             fail("Remote transcription requires explicit permission to upload the selected sources."); return
