@@ -1,4 +1,4 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.2
 import PackageDescription
 import Foundation
 
@@ -20,7 +20,8 @@ let package = Package(
         .package(url: "https://github.com/vapor/websocket-kit.git", from: "2.0.0"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.0.0"),
         .package(url: "https://github.com/AgoraIO/AgoraRtcEngine_macOS.git", exact: "4.7.0"),
-        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.17.5"),
+        // ASR uses no NeMo text normalization; omit its additional Rust runtime.
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.17.5", traits: []),
         .package(url: "https://github.com/argmaxinc/WhisperKit.git", exact: "0.18.0"),
         .package(url: "https://github.com/huggingface/swift-transformers.git", exact: "1.1.9")
     ],
@@ -66,5 +67,6 @@ let package = Package(
             path: "Tests/AstationTests",
             resources: [.copy("Fixtures")]
         )
-    ]
+    ],
+    swiftLanguageModes: [.v5]
 )

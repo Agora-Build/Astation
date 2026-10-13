@@ -66,6 +66,11 @@ serialized output. CMake builds the Rust static library and copies it alongside
 `libastation_core.a`. Swift links both; the Rust library is not embedded as a
 separate runtime framework. Startup and library calls check the ABI version.
 
+Swift 6.2+ package traits disable FluidAudio's unused NeMo text-normalization
+engine, whose prebuilt Rust runtime otherwise conflicts with Atem core in clean
+builds. Astation uses FluidAudio's streaming ASR without this engine. The package
+retains Swift 5 language mode while requiring tools 6.2+ for trait selection.
+
 Install current stable Rust with Cargo, then use the normal CMake and Swift
 build commands or `scripts/run-dev.sh --build-only`. The source pin, header,
 dependency lock and interoperability fixtures must be updated together when

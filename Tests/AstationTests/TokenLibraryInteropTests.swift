@@ -1,8 +1,14 @@
 import CStationCore
+import FluidAudio
 import XCTest
 @testable import Menubar
 
 final class TokenLibraryInteropTests: XCTestCase {
+    func testTranscriptionDoesNotLinkAnAdditionalRustRuntime() {
+        XCTAssertFalse(TextNormalizer.isNativeAvailable,
+                       "FluidAudio's unused NeMo engine must remain disabled alongside Atem core.")
+    }
+
     func testLegacyTokensRebuildIdenticallyWithSharedLibrary() throws {
         let app = "0123456789abcdef0123456789abcdef"
         let certificate = "abcdef0123456789abcdef0123456789"

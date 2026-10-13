@@ -13,7 +13,7 @@ is available for local verification.
 
 ### Build from source
 
-Prerequisites: macOS 14+, Xcode Command Line Tools, CMake 3.19+, and current stable Rust/Cargo.
+Prerequisites: macOS 14+, Xcode 26.2+ (Swift 6.2+), CMake 3.19+, and current stable Rust/Cargo.
 
 ```bash
 git clone git@github.com:Agora-Build/Astation.git
