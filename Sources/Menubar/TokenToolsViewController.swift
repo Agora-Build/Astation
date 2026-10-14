@@ -293,7 +293,7 @@ final class TokenToolsViewController: NSViewController, NSTextFieldDelegate, NST
     @objc private func modeChanged() { updateVisibility() }
     func controlTextDidChange(_ notification: Notification) { invalidate() }
     func textDidChange(_ notification: Notification) { invalidate() }
-    @objc private func closeTools() { certificate.stringValue = ""; onClose?() }
+    @objc private func closeTools() { clearSensitiveContent(); onClose?() }
 
     func clearSensitiveContent() {
         certificate.stringValue = ""; tokenInput.string = ""; invalidate()

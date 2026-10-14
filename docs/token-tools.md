@@ -27,6 +27,8 @@ changing project clears the previous result and disables Copy so the old token
 cannot be mistaken for a new one. Project credentials are resolved again when
 generating; removed projects cannot use a cached certificate. No tokens or
 custom certificates are persisted by this window. Closing it clears its values.
+The picker shows the project list from when the sheet opened; refresh Projects
+and reopen Token Tools to see newly added projects or updated names.
 
 Generation runs locally. Neither the App Certificate nor token is sent to Atem
 or the relay. The Atem executable does not need to be installed or running.
@@ -63,8 +65,16 @@ consumer workspace with dependencies pinned in `Config/atem-core.Cargo.lock`;
 it does not install, build or modify the Atem CLI. Test-only dependencies are
 excluded, and system zlib is enabled to preserve the existing C++ builder's
 serialized output. CMake builds the Rust static library and copies it alongside
-`libastation_core.a`. Swift links both; the Rust library is not embedded as a
-separate runtime framework. Startup and library calls check the ABI version.
+`libastation_core.a`. Cargo checks source freshness on every CMake build. Configure
+validates the checked-in C header against the pinned library and fails on mismatch;
+it does not overwrite tracked headers. Swift links both; the Rust library is not
+embedded as a separate runtime framework. Startup reports an incompatible ABI;
+library calls reject it so other app features can remain available.
+
+To check native linker requirements after a library/toolchain upgrade, run
+`cargo rustc --release --locked -p atem-core-ffi -- --print native-static-libs`
+in `third_party/atem-core`. The current macOS archive requires `iconv` and `z`
+explicitly; the C++ and Swift drivers supply `System`, `c` and `m`.
 
 Swift 6.2+ package traits disable FluidAudio's unused NeMo text-normalization
 engine, whose prebuilt Rust runtime otherwise conflicts with Atem core in clean

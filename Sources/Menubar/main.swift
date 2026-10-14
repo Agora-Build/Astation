@@ -23,9 +23,8 @@ if CommandLine.arguments.contains("--audio-capture-check") {
 // Logs: ~/Library/Logs/Astation/astation.log
 Log.setup()
 
-guard AgoraTokenService.isCompatible else {
-    Log.error("Incompatible token-library ABI. Rebuild Astation.")
-    exit(1)
+if !AgoraTokenService.isCompatible {
+    Log.error("Incompatible token-library ABI. Token operations are unavailable; rebuild Astation.")
 }
 
 Log.info("Starting Astation - AI-powered work suite hub")

@@ -94,9 +94,33 @@ final class TokenToolsUITests: XCTestCase {
         let output = try generate(controller)
         let decoded = try AgoraTokenService.decode(output.string)
         XCTAssertEqual(decoded.services.first?.service_type, 2)
-        controller.clearSensitiveContent()
+        try find(controller.view, NSButton.self) { $0.title == "Close" }.performClick(nil)
         XCTAssertTrue(output.string.isEmpty)
         XCTAssertTrue(try find(controller.view, NSSecureTextField.self) { $0.accessibilityLabel() == "Custom App Certificate" }.stringValue.isEmpty)
+    }
+
+    func testVerificationRejectsAppIDAndCertificateMismatchesIndependently() throws {
+        let controller = TokenToolsViewController(projects: { [self.project()] }, initialProjectID: "demo")
+        let window = host(controller); defer { window.close() }
+        let mode = try find(controller.view, NSSegmentedControl.self) { $0.accessibilityLabel() == "Token operation" }
+        mode.selectedSegment = 1
+        NSApp.sendAction(try XCTUnwrap(mode.action), to: mode.target, from: mode)
+        let input = try find(controller.view, NSTextView.self) { $0.accessibilityLabel() == "Token to inspect" }
+        let decode = try find(controller.view, NSButton.self) { $0.title == "Decode Token" }
+        let verify = try find(controller.view, NSButton.self) { $0.title == "Verify with Project" }
+        let status = try find(controller.view, NSTextField.self) { $0.accessibilityLabel() == "Token verification status" }
+        let different = "fedcba9876543210fedcba9876543210"
+        for (appID, signer) in [(different, certificate), (app, different)] {
+            let token = try AgoraTokenService.rtm(appID: appID, certificate: signer, user: "User42")
+            XCTAssertEqual(try AgoraTokenService.verify(token, certificate: certificate), signer == certificate)
+            input.string = token
+            controller.textDidChange(Notification(name: NSText.didChangeNotification, object: input))
+            decode.performClick(nil)
+            XCTAssertTrue(verify.isEnabled)
+            verify.performClick(nil)
+            XCTAssertTrue(status.stringValue.contains("does not match"))
+            XCTAssertFalse(status.stringValue.contains("Signature verified"))
+        }
     }
 
     func testTokenTextHasReadableWidthAndOptionalSnapshots() throws {

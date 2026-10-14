@@ -16,21 +16,26 @@ if(WIN32)
 else()
     set(ATEM_CORE_LIBRARY "${ATEM_CORE_DIR}/target/release/libatem_core_ffi.a")
 endif()
-add_custom_command(OUTPUT "${ATEM_CORE_LIBRARY}"
+add_custom_target(atem_core_build
     COMMAND "${CARGO_EXECUTABLE}" build --release --locked -p atem-core-ffi
+    BYPRODUCTS "${ATEM_CORE_LIBRARY}"
     WORKING_DIRECTORY "${ATEM_CORE_DIR}"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/Config/atem-core.json"
         "${CMAKE_CURRENT_SOURCE_DIR}/Config/atem-core.Cargo.lock"
         "${CMAKE_CURRENT_SOURCE_DIR}/scripts/setup-atem-core.py"
         "${ATEM_CORE_DIR}/crates/atem-core-ffi/Cargo.toml"
-    COMMENT "Building the shared Atem token library")
-add_custom_target(atem_core_build DEPENDS "${ATEM_CORE_LIBRARY}")
+    COMMENT "Checking and building the shared Atem token library")
 add_library(atem_core_ffi STATIC IMPORTED GLOBAL)
 set_target_properties(atem_core_ffi PROPERTIES IMPORTED_LOCATION "${ATEM_CORE_LIBRARY}"
     INTERFACE_INCLUDE_DIRECTORIES "${ATEM_CORE_DIR}/crates/atem-core-ffi/include")
 add_dependencies(atem_core_ffi atem_core_build)
-configure_file("${ATEM_CORE_DIR}/crates/atem-core-ffi/include/atem_core.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Sources/CAtemCore/include/atem_core.h" COPYONLY)
+execute_process(COMMAND "${CMAKE_COMMAND}" -E compare_files
+    "${ATEM_CORE_DIR}/crates/atem-core-ffi/include/atem_core.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Sources/CAtemCore/include/atem_core.h"
+    RESULT_VARIABLE ATEM_CORE_HEADER_STATUS)
+if(NOT ATEM_CORE_HEADER_STATUS EQUAL 0)
+    message(FATAL_ERROR "Update the checked-in Atem C ABI header to match the pinned library.")
+endif()
 add_custom_command(TARGET atem_core_build POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${ATEM_CORE_LIBRARY}" "${CMAKE_BINARY_DIR}")
 
@@ -178,6 +183,7 @@ endif()
 target_compile_features(astation_core PUBLIC cxx_std_17)
 
 find_package(ZLIB REQUIRED)
+target_link_libraries(atem_core_ffi INTERFACE ZLIB::ZLIB)
 target_link_libraries(astation_core PRIVATE ZLIB::ZLIB PUBLIC atem_core_ffi)
 if(APPLE)
     target_link_libraries(astation_core PRIVATE "-framework CoreVideo")
