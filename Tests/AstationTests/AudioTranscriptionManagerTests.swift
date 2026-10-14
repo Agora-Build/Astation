@@ -375,7 +375,7 @@ final class AudioTranscriptionManagerTests: XCTestCase {
             var settings = manager.settings; settings.sourceID = ids.first ?? ""; settings.additionalSourceIDs = Array(ids.dropFirst())
             manager.updateSettings(settings); manager.start()
             XCTAssertEqual(manager.state, .failed)
-            XCTAssertTrue(manager.message?.contains("Enable sources") == true)
+            XCTAssertTrue(manager.message?.contains("Choose a valid source in the floating controls") == true)
             XCTAssertEqual(factories, 0)
             XCTAssertEqual(recorder.state, .idle)
         }
@@ -890,7 +890,8 @@ final class AudioTranscriptionManagerTests: XCTestCase {
         XCTAssertFalse(manager.settings.floatingCaptions); XCTAssertFalse(manager.floatingCaptionsVisible)
         XCTAssertFalse(toast.isMonitoringCaptions)
         manager.expireFloatingCaptions(now: ProcessInfo.processInfo.systemUptime + 21)
-        let show = try XCTUnwrap(toastViews(settings.view).compactMap { $0 as? NSButton }.first { $0.title == "Show Floating Captions" })
+        let show = try XCTUnwrap(toastViews(settings.view).compactMap { $0 as? NSButton }.first { $0.title.hasPrefix("Floating captions -") })
+        XCTAssertEqual(show.state, .off)
         show.performClick(nil)
         XCTAssertTrue(manager.settings.floatingCaptions); XCTAssertTrue(manager.floatingCaptionsVisible)
         let text = try XCTUnwrap(toastViews(content).compactMap { $0 as? NSTextView }.first)

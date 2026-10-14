@@ -51,6 +51,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: Select Xcode 26.2 (Foundation Models SDK)
         run: sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
 
@@ -84,7 +86,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: libastation_core
-          path: build/libastation_core.a
+          path: |
+            build/libastation_core.a
+            build/libatem_core_ffi.a
 
   build-app:
     name: Build macOS App
@@ -93,6 +97,8 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Select Xcode 26.2 (Foundation Models SDK)
         run: sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer

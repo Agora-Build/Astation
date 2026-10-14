@@ -238,38 +238,40 @@ final class TranscriptionSettingsTests: XCTestCase {
         addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
         return defaults
     }
-    func testSourceCheckboxesSupportMicrophoneWithSystemOrMultipleApps() throws {
+    func testSettingsPreserveSourceSelectionAndEnableFloatingControlsWithoutCapture() throws {
         _ = NSApplication.shared
         let defaults = defaults(), recorder = AudioRecordingManager(defaults: defaults)
+        recorder.transcription.setFloatingCaptions(false)
         let controller = TranscriptionViewController(recorder: recorder)
         controller.loadViewIfNeeded()
+        let toast = TranscriptionToastController(manager: recorder.transcription, showWindow: false)
+        let buttons = descendants(controller.view).compactMap { $0 as? NSButton }
+        XCTAssertFalse(buttons.contains { $0.identifier?.rawValue.hasPrefix("transcription-source-") == true })
+        XCTAssertFalse(buttons.contains { $0.title == "Show Floating Captions" })
+        let show = try XCTUnwrap(buttons.first { $0.title.hasPrefix("Floating captions -") })
+        XCTAssertEqual(buttons.filter { $0.title.hasPrefix("Floating captions -") }.count, 1)
+        XCTAssertEqual(show.state, .off)
+        show.performClick(nil)
+        XCTAssertEqual(show.state, .on)
+        XCTAssertTrue(recorder.transcription.floatingCaptionsVisible)
+        XCTAssertNotNil(toast.panel)
+        XCTAssertEqual(recorder.transcription.state, .idle)
+        let autoSave = try XCTUnwrap(buttons.first { $0.title.hasPrefix("Auto-save transcript") })
         for (mode, ids) in [(RecordingOutputMode.system, ["system"]), (.applications, ["test.app-one", "test.app-two"])] {
             var config = recorder.settings; config.outputMode = mode; config.applicationBundleIDs = ids
             recorder.updateSettings(config)
-            let buttons = descendants(controller.view).compactMap { $0 as? NSButton }
-            let sources = buttons.filter { $0.identifier?.rawValue.hasPrefix("transcription-source-") == true }
-            XCTAssertEqual(sources.count, 1 + ids.count)
-            let mic = try XCTUnwrap(sources.first { $0.identifier?.rawValue == "transcription-source-microphone" })
-            XCTAssertEqual(mic.state, .on)
-            for id in ids {
-                let button = try XCTUnwrap(sources.first { $0.identifier?.rawValue == "transcription-source-\(id)" })
-                XCTAssertEqual(button.state, .off)
-                button.performClick(nil)
-            }
+            var settings = recorder.transcription.settings
+            settings.sourceID = "microphone"; settings.additionalSourceIDs = ids
+            recorder.transcription.updateSettings(settings)
+            autoSave.performClick(nil)
             XCTAssertEqual(recorder.transcription.settings.selectedSourceIDs, ["microphone"] + ids)
-            mic.performClick(nil)
-            XCTAssertEqual(recorder.transcription.settings.selectedSourceIDs, ids)
-            for button in sources where button !== mic { button.performClick(nil) }
-            XCTAssertTrue(recorder.transcription.settings.selectedSourceIDs.isEmpty)
-            let start = try XCTUnwrap(buttons.first { $0.title == "Start Transcription" })
-            XCTAssertFalse(start.isEnabled)
-            mic.performClick(nil)
+            XCTAssertEqual(recorder.settings, config)
         }
         let stored = try JSONDecoder().decode(TranscriptionSettings.self, from: XCTUnwrap(defaults.data(forKey: AudioTranscriptionManager.defaultsKey)))
-        XCTAssertEqual(stored.selectedSourceIDs, ["microphone"])
+        XCTAssertEqual(stored.selectedSourceIDs, ["microphone", "test.app-one", "test.app-two"])
         XCTAssertEqual(recorder.state, .idle)
     }
-    func testSourceControlsLockDuringPreparationButStopRemainsAvailable() throws {
+    func testSettingsLockDuringPreparationButStopAndCaptionsToggleRemainAvailable() throws {
         _ = NSApplication.shared
         let defaults = defaults(), recorder = AudioRecordingManager(defaults: defaults)
         let manager = AudioTranscriptionManager(recorder: recorder, defaults: defaults, engineFactory: { _ in
@@ -282,9 +284,10 @@ final class TranscriptionSettingsTests: XCTestCase {
         defer { manager.stop() }
         XCTAssertEqual(manager.state, .preparing)
         let buttons = descendants(controller.view).compactMap { $0 as? NSButton }
-        let sources = buttons.filter { $0.identifier?.rawValue.hasPrefix("transcription-source-") == true }
-        XCTAssertFalse(sources.isEmpty)
-        XCTAssertTrue(sources.allSatisfy { !$0.isEnabled })
+        let pickers = descendants(controller.view).compactMap { $0 as? NSPopUpButton }
+        XCTAssertFalse(pickers.isEmpty)
+        XCTAssertTrue(pickers.allSatisfy { !$0.isEnabled })
+        XCTAssertTrue(try XCTUnwrap(buttons.first { $0.title.hasPrefix("Floating captions -") }).isEnabled)
         XCTAssertTrue(try XCTUnwrap(buttons.first { $0.title == "Stop Transcription" }).isEnabled)
         XCTAssertEqual(recorder.state, .idle)
     }
@@ -292,20 +295,30 @@ final class TranscriptionSettingsTests: XCTestCase {
         _ = NSApplication.shared
         let defaults = defaults(), recorder = AudioRecordingManager(defaults: defaults)
         var config = recorder.settings; config.microphoneEnabled = false; recorder.updateSettings(config)
+        var settings = recorder.transcription.settings
+        settings.provider = .custom; settings.customEndpoint = "https://speech.example.test/v1/audio/transcriptions"
+        recorder.transcription.updateSettings(settings)
         let controller = TranscriptionViewController(recorder: recorder)
         controller.loadViewIfNeeded()
         let fields = descendants(controller.view).compactMap { $0 as? NSTextField }
-        let sources = descendants(controller.view).compactMap { $0 as? NSButton }.filter { $0.identifier?.rawValue.hasPrefix("transcription-source-") == true }
-        XCTAssertEqual(sources.count, 2, "Mic and System remain available independently of recording settings")
+        let start = try XCTUnwrap(descendants(controller.view).compactMap { $0 as? NSButton }.first { $0.title == "Start Transcription" })
+        XCTAssertTrue(start.isEnabled, "Microphone transcription remains available when recording excludes it")
         XCTAssertFalse(fields.contains { $0.stringValue.hasPrefix("A previously selected source") })
-        config.microphoneEnabled = true; config.outputMode = .applications; config.applicationBundleIDs = ["test.current-app"]
+        config.outputMode = .applications; config.applicationBundleIDs = ["test.current-app"]
         recorder.updateSettings(config)
-        var settings = recorder.transcription.settings; settings.sourceID = "test.previous-app"
+        settings.sourceID = "system"
         recorder.transcription.updateSettings(settings)
-        XCTAssertTrue(fields.contains { $0.stringValue.hasPrefix("A previously selected source") })
-        let current = try XCTUnwrap(descendants(controller.view).compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "transcription-source-test.current-app" })
-        current.performClick(nil)
+        XCTAssertTrue(start.isEnabled, "System transcription remains available when recording selected apps")
+        settings.sourceID = "test.previous-app"
+        recorder.transcription.updateSettings(settings)
+        XCTAssertFalse(start.isEnabled)
+        XCTAssertTrue(fields.contains { $0.stringValue.hasPrefix("A previously selected source") && $0.stringValue.contains("floating controls") })
+        settings.sourceID = ""; recorder.transcription.updateSettings(settings)
+        XCTAssertFalse(start.isEnabled)
+        settings.sourceID = "test.current-app"; recorder.transcription.updateSettings(settings)
+        XCTAssertTrue(start.isEnabled)
         XCTAssertEqual(recorder.transcription.settings.selectedSourceIDs, ["test.current-app"])
+        XCTAssertEqual(recorder.settings, config)
         XCTAssertEqual(recorder.state, .idle)
     }
     func testFloatingPanelAllowsAnyMonitorCoordinatesAndNonactivatingTextFocus() {
@@ -407,7 +420,7 @@ final class TranscriptionSettingsTests: XCTestCase {
         XCTAssertEqual(recorder.state, .idle)
         XCTAssertNil(recorder.transcription.downloadProgress)
     }
-    func testLiveTranscriptionIsSeparateSettingsCategoryWithSourceNavigation() throws {
+    func testLiveTranscriptionIsSeparateSettingsCategory() {
         let suite = "astation-transcription-sidebar-\(UUID())"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -423,11 +436,7 @@ final class TranscriptionSettingsTests: XCTestCase {
         XCTAssertFalse(recording.children.contains { $0 is TranscriptionViewController })
         func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
         XCTAssertFalse(descendants(recording.view).compactMap { $0 as? NSTextField }.contains { $0.stringValue == "Live Transcription" })
-        var navigated = false
-        transcription.onConfigureSources = { navigated = true }
-        let configure = try XCTUnwrap(descendants(transcription.view).compactMap { $0 as? NSButton }.first { $0.title == "Configure Audio Sources..." })
-        configure.performClick(nil)
-        XCTAssertTrue(navigated)
+        XCTAssertFalse(descendants(transcription.view).compactMap { $0 as? NSButton }.contains { $0.title == "Configure Audio Sources..." })
         XCTAssertEqual(recorder.state, .idle)
         XCTAssertEqual(recorder.transcription.state, .idle)
     }

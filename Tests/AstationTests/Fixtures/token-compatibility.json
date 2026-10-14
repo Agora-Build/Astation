@@ -1,0 +1,34 @@
+[
+  {
+    "name" : "RTC publisher",
+    "token" : "007eJxTYGB32CfQu+HNmgOPrYNqHnwW+G1+QODMx9jP\/3799391I8dBgcHA0MjYxNTM3MIyMSk5JTUNna+17lyWAB8Dg\/Nux4WMDIwMLEAM4jOBSWYwyQImeRhKUotLdJMzEvPyUnNYGEAGAQBTtiZ3"
+  },
+  {
+    "name" : "RTC subscriber",
+    "token" : "007eJxTYFBrP6e7y0PyzIVY\/wtTPB5n1jVv\/LPgTnZhU8PWXW3JS+0VGAwMjYxNTM3MLSwTk5JTUtPQ+VrrzmVtYGFgSL5y5zMjAwS2MDMwcDAklqZkpuYlpzIxmJsDALdMJFc="
+  },
+  {
+    "name" : "RTC any UID",
+    "token" : "007eJxTYBDZa7jtZOrFuox9bVvu9C7+1PtYYsuBjfMZVhsaLzRilfyjwGBgaGRsYmpmbmGZmJSckpqGztdady7LhoGBweDks32MDBAI4nMwlGam6FalFuUzMAAARRkiQA=="
+  },
+  {
+    "name" : "RTC maximum UID",
+    "token" : "007eJxTYLBvSnp1\/cPD5ntTHKba7XkY4yqyRNHbUGySUtv3juvv511QYDAwNDI2MTUzt7BMTEpOSU1D52utO5clwMfAMOlaSw4jAyMDCxCD+ExgkhlMsoBJdobcxArd0swULgYTI0sTSzNzI0tTAMgAJEU="
+  },
+  {
+    "name" : "ConvoAI",
+    "token" : "007eJxTYPjfYfOtYnKDxYvd4WfE2eMKj6osPF1WdunnS5u35r31e18oMBgYGhmbmJqZW1gmJiWnpKah87XWnctSkGFg0NWvLWVkYGRgAWIQnwlMMoNJFjDJw1CWn5mcqpucn5KZl87CYGhgYAgA5nYlXQ=="
+  },
+  {
+    "name" : "Caption publisher",
+    "token" : "007eJxTYNjW9GYD4\/KX\/voyl\/SerJ7LwTs996bMuRtT8mzd+U+52mUqMBgYGhmbmJqZW1gmJiWnpKah87XWncsS4GNgiGN2XsfIwMjAAsQgPhOYZAaTLGCSnyE5saAkMz9Ptzi1uBhIMzMYGhgCAOEjIvo="
+  },
+  {
+    "name" : "Caption bot",
+    "token" : "007eJxTYDCLmLqjJ\/TFr1UbKn0P6ao8dPnBwFVgPksnsrZOsTeyzliBwcDQyNjE1MzcwjIxKTklNQ2dr7XuXJYAHwND5lQbRUYGRgYWIAbxmcAkM5hkAZP8DMmJBSWZ+Xm6xanFxUCamcHIwBAAliciSw=="
+  },
+  {
+    "name" : "RTM",
+    "token" : "007eJxTYNg+z\/WoffuNT1flxP+5VWreKbiw\/pZIyoub8y1P7ObZplegwGBgaGRsYmpmbmGZmJSckpqGztdady5LgI+BwYlfvY+RgYmBEQhBfHaG0uLUIl0TIwDe3CAt"
+  }
+]

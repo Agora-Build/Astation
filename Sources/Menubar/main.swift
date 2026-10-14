@@ -23,6 +23,10 @@ if CommandLine.arguments.contains("--audio-capture-check") {
 // Logs: ~/Library/Logs/Astation/astation.log
 Log.setup()
 
+if !AgoraTokenService.isCompatible {
+    Log.error("Incompatible token-library ABI. Token operations are unavailable; rebuild Astation.")
+}
+
 Log.info("Starting Astation - AI-powered work suite hub")
 Log.info("App bundle: \(Bundle.main.bundleURL.path)")
 Log.info("Atem E2E: verification and storage-key unlock; identity formats 1-\(AtemE2EIdentity.storedVersion)")

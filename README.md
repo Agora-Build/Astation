@@ -13,7 +13,7 @@ is available for local verification.
 
 ### Build from source
 
-Prerequisites: macOS 14+, Xcode Command Line Tools, CMake.
+Prerequisites: macOS 14+, Xcode 26.2+ (Swift 6.2+), CMake 3.19+, and current stable Rust/Cargo.
 
 ```bash
 git clone git@github.com:Agora-Build/Astation.git
@@ -34,6 +34,7 @@ swift build -c release
 **What happens during build:**
 - CMake detects missing Agora SDK and downloads 7 xcframeworks from `https://download.agora.io/swiftpm/AgoraRtcEngine_macOS/4.7.0/`
 - CMake and Swift Package Manager use the same Agora SDK version (4.7.0).
+- CMake builds the checksum-pinned Atem token library with locked Rust dependencies.
 - No manual SDK downloads needed!
 
 **Troubleshooting:**
@@ -60,6 +61,11 @@ Astation runs as a macOS menubar app with direct and relay WebSocket transports.
 
 ### Atem Connections
 
+Open **Tools > Connections** from the menubar popout to view connected Atems,
+their agents, and the active routing target. The Connections entry shows the
+online Atem count; the popout does not repeat the client list or a separate
+"Status: ... clients connected" row.
+
 | Atem location | Transport | First connection | Offline behavior |
 |---------------|-----------|------------------|------------------|
 | Same Mac | `ws://127.0.0.1:8080/ws` | Transparent same-user proof | Works with all radios disabled |
@@ -69,6 +75,18 @@ Astation runs as a macOS menubar app with direct and relay WebSocket transports.
 Loopback is identified from the socket peer address, not from a client-supplied header. LAN and relay clients receive a random challenge and must prove possession of their saved session token with HMAC-SHA256 before Astation registers the client or sends credentials.
 
 Direct LAN transport is currently plaintext WebSocket. The authentication protocol prevents session-ID-only impersonation, but LAN deployment is not production-ready until WSS certificate pinning is implemented. See [`docs/specs/2026-07-21-device-authentication-v2.md`](docs/specs/2026-07-21-device-authentication-v2.md).
+
+### Token Tools
+
+In **Show Projects**, select a project and click **Generate Token...**, or use
+**Tools > Token Tools...**. Generate RTC/RTM tokens with configurable identity,
+permissions and expiry; RTC can also include RTM login. **Inspect** decodes an
+existing token, and **Verify with Project** separately checks its signature and
+App ID. Custom App IDs and certificates can be used without saving them.
+
+Token Tools and Astation's existing token flows share Atem's reusable token
+library, bundled locally; no Atem process or relay is required. See the
+[Token Tools guide](docs/token-tools.md) for behavior, privacy and the pinned build.
 
 ### Android Device Sharing
 
@@ -291,6 +309,8 @@ without stealing keyboard focus. Turn floating captions on or off in settings.
 Caption text expires; the source control stays available until Hide. Its compact
 button cycles **Off / Mic / System / All / Apps**. Deliberate scrolling selects a
 mode and applies it automatically after one second; clicking advances immediately.
+This is the transcription source selector; Live Transcription settings hold the
+engine, model, languages, and saving options without duplicate source checkboxes.
 Empty Apps selection opens an app picker; saved selections show app icons on the
 compact control. The floating Polish switch appears only during dictation.
 During Push-to-Talk and Hands-Free dictation, a microphone icon and **Dictation**
@@ -299,15 +319,16 @@ Microphone captions show speech without a source prefix in every mode.
 Scrolling through captions holds your reading position for 15 seconds after the
 last scroll, then follows the latest text while transcription or dictation runs.
 System and Apps do not open the microphone for transcription; Apps uses the saved
-application selection. After Hide, use
-**Show Floating Captions** in the Astation menu or settings. Bind **Toggle Floating
-Captions** in **Keyboard Shortcuts** for global show/hide control (unbound by default).
+application selection. After Hide, enable **Floating captions** at the top of
+Live Transcription settings, or use **Show Floating Captions** in the Astation
+menu. Bind **Toggle Floating Captions** in **Keyboard Shortcuts** for global
+show/hide control (unbound by default).
 Copy or save the session transcript as TXT or JSON. Optional auto-save keeps
 finalized TXT and live JSONL history in `~/Documents/Astation/Transcripts`,
 independently of audio recording.
 
 For other languages or live translation, choose **Agora cloud** and explicitly
-approve sending the checked sources to Agora. This uses the signed-in project
+approve sending the selected sources to Agora. This uses the signed-in project
 with Real-Time STT enabled; each source starts a separate potentially billed
 cloud session. **Custom - OpenAI-compatible HTTP** supports your own full
 `/v1/audio/transcriptions` endpoint, model name, optional Keychain API key, and
@@ -317,6 +338,9 @@ consent. See the
 publishing, and validation details.
 
 ### Voice Dictation
+
+The menubar group starts with **Voice Dictation Settings**, followed by the
+floating-caption control and dictation actions.
 
 **Settings > Voice Dictation** configures local-microphone push-to-talk and Hands-Free
 dictation, independently of RTC. It uses the installed local ASR profile selected

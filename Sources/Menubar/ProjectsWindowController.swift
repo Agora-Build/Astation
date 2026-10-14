@@ -3,6 +3,7 @@ import Foundation
 
 class ProjectsWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
+    private var tokenWindow: NSWindow?
     private let hubManager: AstationHubManager
     private var tableView: NSTableView!
     private var statusLabel: NSTextField!
@@ -29,7 +30,7 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         }
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 700, height: 450),
+            contentRect: NSRect(x: 0, y: 0, width: 980, height: 560),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -38,44 +39,43 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         window.center()
         window.delegate = self
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 550, height: 300)
+        window.minSize = NSSize(width: 820, height: 380)
 
         let contentView = NSView(frame: window.contentView!.bounds)
         contentView.autoresizingMask = [.width, .height]
 
         // Header + selection toast
         let headerLabel = NSTextField(labelWithString: "Projects")
-        headerLabel.font = NSFont.boldSystemFont(ofSize: 14)
-        headerLabel.sizeToFit()
-        headerLabel.frame = NSRect(x: 16, y: 410, width: headerLabel.frame.width, height: headerLabel.frame.height)
-        contentView.addSubview(headerLabel)
+        headerLabel.font = NSFont.boldSystemFont(ofSize: 18)
 
         selectionToast = NSTextField(labelWithString: "")
         selectionToast.font = NSFont.boldSystemFont(ofSize: 14)
         selectionToast.textColor = .systemBlue
         selectionToast.alphaValue = 0
-        selectionToast.frame = NSRect(
-            x: headerLabel.frame.maxX + 8,
-            y: headerLabel.frame.origin.y,
-            width: 400,
-            height: headerLabel.frame.height
-        )
-        contentView.addSubview(selectionToast)
+        selectionToast.lineBreakMode = .byTruncatingTail
+        selectionToast.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        selectionToast.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let tokenButton = NSButton(title: "Generate Token...", target: self, action: #selector(generateToken(_:)))
+        tokenButton.bezelStyle = .rounded
+        tokenButton.image = NSImage(systemSymbolName: "key", accessibilityDescription: nil)
+        tokenButton.imagePosition = .imageLeading
+        tokenButton.toolTip = "Generate a token for the selected project, or inspect an existing token."
 
         // Refresh button
         let refreshButton = NSButton(
             title: "Refresh", target: self, action: #selector(refreshProjects))
         refreshButton.bezelStyle = .rounded
-        refreshButton.frame = NSRect(x: 600, y: 410, width: 80, height: 24)
-        refreshButton.autoresizingMask = [.minXMargin]
-        contentView.addSubview(refreshButton)
+        let header = NSStackView(views: [headerLabel, selectionToast, tokenButton, refreshButton])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 12
 
         // Table in scroll view
-        let scrollView = NSScrollView(frame: NSRect(x: 16, y: 40, width: 668, height: 360))
+        let scrollView = NSScrollView()
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
         scrollView.borderType = .bezelBorder
-        scrollView.autoresizingMask = [.width, .height]
 
         let table = NSTableView()
         table.rowHeight = 28
@@ -84,8 +84,14 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         table.allowsMultipleSelection = false
         table.doubleAction = #selector(tableDoubleClicked)
         table.target = self
+        table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         table.delegate = self
         table.dataSource = self
+        let contextMenu = NSMenu()
+        let contextToken = NSMenuItem(title: "Generate Token...", action: #selector(generateToken(_:)), keyEquivalent: "")
+        contextToken.target = self
+        contextMenu.addItem(contextToken)
+        table.menu = contextMenu
 
         let nameCol = NSTableColumn(identifier: nameColId)
         nameCol.title = "Name"
@@ -124,9 +130,22 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         // Status label
         statusLabel = NSTextField(labelWithString: "")
         statusLabel.font = NSFont.systemFont(ofSize: 11)
-        statusLabel.frame = NSRect(x: 16, y: 12, width: 668, height: 18)
-        statusLabel.autoresizingMask = [.width]
-        contentView.addSubview(statusLabel)
+        for child in [header, scrollView, statusLabel!] {
+            child.translatesAutoresizingMaskIntoConstraints = false
+            contentView.addSubview(child)
+        }
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 16),
+            header.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            header.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+            scrollView.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 14),
+            scrollView.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -12),
+            statusLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+            statusLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+            statusLabel.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -12)
+        ])
         updateStatusLabel()
 
         window.contentView = contentView
@@ -160,6 +179,39 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
     }
 
     // MARK: - Button Actions
+
+    @objc private func generateToken(_ sender: Any?) {
+        let row = sender is NSMenuItem ? tableView.clickedRow : tableView.selectedRow
+        let projects = hubManager.getProjects()
+        showTokenTools(projectID: projects.indices.contains(row) ? projects[row].id : nil)
+    }
+
+    func showTokenTools(projectID: String? = nil) {
+        showWindow()
+        guard let window else { return }
+        if let tokenWindow { tokenWindow.makeKeyAndOrderFront(nil); return }
+        let controller = TokenToolsViewController(projects: { [weak hubManager] in hubManager?.getProjects() ?? [] },
+                                                  initialProjectID: projectID ?? hubManager.effectiveProject?.id)
+        let sheet = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 740),
+                             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        sheet.title = "Token Tools"
+        sheet.minSize = NSSize(width: 560, height: 440)
+        sheet.isReleasedWhenClosed = false
+        sheet.contentViewController = controller
+        sheet.setContentSize(NSSize(width: 680, height: 740))
+        sheet.delegate = self
+        controller.onClose = { [weak self] in self?.closeTokenTools() }
+        tokenWindow = sheet
+        window.beginSheet(sheet)
+    }
+
+    private func closeTokenTools() {
+        guard let sheet = tokenWindow else { return }
+        (sheet.contentViewController as? TokenToolsViewController)?.clearSensitiveContent()
+        window?.endSheet(sheet)
+        sheet.orderOut(nil)
+        tokenWindow = nil
+    }
 
     @objc private func copyAppId(_ sender: NSButton) {
         guard let row = rowForButton(sender) else { return }
@@ -198,7 +250,14 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
     // MARK: - NSWindowDelegate
 
     func windowWillClose(_ notification: Notification) {
+        guard notification.object as? NSWindow === window else { return }
+        closeTokenTools()
         window = nil
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if sender === tokenWindow { closeTokenTools(); return false }
+        return true
     }
 }
 
