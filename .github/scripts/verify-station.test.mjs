@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { healthProblems, settingsFromEnv, waitForHealth } from './verify-station.mjs';
+import { healthProblems, settingsFromEnv, waitForHealth, verifyAgentChat, verifyStoa } from './verify-station.mjs';
 
 const healthy = { status: 'ok', knowledge_store: 'postgres', redis: 'ok', replicas: 2 };
 
@@ -112,4 +112,95 @@ test('waitForHealth gives up', async () => {
     }),
     /did not become healthy: \/health returned HTTP 503/,
   );
+});
+
+function chatAsset(path) {
+  const values = {
+    '/agent/': ['text/html', '<!doctype html><form id="composer"></form>'],
+    '/agent/chat.css': ['text/css', ':root { --paper: white; }'],
+    '/agent/chat-core.mjs': ['text/javascript', 'export class Conversation {}'],
+    '/agent/chat.mjs': ['text/javascript', 'import "./chat-core.mjs";'],
+    '/agent/mark.svg': ['image/svg+xml', '<svg></svg>'],
+  };
+  const [mime, text] = values[path];
+  return new Response(text, { headers: {
+    'content-type': `${mime}; charset=utf-8`,
+    'cache-control': 'no-store', 'referrer-policy': 'no-referrer',
+    'x-content-type-options': 'nosniff',
+    'content-security-policy': "default-src 'none'; script-src 'self'; frame-ancestors 'none'",
+  } });
+}
+
+test('production verification checks the chat webapp and every asset on the same origin', async () => {
+  const paths = [];
+  await verifyAgentChat({ origin: 'https://station.test', log: () => {}, fetchImpl: async (url, options) => {
+    assert.equal(url.origin, 'https://station.test');
+    assert.equal(options.redirect, 'error');
+    paths.push(url.pathname);
+    return chatAsset(url.pathname);
+  } });
+  assert.deepEqual(paths.sort(), ['/agent/', '/agent/chat.css', '/agent/chat-core.mjs', '/agent/chat.mjs', '/agent/mark.svg'].sort());
+});
+
+test('production verification rejects an undeployed page, SPA fallback and wrong JavaScript MIME', async () => {
+  for (const broken of [
+    () => new Response('Not found', { status: 404 }),
+    () => new Response('<!doctype html><html>RTC</html>', { headers: { 'content-type': 'text/html' } }),
+    () => new Response('export {}', { headers: { 'content-type': 'application/octet-stream' } }),
+  ]) {
+    await assert.rejects(verifyAgentChat({ origin: 'https://station.test', log: () => {}, fetchImpl: async url =>
+      url.pathname === '/agent/chat.mjs' ? broken() : chatAsset(url.pathname),
+    }), /Agent chat/);
+  }
+});
+
+test('production verification requires the chat webapp privacy headers, CSP and actual page', async () => {
+  for (const change of [
+    response => response.headers.delete('cache-control'),
+    response => response.headers.delete('referrer-policy'),
+    response => response.headers.delete('x-content-type-options'),
+    response => response.headers.set('content-security-policy', "default-src *; script-src 'unsafe-inline'"),
+  ]) {
+    await assert.rejects(verifyAgentChat({ origin: 'https://station.test', log: () => {}, fetchImpl: async url => {
+      const response = chatAsset(url.pathname);
+      if (url.pathname === '/agent/') change(response);
+      return response;
+    } }), /Agent chat/);
+  }
+  await assert.rejects(verifyAgentChat({ origin: 'https://station.test', log: () => {}, fetchImpl: async url => {
+    const response = chatAsset(url.pathname);
+    return url.pathname === '/agent/' ? new Response('<!doctype html><html>RTC</html>', { headers: response.headers }) : response;
+  } }), /expected asset/);
+});
+
+test('Stoa verification checks the app and its media modules and rejects missing or fallback assets', async () => {
+  const assets = {
+    '/stoa/': ['text/html', '<main id="stoa-home">Stoa</main>'],
+    '/stoa/style.css': ['text/css', '.stoa-home {}'],
+    '/stoa/app.mjs': ['text/javascript', 'sessionIdFromPath'],
+    '/stoa/session-link.mjs': ['text/javascript', 'sessionIdFromInput'],
+    '/stoa/rtc/channel.mjs': ['text/javascript', 'joinChannel'],
+    '/stoa/rtc/codec.mjs': ['text/javascript', 'preferredCodec'],
+    '/stoa/rtc/screen-share.mjs': ['text/javascript', 'class ScreenPublisher {}'],
+  };
+  const paths = [];
+  const fetchImpl = async (url, options) => {
+    assert.equal(url.origin, 'https://station.test');
+    assert.equal(options.redirect, 'error');
+    paths.push(url.pathname);
+    const [mime, text] = assets[url.pathname];
+    return new Response(text, { headers: { 'content-type': mime } });
+  };
+  const settings = { origin: 'https://station.test', log() {}, fetchImpl };
+  await verifyStoa(settings);
+  assert.deepEqual(paths.sort(), Object.keys(assets).sort());
+  for (const response of [
+    new Response('Not found', { status: 404 }),
+    new Response('<html>Wrong app</html>', { headers: { 'content-type': 'text/html' } }),
+    new Response('Wrong module', { headers: { 'content-type': 'text/javascript' } }),
+  ]) {
+    await assert.rejects(verifyStoa({ ...settings, fetchImpl: async (url, options) =>
+      url.pathname === '/stoa/rtc/channel.mjs' ? response : fetchImpl(url, options),
+    }), /Stoa/);
+  }
 });

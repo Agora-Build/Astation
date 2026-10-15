@@ -469,7 +469,7 @@ pub async fn create_rtc_session_handler(
         tracing::info!("Using configured public base URL for sessions: {}", base);
     }
     let base_url = derive_session_base_url(&headers, configured_public_base.as_deref());
-    let url = format!("{}/session/{}", base_url, id);
+    let url = format!("{}/stoa/session/{}", base_url, id);
 
     tracing::info!("Generated session URL: {}", url);
 
@@ -902,8 +902,7 @@ mod tests {
             .unwrap();
         let resp: CreateRtcSessionResponse = serde_json::from_slice(&body).unwrap();
         assert!(!resp.id.is_empty());
-        assert!(resp.url.contains("/session/"));
-        assert!(resp.url.contains(&resp.id));
+        assert!(resp.url.ends_with(&format!("/stoa/session/{}", resp.id)));
     }
 
     #[tokio::test]
@@ -1336,8 +1335,7 @@ mod tests {
             .unwrap();
         let resp: CreateRtcSessionResponse = serde_json::from_slice(&body).unwrap();
 
-        assert!(resp.url.contains("/session/"));
-        assert!(resp.url.contains(&resp.id));
+        assert!(resp.url.ends_with(&format!("/stoa/session/{}", resp.id)));
         assert!(uuid::Uuid::parse_str(&resp.id).is_ok(), "Session ID should be valid UUID");
     }
 

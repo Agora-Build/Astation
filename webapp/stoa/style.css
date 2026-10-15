@@ -30,6 +30,23 @@ body {
     overflow: hidden;
 }
 
+.stoa-home {
+    height: 100dvh;
+    overflow-y: auto;
+    padding: 24px;
+    display: flex;
+    background: radial-gradient(ellipse at top, #182b3d, transparent 65%);
+}
+
+.stoa-home[hidden] { display: none; }
+.stoa-home .dialog-card { width: min(100%, 440px); margin: auto; flex-shrink: 0; }
+.stoa-wordmark { font-weight: 700; letter-spacing: 0.12em; margin-bottom: 28px; }
+.stoa-wordmark span { color: var(--text-muted); font-size: 12px; letter-spacing: 0; margin-left: 8px; }
+.stoa-home h1 { font-family: Georgia, serif; font-size: clamp(28px, 6vw, 36px); font-weight: 400; }
+.stoa-intro { color: var(--text-secondary); margin: 12px 0 28px; }
+.stoa-apps-link { display: inline-block; color: var(--text-secondary); margin-top: 24px; }
+.session-link-error { color: var(--danger); margin: 0 0 16px; }
+
 /* Loading */
 .loading-container {
     display: flex;

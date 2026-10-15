@@ -96,8 +96,17 @@ application IDs, GitHub secrets, runtime configuration, and Cloudflare routing.
 
 **URLs:**
 - Production: `https://station.agora.build`
+- Configured Stoa app: `https://station.agora.build/stoa/` (available after this change is deployed)
+- Configured Agent app: `https://station.agora.build/agent/` (available after deployment; live sessions require companion Astation/Atem support)
 - Legacy staging alias: `https://station-staging.agora.build` (same deployment)
 - Dev: `http://localhost:3000`
+
+The webapp serves the `/agent/` browser UI from `webapp/agent/`; the relay
+provides its WebSocket transport. The deployment verifier checks the public
+HTML, JavaScript MIME types and security headers. Use
+`/agent/?preview=1` for the labeled layout preview. Live prompts and responses
+use the authenticated companion bridge and structured host events described in
+[the agent chat design](../designs/agent-chat.md).
 
 ---
 

@@ -1,4 +1,4 @@
-# Webapp Testing Guide
+# Stoa and Agent Testing Guide
 
 ## Quick Start
 
@@ -8,6 +8,24 @@ docker compose up
 ```
 
 Then open: http://localhost:8080
+
+The webapp serves [Stoa](../docs/stoa.md) at `/stoa/` and
+[Agent](../docs/agent-chat.md) at `/agent/`.
+`/agent/?preview=1` reviews the UI without connecting to an agent. Live prompts
+require the companion Astation bridge and an Atem host with `chat-v1` support.
+See [webapp structure](README.md) for the two apps and reusable RTC implementation.
+
+Run the browser-independent checks and the actual nginx image checks with:
+
+```sh
+node tests/codec.test.mjs
+node tests/nginx.test.js
+node --test tests/agent-chat.test.mjs tests/screen-share.test.mjs tests/rtc-channel.test.mjs tests/stoa-session.test.mjs
+WEBAPP_TEST_ORIGIN=http://localhost:8080 node --test tests/hosting.test.mjs
+```
+
+CI builds the webapp image and runs the hosting checks with an unavailable relay
+to prove that both pages and shared modules are packaged and served by nginx.
 
 ## Testing Screen Share & Microphone
 
@@ -27,13 +45,13 @@ curl -X POST http://localhost:8080/api/rtc-sessions \
 # Response example:
 # {
 #   "id": "abc-123",
-#   "url": "https://station.agora.build/session/abc-123"
+#   "url": "https://station.agora.build/stoa/session/abc-123"
 # }
 ```
 
 ### 2. Open the Webapp
 
-Visit: `http://localhost:8080/session/abc-123`
+Visit: `http://localhost:8080/stoa/session/abc-123`
 
 **Expected behavior:**
 1. Loading screen appears
@@ -79,10 +97,10 @@ When the host (Astation) starts screen sharing:
 
 ```
 Web Browser
-  ↓ GET /session/abc-123
+  ↓ GET /stoa/session/abc-123
 Nginx (port 80)
   ↓ /api/* → proxy to ${STATION_RELAY_UPSTREAM}
-  ↓ /session/* → serve index.html (SPA)
+  ↓ /stoa/session/* → serve stoa/index.html
 API Server (port 3000)
   ↓ Rust Axum + RTC Session Store
   ↓ Returns: app_id, channel, token (uid=0), uid (1000+)
@@ -165,7 +183,7 @@ services:
 - Auto-switches when host starts/stops sharing
 
 ✅ **Microphone Publishing**
-- Creates local audio track on join
+- Creates local audio track on join when microphone is enabled
 - Publishes to RTC channel
 - Toggle mute/unmute with button
 - Visual indicator in participant list
@@ -177,7 +195,7 @@ services:
 - 7-day expiry for inactive users
 
 ✅ **Session Management**
-- URL-based session routing (/session/:id)
+- URL-based session routing (/stoa/session/:id)
 - API verification before showing UI
 - Unique UID assignment (1000+)
 - Participant tracking with display names
@@ -185,4 +203,4 @@ services:
 ✅ **Codec Fallback**
 - Uses H.264 to match the native publisher and support hardware encoding
 - Falls back to VP8 if H.264 joining fails
-- Configurable via codec.js module
+- Configurable via `stoa/rtc/codec.mjs`

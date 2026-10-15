@@ -96,9 +96,20 @@ jobs:
           node-version: "20"
       - name: Run webapp tests
         run: |
-          node webapp/tests/codec.test.js
+          node webapp/tests/codec.test.mjs
           node webapp/tests/nginx.test.js
-          node --test webapp/tests/screen-share.test.js
+          node --test webapp/tests/screen-share.test.mjs webapp/tests/rtc-channel.test.mjs
+          node --test webapp/tests/agent-chat.test.mjs
+          node --test webapp/tests/stoa-session.test.mjs
+
+      - name: Verify Stoa and Agent webapps
+        run: |
+          docker build --tag station-webapp:ci webapp
+          trap 'docker rm -f webapp-check >/dev/null 2>&1' EXIT
+          docker run --detach --name webapp-check \
+            --env STATION_RELAY_UPSTREAM=127.0.0.1:9 \
+            --publish 127.0.0.1:53001:80 station-webapp:ci
+          WEBAPP_TEST_ORIGIN=http://127.0.0.1:53001 node --test webapp/tests/hosting.test.mjs
 
       - name: Test AI review tooling
         run: node --test .github/scripts/*.test.mjs
@@ -174,7 +185,8 @@ jobs:
         run: |
           trap 'docker rm -f relay-build-check >/dev/null 2>&1' EXIT
           docker run --detach --name relay-build-check --publish 127.0.0.1:53000:3000 station-relay-server:ci
-          curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 \
+          # Docker can accept then reset a connection before the relay binds.
+          curl --fail --silent --show-error --retry 10 --retry-all-errors --retry-delay 1 --max-time 5 \
             http://127.0.0.1:53000/health > /tmp/relay-build-health.json
           python3 - <<'PY'
           import json, os
