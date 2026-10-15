@@ -52,11 +52,12 @@ enum AtemAuthenticationLayout {
         return card(stack, accented: true)
     }
 
-    static func touchID(_ authentication: LAAuthenticationView, status: NSTextField) -> NSView {
+    static func touchID(_ authentication: LAAuthenticationView, status: NSTextField,
+                        passwordButton: NSButton) -> NSView {
         let size = authentication.fittingSize
         authentication.widthAnchor.constraint(equalToConstant: size.width).isActive = true
         authentication.heightAnchor.constraint(equalToConstant: size.height).isActive = true
-        let title = NSTextField(labelWithString: "Touch ID")
+        let title = NSTextField(labelWithString: "Verify on This Mac")
         title.font = .systemFont(ofSize: 13, weight: .semibold)
         status.font = .systemFont(ofSize: 12)
         status.textColor = .secondaryLabelColor
@@ -64,7 +65,9 @@ enum AtemAuthenticationLayout {
         status.widthAnchor.constraint(equalToConstant: status.preferredMaxLayoutWidth).isActive = true
         // Reserve room for failure guidance so the window does not jump during authentication.
         status.heightAnchor.constraint(greaterThanOrEqualToConstant: 60).isActive = true
-        let text = NSStackView(views: [title, status])
+        passwordButton.bezelStyle = .rounded
+        passwordButton.controlSize = .small
+        let text = NSStackView(views: [title, status, passwordButton])
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 6

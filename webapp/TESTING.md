@@ -20,7 +20,7 @@ Run the browser-independent checks and the actual nginx image checks with:
 ```sh
 node tests/codec.test.mjs
 node tests/nginx.test.js
-node --test tests/agent-chat.test.mjs tests/screen-share.test.mjs tests/rtc-channel.test.mjs tests/stoa-session.test.mjs
+node --test tests/agent-chat.test.mjs tests/agent-markdown.test.mjs tests/screen-share.test.mjs tests/rtc-channel.test.mjs tests/stoa-session.test.mjs
 WEBAPP_TEST_ORIGIN=http://localhost:8080 node --test tests/hosting.test.mjs
 ```
 

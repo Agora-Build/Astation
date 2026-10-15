@@ -15,7 +15,7 @@ its running key agent; an old executable or agent cannot complete migration.
 
 For the current pairing, project-picker and migration steps, use the
 [credentials guide](credentials.md). Its Atem commands also work from another
-machine; Touch ID approval remains on the home Astation Mac.
+machine; Touch ID or Mac-password approval remains on the home Astation Mac.
 
 ## Protocol And Trust
 
@@ -28,13 +28,16 @@ Astations bind attempts to the authenticated Atem ID, the connection
 generation, the data account, and a fresh 32-byte nonce. Attempts expire
 after three minutes. The revealed keys must match the original commitment
 before the Mac displays a safety code. Approval requires matching codes
-and Touch ID. One window displays the safety code and the embedded system
-Touch ID control. After comparing both codes, click **Codes Match**, then use
+and fresh device-owner authentication. One window displays the safety code and
+the embedded system Touch ID control. After comparing both codes, click **Codes Match**, then use
 Touch ID in that window. The code remains visible; Codes Match alone cannot
 approve the device, and biometrics do not start before confirmation. There is
-no separate authentication alert or password fallback. The first verification
-also requires confirmation that the
-complete recovery kit was saved. Denial, abort, expiry, and connection
+an explicit **Use Mac Password...** button after Codes Match. It opens macOS's
+authentication dialog using a separate context. macOS asks for the Mac login
+password when Touch ID is unavailable; if it offers Touch ID first, choose its
+Use Password option. Astation never receives or stores that password. The first
+verification also requires confirmation that the complete recovery kit was
+saved. Denial, abort, expiry, and connection
 replacement invalidate pending approvals.
 
 See [the verification UI design](../designs/atem-verification-ui.md) for the
@@ -42,7 +45,7 @@ code-comparison gate and biometric lifecycle/security invariants.
 
 Safety-code and recovery dialogs run without blocking the main queue.
 A peer abort, disconnect, or timeout dismisses the active dialog and
-invalidates any pending Touch ID request. A retry can start immediately;
+invalidates any pending Touch ID or password request. A retry can start immediately;
 callbacks from an earlier prompt cannot approve the new attempt.
 
 The Atem client must use its authenticated Atem ID in `verifyCommit`,
@@ -129,15 +132,27 @@ key ID, the ephemeral X25519 key, and a five-minute arrival-time window before
 opening a prompt. One window shows device name, boot ID, request time, last
 unlock and Apple's embedded Touch ID control. Touch ID starts when the window
 opens; there is no extra Approve click or separate authentication alert.
-Approval requires a fresh Touch ID match with no password fallback or reuse
-of a recent Mac unlock. Deny and
+Alternatively, **Use Mac Password...** opens macOS's authentication dialog.
+Approval requires fresh Touch ID or Mac-password authentication, without reuse
+of a recent biometric unlock. Deny and
 revoke removes the local E2E verification pin; the device must verify again
 before receiving further grants. Relay-wide signed device revocation is a
 later protocol step.
 
-The same window explains unavailable Touch ID without offering another way to
-approve. See [the unlock UI design](../designs/atem-unlock-ui.md) for embedded
+The same window explains unavailable Touch ID and keeps the password button
+available. This supports a closed lid with an external display or a remote Mac
+desktop session, subject to macOS's authentication rules. Switching methods
+cancels the previous attempt; stale replies cannot approve. A cancelled or
+unsuccessful password attempt grants nothing and can be retried explicitly.
+See [the unlock UI design](../designs/atem-unlock-ui.md) for embedded
 authentication, cancellation and lifecycle invariants.
+
+Password-fallback lifecycle tests use injected authentication contexts and do
+not enter a real password. They cover separate policies, retries, stale replies,
+cancellation and comparison gating. See [Agent validation](agent-chat.md#verification)
+for combined-build results and local environment limits. With an external display and closed lid, or while
+viewing the Mac remotely, use **Use Mac Password...** on a real request and
+authenticate in Apple's dialog to complete hardware/session acceptance.
 
 `unlockDenied` includes `revoked: true` after Deny and revoke has persisted,
 and when Astation no longer has a verification pin for the authenticated

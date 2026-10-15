@@ -14,6 +14,7 @@ class AstationWebSocketServer {
     private let sessionStore: SessionStore
     private let localBootstrapStore: LocalBootstrapStore?
     private var authenticatedClients: Set<String> = []  // Client IDs that have been authenticated
+    private var authenticatedSessionIds: [String: String] = [:]
     private var pendingAuthentication: [String: DirectAuthenticationContext] = [:]
     private var pairingClients: Set<String> = []
 
@@ -102,6 +103,7 @@ class AstationWebSocketServer {
         ws.onClose.whenComplete { _ in
             self.connectedClients.removeValue(forKey: clientId)
             self.authenticatedClients.remove(clientId)
+            self.authenticatedSessionIds.removeValue(forKey: clientId)
             self.pendingAuthentication.removeValue(forKey: clientId)
             self.pairingClients.remove(clientId)
             self.hubManager.removeClient(withId: clientId)
@@ -127,7 +129,7 @@ class AstationWebSocketServer {
 
         guard let data = text.data(using: .utf8),
               let message = try? JSONDecoder().decode(AstationMessage.self, from: data) else {
-            Log.error("❌ Failed to decode message from \(clientId.prefix(8)): \(text.prefix(100))")
+            Log.error("❌ Failed to decode message from \(clientId.prefix(8)) (\(text.utf8.count) bytes)")
             return
         }
 
@@ -135,6 +137,11 @@ class AstationWebSocketServer {
         if !authenticatedClients.contains(clientId) {
             // Client not authenticated - check if this is an auth message
             handleAuthMessage(message, from: clientId, ws: ws)
+            return
+        }
+
+        if message.isPrivateAgentTraffic, !hasCurrentSession(clientId) {
+            _ = ws.close(code: .policyViolation)
             return
         }
 
@@ -206,7 +213,7 @@ class AstationWebSocketServer {
                     ]
                 )
                 sendMessage(successMsg, to: clientId)
-                registerClient(clientId, hostname: session.hostname, atemId: atemId)
+                registerClient(clientId, hostname: session.hostname, atemId: atemId, sessionId: session.id)
 
                 Log.info("Client \(clientId.prefix(8)) authenticated via LAN session proof")
                 return
@@ -275,17 +282,19 @@ class AstationWebSocketServer {
             "token": session.token,
             "protocol": DeviceAuthentication.protocolVersion
         ]), to: clientId)
-        registerClient(clientId, hostname: hostname, atemId: atemId)
+        registerClient(clientId, hostname: hostname, atemId: atemId, sessionId: session.id)
         Log.info("Loopback client \(clientId.prefix(8)) authenticated without interactive pairing")
     }
 
-    private func registerClient(_ clientId: String, hostname: String, atemId: String?) {
+    private func registerClient(_ clientId: String, hostname: String, atemId: String?, sessionId: String) {
+        authenticatedSessionIds[clientId] = sessionId
         hubManager.addClient(ConnectedClient(
             id: clientId,
             clientType: "Atem",
             connectedAt: Date(),
             hostname: hostname,
-            atemId: atemId
+            atemId: atemId,
+            authenticationSessionId: sessionId
         ))
     }
 
@@ -375,7 +384,7 @@ class AstationWebSocketServer {
                         "token": session.token,
                         "protocol": DeviceAuthentication.protocolVersion
                     ]), to: clientId)
-                    self.registerClient(clientId, hostname: hostname, atemId: atemId)
+                    self.registerClient(clientId, hostname: hostname, atemId: atemId, sessionId: session.id)
                     Log.info("✅ Pairing approved for \(hostname) (\(clientId.prefix(8)))")
                 } else {
                     self.sendMessage(.error(message: "Pairing denied by user"), to: clientId)
@@ -387,6 +396,10 @@ class AstationWebSocketServer {
     }
     
     private func sendMessage(_ message: AstationMessage, to clientId: String) {
+        if message.isPrivateAgentTraffic, !hasCurrentSession(clientId) {
+            _ = connectedClients[clientId]?.close(code: .policyViolation)
+            return
+        }
         guard let ws = connectedClients[clientId],
               let data = try? JSONEncoder().encode(message),
               let text = String(data: data, encoding: .utf8) else {
@@ -397,10 +410,25 @@ class AstationWebSocketServer {
         ws.send(text)
         NetworkDebugLogger.logWebSocket(direction: "send", context: "local \(clientId)", message: text)
     }
+
+    private func hasCurrentSession(_ clientId: String) -> Bool {
+        guard authenticatedClients.contains(clientId), let sessionId = authenticatedSessionIds[clientId],
+              let session = sessionStore.get(sessionId: sessionId) else { return false }
+        return session.isValid
+    }
     
     func sendMessageToClient(_ message: AstationMessage, clientId: String) {
         executeOnStateEventLoop {
             self.sendMessage(message, to: clientId)
+        }
+    }
+
+    func disconnectClients(authenticatedWith sessionIds: [String]) {
+        executeOnStateEventLoop {
+            let removed = Set(sessionIds)
+            for (clientId, sessionId) in self.authenticatedSessionIds where removed.contains(sessionId) {
+                _ = self.connectedClients[clientId]?.close(code: .policyViolation)
+            }
         }
     }
 
@@ -411,6 +439,7 @@ class AstationWebSocketServer {
     }
 
     private func broadcastMessageOnEventLoop(_ message: AstationMessage) {
+        if message.isPrivateAgentTraffic { return }
         guard let data = try? JSONEncoder().encode(message),
               let text = String(data: data, encoding: .utf8) else {
             Log.error("Failed to encode broadcast message")

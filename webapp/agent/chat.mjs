@@ -1,12 +1,15 @@
 import {
   Conversation,
   activity,
-  safeLink,
-  markdownBlocks,
+  messageText,
+  MAX_FRAME_BYTES,
   importSessionKey,
   signedFrame,
   verifiedBody,
 } from "./chat-core.mjs";
+import { renderMarkdown } from "./markdown.mjs";
+
+const parser = new globalThis.commonmark.Parser();
 
 const $ = (id) => document.getElementById(id);
 const conversation = new Conversation();
@@ -43,33 +46,6 @@ async function copy(text) {
   }
 }
 
-function inline(parent, text) {
-  const pattern =
-    /(`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]\n]+\]\([^\s)]+\)|https?:\/\/[^\s<>]+)/g;
-  let start = 0;
-  for (const match of text.matchAll(pattern)) {
-    parent.append(document.createTextNode(text.slice(start, match.index)));
-    const value = match[0];
-    if (value.startsWith("`"))
-      parent.append(node("code", "", value.slice(1, -1)));
-    else if (value.startsWith("**"))
-      parent.append(node("strong", "", value.slice(2, -2)));
-    else {
-      const markdown = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(value);
-      const href = safeLink(markdown ? markdown[2] : value);
-      if (href) {
-        const link = node("a", "", markdown ? markdown[1] : value);
-        link.href = href;
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-        parent.append(link);
-      } else parent.append(document.createTextNode(value));
-    }
-    start = match.index + value.length;
-  }
-  parent.append(document.createTextNode(text.slice(start)));
-}
-
 function highlighted(code, text) {
   const pattern =
     /(\/\/[^\n]*|#[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b(?:const|let|var|func|fn|function|return|if|else|true|false|null|nil|async|await|pub|use|import|from|export|struct|class|guard|try|throw)\b|\b\d+(?:\.\d+)?\b)/g;
@@ -91,12 +67,10 @@ function highlighted(code, text) {
 }
 
 function markdown(text) {
-  const fragment = document.createDocumentFragment();
-  const sections = markdownBlocks(text);
-  for (const section of sections) {
-    if (section.type === "code") {
-      const language = section.language;
-      const source = section.text;
+  return renderMarkdown(text, {
+    document,
+    parser,
+    codeBlock(source, language) {
       const block = node("div", "code-block");
       const header = node("div", "code-header");
       header.append(node("span", "", language));
@@ -109,59 +83,9 @@ function markdown(text) {
       highlighted(code, source);
       pre.append(code);
       block.append(header, pre);
-      fragment.append(block);
-      continue;
-    }
-    const lines = section.text.split("\n");
-    let paragraph = [];
-    let list;
-    const flush = () => {
-      if (paragraph.length) {
-        const p = node("p");
-        inline(p, paragraph.join("\n"));
-        fragment.append(p);
-        paragraph = [];
-      }
-      list = null;
-    };
-    for (const line of lines) {
-      if (!line.trim()) {
-        flush();
-        continue;
-      }
-      const item = /^\s*[-*]\s+(.+)/.exec(line);
-      if (item) {
-        if (paragraph.length) flush();
-        if (!list) {
-          list = node("ul");
-          fragment.append(list);
-        }
-        const li = node("li");
-        inline(li, item[1]);
-        list.append(li);
-        continue;
-      }
-      const heading = /^(#{1,3})\s+(.+)/.exec(line);
-      if (heading) {
-        flush();
-        const h = node(heading[1].length > 1 ? "h3" : "h2");
-        inline(h, heading[2]);
-        fragment.append(h);
-        continue;
-      }
-      if (line.startsWith("> ")) {
-        flush();
-        const quote = node("blockquote");
-        inline(quote, line.slice(2));
-        fragment.append(quote);
-        continue;
-      }
-      list = null;
-      paragraph.push(line);
-    }
-    flush();
-  }
-  return fragment;
+      return block;
+    },
+  });
 }
 
 function messageElement(message) {
@@ -176,7 +100,11 @@ function messageElement(message) {
     node(
       "strong",
       "",
-      message.role === "user" ? "You" : conversation.context.agentName,
+      message.role === "user"
+        ? message.origin === "local"
+          ? "You / Terminal"
+          : "You"
+        : conversation.context.agentName,
     ),
   );
   const time = node(
@@ -190,8 +118,16 @@ function messageElement(message) {
   time.dateTime = new Date(message.at).toISOString();
   meta.append(time);
   const content = node("div", "message-content");
-  if (message.role === "user") content.append(node("p", "", message.text));
-  else content.append(markdown(message.text));
+  for (const part of message.parts) {
+    if (part.kind === "tool") {
+      const tool = node("div", "tool-part");
+      tool.append(node("strong", "tool-name", part.name));
+      if (part.summary) tool.append(node("code", "tool-summary", part.summary));
+      content.append(tool);
+    } else if (message.role === "user")
+      content.append(node("p", "", part.markdown));
+    else content.append(markdown(part.markdown));
+  }
   const footer = node("div", "message-footer");
   if (message.role === "user") {
     const labels = {
@@ -199,6 +135,8 @@ function messageElement(message) {
       delivered: "Delivered",
       unknown: "Delivery unknown",
       failed: "Not delivered",
+      refused: "Refused / check terminal",
+      remote: "From chat",
     };
     const status = node(
       "span",
@@ -210,9 +148,17 @@ function messageElement(message) {
   } else {
     const button = node("button", "", "Copy message");
     button.type = "button";
-    button.addEventListener("click", () => copy(message.text));
+    button.addEventListener("click", () => copy(messageText(message)));
     footer.append(button);
   }
+  if (message.outcome)
+    footer.append(
+      node(
+        "span",
+        "turn-outcome",
+        message.outcome === "interrupted" ? "Interrupted" : "Turn finished",
+      ),
+    );
   element.append(meta, content, footer);
   return element;
 }
@@ -222,6 +168,13 @@ function render() {
   const context = conversation.context;
   const timeline = $("timeline");
   const previousScroll = timeline.scrollTop;
+  const anchor = [...$("messages").children].find(
+    (child) =>
+      child.getBoundingClientRect().bottom >
+      timeline.getBoundingClientRect().top,
+  );
+  const anchorTop = anchor?.getBoundingClientRect().top;
+  const anchorId = anchor?.dataset.messageId;
   $("agent-name").textContent = context.agentName;
   $("agent-location").textContent = `${context.hostname} / Remote coding agent`;
   $("composer-agent").textContent = context.agentName;
@@ -237,7 +190,8 @@ function render() {
     (message) => message.role === "user",
   );
   $("conversation-title").textContent =
-    firstPrompt?.text.slice(0, 70) || "A new conversation";
+    (firstPrompt ? messageText(firstPrompt).slice(0, 70) : "") ||
+    "A new conversation";
   $("empty-state").hidden = conversation.messages.length > 0;
   const existing = new Map(
     Array.from($("messages").children, (child) => [
@@ -245,16 +199,36 @@ function render() {
       child,
     ]),
   );
+  let position = 0;
   for (const message of conversation.messages) {
-    const version = message.text + "\0" + (message.delivery || "");
+    const version = JSON.stringify([
+      message.parts,
+      message.delivery,
+      message.outcome,
+      message.origin,
+      message.at,
+    ]);
     const old = existing.get(`${message.role}:${message.id}`);
-    if (old?.renderVersion === version) continue;
-    const element = messageElement(message);
+    existing.delete(`${message.role}:${message.id}`);
+    const element =
+      old?.renderVersion === version ? old : messageElement(message);
     element.renderVersion = version;
-    if (old) old.replaceWith(element);
-    else $("messages").append(element);
+    if (old && old !== element) old.replaceWith(element);
+    if ($("messages").children[position] !== element)
+      $("messages").insertBefore(
+        element,
+        $("messages").children[position] || null,
+      );
+    position++;
   }
-  $("prompt").disabled = !conversation.canSend;
+  for (const old of existing.values()) old.remove();
+  $("earlier-messages").hidden =
+    !conversation.oldestMessageId || !context.canReopen;
+  $("earlier-messages").disabled = conversation.opening;
+  $("reopen-chat").hidden =
+    !context.canReopen || (!conversation.closed && context.enabled);
+  // Keep a draft editable while the agent works; only submission requires Ready.
+  $("prompt").disabled = !context.supported || !context.connected;
   $("send").disabled = !conversation.canSend || !$("prompt").value.trim();
   $("connection-notice").textContent = conversation.notice;
   $("connection-notice").hidden = !conversation.notice;
@@ -267,7 +241,15 @@ function render() {
         : "Messages stay in this tab. Your terminal is always available in Astation.";
   renderActivity();
   if (followLatest) timeline.scrollTop = timeline.scrollHeight;
-  else timeline.scrollTop = previousScroll;
+  else {
+    const restored = [...$("messages").children].find(
+      (child) => child.dataset.messageId === anchorId,
+    );
+    timeline.scrollTop =
+      restored && anchorTop !== undefined
+        ? previousScroll + restored.getBoundingClientRect().top - anchorTop
+        : previousScroll;
+  }
   $("jump-latest").hidden = followLatest;
 }
 
@@ -294,7 +276,15 @@ function renderActivity() {
   $("activity").title =
     value.state === "unknown"
       ? "No recent semantic activity report is available."
-      : value.label;
+      : [
+          value.label,
+          conversation.detail,
+          conversation.since === null
+            ? ""
+            : `Since ${new Date(conversation.since).toLocaleString()}`,
+        ]
+          .filter(Boolean)
+          .join(" / ");
   $("agent-progress").hidden = !["working", "waiting"].includes(value.state);
   $("agent-progress-label").textContent =
     value.state === "waiting"
@@ -331,48 +321,76 @@ function startPreview() {
     connected: true,
     supported: true,
     enabled: true,
-    generation: "preview",
+    opening: true,
+  });
+  receive({
+    op: "event",
+    event: {
+      v: 1,
+      op: "opened",
+      generation: "preview",
+      sequence: 0,
+      status: { state: "ready", since: Date.now() },
+    },
   });
   const id = "sample-prompt";
   conversation.addPrompt(
     id,
     "Can you make the agent workspace feel more like a conversation? Keep the terminal one click away.",
   );
-  previewEvent("accepted", { requestId: id });
-  previewEvent("message", {
-    messageId: "sample-reply",
-    requestId: id,
-    text: 'Absolutely. Here\u2019s a first pass at a quieter workspace, with the conversation at its center.\n\n### A familiar place to build\n- Your prompts sit on the right; agent replies arrive on the left.\n- **Code stays readable**, with syntax colors and a copy button.\n- The activity indicator follows explicit agent events.\n\n```typescript\nconst conversation = {\n  agent: "Claude Code",\n  workspace: "Genie",\n  status: "ready"\n};\n```\n\nThe same layout adapts to a phone. And when you need the full CLI, **Open Terminal** is still right there in Astation.\n\nReference: [Astation on GitHub](https://github.com/Agora-Build/Astation).',
-  });
-  previewEvent("complete", { requestId: id });
-  previewEvent("status", { state: "ready" });
+  const message = (requestId, text, reply) => {
+    const turnId = `turn-${requestId}`;
+    previewEvent("accepted", { requestId });
+    previewEvent("message", {
+      messageId: `user-${requestId}`,
+      role: "user",
+      origin: "remote",
+      turnId,
+      requestId,
+      createdAt: Date.now(),
+      parts: [{ id: "prompt", kind: "text", markdown: text }],
+    });
+    previewEvent("message", {
+      messageId: `reply-${requestId}`,
+      role: "assistant",
+      turnId,
+      requestId,
+      createdAt: Date.now(),
+      parts: [{ id: "text", kind: "text", markdown: reply }],
+    });
+    previewEvent("delta", {
+      messageId: `reply-${requestId}`,
+      part: {
+        id: "tool",
+        kind: "tool",
+        name: "Read",
+        summary: "webapp/agent/chat.mjs",
+      },
+    });
+    previewEvent("complete", { turnId, requestId, outcome: "done" });
+    previewEvent("status", { state: "ready", since: Date.now() });
+  };
+  message(
+    id,
+    messageText(conversation.messages[0]),
+    'Here is a first pass at a quieter workspace.\n\n### A familiar place to build\n- Prompts sit on the right; agent replies arrive on the left.\n- **Code stays readable**, with syntax colors and a copy button.\n- Activity follows explicit agent events.\n\n```typescript\nconst conversation = {\n  agent: "Claude Code",\n  status: "ready"\n};\n```\n\n[View Astation on GitHub](https://github.com/Agora-Build/Astation).',
+  );
   transport = async (body) => {
     if (body.op !== "submit") return;
-    previewEvent("accepted", { requestId: body.requestId });
-    previewEvent("status", { state: "working" });
-    const text =
-      "This is a **preview reply**, so no prompt was sent to a real code agent.\n\nIn a live conversation, your selected Atem will send the agent\u2019s structured reply here. Messages can include `inline code`, code blocks, and safe links.\n\nYour message was:\n> " +
-      body.text.replace(/\n/g, "\n> ");
-    const chunks = text.match(/[\s\S]{1,35}/g) || [];
-    const messageId = crypto.randomUUID();
-    const step = () => {
-      const chunk = chunks.shift();
-      if (chunk) {
-        previewEvent("delta", {
-          messageId,
-          requestId: body.requestId,
-          text: chunk,
-        });
-        previewTimer = setTimeout(step, 45);
-      } else {
-        previewEvent("complete", { requestId: body.requestId });
-        previewEvent("status", { state: "ready" });
-      }
-    };
-    previewTimer = setTimeout(step, 650);
+    previewEvent("status", { state: "working", since: Date.now() });
+    previewTimer = setTimeout(
+      () =>
+        message(
+          body.requestId,
+          body.text,
+          "This is a **preview reply**. Nothing was sent to a real agent.\n\nYour message was:\n> " +
+            body.text.replace(/\n/g, "\n> "),
+        ),
+      650,
+    );
   };
   $("session-description").textContent =
-    "This is an interactive preview using sample data. You can send messages to explore the layout; nothing is delivered to a real agent.";
+    "This interactive preview uses sample data. Nothing is delivered to a real agent.";
 }
 
 async function connect() {
@@ -432,7 +450,10 @@ async function connect() {
   socket.addEventListener("message", (event) => {
     receiveQueue = receiveQueue
       .then(async () => {
-        if (typeof event.data !== "string" || event.data.length > 300000)
+        if (
+          typeof event.data !== "string" ||
+          event.data.length > MAX_FRAME_BYTES + 2048
+        )
           return;
         let frame;
         try {
@@ -508,7 +529,10 @@ $("composer").addEventListener("submit", async (event) => {
   event.preventDefault();
   const text = $("prompt").value;
   const requestId = crypto.randomUUID();
-  if (!transport || !conversation.addPrompt(requestId, text)) return;
+  if (!transport || !conversation.addPrompt(requestId, text)) {
+    scheduleRender();
+    return;
+  }
   $("prompt").value = "";
   $("prompt").style.height = "";
   followLatest = true;
@@ -571,7 +595,7 @@ $("copy-conversation").addEventListener("click", () =>
     conversation.messages
       .map(
         (message) =>
-          `${message.role === "user" ? "You" : conversation.context.agentName}:\n${message.text}`,
+          `${message.role === "user" ? "You" : conversation.context.agentName}:\n${messageText(message)}`,
       )
       .join("\n\n"),
   ),
@@ -580,7 +604,19 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") sidebar(false);
 });
 window.addEventListener("pagehide", () => clearTimeout(previewTimer));
-setInterval(renderActivity, 1000);
+$("earlier-messages").addEventListener("click", () => {
+  const before = conversation.oldestMessageId;
+  if (!before || !transport) return;
+  followLatest = false;
+  transport({ op: "history", before }).catch(fail);
+});
+$("reopen-chat").addEventListener("click", () =>
+  transport?.({ op: "reopen" }).catch(fail),
+);
+setInterval(() => {
+  renderActivity();
+  $("send").disabled = !conversation.canSend || !$("prompt").value.trim();
+}, 1000);
 if (preview) startPreview();
 else connect().catch(fail);
 render();

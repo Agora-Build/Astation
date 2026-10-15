@@ -84,7 +84,7 @@ enum AtemClientListModel {
 
 struct ConnectionsView: View {
     @ObservedObject var hubManager: AstationHubManager
-    let onRemoteControl: (String, AtemAgentInfo) -> Void
+    let onRemoteControl: (String, AtemAgentInfo?) -> Void
     /// Which client's agents are shown on the right panel.
     @State private var selectedClientId: String?
 
@@ -358,7 +358,7 @@ private struct OfflineClientRow: View {
 private struct AgentListPanel: View {
     @ObservedObject var hubManager: AstationHubManager
     let clientId: String?
-    let onRemoteControl: (String, AtemAgentInfo) -> Void
+    let onRemoteControl: (String, AtemAgentInfo?) -> Void
 
     private var agents: [AtemAgentInfo] {
         guard let id = clientId else { return [] }
@@ -391,6 +391,13 @@ private struct AgentListPanel: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                     if clientIsOnline, let id = clientId {
+                        Button {
+                            onRemoteControl(id, nil)
+                        } label: {
+                            Label("Terminals", systemImage: "terminal")
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
                         Button("Refresh") { hubManager.requestAgentList(from: id) }
                             .buttonStyle(.borderless)
                             .font(.caption)
@@ -440,6 +447,20 @@ private struct AgentListPanel: View {
                         ForEach(agents) { agent in
                             AgentRow(
                                 agent: agent,
+                                onOpenInBrowser: {
+                                    guard let clientId else { return }
+                                    do {
+                                        let url = try hubManager.openAgentInBrowser(clientId: clientId, agent: agent)
+                                        if !NSWorkspace.shared.open(url) {
+                                            throw BrowserAgentChat.OpenError.invalidURL
+                                        }
+                                    } catch {
+                                        let alert = NSAlert()
+                                        alert.messageText = "Could not open agent chat"
+                                        alert.informativeText = error.localizedDescription
+                                        alert.runModal()
+                                    }
+                                },
                                 onRemoteControl: {
                                     guard let clientId else { return }
                                     onRemoteControl(clientId, agent)
@@ -460,14 +481,16 @@ private struct AgentListPanel: View {
 
 private struct AgentRow: View {
     let agent: AtemAgentInfo
+    let onOpenInBrowser: () -> Void
     let onRemoteControl: () -> Void
 
     private var statusColor: Color {
         switch agent.status {
-        case "Idle":            return Color(NSColor.tertiaryLabelColor)
+        case "Idle":            return .green
         case "Thinking":        return .yellow
         case "WaitingForInput": return .green
         case "Disconnected":    return .red
+        case "Unknown":         return Color(NSColor.tertiaryLabelColor)
         default:                return Color(NSColor.tertiaryLabelColor)
         }
     }
@@ -526,10 +549,18 @@ private struct AgentRow: View {
                     Text(agent.status)
                         .font(.caption)
                         .foregroundColor(statusColor)
+                        .help(agent.status == "Unknown"
+                              ? "Atem has no reliable activity report for this agent. Its terminal is still available."
+                              : "Activity reported by Atem's agent integration.")
                 }
 
-                Button(action: onRemoteControl) {
-                    Label("Remote Agent Control", systemImage: "keyboard")
+                HStack(spacing: 14) {
+                    Button(action: onRemoteControl) {
+                        Label("Open Terminal", systemImage: "terminal")
+                    }
+                    Button(action: onOpenInBrowser) {
+                        Label("Open in Browser", systemImage: "arrow.up.right.square")
+                    }
                 }
                 .buttonStyle(.borderless)
                 .controlSize(.small)

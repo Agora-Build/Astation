@@ -86,6 +86,8 @@ export async function verifyAgentChat({ origin, fetchImpl = fetch, log = console
     ['/agent/chat.css', 'text/css', '--paper'],
     ['/agent/chat-core.mjs', 'text/javascript', 'class Conversation'],
     ['/agent/chat.mjs', 'text/javascript', 'chat-core.mjs'],
+    ['/agent/markdown.mjs', 'text/javascript', 'renderMarkdown'],
+    ['/agent/vendor/commonmark.min.js', 'application/javascript', 'commonmark'],
     ['/agent/mark.svg', 'image/svg+xml', '<svg'],
   ];
   await Promise.all(assets.map(async ([path, mime, marker]) => {

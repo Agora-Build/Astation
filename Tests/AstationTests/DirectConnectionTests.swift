@@ -202,6 +202,49 @@ final class DirectConnectionTests: XCTestCase {
         _ = socket.close()
     }
 
+    func testRevokedDirectPairingRejectsTerminalTrafficInBothDirections() throws {
+        for outbound in [false, true] {
+            let fixture = try DirectServerFixture(host: "127.0.0.1")
+            defer { fixture.shutdown() }
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { try? group.syncShutdownGracefully() }
+            var clientId = ""
+            let authenticate = loopbackAuthMessage(fixture: fixture, atemId: "terminal-test")
+            let (result, socket) = try connect(host: "127.0.0.1", fixture: fixture, group: group,
+                authMessage: { data in
+                    clientId = data["clientId"] ?? ""
+                    return authenticate(data)
+                }).wait()
+            XCTAssertEqual(result, "authenticated:local_proof")
+            XCTAssertFalse(clientId.isEmpty)
+            let session = try XCTUnwrap(fixture.sessions.getAllActive().first)
+            fixture.sessions.delete(sessionId: session.id)
+            XCTAssertNil(fixture.sessions.get(sessionId: session.id))
+            let closed = expectation(description: "Revoked terminal transport closes")
+            socket.onClose.whenComplete { _ in closed.fulfill() }
+            if outbound {
+                fixture.server.sendMessageToClient(.terminal(.list), clientId: clientId)
+            } else {
+                socket.send(String(decoding: try JSONEncoder().encode(AstationMessage.terminal(.sessions([]))), as: UTF8.self))
+            }
+            wait(for: [closed], timeout: 2)
+        }
+    }
+
+    func testPairingRemovalDisconnectsAuthenticatedDirectSocket() throws {
+        let fixture = try DirectServerFixture(host: "127.0.0.1")
+        defer { fixture.shutdown() }
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+        let (_, socket) = try connect(host: "127.0.0.1", fixture: fixture, group: group,
+            authMessage: loopbackAuthMessage(fixture: fixture, atemId: "terminal-test")).wait()
+        let session = try XCTUnwrap(fixture.sessions.getAllActive().first)
+        let closed = expectation(description: "Removed pairing closes its direct socket")
+        socket.onClose.whenComplete { _ in closed.fulfill() }
+        fixture.server.disconnectClients(authenticatedWith: [session.id])
+        wait(for: [closed], timeout: 2)
+    }
+
     private func connect(
         host: String,
         fixture: DirectServerFixture,

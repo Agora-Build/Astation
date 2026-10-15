@@ -5,6 +5,24 @@ This documents Astation's authority and durable processing of
 grants, escrow and recovery, is maintained in Atem's
 `designs/e2e-encryption.md`.
 
+## Owner Approval
+
+Device verification and storage-key unlock accept a fresh macOS device-owner
+authentication: Touch ID or the current Mac account's login password. The
+embedded biometric view keeps its biometric-only context. An explicit **Use Mac
+Password...** button invalidates that attempt and creates a separate, nonembedded
+`LAContext` using `.deviceOwnerAuthentication`, allowing macOS to present password
+entry when the lid is closed, biometrics are unavailable or the user selects the
+system password option. Astation never collects, stores or relays the password.
+
+Verification enables either method only after **Codes Match**. Switching methods
+invalidates the previous attempt before presenting the next; late or queued
+callbacks cannot approve a successor. Denial, revocation, window close, peer
+cancellation and expiry invalidate all active contexts and complete at most once.
+Password cancellation/failure grants nothing and leaves the explicit retry/deny
+controls available. Existing device pins, signed requests, route generations,
+recovery requirements and durable cryptographic checks remain required.
+
 ## Lifecycle
 
 1. Owner approval persists `enabling` or `disabling`, its account, target,

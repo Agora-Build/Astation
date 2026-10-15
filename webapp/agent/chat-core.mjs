@@ -1,7 +1,8 @@
 export const MAX_PROMPT_BYTES = 32768;
 export const MAX_MESSAGE_BYTES = 131072;
 export const ACTIVITY_TTL_MS = 30000;
-export const MAX_TRANSCRIPT_BYTES = 2097152;
+export const MAX_TRANSCRIPT_BYTES = 8388608;
+export const MAX_FRAME_BYTES = 1500000;
 export const MAX_MESSAGES = 512;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -12,7 +13,7 @@ export function base64(bytes) {
   return btoa(binary);
 }
 
-export function unbase64(value, limit = MAX_MESSAGE_BYTES * 2) {
+export function unbase64(value, limit = MAX_FRAME_BYTES) {
   if (
     typeof value !== "string" ||
     value.length > limit ||
@@ -97,7 +98,7 @@ export async function verifiedBody(
     !Number.isSafeInteger(frame.sequence) ||
     frame.sequence <= lastSequence ||
     typeof frame.body !== "string" ||
-    frame.body.length > MAX_MESSAGE_BYTES * 2
+    frame.body.length > MAX_FRAME_BYTES
   )
     return null;
   try {
@@ -129,36 +130,6 @@ export function safeLink(value) {
   }
 }
 
-export function markdownBlocks(text) {
-  const blocks = [];
-  let lines = [];
-  let language = null;
-  const flush = () => {
-    if (lines.length || language !== null) {
-      blocks.push({
-        type: language === null ? "text" : "code",
-        language,
-        text: lines.join("\n"),
-      });
-    }
-    lines = [];
-  };
-  for (const line of text.split("\n")) {
-    if (language === null) {
-      const opening = /^```([^`]*)$/.exec(line);
-      if (opening) {
-        flush();
-        language = opening[1].trim().slice(0, 32) || "code";
-      } else lines.push(line);
-    } else if (/^```\s*$/.test(line)) {
-      flush();
-      language = null;
-    } else lines.push(line);
-  }
-  flush();
-  return blocks;
-}
-
 export function activity(state, lastUpdate, connected, now = Date.now()) {
   if (!connected) return { state: "offline", label: "Offline" };
   if (!lastUpdate || now - lastUpdate > ACTIVITY_TTL_MS)
@@ -172,6 +143,64 @@ export function activity(state, lastUpdate, connected, now = Date.now()) {
   );
 }
 
+export function timestamp(value) {
+  const number =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && /^\d{4}-\d\d-\d\dT/.test(value)
+        ? Date.parse(value)
+        : NaN;
+  return Number.isFinite(number) && number >= 0 && number <= 8640000000000000
+    ? number
+    : null;
+}
+
+export function validPrompt(text) {
+  return (
+    typeof text === "string" &&
+    Boolean(text.trim()) &&
+    encoder.encode(text).length <= MAX_PROMPT_BYTES &&
+    !/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/.test(text) &&
+    !/^[\s]*[!/]/u.test(text)
+  );
+}
+
+const identifier = (value) =>
+  typeof value === "string" &&
+  value.length > 0 &&
+  encoder.encode(value).length <= 128;
+const states = ["ready", "working", "waiting", "unknown"];
+const validStatus = (status) =>
+  status &&
+  states.includes(status.state) &&
+  timestamp(status.since) !== null &&
+  (status.detail === undefined ||
+    (typeof status.detail === "string" &&
+      encoder.encode(status.detail).length <= 4096));
+const validPart = (part) =>
+  part &&
+  identifier(part.id) &&
+  ((part.kind === "text" && typeof part.markdown === "string") ||
+    (part.kind === "tool" &&
+      typeof part.name === "string" &&
+      typeof part.summary === "string"));
+const partBytes = (part) =>
+  part.id === "atem:truncated" &&
+  part.kind === "text" &&
+  part.markdown === "\u2026 (truncated)"
+    ? 0
+    : encoder.encode(
+        part.kind === "text" ? part.markdown : part.name + part.summary,
+      ).length;
+export const messageText = (message) =>
+  message.parts
+    .map((part) =>
+      part.kind === "text"
+        ? part.markdown
+        : `${part.name}${part.summary ? `: ${part.summary}` : ""}`,
+    )
+    .join("\n\n");
+
 export class Conversation {
   constructor(now = () => Date.now()) {
     this.now = now;
@@ -183,12 +212,19 @@ export class Conversation {
       enabled: false,
     };
     this.state = "unknown";
+    this.since = null;
+    this.detail = "";
     this.activityAt = 0;
     this.activeRequest = null;
     this.lastSequence = 0;
     this.generation = null;
     this.notice = "";
     this.uncertain = false;
+    this.closed = true;
+    this.opening = false;
+    this.pageBefore = null;
+    this.turns = new Map();
+    this.requestIds = new Set();
   }
 
   get canSend() {
@@ -196,32 +232,41 @@ export class Conversation {
       this.context.connected &&
       this.context.enabled &&
       Boolean(this.generation) &&
+      !this.closed &&
+      !this.opening &&
       !this.activeRequest &&
-      !this.uncertain
+      !this.uncertain &&
+      activity(this.state, this.activityAt, true, this.now()).state === "ready"
     );
   }
 
+  get oldestMessageId() {
+    return this.messages.find((message) => !message.optimistic)?.id;
+  }
+
   addPrompt(id, text) {
-    if (
-      !this.canSend ||
-      typeof id !== "string" ||
-      !id ||
-      this.messages.some((item) => item.id === id && item.role === "user") ||
-      typeof text !== "string" ||
-      !text.trim() ||
-      encoder.encode(text).length > MAX_PROMPT_BYTES
-    )
+    if (!this.canSend || !identifier(id) || this.requestIds.has(id))
       return false;
-    if (!this.withinLimits(text)) {
+    if (!validPrompt(text)) {
+      this.notice =
+        "Use a text prompt up to 32 KiB. Commands (/), shell mode (!) and control characters are unavailable in chat.";
+      return false;
+    }
+    if (!this.withinLimits([{ id: "prompt", kind: "text", markdown: text }])) {
       this.disconnect(
         "This conversation reached its size limit. Open a new session from Astation.",
       );
       return false;
     }
+    this.requestIds.add(id);
+    this.notice = "";
     this.messages.push({
       id,
+      requestId: id,
       role: "user",
-      text,
+      origin: "remote",
+      optimistic: true,
+      parts: [{ id: "prompt", kind: "text", markdown: text }],
       delivery: "sending",
       at: this.now(),
     });
@@ -232,20 +277,24 @@ export class Conversation {
   receive(body) {
     if (!body || typeof body !== "object") return;
     if (body.op === "context") {
-      this.context = { ...this.context, ...body };
       if (
-        !this.generation &&
-        typeof body.generation === "string" &&
-        body.generation
+        body.conversationId &&
+        body.conversationId !== this.context.conversationId
       ) {
-        this.generation = body.generation;
-        this.lastSequence = Number.isSafeInteger(body.lastSequence)
-          ? body.lastSequence
-          : 0;
+        this.opening = true;
+        this.closed = true;
+        this.lastSequence = 0;
+        this.pageBefore = body.before || null;
       }
-      if (body.pending && !this.activeRequest) this.uncertain = true;
+      this.context = { ...this.context, ...body };
+      this.opening = Boolean(body.opening);
+      if (typeof body.closed === "boolean") this.closed = body.closed;
+      if (body.pendingRequestId) this.activeRequest = body.pendingRequestId;
+      else if (body.pending === false) this.activeRequest = null;
+      if (typeof body.deliveryUnknown === "boolean")
+        this.uncertain = body.deliveryUnknown;
       this.notice = body.notice || "";
-      if (!body.connected) this.disconnect(this.notice);
+      if (!body.connected) this.disconnect(this.notice || undefined);
       return;
     }
     if (body.op === "notice") {
@@ -261,112 +310,268 @@ export class Conversation {
     }
     if (body.op !== "event") return;
     const event = body.event;
-    if (!event || event.v !== 1) return;
-    if (event.op === "opened") {
-      if (
-        this.generation ||
-        event.sequence !== 0 ||
-        typeof event.generation !== "string" ||
-        !event.generation
-      )
-        return;
-      this.generation = event.generation;
-      this.lastSequence = 0;
+    if (
+      !event ||
+      event.v !== 1 ||
+      (this.context.conversationId &&
+        event.conversationId !== this.context.conversationId) ||
+      (this.context.agentId && event.agentId !== this.context.agentId)
+    )
+      return;
+    if (
+      event.op === "close" &&
+      event.generation === undefined &&
+      event.sequence === undefined
+    ) {
+      this.closed = true;
+      this.opening = false;
+      this.state = "unknown";
+      this.notice ||=
+        "The host closed this conversation. Reopen the view to load history.";
+      if (this.activeRequest) {
+        this.updateDelivery(this.activeRequest, "unknown");
+        this.uncertain = true;
+      }
       return;
     }
     if (
+      event.op === "error" &&
+      event.generation === undefined &&
+      event.sequence === undefined &&
+      this.opening
+    ) {
+      this.notice = event.text || "Chat is unavailable.";
+      this.closed = true;
+      this.opening = false;
+      return;
+    }
+    if (event.op === "opened") {
+      if (
+        !this.opening ||
+        event.sequence !== 0 ||
+        !identifier(event.generation) ||
+        !validStatus(event.status)
+      )
+        return;
+      if (this.generation && this.generation !== event.generation) {
+        this.disconnect(
+          "The agent process changed. Open a new browser session from Astation.",
+        );
+        return;
+      }
+      this.generation = event.generation;
+      this.lastSequence = 0;
+      this.opening = false;
+      this.closed = false;
+      this.setStatus(event.status);
+      return;
+    }
+    if (
+      this.closed ||
+      this.opening ||
       !this.generation ||
-      event.generation !== this.generation ||
-      !Number.isSafeInteger(event.sequence) ||
-      event.sequence <= this.lastSequence
+      !Number.isSafeInteger(event.sequence)
     )
       return;
-    if (event.sequence !== this.lastSequence + 1) {
+    if (event.generation !== this.generation) {
       this.disconnect(
-        "Some conversation events are missing. Reopen this agent from Astation.",
+        "The agent process changed. Open a new browser session from Astation.",
       );
+      return;
+    }
+    if (event.sequence <= this.lastSequence) return;
+    if (event.sequence !== this.lastSequence + 1) {
+      this.closed = true;
+      this.notice =
+        "Some conversation events are missing. Reopen the view; prompts are never resent.";
+      if (this.activeRequest) this.uncertain = true;
       return;
     }
     this.lastSequence = event.sequence;
     switch (event.op) {
       case "accepted":
         this.updateDelivery(event.requestId, "delivered");
+        if (event.requestId === this.activeRequest) this.uncertain = false;
         break;
       case "message":
+        this.mergeMessage(event);
+        break;
       case "delta": {
-        if (
-          typeof event.messageId !== "string" ||
-          !event.messageId ||
-          typeof event.text !== "string"
-        )
-          return;
-        let message = this.messages.find(
-          (item) => item.id === event.messageId && item.role === "assistant",
+        const message = this.messages.find(
+          (item) => item.id === event.messageId && !item.optimistic,
         );
-        const text =
-          event.op === "delta"
-            ? (message?.text || "") + event.text
-            : event.text;
-        if (encoder.encode(text).length > MAX_MESSAGE_BYTES) {
-          this.disconnect("The reply exceeded the conversation limit.");
-          return;
+        if (!message || !validPart(event.part)) {
+          this.invalid();
+          break;
         }
-        if (!this.withinLimits(text, message)) {
-          this.disconnect(
-            "This conversation reached its size limit. Open a new session from Astation.",
-          );
-          return;
+        if (message.parts.some((part) => part.id === event.part.id)) break;
+        const parts = [...message.parts, event.part];
+        if (!this.withinLimits(parts, message)) {
+          this.invalid();
+          break;
         }
-        if (!message) {
-          message = {
-            id: event.messageId,
-            role: "assistant",
-            text: "",
-            at: this.now(),
-          };
-          this.messages.push(message);
-        }
-        message.text = text;
+        message.parts = parts;
         break;
       }
       case "status":
-        this.state = ["ready", "working", "waiting"].includes(event.state)
-          ? event.state
-          : "unknown";
-        this.activityAt = this.now();
+        if (validStatus(event)) this.setStatus(event);
+        else this.invalid();
         break;
       case "complete":
+        if (
+          !identifier(event.turnId) ||
+          !["done", "interrupted"].includes(event.outcome)
+        ) {
+          this.invalid();
+          break;
+        }
+        this.turns.set(event.turnId, event.outcome);
+        if (this.turns.size > 1024)
+          this.turns.delete(this.turns.keys().next().value);
+        for (const message of this.messages)
+          if (message.turnId === event.turnId) message.outcome = event.outcome;
         if (event.requestId === this.activeRequest) {
           this.updateDelivery(event.requestId, "delivered");
           this.activeRequest = null;
+          this.uncertain = false;
         }
         break;
-      case "error":
+      case "error": {
         this.notice = event.text || "The agent could not complete the request.";
         if (event.requestId === this.activeRequest) {
-          this.updateDelivery(event.requestId, "delivered");
+          const message = this.messages.find(
+            (item) =>
+              item.requestId === event.requestId && item.role === "user",
+          );
+          const unknown = /delivery unknown/i.test(this.notice);
+          this.updateDelivery(
+            event.requestId,
+            unknown
+              ? "unknown"
+              : message?.delivery === "delivered"
+                ? "delivered"
+                : "refused",
+          );
+          this.uncertain = unknown;
           this.activeRequest = null;
         }
         break;
+      }
+    }
+  }
+
+  setStatus(status) {
+    this.state = status.state;
+    this.since = timestamp(status.since);
+    this.detail = status.detail || "";
+    this.activityAt = this.now();
+  }
+
+  mergeMessage(event) {
+    if (
+      !identifier(event.messageId) ||
+      !["user", "assistant"].includes(event.role) ||
+      !identifier(event.turnId) ||
+      timestamp(event.createdAt) === null ||
+      (event.role === "user" && !["local", "remote"].includes(event.origin)) ||
+      !Array.isArray(event.parts) ||
+      !event.parts.every(validPart) ||
+      new Set(event.parts.map((part) => part.id)).size !== event.parts.length
+    ) {
+      this.invalid();
+      return;
+    }
+    let message = this.messages.find(
+      (item) => item.id === event.messageId && !item.optimistic,
+    );
+    if (
+      message &&
+      (message.role !== event.role || message.turnId !== event.turnId)
+    ) {
+      this.invalid();
+      return;
+    }
+    const optimistic =
+      event.role === "user" && event.origin === "remote" && event.requestId
+        ? this.messages.find(
+            (item) => item.optimistic && item.requestId === event.requestId,
+          )
+        : null;
+    const replacement = message || optimistic;
+    if (!this.withinLimits(event.parts, replacement)) {
+      this.invalid();
+      return;
+    }
+    const updated = {
+      id: event.messageId,
+      role: event.role,
+      origin: event.origin,
+      turnId: event.turnId,
+      requestId: event.requestId,
+      parts: event.parts,
+      at: timestamp(event.createdAt),
+      outcome: this.turns.get(event.turnId),
+      history: event.history === true,
+      delivery:
+        event.role === "user" && event.origin === "remote"
+          ? event.history
+            ? "delivered"
+            : replacement?.delivery || "remote"
+          : undefined,
+    };
+    if (replacement) Object.assign(replacement, updated, { optimistic: false });
+    else {
+      const anchor =
+        event.history && this.pageBefore
+          ? this.messages.findIndex((item) => item.id === this.pageBefore)
+          : -1;
+      if (anchor >= 0) this.messages.splice(anchor, 0, updated);
+      else this.messages.push(updated);
+    }
+    if (optimistic && message && optimistic !== message)
+      this.messages.splice(this.messages.indexOf(optimistic), 1);
+    if (
+      event.history &&
+      event.role === "user" &&
+      event.origin === "remote" &&
+      event.requestId === this.activeRequest
+    ) {
+      this.uncertain = false;
     }
   }
 
   updateDelivery(id, delivery) {
     const message = this.messages.find(
-      (item) => item.id === id && item.role === "user",
+      (item) => item.requestId === id && item.role === "user",
     );
-    if (message) message.delivery = delivery;
+    if (
+      message &&
+      !(delivery === "unknown" && message.delivery === "delivered")
+    )
+      message.delivery = delivery;
   }
 
-  withinLimits(text, replacement) {
+  withinLimits(parts, replacement) {
     const bytes = this.messages.reduce(
       (total, item) =>
-        total + (item === replacement ? 0 : encoder.encode(item.text).length),
+        total +
+        (item === replacement
+          ? 0
+          : item.parts.reduce((sum, part) => sum + partBytes(part), 0)),
       0,
     );
+    const size = parts.reduce((sum, part) => sum + partBytes(part), 0);
     return (
-      bytes + encoder.encode(text).length <= MAX_TRANSCRIPT_BYTES &&
+      parts.length <= 4096 &&
+      size <= MAX_MESSAGE_BYTES &&
+      bytes + size <= MAX_TRANSCRIPT_BYTES &&
       (replacement || this.messages.length < MAX_MESSAGES)
+    );
+  }
+
+  invalid() {
+    this.disconnect(
+      "The agent sent invalid or oversized conversation data. Reopen from Astation or use Open Terminal.",
     );
   }
 
@@ -375,11 +580,9 @@ export class Conversation {
   ) {
     this.context.connected = false;
     this.uncertain = true;
+    this.closed = true;
     this.state = "unknown";
     this.notice = reason;
-    if (this.activeRequest) {
-      this.updateDelivery(this.activeRequest, "unknown");
-      this.uncertain = true;
-    }
+    if (this.activeRequest) this.updateDelivery(this.activeRequest, "unknown");
   }
 }

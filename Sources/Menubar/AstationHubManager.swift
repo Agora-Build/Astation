@@ -6,7 +6,10 @@ import Network
 // Hub Manager - Contains all business logic for Agora projects, tokens, etc.
 class AstationHubManager: ObservableObject {
     @Published var connectedClients: [ConnectedClient] = [] {
-        didSet { refreshDirectMigrationContexts() }
+        didSet {
+            refreshDirectMigrationContexts()
+            terminalConnectionsDidChange?()
+        }
     }
     @Published var projects: [AgoraProject] = []
     @Published var selectedProject: AgoraProject?
@@ -135,6 +138,20 @@ class AstationHubManager: ObservableObject {
     /// Callback for sending a message to a specific client by ID.
     /// Set by AstationApp after wiring up the WebSocket server.
     var sendHandler: ((AstationMessage, String) -> Void)?
+    var terminalMessageHandler: ((RemoteTerminalMessage, RemoteTerminalConnection) -> Void)?
+    var terminalConnectionsDidChange: (() -> Void)?
+    var sessionsRemovedHandler: (([String]) -> Void)?
+    private var browserChatTimer: Timer?
+    lazy var browserAgentChat = BrowserAgentChat(
+        currentRoute: { [weak self] in self?.terminalConnection(for: $0) },
+        sendAgent: { [weak self] message, route in
+            guard let self, self.terminalConnection(for: route.clientId) == route, self.sendHandler != nil else { return false }
+            self.sendMessage(.agentChat(message), to: route.clientId,
+                             expectedRelayConnectionId: route.clientId.hasPrefix("relay-") ? route.connectionId : nil)
+            return true
+        },
+        sendBrowser: { [weak self] frame, route in self?.sendBrowserChatFrame(frame, to: route) }
+    )
 
     init(
         skipProjectLoad: Bool = false,
@@ -168,6 +185,8 @@ class AstationHubManager: ObservableObject {
         }
         deviceSessionStore.onSessionsRemoved = { [weak self] sessionIds in
             self?.sendRelayUnbind(sessionIds: sessionIds)
+            self?.sessionsRemovedHandler?(sessionIds)
+            self?.terminalConnectionsDidChange?()
         }
         setupCore()
         setupRTCManager()
@@ -200,6 +219,7 @@ class AstationHubManager: ObservableObject {
     }
 
     deinit {
+        browserChatTimer?.invalidate()
         sessionExpiryTimer?.invalidate()
         identityRelayPathMonitor?.cancel()
         identityRelayTask?.cancel(with: .goingAway, reason: nil)
@@ -698,9 +718,33 @@ class AstationHubManager: ObservableObject {
 
         case .agentListResponse(let agents):
             Log.info("[AstationHub] Agent list from \(clientId.prefix(8))…: \(agents.count) agent(s)")
+            let source = RemoteTerminalConnection(clientId: clientId, connectionId: relayConnectionId ?? clientId)
             DispatchQueue.main.async {
+                guard self.terminalConnection(for: clientId) == source else { return }
                 self.agentsByClientId[clientId] = agents
             }
+            return nil
+
+        case .terminal(let message):
+            // Direct client IDs are unique socket generations. Relay context is
+            // captured from the authenticated envelope before asynchronous delivery.
+            let source = RemoteTerminalConnection(clientId: clientId, connectionId: relayConnectionId ?? clientId)
+            DispatchQueue.main.async {
+                guard self.terminalConnection(for: clientId) == source else { return }
+                self.terminalMessageHandler?(message, source)
+            }
+            return nil
+
+        case .agentChat(let event):
+            let source = RemoteTerminalConnection(clientId: clientId, connectionId: relayConnectionId ?? clientId)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.terminalConnection(for: clientId) == source else { return }
+                self.browserAgentChat.receiveAgent(event, from: source)
+            }
+            return nil
+
+        case .browserChat:
+            // Browser capabilities are accepted only on the explicit relay bridge.
             return nil
 
         case .credentialProjectListResponse(let report):
@@ -1096,6 +1140,61 @@ class AstationHubManager: ObservableObject {
     }
 
     // MARK: - Remote Agent Control
+
+    func openAgentInBrowser(clientId: String, agent: AtemAgentInfo) throws -> URL {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard identityRelayVerified,
+              let client = connectedClients.first(where: { $0.id == clientId }) else {
+            throw BrowserAgentChat.OpenError.offline
+        }
+        if browserChatTimer == nil {
+            browserChatTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                self?.browserAgentChat.tick()
+            }
+        }
+        return try browserAgentChat.createLink(relayURL: stationRelayUrl, stationId: AstationIdentity.shared.id,
+            clientId: clientId, agent: agent, hostname: client.hostname)
+    }
+
+    private func sendBrowserChatFrame(_ frame: BrowserChatFrame, to route: RemoteTerminalConnection) {
+        guard identityRelayVerified, let task = identityRelayTask,
+              route.clientId.hasPrefix("relay-browser-"),
+              let data = try? JSONEncoder().encode(AstationMessage.browserChat(frame)),
+              let payload = try? JSONSerialization.jsonObject(with: data),
+              let envelope = try? JSONSerialization.data(withJSONObject: [
+                "atem_id": String(route.clientId.dropFirst(6)), "connection_id": route.connectionId, "payload": payload
+              ]), let text = String(data: envelope, encoding: .utf8) else { return }
+        task.send(.string(text)) { _ in }
+    }
+
+    func terminalConnection(for clientId: String, atemId: String? = nil) -> RemoteTerminalConnection? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let sameTransport: (ConnectedClient) -> Bool = {
+            $0.id.hasPrefix("relay-") == clientId.hasPrefix("relay-")
+        }
+        guard let client = connectedClients.first(where: { $0.id == clientId })
+                ?? connectedClients.first(where: { atemId != nil && $0.atemId == atemId && sameTransport($0) }),
+              client.clientType == "Atem", atemId == nil || client.atemId == atemId,
+              let sessionId = client.authenticationSessionId,
+              let authenticatedSession = deviceSessionStore.get(sessionId: sessionId),
+              authenticatedSession.isValid, authenticatedSession.atemId == client.atemId else { return nil }
+        if client.id.hasPrefix("relay-") {
+            guard identityRelayVerified,
+                  let generation = identityRelayAuthentication.connectionId(for: client.id),
+                  identityRelayAuthentication.isAuthenticated(clientId: client.id, connectionId: generation) else { return nil }
+            return RemoteTerminalConnection(clientId: client.id, connectionId: generation)
+        }
+        return RemoteTerminalConnection(clientId: client.id, connectionId: client.id)
+    }
+
+    @discardableResult
+    func sendTerminalMessage(_ message: RemoteTerminalMessage, to route: RemoteTerminalConnection) -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard terminalConnection(for: route.clientId) == route, sendHandler != nil else { return false }
+        sendMessage(.terminal(message), to: route.clientId,
+                    expectedRelayConnectionId: route.clientId.hasPrefix("relay-") ? route.connectionId : nil)
+        return true
+    }
 
     /// Send a text instruction to an Atem agent (written to its PTY stdin + Enter).
     /// When no client or agent is specified, the focused Atem and its focused agent are used.
@@ -1507,6 +1606,13 @@ class AstationHubManager: ObservableObject {
                                     Log.debug("[AstationHub] Ignored message from a replaced identity relay socket")
                                     return
                                 }
+                                if case .browserChat(let frame) = msg {
+                                    guard self.identityRelayVerified else { return }
+                                    self.browserAgentChat.receive(frame, from: RemoteTerminalConnection(
+                                        clientId: relayClientId, connectionId: connectionId))
+                                    return
+                                }
+                                guard !relayClientId.hasPrefix("relay-browser-") else { return }
                                 self.handleIdentityRelayMessage(
                                     msg,
                                     clientId: relayClientId,
@@ -1561,6 +1667,8 @@ class AstationHubManager: ObservableObject {
             .filter { $0.id.hasPrefix("relay-") }
             .forEach { removeClient(withId: $0.id) }
         identityRelayAuthentication.removeAll()
+        browserAgentChat.invalidateAll()
+        terminalConnectionsDidChange?()
         let wasVerified = identityRelayVerified
         identityRelayTask = nil
         identityRelayVerified = false
@@ -1785,6 +1893,8 @@ class AstationHubManager: ObservableObject {
         identityRelayReconnectGeneration &+= 1
         connectedClients.filter { $0.id.hasPrefix("relay-") }.forEach { removeClient(withId: $0.id) }
         identityRelayAuthentication.removeAll()
+        browserAgentChat.invalidateAll()
+        terminalConnectionsDidChange?()
         task?.cancel(with: .goingAway, reason: nil)
     }
 
@@ -2263,18 +2373,53 @@ class AstationHubManager: ObservableObject {
         connectionId: String
     ) {
         dispatchPrecondition(condition: .onQueue(.main))
+        // A browser proves a local capability; it is never paired as an Atem device.
+        if clientId.hasPrefix("relay-browser-") { return }
         switch event {
         case "connected":
             if identityRelayAuthentication.connect(clientId: clientId, connectionId: connectionId) {
+                terminalConnectionsDidChange?()
                 removeClient(withId: clientId)
             }
+            requestIdentityRelayAuthentication(clientId: clientId, connectionId: connectionId)
         case "disconnected":
             if identityRelayAuthentication.disconnect(clientId: clientId, connectionId: connectionId) {
+                terminalConnectionsDidChange?()
                 removeClient(withId: clientId)
             }
         default:
             Log.warn("[AstationHub] Ignored unknown identity relay event: \(event)")
         }
+    }
+
+    private func requestIdentityRelayAuthentication(
+        clientId: String,
+        connectionId: String,
+        hostname: String = "unknown"
+    ) {
+        guard identityRelayVerified,
+              !identityRelayAuthentication.isAuthenticated(clientId: clientId, connectionId: connectionId) else { return }
+        // A restored relay socket and a racing hello must use the same proof.
+        let challenge: String
+        if let pending = identityRelayAuthentication.challenge(clientId: clientId, connectionId: connectionId) {
+            challenge = pending
+        } else {
+            challenge = DeviceAuthentication.makeChallenge()
+            guard identityRelayAuthentication.issueChallenge(
+                clientId: clientId, connectionId: connectionId, challenge: challenge
+            ) else {
+                Log.warn("[AstationHub] Relay authentication challenge limit reached")
+                return
+            }
+        }
+        sendHandler?(.statusUpdate(status: "auth_required", data: [
+            "astation_id": AstationIdentity.shared.id,
+            "challenge": challenge,
+            "transport": "relay",
+            "protocol": DeviceAuthentication.protocolVersion,
+            "hostname": hostname
+        ]), clientId)
+        Log.info("[AstationHub] Relay authentication required for \(hostname)")
     }
 
     private func handleIdentityRelayMessage(
@@ -2297,24 +2442,7 @@ class AstationHubManager: ObservableObject {
                 return
             }
             let hostname = DeviceAuthentication.deviceLabel(data["hostname"] ?? "unknown")
-            let challenge = DeviceAuthentication.makeChallenge()
-            guard identityRelayAuthentication.issueChallenge(
-                clientId: clientId,
-                connectionId: connectionId,
-                challenge: challenge
-            ) else {
-                sendHandler?(.error(message: "Too many pending relay authentication requests"), clientId)
-                Log.warn("[AstationHub] Relay authentication challenge limit reached")
-                return
-            }
-            sendHandler?(.statusUpdate(status: "auth_required", data: [
-                "astation_id": AstationIdentity.shared.id,
-                "challenge": challenge,
-                "transport": "relay",
-                "protocol": DeviceAuthentication.protocolVersion,
-                "hostname": hostname
-            ]), clientId)
-            Log.info("[AstationHub] Relay authentication required for \(hostname)")
+            requestIdentityRelayAuthentication(clientId: clientId, connectionId: connectionId, hostname: hostname)
             return
         }
 
@@ -2341,6 +2469,7 @@ class AstationHubManager: ObservableObject {
 
     func broadcastToAuthenticatedIdentityRelayClients(_ message: AstationMessage) {
         dispatchPrecondition(condition: .onQueue(.main))
+        if message.isPrivateAgentTraffic { return }
         for clientId in identityRelayAuthentication.authenticatedClientIds {
             sendHandler?(message, clientId)
         }
@@ -2384,6 +2513,7 @@ class AstationHubManager: ObservableObject {
                 atemId: atemId,
                 connectionId: connectionId,
                 hostname: session.hostname,
+                sessionId: session.id,
                 response: .statusUpdate(status: "authenticated", data: [
                     "method": "session_proof",
                     "session_id": sessionId,
@@ -2430,6 +2560,7 @@ class AstationHubManager: ObservableObject {
             atemId: atemId,
             connectionId: connectionId,
             hostname: hostname,
+            sessionId: session.id,
             response: .auth(info: [
                 "status": "granted",
                 "session_id": session.id,
@@ -2444,6 +2575,7 @@ class AstationHubManager: ObservableObject {
         atemId: String,
         connectionId: String,
         hostname: String,
+        sessionId: String,
         response: AstationMessage
     ) {
         dispatchPrecondition(condition: .onQueue(.main))
@@ -2463,7 +2595,8 @@ class AstationHubManager: ObservableObject {
                 clientType: "Atem",
                 connectedAt: Date(),
                 hostname: "relay:\(hostname)",
-                atemId: atemId
+                atemId: atemId,
+                authenticationSessionId: sessionId
             ),
             relayConnectionId: connectionId
         )
@@ -2516,6 +2649,7 @@ struct ConnectedClient: Identifiable {
     let connectedAt: Date
     var hostname: String = "unknown"
     var atemId: String?
+    var authenticationSessionId: String?
     var tag: String = ""
     var lastActivity: Date = Date()
     var isFocused: Bool = false

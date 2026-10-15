@@ -56,6 +56,9 @@ enum AstationMessage: Codable {
 
     // Remote agent control (Astation → Atem): text or key input to the agent PTY.
     case agentInput(agentId: String?, kind: String, text: String?, key: String?)
+    case terminal(RemoteTerminalMessage)
+    case agentChat(AgentChatWire)
+    case browserChat(BrowserChatFrame)
 
     case encryptionMode(accountState: AtemSignedWire)
     case keyRequest(publicKey: String)
@@ -74,6 +77,13 @@ enum AstationMessage: Codable {
     case storageKeyConfirm(confirm: AtemSignedWire)
     case storageKeyAbandon(abandon: AtemSignedWire)
     case encryptionMigrationComplete(mode: String, kid: String, completion: AtemSignedWire? = nil)
+
+    var isPrivateAgentTraffic: Bool {
+        switch self {
+        case .terminal, .agentChat, .browserChat: return true
+        default: return false
+        }
+    }
 
     // Custom encoding/decoding to handle the enum cases
     private enum CodingKeys: String, CodingKey {
@@ -112,6 +122,8 @@ enum AstationMessage: Codable {
         case credentialProjectListRequest, credentialProjectListResponse
         case credentialSync
         case agentInput
+        case terminal
+        case agentChat, browserChat
         case encryptionMode
         case keyRequest
         case keyGrant
@@ -304,6 +316,18 @@ enum AstationMessage: Codable {
             try dc.encode(kind, forKey: .kind)
             try dc.encodeIfPresent(text, forKey: .text)
             try dc.encodeIfPresent(key, forKey: .key)
+
+        case .terminal(let message):
+            try container.encode(MessageType.terminal, forKey: .type)
+            try container.encode(message, forKey: .data)
+
+        case .agentChat(let message):
+            try container.encode(MessageType.agentChat, forKey: .type)
+            try container.encode(message, forKey: .data)
+
+        case .browserChat(let frame):
+            try container.encode(MessageType.browserChat, forKey: .type)
+            try container.encode(frame, forKey: .data)
 
         case .encryptionMode(let accountState):
             try container.encode(MessageType.encryptionMode, forKey: .type)
@@ -594,6 +618,15 @@ enum AstationMessage: Codable {
             let key = try dc.decodeIfPresent(String.self, forKey: .key)
             self = .agentInput(agentId: agentId, kind: kind, text: text, key: key)
 
+        case .terminal:
+            self = .terminal(try container.decode(RemoteTerminalMessage.self, forKey: .data))
+
+        case .agentChat:
+            self = .agentChat(try container.decode(AgentChatWire.self, forKey: .data))
+
+        case .browserChat:
+            self = .browserChat(try container.decode(BrowserChatFrame.self, forKey: .data))
+
         case .encryptionMode:
             let dc = try container.nestedContainer(keyedBy: EncryptionKeys.self, forKey: .data)
             self = .encryptionMode(
@@ -792,11 +825,12 @@ struct AtemAgentInfo: Codable, Identifiable {
     let kind: String
     /// Protocol string from Rust: "Acp" or "Pty".
     let agentProtocol: String
-    /// Status string from Rust: "Idle", "Thinking", "WaitingForInput", "Disconnected".
+    /// Semantic registry state. Missing or unfamiliar values never imply readiness.
     let status: String
     let sessionIds: [String]
     let acpUrl: String?
     let ptyPid: UInt32?
+    var capabilities: [String] = []
 
     enum CodingKeys: String, CodingKey {
         case id, name, kind, status
@@ -804,6 +838,7 @@ struct AtemAgentInfo: Codable, Identifiable {
         case sessionIds = "session_ids"
         case acpUrl = "acp_url"
         case ptyPid = "pty_pid"
+        case capabilities
     }
 
     init(from decoder: Decoder) throws {
@@ -822,10 +857,13 @@ struct AtemAgentInfo: Codable, Identifiable {
             kind = "Unknown"
         }
         agentProtocol = (try? c.decode(String.self, forKey: .agentProtocol)) ?? "Pty"
-        status = (try? c.decode(String.self, forKey: .status)) ?? "Idle"
+        let reportedStatus = (try? c.decode(String.self, forKey: .status)) ?? "Unknown"
+        status = ["Idle", "Thinking", "WaitingForInput", "Disconnected", "Unknown"].contains(reportedStatus)
+            ? reportedStatus : "Unknown"
         sessionIds = (try? c.decode([String].self, forKey: .sessionIds)) ?? []
         acpUrl = try? c.decodeIfPresent(String.self, forKey: .acpUrl)
         ptyPid = try? c.decodeIfPresent(UInt32.self, forKey: .ptyPid)
+        capabilities = (try? c.decode([String].self, forKey: .capabilities)) ?? []
     }
 
     func encode(to encoder: Encoder) throws {
@@ -835,6 +873,7 @@ struct AtemAgentInfo: Codable, Identifiable {
         try c.encode(kind, forKey: .kind)
         try c.encode(agentProtocol, forKey: .agentProtocol)
         try c.encode(status, forKey: .status)
+        if !capabilities.isEmpty { try c.encode(capabilities, forKey: .capabilities) }
         try c.encode(sessionIds, forKey: .sessionIds)
         try c.encodeIfPresent(acpUrl, forKey: .acpUrl)
         try c.encodeIfPresent(ptyPid, forKey: .ptyPid)

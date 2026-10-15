@@ -1,0 +1,189 @@
+{
+  "source": "Shapes from Agora-Build/Atem PR 65, src/chat/wire.rs at 10d3ea8. Synthetic content, no provider acceptance claim.",
+  "requestId": "12345678-1234-4234-8234-123456789abc",
+  "events": [
+    {
+      "v": 1,
+      "op": "opened",
+      "conversationId": "fixture-conversation",
+      "agentId": "fixture-agent",
+      "generation": "generation",
+      "sequence": 0,
+      "status": {
+        "state": "ready",
+        "since": 1700000000000
+      }
+    },
+    {
+      "v": 1,
+      "op": "message",
+      "conversationId": "fixture-conversation",
+      "agentId": "fixture-agent",
+      "generation": "generation",
+      "sequence": 1,
+      "messageId": "local-user",
+      "role": "user",
+      "origin": "local",
+      "turnId": "local-turn",
+      "createdAt": 1700000000100,
+      "parts": [
+        {
+          "id": "text",
+          "kind": "text",
+          "markdown": "A terminal prompt"
+        }
+      ],
+      "history": true
+    },
+    {
+      "v": 1,
+      "op": "message",
+      "conversationId": "fixture-conversation",
+      "agentId": "fixture-agent",
+      "generation": "generation",
+      "sequence": 2,
+      "messageId": "local-reply",
+      "role": "assistant",
+      "turnId": "local-turn",
+      "createdAt": 1700000000200,
+      "parts": [
+        {
+          "id": "text",
+          "kind": "text",
+          "markdown": "An earlier reply"
+        }
+      ],
+      "history": true
+    },
+    {
+      "v": 1,
+      "op": "status",
+      "conversationId": "fixture-conversation",
+      "agentId": "fixture-agent",
+      "generation": "generation",
+      "sequence": 3,
+      "state": "working",
+      "since": 1700000000300
+    },
+    {
+      "v": 1,
+      "op": "complete",
+      "conversationId": "fixture-conversation",
+      "agentId": "fixture-agent",
+      "generation": "generation",
+      "sequence": 4,
+      "turnId": "local-turn",
+      "outcome": "interrupted"
+    },
+    {
+      "v": 1,
+      "op": "status",
+      "conversationId": "fixture-conversation",
+      "agentId": "fixture-agent",
+      "generation": "generation",
+      "sequence": 5,
+      "state": "ready",
+      "since": 1700000000400
+    },
+    {
+      "v": 1,
+      "op": "accepted",
+      "conversationId": "fixture-conversation",
+      "agentId": "fixture-agent",
+      "generation": "generation",
+      "sequence": 6,
+      "requestId": "12345678-1234-4234-8234-123456789abc"
+    },
+    {
+      "v": 1,
+      "op": "message",
+      "conversationId": "fixture-conversation",
+      "agentId": "fixture-agent",
+      "generation": "generation",
+      "sequence": 7,
+      "messageId": "remote-user",
+      "role": "user",
+      "origin": "remote",
+      "turnId": "remote-turn",
+      "requestId": "12345678-1234-4234-8234-123456789abc",
+      "createdAt": 1700000000500,
+      "parts": [
+        {
+          "id": "text",
+          "kind": "text",
+          "markdown": "Reply with a harmless greeting"
+        }
+      ]
+    },
+    {
+      "v": 1,
+      "op": "message",
+      "conversationId": "fixture-conversation",
+      "agentId": "fixture-agent",
+      "generation": "generation",
+      "sequence": 8,
+      "messageId": "remote-reply",
+      "role": "assistant",
+      "turnId": "remote-turn",
+      "requestId": "12345678-1234-4234-8234-123456789abc",
+      "createdAt": 1700000000600,
+      "parts": [
+        {
+          "id": "p1",
+          "kind": "text",
+          "markdown": "Hello, **Brent**."
+        }
+      ]
+    },
+    {
+      "v": 1,
+      "op": "delta",
+      "conversationId": "fixture-conversation",
+      "agentId": "fixture-agent",
+      "generation": "generation",
+      "sequence": 9,
+      "messageId": "remote-reply",
+      "part": {
+        "id": "p2",
+        "kind": "tool",
+        "name": "Read",
+        "summary": "README.md"
+      }
+    },
+    {
+      "v": 1,
+      "op": "complete",
+      "conversationId": "fixture-conversation",
+      "agentId": "fixture-agent",
+      "generation": "generation",
+      "sequence": 10,
+      "turnId": "remote-turn",
+      "requestId": "12345678-1234-4234-8234-123456789abc",
+      "outcome": "done"
+    },
+    {
+      "v": 1,
+      "op": "delta",
+      "conversationId": "fixture-conversation",
+      "agentId": "fixture-agent",
+      "generation": "generation",
+      "sequence": 11,
+      "messageId": "remote-reply",
+      "part": {
+        "id": "p3",
+        "kind": "text",
+        "markdown": "Late transcript content remains valid."
+      }
+    },
+    {
+      "v": 1,
+      "op": "status",
+      "conversationId": "fixture-conversation",
+      "agentId": "fixture-agent",
+      "generation": "generation",
+      "sequence": 12,
+      "state": "ready",
+      "since": 1700000000700
+    }
+  ]
+}

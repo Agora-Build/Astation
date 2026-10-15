@@ -155,6 +155,9 @@ class AstationApp: NSObject, NSApplicationDelegate {
         hubManager.sendHandler = { [weak webSocketServer] message, clientId in
             webSocketServer?.sendMessageToClient(message, clientId: clientId)
         }
+        hubManager.sessionsRemovedHandler = { [weak webSocketServer] sessionIds in
+            webSocketServer?.disconnectClients(authenticatedWith: sessionIds)
+        }
 
         // Start network monitoring to detect IP changes
         NetworkMonitor.shared.startMonitoring()

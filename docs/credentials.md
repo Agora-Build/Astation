@@ -15,8 +15,8 @@ The Keychain item requires an unlocked Mac and is not synced through iCloud.
 3. Paste the value. **Show multiline value** opens a text editor for PEM, JSON
    or multiline values. Values retain their exact whitespace and may contain
    up to 64 KiB of UTF-8 text.
-4. Click **Save with Touch ID** and approve. The credential appears in the list
-   only after the Keychain write succeeds.
+4. Click **Save Securely** and approve with Touch ID or your Mac login password.
+   The credential appears in the list only after the Keychain write succeeds.
 
 Project spelling is retained for display and saving: `github.com/Agora-Build/Atem`
 stays capitalized. Project comparisons and credential names are case-insensitive,
@@ -43,7 +43,8 @@ to add a credential for a project that is not listed; no connected Atem is neede
    if shared sign-in credentials should remain usable after Astation disconnects;
    without saving, they have a five-minute grace period after disconnection.
 3. Approve pairing in Astation and compare the complete safety codes. Type `y`
-   in Atem; on the Mac click **Codes Match**, then use Touch ID in that window.
+   in Atem; on the Mac click **Codes Match**, then use Touch ID in that window
+   or click **Use Mac Password...** for macOS authentication.
    Either side can finish first. Save and confirm the complete recovery kit
    if requested, and finish any key-escrow/unlock approval.
 4. Check `atem cred status`: the device must be verified, and its key agent
@@ -57,7 +58,7 @@ to add a credential for a project that is not listed; no connected Atem is neede
    ```
 
 Unlock approval happens on the home Astation Mac, even when Atem runs on Linux.
-Keep the command open while approving Touch ID; the wait is bounded to five
+Keep the command open while approving on the Mac; the wait is bounded to five
 minutes. Saving shared sign-in does not unlock device keys indefinitely.
 Open Settings > Credentials on the Mac, click **Add Credential**, enable
 **Use project scope**, and select the repository. Use **Refresh** if needed.
@@ -119,11 +120,12 @@ remains plaintext with mode 0600.
 
 ## Copy and delete
 
-Select a row and click **Copy Value**, then approve Touch ID. The clipboard
-clears after 30 seconds or app termination, provided it still contains that
-copy. A later clipboard change is retained.
+Select a row and click **Copy Value**, then approve with Touch ID or your Mac
+login password. The clipboard clears after 30 seconds or app termination,
+provided it still contains that copy. A later clipboard change is retained.
 
-Select **Delete**, confirm and approve Touch ID to remove the saved credential.
+Select **Delete**, confirm and authenticate with Touch ID or your Mac login
+password to remove the saved credential.
 Cancelling or failing authentication changes nothing. If another operation
 changes the store while a prompt is pending, the stale operation is refused;
 refresh and reopen the editor. Storage errors retain existing credentials.

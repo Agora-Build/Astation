@@ -2,9 +2,9 @@
 
 ## Product
 
-The webapp hosting change serves this UI and its assets in production. The
-companion macOS bridge remains in the `feat/remote-terminal` worktree; Atem's
-semantic host implementation is coordinated through shared project memory.
+The webapp serves this UI and its assets in production. This implementation
+integrates the native bridge with Atem's published `chat-v1` host contract:
+`Agora-Build/Atem`, commit `10d3ea8`, `designs/agent-chat-host.md` (PR 65).
 
 Connections keeps Open Terminal and adds Open in Browser for each agent. The
 new page is served by the webapp at `/agent/`, with a responsive layout for desktop
@@ -15,9 +15,10 @@ the conversation. The terminal remains available for CLI-specific interactions.
 This is a separate protocol from terminal-v1. ANSI redraws cannot establish
 message boundaries, task completion or an approval request. A host must advertise
 `chat-v1` in an agent's optional `capabilities` array before prompts are enabled.
-Existing Atem hosts do not advertise this capability. Their browser page opens
-with an explicit unsupported state. Preview mode is labeled and never contacts
-an agent. Atem implementation is coordinated through shared project memory.
+Claude launched by an updated `atem agent launch claude` advertises this only
+after its hooks become active. Codex and agents without an adapter remain
+Unknown, with terminal access and no chat capability. Preview mode is labeled
+and never contacts an agent. Atem releases are owned by the Atem agent.
 
 ## Lifecycle and security invariants
 
@@ -45,11 +46,13 @@ an agent. Atem implementation is coordinated through shared project memory.
   request ID. Accepted means delivered, not completed. Working/Waiting/Ready
   require semantic host events; missing or stale activity becomes Unknown.
 - Content is rendered using DOM text nodes, never remote HTML. Only explicit
-  HTTPS/HTTP links are clickable. No third-party scripts, fonts, analytics or
+  HTTPS/HTTP links are clickable. No externally hosted scripts, fonts, analytics or
   service worker. Content and capabilities are omitted from network logs.
 - Session state is bounded to eight sessions, 32 browser nonces per session,
-  256 submitted request IDs, 512 messages and 2 MiB of UTF-8 conversation content.
-  One prompt is at most 32 KiB and one accumulated reply at most 128 KiB.
+  256 submitted request IDs, 512 messages and 8 MiB of UTF-8 conversation content.
+  One prompt is at most 32 KiB and one accumulated message at most 128 KiB
+  plus Atem's reserved truncation marker. Typed parts and wire frames also have
+  explicit bounds. History replaces whole messages; repeated part IDs add no data.
   Exceeding a host event bound disables submission. No relay transcript is stored.
 - HMAC authenticates the browser-to-Astation bridge; it does not encrypt content.
   The relay can read the payload; the webapp serves the browser code. Existing TLS and
@@ -58,12 +61,7 @@ an agent. Atem implementation is coordinated through shared project memory.
 
 ## Host contract: chat-v1
 
-This section records the transport proposal implemented by this draft client.
-The Atem owner's approved design adds typed message parts, turn IDs and history,
-as recorded in shared memory `mem_ccbe16ed2a6545688fac459186fef712` (2026-10-15).
-Client/native alignment with that contract and live provider validation remain
-required before live Agent support is enabled. Hosting and Stoa can ship
-independently of that integration. The agreed additions are:
+The approved host contract uses these event shapes:
 
 - Messages carry `role`, `turnId`, `createdAt`, typed text/tool `parts`, optional
   `history` and `requestId`, and local/remote origin for user messages.
@@ -80,18 +78,46 @@ All host traffic uses the existing authenticated connection and
 `{"type":"agentChat","data":{...}}`. `data` always includes `v:1`, `op`,
 `conversationId`, and `agentId`. No broadcast or focused-agent routing is allowed.
 
-1. Astation sends `open` with a new opaque conversation ID.
-2. Host sends `opened` with its opaque process `generation` and `sequence:0`.
+1. Astation sends `open` with a new opaque conversation ID and optional `before`
+   message ID. A page contains at most 50 whole messages / 256 KiB of content.
+2. Host sends `opened` with its opaque process `generation`, `sequence:0` and
+   `status:{state,since,detail?}`. The implemented host uses Unix milliseconds
+   for `since` and `createdAt`; clients also accept RFC 3339 timestamps.
 3. Astation sends `submit` with that generation, a unique `requestId` and `text`.
-   The host must deduplicate request IDs for the lifetime of this conversation.
+   The host deduplicates request IDs for the lifetime of the agent session.
 4. Host events carry the same generation and strictly increasing `sequence`:
-   `accepted` includes `requestId`; `message` includes `messageId`, `requestId`,
-   full Markdown `text`; `delta` appends `text` to that message; `status` includes
-   `state` (`ready`, `working`, `waiting`, `unknown`); `complete` includes
-   `requestId`; `error` includes a safe `text` and optional `requestId`.
-5. A sequence gap disables submissions and requires a fresh view. Duplicate
-   sequences are ignored. Unexpected conversations, agents and generations are
-   rejected. Reconnect does not restore permission or replay prompts.
+   `accepted` includes `requestId`. `message` includes `messageId`, `role`,
+   `turnId`, `createdAt`, `parts`, optional `requestId` and `history:true`.
+   User messages additionally carry `origin:local|remote`. Text parts are
+   `{id,kind:"text",markdown}`; tool parts are `{id,kind:"tool",name,summary}`.
+   `delta:{messageId,part}` appends a part once. `status` carries
+   `state:ready|working|waiting|unknown`, `since` and optional `detail`.
+   `complete` carries `turnId`, optional `requestId`, and `outcome:done|interrupted`.
+   `error` carries safe `text` and optional `requestId`.
+5. Two explicit exceptions have no generation/sequence: pre-session `error`,
+   and host `close`. They are accepted only from the exact authenticated route,
+   agent and currently opened conversation. They never grant readiness.
+6. A sequence gap disables submissions and permits reopening history without
+   replaying prompts. Duplicate sequences are ignored. Unexpected conversations,
+   agents and process generations are rejected. A changed generation requires
+   a new native-authorized link; a relay route never supplies device identity.
+
+History and reload merge messages by stable message ID, reconcile optimistic
+remote prompts by request ID, and retain locally typed terminal prompts as
+distinct user messages. Completion ends an execution turn; late parts for that
+turn are still accepted. A refusal is shown as refused, an already accepted
+request's error as a task error, and "delivery unknown" remains uncertain.
+Unknown delivery never triggers resend. Status freshness uses receipt time;
+the original `since` remains unchanged on a heartbeat. Only fresh Ready permits
+submission. Permission requests stay in the terminal.
+
+Pagination and browser reload close the previous host conversation and open a
+new conversation ID on the same authenticated route, pinned to the original
+generation. This prevents delayed events from an earlier open corrupting the
+new sequence. The host also supports reopening the same ID with `before`, but
+the bridge uses fresh IDs. A host `close` (restart, capability withdrawal,
+session switch or eviction) stops sending and offers an explicit history reopen.
+The reopen action sends only `open`, never a prior `submit`.
 
 The host owns original-session attachment and semantic event collection. It
 must not start an unrelated conversation, scrape ANSI repaint output as replies,
@@ -116,7 +142,7 @@ The browser uses `/ws?role=atem&code=<station ID>&atem_id=browser-<session ID>`
 solely as an untrusted transport to Astation. It sends `browserChat` frames with
 `data:{sessionId,nonce,sequence,body,mac}`. `body` is base64 UTF-8 JSON; `mac` is
 base64 HMAC. The fragment key uses unpadded base64url. Requests are `open`,
-`submit` (requestId/text), and `refresh`.
+`submit` (requestId/text), `history` (before), `reopen`, and `refresh`.
 Signed response bodies are `context`, `event`, or `notice`. The exact payloads
 are defined by the coordinator and covered by cross-language MAC vectors.
 
@@ -124,9 +150,10 @@ Transcripts stay in tab memory; no localStorage, sessionStorage or transcript
 database is used. The capability stays in the URL fragment, which browser
 history may retain, until its local authorization expires. Reloading can
 reuse its fragment until the local session expires, with a new browser nonce and
-response sequence. It receives subsequent events without restoring previous tab
-messages. A pending request at reload disables new submissions; inspect the
-terminal and open a new native-authorized session. A separate `?preview=1`
+response sequence. It reopens host history without sending earlier prompts.
+A pending request with unresolved delivery keeps sending disabled; inspect the
+terminal and open a new native-authorized session if history cannot resolve it.
+A separate `?preview=1`
 mode uses sample data, is visibly labeled and has no live network connection.
 
 ## Validation
@@ -138,6 +165,6 @@ scroll retention, narrow/mobile layout and explicit preview/live separation.
 Production deployment and live Atem integration require separate acceptance;
 no production deployment or Atem source change is part of the UI implementation.
 
-See [user setup and validation](../docs/agent-chat.md). Atem project memory
-contains the proposed host contract (`mem_b3ccce1f5afc4c558655e0f5db13eb60`)
-and provider/activity requirements (`mem_0cf8ab492a6a4465b2dfb9434fb3a43f`).
+See [user setup and validation](../docs/agent-chat.md) and Atem's published
+`designs/agent-chat-host.md`. Shared memory coordinates ownership and records
+validation; the published wire contract supersedes the earlier flat-text draft.

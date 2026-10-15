@@ -10,20 +10,24 @@ final class LocalCredentialActions {
     private var finishCancellation: (() -> Void)?
     var isBusy: Bool { attempt != nil }
 
-    init(account: @escaping () -> String, authenticate: @escaping Authenticate = LocalCredentialActions.touchID) {
+    init(account: @escaping () -> String, authenticate: @escaping Authenticate = LocalCredentialActions.deviceOwner) {
         self.account = account
         self.authenticate = authenticate
     }
 
-    static func touchID(reason: String, completion: @escaping (Bool) -> Void) -> (() -> Void) {
-        let context = LAContext()
-        context.localizedFallbackTitle = ""
+    static func deviceOwner(reason: String, completion: @escaping (Bool) -> Void) -> (() -> Void) {
+        deviceOwner(context: LAContext(), reason: reason, completion: completion)
+    }
+
+    static func deviceOwner(context: LAContext, reason: String, completion: @escaping (Bool) -> Void) -> (() -> Void) {
+        context.localizedFallbackTitle = "Use Password..."
+        context.touchIDAuthenticationAllowableReuseDuration = 0
         var error: NSError?
-        guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
+        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else {
             DispatchQueue.main.async { completion(false) }
             return { context.invalidate() }
         }
-        context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { accepted, _ in
+        context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { accepted, _ in
             DispatchQueue.main.async { completion(accepted) }
         }
         return { context.invalidate() }

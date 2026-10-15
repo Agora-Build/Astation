@@ -15,6 +15,7 @@ work. Completed implementation checklists are available in Git history.
 | [Android device sharing](android-device-sharing.md) | Connection model, setup, lifecycle, and pending phone/IDE validation |
 | [Local audio recording](audio-recording.md) | Capture sources, original tracks, permissions, and practical Mac validation |
 | [Live transcription](live-transcription.md) | Local/cloud captions, draggable floating window, model downloads, privacy, and validation |
+| [Remote terminal control](remote-terminal.md) | View and control original Atem sessions, ownership, clipboard, and recovery |
 | [Agent](agent-chat.md) | Webapp chat app, companion Astation/Atem support, delivery states and recovery |
 | [Stoa](stoa.md) | Browser meeting and screen-sharing app, existing links, and future agora.build destination |
 | [Screen sharing](screen-sharing.md) | ScreenCaptureKit capture, Agora publication, optional system audio, browser controls, and verification |

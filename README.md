@@ -252,11 +252,29 @@ Messages carry only IDs, status, and descriptions -- no images or file lists flo
 ### Remote Agent Control
 
 Open **Connections > Clients & Agents**, select a connected Atem and an agent,
-and open its remote-control window to send text or control keys. Input goes to
-the selected client and agent; the agent's output remains in its Atem terminal.
-The `agentInput` payload contains `agentId`, `kind` (`text` or `key`), and the
-corresponding `text` or `key` field. Relay routing identifiers belong to the
-transport envelope. Voice continues through the existing voice-coding flow.
+then click **Open Terminal**. The **Terminals** button also opens the session
+chooser without requiring an active agent row. The resizable window shows the
+original Claude/Codex terminal, including live output, colors and prompts.
+It starts in viewing mode; **Take Control** enables typing, control keys,
+multiline paste and resizing. **Release** returns local ownership. Closing the
+window keeps the agent running; **Stop Agent** asks before ending its process.
+
+Atem must include shared-terminal support from PR #57 and launch the original
+CLI with `atem agent launch claude` or `atem agent launch codex`. Astation uses
+`terminal-v1` messages over the existing authenticated connection, addressed to
+one host, connection generation, process and stream. Reconnect returns to
+viewing mode and never resends uncertain input. The legacy `agentInput` route
+remains for existing callers; it does not bypass an attached terminal's control
+lease. Voice continues through the existing voice-coding flow.
+
+See [remote terminal control](docs/remote-terminal.md) for setup, ownership,
+clipboard, limitations and validation.
+
+**Open in Browser** opens a responsive chat page served by the webapp at `/agent/`.
+It keeps prompts, replies, code blocks and activity together while Open Terminal
+remains available. Sending requires the selected Atem agent to advertise
+`chat-v1`; the published host in Atem PR #65 supports Claude with active hooks. Codex remains terminal-only.
+See [browser agent chat](docs/agent-chat.md) for support, delivery states and privacy.
 
 ### Local Audio Recording
 
@@ -413,7 +431,7 @@ relay-server/
 ## Configuration
 
 Settings > Credentials manages named API keys and passwords in this Mac's
-protected Keychain, with Global or Git-project scopes and Touch ID for saves,
+protected Keychain, with Global or Git-project scopes and Touch ID or Mac-password authentication for saves,
 updates, copies and deletion. The project picker combines encrypted suggestions
 from verified, unlocked Atem devices with saved scopes; another Git remote can
 always be entered manually. Original capitalization is retained, while identity
@@ -422,7 +440,8 @@ retrieval is not implemented. See the
 [credentials guide](docs/credentials.md) for setup and current availability.
 
 Atem can run on another machine. Pair with `atem pair`, compare the safety code
-on both machines, then click **Codes Match** and approve Touch ID on the Mac.
+on both machines, then click **Codes Match** and approve Touch ID on the Mac,
+or choose **Use Mac Password...** to authenticate in macOS's system dialog.
 Check `atem cred status` for verification; a connected or SSO-paired session
 alone does not establish device trust. `atem cred unlock` requests key access
 from this Mac, and `atem cred projects` sends Git-project suggestions. Use a
