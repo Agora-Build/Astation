@@ -99,6 +99,7 @@ jobs:
           node webapp/tests/codec.test.js
           node webapp/tests/nginx.test.js
           node --test webapp/tests/screen-share.test.js
+          node --test webapp/tests/agent-chat.test.mjs
 
       - name: Test AI review tooling
         run: node --test .github/scripts/*.test.mjs

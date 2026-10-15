@@ -51,3 +51,8 @@ assert.ok(
   !/proxy_pass[^;]*metrics/.test(config),
   "nginx must not proxy /metrics to the relay",
 );
+
+const chatLocation = config.match(/location\s+\/chat\/\s*\{([\s\S]*?)\}/);
+assert.ok(chatLocation, "nginx must serve /chat/ through the relay");
+assert.match(chatLocation[1], /proxy_pass\s+http:\/\/station_relay_upstream;/);
+assert.match(config, /location\s*=\s*\/chat\s*\{\s*return\s+308\s+\/chat\/\$is_args\$args;/);

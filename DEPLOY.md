@@ -7,6 +7,9 @@ The Astation system consists of:
 2. **API Server** - Rust backend for session management + WebSocket relay
 3. **Webapp** - Web client for joining RTC sessions via shareable links
 
+The relay also embeds the browser agent chat app and its assets at `/chat/`.
+The public webapp nginx forwards that route to the relay.
+
 ## GitHub Actions Release
 
 When you push a git tag, GitHub Actions automatically builds and publishes:
@@ -106,6 +109,7 @@ finish:
 3. the final check: public HTTPS, a healthy `/health` (Postgres knowledge
    store; Redis `ok` and at least `STATION_MIN_REPLICAS` live replicas when
    those checks are switched on, see below), the expected relay build commit,
+   the `/chat/` app and its assets with the expected MIME and security headers,
    and an identity WebSocket
    connection to `wss://station.agora.build/ws`.
 
@@ -179,8 +183,30 @@ Runtime configuration:
 - Cloudflare: publish `station.agora.build` on the existing Volumetric tunnel
   with origin `http://10.0.0.1:3010` and a proxied CNAME to that tunnel's
   `<tunnel-id>.cfargotunnel.com`. TLS terminates at Cloudflare; the tunnel
-  forwards `/`, `/health`, `/api/*`, and `/ws` to the webapp. `localhost` inside
+  forwards `/`, `/chat/`, `/health`, `/api/*`, and `/ws` to the webapp. `localhost` inside
   the cloudflared container refers to that container, not Volumetric.
+
+### Relay-hosted agent chat
+
+The production app is `https://station.agora.build/chat/`. Its HTML, CSS,
+JavaScript modules and icon are compiled into the relay binary from
+`relay-server/src/web/agent_chat/`; no runtime asset volume or additional
+service is needed. `webapp/nginx.conf` proxies `/chat/` to the existing relay
+upstream. Both images must deploy through the normal workflow so the public
+proxy recognizes the route and every replica serves the same assets.
+
+The final deployment verifier requests the page and all four assets through
+the public origin. It rejects 404s, the RTC app's HTML fallback, incorrect module
+MIME types and missing privacy/security headers. This runs after the webapp
+deployment; intermediate relay health waits remain unchanged.
+
+`/chat/?preview=1` is a labeled sample for reviewing the layout. Real sessions
+start from a companion Astation build's **Open in Browser** action, using an
+ephemeral authorization in the URL fragment and the existing `/ws` transport.
+The companion macOS bridge is currently on `feat/remote-terminal`; Atem must
+implement structured `chat-v1` events before live chat is usable. A working
+preview does not validate prompt execution or provider replies. See
+[the host contract](designs/agent-chat.md) and [the user guide](docs/agent-chat.md).
 
 Metrics: each relay serves Prometheus text at `GET :3000/metrics`. The
 endpoint is unauthenticated and relies on network isolation: the webapp nginx

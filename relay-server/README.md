@@ -96,8 +96,16 @@ application IDs, GitHub secrets, runtime configuration, and Cloudflare routing.
 
 **URLs:**
 - Production: `https://station.agora.build`
+- Agent chat app: `https://station.agora.build/chat/` (live sessions require companion Astation/Atem support)
 - Legacy staging alias: `https://station-staging.agora.build` (same deployment)
 - Dev: `http://localhost:3000`
+
+The relay embeds the `/chat/` browser app and its version-matched assets.
+The public nginx proxy forwards this route to the relay, and the deployment
+verifier checks the HTML, JavaScript MIME types and security headers. Use
+`/chat/?preview=1` for the labeled layout preview. Live prompts and responses
+use the authenticated companion bridge and structured host events described in
+[the agent chat design](../designs/agent-chat.md).
 
 ---
 

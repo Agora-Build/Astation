@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="light" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Agent Chat &#183; Astation</title>
+    <link rel="icon" href="./mark.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./chat.css" />
+    <script type="module" src="./chat.mjs"></script>
+  </head>
+  <body>
+    <div class="workspace">
+      <aside class="sidebar" id="sidebar" aria-label="Workspace">
+        <a class="brand" href="./" aria-label="Astation Agent Chat"
+          ><span class="brand-mark">a<span></span></span>astation<span
+            class="brand-label"
+            >CHAT</span
+          ></a
+        >
+        <div class="sidebar-heading">
+          YOUR WORKSPACE <span class="tiny-square"></span>
+        </div>
+        <div class="workspace-name">A little closer<br />to your agents.</div>
+        <div class="sidebar-heading conversation-heading">CONVERSATION</div>
+        <button class="conversation selected" id="conversation" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M5 5h14v11H9l-4 4z" />
+          </svg>
+          <span
+            ><strong id="conversation-title">A new conversation</strong
+            ><small id="conversation-subtitle"
+              >Your coding workspace</small
+            ></span
+          >
+          <span class="conversation-dot"></span>
+        </button>
+        <div class="sidebar-bottom">
+          <div class="device-card">
+            <span class="device-icon"
+              ><svg viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="3" y="4" width="18" height="13" rx="2" />
+                <path d="M8 21h8m-4-4v4" /></svg></span
+            ><span
+              ><strong id="device-name">Your Astation</strong
+              ><small id="device-connection"
+                >Waiting for connection</small
+              ></span
+            >
+          </div>
+          <button class="session-details" id="session-details" type="button">
+            About this session <span aria-hidden="true">&#8599;</span>
+          </button>
+          <div class="sidebar-footer">
+            <span>AGORA.BUILD</span><span>Made for the way you work.</span>
+          </div>
+        </div>
+      </aside>
+      <button
+        class="sidebar-backdrop"
+        id="sidebar-backdrop"
+        aria-label="Close workspace"
+        hidden
+      ></button>
+      <main class="chat-pane">
+        <header class="chat-header">
+          <button
+            class="icon-button mobile-menu"
+            id="mobile-menu"
+            type="button"
+            aria-label="Open workspace"
+            aria-expanded="false"
+            aria-controls="sidebar"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 6h16M4 12h16M4 18h16" />
+            </svg>
+          </button>
+          <span class="agent-avatar" aria-hidden="true">&#10035;</span>
+          <div class="agent-heading">
+            <h1 id="agent-name">Your code agent</h1>
+            <p id="agent-location">A conversation, wherever you are.</p>
+          </div>
+          <span
+            class="activity"
+            id="activity"
+            data-state="unknown"
+            role="status"
+            ><span class="status-dot"></span
+            ><span id="activity-label">Unknown</span></span
+          >
+          <button
+            class="icon-button"
+            id="copy-conversation"
+            type="button"
+            title="Copy conversation"
+            aria-label="Copy conversation"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="8" y="8" width="12" height="13" rx="2" />
+              <path d="M16 8V3H3v13h5" />
+            </svg>
+          </button>
+        </header>
+        <div class="mode-banner" id="mode-banner" role="status" hidden></div>
+        <div
+          class="connection-notice"
+          id="connection-notice"
+          role="status"
+          hidden
+        ></div>
+        <section
+          class="timeline"
+          id="timeline"
+          aria-label="Conversation"
+          tabindex="0"
+        >
+          <div class="conversation-start">
+            <span class="start-line"></span
+            ><span id="conversation-date">A SPACE TO BUILD SOMETHING</span
+            ><span class="start-line"></span>
+          </div>
+          <div class="empty-state" id="empty-state">
+            <span class="empty-orbit" aria-hidden="true">&#10035;</span>
+            <p class="eyebrow">YOUR IDEAS. YOUR AGENT.</p>
+            <h2>What shall we build?</h2>
+            <p>
+              Send a thought, a question, or a plan.<br />Your agent takes it
+              from here.
+            </p>
+          </div>
+          <div id="messages" aria-label="Messages"></div>
+          <div class="agent-progress" id="agent-progress" role="status" hidden>
+            <span class="progress-dots" aria-hidden="true"
+              ><i></i><i></i><i></i></span
+            ><span id="agent-progress-label">Agent is working</span>
+          </div>
+        </section>
+        <div class="composer-region">
+          <button class="jump-latest" id="jump-latest" type="button" hidden>
+            Latest messages <span aria-hidden="true">&#8595;</span>
+          </button>
+          <form class="composer" id="composer">
+            <label class="sr-only" for="prompt">Message your agent</label>
+            <textarea
+              id="prompt"
+              rows="1"
+              maxlength="32768"
+              placeholder="Message your agent&#8230;"
+              enterkeyhint="send"
+              disabled
+            ></textarea>
+            <div class="composer-toolbar">
+              <span class="composer-target"
+                ><span class="small-spark" aria-hidden="true">&#10035;</span
+                ><span id="composer-agent">Your agent</span></span
+              ><span class="composer-shortcut" id="composer-shortcut"
+                >Enter to send &#183; Shift + Enter for a new line</span
+              ><button
+                class="send-button"
+                id="send"
+                type="submit"
+                aria-label="Send message"
+                disabled
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 19V5m-6 6 6-6 6 6" />
+                </svg>
+              </button>
+            </div>
+          </form>
+          <p class="composer-note" id="composer-note">
+            Open this conversation from Astation to connect your agent.
+          </p>
+        </div>
+      </main>
+    </div>
+    <dialog id="details-dialog">
+      <form method="dialog">
+        <button class="dialog-close icon-button" aria-label="Close details">
+          &#215;
+        </button>
+      </form>
+      <p class="eyebrow">ASTATION AGENT CHAT</p>
+      <h2>Your workspace,<br />a conversation away.</h2>
+      <p id="session-description">
+        Open an agent from Astation to start a session.
+      </p>
+      <p>
+        Messages stay in this tab. Reloading reconnects the view; prompts are
+        never automatically resent. Your terminal remains available for
+        permission prompts and other CLI controls.
+      </p>
+      <p class="detail-fine">
+        The relay serves this page and can read chat traffic. Storage encryption
+        does not imply chat-stream encryption.
+      </p>
+    </dialog>
+    <div id="toast" class="toast" role="status" hidden></div>
+  </body>
+</html>

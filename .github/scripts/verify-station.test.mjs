@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { healthProblems, settingsFromEnv, waitForHealth } from './verify-station.mjs';
+import { healthProblems, settingsFromEnv, waitForHealth, verifyAgentChat } from './verify-station.mjs';
 
 const healthy = { status: 'ok', knowledge_store: 'postgres', redis: 'ok', replicas: 2 };
 
@@ -112,4 +112,63 @@ test('waitForHealth gives up', async () => {
     }),
     /did not become healthy: \/health returned HTTP 503/,
   );
+});
+
+function chatAsset(path) {
+  const values = {
+    '/chat/': ['text/html', '<!doctype html><form id="composer"></form>'],
+    '/chat/chat.css': ['text/css', ':root { --paper: white; }'],
+    '/chat/chat-core.mjs': ['text/javascript', 'export class Conversation {}'],
+    '/chat/chat.mjs': ['text/javascript', 'import "./chat-core.mjs";'],
+    '/chat/mark.svg': ['image/svg+xml', '<svg></svg>'],
+  };
+  const [mime, text] = values[path];
+  return new Response(text, { headers: {
+    'content-type': `${mime}; charset=utf-8`,
+    'cache-control': 'no-store', 'referrer-policy': 'no-referrer',
+    'x-content-type-options': 'nosniff',
+    'content-security-policy': "default-src 'none'; script-src 'self'; frame-ancestors 'none'",
+  } });
+}
+
+test('production verification checks the relay app and every asset on the same origin', async () => {
+  const paths = [];
+  await verifyAgentChat({ origin: 'https://station.test', log: () => {}, fetchImpl: async (url, options) => {
+    assert.equal(url.origin, 'https://station.test');
+    assert.equal(options.redirect, 'error');
+    paths.push(url.pathname);
+    return chatAsset(url.pathname);
+  } });
+  assert.deepEqual(paths.sort(), ['/chat/', '/chat/chat.css', '/chat/chat-core.mjs', '/chat/chat.mjs', '/chat/mark.svg'].sort());
+});
+
+test('production verification rejects an undeployed page, SPA fallback and wrong JavaScript MIME', async () => {
+  for (const broken of [
+    () => new Response('Not found', { status: 404 }),
+    () => new Response('<!doctype html><html>RTC</html>', { headers: { 'content-type': 'text/html' } }),
+    () => new Response('export {}', { headers: { 'content-type': 'application/octet-stream' } }),
+  ]) {
+    await assert.rejects(verifyAgentChat({ origin: 'https://station.test', log: () => {}, fetchImpl: async url =>
+      url.pathname === '/chat/chat.mjs' ? broken() : chatAsset(url.pathname),
+    }), /Agent chat/);
+  }
+});
+
+test('production verification requires the relay app privacy headers, CSP and actual page', async () => {
+  for (const change of [
+    response => response.headers.delete('cache-control'),
+    response => response.headers.delete('referrer-policy'),
+    response => response.headers.delete('x-content-type-options'),
+    response => response.headers.set('content-security-policy', "default-src *; script-src 'unsafe-inline'"),
+  ]) {
+    await assert.rejects(verifyAgentChat({ origin: 'https://station.test', log: () => {}, fetchImpl: async url => {
+      const response = chatAsset(url.pathname);
+      if (url.pathname === '/chat/') change(response);
+      return response;
+    } }), /Agent chat/);
+  }
+  await assert.rejects(verifyAgentChat({ origin: 'https://station.test', log: () => {}, fetchImpl: async url => {
+    const response = chatAsset(url.pathname);
+    return url.pathname === '/chat/' ? new Response('<!doctype html><html>RTC</html>', { headers: response.headers }) : response;
+  } }), /expected asset/);
 });

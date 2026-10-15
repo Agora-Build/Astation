@@ -613,6 +613,7 @@ fn router(state: AppState) -> Router {
 
     // Combine all routes
     Router::new()
+        .merge(web::agent_chat::router())
         .merge(auth_routes)
         .merge(general_routes)
         .route("/health", get(health_handler))

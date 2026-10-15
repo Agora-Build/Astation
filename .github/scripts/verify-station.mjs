@@ -80,6 +80,37 @@ export async function waitForHealth({
   throw new Error(`Relay did not become healthy: ${last}`);
 }
 
+export async function verifyAgentChat({ origin, fetchImpl = fetch, log = console.log }) {
+  const assets = [
+    ['/chat/', 'text/html', 'id="composer"'],
+    ['/chat/chat.css', 'text/css', '--paper'],
+    ['/chat/chat-core.mjs', 'text/javascript', 'class Conversation'],
+    ['/chat/chat.mjs', 'text/javascript', 'chat-core.mjs'],
+    ['/chat/mark.svg', 'image/svg+xml', '<svg'],
+  ];
+  await Promise.all(assets.map(async ([path, mime, marker]) => {
+    const response = await fetchImpl(new URL(path, origin), {
+      redirect: 'error', signal: AbortSignal.timeout(30_000),
+    });
+    if (!response.ok) throw new Error(`Agent chat ${path} returned HTTP ${response.status}`);
+    const contentType = response.headers.get('content-type')?.split(';')[0].trim();
+    if (contentType !== mime) throw new Error(`Agent chat ${path} has MIME type ${contentType}, expected ${mime}`);
+    if (!response.headers.get('cache-control')?.split(',').map(value => value.trim()).includes('no-store') ||
+        response.headers.get('referrer-policy') !== 'no-referrer' ||
+        response.headers.get('x-content-type-options') !== 'nosniff') {
+      throw new Error(`Agent chat ${path} is missing privacy or MIME protection headers`);
+    }
+    if (path === '/chat/') {
+      const directives = new Set((response.headers.get('content-security-policy') ?? '').split(';').map(value => value.trim()));
+      for (const directive of ["default-src 'none'", "script-src 'self'", "frame-ancestors 'none'"]) {
+        if (!directives.has(directive)) throw new Error(`Agent chat is missing CSP directive ${directive}`);
+      }
+    }
+    if (!(await response.text()).includes(marker)) throw new Error(`Agent chat ${path} did not return its expected asset`);
+    log(`${path}: HTTP ${response.status}, ${mime}`);
+  }));
+}
+
 export async function verifyStation({ origin, minReplicas, requireRedis, expectedCommit = null }) {
   for (const path of ['/', '/health']) {
     const response = await fetch(new URL(path, origin), { signal: AbortSignal.timeout(30_000) });
@@ -98,6 +129,8 @@ export async function verifyStation({ origin, minReplicas, requireRedis, expecte
     }
     console.log(`${path}: HTTP ${response.status}`);
   }
+
+  await verifyAgentChat({ origin });
 
   for (const path of ['/ws', '//ws']) {
     const url = new URL(origin);
