@@ -443,6 +443,17 @@ test("timestamps accept published Unix milliseconds and RFC3339, rejecting malfo
     assert.equal(timestamp(value), null);
 });
 
+test("part metadata is bounded even when every content field is empty", () => {
+  const { conversation: c, event } = connected();
+  const parts = Array.from({ length: 2048 }, (_, i) =>
+    textPart("p".repeat(120) + i, ""),
+  );
+  for (let i = 0; i < 60; i++)
+    event("message", { messageId: `metadata-${i}`, parts });
+  assert(!c.canSend);
+  assert(c.messages.length < 60);
+});
+
 test("safe links reject executable protocols and embedded credentials", () => {
   for (const link of [
     "javascript:alert(1)",

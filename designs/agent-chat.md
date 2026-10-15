@@ -49,7 +49,8 @@ and never contacts an agent. Atem releases are owned by the Atem agent.
   HTTPS/HTTP links are clickable. No externally hosted scripts, fonts, analytics or
   service worker. Content and capabilities are omitted from network logs.
 - Session state is bounded to eight sessions, 32 browser nonces per session,
-  256 submitted request IDs, 512 messages and 8 MiB of UTF-8 conversation content.
+  256 submitted request IDs, 512 messages, 8 MiB of UTF-8 conversation content,
+  and 16 MiB of serialized message data including part IDs and metadata.
   One prompt is at most 32 KiB and one accumulated message at most 128 KiB
   plus Atem's reserved truncation marker. Typed parts and wire frames also have
   explicit bounds. History replaces whole messages; repeated part IDs add no data.

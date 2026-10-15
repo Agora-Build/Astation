@@ -165,6 +165,8 @@ final class BrowserAgentChat {
         var requestIds: Set<String> = []
         var messages: [String: AgentChatWire] = [:]
         var transcriptBytes = 0
+        var serializedBytes = 0
+        var messageSizes: [String: Int] = [:]
 
         init(route: RemoteTerminalConnection, agent: AtemAgentInfo, hostname: String, expiresAt: Date) {
             self.route = route
@@ -430,10 +432,15 @@ final class BrowserAgentChat {
                   Set(parts.map(\.id)).count == parts.count else { return false }
             let size = parts.reduce(0) { $0 + $1.contentBytes }
             let oldSize = previous?.parts?.reduce(0) { $0 + $1.contentBytes } ?? 0
+            let oldSerializedSize = session.messageSizes[id] ?? 0
             guard size <= 131_072, session.transcriptBytes - oldSize + size <= 8_388_608,
-                  previous != nil || session.messages.count < 512 else { return false }
+                  previous != nil || session.messages.count < 512,
+                  let encoded = try? JSONEncoder().encode(message), encoded.count <= 1_048_576,
+                  session.serializedBytes - oldSerializedSize + encoded.count <= 16_777_216 else { return false }
             session.messages[id] = message
             session.transcriptBytes += size - oldSize
+            session.serializedBytes += encoded.count - oldSerializedSize
+            session.messageSizes[id] = encoded.count
             return true
         default: return true
         }

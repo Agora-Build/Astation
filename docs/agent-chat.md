@@ -56,7 +56,8 @@ Opening or reloading reads the host's latest 50 messages / 256 KiB of history.
 **Load earlier messages** asks for an older page and preserves the reading
 position. Atem retains at most 500 messages / 8 MiB per process. Whole messages
 replace prior copies by stable ID, and repeated part IDs never duplicate content.
-Remote prompt history reconciles the Sending bubble by request ID.
+Remote prompt history reconciles the Sending bubble by request ID. Astation
+also limits serialized message data, including IDs and part metadata, to 16 MiB.
 
 **Reopen conversation** restores the view after a closed or interrupted stream.
 It sends only an `open` request, never an earlier prompt. No prompt is retried
@@ -97,10 +98,10 @@ connection replacement, close without sequence headers, pre-session errors,
 size limits, status freshness, generation changes, and unknown delivery.
 
 Local validation (2026-10-14): Debug and Release builds, bundled-resource and
-packaged-app checks, pinned terminal assets, 96 browser/automation tests, and
+packaged-app checks, pinned terminal assets, 97 browser/automation tests, and
 Chrome checks at 1440, 390 and 320 pixels pass. The signed mock bridge covers
 reload/history without resending, duplicate parts, late content and tampering.
-The available Swift run executes 801 tests with seven expected skips and no
+The available Swift run executes 802 tests with seven expected skips and no
 failures after excluding six checks that cannot pass in this local environment:
 five protected Keychain/Secure Enclave tests return macOS error `-25308`, and
 one synthetic caption-scroll test fails identically on unchanged main. No CI

@@ -2,6 +2,7 @@ export const MAX_PROMPT_BYTES = 32768;
 export const MAX_MESSAGE_BYTES = 131072;
 export const ACTIVITY_TTL_MS = 30000;
 export const MAX_TRANSCRIPT_BYTES = 8388608;
+export const MAX_SERIALIZED_BYTES = 16777216;
 export const MAX_FRAME_BYTES = 1500000;
 export const MAX_MESSAGES = 512;
 const encoder = new TextEncoder();
@@ -552,6 +553,16 @@ export class Conversation {
   }
 
   withinLimits(parts, replacement) {
+    // Empty parts still consume memory through IDs, metadata and JSON escaping.
+    const serializedBytes =
+      this.messages.reduce(
+        (total, item) =>
+          total +
+          (item === replacement
+            ? 0
+            : encoder.encode(JSON.stringify(item)).length),
+        0,
+      ) + encoder.encode(JSON.stringify({ ...replacement, parts })).length;
     const bytes = this.messages.reduce(
       (total, item) =>
         total +
@@ -565,6 +576,7 @@ export class Conversation {
       parts.length <= 4096 &&
       size <= MAX_MESSAGE_BYTES &&
       bytes + size <= MAX_TRANSCRIPT_BYTES &&
+      serializedBytes <= MAX_SERIALIZED_BYTES &&
       (replacement || this.messages.length < MAX_MESSAGES)
     );
   }

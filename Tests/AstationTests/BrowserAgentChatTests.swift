@@ -367,6 +367,22 @@ final class BrowserAgentChatTests: XCTestCase {
         XCTAssertTrue(try f.bodies().contains { $0["blocked"] as? Bool == true })
     }
 
+    func testEmptyPartMetadataIsBoundedEvenWithoutAnyContentBytes() throws {
+        let f = try BrowserChatFixture()
+        try f.opened()
+        let conversation = try XCTUnwrap(f.hostMessages.first?.0.conversationId)
+        let parts = (0..<2048).map {
+            AgentChatPart(id: String(repeating: "p", count: 120) + String($0), kind: "text", markdown: "")
+        }
+        for index in 0..<60 {
+            f.chat.receiveAgent(AgentChatWire(op: "message", conversationId: conversation, agentId: "agent",
+                generation: "generation", sequence: UInt64(index + 1), messageId: "m\(index)",
+                role: "assistant", turnId: "turn", createdAt: .milliseconds(1_000_000), parts: parts), from: f.host)
+        }
+        XCTAssertTrue(try f.bodies().contains { $0["blocked"] as? Bool == true })
+        XCTAssertLessThan(try f.bodies().filter { ($0["event"] as? [String: Any])?["op"] as? String == "message" }.count, 60)
+    }
+
     func testChatEnvelopesAndURLCapabilitiesAreRedactedFromLogs() throws {
         for text in [
             #"{"type":"agentChat","data":{"op":"message","text":"private reply"}}"#,
