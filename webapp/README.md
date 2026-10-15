@@ -13,7 +13,7 @@ webapp/
     index.html            Start page and RTC session UI
     style.css
     app.mjs               Page controller and controls
-    session-link.mjs      Current and legacy share-link parsing
+    session-link.mjs      Stoa share-link parsing
     rtc/                  Channel, codec and screen-sharing implementation
   agent/                  Agent chat app, styles and conversation state
   tests/                  Media, conversation, routing and hosting checks
@@ -41,10 +41,9 @@ link never grants RTC access. Agent currently uses the agent protocol, with
 camera/microphone access disabled by its Permissions Policy.
 
 Nginx serves `.mjs` as JavaScript and returns 404 for missing app assets. Canonical
-app routes are `/stoa/` and `/agent/`. New share links use `/stoa/session/<id>`;
-existing `/session/<id>` links redirect there. `/chat/` redirects to `/agent/`
-with the query and browser fragment preserved. This keeps companion Astation
-builds using the earlier browser link compatible during migration.
+app routes are `/stoa/` and `/agent/`. Share links use `/stoa/session/<id>`.
+The earlier `/session/...` and `/chat/...` routes are removed and return 404;
+companion Astation browser links must use `/agent/`.
 
 See [testing](TESTING.md), [Agent](../docs/agent-chat.md) and
 [deployment](../DEPLOY.md) for local setup and production validation.

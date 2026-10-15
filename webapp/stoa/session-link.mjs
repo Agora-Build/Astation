@@ -1,7 +1,7 @@
 const sessionIdPattern = /^[A-Za-z0-9-]{1,128}$/;
 
 export function sessionIdFromPath(path) {
-    return /^\/(?:stoa\/)?session\/([A-Za-z0-9-]{1,128})\/?$/.exec(path)?.[1] ?? null;
+    return /^\/stoa\/session\/([A-Za-z0-9-]{1,128})\/?$/.exec(path)?.[1] ?? null;
 }
 
 export function sessionIdFromInput(value) {

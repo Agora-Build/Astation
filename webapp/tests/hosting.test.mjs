@@ -4,7 +4,7 @@ import { verifyAgentChat, verifyStoa } from "../../.github/scripts/verify-statio
 
 const origin = process.env.WEBAPP_TEST_ORIGIN;
 
-test("webapp serves Stoa and Agent and preserves existing links without a running relay", { skip: !origin }, async () => {
+test("webapp serves Stoa and Agent without obsolete routes or a running relay", { skip: !origin }, async () => {
     // Allow a freshly started container's entrypoint to render the nginx template.
     let ready = false;
     for (let attempt = 0; attempt < 40; attempt++) {
@@ -17,7 +17,7 @@ test("webapp serves Stoa and Agent and preserves existing links without a runnin
     assert.ok(ready, "webapp did not become ready");
     await Promise.all([verifyAgentChat({ origin, log() {} }), verifyStoa({ origin, log() {} })]);
 
-    const redirect = await fetch(new URL("/chat?preview=1", origin), { redirect: "manual" });
+    const redirect = await fetch(new URL("/agent?preview=1", origin), { redirect: "manual" });
     assert.equal(redirect.status, 308);
     assert.equal(redirect.headers.get("location"), "/agent/?preview=1");
     assert.equal(new URL(redirect.headers.get("location"), origin).pathname, "/agent/");
@@ -26,9 +26,6 @@ test("webapp serves Stoa and Agent and preserves existing links without a runnin
 
     for (const [path, target] of [
         ["/agent?preview=1", "/agent/?preview=1"],
-        ["/chat/?preview=1", "/agent/?preview=1"],
-        ["/chat/chat.mjs?version=1", "/agent/chat.mjs?version=1"],
-        ["/session/test-session?view=1", "/stoa/session/test-session?view=1"],
         ["/stoa", "/stoa/"]
     ]) {
         const response = await fetch(new URL(path, origin), { redirect: "manual" });
@@ -37,8 +34,13 @@ test("webapp serves Stoa and Agent and preserves existing links without a runnin
         const location = new URL(response.headers.get("location"), origin);
         assert.equal(location.pathname + location.search, target);
     }
-    for (const path of ["/agent/missing.mjs", "/agent/missing", "/stoa/missing.mjs", "/stoa/rtc/missing.mjs"]) {
-        assert.equal((await fetch(new URL(path, origin))).status, 404, path);
+    for (const path of [
+        "/agent/missing.mjs", "/agent/missing", "/stoa/missing.mjs", "/stoa/rtc/missing.mjs",
+        "/session", "/session/test-session?view=1", "/chat", "/chat/?preview=1", "/chat/chat.mjs"
+    ]) {
+        const response = await fetch(new URL(path, origin), { redirect: "manual" });
+        assert.equal(response.status, 404, path);
+        assert.equal(response.headers.get("location"), null, path);
     }
     const rtcPage = await fetch(new URL("/stoa/session/test-session", origin));
     assert.equal(rtcPage.status, 200);

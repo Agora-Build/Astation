@@ -868,7 +868,7 @@ wget https://github.com/Agora-Build/Astation/archive/refs/tags/latest.tar.gz
 tar xzf latest.tar.gz
 sudo cp -r Astation-*/webapp/* /var/www/astation/
 
-# Use the canonical config for Stoa, Agent, legacy links, module MIME types,
+# Use the canonical config for Stoa, Agent, module MIME types,
 # privacy headers, API limits and WebSockets. A fixed local relay needs no
 # Docker DNS resolver; keep that resolver for the container deployment.
 sed -e 's|/usr/share/nginx/html|/var/www/astation|g' \

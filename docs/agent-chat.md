@@ -46,8 +46,8 @@ The application never retries a prompt automatically.
 The webapp serves the page and its assets directly at `/agent/`. The existing
 relay supplies `/ws` transport. RTC functionality lives in reusable modules
 in Stoa under `webapp/stoa/rtc/`; see [webapp structure](../webapp/README.md). No extra
-deployment environment variables are needed. Earlier `/chat/` links redirect
-to `/agent/`, preserving their authorization fragment. `?preview=1` opens a labeled,
+deployment environment variables are needed. Browser links must use `/agent/`;
+the earlier `/chat/` route is removed. `?preview=1` opens a labeled,
 interactive sample conversation and never connects to an agent.
 
 The session key stays in the URL fragment, and requests and responses are

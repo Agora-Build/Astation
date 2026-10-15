@@ -62,7 +62,8 @@ This section records the transport proposal implemented by this draft client.
 The Atem owner's approved design adds typed message parts, turn IDs and history,
 as recorded in shared memory `mem_ccbe16ed2a6545688fac459186fef712` (2026-10-15).
 Client/native alignment with that contract and live provider validation remain
-required before this feature can leave draft. The agreed additions are:
+required before live Agent support is enabled. Hosting and Stoa can ship
+independently of that integration. The agreed additions are:
 
 - Messages carry `role`, `turnId`, `createdAt`, typed text/tool `parts`, optional
   `history` and `requestId`, and local/remote origin for user messages.

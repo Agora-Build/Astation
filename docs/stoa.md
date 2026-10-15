@@ -12,10 +12,10 @@ microphone. Screen capture, optional source audio, microphone state and the
 1:1 received-video view keep their existing behavior. See
 [screen-sharing controls and limits](screen-sharing.md).
 
-New RTC session responses use `/stoa/session/<id>`. Existing `/session/<id>`
-links redirect to the same Stoa session; query parameters remain intact. Stoa's
-start page also accepts the old links. Opening the start page does not join a
-channel or request microphone/screen access.
+RTC session responses use `/stoa/session/<id>`. Stoa's start page accepts these
+links or a session ID. The old `/session/<id>` route is removed; generate a new
+share link from Astation. Opening the start page does not join a channel or
+request microphone/screen access.
 
 ## Future agora.build destination
 
@@ -35,7 +35,7 @@ When connecting the new destination:
 3. Retain HTTPS and the current session authorization, UID/token allocation and
    microphone/screen consent. A new hostname changes browser permission scope.
 4. Verify start, join, receive, microphone, optional screen audio, source
-   resolution, browser Stop and legacy links before changing the public origin.
+   resolution, browser Stop and Stoa links before changing the public origin.
 
 Agent can reuse Stoa's DOM-independent RTC modules when media controls are
 added. RTC credentials and the signed Agent capability remain separate trust

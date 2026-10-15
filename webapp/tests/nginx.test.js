@@ -59,5 +59,4 @@ assert.doesNotMatch(chatLocation[1], /proxy_pass|\/index\.html/);
 assert.match(chatLocation[1], /add_header\s+Content-Security-Policy\s+"default-src 'none';/);
 assert.match(config, /types\s*\{\s*text\/javascript\s+mjs;/);
 assert.match(config, /location\s*=\s*\/agent\s*\{[^}]*return\s+308\s+\/agent\/\$is_args\$args;/);
-assert.match(config, /location\s*=\s*\/chat\s*\{[^}]*return\s+308\s+\/agent\/\$is_args\$args;/);
 assert.match(config, /location\s+\/stoa\/session\/\s*\{\s*try_files\s+\/stoa\/index\.html\s+=404;/);
