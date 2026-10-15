@@ -1,0 +1,39 @@
+:root {
+  --paper: #f4f1e9;
+  --ink: #29372d;
+  --muted: #657064;
+  --line: #d4d7c9;
+  --stoa: #e3eadc;
+  --agent: #eee1d6;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100dvh;
+  color: var(--ink);
+  background: radial-gradient(ellipse at 90% 0, #e2e7d9, transparent 60%), var(--paper);
+  font-family: "Avenir Next", Avenir, sans-serif;
+}
+main { width: min(100% - 48px, 960px); margin: 56px auto; }
+.brand { color: inherit; font-size: 13px; font-weight: 700; letter-spacing: .12em; text-decoration: none; }
+.eyebrow { color: var(--muted); font-size: 11px; letter-spacing: .18em; margin-top: 88px; }
+h1 { font: 400 clamp(36px, 5.5vw, 60px)/1.1 Georgia, serif; letter-spacing: -.035em; margin: 20px 0 48px; }
+.apps { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid var(--line); }
+.app { color: inherit; padding: 32px; text-decoration: none; transition: background .2s; }
+.app:focus-visible { outline: 3px solid var(--ink); outline-offset: 4px; }
+.stoa { background: var(--stoa); border-right: 1px solid var(--line); }
+.agent { background: var(--agent); }
+.app:hover { background: var(--paper); }
+.number { font-size: 10px; letter-spacing: .12em; }
+h2 { display: flex; justify-content: space-between; font: 400 36px Georgia, serif; margin: 36px 0 18px; }
+h2 span { font: 300 28px "Avenir Next", Avenir, sans-serif; }
+.app p { color: var(--muted); font-size: 15px; line-height: 1.7; margin-bottom: 0; }
+footer { color: var(--muted); font-size: 11px; margin-top: 32px; }
+@media (max-width: 560px) {
+  main { margin: 28px auto; }
+  .eyebrow { margin-top: 52px; }
+  .apps { grid-template-columns: 1fr; }
+  .stoa { border-right: 0; border-bottom: 1px solid var(--line); }
+  .app { padding: 24px; }
+  h2 { margin-top: 24px; }
+}

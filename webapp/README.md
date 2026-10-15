@@ -1,43 +1,50 @@
-# Astation webapp
+# Stoa and Agent
 
-This image owns browser UI for RTC sessions and remote-agent chat. Nginx serves
-the pages and shared assets; the relay handles `/api/*`, authentication and `/ws`.
+The webapp image hosts two browser apps. **Stoa** handles voice, video and screen
+sharing. **Agent** provides chat with remote code agents. The root page links to
+both apps. Nginx serves their UI; the relay handles `/api/*`, authentication and
+`/ws` transport.
 
 ```text
 webapp/
-  index.html              RTC session view, served at /session/<id>
-  css/style.css           RTC session styles
-  js/app.mjs              RTC page controller and DOM updates
-  chat/                   Agent chat view, styles, controller and protocol state
-  lib/media/
-    channel.mjs           Channel join/fallback, subscriptions, mic publishing
-    codec.mjs             Common codec policy
-    screen-share.mjs      Separate screen client, optional audio and cleanup
-  tests/                  Media, chat, routing and nginx integration checks
+  index.html              App chooser
+  index.css
+  stoa/                   Complete meeting and sharing app
+    index.html            Start page and RTC session UI
+    style.css
+    app.mjs               Page controller and controls
+    session-link.mjs      Current and legacy share-link parsing
+    rtc/                  Channel, codec and screen-sharing implementation
+  agent/                  Agent chat app, styles and conversation state
+  tests/                  Media, conversation, routing and hosting checks
 ```
 
-The media library uses standard ES modules and accepts the Agora SDK/client
-as an argument. Its modules do not access a page's DOM or automatically request media
-permissions. The existing RTC page imports them; new media controls in chat can
-import the same implementations. Keep UI state and rendering in page controllers,
-and keep SDK behavior in the shared layer rather than copying it between pages.
+Stoa is intended to move to the **Stoa** subdomain/space within agora.build.
+The complete app is isolated in `webapp/stoa/` for that move. This change configures
+`https://station.agora.build/stoa/` after deployment; the final agora.build destination has not
+been deployed as part of this change. See [Stoa setup and migration](../docs/stoa.md).
 
-Screen sharing uses its own server-allocated UID and matching token, preserves
-the captured source dimensions, requests 60 fps and supports optional source
-audio. Start it directly from a user gesture so the browser can open its picker.
-Stop closes local tracks and leaves the screen client, including when the user
-ends sharing from the browser. See [screen sharing](../docs/screen-sharing.md).
+The app's RTC modules take the Agora SDK/client as arguments and do not depend
+on either app's DOM. Agent can import those implementations when adding media
+controls. Keep page rendering in each app's controller and reuse RTC behavior
+from `stoa/rtc/` rather than copying it.
 
-Chat authorization grants access to one selected agent. RTC participation uses
-a separate session and credentials from `/api/rtc-sessions/*`; a chat link must
-never be converted into RTC authorization. Adding media to chat requires an
-explicit RTC session and user action. The chat page currently uses only the
-agent protocol, with microphone/camera access disabled by its Permissions Policy.
+Screen sharing allocates a separate server UID and matching token, preserves
+captured source dimensions, requests 60 fps and supports optional source audio.
+Start from a user gesture so the browser can open its picker. Stop closes tracks
+and leaves the screen client, including when sharing ends from browser controls.
+See [screen sharing](../docs/screen-sharing.md).
 
-The webapp Dockerfile packages both pages together, including shared modules.
-Nginx preserves `/chat?preview=1` when redirecting to `/chat/`, serves `.mjs` as
-JavaScript and returns 404 for missing chat assets. It serves `/session/*` using
-the existing RTC view and proxies `/ws` and APIs to the configured relay.
+Agent authorization grants access to one selected code agent. Stoa participation
+uses a separate RTC session and credentials from `/api/rtc-sessions/*`; an Agent
+link never grants RTC access. Agent currently uses the agent protocol, with
+camera/microphone access disabled by its Permissions Policy.
 
-See [testing](TESTING.md), [agent chat](../docs/agent-chat.md) and
+Nginx serves `.mjs` as JavaScript and returns 404 for missing app assets. Canonical
+app routes are `/stoa/` and `/agent/`. New share links use `/stoa/session/<id>`;
+existing `/session/<id>` links redirect there. `/chat/` redirects to `/agent/`
+with the query and browser fragment preserved. This keeps companion Astation
+builds using the earlier browser link compatible during migration.
+
+See [testing](TESTING.md), [Agent](../docs/agent-chat.md) and
 [deployment](../DEPLOY.md) for local setup and production validation.

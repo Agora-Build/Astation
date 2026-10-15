@@ -100,8 +100,9 @@ jobs:
           node webapp/tests/nginx.test.js
           node --test webapp/tests/screen-share.test.mjs webapp/tests/rtc-channel.test.mjs
           node --test webapp/tests/agent-chat.test.mjs
+          node --test webapp/tests/stoa-session.test.mjs
 
-      - name: Verify webapp nginx image and shared modules
+      - name: Verify Stoa and Agent webapps
         run: |
           docker build --tag station-webapp:ci webapp
           trap 'docker rm -f webapp-check >/dev/null 2>&1' EXIT

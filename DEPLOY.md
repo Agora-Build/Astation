@@ -5,10 +5,11 @@
 The Astation system consists of:
 1. **macOS App** - Menubar app with RTC capabilities (`.pkg` installer)
 2. **API Server** - Rust backend for session management + WebSocket relay
-3. **Webapp** - Browser UI for RTC sessions and remote-agent chat
+3. **Webapp** - Stoa for meeting/sharing and Agent for remote-agent chat
 
-The webapp image serves both `/session/*` and `/chat/`, including the media
-library under `webapp/lib/media/`. The relay handles APIs and WebSocket transport.
+The webapp image serves Stoa at `/stoa/` and Agent at `/agent/`. Stoa owns the
+complete meeting/sharing app under `webapp/stoa/`, including its RTC code. Agent
+lives in `webapp/agent/`. The relay handles APIs and WebSocket transport.
 
 ## GitHub Actions Release
 
@@ -109,7 +110,7 @@ finish:
 3. the final check: public HTTPS, a healthy `/health` (Postgres knowledge
    store; Redis `ok` and at least `STATION_MIN_REPLICAS` live replicas when
    those checks are switched on, see below), the expected relay build commit,
-   the `/chat/` app and its assets with the expected MIME and security headers,
+   the `/agent/` app and its assets with the expected MIME and security headers,
    and an identity WebSocket
    connection to `wss://station.agora.build/ws`.
 
@@ -183,26 +184,29 @@ Runtime configuration:
 - Cloudflare: publish `station.agora.build` on the existing Volumetric tunnel
   with origin `http://10.0.0.1:3010` and a proxied CNAME to that tunnel's
   `<tunnel-id>.cfargotunnel.com`. TLS terminates at Cloudflare; the tunnel
-  forwards `/`, `/chat/`, `/health`, `/api/*`, and `/ws` to the webapp. `localhost` inside
+  forwards `/`, `/stoa/*`, `/agent/*`, `/health`, `/api/*`, and `/ws` to the webapp. `localhost` inside
   the cloudflared container refers to that container, not Volumetric.
 
-### Webapp agent chat
+### Stoa and Agent webapps
 
-The production app is `https://station.agora.build/chat/`. Its HTML, CSS,
-JavaScript modules and icon live in `webapp/chat/` and are packaged in the
+This change configures Stoa at `https://station.agora.build/stoa/` and Agent at
+`https://station.agora.build/agent/` after deployment. Stoa is intended to move
+to its own Stoa subdomain/space under agora.build; see
+[the migration guide](docs/stoa.md). Agent's HTML, CSS, JavaScript modules and
+icon live in `webapp/agent/` and are packaged in the
 existing webapp image. Nginx serves them directly with restrictive CSP,
 no-store/no-referrer headers and JavaScript module MIME types. Missing assets
 return 404 rather than the RTC page. The relay provides `/ws` transport and
 `/api/*`; it does not package browser UI. Deploy through the normal workflow
 so the webapp and relay stay compatible. See [webapp structure](webapp/README.md)
-for the media library used by browser media features.
+for the Stoa and Agent app boundaries.
 
-The final deployment verifier requests the page and all four assets through
+The final deployment verifier requests both apps and their assets through
 the public origin. It rejects 404s, the RTC app's HTML fallback, incorrect module
 MIME types and missing privacy/security headers. This runs after the webapp
 deployment; intermediate relay health waits remain unchanged.
 
-`/chat/?preview=1` is a labeled sample for reviewing the layout. Real sessions
+`/agent/?preview=1` is a labeled sample for reviewing the layout. Real sessions
 start from a companion Astation build's **Open in Browser** action, using an
 ephemeral authorization in the URL fragment and the existing `/ws` transport.
 The companion macOS bridge is currently on `feat/remote-terminal`; Atem must
@@ -864,42 +868,14 @@ wget https://github.com/Agora-Build/Astation/archive/refs/tags/latest.tar.gz
 tar xzf latest.tar.gz
 sudo cp -r Astation-*/webapp/* /var/www/astation/
 
-# Configure nginx
-sudo tee /etc/nginx/sites-available/astation << 'EOF'
-server {
-    listen 80;
-    server_name station.agora.build;
-    root /var/www/astation;
-    index index.html;
-
-    # SPA routing
-    location /session/ {
-        try_files $uri /index.html;
-    }
-
-    # Proxy API requests
-    location /api/ {
-        proxy_pass http://localhost:3000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    }
-
-    # WebSocket support for relay
-    location /ws {
-        proxy_pass http://localhost:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-    }
-
-    # Static assets
-    location / {
-        try_files $uri $uri/ =404;
-    }
-}
-EOF
+# Use the canonical config for Stoa, Agent, legacy links, module MIME types,
+# privacy headers, API limits and WebSockets. A fixed local relay needs no
+# Docker DNS resolver; keep that resolver for the container deployment.
+sed -e 's|/usr/share/nginx/html|/var/www/astation|g' \
+    -e 's|${STATION_RELAY_UPSTREAM}|127.0.0.1:3000|g' \
+    -e '/^[[:space:]]*resolver /d' \
+    -e 's/ resolve;/;/' \
+    Astation-*/webapp/nginx.conf | sudo tee /etc/nginx/sites-available/astation
 
 sudo ln -s /etc/nginx/sites-available/astation /etc/nginx/sites-enabled/
 sudo nginx -t

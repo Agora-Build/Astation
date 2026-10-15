@@ -1,8 +1,9 @@
-// Astation Session Web App
+// Stoa voice, video and screen-sharing app
 // Agora Web SDK 4.x integration for RTC session sharing
 
-import { ScreenPublisher } from "../lib/media/screen-share.mjs";
-import { joinChannel as joinRTCChannel, publishMicrophone, subscribeTrack, closeLocalTrack } from "../lib/media/channel.mjs";
+import { ScreenPublisher } from "./rtc/screen-share.mjs";
+import { joinChannel as joinRTCChannel, publishMicrophone, subscribeTrack, closeLocalTrack } from "./rtc/channel.mjs";
+import { sessionIdFromPath, sessionIdFromInput, sessionPath } from "./session-link.mjs";
 
 const STORAGE_KEY = "astation_user";
 const EXPIRY_DAYS = 7;
@@ -36,6 +37,17 @@ const screenPublisher = new ScreenPublisher(AgoraRTC, async () => {
 // --- Init ---
 
 document.addEventListener("DOMContentLoaded", () => {
+    document.getElementById("session-link-form").addEventListener("submit", event => {
+        event.preventDefault();
+        const id = sessionIdFromInput(document.getElementById("session-link").value);
+        if (id) {
+            window.location.assign(sessionPath(id));
+        } else {
+            const error = document.getElementById("session-link-error");
+            error.textContent = "Enter a session ID or paste a valid Stoa share link.";
+            error.hidden = false;
+        }
+    });
     for (const [selector, handler] of [
         ["#join-btn", handleJoin], ["#play-audio-btn", resumeRemoteAudio],
         [".sidebar-toggle", toggleSidebar], ["#sidebar-show-btn", toggleSidebar],
@@ -49,19 +61,18 @@ document.addEventListener("DOMContentLoaded", () => {
     };
     new MutationObserver(updateVideoSize).observe(document.getElementById("video-main"), { childList: true, subtree: true });
     window.addEventListener("resize", updateVideoSize);
-    sessionId = extractSessionId();
+    sessionId = sessionIdFromPath(window.location.pathname);
     if (!sessionId) {
-        showError("Invalid session URL.");
+        if (["/stoa/", "/stoa/index.html"].includes(window.location.pathname)) {
+            document.getElementById("loading").style.display = "none";
+            document.getElementById("stoa-home").hidden = false;
+        } else {
+            showError("Invalid session URL.");
+        }
         return;
     }
     verifySession(sessionId);
 });
-
-function extractSessionId() {
-    const path = window.location.pathname;
-    const match = path.match(/^\/session\/([a-zA-Z0-9-]+)/);
-    return match ? match[1] : null;
-}
 
 // --- Session Verification ---
 
@@ -418,7 +429,7 @@ async function disconnectMedia() {
 
 async function leave() {
     await disconnectMedia();
-    window.location.href = "/";
+    window.location.href = "/stoa/";
 }
 
 async function toggleScreenShare() {

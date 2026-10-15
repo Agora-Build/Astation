@@ -52,10 +52,12 @@ assert.ok(
   "nginx must not proxy /metrics to the relay",
 );
 
-const chatLocation = config.match(/location\s+\/chat\/\s*\{([\s\S]*?)\}/);
-assert.ok(chatLocation, "nginx must serve /chat/ from the webapp image");
+const chatLocation = config.match(/location\s+\/agent\/\s*\{([\s\S]*?)\}/);
+assert.ok(chatLocation, "nginx must serve Agent from the webapp image");
 assert.match(chatLocation[1], /try_files\s+\$uri\s+\$uri\/\s+=404;/);
 assert.doesNotMatch(chatLocation[1], /proxy_pass|\/index\.html/);
 assert.match(chatLocation[1], /add_header\s+Content-Security-Policy\s+"default-src 'none';/);
 assert.match(config, /types\s*\{\s*text\/javascript\s+mjs;/);
-assert.match(config, /location\s*=\s*\/chat\s*\{[^}]*return\s+308\s+\/chat\/\$is_args\$args;/);
+assert.match(config, /location\s*=\s*\/agent\s*\{[^}]*return\s+308\s+\/agent\/\$is_args\$args;/);
+assert.match(config, /location\s*=\s*\/chat\s*\{[^}]*return\s+308\s+\/agent\/\$is_args\$args;/);
+assert.match(config, /location\s+\/stoa\/session\/\s*\{\s*try_files\s+\/stoa\/index\.html\s+=404;/);

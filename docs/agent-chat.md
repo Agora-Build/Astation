@@ -1,6 +1,7 @@
-# Agent chat in a browser
+# Agent
 
-The webapp hosts this UI at `https://station.agora.build/chat/`. The macOS
+This change configures the Agent app at `https://station.agora.build/agent/`
+after deployment. The macOS
 **Open in Browser** bridge is being implemented separately on
 `feat/remote-terminal`, and live prompt/reply handling requires Atem's `chat-v1`
 host support. These companion pieces are required for the live workflow below.
@@ -42,10 +43,11 @@ was pending at reload, open a new session after inspecting the original terminal
 When delivery is unknown, inspect the terminal before deciding to send again.
 The application never retries a prompt automatically.
 
-The webapp serves the page and its assets directly at `/chat/`. The existing
+The webapp serves the page and its assets directly at `/agent/`. The existing
 relay supplies `/ws` transport. RTC functionality lives in reusable modules
-under `webapp/lib/media/`; see [webapp structure](../webapp/README.md). No extra
-deployment environment variables are needed. `?preview=1` opens a labeled,
+in Stoa under `webapp/stoa/rtc/`; see [webapp structure](../webapp/README.md). No extra
+deployment environment variables are needed. Earlier `/chat/` links redirect
+to `/agent/`, preserving their authorization fragment. `?preview=1` opens a labeled,
 interactive sample conversation and never connects to an agent.
 
 The session key stays in the URL fragment, and requests and responses are
@@ -64,8 +66,8 @@ WEBAPP_TEST_ORIGIN=http://localhost:8080 node --test webapp/tests/hosting.test.m
 ```
 
 Local validation on 2026-10-14: all 446 runnable relay tests pass (109
-database/Valkey integration tests ignored locally). All 21 browser crypto/state
-and RTC tests pass. An actual nginx 1.28 instance serves both pages and shared
+database/Valkey integration tests ignored locally). All 24 browser crypto/state,
+RTC and Stoa session-link tests pass. An actual nginx 1.28 instance serves both apps and shared
 modules with the relay unavailable; CI repeats this against the webapp image.
 RTC browser checks with a mocked SDK verify join, microphone off/on/mute,
 screen audio selection, native dimensions/60 fps configuration and cleanup.

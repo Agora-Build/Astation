@@ -11,7 +11,7 @@ import {
   base64,
   encodeFields,
   markdownBlocks,
-} from "../chat/chat-core.mjs";
+} from "../agent/chat-core.mjs";
 
 const secret = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const session = "test-session";

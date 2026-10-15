@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { joinChannel, publishMicrophone, subscribeTrack } from "../lib/media/channel.mjs";
+import { joinChannel, publishMicrophone, subscribeTrack } from "../stoa/rtc/channel.mjs";
 
 const identity = { app_id: "app", channel: "channel", token: "matching-token", uid: 1234 };
 

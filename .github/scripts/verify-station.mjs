@@ -82,11 +82,11 @@ export async function waitForHealth({
 
 export async function verifyAgentChat({ origin, fetchImpl = fetch, log = console.log }) {
   const assets = [
-    ['/chat/', 'text/html', 'id="composer"'],
-    ['/chat/chat.css', 'text/css', '--paper'],
-    ['/chat/chat-core.mjs', 'text/javascript', 'class Conversation'],
-    ['/chat/chat.mjs', 'text/javascript', 'chat-core.mjs'],
-    ['/chat/mark.svg', 'image/svg+xml', '<svg'],
+    ['/agent/', 'text/html', 'id="composer"'],
+    ['/agent/chat.css', 'text/css', '--paper'],
+    ['/agent/chat-core.mjs', 'text/javascript', 'class Conversation'],
+    ['/agent/chat.mjs', 'text/javascript', 'chat-core.mjs'],
+    ['/agent/mark.svg', 'image/svg+xml', '<svg'],
   ];
   await Promise.all(assets.map(async ([path, mime, marker]) => {
     const response = await fetchImpl(new URL(path, origin), {
@@ -100,13 +100,36 @@ export async function verifyAgentChat({ origin, fetchImpl = fetch, log = console
         response.headers.get('x-content-type-options') !== 'nosniff') {
       throw new Error(`Agent chat ${path} is missing privacy or MIME protection headers`);
     }
-    if (path === '/chat/') {
+    if (path === '/agent/') {
       const directives = new Set((response.headers.get('content-security-policy') ?? '').split(';').map(value => value.trim()));
       for (const directive of ["default-src 'none'", "script-src 'self'", "frame-ancestors 'none'"]) {
         if (!directives.has(directive)) throw new Error(`Agent chat is missing CSP directive ${directive}`);
       }
     }
     if (!(await response.text()).includes(marker)) throw new Error(`Agent chat ${path} did not return its expected asset`);
+    log(`${path}: HTTP ${response.status}, ${mime}`);
+  }));
+}
+
+export async function verifyStoa({ origin, fetchImpl = fetch, log = console.log }) {
+  const assets = [
+    ['/stoa/', 'text/html', 'id="stoa-home"'],
+    ['/stoa/style.css', 'text/css', '.stoa-home'],
+    ['/stoa/app.mjs', 'text/javascript', 'sessionIdFromPath'],
+    ['/stoa/session-link.mjs', 'text/javascript', 'sessionIdFromInput'],
+    ['/stoa/rtc/channel.mjs', 'text/javascript', 'joinChannel'],
+    ['/stoa/rtc/codec.mjs', 'text/javascript', 'preferredCodec'],
+    ['/stoa/rtc/screen-share.mjs', 'text/javascript', 'class ScreenPublisher'],
+  ];
+  await Promise.all(assets.map(async ([path, mime, marker]) => {
+    const response = await fetchImpl(new URL(path, origin), {
+      redirect: 'error', signal: AbortSignal.timeout(30_000),
+    });
+    if (!response.ok) throw new Error(`Stoa ${path} returned HTTP ${response.status}`);
+    if (response.headers.get('content-type')?.split(';')[0].trim() !== mime) {
+      throw new Error(`Stoa ${path} has an incorrect MIME type`);
+    }
+    if (!(await response.text()).includes(marker)) throw new Error(`Stoa ${path} did not return its expected asset`);
     log(`${path}: HTTP ${response.status}, ${mime}`);
   }));
 }
@@ -130,7 +153,7 @@ export async function verifyStation({ origin, minReplicas, requireRedis, expecte
     console.log(`${path}: HTTP ${response.status}`);
   }
 
-  await verifyAgentChat({ origin });
+  await Promise.all([verifyAgentChat({ origin }), verifyStoa({ origin })]);
 
   for (const path of ['/ws', '//ws']) {
     const url = new URL(origin);

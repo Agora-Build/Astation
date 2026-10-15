@@ -203,6 +203,7 @@ jobs:
           node target/webapp/tests/codec.test.mjs
           node target/webapp/tests/nginx.test.js
           node --test target/webapp/tests/agent-chat.test.mjs target/webapp/tests/screen-share.test.mjs target/webapp/tests/rtc-channel.test.mjs
+          node --test target/webapp/tests/stoa-session.test.mjs
 
       - name: Set up Rust
         if: steps.patch.outputs.test_relay == 'true'

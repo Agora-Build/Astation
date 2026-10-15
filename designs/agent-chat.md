@@ -1,4 +1,4 @@
-# Browser agent chat
+# Agent browser app
 
 ## Product
 
@@ -7,7 +7,7 @@ companion macOS bridge remains in the `feat/remote-terminal` worktree; Atem's
 semantic host implementation is coordinated through shared project memory.
 
 Connections keeps Open Terminal and adds Open in Browser for each agent. The
-new page is served by the webapp at `/chat/`, with a responsive layout for desktop
+new page is served by the webapp at `/agent/`, with a responsive layout for desktop
 and mobile. Prompts are outgoing messages; structured agent replies are incoming
 messages. Code blocks, safe links, copy actions and activity indicators belong to
 the conversation. The terminal remains available for CLI-specific interactions.
@@ -99,12 +99,12 @@ Provider approvals continue through the terminal in this first version.
 
 ## Relay and browser
 
-The webapp owns HTML/CSS/JavaScript under `webapp/chat/`. Its nginx serves
+The webapp owns HTML/CSS/JavaScript under `webapp/agent/`. Its nginx serves
 these files with restrictive CSP, no-store and no-referrer headers. The relay
 owns APIs and `/ws` transport. No new server-side account session or privileged
 WebSocket role is introduced.
 
-The existing RTC page imports shared ES modules from `webapp/lib/media/` for
+The Stoa app imports its reusable ES modules from `webapp/stoa/rtc/` for
 channel setup, microphone publishing, subscriptions and screen sharing. These
 modules take an SDK/client explicitly and do not depend on either page's DOM.
 A page can reuse them when adding media controls. RTC session access and its

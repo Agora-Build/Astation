@@ -2,8 +2,9 @@
 
 Astation captures macOS displays and selected regions with ScreenCaptureKit and
 publishes custom video and audio tracks through Agora RTC. macOS 14 or later is
-required. The browser session page receives the screen and audio with the Agora
-Web SDK.
+required. The [Stoa browser app](stoa.md) receives the screen and audio with the Agora
+Web SDK. Its complete UI and calling/sharing implementation live in
+`webapp/stoa/`, ready for the future Stoa space under agora.build.
 
 Native and browser clients use Agora's live profile with host roles so they can
 publish and receive media in the same channel.
