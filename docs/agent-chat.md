@@ -44,7 +44,7 @@ The application never retries a prompt automatically.
 
 The webapp serves the page and its assets directly at `/chat/`. The existing
 relay supplies `/ws` transport. RTC functionality lives in reusable modules
-under `webapp/shared/rtc/`; see [webapp structure](../webapp/README.md). No extra
+under `webapp/lib/media/`; see [webapp structure](../webapp/README.md). No extra
 deployment environment variables are needed. `?preview=1` opens a labeled,
 interactive sample conversation and never connects to an agent.
 

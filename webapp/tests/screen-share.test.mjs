@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { ScreenPublisher } from "../shared/rtc/screen-share.mjs";
+import { ScreenPublisher } from "../lib/media/screen-share.mjs";
 
 function rig({ audio = false, picker, joinError = false } = {}) {
     const events = [];

@@ -4,7 +4,7 @@ import { verifyAgentChat } from "../../.github/scripts/verify-station.mjs";
 
 const origin = process.env.WEBAPP_TEST_ORIGIN;
 
-test("webapp serves chat and shared RTC modules without a running relay", { skip: !origin }, async () => {
+test("webapp serves chat and the media library without a running relay", { skip: !origin }, async () => {
     // Allow a freshly started container's entrypoint to render the nginx template.
     let ready = false;
     for (let attempt = 0; attempt < 40; attempt++) {
@@ -23,13 +23,13 @@ test("webapp serves chat and shared RTC modules without a running relay", { skip
     assert.equal(new URL(redirect.headers.get("location"), origin).search, "?preview=1");
     assert.equal(redirect.headers.get("referrer-policy"), "no-referrer");
 
-    for (const path of ["/chat/missing.mjs", "/chat/missing", "/shared/rtc/missing.mjs"]) {
+    for (const path of ["/chat/missing.mjs", "/chat/missing", "/lib/media/missing.mjs"]) {
         assert.equal((await fetch(new URL(path, origin))).status, 404, path);
     }
     const rtcPage = await fetch(new URL("/session/test-session", origin));
     assert.equal(rtcPage.status, 200);
     assert.match(await rtcPage.text(), /type="module" src="\/js\/app.mjs"/);
-    for (const path of ["/js/app.mjs", "/shared/rtc/channel.mjs", "/shared/rtc/codec.mjs", "/shared/rtc/screen-share.mjs"]) {
+    for (const path of ["/js/app.mjs", "/lib/media/channel.mjs", "/lib/media/codec.mjs", "/lib/media/screen-share.mjs"]) {
         const response = await fetch(new URL(path, origin));
         assert.equal(response.status, 200, path);
         assert.equal(response.headers.get("content-type")?.split(";")[0], "text/javascript", path);

@@ -9,15 +9,15 @@ webapp/
   css/style.css           RTC session styles
   js/app.mjs              RTC page controller and DOM updates
   chat/                   Agent chat view, styles, controller and protocol state
-  shared/rtc/
+  lib/media/
     channel.mjs           Channel join/fallback, subscriptions, mic publishing
     codec.mjs             Common codec policy
     screen-share.mjs      Separate screen client, optional audio and cleanup
   tests/                  Media, chat, routing and nginx integration checks
 ```
 
-The shared RTC modules use standard ES modules and accept the Agora SDK/client
-as arguments. They do not access a page's DOM or automatically request media
+The media library uses standard ES modules and accepts the Agora SDK/client
+as an argument. Its modules do not access a page's DOM or automatically request media
 permissions. The existing RTC page imports them; new media controls in chat can
 import the same implementations. Keep UI state and rendering in page controllers,
 and keep SDK behavior in the shared layer rather than copying it between pages.

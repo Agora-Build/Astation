@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { preferredCodec, fallbackCodec, pickCodec } from "../shared/rtc/codec.mjs";
+import { preferredCodec, fallbackCodec, pickCodec } from "../lib/media/codec.mjs";
 
 assert.strictEqual(preferredCodec, "h264");
 assert.strictEqual(fallbackCodec, "vp8");

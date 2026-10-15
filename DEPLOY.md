@@ -7,8 +7,8 @@ The Astation system consists of:
 2. **API Server** - Rust backend for session management + WebSocket relay
 3. **Webapp** - Browser UI for RTC sessions and remote-agent chat
 
-The webapp image serves both `/session/*` and `/chat/`, including shared RTC
-modules under `webapp/shared/rtc/`. The relay handles APIs and WebSocket transport.
+The webapp image serves both `/session/*` and `/chat/`, including the media
+library under `webapp/lib/media/`. The relay handles APIs and WebSocket transport.
 
 ## GitHub Actions Release
 
@@ -195,7 +195,7 @@ no-store/no-referrer headers and JavaScript module MIME types. Missing assets
 return 404 rather than the RTC page. The relay provides `/ws` transport and
 `/api/*`; it does not package browser UI. Deploy through the normal workflow
 so the webapp and relay stay compatible. See [webapp structure](webapp/README.md)
-for the shared RTC layer used by browser media features.
+for the media library used by browser media features.
 
 The final deployment verifier requests the page and all four assets through
 the public origin. It rejects 404s, the RTC app's HTML fallback, incorrect module

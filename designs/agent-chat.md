@@ -104,7 +104,7 @@ these files with restrictive CSP, no-store and no-referrer headers. The relay
 owns APIs and `/ws` transport. No new server-side account session or privileged
 WebSocket role is introduced.
 
-The existing RTC page imports shared ES modules from `webapp/shared/rtc/` for
+The existing RTC page imports shared ES modules from `webapp/lib/media/` for
 channel setup, microphone publishing, subscriptions and screen sharing. These
 modules take an SDK/client explicitly and do not depend on either page's DOM.
 A page can reuse them when adding media controls. RTC session access and its

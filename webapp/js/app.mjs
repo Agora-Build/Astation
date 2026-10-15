@@ -1,8 +1,8 @@
 // Astation Session Web App
 // Agora Web SDK 4.x integration for RTC session sharing
 
-import { ScreenPublisher } from "../shared/rtc/screen-share.mjs";
-import { joinChannel as joinRTCChannel, publishMicrophone, subscribeTrack, closeLocalTrack } from "../shared/rtc/channel.mjs";
+import { ScreenPublisher } from "../lib/media/screen-share.mjs";
+import { joinChannel as joinRTCChannel, publishMicrophone, subscribeTrack, closeLocalTrack } from "../lib/media/channel.mjs";
 
 const STORAGE_KEY = "astation_user";
 const EXPIRY_DAYS = 7;
