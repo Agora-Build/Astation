@@ -9,6 +9,23 @@ docker compose up
 
 Then open: http://localhost:8080
 
+The same webapp serves [agent chat](../docs/agent-chat.md) at `/chat/`.
+`/chat/?preview=1` reviews the UI without connecting to an agent. Live prompts
+require the companion Astation bridge and an Atem host with `chat-v1` support.
+See [webapp structure](README.md) for the shared RTC modules used by media UI.
+
+Run the browser-independent checks and the actual nginx image checks with:
+
+```sh
+node tests/codec.test.mjs
+node tests/nginx.test.js
+node --test tests/agent-chat.test.mjs tests/screen-share.test.mjs tests/rtc-channel.test.mjs
+WEBAPP_TEST_ORIGIN=http://localhost:8080 node --test tests/hosting.test.mjs
+```
+
+CI builds the webapp image and runs the hosting checks with an unavailable relay
+to prove that both pages and shared modules are packaged and served by nginx.
+
 ## Testing Screen Share & Microphone
 
 ### 1. Create a Test RTC Session

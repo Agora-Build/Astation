@@ -100,9 +100,9 @@ Automated checks:
 ```sh
 ctest --test-dir build --output-on-failure
 swift test --filter ScreenShareCaptureTests
-node webapp/tests/codec.test.js
+node webapp/tests/codec.test.mjs
 node webapp/tests/nginx.test.js
-node --test webapp/tests/screen-share.test.js
+node --test webapp/tests/screen-share.test.mjs webapp/tests/rtc-channel.test.mjs
 cargo test --manifest-path relay-server/Cargo.toml rtc_session
 ```
 

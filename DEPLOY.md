@@ -5,10 +5,10 @@
 The Astation system consists of:
 1. **macOS App** - Menubar app with RTC capabilities (`.pkg` installer)
 2. **API Server** - Rust backend for session management + WebSocket relay
-3. **Webapp** - Web client for joining RTC sessions via shareable links
+3. **Webapp** - Browser UI for RTC sessions and remote-agent chat
 
-The relay also embeds the browser agent chat app and its assets at `/chat/`.
-The public webapp nginx forwards that route to the relay.
+The webapp image serves both `/session/*` and `/chat/`, including shared RTC
+modules under `webapp/shared/rtc/`. The relay handles APIs and WebSocket transport.
 
 ## GitHub Actions Release
 
@@ -186,14 +186,16 @@ Runtime configuration:
   forwards `/`, `/chat/`, `/health`, `/api/*`, and `/ws` to the webapp. `localhost` inside
   the cloudflared container refers to that container, not Volumetric.
 
-### Relay-hosted agent chat
+### Webapp agent chat
 
 The production app is `https://station.agora.build/chat/`. Its HTML, CSS,
-JavaScript modules and icon are compiled into the relay binary from
-`relay-server/src/web/agent_chat/`; no runtime asset volume or additional
-service is needed. `webapp/nginx.conf` proxies `/chat/` to the existing relay
-upstream. Both images must deploy through the normal workflow so the public
-proxy recognizes the route and every replica serves the same assets.
+JavaScript modules and icon live in `webapp/chat/` and are packaged in the
+existing webapp image. Nginx serves them directly with restrictive CSP,
+no-store/no-referrer headers and JavaScript module MIME types. Missing assets
+return 404 rather than the RTC page. The relay provides `/ws` transport and
+`/api/*`; it does not package browser UI. Deploy through the normal workflow
+so the webapp and relay stay compatible. See [webapp structure](webapp/README.md)
+for the shared RTC layer used by browser media features.
 
 The final deployment verifier requests the page and all four assets through
 the public origin. It rejects 404s, the RTC app's HTML fallback, incorrect module

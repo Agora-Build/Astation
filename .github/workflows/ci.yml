@@ -96,10 +96,19 @@ jobs:
           node-version: "20"
       - name: Run webapp tests
         run: |
-          node webapp/tests/codec.test.js
+          node webapp/tests/codec.test.mjs
           node webapp/tests/nginx.test.js
-          node --test webapp/tests/screen-share.test.js
+          node --test webapp/tests/screen-share.test.mjs webapp/tests/rtc-channel.test.mjs
           node --test webapp/tests/agent-chat.test.mjs
+
+      - name: Verify webapp nginx image and shared modules
+        run: |
+          docker build --tag station-webapp:ci webapp
+          trap 'docker rm -f webapp-check >/dev/null 2>&1' EXIT
+          docker run --detach --name webapp-check \
+            --env STATION_RELAY_UPSTREAM=127.0.0.1:9 \
+            --publish 127.0.0.1:53001:80 station-webapp:ci
+          WEBAPP_TEST_ORIGIN=http://127.0.0.1:53001 node --test webapp/tests/hosting.test.mjs
 
       - name: Test AI review tooling
         run: node --test .github/scripts/*.test.mjs

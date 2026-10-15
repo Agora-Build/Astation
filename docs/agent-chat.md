@@ -1,6 +1,6 @@
 # Agent chat in a browser
 
-The relay hosts this app at `https://station.agora.build/chat/`. The macOS
+The webapp hosts this UI at `https://station.agora.build/chat/`. The macOS
 **Open in Browser** bridge is being implemented separately on
 `feat/remote-terminal`, and live prompt/reply handling requires Atem's `chat-v1`
 host support. These companion pieces are required for the live workflow below.
@@ -18,7 +18,7 @@ copy buttons. Scrolling up keeps your reading position during a reply;
 
 Live chat requires an Atem host that advertises `chat-v1` for the selected agent.
 Without that capability, the page explains that an Atem update is needed and
-keeps sending disabled. The Astation UI and relay page are implemented locally;
+keeps sending disabled. The Astation UI and webapp page are implemented locally;
 the companion host implementation is handed off through shared Atem memory.
 Live provider acceptance remains pending that work.
 
@@ -42,25 +42,34 @@ was pending at reload, open a new session after inspecting the original terminal
 When delivery is unknown, inspect the terminal before deciding to send again.
 The application never retries a prompt automatically.
 
-The relay serves the page at `/chat/`; its nginx proxy forwards this route and
-the version-matched assets to the relay. No extra deployment environment variables
-are needed. `?preview=1` opens a labeled, interactive sample conversation and
-never connects to an agent.
+The webapp serves the page and its assets directly at `/chat/`. The existing
+relay supplies `/ws` transport. RTC functionality lives in reusable modules
+under `webapp/shared/rtc/`; see [webapp structure](../webapp/README.md). No extra
+deployment environment variables are needed. `?preview=1` opens a labeled,
+interactive sample conversation and never connects to an agent.
 
 The session key stays in the URL fragment, and requests and responses are
 authenticated. Chat traffic is not end-to-end encrypted: the relay can read it
-and serves the browser code. Storage encryption does not encrypt this stream.
+and the webapp serves the browser code. Storage encryption does not encrypt this
+stream.
 
 ## Verification
 
 ```sh
 node --test webapp/tests/agent-chat.test.mjs
 node webapp/tests/nginx.test.js
-cd relay-server && cargo test --locked web::agent_chat
+node --test webapp/tests/screen-share.test.mjs webapp/tests/rtc-channel.test.mjs
+# Against a local webapp nginx (also runs in CI against the Docker image):
+WEBAPP_TEST_ORIGIN=http://localhost:8080 node --test webapp/tests/hosting.test.mjs
 ```
 
-Local validation on 2026-10-14: all 448 runnable relay tests pass (109 database/Valkey
-integration tests ignored locally). Browser crypto/state tests and desktop,
+Local validation on 2026-10-14: all 446 runnable relay tests pass (109
+database/Valkey integration tests ignored locally). All 21 browser crypto/state
+and RTC tests pass. An actual nginx 1.28 instance serves both pages and shared
+modules with the relay unavailable; CI repeats this against the webapp image.
+RTC browser checks with a mocked SDK verify join, microphone off/on/mute,
+screen audio selection, native dimensions/60 fps configuration and cleanup.
+These checks do not measure live media quality. Desktop,
 390px and 320px Chrome checks pass. Browser checks exercise streaming, code copy,
 safe Markdown, scroll retention, mobile navigation and preview isolation. A
 signed mock bridge verifies delivery, tamper rejection, unsupported hosts and

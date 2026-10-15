@@ -11,7 +11,7 @@ import {
   base64,
   encodeFields,
   markdownBlocks,
-} from "../../relay-server/src/web/agent_chat/chat-core.mjs";
+} from "../chat/chat-core.mjs";
 
 const secret = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const session = "test-session";

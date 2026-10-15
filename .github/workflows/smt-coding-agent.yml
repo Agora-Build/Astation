@@ -200,8 +200,9 @@ jobs:
       - name: Run webapp tests
         if: steps.patch.outputs.test_webapp == 'true'
         run: |
-          node target/webapp/tests/codec.test.js
+          node target/webapp/tests/codec.test.mjs
           node target/webapp/tests/nginx.test.js
+          node --test target/webapp/tests/agent-chat.test.mjs target/webapp/tests/screen-share.test.mjs target/webapp/tests/rtc-channel.test.mjs
 
       - name: Set up Rust
         if: steps.patch.outputs.test_relay == 'true'

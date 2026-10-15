@@ -2,12 +2,12 @@
 
 ## Product
 
-The relay hosting change serves this page and its assets in production. The
+The webapp hosting change serves this UI and its assets in production. The
 companion macOS bridge remains in the `feat/remote-terminal` worktree; Atem's
 semantic host implementation is coordinated through shared project memory.
 
 Connections keeps Open Terminal and adds Open in Browser for each agent. The
-new page is served by the relay at `/chat/`, with a responsive layout for desktop
+new page is served by the webapp at `/chat/`, with a responsive layout for desktop
 and mobile. Prompts are outgoing messages; structured agent replies are incoming
 messages. Code blocks, safe links, copy actions and activity indicators belong to
 the conversation. The terminal remains available for CLI-specific interactions.
@@ -52,11 +52,28 @@ an agent. Atem implementation is coordinated through shared project memory.
   One prompt is at most 32 KiB and one accumulated reply at most 128 KiB.
   Exceeding a host event bound disables submission. No relay transcript is stored.
 - HMAC authenticates the browser-to-Astation bridge; it does not encrypt content.
-  The relay can read the payload and serves the browser code. Existing TLS and
+  The relay can read the payload; the webapp serves the browser code. Existing TLS and
   endpoint authentication apply to the Astation-to-Atem hop. Storage E2EE does
   not imply chat-stream E2EE. Browser-origin code is part of the trusted UI.
 
 ## Host contract: chat-v1
+
+This section records the transport proposal implemented by this draft client.
+The Atem owner's approved design adds typed message parts, turn IDs and history,
+as recorded in shared memory `mem_ccbe16ed2a6545688fac459186fef712` (2026-10-15).
+Client/native alignment with that contract and live provider validation remain
+required before this feature can leave draft. The agreed additions are:
+
+- Messages carry `role`, `turnId`, `createdAt`, typed text/tool `parts`, optional
+  `history` and `requestId`, and local/remote origin for user messages.
+- Deltas append a typed part, deduplicated by part ID. History and reconnect send
+  whole messages. `open.before` requests older history; the initial page contains
+  at most 50 messages / 256 KB.
+- Completion carries `turnId`, optional `requestId` and `outcome` (`done` or
+  `interrupted`). Late content for a completed turn remains valid.
+- Semantic status includes `since` and optional `detail`, refreshed every 15 s.
+  Request IDs deduplicate across the agent session. The host refuses submission
+  when local terminal input/control or non-ready state makes it unsafe.
 
 All host traffic uses the existing authenticated connection and
 `{"type":"agentChat","data":{...}}`. `data` always includes `v:1`, `op`,
@@ -82,9 +99,17 @@ Provider approvals continue through the terminal in this first version.
 
 ## Relay and browser
 
-The relay embeds and serves the HTML/CSS/JavaScript with restrictive CSP,
-no-store and no-referrer headers. Nginx proxies `/chat/` to the relay. No new
-server-side account session or privileged WebSocket role is introduced.
+The webapp owns HTML/CSS/JavaScript under `webapp/chat/`. Its nginx serves
+these files with restrictive CSP, no-store and no-referrer headers. The relay
+owns APIs and `/ws` transport. No new server-side account session or privileged
+WebSocket role is introduced.
+
+The existing RTC page imports shared ES modules from `webapp/shared/rtc/` for
+channel setup, microphone publishing, subscriptions and screen sharing. These
+modules take an SDK/client explicitly and do not depend on either page's DOM.
+A page can reuse them when adding media controls. RTC session access and its
+UID/token are separate from chat authorization; a chat capability never grants
+RTC access. See [webapp structure](../webapp/README.md).
 
 The browser uses `/ws?role=atem&code=<station ID>&atem_id=browser-<session ID>`
 solely as an untrusted transport to Astation. It sends `browserChat` frames with

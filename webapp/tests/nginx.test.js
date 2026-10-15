@@ -53,6 +53,9 @@ assert.ok(
 );
 
 const chatLocation = config.match(/location\s+\/chat\/\s*\{([\s\S]*?)\}/);
-assert.ok(chatLocation, "nginx must serve /chat/ through the relay");
-assert.match(chatLocation[1], /proxy_pass\s+http:\/\/station_relay_upstream;/);
-assert.match(config, /location\s*=\s*\/chat\s*\{\s*return\s+308\s+\/chat\/\$is_args\$args;/);
+assert.ok(chatLocation, "nginx must serve /chat/ from the webapp image");
+assert.match(chatLocation[1], /try_files\s+\$uri\s+\$uri\/\s+=404;/);
+assert.doesNotMatch(chatLocation[1], /proxy_pass|\/index\.html/);
+assert.match(chatLocation[1], /add_header\s+Content-Security-Policy\s+"default-src 'none';/);
+assert.match(config, /types\s*\{\s*text\/javascript\s+mjs;/);
+assert.match(config, /location\s*=\s*\/chat\s*\{[^}]*return\s+308\s+\/chat\/\$is_args\$args;/);

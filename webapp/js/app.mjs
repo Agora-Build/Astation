@@ -1,11 +1,15 @@
 // Astation Session Web App
 // Agora Web SDK 4.x integration for RTC session sharing
 
+import { ScreenPublisher } from "../shared/rtc/screen-share.mjs";
+import { joinChannel as joinRTCChannel, publishMicrophone, subscribeTrack, closeLocalTrack } from "../shared/rtc/channel.mjs";
+
 const STORAGE_KEY = "astation_user";
 const EXPIRY_DAYS = 7;
 
 let client = null;
 let localAudioTrack = null;
+let mediaLifetime = new AbortController();
 let isMicMuted = false;
 let sessionId = null;
 let currentUid = null;
@@ -13,7 +17,7 @@ let currentName = null;
 let remoteUsers = new Map(); // uid -> { name, audioTrack, videoTrack }
 let activeVideoUid = null;
 let nativeVideoSize = false;
-const screenPublisher = new AstationScreenShare.ScreenPublisher(AgoraRTC, async () => {
+const screenPublisher = new ScreenPublisher(AgoraRTC, async () => {
     const response = await fetch(`/api/rtc-sessions/${sessionId}/join`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -32,6 +36,14 @@ const screenPublisher = new AstationScreenShare.ScreenPublisher(AgoraRTC, async 
 // --- Init ---
 
 document.addEventListener("DOMContentLoaded", () => {
+    for (const [selector, handler] of [
+        ["#join-btn", handleJoin], ["#play-audio-btn", resumeRemoteAudio],
+        [".sidebar-toggle", toggleSidebar], ["#sidebar-show-btn", toggleSidebar],
+        ["#share-btn", toggleScreenShare], ["#video-size-btn", toggleVideoSize],
+        ["#mic-btn", toggleMic], ["#leave-btn", leave]
+    ]) {
+        document.querySelector(selector).addEventListener("click", handler);
+    }
     AgoraRTC.onAutoplayFailed = () => {
         document.getElementById("play-audio-btn").hidden = false;
     };
@@ -190,51 +202,33 @@ async function handleJoin() {
 // --- Agora SDK ---
 
 async function joinChannel(appId, channel, token, uid, micEnabled = true) {
-    const preferredCodec = (window.AstationCodec && window.AstationCodec.preferredCodec) || "h264";
-    const fallbackCodec = (window.AstationCodec && window.AstationCodec.fallbackCodec) || "vp8";
-
-    const createClientWithCodec = async (codec) => {
-        const newClient = AgoraRTC.createClient({ mode: "live", codec });
-
-        newClient.on("user-published", (user, mediaType) => handleUserPublished(user, mediaType, newClient));
-        newClient.on("user-unpublished", handleUserUnpublished);
-        newClient.on("user-joined", handleUserJoined);
-        newClient.on("user-left", handleUserLeft);
-        newClient.on("token-privilege-will-expire", () => {
+    const lifetime = mediaLifetime = new AbortController();
+    client = await joinRTCChannel(AgoraRTC, { app_id: appId, channel, token, uid }, {
+        "user-published": handleUserPublished,
+        "user-unpublished": handleUserUnpublished,
+        "user-joined": handleUserJoined,
+        "user-left": handleUserLeft,
+        "token-privilege-will-expire": () => {
             showMediaMessage("Session access expires soon. Ask the host for a new share link to continue.");
-        });
-        newClient.on("token-privilege-did-expire", async () => {
+        },
+        "token-privilege-did-expire": async () => {
             await disconnectMedia();
             showError("Session access has expired. Open a new share link from the host.");
-        });
-
-        try {
-            await newClient.setClientRole("host");
-            await newClient.join(appId, channel, token, uid);
-            return newClient;
-        } catch (error) {
-            await newClient.leave();
-            throw error;
         }
-    };
-
-    try {
-        client = await createClientWithCodec(preferredCodec);
-    } catch (err) {
-        console.warn(`${preferredCodec} join failed, falling back to ${fallbackCodec}:`, err);
-        client = await createClientWithCodec(fallbackCodec);
+    });
+    if (lifetime.signal.aborted) {
+        await client.leave();
+        client = null;
+        lifetime.signal.throwIfAborted();
     }
 
     // Create and publish local mic track if enabled
     if (micEnabled) {
         try {
-            localAudioTrack = await AgoraRTC.createMicrophoneAudioTrack();
-            await client.publish([localAudioTrack]);
+            localAudioTrack = await openMicrophone();
             isMicMuted = false;
         } catch (err) {
             console.warn("Microphone access denied:", err);
-            localAudioTrack?.stop();
-            localAudioTrack?.close();
             localAudioTrack = null;
             isMicMuted = true;
         }
@@ -254,16 +248,7 @@ async function handleUserPublished(user, mediaType, subscriber = client) {
     if (user.uid === screenPublisher.uid) return;
     if (!remoteUsers.has(user.uid)) handleUserJoined(user);
     try {
-        await subscriber.subscribe(user, mediaType);
-
-        // Set high quality stream for video
-        if (mediaType === "video") {
-            try {
-                await subscriber.setRemoteVideoStreamType(user.uid, 0); // 0 = high quality
-            } catch (error) {
-                console.warn("High-stream selection unavailable:", error);
-            }
-        }
+        await subscribeTrack(subscriber, user, mediaType);
 
         if (mediaType === "video") {
             const videoMain = document.getElementById("video-main");
@@ -384,13 +369,10 @@ async function toggleMic() {
     // If no track exists, create it
     if (!localAudioTrack) {
         try {
-            localAudioTrack = await AgoraRTC.createMicrophoneAudioTrack();
-            await client.publish([localAudioTrack]);
+            localAudioTrack = await openMicrophone();
             isMicMuted = false;
         } catch (err) {
             console.error("Failed to create microphone track:", err);
-            localAudioTrack?.stop();
-            localAudioTrack?.close();
             localAudioTrack = null;
             return;
         }
@@ -409,11 +391,21 @@ async function toggleMic() {
     }
 }
 
+async function openMicrophone() {
+    const signal = mediaLifetime.signal;
+    const track = await publishMicrophone(AgoraRTC, client, { signal });
+    if (signal.aborted) {
+        closeLocalTrack(track);
+        signal.throwIfAborted();
+    }
+    return track;
+}
+
 async function disconnectMedia() {
+    mediaLifetime.abort();
     await screenPublisher.stop();
     if (localAudioTrack) {
-        localAudioTrack.stop();
-        localAudioTrack.close();
+        closeLocalTrack(localAudioTrack);
         localAudioTrack = null;
     }
 

@@ -131,7 +131,7 @@ function chatAsset(path) {
   } });
 }
 
-test('production verification checks the relay app and every asset on the same origin', async () => {
+test('production verification checks the chat webapp and every asset on the same origin', async () => {
   const paths = [];
   await verifyAgentChat({ origin: 'https://station.test', log: () => {}, fetchImpl: async (url, options) => {
     assert.equal(url.origin, 'https://station.test');
@@ -154,7 +154,7 @@ test('production verification rejects an undeployed page, SPA fallback and wrong
   }
 });
 
-test('production verification requires the relay app privacy headers, CSP and actual page', async () => {
+test('production verification requires the chat webapp privacy headers, CSP and actual page', async () => {
   for (const change of [
     response => response.headers.delete('cache-control'),
     response => response.headers.delete('referrer-policy'),

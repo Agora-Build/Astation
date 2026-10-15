@@ -1,6 +1,6 @@
-const assert = require("node:assert/strict");
-const { test } = require("node:test");
-const { ScreenPublisher } = require("../js/screen-share.js");
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { ScreenPublisher } from "../shared/rtc/screen-share.mjs";
 
 function rig({ audio = false, picker, joinError = false } = {}) {
     const events = [];
