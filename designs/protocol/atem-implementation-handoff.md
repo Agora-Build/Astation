@@ -8,6 +8,12 @@ native client against [accepted r5](atem-session-v1.md), pinned at
 [client implementation evidence](astation-session-v1-implementation.md) and
 [product design](../session-multiplexing.md).
 
+Review the Astation client in [draft PR #49](https://github.com/Agora-Build/Astation/pull/49),
+stacked on #48. The implementation commit is `328c7d1`. Nothing is merged or
+deployed. Use this hosted handoff for cross-machine coordination: a local Atem
+memory record was created, but the relay refused its sync because the memory
+did not match the account encryption mode. It is not confirmed shared memory.
+
 ## Published Atem lifecycle changes
 
 The owner's `feat/status-pair-verify` is available on GitHub. Its current head
