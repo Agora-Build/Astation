@@ -1,139 +1,116 @@
+import CryptoKit
 import XCTest
 @testable import Menubar
 
-/// Tests for HubManager.sendAgentText / sendAgentKey routing + the agentInput
-/// payload they emit. Uses a stubbed sendHandler to capture messages.
+@MainActor
 final class AgentInputRoutingTests: XCTestCase {
-    private func makeHub(withClient: Bool) -> (AstationHubManager, [(AstationMessage, String)]) {
-        let hub = AstationHubManager(skipProjectLoad: true)
-        if withClient {
-            hub.connectedClients = [
-                ConnectedClient(id: "atem-1", clientType: "Atem", connectedAt: Date())
-            ]
+    func testVerifiedInputUsesScopedControllerInsteadOfLegacyWireMessage() throws {
+        let f = try ScopedInputFixture()
+        var captured: [(RemoteTerminalConnection, String?, String, String)] = []
+        f.hub.remoteAgentInputHandler = { route, agentId, kind, value in
+            captured.append((route, agentId, kind, value))
+            return true
         }
-        return (hub, [])
+        f.hub.sendAgentText("inspect logs", agentId: "agent-9", clientId: "direct-two")
+        f.hub.sendAgentKey("ctrl-c", agentId: "agent-9", clientId: "direct-two")
+        XCTAssertEqual(captured.map { $0.0.clientId }, ["direct-two", "direct-two"])
+        XCTAssertEqual(captured.map { $0.1 }, ["agent-9", "agent-9"])
+        XCTAssertEqual(captured.map { $0.2 }, ["text", "key"])
+        XCTAssertEqual(captured.map { $0.3 }, ["inspect logs", "ctrl-c"])
+        XCTAssertTrue(f.sent.isEmpty, "legacy lease-less mutations must never be sent")
+        XCTAssertNil(f.hub.remoteInputStatusMessage)
     }
 
-    func testSendAgentTextRoutesToConnectedAtem() {
-        let hub = AstationHubManager(skipProjectLoad: true)
-        hub.connectedClients = [ConnectedClient(id: "atem-1", clientType: "Atem", connectedAt: Date())]
-
-        var captured: [(AstationMessage, String)] = []
-        hub.sendHandler = { msg, clientId in captured.append((msg, clientId)) }
-
-        hub.sendAgentText("print working directory")
-
-        XCTAssertEqual(captured.count, 1)
-        XCTAssertEqual(captured[0].1, "atem-1")
-        guard case let .agentInput(agentId, kind, text, key) = captured[0].0 else {
-            return XCTFail("expected agentInput")
-        }
-        XCTAssertNil(agentId)
-        XCTAssertEqual(kind, "text")
-        XCTAssertEqual(text, "print working directory")
-        XCTAssertNil(key)
+    func testPinnedTargetUsesTheSameVerifiedScopedRoute() throws {
+        let f = try ScopedInputFixture()
+        f.hub.pinnedClientId = "direct-two"
+        var target: RemoteTerminalConnection?
+        f.hub.remoteAgentInputHandler = { route, _, _, _ in target = route; return true }
+        f.hub.sendAgentText("route me")
+        XCTAssertEqual(target?.clientId, "direct-two")
     }
 
-    func testSendAgentKeyRoutesToConnectedAtem() {
-        let hub = AstationHubManager(skipProjectLoad: true)
-        hub.connectedClients = [ConnectedClient(id: "atem-1", clientType: "Atem", connectedAt: Date())]
-
-        var captured: [(AstationMessage, String)] = []
-        hub.sendHandler = { msg, clientId in captured.append((msg, clientId)) }
-
-        hub.sendAgentKey("ctrl-c")
-
-        XCTAssertEqual(captured.count, 1)
-        guard case let .agentInput(_, kind, text, key) = captured[0].0 else {
-            return XCTFail("expected agentInput")
-        }
-        XCTAssertEqual(kind, "key")
-        XCTAssertNil(text)
-        XCTAssertEqual(key, "ctrl-c")
+    func testVerifiedHostWithoutHeldControllerFailsWithActionableHint() throws {
+        let f = try ScopedInputFixture()
+        f.hub.remoteAgentInputHandler = { _, _, _, _ in false }
+        f.hub.sendAgentText("do not send", clientId: "direct-one")
+        XCTAssertTrue(f.sent.isEmpty)
+        XCTAssertTrue(f.hub.remoteInputStatusMessage?.contains("Take Control") == true)
     }
 
-    func testSendAgentTextWithExplicitAgentId() {
-        let hub = AstationHubManager(skipProjectLoad: true)
-        hub.connectedClients = [ConnectedClient(id: "atem-1", clientType: "Atem", connectedAt: Date())]
-
-        var captured: [(AstationMessage, String)] = []
-        hub.sendHandler = { msg, clientId in captured.append((msg, clientId)) }
-
-        hub.sendAgentText("hi", agentId: "agent-9")
-
-        guard case let .agentInput(agentId, _, _, _) = captured[0].0 else {
-            return XCTFail("expected agentInput")
-        }
-        XCTAssertEqual(agentId, "agent-9")
+    func testUnverifiedHostNeverInvokesControllerAndDoesNotSend() throws {
+        let f = try ScopedInputFixture(verified: false)
+        var invoked = false
+        f.hub.remoteAgentInputHandler = { _, _, _, _ in invoked = true; return true }
+        f.hub.sendAgentText("do not send", clientId: "direct-one")
+        f.hub.sendAgentKey("ctrl-c", clientId: "direct-one")
+        XCTAssertFalse(invoked)
+        XCTAssertTrue(f.sent.isEmpty)
+        XCTAssertTrue(f.hub.remoteInputStatusMessage?.contains("atem pair verify") == true)
     }
 
-    func testSendAgentTextDroppedWhenNoAtem() {
-        let hub = AstationHubManager(skipProjectLoad: true)
-        hub.connectedClients = []  // no Atems
-
-        var captured: [(AstationMessage, String)] = []
-        hub.sendHandler = { msg, clientId in captured.append((msg, clientId)) }
-
-        hub.sendAgentText("nobody home")
-        hub.sendAgentKey("enter")
-
-        XCTAssertTrue(captured.isEmpty, "messages should be dropped when no Atem is connected")
+    func testRevokedPairingCannotReuseScopedController() throws {
+        let f = try ScopedInputFixture()
+        var invoked = false
+        f.hub.remoteAgentInputHandler = { _, _, _, _ in invoked = true; return true }
+        let sessionId = try XCTUnwrap(f.hub.connectedClients.first?.authenticationSessionId)
+        f.hub.deviceSessionStore.delete(sessionId: sessionId)
+        f.hub.sendAgentText("do not send", clientId: "direct-one")
+        XCTAssertFalse(invoked)
+        XCTAssertTrue(f.sent.isEmpty)
     }
 
-    func testRoutingPrefersPinnedClient() {
-        let hub = AstationHubManager(skipProjectLoad: true)
-        hub.connectedClients = [
-            ConnectedClient(id: "atem-1", clientType: "Atem", connectedAt: Date()),
-            ConnectedClient(id: "atem-2", clientType: "Atem", connectedAt: Date()),
-        ]
-        hub.pinnedClientId = "atem-2"
-
-        var captured: [(AstationMessage, String)] = []
-        hub.sendHandler = { msg, clientId in captured.append((msg, clientId)) }
-
-        hub.sendAgentText("route me")
-        XCTAssertEqual(captured.first?.1, "atem-2", "pinned client should win")
-    }
-
-    func testRemoteControlRoutesToExplicitClientAndAgent() {
-        let hub = AstationHubManager(skipProjectLoad: true)
-        hub.connectedClients = [
-            ConnectedClient(id: "atem-1", clientType: "Atem", connectedAt: Date()),
-            ConnectedClient(id: "atem-2", clientType: "Atem", connectedAt: Date()),
-        ]
-        hub.pinnedClientId = "atem-1"
-
-        var captured: [(AstationMessage, String)] = []
-        hub.sendHandler = { msg, clientId in captured.append((msg, clientId)) }
-
-        hub.sendAgentText("inspect logs", agentId: "agent-9", clientId: "atem-2")
-        hub.sendAgentKey("ctrl-c", agentId: "agent-9", clientId: "atem-2")
-
-        XCTAssertEqual(captured.map(\.1), ["atem-2", "atem-2"])
-        guard case let .agentInput(textAgentId, textKind, text, _) = captured[0].0,
-              case let .agentInput(keyAgentId, keyKind, _, key) = captured[1].0 else {
-            return XCTFail("expected agentInput messages")
-        }
-        XCTAssertEqual(textAgentId, "agent-9")
-        XCTAssertEqual(textKind, "text")
-        XCTAssertEqual(text, "inspect logs")
-        XCTAssertEqual(keyAgentId, "agent-9")
-        XCTAssertEqual(keyKind, "key")
-        XCTAssertEqual(key, "ctrl-c")
-    }
-
-    func testRemoteControlDropsInputForOfflineExplicitClient() {
-        let hub = AstationHubManager(skipProjectLoad: true)
-        hub.connectedClients = [
-            ConnectedClient(id: "atem-online", clientType: "Atem", connectedAt: Date())
-        ]
-
-        var captured: [(AstationMessage, String)] = []
-        hub.sendHandler = { msg, clientId in captured.append((msg, clientId)) }
-
-        hub.sendAgentText("do not send", agentId: "agent-9", clientId: "atem-offline")
-        hub.sendAgentKey("enter", agentId: "agent-9", clientId: "atem-offline")
-
+    func testFinalVoiceInputRequiresScopedControllerAndPartialInputDoesNothing() throws {
+        let f = try ScopedInputFixture()
+        f.hub.pinnedClientId = "direct-two"
+        var captured: [String] = []
+        f.hub.remoteAgentInputHandler = { _, _, kind, value in captured.append(kind + ":" + value); return true }
+        f.hub.sendVoiceCommand(text: "partial", isFinal: false)
         XCTAssertTrue(captured.isEmpty)
+        f.hub.sendVoiceCommand(text: "finished", isFinal: true)
+        XCTAssertEqual(captured, ["text:finished"])
+        XCTAssertTrue(f.sent.isEmpty)
     }
+
+    func testOfflineExplicitTargetDoesNotFallbackToAnotherHost() throws {
+        let f = try ScopedInputFixture()
+        var invoked = false
+        f.hub.remoteAgentInputHandler = { _, _, _, _ in invoked = true; return true }
+        f.hub.sendAgentText("do not send", agentId: "agent", clientId: "offline")
+        f.hub.sendAgentKey("enter", agentId: "agent", clientId: "offline")
+        XCTAssertFalse(invoked)
+        XCTAssertTrue(f.sent.isEmpty)
+    }
+}
+
+@MainActor
+private final class ScopedInputFixture {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    let hub: AstationHubManager
+    var sent: [AstationMessage] = []
+
+    init(verified: Bool = true) throws {
+        let identity = AtemE2EIdentity(storage: TestAtemStorage(), crypto: TestAtemCryptography())
+        let sessions = SessionStore(storageURL: directory.appendingPathComponent("sessions.json"))
+        if verified {
+            let keys = try identity.verificationKeys(nonce: Data(repeating: 1, count: 32))
+            try identity.markRecoverySaved(signingPublicKey: keys.signPub)
+            _ = try identity.completeVerification(account: AstationIdentity.shared.id, deviceId: "host",
+                reveal: AtemVerifyReveal(devicePub: Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation,
+                    deviceSignPub: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation,
+                    unlockAuthPub: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation,
+                    nonce: Data(repeating: 2, count: 32)), transcript: Data(repeating: 3, count: 32),
+                expectedSigningKey: keys.signPub, key: nil)
+        }
+        hub = AstationHubManager(skipProjectLoad: true, deviceSessionStore: sessions,
+            sessionStore: SsoSessionStore(storageURL: directory.appendingPathComponent("sso.enc")), atemE2EIdentity: identity)
+        hub.connectedClients = ["direct-one", "direct-two"].map { clientId in
+            let session = sessions.create(hostname: "Host", atemId: "host")
+            return ConnectedClient(id: clientId, clientType: "Atem", connectedAt: Date(),
+                atemId: "host", authenticationSessionId: session.id)
+        }
+        hub.sendHandler = { [weak self] message, _ in self?.sent.append(message) }
+    }
+
+    deinit { try? FileManager.default.removeItem(at: directory) }
 }

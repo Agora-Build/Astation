@@ -1,0 +1,44 @@
+{
+  "contract": "astation-atem-session-v1",
+  "defaults": {
+    "control_lease_seconds": 15,
+    "control_renew_seconds": 5,
+    "qr_request_seconds": 120,
+    "browser_grant_seconds": 3600,
+    "offline_authorization_seconds": 86400,
+    "closed_receipt_seconds": 604800,
+    "closed_history_seconds": 2592000
+  },
+  "status_labels": {
+    "credentials": "Credentials"
+  },
+  "session": {
+    "terminal_id": "claude-process-a",
+    "generation": "process-generation-a",
+    "provider": "claude",
+    "rows": 24,
+    "cols": 80,
+    "exit_status": null,
+    "rendering": "vt100-screen-diff",
+    "width_profile": "atem-unicode-width-0.1.14",
+    "capabilities": ["terminal-lease-v1"],
+    "agent_id": "agent-a",
+    "label": "Claude / workspace-a"
+  },
+  "renew": {
+    "v": 1,
+    "op": "renew",
+    "terminal_id": "claude-process-a",
+    "generation": "process-generation-a",
+    "stream_id": "stream-a",
+    "lease_id": "lease-a"
+  },
+  "controller": {
+    "v": 1,
+    "op": "controller",
+    "terminal_id": "claude-process-a",
+    "generation": "process-generation-a",
+    "stream_id": "stream-a",
+    "lease_id": "lease-a"
+  }
+}

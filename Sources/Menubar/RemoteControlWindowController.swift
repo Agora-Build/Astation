@@ -17,9 +17,21 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
     private var releaseButton: NSButton!
     private var stopButton: NSButton!
     private var pasteButton: NSButton!
+    private let promptField = NSTextField()
+    private let receiptLabel = NSTextField(labelWithString: "")
+    private var sendPromptButton: NSButton!
     private var displayedSessions: [RemoteTerminalSession] = []
     private var lastInputEpoch = ""
     private var lastInputEnabled = false
+
+    private lazy var sessions = AtemSessionClient(
+        context: { [weak self] in
+            guard let self, let id = self.targetClientId else { return nil }
+            return self.hubManager.sessionContext(for: id, atemId: self.targetAtemId)
+        },
+        send: { [weak self] message, route in self?.hubManager.sendSessionMessage(message, to: route) ?? false },
+        journal: AtemSessionJournal.persistent()
+    )
 
     private lazy var terminal = RemoteTerminalController(
         currentConnection: { [weak self] in
@@ -32,9 +44,21 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
     init(hubManager: AstationHubManager) {
         self.hubManager = hubManager
         super.init()
+        terminal.sessionClient = sessions
+        sessions.onChange = { [weak self] in self?.terminal.sessionStateChanged(); self?.refresh() }
         terminal.onChange = { [weak self] in self?.refresh() }
         hubManager.terminalMessageHandler = { [weak self] message, source in self?.terminal.receive(message, from: source) }
-        hubManager.terminalConnectionsDidChange = { [weak self] in self?.terminal.connectionChanged() }
+        hubManager.sessionMessageHandler = { [weak self] message, source in self?.sessions.receive(message, from: source) }
+        hubManager.terminalConnectionsDidChange = { [weak self] in
+            self?.sessions.connectionChanged()
+            self?.terminal.connectionChanged()
+        }
+        hubManager.remoteAgentInputHandler = { [weak self] route, agentId, kind, value in
+            guard let self, route == self.terminal.connection,
+                  route == self.hubManager.terminalConnection(for: route.clientId),
+                  agentId == nil || agentId == self.terminal.session?.agentId else { return false }
+            return self.terminal.sendScopedInput(kind: kind, value: value)
+        }
     }
 
     func showWindow(clientId: String, agent: AtemAgentInfo?) {
@@ -43,8 +67,8 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
         targetAtemId = hubManager.connectedClients.first(where: { $0.id == clientId })?.atemId
         targetLabel.stringValue = hubManager.connectedClients.first(where: { $0.id == clientId })?.hostname ?? "Atem"
         if window == nil { createWindow() }
-        let preferred: String? = agent?.kind == "Claude Code" ? "claude" : agent?.kind == "Codex" ? "codex" : nil
-        terminal.open(preferredTerminalId: preferred)
+        sessions.start()
+        terminal.open(preferredTerminalId: nil, preferredAgentId: agent?.id)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -87,6 +111,17 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.setContentCompressionResistancePriority(.required, for: .vertical)
+        promptField.placeholderString = "Send a prompt to this agent"
+        promptField.target = self
+        promptField.action = #selector(sendPrompt)
+        promptField.font = .systemFont(ofSize: 13)
+        sendPromptButton = button("Send", symbol: "arrow.up.circle.fill", action: #selector(sendPrompt))
+        let promptRow = NSStackView(views: [promptField, sendPromptButton])
+        promptRow.orientation = .horizontal
+        promptRow.spacing = 8
+        receiptLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        receiptLabel.textColor = .secondaryLabelColor
+        receiptLabel.lineBreakMode = .byTruncatingTail
         let renderer = RemoteTerminalRenderer()
         self.renderer = renderer
         renderer.onAction = { [weak self, weak renderer] action in
@@ -97,7 +132,7 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
             guard let self, let renderer, self.renderer === renderer else { return }
             self.terminal.rendererFailed()
         }
-        for view in [titleRow, controls, renderer.webView, statusLabel] {
+        for view in [titleRow, controls, renderer.webView, promptRow, receiptLabel, statusLabel] {
             view.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(view)
         }
@@ -111,15 +146,22 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
             renderer.webView.topAnchor.constraint(equalTo: controls.bottomAnchor, constant: 14),
             renderer.webView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             renderer.webView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            renderer.webView.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -10),
+            renderer.webView.bottomAnchor.constraint(equalTo: promptRow.topAnchor, constant: -12),
+            promptRow.leadingAnchor.constraint(equalTo: titleRow.leadingAnchor),
+            promptRow.trailingAnchor.constraint(equalTo: titleRow.trailingAnchor),
+            promptRow.bottomAnchor.constraint(equalTo: receiptLabel.topAnchor, constant: -6),
+            receiptLabel.leadingAnchor.constraint(equalTo: titleRow.leadingAnchor),
+            receiptLabel.trailingAnchor.constraint(equalTo: titleRow.trailingAnchor),
+            receiptLabel.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -6),
             statusLabel.leadingAnchor.constraint(equalTo: titleRow.leadingAnchor),
             statusLabel.trailingAnchor.constraint(equalTo: titleRow.trailingAnchor),
             statusLabel.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12)
         ])
-        timeoutTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        if timeoutTimer == nil { timeoutTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.sessions.tick()
             self?.terminal.connectionChanged()
             self?.terminal.checkTimeouts()
-        }
+        } }
         lastInputEpoch = ""
         lastInputEnabled = false
         renderer.load()
@@ -152,21 +194,35 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
             sessionPicker.removeAllItems()
             for session in displayedSessions {
                 let name = session.provider == "claude" ? "Claude Code" : session.provider == "codex" ? "Codex" : session.provider
-                sessionPicker.addItem(withTitle: name + (session.exitStatus == nil ? " - live" : " - exited"))
+                let identifier = String(session.terminalId.prefix(12))
+                let detail = session.label.flatMap { $0.isEmpty ? nil : $0 + " [" + identifier + "]" } ?? identifier
+                sessionPicker.addItem(withTitle: name + " - " + detail + (session.exitStatus == nil ? " - live" : " - exited"))
+                sessionPicker.lastItem?.toolTip = session.terminalId + " / " + session.generation
             }
         }
         if let index = displayedSessions.firstIndex(where: { $0.id == terminal.session?.id }) { sessionPicker.selectItem(at: index) }
+        else { sessionPicker.select(nil) }
         sessionPicker.isEnabled = !displayedSessions.isEmpty
-        statusLabel.stringValue = terminal.status
+        let blockReason = targetClientId.flatMap { hubManager.remoteAccessBlockReason(for: $0) }
+        statusLabel.stringValue = terminal.phase == .offline ? blockReason?.localizedDescription ?? terminal.status : terminal.status
         statusLabel.textColor = terminal.phase == .failed ? .systemOrange : .secondaryLabelColor
         modeLabel.stringValue = terminal.canInput ? "CONTROLLING" : terminal.phase == .offline ? "OFFLINE" : "VIEWING"
         modeLabel.textColor = terminal.canInput ? .controlAccentColor : .secondaryLabelColor
         viewButton.isEnabled = terminal.session?.isSupported == true && terminal.connection != nil
             && [.ready, .failed, .viewing, .exited].contains(terminal.phase)
+            && terminal.session.flatMap { sessions.target(sessionId: $0.terminalId, process: $0.generation) } != nil
         controlButton.isEnabled = terminal.canTakeControl
         releaseButton.isEnabled = terminal.canRelease
         stopButton.isEnabled = terminal.canInput
         pasteButton.isEnabled = terminal.canInput
+        promptField.isEnabled = terminal.canInput
+        sendPromptButton.isEnabled = terminal.canInput
+        if let receipt = sessions.latestReceipt, receipt.target.session_id == terminal.session?.terminalId,
+           receipt.target.process_gen == terminal.session?.generation {
+            receiptLabel.stringValue = receipt.kind.capitalized + " - " + receipt.state.rawValue.replacingOccurrences(of: "_", with: " ")
+                + (receipt.detail.map { " - " + $0 } ?? "")
+            receiptLabel.toolTip = receipt.request_id
+        } else { receiptLabel.stringValue = sessions.status; receiptLabel.toolTip = nil }
         if renderer?.isReady == true && (lastInputEnabled != terminal.canInput || lastInputEpoch != inputEpoch) {
             lastInputEnabled = terminal.canInput
             lastInputEpoch = inputEpoch
@@ -193,7 +249,14 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
         }
     }
 
-    @objc private func refreshSessions() { terminal.refresh() }
+    @objc private func refreshSessions() { sessions.refresh(); terminal.refresh() }
+    @objc private func sendPrompt() {
+        let text = promptField.stringValue
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              terminal.sendScopedInput(kind: "text", value: text) else { return }
+        promptField.stringValue = ""
+        refresh()
+    }
     @objc private func selectSession() {
         let index = sessionPicker.indexOfSelectedItem
         if displayedSessions.indices.contains(index) { terminal.select(displayedSessions[index]) }
@@ -227,8 +290,7 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         terminal.close()
         terminal.render = nil
-        timeoutTimer?.invalidate()
-        timeoutTimer = nil
+        sessions.releaseAll()
         renderer = nil
         window = nil
         displayedSessions = []

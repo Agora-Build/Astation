@@ -118,7 +118,7 @@ enum NetworkDebugLogger {
         if text.range(of: #""type"\s*:\s*"terminal""#, options: .regularExpression) != nil {
             return "<terminal content redacted; malformed envelope>"
         }
-        if text.range(of: #""type"\s*:\s*"(agentChat|browserChat)""#, options: .regularExpression) != nil {
+        if text.range(of: #""type"\s*:\s*"(session|agentChat|browserChat)""#, options: .regularExpression) != nil {
             return "<agent chat content redacted; malformed envelope>"
         }
         let replacements = [
@@ -145,7 +145,7 @@ enum NetworkDebugLogger {
 
     private static func sanitizeJSONObject(_ value: Any) -> Any {
         if let dictionary = value as? [String: Any] {
-            if let type = dictionary["type"] as? String, ["terminal", "agentChat", "browserChat"].contains(type) {
+            if let type = dictionary["type"] as? String, ["terminal", "session", "agentChat", "browserChat"].contains(type) {
                 let operation = (dictionary["data"] as? [String: Any])?["op"] as? String ?? "unknown"
                 return ["type": type, "data": ["op": operation, "content": "<redacted>"]]
             }

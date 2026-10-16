@@ -21,9 +21,26 @@ final class RemoteTerminalController {
     private(set) var queuedBytes = 0
     var onChange: (() -> Void)?
     var render: ((RemoteTerminalFrame, String) -> Void)?
+    var sessionClient: AtemSessionClient?
 
-    var canTakeControl: Bool { phase == .viewing && !wantsControl && session?.exitStatus == nil }
-    var canInput: Bool { phase == .controlling && leaseId != nil && wantsControl }
+    private var protocolTarget: AtemSessionTarget? {
+        guard let session else { return nil }
+        return sessionClient?.target(sessionId: session.terminalId, process: session.generation)
+    }
+
+    var canTakeControl: Bool {
+        if let client = sessionClient {
+            return phase == .viewing && !wantsControl && session?.exitStatus == nil
+                && protocolTarget.map { client.registry[$0.session_id]?.state == "running" && !client.acquiring($0) } == true
+        }
+        return phase == .viewing && !wantsControl && session?.exitStatus == nil && session?.supportsExpiringControl == true
+    }
+    var canInput: Bool {
+        if let client = sessionClient {
+            return phase == .controlling && stream != nil && restored && protocolTarget.map(client.controls) == true
+        }
+        return phase == .controlling && leaseId != nil && wantsControl && leaseConfirmedAt.map { now() - $0 < 15 } == true
+    }
     var canRelease: Bool { wantsControl || leaseId != nil }
 
     private let currentConnection: () -> RemoteTerminalConnection?
@@ -31,6 +48,7 @@ final class RemoteTerminalController {
     private let now: () -> TimeInterval
     private var isOpen = false
     private var preferredTerminalId: String?
+    private var preferredAgentId: String?
     private var listingSince: TimeInterval?
     private var attachSince: TimeInterval?
     private var controlSince: TimeInterval?
@@ -38,6 +56,8 @@ final class RemoteTerminalController {
     private var autoView = false
     private var reconnectSession: RemoteTerminalSession?
     private var wantsControl = false
+    private var leaseConfirmedAt: TimeInterval?
+    private var renewalSince: TimeInterval?
     private var restored = false
     private var receivedFirstFrame = false
     private var transactionOpen = false
@@ -56,15 +76,16 @@ final class RemoteTerminalController {
 
     init(currentConnection: @escaping () -> RemoteTerminalConnection?,
          send: @escaping (RemoteTerminalMessage, RemoteTerminalConnection) -> Bool,
-         now: @escaping () -> TimeInterval = { Date.timeIntervalSinceReferenceDate }) {
+         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.currentConnection = currentConnection
         self.sendMessage = send
         self.now = now
     }
 
-    func open(preferredTerminalId: String?) {
+    func open(preferredTerminalId: String?, preferredAgentId: String? = nil) {
         close()
         self.preferredTerminalId = preferredTerminalId
+        self.preferredAgentId = preferredAgentId
         isOpen = true
         connectionChanged()
     }
@@ -117,6 +138,7 @@ final class RemoteTerminalController {
         detach()
         session = selected
         preferredTerminalId = selected.terminalId
+        preferredAgentId = selected.agentId
         reconnectSession = nil
         phase = .ready
         status = selected.isSupported ? "Choose View to open this terminal." : "This terminal uses an unsupported renderer."
@@ -125,6 +147,12 @@ final class RemoteTerminalController {
 
     func view() {
         guard let session, session.isSupported, connection != nil, listingSince == nil else { return }
+        guard sessionClient == nil || protocolTarget != nil else {
+            status = sessionClient?.status ?? "Waiting for the session registry."
+            autoView = true
+            changed()
+            return
+        }
         detach()
         guard attachmentRequests.count < 16, let connection else {
             fail("Too many unanswered attach requests. Reconnect Atem before retrying."); return
@@ -139,6 +167,12 @@ final class RemoteTerminalController {
 
     func takeControl() {
         guard canTakeControl, let stream else { return }
+        if let client = sessionClient, let target = protocolTarget {
+            wantsControl = true
+            client.acquire(target)
+            sessionStateChanged()
+            return
+        }
         wantsControl = true
         controlSince = now()
         status = "Requesting control..."
@@ -148,8 +182,18 @@ final class RemoteTerminalController {
 
     func release() {
         guard let stream, canRelease else { return }
+        if let client = sessionClient, let target = protocolTarget {
+            wantsControl = false
+            leaseId = nil
+            phase = .viewing
+            client.release(target)
+            sessionStateChanged()
+            return
+        }
         wantsControl = false
         leaseId = nil
+        leaseConfirmedAt = nil
+        renewalSince = nil
         controlSince = nil
         sentSize = nil
         phase = .viewing
@@ -165,7 +209,7 @@ final class RemoteTerminalController {
             changed()
             return
         }
-        guard pendingWrites.count < 64, nextSequence < UInt64.max else {
+        guard pendingWrites.count < 64, nextSequence < (sessionClient == nil ? UInt64.max : AtemSessionWire.maximumCounter) else {
             fail("Input queue is full. Open a fresh view; unconfirmed input will not be resent.")
             return
         }
@@ -180,6 +224,31 @@ final class RemoteTerminalController {
         changed()
     }
 
+    @discardableResult
+    func sendScopedInput(kind: String, value: String) -> Bool {
+        guard canInput else { return false }
+        if let client = sessionClient, let target = protocolTarget {
+            if kind == "text" {
+                guard !value.isEmpty else { return false }
+                return client.submit(target, kind: "prompt", text: value) != nil
+            }
+            if kind == "key", value == "ctrl-c" { return client.submit(target, kind: "interrupt") != nil }
+        }
+        let bytes: Data
+        if kind == "text" {
+            guard !value.isEmpty, value.utf8.count < 16 * 1024 else { return false }
+            bytes = Data((value + "\r").utf8)
+        } else if kind == "key" {
+            let keys = ["enter": "\r", "esc": "\u{1b}", "ctrl-c": "\u{3}",
+                        "up": "\u{1b}[A", "down": "\u{1b}[B", "y": "y", "n": "n"]
+            guard let key = keys[value] else { return false }
+            bytes = Data(key.utf8)
+        } else { return false }
+        let before = nextSequence
+        input(bytes)
+        return nextSequence > before && canInput
+    }
+
     func resize(rows: Int, cols: Int) {
         desiredSize = (max(2, min(200, rows)), max(2, min(400, cols)))
         sendResizeIfNeeded()
@@ -187,6 +256,14 @@ final class RemoteTerminalController {
 
     func stop() {
         guard canInput, let stream, let leaseId else { return }
+        if let client = sessionClient, let target = protocolTarget {
+            guard client.submit(target, kind: "stop") != nil else { return }
+            phase = .stopping
+            stopSince = now()
+            status = "Stopping this agent. Waiting for its durable receipt..."
+            changed()
+            return
+        }
         phase = .stopping
         stopSince = now()
         status = "Stopping this agent. Waiting for its final screen..."
@@ -195,6 +272,22 @@ final class RemoteTerminalController {
     }
 
     func receive(_ message: RemoteTerminalMessage, from source: RemoteTerminalConnection) {
+        if case .bound(let inner, let binding) = message {
+            guard source == connection, binding.attachment_gen == sessionClient?.welcome?.attachment_gen,
+                  binding.target == protocolTarget else { return }
+            receivePayload(inner, from: source)
+            return
+        }
+        if sessionClient != nil {
+            switch message {
+            case .sessions, .error, .unsupported: break
+            default: return
+            }
+        }
+        receivePayload(message, from: source)
+    }
+
+    private func receivePayload(_ message: RemoteTerminalMessage, from source: RemoteTerminalConnection) {
         if case .attached(let attached, let streamId) = message,
            let index = attachmentRequests.firstIndex(where: { $0.connection == source && $0.sessionId == attached.id }) {
             let request = attachmentRequests.remove(at: index)
@@ -204,8 +297,14 @@ final class RemoteTerminalController {
                 let replaced = attachmentRequests.contains { $0.connection == source && $0.sessionId == attached.id }
                     || (stream?.terminalId == attached.terminalId && stream?.generation == attached.generation)
                 if !replaced, source == currentConnection(), !streamId.isEmpty, streamId.utf8.count <= 128 {
-                    _ = sendMessage(.unsubscribe(RemoteTerminalStream(terminalId: attached.terminalId,
-                        generation: attached.generation, streamId: streamId)), source)
+                    let unsubscribe = RemoteTerminalMessage.unsubscribe(RemoteTerminalStream(terminalId: attached.terminalId,
+                        generation: attached.generation, streamId: streamId))
+                    if let client = sessionClient {
+                        if let target = client.target(sessionId: attached.terminalId, process: attached.generation),
+                           let binding = client.binding(for: target, mutation: false) {
+                            _ = sendMessage(.bound(unsubscribe, binding), source)
+                        }
+                    } else { _ = sendMessage(unsubscribe, source) }
                 }
                 return
             }
@@ -226,14 +325,21 @@ final class RemoteTerminalController {
             sessions = available
             if stream != nil { changed(); return }
             let previous = reconnectSession ?? session
-            session = available.first(where: { $0.id == previous?.id })
-                ?? available.first(where: { $0.terminalId == preferredTerminalId }) ?? available.first
+            let preferred: RemoteTerminalSession?
+            if let preferredAgentId {
+                preferred = available.first(where: { $0.agentId == preferredAgentId })
+            } else if let preferredTerminalId {
+                preferred = available.first(where: { $0.terminalId == preferredTerminalId })
+            } else { preferred = available.first }
+            session = available.first(where: { $0.id == previous?.id }) ?? preferred
             let shouldView = autoView && (previous == nil || session?.id == previous?.id)
             autoView = false
             reconnectSession = nil
             phase = .ready
             if available.isEmpty {
                 status = "No shared terminal. On this host, run atem agent launch claude or codex."
+            } else if session == nil {
+                status = "This agent's original terminal was not reported. Select a terminal explicitly."
             } else if previous != nil && session?.id != previous?.id {
                 status = "The previous process ended or restarted. Choose a terminal and View."
             } else { status = "Choose View to open a terminal." }
@@ -252,13 +358,34 @@ final class RemoteTerminalController {
             guard frame.stream == stream else { return }
             receiveFrame(frame)
         case .controller(let scope, let lease):
+            guard sessionClient == nil else { return }
             guard scope == stream, restored, phase != .exited else { return }
-            controlSince = nil
             if let lease {
                 guard !lease.isEmpty, lease.utf8.count <= 128 else { fail("Invalid control lease."); return }
                 guard wantsControl else {
                     _ = send(.control(scope, take: false))
                     return
+                }
+                if let confirmed = leaseConfirmedAt, now() - confirmed >= 15 {
+                    release()
+                    status = "Control expired before renewal was confirmed. Take Control to type again."
+                    break
+                }
+                guard session?.supportsExpiringControl == true,
+                      leaseId == nil || leaseId == lease else {
+                    fail("The terminal control lease changed unexpectedly. Take Control again from a fresh view.")
+                    return
+                }
+                // Only an outstanding acquire/renew may extend the local deadline.
+                if let since = renewalSince ?? controlSince {
+                    leaseConfirmedAt = since
+                    renewalSince = nil
+                    controlSince = nil
+                }
+                guard leaseConfirmedAt.map({ now() - $0 < 15 }) == true else {
+                    release()
+                    status = "Control confirmation arrived too late. Take Control again."
+                    break
                 }
                 leaseId = lease
                 if phase != .stopping {
@@ -268,6 +395,9 @@ final class RemoteTerminalController {
                 }
             } else {
                 leaseId = nil
+                leaseConfirmedAt = nil
+                renewalSince = nil
+                controlSince = nil
                 wantsControl = false
                 sentSize = nil
                 if phase != .stopping {
@@ -283,6 +413,8 @@ final class RemoteTerminalController {
             guard terminalId == session?.terminalId, generation == session?.generation, stream != nil else { return }
             session?.exitStatus = exitStatus
             leaseId = nil
+            leaseConfirmedAt = nil
+            renewalSince = nil
             wantsControl = false
             stopSince = nil
             attachSince = nil
@@ -317,7 +449,9 @@ final class RemoteTerminalController {
             restored = true
             attachSince = nil
             phase = session?.exitStatus == nil ? .viewing : .exited
-            status = phase == .exited ? "Agent exited. Showing its final screen." : "Viewing. Take Control to type in this terminal."
+            status = phase == .exited ? "Agent exited. Showing its final screen."
+                : sessionClient != nil || session?.supportsExpiringControl == true ? "Viewing. Take Control to type in this terminal."
+                : "Viewing. Update Atem to enable control with expiring session leases."
             changed()
         }
         pumpRenderer()
@@ -330,6 +464,16 @@ final class RemoteTerminalController {
 
     func checkTimeouts() {
         let time = now()
+        if sessionClient == nil, let confirmed = leaseConfirmedAt, time - confirmed >= 15 {
+            release()
+            status = "Control expired. Viewing continues; Take Control to type again."
+            changed()
+        } else if sessionClient == nil, phase == .controlling, wantsControl, renewalSince == nil,
+                  let confirmed = leaseConfirmedAt, time - confirmed >= 5,
+                  let stream, let leaseId {
+            renewalSince = time
+            if !send(.renew(stream, leaseId: leaseId)) { disconnectedSend() }
+        }
         if let since = listingSince, time - since >= 8 {
             listingSince = nil
             if stream == nil {
@@ -366,7 +510,8 @@ final class RemoteTerminalController {
         if !transactionOpen { transactionBytes = 0 }
         transactionBytes += bytes.count
         let (end, overflow) = receivedOffset.addingReportingOverflow(UInt64(bytes.count))
-        guard !overflow, transactionBytes <= 1024 * 1024, queuedBytes + bytes.count <= 128 * 1024,
+        guard !overflow, sessionClient == nil || end <= AtemSessionWire.maximumCounter,
+              transactionBytes <= 1024 * 1024, queuedBytes + bytes.count <= 128 * 1024,
               frames.count < 128 else { fail("Terminal frame limits were exceeded. Choose View to reconnect."); return }
         receivedFirstFrame = true
         transactionOpen = !frame.complete
@@ -392,10 +537,51 @@ final class RemoteTerminalController {
 
     private func send(_ message: RemoteTerminalMessage) -> Bool {
         guard let connection, connection == currentConnection() else { return false }
+        if let client = sessionClient {
+            if case .list = message { return sendMessage(message, connection) }
+            guard client.phase == .ready else { return false }
+            let terminalId: String
+            let generation: String
+            let mutation: Bool
+            switch message {
+            case .subscribe(let id, let process): terminalId = id; generation = process; mutation = false
+            case .unsubscribe(let stream), .ack(let stream, _): terminalId = stream.terminalId; generation = stream.generation; mutation = false
+            case .input(let stream, _, _, _), .resize(let stream, _, _, _), .stop(let stream, _):
+                terminalId = stream.terminalId; generation = stream.generation; mutation = true
+            default: return false
+            }
+            guard let target = client.target(sessionId: terminalId, process: generation),
+                  let binding = client.binding(for: target, mutation: mutation) else { return false }
+            return sendMessage(.bound(message, binding), connection)
+        }
         return sendMessage(message, connection)
     }
 
+    func sessionStateChanged() {
+        guard isOpen, let client = sessionClient else { return }
+        if phase == .ready, autoView, protocolTarget != nil {
+            autoView = false
+            view()
+            return
+        }
+        if let target = protocolTarget, let binding = client.binding(for: target, mutation: true),
+           restored, stream != nil, phase != .stopping {
+            leaseId = binding.attachment_gen + ":" + String(binding.lease_epoch!)
+            wantsControl = true
+            phase = .controlling
+            status = client.status
+            sendResizeIfNeeded()
+        } else if restored, phase != .exited, phase != .stopping {
+            leaseId = nil
+            wantsControl = protocolTarget.map(client.acquiring) == true
+            phase = .viewing
+            status = client.status
+        }
+        changed()
+    }
+
     private func detach() {
+        if let client = sessionClient, let target = protocolTarget, client.controls(target) || client.acquiring(target) { client.release(target) }
         if let stream { _ = send(.unsubscribe(stream)) }
         if stream == nil, attachSince != nil, let connection, let session,
            let index = attachmentRequests.lastIndex(where: { $0.connection == connection && $0.sessionId == session.id }) {
@@ -404,6 +590,8 @@ final class RemoteTerminalController {
         attachmentRequests.removeAll { $0.connection != currentConnection() }
         stream = nil
         leaseId = nil
+        leaseConfirmedAt = nil
+        renewalSince = nil
         wantsControl = false
         restored = false
         receivedFirstFrame = false

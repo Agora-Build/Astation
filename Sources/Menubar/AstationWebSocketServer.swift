@@ -128,7 +128,7 @@ class AstationWebSocketServer {
         NetworkDebugLogger.logWebSocket(direction: "recv", context: "local \(clientId.prefix(8))", message: text)
 
         guard let data = text.data(using: .utf8),
-              let message = try? JSONDecoder().decode(AstationMessage.self, from: data) else {
+              let message = try? AstationMessage.decodePacket(data) else {
             Log.error("❌ Failed to decode message from \(clientId.prefix(8)) (\(text.utf8.count) bytes)")
             return
         }

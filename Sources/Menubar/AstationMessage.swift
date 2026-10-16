@@ -2,6 +2,13 @@ import Foundation
 
 // JSON message protocol for communication between Atem and Astation
 enum AstationMessage: Codable {
+    static func decodePacket(_ data: Data) throws -> AstationMessage {
+        let root = try AtemSessionJSON.validatePacket(data)
+        let decoder = JSONDecoder()
+        decoder.userInfo[AtemSessionJSON.rawRootKey] = root
+        return try decoder.decode(Self.self, from: data)
+    }
+
     case projectListRequest
     case projectListResponse(projects: [AgoraProject], timestamp: Date)
     
@@ -57,6 +64,7 @@ enum AstationMessage: Codable {
     // Remote agent control (Astation → Atem): text or key input to the agent PTY.
     case agentInput(agentId: String?, kind: String, text: String?, key: String?)
     case terminal(RemoteTerminalMessage)
+    case session(AtemSessionMessage)
     case agentChat(AgentChatWire)
     case browserChat(BrowserChatFrame)
 
@@ -80,7 +88,7 @@ enum AstationMessage: Codable {
 
     var isPrivateAgentTraffic: Bool {
         switch self {
-        case .terminal, .agentChat, .browserChat: return true
+        case .terminal, .session, .agentChat, .browserChat: return true
         default: return false
         }
     }
@@ -123,6 +131,7 @@ enum AstationMessage: Codable {
         case credentialSync
         case agentInput
         case terminal
+        case session
         case agentChat, browserChat
         case encryptionMode
         case keyRequest
@@ -319,6 +328,11 @@ enum AstationMessage: Codable {
 
         case .terminal(let message):
             try container.encode(MessageType.terminal, forKey: .type)
+            try container.encode(message, forKey: .data)
+
+        case .session(let message):
+            try message.validate()
+            try container.encode(MessageType.session, forKey: .type)
             try container.encode(message, forKey: .data)
 
         case .agentChat(let message):
@@ -620,6 +634,11 @@ enum AstationMessage: Codable {
 
         case .terminal:
             self = .terminal(try container.decode(RemoteTerminalMessage.self, forKey: .data))
+
+        case .session:
+            let message = try container.decode(AtemSessionMessage.self, forKey: .data)
+            try message.validate()
+            self = .session(message)
 
         case .agentChat:
             self = .agentChat(try container.decode(AgentChatWire.self, forKey: .data))

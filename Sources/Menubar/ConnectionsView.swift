@@ -372,6 +372,10 @@ private struct AgentListPanel: View {
 
     private var clientIsOnline: Bool { selectedClient != nil }
 
+    private var accessBlockReason: RemoteAccessBlockReason? {
+        clientId.flatMap { hubManager.remoteAccessBlockReason(for: $0) }
+    }
+
     private var panelTitle: String {
         guard let c = selectedClient else {
             return clientId.map { String($0.prefix(8)) + "…" } ?? "No client selected"
@@ -398,9 +402,11 @@ private struct AgentListPanel: View {
                         }
                         .buttonStyle(.borderless)
                         .font(.caption)
+                        .disabled(accessBlockReason != nil)
                         Button("Refresh") { hubManager.requestAgentList(from: id) }
                             .buttonStyle(.borderless)
                             .font(.caption)
+                            .disabled(accessBlockReason != nil)
                     }
                 }
             }
@@ -411,6 +417,14 @@ private struct AgentListPanel: View {
             Divider()
 
             // ── Body ──────────────────────────────────────────────────────
+            if let message = hubManager.remoteInputStatusMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.orange.opacity(0.08))
+            }
             if clientId == nil {
                 VStack(spacing: 8) {
                     Image(systemName: "arrow.left")
@@ -420,6 +434,21 @@ private struct AgentListPanel: View {
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let reason = accessBlockReason {
+                VStack(spacing: 12) {
+                    Image(systemName: "lock.shield")
+                        .font(.system(size: 32))
+                        .foregroundColor(.secondary)
+                    Text(reason == .verificationRequired ? "Verify this Atem" : "Remote access unavailable")
+                        .font(.headline)
+                    Text(reason.localizedDescription)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .textSelection(.enabled)
+                }
+                .padding(28)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if agents.isEmpty {
                 VStack(spacing: 10) {

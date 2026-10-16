@@ -179,12 +179,13 @@ final class BrowserAgentChat {
     }
 
     enum OpenError: Error, LocalizedError {
-        case offline, invalidURL, tooManySessions
+        case offline, invalidURL, tooManySessions, sessionProtocolRequired
         var errorDescription: String? {
             switch self {
             case .offline: return "Connect Astation and this Atem to open a browser conversation."
             case .invalidURL: return "The relay URL must use HTTPS (or localhost HTTP for development)."
             case .tooManySessions: return "Eight browser sessions are already open. Wait for a session to expire before opening another."
+            case .sessionProtocolRequired: return "Use Open Terminal for this Atem. Browser access to managed sessions requires the secure companion protocol."
             }
         }
     }

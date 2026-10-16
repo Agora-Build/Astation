@@ -4,11 +4,32 @@ import XCTest
 final class RemoteTerminalWireTests: XCTestCase {
     private let stream = RemoteTerminalStream(terminalId: "claude", generation: "process", streamId: "stream")
 
+    func testSharedMultiplexingFixturePreservesExactProcessAndLeaseTargets() throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "session-multiplexing-v1", withExtension: "json", subdirectory: "Fixtures"))
+        let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        let session = try JSONDecoder().decode(RemoteTerminalSession.self,
+            from: JSONSerialization.data(withJSONObject: try XCTUnwrap(fixture["session"])))
+        XCTAssertTrue(session.isSupported)
+        XCTAssertTrue(session.supportsExpiringControl)
+        XCTAssertEqual(session.agentId, "agent-a")
+        XCTAssertEqual(session.label, "Claude / workspace-a")
+        let target = RemoteTerminalStream(terminalId: session.terminalId, generation: session.generation, streamId: "stream-a")
+        for (key, expected) in [("renew", RemoteTerminalMessage.renew(target, leaseId: "lease-a")),
+                                ("controller", RemoteTerminalMessage.controller(target, leaseId: "lease-a"))] {
+            let object = try XCTUnwrap(fixture[key])
+            let wire = try JSONSerialization.data(withJSONObject: object)
+            XCTAssertEqual(try JSONDecoder().decode(RemoteTerminalMessage.self, from: wire), expected)
+            let encoded = try JSONEncoder().encode(expected)
+            XCTAssertEqual(try JSONSerialization.jsonObject(with: encoded) as? NSDictionary, object as? NSDictionary)
+        }
+    }
+
     func testSerdeWireMessagesRoundTripWithoutRenamingFields() throws {
         let session = terminalSession()
         let messages: [RemoteTerminalMessage] = [
             .list, .sessions([session]), .subscribe(terminalId: "claude", generation: "process"),
             .unsubscribe(stream), .ack(stream, offset: 4096), .control(stream, take: true),
+            .renew(stream, leaseId: "lease"),
             .input(stream, leaseId: "lease", sequence: 0, bytes: "aGVsbG8N"),
             .resize(stream, leaseId: "lease", rows: 40, cols: 120), .stop(stream, leaseId: "lease"),
             .attached(session, streamId: "stream"),
@@ -38,7 +59,8 @@ final class RemoteTerminalWireTests: XCTestCase {
         guard case .terminal(.attached(let session, let id)) = try JSONDecoder().decode(AstationMessage.self, from: attached) else {
             return XCTFail("Host fixture did not decode")
         }
-        XCTAssertEqual(session, terminalSession())
+        XCTAssertEqual(session, terminalSession(capabilities: []))
+        XCTAssertFalse(session.supportsExpiringControl)
         XCTAssertEqual(id, "stream")
         let unsupported = try JSONDecoder().decode(RemoteTerminalMessage.self, from: Data(#"{"v":2,"op":"frame"}"#.utf8))
         XCTAssertEqual(unsupported, .unsupported(version: 2, operation: "frame"))
@@ -62,6 +84,106 @@ final class RemoteTerminalWireTests: XCTestCase {
 }
 
 final class RemoteTerminalControllerTests: XCTestCase {
+    func testVoiceAndShortcutInputReuseHeldLeaseAndSequence() {
+        let f = TerminalFixture()
+        f.viewing()
+        XCTAssertFalse(f.controller.sendScopedInput(kind: "text", value: "do not send"))
+        f.controller.takeControl()
+        f.receive(.controller(terminalStream(), leaseId: "lease"))
+        XCTAssertTrue(f.controller.sendScopedInput(kind: "text", value: "inspect logs"))
+        XCTAssertEqual(f.sent.last?.0, .input(terminalStream(), leaseId: "lease", sequence: 0,
+            bytes: Data("inspect logs\r".utf8).base64EncodedString()))
+        XCTAssertTrue(f.controller.sendScopedInput(kind: "key", value: "ctrl-c"))
+        XCTAssertEqual(f.sent.last?.0, .input(terminalStream(), leaseId: "lease", sequence: 1,
+            bytes: Data([3]).base64EncodedString()))
+        XCTAssertFalse(f.controller.sendScopedInput(kind: "key", value: "unknown"))
+        f.time = 15
+        XCTAssertFalse(f.controller.sendScopedInput(kind: "text", value: "expired"))
+    }
+
+    func testLegacySessionAllowsViewingButDoesNotOfferNonExpiringControl() {
+        let f = TerminalFixture()
+        f.open()
+        let legacy = terminalSession(capabilities: [])
+        f.receive(.sessions([legacy]))
+        f.receive(.attached(legacy, streamId: "stream"))
+        f.frame()
+        f.consume()
+        XCTAssertEqual(f.controller.phase, .viewing)
+        XCTAssertFalse(f.controller.canTakeControl)
+        XCTAssertTrue(f.controller.status.contains("Update Atem"))
+        let before = f.sent.count
+        f.controller.takeControl()
+        XCTAssertEqual(f.sent.count, before)
+    }
+
+    func testLeaseRenewalRequiresMatchingAcknowledgmentAndExpiresWithoutIt() {
+        let f = TerminalFixture()
+        f.controlling()
+        f.time = 5
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.sent.last?.0, .renew(terminalStream(), leaseId: "lease"))
+        f.time = 6
+        f.receive(.controller(terminalStream(), leaseId: "lease"))
+        f.time = 10
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.sent.filter { if case .renew = $0.0 { return true }; return false }.count, 2)
+        f.time = 20
+        XCTAssertFalse(f.controller.canInput, "input stops at the deadline even before the timer fires")
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.controller.phase, .viewing)
+        XCTAssertFalse(f.controller.canInput)
+        XCTAssertTrue(f.controller.status.contains("expired"))
+        f.receive(.controller(terminalStream(), leaseId: "lease"))
+        XCTAssertFalse(f.controller.canInput, "a late acknowledgment never reacquires control")
+    }
+
+    func testUnsolicitedLeaseAcknowledgmentsCannotExtendDeadline() {
+        let f = TerminalFixture()
+        f.controlling()
+        f.time = 14
+        f.receive(.controller(terminalStream(), leaseId: "lease"))
+        f.time = 15
+        XCTAssertFalse(f.controller.canInput)
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.controller.phase, .viewing)
+    }
+
+    func testRenewalReplyAfterPreviousDeadlineCannotRestoreControlWithoutTimeoutTick() {
+        let f = TerminalFixture()
+        f.controlling()
+        f.time = 5
+        f.controller.checkTimeouts()
+        XCTAssertEqual(f.sent.last?.0, .renew(terminalStream(), leaseId: "lease"))
+        f.time = 17
+        f.receive(.controller(terminalStream(), leaseId: "lease"))
+        XCTAssertEqual(f.controller.phase, .viewing)
+        XCTAssertFalse(f.controller.canInput)
+        XCTAssertNil(f.controller.leaseId)
+        XCTAssertTrue(f.controller.status.contains("expired"))
+        XCTAssertEqual(f.sent.last?.0, .control(terminalStream(), take: false))
+        f.receive(.controller(terminalStream(), leaseId: "lease"))
+        XCTAssertFalse(f.controller.canInput)
+        XCTAssertEqual(f.controller.phase, .viewing)
+    }
+
+    func testAgentSelectionDoesNotAttachAnotherSameProviderSession() {
+        let f = TerminalFixture()
+        var first = terminalSession()
+        first.agentId = "agent-one"
+        var second = terminalSession(generation: "process-two")
+        second.agentId = "agent-two"
+        f.controller.open(preferredTerminalId: nil, preferredAgentId: "agent-two")
+        f.receive(.sessions([first, second]))
+        XCTAssertEqual(f.controller.session, second)
+        XCTAssertEqual(f.sent.last?.0, .subscribe(terminalId: second.terminalId, generation: second.generation))
+        f.controller.open(preferredTerminalId: nil, preferredAgentId: "missing-agent")
+        f.receive(.sessions([first, second]))
+        XCTAssertNil(f.controller.session)
+        XCTAssertEqual(f.controller.phase, .ready)
+        XCTAssertTrue(f.controller.status.contains("not reported"))
+    }
+
     func testOpenTargetsOnlySelectedConnectionAndStartsViewOnly() {
         let f = TerminalFixture()
         f.open()
@@ -309,9 +431,10 @@ final class RemoteTerminalControllerTests: XCTestCase {
     }
 }
 
-private func terminalSession(generation: String = "process") -> RemoteTerminalSession {
+private func terminalSession(generation: String = "process", capabilities: [String] = ["terminal-lease-v1"]) -> RemoteTerminalSession {
     RemoteTerminalSession(terminalId: "claude", generation: generation, provider: "claude", rows: 40, cols: 120,
-                          exitStatus: nil, rendering: "vt100-screen-diff", widthProfile: "atem-unicode-width-0.1.14")
+                          exitStatus: nil, rendering: "vt100-screen-diff", widthProfile: "atem-unicode-width-0.1.14",
+                          capabilities: capabilities)
 }
 
 private func terminalStream(id: String = "stream") -> RemoteTerminalStream {

@@ -5,6 +5,12 @@ Atem, and click **Open in Browser** on its agent. The responsive app is served
 at `https://station.agora.build/agent/`. **Open Terminal** remains beside it
 for the full CLI and provider permission prompts.
 
+On the session-v1 development branch, starting a native terminal handshake
+disables this older browser bridge for that exact host socket. New links explain
+that managed sessions require the secure companion protocol. Existing links
+stop sending. Browser access to v1 hosts remains gated on the joint security
+contract and common leases; the behavior below applies to unupgraded connections.
+
 Prompts appear on the right and replies on the left. Prompts typed directly in
 the original terminal are labeled **You / Terminal**. Replies support CommonMark,
 code blocks, syntax colors, safe HTTP/HTTPS links, copy actions, and compact tool

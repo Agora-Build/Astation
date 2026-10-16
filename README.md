@@ -259,13 +259,14 @@ It starts in viewing mode; **Take Control** enables typing, control keys,
 multiline paste and resizing. **Release** returns local ownership. Closing the
 window keeps the agent running; **Stop Agent** asks before ending its process.
 
-Atem must include shared-terminal support from PR #57 and launch the original
-CLI with `atem agent launch claude` or `atem agent launch codex`. Astation uses
-`terminal-v1` messages over the existing authenticated connection, addressed to
-one host, connection generation, process and stream. Reconnect returns to
-viewing mode and never resends uncertain input. The legacy `agentInput` route
-remains for existing callers; it does not bypass an attached terminal's control
-lease. Voice continues through the existing voice-coding flow.
+This development branch requires the accepted Atem session-v1 r5 host protocol,
+in addition to terminal rendering. Launch the original CLI with
+`atem agent launch claude` or `atem agent launch codex`, pair and verify once,
+then select its exact session. A shared lease governs typing, resize, voice,
+prompt submission, interrupt and stop. Reconnect returns to viewing mode,
+queries durable receipts and never resends uncertain input. See the
+[integration handoff](designs/protocol/atem-implementation-handoff.md) for host
+requirements and current validation limits.
 
 See [remote terminal control](docs/remote-terminal.md) for setup, ownership,
 clipboard, limitations and validation.
@@ -275,6 +276,8 @@ It keeps prompts, replies, code blocks and activity together while Open Terminal
 remains available. Sending requires the selected Atem agent to advertise
 `chat-v1`; the published host in Atem PR #65 supports Claude with active hooks. Codex remains terminal-only.
 See [browser agent chat](docs/agent-chat.md) for support, delivery states and privacy.
+Starting native session-v1 disables the older browser bridge on that host socket;
+browser support for managed sessions awaits the secure companion protocol.
 
 ### Local Audio Recording
 

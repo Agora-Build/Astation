@@ -6,10 +6,12 @@ conversation and unfinished input.
 
 ## Start a session
 
-The serving machine needs an Atem build containing shared-terminal support
-(merged Atem PR #57 or later). A release predating that implementation cannot
-serve the terminal. The Atem owner handles upgrading/building it; Astation does
-not download or execute an Atem CLI to render the screen.
+This development branch requires an Atem host implementing
+[atem-session v1 r5](../designs/protocol/atem-session-v1.md), in addition to
+shared-terminal rendering. Earlier terminal-only hosts cannot provide control
+through this build. The Atem owner handles host implementation/upgrades;
+the published pairing fixes alone do not imply r5 support. See the
+[integration status](../designs/protocol/astation-session-v1-implementation.md).
 
 On the serving machine, start the installed agent through Atem:
 
@@ -20,8 +22,9 @@ atem agent launch codex
 
 Agent options can follow the provider, for example
 `atem agent launch codex --profile oss`. Pair/authenticate Atem with Astation
-as usual. One Claude and one Codex process may run concurrently; the chooser
-addresses each separately.
+as usual, then run `atem pair verify` if it is not already verified. Local agent
+launch does not require pairing; remote viewing and control do. The chooser
+addresses each original session separately.
 
 ## Open and control
 
@@ -34,10 +37,11 @@ addresses each separately.
    the viewer and leaves the agent running. **Stop Agent** requires confirmation
    and ends that selected original process.
 
-While Astation controls a terminal, local typing is paused. Atem's default
-**Ctrl+]**, then **g** reclaims control locally. The Astation view then becomes
-read-only. Reconnecting always opens a fresh view and requires another deliberate
-Take Control. A replacement process generation requires choosing View again.
+Control expires after 15 seconds without renewal; Astation renews every five
+seconds. Local input on the host takes priority and revokes remote control.
+The Astation view then becomes read-only. Reconnecting always opens a fresh view
+and requires another deliberate Take Control. A replacement process generation
+requires choosing View again.
 
 **Copy** copies the visible selection. Command-C copies a selection and
 Command-A selects the visible screen. **Paste** and Command-V use the native
@@ -64,6 +68,14 @@ Access to outer tmux or Atem frontend history needs host support; forwarding
 more key sequences cannot expose that history in the current stream.
 
 ## Status and recovery
+
+The prompt field sends a scoped submission to the selected session. Voice text,
+the scoped interrupt shortcut and Stop Agent use the same authority and durable
+receipt lifecycle. The receipt label distinguishes accepted, executing,
+completed, rejected and outcome unknown. Disconnect never replays a prompt;
+reconnect queries its original request ID. Inspect the agent before manually
+trying again when the outcome is unknown. Closing the window releases control
+while Astation continues receipt recovery.
 
 **Written to terminal** confirms a PTY write; it does not mean the agent has
 accepted a prompt or finished a response. Watch its live output for those states.
@@ -100,6 +112,10 @@ or complete conversation history. The zero-scrollback renderer avoids presenting
 incidental repaint scrolls as a transcript. [Browser agent chat](agent-chat.md)
 uses the separate structured chat-v1 protocol, supported by the published Claude
 adapter in Atem PR 65. Other agents keep terminal access without chat capability.
+On this development branch, starting a native session-v1 handshake disables
+that socket's older browser bridge. Browser access to managed sessions awaits
+secure companion grants and common control leases. An unupgraded connection
+retains existing browser chat behavior.
 
 xterm 6.0.0, addon-fit 0.11.0 and Atem's matching Unicode-width provider are
 bundled locally. The viewer loads no CDN, permits no external navigation and
@@ -116,7 +132,7 @@ identity and access.
 
 ```sh
 python3 scripts/setup-terminal-assets.py --verify
-swift test --filter RemoteTerminal
+swift test --filter 'AtemSession|RemoteTerminal|AgentInputRouting|BrowserAgentChat'
 ```
 
 Tests cover the serde-compatible wire format, real WebKit rendering and
@@ -126,12 +142,13 @@ revocation races. The full resource check also verifies that packaged apps
 contain the viewer assets. Live provider tests must use independently owned
 test sessions, preserving the user's active conversation.
 
-Debug/Release builds, pinned assets, WebKit rendering, bundled resources, and
-native routing/controller tests pass. The combined Swift/browser results and
-local Keychain/caption-test limits are in [Agent validation](agent-chat.md#verification).
-Live cross-machine control, physical IME/clipboard and real provider approvals
-remain acceptance checks. Live relay endpoint reauthentication after an Astation
-restart passed separately on Genie at 17:17 PDT on 2026-10-14.
+The current session-v1 client builds in Debug and passes its 96 focused native
+checks, including WebKit rendering, plus the webapp conformance suite and pinned
+assets. The [current validation evidence](../designs/protocol/astation-session-v1-implementation.md)
+records the broader local test failures and pending actual-host integration.
+Live cross-machine r5 control, physical IME/clipboard and real provider approvals
+remain acceptance checks. Earlier relay endpoint reauthentication after an
+Astation restart passed separately on Genie at 17:17 PDT on 2026-10-14.
 
 See [lifecycle and security invariants](../designs/remote-terminal.md) and
 [Atem's host contract](https://github.com/Agora-Build/Atem/blob/396a0f3/designs/terminal-v1-implementation.md).
