@@ -237,6 +237,8 @@ struct HubInner {
     draining: AtomicBool,
     active_sockets: AtomicUsize,
     ws_limiter: WsConnLimiter,
+    push_tokens: std::sync::OnceLock<Arc<dyn crate::push_tokens::PushTokenStore>>,
+    push_delivery: std::sync::OnceLock<Arc<crate::push_delivery::PushDelivery>>,
 }
 
 /// The relay: this replica's sockets plus the shared room directory, the
@@ -286,12 +288,22 @@ impl RelayHub {
                 draining: AtomicBool::new(false),
                 active_sockets: AtomicUsize::new(0),
                 ws_limiter: parts.ws_limiter,
+                push_tokens: std::sync::OnceLock::new(),
+                push_delivery: std::sync::OnceLock::new(),
             }),
         }
     }
 
     pub(crate) fn ws_limiter(&self) -> &WsConnLimiter {
         &self.inner.ws_limiter
+    }
+
+    pub(crate) fn configure_push_tokens(&self, store: Arc<dyn crate::push_tokens::PushTokenStore>) {
+        assert!(self.inner.push_tokens.set(store).is_ok(), "push token store already configured");
+    }
+
+    pub(crate) fn configure_push_delivery(&self, delivery: Arc<crate::push_delivery::PushDelivery>) {
+        assert!(self.inner.push_delivery.set(delivery).is_ok(), "push delivery already configured");
     }
 
     #[cfg(test)]
@@ -1324,6 +1336,8 @@ fn relay_control_type(message: &serde_json::Value) -> Option<&str> {
     matches!(
         kind,
         "relayAuth"
+            | "relayPushRegister"
+            | "relayPushUnregister"
             | "relaySessions"
             | "relayBind"
             | "relayUnbind"
@@ -1923,6 +1937,30 @@ async fn verify_relay_auth(
     }
 }
 
+async fn apply_push_registration(
+    store: &dyn crate::push_tokens::PushTokenStore,
+    verified_device: &str,
+    kind: &str,
+    message: &serde_json::Value,
+) -> String {
+    let result = if kind == "relayPushRegister" {
+        let registration = message.get("registration").cloned()
+            .and_then(|value| serde_json::from_value::<crate::push_tokens::PushRegistration>(value).ok())
+            .filter(|registration| registration.valid());
+        let Some(registration) = registration else { return relay_ack_err(kind, "invalid push registration"); };
+        store.register(verified_device, registration).await
+    } else {
+        let platform = message.get("platform").cloned()
+            .and_then(|value| serde_json::from_value::<crate::push_tokens::PushPlatform>(value).ok());
+        let Some(platform) = platform else { return relay_ack_err(kind, "invalid push platform"); };
+        store.unregister(verified_device, platform).await
+    };
+    match result {
+        Ok(()) => relay_ack_ok(kind),
+        Err(_) => relay_ack_err(kind, "push registration unavailable"),
+    }
+}
+
 /// Apply a `relaySessions` / `relayBind` / `relayUnbind` from a verified
 /// Astation; returns the `relayAck` frame.
 async fn apply_binding_message(
@@ -2110,6 +2148,21 @@ async fn handle_astation_control(
                     false
                 }
             }
+        }
+        "relayPushRegister" | "relayPushUnregister" => {
+            let ack = if !is_current_verified_owner(hub, code, connection_id, auth).await {
+                relay_ack_err(kind, "not verified")
+            } else if let Some(store) = hub.inner.push_tokens.get() {
+                match tokio::time::timeout(IDENTITY_STORE_TIMEOUT,
+                    apply_push_registration(store.as_ref(), code, kind, message)).await {
+                    Ok(ack) => ack,
+                    Err(_) => relay_ack_err(kind, "push registration unavailable"),
+                }
+            } else {
+                relay_ack_err(kind, "push registration unavailable")
+            };
+            hub.local().send(connection_id, ack);
+            true
         }
         "relaySessions" | "relayBind" | "relayUnbind" => {
             // A replaced/removed socket may still be read if its cross-replica
@@ -4591,6 +4644,37 @@ pub(crate) mod tests {
             ack,
             serde_json::json!({"type":"relayAck","for":"relayUnbind","ok":false,"message":"nope"})
         );
+    }
+
+    #[tokio::test]
+    async fn push_registration_requires_the_current_verified_native_socket() {
+        use crate::push_tokens::{InMemoryPushTokenStore, PushTokenStore};
+        let state = memory_identity_state();
+        let store = Arc::new(InMemoryPushTokenStore::default());
+        state.relay.configure_push_tokens(store.clone());
+        let (base, server) = spawn_relay(state).await;
+        let device = "astation-push-test";
+        let key = TestKey::generate();
+        let mut native = verified_astation(&base, device, &key, "registered").await;
+        let registration = serde_json::json!({"type":"relayPushRegister", "device_id":"victim",
+            "account_id":"another-account", "registration":{"platform":"apns_sandbox", "token":"ab".repeat(32)}});
+        let mut atem = connect_atem(&base, device, "host").await;
+        assert_eq!(next_client_json(&mut native).await["relay_event"], "connected");
+        send_json(&mut atem, registration.clone()).await;
+        assert_eq!(next_client_json(&mut native).await["payload"]["type"], "relayPushRegister");
+        assert!(store.for_devices(&[device.into(), "victim".into()]).await.unwrap().is_empty());
+        send_json(&mut native, registration.clone()).await;
+        assert_eq!(next_client_json(&mut native).await["ok"], true);
+        assert_eq!(store.for_devices(&[device.into()]).await.unwrap().len(), 1);
+        assert!(store.for_devices(&["victim".into()]).await.unwrap().is_empty());
+        let (mut pending, _) = connect_astation(&base, device).await;
+        send_json(&mut pending, serde_json::json!({"type":"relayPushUnregister", "platform":"apns_sandbox"})).await;
+        assert_eq!(next_client_json(&mut pending).await["ok"], false);
+        assert_eq!(store.for_devices(&[device.into()]).await.unwrap().len(), 1);
+        send_json(&mut native, serde_json::json!({"type":"relayPushUnregister", "platform":"apns_sandbox"})).await;
+        assert_eq!(next_client_json(&mut native).await["ok"], true);
+        assert!(store.for_devices(&[device.into()]).await.unwrap().is_empty());
+        server.abort();
     }
 
     /// An old Astation ignores the challenge: it still relays both ways (also

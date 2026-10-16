@@ -11,6 +11,10 @@ need Developer ID signing, an authorized distribution profile and notarization.
 See [release readiness and setup](docs/releases.md); personal-team local signing
 is available for local verification.
 
+Agent approval push transport is being prepared separately; host authentication,
+signed membership and r7 decision/catch-up contracts remain gated. See
+[notification provisioning and current limits](docs/push-notifications.md).
+
 ### Build from source
 
 Prerequisites: macOS 14+, Xcode 26.2+ (Swift 6.2+), CMake 3.19+, and current stable Rust/Cargo.

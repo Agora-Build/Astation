@@ -18,6 +18,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
     let dictationManager: VoiceDictationManager
     private var headerTapCount = 0
     private var lastHeaderTapTime: Date?
+    var approvalNotificationSettings: (() -> Void)?
 
     init(hubManager: AstationHubManager, webSocketServer: AstationWebSocketServer, androidDeviceManager: AndroidDeviceManager,
          hotkeyManager: HotkeyManager, recordingManager: AudioRecordingManager = AudioRecordingManager(),
@@ -392,6 +393,12 @@ class StatusBarController: NSObject, NSMenuDelegate {
         showClientsItem.target = self
         statusMenu.addItem(showClientsItem)
 
+        let notifications = NSMenuItem(title: "Approval Notifications...", action: #selector(showApprovalNotificationSettings), keyEquivalent: "")
+        notifications.image = NSImage(systemSymbolName: "bell.badge", accessibilityDescription: nil)
+        notifications.target = self
+        notifications.isEnabled = approvalNotificationSettings != nil
+        statusMenu.addItem(notifications)
+
         // Pair Remote Atem
         let pairRemoteItem = NSMenuItem(
             title: "📡 Pair Remote Atem",
@@ -475,6 +482,18 @@ class StatusBarController: NSObject, NSMenuDelegate {
 
     @objc private func openTokenTools() {
         projectsWindowController.showTokenTools()
+    }
+
+    @objc private func showApprovalNotificationSettings() { approvalNotificationSettings?() }
+
+    func openApprovalNotification(_ hint: ApprovalPushHint) {
+        // r6.2 cannot read or submit approvals. Never interpret notification
+        // contents as an authoritative pending request or use terminal keys.
+        connectionsWindowController.showAndFocus()
+        let alert = NSAlert()
+        alert.messageText = "Approval status could not be checked"
+        alert.informativeText = "This build cannot review agent approvals yet. You can answer the request in the agent's terminal. A notification has not approved anything."
+        alert.runModal()
     }
     
     @objc private func pairRemoteAtem() {

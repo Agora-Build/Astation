@@ -92,6 +92,14 @@ Neither clarification blocks the client changes or initial live tests.
 
 ## Security and approval gates
 
+Update, 2026-10-16: the user approved push delivery independently of a lease and
+atomic acquire:true answers. See the [push preparation and required joint
+contract](push-approvals-handoff.md). Native token registration, provider
+adapters and provisioning docs are on feat/push-approvals; host ingress and
+decision UI await authenticated host/membership proofs and r7 wire fixtures.
+The existing r6.2 client remains unchanged on #49, whose current-head CI is green
+(854 Swift tests, ten skipped, zero failures; relay and webapp checks pass).
+
 Section 9 remains open: resume, browser/QR grants, multiple native attachments,
 account-wide trust/enrollment, signed membership/revocation ordering,
 authenticated freshness proofs and live traffic E2EE stay disabled. The relay

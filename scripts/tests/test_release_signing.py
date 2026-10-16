@@ -93,6 +93,16 @@ class ReleaseSigningTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "debugger"):
                 self.validate(profile)
 
+    def test_push_entitlement_requires_profile_authorization_and_production_environment(self):
+        self.assertNotIn("com.apple.developer.aps-environment", self.validate(self.profile))
+        profile = copy.deepcopy(self.profile)
+        profile["Entitlements"]["com.apple.developer.aps-environment"] = "production"
+        self.assertEqual(self.validate(profile)["com.apple.developer.aps-environment"], "production")
+        for value in ["development", True, "unknown"]:
+            profile["Entitlements"]["com.apple.developer.aps-environment"] = value
+            with self.subTest(environment=value), self.assertRaisesRegex(ValueError, "APNs environment"):
+                self.validate(profile)
+
     def test_local_bundle_and_wrong_keychain_group_are_rejected(self):
         profile = copy.deepcopy(self.profile)
         profile["Entitlements"]["com.apple.application-identifier"] += ".local"

@@ -149,6 +149,9 @@ class AstationHubManager: ObservableObject {
     var terminalMessageHandler: ((RemoteTerminalMessage, RemoteTerminalConnection) -> Void)?
     var sessionMessageHandler: ((AtemSessionMessage, RemoteTerminalConnection) -> Void)?
     var sessionStateDidChange: ((String) -> Void)?
+    @Published private(set) var approvalPushRegistrationStatus: String?
+    private var approvalPushRegistration: ApprovalPushRegistration?
+    private var approvalPushUnregistration: ApprovalPushPlatform?
     var terminalConnectionsDidChange: (() -> Void)?
     var remoteAgentInputHandler: ((RemoteTerminalConnection, String?, String, String) -> Bool)?
     var sessionsRemovedHandler: (([String]) -> Void)?
@@ -1810,6 +1813,12 @@ class AstationHubManager: ObservableObject {
         case .authResult(let status, let message):
             handleRelayAuthResult(status: status, message: message)
         case .ack(let forType, let ok, let message):
+            if forType == "relayPushRegister" || forType == "relayPushUnregister" {
+                approvalPushRegistrationStatus = ok
+                    ? (forType == "relayPushRegister" ? "Notification address registered." : "Approval notifications disabled.")
+                    : "Notification registration failed. It will retry after reconnecting."
+                return
+            }
             if ok {
                 Log.debug("[RelayIdentity] Relay acknowledged \(forType)")
                 if forType.hasPrefix("relayMerge") ||
@@ -2083,6 +2092,7 @@ class AstationHubManager: ObservableObject {
             requestRelayAccountState()
             requestRelayEncryptionState()
             registerRelayAccountIfPossible()
+            syncApprovalPushRegistration()
         case RelayIdentityProtocol.statusRejected:
             relayIdentityKeyRejected = true
             identityRelayVerified = false
@@ -2366,6 +2376,31 @@ class AstationHubManager: ObservableObject {
     func removeRelayAstation(astationId: String) {
         guard let text = RelayIdentityProtocol.removeAstationMessage(astationId: astationId) else { return }
         sendRelayIdentityControl(text, label: "relayRemoveAstation")
+    }
+
+    func setApprovalPushRegistration(_ registration: ApprovalPushRegistration) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        approvalPushRegistration = registration
+        approvalPushUnregistration = nil
+        approvalPushRegistrationStatus = "Waiting for a verified relay connection."
+        syncApprovalPushRegistration()
+    }
+
+    func unregisterApprovalPush(platform: ApprovalPushPlatform) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        approvalPushRegistration = nil
+        approvalPushUnregistration = platform
+        syncApprovalPushRegistration()
+    }
+
+    private func syncApprovalPushRegistration() {
+        guard identityRelayVerified else { return }
+        if let platform = approvalPushUnregistration,
+           let text = ApprovalPushRegistration.unregisterMessage(platform: platform) {
+            sendRelayIdentityControl(text, label: "relayPushUnregister")
+        } else if let text = approvalPushRegistration?.registerMessage {
+            sendRelayIdentityControl(text, label: "relayPushRegister")
+        }
     }
 
     private func registerRelayAccountIfPossible() {

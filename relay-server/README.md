@@ -302,6 +302,13 @@ WebSocket URL in `astation_ws`, in `~/.config/atem/config.toml`.
 | `AGORA_ACCOUNT_USERINFO_URL` | _(unset)_ | Server-side endpoint that accepts the Agora SSO bearer token and returns the stable account subject. Account registration fails closed when this or `AGORA_ACCOUNT_SUBJECT_FIELD` is unset. Do not configure this with an endpoint whose identity changes between sign-ins. |
 | `AGORA_ACCOUNT_SUBJECT_FIELD` | _(unset)_ | Top-level JSON string field in the user-info response containing the permanent Agora account subject, confirmed by the SSO service owner. Email and the observed rotating `loginId` are unsafe. |
 | `AGORA_ACCOUNT_AUTH_TIME_FIELD` | _(unset)_ | Optional top-level integer Unix-time field recording when the user most recently authenticated. Required for the lost/offline-Mac merge path; without it, online approval still works. |
+| `APNS_KEY_FILE`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC` | _(unset)_ | Configure together for APNs; the key is a read-only mounted PKCS#8 `.p8` file. Topic must match the app's signed bundle id. |
+| `FCM_SERVICE_ACCOUNT_FILE` | _(unset)_ | Read-only mounted Firebase service-account JSON for FCM HTTP v1. |
+
+Push-token registrations use the same Postgres pool. Provider configuration
+alone does not enable host push ingress: authenticated host identity, signed
+control membership, r7 approval catch-up and the durable dispatch outbox remain
+gated. See [push provisioning and deployment](../docs/push-notifications.md).
 
 **Legacy account-verifier settings:** leave all three `AGORA_ACCOUNT_*`
 variables unset while building [unified agora.build identity](../docs/specs/2026-10-10-unified-agora-build-identity.md).

@@ -45,6 +45,7 @@ class AstationApp: NSObject, NSApplicationDelegate {
     private var audioRecordingManager: AudioRecordingManager?
     private var transcriptionToast: TranscriptionToastController?
     private var voiceDictationManager: VoiceDictationManager?
+    private var approvalNotifications: ApprovalNotifications?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.info("Initializing Astation components...")
@@ -195,6 +196,17 @@ class AstationApp: NSObject, NSApplicationDelegate {
         // after the first `atem pair` without needing to pair again.
         hubManager.startIdentityRelay()
 
+        let notifications = ApprovalNotifications(
+            register: { [weak hubManager] in hubManager?.setApprovalPushRegistration($0) },
+            unregister: { [weak hubManager] in hubManager?.unregisterApprovalPush(platform: $0) },
+            open: { [weak self] hint in
+                self?.hubManager.startIdentityRelay()
+                self?.statusBarController.openApprovalNotification(hint)
+            })
+        approvalNotifications = notifications
+        statusBarController.approvalNotificationSettings = { [weak notifications] in notifications?.showPreferences() }
+        notifications.start()
+
         Log.info("Astation fully operational!")
         Log.info("Global hotkeys: \(shortcuts.shortcutLabel(for: .voice)) (PTT voice dictation), \(shortcuts.shortcutLabel(for: .video)) (video)")
         Log.info("Log file: \(Log.logFile.path)")
@@ -275,6 +287,18 @@ class AstationApp: NSObject, NSApplicationDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         statusBarController?.showStatus()
         return false
+    }
+
+    func application(_ application: NSApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+        approvalNotifications?.registered(deviceToken: deviceToken)
+    }
+
+    func application(_ application: NSApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
+        approvalNotifications?.registrationFailed()
+    }
+
+    func application(_ application: NSApplication, didReceiveRemoteNotification userInfo: [String: Any]) {
+        approvalNotifications?.received(userInfo: userInfo)
     }
 
     // MARK: - Deep Link Handling (astation:// URL scheme)

@@ -188,6 +188,16 @@ current controller may submit prompts or terminal input. Interrupts, restarts,
 and provider approvals also require their applicable permissions. Holding a
 lease never automatically approves a provider permission request.
 
+Push-based approvals (user decision, 2026-10-16) open a request on every verified
+device with control permission, independently of lease ownership. A tap wakes,
+reconnects and fetches authoritative pending state. Only an explicit Allow once,
+Claude Always allow (showing the exact rule), or Deny may send acquire:true so
+Atem takes control and applies the exact prompt decision atomically. Closed or
+answered prompts stay closed on late taps. Phones require signed membership;
+until then only the verified paired Astation is eligible. See the
+[push implementation and joint contract handoff](protocol/push-approvals-handoff.md).
+This product decision does not enable approval messages in the r6.2 wire contract.
+
 Different clients may control different sessions on the same machine. A Mac
 could operate Codex while a phone operates Claude, with both viewing both.
 
@@ -595,7 +605,9 @@ extension; the client uses the minimum of the previous deadline, request send
 time plus the reply's remaining lifetime, and the authorization deadline.
 
 Once this protocol is negotiated, its lease governs terminal input/resize/stop,
-chat submission, interruption, approval answers, and future mutations. Legacy
+chat submission, interruption, and future mutations. r6.2 rejects approval
+answers; the forthcoming approval contract adds an atomic acquire:true answer
+instead of requiring a pre-existing lease to receive notifications. Legacy
 terminal `control`, agentInput, voice, and chat requests cannot bypass it. Bind
 streams to the controller attachment, exact session, and process generation.
 Revoke the PTY input epoch before writing local input or after remote ownership

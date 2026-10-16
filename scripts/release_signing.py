@@ -91,13 +91,19 @@ def entitlements_for_profile(profile, team, identity, now=None):
         for cert in certificates
     ):
         raise ValueError("Provisioning profile does not authorize the signing certificate.")
-    return {
+    entitlements = {
         "com.apple.application-identifier": app_id,
         "com.apple.developer.team-identifier": team,
         "keychain-access-groups": [app_id],
         "com.apple.security.device.audio-input": True,
         "com.apple.security.device.camera": True,
     }
+    push_environment = allowed.get("com.apple.developer.aps-environment")
+    if push_environment is not None:
+        if push_environment != "production":
+            raise ValueError("A release push profile must authorize the production APNs environment.")
+        entitlements["com.apple.developer.aps-environment"] = push_environment
+    return entitlements
 
 
 def prepare(directory, env):
