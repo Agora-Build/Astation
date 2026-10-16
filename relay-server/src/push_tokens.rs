@@ -37,6 +37,14 @@ impl PushRegistration {
         self
     }
 
+    fn digest(&self) -> String {
+        ring::digest::digest(&ring::digest::SHA256, self.token.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     pub fn valid(&self) -> bool {
         match self.platform {
             PushPlatform::ApnsSandbox | PushPlatform::ApnsProduction => {
@@ -173,31 +181,28 @@ impl PushTokenStore for PgPushTokenStore {
         if !registration.valid() {
             return Err(PushStoreError);
         }
+        let digest = registration.digest();
         let mut tx = self.pool.begin().await.map_err(|_| PushStoreError)?;
         // Serialize a token's reassignment across replicas without locking unrelated devices.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(format!(
-                "{}:{}",
-                registration.platform.name(),
-                registration.token
-            ))
+            .bind(format!("{}:{}", registration.platform.name(), digest))
             .execute(&mut *tx)
             .await
             .map_err(|_| PushStoreError)?;
         sqlx::query(
-            "DELETE FROM device_push_tokens WHERE platform = $1 AND token = $2 AND device_id <> $3",
+            "DELETE FROM device_push_tokens WHERE platform = $1 AND token_digest = $2 AND device_id <> $3",
         )
         .bind(registration.platform.name())
-        .bind(&registration.token)
+        .bind(&digest)
         .bind(device)
         .execute(&mut *tx)
         .await
         .map_err(|_| PushStoreError)?;
-        sqlx::query("INSERT INTO device_push_tokens (device_id, platform, token, generation) VALUES ($1, $2, $3, $4) \
-            ON CONFLICT (device_id, platform) DO UPDATE SET token = EXCLUDED.token, \
+        sqlx::query("INSERT INTO device_push_tokens (device_id, platform, token, token_digest, generation) VALUES ($1, $2, $3, $4, $5) \
+            ON CONFLICT (device_id, platform) DO UPDATE SET token = EXCLUDED.token, token_digest = EXCLUDED.token_digest, \
             generation = CASE WHEN device_push_tokens.token = EXCLUDED.token THEN device_push_tokens.generation ELSE EXCLUDED.generation END, \
             updated_at = now()")
-            .bind(device).bind(registration.platform.name()).bind(&registration.token).bind(uuid::Uuid::new_v4().to_string())
+            .bind(device).bind(registration.platform.name()).bind(&registration.token).bind(&digest).bind(uuid::Uuid::new_v4().to_string())
             .execute(&mut *tx).await.map_err(|_| PushStoreError)?;
         tx.commit().await.map_err(|_| PushStoreError)
     }
@@ -329,6 +334,41 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+        // A raw 4 KiB token cannot be a PostgreSQL btree key. Index its digest.
+        use rand::Rng;
+        let long_token: String = rand::thread_rng()
+            .sample_iter(&rand::distributions::Alphanumeric)
+            .take(4096)
+            .map(char::from)
+            .collect();
+        let registration = PushRegistration {
+            platform: PushPlatform::Fcm,
+            token: long_token.clone(),
+        };
+        first.register("phone", registration.clone()).await.unwrap();
+        assert_eq!(
+            second.for_devices(&["phone".into()]).await.unwrap()[0]
+                .registration
+                .token,
+            long_token
+        );
+        second
+            .register("replacement-phone", registration)
+            .await
+            .unwrap();
+        assert!(first
+            .for_devices(&["phone".into()])
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            first
+                .for_devices(&["replacement-phone".into()])
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         second_pool.close().await;
         database.cleanup().await;
     }

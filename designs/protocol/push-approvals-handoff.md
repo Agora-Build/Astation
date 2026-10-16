@@ -14,7 +14,8 @@ green r6.2 commit `57e2758`. No Atem checkout is changed or built.
   through the native device's verified relay control connection.
 - Postgres token storage shared across replicas; rotation, idempotent upsert,
   exact-generation invalidation and opt-out. The signed connection, not request
-  body fields, selects the token owner.
+  body fields, selects the token owner. Uniqueness uses a server-computed token
+  digest so a maximum-size FCM token does not exceed PostgreSQL's index limit.
 - APNs HTTP/2 / ES256 and FCM HTTP v1 / OAuth RS256 provider adapters. APNs
   provider JWTs are reused for 50 minutes; token credentials and response bodies
   are not logged. Alerts set mutable-content and collapse/tag identities.
@@ -70,7 +71,8 @@ phone approval is claimed by this transport preparation.
 Final focused native run: 55 tests pass (`ApprovalPush`,
 `RelayIdentityRecoveryLifecycle`, `NetworkDebugLogger`, `AtemSession`). Relay's
 regular suite: 456 pass, 110 ignored. The new isolated Postgres
-migration/rotation/reconnect test passes. Signing validation: 16 tests pass.
+migration/rotation/reconnect test passes, including maximum-size FCM tokens and
+token reassignment. Signing validation: 16 tests pass.
 APNs and FCM tests use an injected transport and verify actual request
 headers/body, provider refusals, OAuth refresh and expiration during refresh.
 ES256 and RS256 signatures are verified locally; the RSA fixture is a public
