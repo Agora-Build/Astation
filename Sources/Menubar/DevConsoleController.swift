@@ -250,7 +250,10 @@ class DevConsoleController: NSObject, NSWindowDelegate {
             return
         }
 
-        hubManager.sendCommandToClient(command, action: action, clientId: targetId)
+        guard hubManager.sendCommandToClient(command, action: action, clientId: targetId) else {
+            appendLog(hubManager.remoteInputStatusMessage ?? "Open Terminal to control a session.")
+            return
+        }
         appendLog("Sent [\(action)] to \(targetId.prefix(8))...: \(command.prefix(80))")
 
         // Clear input

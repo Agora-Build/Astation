@@ -78,7 +78,7 @@ private final class TerminalHubFixture {
         hub = AstationHubManager(skipProjectLoad: true, deviceSessionStore: sessions,
             sessionStore: SsoSessionStore(storageURL: directory.appendingPathComponent("sso.enc")),
             relayIdentityKeyManager: manager, relayIdentityRepairDefaults: defaults,
-            atemE2EIdentity: identity, makeIdentityRelayTask: { _ in socket })
+            atemE2EIdentity: identity, sessionJournal: AtemSessionJournal(), makeIdentityRelayTask: { _ in socket })
     }
 
     func drain() async {
@@ -107,6 +107,32 @@ private final class TerminalHubFixture {
     func emit(_ message: AstationMessage) throws {
         try socket.emit(["atem_id": deviceId, "connection_id": generation,
             "payload": JSONSerialization.jsonObject(with: JSONEncoder().encode(message))])
+    }
+
+    var sessionFrames: [[String: Any]] {
+        socket.sent.compactMap { $0["payload"] as? [String: Any] }.filter { $0["type"] as? String == "session" }
+    }
+
+    func readySession() async throws -> (AtemSessionClient, AtemSessionTarget) {
+        let client = try XCTUnwrap(hub.sessionClient(for: clientId))
+        let context = try XCTUnwrap(hub.sessionContext(for: clientId))
+        let hello = try XCTUnwrap(sessionFrames.last { ($0["data"] as? [String: Any])?["op"] as? String == "hello" })
+        let data = try XCTUnwrap(hello["data"] as? [String: Any])
+        var welcome = AtemSessionMessage(op: "welcome")
+        welcome.re = try XCTUnwrap(data["id"] as? String)
+        welcome.account_id = context.account; welcome.atem_device_id = context.device
+        welcome.host_trust_gen = 1; welcome.runtime_gen = "55555555-5555-4555-8555-555555555555"
+        welcome.controller_session = "66666666-6666-4666-8666-666666666666"
+        welcome.attachment_gen = "33333333-3333-4333-8333-333333333333"
+        welcome.client_kind = "native"; welcome.permissions = ["view", "control"]
+        welcome.authorization_ms_left = 60_000; welcome.server_time = 1_760_500_000_000
+        try emit(.session(welcome)); await drain()
+        let descriptor = try JSONDecoder().decode(AtemSessionDescriptor.self, from: Data(
+            #"{"session_id":"ses-aaaaaaaaaaaa","process_gen":"22222222-2222-4222-8222-222222222222","provider":"claude","cwd_label":"Project","state":"running","activity":"ready","activity_since":1,"controller":null,"capabilities":["terminal-v1","chat-v1"],"created_at":1}"#.utf8))
+        var snapshot = AtemSessionMessage(op: "sessions")
+        snapshot.runtime_gen = welcome.runtime_gen; snapshot.runtime_epoch = 7; snapshot.seq = 1; snapshot.sessions = [descriptor]
+        try emit(.session(snapshot)); await drain()
+        return (client, try XCTUnwrap(client.target(sessionId: descriptor.session_id, process: descriptor.process_gen)))
     }
 
     func revokeVerification() throws {
@@ -174,21 +200,19 @@ final class RemoteTerminalHubTests: XCTestCase {
         XCTAssertFalse(routes.contains(current.route))
     }
 
-    func testStartingSessionHandshakeBlocksLegacyBrowserWithoutWaitingForWelcome() async throws {
+    func testBrowserAccessIsBlockedBeforeHelloAndAfterReconnect() async throws {
         let f = try TerminalHubFixture()
         try await f.start(); try await f.authenticate()
         let agent = try JSONDecoder().decode(AtemAgentInfo.self, from: Data(
             #"{"id":"agent","name":"Claude","kind":"ClaudeCode","capabilities":["chat-v1"]}"#.utf8))
-        XCTAssertNoThrow(try f.hub.openAgentInBrowser(clientId: f.clientId, agent: agent))
-        let route = try XCTUnwrap(f.hub.terminalConnection(for: f.clientId))
-        XCTAssertTrue(f.hub.sendSessionMessage(AtemSessionMessage(op: "hello"), to: route))
-        XCTAssertThrowsError(try f.hub.openAgentInBrowser(clientId: f.clientId, agent: agent)) {
-            XCTAssertTrue($0.localizedDescription.contains("secure companion"))
+        for _ in 0..<2 {
+            XCTAssertThrowsError(try f.hub.openAgentInBrowser(clientId: f.clientId, agent: agent)) {
+                XCTAssertTrue($0.localizedDescription.contains("secure companion"))
+            }
+            f.generation = UUID().uuidString
+            try await f.authenticate()
         }
-        XCTAssertTrue(f.hub.sendSessionMessage(AtemSessionMessage(op: "list"), to: route))
-        f.generation = UUID().uuidString
-        try await f.authenticate()
-        XCTAssertNoThrow(try f.hub.openAgentInBrowser(clientId: f.clientId, agent: agent), "The gate is scoped to the exact socket, not a relay presence label")
+        XCTAssertFalse(f.socket.sent.contains { ($0["payload"] as? [String: Any])?["type"] as? String == "agentChat" })
     }
 
     func testVerificationRevocationFencesDelayedFramesAndReconnectedSessionTokens() async throws {
@@ -256,61 +280,41 @@ final class RemoteTerminalHubTests: XCTestCase {
         _ = f.hub.handleMessage(.agentListResponse(agents: [agent]), from: f.clientId, relayConnectionId: f.generation)
         f.hub.deviceSessionStore.delete(sessionId: f.session.id)
         await f.drain()
-        XCTAssertNil(f.hub.agentsByClientId[f.clientId])
+        XCTAssertTrue(f.hub.agentsByClientId[f.clientId]?.isEmpty != false)
     }
 
-    func testBrowserChatUsesScopedUnpairedBridgeAndAuthenticatedHostGeneration() async throws {
+    func testOneSessionClientServesConnectionsAndTerminalWithoutSecondHello() async throws {
         let f = try TerminalHubFixture()
-        try await f.start()
-        try await f.authenticate()
-        let agent = try JSONDecoder().decode(AtemAgentInfo.self, from: Data(
-            #"{"id":"agent","name":"Claude","kind":"ClaudeCode","capabilities":["chat-v1"]}"#.utf8))
-        let link = try f.hub.openAgentInBrowser(clientId: f.clientId, agent: agent)
-        let parameters = URLComponents(string: "?" + (link.fragment ?? ""))?.queryItems ?? []
-        let id = try XCTUnwrap(parameters.first { $0.name == "session" }?.value)
-        var raw = try XCTUnwrap(parameters.first { $0.name == "key" }?.value)
-            .replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
-        while raw.count % 4 != 0 { raw += "=" }
-        let key = SymmetricKey(data: try XCTUnwrap(Data(base64Encoded: raw)))
-        let browserId = "browser-" + id
-        let connection = UUID().uuidString
-        let challenges = f.challenges
-        try f.socket.emit(["atem_id": browserId, "connection_id": connection, "relay_event": "connected"])
-        try f.socket.emit(["atem_id": browserId, "connection_id": connection,
-            "payload": ["type": "statusUpdate", "data": ["status": "hello", "data": ["hostname": "Untrusted"]]]])
-        await f.drain()
-        XCTAssertEqual(f.challenges, challenges)
-        XCTAssertFalse(f.hub.connectedClients.contains { $0.id == "relay-" + browserId })
+        try await f.start(); try await f.authenticate()
+        let (client, target) = try await f.readySession()
+        let initialHellos = f.sessionFrames.filter { ($0["data"] as? [String: Any])?["op"] as? String == "hello" }.count
+        XCTAssertEqual(initialHellos, 1)
+        for _ in 0..<3 {
+            XCTAssertTrue(f.hub.sessionClient(for: f.clientId) === client)
+            client.start()
+            f.hub.requestAgentList(from: f.clientId)
+        }
+        XCTAssertEqual(f.sessionFrames.filter { ($0["data"] as? [String: Any])?["op"] as? String == "hello" }.count, 1)
+        XCTAssertEqual(f.hub.agentsByClientId[f.clientId]?.map(\.id), [target.session_id])
+        XCTAssertEqual(f.hub.agentsByClientId[f.clientId]?.first?.status, "Idle")
+        XCTAssertTrue(f.terminalFrames.isEmpty)
+        XCTAssertFalse(f.socket.sent.contains { ($0["payload"] as? [String: Any])?["type"] as? String == "agentListRequest" })
+    }
 
-        let body = Data(#"{"op":"open"}"#.utf8).base64EncodedString()
-        let mac = HMAC<SHA256>.authenticationCode(for: BrowserChatFrame.signingData("request", sessionId: id,
-            nonce: "nonce", sequence: 1, body: body), using: key)
-        let frame = BrowserChatFrame(sessionId: id, nonce: "nonce", sequence: 1, body: body, mac: Data(mac).base64EncodedString())
-        try f.socket.emit(["atem_id": browserId, "connection_id": connection,
-            "payload": JSONSerialization.jsonObject(with: JSONEncoder().encode(AstationMessage.browserChat(frame)))])
-        await f.drain()
-        let forwarded = try XCTUnwrap(f.socket.sent.last {
-            ($0["payload"] as? [String: Any])?["type"] as? String == "agentChat"
-        })
-        XCTAssertEqual(forwarded["atem_id"] as? String, f.deviceId)
-        XCTAssertEqual(forwarded["connection_id"] as? String, f.generation)
-        let payload = try XCTUnwrap(forwarded["payload"] as? [String: Any])
-        let request = try JSONDecoder().decode(AstationMessage.self, from: JSONSerialization.data(withJSONObject: payload))
+    func testRemovedCommandsReturnUnsupportedVersionAndConsoleNeverSends() async throws {
+        let f = try TerminalHubFixture()
+        try await f.start(); try await f.authenticate()
         let before = f.socket.sent.count
-        f.hub.broadcastToAuthenticatedIdentityRelayClients(request)
-        XCTAssertEqual(f.socket.sent.count, before, "chat must never broadcast to other devices")
-        guard case .agentChat(let open) = request else { return XCTFail("expected chat open") }
-        let browserFramesBeforeRevocation = f.socket.sent.filter {
-            ($0["payload"] as? [String: Any])?["type"] as? String == "browserChat"
-        }.count
-        let event = AgentChatWire(op: "opened", conversationId: open.conversationId, agentId: "agent",
-                                  generation: "process", sequence: 0)
-        try f.emit(.agentChat(event))
-        f.hub.deviceSessionStore.delete(sessionId: f.session.id)
-        await f.drain()
-        XCTAssertEqual(f.socket.sent.filter {
-            ($0["payload"] as? [String: Any])?["type"] as? String == "browserChat"
-        }.count, browserFramesBeforeRevocation, "revocation before delayed dispatch drops the host event")
+        XCTAssertFalse(f.hub.sendCommandToClient("private command", action: "shell", clientId: f.clientId))
+        XCTAssertEqual(f.socket.sent.count, before)
+        for removed in [AstationMessage.agentListRequest, .voiceCommand(text: "never dispatch", isFinal: true),
+                        .userCommand(command: "never execute", context: ["action": "shell"])] {
+            guard case .session(let response) = f.hub.handleMessage(removed, from: f.clientId, relayConnectionId: f.generation) else {
+                return XCTFail("Removed op needs unsupported_version")
+            }
+            XCTAssertEqual(response.code, "unsupported_version")
+            XCTAssertNil(response.re)
+        }
     }
 
     func testRestoredRelayConnectionRequestsProofWithoutHelloAndRacingHelloKeepsProofValid() async throws {
@@ -365,10 +369,15 @@ final class RemoteTerminalHubTests: XCTestCase {
         try await f.authenticate()
         let route = try XCTUnwrap(f.hub.terminalConnection(for: f.clientId))
         XCTAssertEqual(route.connectionId, f.generation)
-        XCTAssertTrue(f.hub.sendTerminalMessage(.list, to: route))
+        let (client, target) = try await f.readySession()
+        let subscribe = RemoteTerminalMessage.bound(.subscribe(terminalId: target.session_id, generation: target.process_gen),
+            try XCTUnwrap(client.binding(for: target, mutation: false)))
+        XCTAssertFalse(f.hub.sendTerminalMessage(.list, to: route))
+        XCTAssertTrue(f.hub.sendTerminalMessage(subscribe, to: route))
         XCTAssertEqual(f.terminalFrames.count, 1)
-        XCTAssertEqual(f.terminalFrames[0]["atem_id"] as? String, f.deviceId)
-        XCTAssertEqual(f.terminalFrames[0]["connection_id"] as? String, f.generation)
+        let sent = try XCTUnwrap(f.terminalFrames.first)
+        XCTAssertEqual(sent["atem_id"] as? String, f.deviceId)
+        XCTAssertEqual(sent["connection_id"] as? String, f.generation)
         try f.emit(.terminal(.sessions([])))
         await f.drain()
         XCTAssertEqual(received, [route])
@@ -393,7 +402,10 @@ final class RemoteTerminalHubTests: XCTestCase {
         let current = try XCTUnwrap(f.hub.terminalConnection(for: f.clientId))
         XCTAssertNotEqual(current, old)
         XCTAssertFalse(f.hub.sendTerminalMessage(.list, to: old))
-        XCTAssertTrue(f.hub.sendTerminalMessage(.list, to: current))
+        let (client, target) = try await f.readySession()
+        let subscribe = RemoteTerminalMessage.bound(.subscribe(terminalId: target.session_id, generation: target.process_gen),
+            try XCTUnwrap(client.binding(for: target, mutation: false)))
+        XCTAssertTrue(f.hub.sendTerminalMessage(subscribe, to: current))
         XCTAssertEqual(f.terminalFrames.last?["connection_id"] as? String, f.generation)
     }
 

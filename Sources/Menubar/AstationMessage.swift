@@ -641,7 +641,11 @@ enum AstationMessage: Codable {
             self = .session(message)
 
         case .agentChat:
-            self = .agentChat(try container.decode(AgentChatWire.self, forKey: .data))
+            let message = try container.decode(AgentChatWire.self, forKey: .data)
+            if message.op == "error" {
+                try AtemSessionWire.check(message.code.map { !$0.isEmpty && $0.utf8.count <= 128 } == true)
+            }
+            self = .agentChat(message)
 
         case .browserChat:
             self = .browserChat(try container.decode(BrowserChatFrame.self, forKey: .data))
@@ -858,6 +862,19 @@ struct AtemAgentInfo: Codable, Identifiable {
         case acpUrl = "acp_url"
         case ptyPid = "pty_pid"
         case capabilities
+    }
+
+    init(session: AtemSessionDescriptor) {
+        id = session.session_id
+        kind = session.provider == "claude" ? "Claude Code" : session.provider == "codex" ? "Codex" : session.provider
+        name = session.cwd_label.isEmpty ? kind : session.cwd_label
+        agentProtocol = "Pty"
+        status = session.state != "running" ? "Disconnected"
+            : ["ready": "Idle", "working": "Thinking", "waiting": "WaitingForInput"][session.activity] ?? "Unknown"
+        sessionIds = [session.session_id]
+        acpUrl = nil
+        ptyPid = nil
+        capabilities = session.capabilities
     }
 
     init(from decoder: Decoder) throws {

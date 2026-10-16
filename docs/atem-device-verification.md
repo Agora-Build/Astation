@@ -53,7 +53,7 @@ rather than its instance UUID. It must receive an explicit safety-code
 answer from an interactive terminal; redirected stdin or unavailable
 input must not be interpreted as a code mismatch. SSO pairing and an
 authenticated connection can remain available after E2E verification
-fails. Check `atem cred status` for device trust.
+fails. Check `atem status` for device trust.
 
 Certificates include the ceremony transcript. The certificate is signed
 at epoch E and the accompanying account state at E+1. Device pins and the
@@ -314,7 +314,7 @@ Before release, complete a real `atem pair` against an isolated account,
 confirm both codes, test Touch ID cancellation and success, relaunch the
 Mac app to check pins/epochs, and confirm a changed key cannot obtain K.
 
-For live step 2a verification, run `atem pair` and check `atem cred status`
+For live step 2a verification, run `atem pair` and check `atem status`
 reports the storage key held by Astation. Then run `atem cred lock` and
 `atem cred unlock`, approve Touch ID on the Mac, and confirm storage-key
 rotation. Test Deny and a disconnected unlock before approving a fresh
@@ -333,7 +333,7 @@ have already passed with Genie. The user has authorized squash merge after
 final review and passing checks. The following live OFF and OFF-then-ON checks
 remain unrecorded; run them with the updated app and client:
 
-1. Confirm Astation's relay/account status is connected and `atem cred status`
+1. Confirm Astation's relay/account status is connected and `atem status`
    on the other machine reports a verified device and an unlocked key agent.
 2. In Astation, turn encryption off. Run `atem cred unlock` on the other
    machine. Astation should reach Off after verified migration, and existing

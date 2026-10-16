@@ -40,13 +40,14 @@ final class AtemSessionClient {
     private var highestLeaseEpoch: [String: UInt64] = [:]
     private var revokedLeaseEpoch: [String: UInt64] = [:]
     private var authorizationDeadline: TimeInterval = 0
-    private var runtimeEpoch: UInt64?
+    private(set) var runtimeEpoch: UInt64?
     private var runtimeGeneration: String?
-    private var sequence: UInt64?
+    private(set) var sequence: UInt64?
     private var resyncing = true
     private var tombstones: [String: Set<String>] = [:]
     private var started = false
     private var lastReceiptQuery: TimeInterval = 0
+    var hasRegistrySnapshot: Bool { phase == .ready && !resyncing }
 
     init(context: @escaping () -> AtemSessionContext?,
          send: @escaping (AtemSessionMessage, RemoteTerminalConnection) -> Bool,
@@ -100,7 +101,7 @@ final class AtemSessionClient {
         guard target == self.target(sessionId: target.session_id, process: target.process_gen),
               let attachment = welcome?.attachment_gen else { return nil }
         if mutation {
-            guard registry[target.session_id]?.state == "running",
+            guard welcome?.permissions?.contains("control") == true, registry[target.session_id]?.state == "running",
                   let lease = leases[target.session_id], lease.target == target, now() < lease.deadline else { return nil }
             return AtemSessionBinding(target: target, attachment_gen: attachment, lease_epoch: lease.epoch)
         }
@@ -147,9 +148,23 @@ final class AtemSessionClient {
         for target in targets { release(target) }
     }
 
+    func renew(_ target: AtemSessionTarget) {
+        guard let binding = binding(for: target, mutation: true),
+              !pending.values.contains(where: { $0.message.op == "renew" && $0.message.binding?.target == target }),
+              let deadline = leases[target.session_id]?.deadline else { return }
+        var message = AtemSessionMessage(op: "renew")
+        message.binding = binding
+        _ = request(message, deadline: deadline)
+    }
+
     @discardableResult
     func submit(_ target: AtemSessionTarget, kind: String, text: String? = nil) -> String? {
         guard pending.count < 64, let binding = binding(for: target, mutation: true), ["prompt", "interrupt", "stop"].contains(kind) else { return nil }
+        if kind == "prompt", registry[target.session_id]?.capabilities.contains("chat-v1") != true {
+            status = "This agent accepts terminal input only. Type or paste in its terminal."
+            changed()
+            return nil
+        }
         let payload: AtemSessionJSON = kind == "prompt" ? .object(["text": .string(text ?? "")]) : .object([:])
         var message = AtemSessionMessage(op: "submit")
         message.binding = binding
@@ -177,14 +192,8 @@ final class AtemSessionClient {
     }
 
     func refresh() {
-        if phase == .failed, context != nil, context == currentContext() {
-            phase = .connecting
-            welcome = nil
-            pending = [:]
-            _ = request(AtemSessionMessage(op: "hello"))
-            changed()
-            return
-        }
+        // A second hello on a welcomed attachment is unauthorized in r6.2.
+        // Failed attachments recover only through a new authenticated connection.
         guard phase == .ready else { return }
         resyncing = true
         if !pending.values.contains(where: { $0.message.op == "list" }) { _ = request(AtemSessionMessage(op: "list")) }
@@ -197,6 +206,13 @@ final class AtemSessionClient {
             if message.op == "welcome" {
                 guard phase == .connecting, let re = message.re, pending[re]?.message.op == "hello" else { return }
                 try acceptWelcome(message); changed(); return
+            }
+            if message.op == "error", message.re == nil {
+                status = "Atem: " + (message.code ?? "request failed")
+                if phase == .connecting || ["unauthorized", "paused", "unsupported_version"].contains(message.code ?? "") {
+                    fail(status + ". Reconnect with matching Astation and Atem builds.")
+                }
+                changed(); return
             }
             if phase == .connecting, message.op == "error", let re = message.re, pending[re]?.message.op == "hello" {
                 fail("Atem could not open a session: " + (message.code ?? "request failed")); changed(); return
@@ -229,8 +245,10 @@ final class AtemSessionClient {
                 if let target = operation.message.binding?.target,
                    ["acquire", "renew", "release"].contains(operation.message.op) { leases.removeValue(forKey: target.session_id) }
                 status = "Atem: " + (message.code ?? "request failed")
-                if ["unauthorized", "paused"].contains(message.code ?? "") { fail("Session authorization expired. Reconnect the verified Atem.") }
-                else if message.code == "stale_target" { refresh() }
+                handleRefusal(code: message.code ?? "request failed", target: operation.message.binding?.target)
+                if message.code == "busy", operation.message.op == "submit" {
+                    status = "Atem is busy. Checking the receipt without resending this request."
+                }
             default: break
             }
         } catch { fail("Atem sent an invalid or inconsistent session message. Reconnect to continue.") }
@@ -254,9 +272,7 @@ final class AtemSessionClient {
                 status = "Control expired. Take Control explicitly to type again."
                 changed()
             } else if time >= lease.renewAt, !pending.values.contains(where: { $0.message.op == "renew" && $0.message.binding?.target == lease.target }) {
-                var message = AtemSessionMessage(op: "renew")
-                message.binding = binding(for: lease.target, mutation: true)
-                if message.binding != nil { _ = request(message, deadline: lease.deadline) }
+                renew(lease.target)
             }
         }
         let timedOut = pending.filter { time - $0.value.sent >= 15 }
@@ -287,6 +303,16 @@ final class AtemSessionClient {
         authorizationDeadline = min(hello.sent + Double(remaining) / 1000, now() + Double(remaining) / 1000)
         try AtemSessionWire.check(now() < authorizationDeadline)
         welcome = message
+        // Sequence numbers, removals and authority belong to this attachment;
+        // only the durable trust/runtime floor survives a new welcome.
+        registry = [:]
+        sequence = nil
+        tombstones = [:]
+        leases = [:]
+        highestLeaseEpoch = [:]
+        revokedLeaseEpoch = [:]
+        resyncing = true
+        latestReceipt = nil
         phase = .ready
         status = "Viewing. Select a session and take control explicitly."
         refresh()
@@ -300,19 +326,13 @@ final class AtemSessionClient {
         if generation != welcome?.runtime_gen {
             if let runtimeEpoch, epoch > runtimeEpoch {
                 try persistRuntime(epoch: epoch, generation: generation)
-                // A broker restart fences the old attachment as well as leases.
-                // Obtain a fresh welcome, without resuming control or input.
-                phase = .connecting
-                leases = [:]
-                highestLeaseEpoch = [:]
-                revokedLeaseEpoch = [:]
-                pending = [:]
-                welcome = nil
+                // The old attachment cannot be welcomed again. Wait for the
+                // host's replacement authenticated connection before hello.
                 registry = [:]
                 sequence = nil
                 tombstones = [:]
                 resyncing = true
-                _ = request(AtemSessionMessage(op: "hello"))
+                fail("Atem restarted. Reconnect to open a fresh session attachment.")
             }
             return
         }
@@ -428,6 +448,18 @@ final class AtemSessionClient {
         latestReceipt = receipt
         status = receipt.state == .outcome_unknown ? "Outcome unknown. Inspect the agent before submitting another request."
             : "Request " + receipt.state.rawValue.replacingOccurrences(of: "_", with: " ") + "."
+    }
+
+    func handleRefusal(code: String, target: AtemSessionTarget?) {
+        if let target, ["forbidden", "session_closed", "stale_lease", "stale_target", "unknown_session"].contains(code) {
+            leases.removeValue(forKey: target.session_id)
+            pending = pending.filter { $0.value.message.binding?.target != target || !["acquire", "renew"].contains($0.value.message.op) }
+        }
+        status = "Atem: " + code
+        if ["unauthorized", "paused", "unsupported_version"].contains(code) {
+            fail("Session access refused (" + code + "). Reconnect the verified Atem with matching builds.")
+        } else if ["session_closed", "stale_target", "unknown_session"].contains(code) { refresh() }
+        changed()
     }
 
     private func queryUnresolvedReceipts() {

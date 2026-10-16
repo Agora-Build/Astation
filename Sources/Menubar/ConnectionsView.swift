@@ -562,6 +562,11 @@ private struct AgentRow: View {
                 }
 
                 HStack(spacing: 10) {
+                    Text(agent.name + " [" + String(agent.id.suffix(12)) + "]")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .help(agent.id)
                     Label(endpointLabel, systemImage: agent.agentProtocol == "Acp" ? "network" : "terminal")
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -590,6 +595,8 @@ private struct AgentRow: View {
                     Button(action: onOpenInBrowser) {
                         Label("Open in Browser", systemImage: "arrow.up.right.square")
                     }
+                    .disabled(true)
+                    .help("Browser access requires the secure companion protocol.")
                 }
                 .buttonStyle(.borderless)
                 .controlSize(.small)

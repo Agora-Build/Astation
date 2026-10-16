@@ -30,10 +30,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
         self.dictationManager = dictationManager ?? VoiceDictationManager(transcription: recordingManager.transcription,
             resolveTarget: { [weak hubManager] in hubManager?.routeToFocusedAtem() },
             sendText: { [weak hubManager] text, target in
-                guard let hubManager, hubManager.connectedClients.contains(where: { $0.id == target && $0.clientType == "Atem" }),
-                      let send = hubManager.sendHandler else { return false }
-                send(.voiceCommand(text: text, isFinal: true), target)
-                return true
+                hubManager?.sendAgentText(text, clientId: target) ?? false
             })
         hubManager.rtcManager.microphoneDeviceUID = { [weak recordingManager] in recordingManager?.settings.microphoneUID }
         super.init()

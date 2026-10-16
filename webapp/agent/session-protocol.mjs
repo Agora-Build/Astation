@@ -1,4 +1,4 @@
-// Pure r5 protocol state for conformance tests. Live browser enrollment and
+// Pure r6.2 protocol state for conformance tests. Live browser enrollment and
 // transport remain gated on the joint section 9 security specification.
 export const BROWSER_SESSION_ACCESS_ENABLED = false;
 const encoder = new TextEncoder();
@@ -170,8 +170,25 @@ export function decodeSessionPacket(input) {
     case "receipt_query": check(message.binding && message.binding.lease_epoch === undefined && Array.isArray(message.request_ids)
       && message.request_ids.length <= 64 && message.request_ids.every(uuid)); break;
     case "receipts": check(uuid(message.re) && Array.isArray(message.receipts) && message.receipts.length <= 64); message.receipts.forEach(receipt); break;
-    case "error": check(uuid(message.re) && bytes(message.code, 128)); break;
+    case "error": check(bytes(message.code, 128) && message.code.length > 0); break;
     default: throw new Error("Unsupported session operation");
+  }
+  return message;
+}
+
+export function decodeFamilyError(input) {
+  const envelope = parseSessionJSON(input, { integersOnly: false, maximum: 2097152 });
+  const packet = envelope.payload ?? envelope;
+  const message = packet.data;
+  check(plain(message) && message.v === 1 && message.op === "error"
+    && bytes(message.code, 128) && message.code.length > 0 && message.binding === undefined);
+  if (packet.type === "terminal") {
+    check(sessionId(message.terminal_id) && bytes(message.message, 512)
+      && (message.stream_id === undefined || (bytes(message.stream_id, 128) && message.stream_id.length > 0)));
+  } else {
+    check(packet.type === "agentChat" && sessionId(message.agentId) && bytes(message.conversationId, 128)
+      && message.conversationId.length > 0 && bytes(message.text, 512)
+      && (message.requestId === undefined || uuid(message.requestId)));
   }
   return message;
 }
@@ -180,9 +197,18 @@ export class SessionRegistry {
   constructor() {
     this.sessions = new Map(); this.tombstones = new Map(); this.epoch = null;
     this.runtime = null; this.seq = null; this.needsSnapshot = true; this.requestedList = false;
+    this.attachment = null;
   }
   apply(message) {
-    check(["sessions", "session_changed"].includes(message.op));
+    check(["welcome", "sessions", "session_changed"].includes(message.op));
+    if (message.op === "welcome") {
+      check(uuid(message.attachment_gen));
+      if (message.attachment_gen === this.attachment) return;
+      this.attachment = message.attachment_gen;
+      this.sessions.clear(); this.tombstones.clear(); this.seq = null;
+      this.needsSnapshot = true; this.requestedList = false;
+      return;
+    }
     const { runtime_epoch: epoch, runtime_gen: runtime, seq } = message;
     if (this.epoch !== null && epoch < this.epoch) return;
     if (epoch === this.epoch) check(runtime === this.runtime);

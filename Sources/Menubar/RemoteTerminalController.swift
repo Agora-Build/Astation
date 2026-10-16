@@ -30,7 +30,8 @@ final class RemoteTerminalController {
 
     var canTakeControl: Bool {
         if let client = sessionClient {
-            return phase == .viewing && !wantsControl && session?.exitStatus == nil
+            return client.welcome?.permissions?.contains("control") == true
+                && phase == .viewing && !wantsControl && session?.exitStatus == nil
                 && protocolTarget.map { client.registry[$0.session_id]?.state == "running" && !client.acquiring($0) } == true
         }
         return phase == .viewing && !wantsControl && session?.exitStatus == nil && session?.supportsExpiringControl == true
@@ -73,6 +74,7 @@ final class RemoteTerminalController {
         var cancelled: Bool
     }
     private var attachmentRequests: [AttachmentRequest] = []
+    private var sessionAttachment: String?
 
     init(currentConnection: @escaping () -> RemoteTerminalConnection?,
          send: @escaping (RemoteTerminalMessage, RemoteTerminalConnection) -> Bool,
@@ -129,6 +131,12 @@ final class RemoteTerminalController {
         self.autoView = autoView
         listingSince = now()
         if stream == nil { phase = .listing; status = "Looking for shared terminals..." }
+        if let client = sessionClient {
+            if !client.hasRegistrySnapshot { client.refresh() }
+            sessionStateChanged()
+            changed()
+            return
+        }
         if !send(.list) { disconnectedSend() }
         changed()
     }
@@ -280,7 +288,9 @@ final class RemoteTerminalController {
         }
         if sessionClient != nil {
             switch message {
-            case .sessions, .error, .unsupported: break
+            // r6.2 host events carry no binding. The authenticated connection,
+            // outstanding subscribe and exact process/stream fence delivery.
+            case .attached, .frame, .written, .exited, .error, .unsupported: break
             default: return
             }
         }
@@ -309,7 +319,8 @@ final class RemoteTerminalController {
                 return
             }
         }
-        if case .error(let terminalId, _) = message,
+        if case .error(let terminalId, let errorStream, _, _) = message,
+           errorStream == nil,
            let index = attachmentRequests.firstIndex(where: { $0.connection == source
                && (terminalId == nil || $0.sessionId.hasPrefix((terminalId ?? "") + ":")) }),
            attachmentRequests[index].cancelled {
@@ -321,7 +332,7 @@ final class RemoteTerminalController {
         case .sessions(let available):
             guard listingSince != nil else { return }
             listingSince = nil
-            guard available.count <= 64 else { fail("Atem reported too many terminals."); return }
+            guard available.count <= (sessionClient == nil ? 64 : 1024) else { fail("Atem reported too many terminals."); return }
             sessions = available
             if stream != nil { changed(); return }
             let previous = reconnectSession ?? session
@@ -422,12 +433,23 @@ final class RemoteTerminalController {
             status = "Agent exited: " + String(exitStatus.prefix(160))
             if !pendingWrites.isEmpty { status += ". Some input has an unknown outcome." }
             pendingWrites = [:]
-        case .error(let terminalId, let message):
+        case .error(let terminalId, let errorStream, let code, let message):
+            guard errorStream == nil || errorStream == stream?.streamId else { return }
             if let index = attachmentRequests.firstIndex(where: { $0.connection == source
                 && (terminalId == nil || $0.sessionId.hasPrefix(terminalId! + ":")) }) {
                 attachmentRequests.remove(at: index)
             }
             guard terminalId == nil || terminalId == session?.terminalId else { return }
+            if let client = sessionClient {
+                // A registry refresh disables target(), but a refusal must
+                // still fence the selected process's cached lease.
+                let target = session.flatMap { session -> AtemSessionTarget? in
+                    guard let context = client.context, let trust = client.welcome?.host_trust_gen else { return nil }
+                    return AtemSessionTarget(account_id: context.account, atem_device_id: context.device,
+                        host_trust_gen: trust, session_id: session.terminalId, process_gen: session.generation)
+                }
+                client.handleRefusal(code: code, target: target)
+            }
             fail("Atem: " + String(message.prefix(300)))
         case .unsupported:
             fail("This Atem uses an unsupported terminal protocol. Update Astation and Atem together.")
@@ -538,7 +560,6 @@ final class RemoteTerminalController {
     private func send(_ message: RemoteTerminalMessage) -> Bool {
         guard let connection, connection == currentConnection() else { return false }
         if let client = sessionClient {
-            if case .list = message { return sendMessage(message, connection) }
             guard client.phase == .ready else { return false }
             let terminalId: String
             let generation: String
@@ -559,6 +580,41 @@ final class RemoteTerminalController {
 
     func sessionStateChanged() {
         guard isOpen, let client = sessionClient else { return }
+        if sessionAttachment != client.welcome?.attachment_gen {
+            sessionAttachment = client.welcome?.attachment_gen
+            let previous = session ?? reconnectSession
+            detach()
+            attachmentRequests = []
+            sessions = []
+            session = nil
+            reconnectSession = previous
+            listingSince = now()
+            autoView = true
+            phase = .listing
+        }
+        guard client.hasRegistrySnapshot else {
+            if client.phase == .failed { fail(client.status) }
+            else { status = client.status; changed() }
+            return
+        }
+        let available = client.registry.values.filter { $0.capabilities.contains("terminal-v1") }
+            .sorted { $0.session_id < $1.session_id }.map { descriptor in
+                RemoteTerminalSession(terminalId: descriptor.session_id, generation: descriptor.process_gen,
+                    provider: descriptor.provider, rows: 24, cols: 80,
+                    exitStatus: descriptor.state == "exited" || descriptor.state == "closed" ? descriptor.state : nil,
+                    rendering: "vt100-screen-diff", widthProfile: "atem-unicode-width-0.1.14",
+                    capabilities: descriptor.capabilities, agentId: descriptor.session_id, label: descriptor.cwd_label)
+            }
+        if listingSince != nil || available != sessions {
+            if let session, !available.contains(where: { $0.id == session.id }), stream != nil {
+                detach()
+                self.session = nil
+                phase = .ready
+            }
+            listingSince = listingSince ?? now()
+            guard let source = connection else { return }
+            receivePayload(.sessions(available), from: source)
+        }
         if phase == .ready, autoView, protocolTarget != nil {
             autoView = false
             view()

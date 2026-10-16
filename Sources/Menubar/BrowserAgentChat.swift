@@ -89,6 +89,8 @@ struct AgentChatWire: Codable, Equatable {
     var history: Bool?
     var before: String?
     var outcome: String?
+    var code: String?
+    var binding: AtemSessionBinding?
 }
 
 struct BrowserChatFrame: Codable {

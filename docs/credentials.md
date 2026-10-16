@@ -47,7 +47,7 @@ to add a credential for a project that is not listed; no connected Atem is neede
    or click **Use Mac Password...** for macOS authentication.
    Either side can finish first. Save and confirm the complete recovery kit
    if requested, and finish any key-escrow/unlock approval.
-4. Check `atem cred status`: the device must be verified, and its key agent
+4. Check `atem status`: the device must be verified, and its key agent
    must be unlocked before reporting projects. **Connected** or **Paired with
    Astation** alone does not establish either state.
 5. In the Git repository on the Atem machine, run:
@@ -87,7 +87,7 @@ its published version. If a command is missing, install a release containing it
 or build current `main` using the [Atem source instructions](https://github.com/Agora-Build/Atem#build-from-source).
 Run the source binary explicitly, such as `./target/release/atem`, for every
 upgrade command; building alone does not replace a global npm installation.
-`atem cred status` marks an older running agent as **older build**.
+`atem status` marks an older running agent as **older build**.
 
 Project names are encrypted to the verified Astation even when memory encryption
 is off. They are suggestions, not device permissions. See the

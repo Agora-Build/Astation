@@ -3,7 +3,7 @@
 Date: 2026-10-15
 
 Status: historical initial proposal, superseded for managed sessions by
-[atem-session v1 r5](protocol/atem-session-v1.md). Use the
+[atem-session v1 r6.2](protocol/atem-session-v1.md). Use the
 [current implementation handoff](protocol/atem-implementation-handoff.md).
 The optional terminal lease below is retained only as a legacy reference.
 
@@ -28,7 +28,7 @@ are implemented. Preserve existing processes and pairwise pins during upgrades.
 
 ## Current implementation limits
 
-The Astation task worktree now uses the r5 client and common session lease in
+The Astation task worktree now uses the r6.2 client and common session lease in
 the native remote terminal UI. Legacy controller code remains isolated for
 unmanaged callers and regression coverage; it is not an authority fallback.
 See [current evidence](protocol/astation-session-v1-implementation.md).
@@ -66,8 +66,7 @@ can require fresh native Touch ID/password approval using existing trust. Lock
 can clear local keys offline, including when no valid pairing exists. Lock and
 unpair preserve stored account data, service credential records, and agent work.
 
-`atem status` is one read-only, offline-capable status implementation. The legacy
-`atem cred status` forwards to it. Its user-facing label is `Credentials`.
+`atem status` is one read-only, offline-capable status implementation. `atem cred status` was removed; use `atem status`. Its user-facing label is `Credentials`.
 Distinguish account login, persisted pairing, cryptographic verification,
 credential availability, authorization freshness, relay connectivity, and agent
 liveness. Cached state is labelled stale or unknown; a saved PID or past relay

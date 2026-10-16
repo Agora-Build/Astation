@@ -7,13 +7,15 @@ conversation and unfinished input.
 ## Start a session
 
 This development branch requires an Atem host implementing
-[atem-session v1 r5](../designs/protocol/atem-session-v1.md), in addition to
+[atem-session v1 r6.2](../designs/protocol/atem-session-v1.md), in addition to
 shared-terminal rendering. Earlier terminal-only hosts cannot provide control
-through this build. The Atem owner handles host implementation/upgrades;
-the published pairing fixes alone do not imply r5 support. See the
+through this build. Use the runtime host in [Atem PR #69](https://github.com/Agora-Build/Atem/pull/69);
+the published pairing fixes alone do not imply r6.2 support. See the
 [integration status](../designs/protocol/astation-session-v1-implementation.md).
 
-On the serving machine, start the installed agent through Atem:
+Use the same host binary for pairing and launch; see the
+[pinned host handoff](../designs/protocol/atem-host-handoff.md) for build and
+run instructions. On the serving machine:
 
 ```sh
 atem agent launch claude
@@ -83,7 +85,8 @@ If an acknowledgment is lost or times out, the outcome is unknown. Astation
 does not retry typing. Open a fresh View, inspect the screen, then decide whether
 to take control and submit something again.
 
-Refresh probes the terminal session list. A missing response can mean an old
+Refresh requests the shared session-v1 registry. Connections and terminal
+windows reuse one client, so opening a window never sends a second hello. A missing response can mean an old
 Atem build or a connection problem. No shared terminals means the host must
 launch an agent through Atem. Unsupported versions/width profiles, malformed
 frames and restore failures disable input and show an actionable status.
@@ -100,22 +103,19 @@ socket and discard previous remote streams and control leases before resuming.
 Older Atem builds that ignore late authentication challenges can leave a running
 Atem paired offline. That companion fix is coordinated with the Atem owner
 through shared project memory. On 2026-10-14 at 17:17 PDT, the running Genie host
-answered a fresh challenge and authenticated after Astation restarted. Quitting
-Atem ends its owned agents, so preserve an active conversation while arranging
-host updates.
+answered a fresh challenge and authenticated after Astation restarted. The new runtime owns independent workers, which survive its restart; preserve
+active conversations while arranging host updates with the Atem owner.
 
 ## Rendering and privacy
 
 The first protocol shares canonical visible-screen ANSI updates, preserving
 colors, cursor and supported terminal modes. It provides no remote scrollback
 or complete conversation history. The zero-scrollback renderer avoids presenting
-incidental repaint scrolls as a transcript. [Browser agent chat](agent-chat.md)
-uses the separate structured chat-v1 protocol, supported by the published Claude
-adapter in Atem PR 65. Other agents keep terminal access without chat capability.
-On this development branch, starting a native session-v1 handshake disables
-that socket's older browser bridge. Browser access to managed sessions awaits
-secure companion grants and common control leases. An unupgraded connection
-retains existing browser chat behavior.
+incidental repaint scrolls as a transcript. Claude advertises `chat-v1`, which
+allows durable prompt submissions; Codex currently accepts terminal input only.
+Astation disables the prompt field for terminal-only sessions. Browser access
+is disabled pending secure section 9 companion grants, regardless of whether
+hello has started. There is no older browser bridge fallback.
 
 xterm 6.0.0, addon-fit 0.11.0 and Atem's matching Unicode-width provider are
 bundled locally. The viewer loads no CDN, permits no external navigation and
@@ -142,13 +142,13 @@ revocation races. The full resource check also verifies that packaged apps
 contain the viewer assets. Live provider tests must use independently owned
 test sessions, preserving the user's active conversation.
 
-The current session-v1 client builds in Debug and passes its 96 focused native
+The current session-v1 client builds in Debug and passes its 102 focused native
 checks, including WebKit rendering, plus the webapp conformance suite and pinned
 assets. The [current validation evidence](../designs/protocol/astation-session-v1-implementation.md)
 records the broader local test failures and pending actual-host integration.
-Live cross-machine r5 control, physical IME/clipboard and real provider approvals
+Live cross-machine r6.2 control, physical IME/clipboard and real provider approvals
 remain acceptance checks. Earlier relay endpoint reauthentication after an
 Astation restart passed separately on Genie at 17:17 PDT on 2026-10-14.
 
 See [lifecycle and security invariants](../designs/remote-terminal.md) and
-[Atem's host contract](https://github.com/Agora-Build/Atem/blob/396a0f3/designs/terminal-v1-implementation.md).
+[Atem's current host handoff](../designs/protocol/atem-host-handoff.md).

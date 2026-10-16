@@ -1,15 +1,14 @@
 # Agent
 
-Open **Tools > Connections > Clients & Agents** in Astation, choose an online
-Atem, and click **Open in Browser** on its agent. The responsive app is served
-at `https://station.agora.build/agent/`. **Open Terminal** remains beside it
-for the full CLI and provider permission prompts.
+Browser host access is disabled in draft Astation PR #49. Atem session r6.2
+removes unbound chat, and the secure browser companion requires section 9 and
+shared host leases. **Open in Browser** is disabled before and after native
+hello; reconnect does not restore an older bridge. Use **Open Terminal** for
+current access to the original agent.
 
-On the session-v1 development branch, starting a native terminal handshake
-disables this older browser bridge for that exact host socket. New links explain
-that managed sessions require the secure companion protocol. Existing links
-stop sending. Browser access to v1 hosts remains gated on the joint security
-contract and common leases; the behavior below applies to unupgraded connections.
+The `/agent/` app remains hosted by the webapp. Its preview and offline protocol
+tests are available; the following UI description is historical behavior for
+the future companion implementation, not supported live access to r6.2 hosts.
 
 Prompts appear on the right and replies on the left. Prompts typed directly in
 the original terminal are labeled **You / Terminal**. Replies support CommonMark,

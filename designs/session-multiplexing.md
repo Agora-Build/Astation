@@ -1,11 +1,11 @@
 # Atem Sessions, Multiplexing, and Device Trust
 
-Date: 2026-10-15
+Date: 2026-10-16
 
 Status: product decisions and all six initial defaults approved by the user on
 2026-10-15. The consolidated CLI workflow below is also approved. Implementation
-of the native r5 client is complete in an Astation task worktree, with host
-integration still pending. All Atem
+of the native r6.2 client is in draft PR #49, targeting main; joint live host
+integration is next. All Atem
 implementation belongs to the Atem agent; see the handoff in section 10. The
 shared wire protocol in section 12 is a joint draft; required engineering
 changes and security gates remain explicit. Product approval is not protocol
@@ -52,9 +52,9 @@ Local agents:   2 running
 ```
 
 Credential availability is separate from pairing and verification. Locking clears
-unlocked key material; it does not delete saved credential records. Keep
-`atem cred status` as a compatibility alias to the unified status implementation;
-do not add a separate `atem pair status` command.
+unlocked key material; it does not delete saved credential records. `atem status`
+is the only status command; `atem cred status` was removed by user decision.
+Do not add a separate `atem pair status` command.
 
 `atem pair verify` requires an existing pairing and is a no-op for a currently
 valid verified binding. Cancellation or interruption preserves pairing and
@@ -425,31 +425,32 @@ side. Preserve existing identities and keys during migration; expanding old
 pairwise trust requires explicit validation and approval. Unsupported clients
 must fail clearly rather than downgrade security.
 
-### Compatibility build status
+### Current build status
 
-The Astation task branch implements the accepted r5 native client: authenticated
-hello/welcome, complete registry descriptors and sequence recovery, bound
-terminal streams, 15-second control leases, and durable client request metadata.
-Prompts, interrupts, and stops use scoped submissions. Reconnect queries receipts
-without replaying requests or restoring control. See the
-[implementation evidence and limits](protocol/astation-session-v1-implementation.md).
+Astations and Atems update together to atem-session r6.2, with no backward
+compatibility. Draft [Astation #49](https://github.com/Agora-Build/Astation/pull/49)
+uses one authenticated hello/welcome and registry client per host connection,
+shared by Connections and terminal windows. Every new attachment resets the
+sequence, removals, streams and leases, retaining durable trust/runtime fences.
+Terminal requests use exact target/attachment bindings; input/resize also need
+the 15-second lease. Prompts, interrupts and stops use durable submissions;
+reconnect queries their receipts without replay or control restoration.
 
-The earlier [initial contract](session-multiplexing-protocol-v1.md) is historical;
-its optional `terminal-lease-v1` authority is not used by the managed native UI.
-Old hosts receive an update instruction instead of a control downgrade. Browser
-chat on an unupgraded connection retains its existing behavior. Starting a v1
-handshake disables that socket's old browser bridge; v1 browser access awaits
-the section 9 security contract and common lease support.
+The host is [Atem #69](https://github.com/Agora-Build/Atem/pull/69), on
+`feat/runtime`; the contract is [Atem #68](https://github.com/Agora-Build/Atem/pull/68),
+with history tagged `atem-session-v1-r6.2`. See the
+[pinned host run instructions and wire changes](protocol/atem-host-handoff.md),
+[client validation](protocol/astation-session-v1-implementation.md) and
+[joint test handoff](protocol/atem-implementation-handoff.md).
+All Atem implementation belongs to its owner; no local Atem checkout is used.
 
-All Atem implementation belongs to the Atem agent. The lifecycle and trust
-changes are published on `feat/status-pair-verify` through `207b0e9`; see the
-[Atem handoff](protocol/atem-implementation-handoff.md). No local Atem checkout
-was changed, built, or tested for this client integration. Live integration
-still requires the owner's actual r5 host, including durable receipts, common
-authority across every mutation path, and worker/runtime recovery.
-
-Account-wide trust, independent QR companions, traffic E2EE, and complete
-recovery remain gated. Existing installed apps and agents have not been replaced.
+Removed agent lists, terminal lists/control/lease_id, unbound prompts/voice and
+console commands are not fallbacks. Browser access is disabled, including on a
+socket that has not started hello. The r6.2 runtime currently has one Astation
+link and attachment; multiple simultaneous native controllers, QR companions,
+account-wide trust, traffic E2EE, freshness proofs and resume still require
+section 9. r7 prompt-bound approvals await their contract and are not enabled.
+No installed app was replaced or restarted and nothing was merged or deployed.
 
 ## 11. Acceptance criteria
 
@@ -461,7 +462,7 @@ host/security work are distinguished in the implementation evidence linked above
 | Concurrent launches and pair/unlock/sync with existing agents | One profile identity and runtime owner; preserve processes, drafts, and separately addressed sessions. |
 | Repeat `atem pair` on an already paired profile, including incomplete verification | Report current status without starting pairing/verification or changing identity, keys, trust, or sessions; require explicit unpair before replacing the binding. |
 | Explicit `atem pair verify`, cancellation, retry, and already-valid verification | Verify only the existing binding; preserve pairing on interruption; do nothing when already validly verified; never silently replace trusted keys. |
-| `atem status`, its `atem cred status` alias, and offline execution | Use one read-only implementation with a `Credentials` label, distinct verification/lock state, and visibly stale cached remote information. |
+| `atem status` and offline execution | Use one read-only implementation with a `Credentials` label, distinct verification/lock state, and visibly stale cached remote information. |
 | Credential unlock/lock on an unverified profile | Unlock instructs the user to run `atem pair verify`; lock can clear local keys offline; neither command initiates verification. |
 | Same-host direct access during a relay outage, connection switching, and simultaneous direct/relay delivery | Honor valid local authorization; preserve the same sessions, leases, and receipts; authenticate replacement connections and reject duplicate submissions or stale input. |
 | Runtime crash, worker failure, PID reuse, and agent restart | Reattach only to authenticated surviving workers; show interrupted sessions honestly; reject old process generations. |
@@ -483,32 +484,29 @@ host/security work are distinguished in the implementation evidence linked above
 
 ## 12. Shared wire protocol: atem-session v1
 
-Status: r5 accepted as the compatibility-mode implementation contract. Shared
-Rust/Swift/browser fixture execution is required before final conformance.
-The session registry, host-enforced leases, explicit process generations, and
-durable receipt states are accepted in principle. The revisions below are
-required engineering constraints, not a claim that the open cryptographic
-protocol or the complete runtime is implemented.
+Status: r6.2 is the current implementation contract, with no legacy paths.
+Source: [Atem #68](https://github.com/Agora-Build/Atem/pull/68), history tag
+`atem-session-v1-r6.2`, commit `22de096b1980ee3ae342c0352b4c1d5fa54e3b51`.
+The [exact snapshot](protocol/atem-session-v1.md),
+[fixture schema](protocol/fixtures/schema.md) and
+[Astation's implementation evidence](protocol/astation-session-v1-implementation.md)
+are available. Historical r1-r5 reviews remain as review history, not a fallback
+implementation contract.
 
-Based on Atem's [upstream r5 draft](https://github.com/Agora-Build/Atem/blob/44987915fb24267960fd9d75221df4ed8c7838ec/designs/protocol/atem-session-v1.md).
-The [r5 snapshot](protocol/atem-session-v1.md), [fixtures](protocol/fixtures/schema.md),
-and [current Astation review](protocol/atem-session-v1-r5-review.md) are available.
-R5 resolves all three r4 findings; no new findings were identified in its changes:
+Removed or undecodable operations receive session `unsupported_version`,
+possibly without `re`; valid refused terminal/chat requests receive their own
+family's error with `code`. Chat receipt outcomes map to chat ops, never session
+receipts. Host admission checks control permission, accepting session, then
+lease; closed sessions report `session_closed` even with a stale lease.
+A new welcome resets per-attachment registry state while preserving the highest
+accepted runtime floor. Lease epochs may skip and are compared, never counted.
 
-- Dispatch failures have durable final receipts: `rejected` only with proof of
-  no side effect, otherwise `outcome_unknown`, with no automatic re-execution.
-- Snapshots and changes require complete descriptors, including removals;
-  changes are never patches and decoders reject missing fields.
-- Both endpoints expire control at `now >= deadline`; a reply applied at its
-  conservative deadline immediately disables control and input.
-
-All eight JSON fixture files parse with duplicate-key detection. The ten digest
-vectors are unchanged from the independently verified r4 set. Descriptor
-completeness, lease arithmetic, and the new failure scenarios were checked for
-content consistency. Native Swift and offline browser JavaScript now execute the
-digest/rejection vectors and both client-side scenarios through their wire
-decoders. Host-side scenarios require the Atem owner's Rust runner and live
-integration. Upstream section 9 remains the security gate.
+All 18 shared fixture files are imported byte-for-byte with pinned hashes.
+Swift and offline JavaScript execute all three client scenarios and digest/raw
+rejection vectors. Atem owns host execution, including the new reconnect,
+closed/exited admission, family-error, PTY boundary and turn-completion steps;
+see its pinned handoff for real-runtime coverage and limits. Joint live testing
+remains outstanding. Upstream section 9 remains the security release gate.
 
 ### Envelope and exact target
 

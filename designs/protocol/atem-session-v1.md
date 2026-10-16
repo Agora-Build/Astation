@@ -1,6 +1,11 @@
-# atem-session v1: sessions, control leases and receipts (DRAFT r5 for joint review)
+# atem-session v1: sessions, control leases and receipts (r6: r5 accepted for compatibility mode, minus legacy paths — for review)
 
-Status: Atem-side draft r5, 2026-10-15. r1 (`7a0c691`), r2 (`9383193`), r3
+Status: r6 (2026-10-16) removes every legacy path from r5 at the user's
+direction (no backward compatibility; Atem and Astation update together) —
+needs Astation's review. r5 was accepted by Astation on 2026-10-15 as the
+compatibility-mode implementation contract ([r5 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r5-review.md)).
+Final conformance needs the shared fixtures to pass in the Rust, Swift and
+browser implementations; §9 remains the security gate. History: r1 (`7a0c691`), r2 (`9383193`), r3
 (`1bf805c`, [r3 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r3-review.md))
 and r4 (`fd907cc`, [r4 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-r4-review.md))
 were reviewed by Astation ([r1 review](https://truck.netbird.cloud:58310/protocol/atem-session-v1-review.md),
@@ -31,30 +36,19 @@ accept it and the fixtures in `fixtures/` pass in Rust, Swift and the browser.
   browser clients, no account-wide native access, and no claim of relay
   confidentiality. Admission fails closed; no placeholder trust decision is
   exposed as production authorization.
-- **One session authority, every connection.** Each session has exactly one
-  lease authority on the host (§5), whatever socket, transport or message family
-  a request uses. A connection is "upgraded" once it received `welcome`; upgrade
-  changes how a client addresses things, not who may mutate a session:
-  - terminal-v1 `control{take:true}` from a non-upgraded connection is an
-    `acquire{takeover:true}` by that connection's attachment on the same
-    authority; `control{take:false}` is `release`. Its `lease_id` maps to that
-    lease.
-  - A session is **managed** from the moment any attachment first acquires its
-    lease (session `acquire` or legacy terminal-v1 `control`) until the session
-    ends; the flag never clears (not on release, expiry or local reclaim).
-    Legacy unscoped mutations (`agentInput`, `agentPrompt`, voice commands,
-    `userCommand`, chat-v1 `submit` without `binding`) routed to a managed
-    session are always rejected (`forbidden`, nothing written or dispatched),
-    whether or not a remote holder exists, and they never acquire. Sessions that
-    have never been managed keep today's legacy behaviour (routed per Atem's
-    default-session rule); legacy can't create a path into a managed session.
-  - Legacy terminal-v1 `control` keeps all its checks (permission, attachment,
-    exact `terminal_id`/`generation`, subscribed `stream_id`, deadline) before it
-    maps onto `acquire`/`release`.
-  - On an upgraded connection every mutation must carry `binding` (§2) and the
-    current lease; legacy unscoped mutations there are always `forbidden`.
+- **One session authority, no legacy paths** (r6). Atem and Astation are
+  updated together; there is no backward compatibility. Every remote mutation
+  of a session — terminal input/resize/stop, chat submit, interrupt — is a
+  session-v1 message carrying `binding` and the current lease, after `welcome`.
+  The old ops are removed from the host and answered with
+  `error{code:"unsupported_version"}` and no effect: `agentInput`,
+  `agentPrompt`, `voiceCommand`/`voiceToggle` prompts, `userCommand`,
+  terminal-v1 `control` and its `lease_id` field, terminal-v1 `list`/`sessions`
+  (session-v1 `list` is the only registry), chat-v1 `submit` without
+  `binding`, and any session op before `welcome`. Terminal ids are session ids
+  only (no `claude`/`codex` aliases).
   - Local terminal input on the host revokes any remote lease first (§5).
-  Fixture `legacy-connection-cannot-bypass-lease`.
+  Fixture `removed-ops-have-no-effect`.
 
 ## 1. Representation
 
@@ -119,8 +113,8 @@ Every request that targets a session carries one **binding** object:
   "binding":{"target":{…},"attachment_gen":"33333333-…","lease_epoch":7}}}
 ```
 
-  On upgraded connections the terminal-v1 `lease_id` field is not used (the
-  binding's epoch replaces it); a chat `submit` is the §6 `submit` with
+  terminal-v1 has no `lease_id` field (the binding's epoch is the lease); a
+  chat `submit` is the §6 `submit` with
   `kind:"prompt"`, `request_id = requestId`, `payload = {"text": text}`.
 - `lease_epoch` is required for mutations, absent for reads.
 - Any mismatch → `error{code:"stale_target"}` with **no** current values; the
@@ -143,7 +137,10 @@ Every request that targets a session carries one **binding** object:
   anything still arriving on it) before accepting mutations on the new one.
   Resume never re-acquires a lease and never revives an expired one.
 - Compatibility mode: no `challenge`/`resume_proof`; every `hello` gets a new
-  `controller_session` and `attachment_gen` and holds no lease.
+  `controller_session` and `attachment_gen` and holds no lease. A `hello`
+  with `resume`, and any `resume_proof`, is refused `unauthorized`. A second
+  `hello` on an attachment that was already welcomed is refused
+  `unauthorized` (a new welcome needs a new attachment).
 - A broker restart (new `runtime_gen`) invalidates all attachments and leases;
   workers and receipts stay addressable by `session_id`/`process_gen`.
 
@@ -191,13 +188,19 @@ Descriptor:
   snapshot arrives, discards every change with `seq` ≤ that snapshot's `seq`.
   A snapshot whose `seq` is lower than the last applied one (same epoch) is
   discarded.
+- **New attachment.** `seq` belongs to one attachment. On every `welcome`
+  (reconnect) the client clears its registry state — sessions, last `seq`,
+  removals and held changes — keeping only its highest accepted
+  (`runtime_epoch`, `runtime_gen`) as the fencing floor; the new attachment's
+  first snapshot applies at any `seq`.
 - **Removal.** A removed session is sent as `state:"removed"`; applying it
   deletes the session, and a later change for that `session_id` is only accepted
   with a higher `seq` in the same epoch and a different `process_gen` — never
   as a resurrection of the removed one. (Tombstones are kept 10 minutes host-side
   only to answer late requests with `unknown_session`.)
 - The registry and every response are filtered by the attachment's view
-  permission. `cwd_label` is the last path component only; clients show
+  permission: `list` without `view` is `forbidden`; an op with a `binding`
+  from an attachment without `view` is `unknown_session`. `cwd_label` is the last path component only; clients show
   `session_id` when labels repeat. Presence is never liveness evidence.
 
 ## 5. Control lease
@@ -217,6 +220,13 @@ Normative rules:
   renew every 5 s and never after their own monotonic estimate of expiry.
   `ms_left` is for estimation only.
 - **Fencing**: a lease is held by one (`controller_session`, `attachment_gen`).
+- **Epochs**: `lease_epoch` strictly increases per session and may skip values
+  (the host reserves epochs durably in blocks, so after a restart the next
+  grant can be well above the last one seen); clients compare, never count.
+- **Recipients**: `lease_changed` goes to every welcomed attachment with `view`
+  except the one whose own request caused the change (it gets the direct
+  reply: `lease` or `lease_released`). Expiry, local input, revocation and
+  process end have no requester, so the holder gets `lease_changed` too.
 - **Reply correlation and the client deadline** (normative for clients):
   1. A `lease` reply is applied only if its `re` equals one outstanding
      `acquire`/`renew` request id, and each outstanding request consumes at most
@@ -288,8 +298,19 @@ Kinds and payloads (v1):
   Same `request_id` with every bound value equal → the recorded receipt (needs
   current view permission for the target; no lease, no re-execution). Same
   `request_id` with any value different → `request_id_reused`.
-- **Admission** of a new request needs the current lease (`stale_lease`
-  otherwise), `control` permission, and a session that accepts submissions.
+- **Admission** of a new request — and every lease-scoped mutation
+  (terminal input/resize/stop) — is checked in this order: `control`
+  permission (`forbidden`), then a session that accepts work
+  (`session_closed`, even when the lease is also stale), then the current
+  lease (`stale_lease`). If the durable write of
+  `accepted` fails, the reply is `error{code:"busy"}`, nothing is recorded and
+  the client may retry with the same `request_id`.
+- A duplicate `submit` names the current target: one naming an earlier
+  `process_gen` of the session is `stale_target`, while `receipt_query` for
+  that earlier target still returns its receipts.
+- **Scheduling**: `prompt`s are serialized per session (one paste at a time;
+  later ones stay `accepted` until the previous one leaves `executing`);
+  `interrupt` and `stop` are dispatched immediately.
 - **States and transitions** (all others are invalid and never happen):
 
 | from | to | when |
@@ -337,7 +358,7 @@ Kinds and payloads (v1):
 - **Retention**: receipts live for the session's life and 7 days after it closes.
   An accepting session's receipts are never evicted; at its limit new
   submissions get `receipt_limit`. Closed sessions answer `session_closed`.
-- chat-v1 on an upgraded connection: its `submit.requestId` is this
+- chat-v1: its `submit.requestId` is this
   `request_id`, it carries `binding`, and its `accepted`/`complete` follow this
   receipt's `accepted`/`completed`.
 
@@ -346,11 +367,28 @@ Kinds and payloads (v1):
 `error{re, code, detail?}`; `detail` is human-readable, bounded, and never
 contains secrets, paths, raw OS errors or other targets' identifiers.
 
+Errors are answered in the family of the request (ruling i):
+
+- session-v1 requests: session `error{re, code, detail?}`.
+- A valid terminal-v1 request that is refused: terminal-v1
+  `error{terminal_id, stream_id?, code, message}` (`stream_id` when the
+  request carried one; `message` is fixed text per code).
+- chat-v1: `error{requestId?, code, text}` (chat-v1's `error` gains `code`).
+  A chat `submit` hears about its request only through chat-v1 ops mapped
+  from its receipt, never a session `receipt`: `accepted`/`executing` →
+  `accepted{requestId}`; `completed` → `complete{requestId, turnId?,
+  outcome:"done"}`; `rejected` → `error{requestId, code:"rejected", text:
+  detail}`; `outcome_unknown` → `error{requestId, code:"outcome_unknown",
+  text: detail}`. Refusals at admission use the §7 code.
+- Removed forms (§0) and requests that don't decode — of any family — get a
+  session `error{code:"unsupported_version"}` without `re` when the request
+  had no readable `id`, and have no effect.
+
 | code | when |
 |---|---|
-| `unsupported_version` | unknown `v` or out-of-range representation |
+| `unsupported_version` | unknown `v`, out-of-range representation, or a removed op (§0) |
 | `unauthorized` | not authenticated, attachment fenced, or authorization expired |
-| `forbidden` | missing permission, or a legacy op on an upgraded connection |
+| `forbidden` | missing permission |
 | `stale_target` | trust generation, session or process generation mismatch |
 | `unknown_session` | unknown or not visible to this attachment |
 | `lease_held` | another controller holds the lease (no takeover) |
@@ -388,7 +426,7 @@ message), `disconnect`, `resume`, `local_input`, `crash_worker`,
 counters: PTY writes, resizes, stops, dispatches, receipts visible per client;
 client state for client-side fixtures: `controls`, `deadline_ms`, registry). Negative scenarios assert both the
 error and the absence of writes, dispatch, disclosure or resurrection. The
-first set (r3 adds the r2-review cases: two-connection lease bypass, late/duplicate
+first set (r3 adds the r2-review cases: removed ops have no effect, late/duplicate
 lease replies, runtime epoch snapshots, snapshot/change reordering, hidden-session
 changes, change after removal, receipt-query authorization, changed-target id
 reuse, failed durable write, local reclaim at the PTY boundary, old attachment

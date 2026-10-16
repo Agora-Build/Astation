@@ -88,12 +88,12 @@ enum RemoteTerminalMessage: Codable, Equatable {
     case controller(RemoteTerminalStream, leaseId: String?)
     case written(RemoteTerminalStream, sequence: UInt64, error: String?)
     case exited(terminalId: String, generation: String, status: String)
-    case error(terminalId: String?, message: String)
+    case error(terminalId: String?, streamId: String? = nil, code: String = "unsupported_version", message: String)
     case unsupported(version: Int, operation: String)
 
     private enum Keys: String, CodingKey {
         case v, op, sessions, session, generation, offset, take, sequence, bytes, rows, cols
-        case reset, complete, error, status, message
+        case reset, complete, error, status, message, code
         case terminalId = "terminal_id", streamId = "stream_id", leaseId = "lease_id", binding
     }
 
@@ -138,7 +138,11 @@ enum RemoteTerminalMessage: Codable, Equatable {
                            generation: try c.decode(String.self, forKey: .generation),
                            status: try c.decode(String.self, forKey: .status))
         case "error":
+            let code = try c.decode(String.self, forKey: .code)
+            try AtemSessionWire.check(!code.isEmpty && code.utf8.count <= 128)
             self = .error(terminalId: try c.decodeIfPresent(String.self, forKey: .terminalId),
+                          streamId: try c.decodeIfPresent(String.self, forKey: .streamId),
+                          code: code,
                           message: try c.decode(String.self, forKey: .message))
         default: self = .unsupported(version: version, operation: op)
         }
@@ -208,8 +212,9 @@ enum RemoteTerminalMessage: Codable, Equatable {
         case .exited(let terminalId, let generation, let status):
             try c.encode("exited", forKey: .op); try c.encode(terminalId, forKey: .terminalId)
             try c.encode(generation, forKey: .generation); try c.encode(status, forKey: .status)
-        case .error(let terminalId, let message):
+        case .error(let terminalId, let streamId, let code, let message):
             try c.encode("error", forKey: .op); try c.encode(terminalId, forKey: .terminalId)
+            try c.encodeIfPresent(streamId, forKey: .streamId); try c.encode(code, forKey: .code)
             try c.encode(message, forKey: .message)
         case .unsupported:
             throw EncodingError.invalidValue(self, .init(codingPath: encoder.codingPath,
@@ -241,7 +246,7 @@ enum RemoteTerminalMessage: Codable, Equatable {
             try AtemSessionWire.check(sequence <= AtemSessionWire.maximumCounter)
         case .exited(let terminal, let generation, _): id = terminal; process = generation
         case .controller(let stream, _): id = stream.terminalId; process = stream.generation
-        case .error(let terminal, _):
+        case .error(let terminal, _, _, _):
             try AtemSessionWire.check(terminal == nil || terminal == binding.target.session_id)
             return
         default: throw AtemSessionJSON.Invalid.json

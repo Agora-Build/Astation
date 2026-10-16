@@ -1,5 +1,26 @@
 {
   "repository": "https://github.com/Agora-Build/Atem",
-  "commit": "44987915fb24267960fd9d75221df4ed8c7838ec",
-  "draft": "r5"
+  "tag": "atem-session-v1-r6.2",
+  "commit": "22de096b1980ee3ae342c0352b4c1d5fa54e3b51",
+  "revision": "r6.2",
+  "sha256": {
+    "closed-session-refuses-work-before-the-lease-check.json": "eb3e53a4ee68d54128290035532e0d866c06045d7955fa5ede3413a6a71915e7",
+    "digest-vectors.json": "321ba7d68808772b2735732bb60b727f6122f8846cd7b138b82f951c0b4ce6a3",
+    "dispatch-failure-after-partial-write-is-outcome-unknown.json": "a2c79c07dcb8f3e7c268027a02b0646b85bb64e8c3f52c7cf7cc10480a604da2",
+    "dispatch-failure-before-any-effect-is-rejected.json": "513ddd521697485ce2b2c19af2380af62fcebc76a2c0c924671db4d21f8a5c2c",
+    "duplicate-submit-returns-receipt-and-reuse-is-rejected.json": "a7af3d5f15a45904dfdc7c9a0b99430ea0c9dff49644853371930cb8e1848456",
+    "exited-session-refuses-work-before-the-lease-check.json": "68fd85d6b5f823a2696a69379bfe618847ea93c26007930a3548c31f34300f02",
+    "family-errors-and-chat-results.json": "a01a7b9f4adc79e61a38024ab103a3736f25526cc46fb1ee18c7b5fe3835fe65",
+    "late-renew-reply-does-not-resurrect-control.json": "144e867e4807559f8e059112822377d258e3cfccbb738b6337545d0e55cd8b9b",
+    "lease-expires-without-renewal.json": "eff3581a31d7e7c4fbc98e89901c6c138c8d382c248d8290fbb77ed1d63b53d0",
+    "lease-expiry-at-the-deadline-needs-no-timer.json": "e2f9debe3cf80ba7a7f48f08a2a5dbf9f69d8531b885652afd497d640458aa31",
+    "local-input-revokes-the-lease-and-drops-queued-bytes.json": "c5a4d191be6e1c5d93f69c8ad6be8faef731f06796084ae5504071185c27dc0a",
+    "receipt-query-is-scoped-to-the-exact-target.json": "309adc61b6344e76b795d5d7e236174a8bb36228594846ab4e856da678029410",
+    "reconnect-restarts-the-registry-sequence.json": "77314620f98187ca93e109acb05777451253db7b9cd3df24b6ab6d6236feb70c",
+    "registry-restarts-on-a-new-attachment.json": "744d19335f10e22e0fb62a7c94e47dd2222f5d68a67e4c77d2ea2b4bf150d9da",
+    "removed-ops-have-no-effect.json": "547d383d8fbf3d1064a21ac2cfe330e900772769c45bbe90b93ea029dc44230d",
+    "runtime-epoch-and-sequence-ordering.json": "75dd2bd6bcd42726cbc74c0c4e9e78eabfc805f3c5341c6bc6df8c91342280aa",
+    "schema.md": "fef712b3b58ab94a3e23cc4300b241ba7e83124247f841ceb836cb86e6db01c2",
+    "takeover-moves-control-and-the-old-holder-becomes-a-viewer.json": "9ae061339270b8a5fe731b3813865d990c99ac8a553d4290c5da5b4861c02334"
+  }
 }

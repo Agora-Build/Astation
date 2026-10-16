@@ -1,17 +1,17 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { webcrypto } from "node:crypto";
+import { createHash, webcrypto } from "node:crypto";
 import test from "node:test";
 import {
   BROWSER_SESSION_ACCESS_ENABLED, canonicalPayload, payloadDigest, parseSessionJSON,
-  decodeSessionPacket, SessionRegistry, SessionLease,
+  decodeSessionPacket, decodeFamilyError, SessionRegistry, SessionLease,
 } from "../agent/session-protocol.mjs";
 
 const root = new URL("../../Tests/AstationTests/Fixtures/atem-session-v1/", import.meta.url);
 const fixture = async (name) => JSON.parse(await readFile(new URL(`${name}.json`, root), "utf8"));
 const decode = (packet) => decodeSessionPacket(JSON.stringify(packet));
 
-test("r5 shared digest vectors and rejection vectors use the wire parser", async () => {
+test("r6.2 shared digest vectors and rejection vectors use the wire parser", async () => {
   const vectors = await fixture("digest-vectors");
   for (const vector of vectors.vectors) {
     const payload = parseSessionJSON(JSON.stringify(vector.payload));
@@ -26,12 +26,14 @@ test("r5 shared digest vectors and rejection vectors use the wire parser", async
 
 test("shared fixture copies match the pinned protocol snapshot", async () => {
   const source = await fixture("source");
-  assert.equal(source.commit, "44987915fb24267960fd9d75221df4ed8c7838ec");
-  for (const name of ["digest-vectors", "late-renew-reply-does-not-resurrect-control", "runtime-epoch-and-sequence-ordering",
-    "lease-expires-without-renewal", "duplicate-submit-returns-receipt-and-reuse-is-rejected", "legacy-connection-cannot-bypass-lease",
-    "dispatch-failure-before-any-effect-is-rejected", "dispatch-failure-after-partial-write-is-outcome-unknown"]) {
-    assert.equal(await readFile(new URL(`${name}.json`, root), "utf8"),
-      await readFile(new URL(`../../designs/protocol/fixtures/${name}.json`, import.meta.url), "utf8"));
+  assert.equal(source.commit, "22de096b1980ee3ae342c0352b4c1d5fa54e3b51");
+  assert.equal(source.tag, "atem-session-v1-r6.2");
+  assert.equal(Object.keys(source.sha256).length, 18);
+  for (const [name, hash] of Object.entries(source.sha256)) {
+    const bytes = await readFile(new URL(name, root));
+    assert.equal(createHash("sha256").update(bytes).digest("hex"), hash, name);
+    assert.equal(bytes.toString("utf8"),
+      await readFile(new URL(`../../designs/protocol/fixtures/${name}`, import.meta.url), "utf8"));
   }
 });
 
@@ -85,6 +87,50 @@ test("shared registry fixture uses complete wire messages and rejects resurrecti
         for (const [id, state] of Object.entries(expected.registry_state)) assert.equal(registry.sessions.get(id)?.state, state);
       }
     }
+  }
+});
+
+test("r6.2 new attachment fixture resets sequence and keeps the runtime floor", async () => {
+  const scenario = await fixture("registry-restarts-on-a-new-attachment");
+  const registry = new SessionRegistry();
+  for (const step of scenario.steps) {
+    if (step.deliver_to_client) registry.apply(decode(step.json));
+    else if (step.assert_client) {
+      const expected = step.assert_client;
+      for (const key of Object.keys(expected)) assert.ok(["registry", "runtime_epoch", "seq"].includes(key), key);
+      if (expected.registry) assert.deepEqual([...registry.sessions.keys()].sort(), expected.registry);
+      if (expected.runtime_epoch !== undefined) assert.equal(registry.epoch, expected.runtime_epoch);
+      if (expected.seq !== undefined) assert.equal(registry.seq, expected.seq);
+    } else assert.fail(`Unhandled fixture step: ${JSON.stringify(step)}`);
+  }
+});
+
+test("new attachments forget removals and require a snapshot before changes", async () => {
+  const scenario = await fixture("registry-restarts-on-a-new-attachment");
+  const snapshot = decode(scenario.steps[0].json);
+  const welcome = decode(scenario.steps[2].json);
+  const registry = new SessionRegistry();
+  registry.apply(snapshot);
+  registry.apply({ ...snapshot, op: "session_changed", seq: 6, descriptor: { ...snapshot.sessions[0], state: "removed" } });
+  registry.apply(welcome);
+  registry.apply({ ...snapshot, op: "session_changed", seq: 1, descriptor: snapshot.sessions[0] });
+  assert.equal(registry.sessions.size, 0);
+  assert.equal(registry.requestedList, true);
+  registry.apply({ ...snapshot, seq: 1 });
+  assert.equal(registry.sessions.size, 1);
+});
+
+test("r6.2 session errors can omit re, and family errors preserve their codes", () => {
+  const error = { v: 1, op: "error", id: "11111111-1111-4111-8111-000000000001", code: "unsupported_version" };
+  assert.equal(decode({ type: "session", data: error }).re, undefined);
+  assert.throws(() => decode({ type: "session", data: { ...error, re: "invalid" } }));
+  for (const packet of [
+    { type: "terminal", data: { v: 1, op: "error", terminal_id: "ses-aaaaaaaaaaaa", stream_id: "old-stream", code: "stale_lease", message: "Control lease is stale" } },
+    { type: "agentChat", data: { v: 1, op: "error", agentId: "ses-aaaaaaaaaaaa", conversationId: "conv-1", requestId: error.id, code: "outcome_unknown", text: "Write interrupted" } },
+  ]) {
+    assert.equal(decodeFamilyError(JSON.stringify(packet)).code, packet.data.code);
+    const invalid = structuredClone(packet); delete invalid.data.code;
+    assert.throws(() => decodeFamilyError(JSON.stringify(invalid)));
   }
 });
 

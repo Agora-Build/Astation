@@ -24,14 +24,11 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
     private var lastInputEpoch = ""
     private var lastInputEnabled = false
 
-    private lazy var sessions = AtemSessionClient(
-        context: { [weak self] in
-            guard let self, let id = self.targetClientId else { return nil }
-            return self.hubManager.sessionContext(for: id, atemId: self.targetAtemId)
-        },
-        send: { [weak self] message, route in self?.hubManager.sendSessionMessage(message, to: route) ?? false },
-        journal: AtemSessionJournal.persistent()
-    )
+    private lazy var offlineSessions = AtemSessionClient(context: { nil }, send: { _, _ in false })
+    private var sessions: AtemSessionClient {
+        guard let id = targetClientId else { return offlineSessions }
+        return hubManager.sessionClient(for: id, atemId: targetAtemId) ?? offlineSessions
+    }
 
     private lazy var terminal = RemoteTerminalController(
         currentConnection: { [weak self] in
@@ -45,13 +42,19 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
         self.hubManager = hubManager
         super.init()
         terminal.sessionClient = sessions
-        sessions.onChange = { [weak self] in self?.terminal.sessionStateChanged(); self?.refresh() }
+        hubManager.sessionStateDidChange = { [weak self] id in
+            guard let self, self.sessions.context?.route.clientId == id else { return }
+            self.terminal.sessionClient = self.sessions
+            self.terminal.sessionStateChanged()
+            self.refresh()
+        }
         terminal.onChange = { [weak self] in self?.refresh() }
         hubManager.terminalMessageHandler = { [weak self] message, source in self?.terminal.receive(message, from: source) }
-        hubManager.sessionMessageHandler = { [weak self] message, source in self?.sessions.receive(message, from: source) }
         hubManager.terminalConnectionsDidChange = { [weak self] in
-            self?.sessions.connectionChanged()
-            self?.terminal.connectionChanged()
+            guard let self else { return }
+            self.terminal.sessionClient = self.sessions
+            self.terminal.connectionChanged()
+            self.terminal.sessionStateChanged()
         }
         hubManager.remoteAgentInputHandler = { [weak self] route, agentId, kind, value in
             guard let self, route == self.terminal.connection,
@@ -65,6 +68,7 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
         terminal.close()
         targetClientId = clientId
         targetAtemId = hubManager.connectedClients.first(where: { $0.id == clientId })?.atemId
+        terminal.sessionClient = sessions
         targetLabel.stringValue = hubManager.connectedClients.first(where: { $0.id == clientId })?.hostname ?? "Atem"
         if window == nil { createWindow() }
         sessions.start()
@@ -158,7 +162,6 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
             statusLabel.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12)
         ])
         if timeoutTimer == nil { timeoutTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.sessions.tick()
             self?.terminal.connectionChanged()
             self?.terminal.checkTimeouts()
         } }
@@ -215,8 +218,10 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
         releaseButton.isEnabled = terminal.canRelease
         stopButton.isEnabled = terminal.canInput
         pasteButton.isEnabled = terminal.canInput
-        promptField.isEnabled = terminal.canInput
-        sendPromptButton.isEnabled = terminal.canInput
+        let supportsPrompts = terminal.session.flatMap { sessions.registry[$0.terminalId] }?.capabilities.contains("chat-v1") == true
+        promptField.isEnabled = terminal.canInput && supportsPrompts
+        sendPromptButton.isEnabled = terminal.canInput && supportsPrompts
+        promptField.placeholderString = supportsPrompts ? "Send a prompt to this agent" : "Type or paste in this agent's terminal"
         if let receipt = sessions.latestReceipt, receipt.target.session_id == terminal.session?.terminalId,
            receipt.target.process_gen == terminal.session?.generation {
             receiptLabel.stringValue = receipt.kind.capitalized + " - " + receipt.state.rawValue.replacingOccurrences(of: "_", with: " ")

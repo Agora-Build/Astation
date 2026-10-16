@@ -202,7 +202,7 @@ struct AtemSessionMessage: Codable, Equatable {
             try AtemSessionWire.check(binding != nil && binding?.lease_epoch == nil && request_ids != nil
                 && request_ids!.count <= 64 && request_ids!.allSatisfy(AtemSessionWire.uuid))
         case "receipts": try AtemSessionWire.check(re != nil && receipts != nil && receipts!.count <= 64 && receipts!.allSatisfy(\.valid))
-        case "error": try AtemSessionWire.check(re != nil && code != nil && code!.utf8.count <= 128)
+        case "error": try AtemSessionWire.check(code != nil && !code!.isEmpty && code!.utf8.count <= 128)
         default: throw AtemSessionJSON.Invalid.json
         }
     }

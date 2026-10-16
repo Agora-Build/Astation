@@ -259,7 +259,7 @@ It starts in viewing mode; **Take Control** enables typing, control keys,
 multiline paste and resizing. **Release** returns local ownership. Closing the
 window keeps the agent running; **Stop Agent** asks before ending its process.
 
-This development branch requires the accepted Atem session-v1 r5 host protocol,
+This development branch requires the Atem session-v1 r6.2 host protocol (Atem PR #69),
 in addition to terminal rendering. Launch the original CLI with
 `atem agent launch claude` or `atem agent launch codex`, pair and verify once,
 then select its exact session. A shared lease governs typing, resize, voice,
@@ -271,13 +271,11 @@ requirements and current validation limits.
 See [remote terminal control](docs/remote-terminal.md) for setup, ownership,
 clipboard, limitations and validation.
 
-**Open in Browser** opens a responsive chat page served by the webapp at `/agent/`.
-It keeps prompts, replies, code blocks and activity together while Open Terminal
-remains available. Sending requires the selected Atem agent to advertise
-`chat-v1`; the published host in Atem PR #65 supports Claude with active hooks. Codex remains terminal-only.
-See [browser agent chat](docs/agent-chat.md) for support, delivery states and privacy.
-Starting native session-v1 disables the older browser bridge on that host socket;
-browser support for managed sessions awaits the secure companion protocol.
+**Open in Browser** is disabled on this development branch. Browser companions
+require the section 9 security contract and a common host lease; there is no
+unbound chat fallback. The `/agent/` webapp and its offline conformance tests
+remain available for that follow-up. Use **Open Terminal** for current host
+access. See the [joint integration handoff](designs/protocol/atem-implementation-handoff.md).
 
 ### Local Audio Recording
 
@@ -445,7 +443,7 @@ retrieval is not implemented. See the
 Atem can run on another machine. Pair with `atem pair`, compare the safety code
 on both machines, then click **Codes Match** and approve Touch ID on the Mac,
 or choose **Use Mac Password...** to authenticate in macOS's system dialog.
-Check `atem cred status` for verification; a connected or SSO-paired session
+Check `atem status` for verification; a connected or SSO-paired session
 alone does not establish device trust. `atem cred unlock` requests key access
 from this Mac, and `atem cred projects` sends Git-project suggestions. Use a
 provisioned Astation build for protected storage; the ad hoc development app
