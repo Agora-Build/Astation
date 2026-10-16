@@ -2,7 +2,8 @@
 
 Date: 2026-10-15
 
-Branch: `feat/session-multiplexing`, based on `feat/chat-v1-integration` (#48).
+Branch: `feat/session-multiplexing`, targeting `main`. It retains both commits
+from #48, which is closed as superseded by the combined #49.
 Review: [draft PR #49](https://github.com/Agora-Build/Astation/pull/49), native
 implementation commit `328c7d157f8048e35194b7c1a393c83c4b4fe7b2`.
 Contract: [atem-session v1 r5](atem-session-v1.md), upstream
