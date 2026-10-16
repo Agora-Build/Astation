@@ -47,6 +47,11 @@ cover actual terminal binding, revocation, exact expiry, reconnects, receipt
 recovery, durable-write failures, and disk reload. The browser module is
 conformance code with live host access disabled.
 
+[GitHub CI](https://github.com/Agora-Build/Astation/actions/runs/38832982893)
+passed for Astation implementation commit `328c7d1`, including macOS build/tests,
+relay tests and webapp tests. Joint live testing against the owner's r5 host
+remains outstanding; passing client CI does not establish host conformance.
+
 ## Next work with the Atem owner
 
 1. Implement/confirm the r5 host hello/welcome, complete registry values,

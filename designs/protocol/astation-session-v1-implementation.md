@@ -73,6 +73,12 @@ python3 scripts/setup-terminal-assets.py --verify
 Latest focused results: 96 native tests pass; webapp tests have 46 passes and
 one skip; all eight pinned terminal assets verify.
 
+[GitHub CI run 38832982893](https://github.com/Agora-Build/Astation/actions/runs/38832982893)
+passed for implementation commit `328c7d1`: macOS build/tests, relay server
+tests, webapp tests and dispatch context validation. Subsequent branch commits
+update documentation only. The local failures below are retained as evidence
+of the limits of this Mac's test environment.
+
 The unfiltered Swift suite was also attempted: 847 tests, nine skipped, four
 failures. Three existing protected-key tests could not create a Secure Enclave
 key (`NSOSStatusErrorDomain -25308`, `AKSError -536870174`). The existing caption
