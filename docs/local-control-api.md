@@ -1,5 +1,10 @@
 # Local session and approval API
 
+The next milestone is a complete conversation, approval and notification API.
+See the [joint agent control API proposal](../designs/protocol/agent-control-api.md)
+for current gaps, proposed history/events routes and Atem/Astation ownership.
+Those proposed routes are not available yet; the implemented routes are listed below.
+
 The optional local API uses the running native Astation's verified Atem session
 clients, approval inbox and durable request journal. It lets a script exercise
 the same flow as a future mobile UI. It does not enroll devices or bypass
