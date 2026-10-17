@@ -88,7 +88,7 @@ verification succeeds. The spurious `relay:TZAZ-Y9W6` row came from Astation
 adding its own pairing transport as an online Atem, rather than evidence of a
 second Atem runtime socket.
 
-All ten actual WebKit renderer tests pass. The full Swift suite executes 904 tests,
+All ten actual WebKit renderer tests pass. The full Swift suite executes 907 tests,
 11 environment-dependent skips, zero failures. The skips cover provisioned
 XCTest/Keychain, live capture and optional local model integrations; they do
 not represent a live APNs or agent-approval test. A harmless print-only prompt
@@ -116,6 +116,11 @@ does not submit; Paste & Go targets the selected terminal and appends Enter
 in one bounded, ownership-fenced write. Empty, oversized, stale and read-only
 pastes never send a stray Enter. Physical Claude clipboard retesting remains
 a joint UI check; no agent input was sent to test this change.
+
+Selecting another agent now automatically opens its terminal without requiring
+View. Switching releases previous control and begins view-only; View remains
+available for retry/reload. Three regressions cover switching from control,
+late attachments/screens from the previous session and a pending list refresh.
 
 [Astation issue #51](https://github.com/Agora-Build/Astation/issues/51) records
 Brent's follow-up for image/audio/PDF/other-file attachments in the separate

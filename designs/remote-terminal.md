@@ -47,7 +47,10 @@ an agent or create another conversation. See the
 
 Connections opens a resizable Remote Terminal window for the selected host.
 The session chooser lists Claude/Codex process generations and final screens.
-View attaches without taking control. Take Control enables normal terminal
+Selecting a different session releases the previous control lease and opens
+the selected screen in viewing mode. Late attachments and frames from the
+previous session cannot replace it. View retries the selected screen without
+taking control. Take Control enables normal terminal
 typing, IME, paste and control keys. Release restores local ownership. Stop
 asks for confirmation before stopping that selected original process.
 

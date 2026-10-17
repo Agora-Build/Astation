@@ -184,6 +184,21 @@ final class RemoteTerminalControllerTests: XCTestCase {
         XCTAssertTrue(f.controller.status.contains("not reported"))
     }
 
+    func testSelectionDuringListRefreshOpensChosenTerminalWhenListArrives() {
+        let f = TerminalFixture()
+        f.viewing()
+        let selected = terminalSession(generation: "second-process")
+        f.controller.refresh()
+        f.receive(.sessions([terminalSession(), selected]))
+        f.controller.refresh()
+        f.controller.select(selected)
+        XCTAssertFalse(f.controller.canInput)
+        f.receive(.sessions([terminalSession(), selected]))
+        XCTAssertEqual(f.controller.phase, .attaching)
+        XCTAssertEqual(f.controller.session?.id, selected.id)
+        XCTAssertEqual(f.sent.last?.0, .subscribe(terminalId: selected.terminalId, generation: selected.generation))
+    }
+
     func testOpenTargetsOnlySelectedConnectionAndStartsViewOnly() {
         let f = TerminalFixture()
         f.open()

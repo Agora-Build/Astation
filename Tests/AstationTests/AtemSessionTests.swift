@@ -80,8 +80,8 @@ private final class SessionFixture {
         try receive(reply)
     }
 
-    static func descriptor(state: String = "running", process: String = processID, provider: String = "claude") throws -> AtemSessionDescriptor {
-        let json: [String: Any] = ["session_id": sessionID, "process_gen": process, "provider": provider, "cwd_label": "Atem",
+    static func descriptor(session: String = sessionID, state: String = "running", process: String = processID, provider: String = "claude") throws -> AtemSessionDescriptor {
+        let json: [String: Any] = ["session_id": session, "process_gen": process, "provider": provider, "cwd_label": "Atem",
             "state": state, "activity": "ready", "activity_since": 1_760_500_000_000,
             "controller": NSNull(), "capabilities": ["terminal-v1", "chat-v1"], "created_at": 1_760_490_000_000]
         return try JSONDecoder().decode(AtemSessionDescriptor.self, from: JSONSerialization.data(withJSONObject: json))
@@ -1189,6 +1189,68 @@ private final class SessionTerminalFixture {
 }
 
 final class AtemSessionTerminalTests: XCTestCase {
+    func testSelectingAnotherSessionAutomaticallyViewsItAndReleasesPreviousControl() throws {
+        let f = SessionTerminalFixture()
+        try f.viewing(); try f.control()
+        let descriptor = try SessionFixture.descriptor(session: "ses-bbbbbbbbbbbb",
+            process: "77777777-7777-4777-8777-777777777777", provider: "codex")
+        try f.protocolFixture.snapshot(sequence: 2, descriptors: [SessionFixture.descriptor(), descriptor])
+        let selected = try XCTUnwrap(f.terminal.sessions.first { $0.terminalId == descriptor.session_id })
+        let target = try XCTUnwrap(f.protocolFixture.client.target(sessionId: selected.terminalId, process: selected.generation))
+        let binding = try XCTUnwrap(f.protocolFixture.client.binding(for: target, mutation: false))
+
+        f.terminal.select(selected)
+
+        XCTAssertEqual(f.terminal.phase, .attaching)
+        XCTAssertEqual(f.terminal.session?.id, selected.id)
+        XCTAssertFalse(f.terminal.canInput)
+        XCTAssertFalse(f.protocolFixture.client.controls(f.protocolFixture.target))
+        XCTAssertEqual(f.protocolFixture.sent.last(where: { $0.op == "release" })?.binding?.target, f.protocolFixture.target)
+        XCTAssertEqual(f.sent.last, .bound(.subscribe(terminalId: selected.terminalId, generation: selected.generation), binding))
+        let writes = f.sent.count
+        f.terminal.input(Data("must not reach either session".utf8))
+        XCTAssertEqual(f.sent.count, writes)
+
+        try f.receive(.attached(selected, streamId: "second-stream"))
+        let stream = RemoteTerminalStream(terminalId: selected.terminalId, generation: selected.generation, streamId: "second-stream")
+        try f.receive(.frame(RemoteTerminalFrame(stream: stream, offset: 0, bytes: Data("Codex screen".utf8).base64EncodedString(),
+            reset: true, complete: true, rows: 24, cols: 80)))
+        f.terminal.consumed(try XCTUnwrap(f.rendered.last).1)
+        XCTAssertEqual(f.terminal.phase, .viewing)
+        XCTAssertEqual(f.rendered.last?.0.stream, stream)
+        XCTAssertTrue(f.terminal.canTakeControl)
+        XCTAssertFalse(f.terminal.canInput)
+        XCTAssertEqual(f.protocolFixture.sent.filter { $0.op == "acquire" }.count, 1, "Switching must not take control")
+        let messages = f.sent.count
+        f.terminal.select(selected)
+        XCTAssertEqual(f.sent.count, messages, "Selecting the current session must not reattach")
+    }
+
+    func testSwitchingBeforeFirstAttachmentIgnoresItsLateScreenAndKeepsSelectedSession() throws {
+        let f = SessionTerminalFixture()
+        try f.protocolFixture.ready()
+        f.terminal.open(preferredTerminalId: sessionID)
+        let descriptor = try SessionFixture.descriptor(session: "ses-bbbbbbbbbbbb",
+            process: "77777777-7777-4777-8777-777777777777")
+        try f.protocolFixture.snapshot(sequence: 2, descriptors: [SessionFixture.descriptor(), descriptor])
+        let selected = try XCTUnwrap(f.terminal.sessions.first { $0.terminalId == descriptor.session_id })
+        f.terminal.select(selected)
+        try f.receive(.attached(f.session, streamId: "stream"))
+        try f.receive(.frame(RemoteTerminalFrame(stream: f.stream, offset: 0, bytes: Data("old screen".utf8).base64EncodedString(),
+            reset: true, complete: true, rows: 40, cols: 120)))
+        XCTAssertEqual(f.terminal.phase, .attaching)
+        XCTAssertEqual(f.terminal.session?.id, selected.id)
+        XCTAssertNil(f.terminal.stream)
+        XCTAssertTrue(f.rendered.isEmpty)
+        XCTAssertTrue(f.sent.contains { if case .bound(.unsubscribe(f.stream), _) = $0 { return true }; return false })
+
+        try f.receive(.attached(selected, streamId: "selected-stream"))
+        XCTAssertEqual(f.terminal.stream?.terminalId, selected.terminalId)
+        XCTAssertEqual(f.terminal.stream?.streamId, "selected-stream")
+        XCTAssertFalse(f.terminal.canInput)
+        XCTAssertFalse(f.protocolFixture.sent.contains { $0.op == "acquire" })
+    }
+
     func testOldStreamErrorCannotCloseNewViewAndCurrentRefusalDropsControl() throws {
         let f = SessionTerminalFixture()
         try f.viewing(); try f.control()

@@ -33,7 +33,9 @@ addresses each original session separately.
 
 1. Open **Tools > Connections > Clients & Agents** and select the online host.
 2. Click **Open Terminal** on its agent, or **Terminals** in the panel header.
-3. Select a session. **View** opens its current screen without taking control.
+3. Select a session to open its current screen automatically without taking
+   control. Switching releases control of the previous session. **View** retries
+   or reloads the selected terminal when needed.
 4. Click **Take Control** to type, paste, send Enter/Escape/Ctrl-C or operate
    the original CLI's approval prompts.
 5. **Release** restores local input ownership. Closing the window detaches

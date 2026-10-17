@@ -142,15 +142,17 @@ final class RemoteTerminalController {
     }
 
     func select(_ selected: RemoteTerminalSession) {
-        guard sessions.contains(selected), selected != session else { return }
+        guard sessions.contains(selected), selected.id != session?.id else { return }
         detach()
         session = selected
         preferredTerminalId = selected.terminalId
         preferredAgentId = selected.agentId
         reconnectSession = nil
+        autoView = listingSince != nil && selected.isSupported
         phase = .ready
-        status = selected.isSupported ? "Choose View to open this terminal." : "This terminal uses an unsupported renderer."
+        status = selected.isSupported ? "Opening the selected terminal..." : "This terminal uses an unsupported renderer."
         changed()
+        view()
     }
 
     func view() {
