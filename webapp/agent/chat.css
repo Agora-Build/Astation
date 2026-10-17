@@ -994,3 +994,41 @@ dialog .detail-fine {
     scroll-behavior: auto !important;
   }
 }
+/* Typed tool activity shares the message rhythm without resembling a reply. */
+.tool-part {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin: 12px 0;
+  padding: 10px 14px;
+  border-left: 2px solid var(--accent, #34796b);
+  background: rgba(52, 121, 107, 0.06);
+  border-radius: 0 8px 8px 0;
+}
+.tool-summary {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.turn-outcome {
+  color: #767a76;
+  font-size: 11px;
+}
+.history-button {
+  display: block;
+  margin: 12px auto;
+  padding: 8px 16px;
+  border: 1px solid #d9dfd8;
+  border-radius: 999px;
+  background: #f9faf7;
+  color: #426153;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.history-button:hover {
+  background: #edf2eb;
+}
+.history-button:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}

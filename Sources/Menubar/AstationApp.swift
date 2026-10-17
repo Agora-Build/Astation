@@ -45,6 +45,7 @@ class AstationApp: NSObject, NSApplicationDelegate {
     private var audioRecordingManager: AudioRecordingManager?
     private var transcriptionToast: TranscriptionToastController?
     private var voiceDictationManager: VoiceDictationManager?
+    private var approvalNotifications: ApprovalNotifications?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.info("Initializing Astation components...")
@@ -155,6 +156,12 @@ class AstationApp: NSObject, NSApplicationDelegate {
         hubManager.sendHandler = { [weak webSocketServer] message, clientId in
             webSocketServer?.sendMessageToClient(message, clientId: clientId)
         }
+        hubManager.disconnectDirectClient = { [weak webSocketServer] clientId in
+            webSocketServer?.disconnectClientForSessionReset(clientId)
+        }
+        hubManager.sessionsRemovedHandler = { [weak webSocketServer] sessionIds in
+            webSocketServer?.disconnectClients(authenticatedWith: sessionIds)
+        }
 
         // Start network monitoring to detect IP changes
         NetworkMonitor.shared.startMonitoring()
@@ -191,6 +198,32 @@ class AstationApp: NSObject, NSApplicationDelegate {
         // Connect to relay using this Astation's identity, so Atem TUI can auto-reconnect
         // after the first `atem pair` without needing to pair again.
         hubManager.startIdentityRelay()
+
+        let notifications = ApprovalNotifications(
+            register: { [weak hubManager] in hubManager?.setApprovalPushRegistration($0) },
+            unregister: { [weak hubManager] in hubManager?.unregisterApprovalPush(platform: $0) },
+            open: { [weak self] _ in
+                self?.hubManager.startIdentityRelay()
+                for client in self?.hubManager.connectedClients ?? [] {
+                    self?.hubManager.requestAgentList(from: client.id)
+                }
+            })
+        approvalNotifications = notifications
+        if let file = ProcessInfo.processInfo.environment["ASTATION_LOCAL_API_TOKEN_FILE"] {
+            do {
+                let key = try LocalAPIKey(file: file)
+                webSocketServer.configureLocalControlAPI(hubManager.localControlAPI(key: key, inbox: notifications.inbox))
+                Log.info("[Local API] Authenticated loopback automation enabled")
+            } catch {
+                Log.error("[Local API] Disabled: token file must be a same-user regular file with mode 0600 and a 32-byte hex token")
+            }
+        }
+        hubManager.approvalSessionDidChange = { [weak notifications] source, client, host in
+            notifications?.sessionChanged(sourceID: source, client: client, host: host)
+        }
+        statusBarController.approvalNotificationSettings = { [weak notifications] in notifications?.showPreferences() }
+        statusBarController.approvalPendingCount = { [weak notifications] in notifications?.inbox.pendingCount ?? 0 }
+        notifications.start()
 
         Log.info("Astation fully operational!")
         Log.info("Global hotkeys: \(shortcuts.shortcutLabel(for: .voice)) (PTT voice dictation), \(shortcuts.shortcutLabel(for: .video)) (video)")
@@ -272,6 +305,18 @@ class AstationApp: NSObject, NSApplicationDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         statusBarController?.showStatus()
         return false
+    }
+
+    func application(_ application: NSApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
+        approvalNotifications?.registered(deviceToken: deviceToken)
+    }
+
+    func application(_ application: NSApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
+        approvalNotifications?.registrationFailed()
+    }
+
+    func application(_ application: NSApplication, didReceiveRemoteNotification userInfo: [String: Any]) {
+        approvalNotifications?.received(userInfo: userInfo)
     }
 
     // MARK: - Deep Link Handling (astation:// URL scheme)

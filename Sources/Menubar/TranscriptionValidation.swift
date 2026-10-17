@@ -12,6 +12,8 @@ enum TranscriptionValidation {
                 }
                 print("PASS: bundled \(model.name) manifest.")
             }
+            try RemoteTerminalAssets.validate()
+            print("PASS: bundled remote terminal assets.")
             return 0
         } catch {
             print("FAIL: \(error.localizedDescription)")

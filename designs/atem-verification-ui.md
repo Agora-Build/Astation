@@ -6,6 +6,8 @@ selectable safety code, comparison instructions and Apple's embedded
 **Codes Match**. That action starts Touch ID inside the same window, keeping
 the code visible throughout authentication. It does not complete verification
 by itself. **Deny** remains available before and during authentication.
+After Codes Match, **Use Mac Password...** can instead open macOS's system
+authentication dialog, including when the lid is closed or Touch ID is unavailable.
 
 Both biometric prompts share a 420-point content column, rounded detail cards
 and a consistently aligned Touch ID panel. Device details use labeled rows;
@@ -27,14 +29,18 @@ comparison must never approve a device.
 - The embedded view and evaluation share a fresh `LAContext`. Clicking Codes
   Match enables one biometric evaluation after the window is visible. Further
   clicks cannot start another evaluation or complete approval.
-- Only `deviceOwnerAuthenticationWithBiometrics` is evaluated, with password
-  fallback and reuse of a recent Mac unlock disabled. Unavailable Touch ID
-  displays guidance in the same window without hiding the code or offering
-  another approval method.
+- The embedded view evaluates `deviceOwnerAuthenticationWithBiometrics` without
+  reuse of a recent Mac unlock. The password button invalidates that context
+  and uses a fresh, nonembedded context with `deviceOwnerAuthentication`.
+  macOS owns password entry; Astation never reads or stores the login password.
+  Unavailable or unsuccessful Touch ID leaves the explicit password/deny controls
+  available, without approving the request or automatically opening a new dialog.
 - Approval requires both explicit code-match confirmation and successful
-  biometrics. Denial, window close, peer abort, disconnect or timeout invalidates
-  the context. Completion runs on main exactly once; queued, duplicate and late
-  biometric replies cannot change a completed or replacement request.
+  device-owner authentication. Denial, window close, peer abort, disconnect or
+  timeout invalidates all contexts. Switching to password invalidates biometric
+  callbacks before evaluating the new policy. Password failure/cancellation
+  grants nothing and permits an explicit retry. Completion runs on main exactly
+  once; queued, duplicate and late replies cannot change a successor request.
 - The shared verification/recovery/unlock prompt gate remains in effect. The
   existing controller rechecks account, connection generation, expiry and
   signing identity before committing a device pin or sending a grant.
@@ -50,4 +56,7 @@ window close, queued/late/duplicate replies, background callbacks and shared
 prompt gating. Existing protocol/controller tests cover commit binding,
 disconnects, replacement accounts/connections, expiry and durable verification.
 Physical Touch ID and the comparison against a live remote Atem need manual
-verification.
+verification. Password regressions cover the code-comparison gate, unavailable
+biometrics, separate contexts, policy switching, retries, queued/late successes
+and cancellation. Physical closed-lid and remote-display password entry require
+manual acceptance.

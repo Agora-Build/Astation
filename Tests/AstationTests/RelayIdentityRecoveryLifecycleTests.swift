@@ -98,6 +98,40 @@ final class RelayIdentityRecoveryLifecycleTests: XCTestCase {
         await withCheckedContinuation { continuation in DispatchQueue.main.async { continuation.resume() } }
     }
 
+    func testPushRegistrationWaitsForRelayKeyProofAndRotationSendsTheNewAddress() async throws {
+        let fixture = try RecoveryFixture()
+        let first = try XCTUnwrap(ApprovalPushRegistration(deviceToken: Data(repeating: 1, count: 32), platform: .apnsSandbox))
+        fixture.hub.setApprovalPushRegistration(first)
+        fixture.hub.startIdentityRelay()
+        let socket = try XCTUnwrap(fixture.sockets.first)
+        XCTAssertFalse(socket.sent.contains { $0.contains("relayPushRegister") })
+        socket.emit("{\"type\":\"relayAuthResult\",\"status\":\"verified\"}")
+        await drainMainQueue()
+        XCTAssertEqual(socket.sent.filter { $0.contains("relayPushRegister") }.count, 1)
+        let rotated = try XCTUnwrap(ApprovalPushRegistration(deviceToken: Data(repeating: 2, count: 32), platform: .apnsSandbox))
+        fixture.hub.setApprovalPushRegistration(rotated)
+        let registrations = socket.sent.filter { $0.contains("relayPushRegister") }
+        XCTAssertEqual(registrations.count, 2)
+        let last = try XCTUnwrap(registrations.last?.data(using: .utf8))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: last) as? [String: Any])
+        XCTAssertEqual((object["registration"] as? [String: Any])?["token"] as? String, rotated.token)
+        XCTAssertNil(object["device_id"])
+        XCTAssertNil(object["account_id"])
+    }
+
+    func testOptOutWhileOfflineCannotRegisterThePreviouslyQueuedToken() async throws {
+        let fixture = try RecoveryFixture()
+        let registration = try XCTUnwrap(ApprovalPushRegistration(deviceToken: Data(repeating: 1, count: 32), platform: .apnsSandbox))
+        fixture.hub.setApprovalPushRegistration(registration)
+        fixture.hub.unregisterApprovalPush(platform: .apnsSandbox)
+        fixture.hub.startIdentityRelay()
+        let socket = try XCTUnwrap(fixture.sockets.first)
+        socket.emit("{\"type\":\"relayAuthResult\",\"status\":\"verified\"}")
+        await drainMainQueue()
+        XCTAssertFalse(socket.sent.contains { $0.contains("relayPushRegister") })
+        XCTAssertEqual(socket.sent.filter { $0.contains("relayPushUnregister") }.count, 1)
+    }
+
     func testARecoveredAppStaysPausedUntilTheUserRequestsReconnect() throws {
         let fixture = try RecoveryFixture(pending: true)
         fixture.hub.startIdentityRelay()

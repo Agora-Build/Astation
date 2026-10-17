@@ -84,7 +84,7 @@ enum AtemClientListModel {
 
 struct ConnectionsView: View {
     @ObservedObject var hubManager: AstationHubManager
-    let onRemoteControl: (String, AtemAgentInfo) -> Void
+    let onRemoteControl: (String, AtemAgentInfo?) -> Void
     /// Which client's agents are shown on the right panel.
     @State private var selectedClientId: String?
 
@@ -358,7 +358,7 @@ private struct OfflineClientRow: View {
 private struct AgentListPanel: View {
     @ObservedObject var hubManager: AstationHubManager
     let clientId: String?
-    let onRemoteControl: (String, AtemAgentInfo) -> Void
+    let onRemoteControl: (String, AtemAgentInfo?) -> Void
 
     private var agents: [AtemAgentInfo] {
         guard let id = clientId else { return [] }
@@ -371,6 +371,14 @@ private struct AgentListPanel: View {
     }
 
     private var clientIsOnline: Bool { selectedClient != nil }
+
+    private var accessBlockReason: RemoteAccessBlockReason? {
+        clientId.flatMap { hubManager.remoteAccessBlockReason(for: $0) }
+    }
+
+    private var sessionStatus: AtemSessionClient.ConnectionStatus? {
+        clientId.flatMap { hubManager.sessionStatusByClientId[$0] }
+    }
 
     private var panelTitle: String {
         guard let c = selectedClient else {
@@ -391,9 +399,18 @@ private struct AgentListPanel: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                     if clientIsOnline, let id = clientId {
+                        Button {
+                            onRemoteControl(id, nil)
+                        } label: {
+                            Label("Terminals", systemImage: "terminal")
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                        .disabled(accessBlockReason != nil)
                         Button("Refresh") { hubManager.requestAgentList(from: id) }
                             .buttonStyle(.borderless)
                             .font(.caption)
+                            .disabled(accessBlockReason != nil || (sessionStatus?.phase != .ready && sessionStatus?.canReconnect != true))
                     }
                 }
             }
@@ -404,6 +421,14 @@ private struct AgentListPanel: View {
             Divider()
 
             // ── Body ──────────────────────────────────────────────────────
+            if let message = hubManager.remoteInputStatusMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.orange.opacity(0.08))
+            }
             if clientId == nil {
                 VStack(spacing: 8) {
                     Image(systemName: "arrow.left")
@@ -413,6 +438,45 @@ private struct AgentListPanel: View {
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let reason = accessBlockReason {
+                VStack(spacing: 12) {
+                    Image(systemName: "lock.shield")
+                        .font(.system(size: 32))
+                        .foregroundColor(.secondary)
+                    Text(reason == .verificationRequired ? "Verify this Atem" : "Remote access unavailable")
+                        .font(.headline)
+                    Text(reason.localizedDescription)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .textSelection(.enabled)
+                }
+                .padding(28)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let sessionStatus, !sessionStatus.hasRegistrySnapshot {
+                VStack(spacing: 12) {
+                    if [.connecting, .reconnecting, .ready].contains(sessionStatus.phase) {
+                        ProgressView()
+                    } else {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.system(size: 32))
+                            .foregroundColor(.secondary)
+                    }
+                    Text(sessionStatus.phase == .failed ? "Session connection failed"
+                         : sessionStatus.phase == .reconnecting ? "Reconnecting sessions" : "Loading sessions")
+                        .font(.headline)
+                    Text(sessionStatus.message)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .textSelection(.enabled)
+                    if sessionStatus.canReconnect, let id = clientId {
+                        Button("Retry Session Connection") { hubManager.requestAgentList(from: id) }
+                            .buttonStyle(.borderedProminent)
+                    }
+                }
+                .padding(28)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if agents.isEmpty {
                 VStack(spacing: 10) {
@@ -427,7 +491,7 @@ private struct AgentListPanel: View {
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
                     if clientIsOnline, let id = clientId {
-                        Button("Request Agent List") { hubManager.requestAgentList(from: id) }
+                        Button("Refresh Sessions") { hubManager.requestAgentList(from: id) }
                             .buttonStyle(.borderedProminent)
                             .padding(.top, 4)
                     }
@@ -440,6 +504,20 @@ private struct AgentListPanel: View {
                         ForEach(agents) { agent in
                             AgentRow(
                                 agent: agent,
+                                onOpenInBrowser: {
+                                    guard let clientId else { return }
+                                    do {
+                                        let url = try hubManager.openAgentInBrowser(clientId: clientId, agent: agent)
+                                        if !NSWorkspace.shared.open(url) {
+                                            throw BrowserAgentChat.OpenError.invalidURL
+                                        }
+                                    } catch {
+                                        let alert = NSAlert()
+                                        alert.messageText = "Could not open agent chat"
+                                        alert.informativeText = error.localizedDescription
+                                        alert.runModal()
+                                    }
+                                },
                                 onRemoteControl: {
                                     guard let clientId else { return }
                                     onRemoteControl(clientId, agent)
@@ -460,15 +538,14 @@ private struct AgentListPanel: View {
 
 private struct AgentRow: View {
     let agent: AtemAgentInfo
+    let onOpenInBrowser: () -> Void
     let onRemoteControl: () -> Void
 
     private var statusColor: Color {
-        switch agent.status {
-        case "Idle":            return Color(NSColor.tertiaryLabelColor)
-        case "Thinking":        return .yellow
-        case "WaitingForInput": return .green
-        case "Disconnected":    return .red
-        default:                return Color(NSColor.tertiaryLabelColor)
+        switch agent.processStatus {
+        case .running: return .green
+        case .stopped: return .red
+        case .unknown: return Color(NSColor.tertiaryLabelColor)
         }
     }
 
@@ -495,6 +572,8 @@ private struct AgentRow: View {
                 .fill(statusColor)
                 .frame(width: 9, height: 9)
                 .shadow(color: statusColor.opacity(0.6), radius: 3)
+                .help(agent.processStatus == .running ? "Agent process is running." : "Agent process is not running or its state is unavailable.")
+                .accessibilityLabel(agent.processStatus == .running ? "Running" : agent.processStatus == .stopped ? "Stopped" : "Process state unknown")
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
@@ -510,6 +589,11 @@ private struct AgentRow: View {
                 }
 
                 HStack(spacing: 10) {
+                    Text(agent.name + " [" + String(agent.id.suffix(12)) + "]")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .help(agent.id)
                     Label(endpointLabel, systemImage: agent.agentProtocol == "Acp" ? "network" : "terminal")
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -523,17 +607,28 @@ private struct AgentRow: View {
                             .foregroundColor(.secondary)
                     }
 
-                    Text(agent.status)
+                    Text(agent.activityLabel)
                         .font(.caption)
-                        .foregroundColor(statusColor)
+                        .foregroundColor(.secondary)
+                        .help(agent.processStatus == .stopped ? "The agent process is not running."
+                              : agent.status == "Unknown"
+                              ? "Atem has no reliable activity report for this agent. Its terminal is still available."
+                              : "Activity reported by Atem's agent integration.")
                 }
 
-                Button(action: onRemoteControl) {
-                    Label("Remote Agent Control", systemImage: "keyboard")
+                HStack(spacing: 14) {
+                    Button(action: onRemoteControl) {
+                        Label("Open Terminal", systemImage: "terminal")
+                    }
+                    Button(action: onOpenInBrowser) {
+                        Label("Open in Browser", systemImage: "arrow.up.right.square")
+                    }
+                    .disabled(true)
+                    .help("Browser access requires the secure companion protocol.")
                 }
                 .buttonStyle(.borderless)
                 .controlSize(.small)
-                .disabled(agent.status == "Disconnected")
+                .disabled(agent.processStatus == .stopped)
             }
 
             Spacer()

@@ -15,7 +15,7 @@ its running key agent; an old executable or agent cannot complete migration.
 
 For the current pairing, project-picker and migration steps, use the
 [credentials guide](credentials.md). Its Atem commands also work from another
-machine; Touch ID approval remains on the home Astation Mac.
+machine; Touch ID or Mac-password approval remains on the home Astation Mac.
 
 ## Protocol And Trust
 
@@ -28,13 +28,16 @@ Astations bind attempts to the authenticated Atem ID, the connection
 generation, the data account, and a fresh 32-byte nonce. Attempts expire
 after three minutes. The revealed keys must match the original commitment
 before the Mac displays a safety code. Approval requires matching codes
-and Touch ID. One window displays the safety code and the embedded system
-Touch ID control. After comparing both codes, click **Codes Match**, then use
+and fresh device-owner authentication. One window displays the safety code and
+the embedded system Touch ID control. After comparing both codes, click **Codes Match**, then use
 Touch ID in that window. The code remains visible; Codes Match alone cannot
 approve the device, and biometrics do not start before confirmation. There is
-no separate authentication alert or password fallback. The first verification
-also requires confirmation that the
-complete recovery kit was saved. Denial, abort, expiry, and connection
+an explicit **Use Mac Password...** button after Codes Match. It opens macOS's
+authentication dialog using a separate context. macOS asks for the Mac login
+password when Touch ID is unavailable; if it offers Touch ID first, choose its
+Use Password option. Astation never receives or stores that password. The first
+verification also requires confirmation that the complete recovery kit was
+saved. Denial, abort, expiry, and connection
 replacement invalidate pending approvals.
 
 See [the verification UI design](../designs/atem-verification-ui.md) for the
@@ -42,7 +45,7 @@ code-comparison gate and biometric lifecycle/security invariants.
 
 Safety-code and recovery dialogs run without blocking the main queue.
 A peer abort, disconnect, or timeout dismisses the active dialog and
-invalidates any pending Touch ID request. A retry can start immediately;
+invalidates any pending Touch ID or password request. A retry can start immediately;
 callbacks from an earlier prompt cannot approve the new attempt.
 
 The Atem client must use its authenticated Atem ID in `verifyCommit`,
@@ -50,7 +53,7 @@ rather than its instance UUID. It must receive an explicit safety-code
 answer from an interactive terminal; redirected stdin or unavailable
 input must not be interpreted as a code mismatch. SSO pairing and an
 authenticated connection can remain available after E2E verification
-fails. Check `atem cred status` for device trust.
+fails. Check `atem status` for device trust.
 
 Certificates include the ceremony transcript. The certificate is signed
 at epoch E and the accompanying account state at E+1. Device pins and the
@@ -129,15 +132,27 @@ key ID, the ephemeral X25519 key, and a five-minute arrival-time window before
 opening a prompt. One window shows device name, boot ID, request time, last
 unlock and Apple's embedded Touch ID control. Touch ID starts when the window
 opens; there is no extra Approve click or separate authentication alert.
-Approval requires a fresh Touch ID match with no password fallback or reuse
-of a recent Mac unlock. Deny and
+Alternatively, **Use Mac Password...** opens macOS's authentication dialog.
+Approval requires fresh Touch ID or Mac-password authentication, without reuse
+of a recent biometric unlock. Deny and
 revoke removes the local E2E verification pin; the device must verify again
 before receiving further grants. Relay-wide signed device revocation is a
 later protocol step.
 
-The same window explains unavailable Touch ID without offering another way to
-approve. See [the unlock UI design](../designs/atem-unlock-ui.md) for embedded
+The same window explains unavailable Touch ID and keeps the password button
+available. This supports a closed lid with an external display or a remote Mac
+desktop session, subject to macOS's authentication rules. Switching methods
+cancels the previous attempt; stale replies cannot approve. A cancelled or
+unsuccessful password attempt grants nothing and can be retried explicitly.
+See [the unlock UI design](../designs/atem-unlock-ui.md) for embedded
 authentication, cancellation and lifecycle invariants.
+
+Password-fallback lifecycle tests use injected authentication contexts and do
+not enter a real password. They cover separate policies, retries, stale replies,
+cancellation and comparison gating. See [Agent validation](agent-chat.md#verification)
+for combined-build results and local environment limits. With an external display and closed lid, or while
+viewing the Mac remotely, use **Use Mac Password...** on a real request and
+authenticate in Apple's dialog to complete hardware/session acceptance.
 
 `unlockDenied` includes `revoked: true` after Deny and revoke has persisted,
 and when Astation no longer has a verification pin for the authenticated
@@ -299,7 +314,7 @@ Before release, complete a real `atem pair` against an isolated account,
 confirm both codes, test Touch ID cancellation and success, relaunch the
 Mac app to check pins/epochs, and confirm a changed key cannot obtain K.
 
-For live step 2a verification, run `atem pair` and check `atem cred status`
+For live step 2a verification, run `atem pair` and check `atem status`
 reports the storage key held by Astation. Then run `atem cred lock` and
 `atem cred unlock`, approve Touch ID on the Mac, and confirm storage-key
 rotation. Test Deny and a disconnected unlock before approving a fresh
@@ -318,7 +333,7 @@ have already passed with Genie. The user has authorized squash merge after
 final review and passing checks. The following live OFF and OFF-then-ON checks
 remain unrecorded; run them with the updated app and client:
 
-1. Confirm Astation's relay/account status is connected and `atem cred status`
+1. Confirm Astation's relay/account status is connected and `atem status`
    on the other machine reports a verified device and an unlocked key agent.
 2. In Astation, turn encryption off. Run `atem cred unlock` on the other
    machine. Astation should reach Off after verified migration, and existing

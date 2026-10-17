@@ -120,6 +120,8 @@ function chatAsset(path) {
     '/agent/chat.css': ['text/css', ':root { --paper: white; }'],
     '/agent/chat-core.mjs': ['text/javascript', 'export class Conversation {}'],
     '/agent/chat.mjs': ['text/javascript', 'import "./chat-core.mjs";'],
+    '/agent/markdown.mjs': ['text/javascript', 'export function renderMarkdown() {}'],
+    '/agent/vendor/commonmark.min.js': ['application/javascript', 'commonmark'],
     '/agent/mark.svg': ['image/svg+xml', '<svg></svg>'],
   };
   const [mime, text] = values[path];
@@ -139,7 +141,7 @@ test('production verification checks the chat webapp and every asset on the same
     paths.push(url.pathname);
     return chatAsset(url.pathname);
   } });
-  assert.deepEqual(paths.sort(), ['/agent/', '/agent/chat.css', '/agent/chat-core.mjs', '/agent/chat.mjs', '/agent/mark.svg'].sort());
+  assert.deepEqual(paths.sort(), ['/agent/', '/agent/chat.css', '/agent/chat-core.mjs', '/agent/chat.mjs', '/agent/markdown.mjs', '/agent/vendor/commonmark.min.js', '/agent/mark.svg'].sort());
 });
 
 test('production verification rejects an undeployed page, SPA fallback and wrong JavaScript MIME', async () => {

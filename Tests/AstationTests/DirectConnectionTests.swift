@@ -5,6 +5,67 @@ import XCTest
 @testable import Menubar
 
 final class DirectConnectionTests: XCTestCase {
+    @MainActor
+    func testLocalAPIIsOptInAuthenticatedAndRejectsBrowserRequests() async throws {
+        let fixture = try DirectServerFixture(host: "127.0.0.1")
+        defer { fixture.shutdown() }
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(fixture.port)/api/v1/status"))
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 2
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let (_, disabled) = try await session.data(from: url)
+        XCTAssertEqual((disabled as? HTTPURLResponse)?.statusCode, 404)
+        let token = String(repeating: "ab", count: 32)
+        let file = fixture.directory.appendingPathComponent("api-token")
+        try Data(token.utf8).write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        fixture.server.configureLocalControlAPI(LocalControlAPI(key: try LocalAPIKey(file: file.path),
+            clients: { [:] }, inbox: ApprovalInbox(), records: { [] }))
+        let (_, unauthorized) = try await session.data(from: url)
+        XCTAssertEqual((unauthorized as? HTTPURLResponse)?.statusCode, 401)
+        var request = URLRequest(url: url)
+        request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
+        let (data, authorized) = try await session.data(for: request)
+        XCTAssertEqual((authorized as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual((authorized as? HTTPURLResponse)?.value(forHTTPHeaderField: "Cache-Control"), "no-store")
+        XCTAssertNil((authorized as? HTTPURLResponse)?.value(forHTTPHeaderField: "Access-Control-Allow-Origin"))
+        XCTAssertEqual((try JSONSerialization.jsonObject(with: data) as? [String: String])?["api"], "v1")
+        request.setValue("http://malicious.test", forHTTPHeaderField: "Origin")
+        let (_, browser) = try await session.data(for: request)
+        XCTAssertEqual((browser as? HTTPURLResponse)?.statusCode, 401)
+        request.setValue(nil, forHTTPHeaderField: "Origin")
+        request.httpMethod = "POST"
+        request.httpBody = Data("{}".utf8)
+        let (_, wrongContentType) = try await session.data(for: request)
+        XCTAssertEqual((wrongContentType as? HTTPURLResponse)?.statusCode, 415)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(repeating: 32, count: LocalControlAPI.maximumBody + 1)
+        let (_, oversized) = try await session.data(for: request)
+        XCTAssertEqual((oversized as? HTTPURLResponse)?.statusCode, 413)
+    }
+
+    func testSessionResetClosesOnlySelectedAuthenticatedDirectSocket() throws {
+        let fixture = try DirectServerFixture(host: "127.0.0.1")
+        defer { fixture.shutdown() }
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+        var firstID = ""
+        let auth = loopbackAuthMessage(fixture: fixture, atemId: "reset-target")
+        let (_, first) = try connect(host: "127.0.0.1", fixture: fixture, group: group, authMessage: {
+            firstID = $0["clientId"] ?? ""
+            return auth($0)
+        }).wait()
+        let (_, second) = try connect(host: "127.0.0.1", fixture: fixture, group: group,
+            authMessage: loopbackAuthMessage(fixture: fixture, atemId: "unrelated-host")).wait()
+        let closed = expectation(description: "Selected direct socket closes for recovery")
+        first.onClose.whenComplete { _ in closed.fulfill() }
+        fixture.server.disconnectClientForSessionReset(firstID)
+        wait(for: [closed], timeout: 2)
+        XCTAssertTrue(second.isClosed == false)
+        _ = second.close()
+    }
+
     func testLoopbackAuthenticatesWithoutPairingOrNetwork() throws {
         let fixture = try DirectServerFixture(host: "127.0.0.1")
         defer { fixture.shutdown() }
@@ -200,6 +261,49 @@ final class DirectConnectionTests: XCTestCase {
         let (received, socket) = try result.futureResult.wait()
         XCTAssertFalse(received)
         _ = socket.close()
+    }
+
+    func testRevokedDirectPairingRejectsTerminalTrafficInBothDirections() throws {
+        for outbound in [false, true] {
+            let fixture = try DirectServerFixture(host: "127.0.0.1")
+            defer { fixture.shutdown() }
+            let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            defer { try? group.syncShutdownGracefully() }
+            var clientId = ""
+            let authenticate = loopbackAuthMessage(fixture: fixture, atemId: "terminal-test")
+            let (result, socket) = try connect(host: "127.0.0.1", fixture: fixture, group: group,
+                authMessage: { data in
+                    clientId = data["clientId"] ?? ""
+                    return authenticate(data)
+                }).wait()
+            XCTAssertEqual(result, "authenticated:local_proof")
+            XCTAssertFalse(clientId.isEmpty)
+            let session = try XCTUnwrap(fixture.sessions.getAllActive().first)
+            fixture.sessions.delete(sessionId: session.id)
+            XCTAssertNil(fixture.sessions.get(sessionId: session.id))
+            let closed = expectation(description: "Revoked terminal transport closes")
+            socket.onClose.whenComplete { _ in closed.fulfill() }
+            if outbound {
+                fixture.server.sendMessageToClient(.terminal(.list), clientId: clientId)
+            } else {
+                socket.send(String(decoding: try JSONEncoder().encode(AstationMessage.terminal(.sessions([]))), as: UTF8.self))
+            }
+            wait(for: [closed], timeout: 2)
+        }
+    }
+
+    func testPairingRemovalDisconnectsAuthenticatedDirectSocket() throws {
+        let fixture = try DirectServerFixture(host: "127.0.0.1")
+        defer { fixture.shutdown() }
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+        let (_, socket) = try connect(host: "127.0.0.1", fixture: fixture, group: group,
+            authMessage: loopbackAuthMessage(fixture: fixture, atemId: "terminal-test")).wait()
+        let session = try XCTUnwrap(fixture.sessions.getAllActive().first)
+        let closed = expectation(description: "Removed pairing closes its direct socket")
+        socket.onClose.whenComplete { _ in closed.fulfill() }
+        fixture.server.disconnectClients(authenticatedWith: [session.id])
+        wait(for: [closed], timeout: 2)
     }
 
     private func connect(

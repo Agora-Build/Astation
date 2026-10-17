@@ -616,13 +616,10 @@ class VoiceCodingManager: NSObject {
             return
         }
 
-        let message = AstationMessage.voiceRequest(
-            sessionId: sessionId,
-            accumulatedText: accumulatedText,
-            relayUrl: hubManager.stationRelayUrl
-        )
-        hubManager.sendHandler?(message, atemId)
-        Log.info("[VoiceCoding] Sent voiceRequest to \(atemId.prefix(8))...: \(accumulatedText.prefix(60))...")
+        let submitted = hubManager.sendAgentText(accumulatedText, clientId: atemId)
+        cleanup()
+        updateStage(submitted ? "Voice: Submitted to the controlled session"
+            : "Voice: Open Terminal and take control first", autoHideAfter: 3.0)
     }
 
     private func recycleHandsFreeSession() {

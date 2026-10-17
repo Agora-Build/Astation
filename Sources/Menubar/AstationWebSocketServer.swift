@@ -14,8 +14,14 @@ class AstationWebSocketServer {
     private let sessionStore: SessionStore
     private let localBootstrapStore: LocalBootstrapStore?
     private var authenticatedClients: Set<String> = []  // Client IDs that have been authenticated
+    private var authenticatedSessionIds: [String: String] = [:]
     private var pendingAuthentication: [String: DirectAuthenticationContext] = [:]
     private var pairingClients: Set<String> = []
+    private var localControlAPI: LocalControlAPI?
+
+    func configureLocalControlAPI(_ api: LocalControlAPI) {
+        executeOnStateEventLoop { self.localControlAPI = api }
+    }
 
     init(
         hubManager: AstationHubManager,
@@ -50,7 +56,7 @@ class AstationWebSocketServer {
             .serverChannelOption(ChannelOptions.backlog, value: 256)
             .serverChannelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
             .childChannelInitializer { channel in
-                let httpHandler = HTTPHandler()
+                let httpHandler = HTTPHandler(api: { [weak self] in self?.localControlAPI })
                 let config = NIOHTTPServerUpgradeConfiguration(
                     upgraders: [upgrader],
                     completionHandler: { _ in
@@ -102,6 +108,7 @@ class AstationWebSocketServer {
         ws.onClose.whenComplete { _ in
             self.connectedClients.removeValue(forKey: clientId)
             self.authenticatedClients.remove(clientId)
+            self.authenticatedSessionIds.removeValue(forKey: clientId)
             self.pendingAuthentication.removeValue(forKey: clientId)
             self.pairingClients.remove(clientId)
             self.hubManager.removeClient(withId: clientId)
@@ -126,8 +133,8 @@ class AstationWebSocketServer {
         NetworkDebugLogger.logWebSocket(direction: "recv", context: "local \(clientId.prefix(8))", message: text)
 
         guard let data = text.data(using: .utf8),
-              let message = try? JSONDecoder().decode(AstationMessage.self, from: data) else {
-            Log.error("❌ Failed to decode message from \(clientId.prefix(8)): \(text.prefix(100))")
+              let message = try? AstationMessage.decodePacket(data) else {
+            Log.error("❌ Failed to decode message from \(clientId.prefix(8)) (\(text.utf8.count) bytes)")
             return
         }
 
@@ -135,6 +142,11 @@ class AstationWebSocketServer {
         if !authenticatedClients.contains(clientId) {
             // Client not authenticated - check if this is an auth message
             handleAuthMessage(message, from: clientId, ws: ws)
+            return
+        }
+
+        if message.isPrivateAgentTraffic, !hasCurrentSession(clientId) {
+            _ = ws.close(code: .policyViolation)
             return
         }
 
@@ -206,7 +218,7 @@ class AstationWebSocketServer {
                     ]
                 )
                 sendMessage(successMsg, to: clientId)
-                registerClient(clientId, hostname: session.hostname, atemId: atemId)
+                registerClient(clientId, hostname: session.hostname, atemId: atemId, sessionId: session.id)
 
                 Log.info("Client \(clientId.prefix(8)) authenticated via LAN session proof")
                 return
@@ -275,17 +287,19 @@ class AstationWebSocketServer {
             "token": session.token,
             "protocol": DeviceAuthentication.protocolVersion
         ]), to: clientId)
-        registerClient(clientId, hostname: hostname, atemId: atemId)
+        registerClient(clientId, hostname: hostname, atemId: atemId, sessionId: session.id)
         Log.info("Loopback client \(clientId.prefix(8)) authenticated without interactive pairing")
     }
 
-    private func registerClient(_ clientId: String, hostname: String, atemId: String?) {
+    private func registerClient(_ clientId: String, hostname: String, atemId: String?, sessionId: String) {
+        authenticatedSessionIds[clientId] = sessionId
         hubManager.addClient(ConnectedClient(
             id: clientId,
             clientType: "Atem",
             connectedAt: Date(),
             hostname: hostname,
-            atemId: atemId
+            atemId: atemId,
+            authenticationSessionId: sessionId
         ))
     }
 
@@ -375,7 +389,7 @@ class AstationWebSocketServer {
                         "token": session.token,
                         "protocol": DeviceAuthentication.protocolVersion
                     ]), to: clientId)
-                    self.registerClient(clientId, hostname: hostname, atemId: atemId)
+                    self.registerClient(clientId, hostname: hostname, atemId: atemId, sessionId: session.id)
                     Log.info("✅ Pairing approved for \(hostname) (\(clientId.prefix(8)))")
                 } else {
                     self.sendMessage(.error(message: "Pairing denied by user"), to: clientId)
@@ -387,6 +401,10 @@ class AstationWebSocketServer {
     }
     
     private func sendMessage(_ message: AstationMessage, to clientId: String) {
+        if message.isPrivateAgentTraffic, !hasCurrentSession(clientId) {
+            _ = connectedClients[clientId]?.close(code: .policyViolation)
+            return
+        }
         guard let ws = connectedClients[clientId],
               let data = try? JSONEncoder().encode(message),
               let text = String(data: data, encoding: .utf8) else {
@@ -397,10 +415,32 @@ class AstationWebSocketServer {
         ws.send(text)
         NetworkDebugLogger.logWebSocket(direction: "send", context: "local \(clientId)", message: text)
     }
+
+    private func hasCurrentSession(_ clientId: String) -> Bool {
+        guard authenticatedClients.contains(clientId), let sessionId = authenticatedSessionIds[clientId],
+              let session = sessionStore.get(sessionId: sessionId) else { return false }
+        return session.isValid
+    }
     
     func sendMessageToClient(_ message: AstationMessage, clientId: String) {
         executeOnStateEventLoop {
             self.sendMessage(message, to: clientId)
+        }
+    }
+
+    func disconnectClients(authenticatedWith sessionIds: [String]) {
+        executeOnStateEventLoop {
+            let removed = Set(sessionIds)
+            for (clientId, sessionId) in self.authenticatedSessionIds where removed.contains(sessionId) {
+                _ = self.connectedClients[clientId]?.close(code: .policyViolation)
+            }
+        }
+    }
+
+    func disconnectClientForSessionReset(_ clientId: String) {
+        executeOnStateEventLoop {
+            guard self.authenticatedClients.contains(clientId) else { return }
+            _ = self.connectedClients[clientId]?.close(code: .goingAway)
         }
     }
 
@@ -411,6 +451,7 @@ class AstationWebSocketServer {
     }
 
     private func broadcastMessageOnEventLoop(_ message: AstationMessage) {
+        if message.isPrivateAgentTraffic { return }
         guard let data = try? JSONEncoder().encode(message),
               let text = String(data: data, encoding: .utf8) else {
             Log.error("Failed to encode broadcast message")
@@ -450,7 +491,7 @@ class AstationWebSocketServer {
     }
 }
 
-private enum DirectConnectionScope: String {
+enum DirectConnectionScope: String {
     case loopback
     case lan
 
@@ -473,21 +514,61 @@ private struct DirectAuthenticationContext {
 private final class HTTPHandler: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
-    
+    private let api: () -> LocalControlAPI?
+    private var acceptedAPI: LocalControlAPI?
+    private var request: HTTPRequestHead?
+    private var body = Data()
+    private var responding = false
+
+    init(api: @escaping () -> LocalControlAPI?) { self.api = api }
+
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        guard !responding else { return }
         let reqPart = unwrapInboundIn(data)
         
         switch reqPart {
         case .head(let request):
-            if request.uri != "/ws" {
-                // Send 404 for non-WebSocket requests
-                let headers = HTTPHeaders([("content-length", "0")])
-                let head = HTTPResponseHead(version: request.version, status: .notFound, headers: headers)
-                context.write(wrapOutboundOut(.head(head)), promise: nil)
-                context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
+            guard self.request == nil else { respond(.error("invalid_request", status: .badRequest), context: context); return }
+            guard request.uri.hasPrefix("/api/v1/"), let api = api() else {
+                respond(.error("not_found", status: .notFound), context: context); return
             }
-        case .body, .end:
-            break
+            guard api.key.authorizes(request, peerAddress: context.remoteAddress?.ipAddress) else {
+                respond(.error("unauthorized", status: .unauthorized), context: context); return
+            }
+            if request.method == .POST, request.headers["content-type"] != ["application/json"] {
+                respond(.error("json_required", status: .unsupportedMediaType), context: context); return
+            }
+            self.request = request
+            acceptedAPI = api
+        case .body(var buffer):
+            guard body.count + buffer.readableBytes <= LocalControlAPI.maximumBody else {
+                respond(.error("body_too_large", status: .payloadTooLarge), context: context); return
+            }
+            body.append(contentsOf: buffer.readBytes(length: buffer.readableBytes) ?? [])
+        case .end:
+            guard let request, let api = acceptedAPI else { return }
+            responding = true
+            let body = self.body
+            let channel = context.channel
+            DispatchQueue.main.async {
+                let response = api.handle(method: request.method, path: request.uri, body: body)
+                channel.eventLoop.execute { self.write(response, channel: channel) }
+            }
         }
+    }
+
+    private func respond(_ response: LocalAPIResponse, context: ChannelHandlerContext) {
+        responding = true
+        write(response, channel: context.channel)
+    }
+
+    private func write(_ response: LocalAPIResponse, channel: Channel) {
+        let headers = HTTPHeaders([("content-type", "application/json"), ("content-length", String(response.body.count)),
+                                   ("cache-control", "no-store"), ("connection", "close"), ("x-content-type-options", "nosniff")])
+        channel.write(HTTPServerResponsePart.head(HTTPResponseHead(version: .http1_1, status: response.status, headers: headers)), promise: nil)
+        var buffer = channel.allocator.buffer(capacity: response.body.count)
+        buffer.writeBytes(response.body)
+        channel.write(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
+        channel.writeAndFlush(HTTPServerResponsePart.end(nil)).whenComplete { _ in channel.close(promise: nil) }
     }
 }

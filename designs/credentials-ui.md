@@ -19,7 +19,10 @@ UserDefaults, files, logs, memory, skills, the shared-notes vault, SSO broadcast
 or the relay. Keychain failures and unsupported/corrupt records retain the
 existing item and fail closed. The existing SSO and E2EE identities are separate.
 
-Add, update, delete and copy require Touch ID. The controller captures the
+Add, update, delete and copy require fresh macOS device-owner authentication
+(Touch ID or the Mac login password in Apple's system dialog). Astation never
+collects or stores the login password. Reuse of a recent biometric unlock is
+disabled. The controller captures the
 Astation's identity and record revision before asking for approval, and checks
 that context again before acting. Cancelled or stale callbacks cannot change
 data or copy a value. Leaving the tab or closing Settings cancels input sheets,

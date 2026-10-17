@@ -146,7 +146,7 @@ final class AtemVerificationUITests: XCTestCase {
         XCTAssertEqual(context.localizedFallbackTitle, "")
         XCTAssertEqual(context.touchIDAuthenticationAllowableReuseDuration, 0)
         let content = try XCTUnwrap(prompt.alert.window.contentView)
-        for view in [prompt.safetyCode, prompt.authenticationView, prompt.status] + prompt.alert.buttons {
+        for view in [prompt.safetyCode, prompt.authenticationView, prompt.status, prompt.passwordButton] + prompt.alert.buttons {
             let frame = content.convert(view.bounds, from: view)
             XCTAssertGreaterThan(frame.height, 0)
             XCTAssertGreaterThan(frame.width, 0)
@@ -273,6 +273,11 @@ final class AtemVerificationUITests: XCTestCase {
             drainMainQueue()
             context.replies[0](false, NSError(domain: LAError.errorDomain, code: code.rawValue))
             drainMainQueue()
+            XCTAssertTrue(results.isEmpty)
+            XCTAssertTrue(prompt.isActive)
+            XCTAssertTrue(prompt.passwordButton.isEnabled)
+            XCTAssertTrue(prompt.status.stringValue.contains("Use Mac Password"))
+            prompt.alert.buttons[1].performClick(nil)
             XCTAssertEqual(results, [false])
             XCTAssertEqual(context.invalidations, 1)
             XCTAssertFalse(prompt.alert.window.isVisible)
@@ -404,7 +409,7 @@ final class AtemVerificationUITests: XCTestCase {
         XCTAssertTrue(decisions.isEmpty)
         XCTAssertTrue(prompt.alert.window.isVisible)
         let content = try XCTUnwrap(prompt.alert.window.contentView)
-        for view in [prompt.authenticationView, prompt.status] + prompt.alert.buttons {
+        for view in [prompt.authenticationView, prompt.status, prompt.passwordButton] + prompt.alert.buttons {
             let frame = content.convert(view.bounds, from: view)
             XCTAssertGreaterThan(frame.height, 0)
             XCTAssertGreaterThan(frame.width, 0)
@@ -531,10 +536,190 @@ final class AtemVerificationUITests: XCTestCase {
             drainMainQueue()
             context.replies[0](false, NSError(domain: LAError.errorDomain, code: code.rawValue))
             drainMainQueue()
+            XCTAssertTrue(decisions.isEmpty)
+            XCTAssertTrue(prompt.isActive)
+            XCTAssertTrue(prompt.passwordButton.isEnabled)
+            XCTAssertTrue(prompt.status.stringValue.contains("Use Mac Password"))
+            prompt.alert.buttons[0].performClick(nil)
             XCTAssertEqual(decisions, [.deny])
             XCTAssertEqual(context.invalidations, 1)
             XCTAssertFalse(prompt.alert.window.isVisible)
         }
+    }
+
+    func testPasswordVerificationRequiresCodesMatchAndSkipsQueuedBiometrics() throws {
+        _ = NSApplication.shared
+        let biometric = AuthenticationContext(), password = AuthenticationContext()
+        var results: [Bool] = []
+        let prompt = AtemSafetyCodePrompt(request: verificationRequest, context: biometric,
+            makePasswordContext: { password }) { results.append($0) }
+        prompt.show()
+        XCTAssertFalse(prompt.passwordButton.isEnabled)
+        prompt.passwordButton.performClick(nil)
+        XCTAssertTrue(password.policies.isEmpty)
+        prompt.alert.buttons[0].performClick(nil)
+        prompt.passwordButton.performClick(nil)
+        prompt.passwordButton.performClick(nil)
+        drainMainQueue()
+        XCTAssertTrue(biometric.policies.isEmpty)
+        XCTAssertEqual(biometric.invalidations, 1)
+        XCTAssertEqual(password.policies, [.deviceOwnerAuthentication])
+        XCTAssertEqual(password.localizedFallbackTitle, "Use Password...")
+        XCTAssertEqual(password.touchIDAuthenticationAllowableReuseDuration, 0)
+        XCTAssertFalse(prompt.authenticationView.context === password)
+        XCTAssertTrue(prompt.alert.window.isVisible)
+        XCTAssertEqual(prompt.safetyCode.stringValue, verificationRequest.safetyCode)
+        let content = try XCTUnwrap(prompt.alert.window.contentView)
+        XCTAssertTrue(content.bounds.contains(content.convert(prompt.passwordButton.bounds, from: prompt.passwordButton)))
+        password.replies[0](true, nil)
+        drainMainQueue()
+        XCTAssertEqual(results, [true])
+        XCTAssertEqual(password.invalidations, 1)
+    }
+
+    func testSwitchToPasswordIgnoresAlreadyQueuedBiometricSuccess() {
+        _ = NSApplication.shared
+        let biometric = AuthenticationContext(), password = AuthenticationContext()
+        var results: [Bool] = []
+        let prompt = AtemSafetyCodePrompt(request: verificationRequest, context: biometric,
+            makePasswordContext: { password }) { results.append($0) }
+        prompt.show()
+        prompt.alert.buttons[0].performClick(nil)
+        drainMainQueue()
+        biometric.replies[0](true, nil)
+        prompt.passwordButton.performClick(nil)
+        drainMainQueue()
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertTrue(prompt.isActive)
+        XCTAssertEqual(biometric.invalidations, 1)
+        password.replies[0](true, nil)
+        drainMainQueue()
+        XCTAssertEqual(results, [true])
+    }
+
+    func testPasswordVerificationRetryIgnoresPreviousAttemptReplies() {
+        _ = NSApplication.shared
+        let biometric = AuthenticationContext(), first = AuthenticationContext(), second = AuthenticationContext()
+        biometric.available = false
+        var contexts = [first, second]
+        var results: [Bool] = []
+        let prompt = AtemSafetyCodePrompt(request: verificationRequest, context: biometric,
+            makePasswordContext: { contexts.removeFirst() }) { results.append($0) }
+        prompt.show()
+        prompt.alert.buttons[0].performClick(nil)
+        drainMainQueue()
+        prompt.passwordButton.performClick(nil)
+        first.replies[0](false, NSError(domain: LAError.errorDomain, code: LAError.userCancel.rawValue))
+        drainMainQueue()
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertTrue(prompt.passwordButton.isEnabled)
+        prompt.passwordButton.performClick(nil)
+        first.replies[0](true, nil)
+        drainMainQueue()
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertEqual(first.invalidations, 1)
+        second.replies[0](true, nil)
+        drainMainQueue()
+        XCTAssertEqual(results, [true])
+        XCTAssertEqual(second.invalidations, 1)
+    }
+
+    func testPasswordUnlockWorksWithUnavailableTouchID() {
+        _ = NSApplication.shared
+        let biometric = AuthenticationContext(), password = AuthenticationContext()
+        biometric.available = false
+        var decisions: [AtemUnlockDecision] = []
+        let prompt = AtemUnlockPrompt(request: unlockRequest, context: biometric,
+            makePasswordContext: { password }) { decisions.append($0) }
+        prompt.show()
+        drainMainQueue()
+        XCTAssertTrue(prompt.status.stringValue.contains("Touch ID is unavailable"))
+        prompt.passwordButton.performClick(nil)
+        XCTAssertEqual(password.preflightPolicies, [.deviceOwnerAuthentication])
+        XCTAssertEqual(password.policies, [.deviceOwnerAuthentication])
+        XCTAssertEqual(password.reasons, ["unlock this Atem's storage key"])
+        XCTAssertTrue(decisions.isEmpty)
+        password.replies[0](true, nil)
+        drainMainQueue()
+        XCTAssertEqual(decisions, [.approve])
+        XCTAssertEqual(biometric.invalidations, 1)
+        XCTAssertEqual(password.invalidations, 1)
+    }
+
+    func testPasswordUnlockDenyRevokeAndPeerCancellationIgnoreQueuedSuccess() {
+        _ = NSApplication.shared
+        for action in 0..<3 {
+            let biometric = AuthenticationContext(), password = AuthenticationContext()
+            var decisions: [AtemUnlockDecision] = []
+            let prompt = AtemUnlockPrompt(request: unlockRequest, context: biometric,
+                makePasswordContext: { password }) { decisions.append($0) }
+            prompt.show()
+            drainMainQueue()
+            prompt.passwordButton.performClick(nil)
+            password.replies[0](true, nil)
+            if action < 2 { prompt.alert.buttons[action].performClick(nil) }
+            else { prompt.finish(.deny) }
+            biometric.replies[0](true, nil)
+            drainMainQueue()
+            XCTAssertEqual(decisions, [action == 1 ? .revoke : .deny])
+            XCTAssertEqual(password.invalidations, 1)
+            XCTAssertEqual(biometric.invalidations, 1)
+            XCTAssertFalse(prompt.alert.window.isVisible)
+        }
+    }
+
+    func testUnavailablePasswordAuthenticationNeverApproves() {
+        _ = NSApplication.shared
+        let biometric = AuthenticationContext(), password = AuthenticationContext()
+        biometric.available = false
+        password.available = false
+        var decisions: [AtemUnlockDecision] = []
+        let prompt = AtemUnlockPrompt(request: unlockRequest, context: biometric,
+            makePasswordContext: { password }) { decisions.append($0) }
+        prompt.show()
+        prompt.passwordButton.performClick(nil)
+        drainMainQueue()
+        XCTAssertTrue(biometric.policies.isEmpty)
+        XCTAssertTrue(password.policies.isEmpty)
+        XCTAssertTrue(decisions.isEmpty)
+        XCTAssertTrue(prompt.passwordButton.isEnabled)
+        prompt.alert.window.close()
+        XCTAssertEqual(decisions, [.deny])
+    }
+
+    func testPasswordVerificationCancellationCannotApprove() {
+        _ = NSApplication.shared
+        for closeWindow in [false, true] {
+            let biometric = AuthenticationContext(), password = AuthenticationContext()
+            var results: [Bool] = []
+            let prompt = AtemSafetyCodePrompt(request: verificationRequest, context: biometric,
+                makePasswordContext: { password }) { results.append($0) }
+            prompt.show()
+            prompt.alert.buttons[0].performClick(nil)
+            prompt.passwordButton.performClick(nil)
+            password.replies[0](true, nil)
+            if closeWindow { prompt.alert.window.close() }
+            else { prompt.finish(false) }
+            drainMainQueue()
+            XCTAssertEqual(results, [false])
+            XCTAssertEqual(password.invalidations, 1)
+            XCTAssertTrue(biometric.policies.isEmpty)
+        }
+    }
+
+    func testLocalCredentialAuthenticationOffersSystemPassword() {
+        let context = AuthenticationContext()
+        var results: [Bool] = []
+        let cancel = LocalCredentialActions.deviceOwner(context: context, reason: "save a credential") { results.append($0) }
+        XCTAssertEqual(context.preflightPolicies, [.deviceOwnerAuthentication])
+        XCTAssertEqual(context.policies, [.deviceOwnerAuthentication])
+        XCTAssertEqual(context.localizedFallbackTitle, "Use Password...")
+        XCTAssertEqual(context.touchIDAuthenticationAllowableReuseDuration, 0)
+        context.replies[0](false, nil)
+        drainMainQueue()
+        XCTAssertEqual(results, [false])
+        cancel()
+        XCTAssertEqual(context.invalidations, 1)
     }
 
     func testUnlockRevokeButtonAndSinglePromptGate() throws {

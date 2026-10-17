@@ -6,23 +6,27 @@ final class AtemSafetyCodePrompt: NSObject, NSWindowDelegate {
     let alert: NSAlert
     let safetyCode: NSTextField
     let authenticationView: LAAuthenticationView
+    let passwordButton = NSButton(title: "Use Mac Password...", target: nil, action: nil)
     let status = NSTextField(wrappingLabelWithString:
-        "After comparing the codes, click Codes Match to enable Touch ID.")
-    private let context: LAContext
+        "After comparing the codes, click Codes Match, then use Touch ID or your Mac password.")
+    private let authentication: AtemOwnerAuthentication
     private var completion: ((Bool) -> Void)?
     private var shown = false
     private var codesMatched = false
+    private var usingPassword = false
     var isActive: Bool { completion != nil }
 
-    init(request: AtemVerificationApproval, context: LAContext, completion: @escaping (Bool) -> Void) {
+    init(request: AtemVerificationApproval, context: LAContext,
+         makePasswordContext: @escaping () -> LAContext = { LAContext() }, completion: @escaping (Bool) -> Void) {
         alert = AtemVerificationUI.verificationAlert()
         safetyCode = NSTextField(labelWithString: request.safetyCode)
-        self.context = context
+        authentication = AtemOwnerAuthentication(context: context, makePasswordContext: makePasswordContext)
         self.completion = completion
-        context.localizedFallbackTitle = ""
-        context.touchIDAuthenticationAllowableReuseDuration = 0
         authenticationView = LAAuthenticationView(context: context, controlSize: .regular)
         super.init()
+        passwordButton.target = self
+        passwordButton.action = #selector(usePassword)
+        passwordButton.isEnabled = false
 
         safetyCode.font = .monospacedSystemFont(ofSize: 26, weight: .semibold)
         safetyCode.alignment = .center
@@ -31,7 +35,7 @@ final class AtemSafetyCodePrompt: NSObject, NSWindowDelegate {
         alert.accessoryView = AtemAuthenticationLayout.content([
             AtemAuthenticationLayout.details([("Device", AtemVerificationUI.displayText(request.deviceName))]),
             AtemAuthenticationLayout.code(safetyCode),
-            AtemAuthenticationLayout.touchID(authenticationView, status: status),
+            AtemAuthenticationLayout.touchID(authenticationView, status: status, passwordButton: passwordButton),
             AtemAuthenticationLayout.note("If the codes differ, choose Deny and pair again.")
         ])
     }
@@ -53,22 +57,40 @@ final class AtemSafetyCodePrompt: NSObject, NSWindowDelegate {
         guard isActive, shown, !codesMatched else { return }
         codesMatched = true
         alert.buttons[0].isEnabled = false
-        status.stringValue = "Place your finger on Touch ID to verify this device."
+        passwordButton.isEnabled = true
+        status.stringValue = "Use Touch ID to verify this device, or choose Use Mac Password."
         // Keep comparison explicit; evaluating on presentation could accept an incidental match.
         DispatchQueue.main.async { [weak self] in self?.authenticate() }
     }
 
     private func authenticate() {
-        guard isActive, codesMatched else { return }
-        var error: NSError?
-        guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
-            status.stringValue = "Touch ID is unavailable. Unlock this Mac and enable Touch ID, then retry pairing. Verification cannot be approved."
-            return
+        guard isActive, codesMatched, !usingPassword else { return }
+        if !authentication.biometrics(reason: "verify this Atem's safety code", completion: { [weak self] accepted in
+            guard let self, self.isActive else { return }
+            if accepted { self.finish(true) }
+            else { self.status.stringValue = "Touch ID did not complete. Choose Use Mac Password to continue, or Deny." }
+        }) {
+            status.stringValue = "Touch ID is unavailable. Choose Use Mac Password to verify with your Mac login password."
         }
-        context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics,
-            localizedReason: "verify this Atem's safety code") { [weak self] accepted, _ in
-            DispatchQueue.main.async { self?.finish(accepted) }
+    }
+
+    @objc private func usePassword() {
+        guard isActive, shown, codesMatched, passwordButton.isEnabled else { return }
+        usingPassword = true
+        passwordButton.isEnabled = false
+        status.stringValue = "Authenticate in the macOS dialog. Choose Use Password if Touch ID is offered."
+        if !authentication.password(reason: "verify this Atem's safety code", completion: { [weak self] accepted in
+            guard let self, self.isActive else { return }
+            if accepted { self.finish(true) }
+            else { self.passwordFailed() }
+        }) {
+            passwordFailed()
         }
+    }
+
+    private func passwordFailed() {
+        passwordButton.isEnabled = true
+        status.stringValue = "Authentication did not complete. Choose Use Mac Password to retry, or Deny."
     }
 
     @objc private func deny() { finish(false) }
@@ -76,7 +98,7 @@ final class AtemSafetyCodePrompt: NSObject, NSWindowDelegate {
     func finish(_ accepted: Bool) {
         guard let callback = completion else { return }
         completion = nil
-        context.invalidate()
+        authentication.cancel()
         alert.window.close()
         callback(accepted && codesMatched)
     }

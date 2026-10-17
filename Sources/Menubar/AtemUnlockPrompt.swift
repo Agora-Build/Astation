@@ -5,21 +5,24 @@ import LocalAuthenticationEmbeddedUI
 final class AtemUnlockPrompt: NSObject, NSWindowDelegate {
     let alert: NSAlert
     let authenticationView: LAAuthenticationView
+    let passwordButton = NSButton(title: "Use Mac Password...", target: nil, action: nil)
     let status = NSTextField(wrappingLabelWithString:
-        "Place your finger on Touch ID to unlock this device's storage key.")
-    private let context: LAContext
+        "Use Touch ID to unlock this device's storage key, or choose Use Mac Password.")
+    private let authentication: AtemOwnerAuthentication
     private var completion: ((AtemUnlockDecision) -> Void)?
     private var shown = false
+    private var usingPassword = false
     var isActive: Bool { completion != nil }
 
-    init(request: AtemUnlockApproval, context: LAContext, completion: @escaping (AtemUnlockDecision) -> Void) {
+    init(request: AtemUnlockApproval, context: LAContext,
+         makePasswordContext: @escaping () -> LAContext = { LAContext() }, completion: @escaping (AtemUnlockDecision) -> Void) {
         alert = AtemVerificationUI.unlockAlert()
-        self.context = context
+        authentication = AtemOwnerAuthentication(context: context, makePasswordContext: makePasswordContext)
         self.completion = completion
-        context.localizedFallbackTitle = ""
-        context.touchIDAuthenticationAllowableReuseDuration = 0
         authenticationView = LAAuthenticationView(context: context, controlSize: .regular)
         super.init()
+        passwordButton.target = self
+        passwordButton.action = #selector(usePassword)
 
         let requested = DateFormatter.localizedString(from: request.requestTime, dateStyle: .medium, timeStyle: .medium)
         let last = request.lastUnlock.map {
@@ -32,7 +35,7 @@ final class AtemUnlockPrompt: NSObject, NSWindowDelegate {
                 ("Last unlock", last),
                 ("Boot ID", AtemVerificationUI.displayText(request.bootId))
             ]),
-            AtemAuthenticationLayout.touchID(authenticationView, status: status),
+            AtemAuthenticationLayout.touchID(authenticationView, status: status, passwordButton: passwordButton),
             AtemAuthenticationLayout.note("Deny and Revoke removes this device's verification.")
         ])
     }
@@ -53,16 +56,33 @@ final class AtemUnlockPrompt: NSObject, NSWindowDelegate {
     }
 
     private func authenticate() {
-        guard isActive else { return }
-        var error: NSError?
-        guard context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else {
-            status.stringValue = "Touch ID is unavailable. Unlock this Mac and enable Touch ID, then retry the Atem command. This request cannot be approved."
-            return
+        guard isActive, !usingPassword else { return }
+        if !authentication.biometrics(reason: "unlock this Atem's storage key", completion: { [weak self] accepted in
+            guard let self, self.isActive else { return }
+            if accepted { self.finish(.approve) }
+            else { self.status.stringValue = "Touch ID did not complete. Choose Use Mac Password to continue, or Deny." }
+        }) {
+            status.stringValue = "Touch ID is unavailable. Choose Use Mac Password to unlock with your Mac login password."
         }
-        context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics,
-            localizedReason: "unlock this Atem's storage key") { [weak self] accepted, _ in
-            DispatchQueue.main.async { self?.finish(accepted ? .approve : .deny) }
+    }
+
+    @objc private func usePassword() {
+        guard isActive, shown, passwordButton.isEnabled else { return }
+        usingPassword = true
+        passwordButton.isEnabled = false
+        status.stringValue = "Authenticate in the macOS dialog. Choose Use Password if Touch ID is offered."
+        if !authentication.password(reason: "unlock this Atem's storage key", completion: { [weak self] accepted in
+            guard let self, self.isActive else { return }
+            if accepted { self.finish(.approve) }
+            else { self.passwordFailed() }
+        }) {
+            passwordFailed()
         }
+    }
+
+    private func passwordFailed() {
+        passwordButton.isEnabled = true
+        status.stringValue = "Authentication did not complete. Choose Use Mac Password to retry, or Deny."
     }
 
     @objc private func deny() { finish(.deny) }
@@ -71,7 +91,7 @@ final class AtemUnlockPrompt: NSObject, NSWindowDelegate {
     func finish(_ decision: AtemUnlockDecision) {
         guard let callback = completion else { return }
         completion = nil
-        context.invalidate()
+        authentication.cancel()
         alert.window.close()
         callback(decision)
     }

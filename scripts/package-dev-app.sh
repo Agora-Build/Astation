@@ -70,6 +70,8 @@ entitlements = {
 }
 if allowed.get("com.apple.security.get-task-allow"):
     entitlements["com.apple.security.get-task-allow"] = True
+if allowed.get("com.apple.developer.aps-environment") in ("development", "production"):
+    entitlements["com.apple.developer.aps-environment"] = allowed["com.apple.developer.aps-environment"]
 Path(destination).write_bytes(plistlib.dumps(entitlements))
 PY
 fi

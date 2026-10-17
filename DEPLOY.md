@@ -256,6 +256,19 @@ Volumetric, check the webapp's relay upstream and Docker DNS resolution.
 A successful deployment webhook only means the deployment was queued; the
 workflow also checks the final deployment status and public endpoints.
 
+#### Agent approval pushes (gated)
+
+Push provider configuration and device-token registration are documented in
+[Agent approval notifications](docs/push-notifications.md), including Apple
+provisioning, Firebase service accounts, mounted secret files and the shared
+Postgres migration. Configure both relay replicas consistently; roll one at a
+time with health checks. There are no push credentials in the repository.
+
+This preparation does not enable live approvals. Host authentication to the
+relay, signed control membership, r7 catch-up/atomic decisions and a durable
+dispatch outbox must be integrated first. A raw Atem room connection and an SSO
+account login are not authorization for approval delivery or decisions.
+
 #### Optional Agora account registration
 
 Leave `AGORA_ACCOUNT_USERINFO_URL`, `AGORA_ACCOUNT_SUBJECT_FIELD`, and

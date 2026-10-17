@@ -81,7 +81,7 @@ final class CredentialEditor: NSObject {
     let projectButton = NSButton(checkboxWithTitle: "Use project scope", target: nil, action: nil)
     let input = CredentialValueInput()
     let status = NSTextField(wrappingLabelWithString: "")
-    let saveButton = NSButton(title: "Save with Touch ID", target: nil, action: nil)
+    let saveButton = NSButton(title: "Save Securely", target: nil, action: nil)
     let entry: LocalCredentialMetadata?
     let revision: UUID?
     private let savedProjects: [String]
@@ -186,7 +186,7 @@ final class CredentialsViewController: NSViewController, NSTableViewDataSource, 
 
     init(account: @escaping () -> String = { AstationIdentity.shared.id },
          makeStore: @escaping (String) -> LocalCredentialStore = { LocalCredentialStore(account: $0) },
-         authenticate: @escaping LocalCredentialActions.Authenticate = LocalCredentialActions.touchID,
+         authenticate: @escaping LocalCredentialActions.Authenticate = LocalCredentialActions.deviceOwner,
          reportedProjects: @escaping () -> [String] = { [] },
          requestProjects: @escaping () -> Void = {},
          projectUpdates: AnyPublisher<[String], Never>? = nil,
@@ -212,7 +212,7 @@ final class CredentialsViewController: NSViewController, NSTableViewDataSource, 
         view = NSView()
         let title = NSTextField(labelWithString: "Credentials")
         title.font = .boldSystemFont(ofSize: 22)
-        let detail = NSTextField(wrappingLabelWithString: "API keys and passwords saved in this Mac's protected Keychain. Choose Global or a Git project. Changes and copies require Touch ID.")
+        let detail = NSTextField(wrappingLabelWithString: "API keys and passwords saved in this Mac's protected Keychain. Choose Global or a Git project. Changes and copies require Touch ID or your Mac login password.")
         detail.textColor = .secondaryLabelColor
         let availability = NSTextField(wrappingLabelWithString: "Available on this Mac. Atem credential retrieval is not available in this version.")
         availability.font = .systemFont(ofSize: 11)
@@ -324,7 +324,7 @@ final class CredentialsViewController: NSViewController, NSTableViewDataSource, 
             do {
                 let input = try form.validatedInput(), store = self.store
                 form.saveButton.isEnabled = false
-                form.status.stringValue = "Approve with Touch ID to save."
+                form.status.stringValue = "Approve with Touch ID or your Mac login password to save."
                 self.actions.perform(account: store.account, reason: "save this credential", operation: {
                     try store.save(name: input.name, project: input.project, value: input.value,
                         updating: form.entry?.id, expectedRevision: form.revision)
@@ -374,7 +374,7 @@ final class CredentialsViewController: NSViewController, NSTableViewDataSource, 
         let alert = NSAlert()
         alert.messageText = "Delete this credential?"
         alert.informativeText = "This removes \(selected.name) from \(selected.scopeLabel) on this Mac."
-        alert.addButton(withTitle: "Delete with Touch ID")
+        alert.addButton(withTitle: "Authenticate and Delete")
         alert.addButton(withTitle: "Cancel")
         pendingDeleteAlert = alert
         updateButtons()

@@ -11,6 +11,10 @@ need Developer ID signing, an authorized distribution profile and notarization.
 See [release readiness and setup](docs/releases.md); personal-team local signing
 is available for local verification.
 
+Agent approval push transport is being prepared separately; host authentication,
+signed membership and r7 decision/catch-up contracts remain gated. See
+[notification provisioning and current limits](docs/push-notifications.md).
+
 ### Build from source
 
 Prerequisites: macOS 14+, Xcode 26.2+ (Swift 6.2+), CMake 3.19+, and current stable Rust/Cargo.
@@ -252,11 +256,30 @@ Messages carry only IDs, status, and descriptions -- no images or file lists flo
 ### Remote Agent Control
 
 Open **Connections > Clients & Agents**, select a connected Atem and an agent,
-and open its remote-control window to send text or control keys. Input goes to
-the selected client and agent; the agent's output remains in its Atem terminal.
-The `agentInput` payload contains `agentId`, `kind` (`text` or `key`), and the
-corresponding `text` or `key` field. Relay routing identifiers belong to the
-transport envelope. Voice continues through the existing voice-coding flow.
+then click **Open Terminal**. The **Terminals** button also opens the session
+chooser without requiring an active agent row. The resizable window shows the
+original Claude/Codex terminal, including live output, colors and prompts.
+It starts in viewing mode; **Take Control** enables typing, control keys,
+multiline paste and resizing. **Release** returns local ownership. Closing the
+window keeps the agent running; **Stop Agent** asks before ending its process.
+
+This development branch requires the Atem session-v1 r6.2 host protocol (Atem PR #69),
+in addition to terminal rendering. Launch the original CLI with
+`atem agent launch claude` or `atem agent launch codex`, pair and verify once,
+then select its exact session. A shared lease governs typing, resize, voice,
+prompt submission, interrupt and stop. Reconnect returns to viewing mode,
+queries durable receipts and never resends uncertain input. See the
+[integration handoff](designs/protocol/atem-implementation-handoff.md) for host
+requirements and current validation limits.
+
+See [remote terminal control](docs/remote-terminal.md) for setup, ownership,
+clipboard, limitations and validation.
+
+**Open in Browser** is disabled on this development branch. Browser companions
+require the section 9 security contract and a common host lease; there is no
+unbound chat fallback. The `/agent/` webapp and its offline conformance tests
+remain available for that follow-up. Use **Open Terminal** for current host
+access. See the [joint integration handoff](designs/protocol/atem-implementation-handoff.md).
 
 ### Local Audio Recording
 
@@ -413,7 +436,7 @@ relay-server/
 ## Configuration
 
 Settings > Credentials manages named API keys and passwords in this Mac's
-protected Keychain, with Global or Git-project scopes and Touch ID for saves,
+protected Keychain, with Global or Git-project scopes and Touch ID or Mac-password authentication for saves,
 updates, copies and deletion. The project picker combines encrypted suggestions
 from verified, unlocked Atem devices with saved scopes; another Git remote can
 always be entered manually. Original capitalization is retained, while identity
@@ -422,8 +445,9 @@ retrieval is not implemented. See the
 [credentials guide](docs/credentials.md) for setup and current availability.
 
 Atem can run on another machine. Pair with `atem pair`, compare the safety code
-on both machines, then click **Codes Match** and approve Touch ID on the Mac.
-Check `atem cred status` for verification; a connected or SSO-paired session
+on both machines, then click **Codes Match** and approve Touch ID on the Mac,
+or choose **Use Mac Password...** to authenticate in macOS's system dialog.
+Check `atem status` for verification; a connected or SSO-paired session
 alone does not establish device trust. `atem cred unlock` requests key access
 from this Mac, and `atem cred projects` sends Git-project suggestions. Use a
 provisioned Astation build for protected storage; the ad hoc development app

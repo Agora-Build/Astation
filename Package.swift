@@ -49,7 +49,7 @@ let package = Package(
             ],
             path: "Sources/Menubar",
             resources: [.copy("Resources/transcription-model.json"), .copy("Resources/whisper-large-v3-turbo-coreml-v1.json"),
-                        .copy("Resources/whisper-large-v3-coreml-v1.json")],
+                        .copy("Resources/whisper-large-v3-coreml-v1.json"), .copy("Resources/RemoteTerminal")],
             linkerSettings: [
                 .unsafeFlags(["-Xlinker", "-sectcreate", "-Xlinker", "__TEXT", "-Xlinker", "__info_plist",
                               "-Xlinker", executableInfoPlist]),

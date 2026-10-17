@@ -18,6 +18,8 @@ class StatusBarController: NSObject, NSMenuDelegate {
     let dictationManager: VoiceDictationManager
     private var headerTapCount = 0
     private var lastHeaderTapTime: Date?
+    var approvalNotificationSettings: (() -> Void)?
+    var approvalPendingCount: (() -> Int)?
 
     init(hubManager: AstationHubManager, webSocketServer: AstationWebSocketServer, androidDeviceManager: AndroidDeviceManager,
          hotkeyManager: HotkeyManager, recordingManager: AudioRecordingManager = AudioRecordingManager(),
@@ -30,10 +32,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
         self.dictationManager = dictationManager ?? VoiceDictationManager(transcription: recordingManager.transcription,
             resolveTarget: { [weak hubManager] in hubManager?.routeToFocusedAtem() },
             sendText: { [weak hubManager] text, target in
-                guard let hubManager, hubManager.connectedClients.contains(where: { $0.id == target && $0.clientType == "Atem" }),
-                      let send = hubManager.sendHandler else { return false }
-                send(.voiceCommand(text: text, isFinal: true), target)
-                return true
+                hubManager?.sendAgentText(text, clientId: target) ?? false
             })
         hubManager.rtcManager.microphoneDeviceUID = { [weak recordingManager] in recordingManager?.settings.microphoneUID }
         super.init()
@@ -90,6 +89,13 @@ class StatusBarController: NSObject, NSMenuDelegate {
         let headerItem = NSMenuItem(title: "🚀 Astation Hub", action: #selector(handleHeaderTap), keyEquivalent: "")
         headerItem.target = self
         statusMenu.addItem(headerItem)
+
+        let pendingApprovals = approvalPendingCount?() ?? 0
+        let notificationsTitle = pendingApprovals > 0 ? "🔔 Approval Notifications (\(pendingApprovals))..." : "🔔 Approval Notifications..."
+        let notifications = NSMenuItem(title: notificationsTitle, action: #selector(showApprovalNotificationSettings), keyEquivalent: "")
+        notifications.target = self
+        notifications.isEnabled = approvalNotificationSettings != nil
+        statusMenu.addItem(notifications)
         
         statusMenu.addItem(NSMenuItem.separator())
         
@@ -479,7 +485,9 @@ class StatusBarController: NSObject, NSMenuDelegate {
     @objc private func openTokenTools() {
         projectsWindowController.showTokenTools()
     }
-    
+
+    @objc private func showApprovalNotificationSettings() { approvalNotificationSettings?() }
+
     @objc private func pairRemoteAtem() {
         Log.info(" Pair Remote Atem requested from status bar")
 

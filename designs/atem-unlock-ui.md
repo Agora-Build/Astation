@@ -16,15 +16,19 @@ that a Touch ID match approves release of this device's sealed keys.
 The window keeps **Deny** and **Deny and Revoke**. Deny closes the request
 without changing verification. Deny and Revoke removes the local E2E pin
 through the existing storage-key controller and requires fresh verification.
-Closing the window, cancelling or failing authentication denies the request.
-When Touch ID is unavailable, the same window explains how to enable it; no
-alternative authentication method or approval action is offered.
+Closing the window or choosing Deny cancels the request. **Use Mac Password...**
+opens Apple's system authentication dialog using a separate context. This works
+when Touch ID is inaccessible, unavailable or locked out. If macOS still offers
+Touch ID, its Use Password option switches to password entry. Unsuccessful
+authentication grants nothing and leaves explicit password retry/deny controls.
 
 ## Lifecycle and Security
 
 - The embedded view and policy evaluation use the same fresh `LAContext`.
-  Only `deviceOwnerAuthenticationWithBiometrics` is evaluated. Password
-  fallback and reuse of a recent Mac unlock are disabled.
+  It evaluates `deviceOwnerAuthenticationWithBiometrics` without reuse of a
+  recent Mac unlock. Password selection invalidates that attempt and uses a
+  fresh nonembedded context with `deviceOwnerAuthentication`. No login password
+  passes through Astation, its logs, memory or relay.
 - The controller validates the signed request and current local device pin
   before presentation. Displayed device names and boot IDs have control and
   Unicode formatting characters removed and their lengths bounded. They
@@ -34,7 +38,8 @@ alternative authentication method or approval action is offered.
   invalidates authentication and closes the window exactly once.
 - Cancelling before authentication starts prevents policy evaluation.
   Disconnect, timeout, account change and replaced connection cancellation
-  invalidate the context; late or duplicate biometric replies have no effect.
+  invalidate all contexts; late or duplicate replies and replies from a replaced
+  authentication method have no effect. Password retry uses another fresh context.
 - The existing controller rechecks the captured connection, account, expiry
   and local pin before releasing a key. A successful Touch ID result cannot
   bypass those checks. Revocation remains an explicit button action.
@@ -48,3 +53,6 @@ denial, explicit revocation, window close, cancellation before evaluation,
 duplicate and delayed replies, and the shared prompt gate. Existing controller
 tests continue covering disconnect, expiry, account and revocation races.
 The real Touch ID sensor and rendered system control need local verification.
+Password tests cover unavailable Touch ID, system policy selection, cancelled
+and stale replies, denial/revocation and visible fallback controls. Actual
+closed-lid and remote-display password entry remain manual acceptance checks.

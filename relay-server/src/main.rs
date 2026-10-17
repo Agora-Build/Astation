@@ -14,6 +14,8 @@ mod session_store;
 mod voice_session;
 mod voice_routes;
 mod llm_proxy;
+mod push_tokens;
+mod push_delivery;
 mod vault_store;
 mod vault_routes;
 mod web;
@@ -718,15 +720,21 @@ async fn serve() {
     let redis_url = redis_url();
     let expected_replicas = replicas_expected();
     let ws_max_per_ip = ws_max_per_ip();
+    let push_delivery = Arc::new(push_delivery::PushDelivery::from_env().unwrap_or_else(|error| {
+        tracing::error!("Push configuration error: {}", error.0);
+        std::process::exit(1);
+    }));
+    tracing::info!("Push providers configured: {}; host push ingress awaits authenticated membership", push_delivery.enabled());
 
     // Vault + knowledge (Atem Memory) + identity stores: Postgres, sharing one
     // pool, when DATABASE_URL is set (the durable path), else in-memory
     // fallbacks so the rest of the server still runs without a DB.
-    let (vault, knowledge, identity, accounts): (
+    let (vault, knowledge, identity, accounts, push_tokens): (
         Arc<dyn vault_store::VaultStore>,
         Arc<dyn knowledge_store::KnowledgeStore>,
         Arc<dyn identity_store::IdentityStore>,
         Arc<dyn account_store::AccountStore>,
+        Arc<dyn push_tokens::PushTokenStore>,
     ) = match std::env::var("DATABASE_URL") {
         Ok(url) if !url.is_empty() => {
             tracing::info!("Connecting to Postgres for vault + knowledge storage...");
@@ -744,7 +752,8 @@ async fn serve() {
                 Arc::new(vault_store::PgVaultStore::new(pool.clone())),
                 Arc::new(knowledge_store::PgKnowledgeStore::new(pool.clone())),
                 Arc::new(identity_store::PgIdentityStore::new(pool.clone())),
-                Arc::new(account_store::PgAccountStore::new(pool)),
+                Arc::new(account_store::PgAccountStore::new(pool.clone())),
+                Arc::new(push_tokens::PgPushTokenStore::new(pool)),
             )
         }
         _ => {
@@ -764,6 +773,7 @@ async fn serve() {
                 knowledge,
                 Arc::new(identity_store::InMemoryIdentityStore::new()),
                 accounts,
+                Arc::new(push_tokens::InMemoryPushTokenStore::default()),
             )
         }
     };
@@ -825,6 +835,9 @@ async fn serve() {
             )
         }
     };
+
+    relay.configure_push_tokens(push_tokens);
+    relay.configure_push_delivery(push_delivery);
 
     // Background tasks run for the life of the process; one that stops
     // outside a drain stops the relay (exit 1) so it is restarted.

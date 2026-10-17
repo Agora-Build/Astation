@@ -2,6 +2,18 @@ import XCTest
 @testable import Menubar
 
 final class NetworkDebugLoggerTests: XCTestCase {
+    func testSessionErrorKeepsOnlyKnownCodeAndRedactsDetailAndIdentifiers() {
+        let payload = #"{"payload":{"type":"session","data":{"v":1,"op":"error","code":"unauthorized","detail":"secret detail","re":"secret id"}}}"#
+        let sanitized = NetworkDebugLogger.sanitizedPayload(payload)
+        XCTAssertTrue(sanitized.contains("unauthorized"))
+        XCTAssertFalse(sanitized.contains("secret detail"))
+        XCTAssertFalse(sanitized.contains("secret id"))
+        let unknown = NetworkDebugLogger.sanitizedPayload(
+            #"{"type":"session","data":{"op":"error","code":"secret error"}}"#)
+        XCTAssertTrue(unknown.contains("unknown_error"))
+        XCTAssertFalse(unknown.contains("secret error"))
+    }
+
     func testSanitizedPayloadRedactsNestedCredentials() {
         let payload = #"{"atem_id":"device-1","payload":{"data":{"session_id":"session-secret","sessionToken":"camel-secret","proof":"proof-secret","token":"token-secret","hostname":"office"}}}"#
         let sanitized = NetworkDebugLogger.sanitizedPayload(payload)

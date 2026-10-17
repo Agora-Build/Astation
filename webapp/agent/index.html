@@ -11,6 +11,7 @@
     <title>Agent &#183; Astation</title>
     <link rel="icon" href="./mark.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="./chat.css" />
+    <script defer src="./vendor/commonmark.min.js"></script>
     <script type="module" src="./chat.mjs"></script>
   </head>
   <body>
@@ -107,6 +108,7 @@
           </button>
         </header>
         <div class="mode-banner" id="mode-banner" role="status" hidden></div>
+        <button class="history-button" id="reopen-chat" type="button" hidden>Reopen conversation</button>
         <div
           class="connection-notice"
           id="connection-notice"
@@ -124,6 +126,7 @@
             ><span id="conversation-date">A SPACE TO BUILD SOMETHING</span
             ><span class="start-line"></span>
           </div>
+          <button class="history-button" id="earlier-messages" type="button" hidden>Load earlier messages</button>
           <div class="empty-state" id="empty-state">
             <span class="empty-orbit" aria-hidden="true">&#10035;</span>
             <p class="eyebrow">YOUR IDEAS. YOUR AGENT.</p>
