@@ -160,7 +160,7 @@ indirect enum AtemSessionJSON: Codable, Equatable {
         let packet = root["payload"] ?? root
         if packet["type"]?.string == "session" {
             guard let body = packet["data"], try body.canonical(allowOtherNumbers: true).utf8.count <= 1_048_576 else { throw Invalid.limit }
-            try integers(body, keys: ["v", "host_trust_gen", "authorization_ms_left", "server_time", "runtime_epoch", "seq", "ms_left", "lease_epoch", "updated_at"])
+            try integers(body, keys: ["v", "host_trust_gen", "authorization_ms_left", "server_time", "runtime_epoch", "seq", "ms_left", "lease_epoch", "updated_at", "created_at"])
             try integers(body["binding"], keys: ["lease_epoch"])
             for target in [body["binding"]?["target"], body["target"]] { try integers(target, keys: ["host_trust_gen"]) }
             try integers(body["controller"], keys: ["lease_epoch"])

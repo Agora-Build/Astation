@@ -6,7 +6,7 @@ authenticated Atem. Only an explicit answer may atomically acquire control and
 answer the exact request. The relay and the notification payload cannot approve
 anything.
 
-The accepted product flow is Atem PR #70, `designs/account-trust.md`,
+The accepted product flow is now in Atem PR #72, `designs/account-trust.md`,
 "Push-based approvals". That section supersedes the earlier requirement that a
 lease must already exist to receive an approval. See the
 [implementation handoff](../designs/protocol/push-approvals-handoff.md) for the
@@ -14,8 +14,24 @@ remaining wire-contract gates.
 
 ## Current implementation boundary
 
-- Native macOS can opt in, request OS notification permission, register its APNs
+- **In-app alerts** show a nonmodal banner and an approval inbox while Astation
+  is running. They require neither APNs nor OS notification permission. The
+  menu is directly under Astation Hub and shows the pending request count.
+  Turning alerts off retains the inbox and does not change offline push.
+- The inbox reads r7 `approval_request` / `approval_closed` from authenticated,
+  safety-code-verified Atem session clients. Requests arrive independently of
+  control leases. Catch-up replaces existing cards without repeating alerts;
+  disconnect, permission loss and process changes disable stale answers.
+- Allow once, Deny (with an optional message) and Claude's offered Always allow
+  rules use a durable r7 approval submission with `acquire:true`. The exact
+  Claude rule and scope are confirmed before sending. Codex has no Always
+  allow. Reconnect queries receipts and never repeats a decision. An unknown
+  outcome requires checking the agent instead of answering again.
+- **Offline APNs push** is a separate opt-in. Native macOS can request OS
+  notification permission and register its APNs
   token, re-register on an authenticated relay reconnect and unregister on opt-out.
+  A build without the APNs entitlement disables only this option, with an
+  explanation; the in-app option and inbox remain usable.
 - The relay persists registrations in Postgres (`0008_device_push_tokens.sql`).
   Only the current native socket that proved the Astation key can change its
   address. Body fields cannot select an account or another device.
@@ -24,14 +40,19 @@ remaining wire-contract gates.
   and distinguish invalid addresses from temporary or configuration failures.
 - A resolution removes matching delivered/pending notifications on the client.
   Bounded persisted tombstones suppress late duplicate transport alerts.
-- Host push ingress, account-wide recipients and decision buttons are disabled.
+- Host push ingress and account-wide recipients remain disabled.
   The relay currently authenticates Astation keys, not an Atem device's key on
-  its room socket. r6.2 rejects approval submissions and has no approval catch-up.
-  A tap in this build explains that review is unavailable and opens Connections;
-  it never claims the approval was answered or submits terminal keystrokes.
+  its room socket. A push tap reconnects, requests fresh session lists and opens
+  the same inbox; push metadata never supplies an actionable request or rule.
+  If no authoritative matching request is available, the UI says its status is
+  unconfirmed. An unavailable or partial catch-up is never called "answered".
 
-This is transport preparation, not an end-to-end approval release. Neither
-live provider delivery nor phone approval has been verified.
+In-app review targets Atem PR #72 at `5ce333e505e77429ffbfd443bdb0794b45136a03`
+([r7 contract](https://github.com/Agora-Build/Atem/blob/5ce333e505e77429ffbfd443bdb0794b45136a03/designs/protocol/atem-session-v1.md#6a-approvals-r7)).
+The session compatibility trust gate still limits access to the verified paired
+native Astation. Live APNs delivery, phones and account-wide approval access
+are not enabled or verified. Offline push requires the host authentication and
+dispatch integration as well as provider credentials and provisioning.
 
 ## Apple setup
 
@@ -49,9 +70,12 @@ live provider delivery nor phone approval has been verified.
 4. Mount the key read-only in each relay container and set the four APNs
    variables in the table below. Set the topic to the signed app's actual bundle
    identifier. Use a separate test relay for a different local bundle id/topic.
-5. In Astation, choose Tools > Approval Notifications and enable notifications.
+5. In Astation, choose Astation Hub > Approval Notifications and enable
+   **Offline APNs push**. **In-app alerts** work with a free Xcode Personal Team
+   profile; APNs requires an eligible paid Apple Developer Program team.
    If macOS refuses permission, allow Astation in System Settings > Notifications
-   and enable it again. The menu explains a missing provisioning entitlement.
+   and enable offline push again. The window explains a missing APNs entitlement
+   without preventing access to the inbox.
 
 The adapter routes development tokens to Apple's sandbox and production tokens
 to production. One configured APNs topic is supported per relay deployment;

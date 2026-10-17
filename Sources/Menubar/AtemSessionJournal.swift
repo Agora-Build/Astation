@@ -6,6 +6,7 @@ struct AtemSessionRequestRecord: Codable, Equatable {
     let target: AtemSessionTarget
     let kind: String
     let digest: String
+    var approvalID: String?
     var receipt: AtemSessionReceipt?
 }
 
@@ -38,7 +39,8 @@ final class AtemSessionJournal {
                   Set(loaded.requests.map(\.requestId)).count == loaded.requests.count,
                   loaded.requests.allSatisfy({ AtemSessionWire.uuid($0.requestId) && $0.target.valid
                       && $0.digest.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil
-                      && ["prompt", "interrupt", "stop"].contains($0.kind) && $0.receipt?.valid != false
+                      && ["prompt", "interrupt", "stop", "approval"].contains($0.kind) && $0.receipt?.valid != false
+                      && ($0.kind == "approval" ? $0.approvalID.map(AtemSessionWire.uuid) == true : $0.approvalID == nil)
                       && ($0.receipt == nil || ($0.receipt?.target == $0.target && $0.receipt?.request_id == $0.requestId && $0.receipt?.kind == $0.kind)) }),
                   Set(loaded.hosts.map { $0.account + "\u{0}" + $0.device }).count == loaded.hosts.count,
                   loaded.hosts.allSatisfy({ AtemSessionWire.opaque($0.account) && AtemSessionWire.opaque($0.device)

@@ -22,6 +22,7 @@ class AstationHubManager: ObservableObject {
 
     /// Agents reported by each Atem, keyed by clientId.
     @Published var agentsByClientId: [String: [AtemAgentInfo]] = [:]
+    @Published private(set) var sessionStatusByClientId: [String: AtemSessionClient.ConnectionStatus] = [:]
     @Published private(set) var credentialProjectSuggestions: [String] = []
     private var credentialProjectReports: [String: AtemReportedProjects] = [:]
     /// User-pinned active client ID. Overrides focus-based routing when set.
@@ -60,6 +61,7 @@ class AstationHubManager: ObservableObject {
     /// accepted from, and binding messages only sent on, this socket. Main thread.
     private var identityRelayTask: IdentityRelaySocket?
     private let makeIdentityRelayTask: (URL) -> IdentityRelaySocket
+    private let makePairingRelayTask: (URL) -> IdentityRelaySocket
     /// Installed once; relay sends resolve identityRelayTask when they execute.
     private var identityRelaySendHandlerInstalled = false
     /// True once the relay answered `relayAuthResult` registered|verified on
@@ -149,6 +151,7 @@ class AstationHubManager: ObservableObject {
     var terminalMessageHandler: ((RemoteTerminalMessage, RemoteTerminalConnection) -> Void)?
     var sessionMessageHandler: ((AtemSessionMessage, RemoteTerminalConnection) -> Void)?
     var sessionStateDidChange: ((String) -> Void)?
+    var approvalSessionDidChange: ((String, AtemSessionClient, String) -> Void)?
     @Published private(set) var approvalPushRegistrationStatus: String?
     private var approvalPushRegistration: ApprovalPushRegistration?
     private var approvalPushUnregistration: ApprovalPushPlatform?
@@ -181,11 +184,13 @@ class AstationHubManager: ObservableObject {
             try DataEncryptionKeyManager.shared.load(dataAccount: $0, kid: $1)
         },
         dispatchMigration: @escaping (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) },
-        makeIdentityRelayTask: @escaping (URL) -> IdentityRelaySocket = { URLSession.shared.webSocketTask(with: $0) }
+        makeIdentityRelayTask: @escaping (URL) -> IdentityRelaySocket = { URLSession.shared.webSocketTask(with: $0) },
+        makePairingRelayTask: @escaping (URL) -> IdentityRelaySocket = { URLSession.shared.webSocketTask(with: $0) }
     ) {
         self.deviceSessionStore = deviceSessionStore
         self.sessionStore = sessionStore
         self.makeIdentityRelayTask = makeIdentityRelayTask
+        self.makePairingRelayTask = makePairingRelayTask
         self.relayIdentityKeyManager = relayIdentityKeyManager
         self.relayIdentityRepairDefaults = relayIdentityRepairDefaults
         self.atemE2EIdentity = atemE2EIdentity ?? AtemE2EIdentity(storage: AtemIdentityKeychainStorage(astationId: AstationIdentity.shared.id))
@@ -621,6 +626,7 @@ class AstationHubManager: ObservableObject {
             self.atemStorageKeys.disconnect(clientId: clientId)
             self.connectedClients.removeAll { $0.id == clientId }
             self.agentsByClientId.removeValue(forKey: clientId)
+            self.sessionStatusByClientId.removeValue(forKey: clientId)
             // If the pinned client disconnected, clear the pin
             if self.pinnedClientId == clientId {
                 self.pinnedClientId = nil
@@ -1149,9 +1155,12 @@ class AstationHubManager: ObservableObject {
         nativeSessionClients[id] = client
         client.onChange = { [weak self, weak client] in
             guard let self, let client else { return }
+            self.sessionStatusByClientId[id] = client.connectionStatus
             self.agentsByClientId[id] = client.hasRegistrySnapshot
                 ? client.registry.values.sorted { $0.session_id < $1.session_id }.map(AtemAgentInfo.init(session:)) : []
             self.sessionStateDidChange?(id)
+            let host = DeviceAuthentication.deviceLabel(self.connectedClients.first(where: { $0.id == id })?.hostname ?? "Atem")
+            self.approvalSessionDidChange?(id, client, host)
         }
         client.start()
         if sessionTimer == nil {
@@ -1169,6 +1178,7 @@ class AstationHubManager: ObservableObject {
             if !connectedClients.contains(where: { $0.id == id }) {
                 nativeSessionClients.removeValue(forKey: id)
                 agentsByClientId.removeValue(forKey: id)
+                sessionStatusByClientId.removeValue(forKey: id)
             }
         }
     }
@@ -1238,6 +1248,9 @@ class AstationHubManager: ObservableObject {
     private func remoteTrustDidChange() {
         refreshDirectMigrationContexts()
         refreshSessionConnections()
+        for client in connectedClients where client.clientType == "Atem" {
+            _ = sessionClient(for: client.id)
+        }
         agentsByClientId = agentsByClientId.filter { terminalConnection(for: $0.key) != nil }
         objectWillChange.send()
         terminalConnectionsDidChange?()
@@ -1476,20 +1489,11 @@ class AstationHubManager: ObservableObject {
         }
         Log.info("[AstationHub] Connecting to relay: \(url.absoluteString)")
 
-        let task = URLSession.shared.webSocketTask(with: url)
+        let task = makePairingRelayTask(url)
         task.resume()
 
         // Generate a synthetic client ID for this relay connection
         let relayClientId = "relay-\(code)"
-
-        // Add as connected client
-        let client = ConnectedClient(
-            id: relayClientId,
-            clientType: "Atem",
-            connectedAt: Date(),
-            hostname: "relay:\(code)"
-        )
-        addClient(client)
 
         // Start reading messages from the relay
         readRelayMessages(task: task, clientId: relayClientId)
@@ -1513,9 +1517,13 @@ class AstationHubManager: ObservableObject {
                 originalSend?(message, targetId)
             }
         }
+        // This socket only hands off pairing credentials. The identity-room
+        // authentication will add the real Atem; a room code is not a device.
+        sendEncryptionMode(to: relayClientId, relayConnectionId: nil)
+        sendCredentials(toClientId: relayClientId)
     }
 
-    private func readRelayMessages(task: URLSessionWebSocketTask, clientId: String) {
+    private func readRelayMessages(task: IdentityRelaySocket, clientId: String) {
         task.receive { [weak self] result in
             switch result {
             case .success(let message):
@@ -1543,9 +1551,6 @@ class AstationHubManager: ObservableObject {
 
             case .failure(let error):
                 Log.info("[AstationHub] Relay connection closed: \(error)")
-                DispatchQueue.main.async {
-                    self?.removeClient(withId: clientId)
-                }
             }
         }
     }

@@ -78,7 +78,8 @@ private final class TerminalHubFixture {
         hub = AstationHubManager(skipProjectLoad: true, deviceSessionStore: sessions,
             sessionStore: SsoSessionStore(storageURL: directory.appendingPathComponent("sso.enc")),
             relayIdentityKeyManager: manager, relayIdentityRepairDefaults: defaults,
-            atemE2EIdentity: identity, sessionJournal: AtemSessionJournal(), makeIdentityRelayTask: { _ in socket })
+            atemE2EIdentity: identity, sessionJournal: AtemSessionJournal(), makeIdentityRelayTask: { _ in socket },
+            makePairingRelayTask: { _ in socket })
     }
 
     func drain() async {
@@ -161,6 +162,48 @@ private final class TerminalHubFixture {
 
 @MainActor
 final class RemoteTerminalHubTests: XCTestCase {
+    func testPairingRoomTransfersMessagesWithoutBecomingAnOnlineAtem() async throws {
+        let f = try TerminalHubFixture()
+        var forwarded: [String] = []
+        f.hub.sendHandler = { _, id in forwarded.append(id) }
+        f.hub.connectToRelay(code: "TEST-CODE")
+        await f.drain()
+        XCTAssertTrue(f.hub.connectedClients.isEmpty)
+        XCTAssertTrue(f.hub.agentsByClientId.isEmpty)
+        XCTAssertTrue(f.hub.sessionStatusByClientId.isEmpty)
+        f.hub.sendHandler?(.statusUpdate(status: "test", data: [:]), "relay-TEST-CODE")
+        XCTAssertEqual(f.socket.sent.last?["type"] as? String, "statusUpdate")
+        XCTAssertTrue(forwarded.isEmpty)
+        f.hub.sendHandler?(.statusUpdate(status: "test", data: [:]), "actual-host")
+        XCTAssertEqual(forwarded, ["actual-host"])
+        XCTAssertTrue(f.sessionFrames.isEmpty)
+        f.socket.fail()
+        await f.drain()
+        XCTAssertTrue(f.hub.connectedClients.isEmpty)
+    }
+
+    func testPairingTimeHelloRefusalIsPublishedAndExplicitRetryUsesFreshID() async throws {
+        let f = try TerminalHubFixture()
+        try await f.start(); try await f.authenticate()
+        let hello = try XCTUnwrap(f.sessionFrames.last?["data"] as? [String: Any])
+        var refusal = AtemSessionMessage(op: "error")
+        refusal.re = try XCTUnwrap(hello["id"] as? String)
+        refusal.code = "unauthorized"
+        try f.emit(.session(refusal)); await f.drain()
+        XCTAssertEqual(f.hub.sessionStatusByClientId[f.clientId]?.phase, .failed)
+        XCTAssertTrue(f.hub.sessionStatusByClientId[f.clientId]?.message.contains("unauthorized") == true)
+        XCTAssertEqual(f.hub.sessionStatusByClientId[f.clientId]?.canRetryHello, true)
+        f.hub.requestAgentList(from: f.clientId)
+        XCTAssertEqual(f.sessionFrames.count, 2)
+        XCTAssertEqual(f.hub.sessionStatusByClientId[f.clientId]?.phase, .connecting)
+        let retry = try XCTUnwrap(f.sessionFrames.last?["data"] as? [String: Any])
+        XCTAssertNotEqual(hello["id"] as? String, retry["id"] as? String)
+        f.generation = UUID().uuidString
+        try await f.authenticate()
+        XCTAssertEqual(f.hub.sessionStatusByClientId[f.clientId]?.phase, .connecting)
+        XCTAssertEqual(f.sessionFrames.count, 3)
+    }
+
     func testDelayedSessionMessagesRecheckPairingAndVerificationBeforeDispatch() async throws {
         for revokeIdentity in [false, true] {
             let f = try TerminalHubFixture()

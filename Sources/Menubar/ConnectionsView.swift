@@ -376,6 +376,10 @@ private struct AgentListPanel: View {
         clientId.flatMap { hubManager.remoteAccessBlockReason(for: $0) }
     }
 
+    private var sessionStatus: AtemSessionClient.ConnectionStatus? {
+        clientId.flatMap { hubManager.sessionStatusByClientId[$0] }
+    }
+
     private var panelTitle: String {
         guard let c = selectedClient else {
             return clientId.map { String($0.prefix(8)) + "…" } ?? "No client selected"
@@ -406,7 +410,7 @@ private struct AgentListPanel: View {
                         Button("Refresh") { hubManager.requestAgentList(from: id) }
                             .buttonStyle(.borderless)
                             .font(.caption)
-                            .disabled(accessBlockReason != nil)
+                            .disabled(accessBlockReason != nil || (sessionStatus?.phase != .ready && sessionStatus?.canRetryHello != true))
                     }
                 }
             }
@@ -450,6 +454,29 @@ private struct AgentListPanel: View {
                 }
                 .padding(28)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let sessionStatus, !sessionStatus.hasRegistrySnapshot {
+                VStack(spacing: 12) {
+                    if sessionStatus.phase == .connecting || sessionStatus.phase == .ready {
+                        ProgressView()
+                    } else {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.system(size: 32))
+                            .foregroundColor(.secondary)
+                    }
+                    Text(sessionStatus.phase == .failed ? "Session connection failed" : "Loading sessions")
+                        .font(.headline)
+                    Text(sessionStatus.message)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .textSelection(.enabled)
+                    if sessionStatus.canRetryHello, let id = clientId {
+                        Button("Retry Session Connection") { hubManager.requestAgentList(from: id) }
+                            .buttonStyle(.borderedProminent)
+                    }
+                }
+                .padding(28)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if agents.isEmpty {
                 VStack(spacing: 10) {
                     Image(systemName: "cpu")
@@ -463,7 +490,7 @@ private struct AgentListPanel: View {
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
                     if clientIsOnline, let id = clientId {
-                        Button("Request Agent List") { hubManager.requestAgentList(from: id) }
+                        Button("Refresh Sessions") { hubManager.requestAgentList(from: id) }
                             .buttonStyle(.borderedProminent)
                             .padding(.top, 4)
                     }

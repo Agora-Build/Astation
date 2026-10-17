@@ -1,8 +1,42 @@
 # Push-based agent approvals
 
-Status: implementation in progress, based on Atem PR #70 at
-`1e5f4d004ef3cca5adb0a21a01ca745f1602b2c8`, "Push-based approvals".
-Build on Astation #49 / atem-session r6.2; no legacy approval fallback.
+## Connected alerts and offline push
+
+The native client now targets the r7 approval contract published in Atem PR #72
+at `5ce333e505e77429ffbfd443bdb0794b45136a03`. In-app alerts and the approval
+inbox work independently of APNs provisioning or OS notification permission.
+Offline APNs is a separate opt-in; enabling or disabling it never changes the
+in-app preference. Existing push opt-in is preserved when migrating preferences.
+
+Only the safety-code-verified session client supplies inbox requests. Bind each
+card to its authenticated account, host trust generation, session and process.
+Drop actionable state when that context changes, the session ends or authority
+expires. Repeated catch-up events replace cards without repeating alerts; a
+resolution fences delayed opens. Notification payloads only locate catch-up,
+never supply a rule or authorize a decision. An unavailable catch-up must remain
+distinguishable from an answered request.
+
+Explicit answers use r7 `kind:approval` with `acquire:true` atomically, after
+durably recording the request identity. Never send a separate acquire or replay
+the decision on reconnect. Show only authoritative offered Claude rules;
+Codex has no Always allow. Query durable receipts after delivery uncertainty.
+
+APNs registration still requires a profile authorizing the push entitlement.
+Live offline dispatch stays gated on authenticated host-to-relay proofs and
+provider configuration; an online in-app alert must never imply offline push
+delivery has been provisioned or tested.
+
+Status: native r7 integration implemented against Atem PR #72 at
+`5ce333e505e77429ffbfd443bdb0794b45136a03`. Existing session and terminal
+semantics are retained; approval messages follow r7 with no legacy fallback.
+Relay host ingress and account-wide fanout remain gated.
+
+Pairing can finish after an initial session hello was refused as unauthorized.
+Permit a fresh hello only if no welcome was ever accepted on that attachment,
+the authenticated verified context still matches and the last hello was refused
+as unauthorized. Verification completion or an explicit retry may trigger it;
+there is no timer retry. A welcomed attachment must reconnect after failure.
+Never restore leases or replay submissions while recovering discovery.
 
 ## Lifecycle and security invariants
 
@@ -28,7 +62,7 @@ Build on Astation #49 / atem-session r6.2; no legacy approval fallback.
    acquire:true. Atem atomically takes the lease and decides the exact prompt.
    Never approximate this with separate acquire and submit messages. Claude's
    Always allow requires the authoritative rule and explicit user confirmation;
-   Codex never offers it. Await r7's wire schema and fixtures before enabling.
+   Codex never offers it. The implementation follows the published r7 wire schema.
 7. Payloads contain only tool and a short redacted summary; never raw inputs,
    transcripts, credentials or decisions. Log no device tokens, provider keys,
    approval summaries or provider response bodies. Set mutable-content:1 for
@@ -62,10 +96,10 @@ Build on Astation #49 / atem-session r6.2; no legacy approval fallback.
 
 ## External dependencies
 
-- r7 approval/catch-up schemas, rule representation, acquire:true receipt/digest
-  semantics and fixtures. Published r6.2 rejects kind:approval.
 - Authenticated Atem-to-relay push context and signed membership wire contract.
 - APNs key/team/topic/profile and Firebase service-account credential names.
 - Actual iOS/Android clients and signed device enrollment before phone answers.
 
-No merge, deployment or running-app replacement is part of this work.
+The user requested a provisioned local build and restart. The existing personal
+team, bundle identifier and Keychain access group are retained. No merge or
+production deployment is included.

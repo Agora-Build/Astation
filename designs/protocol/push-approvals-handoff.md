@@ -1,90 +1,90 @@
-# Push approvals: Astation implementation and Atem contract handoff
+# Approval notifications: Astation implementation and Atem handoff
 
-Date: 2026-10-16. Source: Atem #70 at
-`1e5f4d004ef3cca5adb0a21a01ca745f1602b2c8`, "Push-based approvals".
-The user approved push delivery independently of lease ownership. Older text in
-that proposal requiring an existing lease does not override this decision.
+Updated 2026-10-16. Native r7 integration uses Atem PR #72 at
+`5ce333e505e77429ffbfd443bdb0794b45136a03`,
+[`designs/protocol/atem-session-v1.md`, section 6a](https://github.com/Agora-Build/Atem/blob/5ce333e505e77429ffbfd443bdb0794b45136a03/designs/protocol/atem-session-v1.md#6a-approvals-r7).
+The user approved delivery independently of control lease ownership.
 
-Worktree: Astation-push-approvals, branch `feat/push-approvals`, based on #49's
-green r6.2 commit `57e2758`. No Atem checkout is changed or built.
+Worktree: Astation-push-approvals, branch `feat/push-approvals`, PR #50.
+No Atem checkout was modified or built.
 
 ## Ready on Astation's side
 
-- APNs native opt-in, entitlement detection, OS token callbacks and registration
-  through the native device's verified relay control connection.
-- Postgres token storage shared across replicas; rotation, idempotent upsert,
-  exact-generation invalidation and opt-out. The signed connection, not request
-  body fields, selects the token owner. Uniqueness uses a server-computed token
-  digest so a maximum-size FCM token does not exceed PostgreSQL's index limit.
-- APNs HTTP/2 / ES256 and FCM HTTP v1 / OAuth RS256 provider adapters. APNs
-  provider JWTs are reused for 50 minutes; token credentials and response bodies
-  are not logged. Alerts set mutable-content and collapse/tag identities.
-  Expiry is checked again after authentication refresh, before dispatch.
-- Resolution handling and persisted bounded transport tombstones. A tap wakes
-  the native connection, but r6.2 review is explicitly unavailable. No decisions
-  or separate acquire/submit approximation are sent.
-- [Provisioning and relay deployment instructions](../../docs/push-notifications.md).
-  APNs/FCM credentials have not been supplied or configured. Live delivery has
-  not been verified.
+- Approval Notifications is directly under Astation Hub, with a pending count,
+  an inbox and separate In-app alerts / Offline APNs push switches. In-app
+  banners and review work without APNs provisioning or OS permission. Disabling
+  either channel does not change the other's preference or remove the inbox.
+- The verified paired native session client consumes bounded r7
+  `approval_request` / `approval_closed` messages. Requests arrive with no lease
+  holder as well as during someone else's lease. Catch-up updates one card;
+  closed ids suppress delayed opens. Loss of connection, permission, trust or
+  the target process disables answers. Verification starts the subscription
+  without requiring the user to first open Connections.
+- Explicit Allow once / Deny / Claude Always allow send `kind:approval` with
+  `acquire:true`, no lease epoch and the exact target/attachment. Recovery
+  metadata is committed before send. Reconnect only queries receipts; no answer
+  is replayed. Only the grant from this attachment's pending answer enables
+  renewal. Local input and deadline expiry fence late grants. An unknown
+  outcome cannot enable a second answer. Claude's exact offered rule and scope
+  are shown and confirmed; Codex has no Always allow.
+- APNs taps reconnect, request fresh session lists and open the same inbox.
+  Push fields cannot create actionable cards, grant control or supply rules.
+  The r7 contract has no end-of-approval-catch-up marker: an absent card remains
+  unconfirmed rather than being called answered. An authoritative close can
+  show that the request was answered elsewhere or expired.
+- APNs registration, opt-out, reconnect and token rotation use the native
+  device's key-verified relay socket. Postgres stores device addresses with
+  digest uniqueness and generation-fenced invalidation. APNs/FCM adapters
+  authenticate provider requests, set collapse/tag identity, bound payloads,
+  redact detected credentials and distinguish invalid tokens from temporary
+  failures. Resolution tombstones suppress delayed transport alerts.
+- [Provider provisioning and deployment instructions](../../docs/push-notifications.md).
+  A free Personal Team build supports the protected Keychain and in-app inbox;
+  it does not grant the APNs entitlement. No provider credentials are configured.
 
-## Required joint wire contract
+## Remaining joint integration
 
-1. **Host authentication to the relay.** Today's relay room socket binds a
-   routing atem_id and connection generation, but proves no Atem device key.
-   Existing session bindings authorize account data and do not authenticate
-   the claimed client id. Define the host proof/challenge, pinned key binding,
-   account and trust-generation context, freshness/revocation and reconnect
-   behavior. push_approval.atem_device_id cannot supply this authority.
-2. **Control membership.** Define the signed membership bytes, canonicalization,
-   signatures, genesis/sequence/revocation rules and shared fixtures. Until that
-   lands, only the verified paired Astation is eligible; do not fan out to all
-   SSO devices or devices sharing memory/vault storage. Before activating
-   delivery, bind registrations to the enrolled member key/trust generation;
-   key replacement, removal and revocation must fence existing addresses until
-   the device proves its current authority again. A routing device id alone
-   must not transfer an old token to a replacement identity.
-3. **r7 approval events and catch-up.** Supply exact envelopes, ids, full target
-   and process binding, creation/expiry units, sequence/revision semantics,
-   pending snapshots, resolution reasons and capability negotiation. Empty
-   catch-up must be distinguishable from an unavailable/partial one.
-4. **Atomic decision submission.** Define acquire:true placement, binding when
-   no lease exists, the digest/receipt identity, permission/admission order,
-   replay behavior and duplicate/takeover races. r6.2's submit requires a lease
-   and rejects kind:approval; Astation will not relax it speculatively.
-5. **Claude Always allow.** Define rule ids, exact rule representation/display,
-   decision payload and immutable binding to this prompt. Codex must reject it.
-   Astation must show the rule before confirming it, not derive one from a
-   notification summary.
-6. **Push frames.** Specify version, envelope, field limits, approval-id
-   uniqueness and expires_at units, retry/ack semantics, resolving before an
-   open arrives, and whether safe display labels come from authenticated host
-   metadata. Generic labels are used until that metadata is defined. Define
-   ciphertext/envelope changes separately when E2EE lands.
-
-After these contracts, wire the typed trusted catch-up to the native approval
-card, add the durable relay dispatch outbox and recipient checks, and execute
-the joint host/device/provider tests. No multi-device controller support or
-phone approval is claimed by this transport preparation.
+1. **Atem host authentication to the relay.** A current room socket proves no
+   Atem device key. Its routing id and `push_approval.atem_device_id` cannot
+   supply authority. Define a proof bound to the paired device key, account,
+   host trust generation, connection generation and a fresh challenge, with
+   revocation/reconnect fixtures. Capture validated identity before dispatch.
+2. **Control membership.** Define signed membership bytes, genesis, sequence,
+   signatures, roles, freshness and revocation. Until that lands, only the
+   verified paired native Astation is eligible. Do not fan out to SSO devices
+   or devices sharing memory/vault storage. Bind push addresses to the enrolled
+   member key and generation; removal/replacement must fence old addresses.
+3. **Durable relay dispatch.** Persist approval/resolution outbox state across
+   both replicas. Revalidate recipient authority before send, expire requests,
+   handle resolutions arriving first and invalidate failed token generations
+   conditionally. Configuring provider credentials alone does not enable this
+   gated ingress. Do not relay unauthenticated host messages into APNs.
+4. **Live provider and host verification.** Supply an eligible push-enabled
+   Apple profile and relay APNs credentials; Firebase credentials are needed
+   for future Android clients. Run the paired native r7 flow jointly with
+   Atem, then provider delivery/revocation/disconnect tests. No phone access,
+   account-wide delivery, push E2EE or live APNs delivery is claimed today.
 
 ## Validation
 
-Final focused native run: 55 tests pass (`ApprovalPush`,
-`RelayIdentityRecoveryLifecycle`, `NetworkDebugLogger`, `AtemSession`). Relay's
-regular suite: 456 pass, 110 ignored. The new isolated Postgres
-migration/rotation/reconnect test passes, including maximum-size FCM tokens and
-token reassignment. Signing validation: 16 tests pass.
-APNs and FCM tests use an injected transport and verify actual request
-headers/body, provider refusals, OAuth refresh and expiration during refresh.
-ES256 and RS256 signatures are verified locally; the RSA fixture is a public
-test key with no provider account. No tests contact Apple or Google.
+Native coverage exercises no-lease approval arrival, atomic answers, exact
+Claude rule selection, Codex restrictions, duplicate/catch-up suppression,
+resolved-before-open ordering, process mismatch, immediate disconnect,
+reconnect receipt recovery, persistence failure, local-input/expiry fencing,
+unknown outcomes, text/numeric bounds and preference independence without APNs.
+Session, terminal, menu and log-redaction regression tests are also run.
 
-An earlier broader native run passed 136 tests. Its final rerun blocked on an
-existing local Keychain read and was stopped without changing Keychain access;
-the focused final run above includes the subsequent log-redaction test.
+Local validation on 2026-10-16: 119 focused tests pass; the full Swift suite
+executes 879 tests with 11 environment-dependent skips and zero failures.
+The app is packaged with the existing personal-team provisioned identity,
+passes strict signature and bundled-resource checks, and is running as
+`Astation Local.app`. Its profile authorizes protected Keychain access but
+does not grant APNs. The live verified Genie connection completes hello,
+welcome, list and sessions; both Claude and Codex appear in Connections.
+No live approval was received or answered during this check. Provider delivery
+and a real pending-approval/receipt round trip remain joint validation work.
 
-Required next scenarios include independent delivery without a lease, member
-and host revocation during dispatch, duplicate/out-of-order open/resolved
-messages, receipt loss/reconnect, immediate disconnection after accepting an
-answer, simultaneous local/remote answers, stale process/host/trust generations,
-late taps and showing the exact Claude rule. Current tests do not claim to run
-an r7 host or real APNs/FCM devices.
+Existing relay provider tests use injected transports and verify actual
+headers/body, ES256/RS256 signatures, OAuth refresh, expiry and provider
+refusals. They do not contact Apple or Google. No new relay ingress or Atem
+source modifications are part of this native integration.

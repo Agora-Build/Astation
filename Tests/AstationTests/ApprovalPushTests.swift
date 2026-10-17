@@ -75,5 +75,13 @@ final class ApprovalPushTests: XCTestCase {
                 XCTAssertFalse(sanitized.contains("private-device-address"))
             }
         }
+        for operation in ["push_approval", "push_resolved"] {
+            let wire = "{\"type\":\"relay\",\"data\":{\"v\":1,\"op\":\"\(operation)\",\"summary\":\"private-tool-summary\"}}"
+            for input in [wire, String(wire.dropLast()), "{\"payload\":\(wire)}"] {
+                let sanitized = NetworkDebugLogger.sanitizedPayload(input)
+                XCTAssertFalse(sanitized.contains("private-tool-summary"))
+                XCTAssertTrue(sanitized.contains("redacted"))
+            }
+        }
     }
 }

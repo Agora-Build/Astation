@@ -121,6 +121,9 @@ enum NetworkDebugLogger {
         if text.range(of: #""type"\s*:\s*"(session|agentChat|browserChat|push_approval|push_resolved|relayPushRegister)""#, options: .regularExpression) != nil {
             return "<agent chat content redacted; malformed envelope>"
         }
+        if text.range(of: #""op"\s*:\s*"push_(approval|resolved)""#, options: .regularExpression) != nil {
+            return "<approval content redacted; malformed envelope>"
+        }
         let replacements = [
             (#"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"#, "Bearer <redacted>"),
             (
@@ -145,14 +148,24 @@ enum NetworkDebugLogger {
 
     private static func sanitizeJSONObject(_ value: Any) -> Any {
         if let dictionary = value as? [String: Any] {
+            if dictionary["type"] as? String == "relay",
+               let operation = (dictionary["data"] as? [String: Any])?["op"] as? String,
+               ["push_approval", "push_resolved"].contains(operation) {
+                return ["type": "relay", "data": ["op": operation, "content": "<redacted>"]]
+            }
             if let type = dictionary["type"] as? String,
                ["push_approval", "push_resolved", "relayPushRegister"].contains(type) {
                 return ["type": type, "content": "<redacted>"]
             }
             if let type = dictionary["type"] as? String,
                ["terminal", "session", "agentChat", "browserChat"].contains(type) {
-                let operation = (dictionary["data"] as? [String: Any])?["op"] as? String ?? "unknown"
-                return ["type": type, "data": ["op": operation, "content": "<redacted>"]]
+                let data = dictionary["data"] as? [String: Any]
+                let operation = data?["op"] as? String ?? "unknown"
+                var metadata = ["op": operation, "content": "<redacted>"]
+                if type == "session", operation == "error" {
+                    metadata["code"] = AtemSessionWire.diagnosticErrorCode(data?["code"] as? String)
+                }
+                return ["type": type, "data": metadata]
             }
             return dictionary.reduce(into: [String: Any]()) { result, entry in
                 let normalizedKey = normalizedSensitiveKey(entry.key)

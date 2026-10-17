@@ -19,6 +19,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
     private var headerTapCount = 0
     private var lastHeaderTapTime: Date?
     var approvalNotificationSettings: (() -> Void)?
+    var approvalPendingCount: (() -> Int)?
 
     init(hubManager: AstationHubManager, webSocketServer: AstationWebSocketServer, androidDeviceManager: AndroidDeviceManager,
          hotkeyManager: HotkeyManager, recordingManager: AudioRecordingManager = AudioRecordingManager(),
@@ -88,6 +89,13 @@ class StatusBarController: NSObject, NSMenuDelegate {
         let headerItem = NSMenuItem(title: "🚀 Astation Hub", action: #selector(handleHeaderTap), keyEquivalent: "")
         headerItem.target = self
         statusMenu.addItem(headerItem)
+
+        let pendingApprovals = approvalPendingCount?() ?? 0
+        let notificationsTitle = pendingApprovals > 0 ? "🔔 Approval Notifications (\(pendingApprovals))..." : "🔔 Approval Notifications..."
+        let notifications = NSMenuItem(title: notificationsTitle, action: #selector(showApprovalNotificationSettings), keyEquivalent: "")
+        notifications.target = self
+        notifications.isEnabled = approvalNotificationSettings != nil
+        statusMenu.addItem(notifications)
         
         statusMenu.addItem(NSMenuItem.separator())
         
@@ -393,12 +401,6 @@ class StatusBarController: NSObject, NSMenuDelegate {
         showClientsItem.target = self
         statusMenu.addItem(showClientsItem)
 
-        let notifications = NSMenuItem(title: "Approval Notifications...", action: #selector(showApprovalNotificationSettings), keyEquivalent: "")
-        notifications.image = NSImage(systemSymbolName: "bell.badge", accessibilityDescription: nil)
-        notifications.target = self
-        notifications.isEnabled = approvalNotificationSettings != nil
-        statusMenu.addItem(notifications)
-
         // Pair Remote Atem
         let pairRemoteItem = NSMenuItem(
             title: "📡 Pair Remote Atem",
@@ -486,16 +488,6 @@ class StatusBarController: NSObject, NSMenuDelegate {
 
     @objc private func showApprovalNotificationSettings() { approvalNotificationSettings?() }
 
-    func openApprovalNotification(_ hint: ApprovalPushHint) {
-        // r6.2 cannot read or submit approvals. Never interpret notification
-        // contents as an authoritative pending request or use terminal keys.
-        connectionsWindowController.showAndFocus()
-        let alert = NSAlert()
-        alert.messageText = "Approval status could not be checked"
-        alert.informativeText = "This build cannot review agent approvals yet. You can answer the request in the agent's terminal. A notification has not approved anything."
-        alert.runModal()
-    }
-    
     @objc private func pairRemoteAtem() {
         Log.info(" Pair Remote Atem requested from status bar")
 

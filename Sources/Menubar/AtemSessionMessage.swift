@@ -2,6 +2,12 @@ import Foundation
 
 enum AtemSessionWire {
     static let maximumCounter = UInt64(AtemSessionJSON.maximumInteger)
+    static func diagnosticErrorCode(_ value: String?) -> String {
+        let codes: Set<String> = ["unsupported_version", "unauthorized", "forbidden", "stale_target",
+            "unknown_session", "lease_held", "stale_lease", "request_id_reused", "receipt_limit",
+            "session_closed", "busy", "paused"]
+        return value.flatMap { codes.contains($0) ? $0 : nil } ?? "unknown_error"
+    }
     static func uuid(_ value: String) -> Bool {
         value.range(of: #"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"#, options: .regularExpression) != nil
     }
@@ -115,7 +121,7 @@ struct AtemSessionReceipt: Codable, Equatable {
     let detail: String?
     let updated_at: UInt64
     var valid: Bool {
-        AtemSessionWire.uuid(request_id) && target.valid && ["prompt", "interrupt", "stop"].contains(kind)
+        AtemSessionWire.uuid(request_id) && target.valid && ["prompt", "interrupt", "stop", "approval"].contains(kind)
             && (detail?.utf8.count ?? 0) <= 512 && updated_at <= AtemSessionWire.maximumCounter
     }
 }
@@ -159,6 +165,11 @@ struct AtemSessionMessage: Codable, Equatable {
     var request_ids: [String]?
     var receipts: [AtemSessionReceipt]?
     var code: String?
+    var approval_id: String?
+    var tool: String?
+    var summary: String?
+    var created_at: UInt64?
+    var always_rules: [AtemApprovalRule]?
 
     func validate() throws {
         try AtemSessionWire.check(v == 1 && AtemSessionWire.uuid(id) && re.map(AtemSessionWire.uuid) != false)
@@ -173,7 +184,7 @@ struct AtemSessionMessage: Codable, Equatable {
                 && host_trust_gen != nil && runtime_gen.map(AtemSessionWire.uuid) == true
                 && controller_session.map(AtemSessionWire.uuid) == true && attachment_gen.map(AtemSessionWire.uuid) == true
                 && ["native", "browser"].contains(client_kind ?? "") && permissions != nil
-                && permissions!.allSatisfy { ["view", "control", "approve"].contains($0) }
+                && permissions!.allSatisfy { ["view", "control"].contains($0) }
                 && authorization_ms_left != nil && server_time != nil)
         case "sessions", "session_changed":
             try AtemSessionWire.check(runtime_gen.map(AtemSessionWire.uuid) == true && runtime_epoch != nil && seq != nil)
@@ -187,16 +198,22 @@ struct AtemSessionMessage: Codable, Equatable {
         case "lease_changed":
             try AtemSessionWire.check(session_id.map(AtemSessionWire.session) == true && process_gen.map(AtemSessionWire.uuid) == true
                 && lease_epoch != nil && controller?.valid != false
+                && (controller == nil || controller?.lease_epoch == lease_epoch)
                 && ["granted", "takeover", "local_input", "expired", "released", "revoked", "process_ended"].contains(reason ?? ""))
         case "submit":
-            try AtemSessionWire.check(binding?.lease_epoch != nil && request_id.map(AtemSessionWire.uuid) == true
-                && ["prompt", "interrupt", "stop"].contains(kind ?? "") && payload != nil)
+            try AtemSessionWire.check(binding != nil && request_id.map(AtemSessionWire.uuid) == true
+                && ["prompt", "interrupt", "stop", "approval"].contains(kind ?? "") && payload != nil)
             let canonical = try payload!.canonical()
             try AtemSessionWire.check(canonical.utf8.count <= 65_536)
+            let acquire = kind == "approval" ? try AtemApprovalAnswer.validate(payload!) : false
+            try AtemSessionWire.check(acquire ? binding?.lease_epoch == nil : binding?.lease_epoch != nil)
             if kind == "prompt" {
                 guard case .object(let fields) = payload!, let text = fields["text"]?.string else { throw AtemSessionJSON.Invalid.json }
                 try AtemSessionWire.check(fields.count == 1 && text.utf8.count <= 32_768)
-            } else { try AtemSessionWire.check(payload == .object([:])) }
+            } else if kind != "approval" { try AtemSessionWire.check(payload == .object([:])) }
+        case "approval_request": try AtemSessionWire.check(approval?.valid == true)
+        case "approval_closed":
+            try AtemSessionWire.check(approval_id.map(AtemSessionWire.uuid) == true && AtemApprovalRequest.closeReasons.contains(reason ?? ""))
         case "receipt": try AtemSessionWire.check(receipt?.valid == true)
         case "receipt_query":
             try AtemSessionWire.check(binding != nil && binding?.lease_epoch == nil && request_ids != nil
@@ -210,5 +227,11 @@ struct AtemSessionMessage: Codable, Equatable {
     var receipt: AtemSessionReceipt? {
         guard let request_id, let target, let kind, let state, let updated_at else { return nil }
         return AtemSessionReceipt(request_id: request_id, target: target, kind: kind, state: state, detail: detail, updated_at: updated_at)
+    }
+
+    var approval: AtemApprovalRequest? {
+        guard let approval_id, let session_id, let process_gen, let tool, let summary, let created_at, let always_rules else { return nil }
+        return AtemApprovalRequest(approval_id: approval_id, session_id: session_id, process_gen: process_gen,
+            tool: tool, summary: summary, created_at: created_at, always_rules: always_rules)
     }
 }

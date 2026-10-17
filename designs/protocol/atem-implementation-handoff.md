@@ -1,125 +1,123 @@
 # Atem and Astation session integration handoff
 
-Date: 2026-10-16
+Updated 2026-10-16. The consolidated Astation work is in
+[draft PR #50](https://github.com/Agora-Build/Astation/pull/50),
+`feat/push-approvals`, against main. It includes the r6.2 client from the closed
+PR #49 and the native r7 approval inbox. All Atem implementation belongs to the
+Atem owner; no Atem checkout was modified or built for this integration.
 
-Astations and Atems update together to **atem-session r6.2**, with no backward
-compatibility. Review [draft Astation #49](https://github.com/Agora-Build/Astation/pull/49),
-which targets `main` and contains superseded #48. All Atem implementation belongs
-to the Atem owner; Astation has not changed, built or tested an Atem checkout.
+The session base is [Atem #68](https://github.com/Agora-Build/Atem/pull/68),
+tag `atem-session-v1-r6.2`, with no legacy fallback. The current runtime and
+additive r7 approval contract are consolidated in
+[Atem #72](https://github.com/Agora-Build/Atem/pull/72), `feat/session-runtime`.
+Native approval integration pins the published contract at
+`5ce333e505e77429ffbfd443bdb0794b45136a03`
+([protocol](https://github.com/Agora-Build/Atem/blob/5ce333e505e77429ffbfd443bdb0794b45136a03/designs/protocol/atem-session-v1.md),
+[host handoff](https://github.com/Agora-Build/Atem/blob/5ce333e505e77429ffbfd443bdb0794b45136a03/designs/protocol/atem-host-handoff.md)).
+The later #72 commit `61b4b4b` changes PTY stop grace only, with no wire changes.
 
-Contract: [Atem #68](https://github.com/Agora-Build/Atem/pull/68), history tag
-`atem-session-v1-r6.2`, pinned `22de096b1980ee3ae342c0352b4c1d5fa54e3b51`;
-[exact snapshot](atem-session-v1.md), [fixtures](fixtures/schema.md).
-Host: [Atem #69](https://github.com/Agora-Build/Atem/pull/69), `feat/runtime`,
-read at `a09be62c4db344b9a0540cf68f2ae4b28852844a`;
-[build/run instructions and real-runtime coverage](atem-host-handoff.md).
+## Ready on Astation
 
-## Astation changes ready for joint testing
+- One authenticated session client per host connection serves Connections,
+  terminal windows and the approval inbox. The registry supplies exact session,
+  process, workspace, capability and activity data. Refresh sends session list,
+  never agentListRequest or terminal list.
+- Each new attachment resets sequence, registry, removals, terminal queues,
+  pending replies and leases. Durable trust/runtime fences and submission
+  recovery metadata survive. Reconnect queries receipts without replaying a
+  command, approval answer or control acquisition.
+- All requests bind the full target and attachment; mutations bind the lease.
+  Terminal host events use verified connection, process, subscription and
+  stream fencing. Removed operations have no outgoing fallback. Family errors,
+  local takeover, deadline expiry and stale replies cannot restore authority.
+- Claude structured prompts require chat-v1. Codex uses terminal input/paste.
+  Browser access stays disabled, including before hello, pending the secure
+  companion contract. No unbound chat is sent.
+- Native r7 approval requests arrive independently of a lease. Allow once,
+  Claude's exact offered Always allow rule and Deny use durable approval
+  submissions with acquire:true. See the
+  [approval lifecycle and remaining integration](push-approvals-handoff.md).
+- Connections shows session handshake failures and allowlisted error codes.
+  Pairing-code sockets transfer pairing credentials but never enter the online
+  Atem list or become a session/control target.
+- A hello refused as unauthorized before any accepted welcome may retry after
+  verification or an explicit request, using a fresh id and the still-verified
+  authenticated context. There is no timer retry. Stale hello replies are
+  ignored. An already welcomed attachment must reconnect after failure.
 
-- One authenticated session client per host connection, shared by Connections
-  and terminal windows. No second hello when opening or reopening a window.
-  The session registry replaces both removed lists and supplies exact process
-  ids, workspace labels, capabilities and activity to the UI.
-- Every new attachment clears sequence, registry, removals, terminal queues,
-  pending replies and leases, while retaining durable trust/runtime fences and
-  submission recovery metadata. A first snapshot at sequence 1 after 100 works.
-- Requests bind full target/attachment and mutation lease. Actual r6.2 terminal
-  host events are unbound; Astation checks verified connection, exact process,
-  outstanding subscription and stream instead. Old-stream errors are ignored.
-- Removed operations have no outgoing fallback. Session unsupported_version
-  errors can omit re. Terminal and chat preserve family error codes. Permission,
-  session_closed and stale_lease refusals remove control without replay.
-- Prompt/interrupt/stop requests persist their identities before sending.
-  Reconnect queries the original receipts. Busy also keeps a request unresolved
-  and never causes an automatic resubmit. Codex uses terminal input/paste;
-  structured prompts require chat-v1. Leases retain exact-deadline fencing.
-- Browser access is disabled on all host sockets, including before hello; no
-  unbound chat is sent. Open in Browser is disabled pending secure companions.
-- All 18 r6.2 fixture files are copied and pinned; Swift and offline JavaScript
-  run all three client scenarios, plus digest/rejection vectors. Host scenarios
-  remain the owner's responsibility. See [validation evidence](astation-session-v1-implementation.md).
+## Local validation
 
-## Joint live test sequence
+The provisioned personal-team `Astation Local.app` runs from
+`Astation/.build/Astation Local.app`, retaining bundle identifier
+`build.agora.astation.local.xmgq79xmd5` and its protected Keychain access group.
+Strict signature checks and bundled transcription/terminal resource checks
+pass. The profile has no APNs entitlement; only offline push is disabled.
 
-1. Use the same #69 binary for pair/verify/launch on an isolated test profile;
-   preserve existing sessions. Run instructions are in the host handoff. Build
-   Astation #49, authenticate/verify the host, and check exactly one hello/welcome
-   even when Connections refreshes and terminal windows reopen.
-2. Launch Claude and Codex and another session of one provider. Confirm each
-   session/workspace/process appears, can be selected and viewed independently,
-   and updates activity/removal without agentListRequest or terminal list.
-3. Take Control, type/resize/paste and release. Local host input must revoke
-   remote input at the worker write boundary. Expiry and late renewal must not
-   restore input; large durable epoch jumps must work. No legacy control op or
-   lease_id is sent. Provider approvals still use the controlled terminal.
-4. On Claude, submit a prompt and observe accepted/executing/completed; interrupt
-   and stop use their own receipts. Codex's structured prompt field is disabled.
-   Disconnect immediately after acceptance and restart/reconnect the runtime;
-   query the original receipt without a second dispatch or restored lease.
-5. Reauthenticate/reconnect to the same runtime. The registry sequence can
-   restart at 1, removed-process caches clear, runtime rollback stays refused,
-   and old terminal frames/errors cannot enter the new subscription. Verify
-   session_closed is handled before stale_lease when both conditions apply.
-6. Exercise terminal busy/stale_lease/stale_target errors and chat rejected or
-   outcome_unknown in their own families. Removed forms return session
-   unsupported_version, including without re; malformed messages never write.
-   Browser open and unbound submit stay disabled.
-7. Unpair/revoke with a pending request, then pair/verify again. Old authority
-   never returns, pending work is not replayed under new trust, and local agents,
-   memory, vaults and saved credentials remain intact.
+On 2026-10-16 at 19:56 local, the verified Genie link completes
+`hello -> welcome -> list -> sessions`. Connections shows exactly one online
+Atem, `relay:Genie`, with:
 
-Atem's real runtime currently supports **one Astation link/attachment**; do not
-advertise simultaneous controllers or execute a multiple-link live test yet.
-Its core harness covers the multi-attachment scenarios. New fixture steps
-include reconnect, close_session, turn_complete, held/flushed PTY writes,
-family-filtered expect, captures and end-of-scenario queue exhaustion. The host
-handoff distinguishes actual binary coverage from core-only or unsupported
-fault steps; client tests do not expand that claim.
+- Claude `ses-vozq7s7qkbvr`, Idle.
+- Codex `ses-m636w7gytzwx`, activity Unknown as reported by the host.
 
-## Contract clarifications for the Atem owner
+The earlier 19:42 hello received an error before safety-code verification
+finished. Its old logger hid the error code, so that specific refusal cannot
+be identified retrospectively. A fresh authenticated connection after
+verification succeeds. The spurious `relay:TZAZ-Y9W6` row came from Astation
+adding its own pairing transport as an online Atem, rather than evidence of a
+second Atem runtime socket.
 
-The pinned host handoff says every terminal message carries a binding. Its wire
-implementation and actual host events instead require bindings only on requests
-and prohibit them on host events. Astation follows the implementation and
-fixtures, with local connection/process/stream fencing for responses. Clarify
-that sentence in the owner document for joint testing.
+There are 119 passing focused tests. The full Swift suite executes 879 tests,
+11 environment-dependent skips, zero failures. The skips cover provisioned
+XCTest/Keychain, live capture and optional local model integrations; they do
+not represent a live APNs or agent-approval test. No agent command or approval
+decision was sent during this live discovery check.
 
-The #69 contract adds a double-I/O-failure exception to busy admission: a request
-answered busy might still dispatch once under its original identity. The r6.2
-tag/#68 text says busy records nothing. Astation conservatively retains the
-request for queries and never auto-resends it; reconcile the wording upstream.
-Neither clarification blocks the client changes or initial live tests.
+Production is unchanged: health reports main `9245603`, two replicas and Redis
+OK. Relay account registration still refuses the Agora verifier configuration
+(`AGORA_ACCOUNT_USERINFO_URL` / `AGORA_ACCOUNT_SUBJECT_FIELD` absent). That is a
+separate account-discovery gate; the saved paired Genie connection works.
 
-## Security and approval gates
+## Joint tests remaining
 
-Update, 2026-10-16: the user approved push delivery independently of a lease and
-atomic acquire:true answers. See the [push preparation and required joint
-contract](push-approvals-handoff.md). Native token registration, provider
-adapters and provisioning docs are on feat/push-approvals; host ingress and
-decision UI await authenticated host/membership proofs and r7 wire fixtures.
-The existing r6.2 client remains unchanged on #49, whose current-head CI is green
-(854 Swift tests, ten skipped, zero failures; relay and webapp checks pass).
+1. Use the same #72 runtime for pair/verify/launch, preserving existing
+   sessions. Open, close and reopen Connections and terminal windows; confirm
+   no second hello is sent after a welcome on the same attachment.
+2. View each session, then explicitly take control to type/resize/paste and
+   release. Host local input must revoke queued remote writes. Expiry and late
+   renewal must not restore control. No legacy control op or lease_id is sent.
+3. Submit a Claude prompt and observe its durable receipts. Test interrupt and
+   stop separately. Disconnect immediately after acceptance; reconnect queries
+   the original receipt without another dispatch or a restored lease.
+4. Trigger real Claude and Codex approval hooks with no lease holder. Check
+   in-app alert/inbox, exact Claude rule confirmation, atomic answers, terminal
+   answers, expiry, duplicate catch-up and delayed receipts. Disconnect or
+   revoke while a request is pending; stale cards must be disabled.
+5. Reauthenticate/reconnect to the same runtime, then restart the runtime.
+   Registry sequence can restart, but runtime rollback and old process/stream
+   frames remain refused. Exercise busy/stale-target/family error fixtures.
+6. Unpair/revoke and pair/verify again. Old authority never returns. Local
+   agents, memory, vaults and saved credentials remain intact.
 
-Section 9 remains open: resume, browser/QR grants, multiple native attachments,
-account-wide trust/enrollment, signed membership/revocation ordering,
-authenticated freshness proofs and live traffic E2EE stay disabled. The relay
-is not identity, trust, encryption-state or control authority. Compatibility
-mode does not claim relay confidentiality. r7 prompt-bound allow once / always
-allow / deny is being built by Atem; Astation awaits the contract text before
-implementing approval decisions.
+The actual host currently supports one native Astation link; multi-attachment
+core harness coverage does not establish simultaneous live controllers.
 
-## Coordination and provenance
+## Trust and offline delivery gates
 
-Use this hosted handoff for cross-machine coordination. The r6.2 update is saved
-locally as Atem memory `mem_ad576dc855114182ae1ef6d30ced6d3d` for project Astation,
-but the relay rejected sync: `memory does not match the account encryption mode`.
-The earlier r5 memory id was not present in this CLI store. Shared memory is not
-confirmed; read the hosted handoff instead. Do not rely on a local Atem checkout.
+Section 9 remains the gate for resume, browser/QR grants, account-wide native
+access, signed membership/revocation ordering, freshness proofs and live
+traffic E2EE. The relay is never identity, encryption-state or control
+authority. Compatibility mode does not claim relay confidentiality.
 
-Earlier worktree wording referred to an abandoned, uncommitted experiment at
-`/Users/brent/Dev/Agora.Build/Atem-session-multiplexing`, based on `10d3ea8`.
-It is preserved and is not an implementation source. The owner's published
-pair/verify/status and trust-generation work (#67) is authoritative.
+Offline push needs an eligible push-enabled Apple profile and APNs provider
+credentials, authenticated Atem-to-relay device proof, authorized recipients
+and a durable, revocation-aware dispatch outbox. Current room ids and SSO/data
+account grouping cannot supply that authority. The native inbox and transport
+adapters do not imply live APNs delivery. See
+[provider setup](../../docs/push-notifications.md).
 
-Nothing was merged or deployed, and no installed app or running agent was
-replaced or restarted for this update. #49 remains draft for joint live testing.
+Use this hosted handoff for cross-machine coordination. The latest local Atem
+memory is `mem_752f0f044652415c9a475fe99cde7d29`; the relay rejected its sync
+with `memory does not match the account encryption mode`. Do not assume the
+shared store contains this update unless sync succeeds.
+No production merge or deployment is included.

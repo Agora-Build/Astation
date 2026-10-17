@@ -199,12 +199,18 @@ class AstationApp: NSObject, NSApplicationDelegate {
         let notifications = ApprovalNotifications(
             register: { [weak hubManager] in hubManager?.setApprovalPushRegistration($0) },
             unregister: { [weak hubManager] in hubManager?.unregisterApprovalPush(platform: $0) },
-            open: { [weak self] hint in
+            open: { [weak self] _ in
                 self?.hubManager.startIdentityRelay()
-                self?.statusBarController.openApprovalNotification(hint)
+                for client in self?.hubManager.connectedClients ?? [] {
+                    self?.hubManager.requestAgentList(from: client.id)
+                }
             })
         approvalNotifications = notifications
+        hubManager.approvalSessionDidChange = { [weak notifications] source, client, host in
+            notifications?.sessionChanged(sourceID: source, client: client, host: host)
+        }
         statusBarController.approvalNotificationSettings = { [weak notifications] in notifications?.showPreferences() }
+        statusBarController.approvalPendingCount = { [weak notifications] in notifications?.inbox.pendingCount ?? 0 }
         notifications.start()
 
         Log.info("Astation fully operational!")
