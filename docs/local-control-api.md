@@ -1,5 +1,10 @@
 # Local session and approval API
 
+The next milestone is a complete conversation, approval and notification API.
+See the [joint agent control API proposal](../designs/protocol/agent-control-api.md)
+for current gaps, proposed history/events routes and Atem/Astation ownership.
+Those proposed routes are not available yet; the implemented routes are listed below.
+
 The optional local API uses the running native Astation's verified Atem session
 clients, approval inbox and durable request journal. It lets a script exercise
 the same flow as a future mobile UI. It does not enroll devices or bypass
@@ -72,8 +77,12 @@ process_gen. Copy it from the current list; a label, hostname or session id alon
 cannot identify an authority boundary.
 
 For an answer, copy the entire approval request object unchanged. Always allow
-also echoes the exact rule_id, label and scope offered by Claude; Codex cannot
-use it. A denial may include message (up to 512 UTF-8 bytes). Do not convert a
+also echoes the exact offered rule_id, label and scope. The current Astation
+implementation restricts it to Claude. Atem r7.2 also supports Codex session
+rules; native/API integration, rule display and revoke are tracked in the
+[joint proposal](../designs/protocol/agent-control-api.md). This guide's current
+route list does not claim those additions are implemented.
+A denial may include message (up to 512 UTF-8 bytes). Do not convert a
 notification's fields into an answer request; only authenticated catch-up
 supplies the authoritative card. Closed/unavailable cards return 409.
 
@@ -100,7 +109,9 @@ Stage prompts in those sessions, then use this API to review and answer:
 
 1. Claude Allow once, exact offered Always allow, and Deny with a message;
    check both the durable receipt and the agent's observed action.
-2. Codex Allow once and Deny; verify Always allow is refused.
+2. Codex Allow once and Deny. The current Astation implementation refuses
+   Codex Always allow; after r7.2 integration test exact session-rule grants,
+   auto_allowed cards and revoke against the updated host.
 3. Cross a local terminal answer with a remote answer; honor the host's
    completed/rejected/outcome_unknown result without repeating it.
 4. Let a request expire; ensure the card cannot be answered, including via API.
