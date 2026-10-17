@@ -1,27 +1,34 @@
 # Agent control API: Astation and Atem joint proposal
 
-Status: proposal r1, 2026-10-17. This document records Brent's requested next
-milestone: operate agents started with `atem agent launch` through APIs,
+Status: proposal r2, 2026-10-17, incorporating
+[Atem's response](https://github.com/Agora-Build/Astation/issues/52#issuecomment-6237260882)
+and the baseline corrections in [Atem #74](https://github.com/Agora-Build/Atem/pull/74).
+The [r1 response review](agent-control-api-atem-r1-review.md) records four
+remaining contract/API details before r8 agreement. This document records
+Brent's requested next milestone: operate agents started with `atem agent launch` through APIs,
 including conversations, approvals and notifications. Proposed endpoints and
 wire additions below are not implemented or jointly approved yet.
 
 Tracking: [Astation #52](https://github.com/Agora-Build/Astation/issues/52).
 The existing API shipped in [Astation #50](https://github.com/Agora-Build/Astation/pull/50).
-[Atem #72](https://github.com/Agora-Build/Atem/pull/72) is now merged; its main
-merge commit is `1d79ab66b067464b7a93b549ef5d913c91b6275f`. Baseline contracts:
-[session r7.1](https://github.com/Agora-Build/Atem/blob/1d79ab66b067464b7a93b549ef5d913c91b6275f/designs/protocol/atem-session-v1.md)
-and [agent chat](https://github.com/Agora-Build/Atem/blob/1d79ab66b067464b7a93b549ef5d913c91b6275f/designs/agent-chat-host.md).
+[Atem #73](https://github.com/Agora-Build/Atem/pull/73) is merged after #72;
+the current main baseline is `af56d39abf6394b8706e9eb8b9ea3f04b594197c`. Contracts:
+[session r7.2](https://github.com/Agora-Build/Atem/blob/af56d39abf6394b8706e9eb8b9ea3f04b594197c/designs/protocol/atem-session-v1.md),
+[agent chat](https://github.com/Agora-Build/Atem/blob/af56d39abf6394b8706e9eb8b9ea3f04b594197c/designs/agent-chat-host.md)
+and the [developer guide](https://github.com/Agora-Build/Atem/blob/af56d39abf6394b8706e9eb8b9ea3f04b594197c/designs/agent-chat-api.md).
 The session contract governs bindings, permissions and receipts where the
 older chat document describes pre-runtime behavior.
+Astation main still implements r7.1: r7.2 rule lists/revocation and the
+Claude-only Always allow restriction need implementation work here.
 
 ## Required first milestone
 
 | User operation | Ready today | Work needed |
 | --- | --- | --- |
 | Discover launched agents and their capabilities | Local session registry API | Expose explicit API feature support and actionable unsupported-feature errors. |
-| Send a prompt to the original running agent | Claude, with control and chat-v1 | Codex structured chat adapter in Atem; no second provider session. |
-| Read replies and earlier conversation | Claude host chat-v1 | Session-bound native chat coordinator, history API and live events in Astation; agree history completion/recovery semantics. |
-| See and answer approvals | Local inbox and answer APIs | Joint live tests; render approval parts in structured chat and publish lifecycle events. |
+| Send a prompt to the original running agent | Atem main supports Claude and Codex chat-v1; Astation has the capability-gated submit path | Verify both providers together; respect Codex's first-local-prompt prerequisite. No second provider session. |
+| Read replies and earlier conversation | Both providers have host chat-v1 | Session-bound native chat coordinator, history API and live events in Astation; agree r8 history/recovery semantics. |
+| See and answer approvals | Local inbox and answer APIs | Integrate r7.2 Codex session rules, rule lists/revoke and typed chat cards; run joint live tests. |
 | Be notified when action is needed or work ends | Native in-app approval notifications | API event subscription plus completion, failure and connection/control notifications; offline delivery is a separate gate. |
 | Interrupt or stop an agent | Controlled submissions and durable receipts | Complete disposable-session live tests; keep interrupt and process stop distinct. |
 | Recover an uncertain request | Scoped receipt query and durable UUID journal | Expose receipt updates in events; recover associated replies where host history still exists. |
@@ -31,11 +38,19 @@ remotely, with their real origin. Return text and safe tool summaries as
 structured parts. Do not reconstruct a conversation from ANSI screen output,
 infer success from an idle indicator, or return private reasoning.
 
-Read-only live check on 2026-10-17: the running provisioned Astation answers
-status and session-list requests with r7.1, two running Claude sessions with
-chat-v1 and one running Codex session with terminal-v1 only. All three have no
-controller. This verifies discovery/capability reporting, not the proposed
-history, event stream, offline delivery or the full approval acceptance matrix.
+Earlier read-only live check on 2026-10-17: the running provisioned Astation's
+status identifies its implementation as r7.1, with two Claude chat-v1 sessions
+and one Codex terminal-v1 session. All three have no controller. That observation
+is specific to those running sessions; it does not establish the remote build
+revision or contradict the Codex adapter now on Atem main. Discovery works;
+the proposed history/events and joint approval matrix are not thereby verified.
+
+Provider baseline: Claude Code 2.1.x (Atem verified 2.1.301) and Codex 0.162.1.
+Codex needs enabled/trusted Atem hooks and a first prompt typed in the terminal
+before remote prompts are accepted; until then chat may open with unknown
+status and a prerequisite hint. Respect opened.unavailable: neither provider
+streams partial text or reasoning; Codex also lacks error_details. Whole
+content blocks arriving as parts are not token streaming.
 
 The initial API extends Astation's protected loopback service. The agent may
 run on another machine through the existing authenticated Atem link. Native
@@ -48,8 +63,8 @@ independent Atem HTTP server for this feature.
 **Atem owns** the original agent process, provider adapters, authoritative
 transcript and semantic lifecycle, history retention, pending approval hooks,
 control leases and durable command outcomes. It advertises chat-v1 only when
-the particular running provider's adapter is healthy. Codex approvals already
-work without a Codex chat adapter; they are separate capabilities.
+the particular running provider's adapter is healthy. Codex chat and approvals
+are both built on Atem main; approval availability remains independent of chat.
 
 **Astation owns** the session-bound conversation coordinator, API admission,
 REST operations, event stream, native conversation/approval views and local
@@ -76,8 +91,10 @@ Proposed additions, to be finalized after Atem review:
 | Route | Purpose |
 | --- | --- |
 | POST /api/v1/chat/open | Accept client_id and full target; return an opaque local chat_id while opening a read subscription. Never acquire control or send a prompt. |
-| POST /api/v1/chat/history | Accept chat_id and optional opaque before cursor; return a bounded page with sync state and an explicit continuation/retention boundary. Opening or paging may be pending; only an authenticated end marker can make it complete. |
-| POST /api/v1/chat/close | Release the caller's view. Never interrupt, stop or restart the agent. Share one live host conversation per target among native/API readers where possible. |
+| POST /api/v1/chat/history | Accept chat_id and a bounded cursor or request/turn filter; return one bounded host page with explicit continuation and retention coverage. |
+| POST /api/v1/chat/close | Release the caller's view. Never interrupt, stop or restart the agent. Share exactly one live host conversation per full target and attachment among native/API readers. |
+| GET /api/v1/approval-rules | List authoritative active session rules with client_id and full target; empty means no active rules. |
+| POST /api/v1/approval-rules/revoke | Accept client_id, full target, rule_id and request_id; require current control and use a durable approval_rule_revoke submission. |
 | GET /api/v1/events | Server-sent events for session, chat, approval, receipt and connection/control changes, with replay cursors and explicit reset semantics. |
 
 Every chat_id is bound to the full target: account_id, atem_device_id,
@@ -86,13 +103,23 @@ credential. A changed target cannot be supplied to retarget it. Prompts and
 approval answers still go through the existing durable submission path;
 there is no parallel chat write path with weaker checks.
 
-History replies must distinguish pending, complete, truncated and unavailable.
-They cannot claim that all messages were returned simply because the socket
-was quiet. Use existing host page limits (50 messages / 256 KiB) and message
-limits; return the available retention boundary rather than promising an
-unlimited durable transcript. Pending pages complete through the event stream
-and can be queried again. Separate pagination from the live conversation so
-loading older history cannot lose live messages or reset their ordering.
+The host sends a page as one batch; it does not provide a pending-page job.
+Waiting for network delivery in Astation is not a host background operation.
+Until an explicit boundary arrives the initial view is loading/unconfirmed,
+never complete merely because the socket is quiet. A timeout is unavailable
+or unconfirmed, not an empty completed page.
+
+Use existing page bounds (50 messages / 256 KiB), message bounds and a
+serialized-frame bound for every page, including lookup by request or turn.
+Return continuation and retention coverage rather than promising unlimited
+durable history. Separate pagination from live delivery and add an explicit
+snapshot/version merge rule so a delayed page cannot replace newer parts or
+resolved cards. History truncation is information to display, not an instruction
+to reopen repeatedly. An actual live sequence gap requires resynchronization.
+
+Atem currently retains 500 messages / 8 MiB per process, but broker adoption
+restores only 200 / 1 MiB and loses approval cards. The response reports fixes
+in progress; full restart recovery is not yet a verified joint guarantee.
 
 API status should advertise implemented features, supported providers and
 retention/recovery limits. Unsupported chat is a stable capability error;
@@ -107,7 +134,7 @@ The proposed event families are:
 | --- | --- |
 | Session | Snapshot/change/removal and process/activity updates. Process running and activity unknown are distinct facts. |
 | Chat | Open/history page, whole message replacement, appended part, semantic status, turn completion, error and close. |
-| Approval | Open/update/resolution and unavailable after loss of authority. |
+| Approval | Open/update/resolution, active session rule changes/revocation and unavailable after loss of authority. |
 | Command | Receipt state changes, including rejected and outcome_unknown. |
 | Connection/control | Offline/reconnected, lease granted/lost/expired and authorization unavailable. |
 
@@ -133,6 +160,10 @@ cancel accepted work. Exact bounds belong in the implementation contract.
 
 Native notifications initially cover approval needed, turn completed,
 request rejected/unknown and a relevant session/control connection lost.
+Turn-ended notifications must distinguish done from interrupted, and neither
+is proof that the user's requested task succeeded. Until receipt.result is
+implemented, a completed receipt alone does not supply that distinction;
+use authenticated chat outcome or an explicit receipt detail, else unknown.
 Users can mute routine completion/status alerts. Avoid repeated notices for
 heartbeats and backfilled messages. Resolve existing approval notifications
 when the authenticated request closes. Opening a notice fetches current
@@ -152,7 +183,7 @@ offline delivery requires a push-enabled test device and credentials.
   dispatch. Recheck the current attachment, full target and permission at
   application and at every mutation. Late frames cannot retarget a chat.
 - A read subscription never takes control. Explicit acquire/submit and
-  approval answers follow r7.1 lease and atomic-acquire rules. The current
+  approval answers follow r7.2 lease and atomic-acquire rules. The current
   local token represents the native Astation principal, not an independently
   enrolled device or controller. Native UI/API control ownership and renewal
   must be explicit so an abandoned automation client does not renew control
@@ -165,9 +196,13 @@ offline delivery requires a push-enabled test device and credentials.
   same turn; merge that content. Failed, interrupted and unknown outcomes
   must remain distinguishable.
 - Pending approvals arrive without requiring a held lease. Only an exact
-  current snapshot is answerable; always allow uses an exact provider-offered
-  rule, Claude only. Terminal/remote races, expiry and revocation disable the
-  stale card. Push and chat display fields never supply answer authority.
+  current snapshot is answerable. Always allow echoes an exact offered rule:
+  Claude's provider rule or Codex's Atem session rule. Codex rules match the
+  byte-exact shell command and cwd for this process, account/device/trust
+  generation only; no glob/prefix or cross-session grant. Show session scope,
+  active rules and revoke. auto_allowed cards are informational, not pending
+  questions. Terminal/remote races, expiry and revocation disable stale cards.
+  Push and chat display fields never supply answer authority.
 - Inherit existing loopback peer checks, protected key file, bearer-header
   auth, no Origin/CORS and size limits. No token in URLs/logs; no transcript
   persistence in the command journal. Treat text/Markdown as untrusted data.
@@ -176,40 +211,38 @@ offline delivery requires a push-enabled test device and credentials.
   compatibility transport does not promise relay confidentiality or chat
   E2EE; storage encryption does not establish either.
 
-## Questions for the Atem owner
+## Joint agreement status
 
-1. Confirm provider priorities: keep Claude's existing adapter and add Codex
-   structured chat using its native events/logs; expose the same honest
-   capability and status model. Which Codex versions can meet this contract?
-2. Agree an explicit history-page end marker and metadata: conversation and
-   process generation, last sequence, next-before cursor, retention/truncation
-   boundary and how live events follow the page. The current opened/history
-   message stream has no explicit history-end operation. This is a proposed
-   wire change, not an existing guarantee.
-3. Specify reconnect recovery of requestId -> turnId -> retained messages and
-   final outcome, including broker adoption/restart and history eviction.
-   Session receipts currently carry no turn ID or response text. If replies
-   cannot be recovered, return unavailable/unknown with the receipt; never
-   rerun the command to recreate them.
-4. Confirm typed approval parts and their replacement lifecycle in history,
-   correlation with session approval_request/approval_closed, provider error
-   codes and capability withdrawal. Session inbox state remains authoritative
-   for whether the user can answer.
-5. Publish shared fixtures and an agreed contract revision/feature marker for
-   additions before either side emits them. Keep existing r7.1 working without
-   advertising unimplemented features.
+1. Providers and ownership are answered by Atem #74; no Codex adapter build is
+   needed from Astation. The r7.2 rules, unavailable flags, prerequisite hint
+   and approval-part states need native/API integration and joint tests.
+2. Agree the direction of history_end, separate history/history_page and
+   explicit cursor/retention metadata. Settle safe page/live merging and
+   bounded turn/request pagination in the linked response review.
+3. Agree journaling the completed turn's identity and outcome without reply
+   text. receipt.result availability/IDs are a current projection of retained
+   history, not immutable text or a promise of successful work. Late content
+   remains valid; unavailable replies never trigger command re-execution.
+4. Accept typed approval states, rule_id/note and proposed final-card reason.
+   Session approval_request/approval_closed remain authoritative. Implement
+   rule revoke before exposing a complete session-rule management flow.
+5. Use a jointly updated r8 for incompatible history changes, with required
+   revision/features and shared fixtures. Make incompatible peers fail closed
+   during admission; a welcome-only field old clients ignore is insufficient.
+   No new operation is emitted or advertised before its implementation and
+   fixtures pass on both sides.
 
 ## Implementation and acceptance order
 
-1. Jointly settle the five points above. Astation can build the native chat
-   coordinator and SSE infrastructure against existing events meanwhile;
-   incomplete history must stay visibly pending/unavailable.
-2. Expose Claude conversation history/events through the protected local API,
-   then consume that service from the native chat view. Extend the CLI helper
+1. Resolve the linked r8 review. Astation can build the native chat coordinator,
+   SSE infrastructure and r7.2 integration meanwhile; unavailable capabilities
+   and unconfirmed history remain explicit.
+2. Expose both providers' conversation history/events through the protected
+   local API, then consume that service from the native chat view. Extend the CLI helper
    with watch/history so scripts can exercise the entire flow.
 3. Add approval/receipt notifications and disposable-session integration
-   tests. Atem adds Codex's structured adapter; run the same API contract
-   against both providers before claiming both support chat.
+   tests. Run the same API contract against both providers, including Codex's
+   first-prompt prerequisite, session-scoped rules and revoke.
 4. Follow separately with files under
    [#51](https://github.com/Agora-Build/Astation/issues/51), remote launch or
    restart controls, and multi-device/browser/offline push after their gates.
@@ -220,7 +253,9 @@ overlap and pagination; duplicate/out-of-order parts and replacement approvals;
 late content after completion; missing/withdrawn capability; API disconnect
 immediately after submit; reconnect/reset and broker restart without replay;
 an expired/unknown cursor; slow event consumers; lease expiry/local takeover;
-real Claude allow once/exact always allow/deny and Codex allow once/deny;
+real Claude allow once/exact always allow/deny and Codex allow once/session
+always allow/deny/revoke; auto_allowed cards without a pending approval;
 terminal answer racing remote; expiry and duplicate catch-up; revocation while
-events/answers are queued; and strict local API admission for every new route.
+events/answers are queued; incompatible-revision rejection; and strict local
+API admission for every new route. Include the four response-review fixtures.
 Assert actual agent effects and durable receipts, not only HTTP success.
