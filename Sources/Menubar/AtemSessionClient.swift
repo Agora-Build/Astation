@@ -5,17 +5,27 @@ struct AtemSessionContext: Equatable {
     let account: String
     let device: String
     let pairingSession: String
+    let transportGeneration: String
+
+    init(route: RemoteTerminalConnection, account: String, device: String, pairingSession: String,
+         transportGeneration: String? = nil) {
+        self.route = route
+        self.account = account
+        self.device = device
+        self.pairingSession = pairingSession
+        self.transportGeneration = transportGeneration ?? route.connectionId
+    }
 }
 
 /// Compatibility mode only: this context must come from the hub's existing
 /// authenticated, safety-code-verified connection. Section 9 features stay off.
 final class AtemSessionClient {
-    enum Phase: Equatable { case offline, connecting, ready, failed }
+    enum Phase: Equatable { case offline, connecting, reconnecting, ready, failed }
     struct ConnectionStatus: Equatable {
         let phase: Phase
         let message: String
         let hasRegistrySnapshot: Bool
-        let canRetryHello: Bool
+        let canReconnect: Bool
     }
     private(set) var phase: Phase = .offline
     private(set) var status = "Connect a verified Atem to use sessions."
@@ -40,6 +50,7 @@ final class AtemSessionClient {
     }
     private let currentContext: () -> AtemSessionContext?
     private let sendMessage: (AtemSessionMessage, RemoteTerminalConnection) -> Bool
+    private let reconnectTransport: (AtemSessionContext) -> Bool
     private let now: () -> TimeInterval
     private let makeID: () -> String
     let journal: AtemSessionJournal
@@ -54,12 +65,12 @@ final class AtemSessionClient {
     private var resyncing = true
     private var tombstones: [String: Set<String>] = [:]
     private var started = false
-    private var helloUnauthorized = false
+    private var lastHelloContext: AtemSessionContext?
     private var lastReceiptQuery: TimeInterval = 0
     var hasRegistrySnapshot: Bool { phase == .ready && !resyncing }
     var connectionStatus: ConnectionStatus {
         ConnectionStatus(phase: phase, message: status, hasRegistrySnapshot: hasRegistrySnapshot,
-            canRetryHello: phase == .failed && welcome == nil && helloUnauthorized)
+            canReconnect: phase == .failed && context != nil && context == currentContext() && !journal.loadFailed)
     }
     var canReviewApprovals: Bool {
         hasRegistrySnapshot && context == currentContext() && now() < authorizationDeadline
@@ -70,9 +81,11 @@ final class AtemSessionClient {
          send: @escaping (AtemSessionMessage, RemoteTerminalConnection) -> Bool,
          journal: AtemSessionJournal = AtemSessionJournal(),
          makeID: @escaping () -> String = { UUID().uuidString.lowercased() },
-         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         reconnect: @escaping (AtemSessionContext) -> Bool = { _ in false }) {
         currentContext = context
         sendMessage = send
+        reconnectTransport = reconnect
         self.journal = journal
         self.now = now
         self.makeID = makeID
@@ -85,8 +98,26 @@ final class AtemSessionClient {
         let current = currentContext()
         guard current != context else { return }
         context = current
+        clearAttachment()
+        phase = current == nil ? .offline : .connecting
+        status = current == nil ? "Atem is offline. Unconfirmed requests will only be queried, never replayed."
+            : "Opening an authenticated Atem session..."
+        guard let current else { changed(); return }
+        guard !journal.loadFailed else {
+            fail("Session recovery metadata is unreadable. Remote control is disabled."); changed(); return
+        }
+        if let previous = lastHelloContext, previous.route == current.route,
+           previous.transportGeneration == current.transportGeneration {
+            reconnect()
+            return
+        }
+        lastHelloContext = current
+        _ = request(AtemSessionMessage(op: "hello"))
+        changed()
+    }
+
+    private func clearAttachment() {
         welcome = nil
-        helloUnauthorized = false
         registry = [:]
         approvals = [:]
         closedApprovals = [:]
@@ -100,13 +131,19 @@ final class AtemSessionClient {
         runtimeGeneration = nil
         tombstones = [:]
         resyncing = true
-        phase = current == nil ? .offline : .connecting
-        status = current == nil ? "Atem is offline. Unconfirmed requests will only be queried, never replayed."
-            : "Opening an authenticated Atem session..."
-        guard current != nil else { changed(); return }
-        guard !journal.loadFailed else { fail("Session recovery metadata is unreadable. Remote control is disabled."); return }
-        _ = request(AtemSessionMessage(op: "hello"))
+        authorizationDeadline = 0
+    }
+
+    private func reconnect() {
+        guard let context, context == currentContext(), !journal.loadFailed else { return }
+        clearAttachment()
+        phase = .reconnecting
+        status = "Session reset; reconnecting..."
         changed()
+        if !reconnectTransport(context) {
+            fail("Session reset. Reconnect this Atem to open a fresh session connection.")
+            changed()
+        }
     }
 
     func target(sessionId: String, process: String) -> AtemSessionTarget? {
@@ -178,7 +215,8 @@ final class AtemSessionClient {
     }
 
     @discardableResult
-    func submit(_ target: AtemSessionTarget, kind: String, text: String? = nil) -> String? {
+    func submit(_ target: AtemSessionTarget, kind: String, text: String? = nil,
+                requestID: String = UUID().uuidString.lowercased()) -> String? {
         guard pending.count < 64, let binding = binding(for: target, mutation: true), ["prompt", "interrupt", "stop"].contains(kind) else { return nil }
         if kind == "prompt", registry[target.session_id]?.capabilities.contains("chat-v1") != true {
             status = "This agent accepts terminal input only. Type or paste in its terminal."
@@ -188,7 +226,7 @@ final class AtemSessionClient {
         let payload: AtemSessionJSON = kind == "prompt" ? .object(["text": .string(text ?? "")]) : .object([:])
         var message = AtemSessionMessage(op: "submit")
         message.binding = binding
-        message.request_id = UUID().uuidString.lowercased()
+        message.request_id = requestID
         message.kind = kind
         message.payload = payload
         return submitDurably(message)
@@ -205,7 +243,8 @@ final class AtemSessionClient {
 
     @discardableResult
     func answerApproval(_ approval: AtemApprovalRequest, decision: AtemApprovalAnswer.Decision,
-                        ruleID: String? = nil, message: String? = nil) -> String? {
+                        ruleID: String? = nil, message: String? = nil,
+                        requestID: String = UUID().uuidString.lowercased()) -> String? {
         guard pending.count < 64, canAnswer(approval),
               let target = target(sessionId: approval.session_id, process: approval.process_gen),
               let binding = binding(for: target, mutation: false) else { return nil }
@@ -216,7 +255,7 @@ final class AtemSessionClient {
         let answer = AtemApprovalAnswer(approvalID: approval.approval_id, decision: decision, ruleID: ruleID, message: message)
         var submit = AtemSessionMessage(op: "submit")
         submit.binding = binding
-        submit.request_id = UUID().uuidString.lowercased()
+        submit.request_id = requestID
         submit.kind = "approval"
         submit.payload = answer.payload
         return submitDurably(submit, approvalID: approval.approval_id)
@@ -228,6 +267,11 @@ final class AtemSessionClient {
             try message.validate()
             let record = AtemSessionRequestRecord(requestId: message.request_id!, target: target, kind: kind,
                 digest: try payload.digest(), approvalID: approvalID)
+            if let previous = journal.snapshot.requests.first(where: { $0.requestId == record.requestId }) {
+                guard previous.target == record.target, previous.kind == record.kind,
+                      previous.digest == record.digest, previous.approvalID == record.approvalID else { return nil }
+                return previous.requestId
+            }
             // Persist the identity before sending. Reconnect uses receipt_query;
             // prompt text is never stored or automatically submitted again.
             try journal.update { state in
@@ -246,14 +290,8 @@ final class AtemSessionClient {
     }
 
     func refresh() {
-        // A pairing-time refusal has never welcomed an attachment. The verified
-        // context may now be usable, but a welcomed attachment must reconnect.
-        if connectionStatus.canRetryHello, context != nil, context == currentContext() {
-            helloUnauthorized = false
-            phase = .connecting
-            status = "Retrying the authenticated Atem session..."
-            _ = request(AtemSessionMessage(op: "hello"))
-            changed()
+        if connectionStatus.canReconnect {
+            reconnect()
             return
         }
         guard phase == .ready else { return }
@@ -262,7 +300,7 @@ final class AtemSessionClient {
     }
 
     func receive(_ message: AtemSessionMessage, from source: RemoteTerminalConnection) {
-        guard context?.route == source, context == currentContext(), phase != .failed else { return }
+        guard context?.route == source, context == currentContext(), phase != .failed, phase != .reconnecting else { return }
         do {
             try message.validate()
             if message.op == "welcome" {
@@ -270,19 +308,16 @@ final class AtemSessionClient {
                 try acceptWelcome(message); changed(); return
             }
             if message.op == "error", message.re == nil {
+                if message.code == "unauthorized", welcome != nil { reconnect(); return }
                 status = "Atem: " + AtemSessionWire.diagnosticErrorCode(message.code)
-                helloUnauthorized = phase == .connecting && welcome == nil && message.code == "unauthorized"
                 if phase == .connecting || ["unauthorized", "paused", "unsupported_version"].contains(message.code ?? "") {
-                    fail(status + (helloUnauthorized ? ". Complete verification, then retry the session connection."
-                        : ". Reconnect with matching Astation and Atem builds."))
+                    fail(status + ". Reconnect the session with matching Astation and Atem builds.")
                 }
                 changed(); return
             }
             if phase == .connecting, message.op == "error", let re = message.re, pending[re]?.message.op == "hello" {
-                helloUnauthorized = welcome == nil && message.code == "unauthorized"
                 fail("Atem could not open a session: " + AtemSessionWire.diagnosticErrorCode(message.code)
-                    + (helloUnauthorized ? ". Complete verification, then retry the session connection."
-                        : ". Reconnect to open a new authenticated attachment.")); changed(); return
+                    + ". Reconnect to open a fresh session connection."); changed(); return
             }
             guard phase == .ready, now() < authorizationDeadline else { return }
             switch message.op {
@@ -561,8 +596,10 @@ final class AtemSessionClient {
             leases.removeValue(forKey: target.session_id)
             pending = pending.filter { $0.value.message.binding?.target != target || !["acquire", "renew"].contains($0.value.message.op) }
         }
-        status = "Atem: " + code
-        if ["unauthorized", "paused", "unsupported_version"].contains(code) {
+        status = "Atem: " + AtemSessionWire.diagnosticErrorCode(code)
+        if code == "unauthorized", welcome != nil {
+            reconnect()
+        } else if ["unauthorized", "paused", "unsupported_version"].contains(code) {
             fail("Session access refused (" + code + "). Reconnect the verified Atem with matching builds.")
         } else if ["session_closed", "stale_target", "unknown_session"].contains(code) { refresh() }
         changed()

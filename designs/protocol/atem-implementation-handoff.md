@@ -40,10 +40,22 @@ The later #72 commit `61b4b4b` changes PTY stop grace only, with no wire changes
 - Connections shows session handshake failures and allowlisted error codes.
   Pairing-code sockets transfer pairing credentials but never enter the online
   Atem list or become a session/control target.
-- A hello refused as unauthorized before any accepted welcome may retry after
-  verification or an explicit request, using a fresh id and the still-verified
-  authenticated context. There is no timer retry. Stale hello replies are
-  ignored. An already welcomed attachment must reconnect after failure.
+- Retry Session Connection closes/reopens the transport, completes fresh relay
+  key verification and saved-session authentication, then sends one hello.
+  Sleep fences attachment/control state and closes the sockets; wake reconnects.
+  A post-welcome unauthorized reply reconnects once. Initial refusals stop
+  without a retry loop or misleading verification instruction. A local socket
+  generation fences recovery even when Atem's connection_id stays unchanged.
+  No hello is repeated on the old socket. r7.1 replacement hello remains gated
+  until its published contract and shared fixture land.
+- The optional [local API](../../docs/local-control-api.md) lists sessions,
+  cards and receipts and submits controlled prompts/approval answers through
+  the same native client. It is disabled by default, loopback-only and requires
+  a protected same-user bearer key. UUID retries are idempotent.
+- Astation has no VisualizeRequest/VisualizeResult types, senders or handlers;
+  Atem may remove its remaining types/stub. See the
+  [account trust review](account-trust-review.md) and
+  [host push proof proposal](approval-push-proof.md) for the remaining joint gate.
 
 ## Local validation
 
@@ -53,7 +65,7 @@ The provisioned personal-team `Astation Local.app` runs from
 Strict signature checks and bundled transcription/terminal resource checks
 pass. The profile has no APNs entitlement; only offline push is disabled.
 
-On 2026-10-16 at 19:56 local, the verified Genie link completes
+On 2026-10-16 at 21:31:54 (app log time), the rebuilt provisioned Genie link completes
 `hello -> welcome -> list -> sessions`. Connections shows exactly one online
 Atem, `relay:Genie`, with:
 
@@ -67,11 +79,21 @@ verification succeeds. The spurious `relay:TZAZ-Y9W6` row came from Astation
 adding its own pairing transport as an online Atem, rather than evidence of a
 second Atem runtime socket.
 
-There are 119 passing focused tests. The full Swift suite executes 879 tests,
+There are 73 passing focused reconnect/API/approval tests. The full Swift suite executes 893 tests,
 11 environment-dependent skips, zero failures. The skips cover provisioned
 XCTest/Keychain, live capture and optional local model integrations; they do
-not represent a live APNs or agent-approval test. No agent command or approval
-decision was sent during this live discovery check.
+not represent a live APNs or agent-approval test. A harmless print-only prompt
+was submitted to the existing `atem-jt-proj` Claude test session through the
+local API and received a completed receipt. Control was released. An identical
+UUID retry returned the same request; changed bytes were refused. No approval
+card was emitted, so no approval decision was sent and the live allow/deny
+matrix still needs an actual permission-triggering test prompt from Atem.
+
+Relay push-related tests pass (16 tests; two database integration tests remain
+ignored without their database fixture). A local memory update was saved as
+`mem_195b9f19d21046afb2255ca8273dbb7b`, but relay synchronization was refused
+because it does not match the account encryption mode. Use these hosted docs
+for cross-machine coordination; do not assume the memory reached Atem.
 
 Production is unchanged: health reports main `9245603`, two replicas and Redis
 OK. Relay account registration still refuses the Agora verifier configuration

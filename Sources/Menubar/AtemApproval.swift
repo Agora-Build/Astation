@@ -11,7 +11,7 @@ struct AtemApprovalRule: Codable, Equatable {
     }
 }
 
-struct AtemApprovalRequest: Equatable {
+struct AtemApprovalRequest: Codable, Equatable {
     let approval_id: String
     let session_id: String
     let process_gen: String

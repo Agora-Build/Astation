@@ -31,12 +31,12 @@ Status: native r7 integration implemented against Atem PR #72 at
 semantics are retained; approval messages follow r7 with no legacy fallback.
 Relay host ingress and account-wide fanout remain gated.
 
-Pairing can finish after an initial session hello was refused as unauthorized.
-Permit a fresh hello only if no welcome was ever accepted on that attachment,
-the authenticated verified context still matches and the last hello was refused
-as unauthorized. Verification completion or an explicit retry may trigger it;
-there is no timer retry. A welcomed attachment must reconnect after failure.
-Never restore leases or replay submissions while recovering discovery.
+Recovery closes and reopens the transport before a new hello, including an
+initial pairing-time refusal. Retry uses fresh relay/session authentication;
+there is no same-socket or timer hello retry. Sleep closes transports and fences
+authority; a post-welcome unauthorized reply reconnects once. A local socket
+generation supplements the surviving host connection id. Never restore leases
+or replay submissions. See the [recovery plan](2026-10-16-session-reconnect.md).
 
 ## Lifecycle and security invariants
 

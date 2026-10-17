@@ -60,8 +60,12 @@ class AstationHubManager: ObservableObject {
     /// The current identity relay socket. Relay control frames are only
     /// accepted from, and binding messages only sent on, this socket. Main thread.
     private var identityRelayTask: IdentityRelaySocket?
+    private var identityRelaySocketGeneration = UUID().uuidString
     private let makeIdentityRelayTask: (URL) -> IdentityRelaySocket
     private let makePairingRelayTask: (URL) -> IdentityRelaySocket
+    private let workspaceNotifications: NotificationCenter
+    private var systemIsSleeping = false
+    private var resumeRelayAfterSleep = false
     /// Installed once; relay sends resolve identityRelayTask when they execute.
     private var identityRelaySendHandlerInstalled = false
     /// True once the relay answered `relayAuthResult` registered|verified on
@@ -148,6 +152,7 @@ class AstationHubManager: ObservableObject {
     /// Callback for sending a message to a specific client by ID.
     /// Set by AstationApp after wiring up the WebSocket server.
     var sendHandler: ((AstationMessage, String) -> Void)?
+    var disconnectDirectClient: ((String) -> Void)?
     var terminalMessageHandler: ((RemoteTerminalMessage, RemoteTerminalConnection) -> Void)?
     var sessionMessageHandler: ((AtemSessionMessage, RemoteTerminalConnection) -> Void)?
     var sessionStateDidChange: ((String) -> Void)?
@@ -185,12 +190,14 @@ class AstationHubManager: ObservableObject {
         },
         dispatchMigration: @escaping (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) },
         makeIdentityRelayTask: @escaping (URL) -> IdentityRelaySocket = { URLSession.shared.webSocketTask(with: $0) },
-        makePairingRelayTask: @escaping (URL) -> IdentityRelaySocket = { URLSession.shared.webSocketTask(with: $0) }
+        makePairingRelayTask: @escaping (URL) -> IdentityRelaySocket = { URLSession.shared.webSocketTask(with: $0) },
+        workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter
     ) {
         self.deviceSessionStore = deviceSessionStore
         self.sessionStore = sessionStore
         self.makeIdentityRelayTask = makeIdentityRelayTask
         self.makePairingRelayTask = makePairingRelayTask
+        self.workspaceNotifications = workspaceNotifications
         self.relayIdentityKeyManager = relayIdentityKeyManager
         self.relayIdentityRepairDefaults = relayIdentityRepairDefaults
         self.atemE2EIdentity = atemE2EIdentity ?? AtemE2EIdentity(storage: AtemIdentityKeychainStorage(astationId: AstationIdentity.shared.id))
@@ -223,6 +230,10 @@ class AstationHubManager: ObservableObject {
             name: .credentialsChanged,
             object: nil
         )
+        workspaceNotifications.addObserver(self, selector: #selector(systemWillSleep),
+            name: NSWorkspace.willSleepNotification, object: nil)
+        workspaceNotifications.addObserver(self, selector: #selector(systemDidWake),
+            name: NSWorkspace.didWakeNotification, object: nil)
         self.relayIdentityKeyManager.onChange = { [weak self] state in
             self?.finishRelayIdentityKeyLoad(state)
         }
@@ -242,6 +253,7 @@ class AstationHubManager: ObservableObject {
     }
 
     deinit {
+        workspaceNotifications.removeObserver(self)
         sessionTimer?.invalidate()
         sessionExpiryTimer?.invalidate()
         identityRelayPathMonitor?.cancel()
@@ -1144,6 +1156,15 @@ class AstationHubManager: ObservableObject {
         sessionClient(for: clientId)?.refresh()
     }
 
+    func localControlAPI(key: LocalAPIKey, inbox: ApprovalInbox) -> LocalControlAPI {
+        LocalControlAPI(key: key, clients: { [weak self] in
+            guard let self else { return [:] }
+            return Dictionary(uniqueKeysWithValues: self.connectedClients.compactMap { connected in
+                self.sessionClient(for: connected.id).map { (connected.id, $0) }
+            })
+        }, inbox: inbox, records: { [weak self] in self?.sessionJournal.snapshot.requests ?? [] })
+    }
+
     func sessionClient(for clientId: String, atemId: String? = nil) -> AtemSessionClient? {
         dispatchPrecondition(condition: .onQueue(.main))
         guard let context = sessionContext(for: clientId, atemId: atemId) else { return nil }
@@ -1151,7 +1172,8 @@ class AstationHubManager: ObservableObject {
         if let client = nativeSessionClients[id] { client.connectionChanged(); return client }
         let client = AtemSessionClient(context: { [weak self] in self?.sessionContext(for: id) },
             send: { [weak self] message, route in self?.sendSessionMessage(message, to: route) ?? false },
-            journal: sessionJournal)
+            journal: sessionJournal,
+            reconnect: { [weak self] context in self?.reconnectSessionTransport(context) ?? false })
         nativeSessionClients[id] = client
         client.onChange = { [weak self, weak client] in
             guard let self, let client else { return }
@@ -1213,6 +1235,7 @@ class AstationHubManager: ObservableObject {
 
     func terminalConnection(for clientId: String, atemId: String? = nil) -> RemoteTerminalConnection? {
         dispatchPrecondition(condition: .onQueue(.main))
+        guard !systemIsSleeping else { return nil }
         let sameTransport: (ConnectedClient) -> Bool = {
             $0.id.hasPrefix("relay-") == clientId.hasPrefix("relay-")
         }
@@ -1273,7 +1296,8 @@ class AstationHubManager: ObservableObject {
         guard let route = terminalConnection(for: clientId, atemId: atemId),
               let client = connectedClients.first(where: { $0.id == route.clientId }),
               let device = client.atemId, let session = client.authenticationSessionId else { return nil }
-        return AtemSessionContext(route: route, account: e2eDataAccount, device: device, pairingSession: session)
+        return AtemSessionContext(route: route, account: e2eDataAccount, device: device, pairingSession: session,
+            transportGeneration: clientId.hasPrefix("relay-") ? identityRelaySocketGeneration : route.connectionId)
     }
 
     @discardableResult
@@ -1557,10 +1581,51 @@ class AstationHubManager: ObservableObject {
 
     // MARK: - Identity Relay (persistent background relay for TUI auto-reconnect)
 
+    private func reconnectSessionTransport(_ expected: AtemSessionContext) -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard !systemIsSleeping, sessionContext(for: expected.route.clientId) == expected else { return false }
+        if expected.route.clientId.hasPrefix("relay-") {
+            Log.info("[Sessions] Resetting the relay transport for fresh session authentication")
+            pauseIdentityRelay()
+            startIdentityRelay()
+        } else {
+            guard let disconnectDirectClient else { return false }
+            Log.info("[Sessions] Closing the direct transport for fresh session authentication")
+            disconnectDirectClient(expected.route.clientId)
+            removeClient(withId: expected.route.clientId)
+        }
+        return true
+    }
+
+    @objc private func systemWillSleep() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard !systemIsSleeping else { return }
+        systemIsSleeping = true
+        resumeRelayAfterSleep = identityRelayReconnectGeneration > 0
+        Log.info("[Sessions] Mac sleeping; closing session transports and releasing local authority")
+        refreshSessionConnections()
+        pauseIdentityRelay()
+        for client in connectedClients where !client.id.hasPrefix("relay-") {
+            disconnectDirectClient?(client.id)
+            removeClient(withId: client.id)
+        }
+    }
+
+    @objc private func systemDidWake() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard systemIsSleeping else { return }
+        systemIsSleeping = false
+        if resumeRelayAfterSleep {
+            resumeRelayAfterSleep = false
+            Log.info("[Sessions] Mac woke; reconnecting the relay before session discovery")
+            startIdentityRelay()
+        }
+    }
+
     /// Connect to the relay using this Astation's own identity as the room code.
     /// Atem stores the identity after first pairing and uses it for TUI auto-connect.
     func startIdentityRelay() {
-        guard !identityRelayActive else { return }
+        guard !systemIsSleeping, !identityRelayActive else { return }
 
         // Start NWPathMonitor once — fires when network comes back, enabling
         // immediate reconnect without polling. No battery overhead while offline.
@@ -1582,6 +1647,7 @@ class AstationHubManager: ObservableObject {
         let task = makeIdentityRelayTask(url)
         task.resume()
         identityRelayTask = task
+        identityRelaySocketGeneration = UUID().uuidString
         identityRelayVerified = false
         pendingRelayChallenge = nil
         startSessionExpiryTimerIfNeeded()
@@ -1762,6 +1828,7 @@ class AstationHubManager: ObservableObject {
         terminalConnectionsDidChange?()
         let wasVerified = identityRelayVerified
         identityRelayTask = nil
+        identityRelaySocketGeneration = UUID().uuidString
         identityRelayVerified = false
         pendingRelayChallenge = nil
         identityRelayActive = false
@@ -1984,6 +2051,7 @@ class AstationHubManager: ObservableObject {
     private func pauseIdentityRelay() {
         let task = identityRelayTask
         identityRelayTask = nil
+        identityRelaySocketGeneration = UUID().uuidString
         identityRelayVerified = false
         identityRelayActive = false
         pendingRelayChallenge = nil
@@ -1991,6 +2059,7 @@ class AstationHubManager: ObservableObject {
         connectedClients.filter { $0.id.hasPrefix("relay-") }.forEach { removeClient(withId: $0.id) }
         identityRelayAuthentication.removeAll()
         browserAgentChat.invalidateAll()
+        refreshSessionConnections()
         terminalConnectionsDidChange?()
         task?.cancel(with: .goingAway, reason: nil)
     }

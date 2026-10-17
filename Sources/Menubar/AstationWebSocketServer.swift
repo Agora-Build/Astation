@@ -17,6 +17,11 @@ class AstationWebSocketServer {
     private var authenticatedSessionIds: [String: String] = [:]
     private var pendingAuthentication: [String: DirectAuthenticationContext] = [:]
     private var pairingClients: Set<String> = []
+    private var localControlAPI: LocalControlAPI?
+
+    func configureLocalControlAPI(_ api: LocalControlAPI) {
+        executeOnStateEventLoop { self.localControlAPI = api }
+    }
 
     init(
         hubManager: AstationHubManager,
@@ -51,7 +56,7 @@ class AstationWebSocketServer {
             .serverChannelOption(ChannelOptions.backlog, value: 256)
             .serverChannelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
             .childChannelInitializer { channel in
-                let httpHandler = HTTPHandler()
+                let httpHandler = HTTPHandler(api: { [weak self] in self?.localControlAPI })
                 let config = NIOHTTPServerUpgradeConfiguration(
                     upgraders: [upgrader],
                     completionHandler: { _ in
@@ -432,6 +437,13 @@ class AstationWebSocketServer {
         }
     }
 
+    func disconnectClientForSessionReset(_ clientId: String) {
+        executeOnStateEventLoop {
+            guard self.authenticatedClients.contains(clientId) else { return }
+            _ = self.connectedClients[clientId]?.close(code: .goingAway)
+        }
+    }
+
     func broadcastMessage(_ message: AstationMessage) {
         executeOnStateEventLoop {
             self.broadcastMessageOnEventLoop(message)
@@ -479,7 +491,7 @@ class AstationWebSocketServer {
     }
 }
 
-private enum DirectConnectionScope: String {
+enum DirectConnectionScope: String {
     case loopback
     case lan
 
@@ -502,21 +514,61 @@ private struct DirectAuthenticationContext {
 private final class HTTPHandler: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
-    
+    private let api: () -> LocalControlAPI?
+    private var acceptedAPI: LocalControlAPI?
+    private var request: HTTPRequestHead?
+    private var body = Data()
+    private var responding = false
+
+    init(api: @escaping () -> LocalControlAPI?) { self.api = api }
+
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        guard !responding else { return }
         let reqPart = unwrapInboundIn(data)
         
         switch reqPart {
         case .head(let request):
-            if request.uri != "/ws" {
-                // Send 404 for non-WebSocket requests
-                let headers = HTTPHeaders([("content-length", "0")])
-                let head = HTTPResponseHead(version: request.version, status: .notFound, headers: headers)
-                context.write(wrapOutboundOut(.head(head)), promise: nil)
-                context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
+            guard self.request == nil else { respond(.error("invalid_request", status: .badRequest), context: context); return }
+            guard request.uri.hasPrefix("/api/v1/"), let api = api() else {
+                respond(.error("not_found", status: .notFound), context: context); return
             }
-        case .body, .end:
-            break
+            guard api.key.authorizes(request, peerAddress: context.remoteAddress?.ipAddress) else {
+                respond(.error("unauthorized", status: .unauthorized), context: context); return
+            }
+            if request.method == .POST, request.headers["content-type"] != ["application/json"] {
+                respond(.error("json_required", status: .unsupportedMediaType), context: context); return
+            }
+            self.request = request
+            acceptedAPI = api
+        case .body(var buffer):
+            guard body.count + buffer.readableBytes <= LocalControlAPI.maximumBody else {
+                respond(.error("body_too_large", status: .payloadTooLarge), context: context); return
+            }
+            body.append(contentsOf: buffer.readBytes(length: buffer.readableBytes) ?? [])
+        case .end:
+            guard let request, let api = acceptedAPI else { return }
+            responding = true
+            let body = self.body
+            let channel = context.channel
+            DispatchQueue.main.async {
+                let response = api.handle(method: request.method, path: request.uri, body: body)
+                channel.eventLoop.execute { self.write(response, channel: channel) }
+            }
         }
+    }
+
+    private func respond(_ response: LocalAPIResponse, context: ChannelHandlerContext) {
+        responding = true
+        write(response, channel: context.channel)
+    }
+
+    private func write(_ response: LocalAPIResponse, channel: Channel) {
+        let headers = HTTPHeaders([("content-type", "application/json"), ("content-length", String(response.body.count)),
+                                   ("cache-control", "no-store"), ("connection", "close"), ("x-content-type-options", "nosniff")])
+        channel.write(HTTPServerResponsePart.head(HTTPResponseHead(version: .http1_1, status: response.status, headers: headers)), promise: nil)
+        var buffer = channel.allocator.buffer(capacity: response.body.count)
+        buffer.writeBytes(response.body)
+        channel.write(HTTPServerResponsePart.body(.byteBuffer(buffer)), promise: nil)
+        channel.writeAndFlush(HTTPServerResponsePart.end(nil)).whenComplete { _ in channel.close(promise: nil) }
     }
 }

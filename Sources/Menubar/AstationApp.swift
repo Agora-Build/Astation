@@ -156,6 +156,9 @@ class AstationApp: NSObject, NSApplicationDelegate {
         hubManager.sendHandler = { [weak webSocketServer] message, clientId in
             webSocketServer?.sendMessageToClient(message, clientId: clientId)
         }
+        hubManager.disconnectDirectClient = { [weak webSocketServer] clientId in
+            webSocketServer?.disconnectClientForSessionReset(clientId)
+        }
         hubManager.sessionsRemovedHandler = { [weak webSocketServer] sessionIds in
             webSocketServer?.disconnectClients(authenticatedWith: sessionIds)
         }
@@ -206,6 +209,15 @@ class AstationApp: NSObject, NSApplicationDelegate {
                 }
             })
         approvalNotifications = notifications
+        if let file = ProcessInfo.processInfo.environment["ASTATION_LOCAL_API_TOKEN_FILE"] {
+            do {
+                let key = try LocalAPIKey(file: file)
+                webSocketServer.configureLocalControlAPI(hubManager.localControlAPI(key: key, inbox: notifications.inbox))
+                Log.info("[Local API] Authenticated loopback automation enabled")
+            } catch {
+                Log.error("[Local API] Disabled: token file must be a same-user regular file with mode 0600 and a 32-byte hex token")
+            }
+        }
         hubManager.approvalSessionDidChange = { [weak notifications] source, client, host in
             notifications?.sessionChanged(sourceID: source, client: client, host: host)
         }

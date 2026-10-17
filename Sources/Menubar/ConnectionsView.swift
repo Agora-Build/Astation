@@ -410,7 +410,7 @@ private struct AgentListPanel: View {
                         Button("Refresh") { hubManager.requestAgentList(from: id) }
                             .buttonStyle(.borderless)
                             .font(.caption)
-                            .disabled(accessBlockReason != nil || (sessionStatus?.phase != .ready && sessionStatus?.canRetryHello != true))
+                            .disabled(accessBlockReason != nil || (sessionStatus?.phase != .ready && sessionStatus?.canReconnect != true))
                     }
                 }
             }
@@ -456,21 +456,22 @@ private struct AgentListPanel: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let sessionStatus, !sessionStatus.hasRegistrySnapshot {
                 VStack(spacing: 12) {
-                    if sessionStatus.phase == .connecting || sessionStatus.phase == .ready {
+                    if [.connecting, .reconnecting, .ready].contains(sessionStatus.phase) {
                         ProgressView()
                     } else {
                         Image(systemName: "exclamationmark.triangle")
                             .font(.system(size: 32))
                             .foregroundColor(.secondary)
                     }
-                    Text(sessionStatus.phase == .failed ? "Session connection failed" : "Loading sessions")
+                    Text(sessionStatus.phase == .failed ? "Session connection failed"
+                         : sessionStatus.phase == .reconnecting ? "Reconnecting sessions" : "Loading sessions")
                         .font(.headline)
                     Text(sessionStatus.message)
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
                         .textSelection(.enabled)
-                    if sessionStatus.canRetryHello, let id = clientId {
+                    if sessionStatus.canReconnect, let id = clientId {
                         Button("Retry Session Connection") { hubManager.requestAgentList(from: id) }
                             .buttonStyle(.borderedProminent)
                     }

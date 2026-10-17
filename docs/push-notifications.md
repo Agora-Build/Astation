@@ -12,6 +12,13 @@ lease must already exist to receive an approval. See the
 [implementation handoff](../designs/protocol/push-approvals-handoff.md) for the
 remaining wire-contract gates.
 
+The [local approval API](local-control-api.md) supports headless integration
+tests using the real native inbox and durable journal. Mobile UI is unnecessary
+for session/answer/reconnect tests. See the [account-trust review](../designs/protocol/account-trust-review.md)
+and [host push proof draft](../designs/protocol/approval-push-proof.md) before
+enabling relay host ingress or account-wide recipients. Neither an API test nor
+a provider fake establishes real APNs delivery.
+
 ## Current implementation boundary
 
 - **In-app alerts** show a nonmodal banner and an approval inbox while Astation

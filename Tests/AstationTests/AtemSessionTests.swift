@@ -1,4 +1,5 @@
 import XCTest
+import NIOHTTP1
 @testable import Menubar
 
 private let sessionID = "ses-aaaaaaaaaaaa"
@@ -23,6 +24,7 @@ private final class SessionFixture {
     var source: AtemSessionContext? = AtemSessionContext(route: RemoteTerminalConnection(clientId: "host", connectionId: "socket-1"),
         account: "account-a", device: "host-a", pairingSession: "pairing-1")
     var sent: [AtemSessionMessage] = []
+    var reconnects: [AtemSessionContext] = []
     var nextID: String?
     var canSend = true
     let disk: SessionDisk
@@ -32,7 +34,10 @@ private final class SessionFixture {
     }, journal: disk.journal(), makeID: {
         defer { self.nextID = nil }
         return self.nextID ?? UUID().uuidString.lowercased()
-    }, now: { self.time })
+    }, now: { self.time }, reconnect: { context in
+        self.reconnects.append(context)
+        return true
+    })
 
     init(disk: SessionDisk = SessionDisk()) { self.disk = disk }
     var route: RemoteTerminalConnection { source!.route }
@@ -124,6 +129,93 @@ private extension SessionFixture {
         var message = AtemSessionMessage(op: "approval_closed")
         message.approval_id = id; message.reason = reason
         try receive(message)
+    }
+}
+
+@MainActor
+final class LocalControlAPISessionTests: XCTestCase {
+    private func api(_ f: SessionFixture) throws -> LocalControlAPI {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: file) }
+        try Data(String(repeating: "ab", count: 32).utf8).write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        let inbox = ApprovalInbox()
+        f.client.onChange = { inbox.sync(sourceID: "host", client: f.client, host: "Test host") }
+        inbox.sync(sourceID: "host", client: f.client, host: "Test host")
+        return LocalControlAPI(key: try LocalAPIKey(file: file.path), clients: { ["host": f.client] },
+            inbox: inbox, records: { f.disk.state.requests })
+    }
+
+    private func post(_ api: LocalControlAPI, _ path: String, _ object: [String: Any]) throws -> LocalAPIResponse {
+        api.handle(method: .POST, path: "/api/v1/" + path, body: try JSONSerialization.data(withJSONObject: object))
+    }
+
+    private func object<T: Encodable>(_ value: T) throws -> Any { try JSONSerialization.jsonObject(with: JSONEncoder().encode(value)) }
+
+    func testPromptSubmissionsRequireControlAndIdenticalRetriesNeverReplay() throws {
+        let f = SessionFixture(); try f.ready()
+        let api = try api(f)
+        var input: [String: Any] = ["client_id": "host", "target": try object(f.target),
+            "request_id": UUID().uuidString.lowercased(), "kind": "prompt", "text": "one test prompt"]
+        XCTAssertEqual(try post(api, "sessions/submit", input).status, .conflict)
+        try f.takeControl()
+        XCTAssertEqual(try post(api, "sessions/submit", input).status, .accepted)
+        XCTAssertEqual(try post(api, "sessions/submit", input).status, .accepted)
+        XCTAssertEqual(f.sent.filter { $0.op == "submit" }.count, 1)
+        input["text"] = "different prompt"
+        XCTAssertEqual(try post(api, "sessions/submit", input).status, .conflict)
+        XCTAssertEqual(f.sent.filter { $0.op == "submit" }.count, 1)
+        f.source = nil
+        XCTAssertEqual(try post(api, "sessions/submit", input).status, .conflict)
+    }
+
+    func testApprovalAnswersRequireExactSnapshotAndClaudeRuleWithIdempotentRetries() throws {
+        let f = SessionFixture(); try f.ready()
+        let api = try api(f)
+        let rule = AtemApprovalRule(rule_id: "npm-test", label: "Bash(npm test:*)", scope: "this project")
+        let approval = try f.approval(rules: [rule])
+        var input: [String: Any] = ["client_id": "host", "target": try object(f.target),
+            "request_id": UUID().uuidString.lowercased(), "approval": try object(approval), "decision": "allow_always",
+            "rule": try object(rule)]
+        input["rule"] = ["rule_id": rule.rule_id, "label": "Bash(*)", "scope": rule.scope]
+        XCTAssertEqual(try post(api, "approvals/answer", input).status, .badRequest)
+        input["rule"] = try object(rule)
+        XCTAssertEqual(try post(api, "approvals/answer", input).status, .accepted)
+        try f.closeApproval(approval.approval_id, reason: "answered_remote")
+        XCTAssertEqual(try post(api, "approvals/answer", input).status, .accepted)
+        XCTAssertEqual(f.sent.filter { $0.op == "submit" }.count, 1)
+        let list = api.handle(method: .GET, path: "/api/v1/approvals", body: Data())
+        let entries = try XCTUnwrap(JSONSerialization.jsonObject(with: list.body) as? [[String: Any]])
+        XCTAssertEqual(entries.first?["can_answer"] as? Bool, false)
+        input["request_id"] = UUID().uuidString.lowercased()
+        XCTAssertEqual(try post(api, "approvals/answer", input).status, .conflict)
+    }
+
+    func testTerminalAnswerExpiryAndUnknownReceiptCannotBeOverriddenThroughAPI() throws {
+        for reason in ["answered_terminal", "timed_out", "process_ended"] {
+            let f = SessionFixture(); try f.ready()
+            let api = try api(f)
+            let approval = try f.approval()
+            try f.closeApproval(approval.approval_id, reason: reason)
+            let input: [String: Any] = ["client_id": "host", "target": try object(f.target),
+                "request_id": UUID().uuidString.lowercased(), "approval": try object(approval),
+                "decision": "deny", "message": "Test denial"]
+            XCTAssertEqual(try post(api, "approvals/answer", input).status, .conflict)
+            XCTAssertFalse(f.sent.contains { $0.op == "submit" })
+        }
+    }
+
+    func testReceiptQueriesRequireFullTargetAndMalformedBodiesNeverAct() throws {
+        let f = SessionFixture(); try f.ready(); try f.takeControl()
+        let request = try XCTUnwrap(f.client.submit(f.target, kind: "prompt", text: "one prompt"))
+        let api = try api(f)
+        let query: [String: Any] = ["target": try object(f.target), "request_id": request]
+        XCTAssertEqual(try post(api, "receipts/query", query).status, .ok)
+        XCTAssertEqual(try post(api, "receipts/query", ["request_id": request]).status, .badRequest)
+        let duplicate = Data(#"{"client_id":"host","client_id":"other"}"#.utf8)
+        XCTAssertEqual(api.handle(method: .POST, path: "/api/v1/sessions/submit", body: duplicate).status, .badRequest)
+        XCTAssertEqual(api.handle(method: .GET, path: "/api/v1/trust/enroll", body: Data()).status, .notFound)
+        XCTAssertEqual(f.sent.filter { $0.op == "submit" }.count, 1)
     }
 }
 
@@ -542,7 +634,7 @@ final class AtemSessionWireTests: XCTestCase {
 }
 
 final class AtemSessionClientTests: XCTestCase {
-    func testUnauthorizedHelloRetryFencesOldReplyAndNeverRepeatsWelcomedHello() throws {
+    func testUnauthorizedHelloRetryReconnectsTransportAndFencesOldReply() throws {
         for correlated in [false, true] {
             let f = SessionFixture(); f.client.start()
             let first = try XCTUnwrap(f.sent.last?.id)
@@ -550,19 +642,29 @@ final class AtemSessionClientTests: XCTestCase {
             refusal.re = correlated ? first : nil
             refusal.code = "unauthorized"
             try f.receive(refusal)
-            XCTAssertTrue(f.client.connectionStatus.canRetryHello)
+            XCTAssertTrue(f.client.connectionStatus.canReconnect)
+            XCTAssertFalse(f.client.status.contains("Complete verification"))
             f.time = 9; f.client.tick()
             XCTAssertEqual(f.sent.count, 1, "Discovery never retries on a timer")
+            XCTAssertTrue(f.reconnects.isEmpty)
             f.client.refresh()
+            f.client.refresh()
+            XCTAssertEqual(f.reconnects, [f.source!], "Repeated clicks coalesce while reconnecting")
+            XCTAssertEqual(f.sent.count, 1, "Never send a second hello on the old socket")
+            try f.handshake(helloID: first)
+            XCTAssertEqual(f.client.phase, .reconnecting)
+            f.source = AtemSessionContext(route: f.route, account: "account-a", device: "host-a",
+                pairingSession: "pairing-1", transportGeneration: "fresh-mac-socket")
+            f.client.connectionChanged()
             XCTAssertEqual(f.sent.count, 2)
             XCTAssertNotEqual(f.sent.last?.id, first)
-            try f.handshake(helloID: first)
-            XCTAssertEqual(f.client.phase, .connecting, "A reply to the old refused hello grants no authority")
             try f.handshake(); try f.snapshot(); try f.takeControl()
             refusal.re = nil
             try f.receive(refusal)
-            XCTAssertEqual(f.client.phase, .failed)
-            XCTAssertFalse(f.client.connectionStatus.canRetryHello)
+            XCTAssertEqual(f.client.phase, .reconnecting)
+            XCTAssertEqual(f.reconnects.count, 2)
+            XCTAssertFalse(f.client.status.contains("verification"))
+            XCTAssertFalse(f.client.connectionStatus.canReconnect)
             let sent = f.sent.count
             f.client.refresh()
             XCTAssertEqual(f.sent.count, sent)
@@ -580,7 +682,48 @@ final class AtemSessionClientTests: XCTestCase {
         XCTAssertEqual(f.sent.count, 1)
         f.client.tick()
         XCTAssertEqual(f.client.phase, .offline)
-        XCTAssertFalse(f.client.connectionStatus.canRetryHello)
+        XCTAssertFalse(f.client.connectionStatus.canReconnect)
+        XCTAssertTrue(f.reconnects.isEmpty)
+    }
+
+    func testContextRestorationOnSameSocketReconnectsWithoutReplayingRequestsOrControl() throws {
+        let f = SessionFixture()
+        try f.ready(); try f.takeControl()
+        let request = try XCTUnwrap(f.client.submit(f.target, kind: "prompt", text: "run once"))
+        let original = try XCTUnwrap(f.source)
+        f.source = nil; f.client.connectionChanged()
+        XCTAssertFalse(f.client.controls(f.target))
+        f.source = original; f.client.connectionChanged()
+        XCTAssertEqual(f.client.phase, .reconnecting)
+        XCTAssertEqual(f.reconnects, [original])
+        XCTAssertEqual(f.sent.filter { $0.op == "hello" }.count, 1)
+        try f.handshake()
+        XCTAssertNil(f.client.welcome)
+        f.source = AtemSessionContext(route: original.route, account: original.account, device: original.device,
+            pairingSession: original.pairingSession, transportGeneration: "socket-2")
+        f.client.connectionChanged()
+        try f.handshake(attachment: "99999999-9999-4999-8999-999999999999"); try f.snapshot()
+        XCTAssertEqual(f.sent.filter { $0.op == "hello" }.count, 2)
+        XCTAssertEqual(f.sent.filter { $0.op == "submit" }.count, 1)
+        XCTAssertEqual(f.sent.filter { $0.op == "acquire" }.count, 1)
+        XCTAssertEqual(f.sent.last(where: { $0.op == "receipt_query" })?.request_ids, [request])
+        XCTAssertFalse(f.client.controls(f.target))
+    }
+
+    func testPostWelcomeUnauthorizedReplyReconnectsAndDropsControl() throws {
+        let f = SessionFixture()
+        try f.ready(); try f.takeControl()
+        f.client.refresh()
+        var refusal = AtemSessionMessage(op: "error")
+        refusal.re = try XCTUnwrap(f.sent.last?.id); refusal.code = "unauthorized"
+        try f.receive(refusal)
+        XCTAssertEqual(f.client.phase, .reconnecting)
+        XCTAssertEqual(f.reconnects.count, 1)
+        XCTAssertFalse(f.client.controls(f.target))
+        XCTAssertTrue(f.client.registry.isEmpty)
+        XCTAssertEqual(f.sent.filter { $0.op == "hello" }.count, 1)
+        try f.receive(refusal)
+        XCTAssertEqual(f.reconnects.count, 1)
     }
 
     func testViewOnlyAndTerminalOnlyCapabilitiesDoNotOfferUnsupportedSubmissions() throws {
