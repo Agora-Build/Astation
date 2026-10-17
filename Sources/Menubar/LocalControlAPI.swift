@@ -107,7 +107,7 @@ final class LocalControlAPI {
                 guard body.isEmpty else { return .error("invalid_request", status: .badRequest) }
                 switch path {
                 case "/api/v1/status":
-                    return .json(["api": "v1", "session_contract": "r7", "account_wide_access": "gated",
+                    return .json(["api": "v1", "session_contract": "r7.1", "account_wide_access": "gated",
                                   "host_push_ingress": "gated"])
                 case "/api/v1/sessions":
                     let sessions = clients().sorted { $0.key < $1.key }.flatMap { id, client -> [Session] in

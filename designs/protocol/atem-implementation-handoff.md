@@ -2,19 +2,17 @@
 
 Updated 2026-10-16. The consolidated Astation work is in
 [draft PR #50](https://github.com/Agora-Build/Astation/pull/50),
-`feat/push-approvals`, against main. It includes the r6.2 client from the closed
-PR #49 and the native r7 approval inbox. All Atem implementation belongs to the
+`feat/push-approvals`, against main. It includes the session client from the closed
+PR #49 and the native approval inbox, now pinned to r7.1. All Atem implementation belongs to the
 Atem owner; no Atem checkout was modified or built for this integration.
 
-The session base is [Atem #68](https://github.com/Agora-Build/Atem/pull/68),
-tag `atem-session-v1-r6.2`, with no legacy fallback. The current runtime and
-additive r7 approval contract are consolidated in
+The session contract has no legacy fallback. The current runtime and
+r7.1 contract are consolidated in
 [Atem #72](https://github.com/Agora-Build/Atem/pull/72), `feat/session-runtime`.
-Native approval integration pins the published contract at
-`5ce333e505e77429ffbfd443bdb0794b45136a03`
-([protocol](https://github.com/Agora-Build/Atem/blob/5ce333e505e77429ffbfd443bdb0794b45136a03/designs/protocol/atem-session-v1.md),
-[host handoff](https://github.com/Agora-Build/Atem/blob/5ce333e505e77429ffbfd443bdb0794b45136a03/designs/protocol/atem-host-handoff.md)).
-The later #72 commit `61b4b4b` changes PTY stop grace only, with no wire changes.
+The protocol, host handoff and all shared fixtures pin the published contract at
+`6edda2490f4a4b7634edb446f64aa02748e29fa2`
+([protocol](https://github.com/Agora-Build/Atem/blob/6edda2490f4a4b7634edb446f64aa02748e29fa2/designs/protocol/atem-session-v1.md),
+[host handoff](https://github.com/Agora-Build/Atem/blob/6edda2490f4a4b7634edb446f64aa02748e29fa2/designs/protocol/atem-host-handoff.md)).
 
 ## Ready on Astation
 
@@ -22,6 +20,10 @@ The later #72 commit `61b4b4b` changes PTY stop grace only, with no wire changes
   terminal windows and the approval inbox. The registry supplies exact session,
   process, workspace, capability and activity data. Refresh sends session list,
   never agentListRequest or terminal list.
+- The process-state dot is green for running sessions, including Codex with
+  unknown activity. Idle / Working / Waiting / Unknown describe activity
+  separately. Stopped processes remain unavailable; legacy activity alone
+  never claims the process is running.
 - Each new attachment resets sequence, registry, removals, terminal queues,
   pending replies and leases. Durable trust/runtime fences and submission
   recovery metadata survive. Reconnect queries receipts without replaying a
@@ -46,8 +48,12 @@ The later #72 commit `61b4b4b` changes PTY stop grace only, with no wire changes
   A post-welcome unauthorized reply reconnects once. Initial refusals stop
   without a retry loop or misleading verification instruction. A local socket
   generation fences recovery even when Atem's connection_id stays unchanged.
-  No hello is repeated on the old socket. r7.1 replacement hello remains gated
-  until its published contract and shared fixture land.
+  Retry does not repeat hello on the old socket. A recreated client on a
+  surviving authenticated link can receive the r7.1 replacement welcome;
+  old authority is fenced and durable receipts survive. The new shared host
+  fixture is pinned and its request shapes decode with a UUID for ${gen2}.
+  Host admission, dispatch and replacement-rate assertions need Atem's runner;
+  see the [joint test matrix](session-validation.md).
 - The optional [local API](../../docs/local-control-api.md) lists sessions,
   cards and receipts and submits controlled prompts/approval answers through
   the same native client. It is disabled by default, loopback-only and requires
@@ -65,12 +71,15 @@ The provisioned personal-team `Astation Local.app` runs from
 Strict signature checks and bundled transcription/terminal resource checks
 pass. The profile has no APNs entitlement; only offline push is disabled.
 
-On 2026-10-16 at 21:31:54 (app log time), the rebuilt provisioned Genie link completes
+On 2026-10-16, the rebuilt provisioned Genie link completes
 `hello -> welcome -> list -> sessions`. Connections shows exactly one online
 Atem, `relay:Genie`, with:
 
 - Claude `ses-vozq7s7qkbvr`, Idle.
 - Codex `ses-m636w7gytzwx`, activity Unknown as reported by the host.
+
+The user's Connections screenshot confirms both process dots are green while
+the independent labels remain Claude Idle and Codex Unknown.
 
 The earlier 19:42 hello received an error before safety-code verification
 finished. Its old logger hid the error code, so that specific refusal cannot
@@ -79,7 +88,7 @@ verification succeeds. The spurious `relay:TZAZ-Y9W6` row came from Astation
 adding its own pairing transport as an online Atem, rather than evidence of a
 second Atem runtime socket.
 
-There are 73 passing focused reconnect/API/approval tests. The full Swift suite executes 893 tests,
+There are 149 passing focused session/terminal/API/approval/menu tests. The full Swift suite executes 898 tests,
 11 environment-dependent skips, zero failures. The skips cover provisioned
 XCTest/Keychain, live capture and optional local model integrations; they do
 not represent a live APNs or agent-approval test. A harmless print-only prompt
@@ -88,6 +97,17 @@ local API and received a completed receipt. Control was released. An identical
 UUID retry returned the same request; changed bytes were refused. No approval
 card was emitted, so no approval decision was sent and the live allow/deny
 matrix still needs an actual permission-triggering test prompt from Atem.
+
+A second harmless delayed prompt, request
+`afabc6fe-2496-4141-9702-581de0281a7d`, was executing when Astation quit. The
+provisioned app relaunched, authenticated and recovered the original completed
+receipt, with both agents still running and no inherited control. The first
+observed host state was executing, so the exact accepted-before-executing
+disconnect race remains a controlled joint test rather than a claimed result.
+The live expiry test paused Mac renewals for 17.17 seconds without sending
+agent input: the host controller cleared, Astation reported Control expired,
+and control stayed released. A deliberately delayed renewal reply still needs
+host timing control; deterministic client coverage already refuses it.
 
 Relay push-related tests pass (16 tests; two database integration tests remain
 ignored without their database fixture). A local memory update was saved as
@@ -102,14 +122,15 @@ separate account-discovery gate; the saved paired Genie connection works.
 
 ## Joint tests remaining
 
-1. Use the same #72 runtime for pair/verify/launch, preserving existing
-   sessions. Open, close and reopen Connections and terminal windows; confirm
-   no second hello is sent after a welcome on the same attachment.
+1. Use the same pinned r7.1 #72 runtime for pair/verify/launch, preserving
+   existing sessions. Run second-hello-replaces-the-attachment.json in Atem's
+   host runner. Confirm UUID capture, old binding stale_target, no inherited
+   control, unchanged authorization deadline and busy within one second.
 2. View each session, then explicitly take control to type/resize/paste and
    release. Host local input must revoke queued remote writes. Expiry and late
    renewal must not restore control. No legacy control op or lease_id is sent.
-3. Submit a Claude prompt and observe its durable receipts. Test interrupt and
-   stop separately. Disconnect immediately after acceptance; reconnect queries
+3. The live Claude prompt and disconnect-during-execution receipt recovery
+   passed. Test interrupt and stop separately. Disconnect immediately after acceptance; reconnect queries
    the original receipt without another dispatch or a restored lease.
 4. Trigger real Claude and Codex approval hooks with no lease holder. Check
    in-app alert/inbox, exact Claude rule confirmation, atomic answers, terminal
@@ -138,8 +159,7 @@ account grouping cannot supply that authority. The native inbox and transport
 adapters do not imply live APNs delivery. See
 [provider setup](../../docs/push-notifications.md).
 
-Use this hosted handoff for cross-machine coordination. The latest local Atem
-memory is `mem_752f0f044652415c9a475fe99cde7d29`; the relay rejected its sync
-with `memory does not match the account encryption mode`. Do not assume the
-shared store contains this update unless sync succeeds.
+Use this hosted handoff for cross-machine coordination. Shared Atem memory
+sync is currently refused with `memory does not match the account encryption
+mode`; do not assume this update reached the shared store unless sync succeeds.
 No production merge or deployment is included.

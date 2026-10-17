@@ -839,9 +839,11 @@ struct AtemInstanceInfo: Codable {
     }
 }
 
-/// Snapshot of an agent registered in an Atem instance's AgentRegistry.
-/// Mirrors Rust's `agent_client::AgentInfo` serialization.
+/// Session presentation snapshot, retaining legacy AgentInfo field names
+/// for existing view and serialization consumers.
 struct AtemAgentInfo: Codable, Identifiable {
+    enum ProcessStatus: Equatable { case running, stopped, unknown }
+
     let id: String
     let name: String
     /// Human-readable kind: "Claude Code", "Codex", or raw unknown string.
@@ -850,6 +852,8 @@ struct AtemAgentInfo: Codable, Identifiable {
     let agentProtocol: String
     /// Semantic registry state. Missing or unfamiliar values never imply readiness.
     let status: String
+    /// Session process state is independent of provider activity reporting.
+    let processState: String?
     let sessionIds: [String]
     let acpUrl: String?
     let ptyPid: UInt32?
@@ -862,6 +866,20 @@ struct AtemAgentInfo: Codable, Identifiable {
         case acpUrl = "acp_url"
         case ptyPid = "pty_pid"
         case capabilities
+        case processState = "process_state"
+    }
+
+    var processStatus: ProcessStatus {
+        switch processState {
+        case "running": return .running
+        case "exited", "interrupted", "recovery_required", "closed", "removed": return .stopped
+        default: return status == "Disconnected" ? .stopped : .unknown
+        }
+    }
+
+    var activityLabel: String {
+        guard processStatus != .stopped else { return "Stopped" }
+        return ["Idle": "Idle", "Thinking": "Working", "WaitingForInput": "Waiting"][status] ?? "Unknown"
     }
 
     init(session: AtemSessionDescriptor) {
@@ -869,6 +887,7 @@ struct AtemAgentInfo: Codable, Identifiable {
         kind = session.provider == "claude" ? "Claude Code" : session.provider == "codex" ? "Codex" : session.provider
         name = session.cwd_label.isEmpty ? kind : session.cwd_label
         agentProtocol = "Pty"
+        processState = session.state
         status = session.state != "running" ? "Disconnected"
             : ["ready": "Idle", "working": "Thinking", "waiting": "WaitingForInput"][session.activity] ?? "Unknown"
         sessionIds = [session.session_id]
@@ -896,6 +915,7 @@ struct AtemAgentInfo: Codable, Identifiable {
         let reportedStatus = (try? c.decode(String.self, forKey: .status)) ?? "Unknown"
         status = ["Idle", "Thinking", "WaitingForInput", "Disconnected", "Unknown"].contains(reportedStatus)
             ? reportedStatus : "Unknown"
+        processState = try c.decodeIfPresent(String.self, forKey: .processState)
         sessionIds = (try? c.decode([String].self, forKey: .sessionIds)) ?? []
         acpUrl = try? c.decodeIfPresent(String.self, forKey: .acpUrl)
         ptyPid = try? c.decodeIfPresent(UInt32.self, forKey: .ptyPid)
@@ -909,6 +929,7 @@ struct AtemAgentInfo: Codable, Identifiable {
         try c.encode(kind, forKey: .kind)
         try c.encode(agentProtocol, forKey: .agentProtocol)
         try c.encode(status, forKey: .status)
+        try c.encodeIfPresent(processState, forKey: .processState)
         if !capabilities.isEmpty { try c.encode(capabilities, forKey: .capabilities) }
         try c.encode(sessionIds, forKey: .sessionIds)
         try c.encodeIfPresent(acpUrl, forKey: .acpUrl)

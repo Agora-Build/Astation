@@ -1,8 +1,8 @@
 # Approval notifications: Astation implementation and Atem handoff
 
-Updated 2026-10-16. Native r7 integration uses Atem PR #72 at
-`5ce333e505e77429ffbfd443bdb0794b45136a03`,
-[`designs/protocol/atem-session-v1.md`, section 6a](https://github.com/Agora-Build/Atem/blob/5ce333e505e77429ffbfd443bdb0794b45136a03/designs/protocol/atem-session-v1.md#6a-approvals-r7).
+Updated 2026-10-16. Native approval integration uses Atem PR #72's r7.1 contract at
+`6edda2490f4a4b7634edb446f64aa02748e29fa2`,
+[`designs/protocol/atem-session-v1.md`, section 6a](https://github.com/Agora-Build/Atem/blob/6edda2490f4a4b7634edb446f64aa02748e29fa2/designs/protocol/atem-session-v1.md#6a-approvals-r7).
 The user approved delivery independently of control lease ownership.
 
 Worktree: Astation-push-approvals, branch `feat/push-approvals`, PR #50.
@@ -90,8 +90,8 @@ reconnect receipt recovery, persistence failure, local-input/expiry fencing,
 unknown outcomes, text/numeric bounds and preference independence without APNs.
 Session, terminal, menu and log-redaction regression tests are also run.
 
-Local validation on 2026-10-16: 73 focused reconnect/API/approval tests pass;
-the full Swift suite executes 893 tests with 11 environment-dependent skips
+Local validation on 2026-10-16: 149 focused session/terminal/API/approval/menu tests pass;
+the full Swift suite executes 898 tests with 11 environment-dependent skips
 and zero failures. Relay push-related tests pass (16 tests, two database tests
 ignored without their fixture).
 The app is packaged with the existing personal-team provisioned identity,
@@ -102,9 +102,13 @@ welcome, list and sessions; both Claude and Codex appear in Connections.
 The local API submitted a harmless print-only prompt to the existing joint-test
 Claude session and observed a completed receipt; identical UUID retry returned
 the original request, altered bytes were refused, and control was released.
+A subsequent delayed prompt completed after quitting/relaunching Astation
+during execution; the original receipt recovered without restoring control.
 No approval card was emitted, so no live approval was answered. Provider
 delivery and a real pending-approval/answer/receipt round trip remain joint
 validation work; Atem should stage a prompt that requires permission.
+The [joint session matrix](session-validation.md) tracks r7.1 fixture, terminal,
+lease, command and pairing checks separately from live results.
 
 Existing relay provider tests use injected transports and verify actual
 headers/body, ES256/RS256 signatures, OAuth refresh, expiry and provider

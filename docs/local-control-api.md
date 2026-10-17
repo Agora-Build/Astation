@@ -94,7 +94,7 @@ body limits, duplicate keys, control requirements, exact snapshots/rules,
 duplicate/reused request ids, closure/expiry, stale contexts and receipt scope.
 
 For **live** tests, have Atem launch isolated Claude and Codex test sessions
-using its latest r7 runtime and approval hooks. The installed Atem on this Mac
+using the r7.1 runtime at Atem PR #72 / 6edda24 and approval hooks. The installed Atem on this Mac
 is 0.6.9 and is not the PR #72 host; do not build/edit an Atem checkout here.
 Stage prompts in those sessions, then use this API to review and answer:
 
@@ -113,3 +113,6 @@ still need the [joint trust review](../designs/protocol/account-trust-review.md)
 and [push-proof agreement](../designs/protocol/approval-push-proof.md). Provider
 test transports verify requests without a phone; only a real push-enabled
 profile, provider credentials and token can establish actual APNs delivery.
+The [joint session matrix](../designs/protocol/session-validation.md) records
+automated coverage and confirmed live results, including the host-side r7.1
+replacement-hello fixture boundary.

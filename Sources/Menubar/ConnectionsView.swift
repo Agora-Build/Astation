@@ -542,13 +542,10 @@ private struct AgentRow: View {
     let onRemoteControl: () -> Void
 
     private var statusColor: Color {
-        switch agent.status {
-        case "Idle":            return .green
-        case "Thinking":        return .yellow
-        case "WaitingForInput": return .green
-        case "Disconnected":    return .red
-        case "Unknown":         return Color(NSColor.tertiaryLabelColor)
-        default:                return Color(NSColor.tertiaryLabelColor)
+        switch agent.processStatus {
+        case .running: return .green
+        case .stopped: return .red
+        case .unknown: return Color(NSColor.tertiaryLabelColor)
         }
     }
 
@@ -575,6 +572,8 @@ private struct AgentRow: View {
                 .fill(statusColor)
                 .frame(width: 9, height: 9)
                 .shadow(color: statusColor.opacity(0.6), radius: 3)
+                .help(agent.processStatus == .running ? "Agent process is running." : "Agent process is not running or its state is unavailable.")
+                .accessibilityLabel(agent.processStatus == .running ? "Running" : agent.processStatus == .stopped ? "Stopped" : "Process state unknown")
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
@@ -608,10 +607,11 @@ private struct AgentRow: View {
                             .foregroundColor(.secondary)
                     }
 
-                    Text(agent.status)
+                    Text(agent.activityLabel)
                         .font(.caption)
-                        .foregroundColor(statusColor)
-                        .help(agent.status == "Unknown"
+                        .foregroundColor(.secondary)
+                        .help(agent.processStatus == .stopped ? "The agent process is not running."
+                              : agent.status == "Unknown"
                               ? "Atem has no reliable activity report for this agent. Its terminal is still available."
                               : "Activity reported by Atem's agent integration.")
                 }
@@ -628,7 +628,7 @@ private struct AgentRow: View {
                 }
                 .buttonStyle(.borderless)
                 .controlSize(.small)
-                .disabled(agent.status == "Disconnected")
+                .disabled(agent.processStatus == .stopped)
             }
 
             Spacer()

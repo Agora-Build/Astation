@@ -1,5 +1,6 @@
 import XCTest
 import NIOHTTP1
+import CryptoKit
 @testable import Menubar
 
 private let sessionID = "ses-aaaaaaaaaaaa"
@@ -28,7 +29,8 @@ private final class SessionFixture {
     var nextID: String?
     var canSend = true
     let disk: SessionDisk
-    lazy var client = AtemSessionClient(context: { self.source }, send: { message, _ in
+    lazy var client = makeClient()
+    func makeClient() -> AtemSessionClient { AtemSessionClient(context: { self.source }, send: { message, _ in
         self.sent.append(message)
         return self.canSend
     }, journal: disk.journal(), makeID: {
@@ -37,14 +39,15 @@ private final class SessionFixture {
     }, now: { self.time }, reconnect: { context in
         self.reconnects.append(context)
         return true
-    })
+    }) }
 
     init(disk: SessionDisk = SessionDisk()) { self.disk = disk }
     var route: RemoteTerminalConnection { source!.route }
     var target: AtemSessionTarget { AtemSessionTarget(account_id: "account-a", atem_device_id: "host-a", host_trust_gen: 1, session_id: sessionID, process_gen: processID) }
 
     func handshake(trust: UInt64 = 1, runtime: String = runtimeID, attachment: String = attachmentID,
-                   permissions: [String] = ["view", "control"], helloID: String? = nil) throws {
+                   permissions: [String] = ["view", "control"], helloID: String? = nil,
+                   controller: String = controllerID, remaining: UInt64 = 60_000) throws {
         if sent.isEmpty { client.start() }
         let hello = try XCTUnwrap(sent.last(where: { $0.op == "hello" }))
         var reply = AtemSessionMessage(op: "welcome")
@@ -53,11 +56,11 @@ private final class SessionFixture {
         reply.atem_device_id = "host-a"
         reply.host_trust_gen = trust
         reply.runtime_gen = runtime
-        reply.controller_session = controllerID
+        reply.controller_session = controller
         reply.attachment_gen = attachment
         reply.client_kind = "native"
         reply.permissions = permissions
-        reply.authorization_ms_left = 60_000
+        reply.authorization_ms_left = remaining
         reply.server_time = 1_760_500_000_000
         try receive(reply)
     }
@@ -466,6 +469,49 @@ final class AtemSessionWireTests: XCTestCase {
         return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
     }
 
+    func testPinnedR71FixturesMatchPublishedCommit() throws {
+        let source = try fixture("source")
+        XCTAssertEqual(source["revision"] as? String, "r7.1")
+        XCTAssertEqual(source["commit"] as? String, "6edda2490f4a4b7634edb446f64aa02748e29fa2")
+        let hashes = try XCTUnwrap(source["sha256"] as? [String: String])
+        XCTAssertNotNil(hashes["second-hello-replaces-the-attachment.json"])
+        let directory = try XCTUnwrap(Bundle.module.url(forResource: "atem-session-v1", withExtension: nil, subdirectory: "Fixtures"))
+        let files = try FileManager.default.contentsOfDirectory(atPath: directory.path).filter { $0 != "source.json" }
+        XCTAssertEqual(Set(hashes.keys), Set(files))
+        for (name, expected) in hashes {
+            let digest = SHA256.hash(data: try Data(contentsOf: directory.appendingPathComponent(name)))
+                .map { String(format: "%02x", $0) }.joined()
+            XCTAssertEqual(digest, expected, name)
+        }
+    }
+
+    func testSecondHelloHostFixtureRequestsDecodeWithUUIDCapture() throws {
+        let scenario = try fixture("second-hello-replaces-the-attachment")
+        let replacement = "77777777-7777-4777-8777-777777777777"
+        let steps = try XCTUnwrap(scenario["steps"] as? [[String: Any]])
+        var operations: [String] = []
+        for step in steps where step["send"] != nil {
+            let object = try XCTUnwrap(step["json"])
+            let unresolved = try JSONSerialization.data(withJSONObject: object)
+            let raw = try XCTUnwrap(String(data: unresolved, encoding: .utf8))
+            // Captures are real protocol values, never literal placeholder strings.
+            if raw.contains("${gen2}") { XCTAssertThrowsError(try AstationMessage.decodePacket(unresolved)) }
+            let resolved = Data(raw.replacingOccurrences(of: "${gen2}", with: replacement).utf8)
+            guard case .session(let message) = try AstationMessage.decodePacket(resolved) else { return XCTFail("Expected session message") }
+            operations.append(message.op)
+            if message.op == "renew" { XCTAssertEqual(message.binding?.attachment_gen, attachmentID) }
+            if ["receipt_query", "acquire"].contains(message.op) {
+                XCTAssertEqual(message.binding?.attachment_gen, replacement)
+                XCTAssertNil(message.binding?.lease_epoch)
+            }
+            guard case .session(let roundTrip) = try AstationMessage.decodePacket(JSONEncoder().encode(AstationMessage.session(message))) else {
+                return XCTFail("Expected round trip")
+            }
+            XCTAssertEqual(roundTrip, message)
+        }
+        XCTAssertEqual(operations, ["submit", "hello", "renew", "receipt_query", "acquire", "hello"])
+    }
+
     func testSharedDigestAndRawRejectionVectorsUseActualParser() throws {
         let file = try fixture("digest-vectors")
         for vector in try XCTUnwrap(file["vectors"] as? [[String: Any]]) {
@@ -628,12 +674,71 @@ final class AtemSessionWireTests: XCTestCase {
                 } else { XCTFail("Unhandled fixture step: " + location) }
             }
         }
-        XCTAssertEqual(scenarios, 3, "Every r6.2 client scenario must execute")
+        XCTAssertEqual(scenarios, 3, "Every r7.1 client-side scenario must execute")
     }
 
 }
 
 final class AtemSessionClientTests: XCTestCase {
+    func testR71ClientReplacementOnSameTransportFencesAuthorityAndQueriesDurableReceipt() throws {
+        let f = SessionFixture()
+        try f.ready(); try f.takeControl()
+        let request = try XCTUnwrap(f.client.submit(f.target, kind: "prompt", text: "run the tests",
+            requestID: "44444444-4444-4444-8444-444444444444"))
+        try f.receipt(request, state: .accepted)
+        try f.receipt(request, state: .executing, time: 101)
+        f.client.renew(f.target)
+        let oldRenewal = try XCTUnwrap(f.sent.last)
+        let source = try XCTUnwrap(f.source)
+        let oldClient = f.client
+        f.source = nil; oldClient.connectionChanged()
+        XCTAssertFalse(oldClient.controls(f.target))
+        f.source = source
+        f.time = 2
+        // A recreated client has lost attachment state but retains the protected
+        // journal. r7.1 welcomes its second hello on this same authenticated link.
+        f.client = f.makeClient()
+        f.client.start()
+        let hello = try XCTUnwrap(f.sent.last)
+        XCTAssertEqual(hello.op, "hello")
+        let replacement = "77777777-7777-4777-8777-777777777777"
+        try f.handshake(attachment: replacement, controller: "99999999-9999-4999-8999-999999999999", remaining: 58_000)
+        let query = try XCTUnwrap(f.sent.last(where: { $0.op == "receipt_query" }))
+        XCTAssertEqual(query.request_ids, [request])
+        XCTAssertEqual(query.binding?.attachment_gen, replacement)
+        XCTAssertFalse(f.client.controls(f.target))
+        XCTAssertNil(f.client.submit(f.target, kind: "interrupt"))
+        XCTAssertNil(f.client.sequence)
+        XCTAssertTrue(f.client.registry.isEmpty)
+        try f.snapshot()
+        var stale = AtemSessionMessage(op: "error")
+        stale.re = oldRenewal.id; stale.code = "stale_target"
+        try f.receive(stale)
+        try f.lease(replyTo: oldRenewal.id, epoch: 1)
+        XCTAssertFalse(f.client.controls(f.target), "Neither an old refusal nor a delayed old grant restores authority")
+        var result = AtemSessionMessage(op: "receipts")
+        result.re = query.id
+        result.receipts = [AtemSessionReceipt(request_id: request, target: f.target, kind: "prompt", state: .completed, detail: nil, updated_at: 102)]
+        try f.receive(result)
+        XCTAssertEqual(f.disk.state.requests.first?.receipt?.state, .completed)
+        XCTAssertEqual(f.sent.filter { $0.op == "submit" }.count, 1)
+        f.client.acquire(f.target, takeover: false)
+        let acquire = try XCTUnwrap(f.sent.last)
+        XCTAssertEqual(acquire.binding?.attachment_gen, replacement)
+        XCTAssertNil(acquire.binding?.lease_epoch)
+        var lease = AtemSessionMessage(op: "lease")
+        lease.re = acquire.id; lease.binding = AtemSessionBinding(target: f.target, attachment_gen: replacement, lease_epoch: 3)
+        lease.ms_left = 15_000
+        try f.receive(lease)
+        XCTAssertTrue(f.client.controls(f.target))
+        XCTAssertEqual(f.client.binding(for: f.target, mutation: true)?.lease_epoch, 3)
+        XCTAssertTrue(f.reconnects.isEmpty)
+        XCTAssertEqual(f.source, source, "The replacement hello uses the same authenticated transport")
+        f.time = 60; f.client.tick()
+        XCTAssertEqual(f.client.phase, .failed, "Replacement preserves the host's original authorization deadline")
+        XCTAssertFalse(f.client.controls(f.target))
+    }
+
     func testUnauthorizedHelloRetryReconnectsTransportAndFencesOldReply() throws {
         for correlated in [false, true] {
             let f = SessionFixture(); f.client.start()

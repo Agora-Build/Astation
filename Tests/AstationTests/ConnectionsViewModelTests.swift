@@ -2,6 +2,37 @@ import XCTest
 @testable import Menubar
 
 final class ConnectionsViewModelTests: XCTestCase {
+    func testProcessIndicatorDoesNotDependOnAgentActivity() throws {
+        for state in ["running", "exited", "interrupted", "recovery_required", "closed", "removed"] {
+            for (activity, label) in [("ready", "Idle"), ("working", "Working"), ("waiting", "Waiting"), ("unknown", "Unknown")] {
+                let descriptor: [String: Any] = [
+                    "session_id": "ses-aaaaaaaaaaaa", "process_gen": "22222222-2222-4222-8222-222222222222",
+                    "provider": "codex", "cwd_label": "Atem", "state": state,
+                    "activity": activity, "activity_since": 1, "controller": NSNull(),
+                    "capabilities": ["terminal-v1"], "created_at": 1
+                ]
+                let session = try JSONDecoder().decode(AtemSessionDescriptor.self, from: JSONSerialization.data(withJSONObject: descriptor))
+                let agent = AtemAgentInfo(session: session)
+                XCTAssertEqual(agent.processStatus, state == "running" ? .running : .stopped, "\(state)/\(activity)")
+                XCTAssertEqual(agent.activityLabel, state == "running" ? label : "Stopped")
+                let restored = try JSONDecoder().decode(AtemAgentInfo.self, from: JSONEncoder().encode(agent))
+                XCTAssertEqual(restored.processState, state)
+                XCTAssertEqual(restored.processStatus, agent.processStatus)
+                XCTAssertEqual(restored.activityLabel, agent.activityLabel)
+            }
+        }
+    }
+
+    func testLegacyActivityWithoutProcessStateDoesNotClaimRunning() throws {
+        for status in ["Idle", "Thinking", "WaitingForInput", "Unknown", "Disconnected"] {
+            let object = ["id": "agent", "name": "Codex", "kind": "Codex", "status": status]
+            let agent = try JSONDecoder().decode(AtemAgentInfo.self, from: JSONSerialization.data(withJSONObject: object))
+            XCTAssertNil(agent.processState)
+            XCTAssertEqual(agent.processStatus, status == "Disconnected" ? .stopped : .unknown)
+            XCTAssertEqual(agent.status, status, "Preserve the existing registry serialization")
+        }
+    }
+
     func testOnlineClientsCollapseSameDeviceAndPreferDirectConnection() {
         let connectedAt = Date()
         let relay = ConnectedClient(
