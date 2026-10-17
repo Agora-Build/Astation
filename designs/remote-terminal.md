@@ -1,9 +1,10 @@
 # Remote terminal control
 
-This implementation consumes Atem's `terminal-v1` contract from merged Atem
-PR #57. It attaches to the original Claude/Codex PTY; opening a window does
-not start an agent or create another conversation. The authoritative host
-contract is `Atem/designs/terminal-v1-implementation.md` at commit `396a0f3`.
+This implementation consumes `terminal-v1` through Atem's session r7.1
+contract, pinned to PR #72 at `6edda2490f4a4b7634edb446f64aa02748e29fa2`.
+It attaches to the original Claude/Codex PTY; opening a window does not start
+an agent or create another conversation. See the
+[current host handoff](protocol/atem-implementation-handoff.md).
 
 ## Lifecycle and security invariants
 
@@ -52,8 +53,18 @@ asks for confirmation before stopping that selected original process.
 
 The viewport follows the host's canonical dimensions. Only the active remote
 controller can resize the PTY to fit its window. View-only windows clip/scroll
-an oversized screen without changing the host. Native Copy/Paste actions and
-Command-C/Command-V operate on the visible terminal selection/input.
+an oversized screen without changing the host. Standard Edit actions,
+Command-C/Command-V and a right-click Copy/Paste/Select All menu follow focus.
+The terminal key handler cancels WebKit's default clipboard action as well as
+xterm's handling, preventing one physical shortcut from requesting two pastes.
+Ctrl-C remains a terminal interrupt.
+
+The toolbar exposes Paste & Go instead of separate Copy and Paste buttons.
+It explicitly targets the selected terminal, preserves bracketed paste and
+adds Enter outside its markers in the same guarded write. Ownership epoch and
+size checks apply to the entire write, including Enter. Rejected or empty
+clipboard data cannot send an Enter, and losing control fences an already-open
+clipboard menu. Ordinary paste never adds Enter.
 
 Keyboard combinations are forwarded as terminal bytes only while controlling.
 In particular, tmux's default Control-B then `[` sequence remains two inputs;
@@ -79,3 +90,14 @@ Live tests must use a separately owned test session, never inject prompts or
 approvals into the user's existing agent. Cross-machine relay/LAN, physical
 IME/clipboard, real provider approvals and latency validation are recorded
 separately from synthetic protocol tests.
+
+## Attachment composer follow-up
+
+[GitHub issue #51](https://github.com/Agora-Build/Astation/issues/51) tracks
+images, audio, PDFs and other file attachments in the separate prompt composer.
+Plain text duplicates the original terminal input; previews, transfer progress
+and provider-supported attachments would give the composer a distinct purpose.
+Transfers must bind to the selected verified Atem/session and define provider
+capabilities, limits, remote staging and cleanup with the Atem owner. Raw file
+bytes must not be sent through PTY paste. This is a planned follow-up, separate
+from the clipboard change.

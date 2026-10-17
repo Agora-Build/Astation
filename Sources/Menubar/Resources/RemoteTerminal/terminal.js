@@ -7,6 +7,7 @@
   let displayedStream = '';
   let enabled = false;
   let epoch = '';
+  let pasteSuffix = '';
   let measureTimer;
   function createTerminal() {
     term = new Terminal({
@@ -32,30 +33,42 @@
     post('input', { bytes: base64(bytes), epoch });
   };
   function wireInput() {
-    term.onData(data => send(new TextEncoder().encode(data)));
+    term.onData(data => send(new TextEncoder().encode(data + pasteSuffix)));
     term.onBinary(data => send(Uint8Array.from(data, character => character.charCodeAt(0))));
     term.attachCustomKeyEventHandler(event => {
       if (event.type !== 'keydown') return true;
       if (event.metaKey && !event.altKey && !event.ctrlKey) {
-        if (event.key.toLowerCase() === 'c') {
-          if (term.hasSelection()) post('copy', { text: term.getSelection() });
+        const key = event.key.toLowerCase();
+        if (['c', 'v', 'a'].includes(key)) {
+          // Returning false only stops xterm; cancel WebKit's default action too.
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          if (key === 'c') copySelection();
+          if (key === 'v') requestPaste();
+          if (key === 'a') term.selectAll();
           return false;
         }
-        if (event.key.toLowerCase() === 'v') { if (enabled) post('paste', { epoch }); return false; }
-        if (event.key.toLowerCase() === 'a') { term.selectAll(); return false; }
       }
       return true;
     });
   }
   createTerminal();
   wireInput();
+  function copySelection() {
+    if (term.hasSelection()) post('copy', { text: term.getSelection() });
+  }
+  function requestPaste() { if (enabled) post('paste', { epoch }); }
+  document.addEventListener('copy', event => {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (event.isTrusted) copySelection();
+  }, true);
   // Prevent browser paste from bypassing the native size check and ownership epoch.
   document.addEventListener('paste', event => {
     event.preventDefault();
     event.stopImmediatePropagation();
-    if (enabled && event.isTrusted) post('paste', { epoch });
+    if (event.isTrusted) requestPaste();
   }, true);
-  document.addEventListener('contextmenu', event => event.preventDefault());
 
   function measure() {
     const size = fit.proposeDimensions();
@@ -90,13 +103,19 @@
       if (frame.reset) { term.reset(); term.resize(frame.cols, frame.rows); }
       term.write(bytes, () => post('consumed', { token }));
     },
-    paste(text, expectedEpoch) {
-      if (!enabled || epoch !== expectedEpoch) return;
+    paste(text, expectedEpoch, submit = false) {
+      if (!enabled || epoch !== expectedEpoch || text.length === 0) return;
       // xterm wraps this atomic operation in the CLI's active bracketed-paste mode.
-      if (new TextEncoder().encode(text).length + 12 > 16384) { post('oversizedPaste'); return; }
-      term.paste(text);
+      if (new TextEncoder().encode(text).length + 12 + (submit ? 1 : 0) > 16384) { post('oversizedPaste'); return; }
+      term.focus();
+      // Include Enter in the same guarded write, outside the bracketed paste.
+      pasteSuffix = submit ? '\r' : '';
+      try { term.paste(text); }
+      finally { pasteSuffix = ''; }
     },
-    copySelection() { post('copy', { text: term.getSelection() }); },
+    copySelection,
+    requestPaste,
+    selectAll() { term.selectAll(); },
     clear() { term.reset(); },
     // Read-only hooks used by native renderer regression tests.
     inspect() {

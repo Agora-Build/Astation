@@ -1,5 +1,11 @@
 # Astation atem-session v1 implementation
 
+Historical r6.2 implementation report for superseded PR #49. Current work is
+in [PR #50](https://github.com/Agora-Build/Astation/pull/50), pinned to r7.1.
+Use the [current integration handoff](atem-implementation-handoff.md) and
+[validation matrix](session-validation.md) for present behavior and test results;
+the counts and limitations below describe the earlier revision.
+
 Date: 2026-10-16
 
 Branch: `feat/session-multiplexing`, [draft PR #49](https://github.com/Agora-Build/Astation/pull/49),

@@ -88,7 +88,7 @@ verification succeeds. The spurious `relay:TZAZ-Y9W6` row came from Astation
 adding its own pairing transport as an online Atem, rather than evidence of a
 second Atem runtime socket.
 
-There are 149 passing focused session/terminal/API/approval/menu tests. The full Swift suite executes 898 tests,
+All ten actual WebKit renderer tests pass. The full Swift suite executes 904 tests,
 11 environment-dependent skips, zero failures. The skips cover provisioned
 XCTest/Keychain, live capture and optional local model integrations; they do
 not represent a live APNs or agent-approval test. A harmless print-only prompt
@@ -109,11 +109,25 @@ agent input: the host controller cleared, Astation reported Control expired,
 and control stayed released. A deliberately delayed renewal reply still needs
 host timing control; deterministic client coverage already refuses it.
 
+The clipboard update removes toolbar Copy/Paste in favor of Paste & Go.
+Cmd+V now cancels WebKit's native default as well as xterm handling, preventing
+duplicate paste requests. Native Edit/right-click paste follows focus and
+does not submit; Paste & Go targets the selected terminal and appends Enter
+in one bounded, ownership-fenced write. Empty, oversized, stale and read-only
+pastes never send a stray Enter. Physical Claude clipboard retesting remains
+a joint UI check; no agent input was sent to test this change.
+
+[Astation issue #51](https://github.com/Agora-Build/Astation/issues/51) records
+Brent's follow-up for image/audio/PDF/other-file attachments in the separate
+composer. Coordinate file transport, provider support and remote cleanup with
+the Atem owner; attachment implementation is outside the clipboard fix.
+
 Relay push-related tests pass (16 tests; two database integration tests remain
-ignored without their database fixture). A local memory update was saved as
-`mem_195b9f19d21046afb2255ca8273dbb7b`, but relay synchronization was refused
-because it does not match the account encryption mode. Use these hosted docs
-for cross-machine coordination; do not assume the memory reached Atem.
+ignored without their database fixture). Memory writes are currently refused
+because they do not match the account encryption mode. The new attachment TODO
+was not found after the CLI reported it added and then refused. Use issue #51
+and these hosted docs for durable cross-machine coordination; do not assume
+the memory reached Atem.
 
 Production is unchanged: health reports main `9245603`, two replicas and Redis
 OK. Relay account registration still refuses the Agora verifier configuration

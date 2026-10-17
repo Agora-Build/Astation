@@ -32,6 +32,196 @@ final class RemoteTerminalRendererTests: XCTestCase {
         }
     }
 
+    private func setBracketedPaste(_ enabled: Bool, renderer: RemoteTerminalRenderer) async {
+        let consumed = expectation(description: "Terminal paste mode restored")
+        renderer.onAction = { action in if case .consumed = action { consumed.fulfill() } }
+        let mode = enabled ? "\u{1b}[?2004h" : "\u{1b}[?2004l"
+        renderer.render(RemoteTerminalFrame(stream: RemoteTerminalStream(terminalId: "claude", generation: "test", streamId: "stream"),
+            offset: 0, bytes: Data(mode.utf8).base64EncodedString(), reset: true, complete: true, rows: 10, cols: 60), token: "mode")
+        await fulfillment(of: [consumed], timeout: 10)
+    }
+
+    func testCommandVPastesOnceAndCancelsWebKitDefaultWithoutDebouncingSeparatePastes() async throws {
+        let renderer = RemoteTerminalRenderer()
+        let window = host(renderer)
+        defer { window.close() }
+        await load(renderer)
+        var pastes: [String] = []
+        renderer.onAction = { action in
+            if case .paste(let epoch) = action { pastes.append(epoch) }
+            if case .input = action { XCTFail("Command-V must request a guarded paste, never raw input") }
+        }
+        renderer.setControl(true, epoch: "paste-lease")
+        let shortcut = """
+        (() => {
+          const target = document.querySelector('.xterm-helper-textarea');
+          target.focus();
+          const event = new KeyboardEvent('keydown', {
+            key: 'v', code: 'KeyV', keyCode: 86, which: 86,
+            metaKey: true, bubbles: true, cancelable: true
+          });
+          return { allowed: target.dispatchEvent(event), cancelled: event.defaultPrevented };
+        })()
+        """
+        for _ in 0..<2 {
+            let value = try await evaluate(renderer, shortcut)
+            let result = try XCTUnwrap(value as? [String: Bool])
+            XCTAssertEqual(result["allowed"], false, "The same keystroke must not also invoke WebKit's paste default")
+            XCTAssertEqual(result["cancelled"], true)
+        }
+        _ = try await evaluate(renderer, "window.astationTerminal.inspect()")
+        XCTAssertEqual(pastes, ["paste-lease", "paste-lease"])
+        renderer.setControl(false, epoch: "")
+        _ = try await evaluate(renderer, shortcut)
+        _ = try await evaluate(renderer, "window.astationTerminal.inspect()")
+        XCTAssertEqual(pastes.count, 2, "Viewing cannot request paste")
+    }
+
+    func testPasteAndGoAppendsEnterToOneWriteAndOrdinaryPasteRemainsUnsubmitted() async throws {
+        let renderer = RemoteTerminalRenderer()
+        let window = host(renderer)
+        defer { window.close() }
+        await load(renderer)
+        await setBracketedPaste(true, renderer: renderer)
+        var received: [Data] = []
+        let bracketed = expectation(description: "Paste-and-go and ordinary paste")
+        bracketed.expectedFulfillmentCount = 2
+        renderer.onAction = { action in
+            if case .input(let bytes, let epoch) = action {
+                XCTAssertEqual(epoch, "go-lease")
+                received.append(bytes)
+                bracketed.fulfill()
+            }
+        }
+        renderer.setControl(true, epoch: "go-lease")
+        renderer.paste("first\nsecond", epoch: "go-lease", submit: true)
+        renderer.paste("draft", epoch: "go-lease")
+        await fulfillment(of: [bracketed], timeout: 10)
+        XCTAssertEqual(received, [Data("\u{1b}[200~first\rsecond\u{1b}[201~\r".utf8), Data("\u{1b}[200~draft\u{1b}[201~".utf8)])
+        await setBracketedPaste(false, renderer: renderer)
+        let plain = expectation(description: "Plain terminal receives text and Enter once")
+        renderer.onAction = { action in
+            if case .input(let bytes, _) = action { received.append(bytes); plain.fulfill() }
+        }
+        renderer.setControl(true, epoch: "go-lease")
+        renderer.paste("plain", epoch: "go-lease", submit: true)
+        await fulfillment(of: [plain], timeout: 10)
+        XCTAssertEqual(received.last, Data("plain\r".utf8))
+        XCTAssertEqual(received.count, 3)
+    }
+
+    func testPasteAndGoRejectsEmptyOversizedStaleAndDisabledInputWithoutSendingEnter() async throws {
+        let renderer = RemoteTerminalRenderer()
+        let window = host(renderer)
+        defer { window.close() }
+        await load(renderer)
+        await setBracketedPaste(true, renderer: renderer)
+        var received: [Data] = []
+        var oversized = 0
+        renderer.onAction = { action in
+            if case .input(let bytes, _) = action { received.append(bytes) }
+            if case .oversizedPaste = action { oversized += 1 }
+        }
+        renderer.setControl(true, epoch: "current-lease")
+        renderer.paste("stale", epoch: "old-lease", submit: true)
+        renderer.paste("", epoch: "current-lease", submit: true)
+        renderer.paste(String(repeating: "a", count: 16 * 1024 - 12), epoch: "current-lease", submit: true)
+        _ = try await evaluate(renderer, "window.astationTerminal.inspect()")
+        XCTAssertTrue(received.isEmpty)
+        XCTAssertEqual(oversized, 1)
+        renderer.paste(String(repeating: "a", count: 16 * 1024 - 13), epoch: "current-lease", submit: true)
+        _ = try await evaluate(renderer, "window.astationTerminal.inspect()")
+        XCTAssertEqual(received.count, 1)
+        XCTAssertEqual(received.first?.count, 16 * 1024)
+        renderer.setControl(false, epoch: "")
+        renderer.paste("disabled", epoch: "current-lease", submit: true)
+        _ = try await evaluate(renderer, "window.astationTerminal.inspect()")
+        XCTAssertEqual(received.count, 1)
+    }
+
+    func testPasteAndGoDoesNotAppendEnterToTerminalFocusReports() async throws {
+        let renderer = RemoteTerminalRenderer()
+        let window = host(renderer)
+        defer { window.close() }
+        await load(renderer)
+        let consumed = expectation(description: "Bracketed paste and focus reporting enabled")
+        renderer.onAction = { action in if case .consumed = action { consumed.fulfill() } }
+        renderer.render(RemoteTerminalFrame(stream: RemoteTerminalStream(terminalId: "claude", generation: "test", streamId: "stream"),
+            offset: 0, bytes: Data("\u{1b}[?2004h\u{1b}[?1004h".utf8).base64EncodedString(),
+            reset: true, complete: true, rows: 10, cols: 60), token: "focus-mode")
+        await fulfillment(of: [consumed], timeout: 10)
+        renderer.setControl(true, epoch: "focus-lease")
+        _ = try await evaluate(renderer, "document.body.appendChild(document.createElement('input')).focus()")
+        var received: [Data] = []
+        let pasted = expectation(description: "Paste and focus report have separate semantics")
+        renderer.onAction = { action in
+            if case .input(let bytes, _) = action {
+                received.append(bytes)
+                if bytes == Data("\u{1b}[200~go\u{1b}[201~\r".utf8) { pasted.fulfill() }
+            }
+        }
+        renderer.paste("go", epoch: "focus-lease", submit: true)
+        await fulfillment(of: [pasted], timeout: 10)
+        XCTAssertTrue(received.contains(Data("\u{1b}[I".utf8)))
+        XCTAssertEqual(received.filter { $0.last == 13 }, [Data("\u{1b}[200~go\u{1b}[201~\r".utf8)])
+    }
+
+    func testNativeContextMenuOffersClipboardActionsAndFencesPasteWhileViewing() async throws {
+        let renderer = RemoteTerminalRenderer()
+        let window = host(renderer)
+        defer { window.close() }
+        await load(renderer)
+        let event = try XCTUnwrap(NSEvent.mouseEvent(with: .rightMouseDown, location: .zero, modifierFlags: [],
+            timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
+        let menu = NSMenu()
+        renderer.webView.willOpenMenu(menu, with: event)
+        XCTAssertEqual(menu.items.map(\.title), ["Copy", "Paste", "Select All"])
+        XCTAssertFalse(menu.items[1].isEnabled)
+        var pastes: [String] = []
+        let requested = expectation(description: "One context-menu paste request")
+        renderer.onAction = { action in
+            if case .paste(let epoch) = action { pastes.append(epoch); requested.fulfill() }
+        }
+        renderer.setControl(true, epoch: "menu-lease")
+        renderer.webView.willOpenMenu(menu, with: event)
+        XCTAssertTrue(menu.items[1].isEnabled)
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(menu.items[1].action), to: menu.items[1].target, from: menu.items[1]))
+        await fulfillment(of: [requested], timeout: 10)
+        XCTAssertEqual(pastes, ["menu-lease"])
+        renderer.setControl(false, epoch: "")
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(menu.items[1].action), to: menu.items[1].target, from: menu.items[1]))
+        _ = try await evaluate(renderer, "window.astationTerminal.inspect()")
+        XCTAssertEqual(pastes.count, 1, "An already-open menu cannot outlive control")
+    }
+
+    func testNativeEditPasteRequestsOneGuardedPasteWhileTerminalHasFocus() async throws {
+        let renderer = RemoteTerminalRenderer()
+        let window = host(renderer)
+        defer { window.close() }
+        await load(renderer)
+        let clipboard = NSPasteboard.general
+        let savedItems = clipboard.pasteboardItems?.map { original -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for type in original.types {
+                if let data = original.data(forType: type) { item.setData(data, forType: type) }
+            }
+            return item
+        } ?? []
+        defer { clipboard.clearContents(); clipboard.writeObjects(savedItems) }
+        clipboard.clearContents()
+        clipboard.setString("edit-menu-paste", forType: .string)
+        renderer.setControl(true, epoch: "edit-lease")
+        _ = try await evaluate(renderer, "document.querySelector('.xterm-helper-textarea').focus()")
+        let requested = expectation(description: "Native Edit Paste reaches the guarded bridge")
+        requested.assertForOverFulfill = true
+        renderer.onAction = { action in
+            if case .paste(let epoch) = action { XCTAssertEqual(epoch, "edit-lease"); requested.fulfill() }
+            if case .input = action { XCTFail("Native paste must not bypass the clipboard bridge") }
+        }
+        XCTAssertTrue(NSApp.sendAction(#selector(NSText.paste(_:)), to: renderer.webView, from: nil))
+        await fulfillment(of: [requested], timeout: 10)
+    }
+
     func testActualWebKitRendersByteSplitUnicodeAndCanonicalColors() async throws {
         let renderer = RemoteTerminalRenderer()
         let window = host(renderer)

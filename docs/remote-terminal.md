@@ -7,11 +7,12 @@ conversation and unfinished input.
 ## Start a session
 
 This development branch requires an Atem host implementing
-[atem-session v1 r6.2](../designs/protocol/atem-session-v1.md), in addition to
+[atem-session v1 r7.1](../designs/protocol/atem-session-v1.md), in addition to
 shared-terminal rendering. Earlier terminal-only hosts cannot provide control
-through this build. Use the runtime host in [Atem PR #69](https://github.com/Agora-Build/Atem/pull/69);
-the published pairing fixes alone do not imply r6.2 support. See the
-[integration status](../designs/protocol/astation-session-v1-implementation.md).
+through this build. Use the pinned runtime host in
+[Atem PR #72](https://github.com/Agora-Build/Atem/pull/72); the published pairing
+fixes alone do not imply session-protocol support. See the
+[integration status](../designs/protocol/atem-implementation-handoff.md).
 
 Use the same host binary for pairing and launch; see the
 [pinned host handoff](../designs/protocol/atem-host-handoff.md) for build and
@@ -45,11 +46,19 @@ The Astation view then becomes read-only. Reconnecting always opens a fresh view
 and requires another deliberate Take Control. A replacement process generation
 requires choosing View again.
 
-**Copy** copies the visible selection. Command-C copies a selection and
-Command-A selects the visible screen. **Paste** and Command-V use the native
-clipboard, preserve multiline text and the CLI's bracketed-paste mode, and
-reject oversized pastes before sending. Ctrl-C continues to mean interrupt.
-The maximum single input is 16 KiB, including bracketed-paste framing.
+Command-C copies the terminal selection and Command-A selects the visible
+screen. Command-V, the standard Edit menu and the terminal's right-click menu
+paste once into the focused input, preserving multiline text and the CLI's
+bracketed-paste mode. Ordinary paste does not submit. When the native prompt
+field has focus, its normal clipboard actions edit that field.
+
+**Paste & Go** explicitly pastes the clipboard into the selected remote
+terminal and sends Enter, even when the native prompt field has focus. It
+requires control and sends text, bracketed-paste framing and the final Enter
+in one guarded write. Empty, oversized, stale or disabled pastes send nothing,
+including no stray Enter. The toolbar has no separate Copy or Paste buttons.
+Ctrl-C continues to mean interrupt. The maximum single input is 16 KiB,
+including bracketed-paste framing and, for Paste & Go, the final Enter.
 
 Only the active controller resizes the remote PTY. A viewing window preserves
 the host dimensions and scrolls/clips a screen larger than its viewport.
@@ -142,13 +151,12 @@ revocation races. The full resource check also verifies that packaged apps
 contain the viewer assets. Live provider tests must use independently owned
 test sessions, preserving the user's active conversation.
 
-The current session-v1 client builds in Debug and passes its 102 focused native
-checks, including WebKit rendering, plus the webapp conformance suite and pinned
-assets. The [current validation evidence](../designs/protocol/astation-session-v1-implementation.md)
-records the broader local test failures and pending actual-host integration.
-Live cross-machine r6.2 control, physical IME/clipboard and real provider approvals
-remain acceptance checks. Earlier relay endpoint reauthentication after an
-Astation restart passed separately on Genie at 17:17 PDT on 2026-10-14.
+The [current validation matrix](../designs/protocol/session-validation.md)
+records passing native checks and confirmed Genie integration separately from
+remaining physical terminal, IME/clipboard and real-provider approval checks.
+WebKit regressions cover single-dispatch Command-V and native Edit/context-menu
+paste, bracketed Paste & Go, and rejection without a stray Enter. They do not
+replace the physical Cmd+V check against Claude's live input.
 
 See [lifecycle and security invariants](../designs/remote-terminal.md) and
 [Atem's current host handoff](../designs/protocol/atem-host-handoff.md).

@@ -16,7 +16,7 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
     private var controlButton: NSButton!
     private var releaseButton: NSButton!
     private var stopButton: NSButton!
-    private var pasteButton: NSButton!
+    private var pasteAndGoButton: NSButton!
     private let promptField = NSTextField()
     private let receiptLabel = NSTextField(labelWithString: "")
     private var sendPromptButton: NSButton!
@@ -105,11 +105,11 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
         viewButton = button("View", symbol: "eye", action: #selector(viewSession))
         controlButton = button("Take Control", symbol: "keyboard", action: #selector(takeControl))
         releaseButton = button("Release", symbol: "keyboard.badge.ellipsis", action: #selector(releaseControl))
-        let copyButton = button("Copy", symbol: "doc.on.doc", action: #selector(copySelection))
-        pasteButton = button("Paste", symbol: "doc.on.clipboard", action: #selector(paste))
+        pasteAndGoButton = button("Paste & Go", symbol: "arrow.turn.down.left", action: #selector(pasteAndGo))
+        pasteAndGoButton.toolTip = "Paste the clipboard into the selected remote terminal and press Enter"
         stopButton = button("Stop Agent", symbol: "stop.circle", action: #selector(stopAgent))
         stopButton.toolTip = "Stop this original agent process on the remote machine"
-        let controls = NSStackView(views: [modeLabel, viewButton, controlButton, releaseButton, spacer(), copyButton, pasteButton, stopButton])
+        let controls = NSStackView(views: [modeLabel, viewButton, controlButton, releaseButton, spacer(), pasteAndGoButton, stopButton])
         controls.orientation = .horizontal
         controls.spacing = 8
         statusLabel.font = .systemFont(ofSize: 11)
@@ -217,7 +217,7 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
         controlButton.isEnabled = terminal.canTakeControl
         releaseButton.isEnabled = terminal.canRelease
         stopButton.isEnabled = terminal.canInput
-        pasteButton.isEnabled = terminal.canInput
+        pasteAndGoButton.isEnabled = terminal.canInput
         let supportsPrompts = terminal.session.flatMap { sessions.registry[$0.terminalId] }?.capabilities.contains("chat-v1") == true
         promptField.isEnabled = terminal.canInput && supportsPrompts
         sendPromptButton.isEnabled = terminal.canInput && supportsPrompts
@@ -249,7 +249,7 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
             guard !text.isEmpty else { return }
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(text, forType: .string)
-        case .paste(let epoch): if epoch == inputEpoch { paste(nil) }
+        case .paste(let epoch): if epoch == inputEpoch { pasteClipboard(submit: false) }
         case .oversizedPaste: terminal.input(Data(repeating: 0, count: 16 * 1024 + 1))
         }
     }
@@ -269,12 +269,12 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
     @objc private func viewSession() { terminal.view() }
     @objc private func takeControl() { terminal.takeControl() }
     @objc private func releaseControl() { terminal.release() }
-    @objc private func copySelection() { renderer?.copySelection() }
-    @objc private func paste(_ sender: Any?) {
-        guard terminal.canInput, let text = NSPasteboard.general.string(forType: .string) else { return }
-        if text.utf8.count + 12 > 16 * 1024 {
+    @objc private func pasteAndGo() { pasteClipboard(submit: true) }
+    private func pasteClipboard(submit: Bool) {
+        guard terminal.canInput, let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else { return }
+        if text.utf8.count + 12 + (submit ? 1 : 0) > 16 * 1024 {
             terminal.input(Data(repeating: 0, count: 16 * 1024 + 1))
-        } else { renderer?.paste(text, epoch: inputEpoch) }
+        } else { renderer?.paste(text, epoch: inputEpoch, submit: submit) }
     }
 
     @objc private func stopAgent() {

@@ -33,6 +33,15 @@ private final class WeakTerminalScriptHandler: NSObject, WKScriptMessageHandler 
     }
 }
 
+private final class TerminalWebView: WKWebView {
+    var configureContextMenu: ((NSMenu) -> Void)?
+
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        super.willOpenMenu(menu, with: event)
+        configureContextMenu?(menu)
+    }
+}
+
 final class RemoteTerminalRenderer: NSObject, WKNavigationDelegate, WKUIDelegate {
     let webView: WKWebView
     private(set) var isReady = false
@@ -40,6 +49,7 @@ final class RemoteTerminalRenderer: NSObject, WKNavigationDelegate, WKUIDelegate
     var onFailure: (() -> Void)?
     private let handler: WeakTerminalScriptHandler
     private let pageURL: URL?
+    private var inputEnabled = false
 
     override init() {
         let configuration = WKWebViewConfiguration()
@@ -48,17 +58,20 @@ final class RemoteTerminalRenderer: NSObject, WKNavigationDelegate, WKUIDelegate
         configuration.mediaTypesRequiringUserActionForPlayback = .all
         handler = WeakTerminalScriptHandler()
         configuration.userContentController.add(handler, name: "terminal")
-        webView = WKWebView(frame: .zero, configuration: configuration)
+        let terminalView = TerminalWebView(frame: .zero, configuration: configuration)
+        webView = terminalView
         pageURL = RemoteTerminalAssets.pageURL
         super.init()
         handler.renderer = self
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.setValue(false, forKey: "drawsBackground")
+        terminalView.configureContextMenu = { [weak self] menu in self?.configureContextMenu(menu) }
     }
 
     func load() {
         isReady = false
+        inputEnabled = false
         guard let pageURL else { onFailure?(); return }
         do { try RemoteTerminalAssets.validate() } catch { onFailure?(); return }
         webView.loadFileURL(pageURL, allowingReadAccessTo: pageURL.deletingLastPathComponent())
@@ -70,12 +83,31 @@ final class RemoteTerminalRenderer: NSObject, WKNavigationDelegate, WKUIDelegate
     }
 
     func setControl(_ enabled: Bool, epoch: String) {
+        inputEnabled = enabled
         guard isReady else { return }
         call("setControl", arguments: [enabled, epoch])
     }
 
-    func paste(_ text: String, epoch: String) { call("paste", arguments: [text, epoch]) }
+    func paste(_ text: String, epoch: String, submit: Bool = false) { call("paste", arguments: [text, epoch, submit]) }
     func copySelection() { call("copySelection", arguments: []) }
+
+    private func configureContextMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+        menu.autoenablesItems = false
+        for (title, action, enabled) in [
+            ("Copy", #selector(copyFromMenu(_:)), isReady),
+            ("Paste", #selector(pasteFromMenu(_:)), isReady && inputEnabled),
+            ("Select All", #selector(selectAllFromMenu(_:)), isReady)
+        ] {
+            let item = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.isEnabled = enabled
+        }
+    }
+
+    @objc private func copyFromMenu(_ sender: Any?) { copySelection() }
+    @objc private func pasteFromMenu(_ sender: Any?) { call("requestPaste", arguments: []) }
+    @objc private func selectAllFromMenu(_ sender: Any?) { call("selectAll", arguments: []) }
 
     private func call(_ method: String, arguments: [Any]) {
         guard isReady, let data = try? JSONSerialization.data(withJSONObject: arguments),
