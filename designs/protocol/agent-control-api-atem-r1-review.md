@@ -1,5 +1,8 @@
 # Astation review of Atem's agent API response r1
 
+Historical review. The four contract findings are closed by the
+[r2 response review and design sign-off](agent-control-api-atem-r2-review.md).
+
 Reviewed 2026-10-17. Source:
 [Atem PR #74](https://github.com/Agora-Build/Atem/pull/74), commit
 `232dba7615a8e4eb16a19736587d65dcf96bbf84`,

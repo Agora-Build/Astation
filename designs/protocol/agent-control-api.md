@@ -1,10 +1,12 @@
 # Agent control API: Astation and Atem joint proposal
 
-Status: proposal r2, 2026-10-17, incorporating
+Status: proposal r3, 2026-10-17, incorporating
 [Atem's response](https://github.com/Agora-Build/Astation/issues/52#issuecomment-6237260882)
 and the baseline corrections in [Atem #74](https://github.com/Agora-Build/Atem/pull/74).
-The [r1 response review](agent-control-api-atem-r1-review.md) records four
-remaining contract/API details before r8 agreement. This document records
+The [r2 response review](agent-control-api-atem-r2-review.md) signs off the r8
+design for implementation and records two fixture corrections before its
+conformance gate can pass. The earlier four contract findings are closed.
+This document records
 Brent's requested next milestone: operate agents started with `atem agent launch` through APIs,
 including conversations, approvals and notifications. Proposed endpoints and
 wire additions below are not implemented or jointly approved yet.
@@ -18,8 +20,10 @@ the current main baseline is `af56d39abf6394b8706e9eb8b9ea3f04b594197c`. Contrac
 and the [developer guide](https://github.com/Agora-Build/Atem/blob/af56d39abf6394b8706e9eb8b9ea3f04b594197c/designs/agent-chat-api.md).
 The session contract governs bindings, permissions and receipts where the
 older chat document describes pre-runtime behavior.
-Astation main still implements r7.1: r7.2 rule lists/revocation and the
-Claude-only Always allow restriction need implementation work here.
+Astation main still implements r7.1. A local `feat/codex-approval-rules`
+worktree now implements r7.2 grants, rule lists/revoke and auto_allowed
+activity; its personally provisioned build passes 920 tests (6 skipped).
+That work is not yet merged or jointly verified through a live Codex rule cycle.
 
 ## Required first milestone
 
@@ -94,7 +98,7 @@ Proposed additions, to be finalized after Atem review:
 | POST /api/v1/chat/history | Accept chat_id and a bounded cursor or request/turn filter; return one bounded host page with explicit continuation and retention coverage. |
 | POST /api/v1/chat/close | Release the caller's view. Never interrupt, stop or restart the agent. Share exactly one live host conversation per full target and attachment among native/API readers. |
 | GET /api/v1/approval-rules | List authoritative active session rules with client_id and full target; empty means no active rules. |
-| POST /api/v1/approval-rules/revoke | Accept client_id, full target, rule_id and request_id; require current control and use a durable approval_rule_revoke submission. |
+| POST /api/v1/approval-rules/revoke | Accept client_id, full target, rule_id and request_id; use a durable approval_rule_revoke submission. r7.2 requires a held lease. Planned r7.3 requires control permission only; adopt its exact wire/fixtures when published. |
 | GET /api/v1/events | Server-sent events for session, chat, approval, receipt and connection/control changes, with replay cursors and explicit reset semantics. |
 
 Every chat_id is bound to the full target: account_id, atem_device_id,
@@ -117,9 +121,10 @@ snapshot/version merge rule so a delayed page cannot replace newer parts or
 resolved cards. History truncation is information to display, not an instruction
 to reopen repeatedly. An actual live sequence gap requires resynchronization.
 
-Atem currently retains 500 messages / 8 MiB per process, but broker adoption
-restores only 200 / 1 MiB and loses approval cards. The response reports fixes
-in progress; full restart recovery is not yet a verified joint guarantee.
+Atem retains 500 messages / 8 MiB per process. Response r2 reports that #75
+restores the whole retained history and approval cards on broker adoption,
+closing formerly pending cards. Full restart recovery still needs joint tests;
+the older 200-message / 1 MiB adoption limit is historical.
 
 API status should advertise implemented features, supported providers and
 retention/recovery limits. Unsupported chat is a stable capability error;
@@ -216,9 +221,9 @@ offline delivery requires a push-enabled test device and credentials.
 1. Providers and ownership are answered by Atem #74; no Codex adapter build is
    needed from Astation. The r7.2 rules, unavailable flags, prerequisite hint
    and approval-part states need native/API integration and joint tests.
-2. Agree the direction of history_end, separate history/history_page and
-   explicit cursor/retention metadata. Settle safe page/live merging and
-   bounded turn/request pagination in the linked response review.
+2. Accept the r8 appendix's sequenced history pages/history_end, bounded
+   continuation and persistent coverage semantics. Astation implements the
+   HTTP/SSE merge cursor and its delayed-page regression fixture.
 3. Agree journaling the completed turn's identity and outcome without reply
    text. receipt.result availability/IDs are a current projection of retained
    history, not immutable text or a promise of successful work. Late content
@@ -226,17 +231,19 @@ offline delivery requires a push-enabled test device and credentials.
 4. Accept typed approval states, rule_id/note and proposed final-card reason.
    Session approval_request/approval_closed remain authoritative. Implement
    rule revoke before exposing a complete session-rule management flow.
-5. Use a jointly updated r8 for incompatible history changes, with required
-   revision/features and shared fixtures. Make incompatible peers fail closed
-   during admission; a welcome-only field old clients ignore is insufficient.
+5. Build the approved r8 design with required hello revision, validated
+   welcome revision/features and shared fixtures. Incompatible peers fail
+   closed during admission.
    No new operation is emitted or advertised before its implementation and
    fixtures pass on both sides.
 
 ## Implementation and acceptance order
 
-1. Resolve the linked r8 review. Astation can build the native chat coordinator,
-   SSE infrastructure and r7.2 integration meanwhile; unavailable capabilities
-   and unconfirmed history remain explicit.
+1. Implement the approved r8 contract and correct the two draft fixture
+   inconsistencies. Astation can build the native chat coordinator and SSE
+   infrastructure meanwhile; unavailable capabilities and unconfirmed history
+   remain explicit. Adoption of the separate r7.3 revoke change waits for its
+   exact published contract and tests.
 2. Expose both providers' conversation history/events through the protected
    local API, then consume that service from the native chat view. Extend the CLI helper
    with watch/history so scripts can exercise the entire flow.
