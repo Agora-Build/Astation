@@ -213,6 +213,35 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
             contentView.centerXAnchor.constraint(equalTo: generalContainer.centerXAnchor),
             contentView.topAnchor.constraint(equalTo: generalContainer.topAnchor, constant: 16)
         ])
+        let buildInfo = NSView()
+        let version = Bundle.main.object(forInfoDictionaryKey: "AstationBuildVersion") as? String
+            ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            ?? "Development"
+        let timestamp = Bundle.main.object(forInfoDictionaryKey: "AstationBuildTimestamp") as? String
+            ?? "Unavailable in this build"
+        for (index, entry) in [("Version", version), ("Build timestamp", timestamp)].enumerated() {
+            let y = CGFloat(28 - index * 20)
+            let label = NSTextField(labelWithString: entry.0)
+            label.font = .systemFont(ofSize: 11)
+            label.textColor = .secondaryLabelColor
+            label.frame = NSRect(x: 20, y: y, width: 105, height: 16)
+            let value = NSTextField(labelWithString: entry.1)
+            value.font = .systemFont(ofSize: 11)
+            value.isSelectable = true
+            value.lineBreakMode = .byTruncatingMiddle
+            value.toolTip = entry.1
+            value.frame = NSRect(x: 135, y: y, width: 295, height: 16)
+            buildInfo.addSubview(label)
+            buildInfo.addSubview(value)
+        }
+        generalContainer.addSubview(buildInfo)
+        buildInfo.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            buildInfo.widthAnchor.constraint(equalToConstant: 450),
+            buildInfo.heightAnchor.constraint(equalToConstant: 48),
+            buildInfo.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
+            buildInfo.topAnchor.constraint(equalTo: contentView.bottomAnchor)
+        ])
         general.view = generalContainer
         tabs.addTabViewItem(general)
         let credentials = NSTabViewItem(identifier: "credentials")

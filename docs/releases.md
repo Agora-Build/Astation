@@ -20,6 +20,13 @@ Public release remains blocked until the prerequisites below are available.
 The existing Local.app can continue to provide local verification; keep its
 team, bundle identifier and Keychain group when updating it.
 
+Settings > General shows Version and Build timestamp. Both development and
+release packaging run `scripts/stamp-app-build.py` before signing. Releases
+show their release version; development builds show the Git description,
+including the revision and `dirty` suffix for uncommitted changes. The UTC
+timestamp records packaging time and stays unchanged when the app is launched
+or copied. Unpackaged binaries without metadata report that it is unavailable.
+
 ## Personal account prerequisites
 
 Use the intended paid personal Apple Developer account. The enterprise account
