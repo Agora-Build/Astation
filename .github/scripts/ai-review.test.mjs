@@ -306,7 +306,13 @@ test("sends non-agent requests in each provider's native API format", async () =
       "Claude review",
     );
     assert.equal(
-      await requestModel("codex", "https://gateway/openai", "codex-key", "gpt", "diff"),
+      await requestModel(
+        "codex",
+        "https://gateway/openai",
+        "codex-key",
+        "gpt-6.1-sol",
+        "diff",
+      ),
       "Codex review",
     );
   } finally {
@@ -316,8 +322,13 @@ test("sends non-agent requests in each provider's native API format", async () =
   assert.equal(requests[0].url, "https://gateway/api/v1/messages");
   assert.equal(requests[0].headers["x-api-key"], "claude-key");
   assert.equal(requests[0].body.messages[0].content, "diff");
+  assert.equal(requests[0].body.max_tokens, 4_096);
+  assert.equal("reasoning" in requests[0].body, false);
   assert.equal(requests[1].url, "https://gateway/openai/v1/responses");
   assert.equal(requests[1].headers.Authorization, "Bearer codex-key");
+  assert.equal(requests[1].body.model, "gpt-6.1-sol");
+  assert.deepEqual(requests[1].body.reasoning, { effort: "xhigh" });
+  assert.equal(requests[1].body.max_output_tokens, 32_768);
   assert.equal(requests[1].body.stream, true);
   assert.match(requests[1].body.instructions, /Review only the pull request metadata/);
   assert.match(requests[1].body.instructions, /Never claim to inspect a checkout/);
@@ -328,6 +339,38 @@ test("sends non-agent requests in each provider's native API format", async () =
       type: "message",
     },
   ]);
+});
+
+test("allows a configured reasoning effort for the Codex reviewer", async (t) => {
+  let body;
+  t.mock.method(globalThis, "fetch", async (_url, options) => {
+    body = JSON.parse(options.body);
+    return new Response(JSON.stringify({ output_text: "No findings." }));
+  });
+
+  assert.equal(
+    await requestModel(
+      "codex",
+      "https://gateway/openai",
+      "codex-key",
+      "gpt-6.1-sol",
+      "diff",
+      { reasoningEffort: "high" },
+    ),
+    "No findings.",
+  );
+  assert.deepEqual(body.reasoning, { effort: "high" });
+});
+
+test("refuses a review that exhausts its reasoning and output budget", () => {
+  const stream = [
+    'data: {"type":"response.output_text.delta","delta":"Partial review"}',
+    "",
+    'data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}',
+    "",
+  ].join("\n");
+
+  assert.throws(() => extractCodexStream(stream), /stream failed: max_output_tokens/);
 });
 
 test("reviews internal pull requests immediately after CI", () => {

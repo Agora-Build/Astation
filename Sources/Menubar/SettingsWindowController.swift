@@ -235,6 +235,10 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         security.label = "Security"
         security.view = makeSecurityView()
         tabs.addTabViewItem(security)
+        let about = NSTabViewItem(identifier: "about")
+        about.label = "About"
+        about.view = makeAboutView()
+        tabs.addTabViewItem(about)
         let sidebar = NSVisualEffectView()
         sidebar.material = .sidebar
         sidebar.blendingMode = .behindWindow
@@ -289,6 +293,52 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         NSApp.activate(ignoringOtherApps: true)
 
         self.window = window
+    }
+
+    private func makeAboutView() -> NSView {
+        let view = NSView()
+        let icon = NSImageView(image: NSApplication.shared.applicationIconImage)
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        let title = NSTextField(labelWithString: "Astation")
+        title.font = .systemFont(ofSize: 24, weight: .semibold)
+        let version = Bundle.main.object(forInfoDictionaryKey: "AstationBuildVersion") as? String
+            ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            ?? "Development"
+        let timestamp = Bundle.main.object(forInfoDictionaryKey: "AstationBuildTimestamp") as? String
+            ?? "Unavailable in this build"
+        let rows = [("Version", version), ("Build timestamp", timestamp)].map { entry -> [NSView] in
+            let label = NSTextField(labelWithString: entry.0)
+            label.font = .systemFont(ofSize: 12)
+            label.textColor = .secondaryLabelColor
+            let value = NSTextField(labelWithString: entry.1)
+            value.font = .systemFont(ofSize: 12)
+            value.isSelectable = true
+            value.lineBreakMode = .byTruncatingMiddle
+            value.toolTip = entry.1
+            value.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            return [label, value]
+        }
+        let buildInfo = NSGridView(views: rows)
+        buildInfo.columnSpacing = 16
+        buildInfo.rowSpacing = 8
+        buildInfo.rowAlignment = .firstBaseline
+        buildInfo.column(at: 0).width = 105
+        buildInfo.column(at: 0).xPlacement = .trailing
+        buildInfo.column(at: 1).xPlacement = .fill
+        let stack = NSStackView(views: [icon, title, buildInfo])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 16
+        view.addSubview(stack)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            icon.widthAnchor.constraint(equalToConstant: 64),
+            icon.heightAnchor.constraint(equalToConstant: 64),
+            buildInfo.widthAnchor.constraint(lessThanOrEqualToConstant: 410),
+            stack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 48)
+        ])
+        return view
     }
 
     private func renderAccountState() {
@@ -1302,6 +1352,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         let symbol: String
         switch item.identifier as? String {
         case "general": symbol = "gearshape"
+        case "about": symbol = "info.circle"
         case "security": symbol = "lock.shield"
         case "credentials": symbol = "key"
         case "recording": symbol = "waveform"

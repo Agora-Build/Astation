@@ -174,8 +174,7 @@ jobs:
             "$APP_DIR/MacOS/Astation"
 
           cp Config/Info.plist "$APP_DIR/Info.plist"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $RELEASE_VERSION" "$APP_DIR/Info.plist"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $RELEASE_VERSION" "$APP_DIR/Info.plist"
+          python3 scripts/stamp-app-build.py "$APP_DIR/Info.plist" --version "$RELEASE_VERSION"
 
       - name: Sign, test protected Keychain access, and notarize app and installer
         env:
