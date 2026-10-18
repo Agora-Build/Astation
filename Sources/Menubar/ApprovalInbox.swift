@@ -39,10 +39,61 @@ struct ApprovalInboxEntry: Identifiable {
     }
 }
 
+struct ApprovalRuleEntry: Identifiable {
+    let sourceID: String
+    let target: AtemSessionTarget
+    let rule: AtemApprovalRule
+    let host: String
+    let provider: String
+    let client: AtemSessionClient
+    // Capture presentation values so receipt changes invalidate the SwiftUI row.
+    let available: Bool
+    let canRevoke: Bool
+    private let record: AtemSessionRequestRecord?
+
+    init(sourceID: String, target: AtemSessionTarget, rule: AtemApprovalRule,
+         host: String, provider: String, client: AtemSessionClient) {
+        self.sourceID = sourceID
+        self.target = target
+        self.rule = rule
+        self.host = host
+        self.provider = provider
+        self.client = client
+        available = client.hasRule(rule, target: target)
+        canRevoke = client.canRevoke(rule, target: target)
+        record = client.revokeRecord(rule, target: target)
+    }
+
+    var id: String { [sourceID, target.account_id, target.atem_device_id, String(target.host_trust_gen),
+                      target.session_id, target.process_gen, rule.rule_id].joined(separator: "\u{0}") }
+    var status: String {
+        guard available else { return "Reconnect and refresh to check this rule." }
+        if let record {
+            switch record.receipt?.state {
+            case nil, .accepted, .executing: return "Revocation pending. Checking its receipt without resending."
+            case .completed: return "Revoked. Waiting for the updated rules list."
+            case .outcome_unknown: return "Revocation outcome unknown. Check the agent before retrying."
+            case .rejected: return "Revocation rejected. Check the rule before retrying."
+            }
+        }
+        return "Only this agent process; matches the exact command and working directory."
+    }
+}
+
+struct ApprovalActivityEntry: Identifiable {
+    let sourceID: String
+    let activity: AtemApprovalActivity
+    let host: String
+    let provider: String
+    var id: String { [sourceID, activity.target.session_id, activity.target.process_gen, activity.messageID].joined(separator: "\u{0}") }
+}
+
 /// Only the authenticated session registry populates this inbox. Push hints
 /// can open it, but cannot create actionable cards or resolve a host request.
 final class ApprovalInbox: ObservableObject {
     @Published private(set) var entries: [ApprovalInboxEntry] = []
+    @Published private(set) var rules: [ApprovalRuleEntry] = []
+    @Published private(set) var activities: [ApprovalActivityEntry] = []
     @Published var notificationHint: ApprovalPushHint?
     var onNew: ((ApprovalInboxEntry) -> Void)?
     private var seen: [String] = []
@@ -76,6 +127,20 @@ final class ApprovalInbox: ObservableObject {
         entries = Array(next.filter { $0.available && $0.resolution == nil }.prefix(128))
             + Array(next.filter { !$0.available || $0.resolution != nil }.prefix(64))
         if seen.count > 1024 { seen.removeFirst(seen.count - 1024) }
+        rules.removeAll { $0.sourceID == sourceID }
+        activities.removeAll { $0.sourceID == sourceID }
+        if client.canReviewApprovals {
+            for (session, sessionRules) in client.approvalRules.sorted(by: { $0.key < $1.key }) {
+                guard let descriptor = client.registry[session],
+                      let target = client.target(sessionId: session, process: descriptor.process_gen) else { continue }
+                rules += sessionRules.map { ApprovalRuleEntry(sourceID: sourceID, target: target, rule: $0,
+                    host: host, provider: descriptor.provider, client: client) }
+            }
+            activities += client.approvalActivities.map { ApprovalActivityEntry(sourceID: sourceID, activity: $0,
+                host: host, provider: client.registry[$0.target.session_id]?.provider ?? "Agent") }
+            activities.sort { $0.activity.createdAt > $1.activity.createdAt }
+            activities = Array(activities.prefix(128))
+        }
         for entry in newEntries { onNew?(entry) }
     }
 
@@ -124,8 +189,8 @@ struct ApprovalNotificationsView: View {
                     .font(.callout).foregroundStyle(.secondary)
             }
             ScrollView {
-                LazyVStack(spacing: 12) {
-                    if inbox.entries.isEmpty {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    if inbox.entries.isEmpty && inbox.rules.isEmpty && inbox.activities.isEmpty {
                         VStack(spacing: 10) {
                             Image(systemName: "checkmark.bubble").font(.system(size: 28)).foregroundStyle(.secondary)
                             Text("No approval requests received").font(.headline)
@@ -134,6 +199,14 @@ struct ApprovalNotificationsView: View {
                         }.padding(32).frame(maxWidth: .infinity)
                     }
                     ForEach(inbox.entries) { entry in ApprovalRequestCard(entry: entry, inbox: inbox) }
+                    if !inbox.rules.isEmpty {
+                        Text("Session Rules").font(.headline).padding(.top, 12)
+                        ForEach(inbox.rules) { rule in ApprovalRuleCard(entry: rule) }
+                    }
+                    if !inbox.activities.isEmpty {
+                        Text("Automatically Allowed").font(.headline).padding(.top, 12)
+                        ForEach(inbox.activities) { entry in ApprovalActivityCard(entry: entry) }
+                    }
                 }
             }
             Text("Answering takes control of that session. Notifications never approve a command automatically.")
@@ -163,7 +236,7 @@ private struct ApprovalRequestCard: View {
                         _ = inbox.answer(entry, decision: .deny, message: denial.isEmpty ? nil : denial)
                     }.disabled(!AtemApprovalRequest.text(denial, minimum: 0, maximum: 512, newlines: true))
                     Spacer()
-                    if entry.provider == "claude", !entry.request.always_rules.isEmpty {
+                    if !entry.request.always_rules.isEmpty {
                         Menu("Always allow") {
                             ForEach(entry.request.always_rules, id: \.rule_id) { rule in
                                 Button("\(rule.label) - \(rule.scope)") { confirm(rule) }
@@ -179,10 +252,63 @@ private struct ApprovalRequestCard: View {
 
     private func confirm(_ rule: AtemApprovalRule) {
         let alert = NSAlert()
-        alert.messageText = "Always allow this Claude rule?"
-        alert.informativeText = "\(rule.label)\nScope: \(rule.scope)\nHost: \(entry.host)\n\nThis answers the current request and saves the exact rule offered by Claude."
+        alert.messageText = "Always allow this \(entry.provider.capitalized) rule?"
+        let explanation = rule.scope == "session"
+            ? "This answers the current request and allows the exact command in the same working directory for this agent process only. You can revoke it in Session Rules."
+            : "This answers the current request and saves the exact rule offered by \(entry.provider.capitalized)."
+        alert.informativeText = "\(rule.label)\nScope: \(rule.scope)\nHost: \(entry.host)\nSession: \(entry.target.session_id)\n\n\(explanation)"
         alert.addButton(withTitle: "Always Allow")
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn { _ = inbox.answer(entry, decision: .allowAlways, rule: rule) }
+    }
+}
+
+private struct ApprovalRuleCard: View {
+    let entry: ApprovalRuleEntry
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("\(entry.provider.capitalized) on \(entry.host)", systemImage: "checkmark.shield").font(.headline)
+                Spacer()
+                Text("Session only").font(.caption).foregroundStyle(.secondary)
+            }
+            Text(entry.rule.label).textSelection(.enabled)
+            Text(entry.target.session_id).font(.caption.monospaced()).foregroundStyle(.secondary)
+            HStack {
+                Text(entry.status).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Revoke", role: .destructive) { confirmRevoke() }.disabled(!entry.canRevoke)
+            }
+        }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func confirmRevoke() {
+        let alert = NSAlert()
+        alert.messageText = "Revoke this session rule?"
+        alert.informativeText = "\(entry.rule.label)\nHost: \(entry.host)\nSession: \(entry.target.session_id)\n\nFuture matching commands will ask for approval. The current operator keeps control. Commands already consumed by the agent cannot be undone."
+        alert.addButton(withTitle: "Revoke"); alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn { _ = entry.client.revokeRule(entry.rule, target: entry.target) }
+    }
+}
+
+private struct ApprovalActivityCard: View {
+    let entry: ApprovalActivityEntry
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Allowed by session rule", systemImage: "checkmark.shield.fill").foregroundStyle(.green)
+                Spacer()
+                Text(entry.activity.createdAt, style: .time).foregroundStyle(.secondary)
+            }.font(.caption)
+            Text("\(entry.provider.capitalized) on \(entry.host)").font(.headline)
+            Text(entry.activity.part.summary ?? "").textSelection(.enabled)
+            Text("\(entry.activity.target.session_id) / \(entry.activity.part.rule_id ?? "")")
+                .font(.caption.monospaced()).foregroundStyle(.secondary)
+            if let note = entry.activity.part.note { Text(note).font(.caption).foregroundStyle(.secondary) }
+        }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
     }
 }

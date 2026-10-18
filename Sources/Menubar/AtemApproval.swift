@@ -9,6 +9,11 @@ struct AtemApprovalRule: Codable, Equatable {
         AtemSessionWire.opaque(rule_id) && AtemApprovalRequest.text(label, minimum: 1, maximum: 256)
             && AtemApprovalRequest.text(scope, minimum: 1, maximum: 256)
     }
+
+    static func validSessionList(_ rules: [Self]) -> Bool {
+        rules.count <= 32 && rules.allSatisfy { $0.valid && $0.scope == "session" }
+            && Set(rules.map(\.rule_id)).count == rules.count
+    }
 }
 
 struct AtemApprovalRequest: Codable, Equatable {

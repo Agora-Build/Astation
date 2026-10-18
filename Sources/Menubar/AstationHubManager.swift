@@ -777,9 +777,13 @@ class AstationHubManager: ObservableObject {
             return nil
 
         case .agentChat(let event):
+            let captured = captureSessionContext(clientId: clientId, relayConnectionId: relayConnectionId)
             let source = RemoteTerminalConnection(clientId: clientId, connectionId: relayConnectionId ?? clientId)
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.terminalConnection(for: clientId) == source else { return }
+                if let captured, self.sessionContext(for: clientId) == captured {
+                    self.nativeSessionClients[clientId]?.receiveChat(event, from: captured.route)
+                }
                 self.browserAgentChat.receiveAgent(event, from: source)
             }
             return nil
@@ -1173,7 +1177,8 @@ class AstationHubManager: ObservableObject {
         let client = AtemSessionClient(context: { [weak self] in self?.sessionContext(for: id) },
             send: { [weak self] message, route in self?.sendSessionMessage(message, to: route) ?? false },
             journal: sessionJournal,
-            reconnect: { [weak self] context in self?.reconnectSessionTransport(context) ?? false })
+            reconnect: { [weak self] context in self?.reconnectSessionTransport(context) ?? false },
+            sendChat: { [weak self] message, route in self?.sendSessionChatMessage(message, to: route) ?? false })
         nativeSessionClients[id] = client
         client.onChange = { [weak self, weak client] in
             guard let self, let client else { return }
@@ -1306,6 +1311,14 @@ class AstationHubManager: ObservableObject {
         guard sessionContext(for: route.clientId)?.route == route, sendHandler != nil,
               (try? message.validate()) != nil else { return false }
         sendMessage(.session(message), to: route.clientId,
+                    expectedRelayConnectionId: route.clientId.hasPrefix("relay-") ? route.connectionId : nil)
+        return true
+    }
+
+    private func sendSessionChatMessage(_ message: AgentChatWire, to route: RemoteTerminalConnection) -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard sessionContext(for: route.clientId)?.route == route, sendHandler != nil else { return false }
+        sendMessage(.agentChat(message), to: route.clientId,
                     expectedRelayConnectionId: route.clientId.hasPrefix("relay-") ? route.connectionId : nil)
         return true
     }

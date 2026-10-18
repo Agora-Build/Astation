@@ -642,8 +642,9 @@ enum AstationMessage: Codable {
 
         case .agentChat:
             let message = try container.decode(AgentChatWire.self, forKey: .data)
-            if message.op == "error" {
-                try AtemSessionWire.check(message.code.map { !$0.isEmpty && $0.utf8.count <= 128 } == true)
+            if message.op == "error", let code = message.code {
+                // Chat lifecycle notices have no code; admission errors do.
+                try AtemSessionWire.check(!code.isEmpty && code.utf8.count <= 128)
             }
             self = .agentChat(message)
 

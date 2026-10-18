@@ -81,6 +81,23 @@ final class LocalControlAPI {
         let status: String
         let resolution: String?
     }
+    private struct Rule: Encodable {
+        let client_id: String
+        let target: AtemSessionTarget
+        let rule: AtemApprovalRule
+        let provider: String
+        let host: String
+        let can_revoke: Bool
+        let controls: Bool
+        let status: String
+    }
+    private struct Activity: Encodable {
+        let client_id: String
+        let target: AtemSessionTarget
+        let message_id: String
+        let created_at: Double
+        let part: AgentChatPart
+    }
     private struct Operation: Decodable {
         let client_id: String
         let target: AtemSessionTarget
@@ -91,6 +108,7 @@ final class LocalControlAPI {
         let approval: AtemApprovalRequest?
         let decision: String?
         let rule: AtemApprovalRule?
+        let rule_id: String?
         let message: String?
     }
     private struct ReceiptQuery: Decodable {
@@ -107,8 +125,9 @@ final class LocalControlAPI {
                 guard body.isEmpty else { return .error("invalid_request", status: .badRequest) }
                 switch path {
                 case "/api/v1/status":
-                    return .json(["api": "v1", "session_contract": "r7.1", "account_wide_access": "gated",
-                                  "host_push_ingress": "gated"])
+                    return .json(["api": "v1", "session_contract": "r7.3", "account_wide_access": "gated",
+                                  "host_push_ingress": "gated", "rule_revocation": "lease_free",
+                                  "approval_answers": "acquire_control", "atomic_chat_send": "awaiting_host_contract"])
                 case "/api/v1/sessions":
                     let sessions = clients().sorted { $0.key < $1.key }.flatMap { id, client -> [Session] in
                         let descriptors = client.registry.values.sorted { $0.session_id < $1.session_id }
@@ -128,6 +147,17 @@ final class LocalControlAPI {
                         Approval(client_id: $0.sourceID, target: $0.target, request: $0.request, provider: $0.provider,
                                  host: $0.host, can_answer: $0.canAnswer, status: $0.status, resolution: $0.resolution)
                     })
+                case "/api/v1/approval-rules":
+                    return .json(inbox.rules.filter { $0.client.hasRule($0.rule, target: $0.target) }.map {
+                        Rule(client_id: $0.sourceID, target: $0.target, rule: $0.rule, provider: $0.provider,
+                            host: $0.host, can_revoke: $0.client.canRevoke($0.rule, target: $0.target),
+                            controls: $0.client.controls($0.target), status: $0.status)
+                    })
+                case "/api/v1/approval-activity":
+                    return .json(clients().sorted { $0.key < $1.key }.flatMap { id, client in
+                        client.approvalActivities.map { Activity(client_id: id, target: $0.target,
+                            message_id: $0.messageID, created_at: $0.createdAt.timeIntervalSince1970 * 1000, part: $0.part) }
+                    })
                 default: return .error("not_found", status: .notFound)
                 }
             }
@@ -142,7 +172,7 @@ final class LocalControlAPI {
                 return .json(record)
             }
             guard ["/api/v1/sessions/acquire", "/api/v1/sessions/release", "/api/v1/sessions/submit",
-                   "/api/v1/approvals/answer"].contains(path) else { return .error("not_found", status: .notFound) }
+                   "/api/v1/approvals/answer", "/api/v1/approval-rules/revoke"].contains(path) else { return .error("not_found", status: .notFound) }
             let operation = try JSONDecoder().decode(Operation.self, from: body)
             guard operation.target.valid else { throw AtemSessionJSON.Invalid.json }
             guard let client = clients()[operation.client_id],
@@ -175,6 +205,10 @@ final class LocalControlAPI {
                 payload = AtemApprovalAnswer(approvalID: approval.approval_id, decision: decision,
                     ruleID: operation.rule?.rule_id, message: operation.message).payload
                 _ = try AtemApprovalAnswer.validate(payload)
+            } else if path == "/api/v1/approval-rules/revoke" {
+                guard let ruleID = operation.rule_id, AtemSessionWire.opaque(ruleID) else { throw AtemSessionJSON.Invalid.json }
+                kind = "approval_rule_revoke"
+                payload = .object(["rule_id": .string(ruleID)])
             } else {
                 guard let requestedKind = operation.kind, ["prompt", "interrupt", "stop"].contains(requestedKind),
                       requestedKind == "prompt" || operation.text == nil else { throw AtemSessionJSON.Invalid.json }
@@ -194,7 +228,11 @@ final class LocalControlAPI {
                    && $0.request == approval && $0.canAnswer }) {
                 submitted = entry.client.answerApproval(approval, decision: AtemApprovalAnswer.Decision(rawValue: operation.decision!)!,
                     ruleID: operation.rule?.rule_id, message: operation.message, requestID: requestID)
-            } else if kind != "approval" {
+            } else if kind == "approval_rule_revoke", let rule = client.approvalRules[operation.target.session_id]?.first(where: {
+                $0.rule_id == operation.rule_id
+            }) {
+                submitted = client.revokeRule(rule, target: operation.target, requestID: requestID)
+            } else if kind != "approval" && kind != "approval_rule_revoke" {
                 submitted = client.submit(operation.target, kind: kind, text: operation.text, requestID: requestID)
             } else { submitted = nil }
             guard let submitted else { return .error("not_actionable", status: .conflict) }

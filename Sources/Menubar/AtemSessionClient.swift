@@ -35,6 +35,9 @@ final class AtemSessionClient {
     private(set) var latestReceipt: AtemSessionReceipt?
     private(set) var approvals: [String: AtemApprovalRequest] = [:]
     private(set) var closedApprovals: [String: String] = [:]
+    private(set) var approvalRules: [String: [AtemApprovalRule]] = [:]
+    private var regrantedAfterRevoke: Set<String> = []
+    var approvalActivities: [AtemApprovalActivity] { canReviewApprovals ? approvalActivity.activities : [] }
     var onChange: (() -> Void)?
 
     private struct Pending {
@@ -53,6 +56,12 @@ final class AtemSessionClient {
     private let reconnectTransport: (AtemSessionContext) -> Bool
     private let now: () -> TimeInterval
     private let makeID: () -> String
+    private let sendChat: (AgentChatWire, RemoteTerminalConnection) -> Bool
+    private lazy var approvalActivity = AtemApprovalActivityObserver { [weak self] message in
+        guard let self, let context = self.context, context == self.currentContext(),
+              message.binding?.attachment_gen == self.welcome?.attachment_gen else { return false }
+        return self.sendChat(message, context.route)
+    }
     let journal: AtemSessionJournal
     private var pending: [String: Pending] = [:]
     private var leases: [String: Lease] = [:]
@@ -82,13 +91,15 @@ final class AtemSessionClient {
          journal: AtemSessionJournal = AtemSessionJournal(),
          makeID: @escaping () -> String = { UUID().uuidString.lowercased() },
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-         reconnect: @escaping (AtemSessionContext) -> Bool = { _ in false }) {
+         reconnect: @escaping (AtemSessionContext) -> Bool = { _ in false },
+         sendChat: @escaping (AgentChatWire, RemoteTerminalConnection) -> Bool = { _, _ in false }) {
         currentContext = context
         sendMessage = send
         reconnectTransport = reconnect
         self.journal = journal
         self.now = now
         self.makeID = makeID
+        self.sendChat = sendChat
     }
 
     func start() { started = true; connectionChanged() }
@@ -117,6 +128,9 @@ final class AtemSessionClient {
     }
 
     private func clearAttachment() {
+        approvalActivity.reset(sendClose: false)
+        approvalRules = [:]
+        regrantedAfterRevoke = []
         welcome = nil
         registry = [:]
         approvals = [:]
@@ -249,8 +263,7 @@ final class AtemSessionClient {
               let target = target(sessionId: approval.session_id, process: approval.process_gen),
               let binding = binding(for: target, mutation: false) else { return nil }
         if decision == .allowAlways {
-            guard registry[target.session_id]?.provider == "claude",
-                  approval.always_rules.contains(where: { $0.rule_id == ruleID }) else { return nil }
+            guard approval.always_rules.contains(where: { $0.rule_id == ruleID }) else { return nil }
         }
         let answer = AtemApprovalAnswer(approvalID: approval.approval_id, decision: decision, ruleID: ruleID, message: message)
         var submit = AtemSessionMessage(op: "submit")
@@ -259,6 +272,41 @@ final class AtemSessionClient {
         submit.kind = "approval"
         submit.payload = answer.payload
         return submitDurably(submit, approvalID: approval.approval_id)
+    }
+
+    func hasRule(_ rule: AtemApprovalRule, target: AtemSessionTarget) -> Bool {
+        canReviewApprovals && target == self.target(sessionId: target.session_id, process: target.process_gen)
+            && registry[target.session_id]?.state == "running" && approvalRules[target.session_id]?.contains(rule) == true
+    }
+
+    func revokeRecord(_ rule: AtemApprovalRule, target: AtemSessionTarget) -> AtemSessionRequestRecord? {
+        guard let digest = try? AtemSessionJSON.object(["rule_id": .string(rule.rule_id)]).digest() else { return nil }
+        let record = journal.snapshot.requests.last { $0.target == target && $0.kind == "approval_rule_revoke" && $0.digest == digest }
+        return record.flatMap { regrantedAfterRevoke.contains($0.requestId) ? nil : $0 }
+    }
+
+    func canRevoke(_ rule: AtemApprovalRule, target: AtemSessionTarget) -> Bool {
+        hasRule(rule, target: target)
+            && revokeRecord(rule, target: target).map { $0.receipt?.state == .rejected } != false
+    }
+
+    @discardableResult
+    func revokeRule(_ rule: AtemApprovalRule, target: AtemSessionTarget,
+                    requestID: String = UUID().uuidString.lowercased()) -> String? {
+        guard pending.count < 64, canRevoke(rule, target: target), let binding = binding(for: target, mutation: false) else { return nil }
+        var message = AtemSessionMessage(op: "submit")
+        message.binding = binding
+        message.request_id = requestID
+        message.kind = "approval_rule_revoke"
+        message.payload = .object(["rule_id": .string(rule.rule_id)])
+        return submitDurably(message)
+    }
+
+    func receiveChat(_ event: AgentChatWire, from source: RemoteTerminalConnection) {
+        guard canReviewApprovals, source == context?.route,
+              let descriptor = registry[event.agentId], descriptor.state == "running",
+              descriptor.capabilities.contains("chat-v1") else { return }
+        if approvalActivity.receive(event) { changed() }
     }
 
     private func submitDurably(_ message: AtemSessionMessage, approvalID: String? = nil) -> String? {
@@ -295,6 +343,8 @@ final class AtemSessionClient {
             return
         }
         guard phase == .ready else { return }
+        approvalRules = [:]
+        approvalActivity.reset()
         resyncing = true
         if !pending.values.contains(where: { $0.message.op == "list" }) { _ = request(AtemSessionMessage(op: "list")) }
     }
@@ -322,6 +372,19 @@ final class AtemSessionClient {
             guard phase == .ready, now() < authorizationDeadline else { return }
             switch message.op {
             case "sessions", "session_changed": try acceptRegistry(message)
+            case "approval_rules":
+                guard canReviewApprovals, let id = message.session_id, let process = message.process_gen,
+                      target(sessionId: id, process: process) != nil, registry[id]?.state == "running", let rules = message.rules else { return }
+                approvalRules[id] = rules
+                // A fresh host list may grant the same command again after a
+                // completed revoke. Do not let the old receipt disable it forever.
+                if let target = target(sessionId: id, process: process) {
+                    for rule in rules {
+                        if let record = revokeRecord(rule, target: target), record.receipt?.state == .completed {
+                            regrantedAfterRevoke.insert(record.requestId)
+                        }
+                    }
+                }
             case "approval_request":
                 guard canReviewApprovals, let approval = message.approval,
                       target(sessionId: approval.session_id, process: approval.process_gen) != nil,
@@ -481,6 +544,7 @@ final class AtemSessionClient {
                 else { next[descriptor.session_id] = descriptor }
             }
             registry = next
+            approvalRules = [:]
             sequence = incoming
             resyncing = false
             pending = pending.filter { $0.value.message.op != "list" }
@@ -506,6 +570,14 @@ final class AtemSessionClient {
         approvals = approvals.filter { _, approval in
             registry[approval.session_id]?.process_gen == approval.process_gen && registry[approval.session_id]?.state == "running"
         }
+        approvalRules = approvalRules.filter { id, _ in
+            registry[id]?.state == "running" && previousRegistry[id]?.process_gen == registry[id]?.process_gen
+        }
+        approvalActivity.sync(canReviewApprovals ? registry.values.compactMap { descriptor in
+            guard descriptor.state == "running", descriptor.capabilities.contains("chat-v1"),
+                  let target = target(sessionId: descriptor.session_id, process: descriptor.process_gen) else { return nil }
+            return binding(for: target, mutation: false)
+        } : [])
         try AtemSessionWire.check(tombstones.values.reduce(0) { $0 + $1.count } <= 4096)
     }
 
@@ -632,6 +704,8 @@ final class AtemSessionClient {
         return sendMessage(message, context.route)
     }
     private func fail(_ text: String) {
+        approvalActivity.reset()
+        approvalRules = [:]
         phase = .failed
         approvals = [:]
         leases = [:]

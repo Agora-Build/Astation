@@ -16,11 +16,11 @@ def main():
     parser.add_argument("--token-file", default=os.environ.get("ASTATION_LOCAL_API_TOKEN_FILE"))
     parser.add_argument("--port", type=int, default=8080)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("status", "sessions", "approvals"):
+    for name in ("status", "sessions", "approvals", "approval-rules", "approval-activity"):
         sub.add_parser(name)
     post = sub.add_parser("post")
     post.add_argument("operation", choices=("sessions/acquire", "sessions/release", "sessions/submit",
-                                            "approvals/answer", "receipts/query"))
+                                            "approvals/answer", "approval-rules/revoke", "receipts/query"))
     post.add_argument("--file", required=True, help="JSON request file, or - to read stdin")
     args = parser.parse_args()
     if not args.token_file or not 1 <= args.port <= 65535:

@@ -25,6 +25,7 @@ private final class SessionFixture {
     var source: AtemSessionContext? = AtemSessionContext(route: RemoteTerminalConnection(clientId: "host", connectionId: "socket-1"),
         account: "account-a", device: "host-a", pairingSession: "pairing-1")
     var sent: [AtemSessionMessage] = []
+    var chats: [AgentChatWire] = []
     var reconnects: [AtemSessionContext] = []
     var nextID: String?
     var canSend = true
@@ -39,6 +40,9 @@ private final class SessionFixture {
     }, now: { self.time }, reconnect: { context in
         self.reconnects.append(context)
         return true
+    }, sendChat: { message, _ in
+        self.chats.append(message)
+        return self.canSend
     }) }
 
     init(disk: SessionDisk = SessionDisk()) { self.disk = disk }
@@ -133,6 +137,28 @@ private extension SessionFixture {
         message.approval_id = id; message.reason = reason
         try receive(message)
     }
+
+    func rules(_ rules: [AtemApprovalRule], process: String = processID, route: RemoteTerminalConnection? = nil) throws {
+        var message = AtemSessionMessage(op: "approval_rules")
+        message.session_id = sessionID; message.process_gen = process; message.rules = rules
+        try receive(message, route: route)
+    }
+
+    func chat(_ op: String, sequence: UInt64, part: AgentChatPart? = nil,
+              conversation: String? = nil, process: String = processID, route: RemoteTerminalConnection? = nil) throws {
+        let opened = try XCTUnwrap(chats.last(where: { $0.op == "open" }))
+        var event = AgentChatWire(op: op, conversationId: conversation ?? opened.conversationId,
+            agentId: sessionID, generation: process, sequence: sequence)
+        if op == "opened" { event.status = AgentChatStatus(state: "ready", since: .milliseconds(1_760_500_000_000)) }
+        if let part {
+            event.messageId = "approval-88888888-8888-4888-8888-888888888888"
+            event.role = "assistant"; event.turnId = "turn-1"; event.createdAt = .milliseconds(1_760_500_000_000)
+            event.parts = [part]
+        }
+        let bytes = try JSONEncoder().encode(AstationMessage.agentChat(event))
+        guard case .agentChat(let decoded) = try AstationMessage.decodePacket(bytes) else { throw AtemSessionJSON.Invalid.json }
+        client.receiveChat(decoded, from: route ?? self.route)
+    }
 }
 
 @MainActor
@@ -219,6 +245,363 @@ final class LocalControlAPISessionTests: XCTestCase {
         XCTAssertEqual(api.handle(method: .POST, path: "/api/v1/sessions/submit", body: duplicate).status, .badRequest)
         XCTAssertEqual(api.handle(method: .GET, path: "/api/v1/trust/enroll", body: Data()).status, .notFound)
         XCTAssertEqual(f.sent.filter { $0.op == "submit" }.count, 1)
+    }
+
+    func testCodexSessionRulesCanBeGrantedThroughAPI() throws {
+        let f = SessionFixture(); try f.ready()
+        try f.snapshot(sequence: 2, descriptors: [SessionFixture.descriptor(provider: "codex")])
+        let api = try api(f)
+        let rule = AtemApprovalRule(rule_id: "s-0123456789abcdef", label: "npm test in /project", scope: "session")
+        let request = try f.approval(rules: [rule])
+        let input: [String: Any] = ["client_id": "host", "target": try object(f.target),
+            "request_id": UUID().uuidString.lowercased(), "approval": try object(request),
+            "decision": "allow_always", "rule": try object(rule)]
+        XCTAssertEqual(try post(api, "approvals/answer", input).status, .accepted)
+        XCTAssertEqual(f.sent.last?.payload?["rule_id"], .string(rule.rule_id))
+        XCTAssertEqual(f.sent.last?.payload?["acquire"], .bool(true))
+    }
+
+    func testRulesAPIRevokesWithoutLeaseAndNeverRedispatchesUUIDEvenAfterRemoval() throws {
+        let f = SessionFixture(); try f.ready()
+        let api = try api(f)
+        let rule = AtemApprovalRule(rule_id: "s-0123456789abcdef", label: "npm test in /project", scope: "session")
+        try f.rules([rule])
+        let list = api.handle(method: .GET, path: "/api/v1/approval-rules", body: Data())
+        let entries = try XCTUnwrap(JSONSerialization.jsonObject(with: list.body) as? [[String: Any]])
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertEqual(entries.first?["can_revoke"] as? Bool, true)
+        XCTAssertEqual(entries.first?["controls"] as? Bool, false)
+        var input: [String: Any] = ["client_id": "host", "target": try object(f.target),
+            "request_id": UUID().uuidString.lowercased(), "rule_id": rule.rule_id]
+        XCTAssertEqual(try post(api, "approval-rules/revoke", input).status, .accepted)
+        XCTAssertNil(f.sent.last?.binding?.lease_epoch)
+        XCTAssertFalse(f.sent.contains { $0.op == "acquire" || $0.op == "release" })
+        try f.rules([])
+        XCTAssertEqual(try post(api, "approval-rules/revoke", input).status, .accepted)
+        input["rule_id"] = "s-other"
+        XCTAssertEqual(try post(api, "approval-rules/revoke", input).status, .conflict)
+        XCTAssertEqual(f.sent.filter { $0.kind == "approval_rule_revoke" }.count, 1)
+        f.source = nil
+        XCTAssertEqual(api.handle(method: .GET, path: "/api/v1/approval-rules", body: Data()).body, Data("[]".utf8))
+    }
+}
+
+final class AtemSessionRuleTests: XCTestCase {
+    private let rule = AtemApprovalRule(rule_id: "s-0123456789abcdef", label: "Always allow npm test in /project", scope: "session")
+
+    func testRuleCardCanRevokeBeforeAndAfterControlIsGrantedAndReleased() throws {
+        let f = SessionFixture(); let inbox = ApprovalInbox()
+        f.client.onChange = { inbox.sync(sourceID: "host", client: f.client, host: "Genie") }
+        try f.ready(); try f.rules([rule])
+        let viewing = try XCTUnwrap(inbox.rules.first)
+        XCTAssertFalse(f.client.controls(f.target))
+        XCTAssertTrue(viewing.canRevoke)
+        f.client.acquire(f.target)
+        XCTAssertTrue(try XCTUnwrap(inbox.rules.first).canRevoke)
+        try f.lease(replyTo: XCTUnwrap(f.sent.last(where: { $0.op == "acquire" })).id)
+        let controlling = try XCTUnwrap(inbox.rules.first)
+        XCTAssertEqual(viewing.id, controlling.id)
+        XCTAssertTrue(f.client.controls(f.target))
+        XCTAssertTrue(controlling.canRevoke)
+        f.client.release(f.target)
+        let released = try XCTUnwrap(inbox.rules.first)
+        XCTAssertFalse(f.client.controls(f.target))
+        XCTAssertTrue(released.canRevoke)
+        XCTAssertFalse(f.sent.contains { $0.kind == "approval_rule_revoke" }, "Taking control never revokes a rule implicitly")
+        try f.rules([])
+        XCTAssertTrue(released.canRevoke, "Presentation snapshots remain immutable")
+        XCTAssertNil(released.client.revokeRule(released.rule, target: released.target), "A stale enabled button cannot bypass the live rule check")
+    }
+
+    func testRuleCardSnapshotUpdatesRevocationStatusWithoutMutatingEarlierRows() throws {
+        let f = SessionFixture(); let inbox = ApprovalInbox()
+        f.client.onChange = { inbox.sync(sourceID: "host", client: f.client, host: "Genie") }
+        try f.ready(); try f.rules([rule])
+        let before = try XCTUnwrap(inbox.rules.first)
+        XCTAssertTrue(before.canRevoke)
+        XCTAssertFalse(f.client.controls(f.target))
+        let requestID = try XCTUnwrap(f.client.revokeRule(rule, target: f.target))
+        let pending = try XCTUnwrap(inbox.rules.first)
+        XCTAssertFalse(pending.canRevoke)
+        XCTAssertTrue(pending.status.contains("Revocation pending"))
+        XCTAssertFalse(before.status.contains("Revocation pending"))
+        var receipt = AtemSessionMessage(op: "receipt")
+        receipt.request_id = requestID; receipt.target = f.target; receipt.kind = "approval_rule_revoke"
+        receipt.state = .completed; receipt.updated_at = 1
+        try f.receive(receipt)
+        XCTAssertTrue(try XCTUnwrap(inbox.rules.first).status.contains("Revoked."))
+        XCTAssertTrue(pending.status.contains("Revocation pending"))
+    }
+
+    private var automatic: AgentChatPart {
+        AgentChatPart(id: "approval", kind: "approval", summary: "npm test",
+            approval_id: "88888888-8888-4888-8888-888888888888", tool: "Bash", always_rules: [],
+            state: "auto_allowed", rule_id: rule.rule_id)
+    }
+
+    func testPublishedR73RevokeFixturePinsAndValidatesEveryClientRequest() throws {
+        let directory = try XCTUnwrap(Bundle.module.url(forResource: "atem-session-r7.3", withExtension: nil, subdirectory: "Fixtures"))
+        let source = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: directory.appendingPathComponent("source.json"))) as? [String: Any])
+        XCTAssertEqual(source["commit"] as? String, "976e15462b834a0fc270a9b541cd6952632c522c")
+        XCTAssertEqual(source["revision"] as? String, "r7.3")
+        let hashes = try XCTUnwrap(source["sha256"] as? [String: String])
+        let name = "approval-rule-revoke-needs-control-not-the-lease.json"
+        let data = try Data(contentsOf: directory.appendingPathComponent(name))
+        XCTAssertEqual(SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(), hashes[name])
+        let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let steps = try XCTUnwrap(fixture["steps"] as? [[String: Any]])
+        var revokes: [AtemSessionMessage] = []
+        var invalidPayloads = 0
+        for step in steps where step["send"] != nil {
+            let envelope = try XCTUnwrap(step["json"] as? [String: Any])
+            let fields = try XCTUnwrap(envelope["data"] as? [String: Any])
+            let bytes = try JSONSerialization.data(withJSONObject: envelope)
+            if fields["kind"] as? String == "approval_rule_revoke",
+               (fields["payload"] as? [String: Any])?["acquire"] != nil {
+                XCTAssertThrowsError(try AstationMessage.decodePacket(bytes))
+                invalidPayloads += 1
+                continue
+            }
+            guard case .session(let message) = try AstationMessage.decodePacket(bytes) else {
+                return XCTFail("Expected a session request")
+            }
+            if message.kind == "approval_rule_revoke" { revokes.append(message) }
+        }
+        XCTAssertEqual(invalidPayloads, 1)
+        XCTAssertEqual(revokes.count, 7)
+        XCTAssertTrue(revokes.contains { $0.binding?.lease_epoch == nil })
+        XCTAssertTrue(revokes.contains { $0.binding?.lease_epoch == 1 })
+        XCTAssertTrue(revokes.contains { $0.payload?["rule_id"] == .string(rule.rule_id) })
+    }
+
+    func testRulesRequireCurrentControlPermissionProcessAndRoute() throws {
+        let f = SessionFixture(); try f.ready()
+        try f.rules([rule], process: "99999999-9999-4999-8999-999999999999")
+        try f.rules([rule], route: RemoteTerminalConnection(clientId: "host", connectionId: "old-socket"))
+        XCTAssertTrue(f.client.approvalRules.isEmpty)
+        try f.rules([rule])
+        XCTAssertTrue(f.client.hasRule(rule, target: f.target))
+        let viewer = SessionFixture(); try viewer.handshake(permissions: ["view"]); try viewer.snapshot()
+        try viewer.rules([rule])
+        XCTAssertTrue(viewer.client.approvalRules.isEmpty)
+        XCTAssertTrue(viewer.chats.isEmpty)
+        XCTAssertNil(viewer.client.revokeRule(rule, target: viewer.target))
+        f.source = nil
+        XCTAssertFalse(f.client.hasRule(rule, target: f.target))
+        f.client.tick()
+        XCTAssertTrue(f.client.approvalRules.isEmpty)
+    }
+
+    func testFreshSnapshotRefreshProcessEndAndReplacementClearRules() throws {
+        let f = SessionFixture(); try f.ready(); try f.rules([rule])
+        try f.snapshot(sequence: 2)
+        XCTAssertTrue(f.client.approvalRules.isEmpty)
+        try f.rules([rule]); f.client.refresh()
+        XCTAssertFalse(f.client.hasRule(rule, target: f.target))
+        try f.snapshot(sequence: 3); try f.rules([rule])
+        try f.snapshot(sequence: 4, descriptors: [SessionFixture.descriptor(state: "exited")])
+        XCTAssertTrue(f.client.approvalRules.isEmpty)
+        try f.snapshot(sequence: 5, descriptors: [SessionFixture.descriptor(process: "99999999-9999-4999-8999-999999999999")])
+        try f.rules([rule])
+        XCTAssertTrue(f.client.approvalRules.isEmpty)
+    }
+
+    func testRevokeWithoutLeasePersistsBeforeSendingAndQueriesAfterReconnect() throws {
+        let disk = SessionDisk()
+        let f = SessionFixture(disk: disk); try f.ready(); try f.rules([rule])
+        f.canSend = false
+        let requestID = try XCTUnwrap(f.client.revokeRule(rule, target: f.target))
+        let message = try XCTUnwrap(f.sent.last)
+        XCTAssertEqual(message.kind, "approval_rule_revoke")
+        XCTAssertNil(message.binding?.lease_epoch)
+        XCTAssertEqual(message.payload, .object(["rule_id": .string(rule.rule_id)]))
+        XCTAssertEqual(disk.state.requests.last?.requestId, requestID)
+        XCTAssertFalse(f.sent.contains { $0.op == "acquire" || $0.op == "release" })
+        XCTAssertNil(f.client.revokeRule(rule, target: f.target))
+        let recovered = SessionFixture(disk: disk); try recovered.ready(); try recovered.rules([rule])
+        XCTAssertFalse(recovered.client.journal.loadFailed)
+        XCTAssertTrue(recovered.sent.contains { $0.op == "receipt_query" && $0.request_ids?.contains(requestID) == true })
+        XCTAssertFalse(recovered.sent.contains { $0.op == "submit" || $0.op == "acquire" })
+        XCTAssertNil(recovered.client.revokeRule(rule, target: recovered.target))
+    }
+
+    func testRevokePersistenceFailureSendsNeitherMutationNorAcquire() throws {
+        let f = SessionFixture(); try f.ready(); try f.rules([rule])
+        f.disk.fail = true
+        XCTAssertNil(f.client.revokeRule(rule, target: f.target))
+        XCTAssertFalse(f.sent.contains { $0.op == "submit" || $0.op == "acquire" })
+    }
+
+    func testRevokePreservesOwnLeaseAndDoesNotAcquireAnotherControllersLease() throws {
+        for ownsLease in [false, true] {
+            let f = SessionFixture(); try f.ready(); try f.rules([rule])
+            if ownsLease { try f.takeControl(epoch: 3) }
+            else {
+                var other = AtemSessionMessage(op: "lease_changed")
+                other.session_id = sessionID; other.process_gen = processID; other.lease_epoch = 3
+                other.reason = "granted"
+                other.controller = AtemSessionController(controller_session: "99999999-9999-4999-8999-999999999999", lease_epoch: 3)
+                try f.receive(other)
+            }
+            let binding = f.client.binding(for: f.target, mutation: true)
+            let deadline = f.client.controlDeadline(for: f.target)
+            let before = f.sent.count
+            XCTAssertNotNil(f.client.revokeRule(rule, target: f.target))
+            XCTAssertEqual(f.client.controls(f.target), ownsLease)
+            XCTAssertEqual(f.client.binding(for: f.target, mutation: true), binding)
+            XCTAssertEqual(f.client.controlDeadline(for: f.target), deadline)
+            XCTAssertEqual(f.sent.count, before + 1)
+            XCTAssertEqual(f.sent.last?.kind, "approval_rule_revoke")
+            XCTAssertNil(f.sent.last?.binding?.lease_epoch)
+        }
+    }
+
+    func testRevokeAfterLeaseExpiryStillRequiresFreshDeviceAndProcessAuthority() throws {
+        let f = SessionFixture(); try f.ready(); try f.rules([rule]); try f.takeControl()
+        f.time = 15; f.client.tick()
+        XCTAssertFalse(f.client.controls(f.target))
+        XCTAssertNotNil(f.client.revokeRule(rule, target: f.target))
+        XCTAssertNil(f.sent.last?.binding?.lease_epoch)
+        for invalidation in ["offline", "socket", "process", "authorization", "permission"] {
+            let g = SessionFixture(); try g.ready(); try g.rules([rule])
+            switch invalidation {
+            case "offline": g.source = nil
+            case "socket":
+                g.source = AtemSessionContext(route: RemoteTerminalConnection(clientId: "host", connectionId: "socket-2"),
+                    account: "account-a", device: "host-a", pairingSession: "pairing-1")
+            case "process":
+                try g.snapshot(sequence: 2, descriptors: [SessionFixture.descriptor(process: "99999999-9999-4999-8999-999999999999")])
+            case "authorization": g.time = 60
+            default:
+                g.source = nil; g.client.connectionChanged()
+                g.source = AtemSessionContext(route: RemoteTerminalConnection(clientId: "host", connectionId: "socket-2"),
+                    account: "account-a", device: "host-a", pairingSession: "pairing-1")
+                g.client.connectionChanged(); try g.handshake(permissions: ["view"]); try g.snapshot()
+            }
+            XCTAssertNil(g.client.revokeRule(rule, target: g.target), invalidation)
+            XCTAssertFalse(g.sent.contains { $0.kind == "approval_rule_revoke" || $0.op == "acquire" }, invalidation)
+        }
+    }
+
+    func testRevokeReceiptsAndRegrantOfSameRuleRemainUsable() throws {
+        let f = SessionFixture(); try f.ready(); try f.rules([rule]); try f.takeControl()
+        let requestID = try XCTUnwrap(f.client.revokeRule(rule, target: f.target))
+        for (index, state) in [AtemReceiptState.accepted, .executing, .completed].enumerated() {
+            var message = AtemSessionMessage(op: "receipt")
+            message.request_id = requestID; message.target = f.target; message.kind = "approval_rule_revoke"
+            message.state = state; message.updated_at = UInt64(index + 1)
+            try f.receive(message)
+        }
+        XCTAssertFalse(f.client.canRevoke(rule, target: f.target))
+        try f.rules([])
+        XCTAssertFalse(f.client.hasRule(rule, target: f.target))
+        try f.rules([rule])
+        XCTAssertTrue(f.client.canRevoke(rule, target: f.target))
+        XCTAssertNotNil(f.client.revokeRule(rule, target: f.target))
+        XCTAssertEqual(f.sent.filter { $0.kind == "approval_rule_revoke" }.count, 2)
+    }
+
+    func testRuleWireBoundsAndStrictRevokePayload() throws {
+        let f = SessionFixture(); try f.ready()
+        var list = AtemSessionMessage(op: "approval_rules")
+        list.session_id = sessionID; list.process_gen = processID
+        list.rules = [rule, rule]
+        XCTAssertThrowsError(try list.validate())
+        list.rules = (0..<33).map { AtemApprovalRule(rule_id: "s-\($0)", label: "command", scope: "session") }
+        XCTAssertThrowsError(try list.validate())
+        list.rules = [AtemApprovalRule(rule_id: "r", label: "bad\u{1b}", scope: "session")]
+        XCTAssertThrowsError(try list.validate())
+        list.rules = [AtemApprovalRule(rule_id: "r", label: "all projects", scope: "account")]
+        XCTAssertThrowsError(try list.validate())
+        var revoke = AtemSessionMessage(op: "submit")
+        revoke.binding = AtemSessionBinding(target: f.target, attachment_gen: attachmentID, lease_epoch: 1)
+        revoke.request_id = UUID().uuidString.lowercased(); revoke.kind = "approval_rule_revoke"
+        revoke.payload = .object(["rule_id": .string(rule.rule_id)])
+        XCTAssertNoThrow(try revoke.validate())
+        revoke.payload = .object(["rule_id": .string(rule.rule_id), "acquire": .bool(true)])
+        XCTAssertThrowsError(try revoke.validate())
+        revoke.payload = .object(["rule_id": .string(rule.rule_id)]); revoke.binding?.lease_epoch = nil
+        XCTAssertNoThrow(try revoke.validate())
+        revoke.kind = "prompt"; revoke.payload = .object(["text": .string("test")])
+        XCTAssertThrowsError(try revoke.validate(), "Only rule revocation gains the lease-free exception")
+    }
+
+    func testAutomaticCardsAreClosedInformationalAndNeverAlert() throws {
+        let f = SessionFixture(); try f.ready()
+        let inbox = ApprovalInbox(); var alerts = 0
+        inbox.onNew = { _ in alerts += 1 }
+        XCTAssertEqual(f.chats.filter { $0.op == "open" }.count, 1)
+        try f.chat("opened", sequence: 0)
+        try f.chat("message", sequence: 1, part: automatic)
+        try f.chat("message", sequence: 1, part: automatic)
+        inbox.sync(sourceID: "host", client: f.client, host: "Genie")
+        XCTAssertEqual(inbox.activities.count, 1)
+        XCTAssertEqual(inbox.pendingCount, 0)
+        XCTAssertTrue(inbox.entries.isEmpty)
+        XCTAssertTrue(f.client.approvals.isEmpty)
+        XCTAssertFalse(f.client.controls(f.target))
+        XCTAssertEqual(alerts, 0)
+        var replacement = automatic; replacement.state = "closed"; replacement.rule_id = nil
+        try f.chat("message", sequence: 2, part: replacement)
+        inbox.sync(sourceID: "host", client: f.client, host: "Genie")
+        XCTAssertTrue(inbox.activities.isEmpty)
+        XCTAssertEqual(alerts, 0)
+    }
+
+    func testChatFencesRouteGenerationConversationSequenceAndRefresh() throws {
+        let f = SessionFixture(); try f.ready()
+        try f.chat("opened", sequence: 0)
+        try f.chat("message", sequence: 1, part: automatic, conversation: "stale-conversation")
+        try f.chat("message", sequence: 1, part: automatic, process: "99999999-9999-4999-8999-999999999999")
+        try f.chat("message", sequence: 1, part: automatic, route: RemoteTerminalConnection(clientId: "host", connectionId: "old-socket"))
+        XCTAssertTrue(f.client.approvalActivities.isEmpty)
+        try f.chat("message", sequence: 2, part: automatic)
+        try f.chat("message", sequence: 1, part: automatic)
+        XCTAssertTrue(f.client.approvalActivities.isEmpty)
+        let old = try XCTUnwrap(f.chats.last(where: { $0.op == "open" })?.conversationId)
+        f.client.refresh(); try f.snapshot(sequence: 2)
+        XCTAssertEqual(f.chats.filter { $0.op == "open" }.count, 2)
+        try f.chat("opened", sequence: 0)
+        try f.chat("message", sequence: 1, part: automatic, conversation: old)
+        XCTAssertTrue(f.client.approvalActivities.isEmpty)
+        try f.chat("message", sequence: 1, part: automatic)
+        XCTAssertEqual(f.client.approvalActivities.count, 1)
+        f.source = nil
+        XCTAssertTrue(f.client.approvalActivities.isEmpty)
+        f.client.tick()
+        XCTAssertTrue(f.client.approvalRules.isEmpty)
+    }
+
+    func testMalformedAutoAllowedPartNeverAppears() throws {
+        var part = automatic
+        XCTAssertTrue(part.isValid)
+        part.rule_id = nil
+        XCTAssertFalse(part.isValid)
+        let f = SessionFixture(); try f.ready(); try f.chat("opened", sequence: 0)
+        try f.chat("message", sequence: 1, part: part)
+        XCTAssertTrue(f.client.approvalActivities.isEmpty)
+    }
+
+    func testMultipleSessionsKeepRulesAndMutationsSeparateAndObservationNeverTakesControl() throws {
+        let f = SessionFixture(); try f.ready()
+        let secondID = "ses-bbbbbbbbbbbb"
+        let secondProcess = "99999999-9999-4999-8999-999999999999"
+        try f.snapshot(sequence: 2, descriptors: [SessionFixture.descriptor(provider: "codex"),
+            SessionFixture.descriptor(session: secondID, process: secondProcess)])
+        let opens = f.chats.filter { $0.op == "open" }
+        XCTAssertEqual(opens.count, 2)
+        XCTAssertEqual(Set(opens.map(\.agentId)), [sessionID, secondID])
+        XCTAssertTrue(opens.allSatisfy { $0.binding?.lease_epoch == nil })
+        XCTAssertFalse(f.sent.contains { $0.op == "acquire" || $0.op == "submit" })
+        try f.rules([rule])
+        let request = try f.approval(rules: [rule])
+        XCTAssertNotNil(f.client.answerApproval(request, decision: .allowAlways, ruleID: rule.rule_id))
+        XCTAssertEqual(f.sent.filter { $0.op == "submit" }.map { $0.binding?.target.session_id }, [sessionID])
+        XCTAssertNil(f.client.approvalRules[secondID])
+        let otherTarget = AtemSessionTarget(account_id: f.target.account_id, atem_device_id: f.target.atem_device_id,
+            host_trust_gen: f.target.host_trust_gen, session_id: secondID, process_gen: secondProcess)
+        XCTAssertNil(f.client.revokeRule(rule, target: otherTarget))
+        XCTAssertFalse(f.client.controls(otherTarget))
     }
 }
 
@@ -341,7 +724,7 @@ final class AtemApprovalTests: XCTestCase {
         XCTAssertFalse(second.client.canAnswer(request))
     }
 
-    func testAlwaysAllowMustUseTheExactOfferedClaudeRule() throws {
+    func testAlwaysAllowMustUseTheExactOfferedRuleForClaudeAndCodex() throws {
         let f = SessionFixture(); try f.ready()
         let request = try f.approval(rules: [rule])
         XCTAssertNil(f.client.answerApproval(request, decision: .allowAlways, ruleID: "other-rule"))
@@ -349,8 +732,14 @@ final class AtemApprovalTests: XCTestCase {
         XCTAssertEqual(f.sent.last?.payload?["rule_id"], .string(rule.rule_id))
         let codex = SessionFixture(); try codex.ready()
         try codex.snapshot(sequence: 2, descriptors: [SessionFixture.descriptor(provider: "codex")])
-        let codexRequest = try codex.approval(rules: [rule])
+        let sessionRule = AtemApprovalRule(rule_id: "s-0123456789abcdef", label: "Always allow npm test in /project", scope: "session")
+        let codexRequest = try codex.approval(rules: [sessionRule])
         XCTAssertNil(codex.client.answerApproval(codexRequest, decision: .allowAlways, ruleID: rule.rule_id))
+        XCTAssertNotNil(codex.client.answerApproval(codexRequest, decision: .allowAlways, ruleID: sessionRule.rule_id))
+        XCTAssertEqual(codex.sent.last?.payload, AtemApprovalAnswer(approvalID: codexRequest.approval_id,
+            decision: .allowAlways, ruleID: sessionRule.rule_id).payload)
+        XCTAssertNil(codex.sent.last?.binding?.lease_epoch)
+        XCTAssertFalse(codex.sent.contains { $0.op == "acquire" })
     }
 
     func testApprovalSubmissionFailsClosedWhenJournalCannotCommit() throws {
@@ -616,11 +1005,13 @@ final class AtemSessionWireTests: XCTestCase {
         XCTAssertEqual(event.code, "outcome_unknown")
         XCTAssertEqual(event.requestId, "44444444-4444-4444-8444-000000000001")
         XCTAssertEqual(event.text, "Write interrupted")
-        for packet in [terminal, chat] {
+        for packet in [terminal] {
             var object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(packet.utf8)) as? [String: Any])
             var data = try XCTUnwrap(object["data"] as? [String: Any]); data.removeValue(forKey: "code"); object["data"] = data
             XCTAssertThrowsError(try AstationMessage.decodePacket(JSONSerialization.data(withJSONObject: object)))
         }
+        let notice = AgentChatWire(op: "error", conversationId: "conv-1", agentId: sessionID, text: "the conversation was switched; reopen the chat")
+        XCTAssertNoThrow(try AstationMessage.decodePacket(JSONEncoder().encode(AstationMessage.agentChat(notice))))
     }
 
     func testEverySharedClientScenarioUsesRealWireMessages() throws {
