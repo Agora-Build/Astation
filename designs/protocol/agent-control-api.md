@@ -1,28 +1,37 @@
 # Agent control API: Astation and Atem joint proposal
 
-Status: proposal r3, 2026-10-17, incorporating
+Status: proposal r5, 2026-10-18, incorporating
 [Atem's response](https://github.com/Agora-Build/Astation/issues/52#issuecomment-6237260882)
 and the baseline corrections in [Atem #74](https://github.com/Agora-Build/Atem/pull/74).
-The [r2 response review](agent-control-api-atem-r2-review.md) signs off the r8
-design for implementation and records two fixture corrections before its
-conformance gate can pass. The earlier four contract findings are closed.
+The [r5 review](agent-control-api-atem-r5-review.md) grants design sign-off for
+r8 at `f9fa57aaed2cc7c57e097de678eb3733095af88a`, including history/recovery,
+atomic Send, lease-free approval answers and revocation/persistence. The
+earlier findings and fixture corrections are resolved. Atem may implement
+this pinned contract; implementation conformance and joint live tests remain
+required before shipping r8.
 This document records
 Brent's requested next milestone: operate agents started with `atem agent launch` through APIs,
-including conversations, approvals and notifications. Proposed endpoints and
-wire additions below are not implemented or jointly approved yet.
+including conversations, approvals and notifications. Proposed endpoints below
+are not all implemented; the agreed wire contract is pinned in the r5 review.
+The [chat Send and approval behavior](chat-send-control.md) is user-approved,
+with implementation authorized on 2026-10-18. Lease-free rule revocation is
+implemented locally against r7.3. Atomic prompt submission and lease-free
+approval answers are approved for coordinated r8 implementation, as described
+in the handoff. They must not be emitted to an r7.3 host.
 
 Tracking: [Astation #52](https://github.com/Agora-Build/Astation/issues/52).
 The existing API shipped in [Astation #50](https://github.com/Agora-Build/Astation/pull/50).
 [Atem #73](https://github.com/Agora-Build/Atem/pull/73) is merged after #72;
-the current main baseline is `af56d39abf6394b8706e9eb8b9ea3f04b594197c`. Contracts:
-[session r7.2](https://github.com/Agora-Build/Atem/blob/af56d39abf6394b8706e9eb8b9ea3f04b594197c/designs/protocol/atem-session-v1.md),
-[agent chat](https://github.com/Agora-Build/Atem/blob/af56d39abf6394b8706e9eb8b9ea3f04b594197c/designs/agent-chat-host.md)
-and the [developer guide](https://github.com/Agora-Build/Atem/blob/af56d39abf6394b8706e9eb8b9ea3f04b594197c/designs/agent-chat-api.md).
+the checked main baseline on 2026-10-18 is `976e15462b834a0fc270a9b541cd6952632c522c`. Contracts:
+[session r7.3](https://github.com/Agora-Build/Atem/blob/976e15462b834a0fc270a9b541cd6952632c522c/designs/protocol/atem-session-v1.md),
+[agent chat](https://github.com/Agora-Build/Atem/blob/976e15462b834a0fc270a9b541cd6952632c522c/designs/agent-chat-host.md)
+and the [developer guide](https://github.com/Agora-Build/Atem/blob/976e15462b834a0fc270a9b541cd6952632c522c/designs/agent-chat-api.md).
 The session contract governs bindings, permissions and receipts where the
 older chat document describes pre-runtime behavior.
 Astation main still implements r7.1. A local `feat/codex-approval-rules`
-worktree now implements r7.2 grants, rule lists/revoke and auto_allowed
-activity; its personally provisioned build passes 920 tests (6 skipped).
+worktree now implements r7.3 grants, lease-free rule revocation and auto_allowed
+activity. Its r7.3 personally provisioned build executed 924 tests (6 skipped,
+zero failures), including the published revoke fixture's client envelopes.
 That work is not yet merged or jointly verified through a live Codex rule cycle.
 
 ## Required first milestone
@@ -98,7 +107,7 @@ Proposed additions, to be finalized after Atem review:
 | POST /api/v1/chat/history | Accept chat_id and a bounded cursor or request/turn filter; return one bounded host page with explicit continuation and retention coverage. |
 | POST /api/v1/chat/close | Release the caller's view. Never interrupt, stop or restart the agent. Share exactly one live host conversation per full target and attachment among native/API readers. |
 | GET /api/v1/approval-rules | List authoritative active session rules with client_id and full target; empty means no active rules. |
-| POST /api/v1/approval-rules/revoke | Accept client_id, full target, rule_id and request_id; use a durable approval_rule_revoke submission. r7.2 requires a held lease. Planned r7.3 requires control permission only; adopt its exact wire/fixtures when published. |
+| POST /api/v1/approval-rules/revoke | Accept client_id, full target, rule_id and request_id; use a durable approval_rule_revoke submission. Implemented locally against r7.3: current control permission, active rule and exact process/attachment; no held lease or control transfer. |
 | GET /api/v1/events | Server-sent events for session, chat, approval, receipt and connection/control changes, with replay cursors and explicit reset semantics. |
 
 Every chat_id is bound to the full target: account_id, atem_device_id,
@@ -188,7 +197,10 @@ offline delivery requires a push-enabled test device and credentials.
   dispatch. Recheck the current attachment, full target and permission at
   application and at every mutation. Late frames cannot retarget a chat.
 - A read subscription never takes control. Explicit acquire/submit and
-  approval answers follow r7.2 lease and atomic-acquire rules. The current
+  approval answers follow the currently published lease and atomic-acquire
+  rules; the authorized replacement behavior is in the
+  [chat/approval handoff](chat-send-control.md). r7.3 rule revocation requires
+  control permission but leaves the lease unchanged. The current
   local token represents the native Astation principal, not an independently
   enrolled device or controller. Native UI/API control ownership and renewal
   must be explicit so an abandoned automation client does not renew control
@@ -239,11 +251,12 @@ offline delivery requires a push-enabled test device and credentials.
 
 ## Implementation and acceptance order
 
-1. Implement the approved r8 contract and correct the two draft fixture
-   inconsistencies. Astation can build the native chat coordinator and SSE
-   infrastructure meanwhile; unavailable capabilities and unconfirmed history
-   remain explicit. Adoption of the separate r7.3 revoke change waits for its
-   exact published contract and tests.
+1. Implement the coordinated r8 client against the signed-off contract and
+   fixtures at `f9fa57aaed2cc7c57e097de678eb3733095af88a` while Atem builds
+   the host. Run the applicable shared fixtures, filesystem fault tests and
+   native/API ownership checks before joint live acceptance. The separate
+   r7.3 revoke change has been implemented locally against its published
+   contract and pinned fixture; finish native/API and joint live verification.
 2. Expose both providers' conversation history/events through the protected
    local API, then consume that service from the native chat view. Extend the CLI helper
    with watch/history so scripts can exercise the entire flow.
