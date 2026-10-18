@@ -86,7 +86,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
         statusMenu.removeAllItems()
         
         // Header (clickable — 5 taps opens Dev Console)
-        let headerItem = NSMenuItem(title: "🚀 Astation Hub", action: #selector(handleHeaderTap), keyEquivalent: "")
+        let headerItem = NSMenuItem(title: "🚀 Astation", action: #selector(handleHeaderTap), keyEquivalent: "")
         headerItem.target = self
         statusMenu.addItem(headerItem)
 

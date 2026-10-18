@@ -81,6 +81,7 @@ staged_executable="$(mktemp "$app_bundle/Contents/MacOS/.Astation.XXXXXX")"
 cp -p "$build_dir/astation" "$staged_executable"
 cp "$repo_dir/Config/Info.plist" "$app_bundle/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $bundle_id" "$app_bundle/Contents/Info.plist"
+python3 "$repo_dir/scripts/stamp-app-build.py" "$app_bundle/Contents/Info.plist"
 if [[ "$bundle_id" != build.agora.astation ]]; then
     # An isolated local build must not claim the production SSO callback scheme.
     /usr/libexec/PlistBuddy -c 'Delete :CFBundleURLTypes' "$app_bundle/Contents/Info.plist"
