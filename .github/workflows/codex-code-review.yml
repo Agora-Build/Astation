@@ -67,7 +67,8 @@ jobs:
         env:
           AI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           AI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-          AI_MODEL: ${{ vars.CODEX_REVIEW_MODEL || 'gpt-5.5' }}
+          AI_MODEL: ${{ vars.CODEX_REVIEW_MODEL || 'gpt-6.1-sol' }}
+          AI_REASONING_EFFORT: ${{ vars.CODEX_REVIEW_REASONING_EFFORT || 'xhigh' }}
           AI_OUTPUT_PATH: ${{ runner.temp }}/codex-review.json
           AI_PROVIDER: codex
           CI_CONTEXT_PATH: ${{ steps.ci-run.outputs.event == 'workflow_dispatch' && format('{0}/smt-ci-context/context.json', runner.temp) || '' }}
