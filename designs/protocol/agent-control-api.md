@@ -28,11 +28,13 @@ the checked main baseline on 2026-10-18 is `976e15462b834a0fc270a9b541cd6952632c
 and the [developer guide](https://github.com/Agora-Build/Atem/blob/976e15462b834a0fc270a9b541cd6952632c522c/designs/agent-chat-api.md).
 The session contract governs bindings, permissions and receipts where the
 older chat document describes pre-runtime behavior.
-Astation main still implements r7.1. A local `feat/codex-approval-rules`
-worktree now implements r7.3 grants, lease-free rule revocation and auto_allowed
-activity. Its r7.3 personally provisioned build executed 924 tests (6 skipped,
-zero failures), including the published revoke fixture's client envelopes.
-That work is not yet merged or jointly verified through a live Codex rule cycle.
+Astation main still implements r7.1. The consolidated `feat/agent-control-api`
+branch in [Astation #56](https://github.com/Agora-Build/Astation/pull/56)
+implements r7.3 grants, lease-free rule revocation and auto_allowed activity,
+alongside this protocol handoff. Combined-branch validation executed 924 Swift
+tests (11 skipped, zero failures), including the published revoke fixture's
+client envelopes. That work is not yet merged or jointly verified through a
+live Codex rule cycle.
 
 ## Required first milestone
 
@@ -41,7 +43,7 @@ That work is not yet merged or jointly verified through a live Codex rule cycle.
 | Discover launched agents and their capabilities | Local session registry API | Expose explicit API feature support and actionable unsupported-feature errors. |
 | Send a prompt to the original running agent | Atem main supports Claude and Codex chat-v1; Astation has the capability-gated submit path | Verify both providers together; respect Codex's first-local-prompt prerequisite. No second provider session. |
 | Read replies and earlier conversation | Both providers have host chat-v1 | Session-bound native chat coordinator, history API and live events in Astation; agree r8 history/recovery semantics. |
-| See and answer approvals | Local inbox and answer APIs | Integrate r7.2 Codex session rules, rule lists/revoke and typed chat cards; run joint live tests. |
+| See and answer approvals | Native inbox, answer/rule APIs and typed activity cards in PR #56 (r7.3) | Jointly verify Codex session grants, auto-allowed cards and revocation; implement the approved r8 answer semantics. |
 | Be notified when action is needed or work ends | Native in-app approval notifications | API event subscription plus completion, failure and connection/control notifications; offline delivery is a separate gate. |
 | Interrupt or stop an agent | Controlled submissions and durable receipts | Complete disposable-session live tests; keep interrupt and process stop distinct. |
 | Recover an uncertain request | Scoped receipt query and durable UUID journal | Expose receipt updates in events; recover associated replies where host history still exists. |
