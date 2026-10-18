@@ -1,18 +1,20 @@
 # Agent control API: Astation and Atem joint proposal
 
-Status: proposal r5, 2026-10-18, incorporating
+Status: r8 host handoff confirmed, Astation implementation pending, 2026-10-18, incorporating
 [Atem's response](https://github.com/Agora-Build/Astation/issues/52#issuecomment-6237260882)
 and the baseline corrections in [Atem #74](https://github.com/Agora-Build/Atem/pull/74).
-The [r5 review](agent-control-api-atem-r5-review.md) grants design sign-off for
-r8 at `f9fa57aaed2cc7c57e097de678eb3733095af88a`, including history/recovery,
-atomic Send, lease-free approval answers and revocation/persistence. The
-earlier findings and fixture corrections are resolved. Atem may implement
-this pinned contract; implementation conformance and joint live tests remain
-required before shipping r8.
+The [r5 review](agent-control-api-atem-r5-review.md) granted design sign-off;
+the [r6 review](agent-control-api-atem-r6-review.md) confirms all four edits
+from Atem's implemented r8 host in [PR #78](https://github.com/Agora-Build/Atem/pull/78).
+The implementation/fixture pin is `10e089a3723352975c17b6efd1b9e2d88a05857e`
+until that PR merges; then record its actual merge SHA after checking the
+contract and fixture hashes. Atem may merge #78. Astation r8 conformance and
+joint live tests remain required before the coordinated rollout; r8 refuses
+r7 peers.
 This document records
 Brent's requested next milestone: operate agents started with `atem agent launch` through APIs,
 including conversations, approvals and notifications. Proposed endpoints below
-are not all implemented; the agreed wire contract is pinned in the r5 review.
+are not all implemented; the current wire contract is pinned in the r6 review.
 The [chat Send and approval behavior](chat-send-control.md) is user-approved,
 with implementation authorized on 2026-10-18. Lease-free rule revocation is
 implemented locally against r7.3. Atomic prompt submission and lease-free
@@ -149,7 +151,7 @@ The proposed event families are:
 | Family | Events |
 | --- | --- |
 | Session | Snapshot/change/removal and process/activity updates. Process running and activity unknown are distinct facts. |
-| Chat | Open/history page, whole message replacement, appended part, semantic status, turn completion, error and close. |
+| Chat | Open/history page and boundary, whole message replacement, coverage, semantic status, turn completion, error and close. |
 | Approval | Open/update/resolution, active session rule changes/revocation and unavailable after loss of authority. |
 | Command | Receipt state changes, including rejected and outcome_unknown. |
 | Connection/control | Offline/reconnected, lease granted/lost/expired and authorization unavailable. |
@@ -253,9 +255,9 @@ offline delivery requires a push-enabled test device and credentials.
 
 ## Implementation and acceptance order
 
-1. Implement the coordinated r8 client against the signed-off contract and
-   fixtures at `f9fa57aaed2cc7c57e097de678eb3733095af88a` while Atem builds
-   the host. Run the applicable shared fixtures, filesystem fault tests and
+1. Implement the coordinated r8 client against the confirmed contract and
+   fixtures at `10e089a3723352975c17b6efd1b9e2d88a05857e`; Atem's host is
+   implemented in #78. Run the applicable shared fixtures, filesystem fault tests and
    native/API ownership checks before joint live acceptance. The separate
    r7.3 revoke change has been implemented locally against its published
    contract and pinned fixture; finish native/API and joint live verification.

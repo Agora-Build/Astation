@@ -50,8 +50,9 @@ API callers must explicitly authorize takeover rather than gaining it by default
 
 The operation shape, revision/capability negotiation, refusal codes, request
 identity rules, lease/receipt transaction boundary and fixtures are agreed
-at the pinned r8 commit below. Existing r7.3 clients and hosts retain their
-published semantics until the coordinated r8 implementation passes its checks.
+at the pinned r8 commit below. The implemented r8 host refuses r7 peers;
+Astation still uses r7.3 until the coordinated client implementation passes
+its checks.
 
 ## Required shared tests
 
@@ -76,7 +77,8 @@ on Atem; Astation must not add its own command matcher or grant an unoffered
 rule. Pending-approval races must resolve atomically on the host with durable,
 idempotent decisions and catch-up that closes stale cards everywhere.
 
-Checked against Atem main `976e15462b834a0fc270a9b541cd6952632c522c`:
+Historical r7.3 baseline, checked at Atem main
+`976e15462b834a0fc270a9b541cd6952632c522c` (r8 host support follows below):
 
 | Operation | Published host support | Astation work |
 | --- | --- | --- |
@@ -86,9 +88,13 @@ Checked against Atem main `976e15462b834a0fc270a9b541cd6952632c522c`:
 
 ### Implementation handoff
 
-1. Atem implements the r8 host at the signed-off commit below, including
-   durable admission/refusal, revocation fences and clean/unclean recovery.
-   Run the host scenarios and filesystem fault tests listed in the r5 review.
+1. Atem's r8 host is implemented in
+   [PR #78](https://github.com/Agora-Build/Atem/pull/78), pin
+   `10e089a3723352975c17b6efd1b9e2d88a05857e`, including durable
+   admission/refusal, revocation fences and clean/unclean recovery. The
+   [r6 review](agent-control-api-atem-r6-review.md) confirms its four contract
+   edits and permits Atem to merge. Record the actual merge SHA and verify
+   source hashes before repinning.
 2. Astation implements revision/capability negotiation, ordered history
    recovery, the shared native/API Send/takeover service and lease-free
    approval answers. Bind confirmation to the displayed controller and epoch;
@@ -98,8 +104,8 @@ Checked against Atem main `976e15462b834a0fc270a9b541cd6952632c522c`:
    unsupported steps as passes. Use disposable Claude and Codex sessions for
    the joint mutation, approval and recovery matrix before release.
 
-The host wire shapes and fixture corrections are agreed; implementation and
-live acceptance remain. Terminal input and interrupt/stop keep explicit
+The host wire shapes and fixture corrections are agreed; Astation
+implementation and joint live acceptance remain. Terminal input and interrupt/stop keep explicit
 lease checks, and section 9's security gates remain enforced. Atem changes
 belong to its owner; the Astation agent has not edited or built an Atem checkout.
 
@@ -115,20 +121,24 @@ The Atem agent published both missing operations for review on 2026-10-18 in
 `acquire`). These are approved r8 wire shapes, not payloads Astation can send
 to r7.3.
 
-The [r5 review](agent-control-api-atem-r5-review.md) grants design sign-off
-for this exact commit, with no remaining blocking findings. The lost-fence
+The [r5 review](agent-control-api-atem-r5-review.md) granted design sign-off
+for that draft, with no remaining blocking findings. The lost-fence
 case is resolved: any failed revocation write halts dispatch and fences input
 in memory, and any unclean run rejects recovered queued work with
 `authorization history unknown` before it can run. Only a healthy orderly
 shutdown writes a clean-close marker bound to its runtime epoch. After a
 clean close, trust/control checks and principal reconfirmation within 60
 seconds still apply. The fixture UUID and earlier history corrections are
-complete. Atem may start r8 implementation; static fixture checks are not
-host/client conformance or release approval.
+complete. The implemented host and updated fixture pin are now confirmed
+in the [r6 review](agent-control-api-atem-r6-review.md). It accepts an open
+but unwelcomed halted link, sender-only binding-free close, invalid history
+requests excluded from the eight-valid-requests-per-second budget, and an
+omitted result for unrepresentable turn/user IDs. Static fixture checks are
+not host/client conformance or release approval.
 
 The provisioned local Astation remains on r7.3: direct rule
 revocation is lease-free, approval answers still acquire control, and atomic
-chat Send awaits the coordinated r8 implementation. The build executed 924 tests with
-6 skipped and zero failures. A read-only live check found running Claude and
+chat Send awaits the coordinated r8 implementation. The consolidated branch
+executed 924 tests with 11 skipped and zero failures. A read-only live check found running Claude and
 Codex sessions with no remote control held; no prompts or approval mutations
 were sent to those working sessions.
