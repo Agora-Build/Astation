@@ -11,6 +11,7 @@ indirect enum AtemSessionJSON: Codable, Equatable {
     static let maximumInteger: Int64 = 9_007_199_254_740_991
     enum Invalid: Error { case json, limit, duplicateKey, number }
     static let rawRootKey = CodingUserInfoKey(rawValue: "atemSessionRawJSON")!
+    static let rawSizeKey = CodingUserInfoKey(rawValue: "atemSessionWireBytes")!
 
     init(from decoder: Decoder) throws {
         // Foundation keyed containers normalize Unicode keys. Recover arbitrary
@@ -160,10 +161,12 @@ indirect enum AtemSessionJSON: Codable, Equatable {
         let packet = root["payload"] ?? root
         if packet["type"]?.string == "session" {
             guard let body = packet["data"], try body.canonical(allowOtherNumbers: true).utf8.count <= 1_048_576 else { throw Invalid.limit }
-            try integers(body, keys: ["v", "host_trust_gen", "authorization_ms_left", "server_time", "runtime_epoch", "seq", "ms_left", "lease_epoch", "updated_at", "created_at"])
+            try integers(body, keys: ["v", "revision", "host_trust_gen", "authorization_ms_left", "server_time", "runtime_epoch", "seq", "ms_left", "lease_epoch", "updated_at", "created_at"])
             try integers(body["binding"], keys: ["lease_epoch"])
             for target in [body["binding"]?["target"], body["target"]] { try integers(target, keys: ["host_trust_gen"]) }
             try integers(body["controller"], keys: ["lease_epoch"])
+            try integers(body["expected_controller"], keys: ["lease_epoch"])
+            try integers(body["lease"], keys: ["lease_epoch", "ms_left"])
             var descriptors: [AtemSessionJSON] = []
             if let descriptor = body["descriptor"] { descriptors.append(descriptor) }
             if case .array(let values)? = body["sessions"] { descriptors += values }
@@ -178,6 +181,15 @@ indirect enum AtemSessionJSON: Codable, Equatable {
                 }
             }
             if let payload = body["payload"], try payload.canonical().utf8.count > 65_536 { throw Invalid.limit }
+        } else if packet["type"]?.string == "agentChat", let body = packet["data"] {
+            guard try packet.canonical(allowOtherNumbers: true).utf8.count <= 1_048_576 else { throw Invalid.limit }
+            try integers(body, keys: ["v", "sequence"])
+            try integers(body["page"], keys: ["count", "content_bytes", "wire_bytes"])
+            for container in [body, body["page"]] {
+                if case .array(let holes)? = container?["holes"] {
+                    for hole in holes { try integers(hole, keys: ["count"]) }
+                }
+            }
         } else if packet["type"]?.string == "terminal", let body = packet["data"], body["binding"] != nil {
             try integers(body, keys: ["v", "sequence", "offset", "rows", "cols"])
             try integers(body["binding"], keys: ["lease_epoch"])

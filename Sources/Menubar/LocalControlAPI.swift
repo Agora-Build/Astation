@@ -70,6 +70,8 @@ final class LocalControlAPI {
         let target: AtemSessionTarget?
         let descriptor: AtemSessionDescriptor?
         let controls: Bool
+        let control_owner: String?
+        let features: [String]
     }
     private struct Approval: Encodable {
         let client_id: String
@@ -110,6 +112,12 @@ final class LocalControlAPI {
         let rule: AtemApprovalRule?
         let rule_id: String?
         let message: String?
+        let operator_id: String?
+        let expected_controller: AtemSessionController?
+        let before: String?
+        let next: String?
+        let turn_id: String?
+        let page_id: String?
     }
     private struct ReceiptQuery: Decodable {
         let target: AtemSessionTarget
@@ -125,20 +133,25 @@ final class LocalControlAPI {
                 guard body.isEmpty else { return .error("invalid_request", status: .badRequest) }
                 switch path {
                 case "/api/v1/status":
-                    return .json(["api": "v1", "session_contract": "r7.3", "account_wide_access": "gated",
+                    return .json(["api": "v1", "session_contract": "r8", "account_wide_access": "gated",
                                   "host_push_ingress": "gated", "rule_revocation": "lease_free",
-                                  "approval_answers": "acquire_control", "atomic_chat_send": "awaiting_host_contract"])
+                                  "approval_answers": "lease_free", "atomic_chat_send": "supported",
+                                  "chat_history": "ordered_pages", "api_lease_renewal": "explicit_every_5s",
+                                  "atem_upgrade_required": clients().values.contains(where: \.unsupportedVersion) ? "true" : "false"])
                 case "/api/v1/sessions":
                     let sessions = clients().sorted { $0.key < $1.key }.flatMap { id, client -> [Session] in
+                        guard !client.unsupportedVersion else { return [] }
                         let descriptors = client.registry.values.sorted { $0.session_id < $1.session_id }
                         if descriptors.isEmpty {
                             return [Session(client_id: id, phase: String(describing: client.phase), status: client.status,
-                                            target: nil, descriptor: nil, controls: false)]
+                                            target: nil, descriptor: nil, controls: false, control_owner: nil,
+                                            features: client.features.sorted())]
                         }
                         return descriptors.map {
                             let target = client.target(sessionId: $0.session_id, process: $0.process_gen)
                             return Session(client_id: id, phase: String(describing: client.phase), status: client.status,
-                                           target: target, descriptor: $0, controls: target.map(client.controls) ?? false)
+                                           target: target, descriptor: $0, controls: target.flatMap { client.controlOwner(for: $0) } != nil,
+                                           control_owner: target.flatMap { client.controlOwner(for: $0) }, features: client.features.sorted())
                         }
                     }
                     return .json(sessions)
@@ -171,21 +184,43 @@ final class LocalControlAPI {
                 }
                 return .json(record)
             }
-            guard ["/api/v1/sessions/acquire", "/api/v1/sessions/release", "/api/v1/sessions/submit",
+            guard ["/api/v1/sessions/acquire", "/api/v1/sessions/renew", "/api/v1/sessions/release", "/api/v1/sessions/submit",
+                   "/api/v1/chat/read", "/api/v1/chat/history", "/api/v1/chat/page",
                    "/api/v1/approvals/answer", "/api/v1/approval-rules/revoke"].contains(path) else { return .error("not_found", status: .notFound) }
             let operation = try JSONDecoder().decode(Operation.self, from: body)
-            guard operation.target.valid else { throw AtemSessionJSON.Invalid.json }
+            guard operation.target.valid, operation.operator_id.map(AtemSessionWire.opaque) != false,
+                  operation.expected_controller?.valid != false else { throw AtemSessionJSON.Invalid.json }
+            let owner = "api:" + (operation.operator_id ?? "local-api")
             guard let client = clients()[operation.client_id],
                   client.target(sessionId: operation.target.session_id, process: operation.target.process_gen) == operation.target else {
                 return .error("stale_target", status: .conflict)
             }
             switch path {
+            case "/api/v1/chat/read":
+                guard let snapshot = client.readChat(operation.target) else { return .error("chat_unavailable", status: .conflict) }
+                return .json(snapshot)
+            case "/api/v1/chat/history":
+                guard let pageID = client.chatHistory(operation.target, before: operation.before, next: operation.next,
+                    turn: operation.turn_id, request: operation.request_id) else { return .error("history_unavailable", status: .conflict) }
+                return .json(["page_id": pageID, "status": "requested"], status: .accepted)
+            case "/api/v1/chat/page":
+                guard let pageID = operation.page_id, AtemSessionWire.opaque(pageID),
+                      let reply = client.chatPage(operation.target, pageID: pageID) else { return .error("unknown_page", status: .notFound) }
+                return .json(reply)
             case "/api/v1/sessions/acquire":
                 guard client.welcome?.permissions?.contains("control") == true else { return .error("forbidden", status: .forbidden) }
-                client.acquire(operation.target, takeover: operation.takeover ?? false)
-                return .json(["status": client.controls(operation.target) ? "held" : "requested"], status: .accepted)
+                guard client.acquire(operation.target, takeover: operation.takeover ?? false, owner: owner) else {
+                    return .error("control_not_available", status: .conflict)
+                }
+                return .json(["status": client.controlOwner(for: operation.target) == owner ? "held" : "requested"], status: .accepted)
+            case "/api/v1/sessions/renew":
+                guard client.renew(operation.target, owner: owner) else { return .error("stale_lease", status: .conflict) }
+                return .json(["status": "requested"], status: .accepted)
             case "/api/v1/sessions/release":
-                client.release(operation.target)
+                guard client.controlOwner(for: operation.target).map({ $0 == owner }) != false else {
+                    return .error("control_not_owned", status: .conflict)
+                }
+                client.release(operation.target, owner: owner)
                 return .json(["status": "released"])
             default: break
             }
@@ -204,7 +239,7 @@ final class LocalControlAPI {
                 kind = "approval"
                 payload = AtemApprovalAnswer(approvalID: approval.approval_id, decision: decision,
                     ruleID: operation.rule?.rule_id, message: operation.message).payload
-                _ = try AtemApprovalAnswer.validate(payload)
+                try AtemApprovalAnswer.validate(payload)
             } else if path == "/api/v1/approval-rules/revoke" {
                 guard let ruleID = operation.rule_id, AtemSessionWire.opaque(ruleID) else { throw AtemSessionJSON.Invalid.json }
                 kind = "approval_rule_revoke"
@@ -216,11 +251,20 @@ final class LocalControlAPI {
                 payload = kind == "prompt" ? .object(["text": .string(operation.text ?? "")]) : .object([:])
             }
             let digest = try payload.digest()
+            guard operation.expected_controller == nil || (kind == "prompt" && operation.takeover == true),
+                  operation.takeover != true || (kind == "prompt" && operation.expected_controller != nil) else {
+                throw AtemSessionJSON.Invalid.json
+            }
             if let previous = records().first(where: { $0.requestId == requestID }) {
                 guard previous.target == operation.target, previous.kind == kind, previous.digest == digest else {
                     return .error("request_id_reused", status: .conflict)
                 }
-                return .json(["request_id": requestID, "status": "journaled"], status: .accepted)
+                if previous.receipt != nil || previous.refusal?.code != "lease_held" || operation.takeover != true {
+                    return .json(["request_id": requestID, "status": "journaled"], status: .accepted)
+                }
+                guard operation.expected_controller == previous.refusal?.controller else {
+                    return .error("stale_confirmation", status: .conflict)
+                }
             }
             let submitted: String?
             if kind == "approval", let approval = operation.approval,
@@ -233,7 +277,8 @@ final class LocalControlAPI {
             }) {
                 submitted = client.revokeRule(rule, target: operation.target, requestID: requestID)
             } else if kind != "approval" && kind != "approval_rule_revoke" {
-                submitted = client.submit(operation.target, kind: kind, text: operation.text, requestID: requestID)
+                submitted = client.submit(operation.target, kind: kind, text: operation.text, requestID: requestID,
+                    takeover: operation.expected_controller, owner: owner)
             } else { submitted = nil }
             guard let submitted else { return .error("not_actionable", status: .conflict) }
             return .json(["request_id": submitted, "status": "journaled"], status: .accepted)

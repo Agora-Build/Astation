@@ -1,4 +1,4 @@
-# Codex approval session rules (r7.3)
+# Codex approval session rules
 
 Source: Atem main `976e15462b834a0fc270a9b541cd6952632c522c`,
 [agent chat API](https://github.com/Agora-Build/Atem/blob/976e15462b834a0fc270a9b541cd6952632c522c/designs/agent-chat-api.md)
@@ -80,7 +80,7 @@ answer authority. Chat tests cover stale conversations, generations, sequence
 gaps/repeats and malformed parts. Existing Claude approval behavior is retained.
 
 The r7.3 shared revoke fixture is pinned with SHA-256 in
-`Tests/AstationTests/Fixtures/atem-session-r7.3`. The client test verifies the
+`Tests/AstationTests/Fixtures/atem-session-v1`. The client test verifies the
 published bytes, decodes valid client requests and rejects the fixture's
 invalid acquire payload. Host dispatch, command
 matching and worker revocation belong to Atem's fixture harness and live joint
@@ -108,7 +108,7 @@ No prompts, approval answers or revocations were sent to those working sessions;
 this does not establish the live grant/revoke lifecycle. The personal-team
 provisioning profile expires on 2026-10-24 at 02:29:04 UTC.
 
-Current verification, 2026-10-18 09:01 PDT: the r7.3 personally provisioned
+Historical verification, 2026-10-18 09:01 PDT: the r7.3 personally provisioned
 build executed 924 tests (6 skipped, zero failures), including 15 targeted
 session-rule tests. Signature, personal-team Keychain group, bundled-resource
 and executable-checksum checks passed. The canonical app was replaced and
@@ -120,13 +120,9 @@ Claude and Codex were running with no remote control held. It found zero
 active rules and three auto-allowed activity cards. No prompts, revocations
 or approval answers were sent, so the live rule lifecycle remains unverified.
 
-Atomic chat Send and lease-free approval answers have design sign-off in
-Atem PR #74 at `f9fa57aaed2cc7c57e097de678eb3733095af88a`. The
-[r5 review](https://truck.netbird.cloud:58310/protocol/agent-control-api-atem-r5-review.md)
-closes the failed-fence recovery finding and pins all 42 r8 fixtures. Atem
-may implement the host; Astation must implement and test its r8 client before
-using these operations. Current answers retain r7.3's acquire-and-answer
-behavior. Host/client conformance, filesystem fault tests and joint live
-acceptance remain required. The hosted
-[chat/control handoff](https://truck.netbird.cloud:58310/protocol/chat-send-control.md)
-records the accepted behavior, races and remaining host dependencies.
+The current client requires r8 at Atem main
+`4f87bab1289848cb6a0da5707d2e7830eb5c057d`. Answers and revocations require
+control permission and do not acquire, renew or replace the lease. See the
+[r8 lifecycle](r8-client.md) and [local API guide](../../docs/local-control-api.md).
+The earlier live observations do not establish a complete live rule cycle;
+that remains a joint provider test.

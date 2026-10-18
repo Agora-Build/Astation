@@ -1,8 +1,0 @@
-{
-  "repository": "https://github.com/Agora-Build/Atem",
-  "commit": "976e15462b834a0fc270a9b541cd6952632c522c",
-  "revision": "r7.3",
-  "sha256": {
-    "approval-rule-revoke-needs-control-not-the-lease.json": "2b5f37a752aa180b13ba523b2f904c727e3b51abe8157238d2e9a85d6258fff9"
-  }
-}

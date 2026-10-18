@@ -1,20 +1,22 @@
-# Local session and approval API
+# Local session, chat and approval API
 
-The next milestone is a complete conversation, approval and notification API.
-See the [joint agent control API proposal](../designs/protocol/agent-control-api.md)
-for current gaps, proposed history/events routes and Atem/Astation ownership.
-Those proposed routes are not available yet; the implemented routes are listed below.
+The optional local API operates agents launched by `atem agent launch` using
+the running native Astation's verified session, shared chat coordinator,
+approval inbox and durable request journal. It requires Atem session r8,
+pinned to Atem main `4f87bab1289848cb6a0da5707d2e7830eb5c057d` (PR #78).
+There is no fallback to an older protocol. An incompatible Atem is hidden
+from the session list; status reports `atem_upgrade_required: "true"`.
+Upgrade Atem and reconnect it.
 
-The optional local API uses the running native Astation's verified Atem session
-clients, approval inbox and durable request journal. It lets a script exercise
-the same flow as a future mobile UI. It does not enroll devices or bypass
-verification, permissions, attachment/process checks or control leases.
+The API does not enroll devices or bypass verification, permissions, full
+target/attachment/process checks or control leases. The relay transports
+messages and is never an authority for identity or encryption state.
+See [r8 lifecycle and security invariants](../designs/protocol/r8-client.md).
 
 ## Enable locally
 
-Create a private random key file once. Keep it outside git and shared file
-hosting. The file must be a same-user regular file, mode 0600, with one hard
-link; symlinks are rejected. The example never prints the key:
+Create a private random key file once, outside git and shared file hosting.
+This example never prints the key:
 
 ```sh
 python3 - <<'PY'
@@ -28,30 +30,31 @@ with os.fdopen(fd, 'w') as f:
 PY
 ```
 
-Quit the old Astation, then open the provisioned bundle with the opt-in:
+Quit the old app and open the provisioned bundle with the opt-in:
 
 ```sh
 open --env "ASTATION_LOCAL_API_TOKEN_FILE=$HOME/Library/Application Support/Astation/local-api-token" \
   '/Users/brent/Dev/Agora.Build/Astation/.build/Astation Local.app'
 ```
 
-The token grants local session control to a process that can read it. Never
-share it with a web page, put it in argv, or publish it in memory/docs. The app
-loads it at startup; quit/relaunch to rotate it or disable the API. Launching
-normally without the environment variable leaves every API route disabled.
-The key file must contain 64 lowercase hexadecimal characters and an optional
-final newline. Invalid configuration leaves the API disabled.
+The file must be a same-user regular file, mode 0600, with one hard link;
+symlinks are rejected. It contains 64 lowercase hexadecimal characters and
+an optional final newline. The app loads it at startup. Quit/relaunch to
+rotate it or disable the API; launching without the environment variable
+leaves the routes disabled. Never share the token with a web page, put it in
+argv, or publish it in docs/memory. It grants local session control to
+processes that can read it.
 
-Requests use the existing port 8080, but API admission requires the actual peer
-to be loopback, one matching Authorization: Bearer header, and no Origin.
-Forwarded addresses are ignored. No CORS, caching or redirects are supported.
-POST requires Content-Type: application/json, <=64 KiB, no duplicate JSON keys,
-and protocol-safe integers. Responses close the HTTP connection. The key and
-request bodies are never added to Astation's network debug logs.
+Requests use port 8080 and require the actual peer to be loopback, exactly
+one matching Authorization: Bearer header, and no Origin. Forwarded addresses
+are ignored. No CORS, caching or redirects are supported. POST requires
+Content-Type: application/json, at most 64 KiB, no duplicate JSON keys, and
+protocol-safe integers. Responses close the HTTP connection. Keys and request
+bodies are excluded from network debug logs.
 
-## Commands and routes
+## Routes
 
-The client reads the key from a protected file; it never passes it to curl:
+The helper reads the key from its protected file and does not invoke curl:
 
 ```sh
 export ASTATION_LOCAL_API_TOKEN_FILE="$HOME/Library/Application Support/Astation/local-api-token"
@@ -60,107 +63,120 @@ python3 scripts/astation-api.py sessions
 python3 scripts/astation-api.py approvals
 python3 scripts/astation-api.py approval-rules
 python3 scripts/astation-api.py approval-activity
-python3 scripts/astation-api.py post approvals/answer --file /private/path/answer.json
+python3 scripts/astation-api.py post chat/read --file /private/path/read.json
 ```
 
 | Route | Input or output |
 | --- | --- |
-| GET /api/v1/status | API/session revision, lease-free rule revocation, current approval-answer behavior, atomic chat Send availability, and account-trust/push ingress gates. |
-| GET /api/v1/sessions | client_id, current registry descriptors, full target, phase/status and whether control is held. A target can be absent while connecting. |
-| GET /api/v1/approvals | Exact request snapshot, full target, client_id, provider/host, can_answer, status and authoritative resolution if known. |
-| GET /api/v1/approval-rules | Active Atem session rules with client_id, full target, exact rule, provider/host, controls, can_revoke and revocation status. Requires current control permission; holding a lease is not required to read. |
-| GET /api/v1/approval-activity | Bounded informational auto_allowed cards from authenticated chat views, with client_id, full target, message_id, created_at (Unix milliseconds), and approval part. These are never actionable requests. |
-| POST /api/v1/sessions/acquire | client_id, full target, optional takeover (default false). 202 is a request, not a granted lease. Poll sessions for controls:true. |
-| POST /api/v1/sessions/release | client_id and full target. Releases local control. |
-| POST /api/v1/sessions/submit | client_id, full target, caller-generated request_id UUID, kind prompt/interrupt/stop, text for prompt. Requires current control. Codex without chat-v1 uses its native terminal for prompts. |
-| POST /api/v1/approvals/answer | client_id, full target, new request_id UUID, approval (exact request from GET), decision allow_once/allow_always/deny, optional rule (exact offered object), optional denial message. |
-| POST /api/v1/approval-rules/revoke | client_id, full target, new request_id UUID and rule_id from the active list. Requires current control permission and an active rule, without a held lease (r7.3). Leaves the current controller unchanged. Uses kind approval_rule_revoke and durable receipts. |
-| POST /api/v1/receipts/query | Full target and request_id. Reads the local durable record and latest authenticated host receipt; an absent receipt is unconfirmed. The session client refreshes unresolved receipts from Atem. |
+| GET /api/v1/status | r8 implementation, lease-free answers/revocation, atomic Send, history polling, explicit API renewal, upgrade requirement and trust/push gates. |
+| GET /api/v1/sessions | client_id, current descriptor, full target, phase/status, negotiated features, controls and control_owner. Target may be absent while connecting. Unsupported hosts are excluded. |
+| GET /api/v1/approvals | Exact request, full target, client_id, provider/host, can_answer, status and authoritative resolution. |
+| GET /api/v1/approval-rules | Active rules with client_id, target, exact rule, provider/host, can_revoke and status. Requires control permission, without a held lease. |
+| GET /api/v1/approval-activity | Bounded informational auto_allowed cards, with client_id, target, message_id, created_at in Unix milliseconds and approval part. These never become pending alerts. |
+| POST /api/v1/sessions/acquire | client_id, target, optional operator_id and takeover (default false). 202 means requested, not granted. |
+| POST /api/v1/sessions/renew | client_id, target and matching operator_id. Renew every five seconds while operating. 409 if expired, not owned or already awaiting renewal. |
+| POST /api/v1/sessions/release | client_id, target and matching operator_id. Releases that local caller's control and fences late acquisition replies. |
+| POST /api/v1/sessions/submit | client_id, target, request_id UUID, kind prompt/interrupt/stop, text for prompt, optional operator_id. Prompt Send acquires atomically when unowned. Interrupt/stop require an already-held lease. |
+| POST /api/v1/receipts/query | target and request_id. Returns durable local metadata and latest authenticated receipt/refusal. An absent receipt is unconfirmed. |
+| POST /api/v1/chat/read | client_id and target. Opens/reuses the shared read-only view and returns a bounded snapshot, explicit loaded/closed/error state, sequence, messages and coverage. |
+| POST /api/v1/chat/history | client_id, target and exactly one before/next/turn_id/request_id selector. 202 returns page_id; no control acquisition. |
+| POST /api/v1/chat/page | client_id, target and page_id. Returns pending/error or the bounded completed page with ordered messages, sequence and retention coverage. |
+| POST /api/v1/approvals/answer | client_id, target, request_id UUID, exact approval, decision allow_once/allow_always/deny, exact offered rule for allow_always, optional denial message. Lease-free. |
+| POST /api/v1/approval-rules/revoke | client_id, target, request_id UUID and active rule_id. Requires control permission and the exact process, without acquisition or a lease transfer. |
 
-A full target has account_id, atem_device_id, host_trust_gen, session_id and
-process_gen. Copy it from the current list; a label, hostname or session id alone
-cannot identify an authority boundary.
+A full target contains account_id, atem_device_id, host_trust_gen, session_id
+and process_gen. Copy it from the current session list. A hostname, label or
+session ID alone cannot identify an authority boundary. `operator_id` is an
+opaque local ownership label, not a separate authentication principal; all
+callers still require the bearer token. Omission uses `api:local-api`. Use a
+stable distinct ID for independent scripts; the returned control_owner has
+an `api:` prefix. Native terminal control has owner `native`.
 
-For an answer, copy the entire approval request object unchanged. Always allow
-also echoes the exact rule_id, label and scope offered by the agent. Codex r7.2
-offers `scope: "session"` rules for eligible shell commands; commands without
-an offered rule have only Allow once / Deny. A denial may include message
-(up to 512 UTF-8 bytes). Do not convert a
-notification's fields into an answer request; only authenticated catch-up
-supplies the authoritative card. Closed/unavailable cards return 409.
+## Send, control and recovery
 
-Read the rules list and post the exact rule ID with its full target to revoke.
-There is no preliminary acquisition step, even if another client holds control.
-A 202 only confirms the local journal entry. Query its
-receipt for completion and read the authoritative rules list again. A matching
-retry with the same UUID never dispatches twice, even after the rule disappears.
-An uncertain revocation is queried after reconnect, never replayed. Rules apply
-only to that agent process and byte-identical command/working directory; the
-host handles matching and revocation. Astation does not implement a second matcher.
+An ordinary prompt atomically acquires an unowned host session. When another
+controller holds it, the durable local record exposes refusal code lease_held
+and its controller. After explicit user confirmation, repeat the same UUID,
+text and target with `takeover: true` and `expected_controller` copied from
+that refusal:
 
-Current implementation: `session_contract: "r7.3"` and
-`rule_revocation: "lease_free"`. Approval answers still use the published
-atomic acquire-and-answer operation (`approval_answers: "acquire_control"`).
-The agreed one-click chat Send behavior awaits coordinated r8 implementation;
-this r7.3 build reports `atomic_chat_send: "awaiting_host_contract"`.
-These fields describe Astation's implementation, not negotiated host support.
-Lease-free approval answers and atomic chat Send must not be emulated by
-unbound writes or separate acquire/submit messages.
-Both are approved for coordinated r8 implementation in Atem PR #74, pinned
-to `f9fa57aaed2cc7c57e097de678eb3733095af88a`. Astation's
-[r5 review](https://truck.netbird.cloud:58310/protocol/agent-control-api-atem-r5-review.md)
-closes the failed-revocation-fence recovery finding: unclean recovery rejects
-queued work whose authorization history cannot be established. The contract
-and all 42 r8 fixtures have design sign-off; host/client conformance,
-filesystem fault tests and joint live tests are still required. This build
-continues to send r7.3 payloads until the coordinated r8 change is implemented.
+```json
+{
+  "takeover": true,
+  "expected_controller": {
+    "controller_session": "99999999-9999-4999-8999-999999999999",
+    "lease_epoch": 7
+  }
+}
+```
 
-Submission 202 means journaled locally, not executed. Keep the request_id and
-poll receipts for accepted/executing/completed/rejected/outcome_unknown.
-An identical POST retry returns the existing request without another submit;
-changed target/kind/payload with that id returns 409. Never make a new UUID to
-retry an uncertain answer. Journal retention is bounded (4096 records; final
-records may be evicted), so it is a recovery aid rather than unlimited history.
-Reconnection queries original host receipts and never restores control or
-replays a prompt/decision. Unknown outcomes require checking the agent.
+These fields supplement the original submit body. A stale local confirmation
+returns 409; the host rechecks ownership at admission too. No ordinary retry
+or receipt query acquires or executes again. A lease held by native UI or
+another local operator cannot be consumed by this caller.
 
-## Verification matrix
+Poll sessions to confirm ownership, renew every five seconds and release
+when finished. Astation never auto-renews API control. An abandoned caller
+loses it within 15 seconds. Raw remote-terminal input, paste, resize, interrupt
+and stop continue to require explicit held control.
 
-Automated Swift tests use real session validation, durable journaling and the
-HTTP listener, with deterministic host messages. They cover API admission,
-body limits, duplicate keys, control requirements, exact snapshots/rules,
-duplicate/reused request ids, closure/expiry, stale contexts and receipt scope.
+HTTP 202 means journaled locally, not delivered, accepted or executed. Keep
+the UUID and poll receipts for accepted/executing/completed/rejected or
+outcome_unknown. An identical POST returns the existing identity; changing
+its target/kind/payload returns 409. Only an explicit takeover following a
+definitive lease_held refusal resends that same UUID. A definitive busy means
+refused; a deliberate new attempt needs a new UUID. Uncertain outcomes require
+checking the agent, without replaying the prompt or approval.
 
-For **live** tests, have Atem launch isolated Claude and Codex test sessions
-using the r7.3 runtime from Atem main at `976e154` and approval hooks.
-Do not build/edit an Atem checkout here.
-Stage prompts in those sessions, then use this API to review and answer:
+A completed prompt may include result with turn/user IDs, up to 32 reply IDs,
+more and replies coverage. Read chat or page history by the original request_id
+to obtain retained replies. Partial/unavailable content or absent result is
+not execution failure and never permits resubmission. The journal stores no
+prompt/transcript and is bounded to 4096 records/4 MiB; old final metadata
+may be evicted. Connection loss queries existing receipts and never restores
+control automatically.
 
-1. Claude Allow once, exact offered Always allow, and Deny with a message;
-   check both the durable receipt and the agent's observed action.
-2. Codex Allow once, offered session Always allow, and Deny. Repeat an exactly
-   matching command/cwd and check its informational auto_allowed card (no alert,
-   pending request or new lease). Change the command or cwd and check it asks.
-3. Cross a local terminal answer with a remote answer; honor the host's
-   completed/rejected/outcome_unknown result without repeating it.
-4. Let a request expire; ensure the card cannot be answered, including via API.
-5. Reconnect with a pending and then a closed request; duplicate catch-up must
-   create neither duplicate cards nor repeated alerts/submissions.
-6. Disconnect immediately after a 202 response and query the same receipt.
-7. Revoke a Codex session rule without acquiring control; wait for its completed receipt
-   and disappearance from the list. Repeat the command and check it asks.
-   Grant the same command again and confirm the new rule can also be revoked.
-   Repeat while another controller holds the lease and verify its holder,
-   epoch and deadline remain unchanged.
+## Chat and approvals
 
-None of this needs a mobile client. Membership/freshness and host push APIs
-still need the [joint trust review](../designs/protocol/account-trust-review.md)
-and [push-proof agreement](../designs/protocol/approval-push-proof.md). Provider
-test transports verify requests without a phone; only a real push-enabled
-profile, provider credentials and token can establish actual APNs delivery.
-The [joint session matrix](../designs/protocol/session-validation.md) records
-automated coverage and confirmed live results, including the host-side r7.1
-replacement-hello fixture boundary.
+Chat opens without before/generation and becomes loaded only at history_end.
+Whole-message updates share the ordered stream with history pages. A timeout
+is unconfirmed, not empty completed history. Coverage, oldest_retained,
+truncated, holes and locally_truncated describe retention; they never cause
+reopen loops. Each history page is bounded to 50 messages, 256 KiB content and
+1 MiB wire data, including its boundary. Page results are kept in memory,
+at most four per view; clients should consume them promptly. Snapshots return
+at most 50 messages/900 KiB of message data; the coordinator retains at most
+eight views of 500 messages/8 MiB each. Reading another target prioritizes its
+subscription within that bounded pool.
 
-The [Codex session-rule lifecycle](../designs/protocol/codex-session-rules.md)
-documents the native observer, security boundaries and automated coverage.
+For an approval, copy the entire authenticated request unchanged. Always allow
+echoes the exact rule ID, label and scope offered for Claude or Codex. An
+unoffered rule cannot be invented. Denial messages are at most 512 UTF-8 bytes.
+Closed/unavailable cards return 409. Answers omit acquire and lease_epoch;
+they do not change the terminal controller or its deadline. Revocation also
+leaves the lease unchanged. Poll the receipt and authoritative rules list to
+confirm removal. Rule matching is implemented only by Atem.
+
+The implemented interface supports polling chat, approvals, rule activity,
+receipts and status without mobile clients. SSE replay, a full native chat
+view and offline APNs delivery are separate work in the
+[joint API proposal](../designs/protocol/agent-control-api.md). In-app approval
+notifications continue to use authenticated catch-up. Push requires its own
+provisioning, provider credentials and delivery verification.
+
+## Verification
+
+Automated tests run all seven pinned upstream client scenarios and native/API
+integration cases: r8 negotiation, incompatible-host filtering, Send/takeover,
+lease ownership/renewal/expiry, release before late receipts, lease-free
+approval races, result projection, ordered history, null recovered predecessors,
+coverage, stale contexts, strict JSON and HTTP admission.
+
+Live mutation tests use disposable Claude/Codex sessions with an r8 runtime
+and configured hooks. Check prompts and receipts, allow once, exact always
+rules, deny, terminal/remote answer races, expiry, reconnect and revocation.
+Check the unchanged controller/deadline around each approval action. Codex
+may require its first local prompt before chat becomes available. Read-only
+Genie discovery is useful evidence but does not establish this whole provider
+mutation matrix. Do not edit/build an Atem checkout here; hand requirements
+to the Atem owner through docs/memory.

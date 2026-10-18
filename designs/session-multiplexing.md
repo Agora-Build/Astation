@@ -5,8 +5,9 @@ Date: 2026-10-18
 Status: product decisions and all six initial defaults approved by the user on
 2026-10-15. The consolidated CLI workflow below is also approved. Astation's
 session client shipped in PR #50; the current approval/API work is consolidated
-in draft PR #56. Atem's implemented r8 handoff is confirmed, while Astation's
-r8 client and joint live acceptance remain pending. All Atem
+in PR #56. The r8 contract and client are implemented and verified with
+shared scenarios and provisioned tests. Joint live provider mutation
+acceptance remains separate. All Atem
 implementation belongs to the Atem agent; see the handoff in section 10. The
 shared wire protocol status is in section 12; required engineering
 changes and security gates remain explicit. Product approval is not protocol
@@ -439,13 +440,13 @@ must fail clearly rather than downgrade security.
 ### Current build status
 
 The implemented r8 host in [Atem #78](https://github.com/Agora-Build/Atem/pull/78)
-is confirmed at `10e089a3723352975c17b6efd1b9e2d88a05857e`; see the
+is confirmed at `4f87bab1289848cb6a0da5707d2e7830eb5c057d`; see the
 [four contract decisions and review evidence](protocol/agent-control-api-atem-r6-review.md).
-Atem may merge #78. Its actual merge SHA becomes the pin after the contract
-and fixture hashes are checked. r8 refuses r7 peers, so rollout must be
-coordinated. [Astation #56](https://github.com/Agora-Build/Astation/pull/56)
-and the provisioned local app still use r7.3; their r8 implementation and
-joint tests are next, as recorded in the
+The merged contract and fixture hashes are verified. Astation requires r8,
+implements the [r8 client lifecycle](protocol/r8-client.md), and hides
+incompatible Atem instances with an upgrade instruction. The protected local
+API supports Send/takeover, approvals and bounded history polling. Joint live
+provider tests remain separate, as recorded in the
 [API proposal](protocol/agent-control-api.md) and
 [Send/approval handoff](protocol/chat-send-control.md).
 
@@ -500,15 +501,15 @@ host/security work are distinguished in the implementation evidence linked above
 ## 12. Shared wire protocol: atem-session v1
 
 Status: r8 is implemented in Atem #78, pin
-`10e089a3723352975c17b6efd1b9e2d88a05857e`. The
-[upstream contract](https://github.com/Agora-Build/Atem/blob/10e089a3723352975c17b6efd1b9e2d88a05857e/designs/protocol/atem-session-v1.md)
-and [fixture schema](https://github.com/Agora-Build/Atem/blob/10e089a3723352975c17b6efd1b9e2d88a05857e/designs/protocol/fixtures/schema.md)
+`4f87bab1289848cb6a0da5707d2e7830eb5c057d`. The
+[upstream contract](https://github.com/Agora-Build/Atem/blob/4f87bab1289848cb6a0da5707d2e7830eb5c057d/designs/protocol/atem-session-v1.md)
+and [fixture schema](https://github.com/Agora-Build/Atem/blob/4f87bab1289848cb6a0da5707d2e7830eb5c057d/designs/protocol/fixtures/schema.md)
 are the current host contract; the r8 appendix overrides the older sections.
 The [implementation handoff review](protocol/agent-control-api-atem-r6-review.md)
-confirms the four edits after design sign-off. Astation's client remains
-r7.3 until its coordinated update. Earlier checked-in protocol snapshots and
-examples below describe the previous baseline; they are not a fallback for
-an r8 peer.
+confirms the four edits after design sign-off. Astation sends revision 8
+and enables only known advertised features. Earlier checked-in protocol
+snapshots and examples describe protocol history; there is no fallback for
+an older peer.
 
 Removed or undecodable operations receive session `unsupported_version`,
 possibly without `re`; valid refused terminal/chat requests receive their own

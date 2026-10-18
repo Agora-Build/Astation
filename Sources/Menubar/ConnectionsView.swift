@@ -107,11 +107,14 @@ struct ConnectionsView: View {
         .onChange(of: hubManager.connectedClients.map(\.id)) { _, _ in
             selectAvailableClientIfNeeded()
         }
+        .onChange(of: hubManager.sessionStatusByClientId) { _, _ in
+            selectAvailableClientIfNeeded()
+        }
     }
 
     private func selectAvailableClientIfNeeded() {
         let onlineClients = AtemClientListModel.onlineClients(
-            hubManager.connectedClients,
+            hubManager.supportedAtemClients,
             preferredClientId: hubManager.pinnedClientId
         )
         let onlineIds = Set(onlineClients.map(\.id))
@@ -132,7 +135,7 @@ private struct ClientListPanel: View {
 
     private var onlineAtems: [ConnectedClient] {
         AtemClientListModel.onlineClients(
-            hubManager.connectedClients,
+            hubManager.supportedAtemClients,
             preferredClientId: hubManager.pinnedClientId
         )
     }
@@ -140,7 +143,7 @@ private struct ClientListPanel: View {
     private var offlineAtems: [SessionInfo] {
         AtemClientListModel.offlineSessions(
             activeSessions: hubManager.deviceSessionStore.getAllActive(),
-            connectedClients: onlineAtems
+            connectedClients: hubManager.connectedClients
         )
     }
 
@@ -169,6 +172,14 @@ private struct ClientListPanel: View {
             .background(Color(NSColor.controlBackgroundColor))
 
             Divider()
+
+            if hubManager.sessionStatusByClientId.values.contains(where: \.unsupportedVersion) {
+                Text("This Atem version is not supported. Upgrade Atem.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
 
             // ── Body ──────────────────────────────────────────────────────
             if onlineAtems.isEmpty && offlineAtems.isEmpty {

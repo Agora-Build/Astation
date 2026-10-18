@@ -1,12 +1,15 @@
 import Foundation
 
 enum AtemSessionWire {
+    static let revision: UInt64 = 8
+    static let features: Set<String> = ["chat.history_end", "chat.history", "chat.lookup", "chat.coverage",
+        "receipt.result", "approval.session_rules", "approval.card_reason", "chat.send_acquire", "approval.lease_free"]
     static let maximumCounter = UInt64(AtemSessionJSON.maximumInteger)
     static let submissionKinds = ["prompt", "interrupt", "stop", "approval", "approval_rule_revoke"]
     static func diagnosticErrorCode(_ value: String?) -> String {
         let codes: Set<String> = ["unsupported_version", "unauthorized", "forbidden", "stale_target",
             "unknown_session", "lease_held", "stale_lease", "request_id_reused", "receipt_limit",
-            "session_closed", "busy", "paused"]
+            "session_closed", "busy", "paused", "invalid_request"]
         return value.flatMap { codes.contains($0) ? $0 : nil } ?? "unknown_error"
     }
     static func uuid(_ value: String) -> Bool {
@@ -114,6 +117,32 @@ enum AtemReceiptState: String, Codable {
     }
 }
 
+struct AtemSessionResult: Codable, Equatable {
+    let turn_id: String
+    let user_message_id: String
+    let outcome: String
+    let reply_message_ids: [String]
+    let more: Bool
+    let replies: String
+
+    var valid: Bool {
+        AtemSessionWire.opaque(turn_id) && AtemSessionWire.opaque(user_message_id)
+            && ["done", "interrupted"].contains(outcome) && reply_message_ids.count <= 32
+            && reply_message_ids.allSatisfy(AtemSessionWire.opaque)
+            && Set(reply_message_ids).count == reply_message_ids.count
+            && ["complete", "partial", "unavailable"].contains(replies)
+    }
+    func sameOutcome(as other: Self) -> Bool {
+        turn_id == other.turn_id && user_message_id == other.user_message_id && outcome == other.outcome
+    }
+}
+
+struct AtemSessionSendLease: Codable, Equatable {
+    let lease_epoch: UInt64
+    let ms_left: UInt64
+    var valid: Bool { lease_epoch <= AtemSessionWire.maximumCounter && ms_left <= 15_000 }
+}
+
 struct AtemSessionReceipt: Codable, Equatable {
     let request_id: String
     let target: AtemSessionTarget
@@ -121,9 +150,11 @@ struct AtemSessionReceipt: Codable, Equatable {
     let state: AtemReceiptState
     let detail: String?
     let updated_at: UInt64
+    var result: AtemSessionResult?
     var valid: Bool {
         AtemSessionWire.uuid(request_id) && target.valid && AtemSessionWire.submissionKinds.contains(kind)
             && (detail?.utf8.count ?? 0) <= 512 && updated_at <= AtemSessionWire.maximumCounter
+            && (result == nil || (result?.valid == true && kind == "prompt" && state == .completed && result?.outcome == detail))
     }
 }
 
@@ -172,22 +203,32 @@ struct AtemSessionMessage: Codable, Equatable {
     var created_at: UInt64?
     var always_rules: [AtemApprovalRule]?
     var rules: [AtemApprovalRule]?
+    var revision: UInt64?
+    var features: [String]?
+    var host_error: String?
+    var acquire: Bool?
+    var expected_controller: AtemSessionController?
+    var lease: AtemSessionSendLease?
+    var result: AtemSessionResult?
 
     func validate() throws {
         try AtemSessionWire.check(v == 1 && AtemSessionWire.uuid(id) && re.map(AtemSessionWire.uuid) != false)
         try AtemSessionWire.check(binding?.valid != false && target?.valid != false && (detail?.utf8.count ?? 0) <= 512)
-        for counter in [host_trust_gen, authorization_ms_left, server_time, runtime_epoch, seq, ms_left, lease_epoch, updated_at] {
+        for counter in [host_trust_gen, authorization_ms_left, server_time, runtime_epoch, seq, ms_left, lease_epoch, updated_at, revision] {
             try AtemSessionWire.check(counter.map { $0 <= AtemSessionWire.maximumCounter } != false)
         }
         switch op {
-        case "hello", "list": break
+        case "hello": try AtemSessionWire.check(revision == AtemSessionWire.revision)
+        case "list": break
         case "welcome":
             try AtemSessionWire.check(account_id.map(AtemSessionWire.opaque) == true && atem_device_id.map(AtemSessionWire.opaque) == true
                 && host_trust_gen != nil && runtime_gen.map(AtemSessionWire.uuid) == true
                 && controller_session.map(AtemSessionWire.uuid) == true && attachment_gen.map(AtemSessionWire.uuid) == true
                 && ["native", "browser"].contains(client_kind ?? "") && permissions != nil
                 && permissions!.allSatisfy { ["view", "control"].contains($0) }
-                && authorization_ms_left != nil && server_time != nil)
+                && authorization_ms_left != nil && server_time != nil
+                && features.map { $0.count <= 32 && $0.allSatisfy { !$0.isEmpty && $0.utf8.count <= 128 }
+                    && Set($0).count == $0.count } != false && (host_error?.utf8.count ?? 0) <= 512)
         case "sessions", "session_changed":
             try AtemSessionWire.check(runtime_gen.map(AtemSessionWire.uuid) == true && runtime_epoch != nil && seq != nil)
             if op == "sessions" {
@@ -207,9 +248,12 @@ struct AtemSessionMessage: Codable, Equatable {
                 && AtemSessionWire.submissionKinds.contains(kind ?? "") && payload != nil)
             let canonical = try payload!.canonical()
             try AtemSessionWire.check(canonical.utf8.count <= 65_536)
-            let acquire = kind == "approval" ? try AtemApprovalAnswer.validate(payload!) : false
-            if kind != "approval_rule_revoke" {
-                try AtemSessionWire.check(acquire ? binding?.lease_epoch == nil : binding?.lease_epoch != nil)
+            if kind == "approval" { try AtemApprovalAnswer.validate(payload!) }
+            try AtemSessionWire.check(acquire == nil || (acquire == true && kind == "prompt" && binding?.lease_epoch == nil))
+            try AtemSessionWire.check(takeover == nil || (takeover == true && acquire == true && expected_controller?.valid == true))
+            try AtemSessionWire.check(expected_controller == nil || takeover == true)
+            if ["prompt", "interrupt", "stop"].contains(kind ?? ""), acquire != true {
+                try AtemSessionWire.check(binding?.lease_epoch != nil)
             }
             if kind == "prompt" {
                 guard case .object(let fields) = payload!, let text = fields["text"]?.string else { throw AtemSessionJSON.Invalid.json }
@@ -224,7 +268,9 @@ struct AtemSessionMessage: Codable, Equatable {
                 && rules.map(AtemApprovalRule.validSessionList) == true)
         case "approval_closed":
             try AtemSessionWire.check(approval_id.map(AtemSessionWire.uuid) == true && AtemApprovalRequest.closeReasons.contains(reason ?? ""))
-        case "receipt": try AtemSessionWire.check(receipt?.valid == true)
+        case "receipt":
+            try AtemSessionWire.check(receipt?.valid == true && (lease == nil || (lease?.valid == true
+                && state == .accepted && kind == "prompt" && re != nil)))
         case "receipt_query":
             try AtemSessionWire.check(binding != nil && binding?.lease_epoch == nil && request_ids != nil
                 && request_ids!.count <= 64 && request_ids!.allSatisfy(AtemSessionWire.uuid))
@@ -236,7 +282,7 @@ struct AtemSessionMessage: Codable, Equatable {
 
     var receipt: AtemSessionReceipt? {
         guard let request_id, let target, let kind, let state, let updated_at else { return nil }
-        return AtemSessionReceipt(request_id: request_id, target: target, kind: kind, state: state, detail: detail, updated_at: updated_at)
+        return AtemSessionReceipt(request_id: request_id, target: target, kind: kind, state: state, detail: detail, updated_at: updated_at, result: result)
     }
 
     var approval: AtemApprovalRequest? {

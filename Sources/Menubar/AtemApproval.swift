@@ -47,18 +47,17 @@ struct AtemApprovalAnswer {
     let decision: Decision
     var ruleID: String?
     var message: String?
-    var acquire = true
 
     var payload: AtemSessionJSON {
-        var fields: AtemSessionJSON.Object = ["approval_id": .string(approvalID), "decision": .string(decision.rawValue), "acquire": .bool(acquire)]
+        var fields: AtemSessionJSON.Object = ["approval_id": .string(approvalID), "decision": .string(decision.rawValue)]
         if let ruleID { fields["rule_id"] = .string(ruleID) }
         if let message { fields["message"] = .string(message) }
         return .object(fields)
     }
 
-    static func validate(_ payload: AtemSessionJSON) throws -> Bool {
+    static func validate(_ payload: AtemSessionJSON) throws {
         guard case .object(let fields) = payload,
-              Set(fields.keys).isSubset(of: ["approval_id", "decision", "rule_id", "message", "acquire"]),
+              Set(fields.keys).isSubset(of: ["approval_id", "decision", "rule_id", "message"]),
               let id = fields["approval_id"]?.string, AtemSessionWire.uuid(id),
               let raw = fields["decision"]?.string, let decision = Decision(rawValue: raw) else { throw AtemSessionJSON.Invalid.json }
         if decision == .allowAlways {
@@ -69,10 +68,5 @@ struct AtemApprovalAnswer {
                 AtemApprovalRequest.text($0, minimum: 0, maximum: 512, newlines: true)
             } == true)
         }
-        if let acquire = fields["acquire"] {
-            guard case .bool(let value) = acquire else { throw AtemSessionJSON.Invalid.json }
-            return value
-        }
-        return false
     }
 }

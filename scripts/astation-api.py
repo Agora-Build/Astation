@@ -19,7 +19,8 @@ def main():
     for name in ("status", "sessions", "approvals", "approval-rules", "approval-activity"):
         sub.add_parser(name)
     post = sub.add_parser("post")
-    post.add_argument("operation", choices=("sessions/acquire", "sessions/release", "sessions/submit",
+    post.add_argument("operation", choices=("sessions/acquire", "sessions/renew", "sessions/release", "sessions/submit",
+                                            "chat/read", "chat/history", "chat/page",
                                             "approvals/answer", "approval-rules/revoke", "receipts/query"))
     post.add_argument("--file", required=True, help="JSON request file, or - to read stdin")
     args = parser.parse_args()

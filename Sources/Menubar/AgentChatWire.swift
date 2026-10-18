@@ -44,12 +44,15 @@ struct AgentChatPart: Codable, Equatable {
     var state: String?
     var rule_id: String?
     var note: String?
+    var reason: String?
 
     var contentBytes: Int {
         if id == "atem:truncated", kind == "text", markdown == "\u{2026} (truncated)" { return 0 }
-        return (markdown?.utf8.count ?? 0) + (name?.utf8.count ?? 0) + (summary?.utf8.count ?? 0)
-            + (tool?.utf8.count ?? 0) + (note?.utf8.count ?? 0)
-            + (always_rules ?? []).reduce(0) { $0 + $1.rule_id.utf8.count + $1.label.utf8.count + $1.scope.utf8.count }
+        let textBytes = [markdown, name, summary, tool, note].reduce(0) { $0 + ($1?.utf8.count ?? 0) }
+        let ruleBytes = (always_rules ?? []).reduce(0) { total, rule in
+            total + rule.rule_id.utf8.count + rule.label.utf8.count + rule.scope.utf8.count
+        }
+        return textBytes + ruleBytes
     }
 
     var isValid: Bool {
@@ -67,8 +70,17 @@ struct AgentChatPart: Codable, Equatable {
                 && rule_id.map(AtemSessionWire.opaque) != false
                 && (state != "auto_allowed" || (rule_id != nil && always_rules?.isEmpty == true))
                 && note.map { AtemApprovalRequest.text($0, minimum: 0, maximum: 512, newlines: true) } != false
+                && reason.map { AtemApprovalRequest.closeReasons.contains($0) } != false
+                && (state != "pending" || reason == nil)
         default: return false
         }
+    }
+
+    var historyBytes: Int {
+        let strings = [markdown, name, summary, tool, note, approval_id, rule_id]
+        let text = strings.reduce(0) { $0 + ($1?.utf8.count ?? 0) }
+        let rules = (always_rules ?? []).reduce(0) { $0 + $1.rule_id.utf8.count + $1.label.utf8.count + $1.scope.utf8.count }
+        return id.utf8.count + (kind == "approval" ? 1024 : 64) + text + rules
     }
 }
 
@@ -109,4 +121,60 @@ struct AgentChatWire: Codable, Equatable {
     var code: String?
     var binding: AtemSessionBinding?
     var approvalRules: [AtemApprovalRule]?
+    var page_id: String?
+    var next: String?
+    var turn_id: String?
+    var request_id: String?
+    var page: AtemChatPage?
+    var oldest_retained: String?
+    var truncated: Bool?
+    var holes: [AtemChatHole]?
+    var holes_more: Bool?
+    var after_message_id: String?
+    var reason: String?
+    var unavailable: [String]?
+    var recovered = false
+    var wireBytes = 0
+
+    enum CodingKeys: String, CodingKey {
+        case v, op, conversationId, agentId, generation, sequence, requestId, messageId, text, state, since, detail
+        case status, role, origin, turnId, createdAt, parts, part, history, before, outcome, code, binding, approvalRules
+        case page_id, next, turn_id, request_id, page, oldest_retained, truncated, holes, holes_more, after_message_id, reason, unavailable
+    }
+}
+
+struct AtemChatHole: Codable, Equatable {
+    let after_message_id: String?
+    let before_message_id: String?
+    let count: UInt64?
+    var valid: Bool {
+        after_message_id.map(AtemSessionWire.opaque) != false && before_message_id.map(AtemSessionWire.opaque) != false
+            && count.map { $0 <= AtemSessionWire.maximumCounter } != false
+    }
+}
+
+struct AtemChatPage: Codable, Equatable {
+    let selector: String
+    let count: Int
+    let content_bytes: Int
+    let wire_bytes: Int
+    let end: Bool
+    let next: String?
+    let coverage: String
+    let oldest_retained: String?
+    let truncated: Bool
+    let holes: [AtemChatHole]
+    var holes_more: Bool?
+
+    var valid: Bool {
+        ["newest", "before", "turn_id", "request_id"].contains(selector) && (0...50).contains(count)
+            && (0...262_144).contains(content_bytes) && (0...1_048_576).contains(wire_bytes)
+            && end == (next == nil) && next.map(Self.validToken) != false
+            && ["complete", "partial", "unavailable"].contains(coverage)
+            && oldest_retained.map(AtemSessionWire.opaque) != false && holes.count <= 16 && holes.allSatisfy(\.valid)
+    }
+    static func validToken(_ value: String) -> Bool {
+        (1...512).contains(value.utf8.count)
+            && value.range(of: #"^[A-Za-z0-9_-]+$"#, options: .regularExpression) != nil
+    }
 }

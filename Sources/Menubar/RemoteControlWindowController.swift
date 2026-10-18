@@ -23,6 +23,17 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
     private var displayedSessions: [RemoteTerminalSession] = []
     private var lastInputEpoch = ""
     private var lastInputEnabled = false
+    private struct PromptDraft {
+        let target: AtemSessionTarget
+        let requestID: String
+        let text: String
+    }
+    private var promptDraft: PromptDraft?
+    private var confirmingTakeover = false
+
+    private var promptTarget: AtemSessionTarget? {
+        terminal.session.flatMap { sessions.target(sessionId: $0.terminalId, process: $0.generation) }
+    }
 
     private lazy var offlineSessions = AtemSessionClient(context: { nil }, send: { _, _ in false })
     private var sessions: AtemSessionClient {
@@ -41,6 +52,8 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
     init(hubManager: AstationHubManager) {
         self.hubManager = hubManager
         super.init()
+        NotificationCenter.default.addObserver(self, selector: #selector(releaseForegroundControl),
+            name: NSApplication.didResignActiveNotification, object: nil)
         terminal.sessionClient = sessions
         hubManager.sessionStateDidChange = { [weak self] id in
             guard let self, self.sessions.context?.route.clientId == id else { return }
@@ -65,7 +78,10 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
     }
 
     func showWindow(clientId: String, agent: AtemAgentInfo?) {
+        sessions.releaseAll()
         terminal.close()
+        promptDraft = nil
+        promptField.stringValue = ""
         targetClientId = clientId
         targetAtemId = hubManager.connectedClients.first(where: { $0.id == clientId })?.atemId
         terminal.sessionClient = sessions
@@ -219,13 +235,28 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
         stopButton.isEnabled = terminal.canInput
         pasteAndGoButton.isEnabled = terminal.canInput
         let supportsPrompts = terminal.session.flatMap { sessions.registry[$0.terminalId] }?.capabilities.contains("chat-v1") == true
-        promptField.isEnabled = terminal.canInput && supportsPrompts
-        sendPromptButton.isEnabled = terminal.canInput && supportsPrompts
+        if let draft = promptDraft, let record = sessions.journal.snapshot.requests.first(where: { $0.requestId == draft.requestID }),
+           record.receipt != nil || (record.refusal != nil && record.refusal?.code != "lease_held") {
+            if let receipt = record.receipt, receipt.state != .rejected,
+               promptField.stringValue == draft.text { promptField.stringValue = "" }
+            promptDraft = nil
+        }
+        let refusedHolder = promptDraft.flatMap { draft in
+            sessions.journal.snapshot.requests.first { $0.requestId == draft.requestID }?.refusal?.controller
+        }
+        let holdsControl = promptTarget.map { sessions.controls($0) } ?? false
+        let canSend = supportsPrompts && sessions.canReviewApprovals && promptTarget != nil
+            && (holdsControl || sessions.features.contains("chat.send_acquire"))
+            && (promptTarget.flatMap { sessions.controlOwner(for: $0) }.map { $0 == "native" } != false)
+        promptField.isEnabled = canSend && promptDraft == nil
+        sendPromptButton.isEnabled = canSend && !confirmingTakeover && (promptDraft == nil || refusedHolder != nil)
+        sendPromptButton.title = refusedHolder != nil ? "Take over & Send" : "Send"
         promptField.placeholderString = supportsPrompts ? "Send a prompt to this agent" : "Type or paste in this agent's terminal"
         if let receipt = sessions.latestReceipt, receipt.target.session_id == terminal.session?.terminalId,
            receipt.target.process_gen == terminal.session?.generation {
             receiptLabel.stringValue = receipt.kind.capitalized + " - " + receipt.state.rawValue.replacingOccurrences(of: "_", with: " ")
                 + (receipt.detail.map { " - " + $0 } ?? "")
+                + (receipt.result.map { " - replies " + $0.replies + ($0.more ? " (more available)" : "") } ?? "")
             receiptLabel.toolTip = receipt.request_id
         } else { receiptLabel.stringValue = sessions.status; receiptLabel.toolTip = nil }
         if renderer?.isReady == true && (lastInputEnabled != terminal.canInput || lastInputEpoch != inputEpoch) {
@@ -256,19 +287,51 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
 
     @objc private func refreshSessions() { sessions.refresh(); terminal.refresh() }
     @objc private func sendPrompt() {
+        if let draft = promptDraft {
+            guard draft.target == promptTarget, let window,
+                  let refusal = sessions.journal.snapshot.requests.first(where: { $0.requestId == draft.requestID })?.refusal,
+                  refusal.code == "lease_held", let holder = refusal.controller, !confirmingTakeover else { return }
+            let alert = NSAlert()
+            alert.messageText = "Take over and send?"
+            alert.informativeText = "Controller \(holder.controller_session) currently holds this session (lease \(holder.lease_epoch)). Sending moves control to this Mac."
+            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: "Take over and Send")
+            confirmingTakeover = true
+            alert.beginSheetModal(for: window) { [weak self] result in
+                guard let self else { return }
+                self.confirmingTakeover = false
+                guard result == .alertSecondButtonReturn, self.promptTarget == draft.target,
+                      self.promptDraft?.requestID == draft.requestID else { self.refresh(); return }
+                _ = self.sessions.submit(draft.target, kind: "prompt", text: draft.text,
+                    requestID: draft.requestID, takeover: holder)
+                self.refresh()
+            }
+            return
+        }
         let text = promptField.stringValue
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              terminal.sendScopedInput(kind: "text", value: text) else { return }
-        promptField.stringValue = ""
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let target = promptTarget else { return }
+        let draft = PromptDraft(target: target, requestID: UUID().uuidString.lowercased(), text: text)
+        promptDraft = draft
+        if sessions.submit(target, kind: "prompt", text: text, requestID: draft.requestID) == nil { promptDraft = nil }
         refresh()
     }
     @objc private func selectSession() {
         let index = sessionPicker.indexOfSelectedItem
-        if displayedSessions.indices.contains(index) { terminal.select(displayedSessions[index]) }
+        if displayedSessions.indices.contains(index) {
+            sessions.releaseAll()
+            promptDraft = nil
+            promptField.stringValue = ""
+            terminal.select(displayedSessions[index])
+        }
     }
     @objc private func viewSession() { terminal.view() }
     @objc private func takeControl() { terminal.takeControl() }
     @objc private func releaseControl() { terminal.release() }
+    @objc private func releaseForegroundControl() {
+        sessions.releaseAll()
+        terminal.sessionStateChanged()
+    }
+    func windowDidMiniaturize(_ notification: Notification) { releaseForegroundControl() }
     @objc private func pasteAndGo() { pasteClipboard(submit: true) }
     private func pasteClipboard(submit: Bool) {
         guard terminal.canInput, let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else { return }
@@ -299,5 +362,6 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
         renderer = nil
         window = nil
         displayedSessions = []
+        promptDraft = nil
     }
 }

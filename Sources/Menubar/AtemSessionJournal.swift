@@ -8,6 +8,13 @@ struct AtemSessionRequestRecord: Codable, Equatable {
     let digest: String
     var approvalID: String?
     var receipt: AtemSessionReceipt?
+    var refusal: AtemSessionRefusal?
+}
+
+struct AtemSessionRefusal: Codable, Equatable {
+    let code: String
+    var controller: AtemSessionController?
+    var valid: Bool { AtemSessionWire.diagnosticErrorCode(code) != "unknown_error" && controller?.valid != false }
 }
 
 struct AtemSessionHostFence: Codable, Equatable {
@@ -39,7 +46,7 @@ final class AtemSessionJournal {
                   Set(loaded.requests.map(\.requestId)).count == loaded.requests.count,
                   loaded.requests.allSatisfy({ AtemSessionWire.uuid($0.requestId) && $0.target.valid
                       && $0.digest.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil
-                      && AtemSessionWire.submissionKinds.contains($0.kind) && $0.receipt?.valid != false
+                      && AtemSessionWire.submissionKinds.contains($0.kind) && $0.receipt?.valid != false && $0.refusal?.valid != false
                       && ($0.kind == "approval" ? $0.approvalID.map(AtemSessionWire.uuid) == true : $0.approvalID == nil)
                       && ($0.receipt == nil || ($0.receipt?.target == $0.target && $0.receipt?.request_id == $0.requestId && $0.receipt?.kind == $0.kind)) }),
                   Set(loaded.hosts.map { $0.account + "\u{0}" + $0.device }).count == loaded.hosts.count,
@@ -80,6 +87,16 @@ final class AtemSessionJournal {
         var next = snapshot
         try mutation(&next)
         guard next.requests.count <= 4096, next.hosts.count <= 128 else { throw AtemSessionJSON.Invalid.limit }
+        // Reply identifiers can enlarge final receipts. Evict old final
+        // metadata before the file limit blocks new durable submissions.
+        var bytes = try JSONEncoder().encode(next).count
+        while bytes > 4_194_304 {
+            guard let index = next.requests.firstIndex(where: { $0.receipt?.state.final == true }) else {
+                throw AtemSessionJSON.Invalid.limit
+            }
+            bytes -= try JSONEncoder().encode(next.requests[index]).count + 1
+            next.requests.remove(at: index)
+        }
         do { try persist(next) }
         catch {
             // Rename may have succeeded before a directory fsync failed. Stop

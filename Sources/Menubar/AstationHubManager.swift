@@ -1110,14 +1110,19 @@ class AstationHubManager: ObservableObject {
     /// Pick the target Atem for routing: pinned → focused → first connected.
     /// Returns the client ID, or nil if no Atem is connected.
     func routeToFocusedAtem() -> String? {
+        let available = supportedAtemClients
         if let pinned = pinnedClientId,
-           connectedClients.contains(where: { $0.id == pinned }) {
+           available.contains(where: { $0.id == pinned }) {
             return pinned
         }
-        return (focusedClient() ?? connectedClients.first)?.id
+        return (available.first(where: \.isFocused) ?? available.first)?.id
     }
 
     // MARK: - Client & Agent Management
+
+    var supportedAtemClients: [ConnectedClient] {
+        connectedClients.filter { $0.clientType == "Atem" && sessionStatusByClientId[$0.id]?.unsupportedVersion != true }
+    }
 
     private func refreshCredentialProjectSuggestions() {
         let account = e2eDataAccount

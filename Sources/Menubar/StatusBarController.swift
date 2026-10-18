@@ -389,7 +389,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
         statusMenu.addItem(tokenTools)
 
         // Show Clients & Agents
-        let onlineCount = hubManager.connectedClients.filter { $0.clientType == "Atem" }.count
+        let onlineCount = hubManager.supportedAtemClients.count
         let clientsTitle = onlineCount > 0
             ? "🔌 Connections (\(onlineCount) Atem online)"
             : "🔌 Connections"

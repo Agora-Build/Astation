@@ -140,6 +140,8 @@ private final class TerminalHubFixture {
         let hello = try XCTUnwrap(sessionFrames.last { ($0["data"] as? [String: Any])?["op"] as? String == "hello" })
         let data = try XCTUnwrap(hello["data"] as? [String: Any])
         var welcome = AtemSessionMessage(op: "welcome")
+        welcome.revision = 8
+        welcome.features = AtemSessionWire.features.sorted()
         welcome.re = try XCTUnwrap(data["id"] as? String)
         welcome.account_id = context.account; welcome.atem_device_id = context.device
         welcome.host_trust_gen = 1; welcome.runtime_gen = "55555555-5555-4555-8555-555555555555"
@@ -182,6 +184,22 @@ private final class TerminalHubFixture {
 
 @MainActor
 final class RemoteTerminalHubTests: XCTestCase {
+    func testUnsupportedHostIsHiddenFromRoutingAndSelectionWithoutLosingItsPairing() async throws {
+        let f = try TerminalHubFixture()
+        try await f.start(); try await f.authenticate()
+        let (client, _) = try await f.readySession()
+        XCTAssertEqual(f.hub.supportedAtemClients.count, 1)
+        var refusal = AtemSessionMessage(op: "error"); refusal.code = "unsupported_version"
+        try f.emit(.session(refusal)); await f.drain()
+        XCTAssertTrue(client.unsupportedVersion)
+        XCTAssertTrue(f.hub.supportedAtemClients.isEmpty)
+        XCTAssertNil(f.hub.routeToFocusedAtem())
+        XCTAssertTrue(f.hub.agentsByClientId[f.clientId]?.isEmpty == true)
+        XCTAssertEqual(f.hub.connectedClients.count, 1, "Version rejection does not unpair the verified device")
+        XCTAssertTrue(AtemClientListModel.offlineSessions(activeSessions: f.hub.deviceSessionStore.getAllActive(),
+            connectedClients: f.hub.connectedClients).isEmpty, "A hidden incompatible host is not mislabeled offline")
+    }
+
     func testPairingRoomTransfersMessagesWithoutBecomingAnOnlineAtem() async throws {
         let f = try TerminalHubFixture()
         var forwarded: [String] = []
