@@ -110,4 +110,3 @@ struct AgentChatWire: Codable, Equatable {
     var binding: AtemSessionBinding?
     var approvalRules: [AtemApprovalRule]?
 }
-
