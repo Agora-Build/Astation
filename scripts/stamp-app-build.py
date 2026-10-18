@@ -19,12 +19,15 @@ def main():
         info["CFBundleVersion"] = args.version
         version = args.version
     else:
-        result = subprocess.run(
-            ["git", "describe", "--tags", "--match", "v[0-9]*", "--always", "--dirty"],
-            cwd=Path(__file__).resolve().parent.parent,
-            capture_output=True, text=True, check=True,
-        )
-        version = result.stdout.strip().removeprefix("v")
+        try:
+            result = subprocess.run(
+                ["git", "describe", "--tags", "--match", "v[0-9]*", "--always", "--dirty"],
+                cwd=Path(__file__).resolve().parent.parent,
+                capture_output=True, text=True, check=True,
+            )
+            version = result.stdout.strip().removeprefix("v")
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            version = "Development"
     info["AstationBuildVersion"] = version
     info["AstationBuildTimestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     args.plist.write_bytes(plistlib.dumps(info))
