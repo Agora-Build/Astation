@@ -121,6 +121,17 @@ sessions remain distinct from deterministic conformance tests: do not send
 prompts, interrupts, stop requests or approval decisions to a user's working
 sessions merely to verify discovery.
 
+On 2026-10-18, the personally provisioned build passed 941 Swift tests
+(six environment-dependent skips, no failures), including all seven shared
+client scenarios. Release compilation, 65 automation tests and 18 packaging
+tests also passed. The provisioned app was relaunched from its canonical
+local bundle and connected to Genie's r8 runtime. Both Claude and Codex were
+discovered with all nine negotiated features; each read-only chat view reached
+an explicit complete `history_end` with no error. Their histories were empty
+at that point. Neither discovery nor chat reads acquired control. This live
+check establishes handshake, registry and empty-history boundaries, not prompt
+execution, nonempty pagination or provider approval behavior.
+
 The implemented API uses polling for chat, approvals and receipts. A native
 full conversation UI, SSE replay/notifications and offline APNs delivery remain
 separate work; r8 support does not claim those interfaces are complete.
