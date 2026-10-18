@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       ci_run_id:
+        # Must test the current head of an open PR; merged PRs are skipped.
         description: Successful CI workflow run ID
         required: true
         type: string
@@ -37,6 +38,7 @@ jobs:
     steps:
       # workflow_run uses the workflow and helper from the default branch. The
       # pull request is fetched through the API and is never executed here.
+      # Tooling changes take effect after merging to the default branch.
       - name: Checkout trusted review tooling
         uses: actions/checkout@v5
         with:
@@ -61,10 +63,13 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ github.event.workflow_run.id || inputs.ci_run_id }}
 
+      # The helper's output budget includes reasoning; incomplete streams fail.
       - name: Review the tested pull request
         id: review
         run: node .github/scripts/ai-review.mjs
         env:
+          # Model access depends on the account behind this gateway. Changing
+          # reasoning effort does not fix an unsupported-model error.
           AI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           AI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           AI_MODEL: ${{ vars.CODEX_REVIEW_MODEL || 'gpt-6.1-sol' }}

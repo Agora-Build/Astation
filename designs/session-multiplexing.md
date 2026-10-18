@@ -1,13 +1,15 @@
 # Atem Sessions, Multiplexing, and Device Trust
 
-Date: 2026-10-16
+Date: 2026-10-18
 
 Status: product decisions and all six initial defaults approved by the user on
-2026-10-15. The consolidated CLI workflow below is also approved. Implementation
-of the native r6.2 client is in draft PR #49, targeting main; joint live host
-integration is next. All Atem
+2026-10-15. The consolidated CLI workflow below is also approved. Astation's
+session client shipped in PR #50; the current approval/API work is consolidated
+in PR #56. The r8 contract and client are implemented and verified with
+shared scenarios and provisioned tests. Joint live provider mutation
+acceptance remains separate. All Atem
 implementation belongs to the Atem agent; see the handoff in section 10. The
-shared wire protocol in section 12 is a joint draft; required engineering
+shared wire protocol status is in section 12; required engineering
 changes and security gates remain explicit. Product approval is not protocol
 security signoff or evidence that all features have shipped.
 
@@ -437,30 +439,34 @@ must fail clearly rather than downgrade security.
 
 ### Current build status
 
-Astations and Atems update together to atem-session r6.2, with no backward
-compatibility. Draft [Astation #49](https://github.com/Agora-Build/Astation/pull/49)
-uses one authenticated hello/welcome and registry client per host connection,
+The implemented r8 host in [Atem #78](https://github.com/Agora-Build/Atem/pull/78)
+is confirmed at `4f87bab1289848cb6a0da5707d2e7830eb5c057d`; see the
+[four contract decisions and review evidence](protocol/agent-control-api-atem-r6-review.md).
+The merged contract and fixture hashes are verified. Astation requires r8,
+implements the [r8 client lifecycle](protocol/r8-client.md), and hides
+incompatible Atem instances with an upgrade instruction. The protected local
+API supports Send/takeover, approvals and bounded history polling. Joint live
+provider tests remain separate, as recorded in the
+[API proposal](protocol/agent-control-api.md) and
+[Send/approval handoff](protocol/chat-send-control.md).
+
+The native client uses one authenticated hello/welcome and registry per host connection,
 shared by Connections and terminal windows. Every new attachment resets the
 sequence, removals, streams and leases, retaining durable trust/runtime fences.
 Terminal requests use exact target/attachment bindings; input/resize also need
 the 15-second lease. Prompts, interrupts and stops use durable submissions;
 reconnect queries their receipts without replay or control restoration.
 
-The host is [Atem #69](https://github.com/Agora-Build/Atem/pull/69), on
-`feat/runtime`; the contract is [Atem #68](https://github.com/Agora-Build/Atem/pull/68),
-with history tagged `atem-session-v1-r6.2`. See the
-[pinned host run instructions and wire changes](protocol/atem-host-handoff.md),
-[client validation](protocol/astation-session-v1-implementation.md) and
-[joint test handoff](protocol/atem-implementation-handoff.md).
 All Atem implementation belongs to its owner; no local Atem checkout is used.
 
 Removed agent lists, terminal lists/control/lease_id, unbound prompts/voice and
 console commands are not fallbacks. Browser access is disabled, including on a
-socket that has not started hello. The r6.2 runtime currently has one Astation
+socket that has not started hello. The current runtime has one Astation
 link and attachment; multiple simultaneous native controllers, QR companions,
 account-wide trust, traffic E2EE, freshness proofs and resume still require
-section 9. r7 prompt-bound approvals await their contract and are not enabled.
-No installed app was replaced or restarted and nothing was merged or deployed.
+section 9. Prompt-bound approvals and session rules are implemented; the r8
+client must remove acquire-on-answer and implement atomic Send. No installed
+app was replaced or restarted for this contract review.
 
 ## 11. Acceptance criteria
 
@@ -494,29 +500,33 @@ host/security work are distinguished in the implementation evidence linked above
 
 ## 12. Shared wire protocol: atem-session v1
 
-Status: r6.2 is the current implementation contract, with no legacy paths.
-Source: [Atem #68](https://github.com/Agora-Build/Atem/pull/68), history tag
-`atem-session-v1-r6.2`, commit `22de096b1980ee3ae342c0352b4c1d5fa54e3b51`.
-The [exact snapshot](protocol/atem-session-v1.md),
-[fixture schema](protocol/fixtures/schema.md) and
-[Astation's implementation evidence](protocol/astation-session-v1-implementation.md)
-are available. Historical r1-r5 reviews remain as review history, not a fallback
-implementation contract.
+Status: r8 is implemented in Atem #78, pin
+`4f87bab1289848cb6a0da5707d2e7830eb5c057d`. The
+[upstream contract](https://github.com/Agora-Build/Atem/blob/4f87bab1289848cb6a0da5707d2e7830eb5c057d/designs/protocol/atem-session-v1.md)
+and [fixture schema](https://github.com/Agora-Build/Atem/blob/4f87bab1289848cb6a0da5707d2e7830eb5c057d/designs/protocol/fixtures/schema.md)
+are the current host contract; the r8 appendix overrides the older sections.
+The [implementation handoff review](protocol/agent-control-api-atem-r6-review.md)
+confirms the four edits after design sign-off. Astation sends revision 8
+and enables only known advertised features. Earlier checked-in protocol
+snapshots and examples describe protocol history; there is no fallback for
+an older peer.
 
 Removed or undecodable operations receive session `unsupported_version`,
 possibly without `re`; valid refused terminal/chat requests receive their own
 family's error with `code`. Chat receipt outcomes map to chat ops, never session
-receipts. Host admission checks control permission, accepting session, then
-lease; closed sessions report `session_closed` even with a stale lease.
+receipts. Host admission checks control permission and the accepting session
+before any required lease; r8 approval answers and rule revocation require
+control permission but leave the lease unchanged. Closed sessions report
+`session_closed` even with a stale lease.
 A new welcome resets per-attachment registry state while preserving the highest
 accepted runtime floor. Lease epochs may skip and are compared, never counted.
 
-All 18 shared fixture files are imported byte-for-byte with pinned hashes.
-Swift and offline JavaScript execute all three client scenarios and digest/raw
-rejection vectors. Atem owns host execution, including the new reconnect,
-closed/exited admission, family-error, PTY boundary and turn-completion steps;
-see its pinned handoff for real-runtime coverage and limits. Joint live testing
-remains outstanding. Upstream section 9 remains the security release gate.
+The r8 snapshot has 72 scenarios (65 host, seven client; 47 require r8).
+Static checks pass; Astation has not yet imported or executed them against
+an r8 Swift client. Atem reports all core scenarios passing, and real-runtime
+host coverage of 25 pass / 40 not run / zero fail. Those are host results;
+client conformance and joint live testing remain outstanding. Unsupported
+steps never count as passes. Upstream section 9 remains the security release gate.
 
 ### Envelope and exact target
 

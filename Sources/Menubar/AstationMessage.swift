@@ -6,6 +6,7 @@ enum AstationMessage: Codable {
         let root = try AtemSessionJSON.validatePacket(data)
         let decoder = JSONDecoder()
         decoder.userInfo[AtemSessionJSON.rawRootKey] = root
+        decoder.userInfo[AtemSessionJSON.rawSizeKey] = data.count
         return try decoder.decode(Self.self, from: data)
     }
 
@@ -641,9 +642,14 @@ enum AstationMessage: Codable {
             self = .session(message)
 
         case .agentChat:
-            let message = try container.decode(AgentChatWire.self, forKey: .data)
-            if message.op == "error" {
-                try AtemSessionWire.check(message.code.map { !$0.isEmpty && $0.utf8.count <= 128 } == true)
+            var message = try container.decode(AgentChatWire.self, forKey: .data)
+            if let root = decoder.userInfo[AtemSessionJSON.rawRootKey] as? AtemSessionJSON {
+                message.recovered = root["data"]?["after_message_id"] != nil
+            }
+            message.wireBytes = decoder.userInfo[AtemSessionJSON.rawSizeKey] as? Int ?? 0
+            if message.op == "error", let code = message.code {
+                // Chat lifecycle notices have no code; admission errors do.
+                try AtemSessionWire.check(!code.isEmpty && code.utf8.count <= 128)
             }
             self = .agentChat(message)
 

@@ -17,8 +17,8 @@ struct AtemSessionContext: Equatable {
     }
 }
 
-/// Compatibility mode only: this context must come from the hub's existing
-/// authenticated, safety-code-verified connection. Section 9 features stay off.
+/// The hub supplies the authenticated, safety-code-verified connection.
+/// Protocol r8 is required; section 9's membership gates remain enforced.
 final class AtemSessionClient {
     enum Phase: Equatable { case offline, connecting, reconnecting, ready, failed }
     struct ConnectionStatus: Equatable {
@@ -26,33 +26,48 @@ final class AtemSessionClient {
         let message: String
         let hasRegistrySnapshot: Bool
         let canReconnect: Bool
+        let unsupportedVersion: Bool
     }
     private(set) var phase: Phase = .offline
     private(set) var status = "Connect a verified Atem to use sessions."
     private(set) var context: AtemSessionContext?
     private(set) var welcome: AtemSessionMessage?
+    private(set) var features: Set<String> = []
+    private(set) var unsupportedVersion = false
     private(set) var registry: [String: AtemSessionDescriptor] = [:]
     private(set) var latestReceipt: AtemSessionReceipt?
     private(set) var approvals: [String: AtemApprovalRequest] = [:]
     private(set) var closedApprovals: [String: String] = [:]
+    private(set) var approvalRules: [String: [AtemApprovalRule]] = [:]
+    private var regrantedAfterRevoke: Set<String> = []
+    var approvalActivities: [AtemApprovalActivity] { canReviewApprovals ? chat.activities : [] }
     var onChange: (() -> Void)?
 
     private struct Pending {
         let message: AtemSessionMessage
         let sent: TimeInterval
         let previousDeadline: TimeInterval?
+        let owner: String
+        var mayAdoptControl = true
     }
     private struct Lease {
         let target: AtemSessionTarget
         let epoch: UInt64
         let deadline: TimeInterval
         let renewAt: TimeInterval
+        let owner: String
     }
     private let currentContext: () -> AtemSessionContext?
     private let sendMessage: (AtemSessionMessage, RemoteTerminalConnection) -> Bool
     private let reconnectTransport: (AtemSessionContext) -> Bool
     private let now: () -> TimeInterval
     private let makeID: () -> String
+    private let sendChat: (AgentChatWire, RemoteTerminalConnection) -> Bool
+    private lazy var chat = AtemSessionChat(now: now, features: { [weak self] in self?.features ?? [] }) { [weak self] message in
+        guard let self, let context = self.context, context == self.currentContext(),
+              message.binding?.attachment_gen == self.welcome?.attachment_gen else { return false }
+        return self.sendChat(message, context.route)
+    }
     let journal: AtemSessionJournal
     private var pending: [String: Pending] = [:]
     private var leases: [String: Lease] = [:]
@@ -70,7 +85,8 @@ final class AtemSessionClient {
     var hasRegistrySnapshot: Bool { phase == .ready && !resyncing }
     var connectionStatus: ConnectionStatus {
         ConnectionStatus(phase: phase, message: status, hasRegistrySnapshot: hasRegistrySnapshot,
-            canReconnect: phase == .failed && context != nil && context == currentContext() && !journal.loadFailed)
+            canReconnect: phase == .failed && context != nil && context == currentContext() && !journal.loadFailed,
+            unsupportedVersion: unsupportedVersion)
     }
     var canReviewApprovals: Bool {
         hasRegistrySnapshot && context == currentContext() && now() < authorizationDeadline
@@ -82,13 +98,15 @@ final class AtemSessionClient {
          journal: AtemSessionJournal = AtemSessionJournal(),
          makeID: @escaping () -> String = { UUID().uuidString.lowercased() },
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-         reconnect: @escaping (AtemSessionContext) -> Bool = { _ in false }) {
+         reconnect: @escaping (AtemSessionContext) -> Bool = { _ in false },
+         sendChat: @escaping (AgentChatWire, RemoteTerminalConnection) -> Bool = { _, _ in false }) {
         currentContext = context
         sendMessage = send
         reconnectTransport = reconnect
         self.journal = journal
         self.now = now
         self.makeID = makeID
+        self.sendChat = sendChat
     }
 
     func start() { started = true; connectionChanged() }
@@ -112,12 +130,19 @@ final class AtemSessionClient {
             return
         }
         lastHelloContext = current
-        _ = request(AtemSessionMessage(op: "hello"))
+        var hello = AtemSessionMessage(op: "hello")
+        hello.revision = AtemSessionWire.revision
+        _ = request(hello)
         changed()
     }
 
     private func clearAttachment() {
+        chat.reset(sendClose: false)
+        approvalRules = [:]
+        regrantedAfterRevoke = []
         welcome = nil
+        features = []
+        unsupportedVersion = false
         registry = [:]
         approvals = [:]
         closedApprovals = [:]
@@ -154,27 +179,34 @@ final class AtemSessionClient {
                                  host_trust_gen: trust, session_id: sessionId, process_gen: process)
     }
 
-    func binding(for target: AtemSessionTarget, mutation: Bool) -> AtemSessionBinding? {
+    func binding(for target: AtemSessionTarget, mutation: Bool, owner: String = "native") -> AtemSessionBinding? {
         guard target == self.target(sessionId: target.session_id, process: target.process_gen),
               let attachment = welcome?.attachment_gen else { return nil }
         if mutation {
             guard welcome?.permissions?.contains("control") == true, registry[target.session_id]?.state == "running",
-                  let lease = leases[target.session_id], lease.target == target, now() < lease.deadline else { return nil }
+                  let lease = leases[target.session_id], lease.target == target, lease.owner == owner, now() < lease.deadline else { return nil }
             return AtemSessionBinding(target: target, attachment_gen: attachment, lease_epoch: lease.epoch)
         }
         return AtemSessionBinding(target: target, attachment_gen: attachment)
     }
 
     func controls(_ target: AtemSessionTarget) -> Bool { binding(for: target, mutation: true) != nil }
+    func controlOwner(for target: AtemSessionTarget) -> String? {
+        guard let lease = leases[target.session_id], lease.target == target, now() < lease.deadline else { return nil }
+        return lease.owner
+    }
     func controlDeadline(for target: AtemSessionTarget) -> TimeInterval? { leases[target.session_id]?.deadline }
 
     func acquiring(_ target: AtemSessionTarget) -> Bool {
         pending.values.contains { $0.message.op == "acquire" && $0.message.binding?.target == target }
     }
 
-    func acquire(_ target: AtemSessionTarget, takeover: Bool = true) {
-        guard welcome?.permissions?.contains("control") == true, let binding = binding(for: target, mutation: false),
-              registry[target.session_id]?.state == "running", !acquiring(target) else { return }
+    @discardableResult
+    func acquire(_ target: AtemSessionTarget, takeover: Bool = true, owner: String = "native") -> Bool {
+        guard pending.count < 64, welcome?.permissions?.contains("control") == true, let binding = binding(for: target, mutation: false),
+              registry[target.session_id]?.state == "running", !acquiring(target),
+              controlOwner(for: target).map({ $0 == owner }) != false,
+              !otherOwnerPending(target, owner: owner) else { return false }
         if let old = leases[target.session_id], now() >= old.deadline {
             leases.removeValue(forKey: target.session_id)
             pending = pending.filter { $0.value.message.binding?.target != target || !["acquire", "renew"].contains($0.value.message.op) }
@@ -182,15 +214,22 @@ final class AtemSessionClient {
         var message = AtemSessionMessage(op: "acquire")
         message.binding = binding
         message.takeover = takeover
-        _ = request(message, deadline: leases[target.session_id]?.deadline)
+        _ = request(message, deadline: leases[target.session_id]?.deadline, owner: owner)
         status = "Requesting control of this session..."
         changed()
+        return true
     }
 
-    func release(_ target: AtemSessionTarget) {
-        let binding = binding(for: target, mutation: true)
+    func release(_ target: AtemSessionTarget, owner: String = "native") {
+        guard controlOwner(for: target).map({ $0 == owner }) != false else { return }
+        let binding = binding(for: target, mutation: true, owner: owner)
         leases.removeValue(forKey: target.session_id)
         pending = pending.filter { $0.value.message.binding?.target != target || !["acquire", "renew"].contains($0.value.message.op) }
+        // Keep receipt recovery, but a reply to a closed/backgrounded view
+        // must never restore its authority.
+        for (id, operation) in pending where operation.owner == owner && operation.message.binding?.target == target {
+            pending[id]?.mayAdoptControl = false
+        }
         if let binding {
             var message = AtemSessionMessage(op: "release")
             message.binding = binding
@@ -201,39 +240,58 @@ final class AtemSessionClient {
     }
 
     func releaseAll() {
-        let targets = leases.values.map(\.target)
+        let targets = Set(leases.values.filter { $0.owner == "native" }.map(\.target)
+            + pending.values.filter { $0.owner == "native" }.compactMap { $0.message.binding?.target })
         for target in targets { release(target) }
     }
 
-    func renew(_ target: AtemSessionTarget) {
-        guard let binding = binding(for: target, mutation: true),
+    private func otherOwnerPending(_ target: AtemSessionTarget, owner: String) -> Bool {
+        pending.values.contains { $0.mayAdoptControl && $0.owner != owner && $0.message.binding?.target == target
+            && ($0.message.op == "acquire" || ($0.message.op == "submit" && $0.message.kind == "prompt")) }
+    }
+
+    @discardableResult
+    func renew(_ target: AtemSessionTarget, owner: String = "native") -> Bool {
+        guard let binding = binding(for: target, mutation: true, owner: owner),
               !pending.values.contains(where: { $0.message.op == "renew" && $0.message.binding?.target == target }),
-              let deadline = leases[target.session_id]?.deadline else { return }
+              let deadline = leases[target.session_id]?.deadline else { return false }
         var message = AtemSessionMessage(op: "renew")
         message.binding = binding
-        _ = request(message, deadline: deadline)
+        _ = request(message, deadline: deadline, owner: owner)
+        return true
     }
 
     @discardableResult
     func submit(_ target: AtemSessionTarget, kind: String, text: String? = nil,
-                requestID: String = UUID().uuidString.lowercased()) -> String? {
-        guard pending.count < 64, let binding = binding(for: target, mutation: true), ["prompt", "interrupt", "stop"].contains(kind) else { return nil }
+                requestID: String = UUID().uuidString.lowercased(), takeover: AtemSessionController? = nil,
+                owner: String = "native") -> String? {
+        guard pending.count < 64, welcome?.permissions?.contains("control") == true,
+              registry[target.session_id]?.state == "running", ["prompt", "interrupt", "stop"].contains(kind),
+              controlOwner(for: target).map({ $0 == owner }) != false,
+              !otherOwnerPending(target, owner: owner) else { return nil }
         if kind == "prompt", registry[target.session_id]?.capabilities.contains("chat-v1") != true {
             status = "This agent accepts terminal input only. Type or paste in its terminal."
             changed()
             return nil
         }
         let payload: AtemSessionJSON = kind == "prompt" ? .object(["text": .string(text ?? "")]) : .object([:])
+        let held = binding(for: target, mutation: true, owner: owner)
+        guard let binding = held ?? (kind == "prompt" && features.contains("chat.send_acquire")
+            ? binding(for: target, mutation: false) : nil), kind == "prompt" || takeover == nil else { return nil }
         var message = AtemSessionMessage(op: "submit")
         message.binding = binding
         message.request_id = requestID
         message.kind = kind
         message.payload = payload
-        return submitDurably(message)
+        if held == nil {
+            message.acquire = true
+            if let takeover { message.takeover = true; message.expected_controller = takeover }
+        } else if takeover != nil { return nil }
+        return submitDurably(message, owner: owner)
     }
 
     func canAnswer(_ approval: AtemApprovalRequest) -> Bool {
-        guard canReviewApprovals, approvals[approval.approval_id] == approval,
+        guard canReviewApprovals, features.contains("approval.lease_free"), approvals[approval.approval_id] == approval,
               let target = target(sessionId: approval.session_id, process: approval.process_gen),
               registry[approval.session_id]?.state == "running" else { return false }
         return !journal.snapshot.requests.contains {
@@ -249,8 +307,7 @@ final class AtemSessionClient {
               let target = target(sessionId: approval.session_id, process: approval.process_gen),
               let binding = binding(for: target, mutation: false) else { return nil }
         if decision == .allowAlways {
-            guard registry[target.session_id]?.provider == "claude",
-                  approval.always_rules.contains(where: { $0.rule_id == ruleID }) else { return nil }
+            guard approval.always_rules.contains(where: { $0.rule_id == ruleID }) else { return nil }
         }
         let answer = AtemApprovalAnswer(approvalID: approval.approval_id, decision: decision, ruleID: ruleID, message: message)
         var submit = AtemSessionMessage(op: "submit")
@@ -261,7 +318,74 @@ final class AtemSessionClient {
         return submitDurably(submit, approvalID: approval.approval_id)
     }
 
-    private func submitDurably(_ message: AtemSessionMessage, approvalID: String? = nil) -> String? {
+    func hasRule(_ rule: AtemApprovalRule, target: AtemSessionTarget) -> Bool {
+        canReviewApprovals && features.contains("approval.session_rules") && target == self.target(sessionId: target.session_id, process: target.process_gen)
+            && registry[target.session_id]?.state == "running" && approvalRules[target.session_id]?.contains(rule) == true
+    }
+
+    func revokeRecord(_ rule: AtemApprovalRule, target: AtemSessionTarget) -> AtemSessionRequestRecord? {
+        guard let digest = try? AtemSessionJSON.object(["rule_id": .string(rule.rule_id)]).digest() else { return nil }
+        let record = journal.snapshot.requests.last { $0.target == target && $0.kind == "approval_rule_revoke" && $0.digest == digest }
+        return record.flatMap { regrantedAfterRevoke.contains($0.requestId) ? nil : $0 }
+    }
+
+    func canRevoke(_ rule: AtemApprovalRule, target: AtemSessionTarget) -> Bool {
+        hasRule(rule, target: target)
+            && revokeRecord(rule, target: target).map { $0.receipt?.state == .rejected } != false
+    }
+
+    @discardableResult
+    func revokeRule(_ rule: AtemApprovalRule, target: AtemSessionTarget,
+                    requestID: String = UUID().uuidString.lowercased()) -> String? {
+        guard pending.count < 64, canRevoke(rule, target: target), let binding = binding(for: target, mutation: false) else { return nil }
+        var message = AtemSessionMessage(op: "submit")
+        message.binding = binding
+        message.request_id = requestID
+        message.kind = "approval_rule_revoke"
+        message.payload = .object(["rule_id": .string(rule.rule_id)])
+        return submitDurably(message)
+    }
+
+    func receiveChat(_ event: AgentChatWire, from source: RemoteTerminalConnection) {
+        guard hasRegistrySnapshot, context == currentContext(), now() < authorizationDeadline, source == context?.route,
+              let descriptor = registry[event.agentId], descriptor.state == "running",
+              descriptor.capabilities.contains("chat-v1") else { return }
+        if let generation = event.generation, generation != descriptor.process_gen,
+           let target = target(sessionId: descriptor.session_id, process: descriptor.process_gen),
+           chat.snapshot(target)?.chat_id == event.conversationId {
+            refresh()
+            changed()
+            return
+        }
+        if chat.receive(event) { changed() }
+    }
+
+    func chatSnapshot(_ target: AtemSessionTarget) -> AtemSessionChat.Snapshot? {
+        guard target == self.target(sessionId: target.session_id, process: target.process_gen),
+              features.contains("chat.history_end") else { return nil }
+        return chat.snapshot(target)
+    }
+
+    func readChat(_ target: AtemSessionTarget) -> AtemSessionChat.Snapshot? {
+        guard features.contains("chat.history_end"), registry[target.session_id]?.state == "running",
+              registry[target.session_id]?.capabilities.contains("chat-v1") == true,
+              let binding = binding(for: target, mutation: false) else { return nil }
+        chat.requestView(binding)
+        return chat.snapshot(target)
+    }
+
+    func chatHistory(_ target: AtemSessionTarget, before: String? = nil, next: String? = nil,
+                     turn: String? = nil, request: String? = nil) -> String? {
+        guard target == self.target(sessionId: target.session_id, process: target.process_gen) else { return nil }
+        return chat.history(target, before: before, next: next, turn: turn, request: request, features: features)
+    }
+
+    func chatPage(_ target: AtemSessionTarget, pageID: String) -> AtemSessionChat.HistoryReply? {
+        guard target == self.target(sessionId: target.session_id, process: target.process_gen) else { return nil }
+        return chat.reply(target, pageID: pageID)
+    }
+
+    private func submitDurably(_ message: AtemSessionMessage, approvalID: String? = nil, owner: String = "native") -> String? {
         guard let target = message.binding?.target, let payload = message.payload, let kind = message.kind else { return nil }
         do {
             try message.validate()
@@ -270,18 +394,27 @@ final class AtemSessionClient {
             if let previous = journal.snapshot.requests.first(where: { $0.requestId == record.requestId }) {
                 guard previous.target == record.target, previous.kind == record.kind,
                       previous.digest == record.digest, previous.approvalID == record.approvalID else { return nil }
-                return previous.requestId
+                // Only an explicit retry of a definitive ownership refusal may
+                // send again. Uncertain delivery always recovers the receipt.
+                guard previous.receipt == nil, previous.refusal?.code == "lease_held",
+                      message.takeover == true, message.expected_controller == previous.refusal?.controller else { return previous.requestId }
+                try journal.update { state in
+                    if let index = state.requests.firstIndex(where: { $0.requestId == record.requestId }) {
+                        state.requests[index].refusal = nil
+                    }
+                }
+            } else {
+                try journal.update { state in
+                    if state.requests.count >= 4096, let oldestFinal = state.requests.firstIndex(where: { $0.receipt?.state.final == true }) {
+                        state.requests.remove(at: oldestFinal)
+                    }
+                    state.requests.append(record)
+                }
             }
             // Persist the identity before sending. Reconnect uses receipt_query;
             // prompt text is never stored or automatically submitted again.
-            try journal.update { state in
-                if state.requests.count >= 4096, let oldestFinal = state.requests.firstIndex(where: { $0.receipt?.state.final == true }) {
-                    state.requests.remove(at: oldestFinal)
-                }
-                state.requests.append(record)
-            }
         } catch { status = "Could not save this request safely. Nothing was sent."; changed(); return nil }
-        let delivered = request(message)
+        let delivered = request(message, deadline: leases[target.session_id]?.deadline, owner: owner)
         latestReceipt = nil
         status = delivered ? "Submitted. Waiting for a durable receipt."
             : "Delivery is uncertain. Reconnect will query the request without resending it."
@@ -295,6 +428,8 @@ final class AtemSessionClient {
             return
         }
         guard phase == .ready else { return }
+        approvalRules = [:]
+        chat.reset()
         resyncing = true
         if !pending.values.contains(where: { $0.message.op == "list" }) { _ = request(AtemSessionMessage(op: "list")) }
     }
@@ -305,9 +440,13 @@ final class AtemSessionClient {
             try message.validate()
             if message.op == "welcome" {
                 guard phase == .connecting, let re = message.re, pending[re]?.message.op == "hello" else { return }
+                guard message.revision == AtemSessionWire.revision, message.features != nil else {
+                    failUnsupportedVersion(); return
+                }
                 try acceptWelcome(message); changed(); return
             }
             if message.op == "error", message.re == nil {
+                if message.code == "unsupported_version" { failUnsupportedVersion(); return }
                 if message.code == "unauthorized", welcome != nil { reconnect(); return }
                 status = "Atem: " + AtemSessionWire.diagnosticErrorCode(message.code)
                 if phase == .connecting || ["unauthorized", "paused", "unsupported_version"].contains(message.code ?? "") {
@@ -316,12 +455,26 @@ final class AtemSessionClient {
                 changed(); return
             }
             if phase == .connecting, message.op == "error", let re = message.re, pending[re]?.message.op == "hello" {
+                if message.code == "unsupported_version" { failUnsupportedVersion(); return }
                 fail("Atem could not open a session: " + AtemSessionWire.diagnosticErrorCode(message.code)
                     + ". Reconnect to open a fresh session connection."); changed(); return
             }
             guard phase == .ready, now() < authorizationDeadline else { return }
             switch message.op {
             case "sessions", "session_changed": try acceptRegistry(message)
+            case "approval_rules":
+                guard canReviewApprovals, features.contains("approval.session_rules"), let id = message.session_id, let process = message.process_gen,
+                      target(sessionId: id, process: process) != nil, registry[id]?.state == "running", let rules = message.rules else { return }
+                approvalRules[id] = rules
+                // A fresh host list may grant the same command again after a
+                // completed revoke. Do not let the old receipt disable it forever.
+                if let target = target(sessionId: id, process: process) {
+                    for rule in rules {
+                        if let record = revokeRecord(rule, target: target), record.receipt?.state == .completed {
+                            regrantedAfterRevoke.insert(record.requestId)
+                        }
+                    }
+                }
             case "approval_request":
                 guard canReviewApprovals, let approval = message.approval,
                       target(sessionId: approval.session_id, process: approval.process_gen) != nil,
@@ -347,6 +500,9 @@ final class AtemSessionClient {
                           operation.message.request_id == message.request_id,
                           operation.message.binding?.target == message.target,
                           operation.message.kind == message.kind else { return }
+                    if let lease = message.lease, message.state == .accepted, operation.message.kind == "prompt" {
+                        acceptSendLease(lease, operation: operation)
+                    }
                     pending.removeValue(forKey: re)
                 }
                 if let receipt = message.receipt { try acceptReceipt(receipt) }
@@ -359,12 +515,22 @@ final class AtemSessionClient {
                 }
             case "error":
                 guard let re = message.re, let operation = pending.removeValue(forKey: re) else { return }
+                if operation.message.op == "submit", let requestID = operation.message.request_id,
+                   let index = journal.snapshot.requests.firstIndex(where: { $0.requestId == requestID }) {
+                    let refusal = AtemSessionRefusal(code: message.code ?? "invalid_request", controller: message.controller)
+                    if refusal.valid { try journal.update { $0.requests[index].refusal = refusal } }
+                }
                 if let target = operation.message.binding?.target,
                    ["acquire", "renew", "release"].contains(operation.message.op) { leases.removeValue(forKey: target.session_id) }
                 status = "Atem: " + AtemSessionWire.diagnosticErrorCode(message.code)
-                handleRefusal(code: message.code ?? "request failed", target: operation.message.binding?.target)
+                if !["approval", "approval_rule_revoke"].contains(operation.message.kind ?? "")
+                    || ["unauthorized", "forbidden", "paused", "unsupported_version"].contains(message.code ?? "") {
+                    handleRefusal(code: message.code ?? "request failed", target: operation.message.binding?.target)
+                }
                 if message.code == "busy", operation.message.op == "submit" {
-                    status = "Atem is busy. Checking the receipt without resending this request."
+                    status = "Atem refused this request as busy. It will not be resent automatically."
+                } else if message.code == "lease_held" {
+                    status = "Another controller holds this session. Confirm Take over and send to continue."
                 }
                 if message.code == "stale_target", operation.message.kind == "approval",
                    let id = operation.message.payload?["approval_id"]?.string {
@@ -386,13 +552,14 @@ final class AtemSessionClient {
             return
         }
         let time = now()
+        chat.tick()
         if time >= authorizationDeadline { fail("Session authorization expired. Reconnect the verified Atem."); changed(); return }
         for (session, lease) in leases {
             if time >= lease.deadline {
                 leases.removeValue(forKey: session)
                 status = "Control expired. Take Control explicitly to type again."
                 changed()
-            } else if time >= lease.renewAt, !pending.values.contains(where: { $0.message.op == "renew" && $0.message.binding?.target == lease.target }) {
+            } else if lease.owner == "native", time >= lease.renewAt, !pending.values.contains(where: { $0.message.op == "renew" && $0.message.binding?.target == lease.target }) {
                 renew(lease.target)
             }
         }
@@ -409,7 +576,8 @@ final class AtemSessionClient {
               let context, message.account_id == context.account, message.atem_device_id == context.device,
               message.client_kind == "native", message.permissions?.contains("view") == true,
               let remaining = message.authorization_ms_left, remaining > 0, remaining <= 86_400_000,
-              let trust = message.host_trust_gen else { throw AtemSessionJSON.Invalid.json }
+              let trust = message.host_trust_gen, message.revision == AtemSessionWire.revision,
+              message.host_error == nil else { throw AtemSessionJSON.Invalid.json }
         try journal.update { state in
             if let index = state.hosts.firstIndex(where: { $0.account == context.account && $0.device == context.device }) {
                 let previous = state.hosts[index]
@@ -424,6 +592,7 @@ final class AtemSessionClient {
         authorizationDeadline = min(hello.sent + Double(remaining) / 1000, now() + Double(remaining) / 1000)
         try AtemSessionWire.check(now() < authorizationDeadline)
         welcome = message
+        features = Set(message.features ?? []).intersection(AtemSessionWire.features)
         // Sequence numbers, removals and authority belong to this attachment;
         // only the durable trust/runtime floor survives a new welcome.
         registry = [:]
@@ -481,6 +650,7 @@ final class AtemSessionClient {
                 else { next[descriptor.session_id] = descriptor }
             }
             registry = next
+            approvalRules = [:]
             sequence = incoming
             resyncing = false
             pending = pending.filter { $0.value.message.op != "list" }
@@ -495,8 +665,11 @@ final class AtemSessionClient {
                 tombstones[descriptor.session_id, default: []].insert(descriptor.process_gen)
             } else if tombstones[descriptor.session_id]?.contains(descriptor.process_gen) != true { registry[descriptor.session_id] = descriptor }
         }
-        for (id, lease) in leases where target(sessionId: id, process: lease.target.process_gen) != lease.target || registry[id]?.state != "running" {
+        for (id, lease) in leases where target(sessionId: id, process: lease.target.process_gen) != lease.target
+            || registry[id]?.state != "running" || registry[id]?.controller?.controller_session != welcome?.controller_session
+            || registry[id]?.controller?.lease_epoch != lease.epoch {
             leases.removeValue(forKey: id)
+            revokedLeaseEpoch[id] = max(revokedLeaseEpoch[id] ?? 0, lease.epoch)
         }
         for (id, descriptor) in previousRegistry where registry[id]?.process_gen != descriptor.process_gen {
             highestLeaseEpoch.removeValue(forKey: id)
@@ -506,6 +679,14 @@ final class AtemSessionClient {
         approvals = approvals.filter { _, approval in
             registry[approval.session_id]?.process_gen == approval.process_gen && registry[approval.session_id]?.state == "running"
         }
+        approvalRules = approvalRules.filter { id, _ in
+            registry[id]?.state == "running" && previousRegistry[id]?.process_gen == registry[id]?.process_gen
+        }
+        chat.sync(features.contains("chat.history_end") ? registry.values.compactMap { descriptor in
+            guard descriptor.state == "running", descriptor.capabilities.contains("chat-v1"),
+                  let target = target(sessionId: descriptor.session_id, process: descriptor.process_gen) else { return nil }
+            return binding(for: target, mutation: false)
+        } : [])
         try AtemSessionWire.check(tombstones.values.reduce(0) { $0 + $1.count } <= 4096)
     }
 
@@ -537,7 +718,7 @@ final class AtemSessionClient {
         if operation.message.op == "acquire", let previous = operation.previousDeadline { deadline = min(previous, deadline) }
         guard now() < deadline else { leases.removeValue(forKey: binding.target.session_id); return }
         highestLeaseEpoch[binding.target.session_id] = epoch
-        leases[binding.target.session_id] = Lease(target: binding.target, epoch: epoch, deadline: deadline, renewAt: operation.sent + 5)
+        leases[binding.target.session_id] = Lease(target: binding.target, epoch: epoch, deadline: deadline, renewAt: operation.sent + 5, owner: operation.owner)
         status = "Controlling this session. Local input on Atem takes priority."
     }
 
@@ -554,26 +735,28 @@ final class AtemSessionClient {
             pending = pending.filter { $0.value.message.binding?.target.session_id != id || !["acquire", "renew"].contains($0.value.message.op) }
             status = "Viewing. Control changed on Atem."
         }
-        // r7 grants an approval's lease before returning its receipt. Adopt only
-        // a grant caused by this attachment's explicit, still-pending answer.
-        if message.controller?.controller_session == welcome?.controller_session,
-           ["granted", "takeover"].contains(message.reason ?? ""),
-           revokedLeaseEpoch[id].map({ epoch > $0 }) != false,
-           let operation = pending.values.first(where: {
-               $0.message.op == "submit" && $0.message.kind == "approval"
-                   && $0.message.binding?.target.session_id == id
-                   && $0.message.binding?.target.process_gen == message.process_gen
-                   && $0.message.payload?["acquire"] == .bool(true)
-           }), let target = operation.message.binding?.target,
-           target == self.target(sessionId: id, process: target.process_gen) {
-            let deadline = min(operation.sent + 15, authorizationDeadline)
-            if now() < deadline {
-                leases[id] = Lease(target: target, epoch: epoch, deadline: deadline, renewAt: operation.sent + 5)
-            }
-        }
     }
 
-    private func acceptReceipt(_ receipt: AtemSessionReceipt) throws {
+    private func acceptSendLease(_ lease: AtemSessionSendLease, operation: Pending) {
+        guard operation.mayAdoptControl, features.contains("chat.send_acquire"), lease.valid,
+              operation.message.binding?.attachment_gen == welcome?.attachment_gen,
+              let target = operation.message.binding?.target,
+              target == self.target(sessionId: target.session_id, process: target.process_gen),
+              lease.lease_epoch >= (highestLeaseEpoch[target.session_id] ?? 0),
+              revokedLeaseEpoch[target.session_id].map({ lease.lease_epoch > $0 }) != false,
+              controlOwner(for: target).map({ $0 == operation.owner }) != false,
+              operation.previousDeadline.map({ now() < $0 }) != false else { return }
+        var deadline = min(operation.sent + Double(lease.ms_left) / 1000, authorizationDeadline)
+        if let old = leases[target.session_id], old.epoch == lease.lease_epoch { deadline = min(deadline, old.deadline) }
+        guard now() < deadline else { return }
+        highestLeaseEpoch[target.session_id] = lease.lease_epoch
+        leases[target.session_id] = Lease(target: target, epoch: lease.lease_epoch, deadline: deadline,
+            renewAt: operation.sent + 5, owner: operation.owner)
+    }
+
+    private func acceptReceipt(_ incoming: AtemSessionReceipt) throws {
+        var receipt = incoming
+        if !features.contains("receipt.result") { receipt.result = nil }
         guard let context, receipt.target.account_id == context.account, receipt.target.atem_device_id == context.device,
               receipt.target.host_trust_gen == welcome?.host_trust_gen,
               let index = journal.snapshot.requests.firstIndex(where: { $0.requestId == receipt.request_id }) else { return }
@@ -582,7 +765,13 @@ final class AtemSessionClient {
         if let previous = record.receipt {
             if receipt.updated_at < previous.updated_at { return }
             try AtemSessionWire.check(previous.state.permits(receipt.state))
-            if previous.state.final { try AtemSessionWire.check(previous == receipt); return }
+            if previous.state.final {
+                try AtemSessionWire.check(previous.state == receipt.state && previous.detail == receipt.detail
+                    && previous.updated_at == receipt.updated_at
+                    && (previous.result == nil || receipt.result == nil
+                        || receipt.result.map { previous.result!.sameOutcome(as: $0) } == true))
+                if receipt.result == nil { receipt.result = previous.result }
+            }
         }
         try journal.update { $0.requests[index].receipt = receipt }
         guard journal.snapshot.requests.last(where: { $0.target == receipt.target })?.requestId == receipt.request_id else { return }
@@ -610,7 +799,7 @@ final class AtemSessionClient {
         lastReceiptQuery = now()
         let unresolved = journal.snapshot.requests.filter {
             $0.target.account_id == context.account && $0.target.atem_device_id == context.device
-                && $0.target.host_trust_gen == trust && $0.receipt?.state.final != true
+                && $0.target.host_trust_gen == trust && $0.receipt?.state.final != true && $0.refusal?.code != "lease_held"
         }
         for (target, records) in Dictionary(grouping: unresolved, by: \.target) {
             if pending.values.contains(where: { $0.message.op == "receipt_query" && $0.message.binding?.target == target }) { continue }
@@ -624,19 +813,27 @@ final class AtemSessionClient {
     }
 
     @discardableResult
-    private func request(_ original: AtemSessionMessage, deadline: TimeInterval? = nil) -> Bool {
+    private func request(_ original: AtemSessionMessage, deadline: TimeInterval? = nil, owner: String = "native") -> Bool {
         var message = original
         message.id = makeID()
         guard let context, context == currentContext(), pending.count < 64, (try? message.validate()) != nil else { return false }
-        pending[message.id] = Pending(message: message, sent: now(), previousDeadline: deadline)
+        pending[message.id] = Pending(message: message, sent: now(), previousDeadline: deadline, owner: owner)
         return sendMessage(message, context.route)
     }
     private func fail(_ text: String) {
+        chat.reset()
+        approvalRules = [:]
+        features = []
         phase = .failed
         approvals = [:]
         leases = [:]
         pending = [:]
         status = text
+    }
+    private func failUnsupportedVersion() {
+        unsupportedVersion = true
+        fail("This Atem version is not supported. Upgrade Atem, then reconnect.")
+        changed()
     }
     private func changed() { onChange?() }
 }
