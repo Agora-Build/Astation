@@ -63,6 +63,12 @@ it cannot invent an agent response, approval resolution or successful receipt.
 The existing BrowserAgentChat bridge is not a native session chat service:
 managed-session browser access remains gated by section 9.
 
+The next [remote API design](remote-agent-api.md) removes the Mac from the
+request path for enrolled native clients and scoped services/bots. It retains
+the host's r8 operation semantics and requires joint membership, freshness and
+encrypted-channel admission. The local bearer token is not remote authority.
+That proposal includes the Atem implementation handoff and headless tests.
+
 **Joint work** is the chat history boundary, recovery/correlation contract,
 provider capability expectations and shared fixtures. The Atem owner makes
 all Atem implementation changes. Shared memory and published documents are
