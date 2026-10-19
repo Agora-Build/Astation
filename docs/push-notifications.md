@@ -2,38 +2,42 @@
 
 Push notifications deliver a request to a device with control permission even
 when that device has no lease. A tap reconnects and reads the approval from an
-authenticated Atem. Only an explicit answer may atomically acquire control and
-answer the exact request. The relay and the notification payload cannot approve
-anything.
+authenticated Atem. An explicit answer uses the exact pending request and
+current control permission without changing the lease. The relay and the
+notification payload cannot approve anything.
 
-The accepted product flow is now in Atem PR #72, `designs/account-trust.md`,
-"Push-based approvals". That section supersedes the earlier requirement that a
-lease must already exist to receive an approval. See the
-[implementation handoff](../designs/protocol/push-approvals-handoff.md) for the
-remaining wire-contract gates.
+Current application behavior is r8: approval answers and rule revocation need
+control permission and the exact authoritative request/rule, without acquiring
+or changing a terminal lease. The relay/notification cannot authorize an answer.
+See the [r8 client](../designs/protocol/r8-client.md) and
+[local approval API](local-control-api.md) for implemented behavior and tests.
 
-The [local approval API](local-control-api.md) supports headless integration
-tests using the real native inbox and durable journal. Mobile UI is unnecessary
-for session/answer/reconnect tests. See the [account-trust review](../designs/protocol/account-trust-review.md)
-and [host push proof draft](../designs/protocol/approval-push-proof.md) before
-enabling relay host ingress or account-wide recipients. Neither an API test nor
-a provider fake establishes real APNs delivery.
+Remote multi-device admission and sealed escalation are designed on
+[Atem PR #80](https://github.com/Agora-Build/Atem/pull/80), coordinated through
+[#81](https://github.com/Agora-Build/Atem/issues/81). The approved policy is:
+desktop OS push immediately if no desktop is connected; mobile at 60 seconds
+if unanswered and not actively seen; optional desktop reminder/mobile immediate
+preference; suppression near expiry without disabling a valid answer early.
+See the [aligned push integration plan](../designs/protocol/approval-push-proof.md).
+Wire schemas/fixtures, authenticated host proof, sealed hints, active-user seen
+and a durable relay scheduler are not implemented by provider setup alone.
+Neither a headless API test nor a provider fake proves actual APNs delivery.
 
 ## Current implementation boundary
 
 - **In-app alerts** show a nonmodal banner and an approval inbox while Astation
   is running. They require neither APNs nor OS notification permission. The
-  menu is directly under Astation Hub and shows the pending request count.
+  menu is directly under Astation and shows the pending request count.
   Turning alerts off retains the inbox and does not change offline push.
-- The inbox reads r7 `approval_request` / `approval_closed` from authenticated,
+- The inbox reads r8 `approval_request` / `approval_closed` from authenticated,
   safety-code-verified Atem session clients. Requests arrive independently of
   control leases. Catch-up replaces existing cards without repeating alerts;
   disconnect, permission loss and process changes disable stale answers.
-- Allow once, Deny (with an optional message) and Claude's offered Always allow
-  rules use a durable r7 approval submission with `acquire:true`. The exact
-  Claude rule and scope are confirmed before sending. Codex has no Always
-  allow. Reconnect queries receipts and never repeats a decision. An unknown
-  outcome requires checking the agent instead of answering again.
+- Allow once, Deny (with an optional message) and Claude/Codex offered Always
+  allow rules use durable lease-free r8 approval submissions. Show and confirm
+  the exact offered rule and scope. Reconnect queries receipts and never
+  repeats a decision. An unknown outcome requires checking the agent instead
+  of answering again.
 - **Offline APNs push** is a separate opt-in. Native macOS can request OS
   notification permission and register its APNs
   token, re-register on an authenticated relay reconnect and unregister on opt-out.
@@ -54,8 +58,9 @@ a provider fake establishes real APNs delivery.
   If no authoritative matching request is available, the UI says its status is
   unconfirmed. An unavailable or partial catch-up is never called "answered".
 
-In-app review targets Atem PR #72 at `5ce333e505e77429ffbfd443bdb0794b45136a03`
-([r7 contract](https://github.com/Agora-Build/Atem/blob/5ce333e505e77429ffbfd443bdb0794b45136a03/designs/protocol/atem-session-v1.md#6a-approvals-r7)).
+In-app review targets the merged r8 contract in Atem #78 at
+`4f87bab1289848cb6a0da5707d2e7830eb5c057d`;
+see the [r8 lifecycle](../designs/protocol/r8-client.md).
 The session compatibility trust gate still limits access to the verified paired
 native Astation. Live APNs delivery, phones and account-wide approval access
 are not enabled or verified. Offline push requires the host authentication and

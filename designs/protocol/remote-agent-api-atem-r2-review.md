@@ -8,12 +8,19 @@ and [recovery correction](https://github.com/Agora-Build/Atem/issues/81#issuecom
 The PR body retains superseded attestation/reset text. This review uses the
 pinned files and the correction, not that body.
 
+Follow-up: the [confirmed #81 reply](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6276488130)
+settles all three product questions and confirms v0.7.2 retains device_id.
+The [coordination update](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6276913191)
+makes #81 the working handoff channel and PR #80 the shared design owner.
+Atem acknowledged the handshake issue and is drafting its correction. The
+findings below describe c2ef8ff; a corrected pin and vectors are still needed.
+Current Astation requirements are in [remote-agent-api.md](remote-agent-api.md).
+
 **Architecture agreement permits drafting r9 and its fixtures. It is not
 channel/security sign-off or permission to enable remote admission.** The
 circular handshake below blocks implementation of `atem-ch1` as written.
-Product changes to push and recovery also need confirmation: an external
-comment calling something a user decision does not by itself supersede the
-explicit decisions recorded in Astation's [remote API design](remote-agent-api.md).
+The product questions recorded during the initial review are now resolved
+by the confirmed handoff; they no longer block r9 drafting.
 
 ## Agreed direction
 
@@ -107,8 +114,9 @@ into relay records, logs or shared memory. Restore must validate kit/account
 binding and durably restore K before reporting data recovery; an interrupted
 restore must be retryable without silently creating a new key or trust root.
 
-Whether a kit may also enroll a manager into the old host trust chain is a
-pending product decision below. The schema must follow that answer.
+The kit may enroll a replacement manager into the existing chain after loss
+of every native device, as confirmed on #81. The final schema follows that
+decision and cannot lift a security freeze.
 
 ### 4. Medium: sealed hints and active-user seen need interoperable schemas
 
@@ -141,7 +149,8 @@ is a product decision, not implied by defining the signal.
 The original creation time cannot move on retry/reconnect. Connected desktops
 are a routing hint only. Suppressing provider delivery near expiry must not
 label a still-pending request expired or disable a still-valid answer early.
-The comment's 0/60 schedule and the file's 60/180 schedule currently disagree.
+At the reviewed pin the comment's 0/60 schedule and file's 60/180 schedule
+disagree; the confirmed policy is now 0/60 with active-user seen suppression.
 
 ### 5. Clarify atomic suffix admission and failure recovery
 
@@ -154,16 +163,16 @@ invalid add, concurrent suffixes, write/fsync failure and crash/replay before
 admission. Set entry-count/byte/evidence bounds without allowing rejected
 traffic to create unbounded storage or signature work.
 
-## Product decisions pending in this session
+## Product decisions resolved on #81
 
-The questions have been sent to the user; no answer is implied by a timeout.
-Until answered, Astation's current documented policy is unchanged.
+The user-confirmed reply settles these questions; the earlier alternatives
+are historical and are not current requirements.
 
-| Decision | Current Astation record | Atem's new proposal / recommendation |
-| --- | --- | --- |
-| Approval escalation | Desktop at 60 s; mobile at 180 s; authenticated answer/closure cancels escalation. Mere viewing does not. | Atem proposes desktop immediately if none connected; mobile at 60 s unless actively seen. Need explicit confirmation of timing and seen suppression. |
-| Loss of every trusted native device | Restore data/account, then locally unpair/pair/verify each host. Lost devices are removed explicitly in Settings. | Atem proposes a Recovery Kit enrolling a manager in the existing chain, retaining host access. Need explicit confirmation of that authority change. |
-| Manager biometrics | No r9 session/reuse policy implemented. | Recommend at most five minutes of reuse for routine channel signing, cleared on device lock/background; fresh user confirmation for enrollment, removal and recovery. Platform key policy must enforce it; no exported software copy of the manager key. Await choice versus fresh authentication each channel. |
+| Decision | Confirmed behavior |
+| --- | --- |
+| Approval escalation | Desktop OS immediately when none connected; mobile at 60 s if unanswered and not actively seen; optional desktop reminder/mobile immediate preference; suppress near expiry without changing request expiry. Supersedes 60/180. |
+| Loss of every trusted native device | Kit restores K and enrolls a replacement manager into the existing chain; hosts keep working without re-pairing. Lost records require explicit removal; kit cannot lift a freeze. Supersedes mandatory re-pair after ordinary device loss. |
+| Manager biometrics | At most five-minute reuse for routine channel signing, cleared on lock/background; fresh Face ID/Touch ID for enrollment, removal and recovery. Enforced by platform key policy. |
 
 An enrollment/recovery signature must bind the exact ceremony, applicant keys,
 account/root, requested roles, nonces and current predecessor. A delayed
@@ -209,17 +218,15 @@ old-key refusal, failed signing/storage preserving the old record, and old
 migration completion rejection. These exercise today's pairing identity;
 they do not establish r9 membership or cross-device recovery.
 
-If v0.7.2 also generates a new device ID, it is a new identity. Atem must
-provide an authenticated replacement relationship through the confirmed
-ceremony/membership design, or Astation must explicitly confirm which old
-record to remove. Never replace a trusted device by equal hostname, relay
-room, SSO login or claimed previous ID. Retire old authority before granting
-replacement authority, using the agreed durable fences.
+Atem confirmed v0.7.2 retains atem_id in config.toml, so the tested same-ID
+path applies. A future new-ID replacement would need an authenticated
+relationship in the confirmed ceremony/membership design or explicit user
+selection. Never identify replacement by hostname, relay room or SSO.
 
 ## Implementation gate and next handoff
 
-Atem can draft r9 and shared fixtures now for the agreed architecture, with
-the findings and pending product branches explicitly unresolved. Astation
+Atem is drafting r9 and shared fixtures for the agreed architecture and
+confirmed policies, resolving the technical findings above. Astation
 will consume the pinned shared core, implement native enrollment/recovery and
 encrypted notifications, store/route signed records and run independent
 controller/host tests. No new wire fields, remote admission, push scheduler
@@ -228,7 +235,7 @@ regression tests.
 
 Required next artifacts: corrected channel profile/vectors, exact membership
 and recovery schemas, sealed-open/resolution/seen vectors, explicit suffix
-failure semantics, product answers, and a versioned shared-core binding and
+failure semantics, and a versioned shared-core binding and
 storage/effect contract. Keep Astation PR #58 and Atem PR #80 draft until
 the shared security contract is pinned and independently verified.
 

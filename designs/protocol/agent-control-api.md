@@ -16,7 +16,11 @@ This document also describes later conversation/event interfaces; proposed
 routes are labeled below. The shared session/chat service and polling API
 are implemented. Full conversation UI, SSE replay and offline push delivery
 remain separate milestones. Atem owns its implementation; communication uses
-published docs and memory, without editing or building an Atem checkout.
+GitHub [Atem #81](https://github.com/Agora-Build/Atem/issues/81) for handoffs
+and [PR #80](https://github.com/Agora-Build/Atem/pull/80) for r9 design/review,
+without editing or building an Atem checkout. New remote admission follows
+the aligned [remote API plan](remote-agent-api.md); this document describes
+the implemented r8 local API and its application behavior.
 
 ## Required first milestone
 
@@ -75,14 +79,14 @@ request path for enrolled native clients and scoped services/bots. Mobile
 Astation connects independently whether the Mac is online or offline; Mac and
 mobile can access the same original sessions simultaneously, with one control
 lease per agent session and lease-free approval answers. It retains the host's
-r8 operation semantics and requires joint membership, freshness and encrypted
+r8 operation semantics and requires joint membership and encrypted
 channel admission. The local bearer token is not remote authority. That proposal
 includes the Atem implementation handoff and headless tests.
 
 **Joint work** is the chat history boundary, recovery/correlation contract,
 provider capability expectations and shared fixtures. The Atem owner makes
-all Atem implementation changes. Shared memory and published documents are
-the handoff; Astation must not edit or build an Atem checkout.
+all Atem implementation changes. GitHub #81 and PR #80 are the handoff;
+Astation must not edit or build an Atem checkout.
 
 ## API surface and later additions
 
@@ -179,20 +183,17 @@ authoritative state before offering any action.
 APNs/FCM is the offline delivery channel and is not established by SSE or
 in-app alerts. It still needs provisioned provider credentials, authenticated
 host proof, recipient authorization and the durable relay outbox in
-[the push proposal](approval-push-proof.md). Approval cards/live events are
-immediate. If still pending and unexpired, the relay schedules initial OS push
-at 60 seconds from creation, then a reminder at 180 seconds (two more minutes),
-whether desktop Astation is online or offline. Desktop clients default to both
-stages; mobile defaults to the reminder through a registered notification
-preference. No desktop/mobile identity category is needed. Enforce the mobile
-delay before OS submission; client filtering alone cannot suppress an alert
-while the app is suspended. A missing/failed initial delivery cannot postpone
-the reminder. An authoritative closure on any device/local terminal cancels
-unsent stages; viewing does not. Expired
-approvals never receive delayed approval alerts, and reconnect/duplicate
-catch-up cannot reset deadlines. This scheduling and notification preference
-are not implemented by existing provider adapters; PC OS delivery also needs
-its platform adapter. Completion push, if desired,
+[the push integration plan](approval-push-proof.md). Approval cards/live events
+are immediate. The confirmed policy sends desktop OS push immediately if no
+desktop is connected, and mobile at 60 seconds if unanswered and not actively
+seen. Optional desktop reminders and mobile immediate preference are allowed.
+Authenticated active-user seen suppresses mobile escalation, while answer or
+closure cancels every pending stage. Desktop presence is a routing hint only.
+Signed immutable creation time, expiry margin, sealed recipient hints and seen
+proofs follow the forthcoming r9 contract on Atem #80; the former 60/180 plan
+is superseded. An expiry margin suppresses delivery without disabling a valid
+approval early. These features are not implemented by provider adapters; PC
+OS delivery also needs its platform adapter. Completion push, if desired,
 needs its own agreed event and payload rules. No raw transcript belongs in
 push metadata. API and native tests can run without mobile clients; actual
 offline delivery requires a push-enabled test device and credentials.
