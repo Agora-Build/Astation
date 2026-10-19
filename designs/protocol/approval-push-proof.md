@@ -4,6 +4,12 @@ Status: Astation proposal for Atem review, updated 2026-10-19. Not enabled
 ingress and not a replacement for atem-session r8. Pin to an agreed revision
 with shared signature fixtures before either side sends these fields.
 
+The [r2.1 review](remote-agent-api-atem-r2-review.md) covers Atem's proposed
+sealed recipient hints and active-user seen signal. Their exact schemas and
+a proposed 0/60-second policy change are not agreed or enabled; the recorded
+60/180-second policy below stays in effect pending the user's answer. Signing
+domains in this draft are proposals, not interoperable wire constants.
+
 Product policy: connected clients receive approval cards/events immediately.
 If still pending and unexpired, initial OS push is due at 60 seconds from
 creation and a reminder at 180 seconds. Desktop defaults to receiving both;

@@ -5,6 +5,12 @@ after Astation [#56](https://github.com/Agora-Build/Astation/pull/56), merged
 as `4f4581ac7c3e453a39a830dc6c4577aeb71dda6a`. Public remote operations are
 not enabled. The implemented API is the [protected local API](../../docs/local-control-api.md).
 
+Review update: [Astation's review of Atem response r2.1](remote-agent-api-atem-r2-review.md)
+records architecture agreement at Atem `c2ef8ff`, the channel correction needed
+before r9 implementation, and pending push/recovery/biometric decisions. The
+60/180-second push and lost-device recovery policies here remain the recorded
+policy until the user confirms any change; the review is not remote enablement.
+
 Application baseline: atem-session r8 at Atem
 `4f87bab1289848cb6a0da5707d2e7830eb5c057d` (#78). This draft also reads
 Atem main `0801a4f0b84c4fa8d3e851ad8ec426c365ae144d`, including
