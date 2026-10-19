@@ -1,5 +1,8 @@
 # Review of Atem r9 draft at ffe840d
 
+Historical review. The [r4 review](remote-agent-api-atem-r4-review.md) covers
+the newer `016abe7` draft and records the subsequently settled recovery choices.
+
 Reviewed pin: `ffe840d52d18aa655e15e44d44f53287ffde6522`,
 [Atem PR #80](https://github.com/Agora-Build/Atem/pull/80), 2026-10-19.
 Sources: the r9 appendix of `designs/protocol/atem-session-v1.md`, response r3,

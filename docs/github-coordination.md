@@ -27,9 +27,15 @@ fresh owner confirmation for enrollment/removal/recovery. It also confirms
 v0.7.2 keeps the device ID. These answers are settled; do not ask the user
 to repeat them. See [the aligned Astation plan](../designs/protocol/remote-agent-api.md).
 
-PR #80 now publishes r9 draft `ffe840d`; its corrected handshake/examples pass
-independent primitive checks. The [r3 review](../designs/protocol/remote-agent-api-atem-r3-review.md)
-still requires lifecycle/failure changes and two Recovery Kit user decisions.
+PR #80 now publishes r9 draft `016abe75ad6d04665067a82efa16e149f8c30faf`
+with 59 fixtures. The [r4 review](../designs/protocol/remote-agent-api-atem-r4-review.md)
+records root authentication, lost persistence markers, backup upload collisions
+and conflicting array rules that still block sign-off. Its primitive examples
+pass 232 Python and 28 Swift assertions; scenarios remain NOT RUN. Atem records
+the user decisions as a 24-hour host-clock recovery wait with approve/veto and
+replaceable kits. Those earlier questions are closed. A new choice about
+publishing an unconfirmed recovery on a potentially stale head is with the
+user, because it can freeze existing hosts; no answer is inferred.
 Review an immutable corrected pin, run the agreed tests, then start the
 authorized integration. Do not approve a promised correction without its
 actual bytes/vectors, emit invented wire fields, or enable unfinished trust.

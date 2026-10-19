@@ -9,9 +9,10 @@ local API remain documented in [r8-client.md](r8-client.md) and the
 
 The shared protocol lives in **[Atem PR #80](https://github.com/Agora-Build/Atem/pull/80)**:
 `designs/protocol/remote-agent-api-atem.md`, `designs/account-trust.md`, and the
-forthcoming r9 appendix and shared fixtures. The reviewed document pin is
-`c2ef8ff4f686d0a63826696f7c97aefd84985984`; it still contains the handshake
-error and some superseded policy text. A promised correction is not a new pin.
+r9 appendix and shared fixtures. The current reviewed draft pin is
+`016abe75ad6d04665067a82efa16e149f8c30faf`; the
+[r4 review](remote-agent-api-atem-r4-review.md) records remaining blockers.
+The handshake is corrected, but the contract is not jointly signed off.
 
 [Atem #81](https://github.com/Agora-Build/Atem/issues/81) is the coordination
 thread for handoffs, answers, status and questions. PR #80 owns design changes
@@ -23,7 +24,11 @@ product/security choices to the user before publishing a decision. See the
 The [confirmed policy reply](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6276488130)
 settles push, recovery, authentication and the unchanged v0.7.2 device ID.
 It supersedes Astation's former 60/180-second schedule and mandatory host
-re-pairing after loss of every native device. The [r2 review](remote-agent-api-atem-r2-review.md)
+re-pairing after loss of every native device.
+The [later recovery handoff](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6278073754)
+records the user decisions: a 24-hour host-clock wait with manager approve/veto
+and replaceable kits. These replace the earlier pending recovery questions.
+The [r2 review](remote-agent-api-atem-r2-review.md)
 records the technical findings and their follow-up status; the older
 [#70 review](account-trust-review.md) is historical, not a competing design.
 
@@ -107,6 +112,14 @@ the kit to sign the restricted add-manager entry on the **existing** chain.
 Existing hosts continue without re-pairing. Atem only verifies/applies that
 recovery-signed entry; there is no `atem trust recover` command. The kit
 cannot reset trust, remove devices, change its genesis pin or unfreeze a host.
+Recovery enrollment waits 24 hours from each host's first sight, using both
+monotonic and wall time; the subject has no access meanwhile. A manager can
+approve it immediately or veto it while pending. Kits are replaceable: a
+manager plus the current kit co-signature acts immediately; a manager without
+the kit uses the same wait and approve/veto. A replaced kit never signs again.
+Root authentication and backup lifecycle still need the r4 corrections before
+implementation. The draft's new unconfirmed-restore fallback, which can freeze
+hosts after publication on a stale head, awaits the user's decision.
 Lost devices are removed explicitly in Settings, never automatically. A stolen
 device is removed by a signed membership entry; a compromised manager or freeze
 requires local host re-pairing.
@@ -234,11 +247,12 @@ and expiry before each provider attempt. See the [push integration requirements]
 
 ## Implementation order and readiness
 
-1. Review r9 draft `ffe840d52d18aa655e15e44d44f53287ffde6522` on PR #80.
-   It fixes circular key derivation and supplies 34 fixtures. The
-   [r3 review](remote-agent-api-atem-r3-review.md) records remaining persistence,
-   notification timing/seen and backup-lifecycle findings. Primitive/example
-   vectors pass independent Python and CryptoKit checks; this does not
+1. Review r9 draft `016abe75ad6d04665067a82efa16e149f8c30faf` on PR #80.
+   It supplies 59 fixtures and improves live persistence fencing, push timing
+   and seen delivery. The [r4 review](remote-agent-api-atem-r4-review.md)
+   records root authentication, restart after lost markers, backup collision
+   and array-order blockers. Primitive/example vectors pass 232 independent
+   Python and 28 CryptoKit assertions; this does not
    constitute full shared-core conformance or protocol sign-off.
 2. Atem builds/verifies the shared `atem-client`, binding artifacts and host
    implementation. Agree durable state/effect ordering and FFI lifecycle;
@@ -261,10 +275,10 @@ merges deploy production and still require the user's merge authorization.
 Current implementation: public readiness/gating and an isolated approval
 delivery policy are built and tested; no authenticated r9 ingress, public
 agent operation or provider dispatch is enabled. The policy derives deadlines
-from original creation and accepts a delivery margin. It awaits timing
-alignment before outbox integration. Recovery enrollment delay and kit
-rotation are new questions with the user; neither is inferred from the
-already settled recovery goals.
+from original creation and accepts a delivery margin. It awaits
+full lifecycle agreement before outbox integration. Recovery enrollment delay
+and kit replacement are settled as above. Only the new unconfirmed-restore
+fallback is with the user; it is not implemented or inferred.
 
 ## Tests without phone applications
 
