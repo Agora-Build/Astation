@@ -1,8 +1,12 @@
 # Authenticated host push: joint proof draft
 
-Status: Astation proposal for Atem review, 2026-10-16. Not enabled ingress and
-not a replacement for atem-session r7. Pin to an agreed revision with shared
-signature fixtures before either side sends these fields.
+Status: Astation proposal for Atem review, updated 2026-10-19. Not enabled
+ingress and not a replacement for atem-session r8. Pin to an agreed revision
+with shared signature fixtures before either side sends these fields.
+
+Product policy: connected clients receive approvals immediately; offline OS
+push escalates only if still pending after 120 seconds. Mac availability does
+not control the timer. See the [remote API design](remote-agent-api.md).
 
 ## Identity and authority
 
@@ -48,7 +52,11 @@ Cross-language vectors must settle the exact choices before implementation.
 Each event has a random event_id and kind push_approval or push_resolved. Bind
 its signature to the authenticated account/root, host key/trust generation,
 approval id, session and process generations, payload digest, issued_at and
-expires_at. Sign with a distinct event domain (`agora.build/approval-push/v1`)
+expires_at. An open must also bind an immutable approval-creation timestamp;
+this is distinct from a retry's event issue time and cannot be reset by a new
+event id. The exact field, units, clock-skew validation and open/resolution
+ordering must be agreed with Atem and covered by signature vectors before
+implementation. Sign with a distinct event domain (`agora.build/approval-push/v1`)
 so a connection proof cannot be replayed as an event. A durable event signature
 lets either relay replica verify provenance after socket loss. Do not require
 the host process to stay online after durable acceptance.
@@ -73,7 +81,46 @@ the host process to stay online after durable acceptance.
   generation; do not delete a concurrently rotated address.
 - Bound and redact tool/summary text. Do not include raw arguments, transcripts
   or credentials. Push hints and provider receipts cannot create actionable
-  cards. Tap reconnects and fetches authoritative r7 approval state.
+  cards. Tap reconnects and fetches authoritative r8 approval state. The current
+  answer remains lease-free and subject to current control permission.
+
+## Durable two-minute escalation
+
+- Atem sends the signed open promptly when the approval is created, not after
+  waiting for a Mac response. It sends a signed resolution when any device or
+  the local terminal answers, or the request otherwise closes. Automatic
+  resolution, denial, cancellation and expiry also close the escalation.
+- Transactionally persist the validated original creation time, approval
+  expiry, resolution tombstone and outbox due time before acknowledging the
+  open. Due time is original creation time plus 120 seconds. Redelivery, new
+  event ids, catch-up and reconnect cannot postpone or duplicate that job.
+  Validate time bounds; malformed or inconsistent timestamps cannot bypass
+  the scheduling/admission rules. Agree the exact clock handling in fixtures.
+- The relay scheduler runs independently of Mac sockets, wake state and UI.
+  Seeing the request, receiving an alert or holding a lease is not a response.
+  Escalate after the same 120 seconds even if Mac Astation is already offline;
+  another authorized client's answer cancels just as a Mac answer does.
+- No approval alert is sent before due time, or when now >= approval expiry.
+  If expiry <= due time, omit the approval push; do not alter the agent's
+  deadline. A late accepted open can dispatch immediately after its original
+  due time only while still valid, unresolved and authorized. Resolution
+  tombstones suppress delayed opens even when resolution arrived first.
+- At each attempt, transactionally claim the job and recheck current lifecycle,
+  host/recipient authority and token generation. Persist claims, attempts and
+  completion across replicas/restarts. A successful escalation is not a
+  periodic reminder; retry unknown/provider failures with the same identity
+  and expiry under the bounded retry contract.
+- Recheck resolution immediately before provider submission. A resolution
+  after that boundary cannot reliably retract the external send. Cancel
+  remaining attempts and use push_resolved to coalesce/clear notices where
+  supported. A late tap always asks Atem for current state before any action;
+  resolved/expired requests cannot become actionable from push metadata.
+
+The authenticated ingress and durable scheduler remain gated on the joint
+membership/freshness and signed event contract. Provider adapters alone do
+not implement this policy, and a headless test cannot prove background OS
+delivery. Use APNs/FCM for offline escalation regardless of whether foreground
+traffic uses WSS or a future Agora Signaling adapter.
 
 Do not dispatch after a known removal. An external provider already holding a
 notification cannot retract disclosure, and offline revocation freshness needs
@@ -88,3 +135,10 @@ open/resolution, resolution-before-open, delayed worker, host/member revocation,
 token rotation during an invalid-token reply, provider retry/restart, and
 forged push metadata on the native client. Provider fakes inspect signed HTTP
 requests; separately verify real APNs/FCM credentials and delivery.
+
+Use a controllable clock for 119.999 s / 120 s dispatch, expiry before/at/after
+due time, delayed opens already due, Mac online-but-unanswered and offline,
+answer on another device or local terminal, resolution-before-open, duplicate
+opens with new event ids, creation-time tamper, worker failover and restart,
+resolution before claim/before send/after provider acceptance, and a late tap.
+Viewing/notification acknowledgment must not cancel or reset the timer.

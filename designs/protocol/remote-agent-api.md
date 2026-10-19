@@ -82,6 +82,9 @@ which clients are online.
 | Interrupt or stop | Explicit held-lease submissions | Preserve turn interruption versus process stop. |
 | Recover after disconnect | Scoped receipt query and retained history | New attachment never restores control or replays a prompt. |
 
+Whole-message responses are sufficient; token-by-token response streaming is
+not a requirement. Deliver messages and lifecycle changes as Atem emits them.
+
 Terminal access can use the same authenticated channel and explicit lease.
 Remote process launch, file uploads, arbitrary file access and account vault
 access are separate permissions/features. Respect Claude/Codex capabilities
@@ -111,12 +114,75 @@ Proposed route families, not enabled endpoints:
 | `/api/remote/v1/channels/{id}/frames` | Bounded ciphertext submission; transport ACK is not agent acceptance. |
 | `/api/remote/v1/channels/{id}/events` | Ordered encrypted delivery and explicit cursor/reset semantics. |
 
-WSS is the first transport candidate. An HTTP/SSE adapter preserves the same
-channel and ordering contract; it does not add a second command authority.
+WSS is the selected initial transport. Keep transport adapters separate from
+the authenticated channel and session state machine so a later Agora Signaling
+adapter can improve end-user connectivity without changing agent operations.
+An HTTP/SSE adapter can preserve the same channel and ordering contract.
 Final methods, envelopes, errors and versions require shared schemas/fixtures.
 TLS is required. Account login organizes enrollment and abuse limits, but
 never replaces device proof. The local bearer token and cooperative
 `operator_id` labels are not remote credentials or independent principals.
+
+### Future Agora Signaling transport
+
+Agora Signaling is a later delivery adapter, not part of the initial WSS
+implementation. Start evaluation with Signaling message channels, which are
+intended for signaling and chat. Confirm supported native, browser, host and
+headless runtimes and a working host/bridge path before committing to the
+integration; do not assume an SDK exists for every Astation/Atem platform.
+Measure reachability on the target end-user networks.
+
+Keep application encryption, endpoint proof, signed membership, ordered
+events, full targets, leases and durable request/receipt semantics above the
+adapter. A Signaling login, channel subscription, presence event or transport
+ACK is not device verification, agent acceptance or control permission.
+Transport credentials cannot replace independently enrolled device keys.
+
+Agree frame-size/rate limits, ordering, duplicate/gap handling and reconnect
+fixtures before enabling the adapter. A transport switch authenticates a new
+channel/attachment, fences the replaced attachment and never restores its
+lease or resubmits accepted commands. Do not run WSS and Signaling as two
+independent command authorities. Offline OS push remains APNs/FCM regardless
+of the foreground transport.
+
+## Approval notification escalation
+
+Show a new approval immediately in connected Mac/mobile apps and subscribed
+API clients. Native Mac in-app alerts remain immediate. The two-minute delay
+applies to the offline OS push escalation, not delivery of the approval event.
+
+If the approval remains pending 120 seconds after Atem created it, send an
+APNs/FCM alert to eligible enrolled devices with registered push tokens and
+notification permission. This applies whether Mac Astation is online,
+sleeping, quit or disconnected. A foreground mobile view can show the live
+card immediately; client notification handling should coalesce the matching
+push with that card rather than show a second alert.
+
+"Handled" means Atem confirms an answer or another terminal resolution,
+including denial, automatic resolution, cancellation or expiry. Viewing a
+card, receiving its event, holding a terminal lease or keeping the Mac online
+does not count. An answer on any device or in the local terminal cancels the
+pending escalation once the authenticated resolution reaches the relay.
+
+The relay owns a durable escalation job keyed by the full approval identity;
+the Mac does not run the timer. Its due time comes from a jointly specified,
+signed immutable approval-creation time plus 120 seconds. Duplicate opens,
+catch-up, reconnect and failover cannot move that deadline or schedule fresh
+alerts. At dispatch, recheck unresolved/unexpired state and host/recipient
+authority. A delayed but valid open already past its due time is eligible
+immediately if still pending. An approval that expires at or before the due
+time receives no stale approval alert; do not extend its lifetime or approve
+it automatically to accommodate the delay.
+
+Retry provider delivery with the same approval identity and existing expiry;
+do not repeat a successful escalation periodically. A resolution cancels
+unsent work and coalesces/clears delivered notices where the OS permits. A
+resolution racing an external send can still produce a late notice; tapping
+always reconnects and fetches authoritative pending state, showing "already
+answered" or expired as appropriate. See the
+[push proof and scheduling handoff](approval-push-proof.md) for signed fields,
+durable scheduling, failure handling and tests. This policy is agreed product
+behavior; the authenticated ingress and scheduler are not enabled yet.
 
 ## Security and lifecycle invariants
 
@@ -240,7 +306,10 @@ Then build and publish shared fixtures for:
    [push proof](approval-push-proof.md). Notification payloads never authorize
    a card/answer. Provide a runnable host/headless-controller harness with real
    independent keys and disposable Claude/Codex sessions, without production
-   verification bypasses or the paired Mac's credentials.
+   verification bypasses or the paired Mac's credentials. Agree signed immutable
+   approval-creation time and resolution semantics so the relay can escalate
+   still-pending approvals after 120 seconds without a running Mac. Opens and
+   resolutions are delivered independently of control-lease ownership.
 
 Pin the agreed document and fixtures before either side enables this admission
 mode. Atem commits its implementation on its own branch; communication uses
@@ -263,6 +332,10 @@ published docs/shared memory, not Astation changes in an Atem checkout.
   catch-up. Events include approvals/resolutions, rules/auto-allowed activity,
   receipts/results and session/connection/control changes. Push/webhooks are
   deduplicated expiring hints; late actions fetch the current pending approval.
+- Schedule approval OS push at the original pending time plus 120 seconds in
+  the durable relay outbox. Cancel on authenticated resolution from any device
+  or local terminal. Reconnect, duplicate catch-up, Mac presence and worker
+  failover cannot reset the timer; provider attempts recheck expiry/authority.
 
 A Discord bot decrypts as an authorized endpoint. Posting selected output to
 Discord discloses it to Discord; it does not require relay session keys.
@@ -285,12 +358,14 @@ actual agent effects and durable host receipts, not HTTP 202 or relay presence.
 | Membership | Valid enrollment; swapped keys/roles/root/account/algorithm; unauthorized signer; replayed ceremony; delayed owner-auth result; concurrent managers; hidden fork; removed manager signing fresh nonces. |
 | Freshness | Withheld head; exact expiry; stale/future proof; backward clock; restart; missing witness/manager; no renewal from reconnect/presence. |
 | Channel | Wrong host; endpoint/role/grant/ephemeral-key tamper; cross-replica replay; cross-host/session reuse; downgrade; counter exhaustion; reconnect rejects old frames. |
+| Transport adapters | WSS is the initial path; future Signaling must preserve encrypted frames, ordering/gap detection, receipts and lease fencing across reconnect/switch, including unsupported runtime and frame-limit cases. |
 | Delegation | View/control scopes; constrained targets; expiry/revocation; issuer loss; forbidden redelegation; notification token possession grants nothing. |
 | Operations | Two original sessions; local/remote prompts; receipt/results; complete/partial/unavailable history; overlapping pages; once/always/deny/revoke; terminal answer race; approval expiry and duplicate catch-up. |
 | Control | Concurrent Send; expected-holder race; explicit terminal control; local input wins; lease expiry/late renew; interrupt versus stop; one local operator cannot cancel another's pending work. |
 | Concurrent devices | Mac and mobile view the same original process; mobile answers/revokes while Mac holds the lease without changing its holder/deadline; confirmed takeover and stale-confirmation races; separate sessions have independent holders. |
 | Durability | Disconnect after accepted; queued-work revocation; host/relay crash at journal boundaries; unknown outcome without replay; cursor loss; slow consumer; duplicates; bounded definitive refusal retention. |
 | Independence | Mobile and bot operate with Mac online and offline within authority/freshness; Mac sleep/wake/reconnect does not interrupt or take control from mobile; mobile reconnect does not affect Mac; no calls to the Mac's local API; recovered login cannot replace a pinned host root. |
+| Approval escalation | Live event immediately; no OS escalation before 120 s; still pending at the deadline; Mac online/unanswered and Mac off; answer from any client/local terminal cancels; viewing does not; duplicate opens and restart preserve deadline; expiry before/at deadline suppresses; resolution/send race and stale tap. |
 
 Real keystores/Touch ID/password UI, APNs/FCM and mobile background delivery
 remain separate platform/provider checks. Headless tests do not claim them.
