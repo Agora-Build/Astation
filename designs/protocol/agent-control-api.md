@@ -64,10 +64,13 @@ The existing BrowserAgentChat bridge is not a native session chat service:
 managed-session browser access remains gated by section 9.
 
 The next [remote API design](remote-agent-api.md) removes the Mac from the
-request path for enrolled native clients and scoped services/bots. It retains
-the host's r8 operation semantics and requires joint membership, freshness and
-encrypted-channel admission. The local bearer token is not remote authority.
-That proposal includes the Atem implementation handoff and headless tests.
+request path for enrolled native clients and scoped services/bots. Mobile
+Astation connects independently whether the Mac is online or offline; Mac and
+mobile can access the same original sessions simultaneously, with one control
+lease per agent session and lease-free approval answers. It retains the host's
+r8 operation semantics and requires joint membership, freshness and encrypted
+channel admission. The local bearer token is not remote authority. That proposal
+includes the Atem implementation handoff and headless tests.
 
 **Joint work** is the chat history boundary, recovery/correlation contract,
 provider capability expectations and shared fixtures. The Atem owner makes

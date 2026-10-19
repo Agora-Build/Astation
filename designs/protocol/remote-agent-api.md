@@ -1,6 +1,6 @@
-# Remote agent API without the Mac
+# Remote agent API for independent Astation clients
 
-Status: joint Astation/Atem design draft, 2026-10-18. This starts the next task
+Status: joint Astation/Atem design draft, 2026-10-19. This starts the next task
 after Astation [#56](https://github.com/Agora-Build/Astation/pull/56), merged
 as `4f4581ac7c3e453a39a830dc6c4577aeb71dda6a`. Public remote operations are
 not enabled. The implemented API is the [protected local API](../../docs/local-control-api.md).
@@ -16,10 +16,13 @@ Claude/Codex exact Always allow rules.
 
 ## Product outcome and ownership
 
-A phone app, another native Astation, headless script or Discord bot operates
-an existing `atem agent launch` session through the relay while the Mac is
-offline. The Mac is not a gateway or required running process. A trusted
-native manager approves enrollment initially; ongoing calls use independently
+Mobile Astation, another native Astation, a headless script or a Discord bot
+operates an existing `atem agent launch` session through the relay whether
+the Mac is online or offline. Mac and mobile Astation can access the same
+Atem host and original agent sessions simultaneously. Each client has its own
+authenticated connection; the Mac is not a gateway or required running
+process. The Atem host itself must be running and reachable. A trusted native
+manager approves enrollment initially; ongoing calls use independently
 verified device authority and freshness. Availability without any manager
 depends on the freshness construction agreed below.
 
@@ -30,7 +33,8 @@ does not create native membership or standing agent authority.
 
 ```mermaid
 flowchart LR
-    N[Native manager] -->|Approve enrollment or delegation| C[Phone or bot with its own keys]
+    N[Native manager] -->|Approve enrollment or delegation| C[Mobile Astation or bot with its own keys]
+    M[Mac Astation] <-->|HTTPS / WSS: encrypted frames| R[Relay API]
     C <-->|HTTPS / WSS: encrypted frames| R[Relay API]
     R <-->|Encrypted frames| H[Atem host]
     H <--> A[Original Claude / Codex process]
@@ -43,6 +47,28 @@ The relay stores/routes signed or encrypted records. Clients verify the host;
 the host verifies clients. Neither account login nor relay presence grants
 access. Astation owns native enrollment/removal and the relay/API delivery
 side. The Atem agent owns all host changes; no Atem checkout is edited or built.
+
+### Concurrent Mac and mobile behavior
+
+Multiple authorized clients can view the same session and its authoritative
+chat, receipts and approvals. Connections and attachments are independent;
+no client proxies through another client's local API or borrows its keys.
+Opening a mobile view does not launch another agent or take control.
+
+| Operation | Concurrent behavior |
+| --- | --- |
+| View terminal, chat or history | Multiple permitted viewers read the same original session. |
+| Type, paste, resize, interrupt or stop | Require a held control lease; use explicit Take Control when not already held. One holder per agent session; different sessions can have different holders simultaneously. |
+| Send a prompt | Send atomically acquires an unowned lease or uses this client's held lease. If another client holds it, identify the holder and offer confirmed Take over and send, bound to the displayed expected controller. |
+| Answer an approval or revoke an offered rule | Require control permission and the exact pending request/rule, without acquiring or changing the lease. A mobile answer leaves a Mac's terminal lease and deadline intact; first valid answer wins. |
+| Disconnect, sleep or wake | Affect only that client's attachment and control under r8 expiry rules. Other clients remain attached and usable; reconnect creates a new attachment and never silently reacquires control. |
+
+For example, the Mac can hold terminal control while mobile reads the chat
+and answers an approval. Sending a prompt from mobile in that state requires
+confirmed takeover; reading or approving does not. A Mac coming online,
+reconnecting or waking cannot disable mobile or take its lease back. Account
+membership changes still apply to every affected attachment regardless of
+which clients are online.
 
 ## First usable milestone
 
@@ -203,7 +229,12 @@ Then build and publish shared fixtures for:
    holder on confirmed takeover; 5 s renew/15 s expiry; local input wins.
    Interrupt/stop and terminal writes require a lease. Approval answer/revoke
    need control permission and the exact request/rule, independently of lease;
-   answers omit acquire/lease_epoch and the first answer wins.
+   answers omit acquire/lease_epoch and the first answer wins. Support concurrent
+   independently authenticated Mac/mobile attachments to the same host and
+   session, with leases scoped per session. A client's disconnect/reconnect
+   cannot reset another client's attachment or control. Require takeover only
+   for operations that change the current session's control; lease-free
+   approvals must leave another device's holder and deadline unchanged.
 9. **Notification provenance and harness.** Bind signed host advertisements
    and hints to the same root, host key/trust and session/process context; see
    [push proof](approval-push-proof.md). Notification payloads never authorize
@@ -242,10 +273,12 @@ model before shipping browser control.
 
 ## Tests without phone applications
 
-Use a headless client with real independent keys/member or bot grant, an Atem
-host with disposable Claude/Codex sessions, two relay replicas, Postgres and
-Valkey. Shut down native Astation after enrollment. Assert actual agent effects
-and durable host receipts, not HTTP 202 or relay presence.
+Use independently enrolled Mac-equivalent and mobile-equivalent headless
+clients with different keys, plus a scoped bot grant, an Atem host with
+disposable Claude/Codex sessions, two relay replicas, Postgres and Valkey.
+Exercise both clients online, then disconnect and reconnect each client
+independently; also shut down native Mac Astation after enrollment. Assert
+actual agent effects and durable host receipts, not HTTP 202 or relay presence.
 
 | Area | Required cases |
 | --- | --- |
@@ -255,16 +288,18 @@ and durable host receipts, not HTTP 202 or relay presence.
 | Delegation | View/control scopes; constrained targets; expiry/revocation; issuer loss; forbidden redelegation; notification token possession grants nothing. |
 | Operations | Two original sessions; local/remote prompts; receipt/results; complete/partial/unavailable history; overlapping pages; once/always/deny/revoke; terminal answer race; approval expiry and duplicate catch-up. |
 | Control | Concurrent Send; expected-holder race; explicit terminal control; local input wins; lease expiry/late renew; interrupt versus stop; one local operator cannot cancel another's pending work. |
+| Concurrent devices | Mac and mobile view the same original process; mobile answers/revokes while Mac holds the lease without changing its holder/deadline; confirmed takeover and stale-confirmation races; separate sessions have independent holders. |
 | Durability | Disconnect after accepted; queued-work revocation; host/relay crash at journal boundaries; unknown outcome without replay; cursor loss; slow consumer; duplicates; bounded definitive refusal retention. |
-| Independence | Mac off; headless phone-equivalent and bot still operate within authority/freshness; no calls to the Mac's local API; recovered login cannot replace a pinned host root. |
+| Independence | Mobile and bot operate with Mac online and offline within authority/freshness; Mac sleep/wake/reconnect does not interrupt or take control from mobile; mobile reconnect does not affect Mac; no calls to the Mac's local API; recovered login cannot replace a pinned host root. |
 
 Real keystores/Touch ID/password UI, APNs/FCM and mobile background delivery
 remain separate platform/provider checks. Headless tests do not claim them.
 
 Delivery order: agree the four contract decisions and signed/channel fixtures;
 build membership/persistence and independent host admission; enable encrypted
-transport/SDK and run the Mac-off matrix; then ship mobile/bot clients and
-notifications. Browser companion control follows its code-integrity review.
+transport/SDK and run the concurrent-device and Mac-off matrix; then ship
+mobile/bot clients and notifications. Browser companion control follows its
+code-integrity review.
 The three non-critical r8 client follow-ups are tracked in
 [Astation #57](https://github.com/Agora-Build/Astation/issues/57); cover their
 equivalent paths before copying client logic into this SDK.
