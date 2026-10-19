@@ -1,4 +1,5 @@
 mod admin;
+mod approval_escalation;
 mod account_store;
 mod auth;
 mod cluster;
@@ -8,6 +9,7 @@ mod knowledge_routes;
 mod knowledge_secrets;
 mod knowledge_store;
 mod relay;
+mod remote_api;
 mod routes;
 mod rtc_session;
 mod session_store;
@@ -517,6 +519,7 @@ fn router(state: AppState) -> Router {
 
     // General rate limiting for other API endpoints
     let general_routes = Router::new()
+        .nest("/api/remote/v1", remote_api::routes())
         // Auth API routes
         .route("/api/sessions", post(routes::create_session_handler))
         .route(
@@ -907,7 +910,7 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    fn test_state() -> AppState {
+    pub(crate) fn test_state() -> AppState {
         AppState {
             sessions: SessionStore::new(),
             relay: RelayHub::new(),

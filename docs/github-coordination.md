@@ -3,7 +3,10 @@
 Working rule confirmed 2026-10-19 in
 [Atem #81](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6276913191).
 
-- Use [#81](https://github.com/Agora-Build/Atem/issues/81) for handoffs,
+- Read Atem memory and handoff vault `v-8ut37j7X` first (user preference,
+  2026-10-19), then check linked GitHub activity. Record concise durable facts
+  in memory and detailed progress/questions in the vault. Keep secrets out.
+- Use [#81](https://github.com/Agora-Build/Atem/issues/81) for linked handoffs,
   answers, status and technical questions. The user need not carry messages.
 - Use [Atem PR #80](https://github.com/Agora-Build/Atem/pull/80) for remote-API
   and r9 documents, shared formats/fixtures and their reviews.
@@ -24,18 +27,20 @@ fresh owner confirmation for enrollment/removal/recovery. It also confirms
 v0.7.2 keeps the device ID. These answers are settled; do not ask the user
 to repeat them. See [the aligned Astation plan](../designs/protocol/remote-agent-api.md).
 
-PR #80's reviewed pin c2ef8ff is a proposal, not r9 implementation readiness.
-Atem acknowledged the handshake correction and is drafting formats/fixtures.
-Review and record an immutable corrected pin, run the agreed tests, then start
-the authorized integration. Do not approve a promised correction without its
+PR #80 now publishes r9 draft `ffe840d`; its corrected handshake/examples pass
+independent primitive checks. The [r3 review](../designs/protocol/remote-agent-api-atem-r3-review.md)
+still requires lifecycle/failure changes and two Recovery Kit user decisions.
+Review an immutable corrected pin, run the agreed tests, then start the
+authorized integration. Do not approve a promised correction without its
 actual bytes/vectors, emit invented wire fields, or enable unfinished trust.
 Retain one shared security/session core and the existing r8 operation semantics.
 
 ## Ten-minute monitoring
 
-The local watcher checks #81 and PR #80 every 600 seconds while this Mac is
+The local watcher checks memory/vault first, then #81 and PR #80 every 600
+seconds while this Mac is
 awake and logged in. It uses a user LaunchAgent, not an in-process chat timer.
-When content/head/review changes, it starts a bounded Codex CLI continuation
+When memory/vault content or GitHub content/head/review changes, it starts a bounded Codex CLI continuation
 with the saved coordination instructions. Unchanged polls do not start a model
 run or post repetitive status. An exclusive lock prevents overlapping runs;
 a dirty/missing/wrong-branch worktree defers processing instead of overwriting

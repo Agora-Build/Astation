@@ -187,10 +187,12 @@ lease and receipt semantics. Verify runtime/network support before adopting
 that adapter. Transport presence/login/ACK never replaces enrolled device proof.
 APNs/FCM remains the offline channel regardless of foreground transport.
 
-The proposed relay `/api/remote/v1` families cover capabilities, enrollment
+The relay `/api/remote/v1` families cover capabilities, enrollment
 rendezvous, exact signed membership retrieval/conditional append, verified host
-advertisements, and opaque channels/frames/ordered events. They are not enabled
-endpoints. Final methods, limits, errors, cursor/reset behavior and envelopes
+advertisements, and opaque channels/frames/ordered events. Only the public
+readiness endpoint is implemented on this branch; it reports admission disabled
+and empty supported revisions/transports. Other unimplemented paths return 503.
+See [the API status](../../docs/remote-api.md). Final methods, limits, errors, cursor/reset behavior and envelopes
 follow the jointly pinned contract. A plaintext relay chat API would change the
 E2EE boundary and is not this design.
 
@@ -232,10 +234,12 @@ and expiry before each provider attempt. See the [push integration requirements]
 
 ## Implementation order and readiness
 
-1. Atem publishes corrected r9 schemas, security profile and cross-language
-   fixtures on PR #80. Astation reviews an immutable pin. The current c2ef8ff
-   handshake still derives a key from a head inside its own ciphertext; the
-   promised public signed-head correction needs actual bytes/vectors.
+1. Review r9 draft `ffe840d52d18aa655e15e44d44f53287ffde6522` on PR #80.
+   It fixes circular key derivation and supplies 34 fixtures. The
+   [r3 review](remote-agent-api-atem-r3-review.md) records remaining persistence,
+   notification timing/seen and backup-lifecycle findings. Primitive/example
+   vectors pass independent Python and CryptoKit checks; this does not
+   constitute full shared-core conformance or protocol sign-off.
 2. Atem builds/verifies the shared `atem-client`, binding artifacts and host
    implementation. Agree durable state/effect ordering and FFI lifecycle;
    r9 only, retaining r8 operation semantics.
@@ -253,6 +257,14 @@ platform/relay work where independent of unfinished formats, but emit no new
 wire operations or enable remote admission until the contract and fixtures
 are jointly pinned. No compatibility fallback or verification bypass. Main
 merges deploy production and still require the user's merge authorization.
+
+Current implementation: public readiness/gating and an isolated approval
+delivery policy are built and tested; no authenticated r9 ingress, public
+agent operation or provider dispatch is enabled. The policy derives deadlines
+from original creation and accepts a delivery margin. It awaits timing
+alignment before outbox integration. Recovery enrollment delay and kit
+rotation are new questions with the user; neither is inferred from the
+already settled recovery goals.
 
 ## Tests without phone applications
 
