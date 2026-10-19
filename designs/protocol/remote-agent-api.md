@@ -147,16 +147,30 @@ of the foreground transport.
 
 ## Approval notification escalation
 
-Show a new approval immediately in connected Mac/mobile apps and subscribed
-API clients. Native Mac in-app alerts remain immediate. The two-minute delay
-applies to the offline OS push escalation, not delivery of the approval event.
+Show a new approval card/badge immediately in connected Mac/mobile apps and
+subscribed API clients. Escalate unattended approvals through OS notifications
+in two stages, measured from Atem's original approval-creation time:
 
-If the approval remains pending 120 seconds after Atem created it, send an
-APNs/FCM alert to eligible enrolled devices with registered push tokens and
-notification permission. This applies whether Mac Astation is online,
-sleeping, quit or disconnected. A foreground mobile view can show the live
-card immediately; client notification handling should coalesce the matching
-push with that card rather than show a second alert.
+| Time from creation | Delivery |
+| --- | --- |
+| Immediately | Live approval card/event for connected authorized clients. |
+| 60 seconds | OS push to eligible desktop Mac/PC Astation devices, if still pending and unexpired. |
+| 180 seconds | OS push to eligible mobile Astation devices, if still pending and unexpired: two more minutes after the desktop stage. |
+
+Recipients need a registered supported delivery address, notification
+permission and current device authority. APNs/FCM identifies a provider, not
+whether the device is desktop or mobile; bind an explicit recipient category
+to the enrolled device. Mac APNs and iOS/Android delivery need their platform
+configuration. Windows/Linux desktop OS push requires a separately verified
+provider adapter; it is not implemented by the existing adapters.
+
+The same schedule applies whether desktop Astation is online, sleeping, quit
+or disconnected. Mobile is due at 180 seconds even if no desktop token exists,
+the desktop is offline or the desktop provider send fails. A desktop provider
+receipt does not establish that the user attended to the request. A foreground
+mobile view shows one live card immediately. Deduplicate OS notification
+retries within each stage; receiving/viewing the live card cannot consume a
+later scheduled notification stage.
 
 "Handled" means Atem confirms an answer or another terminal resolution,
 including denial, automatic resolution, cancellation or expiry. Viewing a
@@ -164,19 +178,21 @@ card, receiving its event, holding a terminal lease or keeping the Mac online
 does not count. An answer on any device or in the local terminal cancels the
 pending escalation once the authenticated resolution reaches the relay.
 
-The relay owns a durable escalation job keyed by the full approval identity;
-the Mac does not run the timer. Its due time comes from a jointly specified,
-signed immutable approval-creation time plus 120 seconds. Duplicate opens,
-catch-up, reconnect and failover cannot move that deadline or schedule fresh
-alerts. At dispatch, recheck unresolved/unexpired state and host/recipient
-authority. A delayed but valid open already past its due time is eligible
-immediately if still pending. An approval that expires at or before the due
-time receives no stale approval alert; do not extend its lifetime or approve
-it automatically to accommodate the delay.
+The relay owns durable escalation jobs keyed by full approval identity,
+recipient and stage; the Mac does not run the timers. Both deadlines derive
+from a jointly specified, signed immutable approval-creation time: plus 60
+seconds for desktop and plus 180 seconds for mobile. Duplicate opens, catch-up,
+reconnect and failover cannot move them or create fresh alerts. At dispatch,
+recheck unresolved/unexpired state and host/recipient authority. A delayed
+valid open or worker recovery processes the currently due stage, without
+replaying a missed desktop stage once the mobile deadline has passed. Suppress
+any stage whose deadline is at or after approval expiry. Do not extend the
+approval lifetime or approve automatically to accommodate either delay.
 
-Retry provider delivery with the same approval identity and existing expiry;
-do not repeat a successful escalation periodically. A resolution cancels
-unsent work and coalesces/clears delivered notices where the OS permits. A
+Retry provider delivery with the same approval identity/stage and existing
+expiry; do not repeat a successful stage periodically or let desktop retries
+postpone mobile. A resolution cancels unsent work and coalesces/clears
+delivered notices where the OS permits. A
 resolution racing an external send can still produce a late notice; tapping
 always reconnects and fetches authoritative pending state, showing "already
 answered" or expired as appropriate. See the
@@ -307,9 +323,10 @@ Then build and publish shared fixtures for:
    a card/answer. Provide a runnable host/headless-controller harness with real
    independent keys and disposable Claude/Codex sessions, without production
    verification bypasses or the paired Mac's credentials. Agree signed immutable
-   approval-creation time and resolution semantics so the relay can escalate
-   still-pending approvals after 120 seconds without a running Mac. Opens and
-   resolutions are delivered independently of control-lease ownership.
+   approval-creation time and resolution semantics so the relay can notify
+   desktop at 60 seconds and mobile at 180 seconds if still pending, without
+   a running Mac. The host emits opens/resolutions promptly; the relay owns
+   both timers. Delivery is independent of control-lease ownership.
 
 Pin the agreed document and fixtures before either side enables this admission
 mode. Atem commits its implementation on its own branch; communication uses
@@ -332,10 +349,17 @@ published docs/shared memory, not Astation changes in an Atem checkout.
   catch-up. Events include approvals/resolutions, rules/auto-allowed activity,
   receipts/results and session/connection/control changes. Push/webhooks are
   deduplicated expiring hints; late actions fetch the current pending approval.
-- Schedule approval OS push at the original pending time plus 120 seconds in
-  the durable relay outbox. Cancel on authenticated resolution from any device
-  or local terminal. Reconnect, duplicate catch-up, Mac presence and worker
-  failover cannot reset the timer; provider attempts recheck expiry/authority.
+- Schedule desktop approval OS push at original pending time plus 60 seconds
+  and mobile at plus 180 seconds in the durable relay outbox. Bind recipient
+  category to the enrolled device; provider type cannot identify it. Cancel
+  both stages on authenticated resolution from any device/local terminal.
+  Reconnect, duplicate catch-up, desktop presence and worker failover cannot
+  reset deadlines; desktop failure cannot delay mobile. Provider attempts
+  recheck expiry/authority and suppress superseded stages.
+- Keep immediate live-card/in-app-banner tracking separate from desktop/mobile
+  OS-stage delivery tracking. The native notification reconciliation currently
+  deduplicates alerts by approval alone; update it before enabling staged
+  escalation so an unanswered live card cannot suppress a due OS notification.
 
 A Discord bot decrypts as an authorized endpoint. Posting selected output to
 Discord discloses it to Discord; it does not require relay session keys.
@@ -365,7 +389,7 @@ actual agent effects and durable host receipts, not HTTP 202 or relay presence.
 | Concurrent devices | Mac and mobile view the same original process; mobile answers/revokes while Mac holds the lease without changing its holder/deadline; confirmed takeover and stale-confirmation races; separate sessions have independent holders. |
 | Durability | Disconnect after accepted; queued-work revocation; host/relay crash at journal boundaries; unknown outcome without replay; cursor loss; slow consumer; duplicates; bounded definitive refusal retention. |
 | Independence | Mobile and bot operate with Mac online and offline within authority/freshness; Mac sleep/wake/reconnect does not interrupt or take control from mobile; mobile reconnect does not affect Mac; no calls to the Mac's local API; recovered login cannot replace a pinned host root. |
-| Approval escalation | Live event immediately; no OS escalation before 120 s; still pending at the deadline; Mac online/unanswered and Mac off; answer from any client/local terminal cancels; viewing does not; duplicate opens and restart preserve deadline; expiry before/at deadline suppresses; resolution/send race and stale tap. |
+| Approval escalation | Immediate live card; desktop due at 60 s, mobile due at 180 s, neither early; desktop online/unanswered and offline; failed/missing desktop token cannot delay mobile; mixed Mac/iPhone APNs tokens route by device category; answer anywhere cancels both stages, viewing does not; duplicate/restart/late-worker deadlines; stage expiry; resolution/send race and stale tap. |
 
 Real keystores/Touch ID/password UI, APNs/FCM and mobile background delivery
 remain separate platform/provider checks. Headless tests do not claim them.

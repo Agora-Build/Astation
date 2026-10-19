@@ -4,9 +4,11 @@ Status: Astation proposal for Atem review, updated 2026-10-19. Not enabled
 ingress and not a replacement for atem-session r8. Pin to an agreed revision
 with shared signature fixtures before either side sends these fields.
 
-Product policy: connected clients receive approvals immediately; offline OS
-push escalates only if still pending after 120 seconds. Mac availability does
-not control the timer. See the [remote API design](remote-agent-api.md).
+Product policy: connected clients receive approval cards/events immediately.
+If still pending and unexpired, desktop OS push is due at 60 seconds from
+creation and mobile OS push at 180 seconds: two more minutes after desktop.
+Desktop availability does not control either timer. See the
+[remote API design](remote-agent-api.md).
 
 ## Identity and authority
 
@@ -84,32 +86,68 @@ the host process to stay online after durable acceptance.
   cards. Tap reconnects and fetches authoritative r8 approval state. The current
   answer remains lease-free and subject to current control permission.
 
-## Durable two-minute escalation
+## Desktop and mobile recipient routing
+
+Desktop and mobile are notification recipient categories, not new permissions
+or principal types. Bind the category and registered delivery address to an
+independently enrolled device; body fields cannot retarget a token to another
+device or account. Current registration only identifies the provider, so the
+category and its validation need an agreed registration/schema extension.
+Never infer desktop versus mobile from APNs/FCM alone: both a Mac and an
+iPhone can have APNs addresses. A notification-category update does not enroll
+a device or grant control.
+
+Mac OS delivery uses its provisioned APNs registration; iOS/Android use their
+verified platform adapters. Windows/Linux desktop delivery requires a
+separately implemented and verified adapter; desktop PC support is a product
+target, not an implemented provider path. A connected desktop can still show
+the authoritative in-app approval without an OS push token. OS/provider
+delivery remains best effort, especially while a machine is powered off.
+
+Persist delivery attempts/completion per full approval identity, recipient,
+token generation and escalation stage. A successful desktop send must not
+suppress a later mobile stage. A failed desktop provider send or missing
+desktop recipient must not block mobile scheduling. All stages share the
+same authoritative approval lifecycle; answering anywhere cancels remaining
+stages and clears existing notices where supported.
+
+Keep live-card/in-app-banner dedup separate from per-stage OS delivery. An
+already visible card is not evidence that a scheduled stage was delivered or
+handled. Existing native approval-only alert tracking needs this distinction
+before staged notifications are enabled; stage retries should update the
+same approval notice instead of producing extra cards.
+
+## Durable desktop-first escalation
 
 - Atem sends the signed open promptly when the approval is created, not after
   waiting for a Mac response. It sends a signed resolution when any device or
   the local terminal answers, or the request otherwise closes. Automatic
   resolution, denial, cancellation and expiry also close the escalation.
 - Transactionally persist the validated original creation time, approval
-  expiry, resolution tombstone and outbox due time before acknowledging the
-  open. Due time is original creation time plus 120 seconds. Redelivery, new
-  event ids, catch-up and reconnect cannot postpone or duplicate that job.
-  Validate time bounds; malformed or inconsistent timestamps cannot bypass
-  the scheduling/admission rules. Agree the exact clock handling in fixtures.
-- The relay scheduler runs independently of Mac sockets, wake state and UI.
+  expiry, resolution tombstone and both stage deadlines before acknowledging
+  the open: creation plus 60 seconds for desktop, plus 180 seconds for mobile.
+  Redelivery, new event ids, catch-up and reconnect cannot postpone or
+  duplicate either stage. Validate time bounds; malformed or inconsistent
+  timestamps cannot bypass scheduling/admission. Agree clock handling in
+  fixtures. Atem emits one open promptly; it does not run either push timer.
+- The relay scheduler runs independently of desktop sockets, wake state and UI.
   Seeing the request, receiving an alert or holding a lease is not a response.
-  Escalate after the same 120 seconds even if Mac Astation is already offline;
-  another authorized client's answer cancels just as a Mac answer does.
-- No approval alert is sent before due time, or when now >= approval expiry.
-  If expiry <= due time, omit the approval push; do not alter the agent's
-  deadline. A late accepted open can dispatch immediately after its original
-  due time only while still valid, unresolved and authorized. Resolution
+  Desktop remains due at 60 seconds while offline; mobile is independently
+  due at 180 seconds even without a desktop token or successful desktop send.
+  Another authorized client's answer cancels both stages just as a Mac answer
+  does. A provider delivery acknowledgment alone cannot cancel mobile.
+- No stage is sent before its own due time, or when now >= approval expiry.
+  If expiry <= a stage deadline, omit that stage without changing the agent's
+  deadline. A late accepted open/worker recovery handles only the currently
+  due stage while valid, unresolved and authorized; once mobile is due, skip
+  overdue desktop work instead of replaying both alerts together. Resolution
   tombstones suppress delayed opens even when resolution arrived first.
 - At each attempt, transactionally claim the job and recheck current lifecycle,
   host/recipient authority and token generation. Persist claims, attempts and
-  completion across replicas/restarts. A successful escalation is not a
-  periodic reminder; retry unknown/provider failures with the same identity
-  and expiry under the bounded retry contract.
+  completion across replicas/restarts. A successful stage is not a periodic
+  reminder; retry unknown/provider failures with the same identity, recipient,
+  stage and expiry under the bounded retry contract. Stop desktop retries once
+  mobile is due; desktop delivery cannot postpone or suppress mobile.
 - Recheck resolution immediately before provider submission. A resolution
   after that boundary cannot reliably retract the external send. Cancel
   remaining attempts and use push_resolved to coalesce/clear notices where
@@ -136,9 +174,13 @@ token rotation during an invalid-token reply, provider retry/restart, and
 forged push metadata on the native client. Provider fakes inspect signed HTTP
 requests; separately verify real APNs/FCM credentials and delivery.
 
-Use a controllable clock for 119.999 s / 120 s dispatch, expiry before/at/after
-due time, delayed opens already due, Mac online-but-unanswered and offline,
-answer on another device or local terminal, resolution-before-open, duplicate
-opens with new event ids, creation-time tamper, worker failover and restart,
-resolution before claim/before send/after provider acceptance, and a late tap.
-Viewing/notification acknowledgment must not cancel or reset the timer.
+Use a controllable clock for 59.999 s / 60 s desktop and 179.999 s / 180 s
+mobile dispatch, no early mobile recipient, expiry before/at/after each stage,
+answer before desktop/between stages/after mobile, and desktop
+online-but-unanswered/offline/without token/provider failure. Also cover
+mixed Mac/iPhone APNs addresses, distinct desktop/mobile recipient routing,
+late opens/workers after either deadline, restart between stages, no replay
+of desktop after mobile is due, answer on another device or local terminal,
+resolution-before-open, duplicate opens with new event ids, creation-time
+tamper, resolution before claim/before send/after provider acceptance, and a
+late tap. Viewing/provider acknowledgment cannot cancel or reset either timer.

@@ -172,14 +172,17 @@ authoritative state before offering any action.
 APNs/FCM is the offline delivery channel and is not established by SSE or
 in-app alerts. It still needs provisioned provider credentials, authenticated
 host proof, recipient authorization and the durable relay outbox in
-[the push proposal](approval-push-proof.md). Approval cards/live events and Mac
-in-app alerts are immediate. The relay schedules offline OS push only if the
-approval remains pending 120 seconds after its original creation, whether Mac
-Astation is online or offline. An authoritative answer/closure on any device
-or the local terminal cancels unsent escalation; viewing does not. Expired
-approvals never receive a delayed approval alert, and reconnect/duplicate
-catch-up cannot reset the timer. This scheduling policy is not implemented by
-the existing provider adapters. Completion push, if desired,
+[the push proposal](approval-push-proof.md). Approval cards/live events are
+immediate. If still pending and unexpired, the relay schedules desktop OS push
+at 60 seconds from creation, then mobile OS push at 180 seconds (two more
+minutes), whether desktop Astation is online or offline. Device category must
+be bound to the enrolled recipient; APNs/FCM alone cannot identify it. A missing
+or failed desktop delivery cannot postpone mobile. An authoritative closure
+on any device/local terminal cancels unsent stages; viewing does not. Expired
+approvals never receive delayed approval alerts, and reconnect/duplicate
+catch-up cannot reset deadlines. This scheduling and recipient classification
+are not implemented by existing provider adapters; PC OS delivery also needs
+its platform adapter. Completion push, if desired,
 needs its own agreed event and payload rules. No raw transcript belongs in
 push metadata. API and native tests can run without mobile clients; actual
 offline delivery requires a push-enabled test device and credentials.
