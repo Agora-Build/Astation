@@ -1212,6 +1212,98 @@ final class AtemSessionClientTests: XCTestCase {
         XCTAssertFalse(f.client.controls(f.target))
     }
 
+    func testVerificationRetriesAnUnauthorizedInitialHelloOnceAndFencesItsOldReply() throws {
+        for correlated in [false, true] {
+            let f = SessionFixture(); f.client.start()
+            let original = try XCTUnwrap(f.sent.last?.id)
+            var refusal = AtemSessionMessage(op: "error")
+            refusal.re = correlated ? original : nil
+            refusal.code = "unauthorized"
+            try f.receive(refusal)
+            f.time = 9; f.client.tick()
+            XCTAssertEqual(f.sent.count, 1)
+            f.client.verificationDidComplete(context: try XCTUnwrap(f.source))
+            let retry = try XCTUnwrap(f.sent.last?.id)
+            XCTAssertNotEqual(retry, original)
+            XCTAssertEqual(f.sent.count, 2)
+            XCTAssertEqual(f.sent.last?.revision, 8)
+            XCTAssertTrue(f.reconnects.isEmpty)
+            f.client.verificationDidComplete(context: try XCTUnwrap(f.source))
+            try f.handshake(helloID: original)
+            XCTAssertNil(f.client.welcome)
+            refusal.re = correlated ? retry : nil
+            try f.receive(refusal)
+            f.client.verificationDidComplete(context: try XCTUnwrap(f.source))
+            f.time = 30; f.client.tick()
+            XCTAssertEqual(f.client.phase, .failed)
+            XCTAssertEqual(f.sent.count, 2, "Duplicates and a refused retry never loop")
+        }
+        let f = SessionFixture(); f.client.start()
+        var refusal = AtemSessionMessage(op: "error"); refusal.code = "unauthorized"
+        try f.receive(refusal)
+        f.client.verificationDidComplete(context: try XCTUnwrap(f.source))
+        try f.handshake(); try f.snapshot()
+        XCTAssertTrue(f.client.hasRegistrySnapshot)
+        f.client.verificationDidComplete(context: try XCTUnwrap(f.source))
+        XCTAssertEqual(f.sent.filter { $0.op == "hello" }.count, 2)
+    }
+
+    func testVerificationCompletionRacingTheInitialRefusalStillRetriesOnce() throws {
+        for correlated in [false, true] {
+            let f = SessionFixture(); f.client.start()
+            let original = try XCTUnwrap(f.sent.last?.id)
+            f.client.verificationDidComplete(context: try XCTUnwrap(f.source))
+            XCTAssertEqual(f.sent.count, 1, "Wait for the outstanding hello instead of replacing it")
+            var refusal = AtemSessionMessage(op: "error")
+            refusal.code = "unauthorized"; refusal.re = correlated ? original : nil
+            try f.receive(refusal)
+            XCTAssertEqual(f.sent.count, 2)
+            try f.handshake(); try f.snapshot()
+            XCTAssertTrue(f.client.hasRegistrySnapshot)
+        }
+    }
+
+    func testVerificationCannotRetryAnotherContextOrAnUnrelatedFailure() throws {
+        for code in ["unsupported_version", "busy", "forbidden", "paused"] {
+            let f = SessionFixture(); f.client.start()
+            var refusal = AtemSessionMessage(op: "error")
+            refusal.code = code; refusal.re = f.sent.last?.id
+            try f.receive(refusal)
+            f.client.verificationDidComplete(context: try XCTUnwrap(f.source))
+            XCTAssertEqual(f.sent.count, 1, code)
+        }
+        let f = SessionFixture(); f.client.start()
+        let original = try XCTUnwrap(f.source)
+        var refusal = AtemSessionMessage(op: "error"); refusal.code = "unauthorized"
+        try f.receive(refusal)
+        for stale in [
+            AtemSessionContext(route: original.route, account: "other", device: original.device, pairingSession: original.pairingSession),
+            AtemSessionContext(route: original.route, account: original.account, device: "other", pairingSession: original.pairingSession),
+            AtemSessionContext(route: original.route, account: original.account, device: original.device, pairingSession: "other"),
+            AtemSessionContext(route: original.route, account: original.account, device: original.device,
+                pairingSession: original.pairingSession, transportGeneration: "old-socket")
+        ] { f.client.verificationDidComplete(context: stale) }
+        XCTAssertEqual(f.sent.count, 1)
+        f.source = nil
+        f.client.verificationDidComplete(context: original)
+        XCTAssertEqual(f.sent.count, 1)
+        XCTAssertTrue(f.reconnects.isEmpty)
+    }
+
+    func testVerificationAfterAWelcomeNeverReplacesTheAttachmentOrAcquiresControl() throws {
+        let f = SessionFixture(); try f.ready(); try f.takeControl()
+        let originalCount = f.sent.count
+        f.client.verificationDidComplete(context: try XCTUnwrap(f.source))
+        XCTAssertEqual(f.sent.count, originalCount)
+        XCTAssertTrue(f.client.controls(f.target))
+        var refusal = AtemSessionMessage(op: "error"); refusal.code = "unauthorized"
+        try f.receive(refusal)
+        f.client.verificationDidComplete(context: try XCTUnwrap(f.source))
+        XCTAssertEqual(f.sent.count, originalCount)
+        XCTAssertEqual(f.client.phase, .reconnecting)
+        XCTAssertFalse(f.client.controls(f.target))
+    }
+
     func testUnauthorizedHelloRetryReconnectsTransportAndFencesOldReply() throws {
         for correlated in [false, true] {
             let f = SessionFixture(); f.client.start()

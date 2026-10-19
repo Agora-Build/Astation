@@ -220,6 +220,43 @@ final class RemoteTerminalHubTests: XCTestCase {
         XCTAssertTrue(f.hub.connectedClients.isEmpty)
     }
 
+    func testLocalVerificationCompletionRetriesOnlyTheRefusedInitialHello() async throws {
+        let f = try TerminalHubFixture()
+        try await f.start(); try await f.authenticate()
+        let hello = try XCTUnwrap(f.sessionFrames.last?["data"] as? [String: Any])
+        var refusal = AtemSessionMessage(op: "error")
+        refusal.re = try XCTUnwrap(hello["id"] as? String); refusal.code = "unauthorized"
+        try f.emit(.session(refusal)); await f.drain()
+        let route = AtemVerificationRoute(clientId: f.clientId, connectionId: f.generation,
+            deviceId: f.deviceId, deviceName: "Host")
+        f.hub.remoteVerificationDidComplete(on: route)
+        f.hub.remoteVerificationDidComplete(on: route)
+        XCTAssertEqual(f.socket.cancelCount, 0, "Verification delivery must not be interrupted by reconnect")
+        XCTAssertEqual(f.sockets.identity.count, 1)
+        let hellos = f.sessionFrames.compactMap { $0["data"] as? [String: Any] }.filter { $0["op"] as? String == "hello" }
+        XCTAssertEqual(hellos.count, 2)
+        XCTAssertNotEqual(hellos.last?["id"] as? String, hello["id"] as? String)
+        _ = try await f.readySession()
+        XCTAssertEqual(f.hub.sessionStatusByClientId[f.clientId]?.phase, .ready)
+    }
+
+    func testVerificationCompletionCannotRetryAStaleOrRevokedLink() async throws {
+        let f = try TerminalHubFixture()
+        try await f.start(); try await f.authenticate()
+        var refusal = AtemSessionMessage(op: "error"); refusal.code = "unauthorized"
+        try f.emit(.session(refusal)); await f.drain()
+        for route in [
+            AtemVerificationRoute(clientId: f.clientId, connectionId: "stale", deviceId: f.deviceId, deviceName: "Host"),
+            AtemVerificationRoute(clientId: f.clientId, connectionId: f.generation, deviceId: "other", deviceName: "Host")
+        ] { f.hub.remoteVerificationDidComplete(on: route) }
+        XCTAssertEqual(f.sessionFrames.count, 1)
+        try f.revokeVerification()
+        f.hub.remoteVerificationDidComplete(on: AtemVerificationRoute(clientId: f.clientId, connectionId: f.generation,
+            deviceId: f.deviceId, deviceName: "Host"))
+        XCTAssertEqual(f.sessionFrames.count, 1)
+        XCTAssertEqual(f.socket.cancelCount, 0)
+    }
+
     func testPairingTimeHelloRefusalRetryClosesSocketAndRequiresFreshAuthentication() async throws {
         let f = try TerminalHubFixture()
         try await f.start(); try await f.authenticate()
