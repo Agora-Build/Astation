@@ -27,18 +27,22 @@ fresh owner confirmation for enrollment/removal/recovery. It also confirms
 v0.7.2 keeps the device ID. These answers are settled; do not ask the user
 to repeat them. See [the aligned Astation plan](../designs/protocol/remote-agent-api.md).
 
-PR #80 now publishes r9 draft `016abe75ad6d04665067a82efa16e149f8c30faf`
-with 59 fixtures. The [r4 review](../designs/protocol/remote-agent-api-atem-r4-review.md)
-records root authentication, lost persistence markers, backup upload collisions
-and conflicting array rules that still block sign-off. Its primitive examples
-pass 232 Python and 28 Swift assertions; scenarios remain NOT RUN. Atem records
-the user decisions as a 24-hour host-clock recovery wait with approve/veto and
-replaceable kits. Those earlier questions are closed. A new choice about
-publishing an unconfirmed recovery on a potentially stale head is with the
-user, because it can freeze existing hosts; no answer is inferred.
-Review an immutable corrected pin, run the agreed tests, then start the
-authorized integration. Do not approve a promised correction without its
-actual bytes/vectors, emit invented wire fields, or enable unfinished trust.
+PR #80's r9 contract is signed off for implementation at
+`c685abab92535b167f5f2658c814f0f72541d9a1`; the
+[r5 review](../designs/protocol/remote-agent-api-atem-r5-review.md) closes the
+previous r4 findings. It supplies 69 fixtures; primitive checks pass 274 Python
+and 41 CryptoKit assertions, with 148 symbolic references resolved. The 62
+scenarios remain NOT RUN; runtime security gates still apply. Atem owns the
+next shared-core/host implementation and bindings; Astation continues its
+authorized native/relay integration against those artifacts.
+
+Recovery choices are settled: 24-hour host-clock wait with approve/veto,
+replaceable kits, and no recovery publication without a reachable trusted
+host-signed head. The kit now carries a genesis anchor/tag; older kits need
+re-issue. A recorded storage fault or unreconcilable carriage holds remote
+access for a manager; a plain crash replays durable carriage and resumes.
+There is no pending product choice from this review. Do not emit invented
+wire fields or enable unfinished trust on the strength of design sign-off.
 Retain one shared security/session core and the existing r8 operation semantics.
 
 ## Ten-minute monitoring

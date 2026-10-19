@@ -67,9 +67,9 @@ explicit time and lifecycle inputs, without an app or external provider:
 
 The policy takes original signed times, not a new relay receipt time; late
 admission, restart and retry cannot postpone the 60-second deadline. The
-margin is an input pending the joint contract pin. Atem's `ffe840d` draft
-uses a different receipt-time/skew formula; this is under review, and the
-policy is deliberately not wired to ingress or providers before agreement.
+margin remains an input; the signed-off r9 contract at `c685aba` specifies
+15 seconds and agrees on the original-creation deadlines. Authenticated
+lifecycle/shared-core integration still precedes ingress/provider wiring.
 
 This module is not an authenticated ingress, durable outbox, job claimant,
 retry scheduler or provider dispatcher. Its inputs must come from validated,
@@ -93,9 +93,12 @@ including exact boundaries, late admission/restart, preference changes,
 resolution/revocation and delivery-margin behavior. They do not claim r9
 channel, enrollment, durable provider delivery or mobile OS conformance.
 
+The r9 contract is signed off for implementation at
+`c685abab92535b167f5f2658c814f0f72541d9a1`; see the
+[review and remaining gates](../designs/protocol/remote-agent-api-atem-r5-review.md).
 The remaining native/service operations, scoped Discord integration, signed
-membership/K-backup storage and sealed push use the shared core once r9 is
-pinned. Full testing then uses real independent controller/service keys and
-fake providers with the Mac off, as specified in the
+membership/K-backup storage and sealed push use the Atem-owned shared core
+once its tested artifacts are available. Full testing uses real independent
+controller/service keys and fake providers with the Mac off, as specified in the
 [implementation plan](../designs/protocol/remote-agent-api.md). Real APNs/FCM,
 notification extensions and platform owner authentication are separate checks.

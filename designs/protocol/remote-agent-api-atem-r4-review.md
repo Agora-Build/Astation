@@ -1,5 +1,8 @@
 # Review of Atem r9 draft at 016abe7
 
+Historical review: [r5 at c685aba](remote-agent-api-atem-r5-review.md) closes
+these findings and signs off the corrected contract for implementation.
+
 Reviewed immutable pin: `016abe75ad6d04665067a82efa16e149f8c30faf`,
 [Atem PR #80](https://github.com/Agora-Build/Atem/pull/80), 2026-10-19.
 Compared with `ffe840d52d18aa655e15e44d44f53287ffde6522`; read the changed

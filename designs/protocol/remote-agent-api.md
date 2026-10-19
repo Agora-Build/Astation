@@ -10,9 +10,10 @@ local API remain documented in [r8-client.md](r8-client.md) and the
 The shared protocol lives in **[Atem PR #80](https://github.com/Agora-Build/Atem/pull/80)**:
 `designs/protocol/remote-agent-api-atem.md`, `designs/account-trust.md`, and the
 r9 appendix and shared fixtures. The current reviewed draft pin is
-`016abe75ad6d04665067a82efa16e149f8c30faf`; the
-[r4 review](remote-agent-api-atem-r4-review.md) records remaining blockers.
-The handshake is corrected, but the contract is not jointly signed off.
+`c685abab92535b167f5f2658c814f0f72541d9a1`; the
+[r5 review](remote-agent-api-atem-r5-review.md) signs it off for implementation.
+The previous blockers are resolved; shared-core/runtime conformance and
+platform integration still gate remote admission.
 
 [Atem #81](https://github.com/Agora-Build/Atem/issues/81) is the coordination
 thread for handoffs, answers, status and questions. PR #80 owns design changes
@@ -28,6 +29,10 @@ re-pairing after loss of every native device.
 The [later recovery handoff](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6278073754)
 records the user decisions: a 24-hour host-clock wait with manager approve/veto
 and replaceable kits. These replace the earlier pending recovery questions.
+The [r4 response](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6278600334)
+records the user's later decisions: wait for a host-confirmed recovery head;
+after a plain crash replay durable carriage and resume, while a recorded
+membership fault or unreconcilable carriage holds access for a manager.
 The [r2 review](remote-agent-api-atem-r2-review.md)
 records the technical findings and their follow-up status; the older
 [#70 review](account-trust-review.md) is historical, not a competing design.
@@ -83,7 +88,7 @@ an honest carrier reaches the host. A durable head cannot bound that delay.
 Do not present the removed 24-hour freshness claim as a guarantee. A valid
 conflicting history from a still-current manager freezes remote access; local
 host use remains available. Removed-key conflicts cannot freeze it. Honest
-concurrent signing and exact signature-retry bytes still need r9 fixtures;
+concurrent signing and exact signature-retry bytes follow the r9 fixtures;
 a conflict alone does not prove key theft. Managers and the Recovery Kit
 cannot lift a freeze. Compromised manager/freeze recovery is local unpair/pair
 with a new pinned genesis/trust generation.
@@ -99,7 +104,11 @@ the app does not collect the OS password. Atem verifies key possession, not
 whether a biometric prompt happened.
 
 Create the mandatory offline Recovery Kit at account setup and pin its public
-signing key in genesis. Offer export to a password manager or printed phrase/QR
+signing key in genesis. The expanded format holds R, account_id, genesis_hash,
+kit_tag and relay URL, using the shared R9.5 derivations. Show it only after
+genesis commits. Replacements stay bound to that genesis; older kits missing
+the anchor must be re-issued through the agreed replacement flow.
+Offer export to a password manager or printed phrase/QR
 and require confirmation it was saved. A kit must actually recover K: the
 existing signing-recovery seed and data-key export are distinct formats.
 Astations own the versioned kit, recoverable-K envelope/export, account/root/kid
@@ -117,9 +126,14 @@ monotonic and wall time; the subject has no access meanwhile. A manager can
 approve it immediately or veto it while pending. Kits are replaceable: a
 manager plus the current kit co-signature acts immediately; a manager without
 the kit uses the same wait and approve/veto. A replaced kit never signs again.
-Root authentication and backup lifecycle still need the r4 corrections before
-implementation. The draft's new unconfirmed-restore fallback, which can freeze
-hosts after publication on a stale head, awaits the user's decision.
+Restore verifies the kit tag and independent genesis anchor before trusting
+any relay-supplied log, host or backup. It waits for a reachable host-signed
+head: no host means no K stored as current and no signed/published recovery,
+rotation or backup. Explain how to resume. The user rejected the earlier
+unconfirmed-restore fallback. After a recorded membership write fault or
+unreconcilable carriage the host is held; reconnect a current native manager
+for reconciliation. Ordinary crashes replay durable carriage and resume.
+Held is distinct from a frozen account, which a manager cannot unfreeze.
 Lost devices are removed explicitly in Settings, never automatically. A stolen
 device is removed by a signed membership entry; a compromised manager or freeze
 requires local host re-pairing.
@@ -247,13 +261,13 @@ and expiry before each provider attempt. See the [push integration requirements]
 
 ## Implementation order and readiness
 
-1. Review r9 draft `016abe75ad6d04665067a82efa16e149f8c30faf` on PR #80.
-   It supplies 59 fixtures and improves live persistence fencing, push timing
-   and seen delivery. The [r4 review](remote-agent-api-atem-r4-review.md)
-   records root authentication, restart after lost markers, backup collision
-   and array-order blockers. Primitive/example vectors pass 232 independent
-   Python and 28 CryptoKit assertions; this does not
-   constitute full shared-core conformance or protocol sign-off.
+1. Contract implementation is signed off at
+   `c685abab92535b167f5f2658c814f0f72541d9a1` on PR #80. The
+   [r5 review](remote-agent-api-atem-r5-review.md) closes the previous findings
+   after checking the changed contract and 69 fixtures. Primitive/example
+   checks pass 274 Python and 41 CryptoKit assertions; 148 symbolic references
+   resolve. The 62 scenarios still need execution by the shared core/host and
+   relay harness; this design sign-off does not open the runtime security gate.
 2. Atem builds/verifies the shared `atem-client`, binding artifacts and host
    implementation. Agree durable state/effect ordering and FFI lifecycle;
    r9 only, retaining r8 operation semantics.
@@ -276,9 +290,10 @@ Current implementation: public readiness/gating and an isolated approval
 delivery policy are built and tested; no authenticated r9 ingress, public
 agent operation or provider dispatch is enabled. The policy derives deadlines
 from original creation and accepts a delivery margin. It awaits
-full lifecycle agreement before outbox integration. Recovery enrollment delay
-and kit replacement are settled as above. Only the new unconfirmed-restore
-fallback is with the user; it is not implemented or inferred.
+the authenticated lifecycle/shared-core integration before outbox delivery.
+Recovery enrollment delay, kit replacement, wait-for-host restore and the
+fault-held policy are settled as above. There is no pending product choice
+from this review.
 
 ## Tests without phone applications
 
