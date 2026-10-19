@@ -45,9 +45,9 @@ There is no pending product choice from this review. Do not emit invented
 wire fields or enable unfinished trust on the strength of design sign-off.
 Retain one shared security/session core and the existing r8 operation semantics.
 
-## Ten-minute monitoring
+## Three-minute monitoring
 
-The local watcher checks memory/vault first, then #81 and PR #80 every 600
+The local watcher checks memory/vault first, then #81 and PR #80 every 180
 seconds while this Mac is
 awake and logged in. It uses a user LaunchAgent, not an in-process chat timer.
 When memory/vault content or GitHub content/head/review changes, it starts a bounded Codex CLI continuation
@@ -72,7 +72,7 @@ for the user's answer. Questions requiring that decision are not posted as
 decisions on GitHub. Check local results if notifications are unavailable.
 
 The watcher cannot run while the Mac is powered off/asleep. A wake catches up
-with authoritative GitHub content; it does not assume ten-minute execution
+with authoritative GitHub content; it does not assume three-minute execution
 while offline. The CLI itself has no Scheduled management interface; this
 uses its documented [non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode).
 
