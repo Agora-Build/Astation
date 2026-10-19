@@ -35,6 +35,13 @@ remotely, with their real origin. Return text and safe tool summaries as
 structured parts. Do not reconstruct a conversation from ANSI screen output,
 infer success from an idle indicator, or return private reasoning.
 
+Text parts already carry Markdown. Preserve that original source and typed
+tool/approval parts in API results; mobile/native chat should render paragraphs,
+headings, emphasis, clickable links, lists, code and tables instead of plain
+flattened text. The [rich message requirements](remote-agent-api.md#rich-message-presentation)
+define the shared content profile, mobile behavior and rendering boundaries.
+Images/files remain separate capabilities, not implied by Markdown support.
+
 Provider baseline: Claude Code 2.1.x (Atem verified 2.1.301) and Codex 0.162.1.
 Codex needs enabled/trusted Atem hooks and a first prompt typed in the terminal
 before remote prompts are accepted; until then chat may open with unknown

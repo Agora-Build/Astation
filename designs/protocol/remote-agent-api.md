@@ -75,7 +75,7 @@ which clients are online.
 | Client operation | Existing behavior to reuse | Additional work |
 | --- | --- | --- |
 | Discover hosts and sessions | Full target identity; hello/welcome, list and session_changed | Signed host advertisements and independent controller admission. Presence is only a hint. |
-| Read chat and history | Whole messages, ordered history/history_end, bounded selectors and coverage | Independent client read model, without the Mac's Swift coordinator. |
+| Read chat and history | Whole messages with Markdown/typed parts, ordered history/history_end, bounded selectors and coverage | Independent client read model and rich mobile/native rendering, without the Mac's Swift coordinator. |
 | Send prompts | Atomic acquire, expected-holder takeover, durable UUID/receipt | Client attachment/lease state and safe recovery; no second provider conversation. |
 | Answer approvals and revoke rules | Control permission, exact pending approval/rule, lease-free | Member/grant constraints rechecked at admission and dispatch. |
 | Receive events | Approval, receipt/result, session and connection/control events | Reconnectable bounded stream, explicit cursor loss and catch-up. Push/webhooks are separate hints. |
@@ -90,6 +90,45 @@ Remote process launch, file uploads, arbitrary file access and account vault
 access are separate permissions/features. Respect Claude/Codex capabilities
 and prerequisites; do not infer chat or successful work from terminal ANSI or
 an idle indicator.
+
+## Rich message presentation
+
+Opening an agent response in mobile Astation must preserve its formatting,
+not flatten it into plain text. The existing chat model already carries text
+as `kind: text` with a `markdown` field, plus distinct tool and approval parts
+(`AgentChatPart` in Astation). Basic formatting needs a renderer, not a new
+host message type or token-by-token streaming.
+
+| Content | Required mobile presentation |
+| --- | --- |
+| Paragraphs and headings | Preserve paragraph boundaries and heading hierarchy; wrap prose to the viewport. |
+| Emphasis | Bold, italic and strikethrough according to the agreed Markdown profile. |
+| Links | Visually distinct clickable links, with destination inspection and explicit user navigation. |
+| Lists and quotes | Ordered/unordered lists, task lists and block quotes with readable indentation. |
+| Code | Inline code and fenced blocks, language-aware highlighting where supported, a copy action and horizontal scrolling for long lines. |
+| Tables | Preserve rows/columns with contained horizontal scrolling on narrow screens. |
+| Tool activity and approvals | Separate typed cards; show safe tool summaries and authoritative approval state/actions. |
+
+Keep original Markdown, part boundaries and stable message/part identifiers
+in the client read model and API output. Render locally; neither the relay nor
+the API converts messages into flattened text or server-generated HTML. Use a
+common documented Markdown profile and shared rendering examples across Mac,
+mobile and web, with platform-specific view adapters. Text selection/copy,
+accessible labels and user font sizing must work without breaking code/table
+layout. Layout may adapt to the screen while content/meaning remain intact.
+
+Render Markdown as untrusted content: disable embedded HTML/scripts and
+executable links, and do not automatically fetch remote images/resources.
+Opening a link is a user action, not a command submission or approval.
+Actionable approval buttons come only from the validated typed pending
+approval, never from a model-generated Markdown link or imitation card.
+
+Whole-message replacements and history/reconnect use the same renderer and
+ordered read model; pagination must not drop formatting or regress a newer
+message version. Handle malformed/unsupported Markdown with a readable source
+fallback and existing size bounds. Image, audio, PDF and other attachments
+need separately agreed typed parts, permissions and transfer support; existing
+text/tool/approval parts do not promise those capabilities.
 
 ## High-level client API and public transport
 
@@ -338,6 +377,12 @@ Then build and publish shared fixtures for:
    if still pending, without a running Mac. The host emits opens/resolutions
    promptly; the relay owns both timers. Notification preferences/stage labels
    belong to delivery and do not add host principal types or permissions.
+10. **Rich message fidelity.** Preserve existing Markdown source, typed parts,
+    identifiers and ordering through live/history delivery; do not strip
+    formatting or derive the chat from terminal ANSI. Basic Markdown requires
+    no host schema change. Publish representative text/tool/approval examples
+    for cross-client rendering tests. Any later attachment parts need their
+    own capability/schema agreement before either side emits them.
 
 Pin the agreed document and fixtures before either side enables this admission
 mode. Atem commits its implementation on its own branch; communication uses
@@ -360,6 +405,10 @@ published docs/shared memory, not Astation changes in an Atem checkout.
   catch-up. Events include approvals/resolutions, rules/auto-allowed activity,
   receipts/results and session/connection/control changes. Push/webhooks are
   deduplicated expiring hints; late actions fetch the current pending approval.
+- Render Markdown text and typed tool/approval parts in mobile/native chat.
+  Share the content profile/examples and original structured API model across
+  clients; keep platform views separate from transport/security state. Do not
+  flatten formatted responses or treat embedded links as approval authority.
 - Schedule initial approval OS push at original pending time plus 60 seconds
   and a reminder at plus 180 seconds in the durable relay outbox. Persist each
   client's first-alert-stage preference with its registered delivery address;
@@ -399,6 +448,7 @@ actual agent effects and durable host receipts, not HTTP 202 or relay presence.
 | Transport adapters | WSS is the initial path; future Signaling must preserve encrypted frames, ordering/gap detection, receipts and lease fencing across reconnect/switch, including unsupported runtime and frame-limit cases. |
 | Delegation | View/control scopes; constrained targets; expiry/revocation; issuer loss; forbidden redelegation; notification token possession grants nothing. |
 | Operations | Two original sessions; local/remote prompts; receipt/results; complete/partial/unavailable history; overlapping pages; once/always/deny/revoke; terminal answer race; approval expiry and duplicate catch-up. |
+| Rich content | Preserve original Markdown/typed parts through API, live replacement, history and reconnect; headings/paragraphs, emphasis, links, lists, code/language fences and tables; Unicode and malformed/oversized input; mobile wrapping/selection/font sizing; inert HTML/executable links and no automatic remote resource fetch; unsupported attachment capability. |
 | Control | Concurrent Send; expected-holder race; explicit terminal control; local input wins; lease expiry/late renew; interrupt versus stop; one local operator cannot cancel another's pending work. |
 | Concurrent devices | Mac and mobile view the same original process; mobile answers/revokes while Mac holds the lease without changing its holder/deadline; confirmed takeover and stale-confirmation races; separate sessions have independent holders. |
 | Durability | Disconnect after accepted; queued-work revocation; host/relay crash at journal boundaries; unknown outcome without replay; cursor loss; slow consumer; duplicates; bounded definitive refusal retention. |
@@ -406,7 +456,9 @@ actual agent effects and durable host receipts, not HTTP 202 or relay presence.
 | Approval escalation | Immediate live card; stage 1 due at 60 s, stage 2 at 180 s; mobile preference prevents stage-1 OS send while app is killed; desktop can alert at both stages; missing/failed first delivery cannot delay second; preferences survive restart/token rotation; same-provider tokens need no device classification; answer cancels both, viewing does not; late workers, expiry and stale taps. |
 
 Real keystores/Touch ID/password UI, APNs/FCM and mobile background delivery
-remain separate platform/provider checks. Headless tests do not claim them.
+remain separate platform/provider checks. Mobile visual layout, accessibility,
+link navigation and code/table gestures also need actual renderer/UI checks;
+headless source-fidelity tests do not claim those platform results.
 
 Delivery order: agree the four contract decisions and signed/channel fixtures;
 build membership/persistence and independent host admission; enable encrypted
