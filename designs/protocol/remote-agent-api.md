@@ -164,6 +164,11 @@ An ephemeral client can disconnect after bounded delivery/receipt recovery.
 
 ## Rich message presentation
 
+See [agent status capture and API delivery](agent-status-api.md) for the
+Claude/Codex evidence sources, shared activity model and existing versus
+planned API paths. Process liveness, activity, connection freshness and
+durable request outcomes are separate facts.
+
 Opening an agent response in mobile Astation must preserve its formatting,
 not flatten it into plain text. The existing chat model already carries text
 as `kind: text` with a `markdown` field, plus distinct tool and approval parts
