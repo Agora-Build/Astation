@@ -154,19 +154,28 @@ in two stages, measured from Atem's original approval-creation time:
 | Time from creation | Delivery |
 | --- | --- |
 | Immediately | Live approval card/event for connected authorized clients. |
-| 60 seconds | OS push to eligible desktop Mac/PC Astation devices, if still pending and unexpired. |
-| 180 seconds | OS push to eligible mobile Astation devices, if still pending and unexpired: two more minutes after the desktop stage. |
+| 60 seconds | Initial OS push to eligible recipients whose notification preference starts at stage 1; the desktop default. |
+| 180 seconds | Reminder OS push to all eligible recipients, including stage-2 mobile recipients and desktops already notified; two more minutes after stage 1. |
 
 Recipients need a registered supported delivery address, notification
-permission and current device authority. APNs/FCM identifies a provider, not
-whether the device is desktop or mobile; bind an explicit recipient category
-to the enrolled device. Mac APNs and iOS/Android delivery need their platform
-configuration. Windows/Linux desktop OS push requires a separately verified
-provider adapter; it is not implemented by the existing adapters.
+permission and current device authority. No authoritative desktop/mobile
+category is required. The client registers a small notification preference
+for the first stage it wants: desktop defaults to stage 1, mobile to stage 2.
+The relay applies that preference before sending OS alerts. Stage 2 may alert
+the desktop again; this is an intentional reminder, not a duplicate retry.
+This preference affects presentation only and cannot grant agent access.
+
+Clients can also filter by stage while running. Client-only filtering is not
+sufficient for offline mobile alerts: an OS-rendered push can appear while the
+app is suspended, before app code can suppress it. Do not rely on silent push
+or a notification extension running to enforce the first-stage delay. Keep
+the recipient's preference durable on the relay; APNs/FCM alone still does
+not identify desktop/mobile. Mac and iOS/Android delivery need platform
+configuration; Windows/Linux OS push needs its own verified provider adapter.
 
 The same schedule applies whether desktop Astation is online, sleeping, quit
-or disconnected. Mobile is due at 180 seconds even if no desktop token exists,
-the desktop is offline or the desktop provider send fails. A desktop provider
+or disconnected. Stage 2 is due at 180 seconds even if no stage-1 recipient
+exists, the desktop is offline or the first provider send fails. A provider
 receipt does not establish that the user attended to the request. A foreground
 mobile view shows one live card immediately. Deduplicate OS notification
 retries within each stage; receiving/viewing the live card cannot consume a
@@ -181,19 +190,20 @@ pending escalation once the authenticated resolution reaches the relay.
 The relay owns durable escalation jobs keyed by full approval identity,
 recipient and stage; the Mac does not run the timers. Both deadlines derive
 from a jointly specified, signed immutable approval-creation time: plus 60
-seconds for desktop and plus 180 seconds for mobile. Duplicate opens, catch-up,
+seconds for stage 1 and plus 180 seconds for stage 2. Duplicate opens, catch-up,
 reconnect and failover cannot move them or create fresh alerts. At dispatch,
 recheck unresolved/unexpired state and host/recipient authority. A delayed
 valid open or worker recovery processes the currently due stage, without
-replaying a missed desktop stage once the mobile deadline has passed. Suppress
+replaying a missed initial stage once the reminder deadline has passed. Suppress
 any stage whose deadline is at or after approval expiry. Do not extend the
 approval lifetime or approve automatically to accommodate either delay.
 
 Retry provider delivery with the same approval identity/stage and existing
-expiry; do not repeat a successful stage periodically or let desktop retries
-postpone mobile. A resolution cancels unsent work and coalesces/clears
-delivered notices where the OS permits. A
-resolution racing an external send can still produce a late notice; tapping
+expiry; do not repeat a successful stage periodically or let stage-1 retries
+postpone stage 2. Success at stage 1 does not suppress the stage-2 reminder.
+A resolution cancels unsent work and coalesces/clears delivered notices where
+the OS permits. A resolution racing an external send can still produce a
+late notice; tapping
 always reconnects and fetches authoritative pending state, showing "already
 answered" or expired as appropriate. See the
 [push proof and scheduling handoff](approval-push-proof.md) for signed fields,
@@ -324,9 +334,10 @@ Then build and publish shared fixtures for:
    independent keys and disposable Claude/Codex sessions, without production
    verification bypasses or the paired Mac's credentials. Agree signed immutable
    approval-creation time and resolution semantics so the relay can notify
-   desktop at 60 seconds and mobile at 180 seconds if still pending, without
-   a running Mac. The host emits opens/resolutions promptly; the relay owns
-   both timers. Delivery is independent of control-lease ownership.
+   stage-1 recipients at 60 seconds and all eligible recipients at 180 seconds
+   if still pending, without a running Mac. The host emits opens/resolutions
+   promptly; the relay owns both timers. Notification preferences/stage labels
+   belong to delivery and do not add host principal types or permissions.
 
 Pin the agreed document and fixtures before either side enables this admission
 mode. Atem commits its implementation on its own branch; communication uses
@@ -349,14 +360,17 @@ published docs/shared memory, not Astation changes in an Atem checkout.
   catch-up. Events include approvals/resolutions, rules/auto-allowed activity,
   receipts/results and session/connection/control changes. Push/webhooks are
   deduplicated expiring hints; late actions fetch the current pending approval.
-- Schedule desktop approval OS push at original pending time plus 60 seconds
-  and mobile at plus 180 seconds in the durable relay outbox. Bind recipient
-  category to the enrolled device; provider type cannot identify it. Cancel
+- Schedule initial approval OS push at original pending time plus 60 seconds
+  and a reminder at plus 180 seconds in the durable relay outbox. Persist each
+  client's first-alert-stage preference with its registered delivery address;
+  use it before sending OS alerts, without a desktop/mobile identity schema.
+  Desktop defaults to stage 1 and may receive both; mobile defaults to stage 2.
+  Include a bounded stage marker for client display/dedup. Cancel
   both stages on authenticated resolution from any device/local terminal.
   Reconnect, duplicate catch-up, desktop presence and worker failover cannot
-  reset deadlines; desktop failure cannot delay mobile. Provider attempts
+  reset deadlines; stage-1 failure cannot delay stage 2. Provider attempts
   recheck expiry/authority and suppress superseded stages.
-- Keep immediate live-card/in-app-banner tracking separate from desktop/mobile
+- Keep immediate live-card/in-app-banner tracking separate from per-stage
   OS-stage delivery tracking. The native notification reconciliation currently
   deduplicates alerts by approval alone; update it before enabling staged
   escalation so an unanswered live card cannot suppress a due OS notification.
@@ -389,7 +403,7 @@ actual agent effects and durable host receipts, not HTTP 202 or relay presence.
 | Concurrent devices | Mac and mobile view the same original process; mobile answers/revokes while Mac holds the lease without changing its holder/deadline; confirmed takeover and stale-confirmation races; separate sessions have independent holders. |
 | Durability | Disconnect after accepted; queued-work revocation; host/relay crash at journal boundaries; unknown outcome without replay; cursor loss; slow consumer; duplicates; bounded definitive refusal retention. |
 | Independence | Mobile and bot operate with Mac online and offline within authority/freshness; Mac sleep/wake/reconnect does not interrupt or take control from mobile; mobile reconnect does not affect Mac; no calls to the Mac's local API; recovered login cannot replace a pinned host root. |
-| Approval escalation | Immediate live card; desktop due at 60 s, mobile due at 180 s, neither early; desktop online/unanswered and offline; failed/missing desktop token cannot delay mobile; mixed Mac/iPhone APNs tokens route by device category; answer anywhere cancels both stages, viewing does not; duplicate/restart/late-worker deadlines; stage expiry; resolution/send race and stale tap. |
+| Approval escalation | Immediate live card; stage 1 due at 60 s, stage 2 at 180 s; mobile preference prevents stage-1 OS send while app is killed; desktop can alert at both stages; missing/failed first delivery cannot delay second; preferences survive restart/token rotation; same-provider tokens need no device classification; answer cancels both, viewing does not; late workers, expiry and stale taps. |
 
 Real keystores/Touch ID/password UI, APNs/FCM and mobile background delivery
 remain separate platform/provider checks. Headless tests do not claim them.

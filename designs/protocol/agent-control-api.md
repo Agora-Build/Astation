@@ -173,14 +173,17 @@ APNs/FCM is the offline delivery channel and is not established by SSE or
 in-app alerts. It still needs provisioned provider credentials, authenticated
 host proof, recipient authorization and the durable relay outbox in
 [the push proposal](approval-push-proof.md). Approval cards/live events are
-immediate. If still pending and unexpired, the relay schedules desktop OS push
-at 60 seconds from creation, then mobile OS push at 180 seconds (two more
-minutes), whether desktop Astation is online or offline. Device category must
-be bound to the enrolled recipient; APNs/FCM alone cannot identify it. A missing
-or failed desktop delivery cannot postpone mobile. An authoritative closure
-on any device/local terminal cancels unsent stages; viewing does not. Expired
+immediate. If still pending and unexpired, the relay schedules initial OS push
+at 60 seconds from creation, then a reminder at 180 seconds (two more minutes),
+whether desktop Astation is online or offline. Desktop clients default to both
+stages; mobile defaults to the reminder through a registered notification
+preference. No desktop/mobile identity category is needed. Enforce the mobile
+delay before OS submission; client filtering alone cannot suppress an alert
+while the app is suspended. A missing/failed initial delivery cannot postpone
+the reminder. An authoritative closure on any device/local terminal cancels
+unsent stages; viewing does not. Expired
 approvals never receive delayed approval alerts, and reconnect/duplicate
-catch-up cannot reset deadlines. This scheduling and recipient classification
+catch-up cannot reset deadlines. This scheduling and notification preference
 are not implemented by existing provider adapters; PC OS delivery also needs
 its platform adapter. Completion push, if desired,
 needs its own agreed event and payload rules. No raw transcript belongs in

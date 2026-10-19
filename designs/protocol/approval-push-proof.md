@@ -5,9 +5,11 @@ ingress and not a replacement for atem-session r8. Pin to an agreed revision
 with shared signature fixtures before either side sends these fields.
 
 Product policy: connected clients receive approval cards/events immediately.
-If still pending and unexpired, desktop OS push is due at 60 seconds from
-creation and mobile OS push at 180 seconds: two more minutes after desktop.
-Desktop availability does not control either timer. See the
+If still pending and unexpired, initial OS push is due at 60 seconds from
+creation and a reminder at 180 seconds. Desktop defaults to receiving both;
+mobile defaults to the reminder only. No desktop/mobile identity category is
+needed; a recipient notification preference selects its first stage. Desktop
+availability does not control either timer. See the
 [remote API design](remote-agent-api.md).
 
 ## Identity and authority
@@ -86,16 +88,25 @@ the host process to stay online after durable acceptance.
   cards. Tap reconnects and fetches authoritative r8 approval state. The current
   answer remains lease-free and subject to current control permission.
 
-## Desktop and mobile recipient routing
+## Recipient notification preferences
 
-Desktop and mobile are notification recipient categories, not new permissions
-or principal types. Bind the category and registered delivery address to an
-independently enrolled device; body fields cannot retarget a token to another
-device or account. Current registration only identifies the provider, so the
-category and its validation need an agreed registration/schema extension.
-Never infer desktop versus mobile from APNs/FCM alone: both a Mac and an
-iPhone can have APNs addresses. A notification-category update does not enroll
-a device or grant control.
+Do not add a desktop/mobile identity category just for push scheduling. Each
+client registers a first-alert-stage preference with its delivery address:
+desktop defaults to stage 1 and mobile to stage 2. These are presentation
+preferences, not permissions or principal types. Validate the bounded allowed
+values and bind updates to the authenticated enrolled device and token
+generation. Body fields cannot retarget a token to another device or account,
+and changing a preference cannot enroll a device or grant control. Current
+registration only records provider/token; agree this small preference and
+stage-marker extension before implementing it.
+
+Before OS submission the relay filters stage 1 using that preference; stage 2
+is sent to all otherwise eligible recipients, including desktops. Native
+clients can filter stage metadata as well when running. Client-only filtering
+cannot reliably suppress an alert rendered by the OS while mobile is
+suspended or terminated. Silent/data push and notification extensions cannot
+be the sole mechanism for enforcing the mobile delay. APNs/FCM alone does
+not distinguish desktop/mobile, and no hardware classification is required.
 
 Mac OS delivery uses its provisioned APNs registration; iOS/Android use their
 verified platform adapters. Windows/Linux desktop delivery requires a
@@ -104,11 +115,13 @@ target, not an implemented provider path. A connected desktop can still show
 the authoritative in-app approval without an OS push token. OS/provider
 delivery remains best effort, especially while a machine is powered off.
 
-Persist delivery attempts/completion per full approval identity, recipient,
-token generation and escalation stage. A successful desktop send must not
-suppress a later mobile stage. A failed desktop provider send or missing
-desktop recipient must not block mobile scheduling. All stages share the
-same authoritative approval lifecycle; answering anywhere cancels remaining
+Persist the preference and delivery attempts/completion per full approval
+identity, recipient, token generation and stage. Recheck the current
+preference before a provider attempt and handle updates/token rotation without
+resetting the approval deadlines. A successful initial send must not suppress
+the reminder to that same desktop. A failed stage-1 send or missing recipient
+must not block stage 2. All stages share the same authoritative approval
+lifecycle; answering anywhere cancels remaining
 stages and clears existing notices where supported.
 
 Keep live-card/in-app-banner dedup separate from per-stage OS delivery. An
@@ -125,29 +138,29 @@ same approval notice instead of producing extra cards.
   resolution, denial, cancellation and expiry also close the escalation.
 - Transactionally persist the validated original creation time, approval
   expiry, resolution tombstone and both stage deadlines before acknowledging
-  the open: creation plus 60 seconds for desktop, plus 180 seconds for mobile.
+  the open: creation plus 60 seconds for stage 1, plus 180 seconds for stage 2.
   Redelivery, new event ids, catch-up and reconnect cannot postpone or
   duplicate either stage. Validate time bounds; malformed or inconsistent
   timestamps cannot bypass scheduling/admission. Agree clock handling in
   fixtures. Atem emits one open promptly; it does not run either push timer.
 - The relay scheduler runs independently of desktop sockets, wake state and UI.
   Seeing the request, receiving an alert or holding a lease is not a response.
-  Desktop remains due at 60 seconds while offline; mobile is independently
-  due at 180 seconds even without a desktop token or successful desktop send.
+  Stage 1 remains due at 60 seconds while desktop is offline; stage 2 is
+  independently due at 180 seconds even without a stage-1 token/successful send.
   Another authorized client's answer cancels both stages just as a Mac answer
-  does. A provider delivery acknowledgment alone cannot cancel mobile.
+  does. A provider delivery acknowledgment alone cannot cancel the reminder.
 - No stage is sent before its own due time, or when now >= approval expiry.
   If expiry <= a stage deadline, omit that stage without changing the agent's
   deadline. A late accepted open/worker recovery handles only the currently
-  due stage while valid, unresolved and authorized; once mobile is due, skip
-  overdue desktop work instead of replaying both alerts together. Resolution
+  due stage while valid, unresolved and authorized; once stage 2 is due, skip
+  overdue stage-1 work instead of replaying both alerts together. Resolution
   tombstones suppress delayed opens even when resolution arrived first.
 - At each attempt, transactionally claim the job and recheck current lifecycle,
   host/recipient authority and token generation. Persist claims, attempts and
   completion across replicas/restarts. A successful stage is not a periodic
   reminder; retry unknown/provider failures with the same identity, recipient,
-  stage and expiry under the bounded retry contract. Stop desktop retries once
-  mobile is due; desktop delivery cannot postpone or suppress mobile.
+  stage and expiry under the bounded retry contract. Stop stage-1 retries once
+  stage 2 is due; first delivery cannot postpone or suppress the reminder.
 - Recheck resolution immediately before provider submission. A resolution
   after that boundary cannot reliably retract the external send. Cancel
   remaining attempts and use push_resolved to coalesce/clear notices where
@@ -174,13 +187,16 @@ token rotation during an invalid-token reply, provider retry/restart, and
 forged push metadata on the native client. Provider fakes inspect signed HTTP
 requests; separately verify real APNs/FCM credentials and delivery.
 
-Use a controllable clock for 59.999 s / 60 s desktop and 179.999 s / 180 s
-mobile dispatch, no early mobile recipient, expiry before/at/after each stage,
-answer before desktop/between stages/after mobile, and desktop
-online-but-unanswered/offline/without token/provider failure. Also cover
-mixed Mac/iPhone APNs addresses, distinct desktop/mobile recipient routing,
-late opens/workers after either deadline, restart between stages, no replay
-of desktop after mobile is due, answer on another device or local terminal,
-resolution-before-open, duplicate opens with new event ids, creation-time
-tamper, resolution before claim/before send/after provider acceptance, and a
-late tap. Viewing/provider acknowledgment cannot cancel or reset either timer.
+Use a controllable clock for 59.999 s / 60 s and 179.999 s / 180 s dispatch;
+stage-2 preference causes no stage-1 OS submission even with mobile killed;
+stage-1 preference can alert at both stages without retry duplicates. Cover
+expiry before/at/after each stage, answer before/between/after stages, desktop
+online-but-unanswered/offline/without token/provider failure, same-provider
+tokens with distinct notification preferences, invalid/updated preferences,
+token rotation and restart, late opens/workers after either deadline, no
+replay of stage 1 after stage 2 is due, answer on another device or local
+terminal, resolution-before-open, duplicate opens with new event ids,
+creation-time tamper, resolution before claim/before send/after provider
+acceptance, and a late tap. Viewing/provider acknowledgment cannot cancel or
+reset either timer. Separately verify suspended/terminated mobile behavior
+with real provider delivery; headless/client-filter tests alone do not prove it.
