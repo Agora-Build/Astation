@@ -36,6 +36,14 @@ scenarios remain NOT RUN; runtime security gates still apply. Atem owns the
 next shared-core/host implementation and bindings; Astation continues its
 authorized native/relay integration against those artifacts.
 
+The 2026-10-20 [channel envelope review](../designs/protocol/remote-agent-api-channel-envelope-review.md)
+answers #81's new routing proposal and inspects draft Atem PR #89 at
+`2d926313388b24dd3dc4a9bdb095a25b9989df34`. Its nine fixture corrections
+align with existing decisions; the contract/channel vectors are unchanged.
+The proposed envelope still needs pinned size/lifecycle text and fixtures.
+Passing upstream binding/package CI currently exposes no built artifacts;
+Atem must hand over packages and hashes for Astation integration.
+
 Recovery choices are settled: 24-hour host-clock wait with approve/veto,
 replaceable kits, and no recovery publication without a reachable trusted
 host-signed head. The kit now carries a genesis anchor/tag; older kits need

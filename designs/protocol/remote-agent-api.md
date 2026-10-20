@@ -1,6 +1,6 @@
 # Remote agent API for independent Astation clients
 
-Status: agreed product direction, awaiting the r9 contract/fixtures, 2026-10-19.
+Status: r9 contract signed off for implementation; integration gated, 2026-10-20.
 Remote admission is not enabled. Today's implemented r8 client and protected
 local API remain documented in [r8-client.md](r8-client.md) and the
 [local API guide](../../docs/local-control-api.md).
@@ -227,6 +227,14 @@ and empty supported revisions/transports. Other unimplemented paths return 503.
 See [the API status](../../docs/remote-api.md). Final methods, limits, errors, cursor/reset behavior and envelopes
 follow the jointly pinned contract. A plaintext relay chat API would change the
 E2EE boundary and is not this design.
+
+Atem's outbound-link multiplexing proposal and the new binding/artifact
+handoff are reviewed in the [channel envelope review](remote-agent-api-channel-envelope-review.md).
+The proposed routing fields fit this route family; serialized size and
+channel lifecycle fixtures still need a joint immutable pin. The existing
+1 MiB plaintext limit requires room for base64 ciphertext and its envelope.
+Atem's draft PR #89 has passing binding/package CI but has not published
+the built packages for Astation to consume. Admission remains disabled.
 
 Enrollment binds the applicant's auth/encryption key possession, account/root,
 roles/scopes, both nonces and an expiring single-use ceremony. Native owner
