@@ -8,8 +8,10 @@ import XCTest
 private final class RecoveryMemoryCheckpoint: AstationRecoveryCheckpointStorage {
     var bytes: Data?
     var failAfterWrite = false
+    var writes = 0
     func read() throws -> Data? { bytes }
     func write(_ data: Data) throws {
+        writes += 1
         bytes = data
         if failAfterWrite { failAfterWrite = false; throw RemoteRecoveryError.storageUncertain }
     }
@@ -40,17 +42,21 @@ private actor RecoveryMemoryRelay: RemoteRecoveryTransport {
     var loseAppendReply = false
     var loseUploadReply = false
     var hostOnline = false
+    var nextEntries: [String]?
     let hostKey = Curve25519.Signing.PrivateKey()
 
     func dropNextAppendReply() { loseAppendReply = true }
     func dropNextUploadReply() { loseUploadReply = true }
     func setHostOnline(_ value: Bool) { hostOnline = value }
     func hostPublicKey() -> Data { hostKey.publicKey.rawRepresentation }
+    func injectNextEntries(_ entries: [String]) { nextEntries = entries }
 
     func entries(genesisHash: String, after: UInt64) async throws -> RemoteRecoveryLogPage {
         let log = try XCTUnwrap(log)
         XCTAssertEqual(log.genesisHash(), genesisHash)
-        return RemoteRecoveryLogPage(head: log.head(), entries: log.entriesAfter(seq: after), more: false)
+        let page = nextEntries ?? log.entriesAfter(seq: after)
+        nextEntries = nil
+        return RemoteRecoveryLogPage(head: log.head(), entries: page, more: false)
     }
     func append(genesisHash: String, request: AppendRequest) async throws -> RemoteRecoveryAppendReply {
         appends.append(request)
@@ -137,6 +143,131 @@ private final class RecoveryCoordinatorHarness {
 
 @MainActor
 final class AstationRecoveryCoordinatorTests: XCTestCase {
+    private func checkpoint(_ store: RecoveryMemoryCheckpoint) throws -> [String: Any] {
+        try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(store.bytes), format: nil) as? [String: Any])
+    }
+
+    func testOldEntryOnlyCheckpointMigratesAndCommitsImmediatelyWithoutNetworkOrResigning() async throws {
+        let h = RecoveryCoordinatorHarness()
+        _ = try await h.coordinator().setup()
+        var old = try checkpoint(h.store)
+        old.removeValue(forKey: "membership")
+        h.store.bytes = try PropertyListSerialization.data(fromPropertyList: old, format: .binary, options: 0)
+        let writes = h.store.writes
+        let signatures = h.ownerRequests.count
+        let appends = await h.relay.appends.count
+        let loaded = try h.coordinator()
+        XCTAssertEqual(h.store.writes, writes + 1)
+        XCTAssertNotNil(try checkpoint(h.store)["membership"] as? String)
+        XCTAssertEqual(h.ownerRequests.count, signatures)
+        let after = await h.relay.appends.count
+        XCTAssertEqual(after, appends)
+        try loaded.checkpointPendingWaits()
+    }
+
+    func testFailedImmediateLoadCommitPreventsAnyOperationAndReloadReconcilesCommittedBytes() async throws {
+        let h = RecoveryCoordinatorHarness()
+        _ = try await h.coordinator().setup()
+        let appends = await h.relay.appends.count
+        let installs = h.keys.installs
+        h.store.failAfterWrite = true
+        XCTAssertThrowsError(try h.coordinator())
+        XCTAssertEqual(h.keys.installs, installs)
+        let after = await h.relay.appends.count
+        XCTAssertEqual(after, appends)
+        let resumed = try h.coordinator()
+        _ = try await resumed.exportedKit()
+        XCTAssertEqual(h.keys.installs, installs)
+    }
+
+    func testCorruptMembershipSnapshotFailsClosedWithoutDiscardingCheckpoint() async throws {
+        let h = RecoveryCoordinatorHarness()
+        _ = try await h.coordinator().setup()
+        var corrupt = try checkpoint(h.store)
+        corrupt["membership"] = "{}"
+        h.store.bytes = try PropertyListSerialization.data(fromPropertyList: corrupt, format: .binary, options: 0)
+        let before = h.store.bytes
+        let writes = h.store.writes
+        XCTAssertThrowsError(try h.coordinator())
+        XCTAssertEqual(h.store.bytes, before)
+        XCTAssertEqual(h.store.writes, writes)
+    }
+
+    func testConflictFreezeIsCommittedBeforeRefusalAndSurvivesAppRestart() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        let kit = try await coordinator!.setup()
+        let storedChain = await h.relay.log
+        let chain = try XCTUnwrap(storedChain)
+        let genesis = try MembershipLog.verify(accountId: "account-a", genesisHash: kit.genesisHash,
+            entries: [XCTUnwrap(chain.entries().first)], now: AstationRecoveryCoordinator.clock())
+        let body = try genesis.draftEntry(signer: "manager-a", signedAt: AstationRecoveryCoordinator.clock().wallMs,
+            actionJson: recoveryTestJSON(["action": "add_host", "host": ["host_id": "fork-host", "host_trust_gen": 1,
+                "host_key": ["alg": "ed25519", "pub": recoveryTestBase64(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)]]]))
+        let provider = AstationMembershipKeyProvider(identity: h.identity, keyID: "manager-a", publicKey: try h.identity.remotePublicKeys().signing)
+        let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: "manager-a")
+        let entry = try recoveryTestJSON(["body": JSONSerialization.jsonObject(with: Data(body.utf8)),
+            "sig": recoveryTestBase64(provider.sign(request: request))])
+        await h.relay.injectNextEntries([entry])
+        do { _ = try await coordinator!.exportedKit(); XCTFail("fork must stop the operation") } catch {}
+        let stored = try XCTUnwrap(checkpoint(h.store)["membership"] as? String)
+        XCTAssertNotNil(try MembershipLog.fromStored(accountId: "account-a", genesisHash: kit.genesisHash,
+            storedJson: stored, now: AstationRecoveryCoordinator.clock()).frozen())
+        coordinator = nil
+        coordinator = try h.coordinator()
+        let signatures = h.ownerRequests.count
+        do { _ = try await coordinator!.pairingKeys(nonce: Data(repeating: 8, count: 32)); XCTFail("freeze survives restart") } catch {}
+        XCTAssertEqual(h.ownerRequests.count, signatures)
+    }
+
+    func testPendingRecoveryPeriodicCheckpointSurvivesRestartAndHaltsOnWriteFailure() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let kit = try await h.coordinator().setup()
+        let hostKey = await h.relay.hostPublicKey()
+        try await append(["action": "add_host", "host": ["host_id": "host-a", "host_trust_gen": 3,
+            "host_key": ["alg": "ed25519", "pub": recoveryTestBase64(hostKey)]]], harness: h)
+        await h.relay.setHostOnline(true)
+        let store = RecoveryMemoryCheckpoint()
+        let identity = AtemE2EIdentity(storage: TestAtemStorage(), crypto: TestAtemCryptography())
+        let keys = RecoveryMemoryKeys()
+        let first = AstationRecoveryCoordinator.clock()
+        var time = first
+        func replacement() throws -> AstationRecoveryCoordinator {
+            try AstationRecoveryCoordinator(accountID: "account-a", managerID: "replacement-a", identity: identity,
+                relayURL: "https://configured.example", store: store, transport: h.relay, dataKeys: keys,
+                allowNewDataKey: { false }, confirmOwner: { _ in false }, confirmReplacement: { _ in true },
+                saveKit: { _ in false }, now: { time })
+        }
+        var coordinator: AstationRecoveryCoordinator? = try replacement()
+        _ = try await coordinator!.restoreAccount(kit: kit)
+        func at(_ hours: UInt64) -> HostClock {
+            HostClock(wallMs: first.wallMs + hours * 3_600_000,
+                monoMs: first.monoMs + hours * 3_600_000, bootId: first.bootId)
+        }
+        func deadline() throws -> UInt64? {
+            let saved = try XCTUnwrap(checkpoint(store)["membership"] as? String)
+            let log = try MembershipLog.fromStored(accountId: "account-a", genesisHash: kit.genesisHash, storedJson: saved, now: time)
+            return try log.pendingRecovery(now: time).first?.effectiveAt
+        }
+        let original = try XCTUnwrap(deadline())
+        time = at(10)
+        try coordinator!.checkpointPendingWaits()
+        coordinator = nil
+        time = at(12)
+        coordinator = try replacement()
+        XCTAssertEqual(try deadline(), original, "An app restart must not restart the 24-hour wait")
+        let appends = await h.relay.appends.count
+        let installs = keys.installs
+        store.failAfterWrite = true
+        time = at(13)
+        XCTAssertThrowsError(try coordinator!.checkpointPendingWaits())
+        do { _ = try await coordinator!.exportedKit(); XCTFail("Uncertain periodic write must halt") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .storageUncertain) }
+        let after = await h.relay.appends.count
+        XCTAssertEqual(after, appends)
+        XCTAssertEqual(keys.installs, installs)
+    }
+
     private func append(_ action: [String: Any], harness h: RecoveryCoordinatorHarness,
         signer: String = "manager-a", identity: AtemE2EIdentity? = nil) async throws {
         let stored = await h.relay.log

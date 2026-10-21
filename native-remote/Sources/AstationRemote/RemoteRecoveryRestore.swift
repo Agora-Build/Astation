@@ -36,6 +36,7 @@ public final class RemoteRecoveryRestore {
         let prepared: String?
         let published: Bool
         let stopped: String?
+        let membership: String?
     }
 
     public let kit: RemoteRecoveryKit
@@ -64,7 +65,8 @@ public final class RemoteRecoveryRestore {
     private var freshnessGeneration = UUID()
 
     /// A bad kit is rejected by RemoteRecoveryKit before any transport or store is invoked.
-    public init(kit: RemoteRecoveryKit, checkpoint: Data? = nil, persist: @escaping (Data) throws -> Void) throws {
+    public init(kit: RemoteRecoveryKit, checkpoint: Data? = nil, now: HostClock = RemoteSystemClock.now(),
+        persist: @escaping (Data) throws -> Void) throws {
         self.kit = kit
         self.persist = persist
         let handle = kit.handle
@@ -85,6 +87,9 @@ public final class RemoteRecoveryRestore {
             // Stored keys/head are never treated as a fresh restore after a restart.
             published = saved.published
             stopped = saved.stopped
+            let log = try RemoteMembershipCheckpoint.load(accountID: kit.accountID, genesisHash: kit.genesisHash,
+                entries: saved.entries, storedJSON: saved.membership, now: now)
+            try self.checkpoint(keys: saved.keys.map { AccountKey(kid: $0.kid, k: $0.bytes) }, fallbackLog: log)
             if let stopped { phase = .refused(stopped) }
         } else {
             core = try RestoreSession.read(r: handle.secretR(), accountId: kit.accountID,
@@ -190,9 +195,13 @@ public final class RemoteRecoveryRestore {
     }
 
     public func verifiedEntries() throws -> [String] {
+        try verifiedLog().entries()
+    }
+
+    public func verifiedLog() throws -> MembershipLog {
         try available()
         guard confirmed, let log = core.log() else { throw RemoteChannelError.notReady }
-        return log.entries()
+        return log.snapshot()
     }
 
     @discardableResult
@@ -244,10 +253,11 @@ public final class RemoteRecoveryRestore {
 
     private func checkpoint(keys: [AccountKey], fallbackLog: MembershipLog? = nil) throws {
         guard let log = core.log() ?? fallbackLog else { throw RemoteChannelError.notReady }
-        let saved = Checkpoint(accountID: kit.accountID, genesisHash: kit.genesisHash, kitTag: kit.handle.kitTag(),
-            keys: keys.map { StoredKey(kid: $0.kid, bytes: $0.k) }, entries: log.entries(),
-            prepared: core.preparedJson(), published: published, stopped: stopped)
         do {
+            let saved = Checkpoint(accountID: kit.accountID, genesisHash: kit.genesisHash, kitTag: kit.handle.kitTag(),
+                keys: keys.map { StoredKey(kid: $0.kid, bytes: $0.k) }, entries: log.entries(),
+                prepared: core.preparedJson(), published: published, stopped: stopped,
+                membership: try log.storedJson())
             let encoder = PropertyListEncoder()
             encoder.outputFormat = .binary
             let data = try encoder.encode(saved)

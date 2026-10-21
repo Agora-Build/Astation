@@ -19,6 +19,7 @@ public final class RemoteMembershipPublication {
         let entries: [String]
         let prepared: String?
         let requiresRefresh: Bool
+        let membership: String?
     }
 
     private var log: MembershipLog
@@ -48,11 +49,17 @@ public final class RemoteMembershipPublication {
         guard saved.version == 1, saved.accountID == accountID, saved.genesisHash == genesisHash else {
             throw RemotePublicationError.invalidCheckpoint
         }
-        log = try MembershipLog.verify(accountId: accountID, genesisHash: genesisHash,
-            entries: saved.entries, now: now)
+        log = try RemoteMembershipCheckpoint.load(accountID: accountID, genesisHash: genesisHash,
+            entries: saved.entries, storedJSON: saved.membership, now: now)
         publisher = try saved.prepared.map { try EntryPublisher.resume(preparedJson: $0) } ?? EntryPublisher()
         requiresRefresh = saved.requiresRefresh
         self.persist = persist
+        try transaction { _, _ in }
+    }
+
+    public func committedLog() throws -> MembershipLog {
+        try checkAvailable()
+        return log.snapshot()
     }
 
     /// Persist the exact body before a key provider can see it.
@@ -137,10 +144,11 @@ public final class RemoteMembershipPublication {
         // EntryPublisher owns the process-wide claim for this manager; never clone/resume it live.
         let result = try operation(candidateLog, publisher)
         let nextRequiresRefresh = refreshAfter?(result) ?? requiresRefresh
-        let checkpoint = Checkpoint(version: 1, accountID: candidateLog.accountId(),
-            genesisHash: candidateLog.genesisHash(), entries: candidateLog.entries(),
-            prepared: publisher.preparedJson(), requiresRefresh: nextRequiresRefresh)
         do {
+            let checkpoint = Checkpoint(version: 1, accountID: candidateLog.accountId(),
+                genesisHash: candidateLog.genesisHash(), entries: candidateLog.entries(),
+                prepared: publisher.preparedJson(), requiresRefresh: nextRequiresRefresh,
+                membership: try candidateLog.storedJson())
             // A complete log may exceed the shared JSON helper's 1 MiB per-message bound.
             let encoder = PropertyListEncoder()
             encoder.outputFormat = .binary

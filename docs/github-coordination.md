@@ -2,27 +2,42 @@
 
 ## Current implementation, 2026-10-21
 
-Vault e52 asks for the r9 `genesis_hash`/signed-device-list ceremony before
-Atem #89 can merge. Its head remains `7f2ad11`, with green execution checks;
-the accepted consumed Apple package remains `eaaadc2`. The generation migration
-fix is released in v0.7.4. Mac logs confirm accepted trust 7/runtime epoch 18
-and `welcome`/`list`/`sessions` without Retry at 11:35:57 UTC; vault e52 later
-reports Genie trust 11. Neither is a rendered UI or full ceremony pass.
-Astation's #58 CI at `74770d8` is green, superseding older pending/failing
-status below; the saved dependency patch is already applied.
+Atem #93 supplies the supported durable MembershipLog API at
+`1493ca6a5d704484bff7b30b09222cf20658fdcd`, accepted after memory/vault e66,
+source review, completed CI logs and immutable package/hash verification.
+The Apple package is consumed in #58; the relay retains its accepted eaaadc2
+Cargo pin because signed wire/fixtures are unchanged. No Atem checkout is built.
+See [the upstream delivery](https://github.com/Agora-Build/Atem/issues/93#issuecomment-6328508674)
+and [review](https://github.com/Agora-Build/Atem/pull/80#issuecomment-6328353597).
 
-Interactive implementation now wires the strict generation reader into app
-decoding, captures authenticated verification context before queued handling,
-and adds a shared-core publisher with durable body/signature/commit checkpoints
-and exact retry bytes. The protected store, production key provider, account
-genesis/Recovery Kit v2, relay CAS, transcript and final signed-list handoff
-remain to be wired. An unresolved publication conflict retains a durable
-refresh fence. Do not announce ceremony shipping or r9 admission based on this
-stage. No new policy decision is pending and no merge/deploy is authorized.
-Fresh focused validation passes 41 native tests and 93 app integration tests;
-the app compiles/links. A new provisioned ceremony or app relaunch is not claimed.
+The app's v2 ceremony, mandatory kit, protected signing, relay CAS and K backup
+are implemented. Protected coordinator/publication/backup/restore checkpoints
+now include the shared durable snapshot with independent account/genesis anchors.
+Load commits immediately; changes/clock advances commit before effects; failed
+commits stop account operations. Exact writer state remains separately retained.
+An OS boot-session identifier, 30-second timer and background/sleep checkpoints
+preserve same-boot wait progress without trusting the relay or wall clock.
+Recovery still refetches and requires a fresh host-signed proof after restart.
 
-## Corrected final pin, 2026-10-21
+Local validation: 982 app tests (14 environment-dependent skips), 94 native
+tests and two provisioned recovery signing/storage tests pass. #63's earlier
+23659d9 CI is fully green: 977 app, 87 native, 487 relay, plus all 49 Postgres
+and 64 Valkey cases executed separately. The canonical provisioned app still
+runs 23659d9 until explicitly rebuilt; no new live ceremony pass is claimed.
+
+The user deferred unavailable auth.agora.build so r9 implementation and isolated
+tests continue. #63's account-login implementation stays intact; production
+registration/configuration/deployment and its live validation remain open.
+The storage-authentication alternative requires the user's choice; Auth
+unavailability grants no storage access. No legacy AGORA_ACCOUNT_* configuration.
+
+Independent native/relay routers, durable sealed push/provider integration,
+mobile/service conformance and the complete live ceremony remain #58 work.
+Atem #89 remains unmerged and independent admission remains disabled. Main merges
+and production deployment require user approval. Existing paired-host r8 remains
+operational; no keys, trust floors, pairings or credential agents were reset.
+
+## Historical corrected pin, 2026-10-21
 
 Atem's [final handoff](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6311804983)
 names `eaaadc23477d12f1e2a0caa56ccafb1dd45be571` and its five replacement

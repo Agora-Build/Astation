@@ -12,6 +12,7 @@ public final class RemoteRecoveryBackup {
         let prepared: String?
         let committedVersion: UInt64?
         let failure: String?
+        let membership: String?
     }
 
     private var log: MembershipLog
@@ -21,6 +22,12 @@ public final class RemoteRecoveryBackup {
     public private(set) var storageUncertain = false
     public private(set) var step: BackupStep
     public var committedEntries: [String] { log.entries() }
+
+    public func committedLog() throws -> MembershipLog {
+        guard !storageUncertain else { throw RemoteRecoveryError.storageUncertain }
+        guard !operating else { throw RemoteRecoveryError.busy }
+        return log.snapshot()
+    }
 
     /// The shared writer's documented durable form contains the signature
     /// already committed before upload. Reading it does not advance the writer.
@@ -53,20 +60,21 @@ public final class RemoteRecoveryBackup {
         guard saved.version == 1, saved.accountID == accountID, saved.genesisHash == genesisHash else {
             throw RemoteRecoveryError.invalidCheckpoint
         }
-        log = try MembershipLog.verify(accountId: accountID, genesisHash: genesisHash, entries: saved.entries, now: now)
+        log = try RemoteMembershipCheckpoint.load(accountID: accountID, genesisHash: genesisHash,
+            entries: saved.entries, storedJSON: saved.membership, now: now)
         self.persist = persist
         if let prepared = saved.prepared {
             guard saved.committedVersion == nil, saved.failure == nil else { throw RemoteRecoveryError.invalidCheckpoint }
             let writer = try KBackupWriter.resume(savedJson: prepared)
             self.writer = writer
             step = try writer.restart()
-            try self.checkpoint()
         } else if let version = saved.committedVersion {
             guard saved.failure == nil, log.kBackup()?.blobVersion == version else { throw RemoteRecoveryError.invalidCheckpoint }
             step = .done(committed: version)
         } else if let failure = saved.failure {
             step = .failed(code: failure, detail: "The saved backup operation stopped; its state was retained.")
         } else { throw RemoteRecoveryError.invalidCheckpoint }
+        try self.checkpoint()
     }
 
     @discardableResult
@@ -134,9 +142,10 @@ public final class RemoteRecoveryBackup {
         case .failed(let code, _): committed = nil; failure = code
         default: committed = nil; failure = nil
         }
-        let saved = Checkpoint(accountID: log.accountId(), genesisHash: log.genesisHash(), entries: log.entries(),
-            prepared: writer?.preparedJson(), committedVersion: committed, failure: failure)
         do {
+            let saved = Checkpoint(accountID: log.accountId(), genesisHash: log.genesisHash(), entries: log.entries(),
+                prepared: writer?.preparedJson(), committedVersion: committed, failure: failure,
+                membership: try log.storedJson())
             let encoder = PropertyListEncoder()
             encoder.outputFormat = .binary
             let bytes = try encoder.encode(saved)

@@ -1,5 +1,6 @@
 import AtemClient
 import AstationRemote
+import AppKit
 import Foundation
 
 @MainActor
@@ -28,6 +29,7 @@ final class AstationRecoveryCoordinator {
         let managerID: String
         var bootstrap: Data?
         var entries: [String] = []
+        var membership: String?
         var publication: Data?
         var hostBody: String?
         var backup: Data?
@@ -36,10 +38,9 @@ final class AstationRecoveryCoordinator {
         var pendingDataKey: SavedKey?
     }
 
-    nonisolated static let bootID = UUID().uuidString
+    nonisolated static let bootID = RemoteSystemClock.bootIdentifier
     nonisolated static func clock() -> HostClock {
-        HostClock(wallMs: UInt64(max(0, Date().timeIntervalSince1970 * 1000)),
-            monoMs: DispatchTime.now().uptimeNanoseconds / 1_000_000, bootId: bootID)
+        RemoteSystemClock.now()
     }
 
     let accountID: String
@@ -53,6 +54,9 @@ final class AstationRecoveryCoordinator {
     private let confirmReplacement: (String) async -> Bool
     private let saveKit: (String) async -> Bool
     private let dataKeys: AstationRecoveryDataKeys
+    private let now: () -> HostClock
+    private var checkpointTimer: Timer?
+    private var lifecycleObservers: [(NotificationCenter, NSObjectProtocol)] = []
     private var saved: Saved
     private var bootstrap: RemoteRecoveryBootstrap?
     private var publication: RemoteMembershipPublication?
@@ -88,7 +92,8 @@ final class AstationRecoveryCoordinator {
     init(accountID: String, managerID: String, identity: AtemE2EIdentity, relayURL: String,
         store: AstationRecoveryCheckpointStorage, transport: RemoteRecoveryTransport, dataKeys: AstationRecoveryDataKeys,
         allowNewDataKey: @escaping () -> Bool, confirmOwner: @escaping (SignRequest) async -> Bool,
-        confirmReplacement: @escaping (String) async -> Bool, saveKit: @escaping (String) async -> Bool) throws {
+        confirmReplacement: @escaping (String) async -> Bool, saveKit: @escaping (String) async -> Bool,
+        now: @escaping () -> HostClock = { AstationRecoveryCoordinator.clock() }) throws {
         self.accountID = accountID
         self.managerID = managerID
         self.identity = identity
@@ -100,12 +105,58 @@ final class AstationRecoveryCoordinator {
         self.confirmOwner = confirmOwner
         self.confirmReplacement = confirmReplacement
         self.saveKit = saveKit
+        self.now = now
         if let data = try store.read() {
             saved = try PropertyListDecoder().decode(Saved.self, from: data)
             guard saved.version == 2, saved.accountID == accountID, saved.managerID == managerID else {
                 throw RemoteRecoveryError.invalidCheckpoint
             }
         } else { saved = Saved(accountID: accountID, managerID: managerID) }
+        if !saved.entries.isEmpty {
+            guard let genesis = try currentKit()?.genesisHash else { throw RemoteRecoveryError.invalidCheckpoint }
+            let log = try RemoteMembershipCheckpoint.load(accountID: accountID, genesisHash: genesis,
+                entries: saved.entries, storedJSON: saved.membership, now: now())
+            try commitLog(log)
+        } else if saved.membership != nil { throw RemoteRecoveryError.invalidCheckpoint }
+        checkpointTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkpointFromLifecycle() }
+        }
+        for (center, name) in [(NotificationCenter.default, NSApplication.didResignActiveNotification),
+                               (NSWorkspace.shared.notificationCenter, NSWorkspace.willSleepNotification)] {
+            let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.checkpointFromLifecycle() }
+            }
+            lifecycleObservers.append((center, observer))
+        }
+    }
+
+    deinit {
+        checkpointTimer?.invalidate()
+        for (center, observer) in lifecycleObservers { center.removeObserver(observer) }
+    }
+
+    private func checkpointFromLifecycle() {
+        do { try checkpointPendingWaits() }
+        catch { uncertain = true; Log.error("[Recovery] Membership checkpoint failed; account operations are paused") }
+    }
+
+    func checkpointPendingWaits() throws {
+        guard !uncertain else { throw RemoteRecoveryError.storageUncertain }
+        guard !busy, let current = membershipLog else { return }
+        do {
+            let log = current.snapshot()
+            _ = try log.advance(now: now())
+            if try log.storedJson() != saved.membership { try commitLog(log) }
+        } catch { uncertain = true; throw error }
+    }
+
+    private func commitLog(_ log: MembershipLog, change: (inout Saved) -> Void = { _ in }) throws {
+        do {
+            let state = try log.storedJson()
+            let entries = log.entries()
+            try persist { $0.entries = entries; $0.membership = state; change(&$0) }
+            membershipLog = log.snapshot()
+        } catch { uncertain = true; throw error }
     }
 
     private func persist(_ change: (inout Saved) -> Void) throws {
@@ -142,7 +193,7 @@ final class AstationRecoveryCoordinator {
     private func loadBootstrap() throws -> RemoteRecoveryBootstrap? {
         if let bootstrap { return bootstrap }
         guard let checkpoint = saved.bootstrap else { return nil }
-        let value = try RemoteRecoveryBootstrap(checkpoint: checkpoint, accountID: accountID, now: Self.clock(),
+        let value = try RemoteRecoveryBootstrap(checkpoint: checkpoint, accountID: accountID, now: now(),
             persist: { [unowned self] bytes in try self.persist { $0.bootstrap = bytes } })
         bootstrap = value
         return value
@@ -171,37 +222,36 @@ final class AstationRecoveryCoordinator {
             value = try RemoteRecoveryBootstrap(accountID: accountID, managerID: managerID, keyID: managerID,
                 authKey: PublicKeyData(alg: .p256, raw: keys.signing),
                 encryptionKey: PublicKeyData(alg: .x25519, raw: keys.encryption),
-                recoverySecret: AtemSecureEnclaveCryptography.random32(), relayURL: relayURL, signedAt: Self.clock().wallMs,
+                recoverySecret: AtemSecureEnclaveCryptography.random32(), relayURL: relayURL, signedAt: now().wallMs,
                 persist: { [unowned self] bytes in try self.persist { $0.bootstrap = bytes } })
             bootstrap = value
         }
         let operation = value!
-        if (try? operation.committedLog(now: Self.clock())) == nil {
+        if (try? operation.committedLog(now: now())) == nil {
             let request: AppendRequest
             if let outstanding = try operation.outstanding() { request = outstanding }
             else {
                 let signer = try await confirmed(operation.signingRequest())
-                request = try operation.sign(provider: signer, now: Self.clock())
+                request = try operation.sign(provider: signer, now: now())
             }
             switch try await http.append(genesisHash: operation.genesisHash, request: request) {
             case .stored: break
             case .conflict: throw RemoteRecoveryError.requiresReview
             }
-            try operation.relayStored(now: Self.clock())
+            try operation.relayStored(now: now())
         }
         if saved.entries.isEmpty {
-            let entries = try operation.committedLog(now: Self.clock()).entries()
-            try persist { $0.entries = entries }
+            try commitLog(operation.committedLog(now: now()))
         }
-        let kit = try operation.kit(now: Self.clock())
+        let kit = try operation.kit(now: now())
         let currentLog = try await refreshedLog(genesis: kit.genesisHash)
-        guard currentLog.recoveryKey() == (try operation.committedLog(now: Self.clock())).recoveryKey() else {
+        guard currentLog.recoveryKey() == (try operation.committedLog(now: now())).recoveryKey() else {
             throw RemoteRecoveryError.kitNotCurrent
         }
         if !operation.recoveryIsSaved {
             let accepted = await saveKit(kit.text())
             guard accepted else { throw AtemIdentityError.recoveryNotSaved }
-            try operation.markKitSaved(kit, now: Self.clock())
+            try operation.markKitSaved(kit, now: now())
         }
         try identity.markRecoverySaved(signingPublicKey: identity.remotePublicKeys().signing)
         if backupCurrentKeys { try await finishBackup() }
@@ -241,7 +291,7 @@ final class AstationRecoveryCoordinator {
         if let checkpoint = saved.publication {
             publication = nil
             publication = try RemoteMembershipPublication(checkpoint: checkpoint, accountID: accountID,
-                genesisHash: log.genesisHash(), now: Self.clock(), persist: { [unowned self] bytes in try self.persist { $0.publication = bytes } })
+                genesisHash: log.genesisHash(), now: now(), persist: { [unowned self] bytes in try self.persist { $0.publication = bytes } })
             if let body = saved.hostBody, try publication?.outstanding() != nil {
                 let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: managerID)
                 let object = try JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any]
@@ -259,7 +309,7 @@ final class AstationRecoveryCoordinator {
         let publisher = RemoteMembershipPublication(log: log, persist: { [unowned self] bytes in try self.persist { $0.publication = bytes } })
         publication = publisher
         let body = try publisher.prepareHost(commit: commit,
-            hostChannelKey: PublicKeyData(alg: .ed25519, raw: reveal.hostChannelPublicKey), signer: managerID, signedAt: Self.clock().wallMs)
+            hostChannelKey: PublicKeyData(alg: .ed25519, raw: reveal.hostChannelPublicKey), signer: managerID, signedAt: now().wallMs)
         try persist { $0.hostBody = body }
         return try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: managerID)
     }
@@ -274,16 +324,16 @@ final class AstationRecoveryCoordinator {
         let entry = try publication.sign(provider: signer, keyID: managerID)
         switch try await http.append(genesisHash: genesis, request: entry) {
         case .stored:
-            guard case .committed = try publication.relayStored(now: Self.clock()) else { throw RemoteRecoveryError.requiresReview }
+            guard case .committed = try publication.relayStored(now: now()) else { throw RemoteRecoveryError.requiresReview }
         case .conflict(let page):
-            _ = try publication.relayConflict(head: page.head, entries: page.entries, more: page.more, now: Self.clock())
-            let entries = publication.entries
-            try persist { $0.entries = entries; $0.publication = nil; $0.hostBody = nil }
+            _ = try publication.relayConflict(head: page.head, entries: page.entries, more: page.more, now: now())
+            try commitLog(publication.committedLog()) { $0.publication = nil; $0.hostBody = nil }
             self.publication = nil
             throw RemoteRecoveryError.confirmationRequired
         }
-        let entries = publication.entries
-        try persist { $0.entries = entries; $0.publication = nil; $0.hostBody = nil }
+        let committed = try publication.committedLog()
+        let entries = committed.entries()
+        try commitLog(committed) { $0.publication = nil; $0.hostBody = nil }
         self.publication = nil
         guard current() else { throw RemoteChannelError.staleLink }
         return entries
@@ -301,18 +351,18 @@ final class AstationRecoveryCoordinator {
         if let previous = membershipLog, previous.entries() == saved.entries {
             log = previous.snapshot()
         } else {
-            log = try MembershipLog.verify(accountId: accountID, genesisHash: genesis, entries: saved.entries, now: Self.clock())
+            log = try RemoteMembershipCheckpoint.load(accountID: accountID, genesisHash: genesis,
+                entries: saved.entries, storedJSON: saved.membership, now: now())
         }
-        _ = log.advance(now: Self.clock())
+        _ = try log.advance(now: now())
+        try commitLog(log)
         for _ in 0..<128 {
             let page = try await http.entries(genesisHash: genesis, after: log.head().seq)
-            let result = try log.extend(entries: page.entries, now: Self.clock())
+            let result = try log.extend(entries: page.entries, now: now())
+            try commitLog(log)
             guard result.stop == nil, log.frozen() == nil else { throw RemoteRecoveryError.requiresReview }
             if !page.more {
                 guard log.head() == page.head else { throw RemoteRecoveryTransportError.invalidResponse }
-                let entries = log.entries()
-                try persist { $0.entries = entries }
-                membershipLog = log
                 return log
             }
             guard !page.entries.isEmpty else { throw RemoteRecoveryTransportError.invalidResponse }
@@ -322,7 +372,7 @@ final class AstationRecoveryCoordinator {
 
     private func currentKit() throws -> RemoteRecoveryKit? {
         if let text = saved.restoreKit { return try RemoteRecoveryKit(text: text) }
-        return try loadBootstrap()?.kit(now: Self.clock())
+        return try loadBootstrap()?.kit(now: now())
     }
 
     private func requireManager(_ log: MembershipLog) throws {
@@ -364,7 +414,7 @@ final class AstationRecoveryCoordinator {
         if backup == nil {
             if let checkpoint = saved.backup {
                 backup = try RemoteRecoveryBackup(checkpoint: checkpoint, accountID: accountID, genesisHash: genesis,
-                    now: Self.clock(), persist: { [unowned self] bytes in try self.persist { $0.backup = bytes } })
+                    now: now(), persist: { [unowned self] bytes in try self.persist { $0.backup = bytes } })
             } else {
                 backup = try RemoteRecoveryBackup(log: log, kids: keys.map(\.kid), signer: managerID,
                     persist: { [unowned self] bytes in try self.persist { $0.backup = bytes } })
@@ -375,11 +425,10 @@ final class AstationRecoveryCoordinator {
             guard !operation.storageUncertain else { throw RemoteRecoveryError.storageUncertain }
             switch operation.step {
             case .seal:
-                _ = try operation.seal(keys: keys.map { AccountKey(kid: $0.kid, k: $0.key) }, signedAt: Self.clock().wallMs)
+                _ = try operation.seal(keys: keys.map { AccountKey(kid: $0.kid, k: $0.key) }, signedAt: now().wallMs)
             case .sign(let body):
                 // A CAS conflict may have removed this manager while confirmation was open.
-                let signingLog = try MembershipLog.verify(accountId: accountID, genesisHash: genesis,
-                    entries: operation.committedEntries, now: Self.clock())
+                let signingLog = try operation.committedLog()
                 try requireManager(signingLog)
                 let signer = try await confirmed(RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: managerID))
                 _ = try operation.sign(provider: signer, keyID: managerID)
@@ -388,16 +437,15 @@ final class AstationRecoveryCoordinator {
                 _ = try operation.uploadReply(maxOccupied: occupied)
             case .append(let request):
                 switch try await http.append(genesisHash: genesis, request: request) {
-                case .stored: _ = try operation.relayStored(now: Self.clock(), signedAt: Self.clock().wallMs)
+                case .stored: _ = try operation.relayStored(now: now(), signedAt: now().wallMs)
                 case .conflict(let page): _ = try operation.relayConflict(head: page.head, entries: page.entries,
-                    more: page.more, now: Self.clock(), signedAt: Self.clock().wallMs)
+                    more: page.more, now: now(), signedAt: now().wallMs)
                 }
             case .fetch(let after):
                 let page = try await http.entries(genesisHash: genesis, after: after)
-                _ = try operation.fetched(entries: page.entries, more: page.more, now: Self.clock(), signedAt: Self.clock().wallMs)
+                _ = try operation.fetched(entries: page.entries, more: page.more, now: now(), signedAt: now().wallMs)
             case .done:
-                let entries = operation.committedEntries
-                try persist { $0.entries = entries; $0.backup = nil }
+                try commitLog(operation.committedLog()) { $0.backup = nil }
                 backup = nil
                 try installPendingKey()
                 return
@@ -427,6 +475,7 @@ final class AstationRecoveryCoordinator {
         } else { try persist { $0.restoreKit = kit.text() } }
         if restoreOperation == nil {
             restoreOperation = try RemoteRecoveryRestore(kit: kit, checkpoint: saved.restore,
+                now: now(),
                 persist: { [unowned self] bytes in try self.persist { $0.restore = bytes } })
         }
         let operation = restoreOperation!
@@ -441,17 +490,17 @@ final class AstationRecoveryCoordinator {
             if !page.more { finished = true; break }
         }
         guard finished else { throw RemoteRecoveryTransportError.invalidResponse }
-        let log = try MembershipLog.verify(accountId: kit.accountID, genesisHash: kit.genesisHash, entries: entries, now: Self.clock())
+        let log = try MembershipLog.verify(accountId: kit.accountID, genesisHash: kit.genesisHash, entries: entries, now: now())
         guard log.head() == head, log.frozen() == nil else { throw RemoteRecoveryError.requiresReview }
         let envelope = try await http.backup(log: log)
-        try operation.fetched(entries: entries, envelopeJSON: envelope, now: Self.clock())
+        try operation.fetched(entries: entries, envelopeJSON: envelope, now: now())
         guard case .waitingForHost(let hosts) = operation.phase else { throw RemoteRecoveryError.requiresReview }
         for host in hosts {
             do {
-                let probe = try operation.beginHostProbe(hostID: host, replacementDeviceID: managerID, now: Self.clock())
+                let probe = try operation.beginHostProbe(hostID: host, replacementDeviceID: managerID, now: now())
                 let accept = try await http.hostAccept(genesisHash: kit.genesisHash, hostID: host, initFrame: probe.frame)
-                try operation.receivedHostAccept(accept, probeID: probe.id, now: Self.clock())
-                _ = try operation.attempt(now: Self.clock())
+                try operation.receivedHostAccept(accept, probeID: probe.id, now: now())
+                _ = try operation.attempt(now: now())
                 break
             } catch {
                 if operation.phase == .storageUncertain { throw error }
@@ -461,12 +510,11 @@ final class AstationRecoveryCoordinator {
             return operation.statusText
         }
         let recovered = try operation.recoveredKeys()
+        try commitRestoredLog(operation.verifiedLog())
         try dataKeys.installRecovered(recovered.map { AccountDataKey(kid: $0.kid, key: $0.k) }, dataAccount: accountID)
-        let verified = try operation.verifiedEntries()
-        try persist { $0.entries = verified }
         try identity.markRecoverySaved(signingPublicKey: identity.remotePublicKeys().signing)
         if operation.phase == .published {
-            if let member = log.member(deviceId: managerID), member.status == .active {
+            if let member = membershipLog?.member(deviceId: managerID), member.status == .active {
                 return "Account restored. This device is an active member of your signed device list."
             }
             return operation.statusText
@@ -482,17 +530,24 @@ final class AstationRecoveryCoordinator {
             let accepted = await confirmReplacement(kit.accountID)
             guard accepted, try identity.remotePublicKeys().signing == keys.signing,
                   try identity.remotePublicKeys().encryption == keys.encryption else { throw RemoteRecoveryError.confirmationRequired }
-            request = try operation.enroll(confirmedMemberJSON: json, signedAt: Self.clock().wallMs)
+            request = try operation.enroll(confirmedMemberJSON: json, signedAt: now().wallMs)
         }
         switch try await http.append(genesisHash: kit.genesisHash, request: request) {
         case .stored:
-            _ = try operation.relayStored(now: Self.clock())
-            let entries = try operation.verifiedEntries()
-            try persist { $0.entries = entries }
+            _ = try operation.relayStored(now: now())
+            try commitRestoredLog(operation.verifiedLog())
         case .conflict(let page):
-            _ = try operation.relayConflict(head: page.head, entries: page.entries, more: page.more, now: Self.clock())
+            _ = try operation.relayConflict(head: page.head, entries: page.entries, more: page.more, now: now())
         }
         return operation.statusText
+    }
+
+    private func commitRestoredLog(_ restored: MembershipLog) throws {
+        guard let previous = membershipLog else { try commitLog(restored); return }
+        let log = previous.snapshot()
+        let result = try log.extend(entries: restored.entries(), now: now())
+        try commitLog(log)
+        guard result.stop == nil, log.frozen() == nil else { throw RemoteRecoveryError.requiresReview }
     }
 }
 

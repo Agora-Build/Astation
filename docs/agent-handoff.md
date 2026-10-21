@@ -185,12 +185,16 @@ registration and recovery use only resource-bound account tokens, and the
 relay maps verified issuer/subject tuples without changing existing data
 accounts or signed recovery records. Ordinary registration refuses identity
 changes; verified legacy-binding migration remains separate work. Local
-validation passes 977 app tests (14 skips), 87 native tests, 487 relay tests
-(113 ignored), four isolated account Postgres cases and four provisioned
-account boundary cases. Auth DNS, the actual registered client/resource and
-relay deployment still gate live verification. Atem #93's durable MembershipLog
-binding is in progress; retain the accepted library pin until immutable
-replacement packages are announced. Independent r9 admission remains off.
+validation now passes 982 app tests (14 skips), 94 native tests, 487 relay tests
+(113 ignored), four isolated account Postgres cases, four provisioned account
+boundary cases and two provisioned recovery signing/storage cases. Auth is
+deferred while r9 implementation proceeds; production login still needs actual
+client/resource registration, reachability and approved deployment. Atem #93's
+durable MembershipLog binding is delivered and consumed at 1493ca6, with
+protected snapshots, immediate/before-effect commits, stable OS boot ID and
+periodic wait checkpoints. Independent routers, push/provider and platform
+integration plus the complete live ceremony remain; r9 admission stays off.
+See [current coordination](github-coordination.md) for authoritative task status.
 
 Keep `AGORA_ACCOUNT_USERINFO_URL`, `AGORA_ACCOUNT_SUBJECT_FIELD`, and
 `AGORA_ACCOUNT_AUTH_TIME_FIELD` unset in the current deployment. They are an

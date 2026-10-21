@@ -1,13 +1,39 @@
 # Remote agent API for independent Astation clients
 
+## Auth deferral and durable state, 2026-10-21
+
+The user deferred the unavailable agora.build Auth service. Continue r9
+implementation and controlled integration tests independently of production
+OIDC deployment. Existing device pairing and the r9 signed membership/channel
+remain the trust boundary. The account-login integration from #63 stays
+separate; deferral does not turn a failed login into storage authorization.
+Production account-storage rollout and its live verification remain pending.
+
+Atem #93 supplies accepted immutable bindings at
+`1493ca6a5d704484bff7b30b09222cf20658fdcd`. Native checkpoints must retain the
+shared `stored_json` membership snapshot alongside each writer's exact prepared
+state. Load with independently saved account/genesis anchors, then immediately
+commit the loaded state before exposing it. On each membership change or clock
+advance, export and durably commit before any dependent effect. An uncertain
+commit halts the owner; a process restart must not discard shared wait-ended,
+approval, veto or freeze decisions. Old entry-only checkpoints migrate through
+the shared verifier conservatively and are committed in the new form.
+
+Use the OS boot-session identifier across app restarts and a monotonic clock;
+checkpoint pending waits periodically and on background/sleep. Device-only
+Keychain storage excludes these snapshots and prepared writers from backups.
+Restore always refetches and obtains a new host-signed challenge after restart;
+a saved membership decision is not a new host freshness proof.
+
 ## Pairing integration progress, 2026-10-21
 
 The native v2 ceremony is connected to the app: explicit genesis setup,
 mandatory Recovery Kit saving, protected account checkpoints, fresh owner-bound
 Enclave signatures, relay CAS, K backups and final signed membership. The
 [Recovery Kit v2 design](../recovery-kit-v2.md) describes storage and restore
-invariants and the transport. The Apple package remains pinned to
-`eaaadc23477d12f1e2a0caa56ccafb1dd45be571`.
+invariants and the transport. The Apple package is pinned to
+`1493ca6a5d704484bff7b30b09222cf20658fdcd`; relay Cargo remains at the
+accepted eaaadc2 wire-compatible core pin.
 
 Original-JSON readers validate `verifyCommit.host_trust_gen` and the v2 reveal
 before Foundation decodes them. The required host channel key and genesis are
@@ -41,14 +67,14 @@ the new key; encryption-off setup stays off. Repeated exports verify and reuse
 an unchanged committed backup.
 
 **Remaining gates:** this is not a released or live-tested r9 ceremony.
-Independent admission remains disabled. The accepted Apple binding has no durable
-membership-state export/load API equivalent to Rust `to_stored/from_stored`.
-The app retains in-process wait state, but re-verifying entries after a restart
-conservatively restarts pending recovery waits and cannot preserve local
-wait-ended decisions. [Atem #81](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6325080380)
-requests the shared binding API; no Swift replacement membership engine or
-relay-authoritative timer is introduced. Automatic delayed recovery across
-restart remains a gate. Explicit signed manager approval is tested.
+Independent admission remains disabled. Atem #93's supported durable snapshot
+API is now consumed by the coordinator and publication/backup/restore adapters.
+They preserve shared recovery decisions and freezes across restarts, retain exact
+writer bytes, and commit immediately after load and before dependent effects.
+Same-boot elapsed time survives application restarts; reboot handling remains
+conservative. A 30-second timer and background/sleep checkpoints persist waits.
+Serialization or storage failures stop account operations until reconciled.
+No second membership engine or relay-authoritative clock is introduced.
 
 Validation includes native/app/relay tests, actual isolated Postgres transaction
 and restart tests, HTTP/WebSocket recovery with the Mac offline, and provisioned
@@ -59,12 +85,14 @@ been exercised. Inbound session routers, durable sealed push/provider ingress,
 mobile/service integration and platform conformance still gate independent r9.
 Do not merge Atem #89 based on unit-test or compile evidence alone.
 
-The running provisioned app remains `74770d8`; these worktree changes do not
-replace it. Draft PR #58 is unmerged and no production deployment is authorized.
-The earlier protected-publisher stage at `727342f` passed its CI run; it is
-superseded by this implementation, not evidence for the new commit's CI.
+The canonical provisioned app currently runs `23659d9`; the durable snapshot
+increment has not yet replaced it. Local validation passes 982 app tests
+(14 environment-dependent skips), 94 native tests and two real provisioned
+recovery signing/storage tests. CI at 23659d9 is green, including separately
+executed Postgres/Valkey cases; that result is not the new increment's CI.
+Draft PR #58 remains unmerged and no production deployment is authorized.
 
-## Corrected final implementation and artifacts, 2026-10-21
+## Historical package integration, 2026-10-21
 
 The [eaaadc2 review](remote-agent-api-eaaadc2-review.md) accepts Atem's
 corrected final host/package pin for Astation integration. The journal-loss
@@ -107,7 +135,7 @@ and pushed its preserved changes. Its CI fails the existing verification UI
 timing assertion tracked in [#62](https://github.com/Agora-Build/Astation/issues/62);
 relay/webapp jobs pass. No full-suite pass is claimed.
 
-## Latest reviewed host status
+## Historical host review before corrected packages
 
 The [final-pin review](remote-agent-api-final-pin-review.md) supersedes the
 older pending-package status below. At `58fa1e9`, the original quarantine
