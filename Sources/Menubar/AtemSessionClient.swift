@@ -81,6 +81,9 @@ final class AtemSessionClient {
     private var tombstones: [String: Set<String>] = [:]
     private var started = false
     private var lastHelloContext: AtemSessionContext?
+    private var helloRefusedBeforeVerification = false
+    private var verificationCompleted = false
+    private var retriedAfterVerification = false
     private var lastReceiptQuery: TimeInterval = 0
     var hasRegistrySnapshot: Bool { phase == .ready && !resyncing }
     var connectionStatus: ConnectionStatus {
@@ -117,6 +120,9 @@ final class AtemSessionClient {
         guard current != context else { return }
         context = current
         clearAttachment()
+        helloRefusedBeforeVerification = false
+        verificationCompleted = false
+        retriedAfterVerification = false
         phase = current == nil ? .offline : .connecting
         status = current == nil ? "Atem is offline. Unconfirmed requests will only be queried, never replayed."
             : "Opening an authenticated Atem session..."
@@ -130,6 +136,29 @@ final class AtemSessionClient {
             return
         }
         lastHelloContext = current
+        var hello = AtemSessionMessage(op: "hello")
+        hello.revision = AtemSessionWire.revision
+        _ = request(hello)
+        changed()
+    }
+
+    /// Only local verification completion can retry a refused initial hello.
+    func verificationDidComplete(context verified: AtemSessionContext) {
+        guard welcome == nil, [.connecting, .failed].contains(phase), !retriedAfterVerification,
+              context == verified, verified == currentContext(), !journal.loadFailed else { return }
+        verificationCompleted = true
+        retryInitialHelloAfterVerification()
+    }
+
+    private func retryInitialHelloAfterVerification() {
+        guard phase == .failed, welcome == nil, helloRefusedBeforeVerification,
+              verificationCompleted, !retriedAfterVerification, context != nil,
+              context == currentContext(), !journal.loadFailed else { return }
+        retriedAfterVerification = true
+        helloRefusedBeforeVerification = false
+        clearAttachment()
+        phase = .connecting
+        status = "Verification complete. Opening an authenticated Atem session..."
         var hello = AtemSessionMessage(op: "hello")
         hello.revision = AtemSessionWire.revision
         _ = request(hello)
@@ -448,16 +477,24 @@ final class AtemSessionClient {
             if message.op == "error", message.re == nil {
                 if message.code == "unsupported_version" { failUnsupportedVersion(); return }
                 if message.code == "unauthorized", welcome != nil { reconnect(); return }
+                if message.code == "unauthorized", phase == .connecting,
+                   pending.values.contains(where: { $0.message.op == "hello" }) {
+                    helloRefusedBeforeVerification = true
+                }
                 status = "Atem: " + AtemSessionWire.diagnosticErrorCode(message.code)
                 if phase == .connecting || ["unauthorized", "paused", "unsupported_version"].contains(message.code ?? "") {
                     fail(status + ". Reconnect the session with matching Astation and Atem builds.")
                 }
+                retryInitialHelloAfterVerification()
                 changed(); return
             }
             if phase == .connecting, message.op == "error", let re = message.re, pending[re]?.message.op == "hello" {
                 if message.code == "unsupported_version" { failUnsupportedVersion(); return }
+                helloRefusedBeforeVerification = message.code == "unauthorized"
                 fail("Atem could not open a session: " + AtemSessionWire.diagnosticErrorCode(message.code)
-                    + ". Reconnect to open a fresh session connection."); changed(); return
+                    + ". Reconnect to open a fresh session connection.")
+                retryInitialHelloAfterVerification()
+                changed(); return
             }
             guard phase == .ready, now() < authorizationDeadline else { return }
             switch message.op {
