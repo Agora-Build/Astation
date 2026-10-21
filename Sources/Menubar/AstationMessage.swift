@@ -1,3 +1,4 @@
+import AstationRemote
 import Foundation
 
 // JSON message protocol for communication between Atem and Astation
@@ -7,6 +8,13 @@ enum AstationMessage: Codable {
         let decoder = JSONDecoder()
         decoder.userInfo[AtemSessionJSON.rawRootKey] = root
         decoder.userInfo[AtemSessionJSON.rawSizeKey] = data.count
+        if root["type"]?.string == "verifyCommit" {
+            // Read the original integer token before JSONDecoder can accept 3.0 or 3e0.
+            guard let generation = try? RemotePairingCommit.hostTrustGeneration(originalJSON: data) else {
+                return .invalidVerifyCommit
+            }
+            decoder.userInfo[AtemVerifyCommit.generationKey] = generation
+        }
         return try decoder.decode(Self.self, from: data)
     }
 
@@ -73,6 +81,8 @@ enum AstationMessage: Codable {
     case keyRequest(publicKey: String)
     case keyGrant(grant: AtemGrantWire)
     case verifyCommit(AtemVerifyCommit)
+    // Local decode outcome only; never an additional wire message type.
+    case invalidVerifyCommit
     case verifyKeys(AtemVerifyKeys)
     case verifyReveal(AtemVerifyReveal)
     case deviceVerified(AtemDeviceVerified)
@@ -362,6 +372,9 @@ enum AstationMessage: Codable {
         case .verifyCommit(let value):
             try container.encode(MessageType.verifyCommit, forKey: .type)
             try container.encode(value, forKey: .data)
+        case .invalidVerifyCommit:
+            try container.encode(MessageType.verifyAbort, forKey: .type)
+            try container.encode(["reason": "Invalid verification generation; upgrade Atem and retry"], forKey: .data)
         case .verifyKeys(let value):
             try container.encode(MessageType.verifyKeys, forKey: .type)
             try container.encode(value, forKey: .data)

@@ -19,12 +19,16 @@ public struct RemotePairingCommit: Equatable, Sendable {
     public let hostTrustGeneration: UInt64
     public let commitment: Data
 
-    public init(originalJSON: Data, context: RemotePairingContext) throws {
+    public static func hostTrustGeneration(originalJSON: Data) throws -> UInt64 {
         guard originalJSON.count <= 262_144,
               let json = String(data: originalJSON, encoding: .utf8) else {
             throw RemoteChannelError.invalidInput
         }
-        let generation = try verifyCommitHostTrustGen(messageJson: json)
+        return try verifyCommitHostTrustGen(messageJson: json)
+    }
+
+    public init(originalJSON: Data, context: RemotePairingContext) throws {
+        let generation = try Self.hostTrustGeneration(originalJSON: originalJSON)
         struct Envelope: Decodable {
             struct Payload: Decodable { let device_id: String; let commitment: Data }
             let data: Payload

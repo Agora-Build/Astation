@@ -19,10 +19,31 @@ struct AtemGrantWire: Codable, Equatable {
 struct AtemVerifyCommit: Codable, Equatable {
     let deviceId: String
     let commitment: Data
+    let hostTrustGeneration: UInt64
+
+    static let generationKey = CodingUserInfoKey(rawValue: "atemVerifiedHostTrustGeneration")!
+
+    init(deviceId: String, commitment: Data, hostTrustGeneration: UInt64) {
+        self.deviceId = deviceId
+        self.commitment = commitment
+        self.hostTrustGeneration = hostTrustGeneration
+    }
+
+    init(from decoder: Decoder) throws {
+        guard let generation = decoder.userInfo[Self.generationKey] as? UInt64 else {
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath,
+                debugDescription: "Verification commits require original-packet validation"))
+        }
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        deviceId = try values.decode(String.self, forKey: .deviceId)
+        commitment = try values.decode(Data.self, forKey: .commitment)
+        hostTrustGeneration = generation
+    }
 
     enum CodingKeys: String, CodingKey {
         case deviceId = "device_id"
         case commitment
+        case hostTrustGeneration = "host_trust_gen"
     }
 }
 

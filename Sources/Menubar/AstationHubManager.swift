@@ -832,23 +832,29 @@ class AstationHubManager: ObservableObject {
             return nil
 
         case .verifyCommit(let commit):
+            guard let context = captureMigrationContext(clientId: clientId, relayConnectionId: relayConnectionId) else { return nil }
             DispatchQueue.main.async { [weak self] in
-                guard let self, let route = self.verificationRoute(clientId: clientId, relayConnectionId: relayConnectionId) else { return }
-                self.atemVerification.start(commit, route: route)
+                self?.atemVerification.start(commit, route: context.route, account: context.account)
             }
             return nil
 
+        case .invalidVerifyCommit:
+            guard captureMigrationContext(clientId: clientId, relayConnectionId: relayConnectionId) != nil else { return nil }
+            return .verifyAbort(reason: "Invalid verification generation; upgrade Atem and retry")
+
         case .verifyReveal(let reveal):
+            guard let context = captureMigrationContext(clientId: clientId, relayConnectionId: relayConnectionId) else { return nil }
             DispatchQueue.main.async { [weak self] in
-                guard let self, let route = self.verificationRoute(clientId: clientId, relayConnectionId: relayConnectionId) else { return }
-                self.atemVerification.reveal(reveal, route: route)
+                guard let self, self.e2eDataAccount == context.account else { return }
+                self.atemVerification.reveal(reveal, route: context.route)
             }
             return nil
 
         case .verifyAbort:
+            guard let context = captureMigrationContext(clientId: clientId, relayConnectionId: relayConnectionId) else { return nil }
             DispatchQueue.main.async { [weak self] in
-                guard let self, let route = self.verificationRoute(clientId: clientId, relayConnectionId: relayConnectionId) else { return }
-                self.atemVerification.cancel(route: route)
+                guard let self, self.e2eDataAccount == context.account else { return }
+                self.atemVerification.cancel(route: context.route)
             }
             return nil
 

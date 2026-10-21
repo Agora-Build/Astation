@@ -55,7 +55,7 @@ private final class VerificationHarness {
     )
 
     func begin() throws {
-        controller.start(AtemVerifyCommit(deviceId: route.deviceId, commitment: try reveal.commitment()), route: route)
+        controller.start(AtemVerifyCommit(deviceId: route.deviceId, commitment: try reveal.commitment(), hostTrustGeneration: 3), route: route, account: account)
         controller.reveal(reveal, route: route)
     }
 
@@ -75,6 +75,31 @@ private final class VerificationHarness {
 }
 
 final class AtemVerificationControllerTests: XCTestCase {
+    func testDelayedCommitCannotMoveToANewAccountOrConnection() throws {
+        for changeAccount in [false, true] {
+            let h = VerificationHarness()
+            let originalAccount = h.account
+            let commit = AtemVerifyCommit(deviceId: h.route.deviceId, commitment: try h.reveal.commitment(), hostTrustGeneration: 3)
+            if changeAccount { h.account = "replacement-account" }
+            else { h.currentConnection = "replacement-connection" }
+            h.controller.start(commit, route: h.route, account: originalAccount)
+            XCTAssertTrue(h.messages.isEmpty)
+            XCTAssertEqual(h.crypto.creates, 0)
+        }
+    }
+
+    func testInvalidCapturedGenerationNeverCreatesKeysOrAnApproval() {
+        for generation: UInt64 in [0, 9_007_199_254_740_992] {
+            let h = VerificationHarness()
+            h.controller.start(AtemVerifyCommit(deviceId: h.route.deviceId,
+                commitment: Data(repeating: 1, count: 32), hostTrustGeneration: generation),
+                route: h.route, account: h.account)
+            XCTAssertEqual(h.aborts.count, 1)
+            XCTAssertTrue(h.approvals.isEmpty)
+            XCTAssertEqual(h.crypto.creates, 0)
+        }
+    }
+
     func testSuccessfulCeremonyRequiresApprovalAndSavedRecoveryBeforePinning() throws {
         let h = VerificationHarness()
         h.key = AccountDataKey(kid: "0123abcd", key: Data(repeating: 0x99, count: 32))
@@ -114,7 +139,7 @@ final class AtemVerificationControllerTests: XCTestCase {
         let h = VerificationHarness()
         h.controller.reveal(h.reveal, route: h.route)
         XCTAssertEqual(h.aborts.count, 1)
-        h.controller.start(AtemVerifyCommit(deviceId: h.route.deviceId, commitment: Data(repeating: 1, count: 32)), route: h.route)
+        h.controller.start(AtemVerifyCommit(deviceId: h.route.deviceId, commitment: Data(repeating: 1, count: 32), hostTrustGeneration: 3), route: h.route, account: h.account)
         h.controller.reveal(h.reveal, route: h.route)
         XCTAssertEqual(h.aborts.count, 2)
         XCTAssertTrue(h.approvals.isEmpty)
@@ -123,7 +148,7 @@ final class AtemVerificationControllerTests: XCTestCase {
 
     func testCommitCannotClaimAnotherAuthenticatedDevice() {
         let h = VerificationHarness()
-        h.controller.start(AtemVerifyCommit(deviceId: "other", commitment: Data(repeating: 1, count: 32)), route: h.route)
+        h.controller.start(AtemVerifyCommit(deviceId: "other", commitment: Data(repeating: 1, count: 32), hostTrustGeneration: 3), route: h.route, account: h.account)
         XCTAssertEqual(h.aborts.count, 1)
         XCTAssertEqual(h.crypto.creates, 0)
     }

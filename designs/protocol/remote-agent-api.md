@@ -1,5 +1,54 @@
 # Remote agent API for independent Astation clients
 
+## Pairing integration progress, 2026-10-21
+
+The app now reads `verifyCommit.host_trust_gen` with the accepted shared
+client's strict reader before Foundation decodes the message. Valid generations
+remain immutable through the attempt; absent, fractional, exponent, zero and
+unsafe values cannot start verification. Decodable invalid commits produce
+`verifyAbort` only on an authenticated route; malformed packets, including
+duplicate keys, are dropped. Direct and identity-relay payload paths both use
+this decoder. The relay scanner retains number spellings before extraction.
+Verification commit/reveal/abort handlers capture the authenticated device,
+account and connection before asynchronous dispatch and reject a changed route
+or account instead of resolving a replacement connection inside the callback.
+
+`RemoteMembershipPublication` adds the native durability adapter around the
+shared `MembershipLog` and `EntryPublisher`. It persists the exact body before
+owner signing, persists the signature before returning a sendable append and
+atomically checkpoints the committed log with the cleared pending append after
+the relay reply. A retry returns the same stored signature. One shared publisher
+retains the core's process-wide claim for a manager. Reentrant calls are refused.
+Storage uncertainty halts the instance until its protected store is reconciled
+and reloaded. A conflict uses the shared verifier; an incomplete, invalid,
+inconsistent, pending or divergent result durably blocks further signing pending
+refresh. The refresh/unfreeze workflow is not implemented in this adapter yet.
+The host-entry helper copies the authenticated host id and captured generation
+unchanged into the body; its key must come from the ceremony's verified reveal.
+
+This is a staged integration, **not a completed r9 ceremony**. The existing
+native approval path still uses its earlier commitment/safety transcript and
+does not yet send `genesis_hash` or a signed membership chain. The new publisher
+is not yet connected to protected account-log storage, a production key provider
+or relay CAS requests. Account genesis, Recovery Kit v2, owner-confirmation
+binding, refreshed/frozen-log recovery and the final `deviceVerified.membership`
+handoff must be connected before reporting the ceremony shipped. Independent
+admission remains disabled; no legacy r9 fallback is introduced.
+
+Fresh validation passes all 41 native adapter tests and 93 selected app
+pairing/session/terminal/migration tests, including compilation/linking of the
+macOS app. These are focused tests with injected storage and test signing keys;
+no new provisioned ceremony, rendered UI, full app suite or platform conformance
+pass is claimed.
+
+The latest Atem handoff (vault e52) reports Genie healthy at trust generation
+11 on v0.7.4. The Mac independently accepted generation 7/runtime epoch 18 and
+exchanged `welcome`/`list`/`sessions` without Retry at 11:35:57 UTC; rendered UI
+and session count were not verified. Atem #91's generation migration regression
+is closed by #92/v0.7.4. PR #89's head is `7f2ad113252060160dd9f722698477a1ba05685b`
+with green checks; accepted Apple dependency remains `eaaadc2`. Astation #58's
+previous head `74770d8` has completed green macOS/relay/webapp CI.
+
 ## Corrected final implementation and artifacts, 2026-10-21
 
 The [eaaadc2 review](remote-agent-api-eaaadc2-review.md) accepts Atem's

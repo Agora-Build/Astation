@@ -78,11 +78,13 @@ final class AtemE2EKnownAnswerTests: XCTestCase {
     }
 
     func testMessagesUseTheExactAtemWireNamesAndBase64() throws {
-        let commit = AstationMessage.verifyCommit(AtemVerifyCommit(deviceId: "dev-1", commitment: bytes(AtemKnownAnswers.commitment)))
+        let commit = AstationMessage.verifyCommit(AtemVerifyCommit(deviceId: "dev-1", commitment: bytes(AtemKnownAnswers.commitment), hostTrustGeneration: 3))
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(commit)) as? [String: Any])
         XCTAssertEqual(object["type"] as? String, "verifyCommit")
-        let data = try XCTUnwrap(object["data"] as? [String: String])
-        XCTAssertEqual(data, ["device_id": "dev-1", "commitment": bytes(AtemKnownAnswers.commitment).base64EncodedString()])
+        let data = try XCTUnwrap(object["data"] as? [String: Any])
+        XCTAssertEqual(data["device_id"] as? String, "dev-1")
+        XCTAssertEqual(data["commitment"] as? String, bytes(AtemKnownAnswers.commitment).base64EncodedString())
+        XCTAssertEqual(data["host_trust_gen"] as? Int, 3)
         let certificate = AtemSignedWire(statement: bytes(AtemKnownAnswers.deviceVerified), signature: bytes(AtemKnownAnswers.deviceVerifiedSignature))
         let state = AtemSignedWire(statement: bytes(AtemKnownAnswers.accountState), signature: Data(repeating: 1, count: 64))
         let grant = AtemGrantWire(
@@ -95,7 +97,7 @@ final class AtemE2EKnownAnswerTests: XCTestCase {
             .encryptionMode(accountState: state), .keyGrant(grant: grant), .verifyAbort(reason: "denied"),
         ] {
             let encoded = try JSONEncoder().encode(message)
-            XCTAssertEqual(try JSONSerialization.jsonObject(with: JSONEncoder().encode(JSONDecoder().decode(AstationMessage.self, from: encoded))) as? NSDictionary,
+            XCTAssertEqual(try JSONSerialization.jsonObject(with: JSONEncoder().encode(AstationMessage.decodePacket(encoded))) as? NSDictionary,
                            try JSONSerialization.jsonObject(with: encoded) as? NSDictionary)
         }
         XCTAssertThrowsError(try JSONDecoder().decode(AstationMessage.self, from: Data(#"{"type":"encryptionMode","data":{"mode":"off"}}"#.utf8)))

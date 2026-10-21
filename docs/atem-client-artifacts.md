@@ -1,12 +1,38 @@
 # Consuming the prebuilt r9 Apple client
 
 The current client pin is `eaaadc23477d12f1e2a0caa56ccafb1dd45be571`.
+
+The native adapter now also owns a durable signed-log publication sequence.
+`RemoteMembershipPublication` requires a protected, atomic checkpoint writer;
+an in-memory writer in tests is not a production store. It never sends requests
+itself. The transport must bind a reply to the exact outstanding append before
+calling `relayStored` or `relayConflict`. A fresh confirmation belongs to the
+stored body, as requested by the shared provider. A blocked or uncertain instance
+cannot be replaced with a new empty publisher: storage must be reconciled and
+the saved pending bytes resumed. Initial construction requires an already
+verified, durably pinned log. An unresolved conflict's refresh fence survives
+reload; refreshed/frozen-log recovery remains to be implemented. This adapter
+is not yet connected to the app's account setup, protected storage, native
+signer or relay CAS routes, and does not enable r9 admission.
+
+The app packet decoder now uses the shared generation reader for live
+`verifyCommit` packets. It passes the validated integer into the wire model;
+plain `JSONDecoder` cannot construct an incoming commit without that check.
+Queued verification handlers capture route/account before dispatch. Other
+ceremony changes, including the v2 transcript and signed-list output, remain
+unwired. See the [current integration progress](../designs/protocol/remote-agent-api.md#pairing-integration-progress-2026-10-21).
+
+Fresh validation of this stage passes all 41 native tests and 93 selected app
+pairing/session/terminal/migration tests. The app compiles and links against the
+adapter. These are focused runs; the earlier provisioned storage and FFI results
+below belong to dependency head `74770d8`, not a new app launch or full UI run.
+
 [Binding run 39568023465](https://github.com/Agora-Build/Atem/actions/runs/39568023465)
 produced the Apple package. [The final-pin review](../designs/protocol/remote-agent-api-eaaadc2-review.md)
 verifies all five matching packages and closes the host journal corruption/clock-rollback
 findings. The shared client, bindings and fixtures are unchanged from 58fa1e9;
-the interactive consumer passes 19 FFI checks and all 27 native adapter tests.
-All 111 selected session/API/terminal tests also pass after incorporating main's
+the earlier interactive consumer passed 19 FFI checks and 27 native adapter tests.
+All 111 selected session/API/terminal tests also passed after incorporating main's
 verification retry fix. The macOS app builds, and 37 identity/credential tests
 pass in a provisioned test host with protected Keychain access required.
 The earlier scheduled-worker manifest sandbox failure
@@ -60,15 +86,19 @@ the writer and notify each `RemoteAgentChannel`; the writer never holds a
 socket or restores a lease. Inbound parsing/routing and live socket adapters
 remain unwired.
 
-Native verification includes 27 XCTest cases: generation syntax, duplicate
+Native verification includes 41 XCTest cases: generation syntax, duplicate
 keys and context capture; handshake/authorization deadlines; a signature
 arriving after disconnect; stale routes; operation rejection versus transport
 failure; channel-only closure; and twelve outbound writer cases covering exact
 envelope bounds, original frame bytes, capacity/backpressure, no handle reuse,
 late routes and reentrant link loss. A public signed membership
 prefix is verified by the production core, which then creates a real `init`
-and rejects a malformed `accept` before requesting a signature. The other 26
-cases are platform adapter tests, not the upstream scenario harness.
+and rejects a malformed `accept` before requesting a signature. Fourteen new
+publication cases exercise the production publisher/verifier with test-only
+software signing keys: checkpoint/signature ordering, storage failures,
+restarts, exact retries, conflicting relay replies, process-wide ownership,
+captured host generations and a complete log over 1 MiB. None of these runs is
+the upstream scenario harness.
 The final package's wrapper/static library and AstationRemote module also
 compile/link directly with `swiftc` for arm64 and x86_64 iOS 17 simulator
 targets using the installed simulator SDK. The `xcodebuild` package invocation

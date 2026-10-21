@@ -28,6 +28,7 @@ final class AtemVerificationController {
         let route: AtemVerificationRoute
         let account: String
         let commitment: Data
+        let hostTrustGeneration: UInt64
         let keys: AtemVerifyKeys
         let expires: Date
         var approving = false
@@ -68,12 +69,13 @@ final class AtemVerificationController {
         self.now = now
     }
 
-    func start(_ commit: AtemVerifyCommit, route: AtemVerificationRoute) {
+    func start(_ commit: AtemVerifyCommit, route: AtemVerificationRoute, account capturedAccount: String) {
         dispatchPrecondition(condition: .onQueue(.main))
-        guard isCurrent(route) else { return }
+        guard isCurrent(route), capturedAccount == account() else { return }
         prune()
         guard commit.deviceId == route.deviceId, !commit.deviceId.isEmpty,
-              commit.deviceId.utf8.count <= 256, commit.commitment.count == 32 else {
+              commit.deviceId.utf8.count <= 256, commit.commitment.count == 32,
+              (1...9_007_199_254_740_991).contains(commit.hostTrustGeneration) else {
             abort(route, reason: "Verification identity or commitment is invalid")
             return
         }
@@ -83,7 +85,8 @@ final class AtemVerificationController {
         }
         do {
             let keys = try identity.verificationKeys(nonce: AtemSecureEnclaveCryptography.random32())
-            let attempt = Attempt(route: route, account: account(), commitment: commit.commitment, keys: keys, expires: now().addingTimeInterval(timeout))
+            let attempt = Attempt(route: route, account: capturedAccount, commitment: commit.commitment,
+                hostTrustGeneration: commit.hostTrustGeneration, keys: keys, expires: now().addingTimeInterval(timeout))
             attempts[route] = attempt
             send(.verifyKeys(keys), route)
             DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in

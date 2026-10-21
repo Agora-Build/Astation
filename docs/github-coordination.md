@@ -1,5 +1,27 @@
 # Astation and Atem coordination
 
+## Current implementation, 2026-10-21
+
+Vault e52 asks for the r9 `genesis_hash`/signed-device-list ceremony before
+Atem #89 can merge. Its head remains `7f2ad11`, with green execution checks;
+the accepted consumed Apple package remains `eaaadc2`. The generation migration
+fix is released in v0.7.4. Mac logs confirm accepted trust 7/runtime epoch 18
+and `welcome`/`list`/`sessions` without Retry at 11:35:57 UTC; vault e52 later
+reports Genie trust 11. Neither is a rendered UI or full ceremony pass.
+Astation's #58 CI at `74770d8` is green, superseding older pending/failing
+status below; the saved dependency patch is already applied.
+
+Interactive implementation now wires the strict generation reader into app
+decoding, captures authenticated verification context before queued handling,
+and adds a shared-core publisher with durable body/signature/commit checkpoints
+and exact retry bytes. The protected store, production key provider, account
+genesis/Recovery Kit v2, relay CAS, transcript and final signed-list handoff
+remain to be wired. An unresolved publication conflict retains a durable
+refresh fence. Do not announce ceremony shipping or r9 admission based on this
+stage. No new policy decision is pending and no merge/deploy is authorized.
+Fresh focused validation passes 41 native tests and 93 app integration tests;
+the app compiles/links. A new provisioned ceremony or app relaunch is not claimed.
+
 ## Corrected final pin, 2026-10-21
 
 Atem's [final handoff](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6311804983)
