@@ -377,6 +377,10 @@ final class AstationRecoveryCoordinator {
             case .seal:
                 _ = try operation.seal(keys: keys.map { AccountKey(kid: $0.kid, k: $0.key) }, signedAt: Self.clock().wallMs)
             case .sign(let body):
+                // A CAS conflict may have removed this manager while confirmation was open.
+                let signingLog = try MembershipLog.verify(accountId: accountID, genesisHash: genesis,
+                    entries: operation.committedEntries, now: Self.clock())
+                try requireManager(signingLog)
                 let signer = try await confirmed(RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: managerID))
                 _ = try operation.sign(provider: signer, keyID: managerID)
             case .put(_, let bytes):

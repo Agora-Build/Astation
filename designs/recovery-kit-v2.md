@@ -129,6 +129,14 @@ validated migration lifecycle; a backup never sets encryption ON. Repeated kit
 export checks the committed backup against the actual key set and avoids
 another signature/upload when nothing changed.
 
+A failed local key installation retains the pending key and committed backup.
+After restart, verify and open that exact backup before retrying installation;
+do not generate another key or ask for another backup signature. An uncertain
+final checkpoint halts the current coordinator until its protected state is
+reloaded. If a CAS conflict reveals that the signing manager was removed,
+stop before requesting another owner confirmation or signature. An unrelated
+head change requires owner confirmation of the new exact backup body.
+
 A recovered device keeps the imported kit and original root. Export remains
 available after fresh restore verification; pairing and manager writes require
 the active replacement's exact auth/encryption keys and manager role. A pending,
@@ -147,12 +155,20 @@ Enclave-signed genesis. Postgres tests cover multi-replica CAS, rollback and
 restart. HTTP/WebSocket tests cover genesis retry/isolation and a recovery probe
 with the original Mac offline. No live account keys/floors are reset.
 
+Practical coordinator regressions also cover Keychain-install failure after
+relay commitment, an uncertain checkpoint after installation, lost rotation
+commit replies, overlapping setup while owner confirmation is open, a competing
+manager's CAS update, manager removal during confirmation, and a lost recovery
+enrollment reply followed by restart. They use the shared cryptography and
+membership implementation, with injected local/network failures; they do not
+stand in for a live UI ceremony.
+
 The accepted Apple binding does not expose durable membership-state export/load
 for recovery wait records and wait-ended decisions. In-process snapshots retain
 state; reconstruction from signed entries after restart conservatively restarts
 pending waits. Automatic 24-hour activation across restart is therefore not
 complete. The requested shared binding API is tracked on
-[Atem #81](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6325080380).
+[Atem #93](https://github.com/Agora-Build/Atem/issues/93).
 Do not substitute a Swift timer, trust relay time, or grant access early.
 
 The iOS Simulator source target compiles; execution is blocked by the local
@@ -160,4 +176,5 @@ CoreSimulator version mismatch. Rendered owner-auth UI, a live host ceremony,
 independent native/mobile/service admission and sealed push/provider integration
 still need their platform/conformance gates. Independent remote admission stays
 disabled and Atem #89 stays unmerged pending the ceremony gate. This worktree
-has not replaced the running provisioned app or deployed the relay.
+does not deploy the relay; local provisioned build verification is a separate
+step from the live ceremony and independent-admission gates.
