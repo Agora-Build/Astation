@@ -25,6 +25,38 @@ Keychain storage excludes these snapshots and prepared writers from backups.
 Restore always refetches and obtains a new host-signed challenge after restart;
 a saved membership decision is not a new host freshness proof.
 
+## Native channel components, 2026-10-21
+
+The shared-core endpoint now has an inbound R9.7a reader/router alongside its
+outbound writer. One router belongs to one host connection generation. It
+preserves original inner JSON bytes, refuses duplicate routing fields and
+unknown envelope fields, enforces the serialized 2 MiB limit and identifies an
+oversized channel only from the first 4 KiB before `frame`. A malformed record,
+peer close or exceeded bound ends only that channel. Unknown/repeated closes
+produce no response. Link loss cancels all its handshakes and deferred signing;
+it never replays commands or restores a lease. Bounded writer backpressure
+retains close disposition instead of replaying an operation.
+
+Routine native signing has a separate platform adapter. It accepts only the
+shared core's exact channel-client transcript domain for the pinned existing
+identity. One foreground owner confirmation may cover routine channel
+signatures for less than five minutes; concurrent requests share that prompt
+without extending the window. Background, lock, sleep, key failure and explicit
+invalidation clear reuse and fence late answers. A stale/cancelled connection
+never signs after the prompt. Membership entries still require fresh,
+body-bound confirmation and cannot use this adapter.
+
+These components compile in the app but are not yet connected to live direct
+or relay session dispatch. Tests through the supplied production FFI verify a
+real host-signed accept and native P-256 signature through encrypted finish;
+the host welcome and subsequent agent operations are not exercised in that
+test. Separate provisioned tests exercise the real Secure Enclave primitive.
+Local totals are 987 app tests (15 environment-dependent skips), 109 native
+tests and three provisioned recovery/signing tests, all passing. CI at `455ad8f`
+is green; it precedes the reader/signer increment. Live independent routers,
+durable sealed push/provider integration, platform conformance and the complete
+provisioned ceremony still gate admission.
+
 ## Pairing integration progress, 2026-10-21
 
 The native v2 ceremony is connected to the app: explicit genesis setup,

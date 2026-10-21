@@ -25,6 +25,16 @@ tests and two provisioned recovery signing/storage tests pass. #63's earlier
 and 64 Valkey cases executed separately. The canonical provisioned app still
 runs 23659d9 until explicitly rebuilt; no new live ceremony pass is claimed.
 
+The next increment adds the native inbound reader/router and routine channel
+signer, with generation fencing, original-byte preservation, channel-only
+failures and strict envelope bounds. Five-minute owner reuse is limited to the
+channel transcript; background/lock/sleep invalidate it, while membership
+signatures remain fresh. Actual shared-library host accept/P-256/finish checks
+pass, as do deferred-signing and forged-host refusals. New totals: 987 app tests
+(15 skips), 109 native tests, three provisioned recovery/signing tests. These adapters
+are not yet wired to the live direct/relay socket dispatchers. CI at `455ad8f` is green,
+before this increment; no live router or full r9 claim follows from those tests.
+
 The user deferred unavailable auth.agora.build so r9 implementation and isolated
 tests continue. #63's account-login implementation stays intact; production
 registration/configuration/deployment and its live validation remain open.

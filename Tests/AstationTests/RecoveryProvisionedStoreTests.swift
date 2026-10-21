@@ -7,6 +7,20 @@ import XCTest
 
 @MainActor
 final class RecoveryProvisionedStoreTests: XCTestCase {
+    func testSecureEnclaveSignsTheRoutineChannelTranscriptWithoutAcceptingMembershipInputs() throws {
+        guard ProcessInfo.processInfo.environment["ASTATION_REQUIRE_KEYCHAIN_TESTS"] == "1" else {
+            throw XCTSkip("Run with the provisioned local XCTest host to verify the Secure Enclave.")
+        }
+        let identity = AtemE2EIdentity(storage: TestAtemStorage())
+        let keys = try identity.remotePublicKeys()
+        let request = SignRequest(keyId: "test-manager", purpose: .channel, freshConfirmation: false,
+            label: "atem-ch1-client-sig-v1", input: signingInput(label: .channelClient, payload: Data(repeating: 0x71, count: 32)), bodyJson: nil)
+        let signature = try identity.signChannel(request, keyID: "test-manager", expectedPublicKey: keys.signing)
+        XCTAssertTrue(try P256.Signing.PublicKey(x963Representation: keys.signing)
+            .isValidSignature(P256.Signing.ECDSASignature(rawRepresentation: signature), for: request.input))
+        XCTAssertThrowsError(try identity.signMembership(request, expectedPublicKey: keys.signing))
+    }
+
     func testSecureEnclaveSignsOnlyTheConfirmedV2Genesis() throws {
         guard ProcessInfo.processInfo.environment["ASTATION_REQUIRE_KEYCHAIN_TESTS"] == "1" else {
             throw XCTSkip("Run with the provisioned local XCTest host to verify the Secure Enclave.")
