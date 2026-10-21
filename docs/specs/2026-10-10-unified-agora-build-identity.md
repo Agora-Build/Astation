@@ -1,8 +1,15 @@
 # Unified agora.build Identity
 
-Status: proposed architecture, reflecting the product direction selected on
-October 10, 2026. The identity service, provider integrations, and product
-migration are not implemented. `auth.agora.build` below is a proposed hostname.
+Status: approved architecture, reflecting the product direction selected on
+October 10, 2026. Agora-Build/Auth now implements the OIDC contract at
+`bc1bfe727e8da52fc95b16354d610c050a8b5e2c` (`docs/integrating.md`):
+issuer `https://auth.agora.build`, ES256 API JWTs with resource audience, and
+permanent `acct_` subjects. GitHub and Google are implemented upstream; Apple
+and Agora federation are not. See the
+[account integration design](../../designs/protocol/account-identity-integration.md)
+for Astation's implementation and remaining registration/deployment gates.
+Issuer discovery currently does not resolve from the development Mac; no
+successful production rollout or completed legacy-account migration is claimed.
 
 ## Goal
 
@@ -135,8 +142,10 @@ can operate without this registration feature.
 Do not configure a guessed Agora userinfo endpoint as a temporary dependency.
 Retain the existing compatibility implementation until the replacement and
 data/account migration are verified, then remove its settings and code as part
-of that migration. The new configuration names and deployed issuer URL remain
-to be defined by the selected identity service.
+of that migration. The replacement uses `ACCOUNT_OIDC_ISSUER`,
+`ACCOUNT_OIDC_AUDIENCE` and `ACCOUNT_OIDC_REQUIRED_SCOPE` on the relay, with the
+matching registered native client/resource/scope in the app. Actual service
+availability and Astation registration still require verification.
 
 ## Migration from the current implementation
 

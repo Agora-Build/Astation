@@ -174,7 +174,23 @@ PR #38 records the product requirements in the
 [unified identity specification](specs/2026-10-10-unified-agora-build-identity.md).
 The agora.build/portal project is to implement shared accounts for Astation,
 Atem, Vox, and future products, with GitHub, Google, Apple, and Agora as linked
-sign-in providers. The proposed SSO service and hostname are not deployed.
+sign-in providers. Agora-Build/Auth now implements the OIDC contract (pinned
+at `bc1bfe7`), including GitHub and Google; Apple/Agora federation remains
+future work. Actual Auth reachability and Astation registration are unverified.
+See [the #63 integration](../designs/protocol/account-identity-integration.md).
+
+The #63 implementation separates Settings > Account (native OIDC/PKCE with
+rotating refresh tokens in Keychain) from General > Agora Services. Relay
+registration and recovery use only resource-bound account tokens, and the
+relay maps verified issuer/subject tuples without changing existing data
+accounts or signed recovery records. Ordinary registration refuses identity
+changes; verified legacy-binding migration remains separate work. Local
+validation passes 977 app tests (14 skips), 87 native tests, 487 relay tests
+(113 ignored), four isolated account Postgres cases and four provisioned
+account boundary cases. Auth DNS, the actual registered client/resource and
+relay deployment still gate live verification. Atem #93's durable MembershipLog
+binding is in progress; retain the accepted library pin until immutable
+replacement packages are announced. Independent r9 admission remains off.
 
 Keep `AGORA_ACCOUNT_USERINFO_URL`, `AGORA_ACCOUNT_SUBJECT_FIELD`, and
 `AGORA_ACCOUNT_AUTH_TIME_FIELD` unset in the current deployment. They are an

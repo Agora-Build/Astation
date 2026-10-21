@@ -1,4 +1,4 @@
-//! Agora account registration and explicit Astation data grouping.
+//! Account registration and explicit Astation data grouping.
 //!
 //! Device identity remains in `identity_store`; this layer only maps a
 //! verified Astation id to the data account used by memory, skills and vaults.
@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::identity_store::REVOKED_PUBLIC_KEY;
+use crate::account_identity::{configured_verifier, VerifiedIdentity, LEGACY_ISSUER};
 use crate::encryption::{transition, EncryptionCounts, EncryptionState};
 use crate::knowledge_store::{
     postgres_encryption_counts as postgres_knowledge_counts, KnowledgeStore, PgKnowledgeStore,
@@ -26,7 +27,8 @@ pub const DELAYED_MERGE_EXPIRY_SECS: i64 = 48 * 60 * 60;
 pub const FRESH_SIGN_IN_SECS: i64 = 5 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedAgoraAccount {
+pub struct VerifiedAccount {
+    /// Durable login principal, not a bare OIDC subject. Legacy values are retained.
     pub subject: String,
     pub authenticated_at: Option<i64>,
 }
@@ -41,25 +43,25 @@ pub enum VerifyError {
 impl std::fmt::Display for VerifyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unavailable(message) => write!(f, "Agora identity verification unavailable: {message}"),
-            Self::Rejected => write!(f, "Agora access token was rejected"),
-            Self::InvalidResponse => write!(f, "Agora identity response has no stable subject"),
+            Self::Unavailable(message) => write!(f, "Account identity verification unavailable: {message}"),
+            Self::Rejected => write!(f, "Account access token was rejected"),
+            Self::InvalidResponse => write!(f, "Account identity response is invalid"),
         }
     }
 }
 
 #[async_trait]
 pub trait AccountIdentityVerifier: Send + Sync {
-    async fn verify(&self, access_token: &str) -> Result<VerifiedAgoraAccount, VerifyError>;
+    async fn verify(&self, access_token: &str) -> Result<VerifiedIdentity, VerifyError>;
 }
 
 struct DisabledVerifier;
 
 #[async_trait]
 impl AccountIdentityVerifier for DisabledVerifier {
-    async fn verify(&self, _access_token: &str) -> Result<VerifiedAgoraAccount, VerifyError> {
+    async fn verify(&self, _access_token: &str) -> Result<VerifiedIdentity, VerifyError> {
         Err(VerifyError::Unavailable(
-            "AGORA_ACCOUNT_USERINFO_URL and AGORA_ACCOUNT_SUBJECT_FIELD are not configured"
+            "agora.build account identity is not configured on this relay"
                 .to_string(),
         ))
     }
@@ -99,7 +101,7 @@ impl HttpAccountIdentityVerifier {
 
 #[async_trait]
 impl AccountIdentityVerifier for HttpAccountIdentityVerifier {
-    async fn verify(&self, access_token: &str) -> Result<VerifiedAgoraAccount, VerifyError> {
+    async fn verify(&self, access_token: &str) -> Result<VerifiedIdentity, VerifyError> {
         let response = self
             .http
             .get(&self.url)
@@ -131,7 +133,8 @@ impl AccountIdentityVerifier for HttpAccountIdentityVerifier {
             .as_ref()
             .and_then(|field| body.get(field))
             .and_then(serde_json::Value::as_i64);
-        Ok(VerifiedAgoraAccount {
+        Ok(VerifiedIdentity {
+            issuer: LEGACY_ISSUER.into(),
             subject: subject.to_string(),
             authenticated_at,
         })
@@ -188,6 +191,7 @@ pub enum AccountError {
     AlreadyGrouped,
     WouldOrphanGroup,
     InvalidRequest,
+    IdentityChangeRequiresMigration,
     RequestExpired,
     EncryptionMismatch,
     InvalidEncryption(String),
@@ -197,8 +201,9 @@ impl std::fmt::Display for AccountError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Db(message) => write!(f, "database error: {message}"),
-            Self::NotRegistered => write!(f, "Astation is not registered to an Agora account"),
-            Self::NotSameUser => write!(f, "Astations are not registered to the same Agora account"),
+            Self::NotRegistered => write!(f, "Astation is not registered to an account"),
+            Self::IdentityChangeRequiresMigration => write!(f, "This Astation has an existing account binding. An explicit verified account migration is required; its data and keys were retained."),
+            Self::NotSameUser => write!(f, "Astations are not registered to the same account"),
             Self::AlreadyGrouped => write!(f, "Astations already share a data account"),
             Self::WouldOrphanGroup => write!(
                 f,
@@ -222,7 +227,7 @@ pub trait AccountStore: Send + Sync {
     async fn verify_access_token(
         &self,
         access_token: &str,
-    ) -> Result<VerifiedAgoraAccount, VerifyError>;
+    ) -> Result<VerifiedAccount, VerifyError>;
 
     async fn resolve_data_account(&self, astation_id: &str) -> Result<String, AccountError>;
 
@@ -313,6 +318,7 @@ struct InMemoryState {
     accounts: HashMap<String, AccountRec>,
     requests: HashMap<String, RequestRec>,
     encryption: HashMap<String, EncryptionState>,
+    identities: HashMap<(String, String), String>,
 }
 
 pub struct InMemoryAccountStore {
@@ -324,7 +330,7 @@ pub struct InMemoryAccountStore {
 
 impl InMemoryAccountStore {
     pub fn new(knowledge: Arc<dyn KnowledgeStore>, vault: Arc<dyn VaultStore>) -> Self {
-        Self::with_verifier(knowledge, vault, Arc::new(DisabledVerifier))
+        Self::with_verifier(knowledge, vault, configured_verifier(HttpAccountIdentityVerifier::from_env))
     }
 
     pub fn with_verifier(
@@ -538,8 +544,14 @@ impl AccountStore for InMemoryAccountStore {
     async fn verify_access_token(
         &self,
         access_token: &str,
-    ) -> Result<VerifiedAgoraAccount, VerifyError> {
-        self.verifier.verify(access_token).await
+    ) -> Result<VerifiedAccount, VerifyError> {
+        let identity = self.verifier.verify(access_token).await?;
+        let subject = if identity.issuer == LEGACY_ISSUER { identity.subject }
+        else {
+            self.state.lock().await.identities.entry((identity.issuer, identity.subject))
+                .or_insert_with(|| format!("principal-{}", Uuid::new_v4())).clone()
+        };
+        Ok(VerifiedAccount { subject, authenticated_at: identity.authenticated_at })
     }
 
     async fn resolve_data_account(&self, astation_id: &str) -> Result<String, AccountError> {
@@ -573,24 +585,10 @@ impl AccountStore for InMemoryAccountStore {
     ) -> Result<(), AccountError> {
         let mut state = self.state.lock().await;
         if let Some(existing) = state.accounts.get(astation_id) {
-            let account_changed = existing.agora_user != agora_user;
-            let data_account = existing.data_account.clone();
-            if account_changed
-                && data_account.starts_with("group-")
-                && state
-                    .accounts
-                    .values()
-                    .filter(|candidate| candidate.data_account == data_account)
-                    .count()
-                    == 1
-            {
-                return Err(AccountError::WouldOrphanGroup);
+            if existing.agora_user != agora_user {
+                return Err(AccountError::IdentityChangeRequiresMigration);
             }
             let account = state.accounts.get_mut(astation_id).expect("account checked above");
-            if account_changed {
-                account.data_account = astation_id.to_string();
-                account.registered_at = now;
-            }
             account.agora_user = agora_user.to_string();
             account.label = label.to_string();
             account.last_seen_at = now;
@@ -864,7 +862,7 @@ impl PgAccountStore {
     pub fn new(pool: sqlx::PgPool) -> Self {
         Self {
             pool,
-            verifier: HttpAccountIdentityVerifier::from_env(),
+            verifier: configured_verifier(HttpAccountIdentityVerifier::from_env),
         }
     }
 
@@ -1302,8 +1300,24 @@ impl AccountStore for PgAccountStore {
     async fn verify_access_token(
         &self,
         access_token: &str,
-    ) -> Result<VerifiedAgoraAccount, VerifyError> {
-        self.verifier.verify(access_token).await
+    ) -> Result<VerifiedAccount, VerifyError> {
+        let identity = self.verifier.verify(access_token).await?;
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT principal FROM account_identities WHERE issuer = $1 AND subject = $2")
+            .bind(&identity.issuer).bind(&identity.subject).fetch_optional(&self.pool).await
+            .map_err(|_| VerifyError::Unavailable("account identity storage unavailable".into()))?;
+        if let Some(subject) = stored {
+            return Ok(VerifiedAccount { subject, authenticated_at: identity.authenticated_at });
+        }
+        let candidate = if identity.issuer == LEGACY_ISSUER { identity.subject.clone() }
+            else { format!("principal-{}", Uuid::new_v4()) };
+        let subject: String = sqlx::query_scalar(
+            "INSERT INTO account_identities (issuer, subject, principal) VALUES ($1,$2,$3) \
+             ON CONFLICT (issuer, subject) DO UPDATE SET subject = EXCLUDED.subject RETURNING principal")
+            .bind(&identity.issuer).bind(&identity.subject).bind(candidate)
+            .fetch_one(&self.pool).await
+            .map_err(|_| VerifyError::Unavailable("account identity storage unavailable".into()))?;
+        Ok(VerifiedAccount { subject, authenticated_at: identity.authenticated_at })
     }
 
     async fn resolve_data_account(&self, astation_id: &str) -> Result<String, AccountError> {
@@ -1348,19 +1362,7 @@ impl AccountStore for PgAccountStore {
             lock_agora_user(&mut tx, &snapshot.agora_user).await?;
             let current = load_account(&mut tx, astation_id).await?;
             if current.agora_user != agora_user {
-                ensure_group_will_remain(&mut tx, &current.data_account).await?;
-                sqlx::query(
-                    "UPDATE astation_accounts SET agora_user = $2, label = $3, \
-                       data_account = astation_id, registered_at = $4, last_seen_at = $4 \
-                     WHERE astation_id = $1",
-                )
-                .bind(astation_id)
-                .bind(agora_user)
-                .bind(label)
-                .bind(now)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
+                return Err(AccountError::IdentityChangeRequiresMigration);
             } else {
                 sqlx::query(
                     "UPDATE astation_accounts SET label = $2, last_seen_at = $3 \
@@ -1846,13 +1848,12 @@ mod tests {
         store.register("a", "user-1", "A", 1).await.unwrap();
         store.register("b", "user-1", "B", 1).await.unwrap();
         let request = store.start_merge("a", "b", MergeMode::Online, 2).await.unwrap();
-        store.approve_merge("b", &request.request_id, 3).await.unwrap();
-        store.register("a", "user-2", "A", 4).await.unwrap();
-        assert_eq!(store.resolve_data_account("a").await.unwrap(), "a");
-        assert!(matches!(
-            store.list_for_astation("a").await.unwrap().0.as_slice(),
-            [AccountDevice { astation_id, .. }] if astation_id == "a"
-        ));
+        let group = store.approve_merge("b", &request.request_id, 3).await.unwrap().data_account;
+        assert!(matches!(store.register("a", "user-2", "A", 4).await,
+            Err(AccountError::IdentityChangeRequiresMigration)));
+        assert_eq!(store.resolve_data_account("a").await.unwrap(), group);
+        assert_eq!(store.subject_for_astation("a").await.unwrap().as_deref(), Some("user-1"));
+        assert_eq!(store.list_for_astation("a").await.unwrap().0.len(), 2);
     }
 
     #[tokio::test]
@@ -1876,7 +1877,7 @@ mod tests {
         ));
         assert!(matches!(
             store.register("b", "user-2", "B", 4).await,
-            Err(AccountError::WouldOrphanGroup)
+            Err(AccountError::IdentityChangeRequiresMigration)
         ));
 
         let request = store.start_merge("a", "b", MergeMode::Online, 5).await.unwrap();
@@ -1949,6 +1950,78 @@ mod tests {
     }
 
     use crate::test_database::TestDatabase;
+
+    struct NamespacedVerifier;
+    #[async_trait]
+    impl AccountIdentityVerifier for NamespacedVerifier {
+        async fn verify(&self, token: &str) -> Result<VerifiedIdentity, VerifyError> {
+            Ok(VerifiedIdentity { issuer: if token == "legacy" { LEGACY_ISSUER.into() } else { format!("https://{token}.example") },
+                subject: "same-subject".into(), authenticated_at: None })
+        }
+    }
+
+    #[tokio::test]
+    async fn equal_subjects_from_different_issuers_never_share_an_account() {
+        let store = InMemoryAccountStore::with_verifier(Arc::new(InMemoryKnowledgeStore::new()),
+            Arc::new(InMemoryVaultStore::new()), Arc::new(NamespacedVerifier));
+        let one = store.verify_access_token("one").await.unwrap().subject;
+        let two = store.verify_access_token("two").await.unwrap().subject;
+        let legacy = store.verify_access_token("legacy").await.unwrap().subject;
+        assert_ne!(one,two); assert_ne!(one,legacy); assert_eq!(legacy,"same-subject");
+        assert_eq!(store.verify_access_token("one").await.unwrap().subject,one);
+        store.register("device",&legacy,"Mac",1).await.unwrap();
+        assert!(matches!(store.register("device",&one,"Mac",2).await,Err(AccountError::IdentityChangeRequiresMigration)));
+        assert_eq!(store.subject_for_astation("device").await.unwrap().as_deref(),Some("same-subject"));
+        assert_eq!(store.resolve_data_account("device").await.unwrap(),"device");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn postgres_identity_bindings_survive_restart_and_preserve_existing_data() {
+        let database = TestDatabase::migrated("ACCOUNT_TEST_DATABASE_URL",4).await;
+        let pool = database.pool.clone();
+        let store = PgAccountStore { pool:pool.clone(), verifier:Arc::new(NamespacedVerifier) };
+        store.register("old","same-subject","Old Mac",1).await.unwrap();
+        let principal = store.verify_access_token("one").await.unwrap().subject;
+        store.register("new",&principal,"New Mac",1).await.unwrap();
+        let restart = PgAccountStore { pool:pool.clone(), verifier:Arc::new(NamespacedVerifier) };
+        assert_eq!(restart.verify_access_token("one").await.unwrap().subject,principal);
+        assert_ne!(restart.verify_access_token("two").await.unwrap().subject,principal);
+        assert_eq!(restart.verify_access_token("legacy").await.unwrap().subject,"same-subject");
+        assert!(matches!(restart.register("old",&principal,"Old Mac",2).await,Err(AccountError::IdentityChangeRequiresMigration)));
+        assert_eq!(restart.subject_for_astation("old").await.unwrap().as_deref(),Some("same-subject"));
+        assert_eq!(restart.resolve_data_account("old").await.unwrap(),"old");
+        assert_eq!(restart.resolve_data_account("new").await.unwrap(),"new");
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn postgres_identity_migration_preserves_legacy_subjects_groups_and_recovery_records() {
+        let database = TestDatabase::new("ACCOUNT_TEST_DATABASE_URL",4).await;
+        let migrations = sqlx::migrate!("./migrations");
+        for migration in migrations.iter().filter(|m| m.version < 10) {
+            sqlx::raw_sql(&migration.sql).execute(&database.pool).await.unwrap();
+        }
+        let store = PgAccountStore::new(database.pool.clone());
+        store.register("old-a","legacy-subject","Mac A",1).await.unwrap();
+        store.register("old-b","legacy-subject","Mac B",1).await.unwrap();
+        let merge = store.start_merge("old-a","old-b",MergeMode::Online,2).await.unwrap();
+        let group = store.approve_merge("old-b",&merge.request_id,3).await.unwrap().data_account;
+        let checkpoint = serde_json::json!({"protected":"existing sealed backup and exact signed entries"});
+        sqlx::query("INSERT INTO remote_recovery_roots (genesis_hash, account_subject, state) VALUES ($1,$2,$3)")
+            .bind("a".repeat(64)).bind("legacy-subject").bind(&checkpoint).execute(&database.pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0010_account_identities.sql")).execute(&database.pool).await.unwrap();
+        let bindings: Vec<(String,String,String)> = sqlx::query_as("SELECT issuer,subject,principal FROM account_identities")
+            .fetch_all(&database.pool).await.unwrap();
+        assert_eq!(bindings,vec![(LEGACY_ISSUER.into(),"legacy-subject".into(),"legacy-subject".into())]);
+        assert_eq!(store.resolve_data_account("old-a").await.unwrap(),group);
+        assert_eq!(store.resolve_data_account("old-b").await.unwrap(),group);
+        let saved: (String,serde_json::Value) = sqlx::query_as("SELECT account_subject,state FROM remote_recovery_roots")
+            .fetch_one(&database.pool).await.unwrap();
+        assert_eq!(saved,("legacy-subject".into(),checkpoint));
+        database.cleanup().await;
+    }
 
     /// Exercises the transactional path that cannot be represented by the
     /// separate in-memory knowledge and vault stores.
@@ -2111,7 +2184,7 @@ mod tests {
         ));
         assert!(matches!(
             store.register("b", "user-2", "Mac B", 20).await,
-            Err(AccountError::WouldOrphanGroup)
+            Err(AccountError::IdentityChangeRequiresMigration)
         ));
         let regroup = store.start_merge("a", "b", MergeMode::Online, 21).await.unwrap();
         store.approve_merge("b", &regroup.request_id, 22).await.unwrap();

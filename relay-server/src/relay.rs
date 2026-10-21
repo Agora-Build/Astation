@@ -1658,7 +1658,7 @@ async fn apply_account_message(
                 return;
             };
             let Some(target_device) = devices.iter().find(|device| device.astation_id == target) else {
-                hub.local().send(connection_id, relay_ack_err(kind, "target is not on this Agora account"));
+                hub.local().send(connection_id, relay_ack_err(kind, "target is not on this account"));
                 return;
             };
             let online = match hub.room(target).await {
@@ -1680,7 +1680,7 @@ async fn apply_account_message(
                     .and_then(serde_json::Value::as_str)
                     .filter(|value| !value.is_empty() && value.len() <= 16 * 1024)
                 else {
-                    hub.local().send(connection_id, relay_ack_err(kind, "a fresh Agora sign-in is required"));
+                    hub.local().send(connection_id, relay_ack_err(kind, "a fresh agora.build sign-in is required"));
                     return;
                 };
                 let verified = match accounts.verify_access_token(token).await {
@@ -1710,7 +1710,7 @@ async fn apply_account_message(
                 if verified.subject != subject || !fresh {
                     hub.local().send(
                         connection_id,
-                        relay_ack_err(kind, "fresh sign-in could not be verified for this Agora account"),
+                        relay_ack_err(kind, "fresh sign-in could not be verified for this account"),
                     );
                     return;
                 }
@@ -4361,7 +4361,7 @@ pub(crate) mod tests {
     }
 
     struct TestAccountVerifier {
-        responses: std::collections::HashMap<String, crate::account_store::VerifiedAgoraAccount>,
+        responses: std::collections::HashMap<String, crate::account_identity::VerifiedIdentity>,
     }
 
     #[async_trait::async_trait]
@@ -4369,7 +4369,7 @@ pub(crate) mod tests {
         async fn verify(
             &self,
             access_token: &str,
-        ) -> Result<crate::account_store::VerifiedAgoraAccount, crate::account_store::VerifyError>
+        ) -> Result<crate::account_identity::VerifiedIdentity, crate::account_store::VerifyError>
         {
             self.responses
                 .get(access_token)
@@ -5657,7 +5657,8 @@ pub(crate) mod tests {
     async fn delayed_merge_requires_a_recent_matching_sign_in() {
         let now = chrono::Utc::now().timestamp();
         let verified = |subject: &str, authenticated_at: Option<i64>| {
-            crate::account_store::VerifiedAgoraAccount {
+            crate::account_identity::VerifiedIdentity {
+                issuer: crate::account_identity::LEGACY_ISSUER.into(),
                 subject: subject.to_string(),
                 authenticated_at,
             }

@@ -1,5 +1,6 @@
 import Cocoa
 import Foundation
+import AstationRemote
 
 class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, NSTableViewDataSource, NSTableViewDelegate {
     static let astationRelayUrlKey = "AstationRelayUrl"
@@ -21,6 +22,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var tabView: NSTabView?
     private var sidebarTable: NSTableView?
     private let hubManager: AstationHubManager
+    private lazy var accountController = AccountSettingsViewController(hub: hubManager)
     private let shortcutsController: KeyboardShortcutsViewController
     private let recordingController: AudioRecordingViewController
     private let transcriptionController: TranscriptionViewController
@@ -164,7 +166,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         contentView.addSubview(separator)
 
         // === Agora Account Section ===
-        let acctTitle = NSTextField(labelWithString: "Agora Account")
+        let acctTitle = NSTextField(labelWithString: "Agora Services")
         acctTitle.font = NSFont.boldSystemFont(ofSize: 14)
         acctTitle.frame = NSRect(x: 20, y: 200, width: 410, height: 24)
         contentView.addSubview(acctTitle)
@@ -215,6 +217,10 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         ])
         general.view = generalContainer
         tabs.addTabViewItem(general)
+        let account = NSTabViewItem(identifier: "account")
+        account.label = "Account"
+        account.viewController = accountController
+        tabs.addTabViewItem(account)
         let credentials = NSTabViewItem(identifier: "credentials")
         credentials.label = "Credentials"
         credentials.viewController = credentialsController
@@ -1071,7 +1077,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         alert.messageText = "Merge memories, skills and vaults?"
         alert.informativeText = device.online
             ? "\(device.label) will be asked to approve. After approval, both Macs use one shared data account."
-            : "\(device.label) is offline. Continue with a fresh Agora sign-in; all registered Macs are notified, and the merge waits 24 hours so any of them can cancel."
+            : "\(device.label) is offline. Continue with a fresh agora.build sign-in; all registered Macs are notified, and the merge waits 24 hours so any of them can cancel."
         alert.addButton(withTitle: device.online ? "Request Approval" : "Sign In and Start Wait")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
@@ -1081,13 +1087,13 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         }
         Task { @MainActor in
             do {
-                let manager = SsoAuthManager(ssoUrl: SsoConfig.currentSsoUrl)
-                let session = try await manager.runLoginFlow()
-                try hubManager.sessionStore.save(session)
-                NotificationCenter.default.post(name: .credentialsChanged, object: nil)
+                try await hubManager.accountAuth.signIn(fresh: true)
+                guard let record = try await hubManager.accountAuth.current(),
+                      record.session.authenticatedAt != nil else { throw AccountLoginError.freshProofUnavailable }
+                hubManager.accountSessionChanged()
                 hubManager.requestRelayMerge(
                     targetAstationId: id,
-                    freshAccessToken: session.accessToken
+                    freshAccessToken: record.session.accessToken
                 )
             } catch {
                 relayAccountStatusLabel?.stringValue = error.localizedDescription
@@ -1378,6 +1384,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         let symbol: String
         switch item.identifier as? String {
         case "general": symbol = "gearshape"
+        case "account": symbol = "person.crop.circle"
         case "about": symbol = "info.circle"
         case "security": symbol = "lock.shield"
         case "credentials": symbol = "key"

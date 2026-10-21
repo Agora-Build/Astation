@@ -47,7 +47,7 @@ final class AstationRecoveryCoordinator {
     private let store: AstationRecoveryCheckpointStorage
     private let identity: AtemE2EIdentity
     private let http: RemoteRecoveryTransport
-    private let relayURL: String
+    let relayURL: String
     private let allowNewDataKey: () -> Bool
     private let confirmOwner: (SignRequest) async -> Bool
     private let confirmReplacement: (String) async -> Bool
@@ -63,10 +63,10 @@ final class AstationRecoveryCoordinator {
     private var uncertain = false
 
     convenience init(accountID: String, managerID: String, identity: AtemE2EIdentity, relayURL: String,
-        tokenProvider: SsoTokenProvider, allowNewDataKey: @escaping () -> Bool) throws {
+        accessToken: @escaping @Sendable () async throws -> String, allowNewDataKey: @escaping () -> Bool) throws {
         try self.init(accountID: accountID, managerID: managerID, identity: identity, relayURL: relayURL,
             store: RemoteRecoveryStore(accountID: accountID),
-            transport: RemoteRecoveryHTTP(relayURL: relayURL, accessToken: { try await tokenProvider.validToken() }),
+            transport: RemoteRecoveryHTTP(relayURL: relayURL, accessToken: accessToken),
             dataKeys: DataEncryptionKeyManager.shared, allowNewDataKey: allowNewDataKey,
             confirmOwner: { request in
                 await withCheckedContinuation { continuation in

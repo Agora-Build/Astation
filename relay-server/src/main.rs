@@ -1,5 +1,6 @@
 mod admin;
 mod approval_escalation;
+mod account_identity;
 mod account_store;
 mod auth;
 mod cluster;
@@ -59,7 +60,7 @@ pub struct AppState {
     pub knowledge: Arc<dyn knowledge_store::KnowledgeStore>,
     /// Astation keys + durable session bindings (Postgres when DATABASE_URL is set).
     pub identity: Arc<dyn identity_store::IdentityStore>,
-    /// Optional Agora-account registration and Astation-to-data-account mapping.
+    /// Verified login registration and explicit Astation-to-data-account mapping.
     pub accounts: Arc<dyn account_store::AccountStore>,
     pub recovery: Arc<remote_api::recovery::RecoveryStore>,
 }

@@ -32,6 +32,7 @@ class AstationHubManager: ObservableObject {
     private var hubStartTime = Date()
     let sessionStore: SsoSessionStore
     let tokenProvider: SsoTokenProvider
+    let accountAuth = AstationAccountAuth()
     let apiClient = AgoraAPIClient()
     let rtcManager = RTCManager()
     let authGrantController = AuthGrantController()
@@ -111,10 +112,12 @@ class AstationHubManager: ObservableObject {
 
     @MainActor func recoveryCoordinator(account: String? = nil, relayURL: String? = nil) throws -> AstationRecoveryCoordinator {
         let account = account ?? e2eDataAccount
-        if let coordinator = accountRecovery, coordinator.accountID == account { return coordinator }
+        let targetRelay = relayURL ?? stationRelayUrl
+        if let coordinator = accountRecovery, coordinator.accountID == account, coordinator.relayURL == targetRelay { return coordinator }
         accountRecovery = nil
         let coordinator = try AstationRecoveryCoordinator(accountID: account, managerID: AstationIdentity.shared.id,
-            identity: atemE2EIdentity, relayURL: relayURL ?? stationRelayUrl, tokenProvider: tokenProvider,
+            identity: atemE2EIdentity, relayURL: targetRelay,
+            accessToken: { [accountAuth] in try await accountAuth.accessToken(relayURL: targetRelay) },
             allowNewDataKey: { [weak self] in self?.e2eDataAccount == account && self?.relayEncryptionState?.mode == "off" })
         accountRecovery = coordinator
         return coordinator
@@ -446,6 +449,9 @@ class AstationHubManager: ObservableObject {
         checkSessionStatus()
         refreshProjects()
         broadcastCredentials()
+    }
+
+    func accountSessionChanged() {
         registerRelayAccountIfPossible()
     }
 
@@ -2548,18 +2554,21 @@ class AstationHubManager: ObservableObject {
 
     private func registerRelayAccountIfPossible() {
         guard identityRelayVerified else { return }
+        let generation = identityRelaySocketGeneration
+        let relayURL = stationRelayUrl
         Task { [weak self] in
             guard let self else { return }
             do {
-                _ = try await tokenProvider.validToken()
-                guard let session = sessionStore.load() else { return }
+                let token = try await accountAuth.accessToken(relayURL: relayURL)
                 let rawLabel = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
                 let label = DeviceAuthentication.deviceLabel(rawLabel)
                 guard let text = RelayIdentityProtocol.registerAccountMessage(
-                    accessToken: session.accessToken,
+                    accessToken: token,
                     label: label
                 ) else { return }
                 await MainActor.run {
+                    guard self.identityRelaySocketGeneration == generation,
+                          self.stationRelayUrl == relayURL, self.identityRelayVerified else { return }
                     self.sendRelayIdentityControl(text, label: "relayRegisterAccount")
                 }
             } catch {

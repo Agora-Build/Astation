@@ -269,10 +269,80 @@ relay, signed control membership, r7 catch-up/atomic decisions and a durable
 dispatch outbox must be integrated first. A raw Atem room connection and an SSO
 account login are not authorization for approval delivery or decisions.
 
-#### Optional Agora account registration
+#### Unified account login and recovery storage
+
+Astation #63 separates agora.build login from Agora service credentials. The
+implemented Auth contract is pinned at Agora-Build/Auth `bc1bfe7`,
+`docs/integrating.md`. Its issuer is `https://auth.agora.build`; the issuer must
+actually resolve and serve discovery before live account setup can work.
+
+Ask the Auth operator to register Astation in its private clients file. The
+following is a proposed registration, not an existing deployed client:
+
+```json
+{
+  "resources": [{
+    "indicator": "https://station.agora.build",
+    "name": "Astation account storage",
+    "scopes": ["station:account"]
+  }],
+  "clients": [{
+    "id": "astation", "name": "Astation", "type": "native", "firstParty": true,
+    "redirectUris": ["http://127.0.0.1/callback"],
+    "grants": ["authorization_code", "refresh_token"],
+    "scopes": ["openid", "profile", "offline_access", "station:account"],
+    "resources": ["https://station.agora.build"]
+  }]
+}
+```
+
+Use the operator-confirmed values consistently; do not assume the example is
+registered. The relay needs all three settings on every replica:
+
+```text
+ACCOUNT_OIDC_ISSUER=https://auth.agora.build
+ACCOUNT_OIDC_AUDIENCE=https://station.agora.build
+ACCOUNT_OIDC_REQUIRED_SCOPE=station:account
+```
+
+Set matching app build variables. The package build stamps these public values
+into Info.plist before signing, so a Finder-launched app retains configuration:
+
+```text
+ASTATION_ACCOUNT_ISSUER=https://auth.agora.build
+ASTATION_ACCOUNT_CLIENT_ID=astation
+ASTATION_ACCOUNT_RESOURCE=https://station.agora.build
+ASTATION_ACCOUNT_SCOPE=station:account
+```
+
+Settings > Account signs in to agora.build. General > Agora Services retains
+the existing Agora session for projects and credentialSync. Recovery HTTP and
+relay account registration use only the account token. The app sends it only
+to the registered API origin; pasted Recovery Kit URLs cannot choose a token
+recipient. Keychain stores the rotating refresh token and a durable refresh
+intent. An interrupted refresh requires sign-in instead of replaying an old
+one-use token. This does not delete recovery checkpoints, keys or paired hosts.
+
+Migration `0010_account_identities.sql` preserves existing legacy principal
+strings and records their `legacy:agora` namespace. Data-account IDs, signed
+roots and backups do not change. Inventory legacy registrations before rollout:
+ordinary registration refuses an identity change and retains the old binding.
+An explicit verified legacy-to-unified binding migration is separate work.
+Never relabel subjects, match by email, or clear live state to pass a test.
+
+Validate discovery, a real registered native login, relay registration, and
+recovery storage over the provisioned app/deployed relay before retrying the
+retained isolated `atem pair verify` operation. Signing-key outage must fail
+closed after the 60-second cache window. JWT `iat` is not fresh-authentication
+proof: if API tokens omit `auth_time`, offline data merges remain unavailable;
+online owner approval still works. Login never authorizes membership or K.
+Main merge/deployment still requires user approval. Atem #93 and other r9
+admission gates remain independent.
+
+#### Legacy Agora account registration
 
 Leave `AGORA_ACCOUNT_USERINFO_URL`, `AGORA_ACCOUNT_SUBJECT_FIELD`, and
-`AGORA_ACCOUNT_AUTH_TIME_FIELD` unset while unified agora.build SSO is built.
+`AGORA_ACCOUNT_AUTH_TIME_FIELD` unset for unified agora.build account login.
 These settings enable optional Agora-specific registration and explicit data
 grouping. Ordinary pairing, memory/skills/vault sync, and E2EE do not require
 this feature; unregistered Astations keep using their Astation ID as the data
@@ -285,13 +355,12 @@ migration status separately when diagnosing connection or migration failures.
 `/health` and `verify-station.mjs` verify infrastructure, not account login or
 registration.
 
-The planned replacement is [unified agora.build identity](docs/specs/2026-10-10-unified-agora-build-identity.md),
-with permanent agora.build accounts and linked GitHub, Google, Apple, and Agora
-sign-in providers. The portal team does not need these legacy settings to build
-that service. Product APIs will verify the trusted issuer and intended audience
-through signing keys/JWKS or supported token introspection. Sensitive actions
-may require fresh-authentication proof, separate from device approval and E2EE
-recovery. Changing only the current userinfo URL is insufficient.
+The replacement is [unified agora.build identity](docs/specs/2026-10-10-unified-agora-build-identity.md),
+with permanent accounts and linked sign-in providers. Auth implements GitHub
+and Google; Apple and Agora federation remain future work. The integration
+above verifies the trusted issuer and intended audience through JWKS. Sensitive
+actions require fresh-authentication proof, separate from device approval and
+E2EE recovery. Changing only the old userinfo URL is insufficient.
 
 Keep the runtime compatibility implementation until the new integration and
 safe account/data migration are verified, then remove its settings and code.

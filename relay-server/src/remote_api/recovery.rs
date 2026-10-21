@@ -706,8 +706,9 @@ mod tests {
         async fn verify(
             &self,
             token: &str,
-        ) -> Result<crate::account_store::VerifiedAgoraAccount, VerifyError> {
-            Ok(crate::account_store::VerifiedAgoraAccount {
+        ) -> Result<crate::account_identity::VerifiedIdentity, VerifyError> {
+            Ok(crate::account_identity::VerifiedIdentity {
+                issuer: crate::account_identity::LEGACY_ISSUER.into(),
                 subject: token.to_owned(),
                 authenticated_at: None,
             })
