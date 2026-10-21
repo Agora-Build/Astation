@@ -26,6 +26,9 @@ jobs:
   build-macos:
     name: Build macOS
     runs-on: macos-15
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,6 +67,14 @@ jobs:
 
       - name: Verify pinned terminal assets
         run: python3 scripts/setup-terminal-assets.py --verify
+
+      - name: Prepare verified Atem client package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/check-atem-client-apple.py --install
+
+      - name: Test native r9 adapter against supplied library
+        run: swift test --package-path native-remote
 
       - name: Build Swift package
         run: swift build -c release

@@ -5,10 +5,14 @@
 [Atem's start request](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6306876197)
 confirms that the accepted edeb8f0 client packages and settled binding/effect
 contract can be consumed while the host-only quarantine correction is finalized.
-The task branch now contains encoded-byte push acknowledgment batching and a
-reproducible, integrity-checked Apple artifact consumer. These prepare transport
-and native consumption; authenticated durable push ingress, complete shared-core
-ceremony/adapters and runtime/platform conformance remain before admission.
+The task branch now contains encoded-byte push acknowledgment batching, a
+reproducible Apple artifact installer and a native SwiftPM adapter over the
+accepted shared core. The adapter captures original-JSON pairing commitments,
+owns a connection per virtual channel, fences deferred signing on disconnect
+or expiry and forwards typed operations without replay. Its focused native
+tests and iOS simulator compilation pass. The app's ceremony, membership
+persistence and direct/relay routers still need wiring; authenticated durable
+push ingress and runtime/platform conformance remain before admission.
 Git staging works with actual changes in this session; the earlier metadata
 blocker is no longer reproduced.
 
@@ -60,9 +64,9 @@ bound remain required. All three final binding packages verify; 19 local
 Swift/static-library FFI checks include every pinned verifyCommit example.
 The final-pin/package wait is closed. Android ABI libraries have since passed Task 9b static review; device/emulator
 loading remains. Complete ceremony, platform/storage/router adapters and runtime
-conformance still gate admission. The worker cannot write external Git metadata;
-its staged patch and narrow binding-consumer check are not a committed app
-integration or a successful SwiftPM/iOS run.
+conformance still gate admission. The earlier external-Git-metadata blocker
+is resolved. See [Apple consumption](../../docs/atem-client-artifacts.md) for
+the pinned SwiftPM integration, native adapter coverage and remaining gates.
 
 
 The [Task 9a follow-up](remote-agent-api-task9a-review.md) reviews

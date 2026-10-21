@@ -2,6 +2,7 @@
 /build/
 /output/
 /.build/
+/native-remote/.build/
 /target/
 /server/target/
 

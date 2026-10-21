@@ -14,6 +14,7 @@ on:
 permissions:
   contents: write
   packages: write
+  actions: read
 
 concurrency:
   group: astation-release
@@ -127,6 +128,11 @@ jobs:
             fi
             cmake -S . -B build-sdk -DBUILD_TESTING=OFF
           fi
+
+      - name: Prepare verified Atem client package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/check-atem-client-apple.py --install
 
       - name: Build Swift package
         run: swift build -c release

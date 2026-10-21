@@ -15,6 +15,36 @@ spec.loader.exec_module(artifacts)
 
 
 class ArtifactIntegrityTests(unittest.TestCase):
+    def test_install_is_repeatable_and_refuses_a_modified_dependency(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "Package.swift").write_text("reviewed manifest")
+            destination = root / "installed/AtemClient"
+            artifacts.install_package(source, destination)
+            artifacts.install_package(source, destination)
+            (destination / "Package.swift").write_text("modified manifest")
+            with self.assertRaisesRegex(ValueError, "differs"):
+                artifacts.install_package(source, destination)
+            self.assertEqual((destination / "Package.swift").read_text(), "modified manifest")
+
+    def test_install_refuses_added_source_and_symlink_destination(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "Package.swift").write_text("reviewed manifest")
+            destination = root / "installed"
+            artifacts.install_package(source, destination)
+            (destination / "extra.swift").write_text("unexpected source")
+            with self.assertRaisesRegex(ValueError, "differs"):
+                artifacts.install_package(source, destination)
+            alias = root / "alias"
+            alias.symlink_to(destination, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                artifacts.install_package(source, alias)
+
     def test_modified_artifact_is_rejected(self):
         digest = hashlib.sha256(b"reviewed archive").hexdigest()
         with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):

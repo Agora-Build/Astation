@@ -1,0 +1,98 @@
+{
+  "account_id": "acct-test-1",
+  "entries": [
+    {
+      "body": {
+        "account_id": "acct-test-1",
+        "action": "genesis",
+        "member": {
+          "auth_key": {
+            "alg": "p256",
+            "pub": "BGj-ylkEWPb6IhML-_3UFdZBrKwvdFDlz-QamAuwz2xIOjXX2myAwtuCxfGu8jmWSTz-tAG9CkVNSCiRhZ-00bE"
+          },
+          "device_id": "dev-mac",
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "2v1EMbjZDC-YryNDJmZaakKgKMTtTjjIb0sA4XnLI1k"
+          },
+          "kind": "native",
+          "roles": [
+            "control",
+            "manage",
+            "view"
+          ]
+        },
+        "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "recovery_key": {
+          "alg": "ed25519",
+          "pub": "mHZ8mI_wz3J66ZF4EenE7WO3-0hgjUwyaI23ny7ZQ2A"
+        },
+        "seq": 1,
+        "signed_at": 1792400000000,
+        "signer": "dev-mac",
+        "type": "atem-membership-entry",
+        "v": 1
+      },
+      "sig": "VQHNBz3HVFgfUpkwe-9oD1uMjr6MwSJtD-BPIt38iAwMIglJ_bQXyYC0ItjOtEcXbmHKF796bYWbUXkxDLmxvw"
+    },
+    {
+      "body": {
+        "account_id": "acct-test-1",
+        "action": "add_host",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host": {
+          "host_id": "host-a",
+          "host_key": {
+            "alg": "ed25519",
+            "pub": "ma83XDqxm6EF2qRk7IN4a9VFv5TX8wRPAdlUZYziNY4"
+          },
+          "host_trust_gen": 1
+        },
+        "prev_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "seq": 2,
+        "signed_at": 1792400001000,
+        "signer": "dev-mac",
+        "type": "atem-membership-entry",
+        "v": 1
+      },
+      "sig": "yuNcjJNObR0siA0L4hDpWHBjz4UyJtpq9mkoq2fFUMsy__zw5LxMwn3UuqreD1ybu-QtoR9QeikpEUvgIsCKvQ"
+    },
+    {
+      "body": {
+        "account_id": "acct-test-1",
+        "action": "add",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "member": {
+          "auth_key": {
+            "alg": "p256",
+            "pub": "BGV5Ov3b43EjUrJGejYvqwfQljq9X4Tx0Rd1aYDInE29tmNy-IIhgIH0hY-cheON0bvA_O0yEeah0yUbXnxO5SQ"
+          },
+          "device_id": "dev-phone",
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "oJkn3Pr5ZonLiInBeyLi4eNyIcHkLMRz0EmmHE-ZiXY"
+          },
+          "kind": "native",
+          "roles": [
+            "control",
+            "manage",
+            "view"
+          ]
+        },
+        "prev_hash": "7cc348b5991f0995cb2a7b9300202dc8323733484fc49bfd264800447a2d4e3d",
+        "seq": 3,
+        "signed_at": 1792400002000,
+        "signer": "dev-mac",
+        "type": "atem-membership-entry",
+        "v": 1
+      },
+      "sig": "MBHa-kF4XZ-i_xhlzkTzV_-FEUhWH0EXwCaTn7v9NZkvz3c86ZpZgmDabg4RVRwhLDB5l-jd8rvWuXPezTKDWw"
+    }
+  ],
+  "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+  "source": {
+    "git_blob_sha1": "476dfa6b2468f4c0e9cd44d296479ff6539d1dda",
+    "path": "designs/protocol/fixtures/r9-vectors-membership-log.json",
+    "revision": "edeb8f0fab71d4573e41c4ca7935aab207200caf"
+  }
+}

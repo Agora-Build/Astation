@@ -8,7 +8,8 @@ records its scope; it is separate from the final host/quarantine review.
 Run the native consumer check from this worktree on macOS:
 
 ```sh
-python3 scripts/check-atem-client-apple.py
+python3 scripts/check-atem-client-apple.py --install
+swift test --package-path native-remote
 ```
 
 It uses the existing `gh` sign-in to download artifact `12284764754`. An already
@@ -18,14 +19,33 @@ all three payload digests, clean source commit and production features before
 compiling the supplied Swift wrapper against the supplied macOS static library.
 It runs the checked-in raw pairing examples through the shared strict reader,
 plus extra malformed-input, minimum-generation and canonical-JSON checks.
-The pairing fixture's Git blob hash is also pinned. Temporary binaries and
-extracted packages are removed afterwards.
+The pairing fixture's Git blob hash is also pinned. Temporary check binaries
+are removed afterwards. `--install` retains the verified package under
+`build/atem-client/<revision>/AtemClient`; the app and `native-remote` SwiftPM
+packages consume that exact dependency. Repeated installation verifies its
+files and refuses a modified/extra source or a symlink. Dependency preparation
+runs before Swift compilation in development, signing and CI/release workflows.
 
-This builds an Astation consumer, without building an Atem checkout or executing
-the package manifest or archive scripts. It exercises 19 checks against the
-production FFI. It does not establish full app/SwiftPM/iOS integration, an
-immutable live ceremony, membership persistence, router adapters, or enabled
-remote admission. Those remain the next native integration steps.
+The checker compiles an Astation consumer without building an Atem checkout
+or executing archive-supplied scripts/manifest. SwiftPM subsequently reads the
+reviewed package manifest and compiles the supplied Swift wrapper against its
+prebuilt xcframework. The checker exercises 19 FFI checks. The native module
+adds immutable raw-JSON ceremony capture and one shared-core connection per
+virtual channel, deferred owner signing with disconnect/deadline fencing,
+typed operations and channel-only closure. It does not yet wire the app's
+ceremony, membership persistence or direct/relay routers. Remote admission
+remains disabled; full app/iOS/platform/relay conformance is still required.
+
+Native verification includes 15 XCTest cases: generation syntax, duplicate
+keys and context capture; handshake/authorization deadlines; a signature
+arriving after disconnect; stale routes; operation rejection versus transport
+failure; and closure affecting only its own channel. A public signed membership
+prefix is verified by the production core, which then creates a real `init`
+and rejects a malformed `accept` before requesting a signature. The 14 lifecycle
+and capture cases are adapter tests, not the upstream scenario harness.
+`xcodebuild -scheme AstationRemote -destination 'generic/platform=iOS Simulator'
+build CODE_SIGNING_ALLOWED=NO` also compiles both simulator architectures when
+run from `native-remote`. It is a compilation check, not a simulator runtime test.
 
 The current GitHub artifact expires on 2027-01-18. A later durable artifact
 handoff must update the pin after review; the checker never substitutes a
