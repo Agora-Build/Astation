@@ -115,9 +115,7 @@ class AstationHubManager: ObservableObject {
         send: { [weak self] message, route in
             self?.sendMessage(message, to: route.clientId, expectedRelayConnectionId: route.clientId.hasPrefix("relay-") ? route.connectionId : nil)
             if case .deviceVerified = message {
-                self?.remoteTrustDidChange()
-                self?.requestRelayEncryptionState()
-                self?.requestAgentList(from: route.clientId)
+                self?.remoteVerificationDidComplete(on: route)
             }
         },
         approve: AtemVerificationUI.approve,
@@ -1287,6 +1285,16 @@ class AstationHubManager: ObservableObject {
         agentsByClientId = agentsByClientId.filter { terminalConnection(for: $0.key) != nil }
         objectWillChange.send()
         terminalConnectionsDidChange?()
+    }
+
+    func remoteVerificationDidComplete(on route: AtemVerificationRoute) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard verificationRoute(clientId: route.clientId,
+                  relayConnectionId: route.clientId.hasPrefix("relay-") ? route.connectionId : nil) == route,
+              let context = sessionContext(for: route.clientId), context.device == route.deviceId else { return }
+        remoteTrustDidChange()
+        requestRelayEncryptionState()
+        nativeSessionClients[route.clientId]?.verificationDidComplete(context: context)
     }
 
     @discardableResult
