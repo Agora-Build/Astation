@@ -239,6 +239,7 @@ struct HubInner {
     ws_limiter: WsConnLimiter,
     push_tokens: std::sync::OnceLock<Arc<dyn crate::push_tokens::PushTokenStore>>,
     push_delivery: std::sync::OnceLock<Arc<crate::push_delivery::PushDelivery>>,
+    recovery_probes: crate::remote_api::recovery_probe::ProbeBroker,
 }
 
 /// The relay: this replica's sockets plus the shared room directory, the
@@ -290,12 +291,36 @@ impl RelayHub {
                 ws_limiter: parts.ws_limiter,
                 push_tokens: std::sync::OnceLock::new(),
                 push_delivery: std::sync::OnceLock::new(),
+                recovery_probes: crate::remote_api::recovery_probe::ProbeBroker::default(),
             }),
         }
     }
 
     pub(crate) fn ws_limiter(&self) -> &WsConnLimiter {
         &self.inner.ws_limiter
+    }
+
+    pub(crate) fn probes(&self) -> &crate::remote_api::recovery_probe::ProbeBroker { &self.inner.recovery_probes }
+
+    async fn recovery_probe_reply(&self, connection: &str, text: &str, last_reply: &mut Option<Instant>) -> bool {
+        if text.len() > 65_536 { return false; }
+        let Ok(message) = atem_client::canonical::StrictValue::parse(text.as_bytes(), 65_536) else { return false };
+        let value = message.value();
+        let Some(handle) = value["channel"].as_str().filter(|h| h.len() == 35 && h.starts_with("rp_") && h[3..].bytes().all(|b| b.is_ascii_hexdigit())) else { return false };
+        if value["type"] != "channel" { return false; }
+        if value["event"] == "frame" && value.as_object().map(|o| o.len()) == Some(4) {
+            let frame = value["frame"].clone();
+            if frame["ch"] == "atem-ch1" && (frame["op"] == "accept" || frame["op"] == "error") {
+                if last_reply.is_some_and(|last| last.elapsed() < Duration::from_millis(500)) { return true; }
+                *last_reply = Some(Instant::now());
+                self.probes().reply(handle, connection, frame.clone());
+                let _ = self.inner.bus.broadcast(BroadcastMessage::RecoveryProbe {
+                    handle: handle.into(), connection: connection.into(), frame,
+                }).await;
+            }
+        }
+        // Reserved, single-use recovery handles never become messages to a room owner.
+        true
     }
 
     pub(crate) fn configure_push_tokens(&self, store: Arc<dyn crate::push_tokens::PushTokenStore>) {
@@ -622,6 +647,9 @@ impl RelayHub {
                     .bus_received
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 match event {
+                    BusEvent::Broadcast(BroadcastMessage::RecoveryProbe { handle, connection, frame }) => {
+                        hub.probes().reply(&handle, &connection, frame);
+                    }
                     BusEvent::Inbox(message) => apply_inbox(hub.local(), message),
                     BusEvent::Broadcast(BroadcastMessage::RoomChanged { code }) => {
                         hub.invalidate_room(&code)
@@ -2487,6 +2515,7 @@ async fn handle_ws(
     // Set when the writer must flush (a rejection, a close frame) before
     // the socket goes.
     let mut flush_writer = false;
+    let mut recovery_probe_last_reply = None;
     let mut watch_close = true;
     loop {
         let pending_deadline = astation_auth
@@ -2565,11 +2594,13 @@ async fn handle_ws(
                             .is_some_and(|current| current.conn == connection_id)
                     };
                     match hub.check_sender(&code, is_current).await {
-                        Ok(SenderCheck::Current(RoomInfo { owner: Some(owner), .. })) => {
-                            hub.deliver(&owner, atem_envelope(&atem_id, &connection_id, &text))
-                                .await;
+                        Ok(SenderCheck::Current(room)) => {
+                            if !hub.recovery_probe_reply(&connection_id, &text, &mut recovery_probe_last_reply).await {
+                                if let Some(owner) = room.owner {
+                                    hub.deliver(&owner, atem_envelope(&atem_id, &connection_id, &text)).await;
+                                }
+                            }
                         }
-                        Ok(SenderCheck::Current(_)) => {}
                         Ok(SenderCheck::Stale) => {
                             // Replaced elsewhere, its eviction lost: leave.
                             tracing::debug!(
@@ -3662,6 +3693,7 @@ pub(crate) mod tests {
 
     fn create_relay_app() -> Router {
         let state = crate::AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: crate::session_store::SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: crate::rtc_session::RtcSessionStore::new(),
@@ -4134,6 +4166,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_pair_status_shows_unpaired_then_paired() {
         let state = crate::AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: crate::session_store::SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: crate::rtc_session::RtcSessionStore::new(),
@@ -4309,6 +4342,7 @@ pub(crate) mod tests {
 
     fn identity_state(identity: std::sync::Arc<dyn crate::identity_store::IdentityStore>) -> crate::AppState {
         crate::AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: crate::session_store::SessionStore::new(),
             relay: RelayHub::with_auth_timeout(TEST_AUTH_TIMEOUT),
             rtc_sessions: crate::rtc_session::RtcSessionStore::new(),
@@ -4353,6 +4387,7 @@ pub(crate) mod tests {
             std::sync::Arc::new(verifier),
         );
         crate::AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: crate::session_store::SessionStore::new(),
             relay: RelayHub::with_auth_timeout(TEST_AUTH_TIMEOUT),
             rtc_sessions: crate::rtc_session::RtcSessionStore::new(),
@@ -6104,6 +6139,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn pending_astations_are_capped_per_client_ip_and_per_room() {
         let state = crate::AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             relay: RelayHub::with_auth_timeout(Duration::from_secs(10)),
             ..memory_identity_state()
         };
@@ -6153,6 +6189,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn websocket_connections_are_capped_per_client_ip() {
         let state = crate::AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             relay: RelayHub::with_ws_limit(2, TEST_AUTH_TIMEOUT),
             ..memory_identity_state()
         };
@@ -6200,6 +6237,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_per_ip_cap_keys_on_cloudflares_address_and_leaves_other_ips_alone() {
         let state = crate::AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             relay: RelayHub::with_ws_limit(1, TEST_AUTH_TIMEOUT),
             ..memory_identity_state()
         };
@@ -6247,6 +6285,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn refused_and_closed_sockets_release_their_slot() {
         let state = crate::AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             relay: RelayHub::with_ws_limit(1, TEST_AUTH_TIMEOUT),
             ..memory_identity_state()
         };

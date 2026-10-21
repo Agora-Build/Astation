@@ -569,7 +569,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
 
         content.addArrangedSubview(sectionTitle("Account Recovery"))
         content.addArrangedSubview(wrappingInfo(
-            "Save the recovery kit somewhere off this Mac. It remains the fallback for an Astation that was never registered to an Agora account."
+            "Save your Recovery Kit v2 somewhere off this Mac. It anchors your account's signed device list and restores encrypted data if your trusted devices are lost."
         ))
         let idLabel = NSTextField(labelWithString: "Astation ID: \(RecoveryKit.masked(AstationIdentity.shared.id))")
         idLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
@@ -581,7 +581,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
 
         content.addArrangedSubview(sectionTitle("Restore on a New Mac"))
         content.addArrangedSubview(wrappingInfo(
-            "Replace this Astation's ID with the one in your recovery kit. Astation quits; open it again to finish. Atems paired with the current ID will need to pair again."
+            "Sign in to the same account and import your Recovery Kit v2. A reachable trusted Atem confirms the current device list. Your replacement device then needs manager approval or the recovery waiting period."
         ))
         let restoreButton = NSButton(title: "Restore Account…", target: self, action: #selector(restoreAccount))
         restoreButton.bezelStyle = .rounded
@@ -807,11 +807,15 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         let response = alert.runModal()
         pendingEncryptionAlert = nil
         if response == .alertFirstButtonReturn {
-            do {
-                try hubManager.installEncryptionKey(key)
-                hubManager.setRelayEncryption(mode: "enabling", kid: key.kid)
-            } catch {
-                hubManager.relayEncryptionStatusMessage = error.localizedDescription
+            hubManager.relayEncryptionStatusMessage = "Saving the encrypted recovery backup..."
+            Task { @MainActor in
+                do {
+                    try await hubManager.installEncryptionKey(key)
+                    hubManager.setRelayEncryption(mode: "enabling", kid: key.kid)
+                } catch {
+                    hubManager.relayEncryptionStatusMessage = error.localizedDescription
+                }
+                renderEncryptionState()
             }
         }
         pendingEncryptionRecoveryKey = nil
@@ -939,14 +943,19 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
             alert.addButton(withTitle: "Restore")
             alert.addButton(withTitle: "Cancel")
             guard alert.runModal() == .alertFirstButtonReturn else { return }
-            do {
-                try self.hubManager.restoreEncryptionKey(field.stringValue)
-                self.hubManager.relayEncryptionStatusMessage =
-                    self.hubManager.relayEncryptionState?.mode == "off"
-                    ? "Encryption key restored; turning encryption on."
-                    : "Encryption key restored."
-            } catch {
-                self.hubManager.relayEncryptionStatusMessage = error.localizedDescription
+            let text = field.stringValue
+            self.hubManager.relayEncryptionStatusMessage = "Saving the encrypted recovery backup..."
+            Task { @MainActor in
+                do {
+                    try await self.hubManager.restoreEncryptionKey(text)
+                    self.hubManager.relayEncryptionStatusMessage =
+                        self.hubManager.relayEncryptionState?.mode == "off"
+                        ? "Encryption key restored; turning encryption on."
+                        : "Encryption key restored."
+                } catch {
+                    self.hubManager.relayEncryptionStatusMessage = error.localizedDescription
+                }
+                self.renderEncryptionState()
             }
             self.renderEncryptionState()
         }
@@ -1144,32 +1153,33 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
                 self.setRecoveryStatus("Not authenticated, so the recovery kit wasn't shown.", isError: true)
                 return
             }
-            let relayURL = StationRelayURL.validatedBase(SettingsWindowController.currentAstationRelayUrl)
-                ?? SettingsWindowController.defaultStationURL
-            let text: String
-            do {
-                text = try self.hubManager.atemE2EIdentity.recoveryKit(astationId: AstationIdentity.shared.id, relayURL: relayURL)
-            } catch {
-                self.setRecoveryStatus(error.localizedDescription, isError: true)
-                return
+            self.setRecoveryStatus("Preparing your Recovery Kit v2 and encrypted key backup...", isError: false)
+            Task { @MainActor in
+                do {
+                    let kit = try await self.hubManager.recoveryCoordinator().exportedKit()
+                    self.presentRecoveryKit(kit.text())
+                } catch { self.setRecoveryStatus(error.localizedDescription, isError: true) }
             }
-            let alert = NSAlert()
-            alert.messageText = "Astation Recovery Kit"
-            alert.informativeText = "Save this somewhere off this Mac, such as a password manager. You need it to get your memories, skills and vaults back if this Mac is lost."
-            alert.accessoryView = Self.textBox(text, editable: false).0
-            alert.addButton(withTitle: "Copy")
-            alert.addButton(withTitle: "Save to File…")
-            alert.addButton(withTitle: "Done")
-            switch alert.runModal() {
-            case .alertFirstButtonReturn:
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(text, forType: .string)
-                self.setRecoveryStatus("Recovery kit copied to the clipboard.", isError: false)
-            case .alertSecondButtonReturn:
-                self.saveRecoveryKit(text)
-            default:
-                break
-            }
+        }
+    }
+
+    private func presentRecoveryKit(_ text: String) {
+        let alert = NSAlert()
+        alert.messageText = "Astation Recovery Kit"
+        alert.informativeText = "Save this somewhere off this Mac, such as a password manager. You need it to get your memories, skills and vaults back if this Mac is lost."
+        alert.accessoryView = Self.textBox(text, editable: false).0
+        alert.addButton(withTitle: "Copy")
+        alert.addButton(withTitle: "Save to File…")
+        alert.addButton(withTitle: "Done")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            self.setRecoveryStatus("Recovery kit copied to the clipboard.", isError: false)
+        case .alertSecondButtonReturn:
+            self.saveRecoveryKit(text)
+        default:
+            break
         }
     }
 
@@ -1194,7 +1204,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
             }
             let input = NSAlert()
             input.messageText = "Restore Account"
-            input.informativeText = "Paste your recovery kit, or just the Astation ID."
+            input.informativeText = "Paste your complete Recovery Kit v2. Legacy Astation-ID kits can also be read."
             let (box, textView) = Self.textBox("", editable: true)
             input.accessoryView = box
             input.addButton(withTitle: "Continue")
@@ -1202,9 +1212,25 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
             input.window.initialFirstResponder = textView
             guard input.runModal() == .alertFirstButtonReturn else { return }
 
-            guard let kit = RecoveryKit.parse(textView.string) else {
-                self.setRecoveryStatus("The recovery kit needs a valid Astation ID and relay URL.", isError: true)
+            let parsed: RecoveryKitInput
+            do { parsed = try RecoveryKitInput.parse(textView.string) }
+            catch {
+                self.setRecoveryStatus(error.localizedDescription, isError: true)
                 return
+            }
+            let kit: RecoveryKit
+            switch parsed {
+            case .v2(let recovery):
+                self.setRecoveryStatus("Checking the signed device list and contacting a trusted Atem host...", isError: false)
+                Task { @MainActor in
+                    do {
+                        // An imported URL is a hint, never authority to receive our account token.
+                        let coordinator = try self.hubManager.recoveryCoordinator(account: recovery.accountID)
+                        self.setRecoveryStatus(try await coordinator.restoreAccount(kit: recovery), isError: false)
+                    } catch { self.setRecoveryStatus(error.localizedDescription, isError: true) }
+                }
+                return
+            case .legacy(let legacy): kit = legacy
             }
             guard kit.recoveryKey == nil else {
                 self.setRecoveryStatus("This kit contains an E2E recovery key. This version cannot restore the verification identity. Keep the complete kit; the account was not changed.", isError: true)

@@ -1,3 +1,4 @@
+import AstationRemote
 import Foundation
 import LocalAuthentication
 import Darwin
@@ -57,6 +58,8 @@ struct RecoveryKit: Equatable {
     /// Reads a kit back from its saved text, or from the bare ID pasted on its
     /// own. Returns nil when no valid Astation ID is found.
     static func parse(_ text: String) -> RecoveryKit? {
+        // A damaged/extended v2 kit must never downgrade into an ID-only restore.
+        guard !RecoveryKitInput.requiresV2Reader(text) else { return nil }
         var id: String?
         var relay: String?
         var recovery: String?
@@ -124,6 +127,25 @@ struct RecoveryKit: Equatable {
         let rest = id.hasPrefix(idPrefix) ? String(id.dropFirst(idPrefix.count)) : id
         guard rest.count > 11 else { return id }
         return "\(idPrefix)\(rest.prefix(4))…\(rest.suffix(7))"
+    }
+}
+
+enum RecoveryKitInput {
+    case legacy(RecoveryKit)
+    case v2(RemoteRecoveryKit)
+
+    static func requiresV2Reader(_ text: String) -> Bool {
+        text.split(whereSeparator: \.isNewline).contains { line in
+            let value = line.trimmingCharacters(in: .whitespaces).lowercased()
+            return value.hasPrefix("astation recovery kit v") || value.hasPrefix("recovery secret:") ||
+                value.hasPrefix("genesis fingerprint:") || value.hasPrefix("recovery kit integrity check:")
+        }
+    }
+
+    static func parse(_ text: String) throws -> Self {
+        if requiresV2Reader(text) { return .v2(try RemoteRecoveryKit(text: text)) }
+        guard let legacy = RecoveryKit.parse(text) else { throw RemoteRecoveryError.invalidKit }
+        return .legacy(legacy)
     }
 }
 

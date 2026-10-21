@@ -42,6 +42,8 @@ pub enum BroadcastMessage {
     KeyChanged { astation_id: String },
     /// A room's directory entry changed: drop any cached copy.
     RoomChanged { code: String },
+    /// One public signed head answering a recovery-only challenge.
+    RecoveryProbe { handle: String, connection: String, frame: serde_json::Value },
 }
 
 /// An inbox message whose serialized size (`payload_len`) is over

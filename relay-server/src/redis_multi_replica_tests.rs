@@ -204,6 +204,7 @@ async fn start_replica(shared: &Shared) -> Replica {
         &shared.accounts,
     );
     let state = AppState {
+        recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
         sessions: cluster.sessions.clone(),
         relay: cluster.relay.clone(),
         rtc_sessions: cluster.rtc_sessions.clone(),

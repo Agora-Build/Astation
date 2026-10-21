@@ -15,6 +15,10 @@ enum AstationMessage: Codable {
             }
             decoder.userInfo[AtemVerifyCommit.generationKey] = generation
         }
+        if root["type"]?.string == "verifyReveal" {
+            // No v1 downgrade: validate required keys and their original encoding first.
+            _ = try RemotePairingReveal(originalJSON: data)
+        }
         return try decoder.decode(Self.self, from: data)
     }
 

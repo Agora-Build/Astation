@@ -2,52 +2,67 @@
 
 ## Pairing integration progress, 2026-10-21
 
-The app now reads `verifyCommit.host_trust_gen` with the accepted shared
-client's strict reader before Foundation decodes the message. Valid generations
-remain immutable through the attempt; absent, fractional, exponent, zero and
-unsafe values cannot start verification. Decodable invalid commits produce
-`verifyAbort` only on an authenticated route; malformed packets, including
-duplicate keys, are dropped. Direct and identity-relay payload paths both use
-this decoder. The relay scanner retains number spellings before extraction.
-Verification commit/reveal/abort handlers capture the authenticated device,
-account and connection before asynchronous dispatch and reject a changed route
-or account instead of resolving a replacement connection inside the callback.
+The native v2 ceremony is connected to the app: explicit genesis setup,
+mandatory Recovery Kit saving, protected account checkpoints, fresh owner-bound
+Enclave signatures, relay CAS, K backups and final signed membership. The
+[Recovery Kit v2 design](../recovery-kit-v2.md) describes storage and restore
+invariants and the transport. The Apple package remains pinned to
+`eaaadc23477d12f1e2a0caa56ccafb1dd45be571`.
 
-`RemoteMembershipPublication` adds the native durability adapter around the
-shared `MembershipLog` and `EntryPublisher`. It persists the exact body before
-owner signing, persists the signature before returning a sendable append and
-atomically checkpoints the committed log with the cleared pending append after
-the relay reply. A retry returns the same stored signature. One shared publisher
-retains the core's process-wide claim for a manager. Reentrant calls are refused.
-Storage uncertainty halts the instance until its protected store is reconciled
-and reloaded. A conflict uses the shared verifier; an incomplete, invalid,
-inconsistent, pending or divergent result durably blocks further signing pending
-refresh. The refresh/unfreeze workflow is not implemented in this adapter yet.
-The host-entry helper copies the authenticated host id and captured generation
-unchanged into the body; its key must come from the ceremony's verified reveal.
+Original-JSON readers validate `verifyCommit.host_trust_gen` and the v2 reveal
+before Foundation decodes them. The required host channel key and genesis are
+included in the commitment/safety transcript. Authenticated account, device and
+connection context remain immutable across asynchronous preparation, owner
+approval and publication. Cancellation, reconnect, expiry and account changes
+fence late callbacks. There is no production v1 safety-code fallback.
 
-This is a staged integration, **not a completed r9 ceremony**. The existing
-native approval path still uses its earlier commitment/safety transcript and
-does not yet send `genesis_hash` or a signed membership chain. The new publisher
-is not yet connected to protected account-log storage, a production key provider
-or relay CAS requests. Account genesis, Recovery Kit v2, owner-confirmation
-binding, refreshed/frozen-log recovery and the final `deviceVerified.membership`
-handoff must be connected before reporting the ceremony shipped. Independent
-admission remains disabled; no legacy r9 fallback is introduced.
+The shared publisher checkpoints the exact body before confirmation, signature
+before send and committed head before success. One protected account store and
+process lock serialize bootstrap, publication, backup and restore. An uncertain
+store halts the operation; retries retain exact signed/sealed bytes. A signed
+pending entry is not discarded on cancellation. CAS conflicts use the shared
+verifier and require renewed confirmation; unresolved history stays blocked.
+`deviceVerified.membership` carries the verified chain through the exact host
+id, key and captured trust generation before the local device pin is installed.
 
-Fresh validation passes all 41 native adapter tests and 93 selected app
-pairing/session/terminal/migration tests, including compilation/linking of the
-macOS app. These are focused tests with injected storage and test signing keys;
-no new provisioned ceremony, rendered UI, full app suite or platform conformance
-pass is claimed.
+The relay persists signed logs and sealed backups in Postgres, with root-level
+transactions across replicas. Verified login controls storage visibility; the
+client's independent genesis and the shared verifier control trust. A bounded
+recovery-only HTTP probe reaches the host on its existing outbound socket while
+the original Mac is offline. It can obtain one fresh signed public head, never
+finish a controller handshake or forward commands.
 
-The latest Atem handoff (vault e52) reports Genie healthy at trust generation
-11 on v0.7.4. The Mac independently accepted generation 7/runtime epoch 18 and
-exchanged `welcome`/`list`/`sessions` without Retry at 11:35:57 UTC; rendered UI
-and session count were not verified. Atem #91's generation migration regression
-is closed by #92/v0.7.4. PR #89's head is `7f2ad113252060160dd9f722698477a1ba05685b`
-with green checks; accepted Apple dependency remains `eaaadc2`. Astation #58's
-previous head `74770d8` has completed green macOS/relay/webapp CI.
+Restore checks the kit and anchored chain, fetches the exact committed backup,
+requires a fresh host proof and durably installs current/retained K before
+requesting replacement membership. A pending replacement cannot pair or publish
+manager changes. A signed manager approval permits setup/export/pairing under
+the existing root. Key rotation and AEK1 imports publish a backup before installing
+the new key; encryption-off setup stays off. Repeated exports verify and reuse
+an unchanged committed backup.
+
+**Remaining gates:** this is not a released or live-tested r9 ceremony.
+Independent admission remains disabled. The accepted Apple binding has no durable
+membership-state export/load API equivalent to Rust `to_stored/from_stored`.
+The app retains in-process wait state, but re-verifying entries after a restart
+conservatively restarts pending recovery waits and cannot preserve local
+wait-ended decisions. [Atem #81](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6325080380)
+requests the shared binding API; no Swift replacement membership engine or
+relay-authoritative timer is introduced. Automatic delayed recovery across
+restart remains a gate. Explicit signed manager approval is tested.
+
+Validation includes native/app/relay tests, actual isolated Postgres transaction
+and restart tests, HTTP/WebSocket recovery with the Mac offline, and provisioned
+Data Protection Keychain/Secure Enclave checks. The iOS Simulator target compiles;
+its runtime cannot execute with this machine's mismatched CoreSimulator version.
+Rendered safety-code/Touch ID interaction and a live Atem v2 ceremony have not
+been exercised. Inbound session routers, durable sealed push/provider ingress,
+mobile/service integration and platform conformance still gate independent r9.
+Do not merge Atem #89 based on unit-test or compile evidence alone.
+
+The running provisioned app remains `74770d8`; these worktree changes do not
+replace it. Draft PR #58 is unmerged and no production deployment is authorized.
+The earlier protected-publisher stage at `727342f` passed its CI run; it is
+superseded by this implementation, not evidence for the new commit's CI.
 
 ## Corrected final implementation and artifacts, 2026-10-21
 
@@ -61,9 +76,10 @@ tests and 111 selected session/API/terminal tests pass with the merged main fixe
 The macOS app builds; all 37 selected identity/credential tests pass in the
 provisioned Personal Team host, with protected Keychain access required.
 The earlier scheduled-worker sandbox failure is superseded by this execution;
-no new iOS runtime execution is claimed. Live app ceremony,
-protected storage/signing, inbound/live routers, durable push/provider ingress
-and platform/relay conformance still gate admission, which remains disabled.
+no new iOS runtime execution is claimed. Live app ceremony, durable membership wait-state bindings, inbound/live routers,
+durable push/provider ingress and platform/relay conformance still gate admission,
+which remains disabled. The v2 section above supersedes this earlier stage's
+protected storage/signing status.
 No new product/security choice is pending. This supersedes the historical
 host finding/dependency status below.
 
@@ -464,9 +480,10 @@ wire operations or enable remote admission until the contract and fixtures
 are jointly pinned. No compatibility fallback or verification bypass. Main
 merges deploy production and still require the user's merge authorization.
 
-Current implementation: public readiness/gating and an isolated approval
-delivery policy are built and tested; no authenticated r9 ingress, public
-agent operation or provider dispatch is enabled. The policy derives deadlines
+Current implementation: public readiness/gating, v2 ceremony/recovery storage
+and an isolated approval delivery policy are built and tested. Authenticated
+independent session ingress, public agent operations and provider dispatch
+remain disabled. The policy derives deadlines
 from original creation and accepts a delivery margin. It awaits
 the authenticated lifecycle/shared-core integration before outbox delivery.
 Recovery enrollment delay, kit replacement, wait-for-host restore and the

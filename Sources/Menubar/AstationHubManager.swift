@@ -107,6 +107,18 @@ class AstationHubManager: ObservableObject {
     private var directMigrationContexts: [String: MigrationContext] = [:]
     private var directSessionContexts: [String: AtemSessionContext] = [:]
     let atemE2EIdentity: AtemE2EIdentity
+    @MainActor private var accountRecovery: AstationRecoveryCoordinator?
+
+    @MainActor func recoveryCoordinator(account: String? = nil, relayURL: String? = nil) throws -> AstationRecoveryCoordinator {
+        let account = account ?? e2eDataAccount
+        if let coordinator = accountRecovery, coordinator.accountID == account { return coordinator }
+        accountRecovery = nil
+        let coordinator = try AstationRecoveryCoordinator(accountID: account, managerID: AstationIdentity.shared.id,
+            identity: atemE2EIdentity, relayURL: relayURL ?? stationRelayUrl, tokenProvider: tokenProvider,
+            allowNewDataKey: { [weak self] in self?.e2eDataAccount == account && self?.relayEncryptionState?.mode == "off" })
+        accountRecovery = coordinator
+        return coordinator
+    }
     private lazy var atemVerification = AtemVerificationController(
         identity: atemE2EIdentity,
         account: { [weak self] in self?.e2eDataAccount ?? "" },
@@ -119,10 +131,35 @@ class AstationHubManager: ObservableObject {
             }
         },
         approve: AtemVerificationUI.approve,
-        saveRecovery: AtemVerificationUI.saveRecovery,
-        kit: { [weak self] in
-            guard let self else { throw AtemIdentityError.identityChanged }
-            return try self.atemE2EIdentity.recoveryKit(astationId: AstationIdentity.shared.id, relayURL: self.stationRelayUrl)
+        prepareKeys: { [weak self] account, nonce, completion in
+            Task { @MainActor in
+                do {
+                    guard let self, self.e2eDataAccount == account else { throw AtemIdentityError.identityChanged }
+                    completion(.success(try await self.recoveryCoordinator(account: account).pairingKeys(nonce: nonce)))
+                } catch { completion(.failure(error)) }
+            }
+        },
+        prepareHost: { [weak self] commit, reveal, keys, completion in
+            Task { @MainActor in
+                do {
+                    guard let self, self.e2eDataAccount == commit.context.accountID else { throw AtemIdentityError.identityChanged }
+                    let coordinator = try self.recoveryCoordinator(account: commit.context.accountID)
+                    let request = try await coordinator.prepareHost(commit: commit, reveal: reveal, keys: keys)
+                    var publishing: Task<Void, Never>?
+                    completion(.success(AtemPreparedHostMembership(publish: { confirmedAt, current, reply in
+                        publishing = Task { @MainActor in
+                            do { reply(.success(try await coordinator.commitHost(request: request, confirmedAt: confirmedAt, current: current))) }
+                            catch { reply(.failure(error)) }
+                        }
+                    }, cancel: {
+                        publishing?.cancel()
+                        Task { @MainActor in
+                            do { try coordinator.cancelUnsignedHost(request: request) }
+                            catch { Log.warn("[Recovery] Membership preparation could not be reconciled: \(error.localizedDescription)") }
+                        }
+                    })))
+                } catch { completion(.failure(error)) }
+            }
         }
     )
     private lazy var atemStorageKeys = AtemStorageKeyController(
@@ -2284,11 +2321,10 @@ class AstationHubManager: ObservableObject {
         return (value, try DataEncryptionKeyManager.shared.recoveryKey(for: value))
     }
 
-    func installEncryptionKey(_ value: AccountDataKey) throws {
-        try DataEncryptionKeyManager.shared.install(
-            value,
-            dataAccount: relayEncryptionState?.dataAccount ?? currentDataAccount
-        )
+    @MainActor func installEncryptionKey(_ value: AccountDataKey) async throws {
+        let account = e2eDataAccount
+        try await recoveryCoordinator(account: account).installBackedUpKey(value)
+        guard e2eDataAccount == account else { throw AtemIdentityError.identityChanged }
     }
 
     func encryptionRecoveryKey() throws -> String {
@@ -2302,13 +2338,14 @@ class AstationHubManager: ObservableObject {
         return try DataEncryptionKeyManager.shared.recoveryKey(for: value)
     }
 
-    func restoreEncryptionKey(_ text: String) throws {
+    @MainActor func restoreEncryptionKey(_ text: String) async throws {
         let account = relayEncryptionState?.dataAccount ?? currentDataAccount
         let value = try DataEncryptionKeyManager.decodeRecoveryKey(text)
         if let state = relayEncryptionState, state.kid != nil, state.kid != value.kid {
             throw DataEncryptionKeyError.invalidRecoveryKey
         }
-        try DataEncryptionKeyManager.shared.install(value, dataAccount: account)
+        try await recoveryCoordinator(account: account).installBackedUpKey(value)
+        guard e2eDataAccount == account else { throw AtemIdentityError.identityChanged }
         if let state = relayEncryptionState, state.mode == "off" {
             setRelayEncryption(mode: "enabling", kid: value.kid)
         } else if let state = relayEncryptionState {

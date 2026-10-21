@@ -16,6 +16,8 @@ It returns HTTP 200 with `Cache-Control: no-store` and:
   "version": 1,
   "status": "not_ready",
   "admission_enabled": false,
+  "recovery_storage_durable": false,
+  "recovery_head_probe": false,
   "required_session_revision": 9,
   "supported_session_revisions": [],
   "transports": [],
@@ -48,6 +50,31 @@ curl -i http://127.0.0.1:3000/api/remote/v1/capabilities
 ```
 
 This endpoint is not deployed until this branch is merged and deployed.
+
+## Recovery Storage and Fresh Head Probes
+
+With Postgres configured, authenticated account storage is implemented:
+
+| Method | Path under `/api/remote/v1` | Result |
+| --- | --- | --- |
+| GET | `/logs/{genesis_hash}/entries?after={seq}` | Bounded signed log page |
+| POST | `/logs/{genesis_hash}/entries` | Signed CAS append or bounded 409 conflict |
+| PUT | `/logs/{genesis_hash}/backups/{blob_version}` | Exact sealed envelope, put-if-absent |
+| GET | `/logs/{genesis_hash}/backups/{blob_version}` | Only a committed-named envelope |
+| POST | `/logs/{genesis_hash}/probes/{host_id}` | One fresh public host accept; 10-second bound |
+
+These routes require the existing verified account access token; login controls
+storage visibility, never membership. Initial genesis also requires the creator's
+existing registration to that subject/data account. Clients independently pin
+and verify the genesis, signed chain, backup and host challenge. Imported kit
+URLs never receive the user's token. The probe can reach the host with the Mac
+offline but cannot forward a controller handshake finish, encrypted records or
+commands. Details are in [Recovery Kit v2](../designs/recovery-kit-v2.md).
+
+The two recovery capability flags report durable backend availability and are
+true only when Postgres is configured. They do not enable independent sessions.
+Without a durable backend, recovery storage returns 503; memory storage exists
+only in tests. No new relay deployment is claimed.
 
 ## Notification policy foundation
 
@@ -97,8 +124,9 @@ The r9 contract is signed off for implementation at
 `c685abab92535b167f5f2658c814f0f72541d9a1`; see the
 [review and remaining gates](../designs/protocol/remote-agent-api-atem-r5-review.md).
 The remaining native/service operations, scoped Discord integration, signed
-membership/K-backup storage and sealed push use the Atem-owned shared core
-once its tested artifacts are available. Full testing uses real independent
+membership state and sealed push use the Atem-owned shared core. Signed
+membership/K-backup storage is implemented; durable native recovery wait-state
+bindings, independent session routing and push integration remain gated. Full testing uses real independent
 controller/service keys and fake providers with the Mac off, as specified in the
 [implementation plan](../designs/protocol/remote-agent-api.md). Real APNs/FCM,
 notification extensions and platform owner authentication are separate checks.

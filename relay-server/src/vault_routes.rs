@@ -398,6 +398,7 @@ pub(crate) mod tests {
     /// `astation_id`. Returns (state, session_id).
     async fn test_state(astation_id: &str) -> (AppState, String) {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -576,6 +577,7 @@ pub(crate) mod tests {
 
     fn unbound_state() -> AppState {
         AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),

@@ -19,6 +19,14 @@ public struct RemotePairingCommit: Equatable, Sendable {
     public let hostTrustGeneration: UInt64
     public let commitment: Data
 
+    public init(context: RemotePairingContext, hostTrustGeneration: UInt64, commitment: Data) throws {
+        guard !context.accountID.isEmpty, !context.hostID.isEmpty, commitment.count == 32,
+              (1...9_007_199_254_740_991).contains(hostTrustGeneration) else { throw RemoteChannelError.invalidInput }
+        self.context = context
+        self.hostTrustGeneration = hostTrustGeneration
+        self.commitment = commitment
+    }
+
     public static func hostTrustGeneration(originalJSON: Data) throws -> UInt64 {
         guard originalJSON.count <= 262_144,
               let json = String(data: originalJSON, encoding: .utf8) else {

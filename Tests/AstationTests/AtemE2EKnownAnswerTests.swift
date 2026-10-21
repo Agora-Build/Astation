@@ -91,8 +91,12 @@ final class AtemE2EKnownAnswerTests: XCTestCase {
             signed: AtemSignedWire(statement: bytes(AtemKnownAnswers.grantStatement), signature: bytes(AtemKnownAnswers.grantSignature)),
             encappedKey: bytes(AtemKnownAnswers.encappedKey), ciphertext: bytes(AtemKnownAnswers.ciphertext)
         )
+        var wireKeys = keys
+        wireKeys.genesisHash = String(repeating: "bb", count: 32)
+        var wireReveal = reveal
+        wireReveal.hostChannelPub = try Curve25519.Signing.PrivateKey(rawRepresentation: repeated(0xaa)).publicKey.rawRepresentation
         for message in [
-            commit, .verifyKeys(keys), .verifyReveal(reveal),
+            commit, .verifyKeys(wireKeys), .verifyReveal(wireReveal),
             .deviceVerified(AtemDeviceVerified(deviceVerified: certificate, accountState: state, grants: [grant])),
             .encryptionMode(accountState: state), .keyGrant(grant: grant), .verifyAbort(reason: "denied"),
         ] {

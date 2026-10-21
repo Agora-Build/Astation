@@ -1,4 +1,5 @@
 import Foundation
+import AstationRemote
 
 struct AtemSignedWire: Codable, Equatable {
     let statement: Data
@@ -52,12 +53,20 @@ struct AtemVerifyKeys: Codable, Equatable {
     let encPub: Data
     let recoverySignPub: Data
     let nonce: Data
+    var genesisHash: String? = nil
+
+    func remote() throws -> RemotePairingKeys {
+        guard let genesisHash else { throw AtemIdentityError.invalidState }
+        return try RemotePairingKeys(signingPublicKey: signPub, encryptionPublicKey: encPub,
+            recoverySigningPublicKey: recoverySignPub, genesisHash: genesisHash, nonce: nonce)
+    }
 
     enum CodingKeys: String, CodingKey {
         case signPub = "sign_pub"
         case encPub = "enc_pub"
         case recoverySignPub = "recovery_sign_pub"
         case nonce
+        case genesisHash = "genesis_hash"
     }
 }
 
@@ -66,22 +75,65 @@ struct AtemVerifyReveal: Codable, Equatable {
     let deviceSignPub: Data
     let unlockAuthPub: Data
     let nonce: Data
+    var hostChannelPub: Data? = nil
+
+    init(devicePub: Data, deviceSignPub: Data, unlockAuthPub: Data, nonce: Data, hostChannelPub: Data? = nil) {
+        self.devicePub = devicePub
+        self.deviceSignPub = deviceSignPub
+        self.unlockAuthPub = unlockAuthPub
+        self.nonce = nonce
+        self.hostChannelPub = hostChannelPub
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        devicePub = try values.decode(Data.self, forKey: .devicePub)
+        deviceSignPub = try values.decode(Data.self, forKey: .deviceSignPub)
+        unlockAuthPub = try values.decode(Data.self, forKey: .unlockAuthPub)
+        nonce = try values.decode(Data.self, forKey: .nonce)
+        let text = try values.decode(String.self, forKey: .hostChannelPub)
+        guard let key = Data(base64Encoded: text.replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/") + "=") else { throw AtemIdentityError.invalidState }
+        hostChannelPub = key
+        _ = try remote()
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(devicePub, forKey: .devicePub)
+        try values.encode(deviceSignPub, forKey: .deviceSignPub)
+        try values.encode(unlockAuthPub, forKey: .unlockAuthPub)
+        try values.encode(nonce, forKey: .nonce)
+        if let hostChannelPub {
+            try values.encode(hostChannelPub.base64EncodedString().replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: ""), forKey: .hostChannelPub)
+        }
+    }
+
+    func remote() throws -> RemotePairingReveal {
+        let data = try JSONEncoder().encode(self)
+        let fields = try JSONSerialization.jsonObject(with: data)
+        return try RemotePairingReveal(originalJSON: JSONSerialization.data(withJSONObject: ["type": "verifyReveal", "data": fields]))
+    }
 
     enum CodingKeys: String, CodingKey {
         case devicePub = "device_pub"
         case deviceSignPub = "device_sign_pub"
         case unlockAuthPub = "unlock_auth_pub"
         case nonce
+        case hostChannelPub = "host_channel_pub"
     }
 
     func commitment() throws -> Data {
-        try AtemE2ECrypto.commitment(
+        if hostChannelPub != nil { return try remote().commitment() }
+        return try AtemE2ECrypto.commitment(
             devicePublicKey: devicePub, deviceSigningPublicKey: deviceSignPub,
             unlockAuthPublicKey: unlockAuthPub, nonce: nonce
         )
     }
 
     func safetyCode(keys: AtemVerifyKeys) throws -> String {
+        if hostChannelPub != nil { return try remote().safetyCode(keys: keys.remote()) }
         let digest = try AtemE2ECrypto.safetyDigest(
             devicePublicKey: devicePub, deviceSigningPublicKey: deviceSignPub,
             unlockAuthPublicKey: unlockAuthPub, astationSigningPublicKey: keys.signPub,
@@ -99,11 +151,21 @@ struct AtemDeviceVerified: Codable, Equatable {
     let deviceVerified: AtemSignedWire
     let accountState: AtemSignedWire
     let grants: [AtemGrantWire]
+    var membership: AtemVerifiedMembership? = nil
 
     enum CodingKeys: String, CodingKey {
         case deviceVerified = "device_verified"
         case accountState = "account_state"
         case grants
+        case membership
+    }
+}
+
+struct AtemVerifiedMembership: Codable, Equatable {
+    let entries: [AtemSessionJSON]
+
+    init(entries: [String]) throws {
+        self.entries = try entries.map { try AtemSessionJSON.validatePacket(Data($0.utf8)) }
     }
 }
 

@@ -27,9 +27,14 @@ success. Interrupted publication resends the same durable bytes. A failed store
 halts publication pending reconciliation; an unresolved conflict durably blocks
 another signature. Production protected storage must serialize one publisher
 per manager and resume its checkpoint rather than discard it after a crash.
-The complete native ceremony, protected backend, owner-authentication binding,
-Recovery Kit v2 and relay publication remain unfinished; this stage grants no
-new independent access and does not replace the existing migration invariants.
+The app now connects the v2 ceremony to protected Keychain storage, an exact
+fresh-confirmation Enclave signer, account genesis, Recovery Kit export/import,
+K backup/restore and relay CAS. Key rotation/import backs up current and retained
+keys before installation. Encryption-off setup does not enable encryption.
+See [Recovery Kit v2](recovery-kit-v2.md) for lifecycle/security details and
+remaining gates. Durable native wait-state bindings, a live provisioned ceremony,
+independent routers/push and platform conformance still gate r9 admission.
+This grants no new independent access and preserves the migration invariants.
 
 ## Owner Approval
 

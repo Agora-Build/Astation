@@ -61,6 +61,7 @@ pub struct AppState {
     pub identity: Arc<dyn identity_store::IdentityStore>,
     /// Optional Agora-account registration and Astation-to-data-account mapping.
     pub accounts: Arc<dyn account_store::AccountStore>,
+    pub recovery: Arc<remote_api::recovery::RecoveryStore>,
 }
 
 fn redis_url() -> Option<String> {
@@ -732,12 +733,13 @@ async fn serve() {
     // Vault + knowledge (Atem Memory) + identity stores: Postgres, sharing one
     // pool, when DATABASE_URL is set (the durable path), else in-memory
     // fallbacks so the rest of the server still runs without a DB.
-    let (vault, knowledge, identity, accounts, push_tokens): (
+    let (vault, knowledge, identity, accounts, push_tokens, recovery): (
         Arc<dyn vault_store::VaultStore>,
         Arc<dyn knowledge_store::KnowledgeStore>,
         Arc<dyn identity_store::IdentityStore>,
         Arc<dyn account_store::AccountStore>,
         Arc<dyn push_tokens::PushTokenStore>,
+        Arc<remote_api::recovery::RecoveryStore>,
     ) = match std::env::var("DATABASE_URL") {
         Ok(url) if !url.is_empty() => {
             tracing::info!("Connecting to Postgres for vault + knowledge storage...");
@@ -756,7 +758,8 @@ async fn serve() {
                 Arc::new(knowledge_store::PgKnowledgeStore::new(pool.clone())),
                 Arc::new(identity_store::PgIdentityStore::new(pool.clone())),
                 Arc::new(account_store::PgAccountStore::new(pool.clone())),
-                Arc::new(push_tokens::PgPushTokenStore::new(pool)),
+                Arc::new(push_tokens::PgPushTokenStore::new(pool.clone())),
+                remote_api::recovery::RecoveryStore::postgres(pool),
             )
         }
         _ => {
@@ -777,6 +780,7 @@ async fn serve() {
                 Arc::new(identity_store::InMemoryIdentityStore::new()),
                 accounts,
                 Arc::new(push_tokens::InMemoryPushTokenStore::default()),
+                remote_api::recovery::RecoveryStore::disabled(),
             )
         }
     };
@@ -852,11 +856,23 @@ async fn serve() {
         &voice_sessions,
         &accounts,
     ));
+    let recovery_cleanup = recovery.clone();
+    background.push(("recovery backup collection", tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(error) = recovery_cleanup.collect_expired().await {
+                tracing::error!("Recovery backup collection failed: {}", error);
+            }
+        }
+    })));
     tokio::spawn(run_supervisor(background, relay.clone(), relay::DRAIN_GRACE, |_| {
         std::process::exit(1)
     }));
 
     let state = AppState {
+        recovery,
         sessions,
         relay,
         rtc_sessions,
@@ -912,6 +928,7 @@ mod tests {
 
     pub(crate) fn test_state() -> AppState {
         AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -1002,6 +1019,7 @@ mod tests {
             }
         }
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             relay: RelayHub::with_health(Arc::new(Down)),
             ..test_state()
         };
