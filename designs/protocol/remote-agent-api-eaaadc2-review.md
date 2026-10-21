@@ -62,7 +62,7 @@ blocked before compilation by `sandbox-exec: sandbox_apply: Operation not permit
 The interactive follow-up installs the package in the real Astation worktree
 and passes all 19 FFI checks, all 27 native adapter tests, and 111 selected
 session/API/terminal tests after incorporating main's verification retry fix.
-The full macOS application builds, and 35 identity/credential tests pass in a
+The full macOS application builds, and 37 identity/credential tests pass in a
 provisioned Personal Team host, requiring real protected Keychain access.
 These fresh results supersede the worker's blocked native run. No new iOS
 runtime execution is claimed. ADB has no connected device and the SDK has no

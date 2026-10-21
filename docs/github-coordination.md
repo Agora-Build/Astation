@@ -10,7 +10,7 @@ all three Test targets pass, and downloaded Linux logs execute 1,826 release
 unit tests plus 63 debug-hook tests (zero debug failures/ignores). All five
 archives/12 payloads verify. The interactive Apple consumer passes 19 FFI checks,
 all 27 native adapter tests pass, and 111 selected session/API/terminal tests pass
-after merging main's verification retry fix. The macOS app builds, and 35
+after merging main's verification retry fix. The macOS app builds, and 37
 identity/credential tests pass in the provisioned Personal Team test host,
 including real protected Keychain storage. The dependency pin is updated
 without enabling admission. Full ceremony/storage/signing, inbound/live routers,

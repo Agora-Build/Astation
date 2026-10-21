@@ -9,6 +9,8 @@ runtime regressions. All five archives and 12 payload checksums verify; client,
 binding and fixture trees are unchanged from 58fa1e9. The Apple dependency is
 updated and its interactive consumer passes 19 FFI checks. All 27 native adapter
 tests and 111 selected session/API/terminal tests pass with the merged main fixes.
+The macOS app builds; all 37 selected identity/credential tests pass in the
+provisioned Personal Team host, with protected Keychain access required.
 The earlier scheduled-worker sandbox failure is superseded by this execution;
 no new iOS runtime execution is claimed. Live app ceremony,
 protected storage/signing, inbound/live routers, durable push/provider ingress

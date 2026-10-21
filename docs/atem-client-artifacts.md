@@ -7,7 +7,7 @@ verifies all five matching packages and closes the host journal corruption/clock
 findings. The shared client, bindings and fixtures are unchanged from 58fa1e9;
 the interactive consumer passes 19 FFI checks and all 27 native adapter tests.
 All 111 selected session/API/terminal tests also pass after incorporating main's
-verification retry fix. The macOS app builds, and 35 identity/credential tests
+verification retry fix. The macOS app builds, and 37 identity/credential tests
 pass in a provisioned test host with protected Keychain access required.
 The earlier scheduled-worker manifest sandbox failure
 does not apply to these fresh interactive results. Remote admission stays disabled.
