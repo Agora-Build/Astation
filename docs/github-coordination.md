@@ -1,6 +1,32 @@
 # Astation and Atem coordination
 
-## Current integration status, 2026-10-20
+## Corrected final pin, 2026-10-21
+
+Atem's [final handoff](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6311804983)
+names `eaaadc23477d12f1e2a0caa56ccafb1dd45be571` and its five replacement
+artifacts. The [review](../designs/protocol/remote-agent-api-eaaadc2-review.md)
+accepts them for integration: host corruption/rollback findings are closed,
+all three Test targets pass, and downloaded Linux logs execute 1,826 release
+unit tests plus 63 debug-hook tests (zero debug failures/ignores). All five
+archives/12 payloads verify. The interactive Apple consumer passes 19 FFI checks,
+all 27 native adapter tests pass, and 111 selected session/API/terminal tests pass
+after merging main's verification retry fix. The macOS app builds, and 35
+identity/credential tests pass in the provisioned Personal Team test host,
+including real protected Keychain storage. The dependency pin is updated
+without enabling admission. Full ceremony/storage/signing, inbound/live routers,
+durable push/provider and platform/relay conformance remain. No new user
+product/security question. This supersedes the historical host/dependency/CI
+status below. The scheduled worker prepared the dependency update outside its
+worktree because shared Git metadata is not writable; an interactive session
+applies and publishes it on the existing task branch.
+
+Session welcome failures now identify the failed validation check, a regressed
+host trust generation, or a journal storage failure. Logs contain fixed check
+names and bounded counters, retaining session-payload redaction. The live Genie
+5-to-3 regression belongs to [Atem #91](https://github.com/Agora-Build/Atem/issues/91);
+the client's trust and runtime floors remain intact.
+
+## Historical integration status, 2026-10-20
 
 The [final-pin review](../designs/protocol/remote-agent-api-final-pin-review.md)
 checks host/package pin `58fa1e92bb99fed1ce81a42fb63ac1226782705b`.
@@ -125,9 +151,11 @@ Retain one shared security/session core and the existing r8 operation semantics.
 
 ## Three-minute monitoring
 
-The local watcher checks memory/vault first, then #81 and PR #80 every 180
-seconds while this Mac is
-awake and logged in. It uses a user LaunchAgent, not an in-process chat timer.
+The local watcher checks memory/vault first, then #81, PR #80 and implementation
+PR #89 every 180 seconds while this Mac is awake and logged in. It watches #89's
+head, comments/reviews and exact-head check completion even without a #81 handoff.
+An unannounced commit is review input, not an approved final package pin.
+It uses a user LaunchAgent, not an in-process chat timer.
 When memory/vault content or GitHub content/head/review changes, it starts a bounded Codex CLI continuation
 with the saved coordination instructions. Unchanged polls do not start a model
 run or post repetitive status. An exclusive lock prevents overlapping runs;

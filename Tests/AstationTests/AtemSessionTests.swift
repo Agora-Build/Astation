@@ -52,7 +52,8 @@ private final class SessionFixture {
     func handshake(trust: UInt64 = 1, runtime: String = runtimeID, attachment: String = attachmentID,
                    permissions: [String] = ["view", "control"], helloID: String? = nil,
                    controller: String = controllerID, remaining: UInt64 = 60_000,
-                   features: [String] = AtemSessionWire.features.sorted()) throws {
+                   features: [String] = AtemSessionWire.features.sorted(),
+                   mutate: (inout AtemSessionMessage) -> Void = { _ in }) throws {
         if sent.isEmpty { client.start() }
         let hello = try XCTUnwrap(sent.last(where: { $0.op == "hello" }))
         var reply = AtemSessionMessage(op: "welcome")
@@ -69,6 +70,7 @@ private final class SessionFixture {
         reply.permissions = permissions
         reply.authorization_ms_left = remaining
         reply.server_time = 1_760_500_000_000
+        mutate(&reply)
         try receive(reply)
     }
 
@@ -1592,6 +1594,66 @@ final class AtemSessionClientTests: XCTestCase {
         let stale = SessionFixture(disk: disk)
         try stale.handshake(trust: 1)
         XCTAssertEqual(stale.client.phase, .failed)
+    }
+
+    func testWelcomeReportsTrustRollbackWithoutReplacingTheSavedRuntimeFloor() throws {
+        let disk = SessionDisk()
+        let original = SessionFixture(disk: disk)
+        try original.handshake(trust: 5)
+        try original.snapshot(epoch: 10)
+        let saved = disk.state
+
+        let stale = SessionFixture(disk: disk)
+        try stale.handshake(trust: 3)
+        XCTAssertEqual(stale.client.phase, .failed)
+        XCTAssertTrue(stale.client.status.contains("older trust generation (3; previously accepted 5)"))
+        XCTAssertEqual(disk.state, saved)
+        XCTAssertFalse(stale.client.journal.loadFailed, "A rejected rollback is not a storage fault")
+        XCTAssertFalse(stale.sent.contains { ["list", "receipt_query", "acquire", "submit"].contains($0.op) })
+
+        let newer = SessionFixture(disk: disk)
+        try newer.handshake(trust: 6)
+        try newer.snapshot(epoch: 1)
+        XCTAssertTrue(newer.client.hasRegistrySnapshot)
+        XCTAssertEqual(disk.state.hosts.first?.trust, 6)
+        XCTAssertEqual(disk.state.hosts.first?.runtimeEpoch, 1)
+    }
+
+    func testWelcomeDiagnosticsNameTheFailedCheckWithoutExposingPayloads() throws {
+        let cases: [(String, (inout AtemSessionMessage) -> Void)] = [
+            ("account_id", { $0.account_id = "private-other-account" }),
+            ("atem_device_id", { $0.atem_device_id = "private-other-device" }),
+            ("client_kind", { $0.client_kind = "browser" }),
+            ("permissions", { $0.permissions = ["control"] }),
+            ("authorization_ms_left", { $0.authorization_ms_left = 0 }),
+            ("authorization_ms_left", { $0.authorization_ms_left = 86_400_001 }),
+            ("host_error", { $0.host_error = "private-host-error" }),
+        ]
+        for (field, mutate) in cases {
+            let f = SessionFixture()
+            try f.handshake(mutate: mutate)
+            XCTAssertEqual(f.client.phase, .failed, field)
+            XCTAssertTrue(f.client.status.contains("(\(field))"), f.client.status)
+            XCTAssertFalse(f.client.status.contains("private-"))
+            XCTAssertTrue(f.disk.state.hosts.isEmpty)
+            XCTAssertFalse(f.sent.contains { $0.op == "list" })
+        }
+    }
+
+    func testWelcomeJournalFailureIsDistinctFromTrustRollbackAndKeepsTheFence() throws {
+        let disk = SessionDisk()
+        disk.state.hosts = [AtemSessionHostFence(account: "account-a", device: "host-a", trust: 5,
+            runtimeEpoch: 10, runtimeGeneration: runtimeID)]
+        let f = SessionFixture(disk: disk)
+        let saved = disk.state
+        disk.fail = true
+        try f.handshake(trust: 6)
+        XCTAssertEqual(f.client.phase, .failed)
+        XCTAssertEqual(f.client.status, "Could not save the session's verification state. Check this Mac's local storage before reconnecting.")
+        XCTAssertTrue(f.client.journal.loadFailed)
+        XCTAssertFalse(f.client.connectionStatus.canReconnect)
+        XCTAssertEqual(disk.state, saved)
+        XCTAssertFalse(f.sent.contains { $0.op == "list" })
     }
 
     func testLocalTakeoverFencesOutstandingRenewalAndQueuedControlReply() throws {

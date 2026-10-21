@@ -1,11 +1,16 @@
 # Consuming the prebuilt r9 Apple client
 
-The current client pin is `58fa1e92bb99fed1ce81a42fb63ac1226782705b`.
-[Binding run 39538413559](https://github.com/Agora-Build/Atem/actions/runs/39538413559)
-produced the Apple package. [The final-pin review](../designs/protocol/remote-agent-api-final-pin-review.md)
-verifies all five matching packages and the client delta from accepted edeb8f0.
-Client consumption is independent of the remaining host quarantine finding;
-remote admission stays disabled.
+The current client pin is `eaaadc23477d12f1e2a0caa56ccafb1dd45be571`.
+[Binding run 39568023465](https://github.com/Agora-Build/Atem/actions/runs/39568023465)
+produced the Apple package. [The final-pin review](../designs/protocol/remote-agent-api-eaaadc2-review.md)
+verifies all five matching packages and closes the host journal corruption/clock-rollback
+findings. The shared client, bindings and fixtures are unchanged from 58fa1e9;
+the interactive consumer passes 19 FFI checks and all 27 native adapter tests.
+All 111 selected session/API/terminal tests also pass after incorporating main's
+verification retry fix. The macOS app builds, and 35 identity/credential tests
+pass in a provisioned test host with protected Keychain access required.
+The earlier scheduled-worker manifest sandbox failure
+does not apply to these fresh interactive results. Remote admission stays disabled.
 
 Run the native consumer check from this worktree on macOS:
 
@@ -14,7 +19,7 @@ python3 scripts/check-atem-client-apple.py --install
 swift test --package-path native-remote
 ```
 
-It uses the existing `gh` sign-in to download artifact `12317503957`. An already
+It uses the existing `gh` sign-in to download artifact `12330892581`. An already
 downloaded **GitHub artifact ZIP** can be supplied with `--archive /path/to/archive.zip`.
 [The checked-in pin](../Config/atem-client-apple.json) verifies the archive,
 all three payload digests, clean source commit and production features before
@@ -70,14 +75,14 @@ targets using the installed simulator SDK. The `xcodebuild` package invocation
 was unavailable in this session (CoreSimulator/Xcode mismatch and no recognized
 project/workspace/package). Neither check establishes simulator execution.
 
-The full-app CI for the dependency pin at f9d6ac5 fails one existing verification
+The earlier full-app CI at f9d6ac5 failed one existing verification
 UI timing assertion; see [#62](https://github.com/Agora-Build/Astation/issues/62).
 Its 32-test UI suite passes locally on the same verification source/test bytes.
 The earlier local caption scroll failure remains separately tracked in
-[#61](https://github.com/Agora-Build/Astation/issues/61). Neither is a green
-full-suite claim for the current draft.
+[#61](https://github.com/Agora-Build/Astation/issues/61). Current 8b4d3c1 macOS/relay/webapp CI is green; this dependency update does not
+claim a fresh full-app test execution.
 
-The current GitHub artifact expires on 2027-01-19. A later durable artifact
+The current GitHub artifact expiry is recorded in its API metadata. A later durable artifact
 handoff must update the pin after review; the checker never substitutes a
 different build or downloads source as a fallback.
 

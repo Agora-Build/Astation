@@ -21,6 +21,35 @@ struct AtemSessionContext: Equatable {
 /// Protocol r8 is required; section 9's membership gates remain enforced.
 final class AtemSessionClient {
     enum Phase: Equatable { case offline, connecting, reconnecting, ready, failed }
+    private enum WelcomeFailure: Error {
+        enum Field: String {
+            case account = "account_id", device = "atem_device_id", clientKind = "client_kind"
+            case permissions, authorization = "authorization_ms_left", hostError = "host_error"
+        }
+        case invalid(Field)
+        case trustRollback(received: UInt64, minimum: UInt64)
+        case storage
+
+        var diagnostic: String {
+            switch self {
+            case .invalid(let field): return "welcome.\(field.rawValue)"
+            case .trustRollback(let received, let minimum):
+                return "welcome.host_trust_gen_rollback received=\(received) minimum=\(minimum)"
+            case .storage: return "welcome.journal_storage"
+            }
+        }
+
+        var message: String {
+            switch self {
+            case .invalid(let field):
+                return "Atem's session welcome failed validation (\(field.rawValue)). Reconnect the verified Atem."
+            case .trustRollback(let received, let minimum):
+                return "Atem reported an older trust generation (\(received); previously accepted \(minimum)). Resolve its trust state before reconnecting."
+            case .storage:
+                return "Could not save the session's verification state. Check this Mac's local storage before reconnecting."
+            }
+        }
+    }
     struct ConnectionStatus: Equatable {
         let phase: Phase
         let message: String
@@ -575,7 +604,14 @@ final class AtemSessionClient {
                 }
             default: break
             }
-        } catch { fail("Atem sent an invalid or inconsistent session message. Reconnect to continue.") }
+        } catch let failure as WelcomeFailure {
+            // Only fixed check names and bounded counters belong in diagnostics.
+            Log.warn("[Sessions] Rejected \(failure.diagnostic)")
+            fail(failure.message)
+        } catch {
+            Log.warn("[Sessions] Rejected session message: validation_or_consistency")
+            fail("Atem sent an invalid or inconsistent session message. Reconnect to continue.")
+        }
         changed()
     }
 
@@ -610,24 +646,34 @@ final class AtemSessionClient {
 
     private func acceptWelcome(_ message: AtemSessionMessage) throws {
         guard phase == .connecting, let re = message.re, let hello = pending.removeValue(forKey: re), hello.message.op == "hello",
-              let context, message.account_id == context.account, message.atem_device_id == context.device,
-              message.client_kind == "native", message.permissions?.contains("view") == true,
-              let remaining = message.authorization_ms_left, remaining > 0, remaining <= 86_400_000,
+              let context,
               let trust = message.host_trust_gen, message.revision == AtemSessionWire.revision,
-              message.host_error == nil else { throw AtemSessionJSON.Invalid.json }
-        try journal.update { state in
-            if let index = state.hosts.firstIndex(where: { $0.account == context.account && $0.device == context.device }) {
-                let previous = state.hosts[index]
-                try AtemSessionWire.check(trust >= previous.trust)
-                if trust > previous.trust { state.hosts[index] = AtemSessionHostFence(account: context.account, device: context.device, trust: trust) }
-            } else { state.hosts.append(AtemSessionHostFence(account: context.account, device: context.device, trust: trust)) }
+              let remaining = message.authorization_ms_left else { throw AtemSessionJSON.Invalid.json }
+        guard message.account_id == context.account else { throw WelcomeFailure.invalid(.account) }
+        guard message.atem_device_id == context.device else { throw WelcomeFailure.invalid(.device) }
+        guard message.client_kind == "native" else { throw WelcomeFailure.invalid(.clientKind) }
+        guard message.permissions?.contains("view") == true else { throw WelcomeFailure.invalid(.permissions) }
+        guard remaining > 0, remaining <= 86_400_000 else { throw WelcomeFailure.invalid(.authorization) }
+        guard message.host_error == nil else { throw WelcomeFailure.invalid(.hostError) }
+        do {
+            try journal.update { state in
+                if let index = state.hosts.firstIndex(where: { $0.account == context.account && $0.device == context.device }) {
+                    let previous = state.hosts[index]
+                    guard trust >= previous.trust else { throw WelcomeFailure.trustRollback(received: trust, minimum: previous.trust) }
+                    if trust > previous.trust { state.hosts[index] = AtemSessionHostFence(account: context.account, device: context.device, trust: trust) }
+                } else { state.hosts.append(AtemSessionHostFence(account: context.account, device: context.device, trust: trust)) }
+            }
+        } catch let failure as WelcomeFailure {
+            throw failure
+        } catch {
+            throw WelcomeFailure.storage
         }
         if let fence = journal.snapshot.hosts.first(where: { $0.account == context.account && $0.device == context.device }) {
             runtimeEpoch = fence.runtimeEpoch
             runtimeGeneration = fence.runtimeGeneration
         }
         authorizationDeadline = min(hello.sent + Double(remaining) / 1000, now() + Double(remaining) / 1000)
-        try AtemSessionWire.check(now() < authorizationDeadline)
+        guard now() < authorizationDeadline else { throw WelcomeFailure.invalid(.authorization) }
         welcome = message
         features = Set(message.features ?? []).intersection(AtemSessionWire.features)
         // Sequence numbers, removals and authority belong to this attachment;

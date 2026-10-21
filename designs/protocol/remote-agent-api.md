@@ -1,5 +1,21 @@
 # Remote agent API for independent Astation clients
 
+## Corrected final implementation and artifacts, 2026-10-21
+
+The [eaaadc2 review](remote-agent-api-eaaadc2-review.md) accepts Atem's
+corrected final host/package pin for Astation integration. The journal-loss
+and clock-rollback findings are closed in reviewed source and executed debug
+runtime regressions. All five archives and 12 payload checksums verify; client,
+binding and fixture trees are unchanged from 58fa1e9. The Apple dependency is
+updated and its interactive consumer passes 19 FFI checks. All 27 native adapter
+tests and 111 selected session/API/terminal tests pass with the merged main fixes.
+The earlier scheduled-worker sandbox failure is superseded by this execution;
+no new iOS runtime execution is claimed. Live app ceremony,
+protected storage/signing, inbound/live routers, durable push/provider ingress
+and platform/relay conformance still gate admission, which remains disabled.
+No new product/security choice is pending. This supersedes the historical
+host finding/dependency status below.
+
 ## Integration started, 2026-10-20
 
 [Atem's start request](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6306876197)
