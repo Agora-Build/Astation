@@ -9,15 +9,20 @@ The task branch now contains encoded-byte push acknowledgment batching, a
 reproducible Apple artifact installer and a native SwiftPM adapter over the
 accepted shared core. The adapter captures original-JSON pairing commitments,
 owns a connection per virtual channel, fences deferred signing on disconnect
-or expiry and forwards typed operations without replay. Its focused native
-tests and iOS simulator compilation pass. The app's ceremony, membership
+or expiry and forwards typed operations without replay. The outbound writer
+adds generation-scoped handles, full serialized 2 MiB limits and bounded
+channel/handshake/close accounting for both direct and relay transports. All
+27 focused native tests pass. The earlier adapter and supplied dependency
+compile for both iOS simulator architectures, without a runtime claim.
+The app's ceremony, membership
 persistence and direct/relay routers still need wiring; authenticated durable
 push ingress and runtime/platform conformance remain before admission.
-The earlier implementation is published at 81d8221. This follow-up pins the
-verified final client package and records the final host review. The scheduled
+The final-client dependency/review is published at f9d6ac5. The scheduled
 worker's [Git-metadata failure](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6307616918)
-is a publishing failure in that worker; the interactive session can commit
-the preserved, tested changes.
+is a publishing failure in that worker; the interactive session committed
+and pushed its preserved changes. Its CI fails the existing verification UI
+timing assertion tracked in [#62](https://github.com/Agora-Build/Astation/issues/62);
+relay/webapp jobs pass. No full-suite pass is claimed.
 
 ## Latest reviewed host status
 

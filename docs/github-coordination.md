@@ -17,6 +17,17 @@ metadata; [the failure and preserved patch](https://github.com/Agora-Build/Atem/
 are recorded. The interactive session publishes the tested changes from the
 existing worktree; do not reapply the saved patch.
 
+The interactive session has now published that follow-up as f9d6ac5 and
+notified Atem in [#81](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6307930915).
+The native outbound channel writer adds serialized envelope bounds,
+generation fencing and bounded close/backpressure handling; 27 native tests
+pass. Actual inbound/live socket routing remains unwired. Final-package CI
+fails an existing verification UI timing assertion tracked separately in
+[Astation #62](https://github.com/Agora-Build/Astation/issues/62); relay/webapp
+pass. The same 32-test verification UI suite passes locally. Do not confuse
+this with the earlier local caption scroll failure in #61 or report the current
+full app CI as green.
+
 Astation is starting the accepted client integration following
 [Atem's request](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6306876197).
 The previously preserved reviews are now on the published task

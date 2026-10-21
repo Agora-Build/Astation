@@ -38,18 +38,44 @@ typed operations and channel-only closure. It does not yet wire the app's
 ceremony, membership persistence or direct/relay routers. Remote admission
 remains disabled; full app/iOS/platform/relay conformance is still required.
 
-Native verification includes 15 XCTest cases: generation syntax, duplicate
+`RemoteChannelWriter` prepares the outbound R9.7a path for both direct and
+relay transports. It opens a channel before sending frames, assigns handles
+without reuse during a link generation, and rejects stale routes. Its encoder
+checks the full serialized 2 MiB bound before the transport sees a frame and
+retains the original shared-core JSON bytes, including wide integers. This is
+an outbound framing check, not a strict reader for untrusted inbound frames.
+The shared core remains responsible for channel/cryptographic validation.
+
+There are at most 64 active channels or unsent channel closes, with at most
+16 handshakes in progress. A blocked close retains its slot and is flushed
+before a new open; peer closes are never answered. The transport sink must
+synchronously accept into a bounded queue or throw before acceptance, then
+call `flush` when writable. On link loss, the future router must invalidate
+the writer and notify each `RemoteAgentChannel`; the writer never holds a
+socket or restores a lease. Inbound parsing/routing and live socket adapters
+remain unwired.
+
+Native verification includes 27 XCTest cases: generation syntax, duplicate
 keys and context capture; handshake/authorization deadlines; a signature
 arriving after disconnect; stale routes; operation rejection versus transport
-failure; and closure affecting only its own channel. A public signed membership
+failure; channel-only closure; and twelve outbound writer cases covering exact
+envelope bounds, original frame bytes, capacity/backpressure, no handle reuse,
+late routes and reentrant link loss. A public signed membership
 prefix is verified by the production core, which then creates a real `init`
-and rejects a malformed `accept` before requesting a signature. The 14 lifecycle
-and capture cases are adapter tests, not the upstream scenario harness.
+and rejects a malformed `accept` before requesting a signature. The other 26
+cases are platform adapter tests, not the upstream scenario harness.
 The final package's wrapper/static library and AstationRemote module also
 compile/link directly with `swiftc` for arm64 and x86_64 iOS 17 simulator
 targets using the installed simulator SDK. The `xcodebuild` package invocation
 was unavailable in this session (CoreSimulator/Xcode mismatch and no recognized
 project/workspace/package). Neither check establishes simulator execution.
+
+The full-app CI for the dependency pin at f9d6ac5 fails one existing verification
+UI timing assertion; see [#62](https://github.com/Agora-Build/Astation/issues/62).
+Its 32-test UI suite passes locally on the same verification source/test bytes.
+The earlier local caption scroll failure remains separately tracked in
+[#61](https://github.com/Agora-Build/Astation/issues/61). Neither is a green
+full-suite claim for the current draft.
 
 The current GitHub artifact expires on 2027-01-19. A later durable artifact
 handoff must update the pin after review; the checker never substitutes a
