@@ -1,0 +1,18 @@
+{
+  "repository": "Agora-Build/Atem",
+  "revision": "edeb8f0fab71d4573e41c4ca7935aab207200caf",
+  "run_id": 39465726081,
+  "artifact_id": 12284764754,
+  "archive_sha256": "f7683869b10f0a03b032844f54b28c1749251da76759bd7e857893954803bf48",
+  "package": "atem-client-0.1.0-edeb8f0fab71-apple-swiftpm.zip",
+  "source": "atem-client-0.1.0-edeb8f0fab71-SOURCE.json",
+  "payload_sha256": {
+    "atem-client-0.1.0-edeb8f0fab71-apple-swiftpm.zip": "55974695fdab98f3eff6c174a2e8bf70066ea8877c0c247976211e77f148bfed",
+    "atem-client-0.1.0-edeb8f0fab71-atem_client_ffiFFI.h": "3c667a127bd01ac59d783c8f2bd74aaf5fadd4d16d15902c822b9ca0e5cd711c",
+    "atem-client-0.1.0-edeb8f0fab71-SOURCE.json": "bf5afac921f2c2292f575bd02b383ac5ae4e3ca71103354afd5cf41fcbc9a9ef"
+  },
+  "fixture": {
+    "path": "designs/protocol/fixtures/r9-vectors-pairing.json",
+    "git_blob_sha1": "402cc132312d03caf078c7d7e7ee509e79ac2fb0"
+  }
+}
