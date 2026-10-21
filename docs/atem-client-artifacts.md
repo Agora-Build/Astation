@@ -1,9 +1,11 @@
 # Consuming the prebuilt r9 Apple client
 
-The accepted client pin is `edeb8f0fab71d4573e41c4ca7935aab207200caf`.
-[Binding run 39465726081](https://github.com/Agora-Build/Atem/actions/runs/39465726081)
-produced the Apple package. [The source/package review](../designs/protocol/remote-agent-api-channel-envelope-review.md)
-records its scope; it is separate from the final host/quarantine review.
+The current client pin is `58fa1e92bb99fed1ce81a42fb63ac1226782705b`.
+[Binding run 39538413559](https://github.com/Agora-Build/Atem/actions/runs/39538413559)
+produced the Apple package. [The final-pin review](../designs/protocol/remote-agent-api-final-pin-review.md)
+verifies all five matching packages and the client delta from accepted edeb8f0.
+Client consumption is independent of the remaining host quarantine finding;
+remote admission stays disabled.
 
 Run the native consumer check from this worktree on macOS:
 
@@ -12,7 +14,7 @@ python3 scripts/check-atem-client-apple.py --install
 swift test --package-path native-remote
 ```
 
-It uses the existing `gh` sign-in to download artifact `12284764754`. An already
+It uses the existing `gh` sign-in to download artifact `12317503957`. An already
 downloaded **GitHub artifact ZIP** can be supplied with `--archive /path/to/archive.zip`.
 [The checked-in pin](../Config/atem-client-apple.json) verifies the archive,
 all three payload digests, clean source commit and production features before
@@ -43,11 +45,13 @@ failure; and closure affecting only its own channel. A public signed membership
 prefix is verified by the production core, which then creates a real `init`
 and rejects a malformed `accept` before requesting a signature. The 14 lifecycle
 and capture cases are adapter tests, not the upstream scenario harness.
-`xcodebuild -scheme AstationRemote -destination 'generic/platform=iOS Simulator'
-build CODE_SIGNING_ALLOWED=NO` also compiles both simulator architectures when
-run from `native-remote`. It is a compilation check, not a simulator runtime test.
+The final package's wrapper/static library and AstationRemote module also
+compile/link directly with `swiftc` for arm64 and x86_64 iOS 17 simulator
+targets using the installed simulator SDK. The `xcodebuild` package invocation
+was unavailable in this session (CoreSimulator/Xcode mismatch and no recognized
+project/workspace/package). Neither check establishes simulator execution.
 
-The current GitHub artifact expires on 2027-01-18. A later durable artifact
+The current GitHub artifact expires on 2027-01-19. A later durable artifact
 handoff must update the pin after review; the checker never substitutes a
 different build or downloads source as a fallback.
 

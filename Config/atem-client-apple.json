@@ -1,15 +1,15 @@
 {
   "repository": "Agora-Build/Atem",
-  "revision": "edeb8f0fab71d4573e41c4ca7935aab207200caf",
-  "run_id": 39465726081,
-  "artifact_id": 12284764754,
-  "archive_sha256": "f7683869b10f0a03b032844f54b28c1749251da76759bd7e857893954803bf48",
-  "package": "atem-client-0.1.0-edeb8f0fab71-apple-swiftpm.zip",
-  "source": "atem-client-0.1.0-edeb8f0fab71-SOURCE.json",
+  "revision": "58fa1e92bb99fed1ce81a42fb63ac1226782705b",
+  "run_id": 39538413559,
+  "artifact_id": 12317503957,
+  "archive_sha256": "222537a8636ced74c6e84564fc8b1a9301596163fa0450d00b6b0b6d4a89fd1b",
+  "package": "atem-client-0.1.0-58fa1e92bb99-apple-swiftpm.zip",
+  "source": "atem-client-0.1.0-58fa1e92bb99-SOURCE.json",
   "payload_sha256": {
-    "atem-client-0.1.0-edeb8f0fab71-apple-swiftpm.zip": "55974695fdab98f3eff6c174a2e8bf70066ea8877c0c247976211e77f148bfed",
-    "atem-client-0.1.0-edeb8f0fab71-atem_client_ffiFFI.h": "3c667a127bd01ac59d783c8f2bd74aaf5fadd4d16d15902c822b9ca0e5cd711c",
-    "atem-client-0.1.0-edeb8f0fab71-SOURCE.json": "bf5afac921f2c2292f575bd02b383ac5ae4e3ca71103354afd5cf41fcbc9a9ef"
+    "atem-client-0.1.0-58fa1e92bb99-apple-swiftpm.zip": "0d6da7be43a7fdf6087608a5f6fbad7044e0cd4bfe3de2dfbd4e62810f56b19c",
+    "atem-client-0.1.0-58fa1e92bb99-atem_client_ffiFFI.h": "3c667a127bd01ac59d783c8f2bd74aaf5fadd4d16d15902c822b9ca0e5cd711c",
+    "atem-client-0.1.0-58fa1e92bb99-SOURCE.json": "26ff2f5d9aa58abada88ca983ffc1688bee18a63b77e11e1f2781fd87a20eff4"
   },
   "fixture": {
     "path": "designs/protocol/fixtures/r9-vectors-pairing.json",

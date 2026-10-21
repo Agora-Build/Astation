@@ -13,10 +13,23 @@ or expiry and forwards typed operations without replay. Its focused native
 tests and iOS simulator compilation pass. The app's ceremony, membership
 persistence and direct/relay routers still need wiring; authenticated durable
 push ingress and runtime/platform conformance remain before admission.
-Git staging works with actual changes in this session; the earlier metadata
-blocker is no longer reproduced.
+The earlier implementation is published at 81d8221. This follow-up pins the
+verified final client package and records the final host review. The scheduled
+worker's [Git-metadata failure](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6307616918)
+is a publishing failure in that worker; the interactive session can commit
+the preserved, tested changes.
 
 ## Latest reviewed host status
+
+The [final-pin review](remote-agent-api-final-pin-review.md) supersedes the
+older pending-package status below. At `58fa1e9`, the original quarantine
+rewrite/restart gap is fixed and all five matching packages verify. A repeated
+damage/clock-rollback trace can still lose the earlier quarantine end and
+readmit a revoked grant; final host approval remains withheld. Astation's
+Apple dependency now consumes the verified final client package independently
+of that host finding. App ceremony, native storage/signing, routers, durable
+push ingress and conformance remain incomplete; admission remains disabled.
+No new product/security decision is pending.
 
 The [ade944f review](remote-agent-api-task9b-review.md) is the current
 implementation status and supersedes earlier pending Task 9b source/artifact

@@ -2,10 +2,24 @@
 
 ## Current integration status, 2026-10-20
 
+The [final-pin review](../designs/protocol/remote-agent-api-final-pin-review.md)
+checks host/package pin `58fa1e92bb99fed1ce81a42fb63ac1226782705b`.
+The original quarantine rewrite/restart finding is fixed; a second damaged
+record after clock rollback can lose the earlier end and readmit a revoked
+grant, so host approval remains withheld pending a technical correction.
+All five final artifacts verify. Astation's Apple dependency now uses that
+pin; client/fixture bytes are unchanged from ade944f. Actual app ceremony,
+storage/signing/router/push wiring and conformance still gate admission.
+No new user product/security question is pending. This supersedes the older
+final-pin-wait and dependency status below. The scheduled worker could not
+publish this follow-up because its sandbox omitted the shared worktree Git
+metadata; [the failure and preserved patch](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6307616918)
+are recorded. The interactive session publishes the tested changes from the
+existing worktree; do not reapply the saved patch.
+
 Astation is starting the accepted client integration following
 [Atem's request](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6306876197).
-Git staging of actual changes works in this session; the previous metadata
-blocker is no longer reproduced. The preserved reviews are now on the task
+The previously preserved reviews are now on the published task
 branch. The first implementation prepares encoded-byte `push_ack` batches and
 a repeatable check of the pinned prebuilt Apple package. Neither enables r9
 admission, durable push ingress or the complete ceremony/client adapters.
