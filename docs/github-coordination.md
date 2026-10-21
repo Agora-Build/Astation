@@ -1,5 +1,24 @@
 # Astation and Atem coordination
 
+## Current integration status, 2026-10-20
+
+Astation is starting the accepted client integration following
+[Atem's request](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6306876197).
+Git staging of actual changes works in this session; the previous metadata
+blocker is no longer reproduced. The preserved reviews are now on the task
+branch. The first implementation prepares encoded-byte `push_ack` batches and
+a repeatable check of the pinned prebuilt Apple package. Neither enables r9
+admission, durable push ingress or the complete ceremony/client adapters.
+
+The [Task 9b review](../designs/protocol/remote-agent-api-task9b-review.md)
+records actual two-host source/regressions and statically verified
+Android/harness packages. Fresh PR #89 head
+`12c3c151a0d575ffcc3612357c32ce6c23cf7941` changes only daemon/PTY cleanup
+from reviewed ade944f. The revocation-quarantine finding remains open at that
+head. Atem reports a fix in final checks; review its actual final bytes and
+matching artifacts when posted. This host correction does not block starting
+with the accepted Task 7 client packages. No product/security choice is pending.
+
 Working rule confirmed 2026-10-19 in
 [Atem #81](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6276913191).
 
@@ -32,17 +51,43 @@ PR #80's r9 contract is signed off for implementation at
 [r5 review](../designs/protocol/remote-agent-api-atem-r5-review.md) closes the
 previous r4 findings. It supplies 69 fixtures; primitive checks pass 274 Python
 and 41 CryptoKit assertions, with 148 symbolic references resolved. The 62
-scenarios remain NOT RUN; runtime security gates still apply. Atem owns the
-next shared-core/host implementation and bindings; Astation continues its
-authorized native/relay integration against those artifacts.
+scenarios were NOT RUN at that sign-off; runtime security gates still apply.
+Atem owns shared-core/host implementation and bindings; the current artifact
+and integration handoff is below.
 
 The 2026-10-20 [channel envelope review](../designs/protocol/remote-agent-api-channel-envelope-review.md)
-answers #81's new routing proposal and inspects draft Atem PR #89 at
-`2d926313388b24dd3dc4a9bdb095a25b9989df34`. Its nine fixture corrections
-align with existing decisions; the contract/channel vectors are unchanged.
-The proposed envelope still needs pinned size/lifecycle text and fixtures.
-Passing upstream binding/package CI currently exposes no built artifacts;
-Atem must hand over packages and hashes for Astation integration.
+now reviews final Task 7 pin `edeb8f0fab71d4573e41c4ca7935aab207200caf`.
+The prior restart/status and per-kid project-scope findings are closed; the
+requested mixed-current/retained/unavailable-key retry/lock regression is
+present and upstream CI is green. Contract/fixtures/binding sources are
+unchanged from reviewed 13ef1e0. Both Astation routers must enforce the
+2 MiB serialized envelope bound before forwarding, isolating overflow to one
+virtual channel. The strict original-JSON generation reader remains required.
+All three packages from binding run 39465726081 verify against exactly
+edeb8f0; 19 local Swift/static-library FFI checks pass. The final-pin/package
+wait is closed. Android ABI packages have since passed static inspection in Task 9b; actual
+device/emulator loading remains. Full Astation ceremony/adapters and
+runtime/platform/provider conformance still gate admission. The narrow FFI
+check does not establish SwiftPM/application or iOS execution.
+
+
+The [Task 9a review](../designs/protocol/remote-agent-api-task9a-review.md)
+checks PR #89 at `56c4489bde35e83460655f686e2eff8305b09010` and closes
+the Task 8 cancellation finding in reviewed source. Accept retention of
+published pending/unacknowledged resolved lifecycles, dropping a new hint when
+capacity is full. Native channel lifetime is monotonic; service/browser expiry
+and recovery's dual-clock wait remain separate. The r9 outbound link keeps
+its independent channels past the unused r8 link-attachment deadline; r8
+authorization is unchanged. All 75 fixture files are unchanged. The reported
+48/48 runtime scenarios include 25 unexpressed items. Task 9b subsequently
+supplies the supplementary two-host source test and built Android/harness
+packages, as reviewed above; the original vector exclusions and engine-only
+link-writer stall remain. Final corrected packages, an external adapter entry
+point and Astation platform/relay/provider conformance remain. The
+[adapter requirements](../designs/protocol/remote-agent-api-harness-adapter.md)
+propose replaceable host/client routing I/O for a subsequent artifact; Astation's
+actual public client ingress remains unimplemented. No new product/security
+question is pending.
 
 Recovery choices are settled: 24-hour host-clock wait with approve/veto,
 replaceable kits, and no recovery publication without a reachable trusted
@@ -92,3 +137,15 @@ launchctl bootout gui/$(id -u)/build.agora.astation.github-handoff
 
 Merging Astation main triggers production deployment. Monitoring and the
 instruction to start approved implementation do not authorize a main merge.
+
+## Current integration handoff, 2026-10-20
+
+[Atem's start request](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6306876197)
+confirms that Astation can integrate the accepted Task 7 client packages at
+`edeb8f0fab71d4573e41c4ca7935aab207200caf` while the host-only revocation
+quarantine correction is finalized. Do not wait for that correction to begin
+the shared strict-reader ceremony, full r9 client/router adapters or encoded
+`push_ack` splitting at 262,144 bytes including the wrapper. Review the final
+host pin and matching artifacts separately; a promised fix is not approval.
+Android library loading on a device/emulator remains a validation task.
+Admission and deployment still require their existing gates.

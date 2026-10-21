@@ -1,6 +1,36 @@
 # Remote agent API for independent Astation clients
 
-Status: r9 contract signed off for implementation; integration gated, 2026-10-20.
+## Integration started, 2026-10-20
+
+[Atem's start request](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6306876197)
+confirms that the accepted edeb8f0 client packages and settled binding/effect
+contract can be consumed while the host-only quarantine correction is finalized.
+The task branch now contains encoded-byte push acknowledgment batching and a
+reproducible, integrity-checked Apple artifact consumer. These prepare transport
+and native consumption; authenticated durable push ingress, complete shared-core
+ceremony/adapters and runtime/platform conformance remain before admission.
+Git staging works with actual changes in this session; the earlier metadata
+blocker is no longer reproduced.
+
+## Latest reviewed host status
+
+The [ade944f review](remote-agent-api-task9b-review.md) is the current
+implementation status and supersedes earlier pending Task 9b source/artifact
+claims below. The supplementary two-host test is concrete; Android and
+non-production Linux harness archives pass independent integrity/static checks.
+No Android device/emulator load or local Linux runtime execution is claimed.
+A high-priority unreadable-revocation quarantine rewrite/restart gap remains;
+request a durable fix and real-runtime regression before accepting the final
+rebased implementation/packages. Browser-only idle principal generation reset,
+later-window membership_incomplete, strict membership parsing, and a full
+revocation journal's busy/live-fence behavior are reviewed. Documented push
+cancellation exceptions still allow a stale relay open to escalate until its
+guard; integration tests must retain that limitation. Full Astation ceremony,
+shared-core/native/relay/provider integration remains required with no r8
+fallback. A final artifact review and real platform tests still gate admission.
+
+
+Status: r9 contract signed off; integration started, admission gated, 2026-10-20.
 Remote admission is not enabled. Today's implemented r8 client and protected
 local API remain documented in [r8-client.md](r8-client.md) and the
 [local API guide](../../docs/local-control-api.md).
@@ -21,6 +51,40 @@ and reviews. New topics get their own issue/PR linked from #81. GitHub is the
 working channel; the user need not carry messages between agents. Bring new
 product/security choices to the user before publishing a decision. See the
 [coordination rules](../../docs/github-coordination.md).
+
+The latest [envelope/ceremony/package review](remote-agent-api-channel-envelope-review.md)
+reviews final Task 7 pin `edeb8f0fab71d4573e41c4ca7935aab207200caf`.
+The restart/status and per-kid project findings are closed. Strict original-JSON
+`verifyCommit.data.host_trust_gen` handling and both routers' 2 MiB serialized
+bound remain required. All three final binding packages verify; 19 local
+Swift/static-library FFI checks include every pinned verifyCommit example.
+The final-pin/package wait is closed. Android ABI libraries have since passed Task 9b static review; device/emulator
+loading remains. Complete ceremony, platform/storage/router adapters and runtime
+conformance still gate admission. The worker cannot write external Git metadata;
+its staged patch and narrow binding-consumer check are not a committed app
+integration or a successful SwiftPM/iOS run.
+
+
+The [Task 9a follow-up](remote-agent-api-task9a-review.md) reviews
+`56c4489bde35e83460655f686e2eff8305b09010` and closes the earlier
+[Task 8 cancellation finding](remote-agent-api-task8-review.md) in source.
+Published pending approvals and unacknowledged resolutions retain their slots;
+a new approval goes unhinted when no safe slot remains. Native channels use
+a monotonic 24-hour key-rotation limit; service/browser expiry and recovery's
+dual-clock wait remain separate. An r9 link's unused r8 attachment deadline
+does not end its independent channels. Both Astation routers still enforce
+2 MiB channel envelopes and 256 KiB relay messages; split push_ack by actual
+encoded bytes. Signed seen remains limited to original hint recipients.
+All 75 current fixture files are unchanged: 48 host / 10 relay / 8 client /
+9 vector. Atem reports 48/48 host scenarios, 714 checks and 25 exclusions;
+host B's channel and the real link-stall paths remain coverage gaps. Request
+a built harness or adapter-consumer entry point, final matching production
+packages and Android ABI libraries. Full Astation conformance gates admission.
+Atem has promised a supplementary two-host runtime test and a built fixed-flow
+harness in Task 9b; those bytes remain unreviewed. The
+[harness adapter requirements](remote-agent-api-harness-adapter.md) describe a
+subsequent external transport hook using existing R9.7a, with no newly agreed
+production endpoint. Core, bindings and full Test now pass at exact 56c4489.
 
 The [confirmed policy reply](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6276488130)
 settles push, recovery, authentication and the unchanged v0.7.2 device ID.
@@ -228,13 +292,16 @@ See [the API status](../../docs/remote-api.md). Final methods, limits, errors, c
 follow the jointly pinned contract. A plaintext relay chat API would change the
 E2EE boundary and is not this design.
 
-Atem's outbound-link multiplexing proposal and the new binding/artifact
-handoff are reviewed in the [channel envelope review](remote-agent-api-channel-envelope-review.md).
-The proposed routing fields fit this route family; serialized size and
-channel lifecycle fixtures still need a joint immutable pin. The existing
-1 MiB plaintext limit requires room for base64 ciphertext and its envelope.
-Atem's draft PR #89 has passing binding/package CI but has not published
-the built packages for Astation to consume. Admission remains disabled.
+Atem's outbound-link multiplexing contract and built artifact handoff are
+reviewed in the [channel envelope review](remote-agent-api-channel-envelope-review.md)
+at final Task 7 pin `edeb8f0fab71d4573e41c4ca7935aab207200caf`.
+The corrected envelope fixtures, bounded restart lifecycle, 2 MiB router
+obligation and strict original-JSON generation reader are agreed for
+implementation. Built SwiftPM/xcframework, WASM and Kotlin/JVM Linux packages
+verify against that exact pin. The narrow native FFI consumer check passes;
+full adapters, runtime and platform tests still gate admission. Consume the
+built core with no legacy verification fallback. Android ABI libraries and
+Atem's final Task 9 artifact/harness handoff and Astation conformance remain separate gates.
 
 Enrollment binds the applicant's auth/encryption key possession, account/root,
 roles/scopes, both nonces and an expiring single-use ceremony. Native owner
@@ -279,11 +346,20 @@ and expiry before each provider attempt. See the [push integration requirements]
    [r5 review](remote-agent-api-atem-r5-review.md) closes the previous findings
    after checking the changed contract and 69 fixtures. Primitive/example
    checks pass 274 Python and 41 CryptoKit assertions; 148 symbolic references
-   resolve. The 62 scenarios still need execution by the shared core/host and
-   relay harness; this design sign-off does not open the runtime security gate.
+   resolve. At that sign-off the 62 scenarios were NOT RUN. Later upstream
+   host/core runners are reviewed separately; actual Astation relay/platform
+   conformance still gates admission.
 2. Atem builds/verifies the shared `atem-client`, binding artifacts and host
    implementation. Agree durable state/effect ordering and FFI lifecycle;
    r9 only, retaining r8 operation semantics.
+   The [final Task 7 review](remote-agent-api-channel-envelope-review.md)
+   accepts pin edeb8f0 and its matching verified packages, closing the earlier
+   final-pin wait. The requested three-key retry/lock regression is present;
+   upstream CI and 19 local Swift/static-library checks pass. Consume these
+   packages for the complete ceremony/adapters; do not build Atem source or
+   partially patch legacy verification. Android ABI/Task 8/Task 9 handoffs
+   and full Astation integration/conformance remain.
+
 3. Astation integrates platform keys/owner authentication, mandatory kit and
    restore, Add device/service and Settings removal, shared-core bindings,
    native adapters and relay signed-record/encrypted transport storage.
