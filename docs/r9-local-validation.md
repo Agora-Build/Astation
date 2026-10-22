@@ -109,13 +109,30 @@ the production host's keys or assume an existing production pairing applies.
 6. Use a separately enrolled controller with independent keys while the Mac is
    offline; verify view, a prompt and an approval through its own relay channel.
 7. Exercise host disconnect, room expiry and relay restart using the agreed
-   host routing proof once implemented.
+   host routing proof at Atem pin `83c0776` or its reviewed successor.
 
-Step 7 currently has a real gate: [Astation #64](https://github.com/Agora-Build/Astation/issues/64).
-Atem confirmed its code-based reconnect cannot restore a deleted/expired
-ownerless room. Its shared authenticated host rejoin contract is pending.
+Step 7 remains a live validation gate: [Astation #64](https://github.com/Agora-Build/Astation/issues/64).
+The shared contract and relay implementation are available. Controlled tests
+exercise reconnect with no directory, ownerless expiry, durable Postgres
+bindings, current-key verification and fencing at both replica queues.
 See [the lifecycle evidence](../designs/protocol/r9-host-routing-lifecycle.md).
 Fixture-side directory recreation is not a pass for this step.
+
+Run those controlled checks against an isolated local Postgres instance:
+
+```sh
+cd relay-server
+cargo test
+RECOVERY_TEST_DATABASE_URL=postgres://astation_test@127.0.0.1:55439/postgres \
+  cargo test remote_api -- --include-ignored --nocapture
+```
+
+Each Postgres case creates and removes only its own schema. The full relay run
+passes 513 tests with 119 environment ignores; the remote API run executes all
+47 cases without skips. Its replica transport is an injected bus with real
+dispatchers and separate database pools. Real Redis replicas and the actual
+Atem runtime still need the joint matrix; no mobile client is required for it.
+Drain older relay revisions before admitting routes on an upgraded cluster.
 
 Record test profile, source pins, account/host generations, results and failures
 without credentials. Production login, real APNs/FCM and platform owner-auth

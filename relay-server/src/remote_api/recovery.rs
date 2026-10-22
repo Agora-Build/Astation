@@ -10,6 +10,7 @@ use atem_client::{
     canonical::{jcs, StrictValue},
     membership::{Action, Check, Entry, Head, HostNow, MemberStatus, Membership},
     Hash32,
+    host_route::{verify_host_route_message, HostRouteRefusal, RelayReply},
 };
 use axum::{
     body::{to_bytes, Body},
@@ -55,6 +56,52 @@ struct Root {
     blobs: BTreeMap<u64, Blob>,
     #[serde(default)]
     push: super::push_ingress::PushState,
+    #[serde(default)]
+    routes: BTreeMap<String, HostBinding>,
+}
+
+/// A fresh connection is the generation fence. Presence never substitutes for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HostBinding {
+    pub genesis: String,
+    pub host: String,
+    pub connection: crate::cluster::ConnRef,
+    pub room: String,
+    pub atem_id: String,
+    nonce: [u8; 32],
+    proof: String,
+}
+
+#[derive(Debug)]
+pub(crate) enum HostRouteError {
+    Refused(Value),
+    Unavailable,
+}
+
+/// Carrier A has no route proof; it is usable only while this exact room owner
+/// and host connection remain present. A proved replacement still fences it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OwnerRoute {
+    pub genesis: String,
+    pub host: String,
+    pub room: String,
+    pub connection: crate::cluster::ConnRef,
+    pub host_trust_gen: u64,
+}
+
+impl HostBinding {
+    fn valid(&self, log: &Membership) -> bool {
+        verify_host_route_message(
+            log,
+            self.proof.as_bytes(),
+            &self.nonce,
+            &self.room,
+            &self.atem_id,
+        )
+        .is_ok_and(|route| {
+            route.host_id == self.host && log.genesis_hash().to_hex() == self.genesis
+        })
+    }
 }
 
 /// One root is the transaction/lock unit, including envelope retention and CAS.
@@ -64,6 +111,166 @@ pub struct RecoveryStore {
 }
 
 impl RecoveryStore {
+    pub(crate) async fn admit_host(
+        &self,
+        text: &str,
+        nonce: [u8; 32],
+        room: &str,
+        atem_id: &str,
+        connection: crate::cluster::ConnRef,
+    ) -> Result<(HostBinding, Value), HostRouteError> {
+        // This untrusted selector only locates the anchored log. The shared verifier
+        // validates the exact message and its account, head, key and challenge.
+        let malformed = || {
+            HostRouteError::Refused(
+                RelayReply::refused(&HostRouteRefusal::Malformed("message")).to_json(),
+            )
+        };
+        let value = StrictValue::parse(text.as_bytes(), 16_384).map_err(|_| malformed())?;
+        let genesis = value.value()["proof"]["body"]["genesis_hash"]
+            .as_str()
+            .ok_or_else(malformed)?;
+        let reply = self
+            .perform_scoped(
+                genesis,
+                None,
+                Operation::HostRoute {
+                    text: text.into(),
+                    nonce,
+                    room: room.into(),
+                    atem_id: atem_id.into(),
+                    connection,
+                },
+            )
+            .await;
+        if reply.0 != StatusCode::OK {
+            return Err(if reply.0 == StatusCode::SERVICE_UNAVAILABLE {
+                HostRouteError::Unavailable
+            } else {
+                HostRouteError::Refused(if reply.1 .0["type"] == "relay" {
+                    reply.1 .0
+                } else {
+                    RelayReply::refused(&HostRouteRefusal::UnknownHost).to_json()
+                })
+            });
+        }
+        Ok((
+            serde_json::from_value(reply.1 .0["binding"].clone()).map_err(|_| malformed())?,
+            reply.1 .0,
+        ))
+    }
+
+    /// Keep the membership/binding lock until queue admission or presence publication.
+    /// The action must not recursively enter this store or wait for a peer's ACK.
+    pub(crate) async fn with_host_route<T, F, Fut>(
+        &self,
+        binding: &HostBinding,
+        action: F,
+    ) -> Option<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        self.with_root(
+            &binding.genesis,
+            |root, log| root.routes.get(&binding.host) == Some(binding) && binding.valid(log),
+            action,
+        )
+        .await
+    }
+
+    pub(crate) async fn with_owner_route<T, F, Fut>(
+        &self,
+        route: &OwnerRoute,
+        action: F,
+    ) -> Option<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        self.with_root(
+            &route.genesis,
+            |root, log| {
+                log.host(&route.host)
+                    .is_some_and(|host| host.host_trust_gen == route.host_trust_gen)
+                    && root
+                        .routes
+                        .get(&route.host)
+                        .filter(|binding| binding.valid(log))
+                        .is_none_or(|binding| binding.connection == route.connection)
+            },
+            action,
+        )
+        .await
+    }
+
+    async fn with_root<T, P, F, Fut>(&self, genesis: &str, predicate: P, action: F) -> Option<T>
+    where
+        P: FnOnce(&Root, &Membership) -> bool,
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.with_root_inner(genesis, predicate, action),
+        )
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn with_root_inner<T, P, F, Fut>(
+        &self,
+        genesis: &str,
+        predicate: P,
+        action: F,
+    ) -> Option<T>
+    where
+        P: FnOnce(&Root, &Membership) -> bool,
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let valid = |root: &Root| {
+            let Ok(hash) = Hash32::from_hex(genesis) else {
+                return false;
+            };
+            let Ok(mut log) = Membership::from_stored(&root.account, &hash, &root.membership)
+            else {
+                return false;
+            };
+            log.advance(&now());
+            predicate(root, &log)
+        };
+        if let Some(memory) = &self.memory {
+            let roots = memory.lock().await;
+            let (_, root) = roots.get(genesis)?;
+            if !valid(root) {
+                return None;
+            }
+            return Some(action().await);
+        }
+        let pool = self.pool.as_ref()?;
+        let mut tx = pool.begin().await.ok()?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(genesis)
+            .execute(&mut *tx)
+            .await
+            .ok()?;
+        let saved: Option<(Value,)> = sqlx::query_as(
+            "SELECT state FROM remote_recovery_roots WHERE genesis_hash = $1 FOR UPDATE",
+        )
+        .bind(genesis)
+        .fetch_optional(&mut *tx)
+        .await
+        .ok()?;
+        let root: Root = serde_json::from_value(saved?.0).ok()?;
+        if !valid(&root) {
+            return None;
+        }
+        // No state changes: dropping the read transaction releases its locks.
+        Some(action().await)
+    }
+
     pub fn disabled() -> Arc<Self> {
         Arc::new(Self {
             pool: None,
@@ -78,6 +285,10 @@ impl RecoveryStore {
     }
     pub fn is_durable(&self) -> bool {
         self.pool.is_some()
+    }
+
+    pub(crate) fn route_storage_enabled(&self) -> bool {
+        self.pool.is_some() || self.memory.is_some()
     }
 
     pub async fn collect_expired(&self) -> Result<(), sqlx::Error> {
@@ -204,6 +415,7 @@ impl RecoveryStore {
 }
 
 pub(super) enum Operation {
+    HostRoute { text: String, nonce: [u8; 32], room: String, atem_id: String, connection: crate::cluster::ConnRef },
     Append {
         entry: Entry,
         expected: Head,
@@ -261,6 +473,7 @@ fn apply(
                 membership: log.to_stored(),
                 blobs: BTreeMap::new(),
                 push: Default::default(),
+                routes: Default::default(),
             }
         }
     };
@@ -268,11 +481,23 @@ fn apply(
         .map_err(|_| unavailable())?;
     log.advance(&clock);
     let reply = match operation {
+        Operation::HostRoute { text, nonce, room, atem_id, connection } => {
+            let route = verify_host_route_message(&log, text.as_bytes(), &nonce, &room, &atem_id)
+                .map_err(|refusal| (StatusCode::BAD_REQUEST, Json(RelayReply::refused(&refusal).to_json())))?;
+            let binding = HostBinding { genesis: hash.to_hex(), host: route.host_id.clone(),
+                connection, room, atem_id, nonce, proof: text };
+            let replaced = root.routes.insert(route.host_id.clone(), binding.clone());
+            (StatusCode::OK, Json(json!({"binding":binding,"replaced":replaced,"verdict":RelayReply::ok(&route).to_json()})))
+        }
         Operation::Collect => {
             root.push.collect(clock.wall_ms);
             (StatusCode::OK, Json(json!({})))
         }
         Operation::Push(ingress) => {
+            if root.routes.get(&ingress.context.host).is_some_and(|binding|
+                binding.connection.conn != ingress.context.connection || !binding.valid(&log)) {
+                return Err(error(StatusCode::BAD_REQUEST, "invalid_push_record"));
+            }
             let disposition = root.push.receive(&ingress, &log, clock.wall_ms)
                 .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_push_record"))?;
             (StatusCode::OK, Json(disposition))
@@ -295,7 +520,8 @@ fn apply(
                     _ => None,
                 })
                 .ok_or_else(unavailable)?;
-            (StatusCode::OK, Json(json!({"room":signer})))
+            let binding = root.routes.get(&host).filter(|binding| binding.valid(&log));
+            (StatusCode::OK, Json(json!({"room":signer,"binding":binding,"host_trust_gen":current.host_trust_gen})))
         }
         Operation::Append { entry, expected } => {
             if let Some(existing) = log.entry(entry.seq).filter(|e| e.hash() == entry.hash()) {
@@ -420,6 +646,7 @@ fn apply(
             )
         }
     };
+    root.routes.retain(|_, binding| binding.valid(&log));
     retain(&mut root, &log, clock.wall_ms);
     root.membership = log.to_stored();
     if serde_json::to_vec(&root).map_err(|_| unavailable())?.len() > MAX_STATE {
@@ -500,12 +727,13 @@ pub(super) async fn subject(state: &AppState, headers: &HeaderMap) -> Result<Str
         })
 }
 
-pub(super) async fn probe_room(
+pub(super) async fn host_target(
     state: &AppState,
     genesis: &str,
     subject: &str,
     host: &str,
-) -> Result<String, Reply> {
+) -> Result<(String, crate::cluster::ConnRef, Option<HostBinding>, u64), Reply> {
+    state.relay.configure_recovery(state.recovery.clone());
     let reply = state
         .recovery
         .perform(
@@ -517,10 +745,25 @@ pub(super) async fn probe_room(
     if reply.0 != StatusCode::OK {
         return Err(reply);
     }
-    reply.1 .0["room"]
+    let room = reply.1 .0["room"]
         .as_str()
-        .map(str::to_owned)
-        .ok_or_else(unavailable)
+        .ok_or_else(unavailable)?
+        .to_owned();
+    let binding: Option<HostBinding> = serde_json::from_value(reply.1 .0["binding"].clone()).ok();
+    let target = if let Some(binding) = &binding {
+        Some(binding.connection.clone())
+    } else {
+        match state.relay.room(&room).await {
+            Ok(Some(room)) if room.owner.is_some() => room.atems.get(host).cloned(),
+            _ => None,
+        }
+    };
+    Ok((
+        room,
+        target.ok_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "host_unreachable"))?,
+        binding,
+        reply.1.0["host_trust_gen"].as_u64().ok_or_else(unavailable)?,
+    ))
 }
 
 async fn read(body: Body) -> Result<StrictValue, Reply> {
@@ -693,7 +936,7 @@ pub async fn backup(
 mod channel_crypto_tests;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn fixture() -> Value {
@@ -730,7 +973,7 @@ mod tests {
         }
     }
 
-    pub(super) struct TestAccountVerifier;
+    pub(crate) struct TestAccountVerifier;
     #[async_trait::async_trait]
     impl crate::account_store::AccountIdentityVerifier for TestAccountVerifier {
         async fn verify(
@@ -754,11 +997,12 @@ mod tests {
         state.accounts = Arc::new(crate::account_store::InMemoryAccountStore::with_verifier(
             state.knowledge.clone(), state.vault.clone(), Arc::new(TestAccountVerifier)));
         state.recovery = RecoveryStore::memory();
-        let genesis = fixture()["genesis"].as_str().unwrap().to_owned();
-        for label in ["E1", "E2"] { assert_eq!(state.recovery.perform(&genesis, "alice", append(label)).await.0, StatusCode::OK); }
-        state.relay.ensure_room("dev-mac", "identity", chrono::Utc::now().timestamp()).await.unwrap();
+        let f = super::super::push_ingress::tests::Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
+        f.publish(&state.recovery).await;
+        let genesis = f.log.genesis_hash().to_hex();
         let (base, server) = spawn_relay(state).await;
-        let mut host = connect_atem(&base, "dev-mac", "host-a").await;
+        let mut host = connect_atem(&base, "phone", "host-a").await;
+        crate::remote_api::host_route_tests::prove(&mut host, &f.keys, &f.host_key, &f.log, "host-a").await;
         let url = base.replace("/ws", &format!("/api/remote/v1/channels?genesis={genesis}&host=host-a"));
         let mut unauthorized = url.clone().into_client_request().unwrap();
         unauthorized.headers_mut().insert("authorization", "Bearer mallory".parse().unwrap());
@@ -900,24 +1144,14 @@ mod tests {
             Arc::new(TestAccountVerifier),
         ));
         state.recovery = RecoveryStore::memory();
-        let genesis = fixture()["genesis"].as_str().unwrap().to_owned();
-        for label in ["E1", "E2"] {
-            assert_eq!(
-                state
-                    .recovery
-                    .perform(&genesis, "alice", append(label))
-                    .await
-                    .0,
-                StatusCode::OK
-            );
-        }
-        state
-            .relay
-            .ensure_room("dev-mac", "identity", chrono::Utc::now().timestamp())
-            .await
-            .unwrap();
+        let f = super::super::push_ingress::tests::Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
+        f.publish(&state.recovery).await;
+        let genesis = f.log.genesis_hash().to_hex();
+        let mut vectors = vectors;
+        vectors["init"]["genesis_hash"] = json!(genesis);
         let (base, server) = spawn_relay(state).await;
-        let mut host = connect_atem(&base, "dev-mac", "host-a").await;
+        let mut host = connect_atem(&base, "phone", "host-a").await;
+        crate::remote_api::host_route_tests::prove(&mut host, &f.keys, &f.host_key, &f.log, "host-a").await;
         let url = base.replace("ws://", "http://").replace(
             "/ws",
             &format!("/api/remote/v1/logs/{genesis}/probes/host-a"),

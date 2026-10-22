@@ -15,6 +15,8 @@ pub(crate) mod push_ingress;
 pub(crate) mod recovery;
 pub(crate) mod recovery_probe;
 pub(crate) mod channels;
+#[cfg(test)]
+pub(crate) mod host_route_tests;
 
 pub fn routes() -> Router<AppState> {
     Router::new()

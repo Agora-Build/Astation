@@ -96,16 +96,29 @@ check; this is not a claim of a fresh 121-case/platform pass. No protected
 owner ceremony, real agent, Android device load or provider execution is added
 by these checks. The installed provisioned Local.app remains at 5aa3efd.
 
+## Durable relay follow-up
+
+The relay now implements the two carriers, absent-room challenge candidates,
+durable bindings and verdicts. The shared verifier rechecks current membership
+under the root transaction lock before destination/broker queue admission and
+presence publication. Carrier-A independent channels retain the same root and
+connection scope, so a proved replacement also fences their delayed frames.
+Directory presence is reconstructed from current bindings after expiry or loss.
+
+The full relay suite passes 513 tests with 119 environment ignores. An explicit
+isolated Postgres run passes all 47 remote API tests without skips, including
+two independent pools and both replica dispatchers, lost close notifications,
+write failure before verdict, expiry, restart, key replacement and revocation.
+Real encrypted registry and push retries no longer bootstrap rooms in fixtures.
+See [ordering and evidence](r9-host-routing-lifecycle.md).
+
 ## Remaining gates
 
 This accepts the delivered shared source/runtime and packages for integration.
-The Astation relay still needs both carriers, absent-room challenge admission,
-candidate isolation for B, durable `(genesis_hash, host_id)` binding,
-cross-replica fencing before route exposure, verdicts, membership-change
-revocation/replacement and proved-route presence retention. Run the
+Run the
 [no-Mac restart/rejoin/removal matrix](r9-host-routing-lifecycle.md) against the
-real runtime after these are implemented. No live relay lifecycle pass is
-claimed by this dependency/interception increment.
+real runtime and real relay replicas before release. The controlled tests do
+not establish that joint live lifecycle pass.
 
 Joint provisioned owner/real-agent ceremony remains a release gate. Push
 providers remain follow-up. The known low-severity host follow-up discards a

@@ -81,14 +81,13 @@ async fn independent_native_verifies_host_and_exchanges_encrypted_registry_witho
             StatusCode::OK
         );
     }
-    state
-        .relay
-        .ensure_room("phone-a", "identity", chrono::Utc::now().timestamp())
-        .await
-        .unwrap();
-    let (base, server) = spawn_relay(state).await;
-    // Only the host opens the legacy routing link. No native owner is online.
+    let (base, server) = spawn_relay(state.clone()).await;
+    // The host proves its route without a room or native owner.
     let mut host = connect_atem(&base, "phone-a", "host-a").await;
+    crate::remote_api::host_route_tests::prove(&mut host, &keys, &host_key, &log, "host-a").await;
+    // Independent routing is authoritative even before presence is repaired.
+    state.relay.directory().delete_room("phone-a").await.unwrap();
+    state.relay.invalidate_room("phone-a");
     let url = base.replace(
         "/ws",
         &format!(

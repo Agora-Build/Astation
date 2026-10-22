@@ -87,9 +87,13 @@ Atem has now delivered the shared authenticated rejoin proof and host runtime.
 This Astation increment intercepts relay-only messages from the room owner,
 including targeted payloads, so a peer cannot inject challenges or verdicts.
 Host relay messages already terminate at the relay's push ingress. The relay
-still needs both carriers, an isolated candidate on the independent route,
-durable binding, cross-replica fencing, verdict delivery and presence retention.
-Fixture room recreation is not evidence of production Mac-off rejoin. See the
+now implements both carriers, isolated independent candidates, durable binding,
+cross-replica fencing, verdicts and presence repair. The new controlled suite
+passes 513 relay tests with 119 environment ignores; a separate isolated
+Postgres run executes all 47 remote API cases without skips. Replacement also
+fences older carrier-A channels, including delayed replies. Fixture room
+recreation is no longer used for the encrypted registry/push reconnect tests.
+Real Atem/Redis-replica execution and the owner ceremony remain pending. See the
 [host lifecycle requirements](../designs/protocol/r9-host-routing-lifecycle.md).
 
 Atem #89 remains unmerged; production access is not deployed. The user approved

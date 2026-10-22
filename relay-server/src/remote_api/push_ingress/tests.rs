@@ -168,7 +168,7 @@ impl Fixture {
         }
     }
 
-    fn remove_host(&self) -> Entry {
+    pub(crate) fn remove_host(&self) -> Entry {
         let head = self.log.head();
         let object = SignedObject::sign(&self.keys, &KeyId::new("manager"), json!({
             "type":"atem-membership-entry", "v":1, "action":"remove_host", "account_id":"account-test",
@@ -400,47 +400,23 @@ async fn membership_removal_fences_delayed_ingress_and_previously_accepted_retri
 
 async fn websocket_retry_after_disconnect(store: std::sync::Arc<RecoveryStore>) {
     use crate::relay::tests::{connect_atem, next_client_json, send_json, spawn_relay};
-    use futures_util::SinkExt;
     let f = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
     f.publish(&store).await;
     let state = crate::AppState {
         recovery: store.clone(),
         ..crate::tests::test_state()
     };
-    state
-        .relay
-        .ensure_room(
-            "phone",
-            crate::cluster::directory::IDENTITY_HOSTNAME,
-            chrono::Utc::now().timestamp(),
-        )
-        .await
-        .unwrap();
     let (url, server) = spawn_relay(state.clone()).await;
     let message = push::push_hint_message(&[f.open()]);
     // No Mac is connected. Delivery is accepted independently of its sender's lifetime.
     let mut first = connect_atem(&url, "phone", "host-a").await;
+    crate::remote_api::host_route_tests::prove(&mut first, &f.keys, &f.host_key, &f.log, "host-a").await;
     send_json(&mut first, message.clone()).await;
     first.close(None).await.unwrap();
     drop(first);
-    // The fixture bootstraps the routing room again, as on relay startup.
-    // Durable push storage is independent of that directory lifecycle.
-    for _ in 0..100 {
-        if state.relay.room("phone").await.unwrap().is_none() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    state
-        .relay
-        .ensure_room(
-            "phone",
-            crate::cluster::directory::IDENTITY_HOSTNAME,
-            chrono::Utc::now().timestamp(),
-        )
-        .await
-        .unwrap();
+    // A fresh proof restores the route without fixture-side room creation.
     let mut next = connect_atem(&url, "phone", "host-a").await;
+    crate::remote_api::host_route_tests::prove(&mut next, &f.keys, &f.host_key, &f.log, "host-a").await;
     send_json(&mut next, message.clone()).await;
     let ack = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -467,6 +443,7 @@ async fn websocket_retry_after_disconnect(store: std::sync::Arc<RecoveryStore>) 
     assert_eq!(next_client_json(&mut next).await, ack);
     // A room join alone cannot report another host's signed hint.
     let mut imposter = connect_atem(&url, "phone", "imposter").await;
+    assert_eq!(next_client_json(&mut imposter).await["op"], "host_challenge");
     send_json(&mut imposter, message.clone()).await;
     assert!(tokio::time::timeout(
         std::time::Duration::from_millis(150),
@@ -474,7 +451,9 @@ async fn websocket_retry_after_disconnect(store: std::sync::Arc<RecoveryStore>) 
     )
     .await
     .is_err());
-    let saved = handle(&store, f.context(), &message.to_string())
+    let mut context = f.context();
+    context.connection = state.relay.room("phone").await.unwrap().unwrap().atems["host-a"].conn.clone();
+    let saved = handle(&store, context, &message.to_string())
         .await
         .unwrap();
     assert_eq!(serde_json::from_str::<Value>(&saved[0]).unwrap(), ack);

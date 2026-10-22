@@ -7,7 +7,6 @@ use axum::{
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
 };
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -86,6 +85,8 @@ struct Route {
     sender: mpsc::Sender<QueuedFrame>,
     bytes: Arc<Semaphore>,
     close: watch::Sender<bool>,
+    binding: Option<super::recovery::HostBinding>,
+    owner_route: Option<super::recovery::OwnerRoute>,
 }
 
 pub(crate) struct QueuedFrame {
@@ -138,9 +139,31 @@ impl ChannelBroker {
                 sender,
                 bytes,
                 close,
+                binding: None,
+                owner_route: None,
             },
         );
         Some((handle, frames, closed))
+    }
+
+    pub(crate) fn bind_host(&self, handle: &str, binding: super::recovery::HostBinding) {
+        if let Some(route) = self.0.lock().unwrap_or_else(|e| e.into_inner()).routes.get_mut(handle) {
+            route.binding = Some(binding);
+        }
+    }
+
+    pub(crate) fn host_binding(&self, handle: &str) -> Option<super::recovery::HostBinding> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).routes.get(handle)?.binding.clone()
+    }
+
+    pub(crate) fn bind_owner(&self, handle: &str, route: super::recovery::OwnerRoute) {
+        if let Some(bound) = self.0.lock().unwrap_or_else(|e| e.into_inner()).routes.get_mut(handle) {
+            bound.owner_route = Some(route);
+        }
+    }
+
+    pub(crate) fn owner_route(&self, handle: &str) -> Option<super::recovery::OwnerRoute> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).routes.get(handle)?.owner_route.clone()
     }
 
     pub(crate) fn reply(&self, handle: &str, source: &ConnRef, text: &str) -> bool {
@@ -249,28 +272,19 @@ pub(super) async fn connect(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let room =
-        match super::recovery::probe_room(&state, &query.genesis, &subject, &query.host).await {
-            Ok(r) => r,
-            Err(e) => return e.into_response(),
-        };
-    let target = match state.relay.room(&room).await {
-        Ok(Some(room)) => room.atems.get(&query.host).cloned(),
-        _ => None,
+    let (room, target, binding, host_trust_gen) = match super::recovery::host_target(&state, &query.genesis, &subject, &query.host).await {
+        Ok(route) => route,
+        Err(error) => return error.into_response(),
     };
-    let Some(target) = target else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error":{"code":"host_unreachable"}})),
-        )
-            .into_response();
-    };
+    let owner_route = binding.is_none().then(|| super::recovery::OwnerRoute {
+        genesis:query.genesis, host:query.host.clone(), room:room.clone(), connection:target.clone(), host_trust_gen,
+    });
     // The account subject is only a privacy/rate-limit boundary. No device ID or role is accepted here.
     ws.max_message_size(MAX_BYTES)
         .max_frame_size(MAX_BYTES)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            serve(socket, state.relay, room, query.host, target, subject).await;
+            serve(socket, state.relay, state.recovery, room, query.host, target, subject, binding, owner_route).await;
         })
 }
 
@@ -279,6 +293,7 @@ struct RouteGuard {
     target: ConnRef,
     handle: String,
     notify_host: bool,
+    owner_route: Option<super::recovery::OwnerRoute>,
 }
 impl Drop for RouteGuard {
     fn drop(&mut self) {
@@ -286,13 +301,13 @@ impl Drop for RouteGuard {
         if !self.notify_host {
             return;
         }
-        let (hub, target, handle) = (self.hub.clone(), self.target.clone(), self.handle.clone());
+        let (hub, target, handle, owner_route) = (self.hub.clone(), self.target.clone(), self.handle.clone(), self.owner_route.clone());
         tokio::spawn(async move {
             let _ = hub
-                .deliver_channel(
+                .deliver_scoped_channel(
                     &target,
                     json!({"type":"channel","event":"close","channel":handle,"reason":"closed"})
-                        .to_string(),
+                        .to_string(), owner_route,
                 )
                 .await;
         });
@@ -302,10 +317,13 @@ impl Drop for RouteGuard {
 async fn serve(
     mut socket: WebSocket,
     hub: crate::relay::RelayHub,
+    recovery: Arc<super::recovery::RecoveryStore>,
     room: String,
     host: String,
     target: ConnRef,
     subject: String,
+    binding: Option<super::recovery::HostBinding>,
+    owner_route: Option<super::recovery::OwnerRoute>,
 ) {
     let initial = tokio::time::timeout(Duration::from_secs(10), socket.next()).await;
     let Ok(Some(Ok(Message::Text(text)))) = initial else {
@@ -320,14 +338,17 @@ async fn serve(
     else {
         return;
     };
+    if let Some(binding) = &binding { hub.channels().bind_host(&handle, binding.clone()); }
+    if let Some(route) = &owner_route { hub.channels().bind_owner(&handle, route.clone()); }
     let mut guard = RouteGuard {
         hub: hub.clone(),
         target: target.clone(),
         handle: handle.clone(),
         notify_host: true,
+        owner_route: owner_route.clone(),
     };
     if !hub
-        .deliver_channel(&target, open.with_handle(&handle))
+        .deliver_scoped_channel(&target, open.with_handle(&handle), owner_route.clone())
         .await
     {
         return;
@@ -341,7 +362,10 @@ async fn serve(
             _ = closed.changed() => break,
             _ = &mut lifetime => break,
             _ = health.tick() => {
-                if !matches!(hub.room(&room).await, Ok(Some(r)) if r.atems.get(&host) == Some(&target)) { break; }
+                let current = if let Some(binding) = &binding {
+                    recovery.with_host_route(binding, || async { () }).await.is_some()
+                } else { matches!(hub.room(&room).await, Ok(Some(r)) if r.owner.is_some() && r.atems.get(&host) == Some(&target)) };
+                if !current { break; }
                 if !matches!(tokio::time::timeout(Duration::from_secs(5), socket.send(Message::Ping(vec![]))).await, Ok(Ok(()))) { break; }
             }
             reply = replies.recv() => {
@@ -356,8 +380,11 @@ async fn serve(
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         let Some(message) = Envelope::parse(&text).filter(|e| e.channel == open.channel && e.event != "open") else { break };
-                        if !matches!(hub.room(&room).await, Ok(Some(r)) if r.atems.get(&host) == Some(&target)) { break; }
-                        let sent = hub.deliver_channel(&target, message.with_handle(&handle)).await;
+                        let current = if let Some(binding) = &binding {
+                            recovery.with_host_route(binding, || async { () }).await.is_some()
+                        } else { matches!(hub.room(&room).await, Ok(Some(r)) if r.owner.is_some() && r.atems.get(&host) == Some(&target)) };
+                        if !current { break; }
+                        let sent = hub.deliver_scoped_channel(&target, message.with_handle(&handle), owner_route.clone()).await;
                         if sent && message.event == "close" { guard.notify_host = false; }
                         if !sent || message.event == "close" { break; }
                     },
@@ -472,6 +499,189 @@ mod tests {
             task.abort();
         }
     }
+
+    async fn proved_route_fences_at_both_replica_queues(
+        stores: [Arc<super::super::recovery::RecoveryStore>; 2],
+    ) {
+        use crate::relay::{HubParts, RelayHub};
+        use crate::remote_api::{
+            host_route_tests::proof, push_ingress::tests::Fixture, recovery::Operation,
+        };
+        use atem_client::host_route::HostChallenge;
+        let f = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
+        f.publish(&stores[0]).await;
+        let bus = Arc::new(TestBus::default());
+        let mut hubs = Vec::new();
+        let mut tasks = Vec::new();
+        for (replica, store) in ["r1", "r2"].into_iter().zip(&stores) {
+            let hub = RelayHub::from_parts(HubParts {
+                replica_id: replica.into(),
+                bus: bus.clone(),
+                ..HubParts::single_instance(
+                    crate::cluster::directory::InMemoryRoomDirectory::new(),
+                    Duration::from_secs(10),
+                )
+            });
+            hub.configure_recovery(store.clone());
+            let (tx, rx) = mpsc::unbounded_channel();
+            bus.replicas.lock().unwrap().insert(replica.into(), tx);
+            tasks.push(hub.spawn_bus_dispatcher(
+                Arc::new(crate::identity_store::InMemoryIdentityStore::new()),
+                crate::voice_session::ReplyWaiters::default(),
+                rx,
+            ));
+            hubs.push(hub);
+        }
+        let old_target = ConnRef::new("old-host", "r2");
+        let new_target = ConnRef::new("new-host", "r2");
+        let mut old_socket = hubs[1].local().register(
+            &old_target.conn,
+            "phone",
+            crate::cluster::local::SocketRole::Atem {
+                atem_id: "host-a".into(),
+            },
+        );
+        let mut new_socket = hubs[1].local().register(
+            &new_target.conn,
+            "phone",
+            crate::cluster::local::SocketRole::Atem {
+                atem_id: "host-a".into(),
+            },
+        );
+        hubs[1]
+            .directory()
+            .claim_owner(
+                "phone",
+                &ConnRef::new("owner", "r2"),
+                "127.0.0.1",
+                chrono::Utc::now().timestamp(),
+                crate::cluster::directory::PendingCaps::NONE,
+            )
+            .await
+            .unwrap();
+        hubs[1]
+            .directory()
+            .join_atem("phone", "host-a", &old_target)
+            .await
+            .unwrap();
+        let owner_route = super::super::recovery::OwnerRoute {
+            genesis: f.log.genesis_hash().to_hex(),
+            host: "host-a".into(),
+            room: "phone".into(),
+            connection: old_target.clone(),
+            host_trust_gen: 1,
+        };
+        let (owner_handle, mut owner_replies, _) = hubs[0]
+            .channels()
+            .register("r1", "alice", old_target.clone(), "owner_1")
+            .unwrap();
+        hubs[0]
+            .channels()
+            .bind_owner(&owner_handle, owner_route.clone());
+        let owner_open =
+            json!({"type":"channel","event":"open","channel":owner_handle,"transport":"relay"})
+                .to_string();
+        assert!(
+            hubs[0]
+                .deliver_scoped_channel(&old_target, owner_open.clone(), Some(owner_route.clone()))
+                .await
+        );
+        assert_eq!(old_socket.frames.recv().await.unwrap(), owner_open);
+        let challenge = HostChallenge::new("phone");
+        let message = proof(&f.keys, &f.host_key, &f.log, &challenge, "host-a").to_string();
+        let (old, _) = stores[0]
+            .admit_host(
+                &message,
+                challenge.nonce,
+                "phone",
+                "host-a",
+                old_target.clone(),
+            )
+            .await
+            .unwrap();
+        hubs[1].track_host_route(old.clone());
+        let (handle, mut replies, _) = hubs[0]
+            .channels()
+            .register("r1", "alice", old_target.clone(), "phone_1")
+            .unwrap();
+        hubs[0].channels().bind_host(&handle, old);
+        let open = json!({"type":"channel","event":"open","channel":handle,"transport":"relay"})
+            .to_string();
+        assert!(hubs[0].deliver_channel(&old_target, open.clone()).await);
+        assert_eq!(old_socket.frames.recv().await.unwrap(), open);
+        let challenge = HostChallenge::new("phone");
+        let message = proof(&f.keys, &f.host_key, &f.log, &challenge, "host-a").to_string();
+        let (new, _) = stores[1]
+            .admit_host(
+                &message,
+                challenge.nonce,
+                "phone",
+                "host-a",
+                new_target.clone(),
+            )
+            .await
+            .unwrap();
+        hubs[1].track_host_route(new);
+        // Deliberately deliver no old-connection close or room invalidation. The
+        // destination and reply broker must consult the durable generation anyway.
+        assert!(!hubs[0].deliver_channel(&old_target, open.clone()).await);
+        assert!(
+            !hubs[0]
+                .deliver_scoped_channel(&old_target, owner_open, Some(owner_route))
+                .await
+        );
+        assert!(old_socket.frames.try_recv().is_err());
+        let late = json!({"type":"channel","event":"frame","channel":handle,"frame":{"ct":"late"}})
+            .to_string();
+        assert!(hubs[1].remote_channel_reply(&old_target, &late).await);
+        assert!(replies.try_recv().is_err());
+        let late_owner = json!({"type":"channel","event":"frame","channel":owner_handle,"frame":{"ct":"late_a"}}).to_string();
+        assert!(hubs[1].remote_channel_reply(&old_target, &late_owner).await);
+        assert!(owner_replies.try_recv().is_err());
+        assert!(hubs[0].deliver_channel(&new_target, open.clone()).await);
+        assert_eq!(new_socket.frames.recv().await.unwrap(), open);
+        assert_eq!(
+            stores[0]
+                .perform(
+                    &f.log.genesis_hash().to_hex(),
+                    "alice",
+                    Operation::Append {
+                        entry: f.remove_host(),
+                        expected: f.log.head().clone(),
+                    }
+                )
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert!(!hubs[0].deliver_channel(&new_target, open).await);
+        assert!(new_socket.frames.try_recv().is_err());
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_and_removal_fence_two_replicas_even_when_close_is_lost() {
+        let store = super::super::recovery::RecoveryStore::memory();
+        proved_route_fences_at_both_replica_queues([store.clone(), store]).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a local isolated Postgres test database"]
+    async fn postgres_replica_queues_use_the_same_durable_generation() {
+        let db =
+            crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+        let second = db.reconnect(4).await;
+        proved_route_fences_at_both_replica_queues([
+            super::super::recovery::RecoveryStore::postgres(db.pool.clone()),
+            super::super::recovery::RecoveryStore::postgres(second.clone()),
+        ])
+        .await;
+        second.close().await;
+        db.cleanup().await;
+    }
+
     #[tokio::test]
     async fn replies_are_bound_to_the_host_generation_and_never_change_inner_bytes() {
         let broker = ChannelBroker::default();

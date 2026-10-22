@@ -245,6 +245,8 @@ struct HubInner {
     push_delivery: std::sync::OnceLock<Arc<crate::push_delivery::PushDelivery>>,
     recovery_probes: crate::remote_api::recovery_probe::ProbeBroker,
     remote_channels: crate::remote_api::channels::ChannelBroker,
+    recovery: std::sync::OnceLock<Arc<crate::remote_api::recovery::RecoveryStore>>,
+    host_routes: std::sync::Mutex<HashMap<String, crate::remote_api::recovery::HostBinding>>,
 }
 
 /// The relay: this replica's sockets plus the shared room directory, the
@@ -298,6 +300,8 @@ impl RelayHub {
                 push_delivery: std::sync::OnceLock::new(),
                 recovery_probes: crate::remote_api::recovery_probe::ProbeBroker::default(),
                 remote_channels: crate::remote_api::channels::ChannelBroker::default(),
+                recovery: std::sync::OnceLock::new(),
+                host_routes: std::sync::Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -309,15 +313,187 @@ impl RelayHub {
     pub(crate) fn probes(&self) -> &crate::remote_api::recovery_probe::ProbeBroker { &self.inner.recovery_probes }
     pub(crate) fn channels(&self) -> &crate::remote_api::channels::ChannelBroker { &self.inner.remote_channels }
 
-    pub(crate) async fn deliver_channel(&self, target: &ConnRef, frame: String) -> bool {
-        if target.replica == self.inner.replica_id {
-            return self.inner.local.send_required(&target.conn, frame);
+    pub(crate) fn configure_recovery(
+        &self,
+        store: Arc<crate::remote_api::recovery::RecoveryStore>,
+    ) {
+        self.inner.recovery.get_or_init(|| store);
+    }
+
+    fn host_binding(&self, connection: &str) -> Option<crate::remote_api::recovery::HostBinding> {
+        self.inner
+            .host_routes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(connection)
+            .cloned()
+    }
+
+    pub(crate) fn track_host_route(&self, binding: crate::remote_api::recovery::HostBinding) {
+        self.inner
+            .host_routes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(binding.connection.conn.clone(), binding);
+    }
+
+    async fn publish_host_route(
+        &self,
+        binding: &crate::remote_api::recovery::HostBinding,
+        verdict: Option<String>,
+    ) -> Option<Result<AtemJoin, StoreError>> {
+        let store = self.inner.recovery.get()?;
+        store
+            .with_host_route(binding, || async {
+                if !self.local().contains(&binding.connection.conn) {
+                    return Err(StoreError::Unavailable("host connection gone".into()));
+                }
+                self.ensure_room(
+                    &binding.room,
+                    IDENTITY_HOSTNAME,
+                    chrono::Utc::now().timestamp(),
+                )
+                .await?;
+                let joined = self
+                    .directory()
+                    .join_atem(&binding.room, &binding.atem_id, &binding.connection)
+                    .await?;
+                if let Some(verdict) = verdict {
+                    if !self
+                        .local()
+                        .send_required(&binding.connection.conn, verdict)
+                    {
+                        return Err(StoreError::Unavailable(
+                            "host closed during admission".into(),
+                        ));
+                    }
+                }
+                Ok(joined)
+            })
+            .await
+    }
+
+    async fn send_local_checked(&self, connection: &str, frame: String, required: bool) -> bool {
+        if self.local().role(connection) == Some(SocketRole::HostCandidate) {
+            return false;
         }
-        let Some((delivery, rx)) = self.channels().delivery() else { return false };
-        let message = InboxMessage::ChannelDeliver { connection_id: target.conn.clone(), frame,
-            reply_to: self.inner.replica_id.clone(), delivery: delivery.clone() };
-        let sent = self.inner.bus.send_inbox(&target.replica, message).await.is_ok();
-        let accepted = sent && matches!(tokio::time::timeout(Duration::from_secs(2), rx).await, Ok(Ok(true)));
+        let send = || async {
+            if required {
+                self.local().send_required(connection, frame)
+            } else {
+                self.local().send(connection, frame)
+            }
+        };
+        if let Some(binding) = self.host_binding(connection) {
+            let Some(store) = self.inner.recovery.get() else {
+                return false;
+            };
+            let sent = store.with_host_route(&binding, send).await;
+            if sent.is_none() {
+                self.local()
+                    .close_with(connection, CLOSE_TRY_AGAIN, "host route changed");
+            }
+            sent.unwrap_or(false)
+        } else {
+            send().await
+        }
+    }
+
+    async fn channel_reply_checked(&self, handle: &str, source: &ConnRef, frame: &str) -> bool {
+        if let Some(binding) = self.channels().host_binding(handle) {
+            let Some(store) = self.inner.recovery.get() else {
+                return false;
+            };
+            store
+                .with_host_route(&binding, || async {
+                    self.channels().reply(handle, source, frame)
+                })
+                .await
+                .unwrap_or(false)
+        } else if let Some(route) = self.channels().owner_route(handle) {
+            let Some(store) = self.inner.recovery.get() else {
+                return false;
+            };
+            store
+                .with_owner_route(&route, || async {
+                    self.owner_route_current(&route).await
+                        && self.channels().reply(handle, source, frame)
+                })
+                .await
+                .unwrap_or(false)
+        } else {
+            self.channels().reply(handle, source, frame)
+        }
+    }
+
+    async fn owner_route_current(&self, route: &crate::remote_api::recovery::OwnerRoute) -> bool {
+        matches!(self.room(&route.room).await, Ok(Some(room)) if room.owner.is_some()
+            && room.atems.get(&route.host) == Some(&route.connection))
+    }
+
+    async fn send_scoped_channel(
+        &self,
+        connection: &str,
+        frame: String,
+        owner_route: Option<crate::remote_api::recovery::OwnerRoute>,
+    ) -> bool {
+        if let Some(route) = owner_route {
+            if self.local().role(connection) == Some(SocketRole::HostCandidate)
+                || route.connection != self.me(connection)
+            {
+                return false;
+            }
+            let Some(store) = self.inner.recovery.get() else {
+                return false;
+            };
+            store
+                .with_owner_route(&route, || async {
+                    self.owner_route_current(&route).await
+                        && self.local().send_required(connection, frame)
+                })
+                .await
+                .unwrap_or(false)
+        } else {
+            self.send_local_checked(connection, frame, true).await
+        }
+    }
+
+    pub(crate) async fn deliver_channel(&self, target: &ConnRef, frame: String) -> bool {
+        self.deliver_scoped_channel(target, frame, None).await
+    }
+
+    pub(crate) async fn deliver_scoped_channel(
+        &self,
+        target: &ConnRef,
+        frame: String,
+        owner_route: Option<crate::remote_api::recovery::OwnerRoute>,
+    ) -> bool {
+        if target.replica == self.inner.replica_id {
+            return self
+                .send_scoped_channel(&target.conn, frame, owner_route)
+                .await;
+        }
+        let Some((delivery, rx)) = self.channels().delivery() else {
+            return false;
+        };
+        let message = InboxMessage::ChannelDeliver {
+            connection_id: target.conn.clone(),
+            frame,
+            reply_to: self.inner.replica_id.clone(),
+            delivery: delivery.clone(),
+            owner_route,
+        };
+        let sent = self
+            .inner
+            .bus
+            .send_inbox(&target.replica, message)
+            .await
+            .is_ok();
+        let accepted = sent
+            && matches!(
+                tokio::time::timeout(Duration::from_secs(2), rx).await,
+                Ok(Ok(true))
+            );
         self.channels().delivered(&delivery, false);
         accepted
     }
@@ -329,7 +505,7 @@ impl RelayHub {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else { return false };
         let Some(handle) = value["channel"].as_str().filter(|h| h.starts_with("rc_")) else { return false };
         let Some(origin) = crate::remote_api::channels::origin(handle) else { return true };
-        let accepted = if origin == self.replica_id() { self.channels().reply(handle, source, text) }
+        let accepted = if origin == self.replica_id() { self.channel_reply_checked(handle, source, text).await }
         else {
             if let Some((delivery, rx)) = self.channels().delivery() {
                 let message = InboxMessage::ChannelReply { handle: handle.into(), source: source.clone(), frame: text.into(),
@@ -498,7 +674,7 @@ impl RelayHub {
     /// Queue a frame on a connection, here or on its replica.
     pub(crate) async fn deliver(&self, target: &ConnRef, frame: String) {
         if target.replica == self.inner.replica_id {
-            self.inner.local.send(&target.conn, frame);
+            self.send_local_checked(&target.conn, frame, false).await;
             return;
         }
         let message = InboxMessage::Deliver {
@@ -519,7 +695,7 @@ impl RelayHub {
         for (replica, connection_ids) in by_replica {
             if replica == self.inner.replica_id {
                 for connection_id in connection_ids {
-                    self.inner.local.send(&connection_id, frame.clone());
+                    self.send_local_checked(&connection_id, frame.clone(), false).await;
                 }
                 continue;
             }
@@ -695,15 +871,21 @@ impl RelayHub {
                     BusEvent::Broadcast(BroadcastMessage::RecoveryProbe { handle, connection, frame }) => {
                         hub.probes().reply(&handle, &connection, frame);
                     }
-                    BusEvent::Inbox(InboxMessage::ChannelDeliver { connection_id, frame, reply_to, delivery }) => {
-                        let accepted = hub.local().send_required(&connection_id, frame);
+                    BusEvent::Inbox(InboxMessage::ChannelDeliver { connection_id, frame, reply_to, delivery, owner_route }) => {
+                        let accepted = hub.send_scoped_channel(&connection_id, frame, owner_route).await;
                         let _ = hub.inner.bus.send_inbox(&reply_to, InboxMessage::ChannelDelivered { delivery, accepted }).await;
                     }
                     BusEvent::Inbox(InboxMessage::ChannelDelivered { delivery, accepted }) => hub.channels().delivered(&delivery, accepted),
                     BusEvent::Inbox(InboxMessage::ChannelReply { handle, source, frame, reply_to, delivery }) => {
-                        let accepted = hub.channels().reply(&handle, &source, &frame);
+                        let accepted = hub.channel_reply_checked(&handle, &source, &frame).await;
                         let _ = hub.inner.bus.send_inbox(&reply_to, InboxMessage::ChannelDelivered { delivery, accepted }).await;
                     },
+                    BusEvent::Inbox(InboxMessage::Deliver { connection_ids, frame }) => {
+                        for connection in connection_ids { hub.send_local_checked(&connection, frame.clone(), false).await; }
+                    }
+                    BusEvent::Inbox(InboxMessage::CloseUnproved { connection_id }) => {
+                        if hub.host_binding(&connection_id).is_none() { hub.local().evict(&connection_id); }
+                    }
                     BusEvent::Inbox(message) => apply_inbox(hub.local(), message),
                     BusEvent::Broadcast(BroadcastMessage::RoomChanged { code }) => {
                         hub.invalidate_room(&code)
@@ -901,7 +1083,7 @@ impl RelayHub {
         for (connection_id, role) in self.inner.local.connections_in_room(code) {
             // An Astation keeps (or recreates) its room: one that registered
             // just before the sweep must not be closed.
-            if matches!(role, SocketRole::Atem { .. }) {
+            if matches!(role, SocketRole::Atem { .. }) && self.host_binding(&connection_id).is_none() {
                 self.inner.local.evict(&connection_id);
             }
         }
@@ -913,6 +1095,13 @@ impl RelayHub {
     /// - keep alive the rooms where this replica holds an Astation socket;
     /// - close local Atem sockets whose room is gone (as today's sweep did).
     pub async fn cleanup_expired(&self) {
+        let bindings: Vec<_> = self.inner.host_routes.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
+        for binding in &bindings {
+            if let Some(store) = self.inner.recovery.get() {
+                let current = store.with_host_route(binding, || async { () }).await.is_some();
+                if !current { self.local().close_with(&binding.connection.conn, CLOSE_TRY_AGAIN, "host route changed"); }
+            }
+        }
         let now = chrono::Utc::now().timestamp();
         match self.inner.directory.remove_expired(now).await {
             Ok(removed) => {
@@ -921,6 +1110,21 @@ impl RelayHub {
                 }
             }
             Err(error) => tracing::warn!("Room sweep failed: {}", error),
+        }
+        // Rebuild only projections whose durable generation is still current. This
+        // also repairs Redis TTL expiry/loss without relying on a cached room.
+        for binding in bindings {
+            let present = matches!(self.directory().get(&binding.room).await,
+                Ok(Some(room)) if room.atems.get(&binding.atem_id) == Some(&binding.connection));
+            if !present {
+                if let Some(Ok(AtemJoin::Joined { owner, .. })) = self.publish_host_route(&binding, None).await {
+                    self.room_changed(&binding.room).await;
+                    if let Some(owner) = owner {
+                        self.deliver(&owner, relay_connection_event(&binding.atem_id, &binding.connection.conn, "connected")).await;
+                    }
+                }
+            }
+            let _ = self.directory().touch(&binding.room).await;
         }
         let astation_codes = self.inner.local.codes_with_astations();
         for (done, code) in astation_codes.iter().enumerate() {
@@ -1226,6 +1430,12 @@ pub async fn ws_handler(
             Ok(true) => tracing::info!("Auto-creating identity room for code={}", mask_code(&code)),
             Ok(false) => {}
             Err(error) => return ws_unavailable(&error),
+        }
+    } else if role == "atem" && state.recovery.route_storage_enabled() {
+        // An absent/expired room admits a challenge candidate, not presence.
+        // Current signed membership and key possession are checked after upgrade.
+        if code.is_empty() || code.len() > atem_client::host_route::MAX_ID_BYTES {
+            return StatusCode::BAD_REQUEST.into_response();
         }
     } else {
         match hub.room(&code).await {
@@ -2322,7 +2532,12 @@ async fn register_connection(
             AtemJoin::Joined { replaced, owner } => {
                 hub.room_changed(code).await;
                 if let Some(replaced) = replaced {
-                    hub.close_connection(&replaced, None).await;
+                    if replaced.replica == hub.replica_id() {
+                        if hub.host_binding(&replaced.conn).is_none() { hub.local().evict(&replaced.conn); }
+                    } else {
+                        let _ = hub.inner.bus.send_inbox(&replaced.replica,
+                            InboxMessage::CloseUnproved { connection_id: replaced.conn }).await;
+                    }
                 }
                 if let Some(owner) = owner {
                     hub.deliver(&owner, relay_connection_event(atem_id, connection_id, "connected"))
@@ -2478,6 +2693,7 @@ async fn handle_ws(
     permit: WsPermit,
 ) {
     let _active = ActiveSocket::new(&hub);
+    hub.configure_recovery(recovery.clone());
     let socket_role = match role.as_str() {
         "atem" => SocketRole::Atem { atem_id: atem_id.clone() },
         "astation" => SocketRole::Astation,
@@ -2513,9 +2729,35 @@ async fn handle_ws(
         return;
     }
 
-    let registration =
-        register_connection(&hub, &code, &atem_id, &connection_id, permit.ip(), astation_auth.as_mut())
-            .await;
+    let mut host_challenge = (role == "atem" && recovery.route_storage_enabled())
+        .then(|| atem_client::host_route::HostChallenge::new(&code));
+    if let Some(challenge) = &host_challenge {
+        local.send(&connection_id, challenge.to_json().to_string());
+    }
+    let host_deadline = Instant::now() + hub.auth_timeout();
+    let owner_present = if host_challenge.is_some() {
+        matches!(hub.room(&code).await, Ok(Some(room)) if room.owner.is_some())
+    } else {
+        true
+    };
+    let registration = if role == "atem" && !owner_present {
+        Ok(Registration::Registered)
+    } else {
+        register_connection(
+            &hub,
+            &code,
+            &atem_id,
+            &connection_id,
+            permit.ip(),
+            astation_auth.as_mut(),
+        )
+        .await
+    };
+    let mut carrier_a = role == "atem" && owner_present;
+    if role == "atem" && !carrier_a {
+        local.set_role(&connection_id, SocketRole::HostCandidate);
+    }
+
     let refused = match registration {
         Ok(Registration::Registered) => false,
         Ok(Registration::RoomGone) => {
@@ -2576,10 +2818,12 @@ async fn handle_ws(
     let mut recovery_probe_last_reply = None;
     let mut watch_close = true;
     loop {
+        let isolated_deadline = (role == "atem" && !carrier_a && hub.host_binding(&connection_id).is_none()).then_some(host_deadline);
+        if isolated_deadline.is_some_and(|deadline| Instant::now() >= deadline) { break; }
         let pending_deadline = astation_auth
             .as_ref()
             .filter(|auth| auth.state == AuthState::Pending)
-            .map(|auth| auth.deadline);
+            .map(|auth| auth.deadline).or(isolated_deadline);
         if let Some(deadline) = pending_deadline {
             if Instant::now() >= deadline {
                 tracing::warn!(
@@ -2645,13 +2889,135 @@ async fn handle_ws(
                         );
                         break;
                     }
+                    let is_route = serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .is_some_and(|value| value["type"] == "relay" && value["op"] == "host_route");
+                    if is_route {
+                        let Some(challenge) = host_challenge.take() else {
+                            // A challenge is single use; duplicate proofs cannot re-acquire a route.
+                            continue;
+                        };
+                        if Instant::now() >= host_deadline {
+                            if carrier_a {
+                                continue;
+                            } else {
+                                break;
+                            }
+                        }
+                        let admitted = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            recovery.admit_host(
+                                &text,
+                                challenge.nonce,
+                                &code,
+                                &atem_id,
+                                hub.me(&connection_id),
+                            ),
+                        )
+                        .await;
+                        match admitted {
+                            Ok(Ok((binding, disposition))) => {
+                                hub.track_host_route(binding.clone());
+                                let exposed = hub
+                                    .publish_host_route(&binding, Some(disposition["verdict"].to_string()))
+                                    .await;
+                                if let Some(Ok(AtemJoin::Joined { owner, .. })) = exposed {
+                                    carrier_a = true;
+                                    local.set_role(
+                                        &connection_id,
+                                        SocketRole::Atem {
+                                            atem_id: atem_id.clone(),
+                                        },
+                                    );
+                                    hub.room_changed(&code).await;
+                                    if let Some(owner) = owner {
+                                        hub.deliver(
+                                            &owner,
+                                            relay_connection_event(&atem_id, &connection_id, "connected"),
+                                        )
+                                        .await;
+                                    }
+                                    if let Ok(previous) = serde_json::from_value::<
+                                        crate::remote_api::recovery::HostBinding,
+                                    >(disposition["replaced"].clone())
+                                    {
+                                        if previous.connection != binding.connection {
+                                            hub.close_connection(&previous.connection, None).await;
+                                        }
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            Ok(Err(crate::remote_api::recovery::HostRouteError::Refused(refusal))) => {
+                                if !carrier_a {
+                                    local.send(&connection_id, refusal.to_string());
+                                    flush_writer = true;
+                                    break;
+                                }
+                                // Lack of route proof must not break owner-present enrollment/reconciliation.
+                            }
+                            Err(_) | Ok(Err(crate::remote_api::recovery::HostRouteError::Unavailable)) => {
+                                if !carrier_a {
+                                    local.close_with(&connection_id, CLOSE_TRY_AGAIN, "host route unavailable");
+                                    flush_writer = true;
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(binding) = hub.host_binding(&connection_id) {
+                        if recovery
+                            .with_host_route(&binding, || async { () })
+                            .await
+                            .is_none()
+                        {
+                            break;
+                        }
+                        let context = crate::remote_api::push_ingress::HostContext {
+                            room: code.clone(),
+                            host: binding.host.clone(),
+                            connection: connection_id.clone(),
+                        };
+                        match tokio::time::timeout(
+                            Duration::from_secs(3),
+                            crate::remote_api::push_ingress::handle(recovery.as_ref(), context, &text),
+                        )
+                        .await
+                        {
+                            Ok(Some(acks)) => {
+                                for ack in acks {
+                                    local.send(&connection_id, ack);
+                                }
+                                continue;
+                            }
+                            Err(_) => continue,
+                            Ok(None) => {}
+                        }
+                        if hub
+                            .remote_channel_reply(&hub.me(&connection_id), &text)
+                            .await
+                        {
+                            continue;
+                        }
+                    } else if !carrier_a {
+                        continue;
+                    }
+
                     log_atem_auth_attempt(&code, &atem_id, &text);
                     let is_current = |room: &RoomInfo| {
                         room.atems
                             .get(&atem_id)
                             .is_some_and(|current| current.conn == connection_id)
                     };
-                    match hub.check_sender(&code, is_current).await {
+                    let sender = if recovery.route_storage_enabled() {
+                        hub.room(&code).await.map(|room| match room {
+                            Some(room) if is_current(&room) => SenderCheck::Current(room),
+                            _ => SenderCheck::Stale,
+                        })
+                    } else { hub.check_sender(&code, is_current).await };
+                    match sender {
                         Ok(SenderCheck::Current(room)) => {
                             let context = crate::remote_api::push_ingress::HostContext {
                                 room: code.clone(), host: atem_id.clone(), connection: connection_id.clone(),
@@ -2681,6 +3047,7 @@ async fn handle_ws(
                                 }
                             }
                         }
+                        Ok(SenderCheck::Stale) if hub.host_binding(&connection_id).is_some() => continue,
                         Ok(SenderCheck::Stale) => {
                             // Replaced elsewhere, its eviction lost: leave.
                             tracing::debug!(
@@ -2814,6 +3181,11 @@ async fn handle_ws(
             _ => {}
         }
     }
+
+    // Stop queue admission before dropping the local binding fence, including
+    // while directory cleanup is awaiting another replica or an unavailable store.
+    local.evict(&connection_id);
+    hub.inner.host_routes.lock().unwrap_or_else(|e| e.into_inner()).remove(&connection_id);
 
     // Cleanup: leave the room (a stale close can't remove a newer connection).
     match role.as_str() {

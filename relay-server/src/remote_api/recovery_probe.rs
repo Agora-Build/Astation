@@ -125,16 +125,9 @@ pub(super) async fn probe(
     {
         return error(StatusCode::BAD_REQUEST, "invalid_recovery_probe");
     }
-    let room = match super::recovery::probe_room(&state, &genesis, &subject, &host).await {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    let target = match state.relay.room(&room).await {
-        Ok(Some(room)) => match room.atems.get(&host) {
-            Some(v) => v.clone(),
-            None => return error(StatusCode::SERVICE_UNAVAILABLE, "recovery_host_unreachable"),
-        },
-        _ => return error(StatusCode::SERVICE_UNAVAILABLE, "recovery_host_unreachable"),
+    let (_, target, _, _) = match super::recovery::host_target(&state, &genesis, &subject, &host).await {
+        Ok(route) => route,
+        Err(error) => return error,
     };
     let Some((handle, reply)) = state.relay.probes().register(&subject, &target.conn) else {
         return error(StatusCode::TOO_MANY_REQUESTS, "recovery_probe_busy");

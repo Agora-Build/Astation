@@ -295,11 +295,9 @@ fn spawn_upkeep(
 
     // Room upkeep every 60 s (pre-flight 7). In-memory: sweep expired rooms.
     // Redis: rooms expire on their own (EXPIRE 600), so each replica
-    // refreshes every room where it holds an Astation socket (owner or
-    // pending) and closes its Atem sockets whose room no longer exists.
-    // A Redis outage longer than ~9 minutes (600 s TTL minus one interval)
-    // lets live rooms expire: their sockets are then closed and clients
-    // reconnect, recreating them.
+    // refreshes owner rooms and reconstructs presence for proved host routes.
+    // Ordinary carrier-A sockets close when their room is gone; independently
+    // proved sockets survive directory loss while their durable binding is current.
     let cleanup_relay = relay.clone();
     let rooms_sweep = tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
@@ -846,6 +844,7 @@ async fn serve() {
 
     relay.configure_push_tokens(push_tokens);
     relay.configure_push_delivery(push_delivery);
+    relay.configure_recovery(recovery.clone());
 
     // Background tasks run for the life of the process; one that stops
     // outside a drain stops the relay (exit 1) so it is restarted.
