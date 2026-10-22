@@ -22,8 +22,11 @@ Recovery still refetches and requires a fresh host-signed proof after restart.
 Local validation: 982 app tests (14 environment-dependent skips), 94 native
 tests and two provisioned recovery signing/storage tests pass. #63's earlier
 23659d9 CI is fully green: 977 app, 87 native, 487 relay, plus all 49 Postgres
-and 64 Valkey cases executed separately. The canonical provisioned app still
-runs 23659d9 until explicitly rebuilt; no new live ceremony pass is claimed.
+and 64 Valkey cases executed separately. The canonical provisioned app now runs source `ced29ce`, version
+`0.4.17-65-gced29ce`, built 2026-10-22 00:00:13 UTC. The unchanged personal-team
+signature and all four resource checks pass. Relaunch retained relay identity;
+Genie authenticated and delivered welcome, registry and both chat histories.
+That is an existing r8 paired-host check, not a new r9 ceremony pass.
 
 The next increment adds the native inbound reader/router and routine channel
 signer, with generation fencing, original-byte preservation, channel-only

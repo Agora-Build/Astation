@@ -117,12 +117,15 @@ been exercised. Inbound session routers, durable sealed push/provider ingress,
 mobile/service integration and platform conformance still gate independent r9.
 Do not merge Atem #89 based on unit-test or compile evidence alone.
 
-The canonical provisioned app currently runs `23659d9`; the durable snapshot
-increment has not yet replaced it. Local validation passes 982 app tests
-(14 environment-dependent skips), 94 native tests and two real provisioned
-recovery signing/storage tests. CI at 23659d9 is green, including separately
-executed Postgres/Valkey cases; that result is not the new increment's CI.
-Draft PR #58 remains unmerged and no production deployment is authorized.
+The canonical provisioned app now runs source `ced29ce`, display version
+`0.4.17-65-gced29ce`, built 2026-10-22 00:00:13 UTC with the unchanged Personal
+Team XMGQ79XMD5/bundle identity. Strict signature and all four bundled-resource
+checks pass. Relaunch retained the existing relay identity: Genie authenticated,
+then welcome, sessions and both chat history_end exchanges arrived. This is the
+existing paired-host r8 path, not an independent r9 ceremony pass. The test
+totals for the native components are recorded above. CI at `455ad8f` is fully green;
+ced29ce CI remains pending at publication. Draft PR #58 stays unmerged; no
+production deployment is authorized.
 
 ## Historical package integration, 2026-10-21
 

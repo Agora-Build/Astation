@@ -185,7 +185,7 @@ registration and recovery use only resource-bound account tokens, and the
 relay maps verified issuer/subject tuples without changing existing data
 accounts or signed recovery records. Ordinary registration refuses identity
 changes; verified legacy-binding migration remains separate work. Local
-validation now passes 982 app tests (14 skips), 94 native tests, 487 relay tests
+validation now passes 987 app tests (15 skips), 109 native tests, 487 relay tests
 (113 ignored), four isolated account Postgres cases, four provisioned account
 boundary cases and two provisioned recovery signing/storage cases. Auth is
 deferred while r9 implementation proceeds; production login still needs actual
