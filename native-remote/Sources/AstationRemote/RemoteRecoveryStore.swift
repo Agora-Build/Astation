@@ -80,6 +80,20 @@ public final class RemoteRecoveryStore {
         try self.init(name: name, directory: directory, backend: KeychainCheckpointBackend(account: name), lockName: accountID)
     }
 
+    /// Notification dedup has its own lock; it cannot contend with or own the
+    /// account's enrollment/recovery operation. Only sealed hints are stored.
+    public convenience init(pushAccountID: String, genesisHash: String, deviceID: String) throws {
+        guard RemoteRecoveryKit.validID(pushAccountID), RemoteRecoveryKit.validID(deviceID),
+              genesisHash.utf8.count == 64, genesisHash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+            throw RemoteRecoveryError.invalidCheckpoint
+        }
+        let scope = try JSONEncoder().encode([pushAccountID, genesisHash, deviceID])
+        let name = "push-hints:" + SHA256.hash(data: scope).map { String(format: "%02x", $0) }.joined()
+        let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true).appendingPathComponent("Astation/Account Trust", isDirectory: true)
+        try self.init(name: name, directory: directory, backend: KeychainCheckpointBackend(account: name))
+    }
+
     init(name: String, directory: URL, backend: RecoveryCheckpointBackend, lockName: String? = nil) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])

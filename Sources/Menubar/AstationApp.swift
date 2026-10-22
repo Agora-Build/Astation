@@ -211,6 +211,8 @@ class AstationApp: NSObject, NSApplicationDelegate {
                 for client in self?.hubManager.connectedClients ?? [] {
                     self?.hubManager.requestAgentList(from: client.id)
                 }
+            }, verifyPush: { [weak hubManager] userInfo, tapped in
+                hubManager?.verifyApprovalPush(userInfo, tapped: tapped)
             })
         approvalNotifications = notifications
         if let file = ProcessInfo.processInfo.environment["ASTATION_LOCAL_API_TOKEN_FILE"] {

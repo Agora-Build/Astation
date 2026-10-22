@@ -108,6 +108,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+      - name: Test isolated r9 account issuer
+        run: node --test scripts/tests/test-r9-test-issuer.mjs
       - name: Run webapp tests
         run: |
           node webapp/tests/codec.test.mjs

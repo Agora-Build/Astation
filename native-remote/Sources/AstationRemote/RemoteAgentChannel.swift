@@ -41,6 +41,7 @@ public enum RemoteAgentOperation: Equatable, Sendable {
     case stop(session: String, request: String)
     case approval(session: String, request: String, approval: String, decision: ApprovalChoice, rule: String?, message: String?)
     case revokeRule(session: String, request: String, rule: String)
+    case approvalSeen(session: String, approval: String)
     case receipts(session: String, requests: [String])
 }
 
@@ -275,6 +276,7 @@ private final class SharedRemoteChannelCore: RemoteChannelCore {
         case let .approval(session, request, approval, decision, rule, message):
             return try connection.submitApproval(sessionId: session, requestId: request, approvalId: approval, decision: decision, ruleId: rule, message: message, nowMs: now)
         case let .revokeRule(session, request, rule): return try connection.submitRuleRevoke(sessionId: session, requestId: request, ruleId: rule, nowMs: now)
+        case let .approvalSeen(session, approval): return try connection.approvalSeen(sessionId: session, approvalId: approval, nowMs: now)
         case let .receipts(session, requests): return try connection.receiptQuery(sessionId: session, requestIds: requests, nowMs: now)
         }
     }

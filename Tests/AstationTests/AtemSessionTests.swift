@@ -824,6 +824,89 @@ final class AtemApprovalTests: XCTestCase {
     }
 }
 
+final class AtemApprovalAttendanceTests: XCTestCase {
+    func testAttendanceNeedsVisibleFocusedCardAndRecentPhysicalInput() {
+        for idle in [0.0, 30, 60] {
+            XCTAssertTrue(ApprovalAttendance.eligible(appActive: true, keyWindow: true, visible: true, idleSeconds: idle))
+        }
+        for idle in [-1.0, 60.001, .infinity, .nan] {
+            XCTAssertFalse(ApprovalAttendance.eligible(appActive: true, keyWindow: true, visible: true, idleSeconds: idle))
+        }
+        XCTAssertFalse(ApprovalAttendance.eligible(appActive: false, keyWindow: true, visible: true, idleSeconds: 0))
+        XCTAssertFalse(ApprovalAttendance.eligible(appActive: true, keyWindow: false, visible: true, idleSeconds: 0))
+        XCTAssertFalse(ApprovalAttendance.eligible(appActive: true, keyWindow: true, visible: false, idleSeconds: 0))
+    }
+
+    func testSeenUsesReadBindingAndCorrelatedAcknowledgmentWithoutChangingControl() throws {
+        let f = SessionFixture(); try f.ready()
+        let approval = try f.approval()
+        XCTAssertTrue(f.client.markApprovalSeen(approval))
+        let seen = try XCTUnwrap(f.sent.last)
+        XCTAssertEqual(seen.op, "approval_seen")
+        XCTAssertEqual(seen.binding?.target, f.target)
+        XCTAssertEqual(seen.approval_id, approval.approval_id)
+        XCTAssertNil(seen.binding?.lease_epoch)
+        XCTAssertNil(seen.acquire)
+        XCTAssertFalse(f.client.markApprovalSeen(approval), "Only one report may be in flight")
+        var ack = AtemSessionMessage(op: "seen"); ack.re = UUID().uuidString.lowercased()
+        try f.receive(ack)
+        XCTAssertFalse(f.client.markApprovalSeen(approval), "Uncorrelated ACK cannot suppress reporting")
+        ack.re = seen.id; try f.receive(ack)
+        XCTAssertTrue(f.client.markApprovalSeen(approval))
+        XCTAssertEqual(f.sent.filter { $0.op == "approval_seen" }.count, 1)
+        XCTAssertTrue(f.client.canAnswer(approval), "Seen is neither an answer nor a lease operation")
+        XCTAssertFalse(f.client.controls(f.target))
+        XCTAssertFalse(f.sent.contains { ["acquire", "renew", "submit"].contains($0.op) })
+    }
+
+    func testSeenAcknowledgmentCannotConsumeAnotherOperation() throws {
+        let f = SessionFixture(); try f.ready()
+        XCTAssertTrue(f.client.acquire(f.target))
+        let acquire = try XCTUnwrap(f.sent.last)
+        var ack = AtemSessionMessage(op: "seen"); ack.re = acquire.id
+        try f.receive(ack)
+        try f.lease(replyTo: acquire.id)
+        XCTAssertTrue(f.client.controls(f.target))
+    }
+
+    func testSeenRetriesAfterTimeoutButNeverReportsClosedStaleOrUnauthorizedCards() throws {
+        let f = SessionFixture(); try f.ready()
+        let approval = try f.approval()
+        XCTAssertTrue(f.client.markApprovalSeen(approval))
+        f.time = 16; f.client.tick()
+        XCTAssertTrue(f.client.markApprovalSeen(approval))
+        try f.closeApproval(approval.approval_id)
+        XCTAssertFalse(f.client.markApprovalSeen(approval))
+
+        let stale = SessionFixture(); try stale.ready()
+        let old = try stale.approval()
+        try stale.snapshot(sequence: 2, descriptors: [SessionFixture.descriptor(process: UUID().uuidString.lowercased())])
+        XCTAssertFalse(stale.client.markApprovalSeen(old))
+        let viewer = SessionFixture(); try viewer.handshake(permissions: ["view"]); try viewer.snapshot()
+        XCTAssertFalse(viewer.client.markApprovalSeen(try viewer.approval()))
+        let noFeature = SessionFixture()
+        try noFeature.handshake(features: AtemSessionWire.features.subtracting(["approval.seen"]).sorted()); try noFeature.snapshot()
+        XCTAssertFalse(noFeature.client.markApprovalSeen(try noFeature.approval()))
+    }
+
+    func testReconnectNeedsFreshCatchupAndCanReportTheSameApprovalAgain() throws {
+        let f = SessionFixture(); try f.ready()
+        let approval = try f.approval()
+        XCTAssertTrue(f.client.markApprovalSeen(approval))
+        var ack = AtemSessionMessage(op: "seen"); ack.re = f.sent.last?.id; try f.receive(ack)
+        f.source = nil
+        XCTAssertFalse(f.client.markApprovalSeen(approval))
+        f.client.tick()
+        f.source = AtemSessionContext(route: RemoteTerminalConnection(clientId: "host", connectionId: "socket-2"),
+            account: "account-a", device: "host-a", pairingSession: "pairing-1")
+        f.client.connectionChanged()
+        try f.handshake(attachment: UUID().uuidString.lowercased()); try f.snapshot()
+        XCTAssertFalse(f.client.markApprovalSeen(approval))
+        XCTAssertTrue(f.client.markApprovalSeen(try f.approval()))
+        XCTAssertEqual(f.sent.filter { $0.op == "approval_seen" }.count, 2)
+    }
+}
+
 final class AtemSessionWireTests: XCTestCase {
     private func fixture(_ name: String) throws -> [String: Any] {
         let url = try XCTUnwrap(Bundle.module.url(forResource: "session-" + name, withExtension: "json", subdirectory: "Fixtures"))

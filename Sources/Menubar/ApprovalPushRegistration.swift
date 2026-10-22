@@ -1,4 +1,5 @@
 import Foundation
+import AtemClient
 
 enum ApprovalPushPlatform: String, Codable {
     case apnsSandbox = "apns_sandbox"
@@ -43,6 +44,19 @@ struct ApprovalPushHint: Codable, Equatable {
     let approvalID: String
     let atemDeviceID: String
     let sessionID: String?
+    let scope: String?
+
+    var cacheKey: String { scope ?? atemDeviceID + "\u{0}" + approvalID }
+
+    init(verified approval: ApprovalRef, resolved: Bool) {
+        kind = resolved ? .resolved : .approval
+        approvalID = approval.approvalId
+        atemDeviceID = approval.hostId
+        sessionID = approval.sessionId
+        let fields = [approval.accountId, approval.genesisHash, approval.hostId, String(approval.hostTrustGen),
+                      approval.sessionId, approval.processGen, approval.approvalId]
+        scope = String(decoding: try! JSONEncoder().encode(fields), as: UTF8.self)
+    }
 
     init?(userInfo: [AnyHashable: Any]) {
         guard let kind = (userInfo["kind"] as? String).flatMap(Kind.init(rawValue:)),
@@ -54,6 +68,7 @@ struct ApprovalPushHint: Codable, Equatable {
         approvalID = approval
         atemDeviceID = host
         sessionID = session
+        scope = nil
     }
 
     private static func opaque(_ value: String) -> Bool {
@@ -68,6 +83,7 @@ struct ApprovalPushReconciliation {
         let host: String
         let approval: String
         let receivedAt: Date
+        let scope: String?
     }
     private(set) var resolutions: [Resolution]
 
@@ -79,11 +95,11 @@ struct ApprovalPushReconciliation {
     mutating func receive(_ hint: ApprovalPushHint, now: Date) -> Bool {
         resolutions.removeAll { now.timeIntervalSince($0.receivedAt) >= 86_400 }
         if hint.kind == .resolved {
-            resolutions.removeAll { $0.host == hint.atemDeviceID && $0.approval == hint.approvalID }
-            resolutions.append(Resolution(host: hint.atemDeviceID, approval: hint.approvalID, receivedAt: now))
+            resolutions.removeAll { $0.host == hint.atemDeviceID && $0.approval == hint.approvalID && $0.scope == hint.scope }
+            resolutions.append(Resolution(host: hint.atemDeviceID, approval: hint.approvalID, receivedAt: now, scope: hint.scope))
             if resolutions.count > 512 { resolutions.removeFirst(resolutions.count - 512) }
         }
-        return resolutions.contains { $0.host == hint.atemDeviceID && $0.approval == hint.approvalID }
+        return resolutions.contains { $0.host == hint.atemDeviceID && $0.approval == hint.approvalID && $0.scope == hint.scope }
     }
 
     var saved: Data? { try? JSONEncoder().encode(resolutions) }

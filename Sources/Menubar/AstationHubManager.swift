@@ -111,6 +111,41 @@ class AstationHubManager: ObservableObject {
     private var directSessionContexts: [String: AtemSessionContext] = [:]
     let atemE2EIdentity: AtemE2EIdentity
     @MainActor private var accountRecovery: AstationRecoveryCoordinator?
+    @MainActor private var approvalPushHints: RemotePushHints?
+    @MainActor private var approvalPushScope: String?
+
+    @MainActor func verifyApprovalPush(_ userInfo: [AnyHashable: Any], tapped: Bool) -> ApprovalPushHint? {
+        do {
+            guard let json = userInfo["r9_hint"] as? String, json.utf8.count <= 16_384 else { return nil }
+            let parsed = try signedObjectInfo(json: json)
+            guard parsed.bodyType == "atem-push-hint",
+                  let body = try JSONSerialization.jsonObject(with: Data(parsed.bodyJcs.utf8)) as? [String: Any],
+                  body["account_id"] as? String == e2eDataAccount, let host = body["host_id"] as? String else { return nil }
+            let log = try recoveryCoordinator().channelMembership(hostID: host)
+            let scope = log.accountId() + ":" + log.genesisHash()
+            if approvalPushScope != scope {
+                approvalPushHints = nil; approvalPushScope = nil
+                let store = try RemoteRecoveryStore(pushAccountID: log.accountId(), genesisHash: log.genesisHash(), deviceID: AstationIdentity.shared.id)
+                approvalPushHints = try RemotePushHints(accountID: log.accountId(), genesisHash: log.genesisHash(),
+                    deviceID: AstationIdentity.shared.id, checkpoint: store.read(), persist: { try store.write($0) })
+                approvalPushScope = scope
+            }
+            guard let hints = approvalPushHints else { return nil }
+            let now = UInt64(max(0, Date().timeIntervalSince1970 * 1000))
+            if tapped {
+                let target = try hints.target(hintJSON: json, log: log, now: now)
+                let hint = try verifyPushHint(hintJson: json, log: log, nowMs: now, verifier: .client)
+                if case .resolved = hint.state() { return ApprovalPushHint(verified: target, resolved: true) }
+                return ApprovalPushHint(verified: target, resolved: false)
+            }
+            guard let notice = try hints.receive(hintJSON: json, log: log, now: now) else { return nil }
+            if case .resolved = notice.state { return ApprovalPushHint(verified: notice.approval, resolved: true) }
+            return ApprovalPushHint(verified: notice.approval, resolved: false)
+        } catch {
+            Log.warn("[Approvals] Sealed notification could not be verified; reconnect for current host state")
+            return nil
+        }
+    }
 
     @MainActor func recoveryCoordinator(account: String? = nil, relayURL: String? = nil) throws -> AstationRecoveryCoordinator {
         let account = account ?? e2eDataAccount

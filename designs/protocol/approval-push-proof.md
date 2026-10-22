@@ -1,8 +1,10 @@
 # Approval push: Astation relay and app integration
 
-Status: aligned product policy, awaiting r9 wire schemas and fixtures,
-2026-10-19. Host ingress, sealed push, authenticated seen and escalation are
-not enabled by today's provider adapters.
+Status: signed ingress, sealed provider adapters, native verification and
+foreground attendance implemented on Astation PR #58, 2026-10-22. Shared
+verification uses the pinned r9 contract and packages. Provider dispatch remains
+gated on membership-bound token registration and durable stage jobs/workers.
+See [sealed ingress implementation](sealed-push-relay.md) for the current boundary.
 
 The shared signed formats and protocol are owned by **[Atem PR #80](https://github.com/Agora-Build/Atem/pull/80)**.
 Use [#81](https://github.com/Agora-Build/Atem/issues/81) for handoffs/questions

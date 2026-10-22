@@ -15,6 +15,7 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
     private let register: (ApprovalPushRegistration) -> Void
     private let unregister: (ApprovalPushPlatform) -> Void
     private let open: (ApprovalPushHint) -> Void
+    private let verifyPush: @MainActor ([AnyHashable: Any], Bool) -> ApprovalPushHint?
     private var reconciliation: ApprovalPushReconciliation
     private lazy var center = UNUserNotificationCenter.current()
     private let enabledKey = "agentApprovalNotificationsEnabled"
@@ -30,7 +31,8 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
 
     init(defaults: UserDefaults = .standard, platform: ApprovalPushPlatform? = ApprovalNotifications.platform,
          register: @escaping (ApprovalPushRegistration) -> Void,
-         unregister: @escaping (ApprovalPushPlatform) -> Void, open: @escaping (ApprovalPushHint) -> Void) {
+         unregister: @escaping (ApprovalPushPlatform) -> Void, open: @escaping (ApprovalPushHint) -> Void,
+         verifyPush: @escaping @MainActor ([AnyHashable: Any], Bool) -> ApprovalPushHint? = { _, _ in nil }) {
         self.defaults = defaults
         pushPlatform = platform
         inAppEnabled = defaults.object(forKey: inAppKey) as? Bool ?? true
@@ -41,6 +43,7 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
         self.register = register
         self.unregister = unregister
         self.open = open
+        self.verifyPush = verifyPush
         reconciliation = ApprovalPushReconciliation(saved: defaults.data(forKey: "agentApprovalNotificationResolutions"))
         super.init()
         inbox.onNew = { [weak self] entry in self?.showInAppAlert(entry) }
@@ -151,34 +154,46 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
         for id in client.closedApprovals.keys where !reconciliation.resolutions.contains(where: {
             $0.host == context.device && $0.approval == id
         }) {
-            received(userInfo: ["kind": "resolved", "approval_id": id, "atem_device_id": context.device])
+            if let hint = ApprovalPushHint(userInfo: ["kind": "resolved", "approval_id": id, "atem_device_id": context.device]) {
+                receivedVerified(hint)
+            }
         }
     }
 
     func received(userInfo: [String: Any]) {
-        guard let hint = ApprovalPushHint(userInfo: userInfo) else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let hint = self.verifyPush(userInfo, false) else { return }
+            self.receivedVerified(hint)
+        }
+    }
+
+    private func receivedVerified(_ hint: ApprovalPushHint) {
         let remove = reconciliation.receive(hint, now: Date())
         defaults.set(reconciliation.saved, forKey: resolutionsKey)
         if remove {
             if bannerKey == Self.key(hint) { banner?.orderOut(nil) }
-            center.removeDeliveredNotifications(withIdentifiers: [hint.approvalID])
-            center.removePendingNotificationRequests(withIdentifiers: [hint.approvalID])
+            if hint.scope == nil {
+                center.removeDeliveredNotifications(withIdentifiers: [hint.approvalID])
+                center.removePendingNotificationRequests(withIdentifiers: [hint.approvalID])
+            }
             // The OS may assign its own identifier to an APNs delivery.
             center.getDeliveredNotifications { [weak self] notifications in
-                let identifiers = notifications.filter {
-                    guard let delivered = ApprovalPushHint(userInfo: $0.request.content.userInfo) else { return false }
-                    return delivered.approvalID == hint.approvalID && delivered.atemDeviceID == hint.atemDeviceID
-                }.map { $0.request.identifier }
-                self?.center.removeDeliveredNotifications(withIdentifiers: identifiers)
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    let identifiers = notifications.filter {
+                        self.verifyPush($0.request.content.userInfo, true)?.cacheKey == hint.cacheKey
+                    }.map { $0.request.identifier }
+                    self.center.removeDeliveredNotifications(withIdentifiers: identifiers)
+                }
             }
         }
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
-        let hint = ApprovalPushHint(userInfo: response.notification.request.content.userInfo)
         DispatchQueue.main.async { [weak self] in
-            if response.actionIdentifier == UNNotificationDefaultActionIdentifier, let hint {
+            if response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+               let hint = self?.verifyPush(response.notification.request.content.userInfo, true) {
                 self?.inbox.notificationHint = hint
                 self?.open(hint)
                 self?.showPreferences()
@@ -191,7 +206,7 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.inAppEnabled, self.pushEnabled,
-                  let hint = ApprovalPushHint(userInfo: notification.request.content.userInfo) else {
+                  let hint = self.verifyPush(notification.request.content.userInfo, false) else {
                 completionHandler([]); return
             }
             let remove = self.reconciliation.receive(hint, now: Date())
@@ -203,7 +218,7 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
         }
     }
 
-    private static func key(_ hint: ApprovalPushHint) -> String { hint.atemDeviceID + "\u{0}" + hint.approvalID }
+    private static func key(_ hint: ApprovalPushHint) -> String { hint.cacheKey }
 
     private func rememberAlert(_ key: String) {
         alerted.append(key)

@@ -729,7 +729,7 @@ async fn serve() {
         tracing::error!("Push configuration error: {}", error.0);
         std::process::exit(1);
     }));
-    tracing::info!("Push providers configured: {}; host push ingress awaits authenticated membership", push_delivery.enabled());
+    tracing::info!("Push providers configured: {}; provider dispatch awaits membership-bound registration and durable jobs", push_delivery.enabled());
 
     // Vault + knowledge (Atem Memory) + identity stores: Postgres, sharing one
     // pool, when DATABASE_URL is set (the durable path), else in-memory
@@ -897,7 +897,11 @@ async fn serve() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
 
-    let addr = format!("0.0.0.0:{}", port);
+    let bind_ip: std::net::IpAddr = std::env::var("RELAY_BIND_IP")
+        .unwrap_or_else(|_| "0.0.0.0".into())
+        .parse()
+        .expect("RELAY_BIND_IP must be an IP address");
+    let addr = SocketAddr::new(bind_ip, port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|_| panic!("Failed to bind to {}", addr));

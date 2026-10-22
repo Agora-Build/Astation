@@ -1196,9 +1196,10 @@ pub async fn ws_handler(
                 let atem_id = params.atem_id.clone().unwrap_or_else(|| "session-atem".to_string());
                 let identity = state.identity.clone();
                 let accounts = state.accounts.clone();
+                let recovery = state.recovery.clone();
                 return ws
                     .on_upgrade(move |socket| {
-                        handle_ws(hub, identity, accounts, code, role, atem_id, socket, permit)
+                        handle_ws(hub, identity, accounts, recovery, code, role, atem_id, socket, permit)
                     })
                     .into_response();
             }
@@ -1245,8 +1246,9 @@ pub async fn ws_handler(
 
     let identity = state.identity.clone();
     let accounts = state.accounts.clone();
+    let recovery = state.recovery.clone();
     ws.on_upgrade(move |socket| {
-        handle_ws(hub, identity, accounts, code, role, atem_id, socket, permit)
+        handle_ws(hub, identity, accounts, recovery, code, role, atem_id, socket, permit)
     })
         .into_response()
 }
@@ -2468,6 +2470,7 @@ async fn handle_ws(
     hub: RelayHub,
     identity: Arc<dyn IdentityStore>,
     accounts: Arc<dyn AccountStore>,
+    recovery: Arc<crate::remote_api::recovery::RecoveryStore>,
     code: String,
     role: String,
     atem_id: String,
@@ -2650,6 +2653,18 @@ async fn handle_ws(
                     };
                     match hub.check_sender(&code, is_current).await {
                         Ok(SenderCheck::Current(room)) => {
+                            let context = crate::remote_api::push_ingress::HostContext {
+                                room: code.clone(), host: atem_id.clone(), connection: connection_id.clone(),
+                            };
+                            match tokio::time::timeout(Duration::from_secs(3),
+                                crate::remote_api::push_ingress::handle(recovery.as_ref(), context, &text)).await {
+                                Ok(Some(acks)) => {
+                                    for ack in acks { hub.local().send(&connection_id, ack); }
+                                    continue;
+                                }
+                                Err(_) => continue,
+                                Ok(None) => {}
+                            }
                             if !hub.remote_channel_reply(&hub.me(&connection_id), &text).await
                                 && !hub.recovery_probe_reply(&connection_id, &text, &mut recovery_probe_last_reply).await {
                                 if let Some(owner) = room.owner {
@@ -6182,6 +6197,7 @@ pub(crate) mod tests {
                         late_hub,
                         identity,
                         accounts,
+                        crate::remote_api::recovery::RecoveryStore::disabled(),
                         code.to_string(),
                         "atem".into(),
                         "atem-late".into(),

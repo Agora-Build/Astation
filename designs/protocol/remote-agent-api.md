@@ -37,8 +37,11 @@ The user deferred unavailable auth.agora.build. Code and controlled tests
 continue, while production account registration/configuration, deployment and
 live validation remain pending. The implementation does not introduce another
 storage-authentication rule or legacy AGORA_ACCOUNT_* configuration. Durable
-sealed push/provider integration, mobile/service platform validation and the
-complete provisioned live ceremony remain separate gates. Main merges deploy
+sealed push/provider integration and mobile/service platform validation remain
+follow-up work; push does not block the joint r9 release. The complete provisioned
+live ceremony and host reconnect lifecycle remain release checks. A
+[validated local OIDC/relay path](../../docs/r9-local-validation.md) supports
+controlled testing without production Auth. Main merges deploy
 production and need user approval; neither Astation #58 nor Atem #89 is merged
 by this work.
 
@@ -268,8 +271,10 @@ readiness endpoint, authenticated signed-log/K-backup storage, fresh host probes
 and independent encrypted WebSocket channels are implemented on this branch.
 Capabilities advertise revision 9/WebSocket and enable routing admission with
 durable recovery storage. Identity/permission admission remains authoritative
-on Atem. Enrollment, host discovery and push ingress/provider work still have
-separate gates; unimplemented paths return 503.
+on Atem. Signed push/seen ingress and native attendance now exist; provider
+dispatch remains gated on membership-bound registration and durable stage jobs.
+Enrollment, host discovery and [host rejoin](r9-host-routing-lifecycle.md) still
+have separate gates; unimplemented paths return 503.
 See [the API status](../../docs/remote-api.md). Final methods, limits, errors, cursor/reset behavior and envelopes
 follow the jointly pinned contract. A plaintext relay chat API would change the
 E2EE boundary and is not this design.

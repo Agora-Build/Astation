@@ -10,10 +10,8 @@ use serde_json::json;
 
 use crate::AppState;
 
-// Transport preparation only. The authenticated, durable r9 push ingress is
-// still gated below; it must supply shared-core identities after storage.
-#[allow(dead_code)]
 pub(crate) mod push_ack;
+pub(crate) mod push_ingress;
 pub(crate) mod recovery;
 pub(crate) mod recovery_probe;
 pub(crate) mod channels;

@@ -66,6 +66,7 @@ final class AtemSessionClient {
     private(set) var registry: [String: AtemSessionDescriptor] = [:]
     private(set) var latestReceipt: AtemSessionReceipt?
     private(set) var approvals: [String: AtemApprovalRequest] = [:]
+    private var reportedSeen: Set<String> = []
     private(set) var closedApprovals: [String: String] = [:]
     private(set) var approvalRules: [String: [AtemApprovalRule]] = [:]
     private var regrantedAfterRevoke: Set<String> = []
@@ -215,6 +216,7 @@ final class AtemSessionClient {
         unsupportedVersion = false
         registry = [:]
         approvals = [:]
+        reportedSeen = []
         closedApprovals = [:]
         latestReceipt = nil
         leases = [:]
@@ -368,6 +370,27 @@ final class AtemSessionClient {
         return !journal.snapshot.requests.contains {
             $0.target == target && $0.approvalID == approval.approval_id && $0.receipt?.state != .rejected
         }
+    }
+
+    /// Call only for an actually visible card in a focused window with recent
+    /// user input. This read-form binding neither acquires nor renews a lease.
+    @discardableResult
+    func markApprovalSeen(_ approval: AtemApprovalRequest) -> Bool {
+        guard canReviewApprovals, features.contains("approval.seen"), approvals[approval.approval_id] == approval,
+              let target = target(sessionId: approval.session_id, process: approval.process_gen),
+              registry[approval.session_id]?.state == "running", let binding = binding(for: target, mutation: false) else { return false }
+        let key = seenKey(approval.approval_id, target)
+        if reportedSeen.contains(key) { return true }
+        guard !pending.values.contains(where: { $0.message.op == "approval_seen"
+            && $0.message.approval_id == approval.approval_id && $0.message.binding?.target == target }) else { return false }
+        var message = AtemSessionMessage(op: "approval_seen")
+        message.binding = binding; message.approval_id = approval.approval_id
+        return request(message)
+    }
+
+    private func seenKey(_ approval: String, _ target: AtemSessionTarget) -> String {
+        [target.account_id, target.atem_device_id, String(target.host_trust_gen), target.session_id,
+         target.process_gen, approval].joined(separator: "\u{0}")
     }
 
     @discardableResult
@@ -548,6 +571,13 @@ final class AtemSessionClient {
                 try AtemSessionWire.check(closedApprovals.count < 4096 || closedApprovals[id] != nil)
                 closedApprovals[id] = reason
                 approvals.removeValue(forKey: id)
+            case "seen":
+                if let re = message.re, let operation = pending[re],
+                   operation.message.op == "approval_seen", let id = operation.message.approval_id,
+                   let target = operation.message.binding?.target {
+                    pending.removeValue(forKey: re)
+                    reportedSeen.insert(seenKey(id, target))
+                }
             case "lease": acceptLease(message)
             case "lease_changed": acceptLeaseChange(message)
             case "lease_released":

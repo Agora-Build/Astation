@@ -53,6 +53,8 @@ struct Root {
     account: String,
     membership: Value,
     blobs: BTreeMap<u64, Blob>,
+    #[serde(default)]
+    push: super::push_ingress::PushState,
 }
 
 /// One root is the transaction/lock unit, including envelope retention and CAS.
@@ -94,7 +96,7 @@ impl RecoveryStore {
                 let hash = Hash32::from_hex(genesis)
                     .map_err(|_| sqlx::Error::Protocol("invalid recovery root".into()))?;
                 let _ = self
-                    .database(pool, genesis, owner, hash, Operation::Collect)
+                    .database(pool, genesis, Some(owner), hash, Operation::Collect)
                     .await?;
             }
             cursor = roots.last().unwrap().0.clone();
@@ -109,7 +111,17 @@ impl RecoveryStore {
         })
     }
 
-    async fn perform(&self, genesis: &str, subject: &str, operation: Operation) -> Reply {
+    pub(super) async fn perform(&self, genesis: &str, subject: &str, operation: Operation) -> Reply {
+        self.perform_scoped(genesis, Some(subject), operation).await
+    }
+
+    pub(super) async fn push(&self, ingress: super::push_ingress::Ingress) -> Option<Value> {
+        let genesis = ingress.object.body()["genesis_hash"].as_str()?.to_owned();
+        let reply = self.perform_scoped(&genesis, None, Operation::Push(ingress)).await;
+        (reply.0 == StatusCode::OK).then_some(reply.1.0)
+    }
+
+    async fn perform_scoped(&self, genesis: &str, subject: Option<&str>, operation: Operation) -> Reply {
         let hash = match Hash32::from_hex(genesis) {
             Ok(h) => h,
             Err(_) => return invalid(),
@@ -118,10 +130,12 @@ impl RecoveryStore {
             let mut roots = memory.lock().await;
             if roots
                 .get(genesis)
-                .is_some_and(|(owner, _)| owner != subject)
+                .is_some_and(|(owner, _)| subject.is_some_and(|subject| owner != subject))
             {
                 return error(StatusCode::NOT_FOUND, "recovery_record_not_found");
             }
+            let owner = roots.get(genesis).map(|(owner, _)| owner.as_str()).or(subject).map(str::to_owned);
+            let Some(owner) = owner else { return error(StatusCode::NOT_FOUND, "recovery_record_not_found") };
             match apply(
                 roots.get(genesis).map(|(_, root)| root.clone()),
                 hash,
@@ -129,7 +143,7 @@ impl RecoveryStore {
                 now(),
             ) {
                 Ok((root, reply)) => {
-                    roots.insert(genesis.to_owned(), (subject.to_owned(), root));
+                    roots.insert(genesis.to_owned(), (owner, root));
                     reply
                 }
                 Err(reply) => reply,
@@ -151,7 +165,7 @@ impl RecoveryStore {
         &self,
         pool: &PgPool,
         genesis: &str,
-        subject: &str,
+        subject: Option<&str>,
         hash: Hash32,
         operation: Operation,
     ) -> Result<Reply, sqlx::Error> {
@@ -164,9 +178,11 @@ impl RecoveryStore {
         let saved: Option<(String, Value)> = sqlx::query_as(
             "SELECT account_subject, state FROM remote_recovery_roots WHERE genesis_hash = $1 FOR UPDATE")
             .bind(genesis).fetch_optional(&mut *tx).await?;
-        if saved.as_ref().is_some_and(|(owner, _)| owner != subject) {
+        if saved.as_ref().is_some_and(|(owner, _)| subject.is_some_and(|subject| owner != subject)) {
             return Ok(error(StatusCode::NOT_FOUND, "recovery_record_not_found"));
         }
+        let owner = saved.as_ref().map(|(owner, _)| owner.as_str()).or(subject).map(str::to_owned);
+        let Some(owner) = owner else { return Ok(error(StatusCode::NOT_FOUND, "recovery_record_not_found")) };
         let root = match saved {
             Some((_, value)) => match serde_json::from_value(value) {
                 Ok(r) => Some(r),
@@ -181,13 +197,13 @@ impl RecoveryStore {
         let value = serde_json::to_value(root).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
         sqlx::query("INSERT INTO remote_recovery_roots (genesis_hash, account_subject, state) VALUES ($1,$2,$3) \
             ON CONFLICT (genesis_hash) DO UPDATE SET state = EXCLUDED.state, updated_at = now()")
-            .bind(genesis).bind(subject).bind(value).execute(&mut *tx).await?;
+            .bind(genesis).bind(owner).bind(value).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(reply)
     }
 }
 
-enum Operation {
+pub(super) enum Operation {
     Append {
         entry: Entry,
         expected: Head,
@@ -207,6 +223,7 @@ enum Operation {
         host: String,
     },
     Collect,
+    Push(super::push_ingress::Ingress),
 }
 
 fn now() -> HostNow {
@@ -243,6 +260,7 @@ fn apply(
                 account: entry.account_id.clone(),
                 membership: log.to_stored(),
                 blobs: BTreeMap::new(),
+                push: Default::default(),
             }
         }
     };
@@ -250,7 +268,15 @@ fn apply(
         .map_err(|_| unavailable())?;
     log.advance(&clock);
     let reply = match operation {
-        Operation::Collect => (StatusCode::OK, Json(json!({}))),
+        Operation::Collect => {
+            root.push.collect(clock.wall_ms);
+            (StatusCode::OK, Json(json!({})))
+        }
+        Operation::Push(ingress) => {
+            let disposition = root.push.receive(&ingress, &log, clock.wall_ms)
+                .map_err(|_| error(StatusCode::BAD_REQUEST, "invalid_push_record"))?;
+            (StatusCode::OK, Json(disposition))
+        }
         Operation::ProbeRoute { host } => {
             let current = log
                 .host(&host)

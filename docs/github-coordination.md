@@ -1,6 +1,6 @@
 # Astation and Atem coordination
 
-## Current implementation, 2026-10-21
+## Current implementation, 2026-10-22
 
 Atem #93 supplies the supported durable MembershipLog API at
 `1493ca6a5d704484bff7b30b09222cf20658fdcd`, accepted after memory/vault e66,
@@ -41,23 +41,47 @@ no Mac online, account isolation, raw frame preservation, obsolete plaintext
 rejection, both replica dispatchers/ACK loss and a real P-256 native proof,
 signed host accept, encrypted welcome/registry and ciphertext replay refusal.
 These consume the shared crate; they do not run an Atem checkout or prove a
-live Claude/Codex workflow. Validation: 109 focused app integration tests, 114 native adapter tests,
-495 relay tests (113 environment-gated ignores), 35 web tests (one hosting
-skip) and 23 automation checks pass; release compilation passes. The broad
-app run exposes the caption-scroll baseline failure and Keychain/Enclave
-failures while this Mac is locked. The signed driver confirms the same lock
-restriction; it is not a new provisioned signing pass. Final bounded results
-and the local app build are recorded in the PR and shared vault.
+live Claude/Codex workflow. The latest full suites pass: 988 app tests with
+15 environment-dependent skips, 121 native tests without skips using the local
+issuer, and 503 relay tests with 115 environment-gated ignores. Two additional
+Postgres push tests run explicitly and pass. With the Mac unlocked, all 15
+provisioned identity/Keychain/Enclave tests pass. The previous locked-screen
+restriction and bounded app run are historical evidence, not current failures.
+Web/automation/release validation from c679ed6 remains recorded on #58.
+
+The new increment durably commits shared-verifier push hints/seen and ACKs
+under the membership transaction lock. It adds sealed provider payloads,
+protected native notification verification/dedup and actual foreground-card
+attendance without acquiring a lease. Provider dispatch remains disabled:
+durable stage jobs and a supported membership-key token-registration proof
+are still required. Per the [latest user decision relayed by Atem](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6337135672),
+push is follow-up work and does not block the joint r9 release test.
 
 The user deferred unavailable auth.agora.build so code and isolated tests
 continue. #63's login implementation is retained; production registration,
 configuration/deployment and live validation remain open. There is no alternate
 storage authentication or legacy AGORA_ACCOUNT_* configuration. A valid account
-login and the independently anchored membership are both required.
+login and the independently anchored membership are both required. The
+[local validation runbook](r9-local-validation.md) supplies an isolated ES256
+issuer with normal consent/PKCE/JWKS and a Postgres relay. The production native
+client successfully logs in, refreshes, authenticates a relay key, registers
+the synthetic account and writes/reads a signed genesis over actual HTTP and
+WebSocket connections. This is a controlled account-path pass, not production
+SSO, a GUI owner ceremony or a live agent pass. Use a dedicated macOS test user
+for the GUI; changing only the bundle ID does not isolate saved app files.
 
-Durable sealed push/provider integration, mobile/service platform conformance
-and the complete live ceremony remain #58 work. Atem #89 remains unmerged;
-production access is not deployed. Main merges/deploys need user approval.
+Joint #58/#89 live testing remains the release gate. It includes real terminal,
+chat/receipts, approval and independent-controller operations. End-to-end
+testing also found [Astation #64](https://github.com/Agora-Build/Astation/issues/64):
+the code-based host room is deleted when empty and can expire while ownerless.
+Atem confirmed there is no durable host registration/proof today. The shared
+authenticated rejoin contract is pending on #81; fixture room recreation is
+not evidence of production Mac-off rejoin. See the
+[host lifecycle requirements](../designs/protocol/r9-host-routing-lifecycle.md).
+
+Atem #89 remains unmerged; production access is not deployed. The user approved
+merge/release after successful joint end-to-end tests, which have not yet passed.
+Mobile/service platform and provider workflows remain separate validation.
 The previous ced29ce provisioned build and Genie discovery were historical r8
 checks and do not establish r9 conformance. No keys, trust floors, pairings or
 credential agents were reset.
