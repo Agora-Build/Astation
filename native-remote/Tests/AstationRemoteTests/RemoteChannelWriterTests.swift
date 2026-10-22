@@ -64,7 +64,7 @@ final class RemoteChannelWriterTests: XCTestCase {
         old.linkLost()
         let replacement = RemoteChannelWriter(generation: UUID(), transport: .relay) { newSent.append($0) }
         let newRoute = try replacement.open()
-        XCTAssertEqual(oldRoute.handle, newRoute.handle)
+        XCTAssertNotEqual(oldRoute.handle, newRoute.handle)
         XCTAssertThrowsError(try replacement.send(object, to: oldRoute))
         XCTAssertThrowsError(try replacement.welcomed(oldRoute))
         replacement.close(oldRoute)

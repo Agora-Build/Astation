@@ -156,6 +156,10 @@ class AstationApp: NSObject, NSApplicationDelegate {
         hubManager.sendHandler = { [weak webSocketServer] message, clientId in
             webSocketServer?.sendMessageToClient(message, clientId: clientId)
         }
+        hubManager.sendDirectChannel = { [weak webSocketServer] bytes, clientId, completion in
+            guard let webSocketServer else { completion(CocoaError(.fileNoSuchFile)); return }
+            webSocketServer.sendChannel(bytes, clientID: clientId, completion: completion)
+        }
         hubManager.disconnectDirectClient = { [weak webSocketServer] clientId in
             webSocketServer?.disconnectClientForSessionReset(clientId)
         }

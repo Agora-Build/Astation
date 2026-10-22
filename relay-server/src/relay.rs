@@ -119,6 +119,10 @@ fn relay_connection_event(atem_id: &str, connection_id: &str, event: &str) -> St
 /// An Atem frame wrapped for its Astation. A non-JSON frame travels as a
 /// JSON string payload.
 fn atem_envelope(atem_id: &str, connection_id: &str, text: &str) -> String {
+    if serde_json::from_str::<Box<serde_json::value::RawValue>>(text).is_ok() {
+        return format!("{{\"atem_id\":{},\"connection_id\":{},\"payload\":{text}}}",
+            serde_json::to_string(atem_id).unwrap(), serde_json::to_string(connection_id).unwrap());
+    }
     let payload = serde_json::from_str::<serde_json::Value>(text)
         .unwrap_or_else(|_| serde_json::Value::String(text.to_string()));
     serde_json::json!({
@@ -240,6 +244,7 @@ struct HubInner {
     push_tokens: std::sync::OnceLock<Arc<dyn crate::push_tokens::PushTokenStore>>,
     push_delivery: std::sync::OnceLock<Arc<crate::push_delivery::PushDelivery>>,
     recovery_probes: crate::remote_api::recovery_probe::ProbeBroker,
+    remote_channels: crate::remote_api::channels::ChannelBroker,
 }
 
 /// The relay: this replica's sockets plus the shared room directory, the
@@ -292,6 +297,7 @@ impl RelayHub {
                 push_tokens: std::sync::OnceLock::new(),
                 push_delivery: std::sync::OnceLock::new(),
                 recovery_probes: crate::remote_api::recovery_probe::ProbeBroker::default(),
+                remote_channels: crate::remote_api::channels::ChannelBroker::default(),
             }),
         }
     }
@@ -301,6 +307,45 @@ impl RelayHub {
     }
 
     pub(crate) fn probes(&self) -> &crate::remote_api::recovery_probe::ProbeBroker { &self.inner.recovery_probes }
+    pub(crate) fn channels(&self) -> &crate::remote_api::channels::ChannelBroker { &self.inner.remote_channels }
+
+    pub(crate) async fn deliver_channel(&self, target: &ConnRef, frame: String) -> bool {
+        if target.replica == self.inner.replica_id {
+            return self.inner.local.send_required(&target.conn, frame);
+        }
+        let Some((delivery, rx)) = self.channels().delivery() else { return false };
+        let message = InboxMessage::ChannelDeliver { connection_id: target.conn.clone(), frame,
+            reply_to: self.inner.replica_id.clone(), delivery: delivery.clone() };
+        let sent = self.inner.bus.send_inbox(&target.replica, message).await.is_ok();
+        let accepted = sent && matches!(tokio::time::timeout(Duration::from_secs(2), rx).await, Ok(Ok(true)));
+        self.channels().delivered(&delivery, false);
+        accepted
+    }
+
+    pub(crate) async fn remote_channel_reply(&self, source: &ConnRef, text: &str) -> bool {
+        // Reserved handles never leak into the paired Mac's room traffic.
+        // This is routing discrimination only. The destination broker strictly validates
+        // the envelope, including duplicate fields, before delivering any bytes.
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else { return false };
+        let Some(handle) = value["channel"].as_str().filter(|h| h.starts_with("rc_")) else { return false };
+        let Some(origin) = crate::remote_api::channels::origin(handle) else { return true };
+        let accepted = if origin == self.replica_id() { self.channels().reply(handle, source, text) }
+        else {
+            if let Some((delivery, rx)) = self.channels().delivery() {
+                let message = InboxMessage::ChannelReply { handle: handle.into(), source: source.clone(), frame: text.into(),
+                    reply_to: self.replica_id().into(), delivery: delivery.clone() };
+                let sent = self.inner.bus.send_inbox(origin, message).await.is_ok();
+                let accepted = sent && matches!(tokio::time::timeout(Duration::from_secs(2), rx).await, Ok(Ok(true)));
+                self.channels().delivered(&delivery, false);
+                accepted
+            } else { false }
+        };
+        if !accepted && value["event"] != "close" {
+            let close = serde_json::json!({"type":"channel","event":"close","channel":handle,"reason":"closed"}).to_string();
+            let _ = self.deliver_channel(source, close).await;
+        }
+        true
+    }
 
     async fn recovery_probe_reply(&self, connection: &str, text: &str, last_reply: &mut Option<Instant>) -> bool {
         if text.len() > 65_536 { return false; }
@@ -650,6 +695,15 @@ impl RelayHub {
                     BusEvent::Broadcast(BroadcastMessage::RecoveryProbe { handle, connection, frame }) => {
                         hub.probes().reply(&handle, &connection, frame);
                     }
+                    BusEvent::Inbox(InboxMessage::ChannelDeliver { connection_id, frame, reply_to, delivery }) => {
+                        let accepted = hub.local().send_required(&connection_id, frame);
+                        let _ = hub.inner.bus.send_inbox(&reply_to, InboxMessage::ChannelDelivered { delivery, accepted }).await;
+                    }
+                    BusEvent::Inbox(InboxMessage::ChannelDelivered { delivery, accepted }) => hub.channels().delivered(&delivery, accepted),
+                    BusEvent::Inbox(InboxMessage::ChannelReply { handle, source, frame, reply_to, delivery }) => {
+                        let accepted = hub.channels().reply(&handle, &source, &frame);
+                        let _ = hub.inner.bus.send_inbox(&reply_to, InboxMessage::ChannelDelivered { delivery, accepted }).await;
+                    },
                     BusEvent::Inbox(message) => apply_inbox(hub.local(), message),
                     BusEvent::Broadcast(BroadcastMessage::RoomChanged { code }) => {
                         hub.invalidate_room(&code)
@@ -666,6 +720,7 @@ impl RelayHub {
                         waiters.wake(&session_id, &reply);
                     }
                     BusEvent::Resubscribed => {
+                        hub.channels().reset();
                         // Anything published while we were away is lost:
                         // drop cached rooms and re-read every key.
                         hub.clear_room_cache();
@@ -2595,9 +2650,19 @@ async fn handle_ws(
                     };
                     match hub.check_sender(&code, is_current).await {
                         Ok(SenderCheck::Current(room)) => {
-                            if !hub.recovery_probe_reply(&connection_id, &text, &mut recovery_probe_last_reply).await {
+                            if !hub.remote_channel_reply(&hub.me(&connection_id), &text).await
+                                && !hub.recovery_probe_reply(&connection_id, &text, &mut recovery_probe_last_reply).await {
                                 if let Some(owner) = room.owner {
-                                    hub.deliver(&owner, atem_envelope(&atem_id, &connection_id, &text)).await;
+                                    let frame = atem_envelope(&atem_id, &connection_id, &text);
+                                    let channel = crate::remote_api::channels::Envelope::parse(&text);
+                                    if let Some(channel) = channel {
+                                        if !hub.deliver_channel(&owner, frame).await {
+                                            let close = serde_json::json!({"type":"channel","event":"close","channel":channel.channel,"reason":"closed"}).to_string();
+                                            let _ = hub.deliver_channel(&hub.me(&connection_id), close).await;
+                                        }
+                                    } else if serde_json::from_str::<serde_json::Value>(&text).ok().is_none_or(|v| v["type"] != "channel") {
+                                        hub.deliver(&owner, frame).await;
+                                    }
                                 }
                             }
                         }
@@ -2695,7 +2760,15 @@ async fn handle_ws(
                             .cloned()
                             .unwrap_or(serde_json::Value::Null);
                         match hub.find_atem(&code, target_id, requested_connection_id).await {
-                            Some(target) => hub.deliver(&target, payload.to_string()).await,
+                            Some(target) => {
+                                // Keep original signed/crypto frame representations intact.
+                                #[derive(Deserialize)]
+                                struct TargetPayload<'a> { #[serde(borrow)] payload: &'a serde_json::value::RawValue }
+                                if let Ok(raw) = serde_json::from_str::<TargetPayload>(&text) {
+                                    if payload["type"] == "channel" { let _ = hub.deliver_channel(&target, raw.payload.get().into()).await; }
+                                    else { hub.deliver(&target, raw.payload.get().into()).await; }
+                                }
+                            },
                             None => tracing::debug!(
                                 "Dropping message for stale or missing Atem connection: code={} atem_id={}",
                                 mask_code(&code),

@@ -205,6 +205,13 @@ impl LocalSockets {
         false
     }
 
+    /// A ciphertext gap is a connection failure, never a best-effort frame drop.
+    pub fn send_required(&self, connection_id: &str, frame: String) -> bool {
+        if self.send(connection_id, frame) { return true; }
+        self.close_with(connection_id, CLOSE_SLOW_CLIENT, "r9 queue unavailable");
+        false
+    }
+
     fn close_slow(&self, conn: LocalConn) {
         self.slow_closed.fetch_add(1, Ordering::Relaxed);
         crate::cluster::metrics::metrics()

@@ -20,6 +20,10 @@ pub const BUS_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum InboxMessage {
+    /// r9 ciphertext cannot be silently dropped. Acknowledge queue admission or fail the route.
+    ChannelDeliver { connection_id: String, frame: String, reply_to: String, delivery: String },
+    ChannelDelivered { delivery: String, accepted: bool },
+    ChannelReply { handle: String, source: super::ConnRef, frame: String, reply_to: String, delivery: String },
     /// Queue `frame` on each listed local connection (one publish per
     /// target replica, fanned out there).
     Deliver {
@@ -54,6 +58,8 @@ pub fn drop_if_oversize(replica_id: &str, message: &InboxMessage, payload_len: u
         return false;
     }
     let targets: Vec<String> = match message {
+        InboxMessage::ChannelDeliver { connection_id, .. } => vec![crate::relay::mask_code(connection_id)],
+        InboxMessage::ChannelDelivered { .. } | InboxMessage::ChannelReply { .. } => vec![],
         InboxMessage::Deliver { connection_ids, .. } => {
             connection_ids.iter().map(|id| crate::relay::mask_code(id)).collect()
         }
@@ -75,6 +81,9 @@ pub fn drop_if_oversize(replica_id: &str, message: &InboxMessage, payload_len: u
 /// Apply an inbox message to this replica's sockets.
 pub fn apply_inbox(local: &LocalSockets, message: InboxMessage) {
     match message {
+        InboxMessage::ChannelDeliver { .. } | InboxMessage::ChannelDelivered { .. } | InboxMessage::ChannelReply { .. } => {
+            // Requires the hub's r9 broker; dispatched before this legacy socket handler.
+        }
         InboxMessage::Deliver { connection_ids, frame } => {
             for connection_id in connection_ids {
                 local.send(&connection_id, frame.clone());

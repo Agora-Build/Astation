@@ -1,17 +1,20 @@
-# Astation r8 client
+# Astation r9 client
 
-Astation requires atem-session revision 8. The contract, handoff and fixtures
-are pinned to Atem main `4f87bab1289848cb6a0da5707d2e7830eb5c057d` (PR #78).
-The merged contract matches the reviewed source byte for byte (SHA-256
-`61c02f789fdaf2c72710f975150f196e8c6b6979a6a6a3cc51e921ecbf1680c9`).
-All four [implementation contract edits](agent-control-api-atem-r6-review.md)
-are confirmed. There is no older-protocol fallback.
+Astation requires revision 9 inside an authenticated `atem-ch1` channel.
+The native shared library is pinned to Atem
+`1493ca6a5d704484bff7b30b09222cf20658fdcd`; the relay consumes its reviewed
+wire-compatible `eaaadc23477d12f1e2a0caa56ccafb1dd45be571` library.
+The plaintext session handshake, old fixture runner and unused browser
+protocol replica are removed. No r8 transport or fallback remains.
 
 ## Admission and trust
 
-Every hello sends `revision: 8`. A welcome must name revision 8, advertise
-features, match the verified account/device, and grant view permission before
-Astation requests the registry. Only known advertised features are enabled.
+The shared core builds the encrypted revision 9 hello only after verifying
+the host's signed accept with its independently pinned membership key.
+`AstationR9Connection` admits only the shared core's verified welcome, checks
+the expected account/host/native kind, and passes it to the presentation
+service. Plaintext session, terminal and chat traffic cannot enter that service.
+Only known advertised features are enabled.
 An incompatible Atem is hidden from Connections, agent selection and the local
 session API; Connections explains: "This Atem version is not supported.
 Upgrade Atem." API status exposes `atem_upgrade_required`. Reconnection after
@@ -19,11 +22,33 @@ an upgrade performs a new handshake. Silence times out without an automatic
 retry or a claim that the host is incompatible: a halted journal can also
 withhold welcome.
 
-Authority still comes from the native app's authenticated, safety-code-verified
-pairing. The relay transports messages; it does not establish identity,
-permissions, encryption mode or control. Account-wide membership, standalone
-browser authority and other section 9 features remain gated. Local port 8080
-remains available for same-machine connections and the opt-in local API.
+Authority comes from proof of possession against the independently anchored
+signed membership log. Account login and legacy pairing identify routing
+context only. Durable membership advances commit before channel effects;
+uncertain storage, unknown/removed members, frozen accounts or unpinned hosts
+stop admission. Channel access needs active native view membership, not the
+manage role. The relay cannot establish identity, permissions or encryption
+state. Local port 8080 remains for same-machine transport and the opt-in API.
+
+An authenticated newer membership head pauses operations. The coordinator
+fetches and verifies the chain, commits it and opens a fresh channel. A head
+already held on the same chain does not reconnect. Divergence, failed storage
+or a removed member requires review and cannot silently resume.
+
+Each live host socket has its own generation-bound router, with unique handles
+even if a router is replaced on that socket. Writes are ordered and bounded to
+64 frames/4 MiB. Failure closes the affected channel; ciphertext and uncertain
+commands are never replayed. Peer close is not echoed. Disconnect, sleep and
+late owner-auth replies cannot restore a lost attachment or lease. Repeated
+verification notifications do not restart an in-progress signing prompt.
+
+Native owner confirmation can be reused for less than five minutes while
+foregrounded. Background, lock and sleep clear that reuse. Membership changes
+always require their separate fresh, body-bound confirmation.
+
+`RemoteRelayClient` also opens its own outbound WebSocket without this Mac's
+identity-room connection. See the [independent API](../../docs/remote-api.md)
+for routing, account authentication, bounds and current deployment limits.
 
 ## Prompt and terminal lifecycle
 
@@ -101,12 +126,13 @@ failed subscription indefinitely.
 
 ## Validation and rollout
 
-`Tests/AstationTests/Fixtures/atem-session-v1/source.json` pins the complete
-published fixture set with SHA-256. All seven client scenarios run through
-the actual Swift wire decoder and client, including revision rejection,
-feature negotiation, delayed Send replies, truncation and sequence recovery.
-Host-only fixtures are retained with their upstream ownership; importing them
-is not a claim that Swift executes the host journal or agent runtime.
+The native adapter tests exercise the production shared library's handshake,
+signature refusal and cancellation, raw envelope reader/router, unique
+generations, deadlines and ordered bounded writes. The relay has a real
+WebSocket test with P-256 native proof, independently signed host accept,
+encrypted welcome/registry and replay refusal while no Mac is connected.
+The shared core owns cryptographic/protocol conformance; the Swift app retains
+tests for its presentation, durable requests, leases and local API.
 
 Focused integration tests also exercise API Send/takeover/renew/release,
 lease-free approvals, native/API ownership races, release before a delayed
@@ -121,17 +147,7 @@ sessions remain distinct from deterministic conformance tests: do not send
 prompts, interrupts, stop requests or approval decisions to a user's working
 sessions merely to verify discovery.
 
-On 2026-10-18, the personally provisioned build passed 941 Swift tests
-(six environment-dependent skips, no failures), including all seven shared
-client scenarios. Release compilation, 65 automation tests and 18 packaging
-tests also passed. The provisioned app was relaunched from its canonical
-local bundle and connected to Genie's r8 runtime. Both Claude and Codex were
-discovered with all nine negotiated features; each read-only chat view reached
-an explicit complete `history_end` with no error. Their histories were empty
-at that point. Neither discovery nor chat reads acquired control. This live
-check establishes handshake, registry and empty-history boundaries, not prompt
-execution, nonempty pagination or provider approval behavior.
-
 The implemented API uses polling for chat, approvals and receipts. A native
 full conversation UI, SSE replay/notifications and offline APNs delivery remain
-separate work; r8 support does not claim those interfaces are complete.
+separate work. Controlled transport tests do not establish production Auth,
+mobile owner authentication, APNs/FCM or a live re-pairing ceremony.

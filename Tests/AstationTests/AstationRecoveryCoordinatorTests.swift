@@ -143,6 +143,34 @@ private final class RecoveryCoordinatorHarness {
 
 @MainActor
 final class AstationRecoveryCoordinatorTests: XCTestCase {
+    func testChannelRefreshCommitsSignedMembershipAndAllowsViewOnlyButNeverRemovedDevices() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        _ = try await coordinator!.setup()
+        try await append(["action": "add_host", "host": ["host_id": "host-a", "host_trust_gen": 1,
+            "host_key": ["alg": "ed25519", "pub": recoveryTestBase64(await h.relay.hostPublicKey())]]], harness: h)
+        let manager = try await addSecondManager(harness: h)
+        try await append(["action": "set_roles", "device_id": "manager-a", "roles": ["view"]],
+            harness: h, signer: "manager-b", identity: manager)
+        let updatedValue = await h.relay.log
+        let updated = try XCTUnwrap(updatedValue)
+        try await coordinator!.refreshChannelMembership(hostID: "host-a", requiredHead: updated.head())
+        XCTAssertEqual(try coordinator!.channelMembership(hostID: "host-a").member(deviceId: "manager-a")?.roles, ["view"])
+        coordinator = nil
+        coordinator = try h.coordinator()
+        XCTAssertEqual(try coordinator!.channelMembership(hostID: "host-a").head(), updated.head())
+        XCTAssertThrowsError(try coordinator!.channelMembership(hostID: "unknown-host"))
+        do {
+            try await coordinator!.refreshChannelMembership(hostID: "host-a", requiredHead: LogHead(seq: updated.head().seq, hash: String(repeating: "f", count: 64)))
+            XCTFail("An authenticated head still needs a verified matching chain")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        try await append(["action": "remove", "device_id": "manager-a"], harness: h, signer: "manager-b", identity: manager)
+        let removedValue = await h.relay.log
+        let removed = try XCTUnwrap(removedValue)
+        try await coordinator!.refreshChannelMembership(hostID: "host-a", requiredHead: removed.head())
+        XCTAssertThrowsError(try coordinator!.channelMembership(hostID: "host-a"))
+    }
+
     private func checkpoint(_ store: RecoveryMemoryCheckpoint) throws -> [String: Any] {
         try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(store.bytes), format: nil) as? [String: Any])
     }

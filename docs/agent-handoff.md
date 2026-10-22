@@ -1,5 +1,13 @@
 # Astation Agent Handoff
 
+Current r9 integration (2026-10-21): draft PR #58 now wires native encrypted
+channels and independent relay WebSockets, with no r8 fallback. See
+[coordination status](github-coordination.md), [API usage](remote-api.md) and
+[r9 lifecycle](../designs/protocol/r9-client.md). Production Auth/deployment,
+complete live ceremony and sealed push remain separate gates. The release
+and production records below are historical; they do not describe this
+unmerged worktree or establish a live r9 pass.
+
 Updated on 2026-10-11 for release preparation against `main` at `a174a41`,
 including merged encryption, credential UI and documentation work.
 The prior operational audit on 2026-10-10 checked `b426292`,

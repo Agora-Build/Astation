@@ -1,7 +1,7 @@
 import Foundation
 
 enum AtemSessionWire {
-    static let revision: UInt64 = 8
+    static let revision: UInt64 = 9
     static let features: Set<String> = ["chat.history_end", "chat.history", "chat.lookup", "chat.coverage",
         "receipt.result", "approval.session_rules", "approval.card_reason", "chat.send_acquire", "approval.lease_free"]
     static let maximumCounter = UInt64(AtemSessionJSON.maximumInteger)
@@ -218,7 +218,6 @@ struct AtemSessionMessage: Codable, Equatable {
             try AtemSessionWire.check(counter.map { $0 <= AtemSessionWire.maximumCounter } != false)
         }
         switch op {
-        case "hello": try AtemSessionWire.check(revision == AtemSessionWire.revision)
         case "list": break
         case "welcome":
             try AtemSessionWire.check(account_id.map(AtemSessionWire.opaque) == true && atem_device_id.map(AtemSessionWire.opaque) == true

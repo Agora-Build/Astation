@@ -1,273 +1,83 @@
 # Remote agent API for independent Astation clients
 
-## Auth deferral and durable state, 2026-10-21
+## Implementation status, 2026-10-21
 
-The user deferred the unavailable agora.build Auth service. Continue r9
-implementation and controlled integration tests independently of production
-OIDC deployment. Existing device pairing and the r9 signed membership/channel
-remain the trust boundary. The account-login integration from #63 stays
-separate; deferral does not turn a failed login into storage authorization.
-Production account-storage rollout and its live verification remain pending.
+Native direct and identity-relay sockets now use the shared encrypted r9
+channel for session, terminal, chat and the local API. The plaintext session
+handshake, obsolete fixtures and unused browser protocol replica are removed.
+An unsupported host has no r8 fallback. The shared verifier's welcome is the
+only way to establish presentation authority.
 
-Atem #93 supplies accepted immutable bindings at
-`1493ca6a5d704484bff7b30b09222cf20658fdcd`. Native checkpoints must retain the
-shared `stored_json` membership snapshot alongside each writer's exact prepared
-state. Load with independently saved account/genesis anchors, then immediately
-commit the loaded state before exposing it. On each membership change or clock
-advance, export and durably commit before any dependent effect. An uncertain
-commit halts the owner; a process restart must not discard shared wait-ended,
-approval, veto or freeze decisions. Old entry-only checkpoints migrate through
-the shared verifier conservatively and are committed in the new form.
+Independent clients use their own outbound authenticated WebSocket at
+`/api/remote/v1/channels?genesis=...&host=...`, without a running Mac.
+`AstationRemote.RemoteRelayClient` supplies the native transport. The relay
+binds isolated handles to the exact outbound host socket and preserves inner
+frame bytes. Ordered bounded queues and acknowledged replica delivery close
+the channel on uncertain delivery, without ciphertext replay. The host alone
+verifies device membership, proof of possession, scope and permissions.
 
-Use the OS boot-session identifier across app restarts and a monotonic clock;
-checkpoint pending waits periodically and on background/sleep. Device-only
-Keychain storage excludes these snapshots and prepared writers from backups.
-Restore always refetches and obtains a new host-signed challenge after restart;
-a saved membership decision is not a new host freshness proof.
+A membership update from an authenticated channel stops operations until the
+native coordinator fetches and verifies the signed chain, durably commits it,
+and opens a fresh channel. Same-chain heads already held do not cause a new
+handshake. A removed device cannot reconnect; active view-only native members
+need no manage role to read sessions. Routine signing allows less than five
+minutes of foreground owner-confirmation reuse; background, lock and sleep
+clear it. Membership signatures always need fresh body-bound confirmation.
 
-## Native channel components, 2026-10-21
+Controlled tests cover two independent clients with the Mac absent, exact raw
+bytes, foreign-account refusal, host-generation isolation, bounded queues,
+peer-close behavior and both replica dispatchers with lost ACKs. A real
+WebSocket test performs P-256 native proof, host-signature verification,
+encrypted welcome/registry and ciphertext replay refusal using the shared
+crate. This is not a live Claude/Codex or mobile-platform conformance claim.
+See [API usage](../../docs/remote-api.md), [r9 lifecycle](r9-client.md) and
+[coordination status](../../docs/github-coordination.md).
 
-The shared-core endpoint now has an inbound R9.7a reader/router alongside its
-outbound writer. One router belongs to one host connection generation. It
-preserves original inner JSON bytes, refuses duplicate routing fields and
-unknown envelope fields, enforces the serialized 2 MiB limit and identifies an
-oversized channel only from the first 4 KiB before `frame`. A malformed record,
-peer close or exceeded bound ends only that channel. Unknown/repeated closes
-produce no response. Link loss cancels all its handshakes and deferred signing;
-it never replays commands or restores a lease. Bounded writer backpressure
-retains close disposition instead of replaying an operation.
+The user deferred unavailable auth.agora.build. Code and controlled tests
+continue, while production account registration/configuration, deployment and
+live validation remain pending. The implementation does not introduce another
+storage-authentication rule or legacy AGORA_ACCOUNT_* configuration. Durable
+sealed push/provider integration, mobile/service platform validation and the
+complete provisioned live ceremony remain separate gates. Main merges deploy
+production and need user approval; neither Astation #58 nor Atem #89 is merged
+by this work.
 
-Routine native signing has a separate platform adapter. It accepts only the
-shared core's exact channel-client transcript domain for the pinned existing
-identity. One foreground owner confirmation may cover routine channel
-signatures for less than five minutes; concurrent requests share that prompt
-without extending the window. Background, lock, sleep, key failure and explicit
-invalidation clear reuse and fence late answers. A stale/cancelled connection
-never signs after the prompt. Membership entries still require fresh,
-body-bound confirmation and cannot use this adapter.
+## Durable membership and recovery
 
-These components compile in the app but are not yet connected to live direct
-or relay session dispatch. Tests through the supplied production FFI verify a
-real host-signed accept and native P-256 signature through encrypted finish;
-the host welcome and subsequent agent operations are not exercised in that
-test. Separate provisioned tests exercise the real Secure Enclave primitive.
-Local totals are 987 app tests (15 environment-dependent skips), 109 native
-tests and three provisioned recovery/signing tests, all passing. CI at `455ad8f`
-is green; it precedes the reader/signer increment. Live independent routers,
-durable sealed push/provider integration, platform conformance and the complete
-provisioned ceremony still gate admission.
+The Apple client package is pinned to Atem
+`1493ca6a5d704484bff7b30b09222cf20658fdcd` (delivered by #93). Relay Cargo
+retains the reviewed wire-compatible `eaaadc23477d12f1e2a0caa56ccafb1dd45be571`
+core. Astation consumes the shared libraries and does not edit/build Atem
+checkouts. See [artifact consumption](../../docs/atem-client-artifacts.md).
 
-## Pairing integration progress, 2026-10-21
-
-The native v2 ceremony is connected to the app: explicit genesis setup,
-mandatory Recovery Kit saving, protected account checkpoints, fresh owner-bound
-Enclave signatures, relay CAS, K backups and final signed membership. The
-[Recovery Kit v2 design](../recovery-kit-v2.md) describes storage and restore
-invariants and the transport. The Apple package is pinned to
-`1493ca6a5d704484bff7b30b09222cf20658fdcd`; relay Cargo remains at the
-accepted eaaadc2 wire-compatible core pin.
-
-Original-JSON readers validate `verifyCommit.host_trust_gen` and the v2 reveal
-before Foundation decodes them. The required host channel key and genesis are
-included in the commitment/safety transcript. Authenticated account, device and
-connection context remain immutable across asynchronous preparation, owner
-approval and publication. Cancellation, reconnect, expiry and account changes
-fence late callbacks. There is no production v1 safety-code fallback.
-
-The shared publisher checkpoints the exact body before confirmation, signature
-before send and committed head before success. One protected account store and
-process lock serialize bootstrap, publication, backup and restore. An uncertain
-store halts the operation; retries retain exact signed/sealed bytes. A signed
-pending entry is not discarded on cancellation. CAS conflicts use the shared
-verifier and require renewed confirmation; unresolved history stays blocked.
-`deviceVerified.membership` carries the verified chain through the exact host
-id, key and captured trust generation before the local device pin is installed.
-
-The relay persists signed logs and sealed backups in Postgres, with root-level
-transactions across replicas. Verified login controls storage visibility; the
-client's independent genesis and the shared verifier control trust. A bounded
-recovery-only HTTP probe reaches the host on its existing outbound socket while
-the original Mac is offline. It can obtain one fresh signed public head, never
-finish a controller handshake or forward commands.
-
-Restore checks the kit and anchored chain, fetches the exact committed backup,
-requires a fresh host proof and durably installs current/retained K before
-requesting replacement membership. A pending replacement cannot pair or publish
-manager changes. A signed manager approval permits setup/export/pairing under
-the existing root. Key rotation and AEK1 imports publish a backup before installing
-the new key; encryption-off setup stays off. Repeated exports verify and reuse
-an unchanged committed backup.
-
-**Remaining gates:** this is not a released or live-tested r9 ceremony.
-Independent admission remains disabled. Atem #93's supported durable snapshot
-API is now consumed by the coordinator and publication/backup/restore adapters.
-They preserve shared recovery decisions and freezes across restarts, retain exact
-writer bytes, and commit immediately after load and before dependent effects.
-Same-boot elapsed time survives application restarts; reboot handling remains
-conservative. A 30-second timer and background/sleep checkpoints persist waits.
-Serialization or storage failures stop account operations until reconciled.
-No second membership engine or relay-authoritative clock is introduced.
-
-Validation includes native/app/relay tests, actual isolated Postgres transaction
-and restart tests, HTTP/WebSocket recovery with the Mac offline, and provisioned
-Data Protection Keychain/Secure Enclave checks. The iOS Simulator target compiles;
-its runtime cannot execute with this machine's mismatched CoreSimulator version.
-Rendered safety-code/Touch ID interaction and a live Atem v2 ceremony have not
-been exercised. Inbound session routers, durable sealed push/provider ingress,
-mobile/service integration and platform conformance still gate independent r9.
-Do not merge Atem #89 based on unit-test or compile evidence alone.
-
-The canonical provisioned app now runs source `ced29ce`, display version
-`0.4.17-65-gced29ce`, built 2026-10-22 00:00:13 UTC with the unchanged Personal
-Team XMGQ79XMD5/bundle identity. Strict signature and all four bundled-resource
-checks pass. Relaunch retained the existing relay identity: Genie authenticated,
-then welcome, sessions and both chat history_end exchanges arrived. This is the
-existing paired-host r8 path, not an independent r9 ceremony pass. The test
-totals for the native components are recorded above. CI at `455ad8f` is fully green;
-ced29ce CI remains pending at publication. Draft PR #58 stays unmerged; no
-production deployment is authorized.
-
-## Historical package integration, 2026-10-21
-
-The [eaaadc2 review](remote-agent-api-eaaadc2-review.md) accepts Atem's
-corrected final host/package pin for Astation integration. The journal-loss
-and clock-rollback findings are closed in reviewed source and executed debug
-runtime regressions. All five archives and 12 payload checksums verify; client,
-binding and fixture trees are unchanged from 58fa1e9. The Apple dependency is
-updated and its interactive consumer passes 19 FFI checks. All 27 native adapter
-tests and 111 selected session/API/terminal tests pass with the merged main fixes.
-The macOS app builds; all 37 selected identity/credential tests pass in the
-provisioned Personal Team host, with protected Keychain access required.
-The earlier scheduled-worker sandbox failure is superseded by this execution;
-no new iOS runtime execution is claimed. Live app ceremony, durable membership wait-state bindings, inbound/live routers,
-durable push/provider ingress and platform/relay conformance still gate admission,
-which remains disabled. The v2 section above supersedes this earlier stage's
-protected storage/signing status.
-No new product/security choice is pending. This supersedes the historical
-host finding/dependency status below.
-
-## Integration started, 2026-10-20
-
-[Atem's start request](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6306876197)
-confirms that the accepted edeb8f0 client packages and settled binding/effect
-contract can be consumed while the host-only quarantine correction is finalized.
-The task branch now contains encoded-byte push acknowledgment batching, a
-reproducible Apple artifact installer and a native SwiftPM adapter over the
-accepted shared core. The adapter captures original-JSON pairing commitments,
-owns a connection per virtual channel, fences deferred signing on disconnect
-or expiry and forwards typed operations without replay. The outbound writer
-adds generation-scoped handles, full serialized 2 MiB limits and bounded
-channel/handshake/close accounting for both direct and relay transports. All
-27 focused native tests pass. The earlier adapter and supplied dependency
-compile for both iOS simulator architectures, without a runtime claim.
-The app's ceremony, membership
-persistence and direct/relay routers still need wiring; authenticated durable
-push ingress and runtime/platform conformance remain before admission.
-The final-client dependency/review is published at f9d6ac5. The scheduled
-worker's [Git-metadata failure](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6307616918)
-is a publishing failure in that worker; the interactive session committed
-and pushed its preserved changes. Its CI fails the existing verification UI
-timing assertion tracked in [#62](https://github.com/Agora-Build/Astation/issues/62);
-relay/webapp jobs pass. No full-suite pass is claimed.
-
-## Historical host review before corrected packages
-
-The [final-pin review](remote-agent-api-final-pin-review.md) supersedes the
-older pending-package status below. At `58fa1e9`, the original quarantine
-rewrite/restart gap is fixed and all five matching packages verify. A repeated
-damage/clock-rollback trace can still lose the earlier quarantine end and
-readmit a revoked grant; final host approval remains withheld. Astation's
-Apple dependency now consumes the verified final client package independently
-of that host finding. App ceremony, native storage/signing, routers, durable
-push ingress and conformance remain incomplete; admission remains disabled.
-No new product/security decision is pending.
-
-The [ade944f review](remote-agent-api-task9b-review.md) is the current
-implementation status and supersedes earlier pending Task 9b source/artifact
-claims below. The supplementary two-host test is concrete; Android and
-non-production Linux harness archives pass independent integrity/static checks.
-No Android device/emulator load or local Linux runtime execution is claimed.
-A high-priority unreadable-revocation quarantine rewrite/restart gap remains;
-request a durable fix and real-runtime regression before accepting the final
-rebased implementation/packages. Browser-only idle principal generation reset,
-later-window membership_incomplete, strict membership parsing, and a full
-revocation journal's busy/live-fence behavior are reviewed. Documented push
-cancellation exceptions still allow a stale relay open to escalate until its
-guard; integration tests must retain that limitation. Full Astation ceremony,
-shared-core/native/relay/provider integration remains required with no r8
-fallback. A final artifact review and real platform tests still gate admission.
-
-
-Status: r9 contract signed off; integration started, admission gated, 2026-10-20.
-Remote admission is not enabled. Today's implemented r8 client and protected
-local API remain documented in [r8-client.md](r8-client.md) and the
-[local API guide](../../docs/local-control-api.md).
+Native checkpoints retain shared `stored_json` snapshots alongside each
+writer's exact prepared state. Load with independently saved account/genesis
+anchors and immediately commit before effects. Membership changes and clock
+advances commit before dependent actions. Uncertain persistence halts account
+operations; restart never discards recorded waits, approvals, vetoes or freezes.
+The OS boot-session ID and periodic/background/sleep checkpoints retain
+same-boot progress without trusting wall-clock jumps. Device-only Keychain
+storage excludes these records from backups. Restore refetches the signed
+chain and requires a fresh host-signed challenge after restart; a saved state
+is not a new host freshness proof. See [Recovery Kit v2](../recovery-kit-v2.md).
 
 ## Sources and coordination
 
-The shared protocol lives in **[Atem PR #80](https://github.com/Agora-Build/Atem/pull/80)**:
-`designs/protocol/remote-agent-api-atem.md`, `designs/account-trust.md`, and the
-r9 appendix and shared fixtures. The current reviewed draft pin is
-`c685abab92535b167f5f2658c814f0f72541d9a1`; the
-[r5 review](remote-agent-api-atem-r5-review.md) signs it off for implementation.
-The previous blockers are resolved; shared-core/runtime conformance and
-platform integration still gate remote admission.
+The jointly accepted protocol is in [Atem PR #80](https://github.com/Agora-Build/Atem/pull/80),
+`designs/protocol/remote-agent-api-atem.md`, `designs/account-trust.md` and the
+r9 appendix/fixtures. The [r5 review](remote-agent-api-atem-r5-review.md) signs
+off contract `c685abab92535b167f5f2658c814f0f72541d9a1` for implementation.
+Later implementation/artifact reviews and fixes are recorded in Git history,
+the [eaaadc2 review](remote-agent-api-eaaadc2-review.md), the
+[envelope review](remote-agent-api-channel-envelope-review.md) and #93.
+Superseded review findings are not current blockers.
 
-[Atem #81](https://github.com/Agora-Build/Atem/issues/81) is the coordination
-thread for handoffs, answers, status and questions. PR #80 owns design changes
-and reviews. New topics get their own issue/PR linked from #81. GitHub is the
-working channel; the user need not carry messages between agents. Bring new
-product/security choices to the user before publishing a decision. See the
-[coordination rules](../../docs/github-coordination.md).
-
-The latest [envelope/ceremony/package review](remote-agent-api-channel-envelope-review.md)
-reviews final Task 7 pin `edeb8f0fab71d4573e41c4ca7935aab207200caf`.
-The restart/status and per-kid project findings are closed. Strict original-JSON
-`verifyCommit.data.host_trust_gen` handling and both routers' 2 MiB serialized
-bound remain required. All three final binding packages verify; 19 local
-Swift/static-library FFI checks include every pinned verifyCommit example.
-The final-pin/package wait is closed. Android ABI libraries have since passed Task 9b static review; device/emulator
-loading remains. Complete ceremony, platform/storage/router adapters and runtime
-conformance still gate admission. The earlier external-Git-metadata blocker
-is resolved. See [Apple consumption](../../docs/atem-client-artifacts.md) for
-the pinned SwiftPM integration, native adapter coverage and remaining gates.
-
-
-The [Task 9a follow-up](remote-agent-api-task9a-review.md) reviews
-`56c4489bde35e83460655f686e2eff8305b09010` and closes the earlier
-[Task 8 cancellation finding](remote-agent-api-task8-review.md) in source.
-Published pending approvals and unacknowledged resolutions retain their slots;
-a new approval goes unhinted when no safe slot remains. Native channels use
-a monotonic 24-hour key-rotation limit; service/browser expiry and recovery's
-dual-clock wait remain separate. An r9 link's unused r8 attachment deadline
-does not end its independent channels. Both Astation routers still enforce
-2 MiB channel envelopes and 256 KiB relay messages; split push_ack by actual
-encoded bytes. Signed seen remains limited to original hint recipients.
-All 75 current fixture files are unchanged: 48 host / 10 relay / 8 client /
-9 vector. Atem reports 48/48 host scenarios, 714 checks and 25 exclusions;
-host B's channel and the real link-stall paths remain coverage gaps. Request
-a built harness or adapter-consumer entry point, final matching production
-packages and Android ABI libraries. Full Astation conformance gates admission.
-Atem has promised a supplementary two-host runtime test and a built fixed-flow
-harness in Task 9b; those bytes remain unreviewed. The
-[harness adapter requirements](remote-agent-api-harness-adapter.md) describe a
-subsequent external transport hook using existing R9.7a, with no newly agreed
-production endpoint. Core, bindings and full Test now pass at exact 56c4489.
-
-The [confirmed policy reply](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6276488130)
-settles push, recovery, authentication and the unchanged v0.7.2 device ID.
-It supersedes Astation's former 60/180-second schedule and mandatory host
-re-pairing after loss of every native device.
-The [later recovery handoff](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6278073754)
-records the user decisions: a 24-hour host-clock wait with manager approve/veto
-and replaceable kits. These replace the earlier pending recovery questions.
-The [r4 response](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6278600334)
-records the user's later decisions: wait for a host-confirmed recovery head;
-after a plain crash replay durable carriage and resume, while a recorded
-membership fault or unreconcilable carriage holds access for a manager.
-The [r2 review](remote-agent-api-atem-r2-review.md)
-records the technical findings and their follow-up status; the older
-[#70 review](account-trust-review.md) is historical, not a competing design.
+Read Atem memory and handoff vault `v-8ut37j7X` first, then linked GitHub
+updates, every three minutes during active coordination. [Atem #81](https://github.com/Agora-Build/Atem/issues/81)
+contains handoffs, answers, status and questions; PR #80 owns contract changes
+and reviews. New topics get linked issues/PRs. The user does not carry messages
+between agents. Bring new product/security choices to the user before posting
+a decision. See the [coordination rules](../../docs/github-coordination.md).
 
 ## Product outcome and ownership
 
@@ -454,8 +264,12 @@ APNs/FCM remains the offline channel regardless of foreground transport.
 The relay `/api/remote/v1` families cover capabilities, enrollment
 rendezvous, exact signed membership retrieval/conditional append, verified host
 advertisements, and opaque channels/frames/ordered events. Only the public
-readiness endpoint is implemented on this branch; it reports admission disabled
-and empty supported revisions/transports. Other unimplemented paths return 503.
+readiness endpoint, authenticated signed-log/K-backup storage, fresh host probes
+and independent encrypted WebSocket channels are implemented on this branch.
+Capabilities advertise revision 9/WebSocket and enable routing admission with
+durable recovery storage. Identity/permission admission remains authoritative
+on Atem. Enrollment, host discovery and push ingress/provider work still have
+separate gates; unimplemented paths return 503.
 See [the API status](../../docs/remote-api.md). Final methods, limits, errors, cursor/reset behavior and envelopes
 follow the jointly pinned contract. A plaintext relay chat API would change the
 E2EE boundary and is not this design.

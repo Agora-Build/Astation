@@ -2,6 +2,8 @@ import CStationCore
 import AppKit
 import Foundation
 import Network
+import AtemClient
+import AstationRemote
 
 // Hub Manager - Contains all business logic for Agora projects, tokens, etc.
 class AstationHubManager: ObservableObject {
@@ -190,6 +192,7 @@ class AstationHubManager: ObservableObject {
     /// Callback for sending a message to a specific client by ID.
     /// Set by AstationApp after wiring up the WebSocket server.
     var sendHandler: ((AstationMessage, String) -> Void)?
+    var sendDirectChannel: ((Data, String, @escaping (Error?) -> Void) -> Void)?
     var disconnectDirectClient: ((String) -> Void)?
     var terminalMessageHandler: ((RemoteTerminalMessage, RemoteTerminalConnection) -> Void)?
     var sessionMessageHandler: ((AtemSessionMessage, RemoteTerminalConnection) -> Void)?
@@ -202,6 +205,8 @@ class AstationHubManager: ObservableObject {
     var remoteAgentInputHandler: ((RemoteTerminalConnection, String?, String, String) -> Bool)?
     var sessionsRemovedHandler: (([String]) -> Void)?
     private var nativeSessionClients: [String: AtemSessionClient] = [:]
+    @MainActor private var r9Connections: [String: AstationR9Connection] = [:]
+    @MainActor private var r9Signer: AstationChannelSigner?
     private var sessionTimer: Timer?
     private let sessionJournal: AtemSessionJournal
     lazy var browserAgentChat = BrowserAgentChat(
@@ -798,35 +803,8 @@ class AstationHubManager: ObservableObject {
             // r6.2's authenticated session registry is the only agent list.
             return nil
 
-        case .session(let message):
-            guard let captured = captureSessionContext(clientId: clientId, relayConnectionId: relayConnectionId) else { return nil }
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.sessionContext(for: clientId) == captured else { return }
-                self.nativeSessionClients[clientId]?.receive(message, from: captured.route)
-                self.sessionMessageHandler?(message, captured.route)
-            }
-            return nil
-
-        case .terminal(let message):
-            // Direct client IDs are unique socket generations. Relay context is
-            // captured from the authenticated envelope before asynchronous delivery.
-            guard let captured = captureSessionContext(clientId: clientId, relayConnectionId: relayConnectionId) else { return nil }
-            DispatchQueue.main.async {
-                guard self.sessionContext(for: clientId) == captured else { return }
-                self.terminalMessageHandler?(message, captured.route)
-            }
-            return nil
-
-        case .agentChat(let event):
-            let captured = captureSessionContext(clientId: clientId, relayConnectionId: relayConnectionId)
-            let source = RemoteTerminalConnection(clientId: clientId, connectionId: relayConnectionId ?? clientId)
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.terminalConnection(for: clientId) == source else { return }
-                if let captured, self.sessionContext(for: clientId) == captured {
-                    self.nativeSessionClients[clientId]?.receiveChat(event, from: captured.route)
-                }
-                self.browserAgentChat.receiveAgent(event, from: source)
-            }
+        case .session, .terminal, .agentChat:
+            // Agent traffic is accepted exclusively through the authenticated r9 channel.
             return nil
 
         case .browserChat:
@@ -1230,7 +1208,12 @@ class AstationHubManager: ObservableObject {
             send: { [weak self] message, route in self?.sendSessionMessage(message, to: route) ?? false },
             journal: sessionJournal,
             reconnect: { [weak self] context in self?.reconnectSessionTransport(context) ?? false },
-            sendChat: { [weak self] message, route in self?.sendSessionChatMessage(message, to: route) ?? false })
+            sendChat: { [weak self] message, route in self?.sendSessionChatMessage(message, to: route) ?? false },
+            openChannel: { [weak self] context in
+                Task { @MainActor in self?.openR9Channel(context) }
+            }, closeChannel: { [weak self] context in
+                MainActor.assumeIsolated { self?.closeR9Channel(context) }
+            })
         nativeSessionClients[id] = client
         client.onChange = { [weak self, weak client] in
             guard let self, let client else { return }
@@ -1354,9 +1337,7 @@ class AstationHubManager: ObservableObject {
               let client = nativeSessionClients[route.clientId], client.phase == .ready,
               binding.attachment_gen == client.welcome?.attachment_gen,
               binding == client.binding(for: binding.target, mutation: binding.lease_epoch != nil) else { return false }
-        sendMessage(.terminal(message), to: route.clientId,
-                    expectedRelayConnectionId: route.clientId.hasPrefix("relay-") ? route.connectionId : nil)
-        return true
+        return MainActor.assumeIsolated { r9Connections[route.clientId]?.send(.terminal(message)) ?? false }
     }
 
     func sessionContext(for clientId: String, atemId: String? = nil) -> AtemSessionContext? {
@@ -1372,17 +1353,93 @@ class AstationHubManager: ObservableObject {
         dispatchPrecondition(condition: .onQueue(.main))
         guard sessionContext(for: route.clientId)?.route == route, sendHandler != nil,
               (try? message.validate()) != nil else { return false }
-        sendMessage(.session(message), to: route.clientId,
-                    expectedRelayConnectionId: route.clientId.hasPrefix("relay-") ? route.connectionId : nil)
-        return true
+        return MainActor.assumeIsolated { r9Connections[route.clientId]?.send(.session(message)) ?? false }
     }
 
     private func sendSessionChatMessage(_ message: AgentChatWire, to route: RemoteTerminalConnection) -> Bool {
         dispatchPrecondition(condition: .onQueue(.main))
         guard sessionContext(for: route.clientId)?.route == route, sendHandler != nil else { return false }
-        sendMessage(.agentChat(message), to: route.clientId,
-                    expectedRelayConnectionId: route.clientId.hasPrefix("relay-") ? route.connectionId : nil)
-        return true
+        return MainActor.assumeIsolated { r9Connections[route.clientId]?.send(.agentChat(message)) ?? false }
+    }
+
+    @MainActor private func openR9Channel(_ context: AtemSessionContext) {
+        guard sessionContext(for: context.route.clientId) == context else { return }
+        closeR9Channel(context)
+        do {
+            let coordinator = try recoveryCoordinator(account: context.account)
+            let log = try coordinator.channelMembership(hostID: context.device)
+            if r9Signer == nil { r9Signer = try AstationChannelSigner(identity: atemE2EIdentity, keyID: AstationIdentity.shared.id) }
+            let link = AstationR9Connection(context: context,
+                current: { [weak self] in self?.sessionContext(for: context.route.clientId) == context },
+                write: { [weak self] bytes, completion in
+                    guard let self, self.sessionContext(for: context.route.clientId) == context else {
+                        completion(RemoteChannelError.staleLink); return
+                    }
+                    if context.route.clientId.hasPrefix("relay-") {
+                        guard let socket = self.identityRelayTask, self.identityRelayVerified,
+                              let wrapped = try? RemoteRelayEnvelope.wrap(bytes, host: context.device, connection: context.route.connectionId),
+                              let text = String(data: wrapped, encoding: .utf8) else { completion(RemoteChannelError.staleLink); return }
+                        socket.send(.string(text), completionHandler: { completion($0) })
+                    } else if let send = self.sendDirectChannel { send(bytes, context.route.clientId, completion) }
+                    else { completion(RemoteChannelError.staleLink) }
+                }, welcomed: { [weak self] welcome in
+                    self?.nativeSessionClients[context.route.clientId]?.channelWelcomed(welcome, from: context.route)
+                }, receive: { [weak self] message in
+                    self?.receiveR9Application(message, context: context)
+                }, failed: { [weak self] message, unsupported in
+                    self?.nativeSessionClients[context.route.clientId]?.channelFailed(message, unsupported: unsupported)
+                }, refreshMembership: { [weak self] head in
+                    self?.refreshR9Membership(context, requiredHead: head)
+                })
+            r9Connections[context.route.clientId] = link
+            try link.start(identity: ClientIdentity(kind: .native, deviceId: AstationIdentity.shared.id,
+                keyId: AstationIdentity.shared.id, grantJson: nil), log: log, signer: r9Signer!)
+        } catch {
+            nativeSessionClients[context.route.clientId]?.channelFailed(
+                "r9 account membership is unavailable. Complete recovery setup and verify this Atem with an r9 build.")
+        }
+    }
+
+    @MainActor private func refreshR9Membership(_ context: AtemSessionContext, requiredHead: LogHead) {
+        guard let previous = r9Connections[context.route.clientId] else { return }
+        Task { @MainActor [weak self] in
+            guard let self, self.sessionContext(for: context.route.clientId) == context else { return }
+            do {
+                try await self.recoveryCoordinator(account: context.account)
+                    .refreshChannelMembership(hostID: context.device, requiredHead: requiredHead)
+                guard self.sessionContext(for: context.route.clientId) == context,
+                      self.r9Connections[context.route.clientId] === previous else { return }
+                self.nativeSessionClients[context.route.clientId]?.channelMembershipRefreshed(context: context)
+            } catch {
+                guard self.sessionContext(for: context.route.clientId) == context,
+                      self.r9Connections[context.route.clientId] === previous else { return }
+                self.nativeSessionClients[context.route.clientId]?.channelFailed(
+                    "The signed membership update could not be verified or saved. Review account verification before reconnecting.")
+            }
+        }
+    }
+
+    @MainActor private func closeR9Channel(_ context: AtemSessionContext) {
+        guard let link = r9Connections[context.route.clientId], link.context == context else { return }
+        r9Connections.removeValue(forKey: context.route.clientId)?.disconnect()
+    }
+
+    /// Socket adapters capture their authenticated generation before entering the main actor.
+    @MainActor func receiveR9Envelope(_ bytes: Data, clientID: String, connectionID: String) {
+        guard let context = sessionContext(for: clientID), context.route.connectionId == connectionID else { return }
+        r9Connections[clientID]?.receive(bytes)
+    }
+
+    @MainActor private func receiveR9Application(_ message: AstationMessage, context: AtemSessionContext) {
+        guard sessionContext(for: context.route.clientId) == context else { return }
+        switch message {
+        case .session(let payload):
+            nativeSessionClients[context.route.clientId]?.receive(payload, from: context.route)
+            sessionMessageHandler?(payload, context.route)
+        case .terminal(let payload): terminalMessageHandler?(payload, context.route)
+        case .agentChat(let payload): nativeSessionClients[context.route.clientId]?.receiveChat(payload, from: context.route)
+        default: break
+        }
     }
 
     private func browserChatConnection(for clientId: String) -> RemoteTerminalConnection? {
@@ -1808,6 +1865,15 @@ class AstationHubManager: ObservableObject {
                         // Raw relay control frame (relay-auth-1), not an Atem envelope.
                         DispatchQueue.main.async {
                             self?.handleRelayControlFrame(frame, task: task)
+                        }
+                    } else if let envelope = try? RemoteRelayEnvelope(Data(text.utf8)),
+                              RemoteRelayEnvelope.isChannel(envelope.payload) {
+                        Task { @MainActor in
+                            guard let self, self.identityRelayTask === task, self.identityRelayVerified,
+                                  DeviceAuthentication.isValidAtemId(envelope.host),
+                                  self.identityRelayAuthentication.isAuthenticated(clientId: "relay-\(envelope.host)",
+                                      connectionId: envelope.connection) else { return }
+                            self.receiveR9Envelope(envelope.payload, clientID: "relay-\(envelope.host)", connectionID: envelope.connection)
                         }
                     } else if let data = text.data(using: .utf8),
                        let rawPacket = try? AtemSessionJSON.validatePacket(data),

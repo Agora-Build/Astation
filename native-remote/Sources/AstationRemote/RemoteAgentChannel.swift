@@ -28,6 +28,8 @@ public struct RemoteChannelRoute: Equatable, Sendable {
 }
 
 public enum RemoteAgentOperation: Equatable, Sendable {
+    /// Validated session/terminal/chat messages built by a platform presentation adapter.
+    case message(String)
     case list
     case chatOpen(session: String, conversation: String)
     case terminalSubscribe(session: String)
@@ -259,6 +261,8 @@ private final class SharedRemoteChannelCore: RemoteChannelCore {
 
     func perform(_ operation: RemoteAgentOperation, now: UInt64) throws -> Outgoing {
         switch operation {
+        case let .message(json):
+            return Outgoing(id: "", frame: try connection.sendJson(messageJson: json, nowMs: now))
         case .list: return try connection.list(nowMs: now)
         case let .chatOpen(session, conversation): return try connection.chatOpen(sessionId: session, conversationId: conversation, nowMs: now)
         case let .terminalSubscribe(session): return try connection.terminalSubscribe(sessionId: session, nowMs: now)

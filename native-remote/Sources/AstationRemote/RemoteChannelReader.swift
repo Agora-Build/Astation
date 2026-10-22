@@ -69,7 +69,7 @@ extension RemoteChannelEnvelope {
 
 /// A bounded framing reader, not a cryptographic or membership verifier.
 /// Foundation validates JSON syntax; ranges retain original inner number/string representations.
-private struct RawFields {
+struct RawFields {
     var bytes: [UInt8] = []
     var index = 0
     var values: [String: Data] = [:]

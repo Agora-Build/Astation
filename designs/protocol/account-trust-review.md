@@ -1,7 +1,7 @@
 # Astation review of one pairing, many devices
 
 Historical review/handoff: this records the earlier implementation and is not
-the current remote-admission or approval contract. Use [r8-client.md](r8-client.md)
+the current remote-admission or approval contract. Use [r9-client.md](r9-client.md)
 for shipped behavior and [remote-agent-api.md](remote-agent-api.md) for the
 aligned r9 plan. Atem #81 owns handoffs; PR #80 owns the new shared contract.
 Old freshness attestations, lease-taking approval answers and recovery/push

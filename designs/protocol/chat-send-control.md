@@ -49,7 +49,7 @@ API callers must explicitly authorize takeover rather than gaining it by default
   subscription or abandoned API caller must not retain control indefinitely.
 
 The operation shape and fixtures are implemented in the shared r8
-session service. See [r8 client lifecycle](r8-client.md) and the
+session service. See [r8 client lifecycle](r9-client.md) and the
 [local API guide](../../docs/local-control-api.md). Astation requires r8;
 there is no r7 fallback.
 

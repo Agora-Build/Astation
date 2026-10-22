@@ -17,8 +17,8 @@ struct AtemSessionContext: Equatable {
     }
 }
 
-/// The hub supplies the authenticated, safety-code-verified connection.
-/// Protocol r8 is required; section 9's membership gates remain enforced.
+/// Presentation and durable request state for an authenticated r9 channel.
+/// This adapter never opens a plaintext session or negotiates an older protocol.
 final class AtemSessionClient {
     enum Phase: Equatable { case offline, connecting, reconnecting, ready, failed }
     private enum WelcomeFailure: Error {
@@ -92,6 +92,10 @@ final class AtemSessionClient {
     private let now: () -> TimeInterval
     private let makeID: () -> String
     private let sendChat: (AgentChatWire, RemoteTerminalConnection) -> Bool
+    private let openChannel: (AtemSessionContext) -> Void
+    private let closeChannel: (AtemSessionContext) -> Void
+    private var connectingSince: TimeInterval = 0
+    private var retriedAfterVerification = false
     private lazy var chat = AtemSessionChat(now: now, features: { [weak self] in self?.features ?? [] }) { [weak self] message in
         guard let self, let context = self.context, context == self.currentContext(),
               message.binding?.attachment_gen == self.welcome?.attachment_gen else { return false }
@@ -109,10 +113,6 @@ final class AtemSessionClient {
     private var resyncing = true
     private var tombstones: [String: Set<String>] = [:]
     private var started = false
-    private var lastHelloContext: AtemSessionContext?
-    private var helloRefusedBeforeVerification = false
-    private var verificationCompleted = false
-    private var retriedAfterVerification = false
     private var lastReceiptQuery: TimeInterval = 0
     var hasRegistrySnapshot: Bool { phase == .ready && !resyncing }
     var connectionStatus: ConnectionStatus {
@@ -131,7 +131,9 @@ final class AtemSessionClient {
          makeID: @escaping () -> String = { UUID().uuidString.lowercased() },
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
          reconnect: @escaping (AtemSessionContext) -> Bool = { _ in false },
-         sendChat: @escaping (AgentChatWire, RemoteTerminalConnection) -> Bool = { _, _ in false }) {
+         sendChat: @escaping (AgentChatWire, RemoteTerminalConnection) -> Bool = { _, _ in false },
+         openChannel: @escaping (AtemSessionContext) -> Void,
+         closeChannel: @escaping (AtemSessionContext) -> Void = { _ in }) {
         currentContext = context
         sendMessage = send
         reconnectTransport = reconnect
@@ -139,6 +141,8 @@ final class AtemSessionClient {
         self.now = now
         self.makeID = makeID
         self.sendChat = sendChat
+        self.openChannel = openChannel
+        self.closeChannel = closeChannel
     }
 
     func start() { started = true; connectionChanged() }
@@ -147,54 +151,62 @@ final class AtemSessionClient {
         guard started else { return }
         let current = currentContext()
         guard current != context else { return }
+        let previous = context
         context = current
+        if let previous { closeChannel(previous) }
         clearAttachment()
-        helloRefusedBeforeVerification = false
-        verificationCompleted = false
-        retriedAfterVerification = false
         phase = current == nil ? .offline : .connecting
         status = current == nil ? "Atem is offline. Unconfirmed requests will only be queried, never replayed."
-            : "Opening an authenticated Atem session..."
+            : "Opening an encrypted r9 channel..."
         guard let current else { changed(); return }
         guard !journal.loadFailed else {
             fail("Session recovery metadata is unreadable. Remote control is disabled."); changed(); return
         }
-        if let previous = lastHelloContext, previous.route == current.route,
-           previous.transportGeneration == current.transportGeneration {
-            reconnect()
-            return
-        }
-        lastHelloContext = current
-        var hello = AtemSessionMessage(op: "hello")
-        hello.revision = AtemSessionWire.revision
-        _ = request(hello)
+        connectingSince = now()
+        openChannel(current)
         changed()
     }
 
-    /// Only local verification completion can retry a refused initial hello.
+    /// Verification changes require a new encrypted channel; no plaintext hello is sent.
     func verificationDidComplete(context verified: AtemSessionContext) {
-        guard welcome == nil, [.connecting, .failed].contains(phase), !retriedAfterVerification,
-              context == verified, verified == currentContext(), !journal.loadFailed else { return }
-        verificationCompleted = true
-        retryInitialHelloAfterVerification()
+        guard welcome == nil, [.connecting, .failed].contains(phase),
+              context == verified, verified == currentContext(), !journal.loadFailed, !retriedAfterVerification else { return }
+        retriedAfterVerification = true
+        closeChannel(verified)
+        phase = .connecting
+        connectingSince = now()
+        openChannel(verified)
     }
 
-    private func retryInitialHelloAfterVerification() {
-        guard phase == .failed, welcome == nil, helloRefusedBeforeVerification,
-              verificationCompleted, !retriedAfterVerification, context != nil,
-              context == currentContext(), !journal.loadFailed else { return }
-        retriedAfterVerification = true
-        helloRefusedBeforeVerification = false
+    func channelFailed(_ text: String, unsupported: Bool = false) {
+        guard context == currentContext() else { return }
+        if unsupported { failUnsupportedVersion() } else { fail(text); changed() }
+    }
+
+    func channelMembershipRefreshed(context refreshed: AtemSessionContext) {
+        guard phase == .failed, context == refreshed, refreshed == currentContext(), !journal.loadFailed else { return }
         clearAttachment()
+        retriedAfterVerification = true
         phase = .connecting
-        status = "Verification complete. Opening an authenticated Atem session..."
-        var hello = AtemSessionMessage(op: "hello")
-        hello.revision = AtemSessionWire.revision
-        _ = request(hello)
+        connectingSince = now()
+        openChannel(refreshed)
+        changed()
+    }
+
+    /// Only the shared r9 verifier's welcome may enter here, never a socket's decoded JSON.
+    func channelWelcomed(_ message: AtemSessionMessage, from source: RemoteTerminalConnection) {
+        guard phase == .connecting, context?.route == source, context == currentContext() else { return }
+        do {
+            try message.validate()
+            guard message.revision == AtemSessionWire.revision else { failUnsupportedVersion(); return }
+            try acceptWelcome(message)
+        } catch let error as WelcomeFailure { fail(error.message) }
+        catch { fail("Atem's encrypted welcome failed validation. Reconnect or verify this host with r9.") }
         changed()
     }
 
     private func clearAttachment() {
+        retriedAfterVerification = false
         chat.reset(sendClose: false)
         approvalRules = [:]
         regrantedAfterRevoke = []
@@ -220,6 +232,7 @@ final class AtemSessionClient {
     private func reconnect() {
         guard let context, context == currentContext(), !journal.loadFailed else { return }
         clearAttachment()
+        closeChannel(context)
         phase = .reconnecting
         status = "Session reset; reconnecting..."
         changed()
@@ -496,33 +509,12 @@ final class AtemSessionClient {
         guard context?.route == source, context == currentContext(), phase != .failed, phase != .reconnecting else { return }
         do {
             try message.validate()
-            if message.op == "welcome" {
-                guard phase == .connecting, let re = message.re, pending[re]?.message.op == "hello" else { return }
-                guard message.revision == AtemSessionWire.revision, message.features != nil else {
-                    failUnsupportedVersion(); return
-                }
-                try acceptWelcome(message); changed(); return
-            }
+            // Welcome is admitted only by channelWelcomed after shared-core authentication.
+            guard message.op != "welcome" else { return }
             if message.op == "error", message.re == nil {
                 if message.code == "unsupported_version" { failUnsupportedVersion(); return }
                 if message.code == "unauthorized", welcome != nil { reconnect(); return }
-                if message.code == "unauthorized", phase == .connecting,
-                   pending.values.contains(where: { $0.message.op == "hello" }) {
-                    helloRefusedBeforeVerification = true
-                }
-                status = "Atem: " + AtemSessionWire.diagnosticErrorCode(message.code)
-                if phase == .connecting || ["unauthorized", "paused", "unsupported_version"].contains(message.code ?? "") {
-                    fail(status + ". Reconnect the session with matching Astation and Atem builds.")
-                }
-                retryInitialHelloAfterVerification()
-                changed(); return
-            }
-            if phase == .connecting, message.op == "error", let re = message.re, pending[re]?.message.op == "hello" {
-                if message.code == "unsupported_version" { failUnsupportedVersion(); return }
-                helloRefusedBeforeVerification = message.code == "unauthorized"
-                fail("Atem could not open a session: " + AtemSessionWire.diagnosticErrorCode(message.code)
-                    + ". Reconnect to open a fresh session connection.")
-                retryInitialHelloAfterVerification()
+                fail("Atem: " + AtemSessionWire.diagnosticErrorCode(message.code))
                 changed(); return
             }
             guard phase == .ready, now() < authorizationDeadline else { return }
@@ -618,8 +610,9 @@ final class AtemSessionClient {
     func tick() {
         connectionChanged()
         guard phase == .ready else {
-            if phase == .connecting, pending.values.contains(where: { now() - $0.sent >= 8 }) {
-                fail("This Atem did not open a session. Update Atem to enable remote control.")
+            if phase == .connecting, now() - connectingSince >= 25 {
+                if let context { closeChannel(context) }
+                fail("Atem did not complete the encrypted r9 connection. Check its status or upgrade Atem, then reconnect.")
                 changed()
             }
             return
@@ -645,8 +638,7 @@ final class AtemSessionClient {
     }
 
     private func acceptWelcome(_ message: AtemSessionMessage) throws {
-        guard phase == .connecting, let re = message.re, let hello = pending.removeValue(forKey: re), hello.message.op == "hello",
-              let context,
+        guard phase == .connecting, let context,
               let trust = message.host_trust_gen, message.revision == AtemSessionWire.revision,
               let remaining = message.authorization_ms_left else { throw AtemSessionJSON.Invalid.json }
         guard message.account_id == context.account else { throw WelcomeFailure.invalid(.account) }
@@ -672,7 +664,7 @@ final class AtemSessionClient {
             runtimeEpoch = fence.runtimeEpoch
             runtimeGeneration = fence.runtimeGeneration
         }
-        authorizationDeadline = min(hello.sent + Double(remaining) / 1000, now() + Double(remaining) / 1000)
+        authorizationDeadline = min(connectingSince + Double(remaining) / 1000, now() + Double(remaining) / 1000)
         guard now() < authorizationDeadline else { throw WelcomeFailure.invalid(.authorization) }
         welcome = message
         features = Set(message.features ?? []).intersection(AtemSessionWire.features)

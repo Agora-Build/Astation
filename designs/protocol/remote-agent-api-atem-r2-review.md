@@ -198,7 +198,7 @@ final merged pin `4f87bab1289848cb6a0da5707d2e7830eb5c057d`:
 4. Invalid non-opaque result IDs are omitted from correlation without changing
    the completed receipt or allowing a prompt retry.
 
-Astation [ships r8](r8-client.md). There are no VisualizeRequest/VisualizeResult
+Astation [ships r8](r9-client.md). There are no VisualizeRequest/VisualizeResult
 handlers or message types in Sources, Tests, relay-server or webapp; only
 historical handoff text remains. Atem may remove its types/stub reply.
 

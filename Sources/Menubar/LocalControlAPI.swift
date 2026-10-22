@@ -133,7 +133,7 @@ final class LocalControlAPI {
                 guard body.isEmpty else { return .error("invalid_request", status: .badRequest) }
                 switch path {
                 case "/api/v1/status":
-                    return .json(["api": "v1", "session_contract": "r8", "account_wide_access": "gated",
+                    return .json(["api": "v1", "session_contract": "r9", "account_wide_access": "gated",
                                   "host_push_ingress": "gated", "rule_revocation": "lease_free",
                                   "approval_answers": "lease_free", "atomic_chat_send": "supported",
                                   "chat_history": "ordered_pages", "api_lease_renewal": "explicit_every_5s",

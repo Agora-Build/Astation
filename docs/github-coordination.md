@@ -19,36 +19,48 @@ An OS boot-session identifier, 30-second timer and background/sleep checkpoints
 preserve same-boot wait progress without trusting the relay or wall clock.
 Recovery still refetches and requires a fresh host-signed proof after restart.
 
-Local validation: 982 app tests (14 environment-dependent skips), 94 native
-tests and two provisioned recovery signing/storage tests pass. #63's earlier
-23659d9 CI is fully green: 977 app, 87 native, 487 relay, plus all 49 Postgres
-and 64 Valkey cases executed separately. The canonical provisioned app now runs source `ced29ce`, version
-`0.4.17-65-gced29ce`, built 2026-10-22 00:00:13 UTC. The unchanged personal-team
-signature and all four resource checks pass. Relaunch retained relay identity;
-Genie authenticated and delivered welcome, registry and both chat histories.
-That is an existing r8 paired-host check, not a new r9 ceremony pass.
+The current increment wires the shared r9 channel into native direct and
+identity-relay socket dispatch. Session/chat/terminal data and the local API
+now use revision 9 exclusively. Plaintext agent messages are refused, the
+r8 handshake/fixtures and unused browser protocol replica are removed, and
+unsupported hosts have no fallback. A fresh encrypted welcome alone admits
+presentation state. Reconnect clears leases and queries uncertain receipts.
 
-The next increment adds the native inbound reader/router and routine channel
-signer, with generation fencing, original-byte preservation, channel-only
-failures and strict envelope bounds. Five-minute owner reuse is limited to the
-channel transcript; background/lock/sleep invalidate it, while membership
-signatures remain fresh. Actual shared-library host accept/P-256/finish checks
-pass, as do deferred-signing and forged-host refusals. New totals: 987 app tests
-(15 skips), 109 native tests, three provisioned recovery/signing tests. These adapters
-are not yet wired to the live direct/relay socket dispatchers. CI at `455ad8f` is green,
-before this increment; no live router or full r9 claim follows from those tests.
+Independent controllers use their own outbound authenticated WebSocket at
+`/api/remote/v1/channels?genesis=...&host=...`. Account authentication controls
+routing privacy; the original Atem host verifies enrolled native/service
+identity and scope. Per-controller handles bind to an exact host generation,
+preserve inner JSON bytes, and isolate disconnects. Bounded frame/byte queues
+and acknowledged replica delivery fail closed without ciphertext replay.
+`AstationRemote.RemoteRelayClient` provides the reusable native transport.
+See [API status and usage](remote-api.md) and the
+[r9 client lifecycle](../designs/protocol/r9-client.md).
 
-The user deferred unavailable auth.agora.build so r9 implementation and isolated
-tests continue. #63's account-login implementation stays intact; production
-registration/configuration/deployment and its live validation remain open.
-The storage-authentication alternative requires the user's choice; Auth
-unavailability grants no storage access. No legacy AGORA_ACCOUNT_* configuration.
+Controlled relay tests verify two independent controllers on one host with
+no Mac online, account isolation, raw frame preservation, obsolete plaintext
+rejection, both replica dispatchers/ACK loss and a real P-256 native proof,
+signed host accept, encrypted welcome/registry and ciphertext replay refusal.
+These consume the shared crate; they do not run an Atem checkout or prove a
+live Claude/Codex workflow. Validation: 109 focused app integration tests, 114 native adapter tests,
+495 relay tests (113 environment-gated ignores), 35 web tests (one hosting
+skip) and 23 automation checks pass; release compilation passes. The broad
+app run exposes the caption-scroll baseline failure and Keychain/Enclave
+failures while this Mac is locked. The signed driver confirms the same lock
+restriction; it is not a new provisioned signing pass. Final bounded results
+and the local app build are recorded in the PR and shared vault.
 
-Independent native/relay routers, durable sealed push/provider integration,
-mobile/service conformance and the complete live ceremony remain #58 work.
-Atem #89 remains unmerged and independent admission remains disabled. Main merges
-and production deployment require user approval. Existing paired-host r8 remains
-operational; no keys, trust floors, pairings or credential agents were reset.
+The user deferred unavailable auth.agora.build so code and isolated tests
+continue. #63's login implementation is retained; production registration,
+configuration/deployment and live validation remain open. There is no alternate
+storage authentication or legacy AGORA_ACCOUNT_* configuration. A valid account
+login and the independently anchored membership are both required.
+
+Durable sealed push/provider integration, mobile/service platform conformance
+and the complete live ceremony remain #58 work. Atem #89 remains unmerged;
+production access is not deployed. Main merges/deploys need user approval.
+The previous ced29ce provisioned build and Genie discovery were historical r8
+checks and do not establish r9 conformance. No keys, trust floors, pairings or
+credential agents were reset.
 
 ## Historical corrected pin, 2026-10-21
 

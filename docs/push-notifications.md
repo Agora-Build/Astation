@@ -9,7 +9,7 @@ notification payload cannot approve anything.
 Current application behavior is r8: approval answers and rule revocation need
 control permission and the exact authoritative request/rule, without acquiring
 or changing a terminal lease. The relay/notification cannot authorize an answer.
-See the [r8 client](../designs/protocol/r8-client.md) and
+See the [r8 client](../designs/protocol/r9-client.md) and
 [local approval API](local-control-api.md) for implemented behavior and tests.
 
 Remote multi-device admission and sealed escalation are designed on
@@ -60,7 +60,7 @@ Neither a headless API test nor a provider fake proves actual APNs delivery.
 
 In-app review targets the merged r8 contract in Atem #78 at
 `4f87bab1289848cb6a0da5707d2e7830eb5c057d`;
-see the [r8 lifecycle](../designs/protocol/r8-client.md).
+see the [r8 lifecycle](../designs/protocol/r9-client.md).
 The session compatibility trust gate still limits access to the verified paired
 native Astation. Live APNs delivery, phones and account-wide approval access
 are not enabled or verified. Offline push requires the host authentication and

@@ -663,6 +663,10 @@ pub async fn backup(
 }
 
 #[cfg(test)]
+#[path = "channel_crypto_tests.rs"]
+mod channel_crypto_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -700,7 +704,7 @@ mod tests {
         }
     }
 
-    struct TestAccountVerifier;
+    pub(super) struct TestAccountVerifier;
     #[async_trait::async_trait]
     impl crate::account_store::AccountIdentityVerifier for TestAccountVerifier {
         async fn verify(
@@ -713,6 +717,56 @@ mod tests {
                 authenticated_at: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn independent_clients_share_one_outbound_host_without_any_mac_and_keep_routes_isolated() {
+        use crate::relay::tests::{connect_atem, next_client_json, send_json, spawn_relay};
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+        let mut state = crate::tests::test_state();
+        state.accounts = Arc::new(crate::account_store::InMemoryAccountStore::with_verifier(
+            state.knowledge.clone(), state.vault.clone(), Arc::new(TestAccountVerifier)));
+        state.recovery = RecoveryStore::memory();
+        let genesis = fixture()["genesis"].as_str().unwrap().to_owned();
+        for label in ["E1", "E2"] { assert_eq!(state.recovery.perform(&genesis, "alice", append(label)).await.0, StatusCode::OK); }
+        state.relay.ensure_room("dev-mac", "identity", chrono::Utc::now().timestamp()).await.unwrap();
+        let (base, server) = spawn_relay(state).await;
+        let mut host = connect_atem(&base, "dev-mac", "host-a").await;
+        let url = base.replace("/ws", &format!("/api/remote/v1/channels?genesis={genesis}&host=host-a"));
+        let mut unauthorized = url.clone().into_client_request().unwrap();
+        unauthorized.headers_mut().insert("authorization", "Bearer mallory".parse().unwrap());
+        let Err(tokio_tungstenite::tungstenite::Error::Http(response)) = tokio_tungstenite::connect_async(unauthorized).await else { panic!("foreign account routed"); };
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert("authorization", "Bearer alice".parse().unwrap());
+        let mut a = tokio_tungstenite::connect_async(request.clone()).await.unwrap().0;
+        let mut b = tokio_tungstenite::connect_async(request).await.unwrap().0;
+        send_json(&mut a, json!({"type":"channel","event":"open","channel":"native_1","transport":"relay"})).await;
+        let one = next_client_json(&mut host).await;
+        send_json(&mut b, json!({"type":"channel","event":"open","channel":"native_1","transport":"relay"})).await;
+        let two = next_client_json(&mut host).await;
+        let h1 = one["channel"].as_str().unwrap(); let h2 = two["channel"].as_str().unwrap();
+        assert_ne!(h1, h2); assert_eq!(one["transport"], "relay");
+        // Noncanonical number/escape spellings survive every routing hop intact.
+        let raw = format!(r#"{{"type":"channel","event":"frame","channel":"{h2}","frame":{{"ch":"atem-ch1","op":"record","n":1e3,"ct":"\u0061"}}}}"#);
+        host.send(Message::Text(raw)).await.unwrap();
+        let text = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop { if let Some(Ok(Message::Text(t))) = b.next().await { break t; } }
+        }).await.unwrap();
+        assert!(text.contains(r#""n":1e3,"ct":"\u0061""#));
+        assert!(text.contains(r#""channel":"native_1""#));
+        a.close(None).await.unwrap();
+        let close = next_client_json(&mut host).await;
+        assert_eq!(close["channel"], h1); assert_eq!(close["event"], "close");
+        send_json(&mut b, json!({"type":"channel","event":"frame","channel":"native_1","frame":{"ch":"atem-ch1","op":"finish","ct":"opaque"}})).await;
+        let frame = next_client_json(&mut host).await;
+        assert_eq!(frame["channel"], h2); assert_eq!(frame["frame"]["ct"], "opaque");
+        // The independent endpoint has no plaintext session path or protocol downgrade.
+        send_json(&mut b, json!({"type":"session","data":{"op":"hello","revision":8}})).await;
+        let close = next_client_json(&mut host).await;
+        assert_eq!(close["channel"], h2); assert_eq!(close["event"], "close");
+        server.abort();
     }
 
     #[tokio::test]

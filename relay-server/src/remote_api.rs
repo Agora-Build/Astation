@@ -1,4 +1,4 @@
-//! Recovery storage is separate from the still-closed independent channel gate.
+//! Account-private storage and opaque r9 routing. Endpoint authority stays on Atem.
 use axum::{
     http::{header::CACHE_CONTROL, StatusCode},
     response::{IntoResponse, Response},
@@ -16,10 +16,12 @@ use crate::AppState;
 pub(crate) mod push_ack;
 pub(crate) mod recovery;
 pub(crate) mod recovery_probe;
+pub(crate) mod channels;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/capabilities", get(capabilities))
+        .route("/channels", get(channels::connect))
         .route("/logs/:genesis/entries", get(recovery::entries).post(recovery::append))
         .route("/logs/:genesis/backups/:version", get(recovery::backup).put(recovery::upload))
         .route("/logs/:genesis/probes/:host", axum::routing::post(recovery_probe::probe))
@@ -37,18 +39,16 @@ async fn capabilities(State(state): State<AppState>) -> Response {
         Json(json!({
             "api": "atem-remote",
             "version": 1,
-            "status": "not_ready",
-            "admission_enabled": false,
+            "status": if state.recovery.is_durable() { "r9_transport_ready" } else { "not_ready" },
+            "admission_enabled": state.recovery.is_durable(),
+            "admission_authority": "host_signed_membership",
             "recovery_storage_durable": state.recovery.is_durable(),
             "recovery_head_probe": state.recovery.is_durable(),
             "required_session_revision": 9,
-            "supported_session_revisions": [],
-            "transports": [],
-            "blocked_by": [
-                "r9_contract_conformance",
-                "shared_client_core",
-                "membership_admission"
-            ]
+            "supported_session_revisions": [9],
+            "transports": ["websocket"],
+            "transport_implemented": true,
+            "push_ready": false
         })),
     )
         .into_response()
@@ -61,7 +61,7 @@ async fn unavailable() -> Response {
         Json(json!({
             "error": {
                 "code": "remote_api_unavailable",
-                "message": "Independent agent access is awaiting verified membership and encrypted channels."
+                "message": "This remote API operation is not implemented. Use the encrypted r9 channels endpoint."
             },
             "admission_enabled": false
         })),
@@ -85,7 +85,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_cannot_be_mistaken_for_implemented_r9_admission() {
+    async fn transport_readiness_still_reports_missing_durable_storage() {
         let response = app()
             .oneshot(
                 Request::builder()
@@ -102,15 +102,15 @@ mod tests {
         assert_eq!(value["status"], "not_ready");
         assert_eq!(value["admission_enabled"], false);
         assert_eq!(value["required_session_revision"], 9);
-        assert_eq!(value["supported_session_revisions"], json!([]));
-        assert_eq!(value["transports"], json!([]));
-        assert!(!value["blocked_by"].as_array().unwrap().is_empty());
+        assert_eq!(value["supported_session_revisions"], json!([9]));
+        assert_eq!(value["transports"], json!(["websocket"]));
+        assert_eq!(value["admission_authority"], "host_signed_membership");
+        assert_eq!(value["push_ready"], false);
     }
 
     #[tokio::test]
     async fn admission_routes_stay_closed_regardless_of_claimed_credentials() {
         for path in [
-            "channels",
             "enrollments",
             "hosts",
             "events",

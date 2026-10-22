@@ -375,6 +375,34 @@ final class AstationRecoveryCoordinator {
         return try loadBootstrap()?.kit(now: now())
     }
 
+    /// Use the independently anchored, durable log. A relay/account login never creates membership.
+    func refreshChannelMembership(hostID: String, requiredHead: LogHead) async throws {
+        try begin(); defer { busy = false }
+        guard let kit = try currentKit() else { throw RemoteRecoveryError.notCommitted }
+        let log = try await refreshedLog(genesis: kit.genesisHash)
+        switch try log.relation(head: requiredHead) {
+        case .same, .hostBehind: break
+        case .hostAhead, .diverged: throw RemoteRecoveryError.requiresReview
+        }
+        guard log.host(hostId: hostID) != nil else { throw RemoteRecoveryError.requiresReview }
+    }
+
+    func channelMembership(hostID: String) throws -> MembershipLog {
+        guard !busy, !uncertain, let kit = try currentKit(), let log = membershipLog?.snapshot(),
+              log.genesisHash() == kit.genesisHash else { throw RemoteRecoveryError.notCommitted }
+        _ = try log.advance(now: now())
+        try commitLog(log)
+        let keys = try identity.remotePublicKeys()
+        guard let member = log.member(deviceId: managerID), member.kind == "native",
+              member.status == .active, member.roles.contains("view"),
+              member.authKey == PublicKeyData(alg: .p256, raw: keys.signing),
+              member.encKey == PublicKeyData(alg: .x25519, raw: keys.encryption) else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        guard log.frozen() == nil, log.host(hostId: hostID) != nil else { throw RemoteRecoveryError.requiresReview }
+        return log.snapshot()
+    }
+
     private func requireManager(_ log: MembershipLog) throws {
         let keys = try identity.remotePublicKeys()
         guard let manager = log.member(deviceId: managerID) else { throw RemoteRecoveryError.requiresReview }

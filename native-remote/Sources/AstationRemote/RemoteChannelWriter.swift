@@ -74,7 +74,9 @@ public final class RemoteChannelWriter {
               channels.values.filter({ !$0 }).count < 16,
               nextHandle < UInt64.max else { throw RemoteChannelWriteError.busy }
         nextHandle += 1
-        let route = try RemoteChannelRoute(linkGeneration: generation, handle: "native_\(nextHandle)")
+        // A new router may share the still-live host socket; never reuse that link's old handles.
+        let namespace = generation.uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        let route = try RemoteChannelRoute(linkGeneration: generation, handle: "native_\(namespace)_\(nextHandle)")
         channels[route.handle] = false
         do {
             try write(RemoteChannelEnvelope.open(route: route, transport: transport))

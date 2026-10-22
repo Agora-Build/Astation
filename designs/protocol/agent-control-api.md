@@ -5,7 +5,7 @@ The contract and fixtures are pinned to Atem main `4f87bab1289848cb6a0da5707d2e7
 ([Atem #78](https://github.com/Agora-Build/Atem/pull/78)).
 All four implementation contract edits are confirmed in the
 [r6 review](agent-control-api-atem-r6-review.md). See the
-[r8 client lifecycle](r8-client.md) for the implemented negotiation, ownership,
+[r8 client lifecycle](r9-client.md) for the implemented negotiation, ownership,
 receipt, history and security invariants, and the
 [local API guide](../../docs/local-control-api.md) for callable routes.
 Astation requires revision 8 and does not fall back to r7. Unsupported Atem

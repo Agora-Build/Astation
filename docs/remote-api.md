@@ -19,20 +19,20 @@ It returns HTTP 200 with `Cache-Control: no-store` and:
   "recovery_storage_durable": false,
   "recovery_head_probe": false,
   "required_session_revision": 9,
-  "supported_session_revisions": [],
-  "transports": [],
-  "blocked_by": [
-    "r9_contract_conformance",
-    "shared_client_core",
-    "membership_admission"
-  ]
+  "supported_session_revisions": [9],
+  "transports": ["websocket"],
+  "transport_implemented": true,
+  "admission_authority": "host_signed_membership",
+  "push_ready": false
 }
 ```
 
 This reports implementation readiness, independently of `/health` and the
-Mac's existing local API. Requiring revision 9 does not mean r9 is implemented.
-Clients must check `admission_enabled` and the supported revisions/transports
-before attempting enrollment or an agent connection. The response carries no
+Mac's existing local API. With durable Postgres recovery storage, status becomes
+`r9_transport_ready`, and admission/storage/probe flags become true. This says
+the transport is installed; account authentication and a host-verified enrolled
+device are still required. Clients check the flags and supported transport.
+The response carries no
 account, device, session, presence, token or provider-configuration data. It is
 discovery only, never proof of identity or permission.
 
@@ -41,7 +41,9 @@ code `remote_api_unavailable`, `admission_enabled: false` and `no-store`.
 An account token, local Mac bearer token or body claiming verification does
 not enable these routes. Unsupported methods on an implemented route return
 the router's HTTP 405. No r8 or plaintext fallback is provided here. Existing
-relay, pairing and Mac-local r8 operations retain their own routes.
+pairing and account-data synchronization retain their separate routes.
+Native agent control and the local API use only encrypted r9; there is no
+plaintext session hello, terminal or chat fallback.
 
 With a local relay running on its default port:
 
@@ -50,6 +52,60 @@ curl -i http://127.0.0.1:3000/api/remote/v1/capabilities
 ```
 
 This endpoint is not deployed until this branch is merged and deployed.
+
+## Independent Encrypted WebSocket
+
+`GET /api/remote/v1/channels?genesis={genesis_hash}&host={host_id}` upgrades to
+WebSocket. Use WSS and an `Authorization: Bearer` account token. Never put the
+token in the URL. The account login authorizes routing privacy only; Atem
+authenticates the endpoint using the signed membership log and `atem-ch1`.
+The client must already hold its independent genesis/host anchors and its
+enrolled native or scoped service key. Login alone cannot operate an agent.
+
+There is one encrypted channel per controller WebSocket. Send the shared
+`channel/open` envelope within ten seconds, then forward the shared client's
+original `channel/frame` bytes. The relay substitutes an isolated, random
+handle bound to the current host socket; it never modifies the inner frame.
+Replies restore the client's handle. Session list/change events, whole chat
+messages/history, approvals and durable receipts all travel inside this stream.
+These are host operations, not plaintext HTTP endpoints on the relay.
+
+The portable `AstationRemote.RemoteRelayClient` owns the WebSocket, ordered
+writer and shared r9 client. Its host is fixed at construction:
+
+```swift
+let client = try RemoteRelayClient(relayURL: relayURL, genesis: genesisHash,
+    hostID: hostID, accessToken: accountToken, observe: handleEvent)
+try client.connect(identity: enrolledIdentity, log: anchoredLog, sign: signChannel)
+// After the verified ready event:
+try client.perform(.list)
+```
+
+Keep the client alive while subscribed. After disconnect, construct a new one
+and complete a fresh handshake; query uncertain receipts rather than resending
+commands. Native signing uses platform keys and owner authentication. A service
+uses its own enrolled scoped key through the same shared client; it never uses
+the Mac's local API token. Browser grants and a shipped mobile app remain
+separate integration work.
+
+Limits and failure behavior:
+
+- Envelopes are at most 2 MiB; each controller outbox allows 64 frames/4 MiB,
+  including a frame currently being written.
+- At most 16 channels per account and 1,024 per replica; one hour per relay
+  socket, followed by a fresh connection. Host authorization may expire earlier.
+- Every client frame checks the bound host generation; five-second checks
+  also detect an idle replaced/disconnected host.
+- Replica delivery is acknowledged in both directions, with a two-second
+  bound. Backpressure, bus reset or uncertain delivery closes the channel;
+  ciphertext is never retried or silently dropped on a surviving channel.
+- Disconnect and close affect only that controller. A host close is not echoed.
+  The original Mac can remain offline for the entire connection.
+
+The account verifier, durable recovery storage and outbound Atem link must be
+available. `auth.agora.build` remains a deferred production dependency; the
+implementation adds no authentication bypass. No production deployment is
+claimed by the local test results.
 
 ## Recovery Storage and Fresh Head Probes
 
@@ -72,7 +128,8 @@ offline but cannot forward a controller handshake finish, encrypted records or
 commands. Details are in [Recovery Kit v2](../designs/recovery-kit-v2.md).
 
 The two recovery capability flags report durable backend availability and are
-true only when Postgres is configured. They do not enable independent sessions.
+true only when Postgres is configured. The channel endpoint separately verifies
+account visibility and resolves the signed host record for routing.
 Without a durable backend, recovery storage returns 503; memory storage exists
 only in tests. No new relay deployment is claimed.
 
@@ -115,18 +172,21 @@ cargo test remote_api
 cargo test approval_escalation
 ```
 
-These tests cover the actual discovery/gated routing and deterministic policy,
-including exact boundaries, late admission/restart, preference changes,
-resolution/revocation and delivery-margin behavior. They do not claim r9
-channel, enrollment, durable provider delivery or mobile OS conformance.
+These tests cover discovery, account privacy, independent concurrent channels,
+exact frame bytes, generation scoping, backpressure, replay and the deterministic
+notification policy. A real WebSocket test performs a P-256 native proof,
+signed host accept, encrypted welcome and registry exchange without a Mac.
+It consumes the shared responder/client library; it is not a test of a live
+Claude/Codex process or production owner authentication. Durable provider
+delivery and mobile OS conformance remain separate gates.
 
 The r9 contract is signed off for implementation at
 `c685abab92535b167f5f2658c814f0f72541d9a1`; see the
 [review and remaining gates](../designs/protocol/remote-agent-api-atem-r5-review.md).
 The remaining native/service operations, scoped Discord integration, signed
 membership state and sealed push use the Atem-owned shared core. Signed
-membership/K-backup storage is implemented; durable native recovery wait-state
-bindings, independent session routing and push integration remain gated. Full testing uses real independent
+membership/K-backup storage, durable native recovery snapshots and independent
+session routing are implemented. Push ingress/providers remain gated. Full testing uses real independent
 controller/service keys and fake providers with the Mac off, as specified in the
 [implementation plan](../designs/protocol/remote-agent-api.md). Real APNs/FCM,
 notification extensions and platform owner authentication are separate checks.
