@@ -316,12 +316,12 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
             let label = NSTextField(labelWithString: entry.0)
             label.font = .systemFont(ofSize: 12)
             label.textColor = .secondaryLabelColor
-            let value = NSTextField(labelWithString: entry.1)
+            let value = NSTextField(wrappingLabelWithString: entry.1)
             value.font = .systemFont(ofSize: 12)
             value.isSelectable = true
-            value.lineBreakMode = .byTruncatingMiddle
             value.toolTip = entry.1
             value.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            value.setContentCompressionResistancePriority(.required, for: .vertical)
             return [label, value]
         }
         let buildInfo = NSGridView(views: rows)
@@ -337,10 +337,15 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         stack.spacing = 16
         view.addSubview(stack)
         stack.translatesAutoresizingMaskIntoConstraints = false
+        let preferredInfoWidth = buildInfo.widthAnchor.constraint(equalToConstant: 410)
+        preferredInfoWidth.priority = .defaultHigh
         NSLayoutConstraint.activate([
             icon.widthAnchor.constraint(equalToConstant: 64),
             icon.heightAnchor.constraint(equalToConstant: 64),
+            preferredInfoWidth,
             buildInfo.widthAnchor.constraint(lessThanOrEqualToConstant: 410),
+            stack.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -24),
             stack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 48)
         ])
