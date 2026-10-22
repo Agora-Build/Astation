@@ -2700,6 +2700,11 @@ async fn handle_ws(
                 ("astation", Some(auth)) => {
                     let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
                     if let Some(message) = parsed.as_ref() {
+                        // R9.7b relay messages terminate at the relay. A room
+                        // peer must never supply a host challenge or verdict.
+                        if message["type"] == "relay" {
+                            continue;
+                        }
                         if let Some(kind) = relay_control_type(message) {
                             let keep_open = handle_astation_control(
                                 &hub,
@@ -2774,6 +2779,9 @@ async fn handle_ws(
                             .get("payload")
                             .cloned()
                             .unwrap_or(serde_json::Value::Null);
+                        if payload["type"] == "relay" {
+                            continue;
+                        }
                         match hub.find_atem(&code, target_id, requested_connection_id).await {
                             Some(target) => {
                                 // Keep original signed/crypto frame representations intact.
@@ -5014,6 +5022,53 @@ pub(crate) mod tests {
         send_json(&mut astation, serde_json::json!({"probe":"after-control"})).await;
         assert_eq!(next_client_json(&mut atem).await["probe"], "after-control");
         assert_silent(&mut astation, 100).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn relay_only_messages_from_the_owner_never_reach_a_host() {
+        let state = memory_identity_state();
+        let (base, server) = spawn_relay(state).await;
+        let code = "astation-relay-only";
+        let key = TestKey::generate();
+        let mut owner = verified_astation(&base, code, &key, "registered").await;
+        let mut first = connect_atem(&base, code, "first").await;
+        let connected = next_client_json(&mut owner).await;
+        let connection = connected["connection_id"].as_str().unwrap();
+        let mut second = connect_atem(&base, code, "second").await;
+        assert_eq!(next_client_json(&mut owner).await["atem_id"], "second");
+
+        // A peer must not turn the host into a signing oracle or supply a verdict.
+        // Test both broadcast and the generation-bound targeted carrier.
+        for op in ["host_challenge", "host_route", "host_route_ok", "host_route_refused",
+                   "push_hint", "push_seen", "push_ack", "unknown"] {
+            let message = serde_json::json!({"type":"relay", "op":op, "v":1,
+                "nonce":"A".repeat(43), "room":code});
+            send_json(&mut owner, message.clone()).await;
+            send_json(&mut owner, serde_json::json!({"atem_id":"first",
+                "connection_id":connection, "payload":message})).await;
+        }
+        send_json(&mut owner, serde_json::json!({"probe":"ordinary-broadcast"})).await;
+        assert_eq!(next_client_json(&mut first).await, serde_json::json!({"probe":"ordinary-broadcast"}));
+        assert_eq!(next_client_json(&mut second).await, serde_json::json!({"probe":"ordinary-broadcast"}));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn relay_only_messages_from_a_host_never_reach_the_owner() {
+        let state = memory_identity_state();
+        let (base, server) = spawn_relay(state).await;
+        let code = "astation-relay-replies";
+        let key = TestKey::generate();
+        let mut owner = verified_astation(&base, code, &key, "registered").await;
+        let mut host = connect_atem(&base, code, "host").await;
+        assert_eq!(next_client_json(&mut owner).await["relay_event"], "connected");
+        for op in ["host_challenge", "host_route", "host_route_ok", "host_route_refused",
+                   "push_hint", "push_seen", "push_ack", "unknown"] {
+            send_json(&mut host, serde_json::json!({"type":"relay", "op":op, "v":1})).await;
+        }
+        send_json(&mut host, serde_json::json!({"probe":"ordinary-host-message"})).await;
+        assert_eq!(next_client_json(&mut owner).await["payload"], serde_json::json!({"probe":"ordinary-host-message"}));
         server.abort();
     }
 

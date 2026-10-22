@@ -47,11 +47,13 @@ by this work.
 
 ## Durable membership and recovery
 
-The Apple client package is pinned to Atem
-`1493ca6a5d704484bff7b30b09222cf20658fdcd` (delivered by #93). Relay Cargo
-retains the reviewed wire-compatible `eaaadc23477d12f1e2a0caa56ccafb1dd45be571`
-core. Astation consumes the shared libraries and does not edit/build Atem
-checkouts. See [artifact consumption](../../docs/atem-client-artifacts.md).
+The Apple client package and relay shared crate are pinned to Atem
+`83c0776d21fa35c656eefaee25edd03cbbd203ee`, the final R9.7b host-route
+delivery. It retains #93's durable MembershipLog binding API. The
+[host-route review](remote-agent-api-host-route-review.md) records the
+corrected contract, completed runtime execution and package verification.
+Astation consumes the shared libraries and does not edit/build the Atem host
+or its FFI packages. See [artifact consumption](../../docs/atem-client-artifacts.md).
 
 Native checkpoints retain shared `stored_json` snapshots alongside each
 writer's exact prepared state. Load with independently saved account/genesis

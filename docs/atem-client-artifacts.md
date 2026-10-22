@@ -1,6 +1,30 @@
 # Consuming the prebuilt r9 Apple client
 
-The current client pin is `eaaadc23477d12f1e2a0caa56ccafb1dd45be571`.
+The current Apple and relay shared-library pin is
+`83c0776d21fa35c656eefaee25edd03cbbd203ee`. The
+[host-route review](../designs/protocol/remote-agent-api-host-route-review.md)
+records final delivery, source/runtime acceptance and verification of all four
+packages from [binding run 39773150714](https://github.com/Agora-Build/Atem/actions/runs/39773150714).
+The Apple ZIP is artifact `12422844613`; its exact archive and payload hashes
+are in [the checked-in pin](../Config/atem-client-apple.json). The checker
+passes 19 FFI assertions against its production static library. Its Swift
+wrapper, package manifest and C header are unchanged from accepted 1493ca6.
+The Rust-only host-route verifier becomes available to the relay at this pin;
+the durable route lifecycle still needs implementation and acceptance.
+
+Use the current pin with:
+
+```sh
+python3 scripts/check-atem-client-apple.py --install
+swift test --package-path native-remote
+cargo test --locked --manifest-path relay-server/Cargo.toml
+```
+
+## Historical integration evidence, 2026-10-21
+
+The remaining sections record earlier implementation stages and package pins.
+Current wiring and release gates are in [coordination status](github-coordination.md)
+and the [remote API design](../designs/protocol/remote-agent-api.md).
 
 The native adapter now also owns a durable signed-log publication sequence.
 `RemoteMembershipPublication` requires a protected, atomic checkpoint writer;

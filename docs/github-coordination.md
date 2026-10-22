@@ -2,13 +2,22 @@
 
 ## Current implementation, 2026-10-22
 
-Atem #93 supplies the supported durable MembershipLog API at
-`1493ca6a5d704484bff7b30b09222cf20658fdcd`, accepted after memory/vault e66,
-source review, completed CI logs and immutable package/hash verification.
-The Apple package is consumed in #58; the relay retains its accepted eaaadc2
-Cargo pin because signed wire/fixtures are unchanged. No Atem checkout is built.
-See [the upstream delivery](https://github.com/Agora-Build/Atem/issues/93#issuecomment-6328508674)
-and [review](https://github.com/Agora-Build/Atem/pull/80#issuecomment-6328353597).
+The Apple package and relay shared-library dependency now use Atem
+`83c0776d21fa35c656eefaee25edd03cbbd203ee`, the [final host-route delivery](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6340237151).
+The [review](../designs/protocol/remote-agent-api-host-route-review.md) checks
+the corrected two-carrier contract, completed runtime regressions and all four
+matching package archives. The binding API, generated Swift wrapper and Apple
+manifest are unchanged from accepted 1493ca6; the new host-route verifier is
+Rust-only. Astation builds its relay against the library and consumes the
+prebuilt Apple package; it does not build the Atem host or FFI packages.
+
+This increment passes the 19-assertion Apple consumer, builds the macOS app
+and passes 505 relay tests (115 explicit environment ignores), including the
+new real WebSocket relay-message interception cases. A bounded native run
+passes 120 tests with one optional local issuer skip; the external `sysctl`
+boot-ID test is excluded because this worker's sandbox denies the command.
+The initial full run failed only that test's two assertions. The canonical
+provisioned Local.app remains at 5aa3efd; it is not replaced by this work.
 
 The app's v2 ceremony, mandatory kit, protected signing, relay CAS and K backup
 are implemented. Protected coordinator/publication/backup/restore checkpoints
@@ -41,7 +50,7 @@ no Mac online, account isolation, raw frame preservation, obsolete plaintext
 rejection, both replica dispatchers/ACK loss and a real P-256 native proof,
 signed host accept, encrypted welcome/registry and ciphertext replay refusal.
 These consume the shared crate; they do not run an Atem checkout or prove a
-live Claude/Codex workflow. The latest full suites pass: 988 app tests with
+live Claude/Codex workflow. At f99a7c1, the full suites passed: 988 app tests with
 15 environment-dependent skips, 121 native tests without skips using the local
 issuer, and 503 relay tests with 115 environment-gated ignores. Two additional
 Postgres push tests run explicitly and pass. With the Mac unlocked, all 15
@@ -74,9 +83,13 @@ Joint #58/#89 live testing remains the release gate. It includes real terminal,
 chat/receipts, approval and independent-controller operations. End-to-end
 testing also found [Astation #64](https://github.com/Agora-Build/Astation/issues/64):
 the code-based host room is deleted when empty and can expire while ownerless.
-Atem confirmed there is no durable host registration/proof today. The shared
-authenticated rejoin contract is pending on #81; fixture room recreation is
-not evidence of production Mac-off rejoin. See the
+Atem has now delivered the shared authenticated rejoin proof and host runtime.
+This Astation increment intercepts relay-only messages from the room owner,
+including targeted payloads, so a peer cannot inject challenges or verdicts.
+Host relay messages already terminate at the relay's push ingress. The relay
+still needs both carriers, an isolated candidate on the independent route,
+durable binding, cross-replica fencing, verdict delivery and presence retention.
+Fixture room recreation is not evidence of production Mac-off rejoin. See the
 [host lifecycle requirements](../designs/protocol/r9-host-routing-lifecycle.md).
 
 Atem #89 remains unmerged; production access is not deployed. The user approved

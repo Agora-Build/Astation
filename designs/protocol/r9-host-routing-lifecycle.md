@@ -4,6 +4,29 @@ End-to-end validation on 2026-10-22 found a remaining transport lifecycle gate
 in the identity-room route. It is separate from encrypted controller admission
 and durable signed push ingestion. Account Auth #63 alone does not fix it.
 
+## Accepted shared contract, 2026-10-22
+
+Atem delivered R9.7b, its Rust shared verifier, public vectors and host runtime
+at `83c0776d21fa35c656eefaee25edd03cbbd203ee` after correcting the bootstrap
+and authentication-order findings. See the [review](remote-agent-api-host-route-review.md)
+and [final handoff](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6340237151).
+Both Astation dependencies now use this pin. Relay-only interception is in
+place; durable route admission and the acceptance matrix below remain open.
+
+The contract distinguishes two carriers. Carrier A keeps the existing
+owner-present Astation-authenticated room for pairing, first verification and
+manager reconciliation of a held host, without a route proof. Carrier B is the
+independent proved route: isolate the candidate until its proof verifies,
+persist the `(genesis_hash, host_id)` binding, fence the previous connection
+across replicas, then expose the route and send `host_route_ok`. Refuse it
+with the shared verifier's code on failure. Never forward `type:"relay"`
+messages between room members, including inside targeted envelopes. A valid
+verdict survives overlapping Astation authentication in either order.
+
+The upstream runtime tests exercise a fake relay. Astation must still prove
+its own directory, database and replica lifecycle with the real runtime;
+accepting the shared contract does not close #64.
+
 ## Observed behavior
 
 `/ws?role=atem&code=<identity-room>&atem_id=<host>` requires the room to exist.
