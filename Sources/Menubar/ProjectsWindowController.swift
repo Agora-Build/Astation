@@ -148,6 +148,8 @@ class ProjectsWindowController: NSObject, NSWindowDelegate, NSMenuItemValidation
         footer.orientation = .horizontal
         footer.alignment = .centerY
         footer.spacing = 12
+        // AppKit's button alignment insets vary across macOS versions.
+        footer.setCustomSpacing(24, after: signInButton)
         for child in [header, scrollView, footer] {
             child.translatesAutoresizingMaskIntoConstraints = false
             contentView.addSubview(child)
