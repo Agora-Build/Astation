@@ -1,15 +1,12 @@
 # Unified agora.build Identity
 
-Status: approved architecture, reflecting the product direction selected on
-October 10, 2026. Agora-Build/Auth now implements the OIDC contract at
-`bc1bfe727e8da52fc95b16354d610c050a8b5e2c` (`docs/integrating.md`):
-issuer `https://auth.agora.build`, ES256 API JWTs with resource audience, and
-permanent `acct_` subjects. GitHub and Google are implemented upstream; Apple
-and Agora federation are not. See the
-[account integration design](../../designs/protocol/account-identity-integration.md)
-for Astation's implementation and remaining registration/deployment gates.
-Issuer discovery currently does not resolve from the development Mac; no
-successful production rollout or completed legacy-account migration is claimed.
+Status: approved architecture. The identity service and Portal are implemented;
+Astation now uses their OIDC login and linked Agora project API. See the
+[current login guide](../agora-build-login.md) for configurable dev URLs,
+confirmed API shapes and remaining registration/live-verification requirements,
+and the [account integration design](../../designs/protocol/account-identity-integration.md)
+for trust boundaries. The permanent subject format is now
+`ab` plus a 26-character Crockford ULID; no existing identity is silently renamed.
 
 ## Goal
 
@@ -19,12 +16,11 @@ Apple, or Agora, and explicitly link multiple providers to the same account.
 Agora.build owns the permanent account identity; upstream providers supply
 ways to authenticate that identity.
 
-Operate a maintained OAuth 2.0 / OpenID Connect (OIDC) identity service under
-agora.build rather than implementing authorization-server protocols ourselves.
-The choice of managed service or self-hosted provider remains open. Provider
-support, backups, upgrades, recovery, availability, and deployment ownership
-need to be evaluated before choosing one. Agora federation in particular needs
-an approved provider contract; its public website is not an authentication API.
+The shared identity service implements the registered OIDC contract. Products
+use its discovery, client registration and resource scopes. Provider support,
+backups, upgrades, recovery, availability and deployment ownership belong to
+the Auth service. Agora resource access remains an explicitly authorized
+Portal connection; a provider's public website is not an authentication API.
 
 ```mermaid
 flowchart LR
@@ -149,8 +145,9 @@ availability and Astation registration still require verification.
 
 ## Migration from the current implementation
 
-Today Astation uses Agora-specific OAuth paths, client ID `atem`, and scopes
-`basic_info,console`. The relay's optional `AGORA_ACCOUNT_*` verifier accepts
+Legacy Astation service sessions used Agora-specific OAuth paths, client ID
+`atem`, and scopes `basic_info,console`. New native account login uses agora.build;
+legacy sessions are retained only for existing credential consumers. The relay's optional `AGORA_ACCOUNT_*` verifier accepts
 an Agora bearer token and a single subject string; the database calls that
 field `agora_user`. Those names and interfaces are compatibility behavior,
 not the target unified-account design.

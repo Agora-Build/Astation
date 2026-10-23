@@ -49,18 +49,33 @@ final class AstationAccountAuth: Sendable {
     private let provider: AccountTokenProvider?
 
     init(environment: [String: String] = ProcessInfo.processInfo.environment,
-         info: [String: Any] = Bundle.main.infoDictionary ?? [:], storage: AccountSessionStorage = AccountKeychainStorage()) {
-        func value(_ env: String, _ key: String) -> String? { environment[env] ?? info[key] as? String }
+         info: [String: Any] = Bundle.main.infoDictionary ?? [:], storage: AccountSessionStorage = AccountKeychainStorage(),
+         defaults: UserDefaults = .standard) {
+        func value(_ env: String, _ key: String) -> String? { environment[env] ?? defaults.string(forKey: key) ?? info[key] as? String }
         if let clientID = value("ASTATION_ACCOUNT_CLIENT_ID", "AstationAccountClientID"),
            let resource = value("ASTATION_ACCOUNT_RESOURCE", "AstationAccountResource"),
            let scope = value("ASTATION_ACCOUNT_SCOPE", "AstationAccountScope"),
-           let config = try? AccountOIDCConfiguration(issuer: value("ASTATION_ACCOUNT_ISSUER", "AstationAccountIssuer") ?? "https://auth.agora.build",
+           let config = try? AccountOIDCConfiguration(issuer: value("ASTATION_ACCOUNT_ISSUER", "AstationAccountIssuer") ?? AccountServiceSettings.defaultIssuer,
                 clientID: clientID, resource: resource, requiredScope: scope) {
             configuration = config
             let oidc = AccountOIDCClient(configuration: config); client = oidc
             provider = AccountTokenProvider(configuration: config, client: oidc, storage: storage)
         } else { configuration = nil; client = nil; provider = nil }
     }
+
+    init(configuration: AccountOIDCConfiguration, storage: AccountSessionStorage) {
+        self.configuration = configuration
+        let oidc = AccountOIDCClient(configuration: configuration)
+        client = oidc
+        provider = AccountTokenProvider(configuration: configuration, client: oidc, storage: storage)
+    }
+
+    func accessToken() async throws -> String {
+        guard let provider else { throw AccountLoginError.configuration }
+        return try await provider.validToken()
+    }
+
+    func clearSession() async throws { try await provider?.signOut() }
 
     func accessToken(relayURL: String) async throws -> String {
         guard let configuration, let provider else { throw AccountLoginError.configuration }

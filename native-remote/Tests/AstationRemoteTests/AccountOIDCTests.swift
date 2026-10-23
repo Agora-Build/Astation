@@ -53,7 +53,7 @@ private struct AccountFixture {
     let http = AccountTestHTTP()
     let attempt: AccountLoginAttempt
     let client: AccountOIDCClient
-    static let subject = "acct_01234567890123456789012345"
+    static let subject = "ab01234567890123456789012345"
 
     init() throws {
         config = try AccountOIDCConfiguration(issuer: "https://auth.example", clientID: "astation", resource: "https://station.example", requiredScope: "station:account")
@@ -94,6 +94,32 @@ private struct AccountFixture {
 }
 
 final class AccountOIDCTests: XCTestCase {
+    func testAdditionalAPIScopesAreRequestedAndMustAllBeGranted() async throws {
+        let f = try AccountFixture(); try await f.prepare()
+        let config = try AccountOIDCConfiguration(issuer: f.config.issuer, clientID: f.config.clientID,
+            resource: f.config.resource, requiredScope: f.config.requiredScope, additionalScopes: ["agora:certificates"])
+        let client = AccountOIDCClient(configuration: config, http: f.http, now: { f.clock.now() })
+        let url = try await client.authorizationURL(attempt: f.attempt, redirectURI: "http://127.0.0.1:51091/callback")
+        XCTAssertEqual(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "scope" }?.value,
+            "openid profile offline_access station:account agora:certificates")
+        do { _ = try await client.exchange(code: "code", attempt: f.attempt, redirectURI: "http://127.0.0.1:51091/callback"); XCTFail("Missing certificate scope accepted") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .rejected) }
+        try await f.response(access: ["scope":"openid station:account agora:certificates"])
+        let session = try await client.exchange(code: "code", attempt: f.attempt, redirectURI: "http://127.0.0.1:51091/callback")
+        XCTAssertEqual(session.subject, AccountFixture.subject)
+        XCTAssertThrowsError(try AccountOIDCConfiguration(issuer: f.config.issuer, clientID: f.config.clientID,
+            resource: f.config.resource, requiredScope: "agora:projects", additionalScopes: ["openid"]))
+    }
+
+    func testCurrentAccountIDFormatRejectsLegacyAndMalformedSubjectsEvenWhenBothTokensAgree() async throws {
+        let f = try AccountFixture(); try await f.prepare()
+        for subject in ["acct_01234567890123456789012345", "ab0123456789012345678901234I", "ab0123456789012345678901234a", "ab0123456789012345678901234"] {
+            try await f.response(access: ["sub":subject], id: ["sub":subject])
+            do { _ = try await f.exchange(); XCTFail("Accepted \(subject)") }
+            catch { XCTAssertEqual(error as? AccountLoginError, .rejected) }
+        }
+    }
+
     func testAuthorizationUsesDiscoveryPKCEResourceAndConsent() async throws {
         let f = try AccountFixture(); try await f.prepare()
         let url = try await f.client.authorizationURL(attempt: f.attempt, redirectURI: "http://127.0.0.1:49152/callback", fresh: true)
@@ -128,7 +154,7 @@ final class AccountOIDCTests: XCTestCase {
         XCTAssertTrue(form.contains("code_verifier=" + f.attempt.verifier)); XCTAssertTrue(form.contains("resource="))
         XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
         for (field, value) in [("iss", "https://evil.example"), ("aud", "another-api"), ("scope", "station:account-extra"),
-                               ("client_id", "another-client"), ("sub", "acct_98765432109876543210987654")] {
+                               ("client_id", "another-client"), ("sub", "ab98765432109876543210987654")] {
             try await f.response(access: [field: value])
             do { _ = try await f.exchange(); XCTFail("accepted \(field)") } catch {}
         }

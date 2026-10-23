@@ -1,17 +1,22 @@
 # Account identity integration
 
-Status: implementation for Astation #63. Auth's integration contract is pinned
-to Agora-Build/Auth `bc1bfe727e8da52fc95b16354d610c050a8b5e2c`,
-`docs/integrating.md`. This supersedes the old identity specification's claim
-that the identity service has no implementation. Deployment and Astation's
-client/resource registration still need to be verified.
+Status: Astation account login uses the configurable agora.build portal and OIDC
+issuer. Current development URLs are `https://dev.agora.build` and
+`https://auth.dev.agora.build`; discovery and the portal auth configuration are
+reachable as of 2026-10-23. The login/project integration and registration
+handoff are in [agora-build-login.md](../../docs/agora-build-login.md), reviewed
+against Auth `059c6d94b2985b60531b3e47445329407dd13e73` and Portal
+`52096c566079c182ae402d7dcf169a6a7c4abdfb`. A complete user login and actual
+client/resource registrations still require verification.
 
 ## Separate accounts and service connections
 
-The agora.build account session authenticates relay account registration and
-recovery storage requests. The existing Agora session remains the separately
-consented service connection used for projects, RTC credentials and
-`credentialSync`. Neither token is substituted for the other.
+The agora.build portal grant reads the linked Agora account's projects and
+fetches certificates on demand. Upstream Agora tokens remain on the portal.
+Relay account/recovery requests use a separate resource grant for the same
+issuer and subject. Previously consented legacy service credentials remain
+isolated for existing Atem consumers; neither account token substitutes for
+those credentials. No direct Agora login remains in the native UI.
 
 Native login uses issuer discovery, a public client, PKCE S256, state and nonce,
 and a random-port `http://127.0.0.1:<port>/callback`. It requests the registered
@@ -27,7 +32,7 @@ and a single code; unsolicited requests never finish the pending login.
 
 The app verifies ES256 access and ID tokens against discovered signing keys,
 including token type, issuer, audience, lifetime, scope and ID-token nonce.
-The stable subject is Auth's permanent `acct_` identity, never email. Session
+The stable subject is Auth's permanent `ab` + Crockford ULID identity, never email. Session
 secrets are stored separately in the device-only Keychain. Refreshes are
 serialized and share one in-flight operation. A rotated refresh token is saved
 before its access token is exposed. An uncertain refresh or failed persistence
@@ -92,7 +97,7 @@ remaining r9 admission gates are separate; this change does not enable them.
   under a disposable service. The unprovisioned suite skips that Keychain case.
 - Two build-metadata tests pass. No live account items or pairing state changed.
 
-The issuer still fails DNS resolution from this Mac. No deployed Astation
-client/resource registration has been confirmed, and this relay change has not
-been deployed. These tests establish the implementation against controlled
+The configured dev issuer and portal now answer unauthenticated checks. No
+completed user login, deployed Astation client/resource registration or matching
+relay configuration has been confirmed. These tests establish the implementation against controlled
 issuers, not a completed production login or live r9 verification ceremony.

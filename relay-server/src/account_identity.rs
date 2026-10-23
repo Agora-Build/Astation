@@ -324,9 +324,11 @@ impl AccountIdentityVerifier for OidcVerifier {
             || claims
                 .auth_time
                 .is_some_and(|at| at < 0 || at > claims.iat + 30)
-            || !claims.sub.starts_with("acct_")
-            || claims.sub.len() != 31
-            || !claims.sub[5..].bytes().all(|b| b.is_ascii_alphanumeric())
+            || !claims.sub.starts_with("ab")
+            || claims.sub.len() != 28
+            || !claims.sub[2..]
+                .bytes()
+                .all(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&b))
             || claims.client_id.is_empty()
             || claims.client_id.len() > 128
             || !claims.scope.split(' ').any(|s| s == self.scope)
@@ -422,7 +424,7 @@ mod tests {
         }
         fn claims(&self) -> Value {
             let now = chrono::Utc::now().timestamp();
-            json!({"iss":self.issuer,"sub":"acct_01234567890123456789012345","aud":"https://station.example",
+            json!({"iss":self.issuer,"sub":"ab01234567890123456789012345","aud":"https://station.example",
                 "exp":now+900,"iat":now,"client_id":"astation","scope":"openid station:account"})
         }
         fn token(&self, header: Value, claims: Value) -> String {
@@ -461,12 +463,15 @@ mod tests {
         let token = f.token(f.header(), f.claims());
         let identity = f.verifier.verify(&token).await.unwrap();
         assert_eq!(identity.issuer, f.issuer);
-        assert_eq!(identity.subject, "acct_01234567890123456789012345");
+        assert_eq!(identity.subject, "ab01234567890123456789012345");
         assert_eq!(identity.authenticated_at, None); // iat is never fresh-authentication proof.
         for (field, value) in [
             ("iss", json!("https://evil.example")),
             ("aud", json!("different-api")),
             ("sub", json!("email@example.com")),
+            ("sub", json!("acct_01234567890123456789012345")),
+            ("sub", json!("ab0123456789012345678901234I")),
+            ("sub", json!("ab0123456789012345678901234a")),
             ("scope", json!("openid station:account-extra")),
             ("exp", json!(chrono::Utc::now().timestamp())),
             ("iat", json!(chrono::Utc::now().timestamp() + 60)),
@@ -660,7 +665,7 @@ mod tests {
             StatusCode::OK
         );
         let mut other = f.claims();
-        other["sub"] = json!("acct_98765432109876543210987654");
+        other["sub"] = json!("ab98765432109876543210987654");
         assert!(!client
             .get(&url)
             .bearer_auth(f.token(f.header(), other))

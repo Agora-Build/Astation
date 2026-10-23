@@ -14,7 +14,7 @@ export async function startIssuer({ port = 0, resource, clientID = 'astation-loc
   const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
   const kid = random();
   const jwk = { ...publicKey.export({ format: 'jwk' }), kid, use: 'sig', alg: 'ES256' };
-  const subject = `acct_${randomBytes(13).toString('hex')}`;
+  const subject = `ab${randomBytes(13).toString('hex').toUpperCase()}`;
   const pending = new Map(), codes = new Map(), refreshes = new Map();
   let issuer;
   const now = () => Math.floor(Date.now() / 1000);

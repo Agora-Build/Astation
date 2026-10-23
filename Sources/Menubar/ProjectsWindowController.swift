@@ -191,7 +191,11 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         guard let window else { return }
         if let tokenWindow { tokenWindow.makeKeyAndOrderFront(nil); return }
         let controller = TokenToolsViewController(projects: { [weak hubManager] in hubManager?.getProjects() ?? [] },
-                                                  initialProjectID: projectID ?? hubManager.effectiveProject?.id)
+                                                  initialProjectID: projectID ?? hubManager.effectiveProject?.id,
+                                                  resolveProject: { [weak hubManager] id in
+            guard let hubManager else { throw PortalAPIError.signInRequired }
+            return try await hubManager.projectWithCertificate(id: id)
+        })
         let sheet = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 740),
                              styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         sheet.title = "Token Tools"
@@ -224,16 +228,23 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         guard let row = rowForButton(sender) else { return }
         let projects = hubManager.getProjects()
         guard row < projects.count else { return }
-        let key = projects[row].vendorKey
-        certificateVisibility[key] = !(certificateVisibility[key] ?? false)
-        tableView.reloadData(forRowIndexes: IndexSet(integer: row), columnIndexes: IndexSet(integer: 2))
+        let id = projects[row].id
+        Task { @MainActor in
+            do {
+                let project = try await hubManager.projectWithCertificate(id: id)
+                certificateVisibility[project.vendorKey] = !(certificateVisibility[project.vendorKey] ?? false)
+                tableView.reloadData()
+            } catch { hubManager.projectLoadError = error.localizedDescription }
+        }
     }
 
     @objc private func copyCert(_ sender: NSButton) {
-        guard let row = rowForButton(sender) else { return }
-        let projects = hubManager.getProjects()
-        guard row < projects.count else { return }
-        copyToPasteboard(projects[row].signKey)
+        guard let row = rowForButton(sender), row < hubManager.projects.count else { return }
+        let id = hubManager.projects[row].id
+        Task { @MainActor in
+            do { copyToPasteboard(try await hubManager.projectWithCertificate(id: id).signKey) }
+            catch { hubManager.projectLoadError = error.localizedDescription }
+        }
     }
 
     private func rowForButton(_ button: NSView) -> Int? {

@@ -438,14 +438,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
         
         statusMenu.addItem(NSMenuItem.separator())
 
-        // Agora Account (Sign in / Sign out)
-        let acctTitle: String
-        if hubManager.hasSession {
-            let id = hubManager.currentSession()?.loginId ?? "—"
-            acctTitle = "Sign out (\(id))"
-        } else {
-            acctTitle = "Sign in with Agora…"
-        }
+        let acctTitle = hubManager.signedInAccount.map { "agora.build (\($0))..." } ?? "Sign in to agora.build..."
         let acctItem = NSMenuItem(title: acctTitle, action: #selector(signInOrOut), keyEquivalent: "")
         acctItem.target = self
         statusMenu.addItem(acctItem)
@@ -837,21 +830,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func signInOrOut() {
-        if hubManager.hasSession {
-            try? hubManager.sessionStore.delete()
-            NotificationCenter.default.post(name: .credentialsChanged, object: nil)
-        } else {
-            Task { @MainActor in
-                do {
-                    let mgr = SsoAuthManager(ssoUrl: SsoConfig.currentSsoUrl)
-                    let session = try await mgr.runLoginFlow()
-                    try hubManager.sessionStore.save(session)
-                    NotificationCenter.default.post(name: .credentialsChanged, object: nil)
-                } catch {
-                    Log.error("[StatusBar] sign-in failed: \(error)")
-                }
-            }
-        }
+        settingsWindowController.showGeneral()
     }
 
     @objc private func openSettings() {

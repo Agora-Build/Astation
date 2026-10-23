@@ -4,6 +4,7 @@ import Foundation
 import Network
 import AtemClient
 import AstationRemote
+import CryptoKit
 
 // Hub Manager - Contains all business logic for Agora projects, tokens, etc.
 class AstationHubManager: ObservableObject {
@@ -34,8 +35,25 @@ class AstationHubManager: ObservableObject {
     private var hubStartTime = Date()
     let sessionStore: SsoSessionStore
     let tokenProvider: SsoTokenProvider
-    let accountAuth = AstationAccountAuth()
-    let apiClient = AgoraAPIClient()
+    private(set) var accountAuth: AstationAccountAuth
+    private let accountDefaults: UserDefaults
+    private(set) var portalSettings: AccountServiceSettings?
+    private(set) var portalAuth: AstationAccountAuth?
+    let portalAPI: PortalAPIClient
+    @Published private(set) var signedInAccount: String?
+    @Published private(set) var agoraConnection: PortalAgoraConnection?
+    private var projectLoadTask: Task<Void, Never>?
+    private var accountGeneration = UUID()
+    private var portalProjects: [String: PortalAPIClient.Project] = [:]
+
+    private static func makePortalAuth(settings: AccountServiceSettings?) -> AstationAccountAuth? {
+        guard let settings, let config = try? settings.oidcConfiguration else { return nil }
+        // Include the destination as well as the issuer/audience in credential storage isolation.
+        let context = SHA256.hash(data: Data((settings.portalURL + "|" + config.issuer + "|" + config.clientID + "|" + config.resource).utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        return AstationAccountAuth(configuration: config,
+            storage: AccountKeychainStorage(service: "build.agora.astation.portal-account-v1." + context))
+    }
     let rtcManager = RTCManager()
     let authGrantController = AuthGrantController()
     let deviceSessionStore: SessionStore
@@ -269,8 +287,17 @@ class AstationHubManager: ObservableObject {
         dispatchMigration: @escaping (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) },
         makeIdentityRelayTask: @escaping (URL) -> IdentityRelaySocket = { URLSession.shared.webSocketTask(with: $0) },
         makePairingRelayTask: @escaping (URL) -> IdentityRelaySocket = { URLSession.shared.webSocketTask(with: $0) },
-        workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter
+        workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
+        portalSettings: AccountServiceSettings? = try? AccountServiceSettings.load(),
+        portalAuth: AstationAccountAuth? = nil,
+        portalAPI: PortalAPIClient = PortalAPIClient(),
+        accountDefaults: UserDefaults = .standard
     ) {
+        self.accountDefaults = accountDefaults
+        self.accountAuth = AstationAccountAuth(defaults: accountDefaults)
+        self.portalSettings = portalSettings
+        self.portalAuth = portalAuth ?? Self.makePortalAuth(settings: portalSettings)
+        self.portalAPI = portalAPI
         self.deviceSessionStore = deviceSessionStore
         self.sessionStore = sessionStore
         self.makeIdentityRelayTask = makeIdentityRelayTask
@@ -467,22 +494,10 @@ class AstationHubManager: ObservableObject {
         rtcManager.leaveChannel()
     }
     
-    // MARK: - SSO Session
-
-    /// Whether an SSO session is on disk. Used by the UI to render
-    /// "Signed in" vs "Sign in".
-    var hasSession: Bool { sessionStore.hasSession }
-
-    /// Loaded session (no refresh). Use `tokenProvider.validToken()` if you
-    /// need a fresh access token for a network call.
-    func currentSession() -> SsoSession? { sessionStore.load() }
+    // MARK: - Account Session
 
     func checkSessionStatus() {
-        if hasSession {
-            Log.info("[AstationHub] SSO session found")
-        } else {
-            Log.info("[AstationHub] No SSO session. Open Settings → Sign in with Agora.")
-        }
+        Log.info("[AstationHub] Account login and linked projects use agora.build (Settings > General)")
     }
 
     func reloadSession() {
@@ -492,10 +507,78 @@ class AstationHubManager: ObservableObject {
     }
 
     func accountSessionChanged() {
+        accountGeneration = UUID()
+        refreshProjects()
         registerRelayAccountIfPossible()
+        NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
     }
 
-    /// Broadcast a refreshed-on-use credentialSync to every connected Atem.
+    @MainActor func signInAccount() async throws {
+        guard let portalAuth else { throw AccountLoginError.configuration }
+        accountGeneration = UUID()
+        projectLoadTask?.cancel()
+        projects = []; selectedProject = nil; portalProjects = [:]; agoraConnection = nil; signedInAccount = nil
+        let epoch = accountGeneration
+        try await portalAuth.signIn()
+        let primary = try await portalAuth.current()
+        guard epoch == accountGeneration else { throw AccountLoginError.changed }
+        signedInAccount = primary?.session.subject
+        defer { if epoch == accountGeneration { accountSessionChanged() } }
+        // Relay credentials have a separate resource audience. Never substitute Portal tokens.
+        if accountAuth.configuration != nil {
+            let relayAuth = accountAuth
+            try await relayAuth.signIn()
+            let relay = try await relayAuth.current()
+            guard epoch == accountGeneration else { throw AccountLoginError.changed }
+            guard relay?.session.subject == signedInAccount else {
+                try await relayAuth.clearSession()
+                throw AccountLoginError.changed
+            }
+        }
+    }
+
+    @MainActor func signOutAccount() async throws {
+        accountGeneration = UUID()
+        let epoch = accountGeneration
+        let oldPortal = portalAuth, oldRelay = accountAuth
+        projectLoadTask?.cancel()
+        signedInAccount = nil; agoraConnection = nil
+        projects = []; selectedProject = nil; portalProjects = [:]
+        try await oldPortal?.clearSession()
+        guard epoch == accountGeneration else { throw AccountLoginError.changed }
+        try await oldRelay.clearSession()
+        guard epoch == accountGeneration else { throw AccountLoginError.changed }
+        accountSessionChanged()
+    }
+
+    @MainActor func signInRelayAccount() async throws {
+        let auth = accountAuth
+        let epoch = accountGeneration
+        try await auth.signIn()
+        let relay = try await auth.current()
+        let portal = try await portalAuth?.current()
+        guard epoch == accountGeneration else { throw AccountLoginError.changed }
+        if let portalSubject = portal?.session.subject, relay?.session.subject != portalSubject {
+            try await auth.clearSession()
+            throw AccountLoginError.changed
+        }
+        accountSessionChanged()
+    }
+
+    @MainActor func updateAccountServices(_ settings: AccountServiceSettings) async throws {
+        guard settings != portalSettings else { return }
+        try await signOutAccount()
+        accountRecovery = nil
+        settings.save(defaults: accountDefaults)
+        // Environment overrides remain authoritative; show the effective values in the form.
+        portalSettings = try AccountServiceSettings.load(defaults: accountDefaults)
+        portalAuth = Self.makePortalAuth(settings: portalSettings)
+        accountAuth = AstationAccountAuth(defaults: accountDefaults)
+        accountSessionChanged()
+    }
+
+    /// Retain already-consented legacy service credentials for existing Atems.
+    /// Portal/relay account tokens must never enter this upstream-token message.
     func broadcastCredentials() {
         Task { await pushCredentials(targetClientId: nil) }
     }
@@ -539,53 +622,62 @@ class AstationHubManager: ObservableObject {
     
     // MARK: - Projects Management
 
-    /// Load projects from the BFF using the SSO access token.
+    /// Only Portal-scoped credentials can reach the linked Agora account APIs.
     private func loadProjects() {
-        Task {
-            let token: String
-            do { token = try await tokenProvider.validToken() }
-            catch SsoError.notSignedIn {
-                await MainActor.run {
-                    self.projects = []
-                    self.projectLoadError = "Not signed in. Open Settings → Sign in with Agora."
-                    Log.info("[AstationHub] Cannot load projects: not signed in")
-                }
-                return
-            } catch {
-                await MainActor.run {
-                    self.projects = []
-                    self.projectLoadError = "Session expired — please sign in again."
-                    NotificationCenter.default.post(name: .credentialsChanged, object: nil)
-                    Log.info("[AstationHub] Session expired, cleared: \(error.localizedDescription)")
-                }
-                return
-            }
+        projectLoadTask?.cancel()
+        let epoch = accountGeneration
+        let settings = portalSettings
+        let auth = portalAuth
+        projectLoadTask = Task { @MainActor in
             do {
-                let fetched = try await apiClient.fetchProjects(accessToken: token,
-                                                                bffUrl: SsoConfig.currentBffUrl)
-                await MainActor.run {
-                    self.projects = fetched
-                    self.projectLoadError = nil
-                    if self.selectedProject == nil || !fetched.contains(where: { $0.id == self.selectedProject?.id }) {
-                        self.selectedProject = fetched.first
-                    }
-                    Log.info(" Loaded \(fetched.count) projects from BFF")
+                guard let settings, let auth else { throw AccountLoginError.configuration }
+                let record = try await auth.current()
+                guard epoch == accountGeneration, !Task.isCancelled else { return }
+                signedInAccount = record?.session.subject
+                guard record != nil else { throw AccountLoginError.signInRequired }
+                let token = try await auth.accessToken()
+                let connection = try await portalAPI.connection(settings: settings, token: token)
+                guard epoch == accountGeneration, !Task.isCancelled else { return }
+                agoraConnection = connection
+                guard connection.ready else { throw PortalAPIError.unavailable }
+                guard connection.connected else { throw PortalAPIError.connectAgora }
+                let fetched = try await portalAPI.projects(settings: settings, token: token)
+                guard epoch == accountGeneration, !Task.isCancelled else { return }
+                portalProjects = Dictionary(uniqueKeysWithValues: fetched.map { ($0.appId, $0) })
+                projects = fetched.map(\.localProject)
+                selectedProject = projects.first(where: { $0.id == selectedProject?.id }) ?? projects.first
+                projectLoadError = nil
+                if let id = selectedProject?.id {
+                    do { _ = try await projectWithCertificate(id: id) }
+                    catch { if epoch == accountGeneration { projectLoadError = error.localizedDescription } }
                 }
-            } catch AgoraAPIError.unauthorized {
-                try? self.sessionStore.delete()
-                await MainActor.run {
-                    self.projects = []
-                    self.projectLoadError = "Session expired — please sign in again."
-                    NotificationCenter.default.post(name: .credentialsChanged, object: nil)
-                }
+                guard epoch == accountGeneration, !Task.isCancelled else { return }
+                NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
             } catch {
-                await MainActor.run {
-                    self.projects = []
-                    self.projectLoadError = error.localizedDescription
-                    Log.error(" Failed to fetch projects: \(error)")
-                }
+                guard epoch == accountGeneration, !Task.isCancelled else { return }
+                projects = []; selectedProject = nil; portalProjects = [:]
+                projectLoadError = error.localizedDescription
+                NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
             }
         }
+    }
+
+    /// Fetch certificates only when a feature actually needs one; never log or persist them.
+    @MainActor func projectWithCertificate(id: String) async throws -> AgoraProject {
+        guard let project = projects.first(where: { $0.id == id }) else { throw PortalAPIError.invalidResponse }
+        if !project.signKey.isEmpty { return project }
+        guard let remote = portalProjects[id], let settings = portalSettings, let auth = portalAuth else {
+            throw AccountLoginError.signInRequired
+        }
+        let epoch = accountGeneration
+        let token = try await auth.accessToken()
+        let result = try await portalAPI.certificate(project: remote, settings: settings, token: token)
+        guard epoch == accountGeneration, !Task.isCancelled,
+              portalProjects[id]?.projectId == remote.projectId,
+              let index = projects.firstIndex(where: { $0.id == id }) else { throw AccountLoginError.changed }
+        projects[index] = result
+        if selectedProject?.id == id { selectedProject = result }
+        return result
     }
 
     /// Re-fetch projects from the API (e.g. after credentials change).
@@ -608,6 +700,11 @@ class AstationHubManager: ObservableObject {
             return
         }
         selectedProject = project
+        let epoch = accountGeneration
+        Task { @MainActor in
+            do { _ = try await projectWithCertificate(id: id) }
+            catch { if epoch == accountGeneration { projectLoadError = error.localizedDescription } }
+        }
         Log.info("[AstationHub] Selected project: \(project.name)")
     }
     
@@ -630,7 +727,11 @@ class AstationHubManager: ObservableObject {
             project = effectiveProject
         }
 
-        guard let project = project, !project.signKey.isEmpty else {
+        let authorizedProject: AgoraProject?
+        if let project {
+            authorizedProject = try? await projectWithCertificate(id: project.id)
+        } else { authorizedProject = nil }
+        guard let project = authorizedProject, !project.signKey.isEmpty else {
             Log.warn(" No project with certificate found — returning empty token")
             return TokenResponse(token: "", channel: channel, uid: String(uid), expiresIn: "0")
         }

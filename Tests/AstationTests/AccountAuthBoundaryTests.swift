@@ -8,7 +8,7 @@ final class AccountAuthBoundaryTests: XCTestCase {
         let store = AccountKeychainStorage(service:"build.agora.astation.test-account-\(UUID())")
         defer { try? store.write(nil) }
         let config = try AccountOIDCConfiguration(issuer:"https://auth.example",clientID:"test",resource:"https://station.example",requiredScope:"station:account")
-        let session = AccountLoginSession(configuration:config,subject:"acct_01234567890123456789012345",
+        let session = AccountLoginSession(configuration:config,subject:"ab01234567890123456789012345",
             accessToken:"test-access",refreshToken:"test-refresh",expiresAt:Date().addingTimeInterval(900),authenticatedAt:nil)
         do { try store.write(AccountSessionRecord(session:session)) }
         catch {
@@ -23,11 +23,14 @@ final class AccountAuthBoundaryTests: XCTestCase {
         try store.write(nil); XCTAssertNil(try store.read())
     }
     func testAccountConfigurationNeverReusesAgoraServiceConfiguration() {
-        let serviceOnly = AstationAccountAuth(environment: ["ASTATION_SSO_URL": "https://sso2.agora.io"], info: [:])
+        let suite = "Astation.account-boundary.\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let serviceOnly = AstationAccountAuth(environment: ["ASTATION_SSO_URL": "https://sso2.agora.io"], info: [:], defaults: defaults)
         XCTAssertNil(serviceOnly.configuration)
         let auth = AstationAccountAuth(environment: ["ASTATION_ACCOUNT_CLIENT_ID":"astation-test",
-            "ASTATION_ACCOUNT_RESOURCE":"https://station.example", "ASTATION_ACCOUNT_SCOPE":"station:account"], info: [:])
-        XCTAssertEqual(auth.configuration?.issuer,"https://auth.agora.build")
+            "ASTATION_ACCOUNT_RESOURCE":"https://station.example", "ASTATION_ACCOUNT_SCOPE":"station:account"], info: [:], defaults: defaults)
+        XCTAssertEqual(auth.configuration?.issuer,AccountServiceSettings.defaultIssuer)
         XCTAssertEqual(auth.configuration?.clientID,"astation-test")
         XCTAssertFalse(auth.configuration!.permitsRelay("https://sso2.agora.io"))
     }

@@ -1,0 +1,123 @@
+# agora.build login and Agora projects
+
+Astation's account login uses agora.build OIDC, not the Agora Console OAuth
+flow. Settings > General contains the account login, connection status, and
+editable environment settings:
+
+| Setting | Current default | Override |
+| --- | --- | --- |
+| Portal URL | `https://dev.agora.build` | `ASTATION_PORTAL_URL` |
+| Auth URL (OIDC issuer) | `https://auth.dev.agora.build` | `ASTATION_ACCOUNT_ISSUER` |
+| Native client ID | `astation` | `ASTATION_ACCOUNT_CLIENT_ID` |
+| Portal API resource | `https://api.agora.build` | `ASTATION_PORTAL_RESOURCE` |
+
+The API resource is a token audience, not the portal's network address. Do not
+change it to the portal URL unless that audience is registered in Auth and
+configured as `PORTAL_API_AUDIENCE` on the portal. Environment variables take
+precedence over saved settings, then build configuration, then these defaults;
+overridden fields are read-only. The app uses HTTPS base URLs, allowing HTTP
+only on explicit loopback development hosts.
+
+Changing an environment signs out the active app account sessions and fences
+pending logins, refreshes and project/certificate responses. Keychain storage
+is isolated by portal, issuer, client ID and resource. Account tokens are never
+sent to an old/new environment interchangeably, to the Agora BFF, or through
+`credentialSync`. Device keys, paired Atems, trust records, Recovery Kit and
+encrypted data are retained. Login does not enroll or verify devices.
+
+## Using linked Agora projects
+
+1. Sign in to agora.build in General using the system browser.
+2. Choose **Connect Agora Account...**. It opens `<portal>/account/`; connect
+   the desired Agora account there, while signed in to the same agora.build
+   account.
+3. Return to Astation and choose **Refresh Projects**. A connected Agora
+   account's project names and App IDs populate the existing Projects UI.
+4. Astation fetches a project's certificate when selecting it for media, using
+   Token Tools, or revealing/copying its certificate. It keeps certificates in
+   memory, verifies the returned project/App ID binding, and never logs them.
+
+The portal holds and refreshes the upstream Agora connection. Connecting an
+Agora account grants access to resources; it does not change the agora.build
+account ID. A missing connection shows a connect prompt; an unavailable or
+expired connection shows an error instead of falling back to direct Agora
+login. Existing manually configured credentials remain available.
+
+Previously consented legacy Agora service credentials are retained for the
+existing Atem credential consumer. No new direct Agora login is offered by
+Astation. Replacing that consumer with portal-scoped per-client grants belongs
+to the Atem agent; an agora.build token must never masquerade as an Agora token.
+
+## Confirmed API contract
+
+Source reviewed on 2026-10-23:
+
+- Auth `059c6d94b2985b60531b3e47445329407dd13e73`, `docs/integrating.md`.
+- Portal `52096c566079c182ae402d7dcf169a6a7c4abdfb`, `docs/platform.md`,
+  `scripts/serve.mjs`, `scripts/connections.mjs`.
+
+| Call to configured portal | Required scope | Response |
+| --- | --- | --- |
+| `GET /api/connections` | `agora:projects` | `{agora:{ready,connect,connected,name?}}` |
+| `GET /api/connections/agora/projects` | `agora:projects` | `{projects:[{projectId,appId,name,status}]}` |
+| `POST /api/connections/agora/certificate`, JSON `{projectId}` | `agora:certificates` | `{projectId,appId,certificate}`; certificate can be null |
+
+These APIs already accept bearer tokens. No new project API is requested.
+Bearer requests use an ephemeral, cookie-free HTTP session with redirects
+disabled, response limits and timeouts. Browser cookies are never imported.
+401 requires sign-in; 403 indicates missing API permission; 5xx indicates an
+unavailable service. Responses containing upstream credentials are not logged.
+
+Auth discovery is fetched from the configured issuer and must match exactly.
+Tokens require ES256 signatures, issuer, audience, client ID, expiry, requested
+API scopes and ID-token nonce. The current account-ID format is
+`^ab[0-9A-HJKMNP-TV-Z]{26}$`; the obsolete `acct_` form is rejected. Stored
+legacy identities are not renamed or silently rebound.
+
+## Auth/portal deployment requirements (handoff)
+
+The maintainers must confirm the **actual deployed** native registration:
+
+- Public client `astation`, PKCE S256, no embedded client secret.
+- Native redirect registration `http://127.0.0.1/callback`, permitting random
+  loopback ports as documented by Auth.
+- Grants `authorization_code`, `refresh_token`; scopes `openid`, `profile`,
+  `offline_access`, `agora:projects`, `agora:certificates`.
+- Resource `https://api.agora.build`, also accepted by the portal; both Agora
+  scopes present on this resource and allowed for Astation.
+- Working portal Agora-connection deployment, including its OAuth callback and
+  encrypted provider-token storage. No provider secret belongs in Astation.
+
+The relay account/recovery API has a separate audience and grant. Its existing
+`ASTATION_ACCOUNT_RESOURCE` / `ASTATION_ACCOUNT_SCOPE` and matching
+`ACCOUNT_OIDC_ISSUER` / `ACCOUNT_OIDC_AUDIENCE` /
+`ACCOUNT_OIDC_REQUIRED_SCOPE` remain explicit operator configuration. Astation
+can obtain that separate grant through the same browser SSO after portal login;
+it checks that both subjects agree. Settings > Account also permits authorizing
+or signing out this recovery grant separately, including isolated relay tests.
+Portal access tokens never authenticate relay recovery. The native client must be registered for the relay resource
+and scope too. Fresh offline merge still requires verified `auth_time` in an
+API token; an ID token's timestamp is not substituted.
+
+Live unauthenticated checks confirmed dev discovery and portal auth config,
+and a 401 for an unsigned project request. They do not establish a completed
+user login, linked-project access or deployed relay issuer configuration.
+Complete those checks with the user's own sign-in. No production merge,
+deployment, trust migration or credential reset is part of this change.
+
+## Validation
+
+On 2026-10-23, the full app suite passes 995 tests (15 environment skips), the
+native library passes 123 tests (one opt-in integration skip), and the relay
+passes 513 tests (119 environment ignores). Four account boundary tests also
+pass with zero skips in the existing provisioned personal-team XCTest host,
+including secure Keychain read/write/delete under a disposable service.
+The loopback issuer's consent, signed-token/PKCE and refresh-rotation test
+passes with the current account-ID format.
+
+New regressions cover configurable URL precedence and validation, missing
+Agora connections, audience/scope checks, malformed/legacy subjects,
+certificate/project binding, project replies arriving after logout or server
+changes, late certificate replies after project removal, and General layout
+at the minimum window width. These controlled tests do not replace the live
+user-login and deployment checks listed above.

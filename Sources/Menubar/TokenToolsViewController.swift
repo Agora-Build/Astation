@@ -59,6 +59,8 @@ struct TokenToolsForm {
 final class TokenToolsViewController: NSViewController, NSTextFieldDelegate, NSTextViewDelegate {
     private let projects: () -> [AgoraProject]
     private let initialProjectID: String?
+    private let resolveProject: ((String) async throws -> AgoraProject)?
+    private var credentialGeneration = UUID()
     var onClose: (() -> Void)?
     private var projectIDs: [String] = []
     private let projectPicker = NSPopUpButton()
@@ -96,7 +98,9 @@ final class TokenToolsViewController: NSViewController, NSTextFieldDelegate, NST
     private var generatedToken: String?
     private var decoded: AgoraDecodedToken?
 
-    init(projects: @escaping () -> [AgoraProject], initialProjectID: String?) {
+    init(projects: @escaping () -> [AgoraProject], initialProjectID: String?,
+         resolveProject: ((String) async throws -> AgoraProject)? = nil) {
+        self.resolveProject = resolveProject
         self.projects = projects
         self.initialProjectID = initialProjectID
         super.init(nibName: nil, bundle: nil)
@@ -271,6 +275,32 @@ final class TokenToolsViewController: NSViewController, NSTextFieldDelegate, NST
         return (project.vendorKey, project.signKey)
     }
 
+    private func useCredentials(_ action: @escaping ((app: String, certificate: String)) throws -> Void) {
+        do {
+            let cached = try credentials()
+            guard cached.certificate.isEmpty, let resolveProject,
+                  projectIDs.indices.contains(projectPicker.indexOfSelectedItem) else {
+                try action(cached); return
+            }
+            let id = projectIDs[projectPicker.indexOfSelectedItem]
+            let epoch = credentialGeneration
+            message.stringValue = "Loading project certificate..."
+            Task { @MainActor in
+                do {
+                    let project = try await resolveProject(id)
+                    guard epoch == credentialGeneration else { return }
+                    guard project.id == id, projects().contains(where: { $0.id == id && $0.vendorKey == project.vendorKey }) else {
+                        throw AgoraTokenError.invalid("This project is no longer available. Refresh Projects and reopen Token Tools.")
+                    }
+                    try action((project.vendorKey, project.signKey))
+                } catch {
+                    guard epoch == credentialGeneration else { return }
+                    message.textColor = .systemRed; message.stringValue = error.localizedDescription
+                }
+            }
+        } catch { message.textColor = .systemRed; message.stringValue = error.localizedDescription }
+    }
+
     private func updateVisibility() {
         let rtc = kind.selectedSegment == 0
         customCredentials.isHidden = projectPicker.indexOfSelectedItem != projectIDs.count
@@ -282,6 +312,7 @@ final class TokenToolsViewController: NSViewController, NSTextFieldDelegate, NST
     }
 
     private func invalidate() {
+        credentialGeneration = UUID()
         generatedToken = nil; decoded = nil
         result.string = ""; inspection.string = ""; message.stringValue = ""
         copy.isEnabled = false; inspectGenerated.isEnabled = false; verify.isEnabled = false
@@ -301,8 +332,7 @@ final class TokenToolsViewController: NSViewController, NSTextFieldDelegate, NST
 
     @objc private func generateToken() {
         invalidate()
-        do {
-            let credential = try credentials()
+        useCredentials { [self] credential in
             let form = TokenToolsForm(isRTM: kind.selectedSegment == 1, usesAccount: identityType.indexOfSelectedItem == 1,
                                       channel: channel.stringValue, identity: identity.stringValue,
                                       role: [.publisher, .subscriber, .custom][role.indexOfSelectedItem],
@@ -315,7 +345,7 @@ final class TokenToolsViewController: NSViewController, NSTextFieldDelegate, NST
             copy.isEnabled = true; inspectGenerated.isEnabled = true
             message.textColor = .systemGreen
             message.stringValue = "Generated. Expires \(fields.expiryDate.formatted(date: .abbreviated, time: .standard))."
-        } catch { message.textColor = .systemRed; message.stringValue = error.localizedDescription }
+        }
     }
 
     @objc private func copyToken() {
@@ -342,8 +372,7 @@ final class TokenToolsViewController: NSViewController, NSTextFieldDelegate, NST
     }
 
     @objc private func verifyToken() {
-        do {
-            let credential = try credentials()
+        useCredentials { [self] credential in
             let token = tokenInput.string.trimmingCharacters(in: .whitespacesAndNewlines)
             let fields = try AgoraTokenService.decode(token)
             let valid = try AgoraTokenService.verify(token, certificate: credential.certificate)
@@ -357,7 +386,7 @@ final class TokenToolsViewController: NSViewController, NSTextFieldDelegate, NST
                 verification.textColor = .systemRed
                 verification.stringValue = "The token does not match this project's App ID and certificate."
             }
-        } catch { verification.textColor = .systemRed; verification.stringValue = error.localizedDescription }
+        }
     }
 
     static func describe(_ token: AgoraDecodedToken) -> String {

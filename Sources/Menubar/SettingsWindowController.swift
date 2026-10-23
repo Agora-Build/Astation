@@ -23,6 +23,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var sidebarTable: NSTableView?
     private let hubManager: AstationHubManager
     private lazy var accountController = AccountSettingsViewController(hub: hubManager)
+    private lazy var recoveryAccountController = AccountSettingsViewController(hub: hubManager, forRelayRecovery: true)
     private let shortcutsController: KeyboardShortcutsViewController
     private let recordingController: AudioRecordingViewController
     private let transcriptionController: TranscriptionViewController
@@ -32,10 +33,11 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         requestProjects: { [weak self] in self?.hubManager.requestCredentialProjects() },
         projectUpdates: hubManager.$credentialProjectSuggestions.eraseToAnyPublisher()
     )
-    private var statusLabel: NSTextField!
-    private var signInButton: NSButton!
-    private var signOutButton: NSButton!
-    private var identityLabel: NSTextField!
+    private var portalUrlField = NSTextField()
+    private var issuerUrlField = NSTextField()
+    private var accountClientField = NSTextField()
+    private var portalResourceField = NSTextField()
+    private var accountServerStatus = NSTextField(wrappingLabelWithString: "")
     private var stationUrlField: NSTextField!
     private var serverStatusLabel: NSTextField!
     private var serverInfoLabel: NSTextField!
@@ -72,9 +74,6 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         NotificationCenter.default.addObserver(
             self, selector: #selector(networkChanged),
             name: .networkChanged, object: nil)
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(sessionChanged),
-            name: .credentialsChanged, object: nil)
         NotificationCenter.default.addObserver(
             self, selector: #selector(relayAccountChanged),
             name: .relayAccountChanged, object: nil)
@@ -116,110 +115,17 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         window.delegate = self
         window.isReleasedWhenClosed = false
 
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 450, height: 440))
-
-        // === Server Info Section ===
-        let serverTitle = NSTextField(labelWithString: "Server Info")
-        serverTitle.font = NSFont.boldSystemFont(ofSize: 14)
-        serverTitle.frame = NSRect(x: 20, y: 395, width: 410, height: 24)
-        contentView.addSubview(serverTitle)
-
-        serverInfoLabel = NSTextField(wrappingLabelWithString: "")
-        serverInfoLabel.font = NSFont.systemFont(ofSize: 11)
-        serverInfoLabel.textColor = .secondaryLabelColor
-        serverInfoLabel.frame = NSRect(x: 20, y: 315, width: 410, height: 70)
-        contentView.addSubview(serverInfoLabel)
-
-        // Station Relay URL (for remote connections)
-        let stationLabel = NSTextField(labelWithString: "Relay URL:")
-        stationLabel.frame = NSRect(x: 20, y: 270, width: 80, height: 22)
-        contentView.addSubview(stationLabel)
-
-        stationUrlField = NSTextField(frame: NSRect(x: 105, y: 270, width: 235, height: 22))
-        stationUrlField.placeholderString = SettingsWindowController.defaultStationURL
-        let savedStation = UserDefaults.standard.string(forKey: SettingsWindowController.astationRelayUrlKey) ?? ""
-        stationUrlField.stringValue = savedStation
-        if ProcessInfo.processInfo.environment["ASTATION_RELAY_URL"] != nil {
-            stationUrlField.placeholderString = "Overridden by ASTATION_RELAY_URL env var"
-        }
-        contentView.addSubview(stationUrlField)
-
-        // Server status label (shows current network IP)
-        serverStatusLabel = NSTextField(labelWithString: "")
-        serverStatusLabel.font = NSFont.systemFont(ofSize: 11)
-        serverStatusLabel.textColor = .secondaryLabelColor
-        serverStatusLabel.frame = NSRect(x: 20, y: 245, width: 405, height: 18)
-        contentView.addSubview(serverStatusLabel)
-
-        // Update status immediately
-        updateServerStatus()
-
-        // Save server button
-        let saveServerButton = NSButton(title: "Save", target: self, action: #selector(saveServerInfo))
-        saveServerButton.bezelStyle = .rounded
-        saveServerButton.frame = NSRect(x: 350, y: 268, width: 75, height: 24)
-        contentView.addSubview(saveServerButton)
-
-        // Separator
-        let separator = NSBox(frame: NSRect(x: 20, y: 235, width: 410, height: 1))
-        separator.boxType = .separator
-        contentView.addSubview(separator)
-
-        // === Agora Account Section ===
-        let acctTitle = NSTextField(labelWithString: "Agora Services")
-        acctTitle.font = NSFont.boldSystemFont(ofSize: 14)
-        acctTitle.frame = NSRect(x: 20, y: 200, width: 410, height: 24)
-        contentView.addSubview(acctTitle)
-
-        let info = NSTextField(wrappingLabelWithString:
-            "Sign in once with your Agora account. Astation uses this session to fetch projects and ship credentials to paired Atems. The session is encrypted on disk.")
-        info.font = NSFont.systemFont(ofSize: 11)
-        info.textColor = .secondaryLabelColor
-        info.frame = NSRect(x: 20, y: 150, width: 410, height: 46)
-        contentView.addSubview(info)
-
-        identityLabel = NSTextField(labelWithString: "")
-        identityLabel.font = NSFont.systemFont(ofSize: 12)
-        identityLabel.frame = NSRect(x: 20, y: 110, width: 410, height: 22)
-        contentView.addSubview(identityLabel)
-
-        signInButton = NSButton(title: "Sign in with Agora", target: self, action: #selector(signIn))
-        signInButton.bezelStyle = .rounded
-        signInButton.frame = NSRect(x: 20, y: 70, width: 180, height: 32)
-        contentView.addSubview(signInButton)
-
-        signOutButton = NSButton(title: "Sign out", target: self, action: #selector(signOut))
-        signOutButton.bezelStyle = .rounded
-        signOutButton.frame = NSRect(x: 210, y: 70, width: 100, height: 32)
-        contentView.addSubview(signOutButton)
-
-        statusLabel = NSTextField(labelWithString: "")
-        statusLabel.font = NSFont.systemFont(ofSize: 11)
-        statusLabel.frame = NSRect(x: 20, y: 40, width: 410, height: 22)
-        contentView.addSubview(statusLabel)
-
-        renderAccountState()
-
         let tabs = NSTabView()
         tabs.tabViewType = .noTabsNoBorder
         tabs.delegate = self
         tabView = tabs
         let general = NSTabViewItem(identifier: "general")
         general.label = "General"
-        let generalContainer = NSView()
-        generalContainer.addSubview(contentView)
-        contentView.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            contentView.widthAnchor.constraint(equalToConstant: 450),
-            contentView.heightAnchor.constraint(equalToConstant: 440),
-            contentView.centerXAnchor.constraint(equalTo: generalContainer.centerXAnchor),
-            contentView.topAnchor.constraint(equalTo: generalContainer.topAnchor, constant: 16)
-        ])
-        general.view = generalContainer
+        general.view = makeGeneralView()
         tabs.addTabViewItem(general)
         let account = NSTabViewItem(identifier: "account")
         account.label = "Account"
-        account.viewController = accountController
+        account.viewController = recoveryAccountController
         tabs.addTabViewItem(account)
         let credentials = NSTabViewItem(identifier: "credentials")
         credentials.label = "Credentials"
@@ -352,58 +258,102 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         return view
     }
 
-    private func renderAccountState() {
-        guard identityLabel != nil else { return }
-        if let session = hubManager.currentSession() {
-            let id = session.loginId ?? "—"
-            identityLabel.stringValue = "Signed in as: \(id)"
-            let mins = max(0, Int64(session.expiresAt) - Int64(Date().timeIntervalSince1970)) / 60
-            statusLabel.stringValue = "Access token expires in \(mins) min"
-            statusLabel.textColor = .secondaryLabelColor
-            signInButton.isEnabled = false
-            signOutButton.isEnabled = true
-        } else {
-            identityLabel.stringValue = "Not signed in"
-            statusLabel.stringValue = ""
-            signInButton.isEnabled = true
-            signOutButton.isEnabled = false
-        }
+    func showGeneral() {
+        showWindow()
+        tabView?.selectTabViewItem(withIdentifier: "general")
+        sidebarTable?.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
     }
 
-    @objc private func signIn() {
-        signInButton.isEnabled = false
-        statusLabel.stringValue = "Waiting for browser…"
-        statusLabel.textColor = .secondaryLabelColor
-
-        Task { @MainActor in
-            do {
-                let mgr = SsoAuthManager(ssoUrl: SsoConfig.currentSsoUrl)
-                let session = try await mgr.runLoginFlow()
-                try hubManager.sessionStore.save(session)
-                NotificationCenter.default.post(name: .credentialsChanged, object: nil)
-                Log.info("[Settings] Signed in as \(session.loginId ?? "—")")
-            } catch {
-                statusLabel.stringValue = error.localizedDescription
-                statusLabel.textColor = .systemRed
-                signInButton.isEnabled = true
+    func makeGeneralView() -> NSView {
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true; scroll.drawsBackground = false
+        let document = FlippedSettingsView()
+        let content = NSStackView()
+        content.orientation = .vertical; content.alignment = .leading; content.spacing = 16
+        document.addSubview(content); scroll.documentView = document
+        for view in [document, content] { view.translatesAutoresizingMaskIntoConstraints = false }
+        NSLayoutConstraint.activate([
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            content.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 24),
+            content.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -24),
+            content.topAnchor.constraint(equalTo: document.topAnchor, constant: 24),
+            content.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -24)
+        ])
+        content.addArrangedSubview(accountController.view)
+        accountController.view.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        content.addArrangedSubview(sectionTitle("agora.build Servers"))
+        content.addArrangedSubview(wrappingInfo("Choose the portal and identity service for this environment. Changing servers signs this app out; device keys, pairings and encrypted data are retained."))
+        let settings = hubManager.portalSettings
+        portalUrlField.stringValue = settings?.portalURL ?? ""
+        issuerUrlField.stringValue = settings?.issuer ?? ""
+        accountClientField.stringValue = settings?.clientID ?? ""
+        portalResourceField.stringValue = settings?.resource ?? ""
+        let fields: [(String, NSTextField, String)] = [
+            ("Portal URL", portalUrlField, "ASTATION_PORTAL_URL"),
+            ("Auth URL", issuerUrlField, "ASTATION_ACCOUNT_ISSUER"),
+            ("Client ID", accountClientField, "ASTATION_ACCOUNT_CLIENT_ID"),
+            ("API resource", portalResourceField, "ASTATION_PORTAL_RESOURCE")
+        ]
+        let rows = fields.map { title, field, env -> [NSView] in
+            field.setAccessibilityLabel(title)
+            field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            if ProcessInfo.processInfo.environment[env] != nil {
+                field.isEditable = false; field.toolTip = "Set by " + env
             }
+            return [NSTextField(labelWithString: title), field]
         }
+        let grid = NSGridView(views: rows)
+        grid.columnSpacing = 12; grid.rowSpacing = 10
+        grid.column(at: 0).width = 90; grid.column(at: 1).xPlacement = .fill
+        content.addArrangedSubview(grid)
+        grid.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        let save = NSButton(title: "Save Servers", target: self, action: #selector(saveAccountServers))
+        save.bezelStyle = .rounded; content.addArrangedSubview(save)
+        accountServerStatus.font = .systemFont(ofSize: 11); accountServerStatus.textColor = .secondaryLabelColor
+        accountServerStatus.stringValue = "Client ID and API resource must match the registration at the identity service. Environment overrides are read-only."
+        content.addArrangedSubview(accountServerStatus)
+        content.addArrangedSubview(sectionTitle("Connections"))
+        stationUrlField = NSTextField(string: SettingsWindowController.currentAstationRelayUrl)
+        stationUrlField.setAccessibilityLabel("Relay URL")
+        let saveRelay = NSButton(title: "Save Relay", target: self, action: #selector(saveServerInfo))
+        saveRelay.bezelStyle = .rounded
+        let relayRow = NSStackView(views: [NSTextField(labelWithString: "Relay URL"), stationUrlField, saveRelay])
+        relayRow.spacing = 10
+        content.addArrangedSubview(relayRow)
+        relayRow.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        serverStatusLabel = NSTextField(labelWithString: "")
+        serverStatusLabel.font = .systemFont(ofSize: 11)
+        content.addArrangedSubview(serverStatusLabel)
+        serverInfoLabel = NSTextField(wrappingLabelWithString: "")
+        serverInfoLabel.font = .systemFont(ofSize: 11); serverInfoLabel.textColor = .secondaryLabelColor
+        content.addArrangedSubview(serverInfoLabel)
+        updateServerStatus()
+        return scroll
     }
 
-    @objc private func signOut() {
-        let alert = NSAlert()
-        alert.messageText = "Sign out?"
-        alert.informativeText = "Astation will lose access to your projects until you sign in again. Paired Atems will not receive credential updates."
-        alert.addButton(withTitle: "Sign out")
-        alert.addButton(withTitle: "Cancel")
-        alert.alertStyle = .warning
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        try? hubManager.sessionStore.delete()
-        NotificationCenter.default.post(name: .credentialsChanged, object: nil)
-    }
-
-    @objc private func sessionChanged() {
-        DispatchQueue.main.async { [weak self] in self?.renderAccountState() }
+    @objc private func saveAccountServers(_ sender: NSButton) {
+        do {
+            let settings = try AccountServiceSettings(portalURL: portalUrlField.stringValue,
+                issuer: issuerUrlField.stringValue, clientID: accountClientField.stringValue,
+                resource: portalResourceField.stringValue)
+            sender.isEnabled = false
+            Task { @MainActor in
+                defer { sender.isEnabled = true }
+                do {
+                    try await hubManager.updateAccountServices(settings)
+                    if let effective = hubManager.portalSettings {
+                        portalUrlField.stringValue = effective.portalURL; issuerUrlField.stringValue = effective.issuer
+                        accountClientField.stringValue = effective.clientID; portalResourceField.stringValue = effective.resource
+                    }
+                    accountServerStatus.stringValue = hubManager.signedInAccount == nil
+                        ? "Servers saved. Sign in to agora.build to continue." : "Servers saved."
+                    accountServerStatus.textColor = .secondaryLabelColor
+                } catch { accountServerStatus.stringValue = error.localizedDescription; accountServerStatus.textColor = .systemRed }
+            }
+        } catch {
+            accountServerStatus.stringValue = "Enter valid HTTPS base URLs (HTTP is allowed only for local development), a client ID and API resource."
+            accountServerStatus.textColor = .systemRed
+        }
     }
 
     private func updateServerStatus() {
@@ -990,8 +940,8 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         let devices = hubManager.relayAccountDevices
         guard !devices.isEmpty else {
             stack.addArrangedSubview(wrappingInfo(
-                hubManager.currentSession() == nil
-                    ? "Sign in with Agora in General to register this Mac."
+                hubManager.signedInAccount == nil
+                    ? "Sign in to agora.build in General to register this Mac."
                     : "Waiting for the relay to register this Mac…"
             ))
             leaveGroupButton?.isEnabled = false

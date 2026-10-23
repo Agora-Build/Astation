@@ -44,7 +44,7 @@ test('loopback fixture requires consent, PKCE and exact bindings; refresh tokens
       assert.equal(JSON.parse(Buffer.from(header, 'base64url')).typ, typ);
       const claims = JSON.parse(Buffer.from(body, 'base64url'));
       assert.equal(claims.aud, aud);
-      assert.match(claims.sub, /^acct_[a-z0-9]{26}$/);
+      assert.match(claims.sub, /^ab[0-9A-HJKMNP-TV-Z]{26}$/);
       assert.ok(verify('sha256', Buffer.from(`${header}.${body}`),
         { key: createPublicKey({ key: keys[0], format: 'jwk' }), dsaEncoding: 'ieee-p1363' }, Buffer.from(signature, 'base64url')));
     }

@@ -7,11 +7,11 @@ public enum AccountLoginError: Error, LocalizedError, Equatable {
     case configuration, unavailable, invalidResponse, rejected, cancelled, signInRequired, storage, changed, busy, freshProofUnavailable
     public var errorDescription: String? {
         switch self {
-        case .configuration: return "Account sign-in is not configured for this Astation build."
+        case .configuration: return "Check the agora.build server URLs and client registration in Settings > General."
         case .unavailable: return "The agora.build account service is unavailable. Try again later."
         case .invalidResponse, .rejected: return "The account service returned an invalid or rejected sign-in."
         case .cancelled: return "Account sign-in was cancelled."
-        case .signInRequired: return "Sign in to agora.build in Settings > Account to use account recovery."
+        case .signInRequired: return "Sign in to agora.build in Settings > General to continue."
         case .storage: return "Account credentials could not be saved securely. Sign in again after unlocking this device."
         case .changed: return "The account session changed while this operation was pending. Try again."
         case .busy: return "Finish the current account sign-in first."
@@ -25,15 +25,21 @@ public struct AccountOIDCConfiguration: Codable, Equatable, Sendable {
     public let clientID: String
     public let resource: String
     public let requiredScope: String
+    public let additionalScopes: [String]?
 
-    public init(issuer: String, clientID: String, resource: String, requiredScope: String) throws {
+    public var apiScopes: [String] { [requiredScope] + (additionalScopes ?? []) }
+
+    public init(issuer: String, clientID: String, resource: String, requiredScope: String, additionalScopes: [String] = []) throws {
         _ = try Self.endpoint(issuer)
         _ = try Self.endpoint(resource)
-        guard !clientID.isEmpty, clientID.utf8.count <= 128,
-              !requiredScope.isEmpty, requiredScope.utf8.count <= 128,
-              !requiredScope.contains(where: { $0.isWhitespace }),
-              !["openid", "profile", "offline_access"].contains(requiredScope) else { throw AccountLoginError.configuration }
+        let scopes = [requiredScope] + additionalScopes
+        guard !clientID.isEmpty, clientID.utf8.count <= 128, !clientID.contains(where: { $0.isWhitespace }),
+              scopes.count <= 8, Set(scopes).count == scopes.count,
+              scopes.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 128 &&
+                  $0.utf8.allSatisfy({ $0 == 0x21 || (0x23...0x5B).contains($0) || (0x5D...0x7E).contains($0) }) &&
+                  !["openid", "profile", "offline_access"].contains($0) }) else { throw AccountLoginError.configuration }
         self.issuer = issuer; self.clientID = clientID; self.resource = resource; self.requiredScope = requiredScope
+        self.additionalScopes = additionalScopes.isEmpty ? nil : additionalScopes
     }
 
     static func endpoint(_ value: String) throws -> URL {
@@ -180,7 +186,7 @@ public actor AccountOIDCClient {
         var parts = URLComponents(url: try endpoint(metadata.authorization_endpoint), resolvingAgainstBaseURL: false)!
         parts.queryItems = [URLQueryItem(name: "response_type", value: "code"),
             URLQueryItem(name: "client_id", value: configuration.clientID), URLQueryItem(name: "redirect_uri", value: redirectURI),
-            URLQueryItem(name: "scope", value: "openid profile offline_access " + configuration.requiredScope),
+            URLQueryItem(name: "scope", value: "openid profile offline_access " + configuration.apiScopes.joined(separator: " ")),
             URLQueryItem(name: "resource", value: configuration.resource), URLQueryItem(name: "prompt", value: "consent"),
             URLQueryItem(name: "state", value: attempt.state), URLQueryItem(name: "nonce", value: attempt.nonce),
             URLQueryItem(name: "code_challenge", value: attempt.challenge), URLQueryItem(name: "code_challenge_method", value: "S256")]
@@ -227,7 +233,8 @@ public actor AccountOIDCClient {
         let value = try await claims(access, type: "at+jwt", audience: configuration.resource)
         guard value["sub"] as? String == expectedSubject,
               value["client_id"] as? String == configuration.clientID,
-              let scopes = value["scope"] as? String, scopes.split(separator: " ").contains(Substring(configuration.requiredScope)),
+              let scopes = value["scope"] as? String,
+              Set(configuration.apiScopes).isSubset(of: Set(scopes.split(separator: " ").map(String.init))),
               let exp = integer(value["exp"]) else { throw AccountLoginError.rejected }
         return AccountLoginSession(configuration: configuration, subject: expectedSubject, accessToken: access,
             refreshToken: refresh, expiresAt: Date(timeIntervalSince1970: Double(exp)), authenticatedAt: integer(value["auth_time"]))
@@ -246,8 +253,8 @@ public actor AccountOIDCClient {
             guard payload["azp"] as? String == configuration.clientID else { throw AccountLoginError.rejected }
         }
         guard payload["iss"] as? String == configuration.issuer, audiences.contains(audience),
-              let subject = payload["sub"] as? String, subject.hasPrefix("acct_"), subject.utf8.count == 31,
-              subject.dropFirst(5).utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) }),
+              let subject = payload["sub"] as? String, subject.hasPrefix("ab"), subject.utf8.count == 28,
+              subject.dropFirst(2).utf8.allSatisfy({ "0123456789ABCDEFGHJKMNPQRSTVWXYZ".utf8.contains($0) }),
               let exp = integer(payload["exp"]), let iat = integer(payload["iat"]), iat >= 0,
               Double(exp) > now().timeIntervalSince1970, Double(iat) <= now().timeIntervalSince1970 + 30,
               exp > iat, exp - iat <= (type == "at+jwt" ? 900 : 3600) else { throw AccountLoginError.rejected }
