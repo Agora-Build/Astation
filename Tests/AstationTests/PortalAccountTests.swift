@@ -284,8 +284,9 @@ final class AccountServiceSettingsTests: XCTestCase {
         window.contentView?.layoutSubtreeIfNeeded()
         func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
         let all = descendants(general)
-        let fields = all.compactMap { $0 as? NSTextField }.filter { ["Portal URL", "Auth URL", "Client ID", "API resource", "Relay URL"].contains($0.accessibilityLabel() ?? "") }
-        XCTAssertEqual(fields.count, 5)
+        let fields = all.compactMap { $0 as? NSTextField }.filter { ["Portal URL", "Auth URL", "API resource", "Relay URL"].contains($0.accessibilityLabel() ?? "") }
+        XCTAssertEqual(fields.count, 4)
+        XCTAssertFalse(all.compactMap { $0 as? NSTextField }.contains { $0.accessibilityLabel() == "Client ID" })
         for field in fields {
             XCTAssertGreaterThan(field.bounds.width, 240)
             XCTAssertLessThanOrEqual(field.convert(field.bounds, to: general).maxX, general.bounds.width)

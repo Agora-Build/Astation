@@ -11,7 +11,6 @@ WebSocket addresses in one **Servers & Connections** block:
 | --- | --- | --- |
 | Portal URL | `https://dev.agora.build` | `ASTATION_PORTAL_URL` |
 | Auth URL (OIDC issuer) | `https://auth.dev.agora.build` | `ASTATION_ACCOUNT_ISSUER` |
-| Native client ID | `astation` | `ASTATION_ACCOUNT_CLIENT_ID` |
 | Portal API resource | `https://api.agora.build` | `ASTATION_PORTAL_RESOURCE` |
 | Relay URL | `https://station.agora.build` | `ASTATION_RELAY_URL` |
 
@@ -19,6 +18,10 @@ Each field has a short description. **Save Servers** applies the account and
 relay settings together; changing only the relay keeps the account signed in.
 The read-only WebSocket details show direct Atem connections through this Mac,
 the LAN or a VPN.
+
+The native OAuth client ID is internal, defaulting to `astation`. It is not
+shown or editable in Settings. Saving servers preserves the configured value;
+development builds can still override it with `ASTATION_ACCOUNT_CLIENT_ID`.
 
 The menu-bar **Sign in to Agora.Build...** action starts browser sign-in
 directly. While it is pending, the menu shows **Signing in to Agora.Build...**
