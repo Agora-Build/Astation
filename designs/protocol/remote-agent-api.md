@@ -255,6 +255,11 @@ text/tool/approval parts do not promise those capabilities.
 
 ## High-level client API and public transport
 
+The [unified Integrations design](../unified-integrations.md) proposes one Portal
+flow for Discord and custom API credentials, with a separate decrypting gateway
+for Bearer-token clients. Its ownership, delegated service login and gateway APIs
+need joint review; they are not implemented Station endpoints or R9 wire changes.
+
 Use `atem-client` for listSessions, sendPrompt, readHistory, watchEvents,
 answerApproval, revokeRule and queryReceipt. A bot is an authorized decrypting
 endpoint with its own scoped key, not the Mac's local bearer token. Posting

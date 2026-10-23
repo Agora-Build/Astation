@@ -55,6 +55,11 @@ This endpoint is not deployed until this branch is merged and deployed.
 
 ## Independent Encrypted WebSocket
 
+For the proposed Discord/custom-app setup and simple Bearer-token gateway, see
+the [unified Integrations design](../designs/unified-integrations.md). That gateway
+is a separate decrypting application endpoint; it is not implemented by the
+opaque relay routes described here.
+
 `GET /api/remote/v1/channels?genesis={genesis_hash}&host={host_id}` upgrades to
 WebSocket. Use WSS and an `Authorization: Bearer` account token. Never put the
 token in the URL. The account login authorizes routing privacy only; Atem
