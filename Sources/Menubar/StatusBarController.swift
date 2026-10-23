@@ -835,7 +835,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
     @objc private func openAccount() {
         guard !hubManager.accountSignInInProgress else { return }
         if hubManager.signedInAccount != nil {
-            settingsWindowController.showGeneral()
+            settingsWindowController.showAccount()
             return
         }
         Task { @MainActor [weak self] in

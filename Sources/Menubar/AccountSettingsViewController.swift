@@ -7,11 +7,8 @@ final class AccountSettingsViewController: NSViewController {
     private var auth: AstationAccountAuth? { forRelayRecovery ? hub.accountAuth : hub.portalAuth }
     private let identity = NSTextField(wrappingLabelWithString: "")
     private let status = NSTextField(wrappingLabelWithString: "")
-    private let connection = NSTextField(wrappingLabelWithString: "")
-    private lazy var signIn = NSButton(title: "Sign in to agora.build", target: self, action: #selector(login))
+    private lazy var signIn = NSButton(title: "Sign in to Agora.Build", target: self, action: #selector(login))
     private lazy var signOut = NSButton(title: "Sign out", target: self, action: #selector(logout))
-    private lazy var manage = NSButton(title: "Connect Agora Account...", target: self, action: #selector(openConnections))
-    private lazy var refreshProjects = NSButton(title: "Refresh Projects", target: self, action: #selector(reloadProjects))
     private var busy = false
     private var loginTask: Task<Void, Never>?
     private var loginAuth: AstationAccountAuth?
@@ -25,28 +22,25 @@ final class AccountSettingsViewController: NSViewController {
     override func loadView() {
         view = NSView()
         let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 12
-        let title = NSTextField(labelWithString: forRelayRecovery ? "Account Recovery" : "agora.build Account")
+        let title = NSTextField(labelWithString: forRelayRecovery ? "Account Recovery" : "Agora.Build Account")
         title.font = .boldSystemFont(ofSize: 17)
         let description = NSTextField(wrappingLabelWithString: forRelayRecovery
-            ? "Authorize account recovery and your signed device list with the same agora.build account. Device enrollment and recovery still require security verification. Configure the main account and servers in General."
-            : "Sign in with agora.build. Connect your Agora account in the portal to use its projects and service credentials. Device verification is still required for encrypted data and remote control.")
+            ? "Authorize recovery and your signed device list with the same Agora.Build account. Device enrollment and recovery still require security verification."
+            : "Sign in with Agora.Build. Manage your linked Agora account in Agora Projects. Device verification is still required for encrypted data and remote control.")
         description.textColor = .secondaryLabelColor
         identity.font = .systemFont(ofSize: 13, weight: .medium); identity.isSelectable = true
         status.font = .systemFont(ofSize: 12); status.textColor = .secondaryLabelColor
-        connection.font = .systemFont(ofSize: 12); connection.textColor = .secondaryLabelColor
         let actions = NSStackView(views: [signIn, signOut]); actions.spacing = 10
-        let services = NSStackView(views: [manage, refreshProjects]); services.spacing = 10
-        [signIn, signOut, manage, refreshProjects].forEach { $0.bezelStyle = .rounded }
-        [title, description, identity, actions, status, connection, services].forEach { stack.addArrangedSubview($0) }
-        connection.isHidden = forRelayRecovery; services.isHidden = forRelayRecovery
+        [signIn, signOut].forEach { $0.bezelStyle = .rounded }
+        [title, description, identity, actions, status].forEach { stack.addArrangedSubview($0) }
         stack.translatesAutoresizingMaskIntoConstraints = false; view.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: forRelayRecovery ? 24 : 0),
-            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: forRelayRecovery ? -24 : 0),
-            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: forRelayRecovery ? 28 : 0)
+            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: view.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
-        if !forRelayRecovery { stack.bottomAnchor.constraint(equalTo: view.bottomAnchor).isActive = true }
-        for label in [description, identity, status, connection] {
+        for label in [description, identity, status] {
             label.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
         refresh()
@@ -73,23 +67,13 @@ final class AccountSettingsViewController: NSViewController {
                     ? "The last token refresh was interrupted. Sign in again to continue safely."
                     : record == nil ? "Sign in using your browser." : "Account credentials are saved in this device's Keychain."
                 status.textColor = .secondaryLabelColor
-                signIn.title = record == nil ? "Sign in to agora.build" : "Sign in again"
+                signIn.title = record == nil ? "Sign in to Agora.Build" : "Sign in again"
                 signIn.isEnabled = auth?.configuration != nil; signOut.isEnabled = record != nil
                 if forRelayRecovery, auth?.configuration == nil {
                     status.stringValue = "Account recovery needs a registered relay API resource and scope. Configure ASTATION_ACCOUNT_RESOURCE and ASTATION_ACCOUNT_SCOPE for this build."
                 }
-                let agora = hub.agoraConnection
-                connection.stringValue = agora?.connected == true
-                    ? "Agora connected\(agora?.name.map { " (\($0))" } ?? ""). \(hub.projects.count) projects."
-                    : "Agora projects become available after you connect an Agora account in the portal."
-                if record != nil, hub.usingSavedProjects {
-                    let date = hub.projectCacheUpdatedAt?.formatted(date: .abbreviated, time: .shortened) ?? "an earlier session"
-                    connection.stringValue = "Using \(hub.projects.count) saved Agora projects from \(date). Tokens can be generated offline."
-                } else if record != nil, let error = hub.projectLoadError { connection.stringValue = error }
-                manage.title = agora?.connected == true ? "Manage Agora Connection..." : "Connect Agora Account..."
-                manage.isEnabled = hub.portalSettings != nil; refreshProjects.isEnabled = record != nil
             } catch {
-                identity.stringValue = "Sign in to agora.build"
+                identity.stringValue = "Sign in to Agora.Build"
                 status.stringValue = error.localizedDescription; status.textColor = .secondaryLabelColor
                 signIn.isEnabled = auth?.configuration != nil; signOut.isEnabled = true
             }
@@ -115,7 +99,7 @@ final class AccountSettingsViewController: NSViewController {
         }
     }
     @objc private func logout() {
-        let alert = NSAlert(); alert.messageText = "Sign out of agora.build?"
+        let alert = NSAlert(); alert.messageText = "Sign out of Agora.Build?"
         alert.informativeText = forRelayRecovery
             ? "Account recovery will require sign-in again. Device keys, Recovery Kit, pairings and your portal login are retained."
             : "Account features and Agora projects will require sign-in again. Device keys, Recovery Kit, pairings and encrypted data are retained."
@@ -130,9 +114,4 @@ final class AccountSettingsViewController: NSViewController {
             catch { status.stringValue = error.localizedDescription; status.textColor = .systemRed }
         }
     }
-    @objc private func openConnections() {
-        guard let url = hub.portalSettings?.accountURL else { return }
-        NSWorkspace.shared.open(url)
-    }
-    @objc private func reloadProjects() { hub.refreshProjects() }
 }

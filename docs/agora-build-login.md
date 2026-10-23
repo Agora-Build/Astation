@@ -1,8 +1,11 @@
 # agora.build login and Agora projects
 
 Astation's account login uses agora.build OIDC, not the Agora Console OAuth
-flow. Settings > General contains the account login, connection status, and
-editable environment settings:
+flow. Settings > Account contains sign-in, account identity and recovery.
+Agora Projects contains the linked Agora connection status, **Manage Agora
+Connection...** (or **Connect Agora Account...**) and **Refresh Projects**.
+Settings > General groups the editable environment settings and direct
+WebSocket addresses in one **Servers & Connections** block:
 
 | Setting | Current default | Override |
 | --- | --- | --- |
@@ -10,11 +13,17 @@ editable environment settings:
 | Auth URL (OIDC issuer) | `https://auth.dev.agora.build` | `ASTATION_ACCOUNT_ISSUER` |
 | Native client ID | `astation` | `ASTATION_ACCOUNT_CLIENT_ID` |
 | Portal API resource | `https://api.agora.build` | `ASTATION_PORTAL_RESOURCE` |
+| Relay URL | `https://station.agora.build` | `ASTATION_RELAY_URL` |
+
+Each field has a short description. **Save Servers** applies the account and
+relay settings together; changing only the relay keeps the account signed in.
+The read-only WebSocket details show direct Atem connections through this Mac,
+the LAN or a VPN.
 
 The menu-bar **Sign in to Agora.Build...** action starts browser sign-in
 directly. While it is pending, the menu shows **Signing in to Agora.Build...**
 and prevents duplicate attempts. After signing in, the account item opens
-General for account and connection management.
+Settings > Account for account management.
 
 The API resource is a token audience, not the portal's network address. Do not
 change it to the portal URL unless that audience is registered in Auth and
@@ -34,11 +43,11 @@ encrypted data are retained. Login does not enroll or verify devices.
 ## Using linked Agora projects
 
 1. Choose **Sign in to Agora.Build...** from the menu bar, or sign in from
-   General, using the system browser.
-2. Choose **Connect Agora Account...**. It opens `<portal>/account/`; connect
+   Settings > Account, using the system browser.
+2. Open **Agora Projects** and choose **Connect Agora Account...**. It opens `<portal>/account/`; connect
    the desired Agora account there, while signed in to the same agora.build
    account.
-3. Return to Astation and choose **Refresh Projects**. A connected Agora
+3. Return to Agora Projects and choose **Refresh Projects**. A connected Agora
    account's project names and App IDs populate the existing Projects UI.
 4. Astation fetches a project's certificate when selecting it for media, using
    Token Tools, or revealing/copying its certificate. It verifies the returned
@@ -140,7 +149,9 @@ a 401 for an unsigned project request, and that native `astation` authorization
 with the documented loopback/resource/scopes reaches the login interaction
 without an OAuth registration error. They do not establish a completed
 user login, linked-project access or deployed relay issuer configuration.
-Complete those checks with the user's own sign-in. No production merge,
+Subsequent user screenshots show a signed-in account and eight linked Agora
+projects. Relay issuer configuration and the remaining live workflows still
+need verification. No production merge,
 deployment, trust migration or credential reset is part of this change.
 
 ## Validation

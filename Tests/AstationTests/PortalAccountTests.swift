@@ -269,7 +269,7 @@ final class AccountServiceSettingsTests: XCTestCase {
         XCTAssertTrue(fixture.hub.projects.isEmpty)
     }
 
-    func testGeneralShowsAccountAndEditableServersAtMinimumWidth() throws {
+    func testGeneralShowsUnifiedServersAtMinimumWidth() throws {
         _ = NSApplication.shared
         let fixture = try PortalHubFixture(config: settings(), http: PortalHTTP())
         defer { fixture.cleanup() }
@@ -284,17 +284,18 @@ final class AccountServiceSettingsTests: XCTestCase {
         window.contentView?.layoutSubtreeIfNeeded()
         func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
         let all = descendants(general)
-        let fields = all.compactMap { $0 as? NSTextField }.filter { ["Portal URL", "Auth URL", "Client ID", "API resource"].contains($0.accessibilityLabel() ?? "") }
-        XCTAssertEqual(fields.count, 4)
+        let fields = all.compactMap { $0 as? NSTextField }.filter { ["Portal URL", "Auth URL", "Client ID", "API resource", "Relay URL"].contains($0.accessibilityLabel() ?? "") }
+        XCTAssertEqual(fields.count, 5)
         for field in fields {
             XCTAssertGreaterThan(field.bounds.width, 240)
             XCTAssertLessThanOrEqual(field.convert(field.bounds, to: general).maxX, general.bounds.width)
         }
-        XCTAssertTrue(all.compactMap { $0 as? NSButton }.contains { $0.title == "Sign in to agora.build" })
-        XCTAssertFalse(all.compactMap { $0 as? NSButton }.contains { $0.title == "Sign in with Agora" })
+        XCTAssertTrue(all.compactMap { $0 as? NSTextField }.contains { $0.stringValue == "Servers & Connections" })
+        XCTAssertTrue(all.compactMap { $0 as? NSTextField }.contains { $0.stringValue.contains("Direct Atem connections") })
+        XCTAssertTrue(all.compactMap { $0 as? NSButton }.contains { $0.title == "Save Servers" })
+        XCTAssertFalse(all.compactMap { $0 as? NSButton }.contains { $0.title.hasPrefix("Sign in") || $0.title == "Refresh Projects" })
         let scroll = try XCTUnwrap(general as? NSScrollView)
         XCTAssertTrue(scroll.hasVerticalScroller)
-        XCTAssertGreaterThan(try XCTUnwrap(scroll.documentView).bounds.height, scroll.contentView.bounds.height)
         if let directory = ProcessInfo.processInfo.environment["ASTATION_SETTINGS_SNAPSHOT_DIR"],
            let bitmap = general.bitmapImageRepForCachingDisplay(in: general.bounds) {
             general.cacheDisplay(in: general.bounds, to: bitmap)
