@@ -59,9 +59,11 @@ For the proposed Discord/custom-app setup, see the
 [unified Integrations design](../designs/unified-integrations.md). It extends one
 Station API with an optional agent module using scoped R9 service identities.
 Existing relay handlers transport encrypted traffic; the module reads only its
-authorized integration channels and issues/validates integration API credentials.
+authorized integration channels and validates Agora.Build/Auth-issued API credentials.
 These agent routes are proposed, not implemented by the opaque routes here.
-Agora.Build remains account/setup. Shared-relay users can keep the module off;
+Agora.Build owns account/API authentication, integration management and Stoa's
+RTC/screen-sharing functions. Station owns transport/storage and runtime handlers.
+Shared-relay users can keep the module off;
 authorizing an integration additionally trusts that Station/operator to handle
 the integration's permitted plaintext. Native/direct R9 channels stay opaque.
 

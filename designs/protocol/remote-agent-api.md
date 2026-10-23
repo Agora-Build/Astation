@@ -260,7 +260,9 @@ setup flow and one Station API. Existing relay/storage modules remain opaque;
 an optional agent module handles Bearer-token API calls and Discord through the
 shared R9 client, with a distinct native-authorized service identity per
 integration. No extra public service/deployment is required. Agora.Build owns
-account/setup; private storage stays on the chosen Station. Enabling an
+account/API authentication, integration management and Stoa/RTC/screen sharing.
+Station validates Auth-issued credentials and handles transport/storage/runtime;
+private data stays on the chosen Station. Enabling an
 integration trusts its Station/operator to handle that integration's permitted
 plaintext; it does not expose native/direct R9 channels or account K. The
 module's Auth binding, retention and new API routes still need review and
