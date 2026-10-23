@@ -1,15 +1,21 @@
 import Cocoa
+import Combine
 import Foundation
+import AstationRemote
 
-class ProjectsWindowController: NSObject, NSWindowDelegate {
+class ProjectsWindowController: NSObject, NSWindowDelegate, NSMenuItemValidation {
     private var window: NSWindow?
     private var tokenWindow: NSWindow?
     private let hubManager: AstationHubManager
     private var tableView: NSTableView!
     private var statusLabel: NSTextField!
     private var selectionToast: NSTextField!
+    private lazy var tokenButton = NSButton(title: "Generate Token...", target: self, action: #selector(generateToken(_:)))
+    private lazy var signInButton = NSButton(title: "Sign in to Agora.Build...", target: self, action: #selector(signIn))
     private lazy var manageConnectionButton = NSButton(title: "Connect Agora Account...", target: self, action: #selector(openConnections))
     private lazy var refreshButton = NSButton(title: "Refresh Projects", target: self, action: #selector(refreshProjects))
+    private var accountObservation: AnyCancellable?
+    private var signInError: String?
     private var certificateVisibility: [String: Bool] = [:]
 
     private let nameColId = NSUserInterfaceItemIdentifier("name")
@@ -22,6 +28,10 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         self.hubManager = hubManager
         super.init()
         NotificationCenter.default.addObserver(self, selector: #selector(accountChanged), name: .accountLoginChanged, object: nil)
+        accountObservation = Publishers.CombineLatest3(hubManager.$signedInAccount,
+            hubManager.$accountSignInRequired, hubManager.$accountSignInInProgress)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.refreshTable() }
     }
 
     deinit { NotificationCenter.default.removeObserver(self) }
@@ -61,7 +71,6 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         selectionToast.setContentHuggingPriority(.defaultLow, for: .horizontal)
         selectionToast.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let tokenButton = NSButton(title: "Generate Token...", target: self, action: #selector(generateToken(_:)))
         tokenButton.bezelStyle = .rounded
         tokenButton.image = NSImage(systemSymbolName: "key", accessibilityDescription: nil)
         tokenButton.imagePosition = .imageLeading
@@ -134,7 +143,8 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         statusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         manageConnectionButton.bezelStyle = .rounded
-        let footer = NSStackView(views: [statusLabel, manageConnectionButton])
+        signInButton.bezelStyle = .rounded
+        let footer = NSStackView(views: [statusLabel, signInButton, manageConnectionButton])
         footer.orientation = .horizontal
         footer.alignment = .centerY
         footer.spacing = 12
@@ -163,12 +173,23 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
     }
 
     private func updateStatusLabel() {
-        if hubManager.usingSavedProjects {
+        if hubManager.accountSignInInProgress {
+            statusLabel?.stringValue = "Continue signing in to Agora.Build in your browser."
+            statusLabel?.textColor = .secondaryLabelColor
+        } else if let signInError {
+            statusLabel?.stringValue = signInError
+            statusLabel?.textColor = .systemRed
+        } else if needsSignIn {
+            statusLabel?.stringValue = hubManager.signedInAccount == nil
+                ? "Sign in to Agora.Build to load your projects and generate tokens."
+                : "Sign in again to Agora.Build to continue. Your saved projects are retained."
+            statusLabel?.textColor = .secondaryLabelColor
+        } else if hubManager.usingSavedProjects {
             let date = hubManager.projectCacheUpdatedAt?.formatted(date: .abbreviated, time: .shortened) ?? "an earlier session"
             statusLabel?.stringValue = "Using saved projects from \(date). Token generation works offline."
             statusLabel?.textColor = .secondaryLabelColor
         } else if let error = hubManager.projectLoadError {
-            statusLabel?.stringValue = "Error: \(error)"
+            statusLabel?.stringValue = error
             statusLabel?.textColor = .systemRed
         } else {
             let count = hubManager.getProjects().count
@@ -189,25 +210,57 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
     }
 
     @objc private func openConnections() {
-        guard let url = hubManager.portalSettings?.accountURL else { return }
+        guard canUseAccount, let url = hubManager.portalSettings?.accountURL else { return }
         NSWorkspace.shared.open(url)
     }
 
+    @objc private func signIn() {
+        guard !hubManager.accountSignInInProgress else { return }
+        signInError = nil
+        Task { @MainActor [weak self] in
+            guard let self, !hubManager.accountSignInInProgress else { return }
+            do { try await hubManager.signInAccount() }
+            catch {
+                if !(error is CancellationError), error as? AccountLoginError != .cancelled {
+                    signInError = error.localizedDescription
+                }
+            }
+            refreshTable()
+        }
+    }
+
+    private var needsSignIn: Bool {
+        hubManager.signedInAccount == nil || hubManager.accountSignInRequired
+    }
+
+    private var canUseAccount: Bool { !needsSignIn && !hubManager.accountSignInInProgress }
+
     private func refreshTable() {
+        guard tableView != nil else { return }
         tableView?.reloadData()
+        if !needsSignIn { signInError = nil }
+        tokenButton.isEnabled = canUseAccount
+        signInButton.isHidden = !needsSignIn && !hubManager.accountSignInInProgress
+        signInButton.title = hubManager.accountSignInInProgress ? "Signing in..." : "Sign in to Agora.Build..."
+        signInButton.isEnabled = hubManager.portalAuth?.configuration != nil && !hubManager.accountSignInInProgress
         let agora = hubManager.agoraConnection
         manageConnectionButton.title = agora?.connected == true ? "Manage Agora Connection..." : "Connect Agora Account..."
-        manageConnectionButton.isEnabled = hubManager.portalSettings != nil
-        refreshButton.isEnabled = hubManager.signedInAccount != nil
+        manageConnectionButton.isEnabled = canUseAccount && hubManager.portalSettings != nil
+        refreshButton.isEnabled = canUseAccount
         updateStatusLabel()
     }
 
     // MARK: - Button Actions
 
     @objc private func generateToken(_ sender: Any?) {
+        guard canUseAccount else { return }
         let row = sender is NSMenuItem ? tableView.clickedRow : tableView.selectedRow
         let projects = hubManager.getProjects()
         showTokenTools(projectID: projects.indices.contains(row) ? projects[row].id : nil)
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        menuItem.action == #selector(generateToken(_:)) ? canUseAccount : true
     }
 
     func showTokenTools(projectID: String? = nil) {

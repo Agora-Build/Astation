@@ -41,6 +41,7 @@ class AstationHubManager: ObservableObject {
     private(set) var portalAuth: AstationAccountAuth?
     let portalAPI: PortalAPIClient
     @Published private(set) var signedInAccount: String?
+    @Published private(set) var accountSignInRequired = true
     @Published private(set) var accountSignInInProgress = false
     @Published private(set) var agoraConnection: PortalAgoraConnection?
     private var projectLoadTask: Task<Void, Never>?
@@ -525,6 +526,7 @@ class AstationHubManager: ObservableObject {
         accountGeneration = UUID()
         projectLoadTask?.cancel()
         projects = []; selectedProject = nil; portalProjects = [:]; agoraConnection = nil; signedInAccount = nil
+        accountSignInRequired = true
         projectCacheUpdatedAt = nil; usingSavedProjects = false
         try projectCache?.clear()
         let epoch = accountGeneration
@@ -532,6 +534,7 @@ class AstationHubManager: ObservableObject {
         let primary = try await portalAuth.current()
         guard epoch == accountGeneration else { throw AccountLoginError.changed }
         signedInAccount = primary?.session.subject
+        accountSignInRequired = primary == nil || primary?.refreshPending == true
         defer { if epoch == accountGeneration { accountSessionChanged() } }
         // Relay credentials have a separate resource audience. Never substitute Portal tokens.
         if accountAuth.configuration != nil {
@@ -552,6 +555,7 @@ class AstationHubManager: ObservableObject {
         let oldPortal = portalAuth, oldRelay = accountAuth
         projectLoadTask?.cancel()
         signedInAccount = nil; agoraConnection = nil
+        accountSignInRequired = true
         projects = []; selectedProject = nil; portalProjects = [:]
         projectCacheUpdatedAt = nil; usingSavedProjects = false
         try projectCache?.clear()
@@ -632,6 +636,7 @@ class AstationHubManager: ObservableObject {
                 let record = try await auth.current()
                 guard epoch == accountGeneration, !Task.isCancelled else { return }
                 signedInAccount = record?.session.subject
+                accountSignInRequired = record == nil || record?.refreshPending == true
                 guard record != nil else { throw AccountLoginError.signInRequired }
                 if projects.isEmpty, let cached = try projectCache?.load(subject: record!.session.subject) {
                     portalProjects = Dictionary(uniqueKeysWithValues: cached.metadata.map { ($0.appId, $0) })
@@ -668,6 +673,9 @@ class AstationHubManager: ObservableObject {
                 NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
             } catch {
                 guard epoch == accountGeneration, !Task.isCancelled else { return }
+                if error as? AccountLoginError == .signInRequired || error as? PortalAPIError == .signInRequired {
+                    accountSignInRequired = true
+                }
                 if error as? PortalAPIError == .connectAgora {
                     agoraConnection = PortalAgoraConnection(ready: true, connect: true, connected: false, name: agoraConnection?.name)
                 }
@@ -712,6 +720,11 @@ class AstationHubManager: ObservableObject {
         do {
             result = try await portalAPI.certificate(project: remote, settings: settings, auth: auth)
         } catch {
+            if epoch == accountGeneration, !Task.isCancelled,
+               error as? AccountLoginError == .signInRequired || error as? PortalAPIError == .signInRequired {
+                accountSignInRequired = true
+                NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
+            }
             if epoch == accountGeneration, !Task.isCancelled, !project.signKey.isEmpty, Self.isProjectNetworkFailure(error) {
                 usingSavedProjects = true
                 projectLoadError = "Offline. Using saved projects and local token generation."

@@ -8,7 +8,11 @@ Connection...** (or **Connect Agora Account...**) and **Refresh Projects**.
 **Refresh Projects** follows **Generate Token...** in the top row. The bottom
 row combines connection status and the loaded-project count, with the
 Manage/Connect button on the right. Saved-project and error details use that
-same footer.
+same footer. When signed out, **Sign in to Agora.Build...** appears before the
+disabled Connect button and starts browser sign-in directly. **Generate Token...**
+(including its context-menu item), **Refresh Projects**, and Connect stay disabled
+until sign-in is available. An interrupted refresh or a rejected grant asks for
+sign-in again; the normal signed-out prompt uses secondary text, not a red error.
 Settings > General groups the editable environment settings and direct
 WebSocket addresses in one **Servers & Connections** block:
 
@@ -97,7 +101,10 @@ unavailable. Select each desired project while online before using it offline;
 an uncached certificate still needs an online fetch. Expired or interrupted
 OIDC refresh does not turn cached service credentials into an account token:
 local generation can continue, while online account/relay APIs still require a
-valid, correctly scoped grant.
+valid, correctly scoped grant. The Projects window requires sign-in again before
+opening its token-generation action when that grant needs reauthentication;
+the protected cache is retained. A network outage alone does not disable the
+Projects token-generation action for a retained account session.
 
 **Refresh Projects** updates the project list and selected project's certificate.
 Removed/replaced projects are removed from the cache; a successful selected
@@ -215,6 +222,11 @@ need verification. No production merge,
 deployment, trust migration or credential reset is part of this change.
 
 ## Validation
+
+The Projects sign-in follow-up passes 23 focused Portal and Token Tools tests
+with zero failures or skips. Its UI regression checks signed-out actions and
+footer layout, sign-in completion, offline use, interrupted-refresh
+reauthentication, context-menu gating, and sign-out.
 
 On 2026-10-23, the login baseline at `a14c9eb` passes the full app suite (995
 tests, 15 environment skips), native library (123 tests, one opt-in integration

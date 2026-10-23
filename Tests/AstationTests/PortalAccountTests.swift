@@ -173,6 +173,68 @@ final class AccountServiceSettingsTests: XCTestCase {
         XCTFail("Timed out waiting for Portal operation")
     }
 
+    func testProjectsWindowGatesActionsThroughSignInOfflineUseAndReauthentication() async throws {
+        _ = NSApplication.shared
+        let http = await linkedHTTP(), fixture = try PortalHubFixture(config: settings(), http: http)
+        defer { fixture.cleanup() }
+        let record = try XCTUnwrap(fixture.storage.read())
+        try fixture.storage.write(nil)
+        let controller = ProjectsWindowController(hubManager: fixture.hub)
+        controller.showWindow()
+        let window = try XCTUnwrap(NSApp.windows.first { $0.title == "Agora Projects" })
+        defer { window.close() }
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        let views = descendants(try XCTUnwrap(window.contentView))
+        func button(_ title: String) throws -> NSButton {
+            try XCTUnwrap(views.compactMap { $0 as? NSButton }.first { $0.title == title })
+        }
+        let generate = try button("Generate Token...")
+        let signIn = try button("Sign in to Agora.Build...")
+        let connect = try button("Connect Agora Account...")
+        let refresh = try button("Refresh Projects")
+        let table = try XCTUnwrap(views.compactMap { $0 as? NSTableView }.first)
+        let contextGenerate = try XCTUnwrap(table.menu?.items.first)
+        XCTAssertFalse(generate.isEnabled)
+        XCTAssertFalse(controller.validateMenuItem(contextGenerate))
+        XCTAssertFalse(signIn.isHidden)
+        XCTAssertTrue(signIn.isEnabled)
+        XCTAssertFalse(connect.isEnabled)
+        XCTAssertFalse(refresh.isEnabled)
+        let prompt = try XCTUnwrap(views.compactMap { $0 as? NSTextField }.first {
+            $0.stringValue == "Sign in to Agora.Build to load your projects and generate tokens."
+        })
+        XCTAssertEqual(prompt.textColor, .secondaryLabelColor)
+        window.setContentSize(NSSize(width: 820, height: 380))
+        window.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertLessThan(signIn.convert(signIn.bounds, to: nil).maxX, connect.convert(connect.bounds, to: nil).minX)
+
+        try fixture.storage.write(record)
+        fixture.hub.refreshProjects()
+        await waitUntil { fixture.hub.selectedProject?.signKey == self.certificate && generate.isEnabled }
+        XCTAssertTrue(signIn.isHidden)
+        XCTAssertTrue(connect.isEnabled)
+        XCTAssertTrue(refresh.isEnabled)
+        XCTAssertTrue(controller.validateMenuItem(contextGenerate))
+
+        await http.goOffline()
+        fixture.hub.refreshProjects()
+        await waitUntil { fixture.hub.usingSavedProjects && fixture.hub.projectLoadError != nil }
+        XCTAssertTrue(generate.isEnabled, "A network outage must not disable authorized local token generation")
+
+        try fixture.storage.write(AccountSessionRecord(session: record.session, refreshPending: true))
+        fixture.hub.refreshProjects()
+        await waitUntil { fixture.hub.accountSignInRequired && !generate.isEnabled }
+        XCTAssertFalse(signIn.isHidden)
+        XCTAssertFalse(connect.isEnabled)
+        XCTAssertFalse(controller.validateMenuItem(contextGenerate))
+        XCTAssertEqual(fixture.hub.projects.count, 1, "Reauthentication must retain the protected project cache")
+
+        try await fixture.hub.signOutAccount()
+        await waitUntil { fixture.hub.signedInAccount == nil && !generate.isEnabled }
+        XCTAssertFalse(refresh.isEnabled)
+        XCTAssertFalse(signIn.isHidden)
+    }
+
     private func prepareRefresh(config: AccountServiceSettings, http: PortalHTTP) async throws {
         let key = P256.Signing.PrivateKey(), raw = key.publicKey.x963Representation
         func json(_ value: [String: Any]) throws -> String {
