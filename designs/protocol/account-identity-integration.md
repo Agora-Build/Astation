@@ -5,9 +5,11 @@ issuer. Current development URLs are `https://dev.agora.build` and
 `https://auth.dev.agora.build`; discovery and the portal auth configuration are
 reachable as of 2026-10-23. The login/project integration and registration
 handoff are in [agora-build-login.md](../../docs/agora-build-login.md), reviewed
-against Auth `059c6d94b2985b60531b3e47445329407dd13e73` and Portal
-`3fb16b2859f0eec164dfcb3b85c5a8bd163a27cf`. A complete user login and actual
-client/resource registrations still require verification.
+against Auth PR #8 `edef0b8` and Portal PR #13 `a211c7a`. App APIs use
+`/api/v1/...` and the resource is the exact Portal origin, without a trailing
+slash. Portal login worked before that audience/API migration; the new grant
+needs sign-in again. The separate Station grant/deployment and live relay
+recovery ceremony remain unverified. Shared handoff: vault `v-xZDT9aGD`.
 
 ## Separate accounts and service connections
 
@@ -36,12 +38,15 @@ and a single code; unsolicited requests never finish the pending login.
 
 The app verifies ES256 access and ID tokens against discovered signing keys,
 including token type, issuer, audience, lifetime, scope and ID-token nonce.
-The stable subject is Auth's permanent `ab` + Crockford ULID identity, never email. Session
-secrets are stored separately in the device-only Keychain. Refreshes are
+The stable subject is Auth's permanent `ab` + Crockford ULID identity, never email.
+Access tokens stay in memory; refresh credentials and account/configuration
+binding are stored in the device-only Keychain. Refreshes are
 serialized and share one in-flight operation. A rotated refresh token is saved
 before its access token is exposed. An uncertain refresh or failed persistence
 requires sign-in; an old refresh token must not be sent again. Sign-out fences
 late refresh/login replies and does not remove device keys or recovery state.
+Portal 401s share a single refresh and one retry; `reconnect:true` instead
+retains the Agora.Build login and asks for Agora Console reconnection.
 
 ## Relay boundary
 
@@ -69,6 +74,13 @@ Sensitive operations requiring recent authentication must receive a verified
 `auth_time` proof. Token `iat` is not such a proof. If Auth does not include
 `auth_time` in API tokens, those operations remain unavailable rather than
 treating a refresh as fresh owner authentication.
+
+The user confirmed retaining Agora.Build login for the current work. A relay
+may be self-hosted or shared while keeping this admission gate, provided its
+issuer/resource/scope are explicitly registered. A custom URL alone is not a
+trusted token destination. Sharing the service grants no device membership,
+decryption key or authority over another user's hosts. No login-free admission
+or r9 wire change is introduced here.
 
 ## Deployment gate
 

@@ -23,7 +23,8 @@ final class AccountAuthBoundaryTests: XCTestCase {
         try cache.clear(); XCTAssertNil(try cache.load(subject: subject))
     }
     func testProvisionedAccountKeychainPreservesRotatingRefreshIntentAndClearsOnlyItsOwnItem() throws {
-        let store = AccountKeychainStorage(service:"build.agora.astation.test-account-\(UUID())")
+        let service = "build.agora.astation.test-account-\(UUID())"
+        let store = AccountKeychainStorage(service: service)
         defer { try? store.write(nil) }
         let config = try AccountOIDCConfiguration(issuer:"https://auth.example",clientID:"test",resource:"https://station.example",requiredScope:"station:account")
         let session = AccountLoginSession(configuration:config,subject:"ab01234567890123456789012345",
@@ -35,7 +36,18 @@ final class AccountAuthBoundaryTests: XCTestCase {
             }
             throw error
         }
-        XCTAssertEqual(try store.read()?.session,session)
+        let stored = try XCTUnwrap(store.read()).session
+        XCTAssertEqual(stored.configuration, session.configuration)
+        XCTAssertEqual(stored.subject, session.subject)
+        XCTAssertEqual(stored.refreshToken, session.refreshToken)
+        XCTAssertEqual(stored.accessToken, "")
+        XCTAssertLessThan(stored.expiresAt, Date())
+        let raw = AccountKeychainDataStorage(service: service, account: "account-session")
+        let data = try XCTUnwrap(raw.read())
+        XCTAssertNil(data.range(of: Data(session.accessToken.utf8)))
+        try raw.write(PropertyListEncoder().encode(AccountSessionRecord(session: session)))
+        XCTAssertEqual(try store.read()?.session.accessToken, "")
+        XCTAssertNil(try XCTUnwrap(raw.read()).range(of: Data(session.accessToken.utf8)))
         try store.write(AccountSessionRecord(session:session,refreshPending:true))
         XCTAssertEqual(try store.read()?.refreshPending,true)
         try store.write(nil); XCTAssertNil(try store.read())

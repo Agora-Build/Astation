@@ -6,7 +6,7 @@ extension Notification.Name {
     static let accountLoginChanged = Notification.Name("accountLoginChanged")
 }
 
-struct AccountServiceSettings: Equatable {
+struct AccountServiceSettings: Equatable, Sendable {
     static let portalKey = "AstationPortalURL"
     static let issuerKey = "AstationAccountIssuer"
     static let clientKey = "AstationAccountClientID"
@@ -14,7 +14,6 @@ struct AccountServiceSettings: Equatable {
     static let defaultPortal = "https://agora.build"
     static let defaultIssuer = "https://auth.agora.build"
     static let defaultClient = "astation"
-    static let defaultResource = "https://api.agora.build"
 
     let portalURL: String
     let issuer: String
@@ -46,7 +45,13 @@ struct AccountServiceSettings: Equatable {
         return try Self(portalURL: portal,
             issuer: issuerURL(forPortalURL: portal, environment: environment, info: info),
             clientID: value("ASTATION_ACCOUNT_CLIENT_ID", clientKey, defaultClient),
-            resource: value("ASTATION_PORTAL_RESOURCE", resourceKey, defaultResource))
+            resource: resourceURL(forPortalURL: portal, environment: environment, info: info))
+    }
+
+    static func resourceURL(forPortalURL portalURL: String,
+                            environment: [String: String] = ProcessInfo.processInfo.environment,
+                            info: [String: Any] = Bundle.main.infoDictionary ?? [:]) throws -> String {
+        try baseURL(environment["ASTATION_PORTAL_RESOURCE"] ?? info[resourceKey] as? String ?? portalURL)
     }
 
     static func issuerURL(forPortalURL portalURL: String,
@@ -70,7 +75,8 @@ struct AccountServiceSettings: Equatable {
         // The portal determines Auth; old UI values must not pin a previous environment.
         defaults.removeObject(forKey: Self.issuerKey)
         defaults.set(clientID, forKey: Self.clientKey)
-        defaults.set(resource, forKey: Self.resourceKey)
+        // A saved audience from an older server must not follow a Portal change.
+        defaults.removeObject(forKey: Self.resourceKey)
     }
 
     var accountURL: URL { URL(string: portalURL + "/account/")! }

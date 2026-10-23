@@ -339,7 +339,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
             let settings = try AccountServiceSettings(portalURL: portalUrlField.stringValue,
                 issuer: AccountServiceSettings.issuerURL(forPortalURL: portalUrlField.stringValue),
                 clientID: hubManager.portalSettings?.clientID ?? AccountServiceSettings.defaultClient,
-                resource: hubManager.portalSettings?.resource ?? AccountServiceSettings.defaultResource)
+                resource: AccountServiceSettings.resourceURL(forPortalURL: portalUrlField.stringValue))
             guard let relayURL = StationRelayURL.validatedBase(stationUrlField.stringValue) else {
                 accountServerStatus.stringValue = "Enter a valid relay URL."
                 accountServerStatus.textColor = .systemRed
@@ -487,10 +487,10 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         content.addArrangedSubview(restoreEncryption)
         content.addArrangedSubview(separator())
 
-        let accountTitle = sectionTitle("Astations on Your Agora Account")
+        let accountTitle = sectionTitle("Astations on Your Agora.Build Account")
         content.addArrangedSubview(accountTitle)
         content.addArrangedSubview(wrappingInfo(
-            "Each Mac keeps separate data until you choose Merge. An online Mac must approve; a lost or offline Mac requires a fresh Agora sign-in and a notified 24-hour wait."
+            "Each Mac keeps separate data until you choose Merge. An online Mac must approve; a lost or offline Mac requires a fresh Agora.Build sign-in and a notified 24-hour wait."
         ))
         let accountStack = NSStackView()
         accountStack.orientation = .vertical
@@ -937,7 +937,9 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         let devices = hubManager.relayAccountDevices
         guard !devices.isEmpty else {
             stack.addArrangedSubview(wrappingInfo(
-                hubManager.signedInAccount == nil
+                hubManager.accountAuth.configuration == nil
+                    ? "Relay account access is not configured in this build. Device management and online recovery are unavailable."
+                    : hubManager.signedInAccount == nil
                     ? "Sign in to Agora.Build in Account to register this Mac."
                     : "Waiting for the relay to register this Mac…"
             ))

@@ -11,7 +11,7 @@ public enum AccountLoginError: Error, LocalizedError, Equatable {
         case .unavailable: return "The agora.build account service is unavailable. Try again later."
         case .invalidResponse, .rejected: return "The account service returned an invalid or rejected sign-in."
         case .cancelled: return "Account sign-in was cancelled."
-        case .signInRequired: return "Sign in to agora.build in Settings > General to continue."
+        case .signInRequired: return "Sign in to Agora.Build in Settings > Account to continue."
         case .storage: return "Account credentials could not be saved securely. Sign in again after unlocking this device."
         case .changed: return "The account session changed while this operation was pending. Try again."
         case .busy: return "Finish the current account sign-in first."
@@ -97,6 +97,11 @@ public struct AccountLoginSession: Codable, Equatable, Sendable {
     public let refreshToken: String
     public let expiresAt: Date
     public let authenticatedAt: Int64?
+
+    public func removingAccessToken() -> Self {
+        Self(configuration: configuration, subject: subject, accessToken: "", refreshToken: refreshToken,
+            expiresAt: .distantPast, authenticatedAt: nil)
+    }
 }
 
 public protocol AccountOIDCHTTP: Sendable {
@@ -202,7 +207,12 @@ public actor AccountOIDCClient {
         var form = URLComponents(); form.queryItems = fields.sorted(by: { $0.key < $1.key }).map { URLQueryItem(name: $0.key, value: $0.value) }
         request.httpBody = form.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B").data(using: .utf8)
         let (data, status) = try await http.send(request)
-        guard status == 200 else { throw status >= 500 ? AccountLoginError.unavailable : AccountLoginError.rejected }
+        guard status == 200 else {
+            if status == 400, (try? object(data)["error"] as? String) == "invalid_grant" {
+                throw AccountLoginError.signInRequired
+            }
+            throw status >= 500 ? AccountLoginError.unavailable : AccountLoginError.rejected
+        }
         return try object(data)
     }
 
@@ -327,6 +337,7 @@ public actor AccountTokenProvider {
     private var login: UUID?
     private var refresh: Task<String, Error>?
     private var uncertain = false
+    private var liveSession: AccountLoginSession?
 
     public init(configuration: AccountOIDCConfiguration, client: AccountOIDCClient, storage: AccountSessionStorage, now: @escaping @Sendable () -> Date = { Date() }) {
         self.configuration = configuration; self.client = client; self.storage = storage; self.now = now
@@ -334,26 +345,64 @@ public actor AccountTokenProvider {
     public func current() throws -> AccountSessionRecord? {
         let record = try storage.read()
         guard record == nil || record?.session.configuration == configuration else { throw AccountLoginError.changed }
+        if let record, !record.refreshPending, let liveSession,
+           liveSession.subject == record.session.subject, liveSession.refreshToken == record.session.refreshToken {
+            return AccountSessionRecord(session: liveSession)
+        }
         return record
     }
     public func beginLogin() throws -> UUID {
         guard login == nil else { throw AccountLoginError.busy }
-        generation = UUID(); refresh?.cancel(); refresh = nil; login = generation
+        generation = UUID(); refresh?.cancel(); refresh = nil; login = generation; liveSession = nil
         return generation
     }
     public func finishLogin(_ session: AccountLoginSession, attempt: UUID) throws {
         guard generation == attempt, login == attempt, session.configuration == configuration else { throw AccountLoginError.changed }
         do { try storage.write(AccountSessionRecord(session: session)) }
         catch { uncertain = true; login = nil; throw AccountLoginError.storage }
-        uncertain = false; login = nil
+        liveSession = session; uncertain = false; login = nil
     }
     public func cancelLogin(_ attempt: UUID) { if login == attempt { login = nil } }
     public func signOut() throws {
-        generation = UUID(); login = nil; refresh?.cancel(); refresh = nil
+        generation = UUID(); login = nil; refresh?.cancel(); refresh = nil; liveSession = nil
         do { try storage.write(nil); uncertain = false }
         catch { uncertain = true; throw AccountLoginError.storage }
     }
     public func validToken() async throws -> String {
+        try await validToken(rejectedToken: nil)
+    }
+
+    /// Retry a rejected access token once, sharing rotation with concurrent callers.
+    /// A sign-out or new login fences both the retry and its eventual response.
+    public func performAuthorized<Value: Sendable>(
+        _ operation: @Sendable (String) async throws -> Value,
+        unauthorized: @Sendable (Error) -> Bool
+    ) async throws -> Value {
+        try Task.checkCancellation()
+        let epoch = generation
+        let token = try await validToken()
+        try Task.checkCancellation()
+        guard generation == epoch else { throw AccountLoginError.changed }
+        do {
+            let value = try await operation(token)
+            try Task.checkCancellation()
+            guard generation == epoch else { throw AccountLoginError.changed }
+            return value
+        } catch {
+            try Task.checkCancellation()
+            guard generation == epoch else { throw AccountLoginError.changed }
+            guard unauthorized(error) else { throw error }
+        }
+        let replacement = try await validToken(rejectedToken: token)
+        try Task.checkCancellation()
+        guard generation == epoch else { throw AccountLoginError.changed }
+        let value = try await operation(replacement)
+        try Task.checkCancellation()
+        guard generation == epoch else { throw AccountLoginError.changed }
+        return value
+    }
+
+    private func validToken(rejectedToken: String?) async throws -> String {
         guard !uncertain else { throw AccountLoginError.storage }
         guard login == nil else { throw AccountLoginError.busy }
         if let refresh {
@@ -363,7 +412,8 @@ public actor AccountTokenProvider {
             return token
         }
         guard let record = try current(), !record.refreshPending else { throw AccountLoginError.signInRequired }
-        if record.session.expiresAt.timeIntervalSince(now()) > 60 { return record.session.accessToken }
+        if !record.session.accessToken.isEmpty, record.session.accessToken != rejectedToken,
+           record.session.expiresAt.timeIntervalSince(now()) > 60 { return record.session.accessToken }
         let epoch = generation
         let task = Task { try await self.rotate(record.session, epoch: epoch) }
         refresh = task
@@ -376,10 +426,24 @@ public actor AccountTokenProvider {
         guard generation == epoch else { throw AccountLoginError.changed }
         do { try storage.write(AccountSessionRecord(session: session, refreshPending: true)) }
         catch { uncertain = true; throw AccountLoginError.storage }
-        let next = try await client.refresh(session)
+        let next: AccountLoginSession
+        do { next = try await client.refresh(session) }
+        catch AccountLoginError.signInRequired {
+            guard generation == epoch else { throw AccountLoginError.changed }
+            liveSession = nil
+            do { try storage.write(nil) }
+            catch { uncertain = true; throw AccountLoginError.storage }
+            throw AccountLoginError.signInRequired
+        }
         guard generation == epoch, login == nil else { throw AccountLoginError.changed }
         do { try storage.write(AccountSessionRecord(session: next)) }
-        catch { uncertain = true; throw AccountLoginError.storage }
+        catch {
+            liveSession = nil; uncertain = true
+            // If deletion also fails, the durable pending marker still prevents reuse.
+            try? storage.write(nil)
+            throw AccountLoginError.storage
+        }
+        liveSession = next
         return next.accessToken
     }
 }

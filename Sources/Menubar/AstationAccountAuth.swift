@@ -14,10 +14,17 @@ struct AccountKeychainStorage: AccountSessionStorage {
     func read() throws -> AccountSessionRecord? {
         guard let data = try bytes.read() else { return nil }
         guard let record = try? PropertyListDecoder().decode(AccountSessionRecord.self, from: data) else { throw AccountLoginError.storage }
-        return record
+        let stored = Self.refreshOnly(record)
+        if record.session != stored.session { try write(stored) }
+        return stored
     }
     func write(_ record: AccountSessionRecord?) throws {
-        try bytes.write(record.map { try PropertyListEncoder().encode($0) })
+        try bytes.write(record.map { try PropertyListEncoder().encode(Self.refreshOnly($0)) })
+    }
+
+    private static func refreshOnly(_ record: AccountSessionRecord) -> AccountSessionRecord {
+        return AccountSessionRecord(session: record.session.removingAccessToken(),
+            refreshPending: record.refreshPending)
     }
 }
 
@@ -83,9 +90,10 @@ final class AstationAccountAuth: Sendable {
         } else { configuration = nil; client = nil; provider = nil }
     }
 
-    init(configuration: AccountOIDCConfiguration, storage: AccountSessionStorage) {
+    init(configuration: AccountOIDCConfiguration, storage: AccountSessionStorage,
+         http: AccountOIDCHTTP = AccountURLSessionHTTP()) {
         self.configuration = configuration
-        let oidc = AccountOIDCClient(configuration: configuration)
+        let oidc = AccountOIDCClient(configuration: configuration, http: http)
         client = oidc
         provider = AccountTokenProvider(configuration: configuration, client: oidc, storage: storage)
     }
@@ -93,6 +101,14 @@ final class AstationAccountAuth: Sendable {
     func accessToken() async throws -> String {
         guard let provider else { throw AccountLoginError.configuration }
         return try await provider.validToken()
+    }
+
+    func performAuthorized<Value: Sendable>(
+        _ operation: @Sendable (String) async throws -> Value,
+        unauthorized: @Sendable (Error) -> Bool
+    ) async throws -> Value {
+        guard let provider else { throw AccountLoginError.configuration }
+        return try await provider.performAuthorized(operation, unauthorized: unauthorized)
     }
 
     func clearSession() async throws { try await provider?.signOut() }

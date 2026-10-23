@@ -37,23 +37,25 @@ Developer environment/build overrides (`ASTATION_ACCOUNT_ISSUER` or
 An IP-based loopback portal needs an explicit Auth override, allowing local
 portal and Auth servers to use different ports.
 
-The native OAuth client ID and Portal API resource stay internal, defaulting to
-`astation` and `https://api.agora.build`. They are not shown or editable in
-Settings. Saving servers preserves their configured values. Development builds
-can override them with `ASTATION_ACCOUNT_CLIENT_ID` and
-`ASTATION_PORTAL_RESOURCE`.
+The native OAuth client ID stays internal, defaulting to `astation`. The Portal
+API resource is the exact Portal origin, without a trailing slash:
+`https://dev.agora.build` for development and `https://agora.build` for production.
+Saved audiences from earlier builds, including `https://api.agora.build`, are
+ignored and cleared when saving servers. Development/build overrides remain
+available through `ASTATION_ACCOUNT_CLIENT_ID` and `ASTATION_PORTAL_RESOURCE`.
+The changed audience gets a separate credential/cache namespace; an older
+grant is never silently retargeted. Sign in again to obtain the new grant.
 
 The menu-bar **Sign in to Agora.Build...** action starts browser sign-in
 directly. While it is pending, the menu shows **Signing in to Agora.Build...**
 and prevents duplicate attempts. After signing in, the account item opens
 Settings > Account for account management.
 
-The internal API resource remains the token audience used by the existing
-project/certificate login grant; it does not add a token-generation API call.
-It must match the registered Auth resource and Portal's `PORTAL_API_AUDIENCE`.
-Portal/client/resource values use environment overrides, saved settings, build
-configuration, then defaults. Auth uses an explicit environment/build override
-or portal derivation. Overridden visible fields are read-only. The app uses
+The resource must match Auth's registered resource and Portal's
+`PORTAL_API_AUDIENCE`; it does not add a token-generation API call. Portal/client
+values use environment overrides, saved settings, build configuration, then
+defaults. Auth and resource use explicit environment/build overrides or Portal
+derivation. Overridden visible fields are read-only. The app uses
 HTTPS base URLs, allowing HTTP only on explicit loopback development hosts.
 
 Changing an environment signs out the active app account sessions and fences
@@ -120,22 +122,40 @@ to the Atem agent; an agora.build token must never masquerade as an Agora token.
 
 Source reviewed on 2026-10-23:
 
-- Auth `059c6d94b2985b60531b3e47445329407dd13e73`, `docs/integrating.md`.
-- Portal `3fb16b2859f0eec164dfcb3b85c5a8bd163a27cf`, `docs/platform.md`,
-  `scripts/serve.mjs`, `scripts/connections.mjs`.
+- Auth PR #8 `edef0b8c3046ddc84048a6798b34ab78c0667635`.
+- Portal PR #13 `a211c7aaf9d6571b42e3c25d6a1103fadd0fed74`, `docs/platform.md`.
+- Shared integration vault `v-xZDT9aGD`, entries e1-e3 and Astation reply e5.
 
 | Call to configured portal | Required scope | Response |
 | --- | --- | --- |
-| `GET /api/connections` | `agora:projects` | `{agora:{ready,connect,connected,name?}}` |
-| `GET /api/connections/agora/projects` | `agora:projects` | `{projects:[{projectId,appId,name,status}]}` |
-| `POST /api/connections/agora/certificate`, JSON `{projectId}` | `agora:certificates` | `{projectId,appId,certificate}`; certificate can be null |
-| `POST /api/connections/agora/token` (optional server API, not used for native token creation) | `agora:tokens` | Signs RTC/RTM tokens with the same pinned Atem library; certificate stays on Portal |
+| `GET /api/v1/connections` | `agora:projects` | `{agora:{ready,connect,connected,name?}}` |
+| `GET /api/v1/connections/agora/projects` | `agora:projects` | `{projects:[{projectId,appId,name,status}]}` |
+| `POST /api/v1/connections/agora/certificate`, JSON `{projectId}` | `agora:certificates` | `{projectId,appId,certificate}`; certificate can be null |
+| `POST /api/v1/connections/agora/token` (optional server API, not used for native token creation) | `agora:tokens` | Signs RTC/RTM tokens with the same pinned Atem library; certificate stays on Portal |
 
 These APIs already accept bearer tokens. No new project API is requested.
 Bearer requests use an ephemeral, cookie-free HTTP session with redirects
 disabled, response limits and timeouts. Browser cookies are never imported.
-401 requires sign-in; 403 indicates missing API permission; 5xx indicates an
+Apps use only `/api/v1/...`. Unversioned `/api/...` is for the website; it
+rejects app access tokens with 404. No fallback to the website API is attempted.
+A 401 refreshes the access token and retries the original request once. A 401
+whose JSON has `reconnect: true` instead requires reconnecting Agora Console:
+keep the Agora.Build login and open the configured Portal's `/account/` page.
+A 403 indicates missing API permission and is never refreshed; 5xx indicates an
 unavailable service. Responses containing upstream credentials are not logged.
+
+Access tokens stay in memory. Keychain persists the rotating refresh credential,
+its account/configuration binding and the durable refresh-intent marker. Older
+saved records are stripped of access tokens when read. A restart refreshes on
+the first online operation; later operations refresh on demand within 60 seconds
+of expiry. Concurrent requests share one refresh, including simultaneous 401s.
+A late 401 for an older access token reuses the already rotated token. Save the
+new refresh credential before returning access to callers. If that save fails,
+delete the saved credential; a failed deletion retains the pending marker,
+which prevents retrying the consumed refresh token. An uncertain network reply
+also retains the marker and requires sign-in. `invalid_grant` deletes the saved
+credential. Logout, a new login and cancelled requests fence late responses and
+prevent a rejected request from retrying across the account change.
 
 Auth discovery is fetched from the configured issuer and must match exactly.
 Tokens require ES256 signatures, issuer, audience, client ID, expiry, requested
@@ -152,8 +172,8 @@ The maintainers must confirm the **actual deployed** native registration:
   loopback ports as documented by Auth.
 - Grants `authorization_code`, `refresh_token`; scopes `openid`, `profile`,
   `offline_access`, `agora:projects`, `agora:certificates`.
-- Resource `https://api.agora.build`, also accepted by the portal; both Agora
-  scopes present on this resource and allowed for Astation.
+- Resource equals the Portal origin (`https://dev.agora.build` for the current
+  test environment), with both Agora scopes allowed for Astation.
 - Working portal Agora-connection deployment, including its OAuth callback and
   encrypted provider-token storage. No provider secret belongs in Astation.
 
@@ -168,6 +188,21 @@ sign-in block. Security explains when online recovery is not configured.
 Portal access tokens never authenticate relay recovery. The native client must be registered for the relay resource
 and scope too. Fresh offline merge still requires verified `auth_time` in an
 API token; an ID token's timestamp is not substituted.
+
+The user confirmed keeping Agora.Build login for the current work. Self-hosted
+and shared relays can use the same separation: their operator configures a
+trusted issuer and registers the relay's own resource/scope. A custom relay URL
+alone never authorizes sending Portal credentials there. Sharing infrastructure
+does not merge device membership or encryption keys. The relay controls service
+admission/storage visibility; native signed membership and host verification
+control Atem access. A login-free admission method is not part of this change.
+
+The Station resource/scope registration requested in vault e4 remains
+unconfirmed. A working Portal login does not establish deployed relay recovery
+or device-management access. Do not enable those flows using a Portal token.
+Server revocation on native logout remains follow-up; this change fences local
+requests and clears local credentials. Legacy Agora credentials remain isolated
+for the existing Atem consumer until its owner coordinates their migration.
 
 Live unauthenticated checks confirmed dev discovery and portal auth config,
 a 401 for an unsigned project request, and that native `astation` authorization
@@ -224,3 +259,14 @@ The production-default/Portal-menu follow-up passes 27 focused account,
 settings, project and menu tests (two provisioned-host skips), plus all five
 account boundary tests in the provisioned host without skips. The existing
 saved-development-portal case confirms it retains its derived dev issuer.
+
+The `/api/v1` and audience/refresh follow-up passes the full app suite (1,008
+tests, 16 environment skips) and portable native suite (131 tests, one isolated
+service skip), with zero failures. All five provisioned account/Keychain cases
+pass without skips, including migration of a legacy saved access token to a
+refresh-only record. Regressions cover simultaneous and delayed API 401s,
+exactly one retry, no retry on 403 or cancellation, logout/relogin fences,
+invalid-grant cleanup, failed save plus failed deletion across restart,
+refresh-only startup, each versioned Portal endpoint and Console reconnect
+responses. A fresh real user grant for the changed audience and the separate
+Station registration/recovery ceremony remain live validation gates.

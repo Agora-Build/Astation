@@ -501,7 +501,7 @@ class AstationHubManager: ObservableObject {
     // MARK: - Account Session
 
     func checkSessionStatus() {
-        Log.info("[AstationHub] Account login and linked projects use agora.build (Settings > General)")
+        Log.info("[AstationHub] Account login and linked projects use Agora.Build (Settings > Account)")
     }
 
     func reloadSession() {
@@ -641,14 +641,12 @@ class AstationHubManager: ObservableObject {
                     usingSavedProjects = true
                     NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
                 }
-                let token = try await auth.accessToken()
-                guard epoch == accountGeneration, !Task.isCancelled else { return }
-                let connection = try await portalAPI.connection(settings: settings, token: token)
+                let connection = try await portalAPI.connection(settings: settings, auth: auth)
                 guard epoch == accountGeneration, !Task.isCancelled else { return }
                 agoraConnection = connection
                 guard connection.ready else { throw PortalAPIError.unavailable }
-                guard connection.connected else { throw PortalAPIError.connectAgora }
-                let fetched = try await portalAPI.projects(settings: settings, token: token)
+                guard connection.connected, connection.reconnect != true else { throw PortalAPIError.connectAgora }
+                let fetched = try await portalAPI.projects(settings: settings, auth: auth)
                 guard epoch == accountGeneration, !Task.isCancelled else { return }
                 let previousMetadata = portalProjects
                 let previousProjects = Dictionary(uniqueKeysWithValues: projects.map { ($0.id, $0) })
@@ -670,6 +668,9 @@ class AstationHubManager: ObservableObject {
                 NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
             } catch {
                 guard epoch == accountGeneration, !Task.isCancelled else { return }
+                if error as? PortalAPIError == .connectAgora {
+                    agoraConnection = PortalAgoraConnection(ready: true, connect: true, connected: false, name: agoraConnection?.name)
+                }
                 if !projects.isEmpty, signedInAccount != nil,
                    Self.isProjectNetworkFailure(error) || error as? AccountLoginError == .signInRequired {
                     usingSavedProjects = true
@@ -709,9 +710,7 @@ class AstationHubManager: ObservableObject {
         let epoch = accountGeneration
         let result: AgoraProject
         do {
-            let token = try await auth.accessToken()
-            guard epoch == accountGeneration, !Task.isCancelled else { throw AccountLoginError.changed }
-            result = try await portalAPI.certificate(project: remote, settings: settings, token: token)
+            result = try await portalAPI.certificate(project: remote, settings: settings, auth: auth)
         } catch {
             if epoch == accountGeneration, !Task.isCancelled, !project.signKey.isEmpty, Self.isProjectNetworkFailure(error) {
                 usingSavedProjects = true
@@ -2806,6 +2805,7 @@ class AstationHubManager: ObservableObject {
     private func registerRelayAccountIfPossible() {
         guard identityRelayVerified else { return }
         let generation = identityRelaySocketGeneration
+        let accountEpoch = accountGeneration
         let relayURL = stationRelayUrl
         Task { [weak self] in
             guard let self else { return }
@@ -2818,12 +2818,18 @@ class AstationHubManager: ObservableObject {
                     label: label
                 ) else { return }
                 await MainActor.run {
-                    guard self.identityRelaySocketGeneration == generation,
+                    guard self.identityRelaySocketGeneration == generation, self.accountGeneration == accountEpoch,
                           self.stationRelayUrl == relayURL, self.identityRelayVerified else { return }
                     self.sendRelayIdentityControl(text, label: "relayRegisterAccount")
                 }
             } catch {
                 Log.debug("[RelayAccount] Registration deferred: \(error.localizedDescription)")
+                await MainActor.run {
+                    guard self.identityRelaySocketGeneration == generation, self.accountGeneration == accountEpoch,
+                          self.stationRelayUrl == relayURL else { return }
+                    self.relayAccountStatusMessage = error.localizedDescription
+                    NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
+                }
             }
         }
     }
@@ -3189,7 +3195,7 @@ struct MarkTask {
     var resultMessage: String?
 }
 
-struct AgoraProject: Codable, Identifiable {
+struct AgoraProject: Codable, Identifiable, Sendable {
     let id: String
     let name: String
     let vendorKey: String   // app_id

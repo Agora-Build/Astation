@@ -14,12 +14,20 @@ private final class AccountTestStorage: AccountSessionStorage, @unchecked Sendab
     private var record: AccountSessionRecord?
     private var writes = 0
     var failWrite: Int?
+    var failWrites: Set<Int> = []
+    var refreshOnly = false
     init(_ session: AccountLoginSession) { record = AccountSessionRecord(session: session) }
-    func read() throws -> AccountSessionRecord? { lock.lock(); defer { lock.unlock() }; return record }
+    func read() throws -> AccountSessionRecord? { lock.lock(); defer { lock.unlock() }; return persisted(record) }
     func write(_ record: AccountSessionRecord?) throws {
         lock.lock(); defer { lock.unlock() }; writes += 1
-        if writes == failWrite { throw AccountLoginError.storage }
-        self.record = record
+        if writes == failWrite || failWrites.contains(writes) { throw AccountLoginError.storage }
+        self.record = persisted(record)
+    }
+    private func persisted(_ record: AccountSessionRecord?) -> AccountSessionRecord? {
+        guard refreshOnly, let record else { return record }
+        let session = record.session
+        return AccountSessionRecord(session: AccountLoginSession(configuration: session.configuration, subject: session.subject,
+            accessToken: "", refreshToken: session.refreshToken, expiresAt: .distantPast, authenticatedAt: nil), refreshPending: record.refreshPending)
     }
 }
 private actor AccountHTTPGate {
@@ -45,6 +53,28 @@ private actor AccountTestHTTP: AccountOIDCHTTP {
     }
     func count(_ path: String) -> Int { requests.filter { $0.url?.path == path }.count }
     func last(_ path: String) -> URLRequest? { requests.last { $0.url?.path == path } }
+}
+private enum AccountAPIFailure: Error, Equatable { case unauthorized, forbidden }
+private actor AccountProtectedResource {
+    private let rejectedToken: String
+    private let alwaysReject: Bool
+    private let forbidden: Bool
+    private let gate: AccountHTTPGate?
+    private var calls: [String] = []
+    init(rejectedToken: String, alwaysReject: Bool = false, forbidden: Bool = false, gate: AccountHTTPGate? = nil) {
+        self.rejectedToken = rejectedToken; self.alwaysReject = alwaysReject; self.forbidden = forbidden; self.gate = gate
+    }
+    func get(_ token: String) async throws -> String {
+        calls.append(token)
+        if forbidden { throw AccountAPIFailure.forbidden }
+        if token == rejectedToken {
+            if let gate { await gate.wait() }
+            throw AccountAPIFailure.unauthorized
+        }
+        if alwaysReject { throw AccountAPIFailure.unauthorized }
+        return "authorized"
+    }
+    func count() -> Int { calls.count }
 }
 private struct AccountFixture {
     let config: AccountOIDCConfiguration
@@ -94,6 +124,139 @@ private struct AccountFixture {
 }
 
 final class AccountOIDCTests: XCTestCase {
+    private static let unauthorized: @Sendable (Error) -> Bool = { $0 as? AccountAPIFailure == .unauthorized }
+
+    private func waitUntil(_ predicate: () async -> Bool) async throws {
+        for _ in 0..<500 {
+            if await predicate() { return }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTFail("Timed out waiting for authorized operation")
+        throw AccountLoginError.unavailable
+    }
+
+    func testConcurrentAPIRejectionsRotateOnceBeforeExpiry() async throws {
+        let f = try AccountFixture(); try await f.prepare(); let old = try await f.exchange()
+        let store = AccountTestStorage(old), provider = f.provider(store)
+        try await f.response(access: ["jti":"replacement"], refresh: "refresh-two", includeID: false)
+        let rejectedGate = AccountHTTPGate(), tokenGate = AccountHTTPGate()
+        await f.http.blockTokens(tokenGate)
+        let api = AccountProtectedResource(rejectedToken: old.accessToken, gate: rejectedGate)
+        let task = Task { try await withThrowingTaskGroup(of: String.self) { group in
+            for _ in 0..<12 {
+                group.addTask { try await provider.performAuthorized({ try await api.get($0) }, unauthorized: Self.unauthorized) }
+            }
+            var values: [String] = []; for try await value in group { values.append(value) }; return values
+        } }
+        try await waitUntil { await api.count() == 12 }
+        await rejectedGate.release()
+        try await waitUntil { await f.http.count("/token") == 2 }
+        await tokenGate.release()
+        let values = try await task.value
+        XCTAssertEqual(values, Array(repeating: "authorized", count: 12))
+        let requests = await f.http.count("/token"), apiCalls = await api.count()
+        XCTAssertEqual(requests, 2); XCTAssertEqual(apiCalls, 24)
+        XCTAssertEqual(try store.read()?.session.refreshToken, "refresh-two")
+        XCTAssertFalse(try XCTUnwrap(store.read()).refreshPending)
+    }
+
+    func testLateAPIRejectionReusesTheAlreadyRotatedToken() async throws {
+        let f = try AccountFixture(); try await f.prepare(); let old = try await f.exchange()
+        let store = AccountTestStorage(old), provider = f.provider(store), gate = AccountHTTPGate()
+        let delayed = AccountProtectedResource(rejectedToken: old.accessToken, gate: gate)
+        let late = Task { try await provider.performAuthorized({ try await delayed.get($0) }, unauthorized: Self.unauthorized) }
+        try await waitUntil { await delayed.count() == 1 }
+        try await f.response(access: ["jti":"replacement"], refresh: "refresh-two", includeID: false)
+        let api = AccountProtectedResource(rejectedToken: old.accessToken)
+        _ = try await provider.performAuthorized({ try await api.get($0) }, unauthorized: Self.unauthorized)
+        await gate.release()
+        let result = try await late.value
+        XCTAssertEqual(result, "authorized")
+        let requests = await f.http.count("/token"); XCTAssertEqual(requests, 2)
+    }
+
+    func testPersistentUnauthorizedRetriesOnceAndForbiddenNeverRefreshes() async throws {
+        for forbidden in [false, true] {
+            let f = try AccountFixture(); try await f.prepare(); let old = try await f.exchange()
+            let provider = f.provider(AccountTestStorage(old))
+            try await f.response(access: ["jti":"replacement"], refresh: "refresh-two", includeID: false)
+            let api = AccountProtectedResource(rejectedToken: old.accessToken, alwaysReject: true, forbidden: forbidden)
+            do {
+                _ = try await provider.performAuthorized({ try await api.get($0) }, unauthorized: Self.unauthorized)
+                XCTFail("Rejected API response accepted")
+            } catch { XCTAssertEqual(error as? AccountAPIFailure, forbidden ? .forbidden : .unauthorized) }
+            let requests = await f.http.count("/token"), apiCalls = await api.count()
+            XCTAssertEqual(requests, forbidden ? 1 : 2); XCTAssertEqual(apiCalls, forbidden ? 1 : 2)
+        }
+    }
+
+    func testSignOutAndNewLoginFenceRejectedOperationsBeforeRetry() async throws {
+        for relogin in [false, true] {
+            let f = try AccountFixture(); try await f.prepare(); let old = try await f.exchange()
+            let store = AccountTestStorage(old), provider = f.provider(store), gate = AccountHTTPGate()
+            let api = AccountProtectedResource(rejectedToken: old.accessToken, gate: gate)
+            let task = Task { try await provider.performAuthorized({ try await api.get($0) }, unauthorized: Self.unauthorized) }
+            try await waitUntil { await api.count() == 1 }
+            try await provider.signOut()
+            if relogin {
+                let attempt = try await provider.beginLogin()
+                try await provider.finishLogin(old, attempt: attempt)
+            }
+            await gate.release()
+            do { _ = try await task.value; XCTFail("Old operation crossed a sign-in boundary") }
+            catch { XCTAssertEqual(error as? AccountLoginError, .changed) }
+            let requests = await f.http.count("/token"), apiCalls = await api.count()
+            XCTAssertEqual(requests, 1); XCTAssertEqual(apiCalls, 1)
+            XCTAssertEqual(try store.read() != nil, relogin)
+        }
+    }
+
+    func testCancellationDoesNotRefreshARejectedOperation() async throws {
+        let f = try AccountFixture(); try await f.prepare(); let old = try await f.exchange()
+        let provider = f.provider(AccountTestStorage(old)), gate = AccountHTTPGate()
+        let api = AccountProtectedResource(rejectedToken: old.accessToken, gate: gate)
+        let task = Task { try await provider.performAuthorized({ try await api.get($0) }, unauthorized: Self.unauthorized) }
+        try await waitUntil { await api.count() == 1 }
+        task.cancel(); await gate.release()
+        do { _ = try await task.value; XCTFail("Cancelled operation retried") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        let requests = await f.http.count("/token"), apiCalls = await api.count()
+        XCTAssertEqual(requests, 1); XCTAssertEqual(apiCalls, 1)
+    }
+
+    func testInvalidGrantClearsTheConsumedCredential() async throws {
+        let f = try AccountFixture(); try await f.prepare(); let old = try await f.exchange()
+        let store = AccountTestStorage(old), provider = f.provider(store)
+        f.clock.advance(850)
+        try await f.http.set("/token", ["error":"invalid_grant"], status: 400)
+        do { _ = try await provider.validToken(); XCTFail("Invalid grant accepted") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .signInRequired) }
+        XCTAssertNil(try store.read())
+        do { _ = try await provider.validToken(); XCTFail("Revoked grant retried") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .signInRequired) }
+        let requests = await f.http.count("/token"); XCTAssertEqual(requests, 2)
+    }
+
+    func testRefreshOnlyStorageGetsAnAccessTokenOnLaunchAndKeepsItOnlyInMemory() async throws {
+        let f = try AccountFixture(); try await f.prepare(); let old = try await f.exchange()
+        let store = AccountTestStorage(old); store.refreshOnly = true
+        let provider = f.provider(store)
+        try await f.response(access: ["jti":"replacement"], refresh: "refresh-two", includeID: false)
+        XCTAssertEqual(try store.read()?.session.accessToken, "")
+        let token = try await provider.validToken()
+        XCTAssertFalse(token.isEmpty)
+        XCTAssertEqual(try store.read()?.session.accessToken, "")
+        XCTAssertEqual(try store.read()?.session.refreshToken, "refresh-two")
+        for _ in 0..<3 {
+            let current = try await provider.validToken(); XCTAssertEqual(current, token)
+        }
+        let live = try await provider.current(); XCTAssertEqual(live?.session.accessToken, token)
+        let requests = await f.http.count("/token"); XCTAssertEqual(requests, 2)
+        try await provider.signOut()
+        XCTAssertNil(try store.read())
+        let signedOut = try await provider.current(); XCTAssertNil(signedOut)
+    }
+
     func testAdditionalAPIScopesAreRequestedAndMustAllBeGranted() async throws {
         let f = try AccountFixture(); try await f.prepare()
         let config = try AccountOIDCConfiguration(issuer: f.config.issuer, clientID: f.config.clientID,
@@ -221,7 +384,7 @@ final class AccountOIDCTests: XCTestCase {
             try await f.response(refresh:"refresh-two",includeID:false)
             if !failSave { try await f.http.set("/token",[:],status:503) }
             do { _ = try await provider.validToken(); XCTFail("uncertain refresh accepted") } catch {}
-            XCTAssertEqual(try store.read()?.refreshPending,true)
+            XCTAssertEqual(try store.read()?.refreshPending, failSave ? nil : true)
             do { _ = try await provider.validToken(); XCTFail("old refresh retried") } catch {}
             let restarted = f.provider(store)
             do { _ = try await restarted.validToken(); XCTFail("old refresh retried after restart") } catch {}
@@ -242,5 +405,19 @@ final class AccountOIDCTests: XCTestCase {
         let attempt = try await provider.beginLogin(); try await provider.signOut()
         do { try await provider.finishLogin(old,attempt:attempt); XCTFail("late login resurrected session") } catch {}
         XCTAssertNil(try store.read())
+    }
+
+    func testFailedRefreshSaveAndDeletionRetainTheNoReplayMarkerAfterRestart() async throws {
+        let f = try AccountFixture(); try await f.prepare(); let old = try await f.exchange()
+        let store = AccountTestStorage(old); store.failWrites = [2, 3]
+        let provider = f.provider(store); f.clock.advance(850)
+        try await f.response(refresh: "refresh-two", includeID: false)
+        do { _ = try await provider.validToken(); XCTFail("Unsaved rotated credential accepted") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .storage) }
+        XCTAssertEqual(try store.read()?.refreshPending, true)
+        let restarted = f.provider(store)
+        do { _ = try await restarted.validToken(); XCTFail("Consumed refresh credential replayed") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .signInRequired) }
+        let requests = await f.http.count("/token"); XCTAssertEqual(requests, 2)
     }
 }
