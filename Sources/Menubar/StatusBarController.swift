@@ -1,5 +1,6 @@
 import Cocoa
 import Foundation
+import AstationRemote
 
 class StatusBarController: NSObject, NSMenuDelegate {
     private var statusItem: NSStatusItem!
@@ -438,9 +439,11 @@ class StatusBarController: NSObject, NSMenuDelegate {
         
         statusMenu.addItem(NSMenuItem.separator())
 
-        let acctTitle = hubManager.signedInAccount.map { "agora.build (\($0))..." } ?? "Sign in to agora.build..."
-        let acctItem = NSMenuItem(title: acctTitle, action: #selector(signInOrOut), keyEquivalent: "")
+        let acctTitle = hubManager.accountSignInInProgress ? "Signing in to Agora.Build..."
+            : hubManager.signedInAccount.map { "Agora.Build (\($0))..." } ?? "Sign in to Agora.Build..."
+        let acctItem = NSMenuItem(title: acctTitle, action: #selector(openAccount), keyEquivalent: "")
         acctItem.target = self
+        acctItem.isEnabled = !hubManager.accountSignInInProgress
         statusMenu.addItem(acctItem)
         statusMenu.addItem(NSMenuItem.separator())
 
@@ -829,8 +832,26 @@ class StatusBarController: NSObject, NSMenuDelegate {
         }
     }
 
-    @objc private func signInOrOut() {
-        settingsWindowController.showGeneral()
+    @objc private func openAccount() {
+        guard !hubManager.accountSignInInProgress else { return }
+        if hubManager.signedInAccount != nil {
+            settingsWindowController.showGeneral()
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self, !hubManager.accountSignInInProgress else { return }
+            defer { setupMenu() }
+            do { try await hubManager.signInAccount() }
+            catch {
+                guard !(error is CancellationError), error as? AccountLoginError != .cancelled else { return }
+                let alert = NSAlert()
+                alert.messageText = "Could not sign in to Agora.Build"
+                alert.informativeText = error.localizedDescription
+                alert.addButton(withTitle: "OK")
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
+            }
+        }
     }
 
     @objc private func openSettings() {

@@ -41,6 +41,7 @@ class AstationHubManager: ObservableObject {
     private(set) var portalAuth: AstationAccountAuth?
     let portalAPI: PortalAPIClient
     @Published private(set) var signedInAccount: String?
+    @Published private(set) var accountSignInInProgress = false
     @Published private(set) var agoraConnection: PortalAgoraConnection?
     private var projectLoadTask: Task<Void, Never>?
     private var accountGeneration = UUID()
@@ -517,6 +518,9 @@ class AstationHubManager: ObservableObject {
     }
 
     @MainActor func signInAccount() async throws {
+        guard !accountSignInInProgress else { throw AccountLoginError.busy }
+        accountSignInInProgress = true
+        defer { accountSignInInProgress = false }
         guard let portalAuth else { throw AccountLoginError.configuration }
         accountGeneration = UUID()
         projectLoadTask?.cancel()

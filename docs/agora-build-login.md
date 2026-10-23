@@ -11,6 +11,11 @@ editable environment settings:
 | Native client ID | `astation` | `ASTATION_ACCOUNT_CLIENT_ID` |
 | Portal API resource | `https://api.agora.build` | `ASTATION_PORTAL_RESOURCE` |
 
+The menu-bar **Sign in to Agora.Build...** action starts browser sign-in
+directly. While it is pending, the menu shows **Signing in to Agora.Build...**
+and prevents duplicate attempts. After signing in, the account item opens
+General for account and connection management.
+
 The API resource is a token audience, not the portal's network address. Do not
 change it to the portal URL unless that audience is registered in Auth and
 configured as `PORTAL_API_AUDIENCE` on the portal. Environment variables take
@@ -28,7 +33,8 @@ encrypted data are retained. Login does not enroll or verify devices.
 
 ## Using linked Agora projects
 
-1. Sign in to agora.build in General using the system browser.
+1. Choose **Sign in to Agora.Build...** from the menu bar, or sign in from
+   General, using the system browser.
 2. Choose **Connect Agora Account...**. It opens `<portal>/account/`; connect
    the desired Agora account there, while signed in to the same agora.build
    account.
@@ -159,11 +165,9 @@ offline restoration after restart, expired/interrupted OIDC refresh, certificate
 rotation, unlink/removal invalidation, account/environment isolation and late
 certificate responses after logout being unable to restore the cache.
 
-The current 1,002-test local run encounters three existing protected Secure
-Enclave failures and one existing native caption-scroll failure while the
-console is locked. The provisioned account/cache tests also cannot access
-`WhenUnlocked` Keychain items in that state. Rerun these after unlocking; the
-new offline-cache Keychain round trip is not claimed as passed yet. These
-controlled tests do not replace the live user-login and deployment checks above.
-Excluding the four locked-session cases, the remaining 998 tests pass with 14
-environment skips and zero failures.
+The direct menu sign-in follow-up passes all 28 focused account, settings,
+Token Tools and status-menu tests. With the Mac unlocked, the full app suite
+passes 1,002 tests with 16 environment skips and zero failures. All five
+account boundary tests pass without skips in the existing provisioned host,
+including the protected offline-cache Keychain round trip. These controlled
+tests do not replace the live user-login and deployment checks above.
