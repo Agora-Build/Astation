@@ -84,8 +84,8 @@ final class AccountServiceSettingsTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let initial = try AccountServiceSettings.load(defaults: defaults, environment: [:], info: [:])
-        XCTAssertEqual(initial.portalURL, "https://dev.agora.build")
-        XCTAssertEqual(initial.issuer, "https://auth.dev.agora.build")
+        XCTAssertEqual(initial.portalURL, "https://agora.build")
+        XCTAssertEqual(initial.issuer, "https://auth.agora.build")
         XCTAssertEqual(try initial.oidcConfiguration.apiScopes, ["agora:projects", "agora:certificates"])
         let settings = try AccountServiceSettings(portalURL: " https://portal.example/ ", issuer: "https://auth.portal.example/",
             clientID: "native-test", resource: "https://api.example")

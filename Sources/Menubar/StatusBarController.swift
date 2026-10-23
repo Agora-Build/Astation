@@ -436,6 +436,16 @@ class StatusBarController: NSObject, NSMenuDelegate {
         )
         stationItem.target = self
         statusMenu.addItem(stationItem)
+
+        let portalUrl = hubManager.portalSettings?.portalURL
+        let portalItem = NSMenuItem(
+            title: "🏛️ Portal: \(portalUrl ?? "Not configured")",
+            action: #selector(copyPortalURL),
+            keyEquivalent: ""
+        )
+        portalItem.target = self
+        portalItem.isEnabled = portalUrl != nil
+        statusMenu.addItem(portalItem)
         
         statusMenu.addItem(NSMenuItem.separator())
 
@@ -538,6 +548,19 @@ class StatusBarController: NSObject, NSMenuDelegate {
         let alert = NSAlert()
         alert.messageText = "URL Copied"
         alert.informativeText = "Station relay URL has been copied to clipboard:\n\(url)"
+        alert.alertStyle = .informational
+        alert.runModal()
+    }
+
+    @objc private func copyPortalURL() {
+        guard let url = hubManager.portalSettings?.portalURL else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url, forType: .string)
+
+        let alert = NSAlert()
+        alert.messageText = "URL Copied"
+        alert.informativeText = "Portal URL has been copied to clipboard:\n\(url)"
         alert.alertStyle = .informational
         alert.runModal()
     }

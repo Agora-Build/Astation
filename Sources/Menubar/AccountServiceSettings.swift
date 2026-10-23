@@ -11,8 +11,8 @@ struct AccountServiceSettings: Equatable {
     static let issuerKey = "AstationAccountIssuer"
     static let clientKey = "AstationAccountClientID"
     static let resourceKey = "AstationPortalResource"
-    static let defaultPortal = "https://dev.agora.build"
-    static let defaultIssuer = "https://auth.dev.agora.build"
+    static let defaultPortal = "https://agora.build"
+    static let defaultIssuer = "https://auth.agora.build"
     static let defaultClient = "astation"
     static let defaultResource = "https://api.agora.build"
 

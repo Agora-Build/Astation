@@ -10,13 +10,18 @@ WebSocket addresses in one **Servers & Connections** block:
 
 | Setting | Current default | Override |
 | --- | --- | --- |
-| Portal URL | `https://dev.agora.build` | `ASTATION_PORTAL_URL` |
+| Portal URL | `https://agora.build` | `ASTATION_PORTAL_URL` |
 | Relay URL | `https://station.agora.build` | `ASTATION_RELAY_URL` |
 
 Each field has a short description. **Save Servers** applies the account and
 relay settings together; changing only the relay keeps the account signed in.
 The read-only WebSocket details show direct Atem connections through this Mac,
 the LAN or a VPN.
+
+The menu's **Server Info** also shows the effective Portal URL alongside
+WebSocket and Station. Click a URL to copy it. The current local test setup
+keeps `https://dev.agora.build` as its saved Portal URL; the production default
+applies when no saved setting or override is present.
 
 Auth URL is derived by prefixing the portal host with `auth.`, preserving its
 scheme and port: `https://dev.agora.build` uses `https://auth.dev.agora.build`,
@@ -210,3 +215,8 @@ boundary tests without skips. Regressions cover portal-derived Auth URLs,
 ignoring and clearing stale saved issuers, account/environment isolation,
 custom domains and ports, explicit developer overrides for separate loopback
 services, relay issuer consistency and the simplified General layout.
+
+The production-default/Portal-menu follow-up passes 27 focused account,
+settings, project and menu tests (two provisioned-host skips), plus all five
+account boundary tests in the provisioned host without skips. The existing
+saved-development-portal case confirms it retains its derived dev issuer.
