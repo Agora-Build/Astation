@@ -42,15 +42,33 @@ struct AccountServiceSettings: Equatable {
         func value(_ env: String, _ key: String, _ fallback: String) -> String {
             environment[env] ?? defaults.string(forKey: key) ?? info[key] as? String ?? fallback
         }
-        return try Self(portalURL: value("ASTATION_PORTAL_URL", portalKey, defaultPortal),
-            issuer: value("ASTATION_ACCOUNT_ISSUER", issuerKey, defaultIssuer),
+        let portal = value("ASTATION_PORTAL_URL", portalKey, defaultPortal)
+        return try Self(portalURL: portal,
+            issuer: issuerURL(forPortalURL: portal, environment: environment, info: info),
             clientID: value("ASTATION_ACCOUNT_CLIENT_ID", clientKey, defaultClient),
             resource: value("ASTATION_PORTAL_RESOURCE", resourceKey, defaultResource))
     }
 
+    static func issuerURL(forPortalURL portalURL: String,
+                          environment: [String: String] = ProcessInfo.processInfo.environment,
+                          info: [String: Any] = Bundle.main.infoDictionary ?? [:]) throws -> String {
+        let portal = try baseURL(portalURL)
+        if let override = environment["ASTATION_ACCOUNT_ISSUER"] ?? info[issuerKey] as? String {
+            return try baseURL(override)
+        }
+        guard var components = URLComponents(string: portal), let host = components.host,
+              !host.contains(":"), !host.allSatisfy({ $0.isNumber || $0 == "." }) else {
+            throw AccountLoginError.configuration
+        }
+        components.host = "auth." + host
+        guard let url = components.url else { throw AccountLoginError.configuration }
+        return try baseURL(url.absoluteString)
+    }
+
     func save(defaults: UserDefaults = .standard) {
         defaults.set(portalURL, forKey: Self.portalKey)
-        defaults.set(issuer, forKey: Self.issuerKey)
+        // The portal determines Auth; old UI values must not pin a previous environment.
+        defaults.removeObject(forKey: Self.issuerKey)
         defaults.set(clientID, forKey: Self.clientKey)
         defaults.set(resource, forKey: Self.resourceKey)
     }

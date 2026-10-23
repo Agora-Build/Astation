@@ -87,7 +87,7 @@ final class AccountServiceSettingsTests: XCTestCase {
         XCTAssertEqual(initial.portalURL, "https://dev.agora.build")
         XCTAssertEqual(initial.issuer, "https://auth.dev.agora.build")
         XCTAssertEqual(try initial.oidcConfiguration.apiScopes, ["agora:projects", "agora:certificates"])
-        let settings = try AccountServiceSettings(portalURL: " https://portal.example/ ", issuer: "https://auth.example/",
+        let settings = try AccountServiceSettings(portalURL: " https://portal.example/ ", issuer: "https://auth.portal.example/",
             clientID: "native-test", resource: "https://api.example")
         settings.save(defaults: defaults)
         XCTAssertEqual(try AccountServiceSettings.load(defaults: defaults, environment: [:], info: [:]), settings)
@@ -103,13 +103,52 @@ final class AccountServiceSettingsTests: XCTestCase {
         }
         XCTAssertEqual(try AccountServiceSettings.baseURL("http://127.0.0.1:8081/"), "http://127.0.0.1:8081")
     }
+
+    func testPortalChangesDeriveAuthWithoutReusingThePreviousIssuer() throws {
+        let suite = "Astation.derived-auth.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set("https://dev.agora.build", forKey: AccountServiceSettings.portalKey)
+        defaults.set("https://old-auth.example", forKey: AccountServiceSettings.issuerKey)
+        let initial = try AccountServiceSettings.load(defaults: defaults, environment: [:], info: [:])
+        XCTAssertEqual(initial.issuer, "https://auth.dev.agora.build")
+        let production = try AccountServiceSettings.load(defaults: defaults,
+            environment: ["ASTATION_PORTAL_URL": "https://agora.build"], info: [:])
+        XCTAssertEqual(production.issuer, "https://auth.agora.build")
+        XCTAssertNotEqual(production.storageContext, initial.storageContext)
+        production.save(defaults: defaults)
+        XCTAssertNil(defaults.string(forKey: AccountServiceSettings.issuerKey))
+        XCTAssertEqual(try AccountServiceSettings.load(defaults: defaults, environment: [:], info: [:]), production)
+        let custom = try AccountServiceSettings.load(defaults: defaults,
+            environment: ["ASTATION_PORTAL_URL": "https://preview.example:8443"], info: [:])
+        XCTAssertEqual(custom.issuer, "https://auth.preview.example:8443")
+        XCTAssertEqual(custom.resource, initial.resource)
+        XCTAssertEqual(custom.clientID, initial.clientID)
+    }
+
+    func testExplicitDeveloperAuthOverrideSupportsSeparateLoopbackPorts() throws {
+        let suite = "Astation.local-auth.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let portal = ["ASTATION_PORTAL_URL": "http://127.0.0.1:3000"]
+        XCTAssertThrowsError(try AccountServiceSettings.load(defaults: defaults, environment: portal, info: [:]))
+        var environment = portal
+        environment["ASTATION_ACCOUNT_ISSUER"] = "http://127.0.0.1:4000"
+        let settings = try AccountServiceSettings.load(defaults: defaults, environment: environment, info: [:])
+        XCTAssertEqual(settings.issuer, "http://127.0.0.1:4000")
+        XCTAssertEqual(try AccountServiceSettings.load(defaults: defaults, environment: portal,
+            info: [AccountServiceSettings.issuerKey: "http://127.0.0.1:5000"]).issuer, "http://127.0.0.1:5000")
+        settings.save(defaults: defaults)
+        XCTAssertEqual(try AccountServiceSettings.load(defaults: defaults, environment: environment, info: [:]), settings)
+        XCTAssertThrowsError(try AccountServiceSettings.issuerURL(forPortalURL: "https://[::1]", environment: [:], info: [:]))
+    }
 }
 
 @MainActor final class PortalAccountTests: XCTestCase {
     private let appID = "0123456789abcdef0123456789abcdef"
     private let certificate = "abcdef0123456789abcdef0123456789"
     private func settings(_ suffix: String = "") throws -> AccountServiceSettings {
-        try AccountServiceSettings(portalURL: "https://portal\(suffix).example", issuer: "https://auth\(suffix).example",
+        try AccountServiceSettings(portalURL: "https://portal\(suffix).example", issuer: "https://auth.portal\(suffix).example",
             clientID: "astation-test", resource: "https://api\(suffix).example")
     }
     private func waitUntil(_ predicate: () async -> Bool) async {
@@ -284,9 +323,9 @@ final class AccountServiceSettingsTests: XCTestCase {
         window.contentView?.layoutSubtreeIfNeeded()
         func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
         let all = descendants(general)
-        let fields = all.compactMap { $0 as? NSTextField }.filter { ["Portal URL", "Auth URL", "API resource", "Relay URL"].contains($0.accessibilityLabel() ?? "") }
-        XCTAssertEqual(fields.count, 4)
-        XCTAssertFalse(all.compactMap { $0 as? NSTextField }.contains { $0.accessibilityLabel() == "Client ID" })
+        let fields = all.compactMap { $0 as? NSTextField }.filter { ["Portal URL", "Relay URL"].contains($0.accessibilityLabel() ?? "") }
+        XCTAssertEqual(fields.count, 2)
+        XCTAssertFalse(all.compactMap { $0 as? NSTextField }.contains { ["Client ID", "Auth URL", "API resource"].contains($0.accessibilityLabel() ?? "") })
         for field in fields {
             XCTAssertGreaterThan(field.bounds.width, 240)
             XCTAssertLessThanOrEqual(field.convert(field.bounds, to: general).maxX, general.bounds.width)

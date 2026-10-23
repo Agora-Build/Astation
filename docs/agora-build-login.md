@@ -11,8 +11,6 @@ WebSocket addresses in one **Servers & Connections** block:
 | Setting | Current default | Override |
 | --- | --- | --- |
 | Portal URL | `https://dev.agora.build` | `ASTATION_PORTAL_URL` |
-| Auth URL (OIDC issuer) | `https://auth.dev.agora.build` | `ASTATION_ACCOUNT_ISSUER` |
-| Portal API resource | `https://api.agora.build` | `ASTATION_PORTAL_RESOURCE` |
 | Relay URL | `https://station.agora.build` | `ASTATION_RELAY_URL` |
 
 Each field has a short description. **Save Servers** applies the account and
@@ -20,21 +18,34 @@ relay settings together; changing only the relay keeps the account signed in.
 The read-only WebSocket details show direct Atem connections through this Mac,
 the LAN or a VPN.
 
-The native OAuth client ID is internal, defaulting to `astation`. It is not
-shown or editable in Settings. Saving servers preserves the configured value;
-development builds can still override it with `ASTATION_ACCOUNT_CLIENT_ID`.
+Auth URL is derived by prefixing the portal host with `auth.`, preserving its
+scheme and port: `https://dev.agora.build` uses `https://auth.dev.agora.build`,
+and `https://agora.build` uses `https://auth.agora.build`. Portal and relay
+login use this same issuer. The old separately saved Auth URL is ignored and
+removed when saving servers, so it cannot pin login to a previous environment.
+Developer environment/build overrides (`ASTATION_ACCOUNT_ISSUER` or
+`AstationAccountIssuer`) remain available for separately hosted Auth services.
+An IP-based loopback portal needs an explicit Auth override, allowing local
+portal and Auth servers to use different ports.
+
+The native OAuth client ID and Portal API resource stay internal, defaulting to
+`astation` and `https://api.agora.build`. They are not shown or editable in
+Settings. Saving servers preserves their configured values. Development builds
+can override them with `ASTATION_ACCOUNT_CLIENT_ID` and
+`ASTATION_PORTAL_RESOURCE`.
 
 The menu-bar **Sign in to Agora.Build...** action starts browser sign-in
 directly. While it is pending, the menu shows **Signing in to Agora.Build...**
 and prevents duplicate attempts. After signing in, the account item opens
 Settings > Account for account management.
 
-The API resource is a token audience, not the portal's network address. Do not
-change it to the portal URL unless that audience is registered in Auth and
-configured as `PORTAL_API_AUDIENCE` on the portal. Environment variables take
-precedence over saved settings, then build configuration, then these defaults;
-overridden fields are read-only. The app uses HTTPS base URLs, allowing HTTP
-only on explicit loopback development hosts.
+The internal API resource remains the token audience used by the existing
+project/certificate login grant; it does not add a token-generation API call.
+It must match the registered Auth resource and Portal's `PORTAL_API_AUDIENCE`.
+Portal/client/resource values use environment overrides, saved settings, build
+configuration, then defaults. Auth uses an explicit environment/build override
+or portal derivation. Overridden visible fields are read-only. The app uses
+HTTPS base URLs, allowing HTTP only on explicit loopback development hosts.
 
 Changing an environment signs out the active app account sessions and fences
 pending logins, refreshes and project/certificate responses, and clears the
@@ -192,3 +203,10 @@ The recovery UI cleanup passes 32 focused account-settings, linked-project and
 recovery-coordinator tests with zero skips or failures. It removes the
 standalone relay sign-in controls while retaining the normal sign-in's
 separate relay grant and the Security recovery flows.
+
+The two-field server settings follow-up passes the full app suite (1,004
+tests, 16 environment skips, zero failures) and all five provisioned account
+boundary tests without skips. Regressions cover portal-derived Auth URLs,
+ignoring and clearing stale saved issuers, account/environment isolation,
+custom domains and ports, explicit developer overrides for separate loopback
+services, relay issuer consistency and the simplified General layout.

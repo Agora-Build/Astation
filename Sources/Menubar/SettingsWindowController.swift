@@ -33,8 +33,6 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         projectUpdates: hubManager.$credentialProjectSuggestions.eraseToAnyPublisher()
     )
     private var portalUrlField = NSTextField()
-    private var issuerUrlField = NSTextField()
-    private var portalResourceField = NSTextField()
     private var accountServerStatus = NSTextField(wrappingLabelWithString: "")
     private var stationUrlField: NSTextField!
     private var serverInfoLabel: NSTextField!
@@ -297,13 +295,9 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         content.addArrangedSubview(wrappingInfo("Account services and Atem connections. Account server changes require sign-in again."))
         let settings = hubManager.portalSettings
         portalUrlField.stringValue = settings?.portalURL ?? ""
-        issuerUrlField.stringValue = settings?.issuer ?? ""
-        portalResourceField.stringValue = settings?.resource ?? ""
         stationUrlField = NSTextField(string: SettingsWindowController.currentAstationRelayUrl)
         let fields: [(String, String, NSTextField, String)] = [
             ("Portal URL", "Account and linked projects", portalUrlField, "ASTATION_PORTAL_URL"),
-            ("Auth URL", "Sign-in and identity", issuerUrlField, "ASTATION_ACCOUNT_ISSUER"),
-            ("API resource", "Access-token audience", portalResourceField, "ASTATION_PORTAL_RESOURCE"),
             ("Relay URL", "Remote Atem connections", stationUrlField, "ASTATION_RELAY_URL")
         ]
         var rows = fields.map { title, hint, field, env -> [NSView] in
@@ -343,9 +337,9 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     @objc private func saveAccountServers(_ sender: NSButton) {
         do {
             let settings = try AccountServiceSettings(portalURL: portalUrlField.stringValue,
-                issuer: issuerUrlField.stringValue,
+                issuer: AccountServiceSettings.issuerURL(forPortalURL: portalUrlField.stringValue),
                 clientID: hubManager.portalSettings?.clientID ?? AccountServiceSettings.defaultClient,
-                resource: portalResourceField.stringValue)
+                resource: hubManager.portalSettings?.resource ?? AccountServiceSettings.defaultResource)
             guard let relayURL = StationRelayURL.validatedBase(stationUrlField.stringValue) else {
                 accountServerStatus.stringValue = "Enter a valid relay URL."
                 accountServerStatus.textColor = .systemRed
@@ -357,8 +351,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
                 do {
                     try await hubManager.updateAccountServices(settings)
                     if let effective = hubManager.portalSettings {
-                        portalUrlField.stringValue = effective.portalURL; issuerUrlField.stringValue = effective.issuer
-                        portalResourceField.stringValue = effective.resource
+                        portalUrlField.stringValue = effective.portalURL
                     }
                     if relayURL != SettingsWindowController.currentAstationRelayUrl {
                         UserDefaults.standard.set(relayURL, forKey: SettingsWindowController.astationRelayUrlKey)
@@ -371,7 +364,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
                 } catch { accountServerStatus.stringValue = error.localizedDescription; accountServerStatus.textColor = .systemRed }
             }
         } catch {
-            accountServerStatus.stringValue = "Enter valid HTTPS base URLs (HTTP is allowed only for local development) and an API resource."
+            accountServerStatus.stringValue = "Enter valid HTTPS base URLs (HTTP is allowed only for local development)."
             accountServerStatus.textColor = .systemRed
         }
     }

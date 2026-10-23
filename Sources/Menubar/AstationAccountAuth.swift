@@ -70,10 +70,12 @@ final class AstationAccountAuth: Sendable {
          info: [String: Any] = Bundle.main.infoDictionary ?? [:], storage: AccountSessionStorage = AccountKeychainStorage(),
          defaults: UserDefaults = .standard) {
         func value(_ env: String, _ key: String) -> String? { environment[env] ?? defaults.string(forKey: key) ?? info[key] as? String }
-        if let clientID = value("ASTATION_ACCOUNT_CLIENT_ID", "AstationAccountClientID"),
+        let settings = try? AccountServiceSettings.load(defaults: defaults, environment: environment, info: info)
+        if let clientID = settings?.clientID,
            let resource = value("ASTATION_ACCOUNT_RESOURCE", "AstationAccountResource"),
            let scope = value("ASTATION_ACCOUNT_SCOPE", "AstationAccountScope"),
-           let config = try? AccountOIDCConfiguration(issuer: value("ASTATION_ACCOUNT_ISSUER", "AstationAccountIssuer") ?? AccountServiceSettings.defaultIssuer,
+           let issuer = settings?.issuer,
+           let config = try? AccountOIDCConfiguration(issuer: issuer,
                 clientID: clientID, resource: resource, requiredScope: scope) {
             configuration = config
             let oidc = AccountOIDCClient(configuration: config); client = oidc

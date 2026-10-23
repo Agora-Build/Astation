@@ -51,6 +51,12 @@ final class AccountAuthBoundaryTests: XCTestCase {
         XCTAssertEqual(auth.configuration?.issuer,AccountServiceSettings.defaultIssuer)
         XCTAssertEqual(auth.configuration?.clientID,"astation-test")
         XCTAssertFalse(auth.configuration!.permitsRelay("https://sso2.agora.io"))
+        defaults.set("https://old-auth.example", forKey: AccountServiceSettings.issuerKey)
+        let derived = AstationAccountAuth(environment: ["ASTATION_PORTAL_URL": "https://agora.build",
+            "ASTATION_ACCOUNT_RESOURCE": "https://station.example", "ASTATION_ACCOUNT_SCOPE": "station:account"],
+            info: [:], defaults: defaults)
+        XCTAssertEqual(derived.configuration?.issuer, "https://auth.agora.build")
+        XCTAssertEqual(derived.configuration?.clientID, "astation")
     }
 
     func testLoopbackIgnoresUnsolicitedRequestsAndCompletesOnlyOnce() async throws {
