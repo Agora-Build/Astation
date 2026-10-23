@@ -257,8 +257,15 @@ text/tool/approval parts do not promise those capabilities.
 
 The [unified Integrations design](../unified-integrations.md) proposes one Portal
 flow for Discord and custom API credentials, with a separate decrypting gateway
-for Bearer-token clients. Its ownership, delegated service login and gateway APIs
-need joint review; they are not implemented Station endpoints or R9 wire changes.
+for Bearer-token clients on user-chosen infrastructure. Agora.Build owns account
+and setup; private storage/sync remains on the chosen Station, which sees only
+ciphertext and necessary routing/signed-log metadata. The optional gateway is a
+trusted endpoint with its own scoped service identity, not a plaintext relay
+route or a required Agora.Build data processor. Its implementation assignment,
+delegated service login and gateway APIs need joint review; these are not
+implemented Station endpoints or R9 wire changes. Shared-relay operators remain
+outside the content trust boundary only when they do not also control a
+decrypting endpoint.
 
 Use `atem-client` for listSessions, sendPrompt, readHistory, watchEvents,
 answerApproval, revokeRule and queryReceipt. A bot is an authorized decrypting

@@ -1,6 +1,6 @@
 # Unified integrations and agent API access
 
-Status: design draft for joint Portal, Auth, Astation and Atem review,
+Status: design draft for joint Portal, Auth, Station, Astation and Atem review,
 2026-10-23. This document assigns proposed ownership and describes work to
 build; it does not advertise deployed API endpoints or change the R9 contract.
 
@@ -33,39 +33,117 @@ model; this proposal does not turn browsers into standalone native members.
 
 ## Recommended ownership
 
-Agora.Build owns the account-facing integration experience. The Astation
-product owns agent execution access. Station remains an opaque relay.
+Agora.Build owns accounts and the integration setup experience. The user's
+chosen Station owns private server-side storage and encrypted transport. Atem
+and explicitly authorized clients own decryption and agent execution. A central
+Agora.Build API must not become a required reader of private agent data.
+
+### Private-data boundary
+
+The user requires memory, vault data and user-stored credentials to remain on
+their chosen private infrastructure, including a self-hosted Station or a
+Station shared with friends. This is a data-custody requirement, separate from
+which team writes a component or which repository contains it.
+
+| Boundary | Allowed responsibility | Excluded responsibility |
+| --- | --- | --- |
+| Agora.Build / Auth backend | Account profile, login, provider authentication, integration catalog and explicitly saved relay registrations/opaque integration references. | No agent prompts/results, terminal content, memory/vault bodies, user vault secrets, account decryption keys or endpoint private keys. No proxying those plaintext payloads through the Portal backend. |
+| Chosen Station core | Tenant-private opaque transport; ciphertext storage/sync; signed membership records and sealed recovery material. | No content decryption, plaintext agent HTTP API, API-token-derived device identity or power to sign membership. |
+| Atem and enrolled native/direct clients | Decrypt authorized content, execute host operations and hold their protected keys. | Login alone cannot grant private-data access; a relay operator cannot enroll them. |
+| Optional private Agent API / connector | A separately authorized decrypting endpoint on infrastructure chosen by the user; validate its API tokens and use its scoped service identity. | No automatic access to account K, memory, vault or credentials. Sharing a machine with Station grants no authority. |
+| Discord or another third party | Receive only content explicitly sent through its authorized integration. | No implicit access to the rest of the private account or its secrets. |
+
+"Stays on the relay" means the selected Station is the private server-side
+store, with no duplicate private store on Agora.Build. Authorized clients still
+need plaintext while using data. Local caches, exports, backups and any extra
+server replica need explicit storage policy; do not promise the relay is the
+only physical copy. Station stores synchronized confidential content encrypted;
+plaintext storage with encryption off does not meet this privacy guarantee.
+Changing this design does not enable encryption or erase old plaintext backups.
+
+Authentication data used by Auth is distinct from credentials users put in a
+vault. The existing Agora Console connection also uses Portal-managed provider
+tokens and certificate APIs; it is not evidence that every kind of secret is
+already confined to Station. Whether that existing provider integration meets
+the desired custody rule needs its own review, without silently moving or
+deleting the current credentials.
+
+The Portal may present one Integrations UI while making authorized requests
+directly to the selected private service. Private labels, target policies,
+usage details and secrets need not be copied into its account database. A
+browser remains an explicitly authorized endpoint under the companion model;
+putting a page on agora.build does not grant its backend private-data access.
+
+The recommended simple-API deployment is a separate service alongside the
+chosen Station, or on other infrastructure the user trusts. It is optional:
+native/direct R9 clients need only Station and Atem. A raw-token API that reads
+and returns agent messages necessarily decrypts them somewhere; hosting that
+endpoint centrally on Agora.Build would introduce an additional trusted reader
+and must not be the default under this custody requirement. The implementation
+team and packaging remain open for review; it is not a native-Mac dependency.
+
+### Component assignment
 
 | Component | Proposed implementation owner | Responsibility |
 | --- | --- | --- |
-| Integrations page and catalog | Portal / agora.build | List, create, name, permission/expiry forms, connection progress, usage summary, rotation/revoke UI and Discord installation entry point. |
+| Integrations page and catalog | Portal / agora.build | One setup/management UI and catalog; fetch private integration details directly from the chosen service, without centralizing content or secrets. |
 | Identity and delegated service login | Auth / auth.agora.build | Native OIDC, registered resource audiences/scopes, future public-app OAuth consent, and a supported machine/service grant for unattended routing. |
 | Native integration authorization | Astation | Display the exact endpoint, keys, account/root, targets, permissions and expiry; require fresh owner confirmation; sign and durably publish through the shared R9 core. |
-| Integration runtime and credential authority | Astation Agent API Gateway | Own service keys and scoped R9 channels, issue/validate raw API tokens, execute allowed API operations, manage receipts/events, enforce token revocation and report sanitized status. |
-| Official Discord connector | Astation integration backend | Discord OAuth/install/events, guild/channel/user policy and response formatting, with a distinct scoped R9 service identity for each integration. Share the gateway's agent-operation layer. |
+| Private API runtime and credential authority | Separate optional service; implementation owner under review | Run on user-chosen infrastructure; own scoped service keys/channels, issue/validate private API tokens, manage receipts/events and enforce revocation. |
+| Official Discord connector | Separate optional connector; implementation owner under review | Discord OAuth/install/events, guild/channel/user policy and formatting, with a distinct scoped service identity per integration. May share the private API's operation layer; neither requires a running Mac. |
 | Opaque transport and signed storage | Station / station.agora.build | Account-private routing, unchanged channel bytes, signed-log storage and delivery. Never issue agent authority or store gateway private keys/plaintext transcripts. |
 | Host authority and protocol | Atem | Verify service membership, scope, expiry and key possession; enforce leases/receipts/approvals; provide the shared client and any agreed missing bindings/fixtures. |
 
-The gateway and Discord connector are application services. They may initially
-share a deployment, but credentials, logs, storage permissions and code boundaries
-must remain separate from Station's relay. No gateway hostname is selected by
-this draft. Choose its public origin and registered audience with the owners;
-do not reuse the obsolete Portal `api.agora.build` audience by assumption.
+The private API and Discord connector are application services. They may share
+a deployment with Station, but credentials, logs, storage permissions and code
+boundaries must remain separate from its opaque core. Colocation does not make
+the Station operator an enrolled member, but an operator controlling the
+gateway's machine can potentially read its plaintext/software keys. A shared
+relay operator remains outside the content trust boundary only if the decrypting
+service runs elsewhere or the user explicitly trusts that operator as well.
+Process/container separation alone is not protection against its host admin.
+No gateway hostname is selected by this draft. Choose its public origin and
+registered audience with
+the owners; do not reuse the Portal audience by assumption.
+
+Self-hosting and sharing a Station must preserve separate accounts, roots,
+storage namespaces and routing admission. Friends using one server do not
+become members of each other's trusted device lists. The operator can observe
+necessary routing/membership metadata and traffic timing/size, and can interrupt
+service; it cannot derive decryption authority from operating the server.
+Changing the relay does not reset trust, create membership or expose keys.
+Migration, auth-resource registration and service delegation need explicit
+support; this proposal does not claim arbitrary self-hosted deployments already
+work with Auth or that a relay move is an automatic data migration.
 
 ## Architecture and privacy
 
 ```mermaid
 flowchart LR
-    User[User] --> Portal[Agora.Build Integrations]
-    Portal --> Auth[Auth identity and service grants]
-    Portal -. authorization request .-> Native[Trusted native Astation]
-    Native -. signed scoped membership .-> Station[Station relay and signed storage]
-    Custom[Custom app with API token] --> Gateway[Agent API Gateway]
-    Discord[Discord] --> Connector[Discord connector]
+    subgraph Account[Agora.Build: accounts and setup]
+      Portal[Integrations UI]
+      Auth[Auth identity and service grants]
+    end
+    subgraph PrivateStore[Chosen Station: opaque storage and transport]
+      Station[Station core]
+    end
+    subgraph Endpoints[Authorized endpoints: may read scoped content]
+      Native[Trusted native Astation]
+      Gateway[Optional private Agent API]
+      Connector[Optional Discord connector]
+      Atem[Atem host]
+      Direct[App with R9 SDK and enrolled key]
+    end
+    User[User] --> Portal
+    Portal --> Auth
+    Portal -. authorization request .-> Native
+    Native -. signed scoped membership .-> Station
+    Custom[Custom app with API token] --> Gateway
+    Discord[Discord] --> Connector
     Connector --> Gateway
     Gateway <-->|opaque encrypted R9| Station
-    Station <-->|opaque encrypted R9| Atem[Atem host]
-    Direct[App with R9 SDK and enrolled key] <-->|opaque encrypted R9| Station
+    Station <-->|opaque encrypted R9| Atem
+    Direct <-->|opaque encrypted R9| Station
 ```
 
 Portal/Auth login permits account administration and routing visibility.
@@ -73,8 +151,9 @@ The native-signed service membership permits particular agent operations.
 Neither one substitutes for the other. The gateway cannot grant itself more
 authority by issuing an API token or changing its database.
 
-The gateway is a decrypting R9 endpoint. It can read the requests/results it
-serves; the third-party app can read the content returned to it. Discord also
+The gateway is a decrypting R9 endpoint on the user's selected infrastructure.
+It can read the requests/results it serves; the third-party app can read the
+content returned to it. Discord also
 receives content posted there. Explain this in the connection consent screen.
 Direct SDK clients instead terminate encryption themselves. Station remains
 unable to read R9 payloads in either path. Gateway authorization does not grant
@@ -100,11 +179,12 @@ Atem run independently of that Mac. An Atem host must still be reachable.
    the host-pairing ceremony as a service proof or invent another signed object.
 4. A trusted native manager reviews and approves the exact request using fresh
    Touch ID, Face ID or the OS-supported password/passcode fallback. Bind the
-   keys, principal, account/genesis, scopes, expiry, nonces and predecessor as
-   required by the R9 ceremony. Verify the configured endpoint through TLS and
-   bind its origin to the setup request; do not insert an unsupported origin
-   field into an R9 signed body. A changed request or membership head invalidates
-   the confirmation. Reuse the core's builders and verifier; missing transport/UI
+   exact existing `add` or `set_roles` body, including the keys, principal,
+   account/genesis, scopes, expiry and predecessor. Keep single-use setup context
+   and endpoint-origin binding in the application workflow; they are not extra
+   fields or a new service ceremony in R9. Verify the configured endpoint through
+   TLS. A changed request or membership head invalidates the confirmation.
+   Reuse the core's builders and verifier; missing transport/UI
    APIs require joint review, not new signatures.
 5. Durably commit the signed authorization and provisioning state. Keep the
    integration pending until the relevant host has accepted its service identity.
@@ -210,8 +290,22 @@ credentials/integrations. Expiry cannot be postponed by reconnect or restart.
 
 ## API shape and real-time events
 
+Keep three API responsibilities explicit, even if deployments share a domain:
+
+| API | Authenticates | Handles |
+| --- | --- | --- |
+| Agora.Build account API | Auth-issued account/admin grants for that resource. | Account and setup coordination; no private agent/data payloads. |
+| Station data/transport API | Its registered routing/storage grants, plus existing signed/encrypted object checks. | Ciphertext storage/sync, signed records and opaque R9 transport; login is not decryption authority. |
+| Optional private agent API | API credentials issued/validated by that private endpoint. | Scoped plaintext agent operations backed by its manager-authorized R9 service identity. |
+
+The single Integrations UI is not a single shared API-token authority. A token
+for Agora.Build must not work as a private agent API credential, and a private
+agent token must not work as Station device proof or an account-admin token.
+
 Proposed Portal management family: `/api/v1/integrations`. It owns account UI
-metadata and provisioning requests. The native approval record and gateway
+references and setup coordination, not private content or a proxy to the agent.
+Detailed private configuration and token issuance/validation belong to the
+chosen private service's API. The native approval record and gateway
 activation remain cryptographically verified product operations, not database
 fields the browser can set to true. Portal authenticates its own session/token
 and protects cookie-based writes against CSRF.
@@ -264,8 +358,9 @@ conversation scope or authority just because they use the same global bot.
 
 ## Implementation order and acceptance
 
-1. Jointly review ownership, service-to-account Auth admission and the gateway
-   endpoint/privacy contract. Retain separate Station registration and existing
+1. Jointly review private-data custody, implementation ownership,
+   service-to-account Auth admission and the private API endpoint/privacy
+   contract. Retain separate Station registration and existing
    live R9 release gates; this design does not close them.
 2. Implement one custom integration with native-approved service enrollment,
    hashed API credentials and the minimal gateway methods/events. Use the actual
@@ -283,7 +378,9 @@ late/duplicate owner confirmation; crash between signing/publication/activation;
 lost token response; expiry and token rotation across replicas; pending host;
 revocation of a token versus a service; reconnect after durable prompt acceptance;
 approval races; Discord actor/channel isolation and interaction replay; Mac-off
-operation; and evidence that Station has no plaintext or endpoint private keys.
+operation; two accounts sharing one Station without cross-account access; an
+independently hosted Station/private API; and evidence that the opaque Station
+core and Agora.Build backend receive no private plaintext or endpoint keys.
 
 ## Current shared-core constraints and review gaps
 
@@ -327,17 +424,20 @@ or request an R9 change.
 
 | Owner | Needed before implementation |
 | --- | --- |
-| Portal | Accept ownership of the single Integrations page/catalog, metadata and OAuth installation UX; propose its management API and native handoff. |
+| Agora.Build / Portal | Own the single Integrations page/catalog, permitted account references and installation UX; define direct private-service setup without proxying or storing private content/secrets. |
 | Auth | Specify service delegation and renewal, the exact API audiences/scopes and revocation behavior; distinguish owner account from service principal. Native PKCE login already exists. |
-| Astation | Own native service enrollment and the gateway/connector application boundary; propose key storage, provisioning/receipt persistence, raw-token lifecycle, deployment origin and retention limits. |
-| Station | Confirm routing/privacy/storage integration for delegated services while remaining an opaque relay. This stays within Astation's relay ownership. |
+| Astation | Own native confirmation and signed service enrollment, trusted project-scope preparation and protected local state. No hosted plaintext gateway is assigned to the native app. |
+| Station | Own private ciphertext storage/routing and account isolation for self-hosted/shared deployments; review separate optional API/connector packaging without merging its trust boundary into the core. |
+| Private API / connector owner, to be assigned | Propose user-hosted deployment, key storage, provisioning/receipt persistence, raw-token lifecycle, endpoint and retention. A central Agora.Build decrypting service is not the default. |
 | Atem | Confirm service scope/enrollment/SDK operations needed by the gateway against the current contract; identify missing bindings or fixtures. No R9 wire change is assumed or signed off here. |
 
-Recommended assignment: Portal builds the user-facing management surface;
-Astation builds native authorization and agent gateway/Discord behavior;
-Auth supplies supported identity/delegation contracts; Atem supplies host/core
-capabilities. Resolve owner feedback here before turning proposals into API
-or deployment requirements. No product code, production rollout or trust reset
+Recommended assignment: Agora.Build builds account management and integration
+setup; Station supplies the chosen private store and transport; Astation builds
+native authorization; Atem supplies host/core capabilities. Assign the separate
+private API/Discord implementation after reviewing its deployment and custody
+requirements. Auth supplies supported identity/delegation contracts. Resolve
+owner feedback here before turning proposals into API or deployment
+requirements. No product code, production rollout or trust reset
 is authorized by this design document.
 
 ## References

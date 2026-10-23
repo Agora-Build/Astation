@@ -57,8 +57,13 @@ This endpoint is not deployed until this branch is merged and deployed.
 
 For the proposed Discord/custom-app setup and simple Bearer-token gateway, see
 the [unified Integrations design](../designs/unified-integrations.md). That gateway
-is a separate decrypting application endpoint; it is not implemented by the
-opaque relay routes described here.
+is an optional decrypting endpoint on user-chosen infrastructure; it is not
+implemented by the opaque relay routes described here. Agora.Build manages
+account/setup, while the chosen Station stores ciphertext and routes encrypted
+traffic. A raw-token agent API issues/validates its own credentials and needs
+separate native-authorized service membership. A shared relay must not gain
+plaintext access merely by hosting the transport; its operator is an additional
+trusted reader if the user also hosts the decrypting gateway on that machine.
 
 `GET /api/remote/v1/channels?genesis={genesis_hash}&host={host_id}` upgrades to
 WebSocket. Use WSS and an `Authorization: Bearer` account token. Never put the
