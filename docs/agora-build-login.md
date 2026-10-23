@@ -1,7 +1,8 @@
 # agora.build login and Agora projects
 
 Astation's account login uses agora.build OIDC, not the Agora Console OAuth
-flow. Settings > Account contains sign-in, account identity and recovery.
+flow. Settings > Account contains one sign-in and account identity.
+Recovery Kit and restore actions live under Settings > Security.
 Agora Projects contains the linked Agora connection status, **Manage Agora
 Connection...** (or **Connect Agora Account...**) and **Refresh Projects**.
 Settings > General groups the editable environment settings and direct
@@ -140,9 +141,10 @@ The relay account/recovery API has a separate audience and grant. Its existing
 `ASTATION_ACCOUNT_RESOURCE` / `ASTATION_ACCOUNT_SCOPE` and matching
 `ACCOUNT_OIDC_ISSUER` / `ACCOUNT_OIDC_AUDIENCE` /
 `ACCOUNT_OIDC_REQUIRED_SCOPE` remain explicit operator configuration. Astation
-can obtain that separate grant through the same browser SSO after portal login;
-it checks that both subjects agree. Settings > Account also permits authorizing
-or signing out this recovery grant separately, including isolated relay tests.
+obtains that separate grant through the normal browser SSO after portal login
+when the relay resource is configured; it checks that both subjects agree.
+The grant is an internal authorization detail with no separate recovery
+sign-in block. Security explains when online recovery is not configured.
 Portal access tokens never authenticate relay recovery. The native client must be registered for the relay resource
 and scope too. Fresh offline merge still requires verified `auth_time` in an
 API token; an ID token's timestamp is not substituted.
@@ -185,3 +187,8 @@ passes 1,002 tests with 16 environment skips and zero failures. All five
 account boundary tests pass without skips in the existing provisioned host,
 including the protected offline-cache Keychain round trip. These controlled
 tests do not replace the live user-login and deployment checks above.
+
+The recovery UI cleanup passes 32 focused account-settings, linked-project and
+recovery-coordinator tests with zero skips or failures. It removes the
+standalone relay sign-in controls while retaining the normal sign-in's
+separate relay grant and the Security recovery flows.

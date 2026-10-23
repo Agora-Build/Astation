@@ -23,7 +23,6 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var sidebarTable: NSTableView?
     private let hubManager: AstationHubManager
     private lazy var accountController = AccountSettingsViewController(hub: hubManager)
-    private lazy var recoveryAccountController = AccountSettingsViewController(hub: hubManager, forRelayRecovery: true)
     private let shortcutsController: KeyboardShortcutsViewController
     private let recordingController: AudioRecordingViewController
     private let transcriptionController: TranscriptionViewController
@@ -266,12 +265,9 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true; scroll.drawsBackground = false
         let document = FlippedSettingsView()
-        let divider = NSBox(); divider.boxType = .separator
-        let content = NSStackView(views: [accountController.view, divider, recoveryAccountController.view])
-        content.orientation = .vertical; content.alignment = .leading; content.spacing = 24
+        let content = accountController.view
         document.addSubview(content); scroll.documentView = document
         for view in [document, content] { view.translatesAutoresizingMaskIntoConstraints = false }
-        for view in content.arrangedSubviews { view.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true }
         NSLayoutConstraint.activate([
             document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
             content.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 24),
@@ -537,6 +533,9 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         content.addArrangedSubview(wrappingInfo(
             "Save your Recovery Kit v2 somewhere off this Mac. It anchors your account's signed device list and restores encrypted data if your trusted devices are lost."
         ))
+        if hubManager.accountAuth.configuration == nil {
+            content.addArrangedSubview(wrappingInfo("Online recovery is not configured for this build."))
+        }
         let idLabel = NSTextField(labelWithString: "Astation ID: \(RecoveryKit.masked(AstationIdentity.shared.id))")
         idLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         content.addArrangedSubview(idLabel)

@@ -562,20 +562,6 @@ class AstationHubManager: ObservableObject {
         accountSessionChanged()
     }
 
-    @MainActor func signInRelayAccount() async throws {
-        let auth = accountAuth
-        let epoch = accountGeneration
-        try await auth.signIn()
-        let relay = try await auth.current()
-        let portal = try await portalAuth?.current()
-        guard epoch == accountGeneration else { throw AccountLoginError.changed }
-        if let portalSubject = portal?.session.subject, relay?.session.subject != portalSubject {
-            try await auth.clearSession()
-            throw AccountLoginError.changed
-        }
-        accountSessionChanged()
-    }
-
     @MainActor func updateAccountServices(_ settings: AccountServiceSettings) async throws {
         guard settings != portalSettings else { return }
         try await signOutAccount()
