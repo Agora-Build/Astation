@@ -5,6 +5,10 @@ flow. Settings > Account contains one sign-in and account identity.
 Recovery Kit and restore actions live under Settings > Security.
 Agora Projects contains the linked Agora connection status, **Manage Agora
 Connection...** (or **Connect Agora Account...**) and **Refresh Projects**.
+**Refresh Projects** follows **Generate Token...** in the top row. The bottom
+row combines connection status and the loaded-project count, with the
+Manage/Connect button on the right. Saved-project and error details use that
+same footer.
 Settings > General groups the editable environment settings and direct
 WebSocket addresses in one **Servers & Connections** block:
 

@@ -8,7 +8,6 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
     private var tableView: NSTableView!
     private var statusLabel: NSTextField!
     private var selectionToast: NSTextField!
-    private let connectionLabel = NSTextField(wrappingLabelWithString: "")
     private lazy var manageConnectionButton = NSButton(title: "Connect Agora Account...", target: self, action: #selector(openConnections))
     private lazy var refreshButton = NSButton(title: "Refresh Projects", target: self, action: #selector(refreshProjects))
     private var certificateVisibility: [String: Bool] = [:]
@@ -68,21 +67,11 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         tokenButton.imagePosition = .imageLeading
         tokenButton.toolTip = "Generate a token for the selected project, or inspect an existing token."
 
-        let header = NSStackView(views: [headerLabel, selectionToast, tokenButton])
+        refreshButton.bezelStyle = .rounded
+        let header = NSStackView(views: [headerLabel, selectionToast, tokenButton, refreshButton])
         header.orientation = .horizontal
         header.alignment = .centerY
         header.spacing = 12
-
-        connectionLabel.font = .systemFont(ofSize: 12)
-        connectionLabel.textColor = .secondaryLabelColor
-        [manageConnectionButton, refreshButton].forEach { $0.bezelStyle = .rounded }
-        let connectionActions = NSStackView(views: [manageConnectionButton, refreshButton])
-        connectionActions.spacing = 10
-        let connection = NSStackView(views: [connectionLabel, connectionActions])
-        connection.orientation = .vertical
-        connection.alignment = .leading
-        connection.spacing = 8
-        connectionLabel.widthAnchor.constraint(equalTo: connection.widthAnchor).isActive = true
 
         // Table in scroll view
         let scrollView = NSScrollView()
@@ -137,13 +126,19 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
         table.addTableColumn(createdCol)
 
         scrollView.documentView = table
-        contentView.addSubview(scrollView)
         self.tableView = table
 
-        // Status label
-        statusLabel = NSTextField(labelWithString: "")
+        // Keep connection controls and status together below the project list.
+        statusLabel = NSTextField(wrappingLabelWithString: "")
         statusLabel.font = NSFont.systemFont(ofSize: 11)
-        for child in [header, connection, scrollView, statusLabel!] {
+        statusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        manageConnectionButton.bezelStyle = .rounded
+        let footer = NSStackView(views: [statusLabel, manageConnectionButton])
+        footer.orientation = .horizontal
+        footer.alignment = .centerY
+        footer.spacing = 12
+        for child in [header, scrollView, footer] {
             child.translatesAutoresizingMaskIntoConstraints = false
             contentView.addSubview(child)
         }
@@ -151,16 +146,13 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
             header.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 16),
             header.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
             header.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
-            connection.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 12),
-            connection.leadingAnchor.constraint(equalTo: header.leadingAnchor),
-            connection.trailingAnchor.constraint(equalTo: header.trailingAnchor),
-            scrollView.topAnchor.constraint(equalTo: connection.bottomAnchor, constant: 14),
+            scrollView.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 14),
             scrollView.leadingAnchor.constraint(equalTo: header.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: header.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: statusLabel.topAnchor, constant: -12),
-            statusLabel.leadingAnchor.constraint(equalTo: header.leadingAnchor),
-            statusLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor),
-            statusLabel.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -12)
+            scrollView.bottomAnchor.constraint(equalTo: footer.topAnchor, constant: -12),
+            footer.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+            footer.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -12)
         ])
         refreshTable()
 
@@ -180,7 +172,10 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
             statusLabel?.textColor = .systemRed
         } else {
             let count = hubManager.getProjects().count
-            statusLabel?.stringValue = "\(count) project\(count == 1 ? "" : "s") loaded"
+            let loaded = "\(count) project\(count == 1 ? "" : "s") loaded"
+            statusLabel?.stringValue = hubManager.agoraConnection?.connected == true
+                ? "Agora connected. \(loaded)"
+                : "\(loaded). Connect an Agora account in the portal."
             statusLabel?.textColor = .secondaryLabelColor
         }
     }
@@ -201,10 +196,6 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
     private func refreshTable() {
         tableView?.reloadData()
         let agora = hubManager.agoraConnection
-        connectionLabel.stringValue = agora?.connected == true
-            ? "Agora connected\(agora?.name.map { " (\($0))" } ?? ""). \(hubManager.projects.count) projects."
-            : hubManager.usingSavedProjects ? "Using saved Agora projects."
-            : "Agora projects become available after you connect an Agora account in the portal."
         manageConnectionButton.title = agora?.connected == true ? "Manage Agora Connection..." : "Connect Agora Account..."
         manageConnectionButton.isEnabled = hubManager.portalSettings != nil
         refreshButton.isEnabled = hubManager.signedInAccount != nil
