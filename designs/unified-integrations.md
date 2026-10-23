@@ -92,9 +92,12 @@ Atem run independently of that Mac. An Atem host must still be reachable.
    Proposed expiry default: 30 days; the agreed service maximum is 90 days.
 3. Identify the endpoint. For hosted access, the gateway generates a dedicated
    service identity and retains its private key in protected server storage.
-   A direct SDK client generates its own keys locally. Verify possession through
-   the existing shared-core enrollment ceremony; Portal never accepts a claimed
-   public key as completed enrollment.
+   A direct SDK client generates its own keys locally. Bind its public key and
+   account/genesis to the authenticated setup request reviewed by the manager.
+   Existing R9 has no separate service-enrollment possession-proof ceremony:
+   the host first verifies possession through `sig_c` at channel admission.
+   A claimed public key alone is not an active integration; do not describe
+   the host-pairing ceremony as a service proof or invent another signed object.
 4. A trusted native manager reviews and approves the exact request using fresh
    Touch ID, Face ID or the OS-supported password/passcode fallback. Bind the
    keys, principal, account/genesis, scopes, expiry, nonces and predecessor as
@@ -106,6 +109,8 @@ Atem run independently of that Mac. An Atem host must still be reachable.
 5. Durably commit the signed authorization and provisioning state. Keep the
    integration pending until the relevant host has accepted its service identity.
    A committed log entry with an offline host is not proof that host is ready.
+   The gateway verifies its own service `welcome` against the trusted chain/head
+   including its membership entry; no new host-acknowledgment message is assumed.
 6. Finish the connection: reveal a custom API token once, complete Discord's
    setup automatically, or deliver public enrollment metadata to the SDK client.
    Only an active authorization can expose usable agent access.
@@ -140,6 +145,11 @@ exchange is unnecessary for the first custom-client API. It does not refresh
 itself. Rotation issues a new credential within the existing authorization;
 renewing or expanding R9 authorization needs native manager confirmation.
 The official Discord integration need not mint a user-visible API token.
+Renewal or narrowing through `set_roles` always fences the existing channel,
+lease and queued work, even when it only extends expiry. Open a fresh channel
+and reconcile uncertain receipts without replay; do not promise seamless renewal.
+The verifier's 90-day check is relative to `signed_at`. The native signer must
+use the current time, never forward-date it to stretch an authorization.
 
 Short-lived service routing tokens may renew unattended within the approved
 service delegation. Renewing a login token is not fresh user authentication
@@ -158,12 +168,23 @@ not a reason to change the R9 cryptographic identity model.
 
 ## Permissions and lifecycle
 
-Use the same permissions for Discord and custom clients. Start with session
-discovery, reading chat/results, sending prompts, and optional approval answers.
-Interrupt/stop and terminal control are separate choices. File uploads, remote
+Use the same permissions for Discord and custom clients. R9 requires `view`,
+which includes registry, chat/history, terminal subscription and receipt queries
+within the selected target scope. A service grant cannot provide discovery-only
+or chat-without-terminal-viewing access; consent must describe that whole read
+capability. Gateway policy can further restrict what an API caller receives.
+Sending prompts and answering approvals are optional operations. Interrupt/stop
+and terminal input/resize are separate choices. File uploads, remote
 process launch, vault access, device management and redelegation are not implied.
 Map selections to the core's actual signed scope representation; do not invent
 another scope language on the relay.
+
+Session scopes bind actual process/session IDs and stop matching after agent
+relaunch; never silently widen them. Project scopes use existing `h1.<kid>.`
+hashes produced by a trusted native manager or host. Do not give account `K` to
+the gateway to compute them. A locked host credential agent leaves project
+comparison unavailable and affected sessions out of scope. Key rotation and
+retained-generation behavior need explicit coverage before offering that filter.
 
 Every request is limited by the intersection of the caller credential, current
 integration policy and host-verified R9 authorization. An API token cannot widen
@@ -263,6 +284,44 @@ lost token response; expiry and token rotation across replicas; pending host;
 revocation of a token versus a service; reconnect after durable prompt acceptance;
 approval races; Discord actor/channel isolation and interaction replay; Mac-off
 operation; and evidence that Station has no plaintext or endpoint private keys.
+
+## Current shared-core constraints and review gaps
+
+[Atem's service-path review](https://github.com/Agora-Build/Astation/issues/65#issuecomment-6376801806)
+was checked against immutable host/core pin
+`6526e1cf602f01ebc33893698c2b1d588c8f889e`. The
+[contract](https://github.com/Agora-Build/Atem/blob/6526e1cf602f01ebc33893698c2b1d588c8f889e/designs/protocol/atem-session-v1.md)
+and [bindings](https://github.com/Agora-Build/Atem/blob/6526e1cf602f01ebc33893698c2b1d588c8f889e/designs/protocol/atem-client-bindings.md)
+remain authoritative. This review does not approve additional gateway authority
+or request an R9 change.
+
+- Services have no encryption key for push hints. The gateway receives approvals
+  while attached; it cannot rely on native push delivery to wake it.
+- Shipped bindings exclude `SoftwareKeyStore`. A hosted client needs its own
+  protected key provider or the existing deferred-signature path. Typed service
+  member/scope builders and a project-hash helper are absent; use the verifier's
+  schema checks, never another wire/signature implementation. Select the server
+  runtime and matching tested package after ownership review.
+- Atem reports missing service binding coverage for admission/welcome, scope
+  refusals and expiry, plus host scenarios for approval/seen, session and host
+  restrictions, live renewal/narrowing, grant revocation, K rotation and refusal
+  as a held-host reconciler. Add these to the joint acceptance plan; ordinary
+  native or Rust bot success is insufficient binding/platform evidence.
+- Under the current contract a service with control can `revoke_grant` browser
+  companions on a permitted host even without a corresponding selected operation.
+  The gateway API need not expose that method, but this does not narrow host
+  authority of the service key. Keep this capability visible in the owner/security review and
+  require a focused regression before activation; no narrower host guarantee
+  is claimed by this draft.
+- Logs allow at most 1,024 entries and 256 members; renewals/removals consume
+  entries and IDs are not reused. Capacity planning and truthful exhaustion
+  handling are required. Automatic re-pair, compaction or rollover is not
+  authorized by this proposal.
+- Service channels expire with their grant, subject to record/byte limits;
+  the native channel's fixed 24-hour lifetime does not apply. The gateway can
+  voluntarily close and establish a fresh handshake using the existing
+  protocol. Its connection/receipt-recovery policy still needs review; this
+  draft chooses neither a new host lifetime nor a default reconnect interval.
 
 ## Review and assignment requests
 
