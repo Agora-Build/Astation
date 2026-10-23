@@ -19,7 +19,8 @@ overridden fields are read-only. The app uses HTTPS base URLs, allowing HTTP
 only on explicit loopback development hosts.
 
 Changing an environment signs out the active app account sessions and fences
-pending logins, refreshes and project/certificate responses. Keychain storage
+pending logins, refreshes and project/certificate responses, and clears the
+saved project credentials. Keychain storage
 is isolated by portal, issuer, client ID and resource. Account tokens are never
 sent to an old/new environment interchangeably, to the Agora BFF, or through
 `credentialSync`. Device keys, paired Atems, trust records, Recovery Kit and
@@ -34,8 +35,36 @@ encrypted data are retained. Login does not enroll or verify devices.
 3. Return to Astation and choose **Refresh Projects**. A connected Agora
    account's project names and App IDs populate the existing Projects UI.
 4. Astation fetches a project's certificate when selecting it for media, using
-   Token Tools, or revealing/copying its certificate. It keeps certificates in
-   memory, verifies the returned project/App ID binding, and never logs them.
+   Token Tools, or revealing/copying its certificate. It verifies the returned
+   project/App ID binding and caches the linked projects and certificates in
+   the Data Protection Keychain (`WhenUnlockedThisDeviceOnly`), scoped to the
+   portal, issuer, client, resource and account. It never logs certificates or
+   stores them in preferences or ordinary project files.
+
+### Local token generation and offline use
+
+RTC and RTM tokens use the existing shared Atem token library on this Mac.
+Creating a token does not call the portal when the project's certificate has
+already been loaded. Custom App ID/certificate generation and token inspection
+continue to work locally too. Portal also offers a server-side token API, but
+the user chose local generation to avoid a network dependency per token.
+
+Previously loaded credentials survive an app restart through the protected
+Keychain cache. Astation restores them only for the same saved account and
+environment, and shows the saved-project timestamp when online refresh is
+unavailable. Select each desired project while online before using it offline;
+an uncached certificate still needs an online fetch. Expired or interrupted
+OIDC refresh does not turn cached service credentials into an account token:
+local generation can continue, while online account/relay APIs still require a
+valid, correctly scoped grant.
+
+**Refresh Projects** updates the project list and selected project's certificate.
+Removed/replaced projects are removed from the cache; a successful selected
+certificate response replaces the old value, including a null certificate.
+Signing out, changing environments, a disconnected Agora account, or a
+definitive project-access refusal clears the cache. Offline operation cannot
+learn about a server-side change until the next successful refresh. This cache
+does not authorize device enrollment, recovery, remote control or r9 routing.
 
 The portal holds and refreshes the upstream Agora connection. Connecting an
 Agora account grants access to resources; it does not change the agora.build
@@ -53,7 +82,7 @@ to the Atem agent; an agora.build token must never masquerade as an Agora token.
 Source reviewed on 2026-10-23:
 
 - Auth `059c6d94b2985b60531b3e47445329407dd13e73`, `docs/integrating.md`.
-- Portal `52096c566079c182ae402d7dcf169a6a7c4abdfb`, `docs/platform.md`,
+- Portal `3fb16b2859f0eec164dfcb3b85c5a8bd163a27cf`, `docs/platform.md`,
   `scripts/serve.mjs`, `scripts/connections.mjs`.
 
 | Call to configured portal | Required scope | Response |
@@ -61,6 +90,7 @@ Source reviewed on 2026-10-23:
 | `GET /api/connections` | `agora:projects` | `{agora:{ready,connect,connected,name?}}` |
 | `GET /api/connections/agora/projects` | `agora:projects` | `{projects:[{projectId,appId,name,status}]}` |
 | `POST /api/connections/agora/certificate`, JSON `{projectId}` | `agora:certificates` | `{projectId,appId,certificate}`; certificate can be null |
+| `POST /api/connections/agora/token` (optional server API, not used for native token creation) | `agora:tokens` | Signs RTC/RTM tokens with the same pinned Atem library; certificate stays on Portal |
 
 These APIs already accept bearer tokens. No new project API is requested.
 Bearer requests use an ephemeral, cookie-free HTTP session with redirects
@@ -100,18 +130,20 @@ and scope too. Fresh offline merge still requires verified `auth_time` in an
 API token; an ID token's timestamp is not substituted.
 
 Live unauthenticated checks confirmed dev discovery and portal auth config,
-and a 401 for an unsigned project request. They do not establish a completed
+a 401 for an unsigned project request, and that native `astation` authorization
+with the documented loopback/resource/scopes reaches the login interaction
+without an OAuth registration error. They do not establish a completed
 user login, linked-project access or deployed relay issuer configuration.
 Complete those checks with the user's own sign-in. No production merge,
 deployment, trust migration or credential reset is part of this change.
 
 ## Validation
 
-On 2026-10-23, the full app suite passes 995 tests (15 environment skips), the
-native library passes 123 tests (one opt-in integration skip), and the relay
-passes 513 tests (119 environment ignores). Four account boundary tests also
-pass with zero skips in the existing provisioned personal-team XCTest host,
-including secure Keychain read/write/delete under a disposable service.
+On 2026-10-23, the login baseline at `a14c9eb` passes the full app suite (995
+tests, 15 environment skips), native library (123 tests, one opt-in integration
+skip), and relay (513 tests, 119 environment ignores). Four account boundary
+tests also pass with zero skips in the existing provisioned personal-team
+XCTest host, including Keychain read/write/delete under a disposable service.
 The loopback issuer's consent, signed-token/PKCE and refresh-rotation test
 passes with the current account-ID format.
 
@@ -119,5 +151,19 @@ New regressions cover configurable URL precedence and validation, missing
 Agora connections, audience/scope checks, malformed/legacy subjects,
 certificate/project binding, project replies arriving after logout or server
 changes, late certificate replies after project removal, and General layout
-at the minimum window width. These controlled tests do not replace the live
-user-login and deployment checks listed above.
+at the minimum window width.
+
+The offline follow-up passes all 19 focused settings, project and Token Tools
+tests with zero skips. It adds repeated local generation with no API requests,
+offline restoration after restart, expired/interrupted OIDC refresh, certificate
+rotation, unlink/removal invalidation, account/environment isolation and late
+certificate responses after logout being unable to restore the cache.
+
+The current 1,002-test local run encounters three existing protected Secure
+Enclave failures and one existing native caption-scroll failure while the
+console is locked. The provisioned account/cache tests also cannot access
+`WhenUnlocked` Keychain items in that state. Rerun these after unlocking; the
+new offline-cache Keychain round trip is not claimed as passed yet. These
+controlled tests do not replace the live user-login and deployment checks above.
+Excluding the four locked-session cases, the remaining 998 tests pass with 14
+environment skips and zero failures.

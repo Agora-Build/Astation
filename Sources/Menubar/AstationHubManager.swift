@@ -45,14 +45,15 @@ class AstationHubManager: ObservableObject {
     private var projectLoadTask: Task<Void, Never>?
     private var accountGeneration = UUID()
     private var portalProjects: [String: PortalAPIClient.Project] = [:]
+    private var projectCache: PortalProjectCache?
+    @Published private(set) var projectCacheUpdatedAt: Date?
+    @Published private(set) var usingSavedProjects = false
 
     private static func makePortalAuth(settings: AccountServiceSettings?) -> AstationAccountAuth? {
         guard let settings, let config = try? settings.oidcConfiguration else { return nil }
         // Include the destination as well as the issuer/audience in credential storage isolation.
-        let context = SHA256.hash(data: Data((settings.portalURL + "|" + config.issuer + "|" + config.clientID + "|" + config.resource).utf8))
-            .map { String(format: "%02x", $0) }.joined()
         return AstationAccountAuth(configuration: config,
-            storage: AccountKeychainStorage(service: "build.agora.astation.portal-account-v1." + context))
+            storage: AccountKeychainStorage(service: "build.agora.astation.portal-account-v1." + settings.storageContext))
     }
     let rtcManager = RTCManager()
     let authGrantController = AuthGrantController()
@@ -291,6 +292,7 @@ class AstationHubManager: ObservableObject {
         portalSettings: AccountServiceSettings? = try? AccountServiceSettings.load(),
         portalAuth: AstationAccountAuth? = nil,
         portalAPI: PortalAPIClient = PortalAPIClient(),
+        projectCache: PortalProjectCache? = nil,
         accountDefaults: UserDefaults = .standard
     ) {
         self.accountDefaults = accountDefaults
@@ -298,6 +300,7 @@ class AstationHubManager: ObservableObject {
         self.portalSettings = portalSettings
         self.portalAuth = portalAuth ?? Self.makePortalAuth(settings: portalSettings)
         self.portalAPI = portalAPI
+        self.projectCache = projectCache ?? portalSettings.map(PortalProjectCache.init(settings:))
         self.deviceSessionStore = deviceSessionStore
         self.sessionStore = sessionStore
         self.makeIdentityRelayTask = makeIdentityRelayTask
@@ -518,6 +521,8 @@ class AstationHubManager: ObservableObject {
         accountGeneration = UUID()
         projectLoadTask?.cancel()
         projects = []; selectedProject = nil; portalProjects = [:]; agoraConnection = nil; signedInAccount = nil
+        projectCacheUpdatedAt = nil; usingSavedProjects = false
+        try projectCache?.clear()
         let epoch = accountGeneration
         try await portalAuth.signIn()
         let primary = try await portalAuth.current()
@@ -544,6 +549,8 @@ class AstationHubManager: ObservableObject {
         projectLoadTask?.cancel()
         signedInAccount = nil; agoraConnection = nil
         projects = []; selectedProject = nil; portalProjects = [:]
+        projectCacheUpdatedAt = nil; usingSavedProjects = false
+        try projectCache?.clear()
         try await oldPortal?.clearSession()
         guard epoch == accountGeneration else { throw AccountLoginError.changed }
         try await oldRelay.clearSession()
@@ -573,6 +580,7 @@ class AstationHubManager: ObservableObject {
         // Environment overrides remain authoritative; show the effective values in the form.
         portalSettings = try AccountServiceSettings.load(defaults: accountDefaults)
         portalAuth = Self.makePortalAuth(settings: portalSettings)
+        projectCache = portalSettings.map(PortalProjectCache.init(settings:))
         accountAuth = AstationAccountAuth(defaults: accountDefaults)
         accountSessionChanged()
     }
@@ -635,7 +643,16 @@ class AstationHubManager: ObservableObject {
                 guard epoch == accountGeneration, !Task.isCancelled else { return }
                 signedInAccount = record?.session.subject
                 guard record != nil else { throw AccountLoginError.signInRequired }
+                if projects.isEmpty, let cached = try projectCache?.load(subject: record!.session.subject) {
+                    portalProjects = Dictionary(uniqueKeysWithValues: cached.metadata.map { ($0.appId, $0) })
+                    projects = cached.projects
+                    selectedProject = projects.first
+                    projectCacheUpdatedAt = cached.updatedAt
+                    usingSavedProjects = true
+                    NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
+                }
                 let token = try await auth.accessToken()
+                guard epoch == accountGeneration, !Task.isCancelled else { return }
                 let connection = try await portalAPI.connection(settings: settings, token: token)
                 guard epoch == accountGeneration, !Task.isCancelled else { return }
                 agoraConnection = connection
@@ -643,40 +660,82 @@ class AstationHubManager: ObservableObject {
                 guard connection.connected else { throw PortalAPIError.connectAgora }
                 let fetched = try await portalAPI.projects(settings: settings, token: token)
                 guard epoch == accountGeneration, !Task.isCancelled else { return }
+                let previousMetadata = portalProjects
+                let previousProjects = Dictionary(uniqueKeysWithValues: projects.map { ($0.id, $0) })
                 portalProjects = Dictionary(uniqueKeysWithValues: fetched.map { ($0.appId, $0) })
-                projects = fetched.map(\.localProject)
+                projects = fetched.map { remote in
+                    let old = previousMetadata[remote.appId]?.projectId == remote.projectId ? previousProjects[remote.appId] : nil
+                    return AgoraProject(id: remote.appId, name: remote.name, vendorKey: remote.appId,
+                        signKey: old?.signKey ?? "", status: remote.status, created: 0)
+                }
                 selectedProject = projects.first(where: { $0.id == selectedProject?.id }) ?? projects.first
+                projectCacheUpdatedAt = Date(); usingSavedProjects = false
+                try saveProjectCache()
                 projectLoadError = nil
                 if let id = selectedProject?.id {
-                    do { _ = try await projectWithCertificate(id: id) }
+                    do { _ = try await projectWithCertificate(id: id, refresh: true) }
                     catch { if epoch == accountGeneration { projectLoadError = error.localizedDescription } }
                 }
                 guard epoch == accountGeneration, !Task.isCancelled else { return }
                 NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
             } catch {
                 guard epoch == accountGeneration, !Task.isCancelled else { return }
-                projects = []; selectedProject = nil; portalProjects = [:]
-                projectLoadError = error.localizedDescription
+                if !projects.isEmpty, signedInAccount != nil,
+                   Self.isProjectNetworkFailure(error) || error as? AccountLoginError == .signInRequired {
+                    usingSavedProjects = true
+                    projectLoadError = error as? AccountLoginError == .signInRequired
+                        ? "Using saved projects. Sign in again to refresh online access."
+                        : "Offline. Using saved projects and local token generation."
+                } else {
+                    projects = []; selectedProject = nil; portalProjects = [:]
+                    projectCacheUpdatedAt = nil; usingSavedProjects = false
+                    do { try projectCache?.clear() }
+                    catch { Log.warn("[AstationHub] Could not clear the linked-project Keychain cache") }
+                    projectLoadError = error.localizedDescription
+                }
                 NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
             }
         }
     }
 
-    /// Fetch certificates only when a feature actually needs one; never log or persist them.
-    @MainActor func projectWithCertificate(id: String) async throws -> AgoraProject {
+    private static func isProjectNetworkFailure(_ error: Error) -> Bool {
+        if error as? PortalAPIError == .unavailable || error as? AccountLoginError == .unavailable { return true }
+        guard let error = error as? URLError else { return false }
+        return [.notConnectedToInternet, .networkConnectionLost, .timedOut, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed].contains(error.code)
+    }
+
+    private func saveProjectCache() throws {
+        guard let subject = signedInAccount, let updatedAt = projectCacheUpdatedAt else { return }
+        try projectCache?.save(subject: subject, metadata: Array(portalProjects.values), projects: projects, updatedAt: updatedAt)
+    }
+
+    /// Cached credentials sign tokens locally, including offline. Project refresh fetches again.
+    @MainActor func projectWithCertificate(id: String, refresh: Bool = false) async throws -> AgoraProject {
         guard let project = projects.first(where: { $0.id == id }) else { throw PortalAPIError.invalidResponse }
-        if !project.signKey.isEmpty { return project }
+        if !refresh, !project.signKey.isEmpty { return project }
         guard let remote = portalProjects[id], let settings = portalSettings, let auth = portalAuth else {
             throw AccountLoginError.signInRequired
         }
         let epoch = accountGeneration
-        let token = try await auth.accessToken()
-        let result = try await portalAPI.certificate(project: remote, settings: settings, token: token)
+        let result: AgoraProject
+        do {
+            let token = try await auth.accessToken()
+            guard epoch == accountGeneration, !Task.isCancelled else { throw AccountLoginError.changed }
+            result = try await portalAPI.certificate(project: remote, settings: settings, token: token)
+        } catch {
+            if epoch == accountGeneration, !Task.isCancelled, !project.signKey.isEmpty, Self.isProjectNetworkFailure(error) {
+                usingSavedProjects = true
+                projectLoadError = "Offline. Using saved projects and local token generation."
+                return project
+            }
+            throw error
+        }
         guard epoch == accountGeneration, !Task.isCancelled,
               portalProjects[id]?.projectId == remote.projectId,
               let index = projects.firstIndex(where: { $0.id == id }) else { throw AccountLoginError.changed }
         projects[index] = result
         if selectedProject?.id == id { selectedProject = result }
+        try saveProjectCache()
         return result
     }
 

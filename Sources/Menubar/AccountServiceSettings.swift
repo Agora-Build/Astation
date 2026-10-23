@@ -1,5 +1,6 @@
 import Foundation
 import AstationRemote
+import CryptoKit
 
 extension Notification.Name {
     static let accountLoginChanged = Notification.Name("accountLoginChanged")
@@ -55,6 +56,11 @@ struct AccountServiceSettings: Equatable {
     }
 
     var accountURL: URL { URL(string: portalURL + "/account/")! }
+
+    var storageContext: String {
+        SHA256.hash(data: Data([portalURL, issuer, clientID, resource].joined(separator: "|").utf8))
+            .map { String(format: "%02x", $0) }.joined()
+    }
 
     static func baseURL(_ value: String) throws -> String {
         let text = value.trimmingCharacters(in: .whitespacesAndNewlines)

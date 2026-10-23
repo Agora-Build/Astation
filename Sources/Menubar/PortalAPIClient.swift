@@ -53,7 +53,7 @@ struct PortalAPIClient {
         return result.agora
     }
 
-    struct Project: Decodable {
+    struct Project: Codable {
         let projectId: String
         let appId: String
         let name: String

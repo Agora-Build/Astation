@@ -155,7 +155,11 @@ class ProjectsWindowController: NSObject, NSWindowDelegate {
     }
 
     private func updateStatusLabel() {
-        if let error = hubManager.projectLoadError {
+        if hubManager.usingSavedProjects {
+            let date = hubManager.projectCacheUpdatedAt?.formatted(date: .abbreviated, time: .shortened) ?? "an earlier session"
+            statusLabel?.stringValue = "Using saved projects from \(date). Token generation works offline."
+            statusLabel?.textColor = .secondaryLabelColor
+        } else if let error = hubManager.projectLoadError {
             statusLabel?.stringValue = "Error: \(error)"
             statusLabel?.textColor = .systemRed
         } else {

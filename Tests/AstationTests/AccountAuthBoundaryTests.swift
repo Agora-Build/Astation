@@ -4,6 +4,24 @@ import XCTest
 @testable import Menubar
 
 final class AccountAuthBoundaryTests: XCTestCase {
+    func testProvisionedProjectCacheIsDeviceLocalAndClearsOnlyItsOwnItem() throws {
+        let storage = AccountKeychainDataStorage(service: "build.agora.astation.test-projects-\(UUID())", account: "linked-projects")
+        let cache = PortalProjectCache(storage: storage)
+        defer { try? cache.clear() }
+        let subject = "ab01234567890123456789012345"
+        let metadata = PortalAPIClient.Project(projectId: "p1", appId: "app1", name: "Voice Lab", status: "active")
+        let project = AgoraProject(id: "app1", name: "Voice Lab", vendorKey: "app1", signKey: "test-certificate", status: "active", created: 0)
+        do { try cache.save(subject: subject, metadata: [metadata], projects: [project], updatedAt: Date()) }
+        catch {
+            if ProcessInfo.processInfo.environment["ASTATION_REQUIRE_KEYCHAIN_TESTS"] != "1" {
+                throw XCTSkip("Requires a provisioned XCTest host for Data Protection Keychain")
+            }
+            throw error
+        }
+        XCTAssertEqual(try cache.load(subject: subject)?.projects.first?.signKey, "test-certificate")
+        XCTAssertNil(try cache.load(subject: "ab99999999999999999999999999"))
+        try cache.clear(); XCTAssertNil(try cache.load(subject: subject))
+    }
     func testProvisionedAccountKeychainPreservesRotatingRefreshIntentAndClearsOnlyItsOwnItem() throws {
         let store = AccountKeychainStorage(service:"build.agora.astation.test-account-\(UUID())")
         defer { try? store.write(nil) }

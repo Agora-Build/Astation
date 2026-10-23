@@ -82,7 +82,10 @@ final class AccountSettingsViewController: NSViewController {
                 connection.stringValue = agora?.connected == true
                     ? "Agora connected\(agora?.name.map { " (\($0))" } ?? ""). \(hub.projects.count) projects."
                     : "Agora projects become available after you connect an Agora account in the portal."
-                if record != nil, let error = hub.projectLoadError { connection.stringValue = error }
+                if record != nil, hub.usingSavedProjects {
+                    let date = hub.projectCacheUpdatedAt?.formatted(date: .abbreviated, time: .shortened) ?? "an earlier session"
+                    connection.stringValue = "Using \(hub.projects.count) saved Agora projects from \(date). Tokens can be generated offline."
+                } else if record != nil, let error = hub.projectLoadError { connection.stringValue = error }
                 manage.title = agora?.connected == true ? "Manage Agora Connection..." : "Connect Agora Account..."
                 manage.isEnabled = hub.portalSettings != nil; refreshProjects.isEnabled = record != nil
             } catch {

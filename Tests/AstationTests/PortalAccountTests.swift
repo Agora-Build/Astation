@@ -24,16 +24,26 @@ private actor PortalHTTP: AccountOIDCHTTP {
         "/api/connections/agora/certificate": (#"{"projectId":"p1","appId":"app1","certificate":"test-certificate"}"#, 200)
     ]
     var gate: PortalGate?
-    func block(_ gate: PortalGate) { self.gate = gate }
+    var offline = false
+    var blockedPath = "/api/connections/agora/projects"
+    func goOffline() { offline = true }
+    func block(_ gate: PortalGate, path: String = "/api/connections/agora/projects") { self.gate = gate; blockedPath = path }
     func set(_ path: String, _ body: String, _ status: Int = 200) { responses[path] = (body, status) }
     func requests() -> [URLRequest] { calls }
     func send(_ request: URLRequest) async throws -> (Data, Int) {
         calls.append(request)
+        if offline { throw URLError(.notConnectedToInternet) }
         let path = request.url!.path
         let response = responses[path]!
-        if path == "/api/connections/agora/projects", let gate { await gate.wait() }
+        if path == blockedPath, let gate { await gate.wait() }
         return (Data(response.0.utf8), response.1)
     }
+}
+
+private final class PortalCacheStorage: AccountDataStorage {
+    private var data: Data?
+    func read() throws -> Data? { data }
+    func write(_ data: Data?) throws { self.data = data }
 }
 
 @MainActor private final class PortalHubFixture {
@@ -44,9 +54,12 @@ private actor PortalHTTP: AccountOIDCHTTP {
     let auth: AstationAccountAuth
     let hub: AstationHubManager
     let legacy: SsoSessionStore
-    let subject = "ab01234567890123456789012345"
+    let subject: String
+    let cacheStorage: PortalCacheStorage
     let legacySession = SsoSession(accessToken: "agora-service", refreshToken: "agora-refresh", expiresAt: UInt64.max, loginId: "service")
-    init(config: AccountServiceSettings, http: PortalHTTP) throws {
+    init(config: AccountServiceSettings, http: PortalHTTP, cacheStorage: PortalCacheStorage = PortalCacheStorage(),
+         subject: String = "ab01234567890123456789012345") throws {
+        self.subject = subject; self.cacheStorage = cacheStorage
         defaults = UserDefaults(suiteName: suite)!
         let authConfig = try config.oidcConfiguration
         storage = PortalAccountStorage(AccountLoginSession(configuration: authConfig, subject: subject,
@@ -59,7 +72,8 @@ private actor PortalHTTP: AccountOIDCHTTP {
         hub = AstationHubManager(skipProjectLoad: true,
             deviceSessionStore: SessionStore(storageURL: directory.appendingPathComponent("devices")), sessionStore: legacy,
             atemE2EIdentity: AtemE2EIdentity(storage: TestAtemStorage(), crypto: TestAtemCryptography()), sessionJournal: AtemSessionJournal(),
-            portalSettings: config, portalAuth: auth, portalAPI: PortalAPIClient(http: http), accountDefaults: defaults)
+            portalSettings: config, portalAuth: auth, portalAPI: PortalAPIClient(http: http),
+            projectCache: PortalProjectCache(storage: cacheStorage), accountDefaults: defaults)
     }
     func cleanup() { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
 }
@@ -80,6 +94,9 @@ final class AccountServiceSettingsTests: XCTestCase {
         XCTAssertEqual(try AccountServiceSettings.load(defaults: defaults,
             environment: ["ASTATION_PORTAL_URL":"https://override.example"], info: [:]).portalURL, "https://override.example")
         XCTAssertEqual(settings.accountURL.absoluteString, "https://portal.example/account/")
+        XCTAssertNotEqual(settings.storageContext, initial.storageContext)
+        XCTAssertNotEqual(settings.storageContext, try AccountServiceSettings(portalURL: settings.portalURL,
+            issuer: "https://other-auth.example", clientID: settings.clientID, resource: settings.resource).storageContext)
         for url in ["http://remote.example", "https://user:password@portal.example", "https://portal.example/path",
                     "https://portal.example?token=secret", "https://portal.example#x", "file:///tmp/account", "https://", "https://portal.example:0"] {
             XCTAssertThrowsError(try AccountServiceSettings.baseURL(url), url)
@@ -89,6 +106,8 @@ final class AccountServiceSettingsTests: XCTestCase {
 }
 
 @MainActor final class PortalAccountTests: XCTestCase {
+    private let appID = "0123456789abcdef0123456789abcdef"
+    private let certificate = "abcdef0123456789abcdef0123456789"
     private func settings(_ suffix: String = "") throws -> AccountServiceSettings {
         try AccountServiceSettings(portalURL: "https://portal\(suffix).example", issuer: "https://auth\(suffix).example",
             clientID: "astation-test", resource: "https://api\(suffix).example")
@@ -138,6 +157,116 @@ final class AccountServiceSettingsTests: XCTestCase {
         XCTAssertTrue(hub.projects.isEmpty)
         let calls = await http.requests()
         XCTAssertEqual(calls.map { $0.url!.path }, ["/api/connections"])
+    }
+
+    private func linkedHTTP() async -> PortalHTTP {
+        let http = PortalHTTP()
+        await http.set("/api/connections/agora/projects", "{\"projects\":[{\"projectId\":\"p1\",\"appId\":\"\(appID)\",\"name\":\"Voice Lab\",\"status\":\"active\"}]}")
+        await http.set("/api/connections/agora/certificate", "{\"projectId\":\"p1\",\"appId\":\"\(appID)\",\"certificate\":\"\(certificate)\"}")
+        return http
+    }
+
+    func testLocalTokensDoNotCallTheAPIAndSurviveAnOfflineRestart() async throws {
+        let config = try settings(), online = await linkedHTTP(), cache = PortalCacheStorage()
+        let first = try PortalHubFixture(config: config, http: online, cacheStorage: cache)
+        defer { first.cleanup() }
+        first.hub.refreshProjects()
+        await waitUntil { first.hub.selectedProject?.signKey == self.certificate }
+        let before = await online.requests().count
+        for uid in 1...3 {
+            let response = await first.hub.generateRTCToken(channel: "offline-room", uid: uid)
+            XCTAssertTrue(try AgoraTokenService.verify(response.token, certificate: certificate))
+        }
+        let after = await online.requests().count
+        XCTAssertEqual(after, before, "Token generation must not call Portal when the certificate is cached")
+        let offline = PortalHTTP(); await offline.goOffline()
+        let restarted = try PortalHubFixture(config: config, http: offline, cacheStorage: cache)
+        defer { restarted.cleanup() }
+        restarted.hub.refreshProjects()
+        await waitUntil { restarted.hub.usingSavedProjects && restarted.hub.projectLoadError != nil }
+        XCTAssertEqual(restarted.hub.selectedProject?.signKey, certificate)
+        XCTAssertEqual(restarted.hub.projects.count, 1)
+        let offlineBefore = await offline.requests().count
+        let response = await restarted.hub.generateRTCToken(channel: "offline-room", uid: 42)
+        XCTAssertTrue(try AgoraTokenService.verify(response.token, certificate: certificate))
+        let offlineAfter = await offline.requests().count
+        XCTAssertEqual(offlineAfter, offlineBefore)
+        let expired = AccountLoginSession(configuration: try config.oidcConfiguration, subject: restarted.subject,
+            accessToken: "expired-portal-access", refreshToken: "uncertain-refresh", expiresAt: .distantPast, authenticatedAt: nil)
+        try restarted.storage.write(AccountSessionRecord(session: expired, refreshPending: true))
+        restarted.hub.refreshProjects()
+        await waitUntil { restarted.hub.projectLoadError?.contains("Sign in again") == true }
+        let afterExpiredLogin = await restarted.hub.generateRTCToken(channel: "offline-room", uid: 43)
+        XCTAssertTrue(try AgoraTokenService.verify(afterExpiredLogin.token, certificate: certificate))
+        try await restarted.hub.signOutAccount()
+        XCTAssertNil(try cache.read())
+        XCTAssertTrue(restarted.hub.projects.isEmpty)
+    }
+
+    func testOnlineRefreshRotatesCertificateAndRemovesRevokedProjectsFromOfflineCache() async throws {
+        let http = await linkedHTTP(), fixture = try PortalHubFixture(config: settings(), http: http)
+        defer { fixture.cleanup() }
+        fixture.hub.refreshProjects()
+        await waitUntil { fixture.hub.selectedProject?.signKey == self.certificate }
+        let rotated = "fedcba9876543210fedcba9876543210"
+        await http.set("/api/connections/agora/certificate", "{\"projectId\":\"p1\",\"appId\":\"\(appID)\",\"certificate\":\"\(rotated)\"}")
+        fixture.hub.refreshProjects()
+        await waitUntil { fixture.hub.selectedProject?.signKey == rotated }
+        let response = await fixture.hub.generateRTCToken(channel: "rotated", uid: 42)
+        XCTAssertTrue(try AgoraTokenService.verify(response.token, certificate: rotated))
+        XCTAssertFalse(try AgoraTokenService.verify(response.token, certificate: certificate))
+        await http.set("/api/connections/agora/projects", #"{"projects":[]}"#)
+        fixture.hub.refreshProjects()
+        await waitUntil { fixture.hub.projects.isEmpty }
+        let record = try PortalProjectCache(storage: fixture.cacheStorage).load(subject: fixture.subject)
+        XCTAssertEqual(record?.projects.count, 0)
+        await http.goOffline()
+        fixture.hub.refreshProjects()
+        await waitUntil { fixture.hub.projectLoadError != nil }
+        XCTAssertTrue(fixture.hub.projects.isEmpty)
+    }
+
+    func testOfflineCacheCannotBeUsedByAnotherAccount() async throws {
+        let http = await linkedHTTP(), cache = PortalCacheStorage(), config = try settings()
+        let first = try PortalHubFixture(config: config, http: http, cacheStorage: cache)
+        defer { first.cleanup() }
+        first.hub.refreshProjects()
+        await waitUntil { first.hub.selectedProject?.signKey == self.certificate }
+        let offline = PortalHTTP(); await offline.goOffline()
+        let other = try PortalHubFixture(config: config, http: offline, cacheStorage: cache,
+            subject: "ab99999999999999999999999999")
+        defer { other.cleanup() }
+        other.hub.refreshProjects()
+        await waitUntil { other.hub.projectLoadError != nil }
+        XCTAssertTrue(other.hub.projects.isEmpty)
+        XCTAssertFalse(other.hub.usingSavedProjects)
+    }
+
+    func testUnlinkedAccountClearsPreviouslySavedCertificates() async throws {
+        let http = await linkedHTTP(), fixture = try PortalHubFixture(config: settings(), http: http)
+        defer { fixture.cleanup() }
+        fixture.hub.refreshProjects()
+        await waitUntil { fixture.hub.selectedProject?.signKey == self.certificate }
+        await http.set("/api/connections", #"{"agora":{"ready":true,"connect":true,"connected":false}}"#)
+        fixture.hub.refreshProjects()
+        await waitUntil { fixture.hub.projectLoadError != nil }
+        XCTAssertEqual(fixture.hub.projectLoadError, PortalAPIError.connectAgora.localizedDescription)
+        XCTAssertTrue(fixture.hub.projects.isEmpty)
+        XCTAssertNil(try fixture.cacheStorage.read())
+    }
+
+    func testLateCertificateAfterLogoutCannotRepopulateTheCache() async throws {
+        let http = await linkedHTTP(), gate = PortalGate()
+        await http.block(gate, path: "/api/connections/agora/certificate")
+        let fixture = try PortalHubFixture(config: settings(), http: http)
+        defer { fixture.cleanup() }
+        fixture.hub.refreshProjects()
+        await waitUntil { await http.requests().contains { $0.url?.path == "/api/connections/agora/certificate" } }
+        try await fixture.hub.signOutAccount()
+        await gate.open()
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertNil(try fixture.cacheStorage.read())
+        XCTAssertTrue(fixture.hub.projects.isEmpty)
     }
 
     func testGeneralShowsAccountAndEditableServersAtMinimumWidth() throws {
@@ -201,6 +330,7 @@ final class AccountServiceSettingsTests: XCTestCase {
         await waitUntil { hub.projectLoadError != nil }
         XCTAssertTrue(hub.projects.isEmpty); XCTAssertNil(hub.selectedProject); XCTAssertNil(hub.signedInAccount)
         XCTAssertNil(try fixture.storage.read())
+        XCTAssertNil(try fixture.cacheStorage.read())
         XCTAssertEqual(fixture.legacy.load(), fixture.legacySession)
         let calls = await http.requests()
         XCTAssertFalse(calls.contains { $0.url?.path == "/api/connections/agora/certificate" })

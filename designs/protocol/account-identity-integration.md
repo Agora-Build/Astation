@@ -6,13 +6,17 @@ issuer. Current development URLs are `https://dev.agora.build` and
 reachable as of 2026-10-23. The login/project integration and registration
 handoff are in [agora-build-login.md](../../docs/agora-build-login.md), reviewed
 against Auth `059c6d94b2985b60531b3e47445329407dd13e73` and Portal
-`52096c566079c182ae402d7dcf169a6a7c4abdfb`. A complete user login and actual
+`3fb16b2859f0eec164dfcb3b85c5a8bd163a27cf`. A complete user login and actual
 client/resource registrations still require verification.
 
 ## Separate accounts and service connections
 
 The agora.build portal grant reads the linked Agora account's projects and
-fetches certificates on demand. Upstream Agora tokens remain on the portal.
+fetches certificates on demand. At the user's request, native token generation
+uses the shared local Atem library, with previously loaded project credentials
+stored in the device-only Keychain for offline use. The cache is isolated by
+account and environment and cleared on sign-out; it conveys no relay or device
+authority. Upstream Agora tokens remain on the portal.
 Relay account/recovery requests use a separate resource grant for the same
 issuer and subject. Previously consented legacy service credentials remain
 isolated for existing Atem consumers; neither account token substitutes for

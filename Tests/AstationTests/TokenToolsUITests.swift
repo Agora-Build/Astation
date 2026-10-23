@@ -66,6 +66,18 @@ final class TokenToolsUITests: XCTestCase {
         XCTAssertFalse(try find(controller.view, NSButton.self) { $0.title == "Copy Token" }.isEnabled)
     }
 
+    func testSavedProjectGeneratesLocallyWithoutCallingTheResolver() throws {
+        var requests = 0
+        let controller = TokenToolsViewController(projects: { [self.project()] }, initialProjectID: "demo", resolveProject: { _ in
+            requests += 1
+            throw URLError(.notConnectedToInternet)
+        })
+        let window = host(controller); defer { window.close() }
+        let output = try generate(controller)
+        XCTAssertTrue(try AgoraTokenService.verify(output.string, certificate: certificate))
+        XCTAssertEqual(requests, 0)
+    }
+
     func testDelayedCertificateCannotGenerateAfterTheProjectIsRemoved() async throws {
         let empty = AgoraProject(id: "demo", name: "Voice Lab", vendorKey: app, signKey: "", status: "active", created: 0)
         var projects = [empty]

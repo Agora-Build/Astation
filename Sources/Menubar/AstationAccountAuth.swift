@@ -7,31 +7,49 @@ import NIOHTTP1
 import Security
 
 struct AccountKeychainStorage: AccountSessionStorage {
+    private let bytes: AccountKeychainDataStorage
+    init(service: String = "build.agora.astation.oidc-account-v1") {
+        bytes = AccountKeychainDataStorage(service: service, account: "account-session")
+    }
+    func read() throws -> AccountSessionRecord? {
+        guard let data = try bytes.read() else { return nil }
+        guard let record = try? PropertyListDecoder().decode(AccountSessionRecord.self, from: data) else { throw AccountLoginError.storage }
+        return record
+    }
+    func write(_ record: AccountSessionRecord?) throws {
+        try bytes.write(record.map { try PropertyListEncoder().encode($0) })
+    }
+}
+
+protocol AccountDataStorage {
+    func read() throws -> Data?
+    func write(_ data: Data?) throws
+}
+
+struct AccountKeychainDataStorage: AccountDataStorage {
     let service: String
-    init(service: String = "build.agora.astation.oidc-account-v1") { self.service = service }
+    let account: String
     private var query: [String: Any] {
         let context = LAContext(); context.interactionNotAllowed = true
         return [kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: "account-session", kSecUseDataProtectionKeychain as String: true,
+            kSecAttrAccount as String: account, kSecUseDataProtectionKeychain as String: true,
             kSecUseAuthenticationContext as String: context]
     }
-    func read() throws -> AccountSessionRecord? {
+    func read() throws -> Data? {
         var request = query; request[kSecReturnData as String] = true; request[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
         let status = SecItemCopyMatching(request as CFDictionary, &result)
         if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess, let data = result as? Data,
-              let record = try? PropertyListDecoder().decode(AccountSessionRecord.self, from: data) else { throw AccountLoginError.storage }
-        return record
+        guard status == errSecSuccess, let data = result as? Data else { throw AccountLoginError.storage }
+        return data
     }
-    func write(_ record: AccountSessionRecord?) throws {
-        guard let record else {
+    func write(_ data: Data?) throws {
+        guard let data else {
             let status = SecItemDelete(query as CFDictionary)
             guard status == errSecSuccess || status == errSecItemNotFound else { throw AccountLoginError.storage }
             return
         }
-        let data = try PropertyListEncoder().encode(record)
         let attributes = [kSecValueData as String: data]
         let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if status == errSecItemNotFound {
