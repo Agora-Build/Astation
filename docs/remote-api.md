@@ -55,15 +55,15 @@ This endpoint is not deployed until this branch is merged and deployed.
 
 ## Independent Encrypted WebSocket
 
-For the proposed Discord/custom-app setup and simple Bearer-token gateway, see
-the [unified Integrations design](../designs/unified-integrations.md). That gateway
-is an optional decrypting endpoint on user-chosen infrastructure; it is not
-implemented by the opaque relay routes described here. Agora.Build manages
-account/setup, while the chosen Station stores ciphertext and routes encrypted
-traffic. A raw-token agent API issues/validates its own credentials and needs
-separate native-authorized service membership. A shared relay must not gain
-plaintext access merely by hosting the transport; its operator is an additional
-trusted reader if the user also hosts the decrypting gateway on that machine.
+For the proposed Discord/custom-app setup, see the
+[unified Integrations design](../designs/unified-integrations.md). It extends one
+Station API with an optional agent module using scoped R9 service identities.
+Existing relay handlers transport encrypted traffic; the module reads only its
+authorized integration channels and issues/validates integration API credentials.
+These agent routes are proposed, not implemented by the opaque routes here.
+Agora.Build remains account/setup. Shared-relay users can keep the module off;
+authorizing an integration additionally trusts that Station/operator to handle
+the integration's permitted plaintext. Native/direct R9 channels stay opaque.
 
 `GET /api/remote/v1/channels?genesis={genesis_hash}&host={host_id}` upgrades to
 WebSocket. Use WSS and an `Authorization: Bearer` account token. Never put the

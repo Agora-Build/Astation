@@ -256,16 +256,16 @@ text/tool/approval parts do not promise those capabilities.
 ## High-level client API and public transport
 
 The [unified Integrations design](../unified-integrations.md) proposes one Portal
-flow for Discord and custom API credentials, with a separate decrypting gateway
-for Bearer-token clients on user-chosen infrastructure. Agora.Build owns account
-and setup; private storage/sync remains on the chosen Station, which sees only
-ciphertext and necessary routing/signed-log metadata. The optional gateway is a
-trusted endpoint with its own scoped service identity, not a plaintext relay
-route or a required Agora.Build data processor. Its implementation assignment,
-delegated service login and gateway APIs need joint review; these are not
-implemented Station endpoints or R9 wire changes. Shared-relay operators remain
-outside the content trust boundary only when they do not also control a
-decrypting endpoint.
+setup flow and one Station API. Existing relay/storage modules remain opaque;
+an optional agent module handles Bearer-token API calls and Discord through the
+shared R9 client, with a distinct native-authorized service identity per
+integration. No extra public service/deployment is required. Agora.Build owns
+account/setup; private storage stays on the chosen Station. Enabling an
+integration trusts its Station/operator to handle that integration's permitted
+plaintext; it does not expose native/direct R9 channels or account K. The
+module's Auth binding, retention and new API routes still need review and
+implementation; no R9 wire change is assumed. Shared-relay users can keep the
+agent module disabled and use native/direct encrypted channels.
 
 Use `atem-client` for listSessions, sendPrompt, readHistory, watchEvents,
 answerApproval, revokeRule and queryReceipt. A bot is an authorized decrypting
