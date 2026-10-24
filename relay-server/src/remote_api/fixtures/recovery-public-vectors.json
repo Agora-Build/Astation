@@ -1,0 +1,328 @@
+{
+  "account": "acct-test-1",
+  "genesis": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+  "entries": {
+    "E1": {
+      "body": {
+        "account_id": "acct-test-1",
+        "action": "genesis",
+        "member": {
+          "auth_key": {
+            "alg": "p256",
+            "pub": "BGj-ylkEWPb6IhML-_3UFdZBrKwvdFDlz-QamAuwz2xIOjXX2myAwtuCxfGu8jmWSTz-tAG9CkVNSCiRhZ-00bE"
+          },
+          "device_id": "dev-mac",
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "2v1EMbjZDC-YryNDJmZaakKgKMTtTjjIb0sA4XnLI1k"
+          },
+          "kind": "native",
+          "roles": [
+            "control",
+            "manage",
+            "view"
+          ]
+        },
+        "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "recovery_key": {
+          "alg": "ed25519",
+          "pub": "mHZ8mI_wz3J66ZF4EenE7WO3-0hgjUwyaI23ny7ZQ2A"
+        },
+        "seq": 1,
+        "signed_at": 1792400000000,
+        "signer": "dev-mac",
+        "type": "atem-membership-entry",
+        "v": 1
+      },
+      "sig": "VQHNBz3HVFgfUpkwe-9oD1uMjr6MwSJtD-BPIt38iAwMIglJ_bQXyYC0ItjOtEcXbmHKF796bYWbUXkxDLmxvw"
+    },
+    "E2": {
+      "body": {
+        "account_id": "acct-test-1",
+        "action": "add_host",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host": {
+          "host_id": "host-a",
+          "host_key": {
+            "alg": "ed25519",
+            "pub": "ma83XDqxm6EF2qRk7IN4a9VFv5TX8wRPAdlUZYziNY4"
+          },
+          "host_trust_gen": 1
+        },
+        "prev_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "seq": 2,
+        "signed_at": 1792400001000,
+        "signer": "dev-mac",
+        "type": "atem-membership-entry",
+        "v": 1
+      },
+      "sig": "yuNcjJNObR0siA0L4hDpWHBjz4UyJtpq9mkoq2fFUMsy__zw5LxMwn3UuqreD1ybu-QtoR9QeikpEUvgIsCKvQ"
+    },
+    "E3": {
+      "body": {
+        "account_id": "acct-test-1",
+        "action": "add",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "member": {
+          "auth_key": {
+            "alg": "p256",
+            "pub": "BGV5Ov3b43EjUrJGejYvqwfQljq9X4Tx0Rd1aYDInE29tmNy-IIhgIH0hY-cheON0bvA_O0yEeah0yUbXnxO5SQ"
+          },
+          "device_id": "dev-phone",
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "oJkn3Pr5ZonLiInBeyLi4eNyIcHkLMRz0EmmHE-ZiXY"
+          },
+          "kind": "native",
+          "roles": [
+            "control",
+            "manage",
+            "view"
+          ]
+        },
+        "prev_hash": "7cc348b5991f0995cb2a7b9300202dc8323733484fc49bfd264800447a2d4e3d",
+        "seq": 3,
+        "signed_at": 1792400002000,
+        "signer": "dev-mac",
+        "type": "atem-membership-entry",
+        "v": 1
+      },
+      "sig": "MBHa-kF4XZ-i_xhlzkTzV_-FEUhWH0EXwCaTn7v9NZkvz3c86ZpZgmDabg4RVRwhLDB5l-jd8rvWuXPezTKDWw"
+    },
+    "E4": {
+      "body": {
+        "account_id": "acct-test-1",
+        "action": "add",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "member": {
+          "auth_key": {
+            "alg": "p256",
+            "pub": "BD8UXpprH3CBh945lGGLF4Yko4Z5KbKYeHXByOecSEuLXtZm-AR4BMDHLbp_hfBUC63FDri68xBldtBzjuXzabs"
+          },
+          "device_id": "dev-ipad",
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "TRl4_gy_dBKDDLNsUlk-Qsei_CJeOJrqlQpcayyR_08"
+          },
+          "kind": "native",
+          "roles": [
+            "control",
+            "manage",
+            "view"
+          ]
+        },
+        "prev_hash": "c342f9fa13c5a0707efe755a2d16f8a6089dfa8afaf16fde1858772c71c878a0",
+        "seq": 4,
+        "signed_at": 1792400003000,
+        "signer": "dev-mac",
+        "type": "atem-membership-entry",
+        "v": 1
+      },
+      "sig": "fzspVSv3gm_mY7PRN2NwfB9xWKAIyw6DEhxExE31vCsUExx018VAhrYQaFO9a0YxfHTHTwxkgiPrXsvHmamlmQ"
+    },
+    "E5": {
+      "body": {
+        "account_id": "acct-test-1",
+        "action": "add",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "member": {
+          "auth_key": {
+            "alg": "ed25519",
+            "pub": "QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE"
+          },
+          "device_id": "svc-discord",
+          "expires_at": 1794992004000,
+          "kind": "service",
+          "roles": [
+            "service"
+          ],
+          "scope": {
+            "hosts": [
+              "host-a"
+            ],
+            "ops": [
+              "interrupt",
+              "prompt",
+              "view"
+            ],
+            "projects": [
+              "h1.b982533d.abababababababababababababababababababababababababababababababab"
+            ]
+          }
+        },
+        "prev_hash": "f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a",
+        "seq": 5,
+        "signed_at": 1792400004000,
+        "signer": "dev-phone",
+        "type": "atem-membership-entry",
+        "v": 1
+      },
+      "sig": "y_DQsbGlIpfBs0B6P7US_rnHmp3eD57EUV8FtmJq6FwTGW10FJq5Rvd1rq1yiUUQJRDh408dEfKdpwSeKGI04Q"
+    },
+    "E6": {
+      "body": {
+        "account_id": "acct-test-1",
+        "action": "remove",
+        "device_id": "dev-ipad",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "prev_hash": "54c0f64f7fd1a3677a91650d40079ebffd03a6da8d78b91278c421d862337cf9",
+        "seq": 6,
+        "signed_at": 1792400005000,
+        "signer": "dev-mac",
+        "type": "atem-membership-entry",
+        "v": 1
+      },
+      "sig": "n855P1SB0hla2L6NPbGrO_NKNRvIBVtpmj5ijREJW00zgPVe1vIdIOHcptzm5oA8Idb0cdreG3z6KW777KiWpQ"
+    },
+    "C6_ipad": {
+      "body": {
+        "account_id": "acct-test-1",
+        "action": "add",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "member": {
+          "auth_key": {
+            "alg": "p256",
+            "pub": "BGHvfcwAzX21tE5G_IMNMXHuvpmaEMVRPxp4gbnGWGEbinjKVDN0xR2ZanXa8pIJXYle82o8SdTS_I4DB0S3GJU"
+          },
+          "device_id": "dev-evil",
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "RuTeaapyEz0YLHS52Rx0UjSKfrinZsJNdCS5QjHlEnA"
+          },
+          "kind": "native",
+          "roles": [
+            "control",
+            "manage",
+            "view"
+          ]
+        },
+        "prev_hash": "54c0f64f7fd1a3677a91650d40079ebffd03a6da8d78b91278c421d862337cf9",
+        "seq": 6,
+        "signed_at": 1792400005500,
+        "signer": "dev-ipad",
+        "type": "atem-membership-entry",
+        "v": 1
+      },
+      "sig": "svM3VGqTUOHLb0D2uMH7U-wUF7vanBIGwuHZ3LRxM-w-L21rwJKAvCvMKeFdtazWxbX091v1zMOPdEkH5G3phQ"
+    },
+    "C6_mac": {
+      "body": {
+        "account_id": "acct-test-1",
+        "action": "set_roles",
+        "device_id": "dev-phone",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "prev_hash": "54c0f64f7fd1a3677a91650d40079ebffd03a6da8d78b91278c421d862337cf9",
+        "roles": [
+          "control",
+          "view"
+        ],
+        "seq": 6,
+        "signed_at": 1792400005600,
+        "signer": "dev-mac",
+        "type": "atem-membership-entry",
+        "v": 1
+      },
+      "sig": "iRQex46xpknBm5ANu4Z5stken4o4vrzb40-fruH3Twlkt5n03RYU-bH57jxIdj6R3MWfJOLLMAcDaiYJ_5XVwQ"
+    },
+    "X7_ipad": {
+      "body": {
+        "account_id": "acct-test-1",
+        "action": "add",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "member": {
+          "auth_key": {
+            "alg": "p256",
+            "pub": "BGHvfcwAzX21tE5G_IMNMXHuvpmaEMVRPxp4gbnGWGEbinjKVDN0xR2ZanXa8pIJXYle82o8SdTS_I4DB0S3GJU"
+          },
+          "device_id": "dev-evil",
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "RuTeaapyEz0YLHS52Rx0UjSKfrinZsJNdCS5QjHlEnA"
+          },
+          "kind": "native",
+          "roles": [
+            "control",
+            "manage",
+            "view"
+          ]
+        },
+        "prev_hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+        "seq": 7,
+        "signed_at": 1792400006500,
+        "signer": "dev-ipad",
+        "type": "atem-membership-entry",
+        "v": 1
+      },
+      "sig": "TXHoGocJbnLSzdKzzgLVxbuklSVJdek61B0vFk9k_Ot-UQkN3gHYeCIfZQllPHyDruuUa4wMxlHqKSdkD-7Blw"
+    },
+    "KB7": {
+      "body": {
+        "account_id": "acct-test-1",
+        "action": "k_backup",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "k_backup": {
+          "backup_hash": "ae88af5e8b273a1a5904829a37c2a9b48e3ecb56f072deee923ae0e43e8f7d3e",
+          "blob_version": 3,
+          "kids": [
+            "b982533d",
+            "1f2e3d4c"
+          ],
+          "recovery_key": {
+            "alg": "ed25519",
+            "pub": "mHZ8mI_wz3J66ZF4EenE7WO3-0hgjUwyaI23ny7ZQ2A"
+          }
+        },
+        "prev_hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+        "seq": 7,
+        "signed_at": 1793264100007,
+        "signer": "dev-mac",
+        "type": "atem-membership-entry",
+        "v": 1
+      },
+      "sig": "sck_FnABq5RM1EsYy5wYoSXQ3lIETTCtB6liX6M1x895N3vXNML-TzasqfDVEoW_QjqPGtqCIDnagmvDMpZNdA"
+    },
+    "KB8": {
+      "body": {
+        "account_id": "acct-test-1",
+        "action": "k_backup",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "k_backup": {
+          "backup_hash": "e074775d6eac5f2b12b8d2e30ccc6d5b3ae0d783146796ffc12aae96c5401675",
+          "blob_version": 4,
+          "kids": [
+            "7a3c9e10",
+            "b982533d",
+            "1f2e3d4c"
+          ],
+          "recovery_key": {
+            "alg": "ed25519",
+            "pub": "mHZ8mI_wz3J66ZF4EenE7WO3-0hgjUwyaI23ny7ZQ2A"
+          }
+        },
+        "prev_hash": "2b16779221ada27ca00e1a484a5076df1ac7ef6050496dbf4b227b391ced2ded",
+        "seq": 8,
+        "signed_at": 1793264100008,
+        "signer": "dev-mac",
+        "type": "atem-membership-entry",
+        "v": 1
+      },
+      "sig": "YVndDQuYehtskUriB86gLq0KKaREg1wMjahv_PjD34kwEQNvOgN7rdAHp91nS-U3GhCegqv19k746NbjySgsZQ"
+    }
+  },
+  "backup": {
+    "account_id": "acct-test-1",
+    "blob_version": 3,
+    "ct": "T4MHjwlQ0HujQ6dLV-eEhWinNNXztenHuaNhoM_FUCMFe9DrXPrmeEJA0hCHXKJLxfT2R_G9XudAXCnQTogpi2FoPoH2p2N-oWOTZs7ugBhM69j3tfZem3E74Up7xC3z-mfOvNq47yjZeZGMAxULJKMIV1_Q-snoYFkw4by1lXD0gP19NHm_vSGOjXOo4a5UsERX8I5LDP7x289QJ__uG3Lx3Zg",
+    "enc": "kXvEdzvxH1pGaclvnco0JEfkkZBdQrs4Z-FUGMy0RAo",
+    "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+    "kids": [
+      "b982533d",
+      "1f2e3d4c"
+    ],
+    "recovery_key": {
+      "alg": "ed25519",
+      "pub": "mHZ8mI_wz3J66ZF4EenE7WO3-0hgjUwyaI23ny7ZQ2A"
+    },
+    "v": 2
+  }
+}

@@ -20,6 +20,14 @@ pub const BUS_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum InboxMessage {
+    /// Carrier A replacement cannot evict an independently proved connection.
+    CloseUnproved { connection_id: String },
+    /// r9 ciphertext cannot be silently dropped. Acknowledge queue admission or fail the route.
+    ChannelDeliver { connection_id: String, frame: String, reply_to: String, delivery: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_route: Option<crate::remote_api::recovery::OwnerRoute> },
+    ChannelDelivered { delivery: String, accepted: bool },
+    ChannelReply { handle: String, source: super::ConnRef, frame: String, reply_to: String, delivery: String },
     /// Queue `frame` on each listed local connection (one publish per
     /// target replica, fanned out there).
     Deliver {
@@ -42,6 +50,8 @@ pub enum BroadcastMessage {
     KeyChanged { astation_id: String },
     /// A room's directory entry changed: drop any cached copy.
     RoomChanged { code: String },
+    /// One public signed head answering a recovery-only challenge.
+    RecoveryProbe { handle: String, connection: String, frame: serde_json::Value },
 }
 
 /// An inbox message whose serialized size (`payload_len`) is over
@@ -52,10 +62,12 @@ pub fn drop_if_oversize(replica_id: &str, message: &InboxMessage, payload_len: u
         return false;
     }
     let targets: Vec<String> = match message {
+        InboxMessage::ChannelDeliver { connection_id, .. } => vec![crate::relay::mask_code(connection_id)],
+        InboxMessage::ChannelDelivered { .. } | InboxMessage::ChannelReply { .. } => vec![],
         InboxMessage::Deliver { connection_ids, .. } => {
             connection_ids.iter().map(|id| crate::relay::mask_code(id)).collect()
         }
-        InboxMessage::Close { connection_id, .. } => vec![crate::relay::mask_code(connection_id)],
+        InboxMessage::Close { connection_id, .. } | InboxMessage::CloseUnproved { connection_id } => vec![crate::relay::mask_code(connection_id)],
     };
     tracing::warn!(
         "Dropped a {}-byte frame for connection(s) {} on replica {}: over the {}-byte bus limit",
@@ -73,6 +85,9 @@ pub fn drop_if_oversize(replica_id: &str, message: &InboxMessage, payload_len: u
 /// Apply an inbox message to this replica's sockets.
 pub fn apply_inbox(local: &LocalSockets, message: InboxMessage) {
     match message {
+        InboxMessage::ChannelDeliver { .. } | InboxMessage::ChannelDelivered { .. } | InboxMessage::ChannelReply { .. } | InboxMessage::CloseUnproved { .. } => {
+            // Requires the hub's r9 broker; dispatched before this legacy socket handler.
+        }
         InboxMessage::Deliver { connection_ids, frame } => {
             for connection_id in connection_ids {
                 local.send(&connection_id, frame.clone());

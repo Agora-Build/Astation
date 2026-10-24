@@ -209,7 +209,7 @@ struct ApprovalNotificationsView: View {
                     }
                 }
             }
-            Text("Answering takes control of that session. Notifications never approve a command automatically.")
+            Text("Answering keeps the current operator's control. Notifications never approve a command automatically.")
                 .font(.caption).foregroundStyle(.secondary)
         }.padding(24).frame(minWidth: 560, minHeight: 520)
     }
@@ -248,6 +248,7 @@ private struct ApprovalRequestCard: View {
             }
         }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
             .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
+            .background(ApprovalAttendanceView(entry: entry))
     }
 
     private func confirm(_ rule: AtemApprovalRule) {

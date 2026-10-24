@@ -6,12 +6,12 @@ conversation and unfinished input.
 
 ## Start a session
 
-This development branch requires an Atem host implementing
-[atem-session v1 r7.1](../designs/protocol/atem-session-v1.md), in addition to
-shared-terminal rendering. Earlier terminal-only hosts cannot provide control
-through this build. Use the pinned runtime host in
-[Atem PR #72](https://github.com/Agora-Build/Atem/pull/72); the published pairing
-fixes alone do not imply session-protocol support. See the
+The paired-host interface requires an Atem host implementing
+[atem-session revision 8](../designs/protocol/atem-session-v1.md), in addition to
+shared-terminal rendering. Unsupported hosts are excluded from remote selection
+and must be upgraded. Pairing support alone does not imply session-protocol
+support. Independent r9 admission remains disabled until the
+[remote API integration gates](../designs/protocol/remote-agent-api.md) pass. See the
 [integration status](../designs/protocol/atem-implementation-handoff.md).
 
 Use the same host binary for pairing and launch; see the
@@ -103,6 +103,21 @@ launch an agent through Atem. Unsupported versions/width profiles, malformed
 frames and restore failures disable input and show an actionable status.
 Removing the pairing disables terminal access; direct sockets authenticated
 by that pairing close as well.
+
+### Session welcome failures
+
+The client distinguishes an invalid welcome field, a host trust rollback and
+failure to persist the local session journal. A rollback message names the
+received and previously accepted generations. For example, receiving 3 after
+accepting 5 refuses the session before any list, receipt query or control request.
+Reconnect cannot repair a lower host counter; the host's durable trust state
+must advance correctly. The [Genie investigation](https://github.com/Agora-Build/Atem/issues/91)
+tracks this case. The saved client trust/runtime floors and old receipt metadata
+are retained, and a strictly newer trust generation starts a new runtime fence.
+
+Local logs identify `welcome.host_trust_gen_rollback` with the two counters,
+`welcome.journal_storage`, or the failed welcome field name. They never include
+account/device values, host-error text, prompt content or other session payloads.
 
 **Paired offline** means the pairing is saved but Astation has no authenticated
 connection for that device. The Atem process and its local agent may still be

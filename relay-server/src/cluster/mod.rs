@@ -33,7 +33,7 @@ impl fmt::Display for StoreError {
 impl std::error::Error for StoreError {}
 
 /// One WebSocket on one replica. Stored in Redis as `connection_id|replica_id`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct ConnRef {
     pub conn: String,
     pub replica: String,

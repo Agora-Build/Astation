@@ -1,5 +1,6 @@
 import Cocoa
 import Foundation
+import AstationRemote
 
 class StatusBarController: NSObject, NSMenuDelegate {
     private var statusItem: NSStatusItem!
@@ -435,19 +436,24 @@ class StatusBarController: NSObject, NSMenuDelegate {
         )
         stationItem.target = self
         statusMenu.addItem(stationItem)
+
+        let portalUrl = hubManager.portalSettings?.portalURL
+        let portalItem = NSMenuItem(
+            title: "🏛️ Portal: \(portalUrl ?? "Not configured")",
+            action: #selector(copyPortalURL),
+            keyEquivalent: ""
+        )
+        portalItem.target = self
+        portalItem.isEnabled = portalUrl != nil
+        statusMenu.addItem(portalItem)
         
         statusMenu.addItem(NSMenuItem.separator())
 
-        // Agora Account (Sign in / Sign out)
-        let acctTitle: String
-        if hubManager.hasSession {
-            let id = hubManager.currentSession()?.loginId ?? "—"
-            acctTitle = "Sign out (\(id))"
-        } else {
-            acctTitle = "Sign in with Agora…"
-        }
-        let acctItem = NSMenuItem(title: acctTitle, action: #selector(signInOrOut), keyEquivalent: "")
+        let acctTitle = hubManager.accountSignInInProgress ? "Signing in to Agora.Build..."
+            : hubManager.signedInAccount.map { "Agora.Build (\($0))..." } ?? "Sign in to Agora.Build..."
+        let acctItem = NSMenuItem(title: acctTitle, action: #selector(openAccount), keyEquivalent: "")
         acctItem.target = self
+        acctItem.isEnabled = !hubManager.accountSignInInProgress
         statusMenu.addItem(acctItem)
         statusMenu.addItem(NSMenuItem.separator())
 
@@ -542,6 +548,19 @@ class StatusBarController: NSObject, NSMenuDelegate {
         let alert = NSAlert()
         alert.messageText = "URL Copied"
         alert.informativeText = "Station relay URL has been copied to clipboard:\n\(url)"
+        alert.alertStyle = .informational
+        alert.runModal()
+    }
+
+    @objc private func copyPortalURL() {
+        guard let url = hubManager.portalSettings?.portalURL else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url, forType: .string)
+
+        let alert = NSAlert()
+        alert.messageText = "URL Copied"
+        alert.informativeText = "Portal URL has been copied to clipboard:\n\(url)"
         alert.alertStyle = .informational
         alert.runModal()
     }
@@ -836,20 +855,24 @@ class StatusBarController: NSObject, NSMenuDelegate {
         }
     }
 
-    @objc private func signInOrOut() {
-        if hubManager.hasSession {
-            try? hubManager.sessionStore.delete()
-            NotificationCenter.default.post(name: .credentialsChanged, object: nil)
-        } else {
-            Task { @MainActor in
-                do {
-                    let mgr = SsoAuthManager(ssoUrl: SsoConfig.currentSsoUrl)
-                    let session = try await mgr.runLoginFlow()
-                    try hubManager.sessionStore.save(session)
-                    NotificationCenter.default.post(name: .credentialsChanged, object: nil)
-                } catch {
-                    Log.error("[StatusBar] sign-in failed: \(error)")
-                }
+    @objc private func openAccount() {
+        guard !hubManager.accountSignInInProgress else { return }
+        if hubManager.signedInAccount != nil {
+            settingsWindowController.showAccount()
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self, !hubManager.accountSignInInProgress else { return }
+            defer { setupMenu() }
+            do { try await hubManager.signInAccount() }
+            catch {
+                guard !(error is CancellationError), error as? AccountLoginError != .cancelled else { return }
+                let alert = NSAlert()
+                alert.messageText = "Could not sign in to Agora.Build"
+                alert.informativeText = error.localizedDescription
+                alert.addButton(withTitle: "OK")
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
             }
         }
     }

@@ -1,0 +1,77 @@
+{
+  "open": [
+    {
+      "body": {
+        "account_id": "acct-test-1",
+        "approval_id": "8c3e9d6b-1f40-4b52-8dae-4f5a6b7c8d9e",
+        "created_at": 1793264005000,
+        "expires_at": 1793264605000,
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-a",
+        "host_trust_gen": 1,
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "recipient": {
+          "device_id": "dev-phone",
+          "enc_kid": "07b69e3ee18d1695"
+        },
+        "sealed_hash": "f54b5806081d7fd9071576821331765856a6e608cd1393dfacd62f41b6fcf829",
+        "session_id": "ses-aaaaaaaaaaaa",
+        "state": "open",
+        "type": "atem-push-hint",
+        "v": 1
+      },
+      "ct": "GPwcrdmchVLz2CRKuFMMraaQ4oiShgMdj_EvA1hzcS15PiCy7CcT4sL_1uejen04pE8yIQ",
+      "enc": "jvpPwt0-OYGdUjl9QlT9PqgXsmySwvcTvH1JIHXUNkQ",
+      "sig": "GzVt8PgyRWxuo3j3Ia6dwi3Wz4RHR3L1VCBmzXQnTjggMeHbNzpswTCds0HpREs56h4qorEHuk0AuQUXwVK1Dw"
+    },
+    {
+      "body": {
+        "account_id": "acct-test-1",
+        "approval_id": "8c3e9d6b-1f40-4b52-8dae-4f5a6b7c8d9e",
+        "created_at": 1793264005000,
+        "expires_at": 1793264605000,
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-a",
+        "host_trust_gen": 1,
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "recipient": {
+          "device_id": "dev-mac",
+          "enc_kid": "742c1f83d7133047"
+        },
+        "sealed_hash": "9a5bb6207e593968480a075b5a2f2e2cd36692f669410a0aaaa5de8f078b5cab",
+        "session_id": "ses-aaaaaaaaaaaa",
+        "state": "open",
+        "type": "atem-push-hint",
+        "v": 1
+      },
+      "ct": "nA3mdGlO4SctyXQU3mo41ul0UrbqD-R99i6LbfuFETMY0J_SRhhhetdsywgeXxYpsMBZYw",
+      "enc": "4u4l6Qn_622f9EMyBbGq27iZMsQwVlR9hg75N3fZBXQ",
+      "sig": "LFSBQD_Z88ajjNxa1T32Y3vex9IQivVWVo1nLnTJ-vYhhgYXkZDlEu40cVAFnyPtiB70iVY06eMuGYX9Vr-YAg"
+    }
+  ],
+  "resolved": {
+    "body": {
+      "account_id": "acct-test-1",
+      "approval_id": "8c3e9d6b-1f40-4b52-8dae-4f5a6b7c8d9e",
+      "created_at": 1793264005000,
+      "expires_at": 1793264605000,
+      "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "process_gen": "22222222-2222-4222-8222-222222222222",
+      "reason": "answered_remote",
+      "resolved_at": 1793264047000,
+      "session_id": "ses-aaaaaaaaaaaa",
+      "state": "resolved",
+      "type": "atem-push-hint",
+      "v": 1
+    },
+    "sig": "RHnP889nrsx9M9ES66oKfizlELpbif-dlYEZqATg-3erxkVsQBOUWKIHOA2fyc0kSHTR7nlu7T6SOOCkfmEEBg"
+  },
+  "verifier_now": 1793264005000,
+  "source": {
+    "pin": "c685abab92535b167f5f2658c814f0f72541d9a1",
+    "path": "designs/protocol/fixtures/r9-vectors-push-hint.json",
+    "note": "Public signed known-answer envelopes; no private keys."
+  }
+}

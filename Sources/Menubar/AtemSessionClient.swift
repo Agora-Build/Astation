@@ -17,10 +17,39 @@ struct AtemSessionContext: Equatable {
     }
 }
 
-/// The hub supplies the authenticated, safety-code-verified connection.
-/// Protocol r8 is required; section 9's membership gates remain enforced.
+/// Presentation and durable request state for an authenticated r9 channel.
+/// This adapter never opens a plaintext session or negotiates an older protocol.
 final class AtemSessionClient {
     enum Phase: Equatable { case offline, connecting, reconnecting, ready, failed }
+    private enum WelcomeFailure: Error {
+        enum Field: String {
+            case account = "account_id", device = "atem_device_id", clientKind = "client_kind"
+            case permissions, authorization = "authorization_ms_left", hostError = "host_error"
+        }
+        case invalid(Field)
+        case trustRollback(received: UInt64, minimum: UInt64)
+        case storage
+
+        var diagnostic: String {
+            switch self {
+            case .invalid(let field): return "welcome.\(field.rawValue)"
+            case .trustRollback(let received, let minimum):
+                return "welcome.host_trust_gen_rollback received=\(received) minimum=\(minimum)"
+            case .storage: return "welcome.journal_storage"
+            }
+        }
+
+        var message: String {
+            switch self {
+            case .invalid(let field):
+                return "Atem's session welcome failed validation (\(field.rawValue)). Reconnect the verified Atem."
+            case .trustRollback(let received, let minimum):
+                return "Atem reported an older trust generation (\(received); previously accepted \(minimum)). Resolve its trust state before reconnecting."
+            case .storage:
+                return "Could not save the session's verification state. Check this Mac's local storage before reconnecting."
+            }
+        }
+    }
     struct ConnectionStatus: Equatable {
         let phase: Phase
         let message: String
@@ -37,6 +66,7 @@ final class AtemSessionClient {
     private(set) var registry: [String: AtemSessionDescriptor] = [:]
     private(set) var latestReceipt: AtemSessionReceipt?
     private(set) var approvals: [String: AtemApprovalRequest] = [:]
+    private var reportedSeen: Set<String> = []
     private(set) var closedApprovals: [String: String] = [:]
     private(set) var approvalRules: [String: [AtemApprovalRule]] = [:]
     private var regrantedAfterRevoke: Set<String> = []
@@ -63,6 +93,10 @@ final class AtemSessionClient {
     private let now: () -> TimeInterval
     private let makeID: () -> String
     private let sendChat: (AgentChatWire, RemoteTerminalConnection) -> Bool
+    private let openChannel: (AtemSessionContext) -> Void
+    private let closeChannel: (AtemSessionContext) -> Void
+    private var connectingSince: TimeInterval = 0
+    private var retriedAfterVerification = false
     private lazy var chat = AtemSessionChat(now: now, features: { [weak self] in self?.features ?? [] }) { [weak self] message in
         guard let self, let context = self.context, context == self.currentContext(),
               message.binding?.attachment_gen == self.welcome?.attachment_gen else { return false }
@@ -80,10 +114,6 @@ final class AtemSessionClient {
     private var resyncing = true
     private var tombstones: [String: Set<String>] = [:]
     private var started = false
-    private var lastHelloContext: AtemSessionContext?
-    private var helloRefusedBeforeVerification = false
-    private var verificationCompleted = false
-    private var retriedAfterVerification = false
     private var lastReceiptQuery: TimeInterval = 0
     var hasRegistrySnapshot: Bool { phase == .ready && !resyncing }
     var connectionStatus: ConnectionStatus {
@@ -102,7 +132,9 @@ final class AtemSessionClient {
          makeID: @escaping () -> String = { UUID().uuidString.lowercased() },
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
          reconnect: @escaping (AtemSessionContext) -> Bool = { _ in false },
-         sendChat: @escaping (AgentChatWire, RemoteTerminalConnection) -> Bool = { _, _ in false }) {
+         sendChat: @escaping (AgentChatWire, RemoteTerminalConnection) -> Bool = { _, _ in false },
+         openChannel: @escaping (AtemSessionContext) -> Void,
+         closeChannel: @escaping (AtemSessionContext) -> Void = { _ in }) {
         currentContext = context
         sendMessage = send
         reconnectTransport = reconnect
@@ -110,6 +142,8 @@ final class AtemSessionClient {
         self.now = now
         self.makeID = makeID
         self.sendChat = sendChat
+        self.openChannel = openChannel
+        self.closeChannel = closeChannel
     }
 
     func start() { started = true; connectionChanged() }
@@ -118,54 +152,62 @@ final class AtemSessionClient {
         guard started else { return }
         let current = currentContext()
         guard current != context else { return }
+        let previous = context
         context = current
+        if let previous { closeChannel(previous) }
         clearAttachment()
-        helloRefusedBeforeVerification = false
-        verificationCompleted = false
-        retriedAfterVerification = false
         phase = current == nil ? .offline : .connecting
         status = current == nil ? "Atem is offline. Unconfirmed requests will only be queried, never replayed."
-            : "Opening an authenticated Atem session..."
+            : "Opening an encrypted r9 channel..."
         guard let current else { changed(); return }
         guard !journal.loadFailed else {
             fail("Session recovery metadata is unreadable. Remote control is disabled."); changed(); return
         }
-        if let previous = lastHelloContext, previous.route == current.route,
-           previous.transportGeneration == current.transportGeneration {
-            reconnect()
-            return
-        }
-        lastHelloContext = current
-        var hello = AtemSessionMessage(op: "hello")
-        hello.revision = AtemSessionWire.revision
-        _ = request(hello)
+        connectingSince = now()
+        openChannel(current)
         changed()
     }
 
-    /// Only local verification completion can retry a refused initial hello.
+    /// Verification changes require a new encrypted channel; no plaintext hello is sent.
     func verificationDidComplete(context verified: AtemSessionContext) {
-        guard welcome == nil, [.connecting, .failed].contains(phase), !retriedAfterVerification,
-              context == verified, verified == currentContext(), !journal.loadFailed else { return }
-        verificationCompleted = true
-        retryInitialHelloAfterVerification()
+        guard welcome == nil, [.connecting, .failed].contains(phase),
+              context == verified, verified == currentContext(), !journal.loadFailed, !retriedAfterVerification else { return }
+        retriedAfterVerification = true
+        closeChannel(verified)
+        phase = .connecting
+        connectingSince = now()
+        openChannel(verified)
     }
 
-    private func retryInitialHelloAfterVerification() {
-        guard phase == .failed, welcome == nil, helloRefusedBeforeVerification,
-              verificationCompleted, !retriedAfterVerification, context != nil,
-              context == currentContext(), !journal.loadFailed else { return }
-        retriedAfterVerification = true
-        helloRefusedBeforeVerification = false
+    func channelFailed(_ text: String, unsupported: Bool = false) {
+        guard context == currentContext() else { return }
+        if unsupported { failUnsupportedVersion() } else { fail(text); changed() }
+    }
+
+    func channelMembershipRefreshed(context refreshed: AtemSessionContext) {
+        guard phase == .failed, context == refreshed, refreshed == currentContext(), !journal.loadFailed else { return }
         clearAttachment()
+        retriedAfterVerification = true
         phase = .connecting
-        status = "Verification complete. Opening an authenticated Atem session..."
-        var hello = AtemSessionMessage(op: "hello")
-        hello.revision = AtemSessionWire.revision
-        _ = request(hello)
+        connectingSince = now()
+        openChannel(refreshed)
+        changed()
+    }
+
+    /// Only the shared r9 verifier's welcome may enter here, never a socket's decoded JSON.
+    func channelWelcomed(_ message: AtemSessionMessage, from source: RemoteTerminalConnection) {
+        guard phase == .connecting, context?.route == source, context == currentContext() else { return }
+        do {
+            try message.validate()
+            guard message.revision == AtemSessionWire.revision else { failUnsupportedVersion(); return }
+            try acceptWelcome(message)
+        } catch let error as WelcomeFailure { fail(error.message) }
+        catch { fail("Atem's encrypted welcome failed validation. Reconnect or verify this host with r9.") }
         changed()
     }
 
     private func clearAttachment() {
+        retriedAfterVerification = false
         chat.reset(sendClose: false)
         approvalRules = [:]
         regrantedAfterRevoke = []
@@ -174,6 +216,7 @@ final class AtemSessionClient {
         unsupportedVersion = false
         registry = [:]
         approvals = [:]
+        reportedSeen = []
         closedApprovals = [:]
         latestReceipt = nil
         leases = [:]
@@ -191,6 +234,7 @@ final class AtemSessionClient {
     private func reconnect() {
         guard let context, context == currentContext(), !journal.loadFailed else { return }
         clearAttachment()
+        closeChannel(context)
         phase = .reconnecting
         status = "Session reset; reconnecting..."
         changed()
@@ -326,6 +370,27 @@ final class AtemSessionClient {
         return !journal.snapshot.requests.contains {
             $0.target == target && $0.approvalID == approval.approval_id && $0.receipt?.state != .rejected
         }
+    }
+
+    /// Call only for an actually visible card in a focused window with recent
+    /// user input. This read-form binding neither acquires nor renews a lease.
+    @discardableResult
+    func markApprovalSeen(_ approval: AtemApprovalRequest) -> Bool {
+        guard canReviewApprovals, features.contains("approval.seen"), approvals[approval.approval_id] == approval,
+              let target = target(sessionId: approval.session_id, process: approval.process_gen),
+              registry[approval.session_id]?.state == "running", let binding = binding(for: target, mutation: false) else { return false }
+        let key = seenKey(approval.approval_id, target)
+        if reportedSeen.contains(key) { return true }
+        guard !pending.values.contains(where: { $0.message.op == "approval_seen"
+            && $0.message.approval_id == approval.approval_id && $0.message.binding?.target == target }) else { return false }
+        var message = AtemSessionMessage(op: "approval_seen")
+        message.binding = binding; message.approval_id = approval.approval_id
+        return request(message)
+    }
+
+    private func seenKey(_ approval: String, _ target: AtemSessionTarget) -> String {
+        [target.account_id, target.atem_device_id, String(target.host_trust_gen), target.session_id,
+         target.process_gen, approval].joined(separator: "\u{0}")
     }
 
     @discardableResult
@@ -467,33 +532,12 @@ final class AtemSessionClient {
         guard context?.route == source, context == currentContext(), phase != .failed, phase != .reconnecting else { return }
         do {
             try message.validate()
-            if message.op == "welcome" {
-                guard phase == .connecting, let re = message.re, pending[re]?.message.op == "hello" else { return }
-                guard message.revision == AtemSessionWire.revision, message.features != nil else {
-                    failUnsupportedVersion(); return
-                }
-                try acceptWelcome(message); changed(); return
-            }
+            // Welcome is admitted only by channelWelcomed after shared-core authentication.
+            guard message.op != "welcome" else { return }
             if message.op == "error", message.re == nil {
                 if message.code == "unsupported_version" { failUnsupportedVersion(); return }
                 if message.code == "unauthorized", welcome != nil { reconnect(); return }
-                if message.code == "unauthorized", phase == .connecting,
-                   pending.values.contains(where: { $0.message.op == "hello" }) {
-                    helloRefusedBeforeVerification = true
-                }
-                status = "Atem: " + AtemSessionWire.diagnosticErrorCode(message.code)
-                if phase == .connecting || ["unauthorized", "paused", "unsupported_version"].contains(message.code ?? "") {
-                    fail(status + ". Reconnect the session with matching Astation and Atem builds.")
-                }
-                retryInitialHelloAfterVerification()
-                changed(); return
-            }
-            if phase == .connecting, message.op == "error", let re = message.re, pending[re]?.message.op == "hello" {
-                if message.code == "unsupported_version" { failUnsupportedVersion(); return }
-                helloRefusedBeforeVerification = message.code == "unauthorized"
-                fail("Atem could not open a session: " + AtemSessionWire.diagnosticErrorCode(message.code)
-                    + ". Reconnect to open a fresh session connection.")
-                retryInitialHelloAfterVerification()
+                fail("Atem: " + AtemSessionWire.diagnosticErrorCode(message.code))
                 changed(); return
             }
             guard phase == .ready, now() < authorizationDeadline else { return }
@@ -527,6 +571,13 @@ final class AtemSessionClient {
                 try AtemSessionWire.check(closedApprovals.count < 4096 || closedApprovals[id] != nil)
                 closedApprovals[id] = reason
                 approvals.removeValue(forKey: id)
+            case "seen":
+                if let re = message.re, let operation = pending[re],
+                   operation.message.op == "approval_seen", let id = operation.message.approval_id,
+                   let target = operation.message.binding?.target {
+                    pending.removeValue(forKey: re)
+                    reportedSeen.insert(seenKey(id, target))
+                }
             case "lease": acceptLease(message)
             case "lease_changed": acceptLeaseChange(message)
             case "lease_released":
@@ -575,15 +626,23 @@ final class AtemSessionClient {
                 }
             default: break
             }
-        } catch { fail("Atem sent an invalid or inconsistent session message. Reconnect to continue.") }
+        } catch let failure as WelcomeFailure {
+            // Only fixed check names and bounded counters belong in diagnostics.
+            Log.warn("[Sessions] Rejected \(failure.diagnostic)")
+            fail(failure.message)
+        } catch {
+            Log.warn("[Sessions] Rejected session message: validation_or_consistency")
+            fail("Atem sent an invalid or inconsistent session message. Reconnect to continue.")
+        }
         changed()
     }
 
     func tick() {
         connectionChanged()
         guard phase == .ready else {
-            if phase == .connecting, pending.values.contains(where: { now() - $0.sent >= 8 }) {
-                fail("This Atem did not open a session. Update Atem to enable remote control.")
+            if phase == .connecting, now() - connectingSince >= 25 {
+                if let context { closeChannel(context) }
+                fail("Atem did not complete the encrypted r9 connection. Check its status or upgrade Atem, then reconnect.")
                 changed()
             }
             return
@@ -609,25 +668,34 @@ final class AtemSessionClient {
     }
 
     private func acceptWelcome(_ message: AtemSessionMessage) throws {
-        guard phase == .connecting, let re = message.re, let hello = pending.removeValue(forKey: re), hello.message.op == "hello",
-              let context, message.account_id == context.account, message.atem_device_id == context.device,
-              message.client_kind == "native", message.permissions?.contains("view") == true,
-              let remaining = message.authorization_ms_left, remaining > 0, remaining <= 86_400_000,
+        guard phase == .connecting, let context,
               let trust = message.host_trust_gen, message.revision == AtemSessionWire.revision,
-              message.host_error == nil else { throw AtemSessionJSON.Invalid.json }
-        try journal.update { state in
-            if let index = state.hosts.firstIndex(where: { $0.account == context.account && $0.device == context.device }) {
-                let previous = state.hosts[index]
-                try AtemSessionWire.check(trust >= previous.trust)
-                if trust > previous.trust { state.hosts[index] = AtemSessionHostFence(account: context.account, device: context.device, trust: trust) }
-            } else { state.hosts.append(AtemSessionHostFence(account: context.account, device: context.device, trust: trust)) }
+              let remaining = message.authorization_ms_left else { throw AtemSessionJSON.Invalid.json }
+        guard message.account_id == context.account else { throw WelcomeFailure.invalid(.account) }
+        guard message.atem_device_id == context.device else { throw WelcomeFailure.invalid(.device) }
+        guard message.client_kind == "native" else { throw WelcomeFailure.invalid(.clientKind) }
+        guard message.permissions?.contains("view") == true else { throw WelcomeFailure.invalid(.permissions) }
+        guard remaining > 0, remaining <= 86_400_000 else { throw WelcomeFailure.invalid(.authorization) }
+        guard message.host_error == nil else { throw WelcomeFailure.invalid(.hostError) }
+        do {
+            try journal.update { state in
+                if let index = state.hosts.firstIndex(where: { $0.account == context.account && $0.device == context.device }) {
+                    let previous = state.hosts[index]
+                    guard trust >= previous.trust else { throw WelcomeFailure.trustRollback(received: trust, minimum: previous.trust) }
+                    if trust > previous.trust { state.hosts[index] = AtemSessionHostFence(account: context.account, device: context.device, trust: trust) }
+                } else { state.hosts.append(AtemSessionHostFence(account: context.account, device: context.device, trust: trust)) }
+            }
+        } catch let failure as WelcomeFailure {
+            throw failure
+        } catch {
+            throw WelcomeFailure.storage
         }
         if let fence = journal.snapshot.hosts.first(where: { $0.account == context.account && $0.device == context.device }) {
             runtimeEpoch = fence.runtimeEpoch
             runtimeGeneration = fence.runtimeGeneration
         }
-        authorizationDeadline = min(hello.sent + Double(remaining) / 1000, now() + Double(remaining) / 1000)
-        try AtemSessionWire.check(now() < authorizationDeadline)
+        authorizationDeadline = min(connectingSince + Double(remaining) / 1000, now() + Double(remaining) / 1000)
+        guard now() < authorizationDeadline else { throw WelcomeFailure.invalid(.authorization) }
         welcome = message
         features = Set(message.features ?? []).intersection(AtemSessionWire.features)
         // Sequence numbers, removals and authority belong to this attachment;

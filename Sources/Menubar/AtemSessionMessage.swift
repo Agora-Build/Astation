@@ -1,9 +1,10 @@
 import Foundation
 
 enum AtemSessionWire {
-    static let revision: UInt64 = 8
+    static let revision: UInt64 = 9
     static let features: Set<String> = ["chat.history_end", "chat.history", "chat.lookup", "chat.coverage",
-        "receipt.result", "approval.session_rules", "approval.card_reason", "chat.send_acquire", "approval.lease_free"]
+        "receipt.result", "approval.session_rules", "approval.card_reason", "chat.send_acquire", "approval.lease_free",
+        "membership.carry", "push.sealed", "approval.seen", "grant.revoke", "recovery.wait"]
     static let maximumCounter = UInt64(AtemSessionJSON.maximumInteger)
     static let submissionKinds = ["prompt", "interrupt", "stop", "approval", "approval_rule_revoke"]
     static func diagnosticErrorCode(_ value: String?) -> String {
@@ -218,7 +219,6 @@ struct AtemSessionMessage: Codable, Equatable {
             try AtemSessionWire.check(counter.map { $0 <= AtemSessionWire.maximumCounter } != false)
         }
         switch op {
-        case "hello": try AtemSessionWire.check(revision == AtemSessionWire.revision)
         case "list": break
         case "welcome":
             try AtemSessionWire.check(account_id.map(AtemSessionWire.opaque) == true && atem_device_id.map(AtemSessionWire.opaque) == true
@@ -263,6 +263,9 @@ struct AtemSessionMessage: Codable, Equatable {
                 try AtemSessionWire.check(fields.count == 1 && fields["rule_id"]?.string.map(AtemSessionWire.opaque) == true)
             } else if kind != "approval" { try AtemSessionWire.check(payload == .object([:])) }
         case "approval_request": try AtemSessionWire.check(approval?.valid == true)
+        case "approval_seen":
+            try AtemSessionWire.check(binding != nil && binding?.lease_epoch == nil && approval_id.map(AtemSessionWire.uuid) == true)
+        case "seen": try AtemSessionWire.check(re != nil)
         case "approval_rules":
             try AtemSessionWire.check(session_id.map(AtemSessionWire.session) == true && process_gen.map(AtemSessionWire.uuid) == true
                 && rules.map(AtemApprovalRule.validSessionList) == true)

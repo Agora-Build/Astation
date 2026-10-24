@@ -2,6 +2,7 @@
 """Record immutable build metadata before the app bundle is signed."""
 
 import argparse
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 import plistlib
@@ -29,6 +30,17 @@ def main():
         except (FileNotFoundError, subprocess.CalledProcessError):
             version = "Development"
     info["AstationBuildVersion"] = version
+    account_keys = {
+        "ASTATION_ACCOUNT_CLIENT_ID": "AstationAccountClientID",
+        "ASTATION_ACCOUNT_RESOURCE": "AstationAccountResource",
+        "ASTATION_ACCOUNT_SCOPE": "AstationAccountScope",
+    }
+    if any(os.environ.get(key) for key in account_keys):
+        if not all(os.environ.get(key) for key in account_keys):
+            parser.error("Set all registered Astation account client, resource and scope values together.")
+        for key, plist_key in account_keys.items():
+            info[plist_key] = os.environ[key]
+        info["AstationAccountIssuer"] = os.environ.get("ASTATION_ACCOUNT_ISSUER", "https://auth.agora.build")
     info["AstationBuildTimestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     args.plist.write_bytes(plistlib.dumps(info))
 

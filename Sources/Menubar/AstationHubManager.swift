@@ -2,6 +2,9 @@ import CStationCore
 import AppKit
 import Foundation
 import Network
+import AtemClient
+import AstationRemote
+import CryptoKit
 
 // Hub Manager - Contains all business logic for Agora projects, tokens, etc.
 class AstationHubManager: ObservableObject {
@@ -32,7 +35,28 @@ class AstationHubManager: ObservableObject {
     private var hubStartTime = Date()
     let sessionStore: SsoSessionStore
     let tokenProvider: SsoTokenProvider
-    let apiClient = AgoraAPIClient()
+    private(set) var accountAuth: AstationAccountAuth
+    private let accountDefaults: UserDefaults
+    private(set) var portalSettings: AccountServiceSettings?
+    private(set) var portalAuth: AstationAccountAuth?
+    let portalAPI: PortalAPIClient
+    @Published private(set) var signedInAccount: String?
+    @Published private(set) var accountSignInRequired = true
+    @Published private(set) var accountSignInInProgress = false
+    @Published private(set) var agoraConnection: PortalAgoraConnection?
+    private var projectLoadTask: Task<Void, Never>?
+    private var accountGeneration = UUID()
+    private var portalProjects: [String: PortalAPIClient.Project] = [:]
+    private var projectCache: PortalProjectCache?
+    @Published private(set) var projectCacheUpdatedAt: Date?
+    @Published private(set) var usingSavedProjects = false
+
+    private static func makePortalAuth(settings: AccountServiceSettings?) -> AstationAccountAuth? {
+        guard let settings, let config = try? settings.oidcConfiguration else { return nil }
+        // Include the destination as well as the issuer/audience in credential storage isolation.
+        return AstationAccountAuth(configuration: config,
+            storage: AccountKeychainStorage(service: "build.agora.astation.portal-account-v1." + settings.storageContext))
+    }
     let rtcManager = RTCManager()
     let authGrantController = AuthGrantController()
     let deviceSessionStore: SessionStore
@@ -107,6 +131,55 @@ class AstationHubManager: ObservableObject {
     private var directMigrationContexts: [String: MigrationContext] = [:]
     private var directSessionContexts: [String: AtemSessionContext] = [:]
     let atemE2EIdentity: AtemE2EIdentity
+    @MainActor private var accountRecovery: AstationRecoveryCoordinator?
+    @MainActor private var approvalPushHints: RemotePushHints?
+    @MainActor private var approvalPushScope: String?
+
+    @MainActor func verifyApprovalPush(_ userInfo: [AnyHashable: Any], tapped: Bool) -> ApprovalPushHint? {
+        do {
+            guard let json = userInfo["r9_hint"] as? String, json.utf8.count <= 16_384 else { return nil }
+            let parsed = try signedObjectInfo(json: json)
+            guard parsed.bodyType == "atem-push-hint",
+                  let body = try JSONSerialization.jsonObject(with: Data(parsed.bodyJcs.utf8)) as? [String: Any],
+                  body["account_id"] as? String == e2eDataAccount, let host = body["host_id"] as? String else { return nil }
+            let log = try recoveryCoordinator().channelMembership(hostID: host)
+            let scope = log.accountId() + ":" + log.genesisHash()
+            if approvalPushScope != scope {
+                approvalPushHints = nil; approvalPushScope = nil
+                let store = try RemoteRecoveryStore(pushAccountID: log.accountId(), genesisHash: log.genesisHash(), deviceID: AstationIdentity.shared.id)
+                approvalPushHints = try RemotePushHints(accountID: log.accountId(), genesisHash: log.genesisHash(),
+                    deviceID: AstationIdentity.shared.id, checkpoint: store.read(), persist: { try store.write($0) })
+                approvalPushScope = scope
+            }
+            guard let hints = approvalPushHints else { return nil }
+            let now = UInt64(max(0, Date().timeIntervalSince1970 * 1000))
+            if tapped {
+                let target = try hints.target(hintJSON: json, log: log, now: now)
+                let hint = try verifyPushHint(hintJson: json, log: log, nowMs: now, verifier: .client)
+                if case .resolved = hint.state() { return ApprovalPushHint(verified: target, resolved: true) }
+                return ApprovalPushHint(verified: target, resolved: false)
+            }
+            guard let notice = try hints.receive(hintJSON: json, log: log, now: now) else { return nil }
+            if case .resolved = notice.state { return ApprovalPushHint(verified: notice.approval, resolved: true) }
+            return ApprovalPushHint(verified: notice.approval, resolved: false)
+        } catch {
+            Log.warn("[Approvals] Sealed notification could not be verified; reconnect for current host state")
+            return nil
+        }
+    }
+
+    @MainActor func recoveryCoordinator(account: String? = nil, relayURL: String? = nil) throws -> AstationRecoveryCoordinator {
+        let account = account ?? e2eDataAccount
+        let targetRelay = relayURL ?? stationRelayUrl
+        if let coordinator = accountRecovery, coordinator.accountID == account, coordinator.relayURL == targetRelay { return coordinator }
+        accountRecovery = nil
+        let coordinator = try AstationRecoveryCoordinator(accountID: account, managerID: AstationIdentity.shared.id,
+            identity: atemE2EIdentity, relayURL: targetRelay,
+            accessToken: { [accountAuth] in try await accountAuth.accessToken(relayURL: targetRelay) },
+            allowNewDataKey: { [weak self] in self?.e2eDataAccount == account && self?.relayEncryptionState?.mode == "off" })
+        accountRecovery = coordinator
+        return coordinator
+    }
     private lazy var atemVerification = AtemVerificationController(
         identity: atemE2EIdentity,
         account: { [weak self] in self?.e2eDataAccount ?? "" },
@@ -119,10 +192,35 @@ class AstationHubManager: ObservableObject {
             }
         },
         approve: AtemVerificationUI.approve,
-        saveRecovery: AtemVerificationUI.saveRecovery,
-        kit: { [weak self] in
-            guard let self else { throw AtemIdentityError.identityChanged }
-            return try self.atemE2EIdentity.recoveryKit(astationId: AstationIdentity.shared.id, relayURL: self.stationRelayUrl)
+        prepareKeys: { [weak self] account, nonce, completion in
+            Task { @MainActor in
+                do {
+                    guard let self, self.e2eDataAccount == account else { throw AtemIdentityError.identityChanged }
+                    completion(.success(try await self.recoveryCoordinator(account: account).pairingKeys(nonce: nonce)))
+                } catch { completion(.failure(error)) }
+            }
+        },
+        prepareHost: { [weak self] commit, reveal, keys, completion in
+            Task { @MainActor in
+                do {
+                    guard let self, self.e2eDataAccount == commit.context.accountID else { throw AtemIdentityError.identityChanged }
+                    let coordinator = try self.recoveryCoordinator(account: commit.context.accountID)
+                    let request = try await coordinator.prepareHost(commit: commit, reveal: reveal, keys: keys)
+                    var publishing: Task<Void, Never>?
+                    completion(.success(AtemPreparedHostMembership(publish: { confirmedAt, current, reply in
+                        publishing = Task { @MainActor in
+                            do { reply(.success(try await coordinator.commitHost(request: request, confirmedAt: confirmedAt, current: current))) }
+                            catch { reply(.failure(error)) }
+                        }
+                    }, cancel: {
+                        publishing?.cancel()
+                        Task { @MainActor in
+                            do { try coordinator.cancelUnsignedHost(request: request) }
+                            catch { Log.warn("[Recovery] Membership preparation could not be reconciled: \(error.localizedDescription)") }
+                        }
+                    })))
+                } catch { completion(.failure(error)) }
+            }
         }
     )
     private lazy var atemStorageKeys = AtemStorageKeyController(
@@ -150,6 +248,7 @@ class AstationHubManager: ObservableObject {
     /// Callback for sending a message to a specific client by ID.
     /// Set by AstationApp after wiring up the WebSocket server.
     var sendHandler: ((AstationMessage, String) -> Void)?
+    var sendDirectChannel: ((Data, String, @escaping (Error?) -> Void) -> Void)?
     var disconnectDirectClient: ((String) -> Void)?
     var terminalMessageHandler: ((RemoteTerminalMessage, RemoteTerminalConnection) -> Void)?
     var sessionMessageHandler: ((AtemSessionMessage, RemoteTerminalConnection) -> Void)?
@@ -162,6 +261,8 @@ class AstationHubManager: ObservableObject {
     var remoteAgentInputHandler: ((RemoteTerminalConnection, String?, String, String) -> Bool)?
     var sessionsRemovedHandler: (([String]) -> Void)?
     private var nativeSessionClients: [String: AtemSessionClient] = [:]
+    @MainActor private var r9Connections: [String: AstationR9Connection] = [:]
+    @MainActor private var r9Signer: AstationChannelSigner?
     private var sessionTimer: Timer?
     private let sessionJournal: AtemSessionJournal
     lazy var browserAgentChat = BrowserAgentChat(
@@ -189,8 +290,19 @@ class AstationHubManager: ObservableObject {
         dispatchMigration: @escaping (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) },
         makeIdentityRelayTask: @escaping (URL) -> IdentityRelaySocket = { URLSession.shared.webSocketTask(with: $0) },
         makePairingRelayTask: @escaping (URL) -> IdentityRelaySocket = { URLSession.shared.webSocketTask(with: $0) },
-        workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter
+        workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
+        portalSettings: AccountServiceSettings? = try? AccountServiceSettings.load(),
+        portalAuth: AstationAccountAuth? = nil,
+        portalAPI: PortalAPIClient = PortalAPIClient(),
+        projectCache: PortalProjectCache? = nil,
+        accountDefaults: UserDefaults = .standard
     ) {
+        self.accountDefaults = accountDefaults
+        self.accountAuth = AstationAccountAuth(defaults: accountDefaults)
+        self.portalSettings = portalSettings
+        self.portalAuth = portalAuth ?? Self.makePortalAuth(settings: portalSettings)
+        self.portalAPI = portalAPI
+        self.projectCache = projectCache ?? portalSettings.map(PortalProjectCache.init(settings:))
         self.deviceSessionStore = deviceSessionStore
         self.sessionStore = sessionStore
         self.makeIdentityRelayTask = makeIdentityRelayTask
@@ -387,32 +499,88 @@ class AstationHubManager: ObservableObject {
         rtcManager.leaveChannel()
     }
     
-    // MARK: - SSO Session
-
-    /// Whether an SSO session is on disk. Used by the UI to render
-    /// "Signed in" vs "Sign in".
-    var hasSession: Bool { sessionStore.hasSession }
-
-    /// Loaded session (no refresh). Use `tokenProvider.validToken()` if you
-    /// need a fresh access token for a network call.
-    func currentSession() -> SsoSession? { sessionStore.load() }
+    // MARK: - Account Session
 
     func checkSessionStatus() {
-        if hasSession {
-            Log.info("[AstationHub] SSO session found")
-        } else {
-            Log.info("[AstationHub] No SSO session. Open Settings → Sign in with Agora.")
-        }
+        Log.info("[AstationHub] Account login and linked projects use Agora.Build (Settings > Account)")
     }
 
     func reloadSession() {
         checkSessionStatus()
         refreshProjects()
         broadcastCredentials()
-        registerRelayAccountIfPossible()
     }
 
-    /// Broadcast a refreshed-on-use credentialSync to every connected Atem.
+    func accountSessionChanged() {
+        accountGeneration = UUID()
+        refreshProjects()
+        registerRelayAccountIfPossible()
+        NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
+    }
+
+    @MainActor func signInAccount() async throws {
+        guard !accountSignInInProgress else { throw AccountLoginError.busy }
+        accountSignInInProgress = true
+        defer { accountSignInInProgress = false }
+        guard let portalAuth else { throw AccountLoginError.configuration }
+        accountGeneration = UUID()
+        projectLoadTask?.cancel()
+        projects = []; selectedProject = nil; portalProjects = [:]; agoraConnection = nil; signedInAccount = nil
+        accountSignInRequired = true
+        projectCacheUpdatedAt = nil; usingSavedProjects = false
+        try projectCache?.clear()
+        let epoch = accountGeneration
+        try await portalAuth.signIn()
+        let primary = try await portalAuth.current()
+        guard epoch == accountGeneration else { throw AccountLoginError.changed }
+        signedInAccount = primary?.session.subject
+        accountSignInRequired = primary == nil || primary?.refreshPending == true
+        defer { if epoch == accountGeneration { accountSessionChanged() } }
+        // Relay credentials have a separate resource audience. Never substitute Portal tokens.
+        if accountAuth.configuration != nil {
+            let relayAuth = accountAuth
+            try await relayAuth.signIn()
+            let relay = try await relayAuth.current()
+            guard epoch == accountGeneration else { throw AccountLoginError.changed }
+            guard relay?.session.subject == signedInAccount else {
+                try await relayAuth.clearSession()
+                throw AccountLoginError.changed
+            }
+        }
+    }
+
+    @MainActor func signOutAccount() async throws {
+        accountGeneration = UUID()
+        let epoch = accountGeneration
+        let oldPortal = portalAuth, oldRelay = accountAuth
+        projectLoadTask?.cancel()
+        signedInAccount = nil; agoraConnection = nil
+        accountSignInRequired = true
+        projects = []; selectedProject = nil; portalProjects = [:]
+        projectCacheUpdatedAt = nil; usingSavedProjects = false
+        try projectCache?.clear()
+        try await oldPortal?.clearSession()
+        guard epoch == accountGeneration else { throw AccountLoginError.changed }
+        try await oldRelay.clearSession()
+        guard epoch == accountGeneration else { throw AccountLoginError.changed }
+        accountSessionChanged()
+    }
+
+    @MainActor func updateAccountServices(_ settings: AccountServiceSettings) async throws {
+        guard settings != portalSettings else { return }
+        try await signOutAccount()
+        accountRecovery = nil
+        settings.save(defaults: accountDefaults)
+        // Environment overrides remain authoritative; show the effective values in the form.
+        portalSettings = try AccountServiceSettings.load(defaults: accountDefaults)
+        portalAuth = Self.makePortalAuth(settings: portalSettings)
+        projectCache = portalSettings.map(PortalProjectCache.init(settings:))
+        accountAuth = AstationAccountAuth(defaults: accountDefaults)
+        accountSessionChanged()
+    }
+
+    /// Retain already-consented legacy service credentials for existing Atems.
+    /// Portal/relay account tokens must never enter this upstream-token message.
     func broadcastCredentials() {
         Task { await pushCredentials(targetClientId: nil) }
     }
@@ -456,53 +624,121 @@ class AstationHubManager: ObservableObject {
     
     // MARK: - Projects Management
 
-    /// Load projects from the BFF using the SSO access token.
+    /// Only Portal-scoped credentials can reach the linked Agora account APIs.
     private func loadProjects() {
-        Task {
-            let token: String
-            do { token = try await tokenProvider.validToken() }
-            catch SsoError.notSignedIn {
-                await MainActor.run {
-                    self.projects = []
-                    self.projectLoadError = "Not signed in. Open Settings → Sign in with Agora."
-                    Log.info("[AstationHub] Cannot load projects: not signed in")
-                }
-                return
-            } catch {
-                await MainActor.run {
-                    self.projects = []
-                    self.projectLoadError = "Session expired — please sign in again."
-                    NotificationCenter.default.post(name: .credentialsChanged, object: nil)
-                    Log.info("[AstationHub] Session expired, cleared: \(error.localizedDescription)")
-                }
-                return
-            }
+        projectLoadTask?.cancel()
+        let epoch = accountGeneration
+        let settings = portalSettings
+        let auth = portalAuth
+        projectLoadTask = Task { @MainActor in
             do {
-                let fetched = try await apiClient.fetchProjects(accessToken: token,
-                                                                bffUrl: SsoConfig.currentBffUrl)
-                await MainActor.run {
-                    self.projects = fetched
-                    self.projectLoadError = nil
-                    if self.selectedProject == nil || !fetched.contains(where: { $0.id == self.selectedProject?.id }) {
-                        self.selectedProject = fetched.first
-                    }
-                    Log.info(" Loaded \(fetched.count) projects from BFF")
+                guard let settings, let auth else { throw AccountLoginError.configuration }
+                let record = try await auth.current()
+                guard epoch == accountGeneration, !Task.isCancelled else { return }
+                signedInAccount = record?.session.subject
+                accountSignInRequired = record == nil || record?.refreshPending == true
+                guard record != nil else { throw AccountLoginError.signInRequired }
+                if projects.isEmpty, let cached = try projectCache?.load(subject: record!.session.subject) {
+                    portalProjects = Dictionary(uniqueKeysWithValues: cached.metadata.map { ($0.appId, $0) })
+                    projects = cached.projects
+                    selectedProject = projects.first
+                    projectCacheUpdatedAt = cached.updatedAt
+                    usingSavedProjects = true
+                    NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
                 }
-            } catch AgoraAPIError.unauthorized {
-                try? self.sessionStore.delete()
-                await MainActor.run {
-                    self.projects = []
-                    self.projectLoadError = "Session expired — please sign in again."
-                    NotificationCenter.default.post(name: .credentialsChanged, object: nil)
+                let connection = try await portalAPI.connection(settings: settings, auth: auth)
+                guard epoch == accountGeneration, !Task.isCancelled else { return }
+                agoraConnection = connection
+                guard connection.ready else { throw PortalAPIError.unavailable }
+                guard connection.connected, connection.reconnect != true else { throw PortalAPIError.connectAgora }
+                let fetched = try await portalAPI.projects(settings: settings, auth: auth)
+                guard epoch == accountGeneration, !Task.isCancelled else { return }
+                let previousMetadata = portalProjects
+                let previousProjects = Dictionary(uniqueKeysWithValues: projects.map { ($0.id, $0) })
+                portalProjects = Dictionary(uniqueKeysWithValues: fetched.map { ($0.appId, $0) })
+                projects = fetched.map { remote in
+                    let old = previousMetadata[remote.appId]?.projectId == remote.projectId ? previousProjects[remote.appId] : nil
+                    return AgoraProject(id: remote.appId, name: remote.name, vendorKey: remote.appId,
+                        signKey: old?.signKey ?? "", status: remote.status, created: 0)
                 }
+                selectedProject = projects.first(where: { $0.id == selectedProject?.id }) ?? projects.first
+                projectCacheUpdatedAt = Date(); usingSavedProjects = false
+                try saveProjectCache()
+                projectLoadError = nil
+                if let id = selectedProject?.id {
+                    do { _ = try await projectWithCertificate(id: id, refresh: true) }
+                    catch { if epoch == accountGeneration { projectLoadError = error.localizedDescription } }
+                }
+                guard epoch == accountGeneration, !Task.isCancelled else { return }
+                NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
             } catch {
-                await MainActor.run {
-                    self.projects = []
-                    self.projectLoadError = error.localizedDescription
-                    Log.error(" Failed to fetch projects: \(error)")
+                guard epoch == accountGeneration, !Task.isCancelled else { return }
+                if error as? AccountLoginError == .signInRequired || error as? PortalAPIError == .signInRequired {
+                    accountSignInRequired = true
                 }
+                if error as? PortalAPIError == .connectAgora {
+                    agoraConnection = PortalAgoraConnection(ready: true, connect: true, connected: false, name: agoraConnection?.name)
+                }
+                if !projects.isEmpty, signedInAccount != nil,
+                   Self.isProjectNetworkFailure(error) || error as? AccountLoginError == .signInRequired {
+                    usingSavedProjects = true
+                    projectLoadError = error as? AccountLoginError == .signInRequired
+                        ? "Using saved projects. Sign in again to refresh online access."
+                        : "Offline. Using saved projects and local token generation."
+                } else {
+                    projects = []; selectedProject = nil; portalProjects = [:]
+                    projectCacheUpdatedAt = nil; usingSavedProjects = false
+                    do { try projectCache?.clear() }
+                    catch { Log.warn("[AstationHub] Could not clear the linked-project Keychain cache") }
+                    projectLoadError = error.localizedDescription
+                }
+                NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
             }
         }
+    }
+
+    private static func isProjectNetworkFailure(_ error: Error) -> Bool {
+        if error as? PortalAPIError == .unavailable || error as? AccountLoginError == .unavailable { return true }
+        guard let error = error as? URLError else { return false }
+        return [.notConnectedToInternet, .networkConnectionLost, .timedOut, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed].contains(error.code)
+    }
+
+    private func saveProjectCache() throws {
+        guard let subject = signedInAccount, let updatedAt = projectCacheUpdatedAt else { return }
+        try projectCache?.save(subject: subject, metadata: Array(portalProjects.values), projects: projects, updatedAt: updatedAt)
+    }
+
+    /// Cached credentials sign tokens locally, including offline. Project refresh fetches again.
+    @MainActor func projectWithCertificate(id: String, refresh: Bool = false) async throws -> AgoraProject {
+        guard let project = projects.first(where: { $0.id == id }) else { throw PortalAPIError.invalidResponse }
+        if !refresh, !project.signKey.isEmpty { return project }
+        guard let remote = portalProjects[id], let settings = portalSettings, let auth = portalAuth else {
+            throw AccountLoginError.signInRequired
+        }
+        let epoch = accountGeneration
+        let result: AgoraProject
+        do {
+            result = try await portalAPI.certificate(project: remote, settings: settings, auth: auth)
+        } catch {
+            if epoch == accountGeneration, !Task.isCancelled,
+               error as? AccountLoginError == .signInRequired || error as? PortalAPIError == .signInRequired {
+                accountSignInRequired = true
+                NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
+            }
+            if epoch == accountGeneration, !Task.isCancelled, !project.signKey.isEmpty, Self.isProjectNetworkFailure(error) {
+                usingSavedProjects = true
+                projectLoadError = "Offline. Using saved projects and local token generation."
+                return project
+            }
+            throw error
+        }
+        guard epoch == accountGeneration, !Task.isCancelled,
+              portalProjects[id]?.projectId == remote.projectId,
+              let index = projects.firstIndex(where: { $0.id == id }) else { throw AccountLoginError.changed }
+        projects[index] = result
+        if selectedProject?.id == id { selectedProject = result }
+        try saveProjectCache()
+        return result
     }
 
     /// Re-fetch projects from the API (e.g. after credentials change).
@@ -525,6 +761,11 @@ class AstationHubManager: ObservableObject {
             return
         }
         selectedProject = project
+        let epoch = accountGeneration
+        Task { @MainActor in
+            do { _ = try await projectWithCertificate(id: id) }
+            catch { if epoch == accountGeneration { projectLoadError = error.localizedDescription } }
+        }
         Log.info("[AstationHub] Selected project: \(project.name)")
     }
     
@@ -547,7 +788,11 @@ class AstationHubManager: ObservableObject {
             project = effectiveProject
         }
 
-        guard let project = project, !project.signKey.isEmpty else {
+        let authorizedProject: AgoraProject?
+        if let project {
+            authorizedProject = try? await projectWithCertificate(id: project.id)
+        } else { authorizedProject = nil }
+        guard let project = authorizedProject, !project.signKey.isEmpty else {
             Log.warn(" No project with certificate found — returning empty token")
             return TokenResponse(token: "", channel: channel, uid: String(uid), expiresIn: "0")
         }
@@ -755,35 +1000,8 @@ class AstationHubManager: ObservableObject {
             // r6.2's authenticated session registry is the only agent list.
             return nil
 
-        case .session(let message):
-            guard let captured = captureSessionContext(clientId: clientId, relayConnectionId: relayConnectionId) else { return nil }
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.sessionContext(for: clientId) == captured else { return }
-                self.nativeSessionClients[clientId]?.receive(message, from: captured.route)
-                self.sessionMessageHandler?(message, captured.route)
-            }
-            return nil
-
-        case .terminal(let message):
-            // Direct client IDs are unique socket generations. Relay context is
-            // captured from the authenticated envelope before asynchronous delivery.
-            guard let captured = captureSessionContext(clientId: clientId, relayConnectionId: relayConnectionId) else { return nil }
-            DispatchQueue.main.async {
-                guard self.sessionContext(for: clientId) == captured else { return }
-                self.terminalMessageHandler?(message, captured.route)
-            }
-            return nil
-
-        case .agentChat(let event):
-            let captured = captureSessionContext(clientId: clientId, relayConnectionId: relayConnectionId)
-            let source = RemoteTerminalConnection(clientId: clientId, connectionId: relayConnectionId ?? clientId)
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.terminalConnection(for: clientId) == source else { return }
-                if let captured, self.sessionContext(for: clientId) == captured {
-                    self.nativeSessionClients[clientId]?.receiveChat(event, from: captured.route)
-                }
-                self.browserAgentChat.receiveAgent(event, from: source)
-            }
+        case .session, .terminal, .agentChat:
+            // Agent traffic is accepted exclusively through the authenticated r9 channel.
             return nil
 
         case .browserChat:
@@ -832,23 +1050,29 @@ class AstationHubManager: ObservableObject {
             return nil
 
         case .verifyCommit(let commit):
+            guard let context = captureMigrationContext(clientId: clientId, relayConnectionId: relayConnectionId) else { return nil }
             DispatchQueue.main.async { [weak self] in
-                guard let self, let route = self.verificationRoute(clientId: clientId, relayConnectionId: relayConnectionId) else { return }
-                self.atemVerification.start(commit, route: route)
+                self?.atemVerification.start(commit, route: context.route, account: context.account)
             }
             return nil
 
+        case .invalidVerifyCommit:
+            guard captureMigrationContext(clientId: clientId, relayConnectionId: relayConnectionId) != nil else { return nil }
+            return .verifyAbort(reason: "Invalid verification generation; upgrade Atem and retry")
+
         case .verifyReveal(let reveal):
+            guard let context = captureMigrationContext(clientId: clientId, relayConnectionId: relayConnectionId) else { return nil }
             DispatchQueue.main.async { [weak self] in
-                guard let self, let route = self.verificationRoute(clientId: clientId, relayConnectionId: relayConnectionId) else { return }
-                self.atemVerification.reveal(reveal, route: route)
+                guard let self, self.e2eDataAccount == context.account else { return }
+                self.atemVerification.reveal(reveal, route: context.route)
             }
             return nil
 
         case .verifyAbort:
+            guard let context = captureMigrationContext(clientId: clientId, relayConnectionId: relayConnectionId) else { return nil }
             DispatchQueue.main.async { [weak self] in
-                guard let self, let route = self.verificationRoute(clientId: clientId, relayConnectionId: relayConnectionId) else { return }
-                self.atemVerification.cancel(route: route)
+                guard let self, self.e2eDataAccount == context.account else { return }
+                self.atemVerification.cancel(route: context.route)
             }
             return nil
 
@@ -1181,7 +1405,12 @@ class AstationHubManager: ObservableObject {
             send: { [weak self] message, route in self?.sendSessionMessage(message, to: route) ?? false },
             journal: sessionJournal,
             reconnect: { [weak self] context in self?.reconnectSessionTransport(context) ?? false },
-            sendChat: { [weak self] message, route in self?.sendSessionChatMessage(message, to: route) ?? false })
+            sendChat: { [weak self] message, route in self?.sendSessionChatMessage(message, to: route) ?? false },
+            openChannel: { [weak self] context in
+                Task { @MainActor in self?.openR9Channel(context) }
+            }, closeChannel: { [weak self] context in
+                MainActor.assumeIsolated { self?.closeR9Channel(context) }
+            })
         nativeSessionClients[id] = client
         client.onChange = { [weak self, weak client] in
             guard let self, let client else { return }
@@ -1305,9 +1534,7 @@ class AstationHubManager: ObservableObject {
               let client = nativeSessionClients[route.clientId], client.phase == .ready,
               binding.attachment_gen == client.welcome?.attachment_gen,
               binding == client.binding(for: binding.target, mutation: binding.lease_epoch != nil) else { return false }
-        sendMessage(.terminal(message), to: route.clientId,
-                    expectedRelayConnectionId: route.clientId.hasPrefix("relay-") ? route.connectionId : nil)
-        return true
+        return MainActor.assumeIsolated { r9Connections[route.clientId]?.send(.terminal(message)) ?? false }
     }
 
     func sessionContext(for clientId: String, atemId: String? = nil) -> AtemSessionContext? {
@@ -1323,17 +1550,93 @@ class AstationHubManager: ObservableObject {
         dispatchPrecondition(condition: .onQueue(.main))
         guard sessionContext(for: route.clientId)?.route == route, sendHandler != nil,
               (try? message.validate()) != nil else { return false }
-        sendMessage(.session(message), to: route.clientId,
-                    expectedRelayConnectionId: route.clientId.hasPrefix("relay-") ? route.connectionId : nil)
-        return true
+        return MainActor.assumeIsolated { r9Connections[route.clientId]?.send(.session(message)) ?? false }
     }
 
     private func sendSessionChatMessage(_ message: AgentChatWire, to route: RemoteTerminalConnection) -> Bool {
         dispatchPrecondition(condition: .onQueue(.main))
         guard sessionContext(for: route.clientId)?.route == route, sendHandler != nil else { return false }
-        sendMessage(.agentChat(message), to: route.clientId,
-                    expectedRelayConnectionId: route.clientId.hasPrefix("relay-") ? route.connectionId : nil)
-        return true
+        return MainActor.assumeIsolated { r9Connections[route.clientId]?.send(.agentChat(message)) ?? false }
+    }
+
+    @MainActor private func openR9Channel(_ context: AtemSessionContext) {
+        guard sessionContext(for: context.route.clientId) == context else { return }
+        closeR9Channel(context)
+        do {
+            let coordinator = try recoveryCoordinator(account: context.account)
+            let log = try coordinator.channelMembership(hostID: context.device)
+            if r9Signer == nil { r9Signer = try AstationChannelSigner(identity: atemE2EIdentity, keyID: AstationIdentity.shared.id) }
+            let link = AstationR9Connection(context: context,
+                current: { [weak self] in self?.sessionContext(for: context.route.clientId) == context },
+                write: { [weak self] bytes, completion in
+                    guard let self, self.sessionContext(for: context.route.clientId) == context else {
+                        completion(RemoteChannelError.staleLink); return
+                    }
+                    if context.route.clientId.hasPrefix("relay-") {
+                        guard let socket = self.identityRelayTask, self.identityRelayVerified,
+                              let wrapped = try? RemoteRelayEnvelope.wrap(bytes, host: context.device, connection: context.route.connectionId),
+                              let text = String(data: wrapped, encoding: .utf8) else { completion(RemoteChannelError.staleLink); return }
+                        socket.send(.string(text), completionHandler: { completion($0) })
+                    } else if let send = self.sendDirectChannel { send(bytes, context.route.clientId, completion) }
+                    else { completion(RemoteChannelError.staleLink) }
+                }, welcomed: { [weak self] welcome in
+                    self?.nativeSessionClients[context.route.clientId]?.channelWelcomed(welcome, from: context.route)
+                }, receive: { [weak self] message in
+                    self?.receiveR9Application(message, context: context)
+                }, failed: { [weak self] message, unsupported in
+                    self?.nativeSessionClients[context.route.clientId]?.channelFailed(message, unsupported: unsupported)
+                }, refreshMembership: { [weak self] head in
+                    self?.refreshR9Membership(context, requiredHead: head)
+                })
+            r9Connections[context.route.clientId] = link
+            try link.start(identity: ClientIdentity(kind: .native, deviceId: AstationIdentity.shared.id,
+                keyId: AstationIdentity.shared.id, grantJson: nil), log: log, signer: r9Signer!)
+        } catch {
+            nativeSessionClients[context.route.clientId]?.channelFailed(
+                "r9 account membership is unavailable. Complete recovery setup and verify this Atem with an r9 build.")
+        }
+    }
+
+    @MainActor private func refreshR9Membership(_ context: AtemSessionContext, requiredHead: LogHead) {
+        guard let previous = r9Connections[context.route.clientId] else { return }
+        Task { @MainActor [weak self] in
+            guard let self, self.sessionContext(for: context.route.clientId) == context else { return }
+            do {
+                try await self.recoveryCoordinator(account: context.account)
+                    .refreshChannelMembership(hostID: context.device, requiredHead: requiredHead)
+                guard self.sessionContext(for: context.route.clientId) == context,
+                      self.r9Connections[context.route.clientId] === previous else { return }
+                self.nativeSessionClients[context.route.clientId]?.channelMembershipRefreshed(context: context)
+            } catch {
+                guard self.sessionContext(for: context.route.clientId) == context,
+                      self.r9Connections[context.route.clientId] === previous else { return }
+                self.nativeSessionClients[context.route.clientId]?.channelFailed(
+                    "The signed membership update could not be verified or saved. Review account verification before reconnecting.")
+            }
+        }
+    }
+
+    @MainActor private func closeR9Channel(_ context: AtemSessionContext) {
+        guard let link = r9Connections[context.route.clientId], link.context == context else { return }
+        r9Connections.removeValue(forKey: context.route.clientId)?.disconnect()
+    }
+
+    /// Socket adapters capture their authenticated generation before entering the main actor.
+    @MainActor func receiveR9Envelope(_ bytes: Data, clientID: String, connectionID: String) {
+        guard let context = sessionContext(for: clientID), context.route.connectionId == connectionID else { return }
+        r9Connections[clientID]?.receive(bytes)
+    }
+
+    @MainActor private func receiveR9Application(_ message: AstationMessage, context: AtemSessionContext) {
+        guard sessionContext(for: context.route.clientId) == context else { return }
+        switch message {
+        case .session(let payload):
+            nativeSessionClients[context.route.clientId]?.receive(payload, from: context.route)
+            sessionMessageHandler?(payload, context.route)
+        case .terminal(let payload): terminalMessageHandler?(payload, context.route)
+        case .agentChat(let payload): nativeSessionClients[context.route.clientId]?.receiveChat(payload, from: context.route)
+        default: break
+        }
     }
 
     private func browserChatConnection(for clientId: String) -> RemoteTerminalConnection? {
@@ -1759,6 +2062,15 @@ class AstationHubManager: ObservableObject {
                         // Raw relay control frame (relay-auth-1), not an Atem envelope.
                         DispatchQueue.main.async {
                             self?.handleRelayControlFrame(frame, task: task)
+                        }
+                    } else if let envelope = try? RemoteRelayEnvelope(Data(text.utf8)),
+                              RemoteRelayEnvelope.isChannel(envelope.payload) {
+                        Task { @MainActor in
+                            guard let self, self.identityRelayTask === task, self.identityRelayVerified,
+                                  DeviceAuthentication.isValidAtemId(envelope.host),
+                                  self.identityRelayAuthentication.isAuthenticated(clientId: "relay-\(envelope.host)",
+                                      connectionId: envelope.connection) else { return }
+                            self.receiveR9Envelope(envelope.payload, clientID: "relay-\(envelope.host)", connectionID: envelope.connection)
                         }
                     } else if let data = text.data(using: .utf8),
                        let rawPacket = try? AtemSessionJSON.validatePacket(data),
@@ -2278,11 +2590,10 @@ class AstationHubManager: ObservableObject {
         return (value, try DataEncryptionKeyManager.shared.recoveryKey(for: value))
     }
 
-    func installEncryptionKey(_ value: AccountDataKey) throws {
-        try DataEncryptionKeyManager.shared.install(
-            value,
-            dataAccount: relayEncryptionState?.dataAccount ?? currentDataAccount
-        )
+    @MainActor func installEncryptionKey(_ value: AccountDataKey) async throws {
+        let account = e2eDataAccount
+        try await recoveryCoordinator(account: account).installBackedUpKey(value)
+        guard e2eDataAccount == account else { throw AtemIdentityError.identityChanged }
     }
 
     func encryptionRecoveryKey() throws -> String {
@@ -2296,13 +2607,14 @@ class AstationHubManager: ObservableObject {
         return try DataEncryptionKeyManager.shared.recoveryKey(for: value)
     }
 
-    func restoreEncryptionKey(_ text: String) throws {
+    @MainActor func restoreEncryptionKey(_ text: String) async throws {
         let account = relayEncryptionState?.dataAccount ?? currentDataAccount
         let value = try DataEncryptionKeyManager.decodeRecoveryKey(text)
         if let state = relayEncryptionState, state.kid != nil, state.kid != value.kid {
             throw DataEncryptionKeyError.invalidRecoveryKey
         }
-        try DataEncryptionKeyManager.shared.install(value, dataAccount: account)
+        try await recoveryCoordinator(account: account).installBackedUpKey(value)
+        guard e2eDataAccount == account else { throw AtemIdentityError.identityChanged }
         if let state = relayEncryptionState, state.mode == "off" {
             setRelayEncryption(mode: "enabling", kid: value.kid)
         } else if let state = relayEncryptionState {
@@ -2505,22 +2817,32 @@ class AstationHubManager: ObservableObject {
 
     private func registerRelayAccountIfPossible() {
         guard identityRelayVerified else { return }
+        let generation = identityRelaySocketGeneration
+        let accountEpoch = accountGeneration
+        let relayURL = stationRelayUrl
         Task { [weak self] in
             guard let self else { return }
             do {
-                _ = try await tokenProvider.validToken()
-                guard let session = sessionStore.load() else { return }
+                let token = try await accountAuth.accessToken(relayURL: relayURL)
                 let rawLabel = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
                 let label = DeviceAuthentication.deviceLabel(rawLabel)
                 guard let text = RelayIdentityProtocol.registerAccountMessage(
-                    accessToken: session.accessToken,
+                    accessToken: token,
                     label: label
                 ) else { return }
                 await MainActor.run {
+                    guard self.identityRelaySocketGeneration == generation, self.accountGeneration == accountEpoch,
+                          self.stationRelayUrl == relayURL, self.identityRelayVerified else { return }
                     self.sendRelayIdentityControl(text, label: "relayRegisterAccount")
                 }
             } catch {
                 Log.debug("[RelayAccount] Registration deferred: \(error.localizedDescription)")
+                await MainActor.run {
+                    guard self.identityRelaySocketGeneration == generation, self.accountGeneration == accountEpoch,
+                          self.stationRelayUrl == relayURL else { return }
+                    self.relayAccountStatusMessage = error.localizedDescription
+                    NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
+                }
             }
         }
     }
@@ -2886,7 +3208,7 @@ struct MarkTask {
     var resultMessage: String?
 }
 
-struct AgoraProject: Codable, Identifiable {
+struct AgoraProject: Codable, Identifiable, Sendable {
     let id: String
     let name: String
     let vendorKey: String   // app_id

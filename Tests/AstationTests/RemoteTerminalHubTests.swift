@@ -134,29 +134,7 @@ private final class TerminalHubFixture {
         socket.sent.compactMap { $0["payload"] as? [String: Any] }.filter { $0["type"] as? String == "session" }
     }
 
-    func readySession() async throws -> (AtemSessionClient, AtemSessionTarget) {
-        let client = try XCTUnwrap(hub.sessionClient(for: clientId))
-        let context = try XCTUnwrap(hub.sessionContext(for: clientId))
-        let hello = try XCTUnwrap(sessionFrames.last { ($0["data"] as? [String: Any])?["op"] as? String == "hello" })
-        let data = try XCTUnwrap(hello["data"] as? [String: Any])
-        var welcome = AtemSessionMessage(op: "welcome")
-        welcome.revision = 8
-        welcome.features = AtemSessionWire.features.sorted()
-        welcome.re = try XCTUnwrap(data["id"] as? String)
-        welcome.account_id = context.account; welcome.atem_device_id = context.device
-        welcome.host_trust_gen = 1; welcome.runtime_gen = "55555555-5555-4555-8555-555555555555"
-        welcome.controller_session = "66666666-6666-4666-8666-666666666666"
-        welcome.attachment_gen = "33333333-3333-4333-8333-333333333333"
-        welcome.client_kind = "native"; welcome.permissions = ["view", "control"]
-        welcome.authorization_ms_left = 60_000; welcome.server_time = 1_760_500_000_000
-        try emit(.session(welcome)); await drain()
-        let descriptor = try JSONDecoder().decode(AtemSessionDescriptor.self, from: Data(
-            #"{"session_id":"ses-aaaaaaaaaaaa","process_gen":"22222222-2222-4222-8222-222222222222","provider":"claude","cwd_label":"Project","state":"running","activity":"ready","activity_since":1,"controller":null,"capabilities":["terminal-v1","chat-v1"],"created_at":1}"#.utf8))
-        var snapshot = AtemSessionMessage(op: "sessions")
-        snapshot.runtime_gen = welcome.runtime_gen; snapshot.runtime_epoch = 7; snapshot.seq = 1; snapshot.sessions = [descriptor]
-        try emit(.session(snapshot)); await drain()
-        return (client, try XCTUnwrap(client.target(sessionId: descriptor.session_id, process: descriptor.process_gen)))
-    }
+
 
     func revokeVerification() throws {
         let account = AstationIdentity.shared.id
@@ -184,20 +162,16 @@ private final class TerminalHubFixture {
 
 @MainActor
 final class RemoteTerminalHubTests: XCTestCase {
-    func testUnsupportedHostIsHiddenFromRoutingAndSelectionWithoutLosingItsPairing() async throws {
+    func testUnsupportedHostIsHiddenWithoutLosingItsPairingOrFallingBack() async throws {
         let f = try TerminalHubFixture()
         try await f.start(); try await f.authenticate()
-        let (client, _) = try await f.readySession()
-        XCTAssertEqual(f.hub.supportedAtemClients.count, 1)
-        var refusal = AtemSessionMessage(op: "error"); refusal.code = "unsupported_version"
-        try f.emit(.session(refusal)); await f.drain()
+        let client = try XCTUnwrap(f.hub.sessionClient(for: f.clientId))
+        client.channelFailed("Upgrade Atem", unsupported: true)
         XCTAssertTrue(client.unsupportedVersion)
         XCTAssertTrue(f.hub.supportedAtemClients.isEmpty)
         XCTAssertNil(f.hub.routeToFocusedAtem())
-        XCTAssertTrue(f.hub.agentsByClientId[f.clientId]?.isEmpty == true)
-        XCTAssertEqual(f.hub.connectedClients.count, 1, "Version rejection does not unpair the verified device")
-        XCTAssertTrue(AtemClientListModel.offlineSessions(activeSessions: f.hub.deviceSessionStore.getAllActive(),
-            connectedClients: f.hub.connectedClients).isEmpty, "A hidden incompatible host is not mislabeled offline")
+        XCTAssertEqual(f.hub.connectedClients.count, 1)
+        XCTAssertTrue(f.sessionFrames.isEmpty)
     }
 
     func testPairingRoomTransfersMessagesWithoutBecomingAnOnlineAtem() async throws {
@@ -220,24 +194,17 @@ final class RemoteTerminalHubTests: XCTestCase {
         XCTAssertTrue(f.hub.connectedClients.isEmpty)
     }
 
-    func testLocalVerificationCompletionRetriesOnlyTheRefusedInitialHello() async throws {
+    func testVerificationCannotFallBackWhenR9MembershipIsUnavailable() async throws {
         let f = try TerminalHubFixture()
         try await f.start(); try await f.authenticate()
-        let hello = try XCTUnwrap(f.sessionFrames.last?["data"] as? [String: Any])
-        var refusal = AtemSessionMessage(op: "error")
-        refusal.re = try XCTUnwrap(hello["id"] as? String); refusal.code = "unauthorized"
-        try f.emit(.session(refusal)); await f.drain()
         let route = AtemVerificationRoute(clientId: f.clientId, connectionId: f.generation,
             deviceId: f.deviceId, deviceName: "Host")
         f.hub.remoteVerificationDidComplete(on: route)
-        f.hub.remoteVerificationDidComplete(on: route)
-        XCTAssertEqual(f.socket.cancelCount, 0, "Verification delivery must not be interrupted by reconnect")
-        XCTAssertEqual(f.sockets.identity.count, 1)
-        let hellos = f.sessionFrames.compactMap { $0["data"] as? [String: Any] }.filter { $0["op"] as? String == "hello" }
-        XCTAssertEqual(hellos.count, 2)
-        XCTAssertNotEqual(hellos.last?["id"] as? String, hello["id"] as? String)
-        _ = try await f.readySession()
-        XCTAssertEqual(f.hub.sessionStatusByClientId[f.clientId]?.phase, .ready)
+        await f.drain()
+        XCTAssertTrue(f.sessionFrames.isEmpty)
+        XCTAssertEqual(f.hub.sessionStatusByClientId[f.clientId]?.phase, .failed)
+        XCTAssertTrue(f.hub.sessionStatusByClientId[f.clientId]?.message.contains("r9") == true)
+        XCTAssertEqual(f.socket.cancelCount, 0)
     }
 
     func testVerificationCompletionCannotRetryAStaleOrRevokedLink() async throws {
@@ -249,112 +216,68 @@ final class RemoteTerminalHubTests: XCTestCase {
             AtemVerificationRoute(clientId: f.clientId, connectionId: "stale", deviceId: f.deviceId, deviceName: "Host"),
             AtemVerificationRoute(clientId: f.clientId, connectionId: f.generation, deviceId: "other", deviceName: "Host")
         ] { f.hub.remoteVerificationDidComplete(on: route) }
-        XCTAssertEqual(f.sessionFrames.count, 1)
+        XCTAssertTrue(f.sessionFrames.isEmpty)
         try f.revokeVerification()
         f.hub.remoteVerificationDidComplete(on: AtemVerificationRoute(clientId: f.clientId, connectionId: f.generation,
             deviceId: f.deviceId, deviceName: "Host"))
-        XCTAssertEqual(f.sessionFrames.count, 1)
+        XCTAssertTrue(f.sessionFrames.isEmpty)
         XCTAssertEqual(f.socket.cancelCount, 0)
     }
 
-    func testPairingTimeHelloRefusalRetryClosesSocketAndRequiresFreshAuthentication() async throws {
+    func testPlaintextWelcomeAndRefusalNeverOpenAChannelOrReconnectTheSocket() async throws {
         let f = try TerminalHubFixture()
         try await f.start(); try await f.authenticate()
-        let hello = try XCTUnwrap(f.sessionFrames.last?["data"] as? [String: Any])
-        var refusal = AtemSessionMessage(op: "error")
-        refusal.re = try XCTUnwrap(hello["id"] as? String)
-        refusal.code = "unauthorized"
-        try f.emit(.session(refusal)); await f.drain()
-        XCTAssertEqual(f.hub.sessionStatusByClientId[f.clientId]?.phase, .failed)
-        XCTAssertTrue(f.hub.sessionStatusByClientId[f.clientId]?.message.contains("unauthorized") == true)
-        XCTAssertEqual(f.hub.sessionStatusByClientId[f.clientId]?.canReconnect, true)
-        XCTAssertFalse(f.hub.sessionStatusByClientId[f.clientId]?.message.contains("Complete verification") == true)
-        let oldSocket = f.socket
-        let oldContext = try XCTUnwrap(f.hub.sessionContext(for: f.clientId))
-        let oldChallenge = try XCTUnwrap(f.challenges.last)
-        f.hub.requestAgentList(from: f.clientId)
+        let client = try XCTUnwrap(f.hub.sessionClient(for: f.clientId))
+        var refusal = AtemSessionMessage(op: "error"); refusal.code = "unauthorized"
+        try f.emit(.session(refusal))
         await f.drain()
-        XCTAssertEqual(oldSocket.cancelCount, 1)
-        XCTAssertEqual(oldSocket.closeCode, .goingAway)
-        XCTAssertFalse(f.socket === oldSocket)
-        XCTAssertEqual(f.sockets.identity.count, 2)
-        XCTAssertNil(f.hub.sessionContext(for: f.clientId))
+        XCTAssertNil(client.welcome)
+        XCTAssertFalse(client.hasRegistrySnapshot)
+        XCTAssertEqual(f.socket.cancelCount, 0)
         XCTAssertTrue(f.sessionFrames.isEmpty)
-        try await f.start()
-        try f.socket.emit(["atem_id": f.deviceId, "connection_id": f.generation, "relay_event": "connected"])
-        await f.drain()
-        XCTAssertTrue(f.sessionFrames.isEmpty)
-        try await f.prove(challenge: oldChallenge)
-        XCTAssertNil(f.hub.sessionContext(for: f.clientId))
-        try await f.prove(challenge: XCTUnwrap(f.challenges.last))
-        XCTAssertEqual(f.sessionFrames.count, 1)
-        let current = try XCTUnwrap(f.hub.sessionContext(for: f.clientId))
-        XCTAssertEqual(current.route, oldContext.route, "The Atem host socket survived the Mac reconnect")
-        XCTAssertNotEqual(current.transportGeneration, oldContext.transportGeneration)
-        let retry = try XCTUnwrap(f.sessionFrames.last?["data"] as? [String: Any])
-        XCTAssertNotEqual(hello["id"] as? String, retry["id"] as? String)
-        _ = try await f.readySession()
-        XCTAssertEqual(f.hub.sessionStatusByClientId[f.clientId]?.phase, .ready)
     }
 
-    func testSleepWakeClosesTransportFencesControlAndIgnoresStaleSocket() async throws {
+    func testSleepWakeClosesTransportAndNeverRestoresAPlaintextSession() async throws {
         let f = try TerminalHubFixture()
         try await f.start(); try await f.authenticate()
-        let (client, target) = try await f.readySession()
         let oldContext = try XCTUnwrap(f.hub.sessionContext(for: f.clientId))
-        client.acquire(target)
-        var lease = AtemSessionMessage(op: "lease")
-        lease.re = try XCTUnwrap((f.sessionFrames.last?["data"] as? [String: Any])?["id"] as? String)
-        lease.binding = AtemSessionBinding(target: target, attachment_gen: try XCTUnwrap(client.welcome?.attachment_gen), lease_epoch: 1)
-        lease.ms_left = 15_000
-        try f.emit(.session(lease)); await f.drain()
-        XCTAssertTrue(client.controls(target))
         let oldSocket = f.socket
         f.workspaceNotifications.post(name: NSWorkspace.willSleepNotification, object: nil)
         XCTAssertNil(f.hub.sessionContext(for: f.clientId))
-        XCTAssertFalse(client.controls(target))
-        XCTAssertTrue(client.registry.isEmpty)
         XCTAssertEqual(oldSocket.cancelCount, 1)
         f.hub.startIdentityRelay()
-        XCTAssertEqual(f.sockets.identity.count, 1, "No reconnect while sleeping")
-        await f.drain()
+        XCTAssertEqual(f.sockets.identity.count, 1)
         f.workspaceNotifications.post(name: NSWorkspace.didWakeNotification, object: nil)
         f.workspaceNotifications.post(name: NSWorkspace.didWakeNotification, object: nil)
-        XCTAssertEqual(f.sockets.identity.count, 2, "Duplicate wake does not reconnect twice")
+        XCTAssertEqual(f.sockets.identity.count, 2)
         try oldSocket.emit(["type": "relayAuthResult", "status": "verified"])
         await f.drain()
         XCTAssertNil(f.hub.sessionContext(for: f.clientId))
-        XCTAssertTrue(f.sessionFrames.isEmpty)
         try await f.start(); try await f.authenticate()
         let current = try XCTUnwrap(f.hub.sessionContext(for: f.clientId))
         XCTAssertEqual(oldContext.route, current.route)
         XCTAssertNotEqual(oldContext.transportGeneration, current.transportGeneration)
-        let (newClient, _) = try await f.readySession()
-        try f.emit(.session(lease)); await f.drain()
-        XCTAssertFalse(newClient.controls(target), "Old lease replies never restore control")
-        XCTAssertEqual(f.sessionFrames.filter { ($0["data"] as? [String: Any])?["op"] as? String == "hello" }.count, 1)
+        XCTAssertTrue(f.sessionFrames.isEmpty)
+        XCTAssertNil(f.hub.sessionClient(for: f.clientId)?.welcome)
     }
 
-    func testPostWelcomeUnauthorizedReconnectsOnceWithoutVerificationPrompt() async throws {
+    func testForgedChannelOnUnknownRouteCannotReachTerminalOrChat() async throws {
         let f = try TerminalHubFixture()
         try await f.start(); try await f.authenticate()
-        let (client, _) = try await f.readySession()
-        let oldSocket = f.socket
-        var refusal = AtemSessionMessage(op: "error"); refusal.code = "unauthorized"
-        try f.emit(.session(refusal)); await f.drain()
-        XCTAssertEqual(oldSocket.cancelCount, 1)
-        XCTAssertEqual(f.sockets.identity.count, 2)
-        XCTAssertNil(client.welcome)
-        XCTAssertFalse(client.status.contains("Complete verification"))
+        var delivered = 0
+        f.hub.terminalMessageHandler = { _, _ in delivered += 1 }
+        try f.socket.emit(["atem_id": f.deviceId, "connection_id": f.generation,
+            "payload": ["type":"channel", "event":"frame", "channel":"unknown", "frame":["ch":"atem-ch1", "op":"record", "ct":"forged"]]])
+        await f.drain()
+        XCTAssertEqual(delivered, 0)
+        XCTAssertNil(f.hub.sessionClient(for: f.clientId)?.welcome)
         XCTAssertTrue(f.sessionFrames.isEmpty)
-        oldSocket.fail(); await f.drain()
-        XCTAssertEqual(f.sockets.identity.count, 2)
     }
 
     func testPairingWithOnlineHostNeverCreatesPairingRoomRowOrAnotherHello() async throws {
         let f = try TerminalHubFixture()
         try await f.start(); try await f.authenticate()
-        _ = try await f.readySession()
+        _ = try XCTUnwrap(f.hub.sessionClient(for: f.clientId))
         let before = f.sessionFrames.count
         f.hub.connectToRelay(code: "TEST-CODE"); await f.drain()
         XCTAssertEqual(f.hub.connectedClients.map(\.id), [f.clientId])
@@ -380,7 +303,7 @@ final class RemoteTerminalHubTests: XCTestCase {
         client.receive(refusal, from: try XCTUnwrap(f.hub.sessionContext(for: "direct-one")).route)
         client.refresh(); await f.drain()
         XCTAssertEqual(closed, ["direct-one"])
-        XCTAssertEqual(sent.filter { $0.op == "hello" }.count, 1)
+        XCTAssertTrue(sent.isEmpty)
         XCTAssertNil(f.hub.sessionContext(for: "direct-one"))
         XCTAssertNotNil(f.hub.sessionContext(for: "direct-two"))
     }
@@ -507,22 +430,18 @@ final class RemoteTerminalHubTests: XCTestCase {
         XCTAssertTrue(f.hub.agentsByClientId[f.clientId]?.isEmpty != false)
     }
 
-    func testOneSessionClientServesConnectionsAndTerminalWithoutSecondHello() async throws {
+    func testConnectionsAndTerminalShareOneR9ClientAndNeverSendPlaintextHello() async throws {
         let f = try TerminalHubFixture()
         try await f.start(); try await f.authenticate()
-        let (client, target) = try await f.readySession()
-        let initialHellos = f.sessionFrames.filter { ($0["data"] as? [String: Any])?["op"] as? String == "hello" }.count
-        XCTAssertEqual(initialHellos, 1)
+        let client = try XCTUnwrap(f.hub.sessionClient(for: f.clientId))
         for _ in 0..<3 {
             XCTAssertTrue(f.hub.sessionClient(for: f.clientId) === client)
             client.start()
-            f.hub.requestAgentList(from: f.clientId)
         }
-        XCTAssertEqual(f.sessionFrames.filter { ($0["data"] as? [String: Any])?["op"] as? String == "hello" }.count, 1)
-        XCTAssertEqual(f.hub.agentsByClientId[f.clientId]?.map(\.id), [target.session_id])
-        XCTAssertEqual(f.hub.agentsByClientId[f.clientId]?.first?.status, "Idle")
+        await f.drain()
+        XCTAssertTrue(f.sessionFrames.isEmpty)
         XCTAssertTrue(f.terminalFrames.isEmpty)
-        XCTAssertFalse(f.socket.sent.contains { ($0["payload"] as? [String: Any])?["type"] as? String == "agentListRequest" })
+        XCTAssertNil(client.welcome)
     }
 
     func testRemovedCommandsReturnUnsupportedVersionAndConsoleNeverSends() async throws {
@@ -581,56 +500,34 @@ final class RemoteTerminalHubTests: XCTestCase {
         XCTAssertNotNil(f.hub.terminalConnection(for: f.clientId))
     }
 
-    func testRelayTerminalRequiresEndpointAuthenticationAndTargetsCurrentGeneration() async throws {
+    func testVerifiedTransportStillRejectsPlaintextTerminalAndChatTraffic() async throws {
         let f = try TerminalHubFixture()
-        var received: [RemoteTerminalConnection] = []
-        f.hub.terminalMessageHandler = { _, route in received.append(route) }
-        try await f.start()
-        try f.emit(.terminal(.sessions([])))
-        await f.drain()
-        XCTAssertTrue(received.isEmpty)
-        XCTAssertNil(f.hub.terminalConnection(for: f.clientId))
-        try await f.authenticate()
+        var received = 0
+        f.hub.terminalMessageHandler = { _, _ in received += 1 }
+        try await f.start(); try await f.authenticate()
         let route = try XCTUnwrap(f.hub.terminalConnection(for: f.clientId))
-        XCTAssertEqual(route.connectionId, f.generation)
-        let (client, target) = try await f.readySession()
-        let subscribe = RemoteTerminalMessage.bound(.subscribe(terminalId: target.session_id, generation: target.process_gen),
-            try XCTUnwrap(client.binding(for: target, mutation: false)))
-        XCTAssertFalse(f.hub.sendTerminalMessage(.list, to: route))
-        XCTAssertTrue(f.hub.sendTerminalMessage(subscribe, to: route))
-        XCTAssertEqual(f.terminalFrames.count, 1)
-        let sent = try XCTUnwrap(f.terminalFrames.first)
-        XCTAssertEqual(sent["atem_id"] as? String, f.deviceId)
-        XCTAssertEqual(sent["connection_id"] as? String, f.generation)
         try f.emit(.terminal(.sessions([])))
         await f.drain()
-        XCTAssertEqual(received, [route])
+        XCTAssertEqual(received, 0)
+        XCTAssertFalse(f.hub.sendTerminalMessage(.list, to: route))
         f.hub.broadcastToAuthenticatedIdentityRelayClients(.terminal(.list))
-        XCTAssertEqual(f.terminalFrames.count, 1)
+        XCTAssertTrue(f.terminalFrames.isEmpty)
     }
 
-    func testDisconnectBeforeDelayedDispatchDropsAcceptedTerminalFrame() async throws {
+    func testDisconnectAndReplacementNeverRestoreAnUnencryptedTerminalRoute() async throws {
         let f = try TerminalHubFixture()
-        try await f.start()
-        try await f.authenticate()
-        var delivered = 0
-        f.hub.terminalMessageHandler = { _, _ in delivered += 1 }
+        try await f.start(); try await f.authenticate()
         let old = try XCTUnwrap(f.hub.terminalConnection(for: f.clientId))
-        try f.emit(.terminal(.sessions([])))
         try f.socket.emit(["atem_id": f.deviceId, "connection_id": f.generation, "relay_event": "disconnected"])
         await f.drain()
-        XCTAssertEqual(delivered, 0)
         XCTAssertFalse(f.hub.sendTerminalMessage(.list, to: old))
         f.generation = UUID().uuidString
         try await f.authenticate()
         let current = try XCTUnwrap(f.hub.terminalConnection(for: f.clientId))
         XCTAssertNotEqual(current, old)
         XCTAssertFalse(f.hub.sendTerminalMessage(.list, to: old))
-        let (client, target) = try await f.readySession()
-        let subscribe = RemoteTerminalMessage.bound(.subscribe(terminalId: target.session_id, generation: target.process_gen),
-            try XCTUnwrap(client.binding(for: target, mutation: false)))
-        XCTAssertTrue(f.hub.sendTerminalMessage(subscribe, to: current))
-        XCTAssertEqual(f.terminalFrames.last?["connection_id"] as? String, f.generation)
+        XCTAssertFalse(f.hub.sendTerminalMessage(.list, to: current))
+        XCTAssertTrue(f.terminalFrames.isEmpty)
     }
 
     func testRevokedPairingCannotKeepSendingOrReceivingThroughLiveRelay() async throws {

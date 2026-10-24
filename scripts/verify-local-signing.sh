@@ -37,6 +37,7 @@ if [[ ! -f "$repo_dir/build/libastation_core.a" ]]; then
     printf 'Build the C++ core first: bash scripts/run-dev.sh --build-only\n' >&2
     exit 1
 fi
+python3 scripts/check-atem-client-apple.py --install
 swift build --build-tests
 ASTATION_DEV_BUNDLE_DIR="$app_bundle" ASTATION_DEV_BUNDLE_ID="$bundle_id" \
     ASTATION_SIGNING_IDENTITY="$identity" ASTATION_PROVISIONING_PROFILE="$profile" \

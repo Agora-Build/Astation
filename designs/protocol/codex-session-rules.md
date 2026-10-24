@@ -123,6 +123,6 @@ or approval answers were sent, so the live rule lifecycle remains unverified.
 The current client requires r8 at Atem main
 `4f87bab1289848cb6a0da5707d2e7830eb5c057d`. Answers and revocations require
 control permission and do not acquire, renew or replace the lease. See the
-[r8 lifecycle](r8-client.md) and [local API guide](../../docs/local-control-api.md).
+[r8 lifecycle](r9-client.md) and [local API guide](../../docs/local-control-api.md).
 The earlier live observations do not establish a complete live rule cycle;
 that remains a joint provider test.
