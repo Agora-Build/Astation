@@ -430,6 +430,10 @@ deployment detail remains part of the Discord contract review.
 
 ## Implementation order and acceptance
 
+The voice/assistant direction below is future work. It does not add release
+gates to the current R9 transport/agent API increment or authorize implementing
+every phase at once.
+
 1. Review the unified Station API admission/privacy contract, protected service
    storage, per-account activation and service-to-account Auth binding. Product
    runtime placement is Station; account/API authentication, management and
@@ -447,6 +451,11 @@ deployment detail remains part of the Discord contract review.
 5. Add public developer OAuth registration/consent when multi-user third-party
    products need it. Keep each user's grant in the same Integrations page.
 
+The following roadmap places the current API increment at phase 1; build later
+assistant phases one at a time. Context ingestion, model access and new tools
+need their own reviewed contracts with Atem; they are not implied by today's
+service grant.
+
 Acceptance tests must include cross-account/host refusal; narrow operation scope;
 wrong issuer/audience/service delegation; enrollment key/head substitution;
 late/duplicate owner confirmation; crash between signing/publication/activation;
@@ -459,6 +468,97 @@ independently hosted Station; disabled/unenrolled-module refusals; cross-route
 credential confusion; per-integration key isolation; direct/native channels
 remaining opaque while an integration is active; and evidence that the relay/
 storage handlers and Agora.Build backend receive no private plaintext or keys.
+
+## Future direction: a conversational assistant for coding agents
+
+The end user talks or writes to a dedicated assistant, rather than directly
+addressing the underlying coding agent. The assistant understands the user's
+projects and coding-agent state, discusses the work, retrieves relevant context
+and uses tools to ask coding agents to act. Existing direct agent/API workflows
+remain available; the assistant is another authorized caller of the same tools.
+
+```mermaid
+flowchart LR
+    User[End user] <--> UI[Agora.Build / Stoa or native voice and text UI]
+    UI <--> Assistant[Dedicated assistant / selected LLM]
+    Assistant <-->|scoped retrieval| RAG[Context and RAG on chosen Station infrastructure]
+    Assistant <-->|typed tool calls / receipts| API[Station API]
+    API <-->|encrypted R9| Atem[Atem and coding agents]
+    Atem --> Export[Approved context ingestion]
+    Export --> RAG
+```
+
+Agora.Build owns the assistant experience, configuration and orchestration
+contract; Stoa supplies the relevant voice/media experience. Station holds
+approved private context and provides retrieval/runtime operations. Atem owns
+host-side context capture and coding-agent adapters. The inference/retrieval
+runtime and selected model provider must be explicit authorized endpoints, not
+an unannounced plaintext proxy in the Portal backend. Exact runtime placement,
+speech/model providers and APIs are later design work.
+
+### Context and RAG
+
+Atem can capture more than a terminal transcript: current session/process state,
+agent activity, prompts/responses, tool outcomes, durable receipts, project
+documents and approved memory/vault context. Design the export with source IDs,
+account/project/session scope, timestamps, versions and provenance so retrieval
+can explain where a fact came from and whether it may be stale. Do not assume
+all these sources are exposed by the current API.
+
+Cloud upload means the selected Station infrastructure, which can be self-hosted
+or shared; it does not automatically mean a central Agora.Build content store.
+Upload only approved sources, using encrypted transport/storage. Documents,
+summaries, embeddings, indexes and caches are all private data and need the
+same tenant/access/retention boundaries. Indexing/retrieval must run at an
+authorized decrypting endpoint. A conventional server-side vector index does
+not preserve relay blindness merely because its source documents are encrypted.
+Specify index/key placement before enabling that feature on shared servers.
+
+RAG may know which credential is available and what operation needs it through
+references and safe metadata. Raw passwords, API secrets, private keys and
+recovery material must not become ordinary embeddings, model prompts, transcripts
+or logs. A future credential-consuming tool should resolve/inject the secret at
+the authorized execution endpoint and return a redacted result to the assistant.
+This needs a separately scoped Atem contract; current agent service authority
+does not include memory/vault/credential access or account K.
+
+Sending retrieved context to a cloud LLM, embedding service or speech provider
+is an explicit additional disclosure. Name the provider and selected data in the
+configuration/consent flow; do not represent that content as remaining solely
+on Station. Define retention, cache invalidation, source deletion and index
+rebuild behavior before rollout. A local or self-hosted provider can preserve
+a narrower deployment boundary.
+
+### Tools and current state
+
+Use the same typed Station API tools for listing sessions, reading status/history,
+submitting prompts and handling permitted approvals. Add richer context tools
+only after their source permissions and Atem contract are reviewed. Bind every
+action to the authenticated user/integration and exact host/session/process,
+with existing scopes, takeover confirmation, leases and durable receipts.
+LLM output is a proposed tool invocation, never new authority or evidence that
+an approval was granted. Retrieved documents and coding-agent output cannot
+override those permissions.
+
+The assistant can answer/discuss without acting. When acting, it checks fresh
+host state; RAG summaries are context, not authoritative live status. Reconnects
+query uncertain receipts rather than resubmitting work. Voice and text use this
+same path, including the existing confirmation rules for sensitive operations.
+
+### Phased delivery
+
+| Phase | Deliverable | Boundary |
+| --- | --- | --- |
+| 1. Agent APIs | Finish the current R9-backed text/session/chat/approval/receipt APIs and integration authentication. | Establish live correctness before adding an LLM intermediary. |
+| 2. Approved context | Add source-scoped Atem export, Station ingestion and read-only retrieval/RAG. | Start with selected non-secret content and provenance; design encrypted/derived-index storage explicitly. |
+| 3. Text assistant | Add a dedicated conversational LLM over retrieval and the existing typed tools. | Prove discussion, fresh-state checks, target selection, action confirmation and receipt recovery in text first. |
+| 4. Voice assistant | Add speech input/output through the Agora.Build/Stoa or native client experience. | Users address the assistant; it uses tools to reach coding agents. Keep the same authority and a reviewable text/tool history. |
+| 5. More clients/context | Extend mobile/Discord and additional approved sources/tools. | Review new source/secret permissions and provider disclosures individually; no blanket account-context access. |
+
+Future acceptance includes cross-account/project retrieval isolation, stale or
+removed context, duplicate ingestion, credential-value exclusion, model/tool
+prompt injection, denied/taken-over actions, uncertain receipts and voice/text
+parity. These are future-phase tests, not evidence of implemented capabilities.
 
 ## Current shared-core constraints and review gaps
 
