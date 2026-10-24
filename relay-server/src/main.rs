@@ -6,6 +6,7 @@ mod auth;
 mod cluster;
 mod encryption;
 mod identity_store;
+mod integration_auth;
 mod knowledge_routes;
 mod knowledge_secrets;
 mod knowledge_store;
@@ -14,8 +15,11 @@ mod remote_api;
 mod routes;
 mod rtc_session;
 mod session_store;
+mod station_ai;
 mod voice_session;
+#[cfg(test)]
 mod voice_routes;
+#[cfg(test)]
 mod llm_proxy;
 mod push_tokens;
 mod push_delivery;
@@ -519,6 +523,7 @@ fn router(state: AppState) -> Router {
 
     // General rate limiting for other API endpoints
     let general_routes = Router::new()
+        .merge(station_ai::routes())
         .nest("/api/remote/v1", remote_api::routes())
         // Auth API routes
         .route("/api/sessions", post(routes::create_session_handler))
@@ -543,30 +548,6 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/rtc-sessions/:id/join",
             post(rtc_session::join_rtc_session_handler),
-        )
-        // Voice Session API routes
-        .route(
-            "/api/voice-sessions",
-            post(voice_routes::create_voice_session_handler)
-                .get(voice_routes::list_voice_sessions_handler),
-        )
-        .route(
-            "/api/voice-sessions/:id",
-            get(voice_routes::get_voice_session_handler)
-                .delete(voice_routes::delete_voice_session_handler),
-        )
-        .route(
-            "/api/voice-sessions/:id/trigger",
-            post(voice_routes::trigger_voice_session_handler),
-        )
-        .route(
-            "/api/voice-sessions/response",
-            post(voice_routes::atem_response_handler),
-        )
-        // LLM Proxy (for Agora ConvoAI)
-        .route(
-            "/api/llm/chat",
-            post(llm_proxy::llm_chat_handler),
         )
         // Vault API routes
         .route(

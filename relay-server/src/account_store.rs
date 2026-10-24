@@ -55,92 +55,6 @@ pub trait AccountIdentityVerifier: Send + Sync {
     async fn verify(&self, access_token: &str) -> Result<VerifiedIdentity, VerifyError>;
 }
 
-struct DisabledVerifier;
-
-#[async_trait]
-impl AccountIdentityVerifier for DisabledVerifier {
-    async fn verify(&self, _access_token: &str) -> Result<VerifiedIdentity, VerifyError> {
-        Err(VerifyError::Unavailable(
-            "agora.build account identity is not configured on this relay"
-                .to_string(),
-        ))
-    }
-}
-
-struct HttpAccountIdentityVerifier {
-    url: String,
-    subject_field: String,
-    authenticated_at_field: Option<String>,
-    http: reqwest::Client,
-}
-
-impl HttpAccountIdentityVerifier {
-    fn from_env() -> Arc<dyn AccountIdentityVerifier> {
-        let url = std::env::var("AGORA_ACCOUNT_USERINFO_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty());
-        let subject_field = std::env::var("AGORA_ACCOUNT_SUBJECT_FIELD")
-            .ok()
-            .filter(|value| !value.trim().is_empty());
-        let (Some(url), Some(subject_field)) = (url, subject_field) else {
-            return Arc::new(DisabledVerifier);
-        };
-        Arc::new(Self {
-            url,
-            subject_field,
-            authenticated_at_field: std::env::var("AGORA_ACCOUNT_AUTH_TIME_FIELD")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
-        })
-    }
-}
-
-#[async_trait]
-impl AccountIdentityVerifier for HttpAccountIdentityVerifier {
-    async fn verify(&self, access_token: &str) -> Result<VerifiedIdentity, VerifyError> {
-        let response = self
-            .http
-            .get(&self.url)
-            .bearer_auth(access_token)
-            .send()
-            .await
-            .map_err(|error| VerifyError::Unavailable(error.to_string()))?;
-        if matches!(response.status().as_u16(), 401 | 403) {
-            return Err(VerifyError::Rejected);
-        }
-        if !response.status().is_success() {
-            return Err(VerifyError::Unavailable(format!(
-                "userinfo returned HTTP {}",
-                response.status().as_u16()
-            )));
-        }
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|_| VerifyError::InvalidResponse)?;
-        let subject = body
-            .get(&self.subject_field)
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && value.len() <= 512)
-            .ok_or(VerifyError::InvalidResponse)?;
-        let authenticated_at = self
-            .authenticated_at_field
-            .as_ref()
-            .and_then(|field| body.get(field))
-            .and_then(serde_json::Value::as_i64);
-        Ok(VerifiedIdentity {
-            issuer: LEGACY_ISSUER.into(),
-            subject: subject.to_string(),
-            authenticated_at,
-        })
-    }
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AccountDevice {
     pub astation_id: String,
@@ -330,7 +244,7 @@ pub struct InMemoryAccountStore {
 
 impl InMemoryAccountStore {
     pub fn new(knowledge: Arc<dyn KnowledgeStore>, vault: Arc<dyn VaultStore>) -> Self {
-        Self::with_verifier(knowledge, vault, configured_verifier(HttpAccountIdentityVerifier::from_env))
+        Self::with_verifier(knowledge, vault, configured_verifier())
     }
 
     pub fn with_verifier(
@@ -862,7 +776,7 @@ impl PgAccountStore {
     pub fn new(pool: sqlx::PgPool) -> Self {
         Self {
             pool,
-            verifier: configured_verifier(HttpAccountIdentityVerifier::from_env),
+            verifier: configured_verifier(),
         }
     }
 

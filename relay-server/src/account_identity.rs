@@ -15,6 +15,7 @@ use crate::account_store::{AccountIdentityVerifier, VerifyError};
 pub const LEGACY_ISSUER: &str = "legacy:agora";
 const MAX_DOCUMENT: usize = 64 * 1024;
 const CACHE_TTL: Duration = Duration::from_secs(60);
+const MAX_CACHE_AGE: Duration = Duration::from_secs(60 * 60);
 const REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
@@ -33,27 +34,35 @@ impl AccountIdentityVerifier for UnavailableVerifier {
     }
 }
 
-pub fn configured_verifier(
-    legacy: impl FnOnce() -> Arc<dyn AccountIdentityVerifier>,
-) -> Arc<dyn AccountIdentityVerifier> {
+pub fn configured_verifier() -> Arc<dyn AccountIdentityVerifier> {
     let get = |key| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
     let issuer = get("ACCOUNT_OIDC_ISSUER");
     let audience = get("ACCOUNT_OIDC_AUDIENCE");
     let scope = get("ACCOUNT_OIDC_REQUIRED_SCOPE");
-    if ![
-        "ACCOUNT_OIDC_ISSUER",
-        "ACCOUNT_OIDC_AUDIENCE",
-        "ACCOUNT_OIDC_REQUIRED_SCOPE",
-    ]
-    .iter()
-    .any(|key| std::env::var_os(key).is_some())
-    {
-        return legacy();
-    }
+    let public_origin = get("PUBLIC_BASE_URL");
+    verifier_from_configuration(
+        issuer.as_deref(),
+        audience.as_deref(),
+        scope.as_deref(),
+        public_origin.as_deref(),
+    )
+}
+
+fn verifier_from_configuration(
+    issuer: Option<&str>,
+    audience: Option<&str>,
+    scope: Option<&str>,
+    public_origin: Option<&str>,
+) -> Arc<dyn AccountIdentityVerifier> {
     let (Some(issuer), Some(audience), Some(scope)) = (issuer, audience, scope) else {
         return Arc::new(UnavailableVerifier("configure ACCOUNT_OIDC_ISSUER, ACCOUNT_OIDC_AUDIENCE and ACCOUNT_OIDC_REQUIRED_SCOPE together".into()));
     };
-    match OidcVerifier::new(&issuer, &audience, &scope) {
+    if public_origin.is_some_and(|origin| origin != audience) {
+        return Arc::new(UnavailableVerifier(
+            "ACCOUNT_OIDC_AUDIENCE must equal PUBLIC_BASE_URL exactly".into(),
+        ));
+    }
+    match OidcVerifier::new(issuer, audience, scope) {
         Ok(verifier) => Arc::new(verifier),
         Err(_) => Arc::new(UnavailableVerifier(
             "invalid account OIDC configuration".into(),
@@ -111,10 +120,10 @@ enum Audience {
     Many(Vec<String>),
 }
 impl Audience {
-    fn includes(&self, expected: &str) -> bool {
+    fn matches(&self, expected: &str) -> bool {
         match self {
             Self::One(s) => s == expected,
-            Self::Many(v) => v.iter().any(|s| s == expected),
+            Self::Many(v) => v.len() == 1 && v[0] == expected,
         }
     }
 }
@@ -129,6 +138,23 @@ struct Claims {
     client_id: String,
     nbf: Option<i64>,
     auth_time: Option<i64>,
+    r9_svc: Option<String>,
+    sid: Option<String>,
+}
+
+/// Signature-verified claims only; a current Station binding and R9 admission
+/// are still required before dispatch. Never retain the bearer token here.
+pub(crate) struct VerifiedServiceToken {
+    pub identity: VerifiedIdentity,
+    pub client_id: String,
+    pub service_fingerprint: String,
+    pub scopes: Vec<String>,
+    pub expires_at: i64,
+}
+
+enum Purpose<'a> {
+    Native,
+    Integration { scope: &'a str },
 }
 
 fn unavailable() -> VerifyError {
@@ -160,15 +186,25 @@ fn decoded(value: &str) -> Result<Vec<u8>, VerifyError> {
     Ok(bytes)
 }
 
+fn scope_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| matches!(b, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
+}
+
+pub(crate) fn station_origin(value: &str) -> bool {
+    safe_url(value).is_ok_and(|url| url.origin().ascii_serialization() == value)
+}
+
 impl OidcVerifier {
     pub fn new(issuer: &str, audience: &str, scope: &str) -> Result<Self, VerifyError> {
         let url = safe_url(issuer)?;
         if url.as_str().trim_end_matches('/') != issuer.trim_end_matches('/')
-            || audience.is_empty()
             || audience.len() > 512
-            || scope.is_empty()
-            || scope.len() > 128
-            || scope.chars().any(char::is_whitespace)
+            || !station_origin(audience)
+            || !scope_token(scope)
         {
             return Err(VerifyError::InvalidResponse);
         }
@@ -223,13 +259,27 @@ impl OidcVerifier {
             .attempted
             .is_some_and(|at| now.duration_since(at) < REFRESH_COOLDOWN)
         {
-            return Err(if fresh {
-                VerifyError::Rejected
-            } else {
-                unavailable()
+            return cached_key(&cache, kid).ok_or_else(|| {
+                if fresh {
+                    VerifyError::Rejected
+                } else {
+                    unavailable()
+                }
             });
         }
         cache.attempted = Some(now);
+        match self.fetch_keys().await {
+            Ok(keys) => {
+                // A successful replacement, even an empty set, removes old keys.
+                cache.keys = keys;
+                cache.fetched = Some(Instant::now());
+                cache.keys.get(kid).cloned().ok_or(VerifyError::Rejected)
+            }
+            Err(error) => cached_key(&cache, kid).ok_or(error),
+        }
+    }
+
+    async fn fetch_keys(&self) -> Result<HashMap<String, Vec<u8>>, VerifyError> {
         let discovery_url = format!(
             "{}/.well-known/openid-configuration",
             self.issuer.as_str().trim_end_matches('/')
@@ -243,7 +293,7 @@ impl OidcVerifier {
             return Err(unavailable());
         }
         let set: KeySet = self.document(jwks).await?;
-        if set.keys.is_empty() || set.keys.len() > 64 {
+        if set.keys.len() > 64 {
             return Err(unavailable());
         }
         let mut keys = HashMap::new();
@@ -277,18 +327,14 @@ impl OidcVerifier {
                 return Err(unavailable());
             }
         }
-        if keys.is_empty() {
-            return Err(unavailable());
-        }
-        cache.keys = keys;
-        cache.fetched = Some(Instant::now());
-        cache.keys.get(kid).cloned().ok_or(VerifyError::Rejected)
+        Ok(keys)
     }
-}
 
-#[async_trait]
-impl AccountIdentityVerifier for OidcVerifier {
-    async fn verify(&self, token: &str) -> Result<VerifiedIdentity, VerifyError> {
+    async fn verify_claims(
+        &self,
+        token: &str,
+        purpose: Purpose<'_>,
+    ) -> Result<Claims, VerifyError> {
         if token.len() > 16 * 1024 {
             return Err(VerifyError::Rejected);
         }
@@ -312,15 +358,34 @@ impl AccountIdentityVerifier for OidcVerifier {
         }
         let claims: Claims =
             serde_json::from_slice(&decoded(pieces[1])?).map_err(|_| VerifyError::Rejected)?;
+        let (scope, max_lifetime) = match purpose {
+            Purpose::Native => {
+                if claims.r9_svc.is_some() || claims.sid.is_some() {
+                    return Err(VerifyError::Rejected);
+                }
+                (self.scope.as_str(), 900)
+            }
+            Purpose::Integration { scope } => {
+                if !scope_token(scope)
+                    || claims.sid.is_some()
+                    || !claims.r9_svc.as_deref().is_some_and(|s| {
+                        !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_graphic())
+                    })
+                {
+                    return Err(VerifyError::Rejected);
+                }
+                (scope, 300)
+            }
+        };
         let now = chrono::Utc::now().timestamp();
         if claims.iss != self.issuer_name
-            || !claims.aud.includes(&self.audience)
+            || !claims.aud.matches(&self.audience)
             || claims.exp <= now
             || claims.iat > now + 30
             || claims.iat < 0
             || claims.exp <= claims.iat
-            || claims.exp.saturating_sub(claims.iat) > 900
-            || claims.nbf.is_some_and(|nbf| nbf > now)
+            || claims.exp.saturating_sub(claims.iat) > max_lifetime
+            || claims.nbf.is_some_and(|nbf| nbf < 0 || nbf > now)
             || claims
                 .auth_time
                 .is_some_and(|at| at < 0 || at > claims.iat + 30)
@@ -331,7 +396,10 @@ impl AccountIdentityVerifier for OidcVerifier {
                 .all(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&b))
             || claims.client_id.is_empty()
             || claims.client_id.len() > 128
-            || !claims.scope.split(' ').any(|s| s == self.scope)
+            || claims.client_id.chars().any(char::is_control)
+            || claims.scope.len() > 4096
+            || !claims.scope.split(' ').all(scope_token)
+            || !claims.scope.split(' ').any(|s| s == scope)
         {
             return Err(VerifyError::Rejected);
         }
@@ -340,6 +408,44 @@ impl AccountIdentityVerifier for OidcVerifier {
         UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, key)
             .verify(signed.as_bytes(), &signature)
             .map_err(|_| VerifyError::Rejected)?;
+        // Fetching a rotated key may have crossed the token's deadline.
+        if claims.exp <= chrono::Utc::now().timestamp() {
+            return Err(VerifyError::Rejected);
+        }
+        Ok(claims)
+    }
+
+    pub(crate) async fn verify_integration(
+        &self,
+        token: &str,
+        scope: &str,
+    ) -> Result<VerifiedServiceToken, VerifyError> {
+        let claims = self
+            .verify_claims(token, Purpose::Integration { scope })
+            .await?;
+        Ok(VerifiedServiceToken {
+            identity: VerifiedIdentity {
+                issuer: claims.iss,
+                subject: claims.sub,
+                authenticated_at: None,
+            },
+            client_id: claims.client_id,
+            service_fingerprint: claims.r9_svc.ok_or(VerifyError::Rejected)?,
+            scopes: claims.scope.split(' ').map(String::from).collect(),
+            expires_at: claims.exp,
+        })
+    }
+}
+
+fn cached_key(cache: &Cache, kid: &str) -> Option<Vec<u8>> {
+    cache.fetched.filter(|at| at.elapsed() < MAX_CACHE_AGE)?;
+    cache.keys.get(kid).cloned()
+}
+
+#[async_trait]
+impl AccountIdentityVerifier for OidcVerifier {
+    async fn verify(&self, token: &str) -> Result<VerifiedIdentity, VerifyError> {
+        let claims = self.verify_claims(token, Purpose::Native).await?;
         Ok(VerifiedIdentity {
             issuer: claims.iss,
             subject: claims.sub,
@@ -351,18 +457,22 @@ impl AccountIdentityVerifier for OidcVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{extract::State, routing::get, Json, Router};
+    use axum::{
+        extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router,
+    };
     use ring::{
         rand::SystemRandom,
         signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
     };
     use serde_json::{json, Value};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
     struct Server {
         document: Mutex<Value>,
         jwks: Mutex<Value>,
         gets: AtomicUsize,
+        status: AtomicU16,
+        delay_ms: AtomicU64,
     }
     struct Fixture {
         issuer: String,
@@ -395,6 +505,8 @@ mod tests {
                 document: Mutex::new(json!({"issuer":issuer,"jwks_uri":format!("{issuer}/keys")})),
                 jwks: Mutex::new(jwks(&signer, "one")),
                 gets: AtomicUsize::new(0),
+                status: AtomicU16::new(200),
+                delay_ms: AtomicU64::new(0),
             });
             let router = Router::new()
                 .route(
@@ -407,7 +519,15 @@ mod tests {
                     "/keys",
                     get(|State(s): State<Arc<Server>>| async move {
                         s.gets.fetch_add(1, Ordering::SeqCst);
-                        Json(s.jwks.lock().await.clone())
+                        tokio::time::sleep(Duration::from_millis(
+                            s.delay_ms.load(Ordering::SeqCst),
+                        ))
+                        .await;
+                        (
+                            StatusCode::from_u16(s.status.load(Ordering::SeqCst)).unwrap(),
+                            Json(s.jwks.lock().await.clone()),
+                        )
+                            .into_response()
                     }),
                 )
                 .with_state(state.clone());
@@ -452,7 +572,7 @@ mod tests {
             let mut cache = self.verifier.cache.lock().await;
             cache.attempted = Some(Instant::now() - REFRESH_COOLDOWN - Duration::from_secs(1));
             if expired {
-                cache.fetched = Some(Instant::now() - CACHE_TTL - Duration::from_secs(1));
+                cache.fetched = Some(Instant::now() - MAX_CACHE_AGE - Duration::from_secs(1));
             }
         }
     }
@@ -537,8 +657,8 @@ mod tests {
         f.allow_refresh(false).await;
         f.verifier.verify(&next).await.unwrap();
         assert_eq!(f.state.gets.load(Ordering::SeqCst), 2);
-        *f.state.jwks.lock().await = json!({"keys":[]});
-        f.verifier.verify(&next).await.unwrap(); // Valid cache, within the explicit 60-second revocation window.
+        f.state.status.store(503, Ordering::SeqCst);
+        f.verifier.verify(&next).await.unwrap();
         f.allow_refresh(true).await;
         assert!(matches!(
             f.verifier.verify(&next).await,
@@ -549,6 +669,252 @@ mod tests {
             Err(VerifyError::Unavailable(_))
         ));
         assert_eq!(f.state.gets.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn known_keys_survive_bounded_outages_without_extending_token_expiry() {
+        let f = Fixture::new().await;
+        let token = f.token(f.header(), f.claims());
+        f.verifier.verify(&token).await.unwrap();
+        f.state.status.store(503, Ordering::SeqCst);
+        {
+            let mut cache = f.verifier.cache.lock().await;
+            cache.fetched = Some(Instant::now() - Duration::from_secs(3590));
+            cache.attempted = None;
+        }
+        f.verifier.verify(&token).await.unwrap();
+        let fetched = f.verifier.cache.lock().await.fetched;
+        f.verifier.verify(&token).await.unwrap();
+        assert_eq!(f.verifier.cache.lock().await.fetched, fetched);
+        assert_eq!(f.state.gets.load(Ordering::SeqCst), 2);
+        let mut expired = f.claims();
+        expired["exp"] = json!(chrono::Utc::now().timestamp());
+        assert!(matches!(
+            f.verifier.verify(&f.token(f.header(), expired)).await,
+            Err(VerifyError::Rejected)
+        ));
+        f.allow_refresh(true).await;
+        assert!(matches!(
+            f.verifier.verify(&token).await,
+            Err(VerifyError::Unavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn successful_jwks_removal_never_falls_back_to_the_removed_key() {
+        let f = Fixture::new().await;
+        let token = f.token(f.header(), f.claims());
+        f.verifier.verify(&token).await.unwrap();
+        *f.state.jwks.lock().await = json!({"keys":[]});
+        {
+            let mut cache = f.verifier.cache.lock().await;
+            cache.fetched = Some(Instant::now() - CACHE_TTL);
+            cache.attempted = None;
+        }
+        assert!(matches!(
+            f.verifier.verify(&token).await,
+            Err(VerifyError::Rejected)
+        ));
+        f.state.status.store(503, Ordering::SeqCst);
+        f.allow_refresh(false).await;
+        assert!(f.verifier.verify(&token).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unknown_key_flood_has_a_shared_refresh_budget_and_no_unbounded_negative_cache() {
+        let f = Fixture::new().await;
+        f.verifier
+            .verify(&f.token(f.header(), f.claims()))
+            .await
+            .unwrap();
+        f.state.status.store(503, Ordering::SeqCst);
+        f.allow_refresh(false).await;
+        let attempts = (0..50).map(|i| {
+            let mut header = f.header();
+            header["kid"] = json!(format!("unknown-{i}"));
+            let token = f.token(header, f.claims());
+            let verifier = &f.verifier;
+            async move { verifier.verify(&token).await }
+        });
+        for result in futures_util::future::join_all(attempts).await {
+            assert!(result.is_err());
+        }
+        assert_eq!(f.state.gets.load(Ordering::SeqCst), 2);
+        assert_eq!(f.verifier.cache.lock().await.keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn expiration_during_key_retrieval_is_rejected() {
+        let f = Fixture::new().await;
+        f.state.delay_ms.store(2100, Ordering::SeqCst);
+        let mut claims = f.claims();
+        claims["exp"] = json!(chrono::Utc::now().timestamp() + 2);
+        assert!(matches!(
+            f.verifier.verify(&f.token(f.header(), claims)).await,
+            Err(VerifyError::Rejected)
+        ));
+        assert_eq!(f.state.gets.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn incomplete_or_cross_resource_configuration_has_no_legacy_fallback() {
+        for (issuer, audience, scope, origin) in [
+            (None, None, None, None),
+            (
+                Some("https://auth.agora.build"),
+                None,
+                Some("astation.remote"),
+                None,
+            ),
+            (
+                Some("https://auth.agora.build"),
+                Some("https://station.agora.build"),
+                None,
+                None,
+            ),
+            (
+                Some("https://auth.agora.build"),
+                Some("https://agora.build"),
+                Some("astation.remote"),
+                Some("https://station.agora.build"),
+            ),
+            (
+                Some("http://auth.example"),
+                Some("https://station.agora.build"),
+                Some("astation.remote"),
+                None,
+            ),
+        ] {
+            let verifier = verifier_from_configuration(issuer, audience, scope, origin);
+            assert!(matches!(
+                verifier.verify("legacy-or-opaque-token").await,
+                Err(VerifyError::Unavailable(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn outage_cannot_extend_cache_age_while_key_fetch_is_in_flight() {
+        let f = Fixture::new().await;
+        let token = f.token(f.header(), f.claims());
+        f.verifier.verify(&token).await.unwrap();
+        {
+            let mut cache = f.verifier.cache.lock().await;
+            cache.fetched = Some(Instant::now() - MAX_CACHE_AGE + Duration::from_millis(500));
+            cache.attempted = None;
+        }
+        f.state.delay_ms.store(1100, Ordering::SeqCst);
+        f.state.status.store(503, Ordering::SeqCst);
+        assert!(matches!(
+            f.verifier.verify(&token).await,
+            Err(VerifyError::Unavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn native_and_integration_profiles_are_not_interchangeable() {
+        use crate::integration_auth::IntegrationBinding;
+        let f = Fixture::new().await;
+        let mut claims = f.claims();
+        claims["exp"] = json!(chrono::Utc::now().timestamp() + 300);
+        claims["scope"] = json!("agent.view agent.prompt");
+        claims["client_id"] = json!("integration-1");
+        claims["r9_svc"] = json!("a".repeat(64));
+        let binding = IntegrationBinding {
+            issuer: f.issuer.clone(),
+            owner: claims["sub"].as_str().unwrap().into(),
+            client_id: "integration-1".into(),
+            service_fingerprint: "a".repeat(64),
+            account_allowed: true,
+            active: true,
+            expires_at: chrono::Utc::now().timestamp() + 3600,
+            scopes: vec!["agent.view".into()],
+        };
+        let token = f.token(f.header(), claims.clone());
+        let verified = binding
+            .verify(&f.verifier, &token, "agent.view")
+            .await
+            .unwrap();
+        assert_eq!(verified.identity.authenticated_at, None);
+        assert!(binding
+            .verify(&f.verifier, &token, "agent.prompt")
+            .await
+            .is_err());
+        assert!(matches!(
+            f.verifier.verify(&token).await,
+            Err(VerifyError::Rejected)
+        ));
+        assert!(f
+            .verifier
+            .verify_integration(&f.token(f.header(), f.claims()), "station:account")
+            .await
+            .is_err());
+        for (field, value) in [
+            ("aud", json!("https://dev.agora.build")),
+            (
+                "aud",
+                json!(["https://station.example", "https://dev.agora.build"]),
+            ),
+            ("client_id", json!("integration-2")),
+            ("sub", json!("ab98765432109876543210987654")),
+            ("r9_svc", json!("b".repeat(64))),
+            ("r9_svc", json!(null)),
+            ("sid", json!("assistant-session")),
+            ("exp", json!(chrono::Utc::now().timestamp() + 301)),
+            ("scope", json!("agent.view.extra")),
+        ] {
+            let mut altered = claims.clone();
+            altered[field] = value;
+            assert!(
+                binding
+                    .verify(&f.verifier, &f.token(f.header(), altered), "agent.view")
+                    .await
+                    .is_err(),
+                "{field}"
+            );
+        }
+        // A misleading native scope cannot turn a service token into a login.
+        claims["scope"] = json!("station:account agent.view");
+        assert!(matches!(
+            f.verifier.verify(&f.token(f.header(), claims)).await,
+            Err(VerifyError::Rejected)
+        ));
+        assert_eq!(f.state.gets.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn audience_is_an_exact_canonical_station_origin() {
+        let f = Fixture::new().await;
+        for audience in [
+            "api",
+            "https://station.example/",
+            "https://station.example/path",
+            "https://Station.example",
+            "https://station.example:443",
+            "https://station.example?x=1",
+        ] {
+            assert!(
+                OidcVerifier::new(&f.issuer, audience, "station:account").is_err(),
+                "{audience}"
+            );
+        }
+        for audience in [
+            json!("https://station.example/"),
+            json!(["https://station.example", "https://dev.agora.build"]),
+        ] {
+            let mut claims = f.claims();
+            claims["aud"] = audience;
+            assert!(matches!(
+                f.verifier.verify(&f.token(f.header(), claims)).await,
+                Err(VerifyError::Rejected)
+            ));
+        }
+        let mut claims = f.claims();
+        claims["aud"] = json!(["https://station.example"]);
+        f.verifier
+            .verify(&f.token(f.header(), claims))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -624,10 +990,10 @@ mod tests {
         );
         let client = reqwest::Client::new();
         let body = json!({"entry":genesis,"expected":{"seq":0,"hash":"0".repeat(64)}});
-        *f.state.jwks.lock().await = json!({"keys":[]});
+        f.state.status.store(503, Ordering::SeqCst);
         {
             let mut cache = verifier.cache.lock().await;
-            cache.fetched = Some(Instant::now() - CACHE_TTL - Duration::from_secs(1));
+            cache.fetched = Some(Instant::now() - MAX_CACHE_AGE - Duration::from_secs(1));
             cache.attempted = None;
         }
         assert_eq!(
@@ -641,7 +1007,7 @@ mod tests {
                 .status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
-        *f.state.jwks.lock().await = jwks(&f.signer, "one");
+        f.state.status.store(200, Ordering::SeqCst);
         verifier.cache.lock().await.attempted = None;
         for _ in 0..2 {
             let response = client

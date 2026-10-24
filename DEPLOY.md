@@ -173,10 +173,11 @@ Runtime configuration:
   (exit 1), and a value that isn't a positive integer also exits 1. Both apps
   carry the `station-relay-server` network alias, so nginx sees every replica.
   Health check `GET /health` on port 3000.
-- Account registration: leave `AGORA_ACCOUNT_USERINFO_URL`,
-  `AGORA_ACCOUNT_SUBJECT_FIELD`, and `AGORA_ACCOUNT_AUTH_TIME_FIELD` unset
-  while unified agora.build SSO is built. See the account-registration section
-  below for the disabled-mode behavior and migration plan.
+- Account registration: configure the three `ACCOUNT_OIDC_*` settings with the
+  registered Auth issuer, exact Station origin and `astation.remote` scope.
+  `ACCOUNT_OIDC_AUDIENCE` must equal `PUBLIC_BASE_URL` exactly. Missing or partial
+  configuration fails closed; the old `AGORA_ACCOUNT_*` userinfo verifier has
+  been removed. Existing identity/data rows are retained.
 - Webapp: `STATION_RELAY_UPSTREAM=station-relay-server:3000`. All containers
   must use the `coolify` Docker network. nginx re-resolves the alias through
   Docker DNS every 10 s and spreads requests across every address it returns,
@@ -290,7 +291,7 @@ following is a proposed registration, not an existing deployed client:
     "id": "astation", "name": "Astation", "type": "native", "firstParty": true,
     "redirectUris": ["http://127.0.0.1/callback"],
     "grants": ["authorization_code", "refresh_token"],
-    "scopes": ["openid", "profile", "offline_access", "station:account"],
+    "scopes": ["openid", "profile", "offline_access", "astation.remote"],
     "resources": ["https://station.agora.build"]
   }]
 }
@@ -302,7 +303,7 @@ registered. The relay needs all three settings on every replica:
 ```text
 ACCOUNT_OIDC_ISSUER=https://auth.agora.build
 ACCOUNT_OIDC_AUDIENCE=https://station.agora.build
-ACCOUNT_OIDC_REQUIRED_SCOPE=station:account
+ACCOUNT_OIDC_REQUIRED_SCOPE=astation.remote
 ```
 
 Set matching app build variables. The package build stamps these public values
@@ -312,12 +313,12 @@ into Info.plist before signing, so a Finder-launched app retains configuration:
 ASTATION_ACCOUNT_ISSUER=https://auth.agora.build
 ASTATION_ACCOUNT_CLIENT_ID=astation
 ASTATION_ACCOUNT_RESOURCE=https://station.agora.build
-ASTATION_ACCOUNT_SCOPE=station:account
+ASTATION_ACCOUNT_SCOPE=astation.remote
 ```
 
-Settings > Account signs in to agora.build. General > Agora Services retains
-the existing Agora session for projects and credentialSync. Recovery HTTP and
-relay account registration use only the account token. The app sends it only
+Settings > Account signs in to Agora.Build. Agora Projects uses its separately
+scoped Portal grant and protected certificate cache. Recovery HTTP and relay
+account registration use only the Station token. The app sends it only
 to the registered API origin; pasted Recovery Kit URLs cannot choose a token
 recipient. Keychain stores the rotating refresh token and a durable refresh
 intent. An interrupted refresh requires sign-in instead of replaying an old
@@ -333,42 +334,42 @@ Never relabel subjects, match by email, or clear live state to pass a test.
 Validate discovery, a real registered native login, relay registration, and
 recovery storage over the provisioned app/deployed relay before retrying the
 retained isolated `atem pair verify` operation. Signing-key outage must fail
-closed after the 60-second cache window. JWT `iat` is not fresh-authentication
+closed after a maximum one-hour JWKS outage window; keys refresh normally after
+60 seconds, and removed keys do not survive a successful JWKS replacement.
+Access-token expiration applies throughout the outage. JWT `iat` is not fresh-authentication
 proof: if API tokens omit `auth_time`, offline data merges remain unavailable;
 online owner approval still works. Login never authorizes membership or K.
 Main merge/deployment still requires user approval. Atem #93 and other r9
 admission gates remain independent.
 
-#### Legacy Agora account registration
+#### Auth validation and custom Station registration
 
-Leave `AGORA_ACCOUNT_USERINFO_URL`, `AGORA_ACCOUNT_SUBJECT_FIELD`, and
-`AGORA_ACCOUNT_AUTH_TIME_FIELD` unset for unified agora.build account login.
-These settings enable optional Agora-specific registration and explicit data
-grouping. Ordinary pairing, memory/skills/vault sync, and E2EE do not require
-this feature; unregistered Astations keep using their Astation ID as the data
-account. Removing verifier configuration does not undo existing registrations
-or data groups in Postgres.
+There is no legacy userinfo fallback. An unavailable or misconfigured issuer
+leaves account registration/recovery unavailable without relabeling existing
+principals or changing pairings/encryption. `/health` and `verify-station.mjs`
+prove infrastructure availability, not Auth interoperability or R9 authority.
 
-A warning that the URL and subject field are not configured means account
-registration is unavailable. Check relay authentication and encryption
-migration status separately when diagnosing connection or migration failures.
-`/health` and `verify-station.mjs` verify infrastructure, not account login or
-registration.
+For a custom Station, first register its exact origin in Portal > Stations.
+Set the Portal-generated public `STATION_REGISTRATION_CHALLENGE` on every
+replica. `GET /.well-known/agora-build-station` serves that exact value as
+`text/plain` with `Cache-Control: no-store`; unset it after verification. This
+proof endpoint is absent on the default relay. It never activates Station AI
+or enrolls an account/device. Confirm the proof-response schema with Portal
+before live registration; no control-plane secrets belong in the challenge.
 
-The replacement is [unified agora.build identity](docs/specs/2026-10-10-unified-agora-build-identity.md),
-with permanent accounts and linked sign-in providers. Auth implements GitHub
-and Google; Apple and Agora federation remain future work. The integration
-above verifies the trusted issuer and intended audience through JWKS. Sensitive
-actions require fresh-authentication proof, separate from device approval and
-E2EE recovery. Changing only the old userinfo URL is insufficient.
-
-Keep the runtime compatibility implementation until the new integration and
-safe account/data migration are verified, then remove its settings and code.
-The [relay environment reference](relay-server/README.md#environment-variables)
-describes the existing verifier contract; the unified identity specification
-contains the migration and acceptance requirements. Any future authentication
-rollout must verify each replica's configuration and product login behavior in
-addition to infrastructure health.
+Auth must register the origin/resource and allowed accounts before a token for
+it can be issued. Agent access additionally needs Auth's five-minute
+client-credentials tokens and the matching native-approved R9 service binding.
+The [admission contract](designs/protocol/station-auth-validation.md) records
+purpose isolation, key rotation/outage rules and remaining interoperability
+work. `/api/agent/v1`, `/mcp` and `/v1/chat/completions` remain closed: the public
+relay requires a custom Station, and a custom Station awaits verified runtime
+provisioning. Existing live R9 gates remain separate. No deployment is
+authorized by adding configuration/examples to this document.
+The old `/api/llm/chat` and `/api/voice-sessions` bridge now uses that closed
+gate too; its session-ID-only authentication cannot substitute for the new
+assistant session contract. The former voice coding bridge stops working in
+this branch until the replacement is provisioned. RTC sharing is unaffected.
 
 #### Relay replicas and Valkey
 

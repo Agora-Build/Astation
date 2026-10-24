@@ -1,8 +1,10 @@
 # Unified integrations and agent API access
 
-Status: design draft for joint Portal, Auth, Station, Astation and Atem review,
-2026-10-23. This document assigns proposed ownership and describes work to
-build; it does not advertise deployed API endpoints or change the R9 contract.
+Status: implementation started, 2026-10-24, following the owner's decisions in
+the [Agora.Build companion](https://genie.netbird.cloud:44259/AGORA-BUILD-INTEGRATIONS.md).
+The first Station increment is Auth validation and closed runtime admission;
+integration execution is not yet enabled. This does not change the R9 contract
+or authorize production deployment.
 
 ## Shared design and coordination
 
@@ -19,6 +21,12 @@ contracts and any new Atem context/tool contracts require their owners' review.
 The existing signed R9 contract remains authoritative for wire/security behavior;
 this document neither expands current service scopes nor replaces that review.
 Keep Portal/Auth and joint Atem handoff vaults aligned with the same revision.
+
+The companion records D1-D23 and the Portal/Auth work, not a second system
+architecture. Its 2026-10-24 snapshot has SHA-256
+`2882551f944cf98a0cf39a18187884267c6bb1f11266ad544c73812ca815c8a0`.
+The [Auth/Station admission contract](protocol/station-auth-validation.md)
+describes the first implementation and the remaining live interoperability gate.
 
 ## Product direction
 
@@ -42,7 +50,10 @@ application; each user's authorized connection still appears here.
 
 Both first-party and third-party integrations receive explicit permissions,
 expiry and revocation controls. The official Discord connector provisions
-credentials automatically; a custom API client can copy an API token once.
+credentials automatically; a custom client retains its own private assertion
+key and obtains five-minute Auth access tokens. Agora.Build stores public keys,
+not the client's private key. Browser-generated keys are downloaded once and
+never uploaded to Portal/Auth.
 Native Astation apps continue using account login and their own enrolled
 device keys. Browser clients retain the existing native-approved companion
 model; this proposal does not turn browsers into standalone native members.
@@ -63,8 +74,9 @@ content through its backend.
 Expose one Station API rather than requiring another publicly named service
 or a separate gateway deployment. Implement agent integrations as a module in
 the existing Rust Station server, using the shared `atem-client` crate. One
-Station deployment and API origin can serve all modules. This is a design assignment, not a claim
-that the new agent/integration routes already exist.
+Station deployment and API origin can serve all modules on a registered custom
+Station. The public `station.agora.build` remains an opaque relay/encrypted
+store; it never runs decrypting MCP, LLM or agent modules.
 
 ### What handles R9
 
@@ -131,6 +143,22 @@ Use the same Station server/package for both deployments:
   native manager. Installing/enabling the module enrolls nobody and grants
   access to no account by itself.
 
+Register a custom Station in Portal using proof of control at
+`/.well-known/agora-build-station`. Auth registers its exact origin and allowed
+accounts; initially only the registering owner may use it. Owners can invite
+other accounts; open public/shared-relay discovery is deferred. Each account
+configures that relay in Astation/Atem without fallback to the public default.
+
+Settings > Station AI has independent MCP, LLM and Agent switches, all off by
+default, with explicit feature/Station/provider consent and Off/Starting/On/Error
+states. Any enabled switch sets whole-account relay-only transport. Astation
+sends the authenticated `transportPolicy` message after authentication and on
+change; Atem durably saves the pairing-bound value and acknowledges it. Only
+then is a direct link closed. Refuse affected direct Atem connections on port
+8080 while enabled; preserve the shared local listener/HTTP API and credential
+unlock/sync behavior. Lost ACKs/reconnects must be reconciled, not presented as
+a completed account-wide transition. Native and host implementation is pending.
+
 Enabling an integration explicitly trusts the selected Station as a decrypting
 endpoint for that integration's scoped agent content. An administrator who
 controls that machine may read its plaintext/software service keys. Module,
@@ -170,6 +198,8 @@ flowchart LR
       Portal[Account and Integrations management]
       Auth[Login and API credential authority]
       Stoa[Stoa: voice / video / screen sharing]
+      Voice[Opt-in ConvoAI pipeline and conversation history]
+      OfficialDiscord[Official Discord delivery adapter]
     end
     subgraph Station[Chosen Station server: one Station API]
       Relay[WebSocket transport: opaque R9]
@@ -177,15 +207,13 @@ flowchart LR
       Trust[Signed membership / sealed recovery]
       Ops[Optional agent module: scoped R9 client]
       Context[Optional lightweight context store]
+      Assistant[Optional LLM: retrieval and typed tools]
     end
     subgraph Host[User's Atem machine]
       Atem[Atem host: identity / scope / execution]
       Coding[Claude / Codex / other coding agents]
     end
-    subgraph Future[Explicitly enabled assistant feature]
-      Assistant[Dedicated conversational assistant]
-      Model[Selected local / cloud model and speech providers]
-    end
+    Model[Selected local / cloud model provider]
     User[End user] --> Portal
     User <--> Native[Native Astation / direct R9 client]
     User <--> Stoa
@@ -194,7 +222,9 @@ flowchart LR
     Atem <--> Coding
     Ops <-->|encrypted R9| Relay
     Custom[Custom API client] <-->|HTTPS / WSS| Ops
-    Discord[Discord] <-->|runtime interactions| Ops
+    Discord[Discord] <-->|official app| OfficialDiscord
+    OfficialDiscord <-->|transient delivery| Ops
+    Discord <-->|user's own app| Ops
     Native <-->|encrypted sync| Store
     Atem <-->|encrypted sync| Store
     Portal --> Auth
@@ -204,7 +234,8 @@ flowchart LR
     Native -. manager-signed membership .-> Trust
     Stoa <-->|media| RTC[RTC provider transport]
     Native <-->|capture / media| RTC
-    Stoa -. opt-in voice / text .-> Assistant
+    Stoa -. opt-in voice / text .-> Voice
+    Voice <-->|assistant.chat session| Assistant
     Native -. opt-in voice / text .-> Assistant
     Atem -. approved non-secret context .-> Context
     Assistant <-->|scoped context retrieval| Context
@@ -217,6 +248,11 @@ context paths require separate explicit opt-in and source permissions; they
 are not existing transports or extra R9 message definitions. An authorized
 context or agent handler may read its permitted data; the relay/storage paths
 remain opaque. Credential payloads never flow into the context/model paths.
+The agent/LLM/MCP nodes require a registered custom Station; they do not run on
+`station.agora.build`. The official Discord adapter sees interactions/replies
+transiently. The explicitly enabled voice pipeline receives audio/transcripts/
+replies and stores conversation history as described below; neither path gets
+vault secrets or account K.
 
 For native/direct clients, Station transports ciphertext and Atem handles the
 R9 host endpoint. For integration API/Discord calls, Station's agent module is
@@ -309,17 +345,26 @@ agent module does not imply an active service grant.
 | --- | --- | --- |
 | Native login access/refresh tokens | Auth; access in memory, rotating refresh in device-only protected storage. | Portal or Station checks its own registered audience/scope. Existing serialized refresh and fresh-auth rules apply. |
 | Integration API credential | Agora.Build/Auth owns issuance, rotation, revocation and its protected credential records; the caller retains its issued bearer credential. Station does not mint a competing credential. | Station validates the supported Auth contract, selected Station audience/resource, account/integration binding, status, operation and expiry. Access never exceeds current signed R9 service authority. Send only in the Authorization header over HTTPS/WSS. |
-| Service routing access token | Auth, through a proposed dedicated delegated service grant. | Station validates its own audience/scope and the authorized account binding. A short-lived routing token never replaces R9 proof. Exact registration/claims/issuance contract needs Auth review. |
+| Integration/service access token | Auth, using `private_key_jwt` and `client_credentials`; owner `sub`, integration `client_id`, selected Station `aud`, scopes and `r9_svc`. | ES256 `at+jwt`, at most five minutes. Match `r9_svc` to the approved R9 service key and the owner/client to current Station policy. No native refresh token is copied. |
 | R9 service key and signed authorization | Service generates its key; an existing native manager signs its membership through the core. Private key stays at the agent module/connector or direct client. | Atem verifies the chain, scopes, expiry and possession. No manage/redelegation; at most 90 days, as in the existing service contract. |
 | Discord bot/install credentials | Discord; retained only by the connector's secret store. | Discord credentials authenticate Discord interactions, not Atem access. Do not show/copy the shared Discord bot secret as a user's integration token. |
 
-A caller can use an Agora.Build/Auth-issued bearer credential with Station API
-without implementing R9. Auth must define whether that credential is a locally
-verifiable signed token or an opaque key with a supported validation/exchange
-contract; this draft does not invent a shipped format. Prefer local validation
-of supported signed grants to avoid an Auth request for every operation. Specify
-expiry, rotation/revocation propagation, stale-policy bounds and outage behavior
-before enabling access. A raw key must not silently become a device identity.
+A caller can use an Agora.Build/Auth-issued bearer access token with Station API
+without implementing R9. Station verifies Auth's signed ES256 `at+jwt` locally
+against discovery/JWKS, exact issuer/Station audience and route scope. There is
+no Auth call per operation. Unknown key refreshes have a five-second shared
+budget; known cached keys survive an Auth outage for at most one hour, without
+extending token expiration. Successful JWKS replacement removes old keys.
+Portal tokens, native-login tokens, integration tokens and future assistant
+session tokens remain separate admission profiles. A token is not R9 identity.
+
+Integration client-key rotation accepts old/new public keys at Auth for ten
+minutes. Disabling the client prevents new tokens; issued tokens expire within
+five minutes. Station also applies signed Portal push notices and polls every
+minute for pauses, revocations and account-access changes. A Station's own Auth
+client reports with `station.report` to Portal. Browser private reads use a
+five-minute token-exchanged `station.read` token and call Station directly with
+Portal-origin CORS. These service/feed APIs require live owner implementation.
 
 Agora.Build manages credential rotation within existing authority; renewing or
 expanding R9 authorization still needs native manager confirmation. The official
@@ -336,14 +381,14 @@ and cannot extend the signed service expiry. Account logout, disconnecting
 Discord, token rotation and revoking R9 authorization are distinct actions;
 the UI must say which action is being performed.
 
-Auth/Station need an explicit service-to-account delegation contract before
-unattended hosted access can ship. Current Station login maps a verified
-`(issuer, subject)` to its account; a new service subject must not be treated as
-the human subject, matched by email or supplied by an unsigned request field.
-Agree how Auth attests the delegation and how Station validates it. Do not
-copy a user's native refresh token to the agent module or invent
-`client_credentials` support that Auth has not registered. This is an integration
-contract gap, not a reason to change the R9 cryptographic identity model.
+Auth attests service delegation with owner `sub`, integration `client_id` and
+`r9_svc`. Station maps only the verified `(issuer, subject)` and matches the
+complete binding to current approved policy. Do not derive the owner from email,
+unsigned request fields or a service subject supplied by the caller. The
+`private_key_jwt`/client-credentials grant, registered custom resources and exact
+fingerprint/feed interoperability must be delivered and tested before live
+activation. The deployed dev discovery still lacks these grants at this check;
+local signed test tokens do not establish production interoperability.
 
 ## Permissions and lifecycle
 
@@ -445,19 +490,28 @@ session flow; do not embed a shared integration secret into distributed web or
 mobile code. Ordinary EventSource/browser WebSocket limitations need a supported
 authenticated adapter, not a query-string credential workaround.
 
-The agent module handles plaintext as an endpoint, so retention needs a
-documented policy. Default to no persisted transcript/prompt/tool body. Keep
-only the minimal encrypted operational state needed for receipts/recovery, with defined
-retention; logs, metrics, Portal summaries and idempotency indexes exclude raw
-tokens, keys and agent content. Detailed retention limits belong in the Station
-API contract before implementation.
+Station keeps operational state/receipts and every signed R9 log entry in its
+Postgres, with append-only operational events/monthly partitions and account
+JSON export. Private-content references/receipts stay encrypted; Redis remains
+transient routing. The log archive is an availability backup, never authority.
+Do not persist extra transcript/prompt/tool bodies without explicit source
+consent. Logs, metrics and management metadata exclude tokens, private keys and
+agent content. Normal retention is indefinite; account deletion blocks access
+and revokes integrations immediately, then permanently deletes all account
+data after 14 days across Portal/Auth/Station. Restoration during the window
+does not revive revoked grants. Backups expire within 30 days and restores
+consult deletion records. Station deletion ACK/retry/export contracts remain
+implementation work.
 
 ## Discord-specific behavior
 
 Agora.Build owns the Connect Discord installation/consent/configuration workflow,
 including OAuth state/callback handling and the selected guild/channel/actor
 policy. Station owns runtime delivery and the adapter to its R9 client; private
-agent content does not pass through the Portal backend for account management.
+agent content is not stored in the Portal management database. The official
+Agora.Build Discord app verifies/deduplicates ingress centrally and forwards it
+to the selected custom Station; its bot secret stays at Agora.Build. Replies
+pass back through that adapter for delivery, with no transcript retention.
 Verify Discord's documented ingress
 authentication and deduplicate interaction IDs. Installation alone does not
 authorize everyone in that server to operate Atem. Bind each invocation to the
@@ -471,12 +525,12 @@ Formatting adapts to Discord's limits without changing receipt meaning or
 silently losing content. Separate integrations cannot share an R9 identity,
 conversation scope or authority just because they use the same global bot.
 
-Self-hosted Discord installation needs an explicit application/bot provisioning
-strategy. Never distribute an official shared bot secret to arbitrary Station
-operators. Use deployment-specific Discord credentials or a separately reviewed
-installation/routing design with truthful data-handling disclosure. Automatic
-setup must not conceal central plaintext forwarding or shared credentials; this
-deployment detail remains part of the Discord contract review.
+After the official app, support the user's own Discord app with its Interactions
+Endpoint on their Station. Provision its bot token and public key directly from
+Station AI > Agent to the authenticated Station, encrypted at rest, never to
+Agora.Build. Portal still manages allowed actors/channels/expiry/revocation and
+labels it Own Discord app. Never distribute the official shared bot secret to
+Station operators. Disclose which adapter receives interaction content.
 
 ## Implementation order and acceptance
 
@@ -484,10 +538,11 @@ The voice/assistant direction below is future work. It does not add release
 gates to the current R9 transport/agent API increment or authorize implementing
 every phase at once.
 
-1. Review the unified Station API admission/privacy contract, protected service
+1. Implement the unified Station API admission/privacy contract, protected service
    storage, per-account activation and service-to-account Auth binding. Product
    runtime placement is Station; account/API authentication, management and
-   Stoa/RTC belong to Agora.Build. Remaining API/security contracts need review.
+   Stoa/RTC belong to Agora.Build. D1-D23 settle owner policy; exact API/security
+   formats and live execution still need implementation/conformance review.
    Retain separate Station registration and existing live R9 release gates;
    this design does not close them.
 2. Implement one custom integration with native-approved service enrollment,
@@ -530,7 +585,8 @@ remain available; the assistant is another authorized caller of the same tools.
 ```mermaid
 flowchart LR
     User[End user] <--> UI[Agora.Build / Stoa or native voice and text UI]
-    UI <--> Assistant[Dedicated assistant / selected LLM]
+    UI <--> Voice[Agora.Build ConvoAI pipeline and consented history]
+    Voice <-->|assistant.chat session| Assistant[Station LLM endpoint / selected model]
     Assistant <-->|scoped retrieval| Context[Lightweight context store on chosen Station]
     Assistant <-->|typed tool calls / receipts| API[Station API]
     API <-->|encrypted R9| Atem[Atem and coding agents]
@@ -542,9 +598,29 @@ Agora.Build owns the assistant experience, configuration and orchestration
 contract; Stoa supplies the relevant voice/media experience. Station holds
 approved private context and provides retrieval/runtime operations. Atem owns
 host-side context capture and coding-agent adapters. The inference/retrieval
-runtime and selected model provider must be explicit authorized endpoints, not
-an unannounced plaintext proxy in the Portal backend. Exact runtime placement,
-speech/model providers and APIs are later design work.
+runtime and selected model provider must be explicit authorized endpoints.
+Station exposes OpenAI-compatible `/v1/chat/completions`, performs retrieval
+and function calls internally, and uses the configured model. ConvoAI declares
+no tools. Its LLM URL and Auth session token are fixed for a conversation;
+the token has `assistant.chat`, the exact Station audience, integration and
+`sid`, lasts at most 72 hours, and requires an active session on every call.
+Session-end notices/polling revoke it. RTC/RTM tokens refresh in place every
+20 minutes (30-minute expiry) without replacing the ConvoAI agent.
+
+The user's custom model provider URL/model and write-only API key are provisioned
+directly from Astation to Station. One encrypted key per account is shared by
+its Astation devices; Astation retains no saved copy. Never put that key in
+Portal/Auth, logs or context. The consent names the Station/operator and model
+recipient. A Station-local model may use a local HTTP address; otherwise require
+HTTPS. Station default/custom provider selection and a minimal through-Station
+test are later UI/runtime implementation, not an enabled model proxy today.
+
+Opt-in Agora.Build voice conversations retain transcripts/replies in Portal's
+history: Basic 90 days, Premium indefinitely. After downgrade, older-than-90-day
+history gets 30 days with warnings before deletion unless upgraded again.
+Audio/transcripts/replies cross Agora's pipeline; retrieved context goes to the
+chosen model and stays off Portal unless included in a reply. Disclose this
+additional retained copy. The credential-export prohibition still applies.
 
 ### Explicit opt-in
 
@@ -692,10 +768,10 @@ or request an R9 change.
 
 ## Review and assignment requests
 
-| Owner | Needed before implementation |
+| Owner | Implementation and conformance work |
 | --- | --- |
 | Agora.Build / Portal | Integration management UI/API, permitted metadata and Discord installation/consent; direct setup with chosen Station runtime without proxying/storing private content or user vault credentials. |
-| Agora.Build / Auth | Account/API credential issuance/rotation/revocation and verification contract; exact Station resources/scopes, supported service delegation, local validation, revocation-cache and outage behavior. Native PKCE exists. |
+| Agora.Build / Auth | Implement D1-D4/D15/D17: dynamic clients, private-key assertions/client-credentials, registered Station resources/accounts, signed owner/service binding, rotation and browser exchange. Publish byte-level fingerprint vectors and dev interoperability evidence. Native PKCE exists. |
 | Agora.Build / Stoa | RTC/meeting/screen-sharing application, media APIs and provider integration, separate from Station's agent/data transport. |
 | Astation native | Exact manager-confirmed service enrollment, trusted project-scope preparation and protected local state. |
 | Station server / Astation team | Unified transport/storage/runtime handlers, Auth credential validation, protected per-integration R9 service keys, authenticated management-change application, receipt persistence, tenant/route isolation and Discord runtime delivery. No account/credential issuer or RTC application. |
@@ -704,14 +780,18 @@ or request an R9 change.
 Station owns integrated transport/storage/runtime APIs; Agora.Build owns account
 and API authentication, integration management and Stoa/RTC/screen sharing.
 Native Astation owns manager approval; Atem owns host/core.
-The user-requested consolidation resolves the extra public service/name, without
-approving additional R9 authority, undecided expiry/retention policy or a change
-to the existing live release gates. This document does not deploy/enable the
-agent module, change trust or authorize a production rollout.
+The user authorized implementation from both documents on 2026-10-24. D1-D23
+settle the earlier owner-policy questions, including retention and credential
+lifetimes. Exact feed/fingerprint APIs, native approval, protected service keys
+and current shared-core constraints remain technical implementation/security
+gates. No expanded R9 authority, live trust reset or production rollout follows
+from starting this work. Main merges still require user approval.
 
 ## References
 
 - [Remote agent API design](protocol/remote-agent-api.md)
+- [Auth and Station admission](protocol/station-auth-validation.md)
+- [Agora.Build companion: D1-D23 and delivery](https://genie.netbird.cloud:44259/AGORA-BUILD-INTEGRATIONS.md)
 - [Current independent API implementation](../docs/remote-api.md)
 - [Account integration and trust boundary](protocol/account-identity-integration.md)
 - [Agora.Build login and separate resource grants](../docs/agora-build-login.md)
