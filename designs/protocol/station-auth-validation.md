@@ -85,6 +85,14 @@ service-key mismatches, policy revocation, expiry while fetching keys, key
 rotation/removal and bounded Auth outages. Existing signed native login and
 recovery HTTP tests continue to exercise production account routing.
 
+The Redis suite tests cross-replica voice-store delivery, early replies and
+timeouts directly, without reopening the retired HTTP bridge. Separate
+production-router checks refuse the bridge on both replicas before and during
+a Redis outage, with no disclosure or mutation of retained session content.
+Local validation passes 530 regular relay tests (120 environment-gated tests
+ignored in that run), plus all 65 explicitly selected Redis tests against an
+isolated Valkey 8.1 server, with zero failures or skips in the Redis run.
+
 Next: durable provisioning/change-feed bindings and account-access changes,
 per-integration quotas, registered-Station proof, native Station AI settings and
 relay-only acknowledgments, then shared-client execution/receipts and Discord.
@@ -107,7 +115,7 @@ ten tasks; an assignment is not a claim that another agent has started it.
 | 5. Typed agent APIs/events/receipts | Station/Astation, shared client from Atem | Existing native APIs; hosted integration execution remains closed. |
 | 6. Durable lifecycle/export/deletion | Station/Astation | Integration-specific persistence and deletion propagation pending. |
 | 7. Station AI settings | Astation | Pending authenticated account-wide configuration. |
-| 8. Relay-only policy and ACKs | Astation + Atem host | Host proposal e105; pairing/generation/persistence review on #81. |
+| 8. Relay-only policy and ACKs | Astation + Atem host | Atem [#96](https://github.com/Agora-Build/Atem/pull/96) merged; deferred ACK delivery and unreadable-policy findings remain in [review](https://github.com/Agora-Build/Atem/pull/96#issuecomment-6381772041). Native activation remains gated. |
 | 9. Discord | Portal + Station/Astation | Official app after API foundations; own app later. |
 | 10. Joint end-to-end verification | All owners | Local adversarial tests run; live grants/owner/no-Mac/replica matrix pending. |
 
