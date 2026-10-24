@@ -4,6 +4,22 @@ Status: design draft for joint Portal, Auth, Station, Astation and Atem review,
 2026-10-23. This document assigns proposed ownership and describes work to
 build; it does not advertise deployed API endpoints or change the R9 contract.
 
+## Shared design and coordination
+
+This is one shared design for **native Astation, Atem, Station API and
+Agora.Build (Portal, Auth and Stoa)**. The current canonical source is this file
+in the Astation repository, reviewed through
+[Astation #65](https://github.com/Agora-Build/Astation/issues/65) and linked from
+[Atem #81](https://github.com/Agora-Build/Atem/issues/81). Other components should
+link to the shared revision instead of maintaining independent copies.
+
+Pin the reviewed commit in cross-team handoffs, distinguish decisions from
+future proposals and record which phase is being implemented. Agora.Build/Auth
+contracts and any new Atem context/tool contracts require their owners' review.
+The existing signed R9 contract remains authoritative for wire/security behavior;
+this document neither expands current service scopes nor replaces that review.
+Keep Portal/Auth and joint Atem handoff vaults aligned with the same revision.
+
 ## Product direction
 
 Use one Agora.Build account page and one authorization model for built-in
@@ -84,6 +100,12 @@ plaintext agent proxy.
 | Atem host | Verify membership and operation scope, enforce control/receipts/approvals and execute host operations. |
 | Discord / third-party callers | Receive content explicitly sent through their permitted integration; no implied access to the rest of the private account. |
 
+The Agora.Build backend boundary above covers normal account/control services.
+The future assistant is separately optional: explicit user consent can authorize
+a disclosed hosted assistant/model endpoint to receive selected non-secret
+context, as described below. It never implicitly changes the control-plane
+storage policy or grants plaintext credential access.
+
 "Stays on Station" defines the private server-side store. Authorized clients
 still need plaintext while using data. Local caches, exports, backups and any
 additional replica require explicit storage policy; this is not a promise that
@@ -144,29 +166,57 @@ Auth-resource registration and migration need explicit support and validation.
 
 ```mermaid
 flowchart LR
-    subgraph Account[Agora.Build: accounts and setup]
-      Portal[Integrations UI]
-      Auth[Auth]
-      Stoa[Stoa: RTC and screen sharing]
+    subgraph Account[Agora.Build: control plane and media application]
+      Portal[Account and Integrations management]
+      Auth[Login and API credential authority]
+      Stoa[Stoa: voice / video / screen sharing]
     end
     subgraph Station[Chosen Station server: one Station API]
-      Relay[WebSocket relay: opaque R9]
-      Store[Encrypted data and signed records]
-      Agents[Optional agent module: scoped R9 client]
-      DiscordAdapter[Discord adapter]
+      Relay[WebSocket transport: opaque R9]
+      Store[Encrypted memory / vault / credentials]
+      Trust[Signed membership / sealed recovery]
+      Ops[Optional agent module: scoped R9 client]
+      Context[Optional lightweight context store]
     end
-    Native[Native Astation / direct R9 client] <-->|encrypted R9| Relay
-    Relay <-->|encrypted R9| Atem[Atem host]
-    Agents <-->|encrypted R9| Relay
-    Custom[Custom API client] <-->|HTTPS / WSS| Agents
-    Discord[Discord] <--> DiscordAdapter
-    DiscordAdapter <--> Agents
+    subgraph Host[User's Atem machine]
+      Atem[Atem host: identity / scope / execution]
+      Coding[Claude / Codex / other coding agents]
+    end
+    subgraph Future[Explicitly enabled assistant feature]
+      Assistant[Dedicated conversational assistant]
+      Model[Selected local / cloud model and speech providers]
+    end
+    User[End user] --> Portal
+    User <--> Native[Native Astation / direct R9 client]
+    User <--> Stoa
+    Native <-->|encrypted R9| Relay
+    Relay <-->|encrypted R9| Atem
+    Atem <--> Coding
+    Ops <-->|encrypted R9| Relay
+    Custom[Custom API client] <-->|HTTPS / WSS| Ops
+    Discord[Discord] <-->|runtime interactions| Ops
+    Native <-->|encrypted sync| Store
+    Atem <-->|encrypted sync| Store
     Portal --> Auth
-    Portal -. managed configuration .-> Agents
-    Auth -. credential validation contract .-> Agents
-    Portal -. manager confirmation .-> Native
-    Native -. signed membership / encrypted sync .-> Store
+    Native -. login .-> Auth
+    Portal -. managed configuration .-> Ops
+    Auth -. credential validation contract .-> Ops
+    Native -. manager-signed membership .-> Trust
+    Stoa <-->|media| RTC[RTC provider transport]
+    Native <-->|capture / media| RTC
+    Stoa -. opt-in voice / text .-> Assistant
+    Native -. opt-in voice / text .-> Assistant
+    Atem -. approved non-secret context .-> Context
+    Assistant <-->|scoped context retrieval| Context
+    Assistant <-->|typed tool calls / receipts| Ops
+    Assistant <-->|explicitly approved inputs| Model
 ```
+
+This is the whole target design, including future modules. Dashed assistant/
+context paths require separate explicit opt-in and source permissions; they
+are not existing transports or extra R9 message definitions. An authorized
+context or agent handler may read its permitted data; the relay/storage paths
+remain opaque. Credential payloads never flow into the context/model paths.
 
 For native/direct clients, Station transports ciphertext and Atem handles the
 R9 host endpoint. For integration API/Discord calls, Station's agent module is
@@ -481,11 +531,11 @@ remain available; the assistant is another authorized caller of the same tools.
 flowchart LR
     User[End user] <--> UI[Agora.Build / Stoa or native voice and text UI]
     UI <--> Assistant[Dedicated assistant / selected LLM]
-    Assistant <-->|scoped retrieval| RAG[Context and RAG on chosen Station infrastructure]
+    Assistant <-->|scoped retrieval| Context[Lightweight context store on chosen Station]
     Assistant <-->|typed tool calls / receipts| API[Station API]
     API <-->|encrypted R9| Atem[Atem and coding agents]
     Atem --> Export[Approved context ingestion]
-    Export --> RAG
+    Export --> Context
 ```
 
 Agora.Build owns the assistant experience, configuration and orchestration
@@ -496,7 +546,28 @@ runtime and selected model provider must be explicit authorized endpoints, not
 an unannounced plaintext proxy in the Portal backend. Exact runtime placement,
 speech/model providers and APIs are later design work.
 
-### Context and RAG
+### Explicit opt-in
+
+This feature is off by default. The user explicitly enables it and selects
+accounts/projects/sessions, source categories, context retention and the local
+or cloud providers that may receive context/audio. Account login, pairing,
+agent API access or ordinary screen sharing does not enable context collection
+or assistant/model access.
+
+The user can knowingly authorize a privacy tradeoff for selected context sent
+to a selected cloud assistant/model endpoint, including a managed Agora.Build
+assistant if offered. That endpoint is an additional disclosed data recipient,
+separate from the ordinary account/control plane. Enabling it never authorizes
+plaintext credential export. Canonical private storage stays on chosen Station;
+any extra retained copy/provider retention must be explicitly described.
+
+Disabling the feature stops new collection, retrieval/model calls and tool use
+through that assistant. Define credential revocation, stored-context deletion
+and provider retention separately; do not promise that disabling recalls data
+already sent to a provider. Broader sources/provider changes require a new
+explicit choice rather than silently widening the existing opt-in.
+
+### Lightweight context store
 
 Atem can capture more than a terminal transcript: current session/process state,
 agent activity, prompts/responses, tool outcomes, durable receipts, project
@@ -505,28 +576,46 @@ account/project/session scope, timestamps, versions and provenance so retrieval
 can explain where a fact came from and whether it may be stale. Do not assume
 all these sources are exposed by the current API.
 
-Cloud upload means the selected Station infrastructure, which can be self-hosted
-or shared; it does not automatically mean a central Agora.Build content store.
-Upload only approved sources, using encrypted transport/storage. Documents,
-summaries, embeddings, indexes and caches are all private data and need the
-same tenant/access/retention boundaries. Indexing/retrieval must run at an
-authorized decrypting endpoint. A conventional server-side vector index does
-not preserve relay blindness merely because its source documents are encrypted.
-Specify index/key placement before enabling that feature on shared servers.
+Start with a place to hold approved context, not a required vector database or
+embedding pipeline. Use small versioned records/files for current state,
+summaries, recent events and document/source references, with simple scoped
+list/read/search operations. Bound reads and select relevant context for each
+conversation rather than sending the entire store on every turn. Reuse suitable
+Station persistence after its encrypted-storage/access contract is reviewed.
 
-RAG may know which credential is available and what operation needs it through
-references and safe metadata. Raw passwords, API secrets, private keys and
-recovery material must not become ordinary embeddings, model prompts, transcripts
-or logs. A future credential-consuming tool should resolve/inject the secret at
-the authorized execution endpoint and return a redacted result to the assistant.
-This needs a separately scoped Atem contract; current agent service authority
-does not include memory/vault/credential access or account K.
+Cloud upload initially means the selected Station infrastructure, which can be
+self-hosted or shared. Upload only approved non-secret projections, using
+encrypted transport/storage. A reader still needs explicit decryption authority;
+adding retrieval to Station does not grant a shared operator plaintext access.
+Specify context-key/runtime placement before enabling retrieval there.
+
+Embeddings, semantic search and a richer RAG pipeline are later options if
+simple context retrieval proves insufficient. Documents, summaries, future
+indexes/embeddings and caches all remain private data with the same tenant,
+access and retention requirements. Conventional server-side search cannot be
+advertised as opaque solely because its source documents are encrypted.
+
+**Credential invariant:** credentials from Atem/Astation are never decrypted
+for context export or uploaded as plaintext. The uploader must not decrypt
+credential payloads and then attempt to redact them. Assistant context may
+contain safe credential references/metadata, never the credential values,
+private keys or recovery material. Credential synchronization, where enabled,
+must carry encrypted payloads; those payloads are not decrypted for export or
+model-readable context.
+
+Use allowlisted non-secret exports instead of uploading a whole credential
+store/vault. When an approved operation needs a credential, resolve/use it at
+the authorized execution endpoint without returning its value to the context
+store, assistant, model or cloud tool arguments/results. Enabling the assistant
+does not relax this rule. New context/tools need a separately scoped Atem
+contract; today's agent service authority includes no memory/vault/credential
+access or account K.
 
 Sending retrieved context to a cloud LLM, embedding service or speech provider
 is an explicit additional disclosure. Name the provider and selected data in the
 configuration/consent flow; do not represent that content as remaining solely
-on Station. Define retention, cache invalidation, source deletion and index
-rebuild behavior before rollout. A local or self-hosted provider can preserve
+on Station. Define retention, cache invalidation and source deletion before
+rollout; later indexes need matching rebuild behavior. A local or self-hosted provider can preserve
 a narrower deployment boundary.
 
 ### Tools and current state
@@ -541,7 +630,7 @@ an approval was granted. Retrieved documents and coding-agent output cannot
 override those permissions.
 
 The assistant can answer/discuss without acting. When acting, it checks fresh
-host state; RAG summaries are context, not authoritative live status. Reconnects
+host state; stored summaries are context, not authoritative live status. Reconnects
 query uncertain receipts rather than resubmitting work. Voice and text use this
 same path, including the existing confirmation rules for sensitive operations.
 
@@ -550,13 +639,14 @@ same path, including the existing confirmation rules for sensitive operations.
 | Phase | Deliverable | Boundary |
 | --- | --- | --- |
 | 1. Agent APIs | Finish the current R9-backed text/session/chat/approval/receipt APIs and integration authentication. | Establish live correctness before adding an LLM intermediary. |
-| 2. Approved context | Add source-scoped Atem export, Station ingestion and read-only retrieval/RAG. | Start with selected non-secret content and provenance; design encrypted/derived-index storage explicitly. |
+| 2. Lightweight context | Add source-scoped Atem export, Station context records and simple read-only retrieval. | Explicit opt-in, selected non-secret projections and provenance; no mandatory embeddings or vector database. |
 | 3. Text assistant | Add a dedicated conversational LLM over retrieval and the existing typed tools. | Prove discussion, fresh-state checks, target selection, action confirmation and receipt recovery in text first. |
 | 4. Voice assistant | Add speech input/output through the Agora.Build/Stoa or native client experience. | Users address the assistant; it uses tools to reach coding agents. Keep the same authority and a reviewable text/tool history. |
 | 5. More clients/context | Extend mobile/Discord and additional approved sources/tools. | Review new source/secret permissions and provider disclosures individually; no blanket account-context access. |
 
-Future acceptance includes cross-account/project retrieval isolation, stale or
-removed context, duplicate ingestion, credential-value exclusion, model/tool
+Future acceptance includes disabled/no-consent refusal, changed/revoked opt-in,
+cross-account/project retrieval isolation, stale or removed context, duplicate
+ingestion, credential payloads never decrypted/exported, model/tool
 prompt injection, denied/taken-over actions, uncertain receipts and voice/text
 parity. These are future-phase tests, not evidence of implemented capabilities.
 
