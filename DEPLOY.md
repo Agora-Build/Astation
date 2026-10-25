@@ -1205,8 +1205,8 @@ keys and must never overwrite an established deployment's files):
 
 ```sh
 umask 077
-openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
-  -outform DER -out station-report.der
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 |
+  openssl pkcs8 -topk8 -nocrypt -outform DER -out station-report.der
 openssl rand -out station-service-wrapping.bin 32
 ```
 
