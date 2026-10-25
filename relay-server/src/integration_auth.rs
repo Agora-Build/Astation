@@ -3,6 +3,77 @@ use crate::{
     account_identity::{OidcVerifier, VerifiedServiceToken},
     account_store::VerifyError,
 };
+use axum::{
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
+
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Result<&str, VerifyError> {
+    if headers.get_all(header::AUTHORIZATION).iter().count() > 1 {
+        return Err(VerifyError::MalformedBearer);
+    }
+    let value = headers
+        .get(header::AUTHORIZATION)
+        .ok_or(VerifyError::MissingBearer)?
+        .to_str()
+        .map_err(|_| VerifyError::MalformedBearer)?;
+    let scheme = value.split_whitespace().next().unwrap_or("");
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return Err(VerifyError::MissingBearer);
+    }
+    let token = value
+        .get(7..)
+        .filter(|_| value.as_bytes().get(6) == Some(&b' '))
+        .filter(|token| !token.is_empty() && !token.bytes().any(|b| b.is_ascii_whitespace()))
+        .ok_or(VerifyError::MalformedBearer)?;
+    Ok(token)
+}
+
+pub(crate) fn token_error(error: &VerifyError, scope: &str) -> Response {
+    let (status, code, challenge) = match error {
+        VerifyError::MissingBearer => (StatusCode::UNAUTHORIZED, None, Some("Bearer".to_string())),
+        VerifyError::MalformedBearer => (
+            StatusCode::BAD_REQUEST,
+            Some("invalid_request"),
+            Some("Bearer error=\"invalid_request\"".into()),
+        ),
+        VerifyError::InsufficientScope => (
+            StatusCode::FORBIDDEN,
+            Some("insufficient_scope"),
+            Some(format!(
+                "Bearer error=\"insufficient_scope\", scope=\"{scope}\""
+            )),
+        ),
+        VerifyError::Unavailable(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("temporarily_unavailable"),
+            None,
+        ),
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Some("invalid_token"),
+            Some("Bearer error=\"invalid_token\"".into()),
+        ),
+    };
+    let mut response = (status, Json(serde_json::json!({"error": code}))).into_response();
+    if let Some(challenge) = challenge {
+        if let Ok(value) = challenge.parse() {
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, value);
+        }
+    }
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, "5".parse().unwrap());
+    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
+}
 
 /// Current internal policy from native-approved provisioning and authenticated
 /// Portal changes. Never deserialize this from an agent caller's request body.
@@ -24,7 +95,9 @@ impl IntegrationBinding {
         token: &str,
         operation: &str,
     ) -> Result<VerifiedServiceToken, VerifyError> {
-        let verified = verifier.verify_integration(token, operation).await?;
+        let verified = verifier
+            .verify_integration(token, operation, &self.service_fingerprint)
+            .await?;
         self.authorize(&verified, operation, chrono::Utc::now().timestamp())?;
         Ok(verified)
     }
@@ -58,6 +131,52 @@ impl IntegrationBinding {
 mod tests {
     use super::*;
     use crate::account_identity::VerifiedIdentity;
+
+    #[test]
+    fn authorization_is_one_bearer_header_and_errors_follow_auth_contract() {
+        let mut headers = HeaderMap::new();
+        assert!(matches!(
+            bearer_token(&headers),
+            Err(VerifyError::MissingBearer)
+        ));
+        for value in [
+            "Bearer",
+            "Bearer  token",
+            "Bearer\ttoken",
+            "Bearer token extra",
+        ] {
+            headers.insert(header::AUTHORIZATION, value.parse().unwrap());
+            assert!(
+                matches!(bearer_token(&headers), Err(VerifyError::MalformedBearer)),
+                "{value}"
+            );
+        }
+        headers.insert(header::AUTHORIZATION, "Basic token".parse().unwrap());
+        assert!(matches!(
+            bearer_token(&headers),
+            Err(VerifyError::MissingBearer)
+        ));
+        headers.insert(header::AUTHORIZATION, "bEaReR token".parse().unwrap());
+        assert_eq!(bearer_token(&headers).unwrap(), "token");
+        headers.append(header::AUTHORIZATION, "Bearer other".parse().unwrap());
+        assert!(matches!(
+            bearer_token(&headers),
+            Err(VerifyError::MalformedBearer)
+        ));
+        let response = token_error(&VerifyError::InsufficientScope, "agent.prompt");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.headers()[header::WWW_AUTHENTICATE],
+            "Bearer error=\"insufficient_scope\", scope=\"agent.prompt\""
+        );
+        let response = token_error(
+            &VerifyError::Unavailable("private diagnostic".into()),
+            "agent.prompt",
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "5");
+        assert!(!response.headers().contains_key(header::WWW_AUTHENTICATE));
+    }
 
     fn fixture() -> (IntegrationBinding, VerifiedServiceToken) {
         let binding = IntegrationBinding {

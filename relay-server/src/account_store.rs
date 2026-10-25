@@ -38,6 +38,9 @@ pub enum VerifyError {
     Unavailable(String),
     Rejected,
     InvalidResponse,
+    InsufficientScope,
+    MissingBearer,
+    MalformedBearer,
 }
 
 impl std::fmt::Display for VerifyError {
@@ -46,6 +49,9 @@ impl std::fmt::Display for VerifyError {
             Self::Unavailable(message) => write!(f, "Account identity verification unavailable: {message}"),
             Self::Rejected => write!(f, "Account access token was rejected"),
             Self::InvalidResponse => write!(f, "Account identity response is invalid"),
+            Self::InsufficientScope => write!(f, "The access token lacks the required scope"),
+            Self::MissingBearer => write!(f, "A Bearer access token is required"),
+            Self::MalformedBearer => write!(f, "The Authorization header is malformed"),
         }
     }
 }

@@ -13,6 +13,22 @@ private func json(_ value: Any) throws -> String {
     String(decoding: try JSONSerialization.data(withJSONObject: value, options: .sortedKeys), as: UTF8.self)
 }
 
+private actor IntegrationApprovalTestHTTP: AccountOIDCHTTP {
+    var reply = Data()
+    var status = 200
+    private var requests: [URLRequest] = []
+    func set(_ object: [String: Any], status: Int = 200) throws {
+        reply = try JSONSerialization.data(withJSONObject: object)
+        self.status = status
+    }
+    func send(_ request: URLRequest) async throws -> (Data, Int) {
+        requests.append(request)
+        return (reply, status)
+    }
+    func last() -> URLRequest? { requests.last }
+    func count() -> Int { requests.count }
+}
+
 private final class PublicationKeys: AppKeyProvider, @unchecked Sendable {
     // Test-only software manager. Production supplies its native protected key provider.
     let key = Curve25519.Signing.PrivateKey()
@@ -92,6 +108,158 @@ private final class PublicationFixture {
 }
 
 final class RemoteMembershipPublicationTests: XCTestCase {
+    func testServiceFingerprintMatchesBothPublicAuthVectors() throws {
+        let cases: [(KeyAlg, String, Int, String)] = [
+            (.p256, "BNa0CKl9dCuZMEg6WPNIaZatMGhIKeCElX2Pc8FA3H2v8Iezbt5Glq2FKvXNzpwYxjaRpx_aqnXuXSTjG4kQq90", 65,
+             "9af59dce1292f9401b3fa89bbd050b1671bddfccc5ace04a2402bacffda5e5d6"),
+            (.ed25519, "ggpM_o3M3L3H4slbWlvWcIkSew9H-qMEWi49Py_wbkE", 32,
+             "837e9176e9bcaffae6ca630d56ded10fb7d8d2b6cfe2d7d19499a483c3ba2cf4")
+        ]
+        for (alg, encoded, count, expected) in cases {
+            let key = PublicKeyData(alg: alg, raw: try XCTUnwrap(RemoteRecoveryKit.decodeBase64URL(encoded, count: count)))
+            XCTAssertEqual(try RemoteServiceKeyFingerprint.compute(key), expected)
+        }
+        XCTAssertThrowsError(try RemoteServiceKeyFingerprint.compute(PublicKeyData(alg: .p256, raw: Data(repeating: 0, count: 65))))
+        XCTAssertThrowsError(try RemoteServiceKeyFingerprint.compute(PublicKeyData(alg: .x25519, raw: Data(repeating: 1, count: 32))))
+    }
+    @MainActor
+    private func serviceApproval(_ f: PublicationFixture) throws -> RemoteServiceApproval {
+        let action = try json(["action": "add", "member": [
+            "device_id": "service-a", "kind": "service", "roles": ["service"],
+            "auth_key": ["alg": "ed25519", "pub": b64u(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)],
+            "scope": ["hosts": ["host-a"], "ops": ["prompt", "view"]],
+            "expires_at": f.clock.wallMs + 60_000
+        ]])
+        let body = try f.log.draftEntry(signer: "manager-a", signedAt: f.clock.wallMs, actionJson: action)
+        return try RemoteServiceApproval(operationID: "setup-a", integrationID: "i-01234567890123456789012345",
+            issuer: "https://auth.example", ownerAccount: "ab01234567890123456789012345",
+            stationOrigin: "https://custom.example", bodyJSON: body, log: f.log, managerID: "manager-a", now: f.clock)
+    }
+
+    @MainActor
+    func testServiceConsentSurvivesRestartAndSignsTheExactReviewedBodyOnce() throws {
+        let f = try PublicationFixture()
+        let approval = try serviceApproval(f)
+        let request = try approval.prepare(publication: f.publication, managerID: "manager-a", now: f.clock)
+        XCTAssertEqual(request.purpose, .enroll)
+        XCTAssertTrue(request.freshConfirmation)
+        XCTAssertEqual(f.keys.requests.count, 0)
+        let restored = try f.restore()
+        XCTAssertEqual(try JSONDecoder().decode(RemoteServiceApproval.self, from: XCTUnwrap(restored.operationContext)), approval)
+        let append = try approval.sign(publication: restored, provider: f.keys, managerID: "manager-a", validationClock: f.clock,
+            confirmedAt: 100, now: { 100 }, current: { true })
+        let duplicate = try approval.sign(publication: restored, provider: f.keys, managerID: "manager-a", validationClock: f.clock,
+            confirmedAt: 100, now: { 100 }, current: { true })
+        XCTAssertEqual(append, duplicate)
+        XCTAssertEqual(f.keys.requests.count, 1)
+        XCTAssertEqual(try signedObjectInfo(json: append.entryJson).bodyJcs, approval.bodyJSON)
+        guard case .committed = try restored.relayStored(now: f.clock) else { return XCTFail("Expected commit") }
+        let member = try XCTUnwrap(restored.committedLog().member(deviceId: "service-a"))
+        XCTAssertEqual(member.roles, ["service"])
+        XCTAssertEqual(try RemoteServiceKeyFingerprint.compute(member.authKey), approval.fingerprint)
+        XCTAssertNil(member.encKey)
+    }
+
+    @MainActor
+    func testPortalApprovalWaitsForDurableExactMembershipAndRejectsChangedContext() async throws {
+        let f = try PublicationFixture()
+        let approval = try serviceApproval(f)
+        let transport = IntegrationApprovalTestHTTP()
+        let config = try AccountOIDCConfiguration(issuer: "https://auth.example", clientID: "astation",
+            resource: "https://portal.example", requiredScope: "integrations:read", additionalScopes: ["integrations:approve"])
+        let http = try PortalIntegrationHTTP(configuration: config, portalOrigin: config.resource,
+            ownerAccount: approval.ownerAccount, http: transport, accessToken: { "native-portal-token" })
+        let now = Date(timeIntervalSince1970: Double(f.clock.wallMs) / 1000)
+        let record: [String: Any] = ["id": approval.integrationID, "name": "My API", "stationOrigin": approval.stationOrigin,
+            "state": "provisioning", "scopes": ["agent.view", "agent.prompt"], "r9Svc": approval.fingerprint,
+            "expiresAt": "2099-01-01T00:00:00.000Z", "role": "owner"]
+        try await transport.set(record)
+        _ = try approval.prepare(publication: f.publication, managerID: "manager-a", now: f.clock)
+        _ = try approval.sign(publication: f.publication, provider: f.keys, managerID: "manager-a",
+            validationClock: f.clock, confirmedAt: 100, now: { 100 }, current: { true })
+        do {
+            _ = try await http.approve(approval, publication: f.publication, current: { true }, now: now)
+            XCTFail("Signing without durable membership publication must not approve at Auth")
+        } catch {}
+        let before = await transport.count()
+        XCTAssertEqual(before, 0)
+        _ = try f.publication.relayStored(now: f.clock)
+        let result = try await http.approve(approval, publication: f.publication, current: { true }, now: now)
+        XCTAssertEqual(result.r9Svc, approval.fingerprint)
+        let last = await transport.last()
+        let sent = try XCTUnwrap(last)
+        XCTAssertEqual(sent.url?.absoluteString, "https://portal.example/api/v1/integrations/\(approval.integrationID)/approval")
+        XCTAssertEqual(sent.value(forHTTPHeaderField: "Authorization"), "Bearer native-portal-token")
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(sent.httpBody)) as? [String: String])
+        XCTAssertEqual(body, ["r9Svc": approval.fingerprint])
+        var changed = try XCTUnwrap(JSONSerialization.jsonObject(with: approval.checkpoint()) as? [String: Any])
+        changed["integrationID"] = "i-11234567890123456789012345"
+        let swapped = try JSONDecoder().decode(RemoteServiceApproval.self, from: JSONSerialization.data(withJSONObject: changed))
+        do {
+            _ = try await http.approve(swapped, publication: f.publication, current: { true }, now: now)
+            XCTFail("Another integration must not reuse this consent")
+        } catch {}
+        let after = await transport.count()
+        XCTAssertEqual(after, 1)
+        var pending = record; pending["state"] = "awaiting_approval"; pending.removeValue(forKey: "r9Svc")
+        try await transport.set(["integrations": [pending], "stale": false])
+        let list = try await http.pending(stationOrigin: approval.stationOrigin, now: now)
+        XCTAssertEqual(list.map(\.id), [approval.integrationID])
+        try await transport.set(["integrations": [pending], "stale": true])
+        do { _ = try await http.pending(stationOrigin: approval.stationOrigin, now: now); XCTFail("Stale Portal data cannot authorize") } catch {}
+    }
+
+    @MainActor
+    func testServiceExpiryIsRecheckedAfterConfirmationBeforeSigning() throws {
+        let f = try PublicationFixture()
+        let approval = try serviceApproval(f)
+        _ = try approval.prepare(publication: f.publication, managerID: "manager-a", now: f.clock)
+        let expired = HostClock(wallMs: f.clock.wallMs + 60_000, monoMs: f.clock.monoMs + 60_000, bootId: f.clock.bootId)
+        XCTAssertThrowsError(try approval.sign(publication: f.publication, provider: f.keys, managerID: "manager-a",
+            validationClock: expired, confirmedAt: 100, now: { 100 }, current: { true }))
+        XCTAssertTrue(f.keys.requests.isEmpty)
+    }
+
+    @MainActor
+    func testChangedServiceConsentOrAccountContextCannotReuseConfirmation() throws {
+        let f = try PublicationFixture()
+        let approval = try serviceApproval(f)
+        _ = try approval.prepare(publication: f.publication, managerID: "manager-a", now: f.clock)
+        for (field, changed) in [("stationOrigin", "https://other.example"), ("operationID", "setup-b"),
+            ("issuer", "https://other-auth.example"), ("ownerAccount", "ab11234567890123456789012345"),
+            ("genesisHash", String(repeating: "f", count: 64)),
+            ("integrationID", "i-11234567890123456789012345"), ("fingerprint", String(repeating: "f", count: 64))] {
+            var value = try XCTUnwrap(JSONSerialization.jsonObject(with: approval.checkpoint()) as? [String: Any])
+            value[field] = changed
+            let altered = try JSONDecoder().decode(RemoteServiceApproval.self, from: JSONSerialization.data(withJSONObject: value))
+            XCTAssertThrowsError(try altered.sign(publication: f.publication, provider: f.keys, managerID: "manager-a", validationClock: f.clock,
+                confirmedAt: 100, now: { 100 }, current: { true }), field)
+        }
+        XCTAssertThrowsError(try approval.sign(publication: f.publication, provider: f.keys, managerID: "manager-a", validationClock: f.clock,
+            confirmedAt: 100, now: { 100 }, current: { false }))
+        XCTAssertThrowsError(try approval.sign(publication: f.publication, provider: f.keys, managerID: "manager-a", validationClock: f.clock,
+            confirmedAt: 100, now: { 30_100 }, current: { true }))
+        XCTAssertTrue(f.keys.requests.isEmpty)
+    }
+
+    @MainActor
+    func testServiceApprovalRefusesChangedHeadAndFailedProtectedStorage() throws {
+        let f = try PublicationFixture()
+        let approval = try serviceApproval(f)
+        try f.prepare()
+        _ = try f.publication.sign(provider: f.keys, keyID: "manager-a")
+        _ = try f.publication.relayStored(now: f.clock)
+        XCTAssertThrowsError(try approval.prepare(publication: f.publication, managerID: "manager-a", now: f.clock))
+        let g = try PublicationFixture()
+        let other = try serviceApproval(g)
+        g.failWrite = true
+        XCTAssertThrowsError(try other.prepare(publication: g.publication, managerID: "manager-a", now: g.clock))
+        XCTAssertTrue(g.publication.storageUncertain)
+        XCTAssertThrowsError(try other.sign(publication: g.publication, provider: g.keys, managerID: "manager-a", validationClock: g.clock,
+            confirmedAt: 100, now: { 100 }, current: { true }))
+        XCTAssertTrue(g.keys.requests.isEmpty)
+    }
+
     @MainActor
     func testHostEntryUsesTheCapturedAuthenticatedIdentityAndExactGeneration() throws {
         for generation: UInt64 in [3, 9_007_199_254_740_991] {

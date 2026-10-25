@@ -360,11 +360,14 @@ session tokens remain separate admission profiles. A token is not R9 identity.
 
 Integration client-key rotation accepts old/new public keys at Auth for ten
 minutes. Disabling the client prevents new tokens; issued tokens expire within
-five minutes. Station also applies signed Portal push notices and polls every
+five minutes. Portal sends an unsigned poll hint with no authority; Station
+never adopts its cursor or policy. Station polls the authenticated feed every
 minute for pauses, revocations and account-access changes. A Station's own Auth
 client reports with `station.report` to Portal. Browser private reads use a
 five-minute token-exchanged `station.read` token and call Station directly with
-Portal-origin CORS. These service/feed APIs require live owner implementation.
+Portal-origin CORS. Auth PR #9 and Portal PR #15 publish these contracts;
+Station wiring and live verification remain required. Portal #16 tracks the
+missing authenticated owner field and cursor-recovery rule.
 
 Agora.Build manages credential rotation within existing authority; renewing or
 expanding R9 authorization still needs native manager confirmation. The official
@@ -387,8 +390,8 @@ complete binding to current approved policy. Do not derive the owner from email,
 unsigned request fields or a service subject supplied by the caller. The
 `private_key_jwt`/client-credentials grant, registered custom resources and exact
 fingerprint/feed interoperability must be delivered and tested before live
-activation. The deployed dev discovery still lacks these grants at this check;
-local signed test tokens do not establish production interoperability.
+activation. Published or merged source does not establish a deployed dev
+grant; local signed test tokens do not establish production interoperability.
 
 ## Permissions and lifecycle
 
@@ -782,8 +785,10 @@ and API authentication, integration management and Stoa/RTC/screen sharing.
 Native Astation owns manager approval; Atem owns host/core.
 The user authorized implementation from both documents on 2026-10-24. D1-D23
 settle the earlier owner-policy questions, including retention and credential
-lifetimes. Exact feed/fingerprint APIs, native approval, protected service keys
-and current shared-core constraints remain technical implementation/security
+lifetimes. The fingerprint definition and published issuance/feed contracts
+are consumed by the [integration components](protocol/station-integration-lifecycle.md).
+The owner/recovery feed follow-up, native/provisioning/runtime wiring and
+current shared-core constraints remain technical implementation/security
 gates. No expanded R9 authority, live trust reset or production rollout follows
 from starting this work. Main merges still require user approval.
 

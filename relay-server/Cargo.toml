@@ -28,6 +28,7 @@ base64 = "0.22"
 atem-client = { git = "https://github.com/Agora-Build/Atem.git", rev = "83c0776d21fa35c656eefaee25edd03cbbd203ee" }
 # Astation relay-identity proofs (ECDSA P-256); already in the tree via rustls.
 ring = "0.17"
+zeroize = "1"
 # Shared relay state across replicas (REDIS_URL): commands with automatic
 # reconnect, pub/sub, Lua scripts. Valkey-compatible.
 redis = { version = "0.27", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "keep-alive"] }

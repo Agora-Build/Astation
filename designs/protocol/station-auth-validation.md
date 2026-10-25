@@ -9,8 +9,9 @@ and registered custom Stations. It does not grant R9 device authority.
 
 1. Accept a bounded signed access token, never an ID token, refresh token,
    query-string credential or an unsigned account/device assertion.
-2. Require `typ=at+jwt`, `alg=ES256`, a bounded `kid`, the configured Auth
-   issuer, and the selected Station's exact origin as the sole audience.
+2. Require `typ=at+jwt` or `application/at+jwt` (case insensitive),
+   `alg=ES256`, a bounded `kid`, the configured Auth issuer, and the selected
+   Station's exact origin in the string or array audience.
    Portal-audience tokens cannot authorize Station. HTTP is permitted only
    for loopback development issuers/resources.
    Missing/partial configuration never falls back to a userinfo endpoint;
@@ -19,10 +20,11 @@ and registered custom Stations. It does not grant R9 device authority.
 3. Verify the signature with the configured issuer's discovery/JWKS. Do not
    follow redirects or token-provided key URLs. Discovery must retain the
    issuer and its JWKS origin. Bound document sizes and network timeouts.
-4. Enforce expiration, issuance/not-before times, the `ab` + ULID owner subject,
+4. Enforce expiration, issuance/not-before times with Auth's 60-second skew,
+   the `ab` + ULID owner subject,
    client ID and the route's exact scope. Check time again after key retrieval.
-5. Keep token purposes separate. Native login accepts no integration service
-   binding or assistant session. Integration access lasts at most 300 seconds,
+5. Keep token purposes separate. Native login accepts no integration client
+   or assistant session. Integration access lasts at most 300 seconds,
    requires `r9_svc`, and cannot use an assistant `sid`.
 6. Integration admission additionally matches the verified issuer, owner,
    `client_id` and `r9_svc` to the current approved Station binding. Require
@@ -36,9 +38,19 @@ and registered custom Stations. It does not grant R9 device authority.
 The binding passed to integration admission is trusted internal policy loaded
 by the provisioning/change-feed layer, not a JSON body supplied by the caller.
 It is keyed by `(issuer, owner, integration ID)` and its fingerprint comes from
-the approved service identity. Until Auth and the shared-core owners publish
-the fingerprint byte/encoding vector and the signed policy-feed format, this
-increment does not expose a provisionable integration execution route.
+the approved service identity. `r9_svc` is lowercase hex SHA-256 of the decoded
+current member `auth_key.pub` bytes: 65-byte uncompressed SEC1 for P-256 or
+32 raw bytes for Ed25519. Hash no JSON, algorithm prefix, PEM or DER.
+Native and Rust tests match both public Auth vectors. The shared helper has
+been requested from Atem; this does not change the existing core dependency.
+
+The verifier consumes Auth PR #9 `d7de4416e74f2fcc85dcf4befa0a6bd8ad9ffb64`
+(subsequently merged as `ca657bb`). All 42 pinned vectors match their verdict,
+HTTP error, principal and scope expectations. Integration binding is checked
+before required scope: an incorrect `r9_svc` is `invalid_token`, not
+`insufficient_scope`. Missing/non-Bearer authorization is 401 with a plain
+Bearer challenge; malformed Bearer is 400, insufficient scope 403 and key
+retrieval failure 503 with a five-second Retry-After. No token is logged.
 
 ## Rotation, revocation and outages
 
@@ -48,13 +60,18 @@ increment does not expose a provisionable integration execution route.
 - During a discovery/JWKS outage, a previously verified key set may be used
   for at most one hour from its last successful fetch. Never use an unknown
   key from a failed fetch, extend token expiry, or reset the cache age on a
-  failure. At the one-hour boundary fail closed.
+  failure. At the one-hour boundary fail closed. An unknown key after a failed
+  refresh returns 503, including during backoff; backoff starts when that fetch
+  finishes rather than when it started.
 - A successful JWKS replacement is authoritative for signing keys: removed
   keys, including an empty key set, do not survive in a fallback cache.
 - Integration client-key rotation has a ten-minute overlap at Auth. It does
   not change the R9 service key or bypass the five-minute access-token limit.
-- Portal pushes authenticated pauses/revocations/account-access changes;
-  Station also polls every minute. Missing tokens expire within five minutes.
+- Portal sends an unsigned, bounded/coalesced poll hint. It contains no policy
+  authority and its cursor is never adopted. Only the authenticated Station
+  report-token feed applies pauses/revocations/account-access changes; poll
+  every minute and fetch a full 500-event page again immediately.
+  Missing tokens expire within five minutes.
   A local policy denial wins even while an access token's signature is valid.
 - A stream or queued command must be checked against current expiry/policy
   before dispatch; reconnect and token refresh never revive revoked work.
@@ -93,7 +110,15 @@ Local validation passes 530 regular relay tests (120 environment-gated tests
 ignored in that run), plus all 65 explicitly selected Redis tests against an
 isolated Valkey 8.1 server, with zero failures or skips in the Redis run.
 
-Next: durable provisioning/change-feed bindings and account-access changes,
+The next component increment adds native exact-body service consent, protected
+publication context, the separately scoped native Portal approval transport,
+encrypted Station P-256 service keys, and a report-key-authenticated Portal
+client with a durable policy/cursor CAS store. These are tested components;
+the native UI, Station provisioning endpoints and runtime poller are not wired.
+See [the integration lifecycle](station-integration-lifecycle.md) for exact
+implemented boundaries, failure handling and remaining gates.
+
+Next: wire provisioning/change-feed bindings and account-access changes,
 per-integration quotas, registered-Station proof, native Station AI settings and
 relay-only acknowledgments, then shared-client execution/receipts and Discord.
 Assistant session tokens (`assistant.chat`, `sid`, up to 72 hours) need their
@@ -109,13 +134,13 @@ ten tasks; an assignment is not a claim that another agent has started it.
 | Task | Owner | Current status |
 | --- | --- | --- |
 | 1. Auth to Station validation | Station/Astation | Local verifier and policy checks implemented; live Auth interoperability pending. |
-| 2. Credentials and registered Stations | Auth | Delegated; Station proof endpoint foundation implemented here. |
-| 3. Integration/Station management and change APIs | Portal | Delegated; exact API/feed formats pending. |
-| 4. Native approval and protected R9 provisioning | Station/Astation, shared core from Atem | Existing R9 primitives; integration lifecycle not wired. |
+| 2. Credentials and registered Stations | Auth | Contract and 42 vectors consumed from PR #9; actual deployment/live Station interoperability pending. |
+| 3. Integration/Station management and change APIs | Portal | PR #15 contract consumed; owner binding and cursor recovery tracked in Portal #16. |
+| 4. Native approval and protected R9 provisioning | Station/Astation, shared core from Atem | Exact-body consent, checkpoint, Portal transport and encrypted service-key components tested; UI/provisioning/runtime wiring pending. |
 | 5. Typed agent APIs/events/receipts | Station/Astation, shared client from Atem | Existing native APIs; hosted integration execution remains closed. |
 | 6. Durable lifecycle/export/deletion | Station/Astation | Integration-specific persistence and deletion propagation pending. |
 | 7. Station AI settings | Astation | Pending authenticated account-wide configuration. |
-| 8. Relay-only policy and ACKs | Astation + Atem host | Atem [#96](https://github.com/Agora-Build/Atem/pull/96) merged; deferred ACK delivery and unreadable-policy findings remain in [review](https://github.com/Agora-Build/Atem/pull/96#issuecomment-6381772041). Native activation remains gated. |
+| 8. Relay-only policy and ACKs | Astation + Atem host | Atem [#97](https://github.com/Agora-Build/Atem/pull/97) merged as `8815bf7`; fixes both #96 findings, source/CI reviewed. Release and joint live policy/ACK verification remain. |
 | 9. Discord | Portal + Station/Astation | Official app after API foundations; own app later. |
 | 10. Joint end-to-end verification | All owners | Local adversarial tests run; live grants/owner/no-Mac/replica matrix pending. |
 

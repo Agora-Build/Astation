@@ -7,6 +7,8 @@ mod cluster;
 mod encryption;
 mod identity_store;
 mod integration_auth;
+mod integration_feed;
+mod integration_portal;
 mod knowledge_routes;
 mod knowledge_secrets;
 mod knowledge_store;
@@ -16,6 +18,7 @@ mod routes;
 mod rtc_session;
 mod session_store;
 mod station_ai;
+mod service_keys;
 mod voice_session;
 #[cfg(test)]
 mod voice_routes;

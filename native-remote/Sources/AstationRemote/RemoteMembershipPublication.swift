@@ -20,6 +20,7 @@ public final class RemoteMembershipPublication {
         let prepared: String?
         let requiresRefresh: Bool
         let membership: String?
+        let operationContext: Data?
     }
 
     private var log: MembershipLog
@@ -28,6 +29,7 @@ public final class RemoteMembershipPublication {
     private var operating = false
     public private(set) var storageUncertain = false
     public private(set) var requiresRefresh = false
+    public private(set) var operationContext: Data?
 
     public var head: LogHead { log.head() }
     public var entries: [String] { log.entries() }
@@ -53,6 +55,7 @@ public final class RemoteMembershipPublication {
             entries: saved.entries, storedJSON: saved.membership, now: now)
         publisher = try saved.prepared.map { try EntryPublisher.resume(preparedJson: $0) } ?? EntryPublisher()
         requiresRefresh = saved.requiresRefresh
+        operationContext = saved.operationContext
         self.persist = persist
         try transaction { _, _ in }
     }
@@ -64,9 +67,11 @@ public final class RemoteMembershipPublication {
 
     /// Persist the exact body before a key provider can see it.
     @discardableResult
-    public func prepare(actionJSON: String, signer: String, signedAt: UInt64) throws -> String {
+    public func prepare(actionJSON: String, signer: String, signedAt: UInt64,
+        operationContext: Data? = nil) throws -> String {
         guard !requiresRefresh else { throw RemotePublicationError.requiresRefresh }
-        return try transaction { log, publisher in
+        guard (operationContext?.count ?? 0) <= 131_072 else { throw RemotePublicationError.invalidCheckpoint }
+        return try transaction(context: .some(operationContext)) { log, publisher in
             let body = try log.draftEntry(signer: signer, signedAt: signedAt, actionJson: actionJSON)
             try publisher.prepare(log: log, bodyJson: body)
             return body
@@ -135,7 +140,8 @@ public final class RemoteMembershipPublication {
     }
 
     private func transaction<T>(
-        refreshAfter: ((T) -> Bool)? = nil, _ operation: (MembershipLog, EntryPublisher) throws -> T
+        refreshAfter: ((T) -> Bool)? = nil, context: Data?? = nil,
+        _ operation: (MembershipLog, EntryPublisher) throws -> T
     ) throws -> T {
         try checkAvailable()
         operating = true
@@ -144,11 +150,13 @@ public final class RemoteMembershipPublication {
         // EntryPublisher owns the process-wide claim for this manager; never clone/resume it live.
         let result = try operation(candidateLog, publisher)
         let nextRequiresRefresh = refreshAfter?(result) ?? requiresRefresh
+        // Outer nil preserves context; .some(nil) clears it for an unrelated operation.
+        let nextContext = context ?? operationContext
         do {
             let checkpoint = Checkpoint(version: 1, accountID: candidateLog.accountId(),
                 genesisHash: candidateLog.genesisHash(), entries: candidateLog.entries(),
                 prepared: publisher.preparedJson(), requiresRefresh: nextRequiresRefresh,
-                membership: try candidateLog.storedJson())
+                membership: try candidateLog.storedJson(), operationContext: nextContext)
             // A complete log may exceed the shared JSON helper's 1 MiB per-message bound.
             let encoder = PropertyListEncoder()
             encoder.outputFormat = .binary
@@ -162,6 +170,7 @@ public final class RemoteMembershipPublication {
         }
         log = candidateLog
         requiresRefresh = nextRequiresRefresh
+        operationContext = nextContext
         return result
     }
 }

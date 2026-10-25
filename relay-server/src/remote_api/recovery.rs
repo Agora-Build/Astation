@@ -723,6 +723,7 @@ pub(super) async fn subject(state: &AppState, headers: &HeaderMap) -> Result<Str
         .map(|a| a.subject)
         .map_err(|e| match e {
             VerifyError::Rejected => error(StatusCode::UNAUTHORIZED, "account_login_required"),
+            VerifyError::InsufficientScope => error(StatusCode::FORBIDDEN, "insufficient_scope"),
             _ => unavailable(),
         })
 }
