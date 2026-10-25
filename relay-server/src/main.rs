@@ -9,6 +9,8 @@ mod identity_store;
 mod integration_auth;
 mod integration_feed;
 mod integration_portal;
+mod station_integrations;
+mod hosted_agents;
 mod knowledge_routes;
 mod knowledge_secrets;
 mod knowledge_store;
@@ -463,15 +465,24 @@ fn cors_layer() -> CorsLayer {
     let allowed_origin = std::env::var("CORS_ORIGIN")
         .unwrap_or_else(|_| "https://station.agora.build".to_string());
 
+    cors_layer_for(&allowed_origin, std::env::var("STATION_PORTAL_ORIGIN").ok().as_deref())
+}
+
+fn cors_layer_for(allowed_origin: &str, portal_origin: Option<&str>) -> CorsLayer {
     if allowed_origin == "*" {
         // Development mode: allow all origins
         tracing::warn!("CORS configured to allow ALL origins - only use in development!");
         CorsLayer::permissive()
     } else {
+        let allowed = allowed_origin.parse::<HeaderValue>().expect("Invalid CORS_ORIGIN");
+        let portal = portal_origin.filter(|v| crate::account_identity::station_origin(v))
+            .and_then(|v| v.parse::<HeaderValue>().ok());
         // Production mode: whitelist specific domain
         tracing::info!("CORS configured to allow origin: {}", allowed_origin);
         CorsLayer::new()
-            .allow_origin(allowed_origin.parse::<HeaderValue>().expect("Invalid CORS_ORIGIN"))
+            .allow_origin(tower_http::cors::AllowOrigin::predicate(move |origin: &HeaderValue, parts: &axum::http::request::Parts| {
+                origin == allowed || (parts.uri.path() == "/agora-build/v1/details" && portal.as_ref() == Some(origin))
+            }))
             .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
             .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
             .allow_credentials(true)
@@ -527,6 +538,7 @@ fn router(state: AppState) -> Router {
     // General rate limiting for other API endpoints
     let general_routes = Router::new()
         .merge(station_ai::routes())
+        .merge(station_integrations::routes(state.clone()))
         .nest("/api/remote/v1", remote_api::routes())
         // Auth API routes
         .route("/api/sessions", post(routes::create_session_handler))

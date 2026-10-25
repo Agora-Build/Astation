@@ -97,7 +97,7 @@ dependencies = [
 [[package]]
 name = "atem-client"
 version = "0.1.0"
-source = "git+https://github.com/Agora-Build/Atem.git?rev=83c0776d21fa35c656eefaee25edd03cbbd203ee#83c0776d21fa35c656eefaee25edd03cbbd203ee"
+source = "git+https://github.com/Agora-Build/Atem.git?rev=04140840fc0cec4086072ab6326b7a1b46b25be4#04140840fc0cec4086072ab6326b7a1b46b25be4"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",

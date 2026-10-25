@@ -1176,6 +1176,79 @@ pg_restore --clean --if-exists --dbname="$DATABASE_URL" station-YYYY-MM-DD.dump
   backup. An Astation whose key was reset after the backup is taken is
   rejected until you repeat the admin reset.
 
+## Custom Station Integrations
+
+The provisioning endpoints and authenticated feed worker require durable
+Postgres. The public `station.agora.build` relay does not host integration
+execution. Configure a registered **custom** HTTPS origin, exactly matching
+the Auth resource, without paths, credentials, query parameters or a trailing
+slash. Each replica uses the same binding and protected keys:
+
+| Variable | Purpose |
+| --- | --- |
+| `PUBLIC_BASE_URL` | Exact registered custom Station origin. |
+| `ACCOUNT_OIDC_ISSUER` | Pinned Agora.Build Auth issuer; dev is `https://auth.dev.agora.build`. |
+| `ACCOUNT_OIDC_AUDIENCE` | Must equal `PUBLIC_BASE_URL` exactly. |
+| `ACCOUNT_OIDC_REQUIRED_SCOPE` | Native account scope `astation.remote`. |
+| `STATION_PORTAL_ORIGIN` | Exact Portal transport/resource origin; dev is `https://dev.agora.build`. |
+| `STATION_REPORT_CLIENT_ID` | Registered Station's `s-...` client ID. |
+| `STATION_REPORT_KEY_FILE` | Mounted P-256 PKCS8 DER report-signing key, separate from service/native keys. |
+| `STATION_SERVICE_WRAPPING_KEY_FILE` | Mounted raw 32-byte AES wrapping key for integration service keys. |
+| `STATION_SERVICE_WRAPPING_KEY_ID` | Stable operator label binding every encrypted service-key envelope. |
+
+Mount regular files with mode 0600 or stricter, readable only by the service
+user. Symlinks, empty/oversized files and group/world permissions are refused.
+Missing/invalid configuration leaves provisioning and hosted admission closed.
+Startup never creates replacement keys. Prepare files outside the container
+image, using a protected operator directory (example commands generate new
+keys and must never overwrite an established deployment's files):
+
+```sh
+umask 077
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+  -outform DER -out station-report.der
+openssl rand -out station-service-wrapping.bin 32
+```
+
+Register only the report key's public JWK in Portal. The authenticated
+`GET /agora-build/v1/details` (`station.read`) returns it; exact Portal-origin
+preflight is supported for that path. Keep native Station access tokens and
+Portal approval/report tokens scoped to their own resource. A localhost
+Portal process may sit behind the configured public HTTPS origin; do not send
+public-resource bearer credentials to an unrelated transport origin. Confirm
+Auth permits native `astation` issuance of `astation.remote` for this exact
+custom Station, and issue `station.report` for its configured Portal origin.
+
+Migrations 0012/0013 persist authenticated policy/cursor/denial, encrypted
+service keys, immutable owner/root/integration mappings and exposed key
+fingerprints, fleet poll pacing and quota counters. Back up these records
+with the R9 membership/recovery tables and operator wrapping/report keys.
+Protect the operator keys separately from database backups; test restoration
+together. Losing a key must fail closed. Do not delete rows or regenerate
+keys to recover an approved identity. Re-enrollment requires a new explicit
+native approval. Wrapping-key rotation needs an offline, verified rewrap of
+every envelope before restarting replicas; automatic key-ring rotation is
+not implemented. Report-key replacement must also update Portal's registered
+public key before the worker resumes.
+
+Workers reconcile a current snapshot from cursor zero at startup, poll every
+minute, and coalesce unsigned POST `/agora-build/v1/changes` hints. A durable
+fleet claim caps feed requests at one per second. Only authenticated
+`409 code:cursor_ahead` resets via a committed denial fence. After a known
+Portal database restore, restart the worker replicas to reconcile from zero,
+even if their old cursors are not ahead. Failed polls do not refresh policy;
+admission refuses snapshots aged 120 seconds or more.
+
+Settings > Integrations in Astation supplies the native review/owner approval
+flow. The exact reviewed body and signature survive uncertain replies and
+restarts. Provisioning returns a draft, not readiness. Hosted endpoints under
+`/api/agent/v1/integrations/...` remain **hard disabled**, with no environment
+override, until actual Auth/native/host/relay-only ACK, reconnect/revocation,
+Mac-off and replica tests pass. Readiness reports cannot advertise Ready with
+this gate closed. MCP, LLM and Discord activation are separate later work.
+See the [typed API](designs/protocol/station-hosted-agent-api.md) and
+[lifecycle](designs/protocol/station-integration-lifecycle.md).
+
 ## Support
 
 - GitHub Issues: https://github.com/Agora-Build/Astation/issues

@@ -248,6 +248,13 @@ impl PolicyCheckpoint {
 pub(crate) struct PolicyStore(pub sqlx::PgPool);
 
 impl PolicyStore {
+    /// Global pacing across replicas; nudges carry no authority and cannot
+    /// consume the Portal's per-Station quota faster than once per second.
+    pub async fn claim_poll(&self, binding: &FeedBinding) -> Result<bool, ()> {
+        let result = sqlx::query("INSERT INTO station_integration_feed_poll(binding,not_before) VALUES ($1,clock_timestamp()+interval '1 second') ON CONFLICT(binding) DO UPDATE SET not_before=EXCLUDED.not_before WHERE station_integration_feed_poll.not_before <= clock_timestamp()")
+            .bind(binding.storage_key()?).execute(&self.0).await.map_err(|_| ())?;
+        Ok(result.rows_affected() == 1)
+    }
     pub async fn load(&self, binding: &FeedBinding) -> Result<PolicyCheckpoint, ()> {
         let key = binding.storage_key()?;
         let saved: Option<String> = sqlx::query_scalar(

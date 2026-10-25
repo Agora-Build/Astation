@@ -1,32 +1,36 @@
 # Station integration lifecycle
 
-This increment consumes the published Auth and Portal contracts without
-waiting for a larger release. Hosted execution remains hard disabled in
-`station_ai.rs`. No native approval screen, Station provisioning endpoint,
-background feed poller or hosted agent execution adapter is enabled by these
-components. Their wiring is the next increment, followed by the full live flow.
+The native approval screen, protected provisioning endpoints, authenticated
+background feed polling and typed hosted agent adapter are wired. Hosted
+execution remains hard disabled by `HOSTED_EXECUTION_ENABLED = false` in
+`hosted_agents.rs`; MCP/LLM and legacy voice routes retain their closed gates.
+The implementation is available for review and controlled tests, not activation.
 
-## Contract pins and open follow-ups
+## Contract pins and remaining interoperability
 
 - Auth PR #9: `d7de4416e74f2fcc85dcf4befa0a6bd8ad9ffb64`, merged `ca657bb`.
-  The exact 42 public token vectors are pinned in the relay test fixtures.
-- Portal PR #15: `bda6824c874afae1d878f10d47054d5513381c80`, subsequently
-  merged as `ee57da31fb3b4b5a7c5f0f4aa383b420c1735a39`.
-  Reports, report-token issuance and the existing feed envelope are consumed.
-- [Portal #16](https://github.com/Agora-Build/Portal/issues/16) requests
-  `ownerAccount` on every full integration snapshot, plus a defined repair
-  for an ahead cursor after a Portal restore. The parser requires owner
-  metadata and refuses the older incomplete snapshot. This is a specific
-  shared-Station provisioning blocker, not a reason to stop component work.
-- R9 contract, host and consumed client pins remain unchanged:
-  `c685abab`, `6526e1cf` and `83c0776d` respectively. Atem owns those sources.
+  The exact 42 public token vectors are pinned in relay tests.
+- Portal PR #17: `83e6543592b6142fca6bf02a15ce302194b8b828`, merged
+  `efde3bc1a7aa796ac301e776c5512350dcf5f6ac`. It closes Portal #16:
+  authenticated snapshots include `ownerAccount`; HTTP 409 with
+  `code: cursor_ahead` requires a full cursor-zero reconciliation.
+- R9 contract and host pins remain `c685abab` and `6526e1cf`. The consumed
+  Rust and verified Apple client package now pin
+  `04140840fc0cec4086072ab6326b7a1b46b25be4` (Atem PR #98). Fingerprinting
+  delegates to the shared helper; wire and signature formats are unchanged.
+- [Portal #18](https://github.com/Agora-Build/Portal/issues/18) and vault
+  `v-xZDT9aGD` e24 ask for a tested native `astation.remote`
+  issuance case for the exact **custom** Station origin. The earlier dev
+  registration report named only the static station.agora.build resource.
+  This is a live interoperability prerequisite, not an unresolved feed shape.
+  Never forward a public-resource bearer to an unrelated localhost origin.
 
 ## Consent and publication
 
 `RemoteServiceApproval` binds one operation ID, integration ID, Auth issuer,
 verified owner account, genesis, selected custom HTTPS Station origin,
 exact canonical R9 add body and service-key
-fingerprint. The application must show its actual account/root, service key,
+fingerprint. Settings > Integrations shows the actual account/root, service key,
 host/session/project scope, operations, expiry and predecessor for native
 manager approval. No extra fields are added to the signed R9 body.
 
@@ -45,7 +49,12 @@ existing fresh, single-use confirmation wrapper signs only that exact stored
 request. Signature and body survive a restart; uncertain storage stops the
 operation until a protected-store reload. A lost append reply retries the
 same saved signature and expected head. A CAS conflict verifies the winning
-log and requires a new approval for a different body.
+log and requires a new approval for a different body. Leaving the screen does
+not erase the checkpoint. "Review Changed Request" can clear an unsigned review;
+a signed review is retained until an independently anchored winning entry at
+the same sequence proves it was superseded. Its checkpoint and consent are
+archived before preparing a replacement (at most 16 retained reviews). A
+committed service cannot be discarded through this action.
 
 `PortalIntegrationHTTP` uses a separate native scope profile
 `integrations:read integrations:approve` for the configured Portal resource.
@@ -70,9 +79,12 @@ The encrypted record must commit before its public key is returned for
 approval. Concurrent pending creation uses the winning stored key. Loading
 an approved identity checks its expected current R9 fingerprint and never
 generates a replacement after loss, corruption or a wrong wrapping key.
-Re-enrollment is an explicit new native approval. Operator key-file loading,
-rotation and backup wiring remain work for provisioning; the component is
-not an unattended secret-configuration interface.
+Re-enrollment is an explicit new native approval. Operator key files are bounded regular files, refuse symlinks and group/world
+permissions, and are never generated or replaced at startup. The separate
+durable fingerprint is saved before public-key exposure, so deleting a pending
+key after a draft was exposed cannot silently rotate it either. See
+[deployment instructions](../../DEPLOY.md#custom-station-integrations) for
+operator backup and replacement procedures.
 
 The service key implements the shared `KeyProvider` and signs only the
 domain-separated ChannelClient transcript hash for its own key ID. Membership,
@@ -107,23 +119,35 @@ owner mismatch and expiry. A caller must still require the appropriate
 state/operation and current host-verified R9 authority before dispatch.
 
 An unsigned `{cursor}` nudge is only a coalesced request to poll. It must
-never set a cursor, owner, policy, readiness or trusted log head. Nudge route
-and bounded poll-loop wiring wait for the Portal #16 recovery contract; no
-placeholder endpoint claims to consume it today.
+never set a cursor, owner, policy, readiness or trusted log head. The POST nudge route wakes the background worker. Startup reconciles from zero;
+normal polling is once per minute. Full pages and conflicts drain promptly,
+with an atomic Postgres claim limiting the whole replica fleet to one feed
+request per second. Only the exact authenticated `cursor_ahead` response clears
+the cursor through a durable denial fence; an unrelated 409 does not. After a
+known Portal restore, restart workers to force cursor-zero reconciliation even
+when the restore is not detectable as an ahead cursor.
+
+Readiness reports use the separate Station report credential. With the hosted
+gate closed they retain `waiting_for_host` and explain the verification gate;
+they never advertise Ready. The readiness adapter requires an authenticated R9
+service welcome and registry from every allowed host before it can report
+Ready after activation. Reports recheck current policy, are bounded to eight
+integrations per cycle and four concurrent checks, and reconcile via the feed.
 
 ## Activation and remaining gates
 
-1. Finish authenticated pending-service provisioning, the native review UI
-   and account/operation fencing; consume Portal #16's owner/recovery fix.
-2. Wire report-key/operator storage, durable feed polling and current-policy
-   checks with account access and quotas across replicas.
-3. Connect typed sessions/history/prompts/approvals/receipts/events APIs to
-   the existing shared atem-client service channel. Keep unsupported authority
-   unavailable; never implement a second R9 stack or infer readiness from a
-   stored log entry. Require a verified service welcome from the target host.
-4. Prove actual Auth issuance, native confirmation, protected persistence,
-   host admission/execution, reconnect/revocation and operation with the Mac
-   offline before enabling any hosted integration operation.
+Implemented: native review and durable approval retry, protected operator/service
+keys, native-authenticated provisioning, owner-bound Portal polling and
+cursor recovery, fleet quota checks, and typed shared-client sessions/history/
+prompts/approvals/receipts/events APIs. The HTTP API and its limits are in
+[hosted agent API](station-hosted-agent-api.md).
+
+Activation still requires actual custom-resource Auth issuance, native owner
+confirmation and persistence, a pinned/released host, selected-relay-only
+same-generation stored-policy ACKs, real-agent admission/execution and
+revocation, reconnect, Mac-off and replica tests. Controlled cryptographic
+host tests and test tokens do not satisfy this live gate. There is no
+runtime environment switch to bypass it.
 
 The two Atem #96 review findings are addressed by merged
 [Atem #97](https://github.com/Agora-Build/Atem/pull/97), `8815bf766ef515f2d72eced75d47aa5b92d47789`.
@@ -139,3 +163,30 @@ loss or timeout never enables the integration.
 
 Hosted execution, Discord, MCP and LLM admission remain disabled. No live
 account/trust migration, app replacement, main merge or deploy occurs here.
+
+## Validation of this increment
+
+Local validation on 2026-10-25:
+
+- Relay: 545 regular tests pass; 130 environment cases are not selected in
+  that run. All 65 explicitly selected isolated Postgres cases pass with
+  zero skips, including real encrypted service-channel and WebSocket adapter
+  traffic, policy denial, same-key renewal, rich history and fleet polling.
+- Native library: 138 tests, one optional OIDC environment skip, no failures.
+  App recovery coordinator: 25 tests, no failures, including uncertain relay/
+  Portal replies, restart without re-signing, account change during owner
+  confirmation and an anchored competing head.
+- App build and production Rust check pass. The verified prebuilt Apple
+  dependency passes its 19 production consumer checks.
+- Full unsigned app run: 1013 tests, 14 skips, four failures. Three protected
+  identity tests cannot create Secure Enclave keys in this unsigned process;
+  the existing caption-scroll test fails its scroll-position assertion on
+  this Mac. Excluding exactly those four cases: 1009 tests, 14 skips, no
+  failures. These exclusions are verification gaps, not passing evidence.
+- The saved personal provisioning profile expired on 2026-10-24. An isolated
+  signing refresh attempt fails because Xcode cannot load account credentials
+  (`No Accounts` / no matching profile). No app is replaced or relaunched.
+
+Previous d566cd7 CI is green (40173354182), but is not validation of this new
+increment. Real owner authentication and real Auth/custom-Station issuance,
+host execution, Mac-off and replica admission remain release gates.

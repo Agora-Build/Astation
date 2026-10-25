@@ -112,6 +112,15 @@ use the authenticated companion bridge and structured host events described in
 
 ## API Reference
 
+### Custom Station Integrations
+
+Native service approval, protected provisioning and authenticated background
+feed polling are wired. The typed hosted agent handlers remain hard-disabled
+until the joint live release gate passes. See the
+[API contract](../designs/protocol/station-hosted-agent-api.md),
+[lifecycle](../designs/protocol/station-integration-lifecycle.md) and
+[operator setup](../DEPLOY.md#custom-station-integrations).
+
 ### Auth Sessions
 Deep link authentication for Astation app.
 

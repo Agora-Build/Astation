@@ -46,6 +46,22 @@ class AstationHubManager: ObservableObject {
     @Published private(set) var agoraConnection: PortalAgoraConnection?
     private var projectLoadTask: Task<Void, Never>?
     private var accountGeneration = UUID()
+    var integrationAccountGeneration: UUID { accountGeneration }
+
+    @MainActor func configureIntegrationRelayAuth() throws {
+        let origin = stationRelayUrl
+        guard let settings = portalSettings, PortalIntegrationRecord.validOrigin(origin) else {
+            throw AccountLoginError.configuration
+        }
+        let configuration = try AccountOIDCConfiguration(issuer: settings.issuer, clientID: settings.clientID,
+            resource: origin, requiredScope: "astation.remote")
+        if accountAuth.configuration == configuration { return }
+        let context = SHA256.hash(data: Data([settings.issuer, settings.clientID, origin].joined(separator: "|").utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        accountGeneration = UUID(); accountRecovery = nil
+        accountAuth = AstationAccountAuth(configuration: configuration,
+            storage: AccountKeychainStorage(service: "build.agora.astation.station-account-v1." + context))
+    }
     private var portalProjects: [String: PortalAPIClient.Project] = [:]
     private var projectCache: PortalProjectCache?
     @Published private(set) var projectCacheUpdatedAt: Date?

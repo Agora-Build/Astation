@@ -111,6 +111,14 @@ pub struct RecoveryStore {
 }
 
 impl RecoveryStore {
+    pub(crate) fn pool(&self) -> Option<PgPool> { self.pool.clone() }
+
+    pub(crate) async fn integration_log(&self, genesis: &str, owner: &str) -> Option<Membership> {
+        let reply = self.perform(genesis, owner, Operation::IntegrationSnapshot).await;
+        if reply.0 != StatusCode::OK { return None; }
+        let account = reply.1.0["account"].as_str()?;
+        Membership::from_stored(account, &Hash32::from_hex(genesis).ok()?, &reply.1.0["membership"]).ok()
+    }
     pub(crate) async fn admit_host(
         &self,
         text: &str,
@@ -322,6 +330,11 @@ impl RecoveryStore {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) async fn append_test_entry(&self, genesis: &str, subject: &str, entry: Entry, expected: Head) -> StatusCode {
+        self.perform(genesis, subject, Operation::Append { entry, expected }).await.0
+    }
+
     pub(super) async fn perform(&self, genesis: &str, subject: &str, operation: Operation) -> Reply {
         self.perform_scoped(genesis, Some(subject), operation).await
     }
@@ -415,6 +428,7 @@ impl RecoveryStore {
 }
 
 pub(super) enum Operation {
+    IntegrationSnapshot,
     HostRoute { text: String, nonce: [u8; 32], room: String, atem_id: String, connection: crate::cluster::ConnRef },
     Append {
         entry: Entry,
@@ -489,6 +503,7 @@ fn apply(
             let replaced = root.routes.insert(route.host_id.clone(), binding.clone());
             (StatusCode::OK, Json(json!({"binding":binding,"replaced":replaced,"verdict":RelayReply::ok(&route).to_json()})))
         }
+        Operation::IntegrationSnapshot => (StatusCode::OK, Json(json!({"account":root.account,"membership":log.to_stored()}))),
         Operation::Collect => {
             root.push.collect(clock.wall_ms);
             (StatusCode::OK, Json(json!({})))
@@ -728,7 +743,7 @@ pub(super) async fn subject(state: &AppState, headers: &HeaderMap) -> Result<Str
         })
 }
 
-pub(super) async fn host_target(
+pub(crate) async fn host_target(
     state: &AppState,
     genesis: &str,
     subject: &str,

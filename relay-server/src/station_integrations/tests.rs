@@ -1,0 +1,289 @@
+use super::*;
+use crate::remote_api::{push_ingress::tests::Fixture, recovery::RecoveryStore};
+use atem_client::membership::Head;
+use ring::{rand::SystemRandom, signature};
+pub(crate) const OWNER: &str = "ab01234567890123456789012345";
+pub(crate) const ID: &str = "i-01234567890123456789012345";
+
+pub(crate) async fn fixture() -> (
+    crate::test_database::TestDatabase,
+    Arc<StationIntegrations>,
+    Fixture,
+) {
+    let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 8).await;
+    let mut app = crate::tests::test_state();
+    app.recovery = RecoveryStore::postgres(db.pool.clone());
+    let f = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
+    for entry in f.log.entries() {
+        assert_eq!(
+            app.recovery
+                .append_test_entry(
+                    &f.log.genesis_hash().to_hex(),
+                    OWNER,
+                    entry.clone(),
+                    Head {
+                        seq: entry.seq - 1,
+                        hash: entry.prev_hash
+                    }
+                )
+                .await,
+            StatusCode::OK
+        );
+    }
+    let report = signature::EcdsaKeyPair::generate_pkcs8(
+        &signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+        &SystemRandom::new(),
+    )
+    .unwrap();
+    let runtime = StationIntegrations::new(
+        app,
+        FeedBinding {
+            issuer: "https://auth.example".into(),
+            portal_origin: "https://portal.example".into(),
+            station_origin: "https://custom.example".into(),
+            report_client_id: "s-01234567890123456789012345".into(),
+        },
+        ServiceKeyVault::new(&[42; 32], "operator-test").unwrap(),
+        StationReportKey::from_pkcs8(report.as_ref()).unwrap(),
+    )
+    .unwrap();
+    let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+    let page=serde_json::from_value(json!({"changes":[],"cursor":0,"integrations":[{"id":ID,"ownerAccount":OWNER,"state":"awaiting_approval","scopes":["agent.view","agent.prompt","agent.approve"],"r9Svc":null,"expiresAt":(chrono::Utc::now()+chrono::Duration::days(1)).to_rfc3339(),"quotaPerSecond":10}]})).unwrap();
+    runtime
+        .policies
+        .commit(
+            &previous,
+            &previous
+                .apply(0, page, chrono::Utc::now().timestamp())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    (db, runtime, f)
+}
+pub(crate) fn request(f: &Fixture) -> ProvisionRequest {
+    ProvisionRequest {
+        genesis_hash: f.log.genesis_hash().to_hex(),
+        manager_id: "phone".into(),
+        expected_head: f.log.head().to_json(),
+        signed_at: chrono::Utc::now().timestamp_millis() as u64,
+        hosts: vec!["host-a".into()],
+        sessions: None,
+        projects: None,
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_provisioning_binds_owner_root_exact_scope_and_durable_key() {
+    let (db, runtime, f) = fixture().await;
+    assert!(runtime
+        .prepare(ID, "ab99999999999999999999999999", request(&f))
+        .await
+        .is_err());
+    let first = runtime.prepare(ID, OWNER, request(&f)).await.unwrap();
+    let retry = runtime.prepare(ID, OWNER, request(&f)).await.unwrap();
+    assert_eq!(first["fingerprint"], retry["fingerprint"]);
+    let body: Value = serde_json::from_str(first["bodyJSON"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        body["member"]["scope"],
+        json!({"hosts":["host-a"],"ops":["approval","prompt","rule_revoke","view"]})
+    );
+    assert_eq!(body["member"]["roles"], json!(["service"]));
+    assert!(body["member"].get("enc_key").is_none());
+    assert_eq!(first["hostedExecutionEnabled"], false);
+    let mut stale = request(&f);
+    stale.expected_head["hash"] = json!("f".repeat(64));
+    assert!(runtime.prepare(ID, OWNER, stale).await.is_err());
+    let mut overbroad = request(&f);
+    overbroad.hosts = vec!["unknown-host".into()];
+    assert!(runtime.prepare(ID, OWNER, overbroad).await.is_err());
+    runtime.policies.deny(&runtime.binding).await.unwrap();
+    assert!(runtime.prepare(ID, OWNER, request(&f)).await.is_err());
+    drop(runtime);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_provisioning_missing_or_unreadable_key_never_rotates_an_identity() {
+    let (db, runtime, f) = fixture().await;
+    runtime.prepare(ID, OWNER, request(&f)).await.unwrap();
+    sqlx::query("UPDATE station_service_keys SET sealed='corrupt'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(runtime.prepare(ID, OWNER, request(&f)).await.is_err());
+    let stored: String = sqlx::query_scalar("SELECT sealed FROM station_service_keys")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, "corrupt");
+    sqlx::query("DELETE FROM station_service_keys")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(runtime.prepare(ID, OWNER, request(&f)).await.is_err());
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM station_service_keys")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "an established missing key must not be regenerated"
+    );
+    drop(runtime);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_feed_pacing_is_shared_by_replicas() {
+    let (db, runtime, _) = fixture().await;
+    let replica = PolicyStore(db.reconnect(2).await);
+    let (a, b) = tokio::join!(
+        runtime.policies.claim_poll(&runtime.binding),
+        replica.claim_poll(&runtime.binding)
+    );
+    assert_ne!(a.unwrap(), b.unwrap());
+    assert!(!runtime.policies.claim_poll(&runtime.binding).await.unwrap());
+    replica.0.close().await;
+    drop(runtime);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_background_poll_nudge_restart_and_closed_readiness() {
+    let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 6).await;
+    let mut portal = crate::integration_portal::tests::Fixture::new().await;
+    *portal.shared.feed.lock().await = Some(json!({"changes":[],"cursor":0,"integrations":[{
+        "id":ID,"ownerAccount":OWNER,"state":"provisioning","scopes":["agent.view"],"r9Svc":"a".repeat(64),
+        "expiresAt":(chrono::Utc::now()+chrono::Duration::days(1)).to_rfc3339(),"quotaPerSecond":10}]}));
+    let mut app = crate::tests::test_state();
+    app.recovery = RecoveryStore::postgres(db.pool.clone());
+    let runtime = StationIntegrations::new(
+        app,
+        portal.binding.clone(),
+        ServiceKeyVault::new(&[42; 32], "operator-test").unwrap(),
+        portal.key.take().unwrap(),
+    )
+    .unwrap();
+    let worker = tokio::spawn(runtime.clone().run());
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while portal.shared.reports.lock().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        portal.shared.reports.lock().await[0]["state"],
+        "waiting_for_host"
+    );
+    assert_eq!(
+        portal.shared.reports.lock().await[0]["reason"],
+        "Hosted execution awaits end-to-end verification"
+    );
+    let saved = runtime.policies.load(&runtime.binding).await.unwrap();
+    assert!(!saved.denied);
+    // An unsigned nudge asks for a fresh authenticated snapshot, not a cursor jump.
+    let response = nudge(
+        State(IntegrationState(Some(runtime.clone()))),
+        axum::body::Bytes::from_static(br#"{"cursor":999999}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while portal.shared.cursors.lock().await.len() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(portal.shared.cursors.lock().await.iter().all(|&v| v == 0));
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while runtime
+            .policies
+            .load(&runtime.binding)
+            .await
+            .unwrap()
+            .revision
+            <= saved.revision
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let before_restart = runtime
+        .policies
+        .load(&runtime.binding)
+        .await
+        .unwrap()
+        .revision;
+    worker.abort();
+    let _ = worker.await;
+    let worker = tokio::spawn(runtime.clone().run());
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while runtime
+            .policies
+            .load(&runtime.binding)
+            .await
+            .unwrap()
+            .revision
+            <= before_restart
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime
+            .policies
+            .load(&runtime.binding)
+            .await
+            .unwrap()
+            .cursor,
+        0
+    );
+    assert!(!portal
+        .shared
+        .reports
+        .lock()
+        .await
+        .iter()
+        .any(|v| v["state"] == "ready"));
+    worker.abort();
+    let _ = worker.await;
+    drop(runtime);
+    drop(portal);
+    db.cleanup().await;
+}
+
+#[cfg(unix)]
+#[test]
+fn operator_keys_refuse_world_readable_symlink_empty_and_oversized_files() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let folder = std::env::temp_dir().join(format!("station-key-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&folder).unwrap();
+    let file = folder.join("wrapping");
+    std::fs::write(&file, [9; 32]).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        protected_file(file.to_str().unwrap(), 32).unwrap().len(),
+        32
+    );
+    let link = folder.join("link");
+    symlink(&file, &link).unwrap();
+    assert!(protected_file(link.to_str().unwrap(), 32).is_err());
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(protected_file(file.to_str().unwrap(), 32).is_err());
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(&file, [9; 33]).unwrap();
+    assert!(protected_file(file.to_str().unwrap(), 32).is_err());
+    std::fs::write(&file, []).unwrap();
+    assert!(protected_file(file.to_str().unwrap(), 32).is_err());
+    std::fs::remove_dir_all(folder).unwrap();
+}

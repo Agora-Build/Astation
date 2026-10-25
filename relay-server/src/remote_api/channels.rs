@@ -28,7 +28,7 @@ pub(crate) struct Envelope<'a> {
     event: String,
     pub(crate) channel: String,
     #[serde(borrow)]
-    frame: Option<&'a RawValue>,
+    pub(crate) frame: Option<&'a RawValue>,
     transport: Option<String>,
     reason: Option<String>,
 }
@@ -90,7 +90,7 @@ struct Route {
 }
 
 pub(crate) struct QueuedFrame {
-    text: String,
+    pub(crate) text: String,
     _bytes: OwnedSemaphorePermit,
 }
 

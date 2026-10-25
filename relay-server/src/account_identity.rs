@@ -174,16 +174,14 @@ pub(crate) struct VerifiedAccessToken {
 }
 
 pub(crate) fn service_key_fingerprint(alg: &str, public_key: &[u8]) -> Result<String, VerifyError> {
-    match alg {
-        "p256" if public_key.len() == 65 && public_key[0] == 4 => {}
-        "ed25519" if public_key.len() == 32 => {}
+    let alg = match alg {
+        "p256" => atem_client::keys::Alg::P256,
+        "ed25519" => atem_client::keys::Alg::Ed25519,
         _ => return Err(VerifyError::Rejected),
-    }
-    Ok(ring::digest::digest(&ring::digest::SHA256, public_key)
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    };
+    let key =
+        atem_client::keys::PublicKey::new(alg, public_key).map_err(|_| VerifyError::Rejected)?;
+    atem_client::membership::service_key_fingerprint(&key).map_err(|_| VerifyError::Rejected)
 }
 
 fn integration_id(value: &str) -> bool {

@@ -32,6 +32,8 @@ final class AstationRecoveryCoordinator {
         var membership: String?
         var publication: Data?
         var hostBody: String?
+        var serviceApproval: Data?
+        var supersededServiceReviews: [Data]?
         var backup: Data?
         var restoreKit: String?
         var restore: Data?
@@ -74,7 +76,10 @@ final class AstationRecoveryCoordinator {
             dataKeys: DataEncryptionKeyManager.shared, allowNewDataKey: allowNewDataKey,
             confirmOwner: { request in
                 await withCheckedContinuation { continuation in
-                    DeviceOwnerAuth.authenticate(reason: "confirm this account's \(request.purpose == .genesis ? "recovery setup" : "encrypted key backup")") {
+                    let reason = request.purpose == .genesis ? "confirm this account's recovery setup"
+                        : request.purpose != .keyBackup ? "approve this account's device or integration access"
+                        : "confirm this account's encrypted key backup"
+                    DeviceOwnerAuth.authenticate(reason: reason) {
                         continuation.resume(returning: $0)
                     }
                 }
@@ -286,6 +291,7 @@ final class AstationRecoveryCoordinator {
 
     func prepareHost(commit: RemotePairingCommit, reveal: RemotePairingReveal, keys: AtemVerifyKeys) async throws -> SignRequest {
         try begin(); defer { busy = false }
+        guard saved.serviceApproval == nil else { throw RemoteRecoveryError.busy }
         guard let genesis = keys.genesisHash else { throw AtemIdentityError.invalidState }
         let log = try await refreshedLog(genesis: genesis)
         if let checkpoint = saved.publication {
@@ -342,6 +348,145 @@ final class AstationRecoveryCoordinator {
     func cancelUnsignedHost(request: SignRequest) throws {
         guard !busy, saved.hostBody == request.bodyJson, try publication?.outstanding() == nil else { return }
         try persist { $0.publication = nil; $0.hostBody = nil }
+        publication = nil
+    }
+
+    func serviceMembership() async throws -> MembershipLog {
+        try begin(); defer { busy = false }
+        guard let kit = try currentKit() else { throw RemoteRecoveryError.notCommitted }
+        let log = try await refreshedLog(genesis: kit.genesisHash)
+        try requireManager(log)
+        return log.snapshot()
+    }
+
+    func pendingServiceApproval() throws -> RemoteServiceApproval? {
+        guard !uncertain else { throw RemoteRecoveryError.storageUncertain }
+        return try saved.serviceApproval.map { try JSONDecoder().decode(RemoteServiceApproval.self, from: $0) }
+    }
+
+    func prepareService(_ approval: RemoteServiceApproval) async throws {
+        try begin(); defer { busy = false }
+        guard saved.hostBody == nil, let kit = try currentKit(), kit.genesisHash == approval.genesisHash else {
+            throw RemoteRecoveryError.busy
+        }
+        if let pending = try pendingServiceApproval() {
+            guard pending == approval else { throw RemoteRecoveryError.requiresReview }
+            return
+        }
+        let log = try await refreshedLog(genesis: kit.genesisHash)
+        try requireManager(log)
+        let consent = try approval.checkpoint()
+        let candidate = RemoteMembershipPublication(log: log, persist: { [unowned self] bytes in
+            try self.persist { $0.publication = bytes; $0.serviceApproval = consent }
+        })
+        _ = try approval.prepare(publication: candidate, managerID: managerID, now: now())
+        publication = candidate
+    }
+
+    /// Retain the exact publication across lost relay/Portal replies. A retry
+    /// uses its saved signature; a conflicting head requires another review.
+    func approveService(_ approval: RemoteServiceApproval, portal: PortalIntegrationHTTP,
+        current: @escaping () -> Bool) async throws {
+        try begin(); defer { busy = false }
+        guard current(), try pendingServiceApproval() == approval, let checkpoint = saved.publication else {
+            throw RemoteChannelError.staleLink
+        }
+        if publication == nil {
+            publication = try RemoteMembershipPublication(checkpoint: checkpoint, accountID: accountID,
+                genesisHash: approval.genesisHash, now: now(), persist: { [unowned self] bytes in
+                    try self.persist { $0.publication = bytes }
+                })
+        }
+        guard let publication else { throw RemoteRecoveryError.notCommitted }
+        let committed = try publication.committedLog()
+        let exists = try committed.entries().contains { try signedObjectInfo(json: $0).bodyJcs == approval.bodyJSON }
+        if !exists {
+            let append: AppendRequest
+            if let retry = try publication.outstanding() { append = retry }
+            else {
+                let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: approval.bodyJSON, keyID: managerID)
+                guard await confirmOwner(request), current() else { throw RemoteRecoveryError.confirmationRequired }
+                let latest = try await refreshedLog(genesis: approval.genesisHash)
+                try requireManager(latest)
+                guard current(), latest.head() == publication.head else { throw RemoteRecoveryError.requiresReview }
+                let stamp = now().monoMs
+                append = try approval.sign(publication: publication, provider: provider(), managerID: managerID,
+                    validationClock: now(), confirmedAt: stamp, now: { Self.clock().monoMs }, current: current)
+            }
+            guard current() else { throw RemoteChannelError.staleLink }
+            switch try await http.append(genesisHash: approval.genesisHash, request: append) {
+            case .stored:
+                guard case .committed = try publication.relayStored(now: now()) else { throw RemoteRecoveryError.requiresReview }
+            case .conflict(let page):
+                _ = try publication.relayConflict(head: page.head, entries: page.entries, more: page.more, now: now())
+                try commitLog(publication.committedLog())
+                throw RemoteRecoveryError.requiresReview
+            }
+            try commitLog(publication.committedLog())
+        }
+        guard current() else { throw RemoteChannelError.staleLink }
+        let latest = try await refreshedLog(genesis: approval.genesisHash)
+        try requireManager(latest)
+        let review = try RemoteServiceReview(approval: approval)
+        let member = latest.member(deviceId: review.serviceID)
+        guard current(), latest.frozen() == nil, member?.status == .active,
+              member?.memberJson == (try publication.committedLog().member(deviceId: review.serviceID)?.memberJson),
+              member?.expiresAt.map({ $0 > now().wallMs }) == true else { throw RemoteRecoveryError.requiresReview }
+        // Listing reconciles an uncertain previous POST before any new POST.
+        let records = try await portal.owned(stationOrigin: approval.stationOrigin)
+        guard current(), let record = records.first(where: { $0.id == approval.integrationID }) else { throw AccountLoginError.changed }
+        if record.state == "awaiting_approval" {
+            _ = try await portal.approve(approval, publication: publication, current: current)
+        } else {
+            guard ["provisioning", "waiting_for_host", "ready"].contains(record.state), record.r9Svc == approval.fingerprint else {
+                throw AccountLoginError.changed
+            }
+        }
+        guard current() else { throw RemoteChannelError.staleLink }
+        try persist { $0.publication = nil; $0.serviceApproval = nil }
+        self.publication = nil
+    }
+
+    func cancelUnsignedService(_ approval: RemoteServiceApproval) throws {
+        guard !busy, try pendingServiceApproval() == approval else { return }
+        if publication == nil, let checkpoint = saved.publication {
+            publication = try RemoteMembershipPublication(checkpoint: checkpoint, accountID: accountID,
+                genesisHash: approval.genesisHash, now: now(), persist: { [unowned self] bytes in
+                    try self.persist { $0.publication = bytes }
+                })
+        }
+        guard try publication?.outstanding() == nil else { throw RemoteRecoveryError.requiresReview }
+        if let log = try publication?.committedLog(), try log.entries().contains(where: { try signedObjectInfo(json: $0).bodyJcs == approval.bodyJSON }) {
+            throw RemoteRecoveryError.requiresReview
+        }
+        try persist { $0.publication = nil; $0.serviceApproval = nil }
+        publication = nil
+    }
+
+    /// A signed losing draft is safe to replace only after the anchored chain
+    /// proves another body permanently occupies its sequence. Keep its evidence.
+    func reviewServiceAgain(_ approval: RemoteServiceApproval) async throws {
+        try begin(); defer { busy = false }
+        guard try pendingServiceApproval() == approval, let checkpoint = saved.publication else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        let latest = try await refreshedLog(genesis: approval.genesisHash)
+        try requireManager(latest)
+        let fields = try JSONSerialization.jsonObject(with: Data(approval.bodyJSON.utf8)) as? [String: Any]
+        guard let sequence = fields?["seq"] as? NSNumber else { throw RemoteRecoveryError.requiresReview }
+        let replacement = try latest.entries().first { entry in
+            let info = try signedObjectInfo(json: entry)
+            let body = try JSONSerialization.jsonObject(with: Data(info.bodyJcs.utf8)) as? [String: Any]
+            return body?["seq"] as? NSNumber == sequence && info.bodyJcs != approval.bodyJSON
+        }
+        guard replacement != nil, (saved.supersededServiceReviews?.count ?? 0) < 16 else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        let evidence = try PropertyListEncoder().encode(["publication": checkpoint, "consent": approval.checkpoint()])
+        try persist {
+            $0.supersededServiceReviews = ($0.supersededServiceReviews ?? []) + [evidence]
+            $0.publication = nil; $0.serviceApproval = nil
+        }
         publication = nil
     }
 

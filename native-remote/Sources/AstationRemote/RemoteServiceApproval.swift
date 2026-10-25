@@ -1,18 +1,9 @@
 import AtemClient
-import CryptoKit
 import Foundation
 
 public enum RemoteServiceKeyFingerprint {
     public static func compute(_ key: PublicKeyData) throws -> String {
-        switch key.alg {
-        case .p256:
-            guard key.raw.count == 65, key.raw.first == 4 else { throw RemoteChannelError.invalidInput }
-            _ = try P256.Signing.PublicKey(x963Representation: key.raw)
-        case .ed25519:
-            _ = try Curve25519.Signing.PublicKey(rawRepresentation: key.raw)
-        default: throw RemoteChannelError.invalidInput
-        }
-        return SHA256.hash(data: key.raw).map { String(format: "%02x", $0) }.joined()
+        return try serviceKeyFingerprint(authKey: key)
     }
 }
 

@@ -23,6 +23,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var sidebarTable: NSTableView?
     private let hubManager: AstationHubManager
     private lazy var accountController = AccountSettingsViewController(hub: hubManager)
+    private lazy var integrationController = MainActor.assumeIsolated { IntegrationApprovalViewController(hub: hubManager) }
     private let shortcutsController: KeyboardShortcutsViewController
     private let recordingController: AudioRecordingViewController
     private let transcriptionController: TranscriptionViewController
@@ -122,6 +123,10 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         account.label = "Account"
         account.view = makeAccountView()
         tabs.addTabViewItem(account)
+        let integrations = NSTabViewItem(identifier: "integrations")
+        integrations.label = "Integrations"
+        integrations.viewController = integrationController
+        tabs.addTabViewItem(integrations)
         let credentials = NSTabViewItem(identifier: "credentials")
         credentials.label = "Credentials"
         credentials.viewController = credentialsController
@@ -1294,6 +1299,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     func showSecurity() { showWindow(); tabView?.selectTabViewItem(withIdentifier: "security") }
 
     func windowWillClose(_ notification: Notification) {
+        integrationController.cancelPending()
         credentialsController.cancelPending()
         recordingController.setPageVisible(false)
         shortcutsController.cancelRecording()
@@ -1303,6 +1309,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     }
 
     func tabView(_ tabView: NSTabView, willSelect tabViewItem: NSTabViewItem?) {
+        if tabViewItem?.identifier as? String != "integrations" { integrationController.cancelPending() }
         if tabViewItem?.identifier as? String != "credentials" { credentialsController.cancelPending() }
         shortcutsController.cancelRecording()
         shortcutsController.refresh()
@@ -1339,6 +1346,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         switch item.identifier as? String {
         case "general": symbol = "gearshape"
         case "account": symbol = "person.crop.circle"
+        case "integrations": symbol = "point.3.connected.trianglepath.dotted"
         case "about": symbol = "info.circle"
         case "security": symbol = "lock.shield"
         case "credentials": symbol = "key"

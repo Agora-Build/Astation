@@ -11,7 +11,7 @@ public struct PortalIntegrationRecord: Decodable, Equatable, Sendable {
     public let expiresAt: String
     public let role: String
 
-    private func validate() throws {
+    fileprivate func validate() throws {
         guard Self.validID(id), !name.isEmpty, name.utf8.count <= 320,
               !name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
               ["owner", "station_owner"].contains(role),
@@ -42,7 +42,7 @@ public struct PortalIntegrationRecord: Decodable, Equatable, Sendable {
         })
     }
 
-    static func validOrigin(_ value: String) -> Bool {
+    public static func validOrigin(_ value: String) -> Bool {
         guard let parts = URLComponents(string: value), parts.scheme == "https", let host = parts.host,
               host.contains("."), host == host.lowercased(), !host.hasSuffix("."), !host.contains(":"),
               !host.allSatisfy({ $0.isNumber || $0 == "." }), host != "station.agora.build",
@@ -84,14 +84,19 @@ public struct PortalIntegrationHTTP: Sendable {
     }
 
     public func pending(stationOrigin: String, now: Date = Date()) async throws -> [PortalIntegrationRecord] {
+        try await owned(stationOrigin: stationOrigin, now: now).filter { $0.state == "awaiting_approval" }
+            .map { try $0.checked(stationOrigin: stationOrigin, now: now) }
+    }
+
+    public func owned(stationOrigin: String, now: Date = Date()) async throws -> [PortalIntegrationRecord] {
         guard PortalIntegrationRecord.validOrigin(stationOrigin) else { throw AccountLoginError.configuration }
         struct List: Decodable { let integrations: [PortalIntegrationRecord]; let stale: Bool }
         let result: List = try await request(path: "/api/v1/integrations")
         guard !result.stale, result.integrations.count <= 500,
               Set(result.integrations.map(\.id)).count == result.integrations.count else { throw AccountLoginError.unavailable }
         return try result.integrations.filter {
-            $0.role == "owner" && $0.state == "awaiting_approval" && $0.stationOrigin == stationOrigin
-        }.map { try $0.checked(stationOrigin: stationOrigin, now: now) }
+            $0.role == "owner" && $0.stationOrigin == stationOrigin
+        }.map { try $0.validate(); return $0 }
     }
 
     /// Publish only after the native checkpoint contains the exact signed entry.

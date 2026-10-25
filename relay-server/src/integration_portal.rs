@@ -17,6 +17,7 @@ pub(crate) enum PortalError {
     Denied,
     Contract,
     Conflict,
+    CursorAhead,
 }
 
 /// Separate report-only key. It is never an R9 service/native signing provider.
@@ -86,6 +87,9 @@ pub(crate) struct IntegrationReport<'a> {
 }
 
 impl PortalReportClient {
+    pub fn public_jwk(&self) -> Value {
+        self.key.public_jwk()
+    }
     pub fn new(binding: FeedBinding, key: StationReportKey) -> Result<Self, PortalError> {
         binding.validate().map_err(|_| PortalError::Configuration)?;
         let http = reqwest::Client::builder()
@@ -106,10 +110,10 @@ impl PortalReportClient {
         mut response: reqwest::Response,
         bound: usize,
     ) -> Result<T, PortalError> {
-        match response.status().as_u16() {
-            200 => {}
+        let status = response.status().as_u16();
+        match status {
+            200 | 409 => {}
             401 | 403 => return Err(PortalError::Denied),
-            409 => return Err(PortalError::Conflict),
             400 | 404 | 422 => return Err(PortalError::Contract),
             _ => return Err(PortalError::Unavailable),
         }
@@ -126,6 +130,17 @@ impl PortalReportClient {
                 return Err(PortalError::Contract);
             }
             bytes.extend_from_slice(&chunk);
+        }
+        if status == 409 {
+            return Err(
+                if serde_json::from_slice::<Value>(&bytes)
+                    .is_ok_and(|v| v["code"] == "cursor_ahead")
+                {
+                    PortalError::CursorAhead
+                } else {
+                    PortalError::Conflict
+                },
+            );
         }
         serde_json::from_slice(&bytes).map_err(|_| PortalError::Contract)
     }
@@ -243,7 +258,7 @@ impl PortalReportClient {
             .load(&self.binding)
             .await
             .map_err(|_| PortalError::Unavailable)?;
-        let cursor = if reconcile || old.revision == 0 {
+        let cursor = if reconcile || old.revision == 0 || old.denied {
             0
         } else {
             old.cursor
@@ -260,12 +275,14 @@ impl PortalReportClient {
                     .map_err(|_| PortalError::Conflict)?;
                 Ok(full)
             }
-            Err(PortalError::Denied) => {
+            Err(error @ (PortalError::Denied | PortalError::CursorAhead)) => {
                 store
                     .deny(&self.binding)
                     .await
                     .map_err(|_| PortalError::Unavailable)?;
-                Err(PortalError::Denied)
+                // Persist the fence before a cursor-zero refresh. A response
+                // already in flight on another replica cannot undo this denial.
+                Err(error)
             }
             Err(error) => Err(error),
         }
@@ -273,7 +290,7 @@ impl PortalReportClient {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::{
         extract::State,
@@ -288,19 +305,21 @@ mod tests {
     };
     use tokio::task::JoinHandle;
 
-    struct Fixture {
-        binding: FeedBinding,
-        key: Option<StationReportKey>,
-        shared: Arc<Shared>,
+    pub(crate) struct Fixture {
+        pub binding: FeedBinding,
+        pub key: Option<StationReportKey>,
+        pub shared: Arc<Shared>,
         task: JoinHandle<()>,
     }
-    struct Shared {
+    pub(crate) struct Shared {
         public: Vec<u8>,
         tokens: AtomicUsize,
         feeds: AtomicUsize,
         status: AtomicUsize,
         assertions: Mutex<Vec<String>>,
-        reports: Mutex<Vec<Value>>,
+        pub reports: Mutex<Vec<Value>>,
+        pub feed: Mutex<Option<Value>>,
+        pub cursors: Mutex<Vec<u64>>,
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
@@ -308,7 +327,7 @@ mod tests {
         }
     }
     impl Fixture {
-        async fn new() -> Self {
+        pub async fn new() -> Self {
             let bytes = signature::EcdsaKeyPair::generate_pkcs8(
                 &signature::ECDSA_P256_SHA256_FIXED_SIGNING,
                 &SystemRandom::new(),
@@ -322,6 +341,8 @@ mod tests {
                 status: AtomicUsize::new(200),
                 assertions: Mutex::new(vec![]),
                 reports: Mutex::new(vec![]),
+                feed: Mutex::new(None),
+                cursors: Mutex::new(vec![]),
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -384,14 +405,23 @@ mod tests {
     }
     async fn changes(
         State(shared): State<Arc<Shared>>,
+        axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, u64>>,
         headers: HeaderMap,
     ) -> axum::response::Response {
         assert_eq!(headers["authorization"], "Bearer test-report-token");
         shared.feeds.fetch_add(1, Ordering::SeqCst);
+        shared.cursors.lock().await.push(query["cursor"]);
         let code = shared.status.load(Ordering::SeqCst) as u16;
         (
             StatusCode::from_u16(code).unwrap(),
-            Json(json!({"changes":[],"cursor":0,"integrations":[]})),
+            Json(
+                shared
+                    .feed
+                    .lock()
+                    .await
+                    .clone()
+                    .unwrap_or_else(|| json!({"changes":[],"cursor":0,"integrations":[]})),
+            ),
         )
             .into_response()
     }
@@ -494,5 +524,67 @@ mod tests {
         );
         assert_eq!(store.load(&f.binding).await.unwrap(), saved);
         db.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn postgres_cursor_ahead_fences_inflight_policy_then_reconciles_from_zero() {
+        let db =
+            crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+        let store = PolicyStore(db.pool.clone());
+        let mut f = Fixture::new().await;
+        let client = f.client();
+        *f.shared.feed.lock().await = Some(
+            json!({"changes":[{"id":47,"kind":"station_registered"}],"cursor":47,"integrations":[]}),
+        );
+        client.poll(&store, false).await.unwrap();
+        let previous = store.load(&f.binding).await.unwrap();
+        f.shared.status.store(409, Ordering::SeqCst);
+        *f.shared.feed.lock().await =
+            Some(json!({"error":"cursor is ahead","code":"cursor_ahead"}));
+        assert_eq!(
+            client.poll(&store, false).await,
+            Err(PortalError::CursorAhead)
+        );
+        let denied = store.load(&f.binding).await.unwrap();
+        assert!(denied.denied);
+        assert_eq!(denied.cursor, 47);
+        assert!(store
+            .commit(
+                &previous,
+                &previous
+                    .apply(
+                        47,
+                        serde_json::from_value(json!({"changes":[],"cursor":47})).unwrap(),
+                        chrono::Utc::now().timestamp()
+                    )
+                    .unwrap()
+            )
+            .await
+            .is_err());
+        f.shared.status.store(200, Ordering::SeqCst);
+        *f.shared.feed.lock().await = Some(
+            json!({"changes":[{"id":2,"kind":"station_registered"}],"cursor":2,"integrations":[]}),
+        );
+        client.poll(&store, false).await.unwrap();
+        let repaired = store.load(&f.binding).await.unwrap();
+        assert!(!repaired.denied);
+        assert_eq!(repaired.cursor, 2);
+        assert!(repaired.revision > denied.revision);
+        assert_eq!(*f.shared.cursors.lock().await, vec![0, 47, 0]);
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn unrelated_conflict_never_becomes_a_cursor_reset() {
+        let mut f = Fixture::new().await;
+        let client = f.client();
+        f.shared.status.store(409, Ordering::SeqCst);
+        *f.shared.feed.lock().await = Some(json!({"code":"some_other_conflict","cursor":0}));
+        assert!(matches!(
+            client.changes(47).await,
+            Err(PortalError::Conflict)
+        ));
+        assert_eq!(*f.shared.cursors.lock().await, vec![47]);
     }
 }

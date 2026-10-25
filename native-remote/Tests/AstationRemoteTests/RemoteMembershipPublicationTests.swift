@@ -108,6 +108,37 @@ private final class PublicationFixture {
 }
 
 final class RemoteMembershipPublicationTests: XCTestCase {
+    @MainActor
+    func testStationDraftTransportBindsOwnerRootOriginAndExactReviewedScope() async throws {
+        let f = try PublicationFixture(), approval = try serviceApproval(f)
+        let transport = IntegrationApprovalTestHTTP()
+        let client = try StationIntegrationHTTP(origin: approval.stationOrigin, http: transport, accessToken: { "native-station-token" })
+        let record = try JSONDecoder().decode(PortalIntegrationRecord.self, from: JSONSerialization.data(withJSONObject: [
+            "id":approval.integrationID,"name":"Test integration","stationOrigin":approval.stationOrigin,"state":"awaiting_approval",
+            "scopes":["agent.view","agent.prompt"],"expiresAt":"2099-01-01T00:00:00Z","role":"owner"]))
+        var draft: [String: Any] = ["integrationId":approval.integrationID,"ownerAccount":approval.ownerAccount,"issuer":approval.issuer,
+            "stationOrigin":approval.stationOrigin,"genesisHash":approval.genesisHash,"bodyJSON":approval.bodyJSON,"fingerprint":approval.fingerprint]
+        try await transport.set(draft)
+        let response = try await client.prepare(record: record, ownerAccount: approval.ownerAccount, issuer: approval.issuer,
+            log: f.log, managerID: "manager-a", hosts: ["host-a"], sessions: nil, projects: nil, signedAt: f.clock.wallMs)
+        XCTAssertEqual(response.fingerprint, approval.fingerprint)
+        let sent = await transport.last()
+        let request = try XCTUnwrap(sent)
+        XCTAssertEqual(request.url?.absoluteString, approval.stationOrigin + "/agora-build/v1/integrations/" + approval.integrationID + "/provision")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer native-station-token")
+        let review = try RemoteServiceReview(approval: approval)
+        let now = Date(timeIntervalSince1970: Double(f.clock.wallMs) / 1000)
+        try review.check(record: record, hosts: ["host-a"], sessions: nil, projects: nil, now: now)
+        XCTAssertThrowsError(try review.check(record: record, hosts: ["other-host"], sessions: nil, projects: nil, now: now))
+        XCTAssertThrowsError(try review.check(record: record, hosts: ["host-a"], sessions: ["ses-aaaaaaaaaaaa"], projects: nil, now: now))
+        draft["ownerAccount"] = "ab99999999999999999999999999"; try await transport.set(draft)
+        do {
+            _ = try await client.prepare(record: record, ownerAccount: approval.ownerAccount, issuer: approval.issuer,
+                log: f.log, managerID: "manager-a", hosts: ["host-a"], sessions: nil, projects: nil, signedAt: f.clock.wallMs)
+            XCTFail("Station cannot substitute an owner")
+        } catch { XCTAssertEqual(error as? AccountLoginError, .changed) }
+    }
+
     func testServiceFingerprintMatchesBothPublicAuthVectors() throws {
         let cases: [(KeyAlg, String, Int, String)] = [
             (.p256, "BNa0CKl9dCuZMEg6WPNIaZatMGhIKeCElX2Pc8FA3H2v8Iezbt5Glq2FKvXNzpwYxjaRpx_aqnXuXSTjG4kQq90", 65,

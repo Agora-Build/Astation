@@ -41,8 +41,8 @@ It is keyed by `(issuer, owner, integration ID)` and its fingerprint comes from
 the approved service identity. `r9_svc` is lowercase hex SHA-256 of the decoded
 current member `auth_key.pub` bytes: 65-byte uncompressed SEC1 for P-256 or
 32 raw bytes for Ed25519. Hash no JSON, algorithm prefix, PEM or DER.
-Native and Rust tests match both public Auth vectors. The shared helper has
-been requested from Atem; this does not change the existing core dependency.
+Native and Rust tests match both public Auth vectors. The native and relay implementations use the shared fingerprint helper from
+Atem PR #98, pinned at `04140840fc0cec4086072ab6326b7a1b46b25be4`.
 
 The verifier consumes Auth PR #9 `d7de4416e74f2fcc85dcf4befa0a6bd8ad9ffb64`
 (subsequently merged as `ca657bb`). All 42 pinned vectors match their verdict,
@@ -110,18 +110,20 @@ Local validation passes 530 regular relay tests (120 environment-gated tests
 ignored in that run), plus all 65 explicitly selected Redis tests against an
 isolated Valkey 8.1 server, with zero failures or skips in the Redis run.
 
-The next component increment adds native exact-body service consent, protected
-publication context, the separately scoped native Portal approval transport,
-encrypted Station P-256 service keys, and a report-key-authenticated Portal
-client with a durable policy/cursor CAS store. These are tested components;
-the native UI, Station provisioning endpoints and runtime poller are not wired.
-See [the integration lifecycle](station-integration-lifecycle.md) for exact
-implemented boundaries, failure handling and remaining gates.
+Native consent, protected publication retries, a Settings > Integrations review
+screen and scoped Portal approval are wired. Station provisioning persists the
+protected service key and identity before exposing its canonical draft. The
+worker authenticates the feed, handles cursor-ahead restoration, and commits
+policy/cursor/freshness atomically. Hosted HTTP/WebSocket handlers use that
+policy plus the current R9 grant, durable owner/root mapping and fleet quotas.
+Every membership-head change fences a channel, including a same-key renewal.
+See [the integration lifecycle](station-integration-lifecycle.md) and
+[typed API contract](station-hosted-agent-api.md).
 
-Next: wire provisioning/change-feed bindings and account-access changes,
-per-integration quotas, registered-Station proof, native Station AI settings and
-relay-only acknowledgments, then shared-client execution/receipts and Discord.
-Assistant session tokens (`assistant.chat`, `sid`, up to 72 hours) need their
+Hosted execution stays disabled pending actual custom-resource Auth/native/host
+interoperability, selected-relay-only policy ACKs and Mac-off/replica tests.
+Station AI account-wide settings, integration deletion propagation and Discord
+remain separate increments. Assistant session tokens (`assistant.chat`, `sid`, up to 72 hours) need their
 own active-session verifier; they must not enter the five-minute agent-token
 or native-login paths. Real dev Auth/Station interoperability remains a gate;
 local test tokens are not evidence of production registration or deployment.
@@ -135,9 +137,9 @@ ten tasks; an assignment is not a claim that another agent has started it.
 | --- | --- | --- |
 | 1. Auth to Station validation | Station/Astation | Local verifier and policy checks implemented; live Auth interoperability pending. |
 | 2. Credentials and registered Stations | Auth | Contract and 42 vectors consumed from PR #9; actual deployment/live Station interoperability pending. |
-| 3. Integration/Station management and change APIs | Portal | PR #15 contract consumed; owner binding and cursor recovery tracked in Portal #16. |
-| 4. Native approval and protected R9 provisioning | Station/Astation, shared core from Atem | Exact-body consent, checkpoint, Portal transport and encrypted service-key components tested; UI/provisioning/runtime wiring pending. |
-| 5. Typed agent APIs/events/receipts | Station/Astation, shared client from Atem | Existing native APIs; hosted integration execution remains closed. |
+| 3. Integration/Station management and change APIs | Portal | PR #17 owner/cursor contract consumed at 83e6543 (merge efde3bc); #16 closed. |
+| 4. Native approval and protected R9 provisioning | Station/Astation, shared core from Atem | Native review, durable consent/retries, provisioning endpoints and protected keys wired and tested; actual-owner confirmation pending. |
+| 5. Typed agent APIs/events/receipts | Station/Astation, shared client from Atem | Typed HTTP/WebSocket shared-client adapter wired; controlled encrypted-host tests pass; hosted execution remains closed. |
 | 6. Durable lifecycle/export/deletion | Station/Astation | Integration-specific persistence and deletion propagation pending. |
 | 7. Station AI settings | Astation | Pending authenticated account-wide configuration. |
 | 8. Relay-only policy and ACKs | Astation + Atem host | Atem [#97](https://github.com/Agora-Build/Atem/pull/97) merged as `8815bf7`; fixes both #96 findings, source/CI reviewed. Release and joint live policy/ACK verification remain. |
