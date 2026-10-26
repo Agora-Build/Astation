@@ -157,7 +157,10 @@ change; Atem durably saves the pairing-bound value and acknowledges it. Only
 then is a direct link closed. Refuse affected direct Atem connections on port
 8080 while enabled; preserve the shared local listener/HTTP API and credential
 unlock/sync behavior. Lost ACKs/reconnects must be reconciled, not presented as
-a completed account-wide transition. Native and host implementation is pending.
+a completed account-wide transition. Atem #97 supplies durable host policy;
+Astation supplies native intent/ACK reconciliation and direct-agent admission
+guards. Actual protected native/host/reconnect verification remains pending,
+and hosted execution stays hard disabled.
 
 Enabling an integration explicitly trusts the selected Station as a decrypting
 endpoint for that integration's scoped agent content. An administrator who

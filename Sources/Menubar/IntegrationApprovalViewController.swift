@@ -1,6 +1,7 @@
 import AppKit
 import AtemClient
 import AstationRemote
+import Combine
 
 /// Account-scoped consent UI; all signing and durable retry state lives in the
 /// existing recovery coordinator, shared with pairing and recovery.
@@ -17,6 +18,9 @@ final class IntegrationApprovalViewController: NSViewController {
     private let reviewButton = NSButton(title: "Review Access", target: nil, action: nil)
     private let approveButton = NSButton(title: "Approve on This Mac…", target: nil, action: nil)
     private let reviewAgainButton = NSButton(title: "Review Changed Request", target: nil, action: nil)
+    private let relayOnlyButton = NSButton(title: "Use Selected Relay Only…", target: nil, action: nil)
+    private let relayStatus = NSTextField(wrappingLabelWithString: "")
+    private var policySubscription: AnyCancellable?
     private var hostButtons: [(String, NSButton)] = []
     private var records: [PortalIntegrationRecord] = []
     private var auth: AstationAccountAuth?
@@ -47,7 +51,8 @@ final class IntegrationApprovalViewController: NSViewController {
         status.textColor = .secondaryLabelColor
         let actions = NSStackView(views: [loadButton, reviewButton, approveButton])
         actions.spacing = 10
-        let stack = NSStackView(views: [title, intro, actions, picker,
+        relayStatus.textColor = .secondaryLabelColor
+        let stack = NSStackView(views: [title, intro, relayOnlyButton, relayStatus, actions, picker,
             NSTextField(labelWithString: "Allowed Atem hosts"), hosts, sessions, projects, reviewText, reviewAgainButton, status])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 14
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.drawsBackground = false
@@ -64,7 +69,7 @@ final class IntegrationApprovalViewController: NSViewController {
             stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 24),
             stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -24)
         ])
-        for field in [intro, sessions, projects, reviewText, status] {
+        for field in [intro, sessions, projects, reviewText, status, relayStatus] {
             field.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
         picker.target = self; picker.action = #selector(selectionChanged)
@@ -72,6 +77,8 @@ final class IntegrationApprovalViewController: NSViewController {
         reviewButton.target = self; reviewButton.action = #selector(reviewAccess)
         approveButton.target = self; approveButton.action = #selector(approveAccess)
         reviewAgainButton.target = self; reviewAgainButton.action = #selector(reviewAgain)
+        relayOnlyButton.target = self; relayOnlyButton.action = #selector(changeRelayPolicy)
+        policySubscription = hub.$relayOnlyPolicyStatus.sink { [weak self] value in self?.relayStatus.stringValue = value }
         render()
     }
 
@@ -83,6 +90,8 @@ final class IntegrationApprovalViewController: NSViewController {
 
     private func render(busy: Bool = false) {
         loadButton.isEnabled = !busy
+        relayOnlyButton.isEnabled = !busy && contextCurrent?() == true
+        relayOnlyButton.title = hub.relayOnlyPolicyRequired ? "Allow Direct Connections…" : "Use Selected Relay Only…"
         picker.isEnabled = !busy && !records.isEmpty && approval == nil
         let pendingSelection = records.indices.contains(picker.indexOfSelectedItem)
             && records[picker.indexOfSelectedItem].state == "awaiting_approval"
@@ -95,6 +104,27 @@ final class IntegrationApprovalViewController: NSViewController {
     }
 
     @objc private func selectionChanged() { approval = nil; reviewText.stringValue = ""; render() }
+
+    @objc private func changeRelayPolicy() {
+        guard contextCurrent?() == true else { return }
+        let required = !hub.relayOnlyPolicyRequired
+        let alert = NSAlert()
+        alert.messageText = required ? "Use only the selected Station?" : "Allow direct Atem connections?"
+        alert.informativeText = required
+            ? "Atem hosts will save this policy and reconnect through your selected relay. Offline hosts remain pending. Agent integrations remain disabled until live verification is complete."
+            : "Atem hosts may connect directly again after they save this change. This does not enable hosted integrations."
+        alert.addButton(withTitle: "Apply"); alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let epoch = generation; render(busy: true)
+        task = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await hub.setRelayOnlyPolicy(required)
+                guard epoch == generation else { return }
+                render()
+            } catch { fail(error, epoch: epoch) }
+        }
+    }
 
     @objc private func loadRequests() {
         cancelPending(); render(busy: true)
@@ -142,7 +172,7 @@ final class IntegrationApprovalViewController: NSViewController {
                 picker.removeAllItems(); picker.addItems(withTitles: self.records.map { "\($0.name) · \($0.state.replacingOccurrences(of: "_", with: " "))" })
                 for child in hosts.arrangedSubviews { hosts.removeArrangedSubview(child); child.removeFromSuperview() }
                 hostButtons = try Self.hostIDs(log).map { id in
-                    let button = NSButton(checkboxWithTitle: id, target: nil, action: nil); hosts.addArrangedSubview(button)
+                    let button = NSButton(checkboxWithTitle: id, target: nil, action: nil); self.hosts.addArrangedSubview(button)
                     return (id, button)
                 }
                 if let saved = try coordinator.pendingServiceApproval() {

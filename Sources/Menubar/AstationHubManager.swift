@@ -31,6 +31,7 @@ class AstationHubManager: ObservableObject {
     /// User-pinned active client ID. Overrides focus-based routing when set.
     @Published var pinnedClientId: String?
     @Published private(set) var remoteInputStatusMessage: String?
+    @Published private(set) var relayOnlyPolicyStatus = "No transport policy has been requested on this Mac."
 
     private var hubStartTime = Date()
     let sessionStore: SsoSessionStore
@@ -146,6 +147,7 @@ class AstationHubManager: ObservableObject {
     private let migrationContextLock = NSLock()
     private var directMigrationContexts: [String: MigrationContext] = [:]
     private var directSessionContexts: [String: AtemSessionContext] = [:]
+    private var directTransportPolicyContexts: [String: AtemTransportPolicyContext] = [:]
     let atemE2EIdentity: AtemE2EIdentity
     @MainActor private var accountRecovery: AstationRecoveryCoordinator?
     @MainActor private var approvalPushHints: RemotePushHints?
@@ -281,6 +283,17 @@ class AstationHubManager: ObservableObject {
     @MainActor private var r9Signer: AstationChannelSigner?
     private var sessionTimer: Timer?
     private let sessionJournal: AtemSessionJournal
+    private lazy var transportPolicy = AtemTransportPolicyController(journal: sessionJournal,
+        current: { [weak self] context in self?.transportPolicyContext(for: context.route.clientId) == context },
+        send: { [weak self] value, context in
+            self?.sendMessage(.transportPolicy(relayOnly: value), to: context.route.clientId,
+                expectedRelayConnectionId: context.isRelay ? context.route.connectionId : nil)
+        }, reconnect: { [weak self] context in
+            guard let self, self.transportPolicyContext(for: context.route.clientId) == context else { return }
+            if context.isRelay { self.pauseIdentityRelay(); self.startIdentityRelay() }
+            else { self.disconnectDirectClient?(context.route.clientId); self.removeClient(withId: context.route.clientId) }
+        })
+    private var transportPolicyTimer: Timer?
     lazy var browserAgentChat = BrowserAgentChat(
         currentRoute: { [weak self] in self?.browserChatConnection(for: $0) },
         sendAgent: { [weak self] message, route in
@@ -381,6 +394,7 @@ class AstationHubManager: ObservableObject {
     deinit {
         workspaceNotifications.removeObserver(self)
         sessionTimer?.invalidate()
+        transportPolicyTimer?.invalidate()
         sessionExpiryTimer?.invalidate()
         identityRelayPathMonitor?.cancel()
         identityRelayTask?.cancel(with: .goingAway, reason: nil)
@@ -863,6 +877,73 @@ class AstationHubManager: ObservableObject {
     }
 
     // MARK: - Client Management
+
+    @MainActor func setRelayOnlyPolicy(_ required: Bool) async throws {
+        guard let issuer = portalSettings?.issuer, let owner = signedInAccount, !accountSignInRequired,
+              PortalIntegrationRecord.validOrigin(stationRelayUrl) else { throw AccountLoginError.signInRequired }
+        let epoch = accountGeneration, account = e2eDataAccount, station = stationRelayUrl
+        let log = try await recoveryCoordinator().serviceMembership()
+        let hosts = try log.entries().compactMap { entry -> String? in
+            let body = try JSONSerialization.jsonObject(with: Data(signedObjectInfo(json: entry).bodyJcs.utf8)) as? [String: Any]
+            return (body?["host"] as? [String: Any])?["host_id"] as? String
+        }
+        guard epoch == accountGeneration, account == e2eDataAccount, station == stationRelayUrl,
+              portalSettings?.issuer == issuer, signedInAccount == owner, !accountSignInRequired else { throw AccountLoginError.changed }
+        let policy = AtemTransportPolicyRecord(account: account, issuer: issuer, station: station,
+            relayOnly: required, hosts: Set(hosts).filter { log.host(hostId: $0) != nil }.sorted())
+        defer { updateTransportPolicyPresentation(); refreshSessionConnections(); refreshDirectMigrationContexts() }
+        try transportPolicy.set(policy, connections: connectedClients.compactMap { transportPolicyContext(for: $0.id) })
+    }
+
+    var relayOnlyPolicyRequired: Bool {
+        transportPolicy.blocksDirect(account: e2eDataAccount, issuer: portalSettings?.issuer ?? "")
+    }
+
+    var relayOnlyPolicyReady: Bool {
+        transportPolicy.ready(account: e2eDataAccount, issuer: portalSettings?.issuer ?? "", station: stationRelayUrl)
+    }
+
+    private func updateTransportPolicyPresentation() {
+        let status = transportPolicy.status(account: e2eDataAccount,
+            issuer: portalSettings?.issuer ?? "", station: stationRelayUrl)
+        if relayOnlyPolicyStatus != status { relayOnlyPolicyStatus = status }
+    }
+
+    private func transportPolicyContext(for clientID: String) -> AtemTransportPolicyContext? {
+        guard let issuer = portalSettings?.issuer,
+              let client = connectedClients.first(where: { $0.id == clientID && $0.clientType == "Atem" }),
+              let sessionID = client.authenticationSessionId,
+              let session = deviceSessionStore.get(sessionId: sessionID), session.isValid, session.atemId == client.atemId,
+              let route = verificationRoute(clientId: clientID,
+                relayConnectionId: identityRelayAuthentication.connectionId(for: clientID)) else { return nil }
+        return AtemTransportPolicyContext(route: route, account: e2eDataAccount, issuer: issuer, station: stationRelayUrl,
+            pairingSession: sessionID, transportGeneration: clientID.hasPrefix("relay-") ? identityRelaySocketGeneration : clientID,
+            verifiedPin: try? atemE2EIdentity.credentialProjectPin(account: e2eDataAccount, deviceId: route.deviceId))
+    }
+
+    private func captureTransportPolicyContext(clientID: String, relayConnectionID: String?) -> AtemTransportPolicyContext? {
+        if Thread.isMainThread {
+            guard let context = transportPolicyContext(for: clientID),
+                  !context.isRelay || context.route.connectionId == relayConnectionID else { return nil }
+            return context
+        }
+        guard !clientID.hasPrefix("relay-"), relayConnectionID == nil else { return nil }
+        migrationContextLock.lock(); defer { migrationContextLock.unlock() }
+        return directTransportPolicyContexts[clientID]
+    }
+
+    private func reconcileTransportPolicy(clientID: String) {
+        guard let context = transportPolicyContext(for: clientID) else { return }
+        transportPolicy.authenticated(context)
+        updateTransportPolicyPresentation()
+        if transportPolicyTimer == nil {
+            transportPolicyTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.transportPolicy.tick()
+                self.updateTransportPolicyPresentation()
+            }
+        }
+    }
     
     func addClient(_ client: ConnectedClient, relayConnectionId: String? = nil) {
         DispatchQueue.main.async {
@@ -877,6 +958,8 @@ class AstationHubManager: ObservableObject {
             }
             self.connectedClients.append(client)
             Log.info(" Client connected: \(client.id) (\(client.clientType))")
+
+            self.reconcileTransportPolicy(clientID: client.id)
 
             self.sendEncryptionMode(to: client.id, relayConnectionId: relayConnectionId)
 
@@ -895,6 +978,7 @@ class AstationHubManager: ObservableObject {
         DispatchQueue.main.async {
             self.atemVerification.disconnect(clientId: clientId)
             self.atemStorageKeys.disconnect(clientId: clientId)
+            self.transportPolicy.disconnected(clientID: clientId)
             self.connectedClients.removeAll { $0.id == clientId }
             self.agentsByClientId.removeValue(forKey: clientId)
             self.sessionStatusByClientId.removeValue(forKey: clientId)
@@ -958,6 +1042,17 @@ class AstationHubManager: ObservableObject {
         relayConnectionId: String? = nil
     ) -> AstationMessage? {
         switch message {
+        case .transportPolicyAck(let ack):
+            // Capture the authenticated generation before dispatch from a direct socket.
+            guard let context = captureTransportPolicyContext(clientID: clientId, relayConnectionID: relayConnectionId) else { return nil }
+            DispatchQueue.main.async { [weak self] in
+                self?.transportPolicy.receive(ack, context: context)
+                self?.updateTransportPolicyPresentation()
+            }
+            return nil
+        case .transportPolicy:
+            // A host or relay cannot choose this Mac's account transport policy.
+            return nil
         case .projectListRequest:
             Log.info(" Project list requested by client: \(clientId)")
             return .projectListResponse(projects: getProjects(), timestamp: Date())
@@ -1489,6 +1584,8 @@ class AstationHubManager: ObservableObject {
     func terminalConnection(for clientId: String, atemId: String? = nil) -> RemoteTerminalConnection? {
         dispatchPrecondition(condition: .onQueue(.main))
         guard !systemIsSleeping else { return nil }
+        guard clientId.hasPrefix("relay-") || !transportPolicy.blocksDirect(account: e2eDataAccount,
+            issuer: portalSettings?.issuer ?? "") else { return nil }
         let sameTransport: (ConnectedClient) -> Bool = {
             $0.id.hasPrefix("relay-") == clientId.hasPrefix("relay-")
         }
@@ -1518,6 +1615,8 @@ class AstationHubManager: ObservableObject {
         do {
             guard try atemE2EIdentity.isVerified(account: e2eDataAccount, deviceId: deviceId) else { return .verificationRequired }
         } catch { return .identityUnavailable }
+        if !clientId.hasPrefix("relay-"), transportPolicy.blocksDirect(account: e2eDataAccount,
+            issuer: portalSettings?.issuer ?? "") { return .selectedRelayRequired }
         return terminalConnection(for: clientId) == nil ? .authenticationRequired : nil
     }
 
@@ -1525,6 +1624,7 @@ class AstationHubManager: ObservableObject {
         refreshDirectMigrationContexts()
         refreshSessionConnections()
         for client in connectedClients where client.clientType == "Atem" {
+            reconcileTransportPolicy(clientID: client.id)
             _ = sessionClient(for: client.id)
         }
         agentsByClientId = agentsByClientId.filter { terminalConnection(for: $0.key) != nil }
@@ -2662,15 +2762,18 @@ class AstationHubManager: ObservableObject {
         let account = e2eDataAccount
         var contexts: [String: MigrationContext] = [:]
         var sessions: [String: AtemSessionContext] = [:]
+        var policies: [String: AtemTransportPolicyContext] = [:]
         for client in connectedClients where !client.id.hasPrefix("relay-") {
             if let route = Self.directVerificationRoute(client) {
                 contexts[client.id] = MigrationContext(account: account, route: route)
             }
             if let context = sessionContext(for: client.id) { sessions[client.id] = context }
+            if let context = transportPolicyContext(for: client.id) { policies[client.id] = context }
         }
         migrationContextLock.lock()
         directMigrationContexts = contexts
         directSessionContexts = sessions
+        directTransportPolicyContexts = policies
         migrationContextLock.unlock()
     }
 

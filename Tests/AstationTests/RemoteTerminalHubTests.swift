@@ -75,7 +75,7 @@ private final class TerminalHubFixture {
         }
     }
 
-    init(verified: Bool = true) throws {
+    init(verified: Bool = true, relayOnly: Bool? = nil) throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -95,10 +95,18 @@ private final class TerminalHubFixture {
                     nonce: Data(repeating: 2, count: 32)),
                 transcript: Data(repeating: 3, count: 32), expectedSigningKey: keys.signPub, key: nil)
         }
+        let journal = AtemSessionJournal()
+        if let relayOnly {
+            let issuer = try AccountServiceSettings.load().issuer
+            let station = StationRelayURL.normalizedBase(SettingsWindowController.currentAstationRelayUrl)
+            let policy = AtemTransportPolicyRecord(account: AstationIdentity.shared.id,
+                issuer: issuer, station: station, relayOnly: relayOnly, hosts: [deviceId])
+            try journal.update { $0.transportPolicies = [policy] }
+        }
         hub = AstationHubManager(skipProjectLoad: true, deviceSessionStore: sessions,
             sessionStore: SsoSessionStore(storageURL: directory.appendingPathComponent("sso.enc")),
             relayIdentityKeyManager: manager, relayIdentityRepairDefaults: defaults,
-            atemE2EIdentity: identity, sessionJournal: AtemSessionJournal(), makeIdentityRelayTask: { _ in sockets.makeIdentity() },
+            atemE2EIdentity: identity, sessionJournal: journal, makeIdentityRelayTask: { _ in sockets.makeIdentity() },
             makePairingRelayTask: { _ in sockets.pairing }, workspaceNotifications: workspaceNotifications)
     }
 
@@ -162,6 +170,57 @@ private final class TerminalHubFixture {
 
 @MainActor
 final class RemoteTerminalHubTests: XCTestCase {
+    func testRelayOnlyPolicyIsSentAfterAuthenticationAndAckIsFencedAcrossReconnect() async throws {
+        let f = try TerminalHubFixture(relayOnly: true)
+        func policies() -> [[String: Any]] {
+            f.socket.sent.compactMap { $0["payload"] as? [String: Any] }.filter { $0["type"] as? String == "transportPolicy" }
+        }
+        try await f.start()
+        XCTAssertTrue(policies().isEmpty)
+        try await f.authenticate()
+        XCTAssertEqual(policies().count, 1)
+        XCTAssertEqual((policies().first?["data"] as? [String: Bool])?["relay_only"], true)
+        XCTAssertFalse(f.hub.relayOnlyPolicyReady)
+        try f.emit(.transportPolicyAck(AtemTransportPolicyAck(relayOnly: false, stored: true)))
+        await f.drain(); XCTAssertFalse(f.hub.relayOnlyPolicyReady)
+        try f.emit(.transportPolicyAck(AtemTransportPolicyAck(relayOnly: true, stored: true)))
+        await f.drain(); XCTAssertTrue(f.hub.relayOnlyPolicyReady)
+        let oldGeneration = f.generation
+        f.generation = UUID().uuidString
+        try f.socket.emit(["relay_event": "connected", "atem_id": f.deviceId, "connection_id": f.generation])
+        await f.drain(); XCTAssertFalse(f.hub.relayOnlyPolicyReady)
+        let stale = try JSONSerialization.jsonObject(with: JSONEncoder().encode(
+            AstationMessage.transportPolicyAck(AtemTransportPolicyAck(relayOnly: true, stored: true))))
+        try f.socket.emit(["atem_id": f.deviceId, "connection_id": oldGeneration, "payload": stale])
+        await f.drain(); XCTAssertFalse(f.hub.relayOnlyPolicyReady)
+        try await f.authenticate()
+        try f.emit(.transportPolicyAck(AtemTransportPolicyAck(relayOnly: true, stored: true)))
+        await f.drain(); XCTAssertTrue(f.hub.relayOnlyPolicyReady)
+        f.socket.fail()
+        await f.drain()
+        XCTAssertFalse(f.hub.relayOnlyPolicyReady)
+    }
+
+    func testRelayOnlyBlocksExistingAndNewDirectAgentChannelsWithoutRemovingPairing() async throws {
+        let f = try TerminalHubFixture(relayOnly: true)
+        var sent: [AstationMessage] = [], closed: [String] = []
+        f.hub.sendHandler = { message, _ in sent.append(message) }
+        f.hub.disconnectDirectClient = { closed.append($0) }
+        let id = UUID().uuidString
+        f.hub.addClient(ConnectedClient(id: id, clientType: "Atem", connectedAt: Date(), hostname: "LAN",
+            atemId: f.deviceId, authenticationSessionId: f.session.id))
+        await f.drain()
+        XCTAssertNil(f.hub.terminalConnection(for: id))
+        XCTAssertEqual(f.hub.remoteAccessBlockReason(for: id), .selectedRelayRequired)
+        XCTAssertTrue(sent.contains { if case .transportPolicy(relayOnly: true) = $0 { return true }; return false })
+        XCTAssertNotNil(f.hub.deviceSessionStore.get(sessionId: f.session.id))
+        _ = f.hub.handleMessage(.transportPolicyAck(AtemTransportPolicyAck(relayOnly: true, stored: true)), from: id)
+        await f.drain()
+        XCTAssertEqual(closed, [id])
+        XCTAssertFalse(f.hub.relayOnlyPolicyReady, "A direct ACK is not selected-relay readiness")
+        XCTAssertNotNil(f.hub.deviceSessionStore.get(sessionId: f.session.id))
+    }
+
     func testUnsupportedHostIsHiddenWithoutLosingItsPairingOrFallingBack() async throws {
         let f = try TerminalHubFixture()
         try await f.start(); try await f.authenticate()
