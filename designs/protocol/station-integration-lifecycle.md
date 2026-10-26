@@ -147,7 +147,7 @@ prompts/approvals/receipts/events APIs. The HTTP API and its limits are in
 
 Activation still requires actual native custom-resource Auth issuance, owner
 confirmation and persistence, a pinned/released host, selected-relay-only
-same-generation stored-policy ACKs, real-agent admission/execution and
+authenticated, same-generation stored-policy ACKs, real-agent admission/execution and
 revocation, reconnect, Mac-off and replica tests. Controlled cryptographic
 host tests and test tokens do not satisfy this live gate. There is no
 runtime environment switch to bypass it.
@@ -160,9 +160,12 @@ independent of config.toml. Focused paused-writer/save-failure/real-runtime
 restart tests and successful CI `40170347648` were reviewed, without building
 or changing an Atem checkout. The previous findings do not remain unresolved
 code objections. They still require a released or explicitly pinned host and
-joint live verification before selected-relay-only activation. Native accepts
-only stored:true with the expected value on the same authenticated generation;
-loss or timeout never enables the integration.
+joint live verification before selected-relay-only activation. A further
+trust-boundary review found that the policy and ACK travel outside `atem-ch1`.
+[Atem #99](https://github.com/Agora-Build/Atem/issues/99) tracks the required
+authenticated exchange. Until that contract and implementation are available,
+no outer ACK establishes activation readiness, including `stored:true` with
+the expected value on the current pairing-authenticated connection.
 
 ### Native transport-policy reconciliation
 
@@ -175,22 +178,27 @@ the checkpoint can be reloaded.
 
 Each pending request captures the authenticated device and local verification
 key pin, pairing session, connection and transport generation before dispatch.
-Only the expected value
-with `stored:true` on that same current context, before its monotonic deadline,
-confirms it. Host refusal, timeout, disconnect, account change and reconnect
-remove confirmation. Reauthentication sends the durable desired value again.
+Only the expected value with `stored:true` on that same current context,
+before its monotonic deadline, is recorded as a host routing report. This
+report is unverified: TLS terminates at the relay, which can forge the outer
+message even when the device is locally pinned. Host refusal, timeout,
+disconnect, account change and reconnect remove the report. Reauthentication
+sends the durable desired value again.
 An opposite policy change reconnects an already-used transport before resending:
 the existing wire has no request ID, so a true/false/true change on one socket
 would make an old true ACK indistinguishable from a new one.
 
 While relay-only is desired, direct agent channels are denied immediately;
 the shared listener and credential protocol remain available to complete
-policy migration. A direct ACK never establishes relay readiness. Every host
-in the verified membership must acknowledge on the current selected relay;
-offline hosts keep the account transition pending. These policy ACKs do not
-establish device identity or grant service authority: signed membership and
-the authenticated R9 host channel remain independently required. Hosted
-execution remains hard disabled during this work.
+policy migration. A direct ACK never establishes relay readiness. Reports
+from every host in the verified membership are tracked on the current
+selected relay; offline hosts remain pending. Even a complete set of these
+reports cannot enable activation. The agreed replacement must authenticate
+the authorized native manager and the exact host/account/current channel,
+echo a fresh request ID or challenge only after durable save, and reject
+unsigned overwrites and replay. Signed membership and the authenticated R9
+host channel alone do not authenticate an outer ACK. Hosted execution remains
+hard disabled during this work.
 
 The desired policy shares the existing durable session security journal.
 Version 2 retains version-1 receipts and trust floors on load; writes use
@@ -232,10 +240,11 @@ host execution, Mac-off and replica admission remain release gates.
 ## 2026-10-26 verification follow-up
 
 - Implemented native policy sending/reconciliation, direct-agent gating and
-  explicit Settings controls described above. Fourteen new policy tests cover
+  explicit Settings controls described above. Fifteen new policy tests cover
   actual wire decoding, persistence/restart, save faults, exact deadlines,
   wrong/refused/duplicate ACKs, account/pairing/generation/key-pin changes,
-  offline hosts, unknown hosts and rapid true/false/true changes. Two additional
+  offline hosts, unknown hosts, rapid true/false/true changes, and a forged
+  matching outer ACK that cannot satisfy activation readiness. Two additional
   Hub tests exercise authenticated relay sends/reconnects and direct-channel
   migration without removing the pairing.
 - Full app test run: **1,026 tests, 14 skips, zero failures**, excluding exactly
@@ -244,7 +253,7 @@ host execution, Mac-off and replica admission remain release gates.
   `testRealSecureEnclaveMaterialSealsEncryptionKeyAndSigns` and
   `testRealProtectedMigrationJournalRecoversAndCommitsOnceAfterIdentityReload`.
   These excluded cases remain unverified. The caption-scroll test passes in
-  this run. After the final status-message change, all 40 selected policy/Hub
+  this run. After the relay trust-boundary correction, all 41 selected policy/Hub
   tests pass with zero skips/failures. The app builds successfully.
 - Retried automatic personal-team provisioning in a fresh DerivedData directory.
   The development certificate is valid, but renewal still exits 65 with

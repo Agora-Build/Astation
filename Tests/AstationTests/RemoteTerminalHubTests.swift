@@ -170,7 +170,7 @@ private final class TerminalHubFixture {
 
 @MainActor
 final class RemoteTerminalHubTests: XCTestCase {
-    func testRelayOnlyPolicyIsSentAfterAuthenticationAndAckIsFencedAcrossReconnect() async throws {
+    func testRelayOnlyReportsAreFencedAcrossReconnectAndNeverAuthorizeActivation() async throws {
         let f = try TerminalHubFixture(relayOnly: true)
         func policies() -> [[String: Any]] {
             f.socket.sent.compactMap { $0["payload"] as? [String: Any] }.filter { $0["type"] as? String == "transportPolicy" }
@@ -184,7 +184,8 @@ final class RemoteTerminalHubTests: XCTestCase {
         try f.emit(.transportPolicyAck(AtemTransportPolicyAck(relayOnly: false, stored: true)))
         await f.drain(); XCTAssertFalse(f.hub.relayOnlyPolicyReady)
         try f.emit(.transportPolicyAck(AtemTransportPolicyAck(relayOnly: true, stored: true)))
-        await f.drain(); XCTAssertTrue(f.hub.relayOnlyPolicyReady)
+        await f.drain(); XCTAssertFalse(f.hub.relayOnlyPolicyReady)
+        XCTAssertTrue(f.hub.relayOnlyPolicyStatus.contains("reported relay-only"))
         let oldGeneration = f.generation
         f.generation = UUID().uuidString
         try f.socket.emit(["relay_event": "connected", "atem_id": f.deviceId, "connection_id": f.generation])
@@ -195,7 +196,8 @@ final class RemoteTerminalHubTests: XCTestCase {
         await f.drain(); XCTAssertFalse(f.hub.relayOnlyPolicyReady)
         try await f.authenticate()
         try f.emit(.transportPolicyAck(AtemTransportPolicyAck(relayOnly: true, stored: true)))
-        await f.drain(); XCTAssertTrue(f.hub.relayOnlyPolicyReady)
+        await f.drain(); XCTAssertFalse(f.hub.relayOnlyPolicyReady)
+        XCTAssertTrue(f.hub.relayOnlyPolicyStatus.contains("reported relay-only"))
         f.socket.fail()
         await f.drain()
         XCTAssertFalse(f.hub.relayOnlyPolicyReady)

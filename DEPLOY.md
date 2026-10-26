@@ -1245,7 +1245,11 @@ restarts. Provisioning returns a draft, not readiness. Hosted endpoints under
 `/api/agent/v1/integrations/...` remain **hard disabled**, with no environment
 override, until actual Auth/native/host/relay-only ACK, reconnect/revocation,
 Mac-off and replica tests pass. Readiness reports cannot advertise Ready with
-this gate closed. MCP, LLM and Discord activation are separate later work.
+this gate closed. The current outer `transportPolicyAck` is an unverified
+routing report; TLS and a saved device pin do not authenticate it against the
+relay. The authenticated replacement tracked in
+[Atem #99](https://github.com/Agora-Build/Atem/issues/99) is also an activation
+gate. MCP, LLM and Discord activation are separate later work.
 See the [typed API](designs/protocol/station-hosted-agent-api.md) and
 [lifecycle](designs/protocol/station-integration-lifecycle.md).
 

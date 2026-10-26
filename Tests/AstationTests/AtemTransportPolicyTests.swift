@@ -36,13 +36,29 @@ private final class TransportPolicyFixture {
     func connect(_ context: AtemTransportPolicyContext) {
         contexts[context.route.clientId] = context; controller.authenticated(context)
     }
-    var ready: Bool { controller.ready(account: "account-a", issuer: "https://auth.example.test", station: "https://station.example.test") }
+    var reported: Bool { controller.allHostsReported(account: "account-a", issuer: "https://auth.example.test", station: "https://station.example.test") }
     func ack(_ context: AtemTransportPolicyContext, value: Bool = true, stored: Bool = true, reason: String? = nil) {
         controller.receive(AtemTransportPolicyAck(relayOnly: value, stored: stored, reason: reason), context: context)
     }
 }
 
 final class AtemTransportPolicyTests: XCTestCase {
+    func testMatchingOuterAckForAPinnedHostCannotEstablishActivationReadiness() throws {
+        let f = TransportPolicyFixture(); try f.controller.set(f.policy(), connections: [])
+        let c = f.context(); f.connect(c)
+        // A relay knows the requested value and can inject this exact outer frame.
+        let forged = try AstationMessage.decodePacket(Data(
+            #"{"type":"transportPolicyAck","data":{"relay_only":true,"stored":true}}"#.utf8))
+        guard case .transportPolicyAck(let ack) = forged else { return XCTFail("ACK not decoded") }
+        f.controller.receive(ack, context: c)
+        XCTAssertTrue(f.reported)
+        XCTAssertFalse(f.controller.ready(account: c.account, issuer: c.issuer, station: c.station))
+        let status = f.controller.status(account: c.account, issuer: c.issuer, station: c.station)
+        XCTAssertTrue(status.contains("reported relay-only"))
+        XCTAssertTrue(status.contains("hosted execution remains disabled"))
+        XCTAssertFalse(status.contains("confirmed relay-only"))
+    }
+
     func testWireMatchesAtemAndRequiresRealBooleans() throws {
         let data = try JSONEncoder().encode(AstationMessage.transportPolicy(relayOnly: true))
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? NSDictionary)
@@ -64,10 +80,10 @@ final class AtemTransportPolicyTests: XCTestCase {
     func testOpeningAnotherControllerDoesNotSilentlyClearTheHostPolicy() {
         let f = TransportPolicyFixture(); f.connect(f.context())
         XCTAssertTrue(f.sent.isEmpty)
-        XCTAssertFalse(f.ready)
+        XCTAssertFalse(f.reported)
     }
 
-    func testIntentIsDurableBeforeSendAndEveryReviewedHostMustConfirmOnRelay() throws {
+    func testIntentIsDurableBeforeSendAndEveryReviewedHostMustReportOnRelay() throws {
         let f = TransportPolicyFixture()
         try f.controller.set(f.policy(hosts: ["host-a", "host-b"]), connections: [])
         let a = f.context(), b = f.context(host: "host-b")
@@ -75,20 +91,20 @@ final class AtemTransportPolicyTests: XCTestCase {
         XCTAssertEqual(f.snapshot.transportPolicies, [f.policy(hosts: ["host-a", "host-b"])])
         XCTAssertEqual(f.sent.count, 1)
         f.ack(a)
-        XCTAssertFalse(f.ready, "Offline hosts cannot count as confirmed")
+        XCTAssertFalse(f.reported, "Offline hosts cannot count as reported")
         f.connect(b); f.ack(b)
-        XCTAssertTrue(f.ready)
+        XCTAssertTrue(f.reported)
         f.ack(b)
-        XCTAssertTrue(f.ready, "A duplicate ACK is harmless")
+        XCTAssertTrue(f.reported, "A duplicate ACK is harmless")
         f.contexts.removeValue(forKey: a.route.clientId)
-        XCTAssertFalse(f.ready, "A formerly confirmed connection is not live evidence")
+        XCTAssertFalse(f.reported, "A former connection is not a current routing report")
     }
 
-    func testWrongValueRefusalOrContradictoryAckNeverConfirms() throws {
+    func testWrongValueRefusalOrContradictoryAckIsNotASuccessReport() throws {
         for (value, stored, reason) in [(false, true, nil), (true, false, "save_failed"), (true, true, "pairing_changed")] {
             let f = TransportPolicyFixture(); try f.controller.set(f.policy(), connections: [])
             let c = f.context(); f.connect(c); f.ack(c, value: value, stored: stored, reason: reason)
-            XCTAssertFalse(f.ready)
+            XCTAssertFalse(f.reported)
         }
     }
 
@@ -100,36 +116,36 @@ final class AtemTransportPolicyTests: XCTestCase {
                 pairing: replacement == "pairing" ? "pairing-2" : "pairing-1",
                 account: replacement == "account" ? "account-b" : "account-a")
             f.connect(new); f.ack(old)
-            XCTAssertFalse(f.ready)
-            if replacement != "account" { f.ack(new); XCTAssertTrue(f.ready) }
+            XCTAssertFalse(f.reported)
+            if replacement != "account" { f.ack(new); XCTAssertTrue(f.reported) }
         }
     }
 
-    func testDeadlineIsMonotonicAndLateAcknowledgmentCannotRestoreReadiness() throws {
+    func testDeadlineIsMonotonicAndLateAcknowledgmentCannotRestoreAReport() throws {
         let f = TransportPolicyFixture(); try f.controller.set(f.policy(), connections: [])
         let c = f.context(); f.connect(c); f.time = 110; f.ack(c)
-        XCTAssertFalse(f.ready, "At the exact deadline the attempt is expired")
+        XCTAssertFalse(f.reported, "At the exact deadline the attempt is expired")
         f.controller.tick(); f.ack(c)
-        XCTAssertFalse(f.ready)
+        XCTAssertFalse(f.reported)
         XCTAssertTrue(f.controller.status(account: c.account, issuer: c.issuer, station: c.station).contains("did not confirm"))
         let next = f.context(generation: "link-2"); f.connect(next); f.ack(next)
-        XCTAssertTrue(f.ready)
+        XCTAssertTrue(f.reported)
     }
 
     func testDirectAckIsMigrationOnlyAndNewDirectConnectionsStayBlocked() throws {
         let f = TransportPolicyFixture(); try f.controller.set(f.policy(), connections: [])
         let direct = f.context(relay: false); f.connect(direct); f.ack(direct)
         XCTAssertEqual(f.reconnects, [direct])
-        XCTAssertFalse(f.ready)
+        XCTAssertFalse(f.reported)
         XCTAssertTrue(f.controller.blocksDirect(account: "account-a", issuer: "https://auth.example.test"))
         let relay = f.context(); f.connect(relay); f.ack(relay)
-        XCTAssertTrue(f.ready)
+        XCTAssertTrue(f.reported)
     }
 
     func testDirectTimeoutClosesTheMigrationLinkWithoutClaimingSavedPolicy() throws {
         let f = TransportPolicyFixture(); try f.controller.set(f.policy(), connections: [])
         let c = f.context(relay: false); f.connect(c); f.time += 10; f.controller.tick()
-        XCTAssertEqual(f.reconnects, [c]); XCTAssertFalse(f.ready)
+        XCTAssertEqual(f.reconnects, [c]); XCTAssertFalse(f.reported)
         f.controller.tick(); XCTAssertEqual(f.reconnects.count, 1)
     }
 
@@ -139,9 +155,9 @@ final class AtemTransportPolicyTests: XCTestCase {
         try f.controller.set(f.policy(false), connections: [c])
         try f.controller.set(f.policy(), connections: [c])
         XCTAssertEqual(f.sent.count, 1, "The opposite value must wait for a new connection")
-        XCTAssertEqual(f.reconnects, [c]); f.ack(c); XCTAssertFalse(f.ready)
+        XCTAssertEqual(f.reconnects, [c]); f.ack(c); XCTAssertFalse(f.reported)
         let next = f.context(generation: "link-2"); f.connect(next); f.ack(next)
-        XCTAssertTrue(f.ready)
+        XCTAssertTrue(f.reported)
     }
 
     func testWriteFailureAndCorruptStorageNeverSendOrAdmit() throws {
@@ -149,12 +165,12 @@ final class AtemTransportPolicyTests: XCTestCase {
         XCTAssertThrowsError(try f.controller.set(f.policy(), connections: [c]))
         XCTAssertTrue(f.sent.isEmpty); XCTAssertTrue(f.journal.loadFailed)
         XCTAssertTrue(f.controller.blocksDirect(account: "account-a", issuer: "https://auth.example.test"))
-        f.ack(c); XCTAssertFalse(f.ready)
+        f.ack(c); XCTAssertFalse(f.reported)
         let corrupt = AtemSessionJournal(load: { throw CocoaError(.fileReadCorruptFile) })
         let controller = AtemTransportPolicyController(journal: corrupt, current: { _ in true },
             send: { _, _ in XCTFail("Corrupt checkpoint sent a policy") }, reconnect: { _ in })
         controller.authenticated(c)
-        XCTAssertFalse(controller.ready(account: "account-a", issuer: "https://auth.example.test", station: c.station))
+        XCTAssertFalse(controller.allHostsReported(account: "account-a", issuer: "https://auth.example.test", station: c.station))
     }
 
     func testRestartRetainsIntentButRequiresANewLiveAcknowledgment() throws {
@@ -170,27 +186,27 @@ final class AtemTransportPolicyTests: XCTestCase {
         let controller = AtemTransportPolicyController(journal: restored, current: { $0 == c },
             send: { value, context in XCTAssertTrue(value); XCTAssertEqual(context, c); sends += 1 }, reconnect: { _ in })
         XCTAssertEqual(controller.policy(account: policy.account, issuer: policy.issuer), policy)
-        XCTAssertFalse(controller.ready(account: policy.account, issuer: policy.issuer, station: policy.station))
+        XCTAssertFalse(controller.allHostsReported(account: policy.account, issuer: policy.issuer, station: policy.station))
         controller.authenticated(c); XCTAssertEqual(sends, 1)
         controller.receive(AtemTransportPolicyAck(relayOnly: true, stored: true), context: c)
-        XCTAssertTrue(controller.ready(account: policy.account, issuer: policy.issuer, station: policy.station))
+        XCTAssertTrue(controller.allHostsReported(account: policy.account, issuer: policy.issuer, station: policy.station))
     }
 
-    func testDifferentStationAndNewHostDoNotInheritReadiness() throws {
+    func testDifferentStationAndNewHostDoNotInheritReports() throws {
         let f = TransportPolicyFixture(); try f.controller.set(f.policy(), connections: [])
-        let c = f.context(); f.connect(c); f.ack(c); XCTAssertTrue(f.ready)
-        XCTAssertFalse(f.controller.ready(account: "account-a", issuer: c.issuer, station: "https://other.example.test"))
-        f.connect(f.context(host: "new-host")); XCTAssertFalse(f.ready)
+        let c = f.context(); f.connect(c); f.ack(c); XCTAssertTrue(f.reported)
+        XCTAssertFalse(f.controller.allHostsReported(account: "account-a", issuer: c.issuer, station: "https://other.example.test"))
+        f.connect(f.context(host: "new-host")); XCTAssertFalse(f.reported)
     }
 
-    func testUnverifiedOrRevokedDeviceCannotProvideReadiness() throws {
+    func testUnverifiedOrRevokedDeviceCannotProvideACurrentReport() throws {
         let f = TransportPolicyFixture(); try f.controller.set(f.policy(), connections: [])
         let unverified = f.context(verified: false); f.connect(unverified); f.ack(unverified)
-        XCTAssertFalse(f.ready)
-        let verified = f.context(); f.connect(verified); f.ack(verified); XCTAssertTrue(f.ready)
+        XCTAssertFalse(f.reported)
+        let verified = f.context(); f.connect(verified); f.ack(verified); XCTAssertTrue(f.reported)
         f.contexts[verified.route.clientId] = unverified
-        XCTAssertFalse(f.ready)
-        f.ack(verified); XCTAssertFalse(f.ready)
+        XCTAssertFalse(f.reported)
+        f.ack(verified); XCTAssertFalse(f.reported)
     }
 
     func testOldJournalMigratesWithoutInventingPolicyAndNewPoliciesRequireTheNewFormat() throws {

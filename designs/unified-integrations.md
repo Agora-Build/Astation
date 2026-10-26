@@ -152,14 +152,19 @@ configures that relay in Astation/Atem without fallback to the public default.
 Settings > Station AI has independent MCP, LLM and Agent switches, all off by
 default, with explicit feature/Station/provider consent and Off/Starting/On/Error
 states. Any enabled switch sets whole-account relay-only transport. Astation
-sends the authenticated `transportPolicy` message after authentication and on
-change; Atem durably saves the pairing-bound value and acknowledges it. Only
-then is a direct link closed. Refuse affected direct Atem connections on port
+sends `transportPolicy` after pairing authentication and on change; Atem
+durably saves the pairing-bound value and reports it. This outer exchange
+is not cryptographically authenticated against the relay and cannot establish
+activation readiness. [Atem #99](https://github.com/Agora-Build/Atem/issues/99)
+tracks an authenticated policy/ACK contract with fresh request binding and
+protection against unsigned overwrite. A direct link closes after a matching
+report or bounded timeout. Refuse affected direct Atem connections on port
 8080 while enabled; preserve the shared local listener/HTTP API and credential
 unlock/sync behavior. Lost ACKs/reconnects must be reconciled, not presented as
 a completed account-wide transition. Atem #97 supplies durable host policy;
 Astation supplies native intent/ACK reconciliation and direct-agent admission
-guards. Actual protected native/host/reconnect verification remains pending,
+guards. Authenticated policy/ACK delivery and actual protected
+native/host/reconnect verification remain pending,
 and hosted execution stays hard disabled.
 
 Enabling an integration explicitly trusts the selected Station as a decrypting

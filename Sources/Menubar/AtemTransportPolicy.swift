@@ -33,9 +33,9 @@ struct AtemTransportPolicyContext: Equatable {
     var isRelay: Bool { route.clientId.hasPrefix("relay-") }
 }
 
-/// ACKs are live connection evidence, never durable device or service authority.
+/// Outer ACKs are unverified routing reports, never activation or device authority.
 final class AtemTransportPolicyController {
-    enum Result: Equatable { case pending, confirmed, failed(String) }
+    enum Result: Equatable { case pending, reported, failed(String) }
     private struct Attempt {
         let context: AtemTransportPolicyContext
         let value: Bool
@@ -111,7 +111,7 @@ final class AtemTransportPolicyController {
               let policy = policy(account: context.account, issuer: context.issuer),
               policy.station == context.station, policy.relayOnly == attempt.value,
               ack.relayOnly == attempt.value else { return }
-        attempt.result = ack.stored && ack.reason == nil ? .confirmed : .failed("Atem could not save the transport policy.")
+        attempt.result = ack.stored && ack.reason == nil ? .reported : .failed("Atem could not save the transport policy.")
         attempts[context.route.clientId] = attempt
         changed?()
         if context.isRelay == false && attempt.value { reconnect(context) }
@@ -134,6 +134,12 @@ final class AtemTransportPolicyController {
     }
 
     func ready(account: String, issuer: String, station: String) -> Bool {
+        // Atem #99: the relay can forge outer ACKs. Only the agreed authenticated
+        // replacement can satisfy activation, even with a complete set of reports.
+        false
+    }
+
+    func allHostsReported(account: String, issuer: String, station: String) -> Bool {
         guard !journal.loadFailed, let policy = policy(account: account, issuer: issuer),
               policy.relayOnly, policy.station == station else { return false }
         guard !attempts.values.contains(where: { current($0.context) && $0.context.account == account
@@ -143,7 +149,7 @@ final class AtemTransportPolicyController {
                 attempt.context.account == account && attempt.context.issuer == issuer
                     && attempt.context.station == station && attempt.context.route.deviceId == host
                     && attempt.context.verifiedPin != nil && attempt.context.isRelay
-                    && attempt.value && attempt.result == .confirmed && current(attempt.context)
+                    && attempt.value && attempt.result == .reported && current(attempt.context)
             }
         }
     }
@@ -153,7 +159,9 @@ final class AtemTransportPolicyController {
         guard let policy = policy(account: account, issuer: issuer) else { return "No transport policy has been requested on this Mac." }
         guard policy.station == station else { return "The saved policy belongs to another Station. Review the selected relay before continuing." }
         if !policy.relayOnly { return "Direct connections are permitted. Atems reconcile this policy when they authenticate." }
-        if ready(account: account, issuer: issuer, station: station) { return "All enrolled Atem hosts confirmed relay-only connections. Hosted execution remains disabled." }
+        if allHostsReported(account: account, issuer: issuer, station: station) {
+            return "All enrolled Atem hosts reported relay-only. Authenticated policy confirmation is not available yet; hosted execution remains disabled."
+        }
         for attempt in attempts.values where attempt.context.account == account && attempt.context.issuer == issuer
             && attempt.context.station == station && current(attempt.context) {
             if case .failed(let message) = attempt.result { return message + " Hosted execution remains disabled." }
