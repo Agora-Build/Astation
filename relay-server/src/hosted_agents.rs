@@ -18,6 +18,10 @@ mod tests;
 pub(crate) const HOSTED_EXECUTION_ENABLED: bool = false;
 
 pub(crate) fn routes() -> Router<IntegrationState> {
+    operation_routes().layer(axum::middleware::from_fn(release_gate))
+}
+
+fn operation_routes() -> Router<IntegrationState> {
     Router::new()
         .route(
             "/api/agent/v1/integrations/:id/hosts/:host/sessions",
@@ -59,7 +63,6 @@ pub(crate) fn routes() -> Router<IntegrationState> {
             "/api/agent/v1/integrations/:id/hosts/:host/sessions/:session/receipts",
             post(operations::receipts),
         )
-        .layer(axum::middleware::from_fn(release_gate))
 }
 
 async fn release_gate(request: axum::extract::Request, next: axum::middleware::Next) -> Response {

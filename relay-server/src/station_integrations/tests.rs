@@ -10,6 +10,16 @@ pub(crate) async fn fixture() -> (
     Arc<StationIntegrations>,
     Fixture,
 ) {
+    fixture_with_issuer("https://auth.example").await
+}
+
+pub(crate) async fn fixture_with_issuer(
+    issuer: &str,
+) -> (
+    crate::test_database::TestDatabase,
+    Arc<StationIntegrations>,
+    Fixture,
+) {
     let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 8).await;
     let mut app = crate::tests::test_state();
     app.recovery = RecoveryStore::postgres(db.pool.clone());
@@ -38,7 +48,7 @@ pub(crate) async fn fixture() -> (
     let runtime = StationIntegrations::new(
         app,
         FeedBinding {
-            issuer: "https://auth.example".into(),
+            issuer: issuer.into(),
             portal_origin: "https://portal.example".into(),
             station_origin: "https://custom.example".into(),
             report_client_id: "s-01234567890123456789012345".into(),

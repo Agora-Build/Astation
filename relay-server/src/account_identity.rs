@@ -543,7 +543,7 @@ impl AccountIdentityVerifier for OidcVerifier {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::{
         extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router,
@@ -562,8 +562,8 @@ mod tests {
         status: AtomicU16,
         delay_ms: AtomicU64,
     }
-    struct Fixture {
-        issuer: String,
+    pub(crate) struct Fixture {
+        pub issuer: String,
         state: Arc<Server>,
         signer: EcdsaKeyPair,
         verifier: OidcVerifier,
@@ -585,7 +585,7 @@ mod tests {
             "x":URL_SAFE_NO_PAD.encode(&raw[1..33]),"y":URL_SAFE_NO_PAD.encode(&raw[33..65])}]})
     }
     impl Fixture {
-        async fn new() -> Self {
+        pub(crate) async fn new() -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let issuer = format!("http://{}", listener.local_addr().unwrap());
             let signer = signer();
@@ -630,12 +630,12 @@ mod tests {
                 task,
             }
         }
-        fn claims(&self) -> Value {
+        pub(crate) fn claims(&self) -> Value {
             let now = chrono::Utc::now().timestamp();
             json!({"iss":self.issuer,"sub":"ab01234567890123456789012345","aud":"https://station.example",
                 "exp":now+900,"iat":now,"client_id":"astation","scope":"openid station:account"})
         }
-        fn token(&self, header: Value, claims: Value) -> String {
+        pub(crate) fn token(&self, header: Value, claims: Value) -> String {
             self.signed(
                 &serde_json::to_string(&header).unwrap(),
                 &serde_json::to_string(&claims).unwrap(),
@@ -653,7 +653,7 @@ mod tests {
                 .unwrap();
             format!("{message}.{}", URL_SAFE_NO_PAD.encode(signature.as_ref()))
         }
-        fn header(&self) -> Value {
+        pub(crate) fn header(&self) -> Value {
             json!({"alg":"ES256","typ":"at+jwt","kid":"one"})
         }
         async fn allow_refresh(&self, expired: bool) {

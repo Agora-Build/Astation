@@ -122,3 +122,34 @@ prompt/receipt/approval/revoke/history adapters, retained formatting,
 same-key membership changes, policy denial, protected-key loss/corruption,
 feed recovery/restart, CORS and the closed production gate. They do not replace
 the joint real Auth/native/host execution and replica release matrix.
+
+## Test without an app
+
+No mobile app or Discord bot is needed to exercise these APIs. The headless
+HTTP test runs a loopback API server, an ES256-signed test issuer with real
+discovery/JWKS, isolated Postgres and a controlled R9 host. It uses the same
+token verifier, protected service-key store, encrypted channel and operation
+handlers as Station. Disposable test manager keys establish its service grant;
+it does not use the owner's existing identity or replace native consent.
+
+With `RECOVERY_TEST_DATABASE_URL` set to a dedicated local test database, run:
+
+```sh
+cargo test --locked --manifest-path relay-server/Cargo.toml \
+  hosted_agents::tests::postgres_http_api_authentication_operations_reconnect_and_revocation_without_app \
+  -- --ignored
+```
+
+The test covers session discovery, prompt acceptance, receipt lookup on a new
+attachment, approval-answer and rule-revocation requests, formatted history,
+authenticated WebSocket updates, and closing that stream after policy denial.
+It also refuses missing/invalid tokens, wrong issuer/resource/owner/client/key,
+native tokens, expired tokens, insufficient scopes, stale process targets,
+invalid control flags, unknown fields and oversized bodies.
+
+Only the test listener omits the production release gate. No environment or
+API option enables execution on a running Station. The controlled host verifies
+real channel cryptography but supplies test session replies; its accepted
+receipt is not evidence that Claude or Codex performed an operation. Real Auth
+issuance, protected native approval, the fixing Atem host, relay-only policy,
+Mac-off routing and replica failover remain separate live release checks.
