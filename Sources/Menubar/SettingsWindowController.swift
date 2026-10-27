@@ -23,7 +23,11 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var sidebarTable: NSTableView?
     private let hubManager: AstationHubManager
     private lazy var accountController = AccountSettingsViewController(hub: hubManager)
-    private lazy var integrationController = MainActor.assumeIsolated { IntegrationApprovalViewController(hub: hubManager) }
+    private lazy var integrationController = MainActor.assumeIsolated {
+        IntegrationApprovalViewController(hub: hubManager, openSecurity: { [weak self] in
+            self?.tabView?.selectTabViewItem(withIdentifier: "security")
+        })
+    }
     private let shortcutsController: KeyboardShortcutsViewController
     private let recordingController: AudioRecordingViewController
     private let transcriptionController: TranscriptionViewController
@@ -38,6 +42,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var stationUrlField: NSTextField!
     private var serverInfoLabel: NSTextField!
     private var recoveryStatusLabel: NSTextField?
+    private var recoverySetupButton: NSButton?
     private var relayIdentityKeyStatusLabel: NSTextField?
     private var relayIdentityKeyRetryButton: NSButton?
     private var relayIdentityKeyRepairButton: NSButton?
@@ -529,15 +534,13 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
 
         content.addArrangedSubview(sectionTitle("Account Recovery"))
         content.addArrangedSubview(wrappingInfo(
-            "Save your Recovery Kit v2 somewhere off this Mac. It anchors your account's signed device list and restores encrypted data if your trusted devices are lost."
+            "Set up this Mac's signed device list before approving integrations. Save the Recovery Kit somewhere off this Mac so you can restore encrypted data if trusted devices are lost."
         ))
-        if hubManager.accountAuth.configuration == nil {
-            content.addArrangedSubview(wrappingInfo("Online recovery is not configured for this build."))
-        }
         let idLabel = NSTextField(labelWithString: "Astation ID: \(RecoveryKit.masked(AstationIdentity.shared.id))")
         idLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         content.addArrangedSubview(idLabel)
-        let showButton = NSButton(title: "Show Recovery Kit…", target: self, action: #selector(showRecoveryKit))
+        let showButton = NSButton(title: "Set Up Account Security…", target: self, action: #selector(showRecoveryKit))
+        recoverySetupButton = showButton
         showButton.bezelStyle = .rounded
         content.addArrangedSubview(showButton)
         content.addArrangedSubview(separator())
@@ -558,6 +561,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
 
         renderRelayIdentityKeyState()
         renderRelayAccountState()
+        MainActor.assumeIsolated { renderRecoverySetup() }
         hubManager.requestRelayAccountState()
         renderEncryptionState()
         hubManager.requestRelayEncryptionState()
@@ -929,7 +933,12 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     }
 
     @objc private func refreshRelayAccount() {
-        hubManager.requestRelayAccountState()
+        Task { @MainActor in
+            do {
+                try await hubManager.prepareAccountSecurityAccess()
+                hubManager.requestRelayAccountState()
+            } catch { setRecoveryStatus(error.localizedDescription, isError: true) }
+        }
     }
 
     private func renderRelayAccountState() {
@@ -1111,20 +1120,38 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         return (scroll, textView)
     }
 
+    @MainActor private func renderRecoverySetup() {
+        let complete = (try? hubManager.recoveryCoordinator().securitySetupComplete) == true
+        recoverySetupButton?.title = complete ? "Show Recovery Kit…" : "Set Up Account Security…"
+    }
+
     @objc private func showRecoveryKit() {
-        DeviceOwnerAuth.authenticate(reason: "show your Astation recovery kit") { [weak self] ok in
-            guard let self else { return }
-            guard ok else {
-                self.setRecoveryStatus("Not authenticated, so the recovery kit wasn't shown.", isError: true)
-                return
-            }
-            self.setRecoveryStatus("Preparing your Recovery Kit v2 and encrypted key backup...", isError: false)
-            Task { @MainActor in
-                do {
-                    let kit = try await self.hubManager.recoveryCoordinator().exportedKit()
-                    self.presentRecoveryKit(kit.text())
-                } catch { self.setRecoveryStatus(error.localizedDescription, isError: true) }
-            }
+        recoverySetupButton?.isEnabled = false
+        setRecoveryStatus("Checking this Mac's access to the selected Station...", isError: false)
+        Task { @MainActor in
+            defer { recoverySetupButton?.isEnabled = true; renderRecoverySetup() }
+            do {
+                try await hubManager.prepareAccountSecurityAccess()
+                let epoch = hubManager.integrationAccountGeneration, origin = hubManager.stationRelayUrl
+                let coordinator = try hubManager.recoveryCoordinator()
+                let complete = try coordinator.securitySetupComplete
+                let authenticated = await withCheckedContinuation { continuation in
+                    DeviceOwnerAuth.authenticate(reason: complete ? "show your Astation recovery kit" : "set up account security") {
+                        continuation.resume(returning: $0)
+                    }
+                }
+                guard epoch == hubManager.integrationAccountGeneration, origin == hubManager.stationRelayUrl else {
+                    throw AccountLoginError.changed
+                }
+                guard authenticated else { throw RemoteRecoveryError.confirmationRequired }
+                setRecoveryStatus("Preparing your Recovery Kit and encrypted key backup...", isError: false)
+                let kit = try await coordinator.exportedKit()
+                guard epoch == hubManager.integrationAccountGeneration, origin == hubManager.stationRelayUrl else {
+                    throw AccountLoginError.changed
+                }
+                if complete { presentRecoveryKit(kit.text()) }
+                else { setRecoveryStatus("Account security is set up and your Recovery Kit is saved. Return to Integrations and load requests.", isError: false) }
+            } catch { setRecoveryStatus(error.localizedDescription, isError: true) }
         }
     }
 
@@ -1318,6 +1345,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
         guard let tabViewItem else { return }
         if tabViewItem.identifier as? String == "credentials" { credentialsController.refreshForDisplay() }
+        if tabViewItem.identifier as? String == "security" { MainActor.assumeIsolated { renderRecoverySetup() } }
         recordingController.setPageVisible((tabViewItem.identifier as? String) == "recording")
         let index = tabView.indexOfTabViewItem(tabViewItem)
         if sidebarTable?.selectedRow != index {

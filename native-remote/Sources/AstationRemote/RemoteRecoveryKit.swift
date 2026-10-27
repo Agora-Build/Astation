@@ -89,6 +89,16 @@ public struct RemoteRecoveryKit: Equatable, Sendable {
         } catch { throw RemoteRecoveryError.invalidKit }
     }
 
+    private init(handle: RecoveryKitHandle, relayURL: String) throws {
+        self.relayURL = try Self.checkedRelayURL(relayURL)
+        self.handle = handle
+    }
+
+    /// Update only the routing hint, after the caller verifies the pinned log at this destination.
+    public func replacingRelayURL(_ relayURL: String) throws -> Self {
+        try Self(handle: handle, relayURL: relayURL)
+    }
+
     public func text() -> String {
         """
         \(Self.title)

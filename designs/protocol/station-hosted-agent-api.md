@@ -17,9 +17,20 @@ and controlled tests, not a deployed service.
    open Settings > Integrations > Load Requests. The native app requests
    `integrations:read integrations:approve` for Portal and `astation.remote`
    for the exact custom Station, in separate Auth profiles. Both verified
-   subjects must equal the signed-in owner.
+   subjects must equal the signed-in owner. Two browser authorization prompts
+   are expected when these grants have not been saved yet. The native app
+   waits for account registration on the selected Station before recovery
+   storage requests. Selecting another Station reconnects its relay socket.
+   If account security has not been set up, the request selector still loads;
+   **Set Up Account Security** opens Settings > Security for explicit owner
+   confirmation and Recovery Kit saving. Return and reload requests afterward.
 3. Select the owned request, allowed hosts and optional session/project
-   restrictions. Review Access requests the exact canonical draft from
+   restrictions. At least one verified host must be explicitly selected before
+   Review Access is enabled. An empty host list means a host must first be
+   paired and verified into this account's signed membership log; account
+   sign-in and Recovery Kit setup alone do not enroll an Atem host. Empty
+   selections never request a service key or report an account-session change.
+   Review Access requests the exact canonical draft from
    `POST /agora-build/v1/integrations/:id/provision`. Its camelCase body is
    `{genesisHash, managerId, expectedHead:{seq,hash}, signedAt, hosts,
    sessions?, projects?}`. The server verifies owner policy, anchored root,

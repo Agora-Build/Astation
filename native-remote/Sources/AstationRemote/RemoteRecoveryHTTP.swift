@@ -2,11 +2,14 @@ import AtemClient
 import Foundation
 
 public enum RemoteRecoveryTransportError: LocalizedError {
-    case authenticationRequired, unavailable, invalidResponse, insecureURL
+    case authenticationRequired, registrationRequired, permissionRequired, accessDenied, unavailable, invalidResponse, insecureURL
 
     public var errorDescription: String? {
         switch self {
-        case .authenticationRequired: return "Sign in to the account that owns this Recovery Kit, then retry."
+        case .authenticationRequired: return "Authorize your Agora.Build account for this Station, then retry."
+        case .registrationRequired: return "This Mac has not registered with the selected Station. Reconnect to the Station, then retry account security setup."
+        case .permissionRequired: return "Your Station authorization does not include account recovery access. Authorize Station access again."
+        case .accessDenied: return "This Station refused access to the account's recovery data. Your saved setup was retained."
         case .unavailable: return "Account recovery is unavailable on this relay. Your saved operation was retained; retry later."
         case .invalidResponse: return "The relay returned recovery data that could not be verified. Nothing was trusted from this response."
         case .insecureURL: return "Account recovery requires an HTTPS relay, or a local loopback relay."
@@ -157,7 +160,20 @@ public final class RemoteRecoveryHTTP: RemoteRecoveryTransport, @unchecked Senda
         let (stream, response) = try await session.bytes(for: request)
         defer { stream.task.cancel() }
         guard let response = response as? HTTPURLResponse else { throw RemoteRecoveryTransportError.invalidResponse }
-        if response.statusCode == 401 || response.statusCode == 403 { throw RemoteRecoveryTransportError.authenticationRequired }
+        if response.statusCode == 401 { throw RemoteRecoveryTransportError.authenticationRequired }
+        if response.statusCode == 403 {
+            var data = Data()
+            for try await byte in stream {
+                guard data.count < 16_384 else { throw RemoteRecoveryTransportError.invalidResponse }
+                data.append(byte)
+            }
+            let code = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? [String: Any]
+            switch code?["code"] as? String {
+            case "recovery_creator_not_registered": throw RemoteRecoveryTransportError.registrationRequired
+            case "insufficient_scope": throw RemoteRecoveryTransportError.permissionRequired
+            default: throw RemoteRecoveryTransportError.accessDenied
+            }
+        }
         guard response.statusCode == 200 || (allowConflict && response.statusCode == 409) else { throw RemoteRecoveryTransportError.unavailable }
         var data = Data()
         for try await byte in stream {

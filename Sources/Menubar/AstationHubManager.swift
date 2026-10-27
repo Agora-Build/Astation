@@ -48,20 +48,78 @@ class AstationHubManager: ObservableObject {
     private var projectLoadTask: Task<Void, Never>?
     private var accountGeneration = UUID()
     var integrationAccountGeneration: UUID { accountGeneration }
+    private struct StationRegistrationContext: Equatable {
+        let socket: String
+        let account: UUID
+        let origin: String
+    }
+    private var stationRegistration: StationRegistrationContext?
+    private var stationRegistrationPending: StationRegistrationContext?
+    private var stationRegistrationWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+    private var configuredStationOrigin: String
+
+    private static func stationAccountAuth(settings: AccountServiceSettings, origin: String) throws -> AstationAccountAuth {
+        let configuration = try AccountOIDCConfiguration(issuer: settings.issuer, clientID: settings.clientID,
+            resource: origin, requiredScope: "astation.remote")
+        let context = SHA256.hash(data: Data([settings.issuer, settings.clientID, origin].joined(separator: "|").utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        return AstationAccountAuth(configuration: configuration,
+            storage: AccountKeychainStorage(service: "build.agora.astation.station-account-v1." + context))
+    }
 
     @MainActor func configureIntegrationRelayAuth() throws {
-        let origin = stationRelayUrl
-        guard let settings = portalSettings, PortalIntegrationRecord.validOrigin(origin) else {
+        guard PortalIntegrationRecord.validOrigin(stationRelayUrl) else {
             throw AccountLoginError.configuration
         }
+        try configureStationAccountAuth()
+    }
+
+    @MainActor private func configureStationAccountAuth() throws {
+        let origin = stationRelayUrl
+        guard let settings = portalSettings else { throw AccountLoginError.configuration }
         let configuration = try AccountOIDCConfiguration(issuer: settings.issuer, clientID: settings.clientID,
             resource: origin, requiredScope: "astation.remote")
         if accountAuth.configuration == configuration { return }
-        let context = SHA256.hash(data: Data([settings.issuer, settings.clientID, origin].joined(separator: "|").utf8))
-            .map { String(format: "%02x", $0) }.joined()
+        let reconnect = identityRelayActive
+        pauseIdentityRelay()
         accountGeneration = UUID(); accountRecovery = nil
-        accountAuth = AstationAccountAuth(configuration: configuration,
-            storage: AccountKeychainStorage(service: "build.agora.astation.station-account-v1." + context))
+        accountAuth = try Self.stationAccountAuth(settings: settings, origin: origin)
+        if reconnect { startIdentityRelay() }
+    }
+
+    @MainActor func prepareAccountSecurityAccess(registrationTimeout: TimeInterval = 15) async throws {
+        try Task.checkCancellation()
+        try configureStationAccountAuth()
+        guard let owner = signedInAccount, !accountSignInRequired else { throw AccountLoginError.signInRequired }
+        let epoch = accountGeneration, origin = stationRelayUrl, auth = accountAuth
+        do { _ = try await auth.accessToken(relayURL: origin) }
+        catch AccountLoginError.signInRequired { try await auth.signIn() }
+        try Task.checkCancellation()
+        guard epoch == accountGeneration, origin == stationRelayUrl, signedInAccount == owner,
+              try await auth.current()?.session.subject == owner else { throw AccountLoginError.changed }
+        let context = StationRegistrationContext(socket: identityRelaySocketGeneration, account: epoch, origin: origin)
+        if identityRelayVerified, stationRegistration == context { return }
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                guard !Task.isCancelled else { continuation.resume(throwing: CancellationError()); return }
+                stationRegistrationWaiters[id] = continuation
+                startIdentityRelay()
+                registerRelayAccountIfPossible()
+                DispatchQueue.main.asyncAfter(deadline: .now() + registrationTimeout) { [weak self] in
+                    guard let self, let waiter = self.stationRegistrationWaiters.removeValue(forKey: id) else { return }
+                    waiter.resume(throwing: RemoteRecoveryTransportError.registrationRequired)
+                    self.pauseIdentityRelay()
+                    self.startIdentityRelay()
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.stationRegistrationWaiters.removeValue(forKey: id)?.resume(throwing: CancellationError())
+            }
+        }
+        try Task.checkCancellation()
+        guard epoch == accountGeneration, origin == stationRelayUrl, signedInAccount == owner else { throw AccountLoginError.changed }
     }
     private var portalProjects: [String: PortalAPIClient.Project] = [:]
     private var projectCache: PortalProjectCache?
@@ -321,12 +379,16 @@ class AstationHubManager: ObservableObject {
         workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
         portalSettings: AccountServiceSettings? = try? AccountServiceSettings.load(),
         portalAuth: AstationAccountAuth? = nil,
+        stationAuth: AstationAccountAuth? = nil,
         portalAPI: PortalAPIClient = PortalAPIClient(),
         projectCache: PortalProjectCache? = nil,
         accountDefaults: UserDefaults = .standard
     ) {
         self.accountDefaults = accountDefaults
-        self.accountAuth = AstationAccountAuth(defaults: accountDefaults)
+        let station = SettingsWindowController.currentAstationRelayUrl
+        self.configuredStationOrigin = station
+        self.accountAuth = stationAuth ?? portalSettings.flatMap { try? Self.stationAccountAuth(settings: $0, origin: station) }
+            ?? AstationAccountAuth(defaults: accountDefaults)
         self.portalSettings = portalSettings
         self.portalAuth = portalAuth ?? Self.makePortalAuth(settings: portalSettings)
         self.portalAPI = portalAPI
@@ -368,6 +430,8 @@ class AstationHubManager: ObservableObject {
             name: .credentialsChanged,
             object: nil
         )
+        NotificationCenter.default.addObserver(self, selector: #selector(stationServerChanged),
+            name: .serverInfoChanged, object: nil)
         workspaceNotifications.addObserver(self, selector: #selector(systemWillSleep),
             name: NSWorkspace.willSleepNotification, object: nil)
         workspaceNotifications.addObserver(self, selector: #selector(systemDidWake),
@@ -391,6 +455,7 @@ class AstationHubManager: ObservableObject {
     }
 
     deinit {
+        NotificationCenter.default.removeObserver(self)
         workspaceNotifications.removeObserver(self)
         sessionTimer?.invalidate()
         transportPolicyTimer?.invalidate()
@@ -542,6 +607,9 @@ class AstationHubManager: ObservableObject {
 
     func accountSessionChanged() {
         accountGeneration = UUID()
+        let reconnect = identityRelayActive
+        pauseIdentityRelay()
+        if reconnect { startIdentityRelay() }
         refreshProjects()
         registerRelayAccountIfPossible()
         NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
@@ -604,8 +672,28 @@ class AstationHubManager: ObservableObject {
         portalSettings = try AccountServiceSettings.load(defaults: accountDefaults)
         portalAuth = Self.makePortalAuth(settings: portalSettings)
         projectCache = portalSettings.map(PortalProjectCache.init(settings:))
-        accountAuth = AstationAccountAuth(defaults: accountDefaults)
+        guard let effective = portalSettings else { throw AccountLoginError.configuration }
+        accountAuth = try Self.stationAccountAuth(settings: effective, origin: stationRelayUrl)
         accountSessionChanged()
+    }
+
+    @MainActor @objc private func stationServerChanged() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard configuredStationOrigin != stationRelayUrl else { return }
+        pauseIdentityRelay()
+        accountGeneration = UUID(); accountRecovery = nil
+        configuredStationOrigin = stationRelayUrl
+        if let settings = portalSettings,
+           let auth = try? Self.stationAccountAuth(settings: settings, origin: stationRelayUrl) { accountAuth = auth }
+        relayAccountDevices = []; relayMergeRequests = []; relayAccountStatusMessage = nil
+        relayEncryptionState = nil; relayEncryptionStatusMessage = nil
+        relayIdentityKeyRepairRecord = RelayIdentityKeyRepairRecord.load(
+            astationId: AstationIdentity.shared.id, relayURL: stationRelayUrl, defaults: relayIdentityRepairDefaults)
+        relayIdentityKeyRepairPending = relayIdentityKeyRepairRecord != nil
+        relayIdentityRepairReconnectRequested = false
+        startIdentityRelay()
+        NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
+        NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
     }
 
     /// Retain already-consented legacy service credentials for existing Atems.
@@ -667,6 +755,7 @@ class AstationHubManager: ObservableObject {
                 signedInAccount = record?.session.subject
                 accountSignInRequired = record == nil || record?.refreshPending == true
                 guard record != nil else { throw AccountLoginError.signInRequired }
+                registerRelayAccountIfPossible()
                 if projects.isEmpty, let cached = try projectCache?.load(subject: record!.session.subject) {
                     portalProjects = Dictionary(uniqueKeysWithValues: cached.metadata.map { ($0.appId, $0) })
                     projects = cached.projects
@@ -2336,6 +2425,8 @@ class AstationHubManager: ObservableObject {
             return
         }
 
+        invalidateStationRegistration()
+
         let closeDescription = closeCode.map(String.init) ?? "none"
         let reasonDescription = closeReason.map { " reason=\($0)" } ?? ""
         let errorDescription = error.map { " error=\($0)" } ?? ""
@@ -2409,6 +2500,15 @@ class AstationHubManager: ObservableObject {
         case .authResult(let status, let message):
             handleRelayAuthResult(status: status, message: message)
         case .ack(let forType, let ok, let message):
+            if forType == "relayRegisterAccount", let pending = stationRegistrationPending {
+                stationRegistrationPending = nil
+                let current = StationRegistrationContext(socket: identityRelaySocketGeneration,
+                    account: accountGeneration, origin: stationRelayUrl)
+                if pending == current {
+                    if ok { stationRegistration = current }
+                    finishStationRegistration(ok ? .success(()) : .failure(RemoteRecoveryTransportError.registrationRequired))
+                }
+            }
             if forType == "relayPushRegister" || forType == "relayPushUnregister" {
                 approvalPushRegistrationStatus = ok
                     ? (forType == "relayPushRegister" ? "Notification address registered." : "Approval notifications disabled.")
@@ -2573,6 +2673,7 @@ class AstationHubManager: ObservableObject {
     }
 
     private func pauseIdentityRelay() {
+        invalidateStationRegistration()
         let task = identityRelayTask
         identityRelayTask = nil
         identityRelaySocketGeneration = UUID().uuidString
@@ -3002,23 +3103,29 @@ class AstationHubManager: ObservableObject {
     }
 
     private func registerRelayAccountIfPossible() {
-        guard identityRelayVerified else { return }
+        guard identityRelayVerified, let owner = signedInAccount, !accountSignInRequired else { return }
         let generation = identityRelaySocketGeneration
         let accountEpoch = accountGeneration
         let relayURL = stationRelayUrl
+        let context = StationRegistrationContext(socket: generation, account: accountEpoch, origin: relayURL)
+        guard stationRegistration != context, stationRegistrationPending == nil else { return }
+        stationRegistrationPending = context
+        let auth = accountAuth
         Task { [weak self] in
             guard let self else { return }
             do {
-                let token = try await accountAuth.accessToken(relayURL: relayURL)
+                let token = try await auth.accessToken(relayURL: relayURL)
+                guard try await auth.current()?.session.subject == owner else { throw AccountLoginError.changed }
                 let rawLabel = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
                 let label = DeviceAuthentication.deviceLabel(rawLabel)
                 guard let text = RelayIdentityProtocol.registerAccountMessage(
                     accessToken: token,
                     label: label
-                ) else { return }
+                ) else { throw AccountLoginError.invalidResponse }
                 await MainActor.run {
                     guard self.identityRelaySocketGeneration == generation, self.accountGeneration == accountEpoch,
-                          self.stationRelayUrl == relayURL, self.identityRelayVerified else { return }
+                          self.stationRelayUrl == relayURL, self.identityRelayVerified,
+                          self.signedInAccount == owner, self.stationRegistrationPending == context else { return }
                     self.sendRelayIdentityControl(text, label: "relayRegisterAccount")
                 }
             } catch {
@@ -3026,11 +3133,24 @@ class AstationHubManager: ObservableObject {
                 await MainActor.run {
                     guard self.identityRelaySocketGeneration == generation, self.accountGeneration == accountEpoch,
                           self.stationRelayUrl == relayURL else { return }
+                    self.stationRegistrationPending = nil
+                    self.finishStationRegistration(.failure(error))
                     self.relayAccountStatusMessage = error.localizedDescription
                     NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
                 }
             }
         }
+    }
+
+    private func finishStationRegistration(_ result: Result<Void, Error>) {
+        let waiters = stationRegistrationWaiters
+        stationRegistrationWaiters.removeAll()
+        for waiter in waiters.values { waiter.resume(with: result) }
+    }
+
+    private func invalidateStationRegistration() {
+        stationRegistration = nil; stationRegistrationPending = nil
+        finishStationRegistration(.failure(AccountLoginError.changed))
     }
 
     private func showMergeApproval(_ approval: RelayMergeApproval) {

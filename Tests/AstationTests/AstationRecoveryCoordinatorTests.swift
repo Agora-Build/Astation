@@ -43,6 +43,7 @@ private actor RecoveryMemoryRelay: RemoteRecoveryTransport {
     var loseUploadReply = false
     var hostOnline = false
     var nextEntries: [String]?
+    var entriesUnavailable = false
     let hostKey = Curve25519.Signing.PrivateKey()
 
     func dropNextAppendReply() { loseAppendReply = true }
@@ -50,8 +51,10 @@ private actor RecoveryMemoryRelay: RemoteRecoveryTransport {
     func setHostOnline(_ value: Bool) { hostOnline = value }
     func hostPublicKey() -> Data { hostKey.publicKey.rawRepresentation }
     func injectNextEntries(_ entries: [String]) { nextEntries = entries }
+    func setEntriesUnavailable(_ value: Bool) { entriesUnavailable = value }
 
     func entries(genesisHash: String, after: UInt64) async throws -> RemoteRecoveryLogPage {
+        if entriesUnavailable { throw RemoteRecoveryTransportError.unavailable }
         let log = try XCTUnwrap(log)
         XCTAssertEqual(log.genesisHash(), genesisHash)
         let page = nextEntries ?? log.entriesAfter(seq: after)
@@ -145,9 +148,9 @@ private final class RecoveryCoordinatorHarness {
     var save = true
     var ownerConfirmation: ((SignRequest) async throws -> Bool)?
 
-    func coordinator() throws -> AstationRecoveryCoordinator {
+    func coordinator(relayURL: String = "https://configured.example") throws -> AstationRecoveryCoordinator {
         try AstationRecoveryCoordinator(accountID: "account-a", managerID: "manager-a", identity: identity,
-            relayURL: "https://configured.example", store: store, transport: relay, dataKeys: keys,
+            relayURL: relayURL, store: store, transport: relay, dataKeys: keys,
             allowNewDataKey: { true }, confirmOwner: { [unowned self] request in
                 ownerRequests.append(request)
                 if let ownerConfirmation {
@@ -164,6 +167,69 @@ private final class RecoveryCoordinatorHarness {
 
 @MainActor
 final class AstationRecoveryCoordinatorTests: XCTestCase {
+    func testAccountSecurityRequiresExplicitSetupAndSavedKit() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let coordinator = try h.coordinator()
+        XCTAssertFalse(try coordinator.securitySetupComplete)
+        do { _ = try await coordinator.serviceMembership(); XCTFail("uninitialized account admitted a service") }
+        catch { XCTAssertTrue(h.ownerRequests.isEmpty); XCTAssertTrue(h.savedKits.isEmpty) }
+        h.save = false
+        do { _ = try await coordinator.setup(); XCTFail("unsaved kit completed setup") }
+        catch { XCTAssertFalse(try coordinator.securitySetupComplete) }
+        h.save = true
+        _ = try await coordinator.setup()
+        XCTAssertTrue(try coordinator.securitySetupComplete)
+        let entries = try await coordinator.serviceMembership().entries()
+        XCTAssertFalse(entries.isEmpty)
+    }
+
+    func testResumedSetupAndLaterExportsUseVerifiedConfiguredRelay() async throws {
+        let h = RecoveryCoordinatorHarness()
+        h.save = false
+        do { _ = try await h.coordinator().setup(); XCTFail("unsaved kit completed setup") }
+        catch { XCTAssertEqual(error.localizedDescription, AtemIdentityError.recoveryNotSaved.localizedDescription) }
+        let original = try RemoteRecoveryKit(text: XCTUnwrap(h.savedKits.first))
+        let previousBootstrap = try XCTUnwrap(checkpoint(h.store)["bootstrap"] as? Data)
+        h.save = true
+        let relay = "https://new-station.example"
+        let resumed = try await h.coordinator(relayURL: relay).setup()
+        let saved = try RemoteRecoveryKit(text: XCTUnwrap(h.savedKits.last))
+        XCTAssertEqual(resumed.relayURL, relay)
+        XCTAssertEqual(saved, resumed)
+        XCTAssertEqual(resumed.genesisHash, original.genesisHash)
+        XCTAssertEqual(resumed.recoveryKey, original.recoveryKey)
+        XCTAssertEqual(resumed.text().replacingOccurrences(of: relay, with: original.relayURL), original.text())
+        XCTAssertEqual(h.ownerRequests.filter { $0.purpose == .genesis }.count, 1)
+        let before = try XCTUnwrap(PropertyListSerialization.propertyList(from: previousBootstrap, format: nil) as? [String: Any])
+        let current = try XCTUnwrap(checkpoint(h.store)["bootstrap"] as? Data)
+        let after = try XCTUnwrap(PropertyListSerialization.propertyList(from: current, format: nil) as? [String: Any])
+        XCTAssertEqual(before["body"] as? String, after["body"] as? String)
+        XCTAssertEqual(before["entry"] as? String, after["entry"] as? String)
+        XCTAssertEqual(after["relayURL"] as? String, original.relayURL)
+        let exported = try await h.coordinator(relayURL: "https://third-station.example").exportedKit()
+        XCTAssertEqual(exported.relayURL, "https://third-station.example")
+        XCTAssertEqual(exported.genesisHash, original.genesisHash)
+        XCTAssertEqual(h.savedKits.count, 2, "Exporting a routing hint must not create another kit-saving acknowledgment")
+    }
+
+    func testRelayHintIsNotExportedWhenConfiguredStationCannotConfirmHistory() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let original = try await h.coordinator().setup()
+        let bootstrap = try XCTUnwrap(checkpoint(h.store)["bootstrap"] as? Data)
+        let approvals = h.ownerRequests.count
+        await h.relay.setEntriesUnavailable(true)
+        do {
+            _ = try await h.coordinator(relayURL: "https://unavailable-station.example").exportedKit()
+            XCTFail("unavailable Station was exported as the recovery destination")
+        } catch { XCTAssertTrue(error is RemoteRecoveryTransportError) }
+        XCTAssertEqual(h.savedKits.count, 1)
+        XCTAssertEqual(h.ownerRequests.count, approvals)
+        XCTAssertEqual(try checkpoint(h.store)["bootstrap"] as? Data, bootstrap)
+        await h.relay.setEntriesUnavailable(false)
+        let retried = try await h.coordinator().exportedKit()
+        XCTAssertEqual(retried, original)
+    }
+
     private func service(_ coordinator: AstationRecoveryCoordinator) async throws -> RemoteServiceApproval {
         let log = try await coordinator.serviceMembership()
         let time = AstationRecoveryCoordinator.clock()

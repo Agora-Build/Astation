@@ -219,7 +219,7 @@ final class AstationRecoveryCoordinator {
                 try requireManager(log)
                 if backupCurrentKeys { try await finishBackup() }
             }
-            return kit
+            return try kit.replacingRelayURL(relayURL)
         }
         var value = try loadBootstrap()
         if value == nil {
@@ -248,15 +248,16 @@ final class AstationRecoveryCoordinator {
         if saved.entries.isEmpty {
             try commitLog(operation.committedLog(now: now()))
         }
-        let kit = try operation.kit(now: now())
-        let currentLog = try await refreshedLog(genesis: kit.genesisHash)
+        let originalKit = try operation.kit(now: now())
+        let currentLog = try await refreshedLog(genesis: originalKit.genesisHash)
         guard currentLog.recoveryKey() == (try operation.committedLog(now: now())).recoveryKey() else {
             throw RemoteRecoveryError.kitNotCurrent
         }
+        let kit = try originalKit.replacingRelayURL(relayURL)
         if !operation.recoveryIsSaved {
             let accepted = await saveKit(kit.text())
             guard accepted else { throw AtemIdentityError.recoveryNotSaved }
-            try operation.markKitSaved(kit, now: now())
+            try operation.markKitSaved(originalKit, now: now())
         }
         try identity.markRecoverySaved(signingPublicKey: identity.remotePublicKeys().signing)
         if backupCurrentKeys { try await finishBackup() }
@@ -278,6 +279,14 @@ final class AstationRecoveryCoordinator {
 
     func exportedKit() async throws -> RemoteRecoveryKit {
         try await setup()
+    }
+
+    var securitySetupComplete: Bool {
+        get throws {
+            guard !saved.entries.isEmpty else { return false }
+            if saved.restoreKit != nil { return true }
+            return try loadBootstrap()?.recoveryIsSaved == true
+        }
     }
 
     func pairingKeys(nonce: Data) async throws -> AtemVerifyKeys {

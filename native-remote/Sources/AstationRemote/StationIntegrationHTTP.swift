@@ -1,6 +1,14 @@
 import AtemClient
 import Foundation
 
+public enum StationIntegrationError: Error, LocalizedError {
+    case hostSelectionRequired
+
+    public var errorDescription: String? {
+        "Select at least one verified Atem host before reviewing access."
+    }
+}
+
 /// The response is untrusted until RemoteServiceApproval verifies the body on
 /// the native account's independently anchored membership log.
 public struct StationServiceDraft: Decodable, Sendable {
@@ -29,8 +37,9 @@ public struct StationIntegrationHTTP: Sendable {
         log: MembershipLog, managerID: String, hosts: [String], sessions: [String]?, projects: [String]?,
         signedAt: UInt64) async throws -> StationServiceDraft {
         guard record.stationOrigin == origin, record.role == "owner", record.state == "awaiting_approval",
-              PortalIntegrationRecord.validID(record.id), !hosts.isEmpty,
+              PortalIntegrationRecord.validID(record.id),
               hosts.count <= 64, Set(hosts).count == hosts.count else { throw AccountLoginError.changed }
+        guard !hosts.isEmpty else { throw StationIntegrationError.hostSelectionRequired }
         var body: [String: Any] = ["genesisHash": log.genesisHash(), "managerId": managerID,
             "expectedHead": ["seq": log.head().seq, "hash": log.head().hash], "signedAt": signedAt, "hosts": hosts]
         if let sessions { body["sessions"] = sessions }

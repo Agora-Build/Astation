@@ -353,6 +353,12 @@ final class RemoteRecoveryKitTests: XCTestCase {
         XCTAssertEqual(moved.genesisHash, kit.genesisHash)
         XCTAssertEqual(moved.handle.kitTag(), kit.handle.kitTag())
         XCTAssertEqual(moved.relayURL, "https://other.test/base")
+        XCTAssertEqual(try kit.replacingRelayURL("https://other.test/base///"), moved)
+        XCTAssertEqual(moved.handle.secretR(), kit.handle.secretR())
+        XCTAssertEqual(moved.recoveryKey, kit.recoveryKey)
+        XCTAssertEqual(kit.relayURL, "https://station.agora.build")
+        XCTAssertThrowsError(try kit.replacingRelayURL("https://user:password@other.test"))
+        XCTAssertThrowsError(try kit.replacingRelayURL("https://other.test?token=abc"))
     }
 
     @MainActor

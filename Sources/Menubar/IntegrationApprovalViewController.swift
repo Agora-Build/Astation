@@ -11,6 +11,7 @@ final class IntegrationApprovalViewController: NSViewController {
     private let status = NSTextField(wrappingLabelWithString: "Choose a custom Station in General, then load your integration requests.")
     private let picker = NSPopUpButton()
     private let hosts = NSStackView()
+    private let hostStatus = NSTextField(wrappingLabelWithString: "")
     private let sessions = NSTextField()
     private let projects = NSTextField()
     private let reviewText = NSTextField(wrappingLabelWithString: "")
@@ -18,6 +19,8 @@ final class IntegrationApprovalViewController: NSViewController {
     private let reviewButton = NSButton(title: "Review Access", target: nil, action: nil)
     private let approveButton = NSButton(title: "Approve on This Mac…", target: nil, action: nil)
     private let reviewAgainButton = NSButton(title: "Review Changed Request", target: nil, action: nil)
+    private let setupButton = NSButton(title: "Set Up Account Security…", target: nil, action: nil)
+    private let openSecurity: () -> Void
     private let relayOnlyButton = NSButton(title: "Use Selected Relay Only…", target: nil, action: nil)
     private let relayStatus = NSTextField(wrappingLabelWithString: "")
     private var policySubscription: AnyCancellable?
@@ -32,7 +35,9 @@ final class IntegrationApprovalViewController: NSViewController {
     private var generation = UUID()
     private var contextCurrent: (() -> Bool)?
 
-    init(hub: AstationHubManager) { self.hub = hub; super.init(nibName: nil, bundle: nil) }
+    init(hub: AstationHubManager, openSecurity: @escaping () -> Void = {}) {
+        self.hub = hub; self.openSecurity = openSecurity; super.init(nibName: nil, bundle: nil)
+    }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     override func loadView() {
@@ -42,18 +47,22 @@ final class IntegrationApprovalViewController: NSViewController {
         let intro = NSTextField(wrappingLabelWithString: "Review which agents an integration can use. Approval requires this Mac’s owner authentication.")
         intro.textColor = .secondaryLabelColor
         hosts.orientation = .vertical; hosts.alignment = .leading; hosts.spacing = 6
+        hostStatus.textColor = .secondaryLabelColor
         sessions.placeholderString = "All sessions, or comma-separated session IDs"
         projects.placeholderString = "All projects, or comma-separated h1 project hashes"
         sessions.setAccessibilityLabel("Session restrictions")
         projects.setAccessibilityLabel("Project restrictions")
         reviewText.isSelectable = true
         reviewText.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        picker.setAccessibilityLabel("Integration request")
+        picker.addItem(withTitle: "Load requests to choose an integration")
         status.textColor = .secondaryLabelColor
         let actions = NSStackView(views: [loadButton, reviewButton, approveButton])
         actions.spacing = 10
         relayStatus.textColor = .secondaryLabelColor
-        let stack = NSStackView(views: [title, intro, relayOnlyButton, relayStatus, actions, picker,
-            NSTextField(labelWithString: "Allowed Atem hosts"), hosts, sessions, projects, reviewText, reviewAgainButton, status])
+        let stack = NSStackView(views: [title, intro, relayOnlyButton, relayStatus, actions,
+            NSTextField(labelWithString: "Integration request"), picker,
+            setupButton, NSTextField(labelWithString: "Allowed Atem hosts"), hosts, hostStatus, sessions, projects, reviewText, reviewAgainButton, status])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 14
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.drawsBackground = false
         let document = NSView(); scroll.documentView = document
@@ -69,41 +78,54 @@ final class IntegrationApprovalViewController: NSViewController {
             stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 24),
             stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -24)
         ])
-        for field in [intro, sessions, projects, reviewText, status, relayStatus] {
+        for field in [intro, sessions, projects, reviewText, status, relayStatus, hostStatus] {
             field.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
+        picker.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         picker.target = self; picker.action = #selector(selectionChanged)
         loadButton.target = self; loadButton.action = #selector(loadRequests)
         reviewButton.target = self; reviewButton.action = #selector(reviewAccess)
         approveButton.target = self; approveButton.action = #selector(approveAccess)
         reviewAgainButton.target = self; reviewAgainButton.action = #selector(reviewAgain)
         relayOnlyButton.target = self; relayOnlyButton.action = #selector(changeRelayPolicy)
+        setupButton.target = self; setupButton.action = #selector(setupSecurity)
         policySubscription = hub.$relayOnlyPolicyStatus.sink { [weak self] value in self?.relayStatus.stringValue = value }
         render()
     }
 
     func cancelPending() {
         generation = UUID(); task?.cancel(); task = nil
-        approval = nil; contextCurrent = nil; reviewText.stringValue = ""
+        approval = nil; contextCurrent = nil; log = nil; reviewText.stringValue = ""
         render()
     }
 
     private func render(busy: Bool = false) {
         loadButton.isEnabled = !busy
-        relayOnlyButton.isEnabled = !busy && contextCurrent?() == true
+        relayOnlyButton.isEnabled = !busy && log != nil && contextCurrent?() == true
         relayOnlyButton.title = hub.relayOnlyPolicyRequired ? "Allow Direct Connections…" : "Use Selected Relay Only…"
         picker.isEnabled = !busy && !records.isEmpty && approval == nil
         let pendingSelection = records.indices.contains(picker.indexOfSelectedItem)
             && records[picker.indexOfSelectedItem].state == "awaiting_approval"
-        reviewButton.isEnabled = !busy && pendingSelection && approval == nil && contextCurrent?() == true
+        let canSelectHosts = !busy && log != nil && approval == nil && contextCurrent?() == true
+        let hasSelectedHost = hostButtons.contains { $0.1.state == .on }
+        reviewButton.isEnabled = canSelectHosts && pendingSelection && hasSelectedHost
+        hostStatus.isHidden = log == nil || approval != nil
+        hostStatus.stringValue = hostButtons.isEmpty
+            ? "No verified Atem hosts are enrolled in this account. Pair and verify an Atem host, then load requests again."
+            : "Select at least one host to review access."
+        if hasSelectedHost { hostStatus.isHidden = true }
+        setupButton.isHidden = contextCurrent?() != true || log != nil
+        setupButton.isEnabled = !busy && contextCurrent?() == true
         approveButton.isEnabled = !busy && approval != nil && contextCurrent?() == true
         reviewAgainButton.isHidden = approval == nil
         reviewAgainButton.isEnabled = !busy && approval != nil && contextCurrent?() == true
-        sessions.isEnabled = !busy && approval == nil; projects.isEnabled = sessions.isEnabled
-        for (_, button) in hostButtons { button.isEnabled = sessions.isEnabled }
+        sessions.isEnabled = canSelectHosts && hasSelectedHost; projects.isEnabled = sessions.isEnabled
+        for (_, button) in hostButtons { button.isEnabled = canSelectHosts }
     }
 
     @objc private func selectionChanged() { approval = nil; reviewText.stringValue = ""; render() }
+    @objc private func hostSelectionChanged() { render() }
+    @objc private func setupSecurity() { openSecurity() }
 
     @objc private func changeRelayPolicy() {
         guard contextCurrent?() == true else { return }
@@ -159,20 +181,31 @@ final class IntegrationApprovalViewController: NSViewController {
                 let portal = try PortalIntegrationHTTP(configuration: config, portalOrigin: settings.portalURL,
                     ownerAccount: owner, accessToken: { try await auth.accessToken() })
                 let records = try await portal.owned(stationOrigin: origin)
-                let coordinator = try hub.recoveryCoordinator()
-                let log = try await coordinator.serviceMembership()
                 guard epoch == generation, accountEpoch == hub.integrationAccountGeneration,
                       hub.signedInAccount == owner, hub.stationRelayUrl == origin, !Task.isCancelled else { throw AccountLoginError.changed }
                 contextCurrent = { [weak self, weak hub = self.hub] in
                     self?.generation == epoch && hub?.integrationAccountGeneration == accountEpoch && hub?.signedInAccount == owner
                         && hub?.accountSignInRequired == false && hub?.stationRelayUrl == origin
                 }
-                self.portal = portal; self.coordinator = coordinator; self.log = log
+                self.portal = portal
                 self.records = records.filter { $0.state == "awaiting_approval" || ["provisioning", "waiting_for_host"].contains($0.state) }
                 picker.removeAllItems(); picker.addItems(withTitles: self.records.map { "\($0.name) · \($0.state.replacingOccurrences(of: "_", with: " "))" })
                 for child in hosts.arrangedSubviews { hosts.removeArrangedSubview(child); child.removeFromSuperview() }
+                hostButtons = []
+                try await hub.prepareAccountSecurityAccess()
+                guard contextCurrent?() == true else { throw AccountLoginError.changed }
+                let coordinator = try hub.recoveryCoordinator()
+                self.coordinator = coordinator
+                guard try coordinator.securitySetupComplete else {
+                    status.stringValue = "Requests loaded. Set up account security before reviewing integration access."
+                    render(); return
+                }
+                let log = try await coordinator.serviceMembership()
+                guard contextCurrent?() == true else { throw AccountLoginError.changed }
+                self.log = log
                 hostButtons = try Self.hostIDs(log).map { id in
-                    let button = NSButton(checkboxWithTitle: id, target: nil, action: nil); self.hosts.addArrangedSubview(button)
+                    let button = NSButton(checkboxWithTitle: id, target: self, action: #selector(hostSelectionChanged))
+                    self.hosts.addArrangedSubview(button)
                     return (id, button)
                 }
                 if let saved = try coordinator.pendingServiceApproval() {
@@ -191,6 +224,10 @@ final class IntegrationApprovalViewController: NSViewController {
         guard records.indices.contains(picker.indexOfSelectedItem), let coordinator, let log, let settings = hub.portalSettings,
               let owner = hub.signedInAccount, contextCurrent?() == true else { return }
         let record = records[picker.indexOfSelectedItem], selectedHosts = hostButtons.filter { $0.1.state == .on }.map(\.0)
+        guard !selectedHosts.isEmpty else {
+            status.stringValue = StationIntegrationError.hostSelectionRequired.localizedDescription
+            render(); return
+        }
         let epoch = generation
         render(busy: true)
         task = Task { [weak self] in

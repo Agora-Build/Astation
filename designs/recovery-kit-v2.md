@@ -26,7 +26,45 @@ routing hint, not a signed identity or part of the integrity check. Import uses
 the user's configured relay for authenticated requests; it never sends the
 account token to a URL supplied by the pasted kit.
 
+Setup can resume a checkpoint created before a Station change. Once the
+configured Station has returned history matching the locally pinned log,
+setup and later exports print that Station's address in the Relay field.
+This changes only the routing hint: the recovery secret, integrity check,
+genesis, original checkpoint and signatures are retained. A failed history
+check prevents export; merely editing a Station URL never grants trust or
+migrates relay data. Previously saved files retain their old routing hint
+until the user saves an updated export.
+
 ## Setup and Interrupted Operations
+
+Agora.Build sign-in establishes the account session. Account security setup is
+a separate, explicit operation: it creates this Mac's signed device-list trust
+anchor and saves the Recovery Kit. Settings > Security shows **Set Up Account
+Security** until setup and kit acknowledgment are complete, then **Show
+Recovery Kit**. Integration requests can be listed before setup; reviewing or
+approving their access remains disabled until a verified manager log is ready.
+Merely listing requests must never generate a root or export a recovery secret.
+
+The native UI owns its modeless recovery prompt until acceptance, cancellation
+or window closure, even if the caller discards its cancellation handle. AppKit
+does not retain button targets. A save-sheet cancellation or write failure must
+not acknowledge kit saving; continuing requires the user's explicit saved-kit
+confirmation. Closing the prompt fences late save callbacks. Interrupted setup
+resumes its protected checkpoint without replacing the trust anchor or kit.
+
+The native app uses a separate `astation.remote` grant whose resource is the
+exact selected Station origin. Before setup, it verifies the grant belongs to
+the signed-in Portal owner and waits for this Mac's account-registration
+acknowledgment on the current authenticated relay socket. Changing Station or
+account invalidates that wait and closes the old connection. Timeouts reconnect
+before retrying, so a late acknowledgment cannot authorize a new operation.
+Registration controls storage ownership; it grants no signed membership.
+Account recovery retains its existing HTTPS and loopback Station support;
+the hosted-integration requirement for a custom HTTPS Station is checked
+separately and never relaxes the exact Station token audience or owner check.
+An HTTP 403 for an unregistered creator or missing scope is reported separately
+from an expired/absent login. Interrupted setup keeps its original checkpoint,
+signature and trust anchor.
 
 Generate the recovery secret and prepare the genesis body in protected
 storage before requesting fresh owner confirmation of that exact body. Store

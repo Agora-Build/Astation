@@ -109,6 +109,26 @@ private final class PublicationFixture {
 
 final class RemoteMembershipPublicationTests: XCTestCase {
     @MainActor
+    func testUnselectedHostIsExplainedBeforeTokenAccessOrProvisioning() async throws {
+        let f = try PublicationFixture(), approval = try serviceApproval(f)
+        let transport = IntegrationApprovalTestHTTP()
+        let client = try StationIntegrationHTTP(origin: approval.stationOrigin, http: transport,
+            accessToken: { XCTFail("Selecting a host must precede token access"); throw AccountLoginError.unavailable })
+        let record = try JSONDecoder().decode(PortalIntegrationRecord.self, from: JSONSerialization.data(withJSONObject: [
+            "id": approval.integrationID, "name": "Test integration", "stationOrigin": approval.stationOrigin,
+            "state": "awaiting_approval", "scopes": ["agent.view"], "expiresAt": "2099-01-01T00:00:00Z", "role": "owner"]))
+        do {
+            _ = try await client.prepare(record: record, ownerAccount: approval.ownerAccount, issuer: approval.issuer,
+                log: f.log, managerID: "manager-a", hosts: [], sessions: nil, projects: nil, signedAt: f.clock.wallMs)
+            XCTFail("An integration must have an explicitly selected host")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "Select at least one verified Atem host before reviewing access.")
+        }
+        let count = await transport.count()
+        XCTAssertEqual(count, 0)
+    }
+
+    @MainActor
     func testStationDraftTransportBindsOwnerRootOriginAndExactReviewedScope() async throws {
         let f = try PublicationFixture(), approval = try serviceApproval(f)
         let transport = IntegrationApprovalTestHTTP()

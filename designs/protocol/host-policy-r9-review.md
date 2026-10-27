@@ -9,6 +9,33 @@ This is not release approval for the complete R9 stack or hosted execution.
 The published binding suite does not exercise policy operations against its
 test host; native binding and actual-host verification remain release gates.
 
+## Shared service test scenarios
+
+Reviewed `tests/r9_services_binary.rs` and the contract at #98's immutable
+`04140840fc0cec4086072ab6326b7a1b46b25be4`. The following six existing
+runtime scenarios are accepted as coverage to promote into shared fixtures:
+
+1. Approval delivery and lease-free answers require the service's exact
+   `approval` operation; a service's seen event cannot sign a native push ACK.
+2. Host and session restrictions prevent admission or hide out-of-scope
+   sessions, including receipt queries.
+3. Renewal and narrowing fence the existing service channel, requiring fresh
+   admission under the new scope and expiry.
+4. Native browser-grant revocation fences that browser while an independent
+   service remains usable.
+5. Project scopes track retained K generations; unknown, foreign and dropped
+   generations cannot match. The test's hash-table hook is test-only.
+6. A service cannot reconcile a held host; reconciliation requires the
+   managing native device.
+
+This accepts the test coverage without changing wire formats or granting new
+authority. The additional seventh test recording service-initiated browser
+grant revocation is outside this acceptance and does not close the existing
+browser-companion security review. Exact shared JSON fixtures and their
+cross-platform execution still require review once published. Fixture
+promotion does not block preparing the disposable host or adding the binding
+policy tests. No main merge or hosted-execution release is approved here.
+
 ## Invariants
 
 - Only a verified native manager sends policy operations, inside an admitted

@@ -81,6 +81,24 @@ final class RemoteRecoveryHTTPTests: XCTestCase {
         }
     }
 
+    func testForbiddenRepliesDistinguishRegistrationScopeAndAccountAccess() async throws {
+        let cases: [(String, String)] = [
+            ("recovery_creator_not_registered", RemoteRecoveryTransportError.registrationRequired.localizedDescription),
+            ("insufficient_scope", RemoteRecoveryTransportError.permissionRequired.localizedDescription),
+            ("wrong_account", RemoteRecoveryTransportError.accessDenied.localizedDescription)
+        ]
+        for (code, message) in cases {
+            let (http, host) = try transport { _ in (403, Data("{\"error\":{\"code\":\"\(code)\"}}".utf8)) }
+            defer { RecoveryHTTPStub.remove(host: host) }
+            do { _ = try await http.entries(genesisHash: genesis, after: 0); XCTFail("accepted forbidden response") }
+            catch { XCTAssertEqual(error.localizedDescription, message) }
+        }
+        let (http, host) = try transport { _ in (403, Data(repeating: 0x20, count: 16_385)) }
+        defer { RecoveryHTTPStub.remove(host: host) }
+        do { _ = try await http.entries(genesisHash: genesis, after: 0); XCTFail("accepted oversized refusal") }
+        catch { XCTAssertEqual(error.localizedDescription, RemoteRecoveryTransportError.invalidResponse.localizedDescription) }
+    }
+
     func testInsecureOriginsAreRefusedBeforeTokenProviderCanRun() {
         for url in ["http://relay.example", "ws://relay.example", "https://user@relay.example", "https://relay.example?token=x"] {
             XCTAssertThrowsError(try RemoteRecoveryHTTP(relayURL: url, accessToken: {
