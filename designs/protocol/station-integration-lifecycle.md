@@ -147,155 +147,102 @@ prompts/approvals/receipts/events APIs. The HTTP API and its limits are in
 
 Activation still requires actual native custom-resource Auth issuance, owner
 confirmation and persistence, a pinned/released host, selected-relay-only
-authenticated, same-generation stored-policy ACKs, real-agent admission/execution and
+authenticated, correlated durable policy confirmations, real-agent admission/execution and
 revocation, reconnect, Mac-off and replica tests. Controlled cryptographic
 host tests and test tokens do not satisfy this live gate. There is no
 runtime environment switch to bypass it.
 
-The two Atem #96 review findings are addressed by merged
-[Atem #97](https://github.com/Agora-Build/Atem/pull/97), `8815bf766ef515f2d72eced75d47aa5b92d47789`.
-The source adds a polled writer-receipt barrier on immediate and deferred
-close, a five-second bound, link-generation fencing and fail-closed reads
-independent of config.toml. Focused paused-writer/save-failure/real-runtime
-restart tests and successful CI `40170347648` were reviewed, without building
-or changing an Atem checkout. The previous findings do not remain unresolved
-code objections. They still require a released or explicitly pinned host and
-joint live verification before selected-relay-only activation. A further
-trust-boundary review found that the policy and ACK travel outside `atem-ch1`.
-[Atem #99](https://github.com/Agora-Build/Atem/issues/99) tracks the required
-authenticated exchange. Until that contract and implementation are available,
-no outer ACK establishes activation readiness, including `stored:true` with
-the expected value on the current pairing-authenticated connection.
+The two Atem #96 findings were addressed by merged
+[Atem #97](https://github.com/Agora-Build/Atem/pull/97), `8815bf7`: the bounded
+writer-receipt barrier and fail-closed policy reads remain part of the host.
+A subsequent review found that the outer policy ACK was forgeable by the
+relay. [Atem #99](https://github.com/Agora-Build/Atem/issues/99) is answered by
+PR #100 at `ed0b45bad5db0a278c63efe8a464f12d4d548465`. Astation accepts R9.8a
+for integration and consumes that exact shared Rust/Apple client pin. The
+format review has no remaining critical objection; binding E2E and disposable
+actual-host verification are still release obligations.
 
 ### Native transport-policy reconciliation
 
-The previous revision described native ACK enforcement before it was wired.
-The native controller now persists the desired account/issuer/selected-Station
-policy and complete verified host set before sending any change. No saved
-policy means no automatic `false`: another controller's host policy must not
-be cleared merely by opening Astation. A storage fault blocks admission until
-the checkpoint can be reloaded.
+The native controller saves account, issuer, selected Station and the complete
+reviewed host set before sending. No saved policy means no automatic `false`:
+opening Astation cannot clear another manager's policy. Storage faults block
+admission until reloaded.
 
-Each pending request captures the authenticated device and local verification
-key pin, pairing session, connection and transport generation before dispatch.
-Only the expected value with `stored:true` on that same current context,
-before its monotonic deadline, is recorded as a host routing report. This
-report is unverified: TLS terminates at the relay, which can forge the outer
-message even when the device is locally pinned. Host refusal, timeout,
-disconnect, account change and reconnect remove the report. Reauthentication
-sends the durable desired value again.
-An opposite policy change reconnects an already-used transport before resending:
-the existing wire has no request ID, so a true/false/true change on one socket
-would make an old true ACK indistinguishable from a new one.
+A dedicated policy channel uses the same R9 connection/router/shared verifier
+as normal agent channels, but sends only host-policy operations. Each fresh
+attachment reads current policy first. Before a mutation is sent, the journal
+saves its UUID, original expected revision, desired value and account/root/host/
+manager/trust binding. Reconnect retries that exact mutation with fresh wire
+correlation; it never converts a retry into a new decision. A superseded result
+or another manager's conflicting change requires explicit review and apply.
+Uncertain writes are polled within a 15-second monotonic attempt deadline.
 
-While relay-only is desired, direct agent channels are denied immediately;
-the shared listener and credential protocol remain available to complete
-policy migration. A direct ACK never establishes relay readiness. Reports
-from every host in the verified membership are tracked on the current
-selected relay; offline hosts remain pending. Even a complete set of these
-reports cannot enable activation. The agreed replacement must authenticate
-the authorized native manager and the exact host/account/current channel,
-echo a fresh request ID or challenge only after durable save, and reject
-unsigned overwrites and replay. Signed membership and the authenticated R9
-host channel alone do not authenticate an outer ACK. Hosted execution remains
-hard disabled during this work.
+Only the shared core's current, bound, durable confirmation can mark a host
+ready. The native adapter also checks the current account, issuer, selected
+Station, device pin, pairing/link generation, membership head and attachment.
+Changed membership is verified before reconnecting. Readiness is never restored
+from disk. Every reviewed host must confirm on the selected relay; offline or
+new unreviewed hosts keep readiness false. Plaintext policy/ACK codecs and
+handlers are removed entirely.
 
-The desired policy shares the existing durable session security journal.
-Version 2 retains version-1 receipts and trust floors on load; writes use
-version 2 so older journal readers fail closed instead of silently dropping
-transport policy. ACKs themselves are never restored as live confirmation.
-Settings > Integrations exposes an explicit relay-only request and a separate
-allow-direct action, with confirmation. Neither action enables integrations.
+Saving relay-only intent immediately blocks direct terminal/chat/session
+operations. An existing direct link may perform the restricted encrypted
+migration, then closes on confirmation, refusal, conflict, save failure or
+bounded timeout without deleting its pairing. A direct confirmation never
+counts as relay readiness. Journal version 3 retains version-1/2 receipts and
+trust floors; old readers fail closed instead of dropping mutation identity. Settings >
+Integrations exposes explicit relay-only and allow-direct actions.
 
-Hosted execution, Discord, MCP and LLM admission remain disabled. No live
-account/trust migration, app replacement, main merge or deploy occurs here.
+Native approval can publish reviewed service membership while a host is offline;
+that publication does not enable execution. The production gate also prevents
+Ready reports. Before opening it, verify actual encrypted policy and service
+admission, revocation/reconnect, Mac-off and replicas; native cached readiness
+is not Station authority. See the [review and security invariants](host-policy-r9-review.md).
 
-## Validation of this increment
+## Verification status (2026-10-27)
 
-Local validation on 2026-10-25:
+Personal provisioning is resolved after Xcode reauthentication, using the
+existing personal team and bundle. The renewed profile expires
+**2026-11-02 23:59:57 UTC**. The signed bundle in the task worktree passes strict
+signature and bundled-resource checks; the canonical running app is retained.
+No protected identity test is excluded. Secure Enclave signing, protected
+identity/recovery-pin reload, migration journal restart/commit, storage-key
+escrow and protected refresh/project/credential storage all pass.
 
-- Relay: 545 regular tests pass; 130 environment cases are not selected in
-  that run. All 65 explicitly selected isolated Postgres cases pass with
-  zero skips, including real encrypted service-channel and WebSocket adapter
-  traffic, policy denial, same-key renewal, rich history and fleet polling.
-- Native library: 138 tests, one optional OIDC environment skip, no failures.
-  App recovery coordinator: 25 tests, no failures, including uncertain relay/
-  Portal replies, restart without re-signing, account change during owner
-  confirmation and an anchored competing head.
-- App build and production Rust check pass. The verified prebuilt Apple
-  dependency passes its 19 production consumer checks.
-- Full unsigned app run: 1013 tests, 14 skips, four failures. Three protected
-  identity tests cannot create Secure Enclave keys in this unsigned process;
-  the existing caption-scroll test fails its scroll-position assertion on
-  this Mac. Excluding exactly those four cases: 1009 tests, 14 skips, no
-  failures. These exclusions are verification gaps, not passing evidence.
-- The saved personal provisioning profile expired on 2026-10-24. An isolated
-  signing refresh attempt fails because Xcode cannot load account credentials
-  (`No Accounts` / no matching profile). No app is replaced or relaunched.
+Latest R9.8a integration checks:
 
-Previous d566cd7 CI is green (40173354182), but is not validation of this new
-increment. Real owner authentication and real Auth/custom-Station issuance,
-host execution, Mac-off and replica admission remain release gates.
+- **1,032 provisioned app tests, six environment skips, zero failures**, with
+  `ASTATION_REQUIRE_KEYCHAIN_TESTS=1` and no exclusions. The skips concern live
+  speech/polishing/screen capture or an unavailable-model branch on this Mac.
+- **43 focused native policy/Hub tests, zero skips/failures**, including durable
+  intent/mutation identity, uncertain writes, duplicates and late replies,
+  reconnect, another manager's decision, stale/revoked/re-paired bindings,
+  offline hosts and direct migration failure/timeout without losing pairing.
+- **139 native library tests, one optional OIDC environment skip, zero failures**,
+  plus **23 production Apple consumer assertions**. The published artifact's
+  outer digest, payload digests and clean immutable source metadata are verified.
+- **42 focused Rust tests, zero failures or ignored cases**, exercising hosted
+  HTTP/WebSocket APIs, provisioning, Portal/feed clients, service keys, OIDC and
+  integration authorization against isolated Postgres on the same shared pin.
+  The headless API uses a controlled encrypted R9 host, not an actual coding
+  agent, and does not stand in for native owner consent.
 
-## 2026-10-26 verification follow-up
+Earlier full CI on implementation `d061429` passed: macOS/relay/web jobs, 545
+regular relay tests, all 65 Postgres, 65 Redis and eight load-client cases.
+That run is historical evidence; CI must run on the new pushed implementation.
 
-- Implemented native policy sending/reconciliation, direct-agent gating and
-  explicit Settings controls described above. Fifteen new policy tests cover
-  actual wire decoding, persistence/restart, save faults, exact deadlines,
-  wrong/refused/duplicate ACKs, account/pairing/generation/key-pin changes,
-  offline hosts, unknown hosts, rapid true/false/true changes, and a forged
-  matching outer ACK that cannot satisfy activation readiness. Two additional
-  Hub tests exercise authenticated relay sends/reconnects and direct-channel
-  migration without removing the pairing.
-- Full app test run: **1,026 tests, 14 skips, zero failures**, excluding exactly
-  the three previously failing protected identity tests
-  `testRealProtectedIdentityReloadsRecoveryPinsAndEpochs`,
-  `testRealSecureEnclaveMaterialSealsEncryptionKeyAndSigns` and
-  `testRealProtectedMigrationJournalRecoversAndCommitsOnceAfterIdentityReload`.
-  These excluded cases remain unverified. The caption-scroll test passes in
-  this run. After the relay trust-boundary correction, all 41 selected policy/Hub
-  tests pass with zero skips/failures. The app builds successfully.
-- Retried automatic personal-team provisioning in a fresh DerivedData directory.
-  The development certificate is valid, but renewal still exits 65 with
-  `No Accounts` and no matching Mac App Development profile. The user's personal
-  Xcode sign-in is required before protected tests can run. No existing signed
-  app was replaced or relaunched.
-- The installed local Atem reports session r8 and is unsuitable as r9 host
-  evidence. A disposable fixing host/session and registered custom Station
-  are requested from the Atem/Portal agents through #81 and the shared vaults.
-  No production pairing/profile or credential agent was changed.
-- Hosted execution remains hard disabled. The real native/host execution,
-  revocation/reconnect, policy persistence, Mac-off and replica matrix has
-  **not run** in this follow-up.
+The isolated custom Station is registered on dev. Its actual background worker
+obtained an Auth report token and consumed the authenticated Portal feed,
+persisting cursor/revision 1 with denial false. Public health returns 200 and
+unauthenticated details returns 401. These are real Auth/Portal/Station results;
+no integration or native approval is inferred from registration.
 
-## Personal signing renewed after account reauthentication
-
-After the user signed back into the personal Xcode account on 2026-10-26,
-automatic provisioning succeeded with the existing team and bundle identity.
-The renewed profile expires **2026-11-02 23:59:57 UTC**. The Data Protection
-Keychain probe succeeds, and the signed application passes strict bundle
-verification and all four bundled-resource checks.
-
-Running `scripts/verify-local-signing.sh` without exclusions against application
-source `d061429` passes **1,030 tests, six skips, zero failures** in the
-provisioned XCTest host. `ASTATION_REQUIRE_KEYCHAIN_TESTS=1` is set. All formerly
-blocked identity tests pass, including Secure Enclave signing, protected
-identity/recovery-pin reload, migration journal commit after restart, and
-storage-key escrow/unlock/replay rejection. Protected account-refresh and project
-cache storage, credential isolation/accessibility, and the V2 recovery checkpoint
-and signing tests also pass. The six skips concern optional live speech,
-polishing, screen capture, or the unavailable-model case on this model-capable
-Mac; no protected identity/storage test is skipped.
-
-CI `40389868125` also passes on `d061429`: macOS, relay and web jobs succeed.
-Downloaded logs establish 1,030 app tests/15 skips, 138 native tests/one optional
-skip, 545 regular relay passes/130 environment cases not selected, and all
-65 explicit Postgres, 65 Redis and eight load-client cases passing.
-
-The newly signed bundle is built in the task worktree; the existing running
-canonical app is retained. Protected storage and cryptographic signing are now
-verified locally. Actual native PKCE/user owner approval/service enrollment,
-actual-host execution/revocation/reconnect, authenticated policy ACKs (Atem #99),
-Mac-off and replica admission remain live gates. Hosted execution stays hard
-disabled. No account trust or pairing reset, credential-agent restart, Atem
-checkout change, main merge or deployment is performed.
+Remaining live handoffs: Portal supplies the awaiting-approval integration ID
+([Portal #20](https://github.com/Agora-Build/Portal/issues/20)); Atem supplies a
+disposable actual host on the agreed policy lineage and completes binding E2E.
+Then run native PKCE/owner approval, protected service enrollment, actual agent
+execution, policy durability, revocation/reconnect, Mac-off and replica checks.
+Hosted execution remains hard disabled without an override. No production
+trust reset, credential-agent restart, Atem checkout edit/build, canonical app
+replacement or production merge/deploy is part of this verification.

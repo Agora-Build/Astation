@@ -147,7 +147,6 @@ class AstationHubManager: ObservableObject {
     private let migrationContextLock = NSLock()
     private var directMigrationContexts: [String: MigrationContext] = [:]
     private var directSessionContexts: [String: AtemSessionContext] = [:]
-    private var directTransportPolicyContexts: [String: AtemTransportPolicyContext] = [:]
     let atemE2EIdentity: AtemE2EIdentity
     @MainActor private var accountRecovery: AstationRecoveryCoordinator?
     @MainActor private var approvalPushHints: RemotePushHints?
@@ -280,14 +279,14 @@ class AstationHubManager: ObservableObject {
     var sessionsRemovedHandler: (([String]) -> Void)?
     private var nativeSessionClients: [String: AtemSessionClient] = [:]
     @MainActor private var r9Connections: [String: AstationR9Connection] = [:]
+    @MainActor private var policyR9Connections: [String: AstationR9Connection] = [:]
     @MainActor private var r9Signer: AstationChannelSigner?
     private var sessionTimer: Timer?
     private let sessionJournal: AtemSessionJournal
     private lazy var transportPolicy = AtemTransportPolicyController(journal: sessionJournal,
         current: { [weak self] context in self?.transportPolicyContext(for: context.route.clientId) == context },
-        send: { [weak self] value, context in
-            self?.sendMessage(.transportPolicy(relayOnly: value), to: context.route.clientId,
-                expectedRelayConnectionId: context.isRelay ? context.route.connectionId : nil)
+        send: { [weak self] operation, context in
+            MainActor.assumeIsolated { self?.policyR9Connections[context.route.clientId]?.sendPolicy(operation) }
         }, reconnect: { [weak self] context in
             guard let self, self.transportPolicyContext(for: context.route.clientId) == context else { return }
             if context.isRelay { self.pauseIdentityRelay(); self.startIdentityRelay() }
@@ -891,7 +890,10 @@ class AstationHubManager: ObservableObject {
               portalSettings?.issuer == issuer, signedInAccount == owner, !accountSignInRequired else { throw AccountLoginError.changed }
         let policy = AtemTransportPolicyRecord(account: account, issuer: issuer, station: station,
             relayOnly: required, hosts: Set(hosts).filter { log.host(hostId: $0) != nil }.sorted())
-        defer { updateTransportPolicyPresentation(); refreshSessionConnections(); refreshDirectMigrationContexts() }
+        defer {
+            updateTransportPolicyPresentation(); refreshSessionConnections(); refreshDirectMigrationContexts()
+            for client in connectedClients { reconcileTransportPolicy(clientID: client.id) }
+        }
         try transportPolicy.set(policy, connections: connectedClients.compactMap { transportPolicyContext(for: $0.id) })
     }
 
@@ -909,8 +911,8 @@ class AstationHubManager: ObservableObject {
         if relayOnlyPolicyStatus != status { relayOnlyPolicyStatus = status }
     }
 
-    private func transportPolicyContext(for clientID: String) -> AtemTransportPolicyContext? {
-        guard let issuer = portalSettings?.issuer,
+    private func transportPolicyContext(for clientID: String, includeBinding: Bool = true) -> AtemTransportPolicyContext? {
+        guard !systemIsSleeping, let issuer = portalSettings?.issuer,
               let client = connectedClients.first(where: { $0.id == clientID && $0.clientType == "Atem" }),
               let sessionID = client.authenticationSessionId,
               let session = deviceSessionStore.get(sessionId: sessionID), session.isValid, session.atemId == client.atemId,
@@ -918,23 +920,13 @@ class AstationHubManager: ObservableObject {
                 relayConnectionId: identityRelayAuthentication.connectionId(for: clientID)) else { return nil }
         return AtemTransportPolicyContext(route: route, account: e2eDataAccount, issuer: issuer, station: stationRelayUrl,
             pairingSession: sessionID, transportGeneration: clientID.hasPrefix("relay-") ? identityRelaySocketGeneration : clientID,
-            verifiedPin: try? atemE2EIdentity.credentialProjectPin(account: e2eDataAccount, deviceId: route.deviceId))
-    }
-
-    private func captureTransportPolicyContext(clientID: String, relayConnectionID: String?) -> AtemTransportPolicyContext? {
-        if Thread.isMainThread {
-            guard let context = transportPolicyContext(for: clientID),
-                  !context.isRelay || context.route.connectionId == relayConnectionID else { return nil }
-            return context
-        }
-        guard !clientID.hasPrefix("relay-"), relayConnectionID == nil else { return nil }
-        migrationContextLock.lock(); defer { migrationContextLock.unlock() }
-        return directTransportPolicyContexts[clientID]
+            verifiedPin: try? atemE2EIdentity.credentialProjectPin(account: e2eDataAccount, deviceId: route.deviceId),
+            binding: includeBinding ? MainActor.assumeIsolated { policyR9Connections[clientID]?.hostPolicyBinding } : nil)
     }
 
     private func reconcileTransportPolicy(clientID: String) {
-        guard let context = transportPolicyContext(for: clientID) else { return }
-        transportPolicy.authenticated(context)
+        guard let context = transportPolicyContext(for: clientID, includeBinding: false) else { return }
+        Task { @MainActor [weak self] in self?.openPolicyR9Channel(context) }
         updateTransportPolicyPresentation()
         if transportPolicyTimer == nil {
             transportPolicyTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
@@ -1042,17 +1034,6 @@ class AstationHubManager: ObservableObject {
         relayConnectionId: String? = nil
     ) -> AstationMessage? {
         switch message {
-        case .transportPolicyAck(let ack):
-            // Capture the authenticated generation before dispatch from a direct socket.
-            guard let context = captureTransportPolicyContext(clientID: clientId, relayConnectionID: relayConnectionId) else { return nil }
-            DispatchQueue.main.async { [weak self] in
-                self?.transportPolicy.receive(ack, context: context)
-                self?.updateTransportPolicyPresentation()
-            }
-            return nil
-        case .transportPolicy:
-            // A host or relay cannot choose this Mac's account transport policy.
-            return nil
         case .projectListRequest:
             Log.info(" Project list requested by client: \(clientId)")
             return .projectListResponse(projects: getProjects(), timestamp: Date())
@@ -1543,6 +1524,12 @@ class AstationHubManager: ObservableObject {
     }
 
     private func refreshSessionConnections() {
+        MainActor.assumeIsolated {
+            for (id, link) in Array(policyR9Connections) where !link.isCurrent {
+                policyR9Connections.removeValue(forKey: id)?.disconnect()
+                transportPolicy.disconnected(clientID: id)
+            }
+        }
         for (id, client) in Array(nativeSessionClients) {
             client.connectionChanged()
             if !connectedClients.contains(where: { $0.id == id }) {
@@ -1688,13 +1675,7 @@ class AstationHubManager: ObservableObject {
                     guard let self, self.sessionContext(for: context.route.clientId) == context else {
                         completion(RemoteChannelError.staleLink); return
                     }
-                    if context.route.clientId.hasPrefix("relay-") {
-                        guard let socket = self.identityRelayTask, self.identityRelayVerified,
-                              let wrapped = try? RemoteRelayEnvelope.wrap(bytes, host: context.device, connection: context.route.connectionId),
-                              let text = String(data: wrapped, encoding: .utf8) else { completion(RemoteChannelError.staleLink); return }
-                        socket.send(.string(text), completionHandler: { completion($0) })
-                    } else if let send = self.sendDirectChannel { send(bytes, context.route.clientId, completion) }
-                    else { completion(RemoteChannelError.staleLink) }
+                    self.writeR9Envelope(bytes, context: context, completion: completion)
                 }, welcomed: { [weak self] welcome in
                     self?.nativeSessionClients[context.route.clientId]?.channelWelcomed(welcome, from: context.route)
                 }, receive: { [weak self] message in
@@ -1710,6 +1691,91 @@ class AstationHubManager: ObservableObject {
         } catch {
             nativeSessionClients[context.route.clientId]?.channelFailed(
                 "r9 account membership is unavailable. Complete recovery setup and verify this Atem with an r9 build.")
+        }
+    }
+
+    @MainActor private func writeR9Envelope(_ bytes: Data, context: AtemSessionContext, completion: @escaping (Error?) -> Void) {
+        if context.route.clientId.hasPrefix("relay-") {
+            guard let socket = identityRelayTask, identityRelayVerified,
+                  identityRelayAuthentication.isAuthenticated(clientId: context.route.clientId, connectionId: context.route.connectionId),
+                  let wrapped = try? RemoteRelayEnvelope.wrap(bytes, host: context.device, connection: context.route.connectionId),
+                  let text = String(data: wrapped, encoding: .utf8) else { completion(RemoteChannelError.staleLink); return }
+            socket.send(.string(text), completionHandler: { completion($0) })
+        } else if let send = sendDirectChannel { send(bytes, context.route.clientId, completion) }
+        else { completion(RemoteChannelError.staleLink) }
+    }
+
+    @MainActor private func openPolicyR9Channel(_ policyContext: AtemTransportPolicyContext) {
+        let id = policyContext.route.clientId
+        guard transportPolicyContext(for: id, includeBinding: false) == policyContext, policyContext.verifiedPin != nil,
+              let intent = transportPolicy.policy(account: policyContext.account, issuer: policyContext.issuer),
+              intent.station == policyContext.station, !sessionJournal.loadFailed else { return }
+        if let previous = policyR9Connections[id], previous.isCurrent {
+            if let ready = transportPolicyContext(for: id) { transportPolicy.authenticated(ready) }
+            return
+        }
+        policyR9Connections.removeValue(forKey: id)?.disconnect()
+        transportPolicy.disconnected(clientID: id)
+        let context = AtemSessionContext(route: RemoteTerminalConnection(clientId: id, connectionId: policyContext.route.connectionId),
+            account: policyContext.account, device: policyContext.route.deviceId, pairingSession: policyContext.pairingSession,
+            transportGeneration: policyContext.transportGeneration)
+        let generation = UUID()
+        do {
+            let coordinator = try recoveryCoordinator(account: context.account)
+            let log = try coordinator.channelMembership(hostID: context.device)
+            if r9Signer == nil { r9Signer = try AstationChannelSigner(identity: atemE2EIdentity, keyID: AstationIdentity.shared.id) }
+            let link = AstationR9Connection(context: context,
+                current: { [weak self] in self?.transportPolicyContext(for: id, includeBinding: false) == policyContext },
+                write: { [weak self] bytes, completion in
+                    guard let self, self.transportPolicyContext(for: id, includeBinding: false) == policyContext else {
+                        completion(RemoteChannelError.staleLink); return
+                    }
+                    self.writeR9Envelope(bytes, context: context, completion: completion)
+                }, welcomed: { _ in }, receive: { _ in }, failed: { [weak self] message, _ in
+                    guard let self, self.policyR9Connections[id]?.generation == generation else { return }
+                    self.transportPolicy.disconnected(clientID: id)
+                    self.updateTransportPolicyPresentation()
+                    Log.warn("[AstationHub] Encrypted host policy channel closed: \(message)")
+                    if !policyContext.isRelay && self.transportPolicy.blocksDirect(account: policyContext.account, issuer: policyContext.issuer) {
+                        self.disconnectDirectClient?(id); self.removeClient(withId: id)
+                    }
+                }, refreshMembership: { [weak self] head in
+                    Task { @MainActor in
+                        guard let self, self.policyR9Connections[id]?.generation == generation else { return }
+                        do {
+                            try await coordinator.refreshChannelMembership(hostID: context.device, requiredHead: head)
+                            guard self.policyR9Connections[id]?.generation == generation else { return }
+                            self.policyR9Connections.removeValue(forKey: id)?.disconnect()
+                            self.openPolicyR9Channel(policyContext)
+                        } catch { self.updateTransportPolicyPresentation() }
+                    }
+                }, policyWelcomed: { [weak self] in
+                    guard let self, self.policyR9Connections[id]?.generation == generation,
+                          let ready = self.transportPolicyContext(for: id) else { return }
+                    self.transportPolicy.authenticated(ready)
+                    self.updateTransportPolicyPresentation()
+                }, policyEvent: { [weak self] event, confirmed in
+                    guard let self, self.policyR9Connections[id]?.generation == generation,
+                          let ready = self.transportPolicyContext(for: id) else { return }
+                    switch event {
+                    case let .hostPolicy(re, request, outcome, value, revision, state, _, _):
+                        self.transportPolicy.receive(AtemHostPolicyReply(re: re, requestID: request, outcome: outcome,
+                            relayOnly: value, revision: revision, state: state, confirmed: confirmed), context: ready)
+                    case .hostPolicyChanged: self.transportPolicy.receivedChange(context: ready)
+                    case .error(_, let re, _, _): self.transportPolicy.refused(re: re, context: ready)
+                    default: break
+                    }
+                    self.updateTransportPolicyPresentation()
+                }, generation: generation)
+            policyR9Connections[id] = link
+            try link.start(identity: ClientIdentity(kind: .native, deviceId: AstationIdentity.shared.id,
+                keyId: AstationIdentity.shared.id, grantJson: nil), log: log, signer: r9Signer!)
+        } catch {
+            policyR9Connections.removeValue(forKey: id)?.disconnect()
+            Log.warn("[AstationHub] Encrypted host policy needs verified account membership")
+            if !policyContext.isRelay && intent.relayOnly {
+                disconnectDirectClient?(id); removeClient(withId: id)
+            }
         }
     }
 
@@ -1739,8 +1805,12 @@ class AstationHubManager: ObservableObject {
 
     /// Socket adapters capture their authenticated generation before entering the main actor.
     @MainActor func receiveR9Envelope(_ bytes: Data, clientID: String, connectionID: String) {
-        guard let context = sessionContext(for: clientID), context.route.connectionId == connectionID else { return }
-        r9Connections[clientID]?.receive(bytes)
+        if let context = sessionContext(for: clientID), context.route.connectionId == connectionID {
+            r9Connections[clientID]?.receive(bytes)
+        }
+        if let context = transportPolicyContext(for: clientID, includeBinding: false), context.route.connectionId == connectionID {
+            policyR9Connections[clientID]?.receive(bytes)
+        }
     }
 
     @MainActor private func receiveR9Application(_ message: AstationMessage, context: AtemSessionContext) {
@@ -2762,18 +2832,15 @@ class AstationHubManager: ObservableObject {
         let account = e2eDataAccount
         var contexts: [String: MigrationContext] = [:]
         var sessions: [String: AtemSessionContext] = [:]
-        var policies: [String: AtemTransportPolicyContext] = [:]
         for client in connectedClients where !client.id.hasPrefix("relay-") {
             if let route = Self.directVerificationRoute(client) {
                 contexts[client.id] = MigrationContext(account: account, route: route)
             }
             if let context = sessionContext(for: client.id) { sessions[client.id] = context }
-            if let context = transportPolicyContext(for: client.id) { policies[client.id] = context }
         }
         migrationContextLock.lock()
         directMigrationContexts = contexts
         directSessionContexts = sessions
-        directTransportPolicyContexts = policies
         migrationContextLock.unlock()
     }
 

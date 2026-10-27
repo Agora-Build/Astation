@@ -6,7 +6,10 @@ import Foundation
 @MainActor
 final class AstationR9Connection {
     let context: AtemSessionContext
-    private let generation = UUID()
+    private(set) var hostPolicyBinding: AtemHostPolicyBinding?
+    let generation: UUID
+    var isClosed: Bool { closed }
+    var isCurrent: Bool { !closed && current() }
     private var router: RemoteChannelRouter!
     private var queue: RemoteSocketQueue!
     private var channel: RemoteAgentChannel?
@@ -18,19 +21,26 @@ final class AstationR9Connection {
     private let receiveMessage: (AstationMessage) -> Void
     private let failed: (String, Bool) -> Void
     private let refreshMembership: (LogHead) -> Void
+    private let policyWelcomed: () -> Void
+    private let policyEvent: (ClientEvent, Bool) -> Void
 
     init(context: AtemSessionContext, current: @escaping () -> Bool,
          write: @escaping (Data, @escaping (Error?) -> Void) -> Void,
          welcomed: @escaping (AtemSessionMessage) -> Void,
          receive: @escaping (AstationMessage) -> Void,
          failed: @escaping (String, Bool) -> Void,
-         refreshMembership: @escaping (LogHead) -> Void) {
+         refreshMembership: @escaping (LogHead) -> Void,
+         policyWelcomed: @escaping () -> Void = {}, policyEvent: @escaping (ClientEvent, Bool) -> Void = { _, _ in },
+         generation: UUID = UUID()) {
         self.context = context
+        self.generation = generation
         self.current = current
         self.welcomed = welcomed
         receiveMessage = receive
         self.failed = failed
         self.refreshMembership = refreshMembership
+        self.policyWelcomed = policyWelcomed
+        self.policyEvent = policyEvent
         queue = RemoteSocketQueue(write: write, failed: { [weak self] _ in
             self?.finish("The r9 connection was interrupted. Reconnect to query pending requests.")
         })
@@ -62,9 +72,18 @@ final class AstationR9Connection {
         catch { return false }
     }
 
+    func sendPolicy(_ operation: RemoteAgentOperation) -> String? {
+        guard !closed, current(), let channel, channel.phase == .ready else { return nil }
+        switch operation {
+        case .hostPolicyGet, .hostPolicyRetry: return try? channel.perform(operation)
+        default: return nil
+        }
+    }
+
     func disconnect(sendClose: Bool = true) {
         guard !closed else { return }
         closed = true
+        hostPolicyBinding = nil
         if !sendClose { queue.drain() }
         else if current(), let channel { queue.finish(with: RemoteChannelEnvelope.close(route: channel.route)) }
         else { queue.disconnect() }
@@ -81,6 +100,10 @@ final class AstationR9Connection {
             if let membershipHead, info.head.seq > membershipHead.seq {
                 refresh(head: info.head); return
             }
+            guard let membershipLog else { finish("Account membership is unavailable."); return }
+            hostPolicyBinding = AtemHostPolicyBinding(genesis: membershipLog.genesisHash(), manager: AstationIdentity.shared.id,
+                trust: info.hostTrustGen, channel: info.channelId, attachment: info.attachmentGen,
+                supported: info.features.contains("host.policy"))
             var welcome = AtemSessionMessage(op: "welcome")
             welcome.revision = info.revision; welcome.features = info.features
             welcome.account_id = info.accountId; welcome.atem_device_id = info.atemDeviceId
@@ -89,9 +112,15 @@ final class AstationR9Connection {
             welcome.client_kind = info.clientKind; welcome.permissions = info.permissions
             welcome.authorization_ms_left = info.authorizationMsLeft; welcome.server_time = info.serverTime
             welcomed(welcome)
+            policyWelcomed()
         case .update(let update):
             switch update {
+            case .hostPolicy(_, _, _, _, _, _, let observed, let json),
+                 .hostPolicyChanged(_, _, _, let observed, let json):
+                guard observed != "foreign", acceptPolicyHead(json) else { return }
+                policyEvent(update, channel?.hostPolicyReady == true)
             case .session(_, _, _, let json), .family(_, _, let json), .error(_, _, _, let json):
+                if case .error = update { policyEvent(update, false) }
                 guard let message = try? AstationMessage.decodePacket(Data(json.utf8)) else {
                     finish("Atem sent an invalid r9 application message."); return
                 }
@@ -111,6 +140,17 @@ final class AstationR9Connection {
                 : "The encrypted r9 channel closed. Reconnect or complete r9 device verification.", unsupported: unsupported, sendClose: false)
         default: break
         }
+    }
+
+    private func acceptPolicyHead(_ json: String) -> Bool {
+        guard let root = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],
+              let data = root["data"] as? [String: Any], let head = data["head"] as? [String: Any],
+              let seq = head["seq"] as? UInt64, let hash = head["hash"] as? String else {
+            finish("Atem sent an invalid policy membership head."); return false
+        }
+        let received = LogHead(seq: seq, hash: hash)
+        guard received == membershipHead else { refresh(head: received); return false }
+        return true
     }
 
     private func refresh(head: LogHead) {

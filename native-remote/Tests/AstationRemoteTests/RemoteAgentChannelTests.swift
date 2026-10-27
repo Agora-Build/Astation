@@ -7,6 +7,7 @@ import XCTest
 private final class FakeCore: RemoteChannelCore {
     var acceptDeadline: UInt64? = 5_000
     var isClosed = false
+    var hostPolicyReady = false
     var disconnects = 0
     var finishCalls = 0
     var received = 0
@@ -107,7 +108,9 @@ final class RemoteAgentChannelTests: XCTestCase {
         let operations: [RemoteAgentOperation] = [
             .prompt(session: "session", request: "durable-id", text: "test"),
             .approval(session: "session", request: "answer", approval: "approval", decision: .deny, rule: nil, message: "no"),
-            .receipts(session: "session", requests: ["durable-id"])
+            .receipts(session: "session", requests: ["durable-id"]),
+            .hostPolicyGet(desired: true),
+            .hostPolicyRetry(relayOnly: true, request: "durable-mutation", expectedRevision: 4)
         ]
         for (index, operation) in operations.enumerated() {
             XCTAssertEqual(try h.channel.perform(operation), "request-\(index + 1)")
@@ -117,6 +120,20 @@ final class RemoteAgentChannelTests: XCTestCase {
         XCTAssertThrowsError(try h.channel.perform(.list))
         XCTAssertThrowsError(try h.channel.start())
         XCTAssertEqual(h.core.operations, operations)
+    }
+
+    @MainActor
+    func testPolicyReadinessUsesTheSharedCoreAndEndsWithTheAttachment() async throws {
+        let h = Harness()
+        h.core.hostPolicyReady = true
+        XCTAssertFalse(h.channel.hostPolicyReady)
+        try await h.welcome()
+        XCTAssertTrue(h.channel.hostPolicyReady)
+        h.core.hostPolicyReady = false
+        XCTAssertFalse(h.channel.hostPolicyReady)
+        h.core.hostPolicyReady = true
+        h.channel.disconnect()
+        XCTAssertFalse(h.channel.hostPolicyReady)
     }
 
     @MainActor

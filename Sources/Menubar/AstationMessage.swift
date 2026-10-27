@@ -100,8 +100,6 @@ enum AstationMessage: Codable {
     case storageKeyConfirm(confirm: AtemSignedWire)
     case storageKeyAbandon(abandon: AtemSignedWire)
     case encryptionMigrationComplete(mode: String, kid: String, completion: AtemSignedWire? = nil)
-    case transportPolicy(relayOnly: Bool)
-    case transportPolicyAck(AtemTransportPolicyAck)
 
     var isPrivateAgentTraffic: Bool {
         switch self {
@@ -157,7 +155,6 @@ enum AstationMessage: Codable {
         case unlockRequest, unlockGrant, unlockDenied
         case storageKeyRotate, storageKeyAck, storageKeyRejected, storageKeyConfirm, storageKeyAbandon
         case encryptionMigrationComplete
-        case transportPolicy, transportPolicyAck
     }
     
     func encode(to encoder: Encoder) throws {
@@ -434,13 +431,6 @@ enum AstationMessage: Codable {
             try dc.encode(mode, forKey: .mode)
             try dc.encode(kid, forKey: .kid)
             try dc.encodeIfPresent(completion, forKey: .completion)
-        case .transportPolicy(let relayOnly):
-            try container.encode(MessageType.transportPolicy, forKey: .type)
-            var dc = container.nestedContainer(keyedBy: TransportPolicyKeys.self, forKey: .data)
-            try dc.encode(relayOnly, forKey: .relayOnly)
-        case .transportPolicyAck(let ack):
-            try container.encode(MessageType.transportPolicyAck, forKey: .type)
-            try container.encode(ack, forKey: .data)
         }
     }
 
@@ -466,18 +456,12 @@ enum AstationMessage: Codable {
         case grant, reason
         case publicKey = "public_key"
     }
-    private enum TransportPolicyKeys: String, CodingKey { case relayOnly = "relay_only" }
     
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let type = try container.decode(MessageType.self, forKey: .type)
         
         switch type {
-        case .transportPolicy:
-            let dc = try container.nestedContainer(keyedBy: TransportPolicyKeys.self, forKey: .data)
-            self = .transportPolicy(relayOnly: try dc.decode(Bool.self, forKey: .relayOnly))
-        case .transportPolicyAck:
-            self = .transportPolicyAck(try container.decode(AtemTransportPolicyAck.self, forKey: .data))
         case .projectListRequest:
             self = .projectListRequest
             

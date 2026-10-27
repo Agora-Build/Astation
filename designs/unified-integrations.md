@@ -152,20 +152,20 @@ configures that relay in Astation/Atem without fallback to the public default.
 Settings > Station AI has independent MCP, LLM and Agent switches, all off by
 default, with explicit feature/Station/provider consent and Off/Starting/On/Error
 states. Any enabled switch sets whole-account relay-only transport. Astation
-sends `transportPolicy` after pairing authentication and on change; Atem
-durably saves the pairing-bound value and reports it. This outer exchange
-is not cryptographically authenticated against the relay and cannot establish
-activation readiness. [Atem #99](https://github.com/Agora-Build/Atem/issues/99)
-tracks an authenticated policy/ACK contract with fresh request binding and
-protection against unsigned overwrite. A direct link closes after a matching
-report or bounded timeout. Refuse affected direct Atem connections on port
-8080 while enabled; preserve the shared local listener/HTTP API and credential
-unlock/sync behavior. Lost ACKs/reconnects must be reconciled, not presented as
-a completed account-wide transition. Atem #97 supplies durable host policy;
-Astation supplies native intent/ACK reconciliation and direct-agent admission
-guards. Authenticated policy/ACK delivery and actual protected
-native/host/reconnect verification remain pending,
-and hosted execution stays hard disabled.
+uses R9.8a `host_policy_get/set/result` inside an admitted encrypted `atem-ch1`
+channel. Only a native manager can change policy; plaintext policy messages
+are removed. Save intent and each mutation's original identity/revision before
+sending, then retry that same mutation after a lost reply. Read the current
+policy on each new attachment; an old receipt cannot reverse another manager.
+Only a matching durable confirmation on the selected relay counts toward
+account readiness, and every enrolled host must confirm. Offline hosts stay
+pending. A restricted encrypted policy channel can migrate an existing direct
+link, with agent operations blocked and a bounded close; port 8080's shared
+listener/local HTTP API and credential unlock/sync remain available. See the
+[native policy lifecycle](protocol/host-policy-r9-review.md) and
+[Atem #100](https://github.com/Agora-Build/Atem/pull/100). Actual protected
+native/host/reconnect verification still gates release, and hosted execution
+stays hard disabled.
 
 Enabling an integration explicitly trusts the selected Station as a decrypting
 endpoint for that integration's scoped agent content. An administrator who

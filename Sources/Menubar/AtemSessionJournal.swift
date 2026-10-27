@@ -29,10 +29,12 @@ struct AtemSessionHostFence: Codable, Equatable {
 /// or authority. Only the authenticated host can supply a receipt outcome.
 final class AtemSessionJournal {
     struct Snapshot: Codable, Equatable {
-        var version = 2
+        // Older readers must not discard pending host-policy mutation identities.
+        var version = 3
         var requests: [AtemSessionRequestRecord] = []
         var hosts: [AtemSessionHostFence] = []
         var transportPolicies: [AtemTransportPolicyRecord]?
+        var hostPolicies: [AtemHostPolicyCheckpoint]?
     }
 
     private(set) var snapshot: Snapshot
@@ -43,7 +45,8 @@ final class AtemSessionJournal {
         self.persist = save
         do {
             let loaded = try load()
-            guard (loaded.version == 1 && loaded.transportPolicies == nil || loaded.version == 2),
+            guard (loaded.version == 1 && loaded.transportPolicies == nil && loaded.hostPolicies == nil
+                   || loaded.version == 2 && loaded.hostPolicies == nil || loaded.version == 3),
                   loaded.requests.count <= 4096, loaded.hosts.count <= 128,
                   Set(loaded.requests.map(\.requestId)).count == loaded.requests.count,
                   loaded.requests.allSatisfy({ AtemSessionWire.uuid($0.requestId) && $0.target.valid
@@ -55,13 +58,16 @@ final class AtemSessionJournal {
                   (loaded.transportPolicies ?? []).count <= 128,
                   Set((loaded.transportPolicies ?? []).map { $0.issuer + "\u{0}" + $0.account }).count == (loaded.transportPolicies ?? []).count,
                   (loaded.transportPolicies ?? []).allSatisfy(\.valid),
+                  (loaded.hostPolicies ?? []).count <= 1024,
+                  (loaded.hostPolicies ?? []).allSatisfy(\.valid),
+                  Set((loaded.hostPolicies ?? []).map { $0.issuer + "\u{0}" + $0.account + "\u{0}" + $0.station + "\u{0}" + $0.host }).count == (loaded.hostPolicies ?? []).count,
                   loaded.hosts.allSatisfy({ AtemSessionWire.opaque($0.account) && AtemSessionWire.opaque($0.device)
                       && $0.trust <= AtemSessionWire.maximumCounter
                       && ($0.runtimeEpoch == nil) == ($0.runtimeGeneration == nil)
                       && $0.runtimeEpoch.map { $0 <= AtemSessionWire.maximumCounter } != false
                       && $0.runtimeGeneration.map(AtemSessionWire.uuid) != false }) else { throw AtemSessionJSON.Invalid.json }
             snapshot = loaded
-            snapshot.version = 2
+            snapshot.version = 3
         } catch { snapshot = Snapshot(); loadFailed = true }
     }
 

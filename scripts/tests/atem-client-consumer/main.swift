@@ -43,4 +43,16 @@ for (raw, expected) in negatives {
 }
 require(try verifyCommitHostTrustGen(messageJson: #"{"type":"verifyCommit","data":{"host_trust_gen":1}}"#) == 1, "minimum")
 require(try canonicalJson(json: #"{"z":3,"a":"test"}"#) == #"{"a":"test","z":3}"#, "canonical JSON through built core")
+let connection = try ClientConnection(hostId: "host-a", identity: ClientIdentity(kind: .native,
+    deviceId: "dev-phone", keyId: "phone-key", grantJson: nil), needBefore: nil)
+require(!connection.hostPolicyReady(), "policy cannot be ready before admission")
+require(connection.hostPolicyRevision() == nil, "policy revision absent before admission")
+do {
+    _ = try connection.hostPolicyGet(desired: true, nowMs: 100)
+    fatalError("policy read before admission")
+} catch { checked += 1 }
+do {
+    _ = try connection.hostPolicyRetry(relayOnly: true, requestId: UUID().uuidString.lowercased(), expectedRevision: 0, nowMs: 100)
+    fatalError("policy retry before admission")
+} catch { checked += 1 }
 print("PASS: \(checked) Swift consumer checks through the pinned production static library; all 12 pinned verifyCommit examples included")

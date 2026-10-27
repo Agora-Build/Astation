@@ -170,36 +170,21 @@ private final class TerminalHubFixture {
 
 @MainActor
 final class RemoteTerminalHubTests: XCTestCase {
-    func testRelayOnlyReportsAreFencedAcrossReconnectAndNeverAuthorizeActivation() async throws {
+    func testRelayOnlyRequiresEncryptedPolicyConfirmationAndNeverSendsPlaintext() async throws {
         let f = try TerminalHubFixture(relayOnly: true)
-        func policies() -> [[String: Any]] {
-            f.socket.sent.compactMap { $0["payload"] as? [String: Any] }.filter { $0["type"] as? String == "transportPolicy" }
-        }
         try await f.start()
-        XCTAssertTrue(policies().isEmpty)
         try await f.authenticate()
-        XCTAssertEqual(policies().count, 1)
-        XCTAssertEqual((policies().first?["data"] as? [String: Bool])?["relay_only"], true)
         XCTAssertFalse(f.hub.relayOnlyPolicyReady)
-        try f.emit(.transportPolicyAck(AtemTransportPolicyAck(relayOnly: false, stored: true)))
-        await f.drain(); XCTAssertFalse(f.hub.relayOnlyPolicyReady)
-        try f.emit(.transportPolicyAck(AtemTransportPolicyAck(relayOnly: true, stored: true)))
-        await f.drain(); XCTAssertFalse(f.hub.relayOnlyPolicyReady)
-        XCTAssertTrue(f.hub.relayOnlyPolicyStatus.contains("reported relay-only"))
-        let oldGeneration = f.generation
-        f.generation = UUID().uuidString
-        try f.socket.emit(["relay_event": "connected", "atem_id": f.deviceId, "connection_id": f.generation])
-        await f.drain(); XCTAssertFalse(f.hub.relayOnlyPolicyReady)
-        let stale = try JSONSerialization.jsonObject(with: JSONEncoder().encode(
-            AstationMessage.transportPolicyAck(AtemTransportPolicyAck(relayOnly: true, stored: true))))
-        try f.socket.emit(["atem_id": f.deviceId, "connection_id": oldGeneration, "payload": stale])
-        await f.drain(); XCTAssertFalse(f.hub.relayOnlyPolicyReady)
-        try await f.authenticate()
-        try f.emit(.transportPolicyAck(AtemTransportPolicyAck(relayOnly: true, stored: true)))
-        await f.drain(); XCTAssertFalse(f.hub.relayOnlyPolicyReady)
-        XCTAssertTrue(f.hub.relayOnlyPolicyStatus.contains("reported relay-only"))
-        f.socket.fail()
+        XCTAssertFalse(f.socket.sent.contains { frame in
+            let type = (frame["payload"] as? [String: Any])?["type"] as? String
+            return type == "transportPolicy" || type == "transportPolicyAck"
+        })
+        try f.socket.emit(["atem_id": f.deviceId, "connection_id": f.generation,
+            "payload": ["type": "transportPolicyAck", "data": ["relay_only": true, "stored": true]]])
         await f.drain()
+        XCTAssertFalse(f.hub.relayOnlyPolicyReady)
+        XCTAssertFalse(f.hub.relayOnlyPolicyStatus.contains("reported relay-only"))
+        f.socket.fail(); await f.drain()
         XCTAssertFalse(f.hub.relayOnlyPolicyReady)
     }
 
@@ -213,13 +198,13 @@ final class RemoteTerminalHubTests: XCTestCase {
             atemId: f.deviceId, authenticationSessionId: f.session.id))
         await f.drain()
         XCTAssertNil(f.hub.terminalConnection(for: id))
-        XCTAssertEqual(f.hub.remoteAccessBlockReason(for: id), .selectedRelayRequired)
-        XCTAssertTrue(sent.contains { if case .transportPolicy(relayOnly: true) = $0 { return true }; return false })
+        XCTAssertEqual(f.hub.remoteAccessBlockReason(for: id), .offline, "An unavailable migration channel closes the direct connection")
+        let types = try sent.map { try JSONSerialization.jsonObject(with: JSONEncoder().encode($0)) as? [String: Any] }
+        XCTAssertFalse(types.contains { ["transportPolicy", "transportPolicyAck"].contains($0?["type"] as? String ?? "") })
         XCTAssertNotNil(f.hub.deviceSessionStore.get(sessionId: f.session.id))
-        _ = f.hub.handleMessage(.transportPolicyAck(AtemTransportPolicyAck(relayOnly: true, stored: true)), from: id)
         await f.drain()
         XCTAssertEqual(closed, [id])
-        XCTAssertFalse(f.hub.relayOnlyPolicyReady, "A direct ACK is not selected-relay readiness")
+        XCTAssertFalse(f.hub.relayOnlyPolicyReady, "A direct link is never selected-relay readiness")
         XCTAssertNotNil(f.hub.deviceSessionStore.get(sessionId: f.session.id))
     }
 

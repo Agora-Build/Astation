@@ -43,6 +43,8 @@ public enum RemoteAgentOperation: Equatable, Sendable {
     case revokeRule(session: String, request: String, rule: String)
     case approvalSeen(session: String, approval: String)
     case receipts(session: String, requests: [String])
+    case hostPolicyGet(desired: Bool)
+    case hostPolicyRetry(relayOnly: Bool, request: String, expectedRevision: UInt64)
 }
 
 /// The router supplies inner frames only. Closing here closes one virtual channel, never its host socket.
@@ -58,6 +60,7 @@ public final class RemoteAgentChannel {
 
     public let route: RemoteChannelRoute
     public private(set) var phase = Phase.new
+    public var hostPolicyReady: Bool { phase == .ready && core.hostPolicyReady }
     private let core: RemoteChannelCore
     private let clock: () -> UInt64
     private let sign: (SignRequest) async throws -> Data
@@ -226,6 +229,7 @@ public final class RemoteAgentChannel {
 protocol RemoteChannelCore: AnyObject {
     var acceptDeadline: UInt64? { get }
     var isClosed: Bool { get }
+    var hostPolicyReady: Bool { get }
     func start(now: UInt64) throws -> Data
     func accept(_ frame: Data, now: UInt64) throws -> SignRequest
     func finish(_ signature: Data, now: UInt64) throws -> Data
@@ -233,6 +237,10 @@ protocol RemoteChannelCore: AnyObject {
     func receive(_ frame: Data, now: UInt64) throws -> [ClientEvent]
     func perform(_ operation: RemoteAgentOperation, now: UInt64) throws -> Outgoing
     func disconnect()
+}
+
+extension RemoteChannelCore {
+    var hostPolicyReady: Bool { false }
 }
 
 @MainActor
@@ -247,6 +255,7 @@ private final class SharedRemoteChannelCore: RemoteChannelCore {
 
     var acceptDeadline: UInt64? { connection.acceptDeadlineMs() }
     var isClosed: Bool { connection.isClosed() }
+    var hostPolicyReady: Bool { connection.hostPolicyReady() }
     func start(now: UInt64) throws -> Data { try connection.start(log: log, nowMs: now) }
     func accept(_ frame: Data, now: UInt64) throws -> SignRequest {
         try connection.onAcceptDeferred(frame: frame, log: log, nowMs: now)
@@ -278,6 +287,9 @@ private final class SharedRemoteChannelCore: RemoteChannelCore {
         case let .revokeRule(session, request, rule): return try connection.submitRuleRevoke(sessionId: session, requestId: request, ruleId: rule, nowMs: now)
         case let .approvalSeen(session, approval): return try connection.approvalSeen(sessionId: session, approvalId: approval, nowMs: now)
         case let .receipts(session, requests): return try connection.receiptQuery(sessionId: session, requestIds: requests, nowMs: now)
+        case let .hostPolicyGet(desired): return try connection.hostPolicyGet(desired: desired, nowMs: now)
+        case let .hostPolicyRetry(value, request, revision):
+            return try connection.hostPolicyRetry(relayOnly: value, requestId: request, expectedRevision: revision, nowMs: now)
         }
     }
 }

@@ -1243,13 +1243,16 @@ Settings > Integrations in Astation supplies the native review/owner approval
 flow. The exact reviewed body and signature survive uncertain replies and
 restarts. Provisioning returns a draft, not readiness. Hosted endpoints under
 `/api/agent/v1/integrations/...` remain **hard disabled**, with no environment
-override, until actual Auth/native/host/relay-only ACK, reconnect/revocation,
+override, until actual Auth/native/host/encrypted relay-only confirmation, reconnect/revocation,
 Mac-off and replica tests pass. Readiness reports cannot advertise Ready with
-this gate closed. The current outer `transportPolicyAck` is an unverified
-routing report; TLS and a saved device pin do not authenticate it against the
-relay. The authenticated replacement tracked in
-[Atem #99](https://github.com/Agora-Build/Atem/issues/99) is also an activation
-gate. MCP, LLM and Discord activation are separate later work.
+this gate closed. Native host-policy reconciliation uses R9.8a through the
+pinned shared client: only a current, correlated, durable response inside an
+admitted native-manager `atem-ch1` channel confirms the selected relay policy.
+Plaintext policy/ACK messages are removed. A confirmation on a direct
+migration channel never establishes relay readiness. Policy confirmation
+against the disposable actual host remains a live activation gate; see the
+[policy review and lifecycle](designs/protocol/host-policy-r9-review.md).
+MCP, LLM and Discord activation are separate later work.
 See the [typed API](designs/protocol/station-hosted-agent-api.md) and
 [lifecycle](designs/protocol/station-integration-lifecycle.md).
 
