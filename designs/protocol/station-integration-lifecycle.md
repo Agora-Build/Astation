@@ -267,3 +267,35 @@ host execution, Mac-off and replica admission remain release gates.
 - Hosted execution remains hard disabled. The real native/host execution,
   revocation/reconnect, policy persistence, Mac-off and replica matrix has
   **not run** in this follow-up.
+
+## Personal signing renewed after account reauthentication
+
+After the user signed back into the personal Xcode account on 2026-10-26,
+automatic provisioning succeeded with the existing team and bundle identity.
+The renewed profile expires **2026-11-02 23:59:57 UTC**. The Data Protection
+Keychain probe succeeds, and the signed application passes strict bundle
+verification and all four bundled-resource checks.
+
+Running `scripts/verify-local-signing.sh` without exclusions against application
+source `d061429` passes **1,030 tests, six skips, zero failures** in the
+provisioned XCTest host. `ASTATION_REQUIRE_KEYCHAIN_TESTS=1` is set. All formerly
+blocked identity tests pass, including Secure Enclave signing, protected
+identity/recovery-pin reload, migration journal commit after restart, and
+storage-key escrow/unlock/replay rejection. Protected account-refresh and project
+cache storage, credential isolation/accessibility, and the V2 recovery checkpoint
+and signing tests also pass. The six skips concern optional live speech,
+polishing, screen capture, or the unavailable-model case on this model-capable
+Mac; no protected identity/storage test is skipped.
+
+CI `40389868125` also passes on `d061429`: macOS, relay and web jobs succeed.
+Downloaded logs establish 1,030 app tests/15 skips, 138 native tests/one optional
+skip, 545 regular relay passes/130 environment cases not selected, and all
+65 explicit Postgres, 65 Redis and eight load-client cases passing.
+
+The newly signed bundle is built in the task worktree; the existing running
+canonical app is retained. Protected storage and cryptographic signing are now
+verified locally. Actual native PKCE/user owner approval/service enrollment,
+actual-host execution/revocation/reconnect, authenticated policy ACKs (Atem #99),
+Mac-off and replica admission remain live gates. Hosted execution stays hard
+disabled. No account trust or pairing reset, credential-agent restart, Atem
+checkout change, main merge or deployment is performed.
