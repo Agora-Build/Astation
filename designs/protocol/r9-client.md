@@ -176,3 +176,13 @@ The implemented API uses polling for chat, approvals and receipts. A native
 full conversation UI, SSE replay/notifications and offline APNs delivery remain
 separate work. Controlled transport tests do not establish production Auth,
 mobile owner authentication, APNs/FCM or a live re-pairing ceremony.
+
+Live native validation on 2026-10-28 at 22:26:49 UTC: provisioned `34efe40`
+completed foreground owner authentication and channel admission against the
+preserved verified Genie test host. The user's Connections screen displays
+the real running Codex session `ses-i5py5pldao4d`, matching Atem's #81 handoff.
+Host accept and encrypted records follow explicit native focus restoration.
+This proves native admission/discovery, not prompt completion, service
+execution, policy persistence, revocation or Mac-off/replica behavior. The
+expired service grant still needs supported renewal and fresh native review;
+hosted execution remains hard disabled.

@@ -388,12 +388,23 @@ inactive after the system prompt closed. The adapter now explicitly restores
 the originating visible window and requests activation after successful,
 current authentication. It never requests this for a denial or fenced context.
 All 1,083 provisioned app tests and 148 reusable native tests pass
-(eight and one optional skips respectively). This does not claim a successful
-live R9 welcome. See [the R9 client lifecycle](r9-client.md). The approved test service
+(eight and one optional skips respectively).
+
+The user retry on native `34efe40` succeeded at 22:26:49 UTC. Logs show owner
+authentication approved, explicit focus restoration, host accept and encrypted
+records. The Connections screen displays the running actual Codex session
+`ses-i5py5pldao4d`, matching the Atem agent's handoff on #81. This establishes
+native R9 admission and session discovery on the preserved verified profile.
+The host reports that activity remains `unknown` until Codex's first prompt
+fires its lazy SessionStart hook; this is separate from process/connection
+health. It does not establish a completed prompt, service execution or the
+rest of the live gate matrix.
+
+See [the R9 client lifecycle](r9-client.md). The approved test service
 expired at 21:52:56 UTC. Renewal needs a supported Portal operation and another
 native review of any changed signed grant; an operator must not extend it in
 storage.
 
-Still required: renewed service access, actual R9 session admission and agent
-execution, and the policy/revocation/reconnect/Mac-off/replica checks. A synthetic
+Still required: renewed service access, real agent execution through the
+intended native/service flows, and the policy/revocation/reconnect/Mac-off/replica checks. A synthetic
 relay pass does not satisfy these gates. Hosted execution remains disabled.

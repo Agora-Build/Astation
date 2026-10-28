@@ -235,8 +235,11 @@ Latest native pairing checks:
   adapter now explicitly restores its originating visible window and requests
   activation after a successful, current confirmation, before the bounded
   wait. Denied or fenced contexts cannot request focus. The library's
-  148 tests pass, with one optional skip. Live session admission is still
-  unconfirmed. The signed test grant expired at
+  148 tests pass, with one optional skip. At 22:26:49 UTC the user's retry on
+  `34efe40` succeeded: native R9 admission delivered the real Codex registry
+  entry `ses-i5py5pldao4d`, matching Atem's disposable-host handoff. Native
+  discovery is complete; actual prompt execution, service access and the
+  remaining joint gates are separate. The signed test grant expired at
   21:52:56 UTC and requires supported renewal plus fresh native review.
   See the [pairing lifecycle](pairing-and-service-authorization.md).
 
