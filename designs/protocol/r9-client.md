@@ -182,7 +182,18 @@ completed foreground owner authentication and channel admission against the
 preserved verified Genie test host. The user's Connections screen displays
 the real running Codex session `ses-i5py5pldao4d`, matching Atem's #81 handoff.
 Host accept and encrypted records follow explicit native focus restoration.
-This proves native admission/discovery, not prompt completion, service
-execution, policy persistence, revocation or Mac-off/replica behavior. The
-expired service grant still needs supported renewal and fresh native review;
-hosted execution remains hard disabled.
+This proves native admission/discovery, not service execution, policy
+persistence, revocation or Mac-off/replica behavior. The discovery session is
+historical; Atem now reports real model replies and `ready` activity on
+`ses-emcvcza5lnsj`, process generation `28c9e08d-1b3a-45f1-8a1a-3d06c0969e5e`.
+Resolve the authoritative complete target before operations.
+
+Fresh native approval of replacement integration
+`i-01m62bpj9tj16evs0bry3k27mf` completed at 23:00:42.637 UTC, with a new
+protected R9 identity and expiry 2026-11-04 at 22:57:08.898 UTC. Read-only
+Station checks confirm membership head seq 6 and a healthy non-denied feed.
+Its `waiting_for_host` reason reflects the end-to-end verification gate;
+owner approval is complete. Protected service token/channel execution,
+approvals, durable policy acknowledgment, old-service removal, reconnect,
+Mac-off and replicas remain to be verified. Hosted execution stays hard
+disabled. See the [integration lifecycle](station-integration-lifecycle.md).

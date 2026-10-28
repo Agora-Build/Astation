@@ -238,10 +238,26 @@ Latest native pairing checks:
   148 tests pass, with one optional skip. At 22:26:49 UTC the user's retry on
   `34efe40` succeeded: native R9 admission delivered the real Codex registry
   entry `ses-i5py5pldao4d`, matching Atem's disposable-host handoff. Native
-  discovery is complete; actual prompt execution, service access and the
-  remaining joint gates are separate. The signed test grant expired at
-  21:52:56 UTC and requires supported renewal plus fresh native review.
+  discovery is complete; actual service execution and the remaining joint
+  gates are separate. The initial session is historical; Atem now reports
+  actual model replies and `ready` activity on `ses-emcvcza5lnsj`, process
+  generation `28c9e08d-1b3a-45f1-8a1a-3d06c0969e5e`. Operations still need
+  the authoritative complete target from the admitted registry.
   See the [pairing lifecycle](pairing-and-service-authorization.md).
+- The replacement integration `i-01m62bpj9tj16evs0bry3k27mf` received fresh
+  native owner approval at 23:00:42.637 UTC and expires on 2026-11-04 at
+  22:57:08.898 UTC. Its new protected R9 fingerprint is
+  `7f53966e81b35717b5cf9fcbce748136f8687123fda87880dfa1e9fce29fedec`.
+  Independent read-only checks confirm signed membership head seq 6, a healthy
+  non-denied policy feed and `waiting_for_host`. Portal/Auth confirms the
+  active service client in [Portal #20](https://github.com/Agora-Build/Portal/issues/20#issuecomment-6482950230).
+  The state reason is "Hosted execution awaits end-to-end verification";
+  native approval and request replacement are complete. This does not prove
+  service token issuance, host admission or agent execution.
+- The expired original integration `i-01m5znm96jfztp4nx95v8wg7b2` is revoked
+  at Auth but remains `revoking` in Portal. Complete supported signed removal
+  of its service member before reporting `revoked`; neither the old signed
+  approval nor an Auth-only expiry extension authorizes its replacement.
 
 Earlier R9.8a integration checks:
 
@@ -275,15 +291,17 @@ Portal supplied the awaiting-approval integration ID and Atem delivered the
 disposable policy-capable host and binding E2E, accepted for test integration
 at `e7dff6d`. Those deliveries are no longer missing. The current live handoff
 is Atem `03ca230`, whose generation-2 joint ceremony and native service approval
-have completed. Session admission and a renewed test service grant remain
-open. The separate provisioning refusal is fixed
+have completed. Native R9 session admission and fresh replacement-service
+approval have also completed. The separate provisioning refusal is fixed
 by resolving the external owner to its exact issuer-scoped storage principal;
 policy/token/service-key bindings keep the external owner. Thirteen account
 tests, five isolated provisioning tests and three isolated hosted API tests
 pass, including different owner/principal namespaces and wrong-issuer denial.
 The hosted API tests use a controlled encrypted host, not a real coding agent.
-Then run actual R9 session admission and agent execution, policy durability,
-revocation/reconnect, Mac-off and replica checks.
+Next verify actual protected service token/channel execution and approvals,
+host policy durability, old-service removal, revocation/reconnect, Mac-off and
+replica behavior. Native discovery and Atem's reported real model replies do
+not establish this service pipeline.
 Hosted execution remains hard disabled without an override. No production
 trust reset, credential-agent restart, Atem checkout edit/build or production
 merge/deploy is part of this verification.

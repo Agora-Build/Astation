@@ -400,11 +400,31 @@ fires its lazy SessionStart hook; this is separate from process/connection
 health. It does not establish a completed prompt, service execution or the
 rest of the live gate matrix.
 
-See [the R9 client lifecycle](r9-client.md). The approved test service
-expired at 21:52:56 UTC. Renewal needs a supported Portal operation and another
-native review of any changed signed grant; an operator must not extend it in
-storage.
+The original test service expired at 21:52:56 UTC and was revoked at Auth.
+Its Portal state remains `revoking` until supported signed service-member
+removal and the Station's completion report. Its signed grant is never reused
+or extended in storage.
 
-Still required: renewed service access, real agent execution through the
-intended native/service flows, and the policy/revocation/reconnect/Mac-off/replica checks. A synthetic
-relay pass does not satisfy these gates. Hosted execution remains disabled.
+The owner approved the replacement integration
+`i-01m62bpj9tj16evs0bry3k27mf` at 23:00:42.637 UTC through a fresh native
+review. It expires on 2026-11-04 at 22:57:08.898 UTC and uses the new protected
+R9 service fingerprint
+`7f53966e81b35717b5cf9fcbce748136f8687123fda87880dfa1e9fce29fedec`.
+Read-only Station checks confirm signed membership head seq 6 and a healthy,
+non-denied Portal feed. Portal/Auth confirms the approval and active service
+client in [Portal #20](https://github.com/Agora-Build/Portal/issues/20#issuecomment-6482950230).
+The displayed `waiting_for_host` reason is "Hosted execution awaits end-to-end
+verification"; this is not another pending owner approval or evidence that
+the host is offline.
+
+The initial discovery session above is historical. Atem's current disposable
+Codex session is `ses-emcvcza5lnsj`, process generation
+`28c9e08d-1b3a-45f1-8a1a-3d06c0969e5e`, with real model replies and `ready`
+activity reported in [Atem #81](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6482619557).
+Operations must obtain the complete current target from the admitted registry.
+
+See [the R9 client lifecycle](r9-client.md). Still required: actual protected
+service token/channel execution and approval evidence, durable policy
+acknowledgment, old-service removal, revocation/reconnect, Mac-off and replica
+checks. A synthetic relay pass does not satisfy these gates. Hosted execution
+remains disabled.
