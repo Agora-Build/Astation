@@ -50,10 +50,10 @@ retains the Agora.Build login and asks for Agora Console reconnection.
 
 ## Live pairing bootstrap gap (2026-10-28)
 
-The [pairing and service authorization draft](pairing-and-service-authorization.md)
-describes the proposed separation, guided native flow, diagram, trust
-boundaries and joint tests. It is awaiting owner review; the wire change has
-not been agreed or implemented.
+The [pairing and service authorization design](pairing-and-service-authorization.md)
+records the owner-approved separation, guided native flow, diagram, trust
+boundaries, candidate v1 wire and joint tests. The native candidate is
+implemented; Atem's wire confirmation and receiver build remain required.
 
 The provisioned native app reaches the selected dev Station. For the
 `DP4E-QG58` attempt, the native log records the dev WebSocket URL at
@@ -61,7 +61,7 @@ The provisioned native app reaches the selected dev Station. For the
 existing pairing room at 18:22:02.051 UTC. The host subsequently times out.
 Changing the relay URL is not the remedy for this attempt.
 
-The current native `connectToRelay` path calls `sendCredentials`, which
+The native `connectToRelay` path in that running build called `sendCredentials`, which
 requires the legacy Agora service session. With only Agora.Build login, it
 logs `No session - skipping credentialSync` and sends no identity handoff.
 Read-only inspection of joint Atem source `e7dff6d` confirms its
@@ -79,8 +79,11 @@ substituted into legacy `credentialSync`, and empty or fabricated credentials
 must not be used to make the old receiver proceed.
 
 Atem owns the receiver and CLI state changes; Astation owns the sender and
-visible pairing progress/errors. The exact message shape and new joint host
-pin require confirmation on Atem #81 before implementation. Regression
+visible pairing progress/errors. The native candidate removes automatic
+credential sharing, correlates the introduction with the identity link and
+waits for the existing durable verification callback. The candidate message
+shape and new joint host pin require confirmation on Atem #81 before the
+real joint ceremony. Regression
 coverage must include Agora.Build-only login with no legacy session, refusal
 without the required native account state, expired/missing rooms, disconnect,
 account/relay changes during asynchronous work, duplicate attempts, and

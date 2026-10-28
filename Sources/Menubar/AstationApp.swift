@@ -395,8 +395,7 @@ class AstationApp: NSObject, NSApplicationDelegate {
             return
         }
 
-        Log.info(" Pair deep link received with code: \(code)")
-        hubManager?.connectToRelay(code: code)
+        MainActor.assumeIsolated { statusBarController?.showPairing(code: code) }
     }
 }
 

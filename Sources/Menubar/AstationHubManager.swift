@@ -32,6 +32,8 @@ class AstationHubManager: ObservableObject {
     @Published var pinnedClientId: String?
     @Published private(set) var remoteInputStatusMessage: String?
     @Published private(set) var relayOnlyPolicyStatus = "No transport policy has been requested on this Mac."
+    @Published private(set) var pairingState = NativePairingState.idle
+    @MainActor private var pairingSession: NativePairingSession?
 
     private var hubStartTime = Date()
     let sessionStore: SsoSessionStore
@@ -264,6 +266,8 @@ class AstationHubManager: ObservableObject {
             self?.sendMessage(message, to: route.clientId, expectedRelayConnectionId: route.clientId.hasPrefix("relay-") ? route.connectionId : nil)
             if case .deviceVerified = message {
                 self?.remoteVerificationDidComplete(on: route)
+            } else if case .verifyAbort = message {
+                self?.remotePairingVerificationFailed(on: route)
             }
         },
         approve: AtemVerificationUI.approve,
@@ -602,11 +606,11 @@ class AstationHubManager: ObservableObject {
     func reloadSession() {
         checkSessionStatus()
         refreshProjects()
-        broadcastCredentials()
     }
 
     func accountSessionChanged() {
         accountGeneration = UUID()
+        MainActor.assumeIsolated { pairingSession?.contextChanged() }
         let reconnect = identityRelayActive
         pauseIdentityRelay()
         if reconnect { startIdentityRelay() }
@@ -621,6 +625,7 @@ class AstationHubManager: ObservableObject {
         defer { accountSignInInProgress = false }
         guard let portalAuth else { throw AccountLoginError.configuration }
         accountGeneration = UUID()
+        pairingSession?.contextChanged()
         projectLoadTask?.cancel()
         projects = []; selectedProject = nil; portalProjects = [:]; agoraConnection = nil; signedInAccount = nil
         accountSignInRequired = true
@@ -648,6 +653,7 @@ class AstationHubManager: ObservableObject {
 
     @MainActor func signOutAccount() async throws {
         accountGeneration = UUID()
+        pairingSession?.contextChanged()
         let epoch = accountGeneration
         let oldPortal = portalAuth, oldRelay = accountAuth
         projectLoadTask?.cancel()
@@ -682,6 +688,7 @@ class AstationHubManager: ObservableObject {
         guard configuredStationOrigin != stationRelayUrl else { return }
         pauseIdentityRelay()
         accountGeneration = UUID(); accountRecovery = nil
+        pairingSession?.contextChanged()
         configuredStationOrigin = stationRelayUrl
         if let settings = portalSettings,
            let auth = try? Self.stationAccountAuth(settings: settings, origin: stationRelayUrl) { accountAuth = auth }
@@ -696,49 +703,6 @@ class AstationHubManager: ObservableObject {
         NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
     }
 
-    /// Retain already-consented legacy service credentials for existing Atems.
-    /// Portal/relay account tokens must never enter this upstream-token message.
-    func broadcastCredentials() {
-        Task { await pushCredentials(targetClientId: nil) }
-    }
-
-    /// Send credentialSync to one specific Atem (e.g. just-connected).
-    func sendCredentials(toClientId clientId: String, relayConnectionId: String? = nil) {
-        Task {
-            await pushCredentials(
-                targetClientId: clientId,
-                relayConnectionId: relayConnectionId
-            )
-        }
-    }
-
-    private func pushCredentials(
-        targetClientId: String?,
-        relayConnectionId: String? = nil
-    ) async {
-        do { _ = try await tokenProvider.validToken() }
-        catch {
-            Log.info("[AstationHub] No session — skipping credentialSync (\(error.localizedDescription))")
-            return
-        }
-        guard let session = sessionStore.load() else { return }
-        let msg = AstationMessage.credentialSync(
-            accessToken: session.accessToken,
-            refreshToken: session.refreshToken,
-            expiresAt: session.expiresAt,
-            loginId: session.loginId,
-            astationId: AstationIdentity.shared.id,
-            saveCredentials: false
-        )
-        if let id = targetClientId {
-            sendMessage(msg, to: id, expectedRelayConnectionId: relayConnectionId)
-            Log.info("[AstationHub] Sent credentialSync to \(id.prefix(8))…")
-        } else {
-            broadcastHandler?(msg)
-            Log.info("[AstationHub] Broadcast credentialSync to all Atems")
-        }
-    }
-    
     // MARK: - Projects Management
 
     /// Only Portal-scoped credentials can reach the linked Agora account APIs.
@@ -1044,12 +1008,6 @@ class AstationHubManager: ObservableObject {
 
             self.sendEncryptionMode(to: client.id, relayConnectionId: relayConnectionId)
 
-            // Send credentials immediately after connection
-            self.sendCredentials(
-                toClientId: client.id,
-                relayConnectionId: relayConnectionId
-            )
-
             self.broadcastInstanceList()
             self.requestAgentList(from: client.id)
         }
@@ -1254,6 +1212,7 @@ class AstationHubManager: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.e2eDataAccount == context.account else { return }
                 self.atemVerification.cancel(route: context.route)
+                self.remotePairingVerificationFailed(on: context.route)
             }
             return nil
 
@@ -1479,8 +1438,6 @@ class AstationHubManager: ObservableObject {
             self.requestAgentList(from: clientId)
         }
 
-        // Push credentials to the newly connected Atem.
-        sendCredentials(toClientId: clientId, relayConnectionId: relayConnectionId)
     }
 
     /// Mark the most-recently-active client as focused, unfocus others.
@@ -1716,6 +1673,25 @@ class AstationHubManager: ObservableObject {
         remoteTrustDidChange()
         requestRelayEncryptionState()
         nativeSessionClients[route.clientId]?.verificationDidComplete(context: context)
+        MainActor.assumeIsolated {
+            pairingSession?.verificationCompleted(.init(device: route.deviceId,
+                session: context.pairingSession, connection: route.connectionId))
+        }
+    }
+
+    private func remotePairingVerificationFailed(on route: AtemVerificationRoute) {
+        guard let session = connectedClients.first(where: { $0.id == route.clientId })?.authenticationSessionId else { return }
+        MainActor.assumeIsolated {
+            pairingSession?.verificationFailed(.init(device: route.deviceId, session: session, connection: route.connectionId))
+        }
+    }
+
+    private func remotePairingConnectionClosed(clientId: String, connectionId: String) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard clientId.hasPrefix("relay-") else { return }
+        MainActor.assumeIsolated {
+            pairingSession?.identityConnectionClosed(device: String(clientId.dropFirst("relay-".count)), connection: connectionId)
+        }
     }
 
     @discardableResult
@@ -2108,80 +2084,34 @@ class AstationHubManager: ObservableObject {
 
     // MARK: - Relay Pairing
 
-    /// Connect to a remote Atem via the relay service using a pairing code.
+    @MainActor private var nativePairingContext: NativePairingContext? {
+        guard let account = signedInAccount, !accountSignInRequired else { return nil }
+        return NativePairingContext(accountGeneration: accountGeneration, account: account,
+            station: stationRelayUrl, astationID: AstationIdentity.shared.id)
+    }
+
+    /// The pairing socket carries only the versioned routing introduction.
+    @MainActor
     func connectToRelay(code: String) {
-        // Open a WebSocket to the relay and bridge messages
-        guard let url = StationRelayURL.webSocketURL(base: stationRelayUrl, code: code) else {
-            Log.info("[AstationHub] Invalid relay URL: \(stationRelayUrl)")
-            return
+        if pairingSession == nil {
+            pairingSession = NativePairingSession(context: { [weak self] in self?.nativePairingContext },
+                authorize: { [weak self] in
+                    guard let self else { throw AccountLoginError.changed }
+                    try await self.prepareAccountSecurityAccess()
+                }, makeSocket: makePairingRelayTask, changed: { [weak self] state in
+                    self?.pairingState = state
+                    Log.info("[Pairing] \(state.message)")
+                }, cancelPeer: { [weak self] peer in
+                    guard let self,
+                          self.identityRelayAuthentication.connectionId(for: "relay-" + peer.device) == peer.connection,
+                          self.connectedClients.first(where: { $0.id == "relay-" + peer.device })?.authenticationSessionId == peer.session else { return }
+                    self.atemVerification.disconnect(clientId: "relay-" + peer.device)
+                })
         }
-        Log.info("[AstationHub] Connecting to relay: \(url.absoluteString)")
-
-        let task = makePairingRelayTask(url)
-        task.resume()
-
-        // Generate a synthetic client ID for this relay connection
-        let relayClientId = "relay-\(code)"
-
-        // Start reading messages from the relay
-        readRelayMessages(task: task, clientId: relayClientId)
-
-        // Wire send handler to also forward to relay
-        let originalSend = sendHandler
-        sendHandler = { [weak task] message, targetId in
-            if targetId == relayClientId {
-                // Send to relay WebSocket
-                if let jsonData = try? JSONEncoder().encode(message),
-                   let jsonString = String(data: jsonData, encoding: .utf8) {
-                    NetworkDebugLogger.logWebSocket(direction: "send", context: "relay \(relayClientId)", message: jsonString)
-                    task?.send(.string(jsonString)) { error in
-                        if let error = error {
-                            Log.info("[AstationHub] Relay send error: \(error)")
-                        }
-                    }
-                }
-            } else {
-                // Forward to original handler (local WebSocket)
-                originalSend?(message, targetId)
-            }
-        }
-        // This socket only hands off pairing credentials. The identity-room
-        // authentication will add the real Atem; a room code is not a device.
-        sendEncryptionMode(to: relayClientId, relayConnectionId: nil)
-        sendCredentials(toClientId: relayClientId)
+        pairingSession?.start(code: code)
     }
 
-    private func readRelayMessages(task: IdentityRelaySocket, clientId: String) {
-        task.receive { [weak self] result in
-            switch result {
-            case .success(let message):
-                switch message {
-                case .string(let text):
-                    NetworkDebugLogger.logWebSocket(direction: "recv", context: "relay \(clientId)", message: text)
-                    if let data = text.data(using: .utf8),
-                       let msg = try? AstationMessage.decodePacket(data) {
-                        DispatchQueue.main.async {
-                            let response = self?.handleMessage(msg, from: clientId)
-                            // If there's a response, send it back via relay
-                            if let response = response,
-                               let jsonData = try? JSONEncoder().encode(response),
-                               let jsonString = String(data: jsonData, encoding: .utf8) {
-                                NetworkDebugLogger.logWebSocket(direction: "send", context: "relay \(clientId)", message: jsonString)
-                                task.send(.string(jsonString)) { _ in }
-                            }
-                        }
-                    }
-                default:
-                    break
-                }
-                // Continue reading
-                self?.readRelayMessages(task: task, clientId: clientId)
-
-            case .failure(let error):
-                Log.info("[AstationHub] Relay connection closed: \(error)")
-            }
-        }
-    }
+    @MainActor func cancelRemotePairing() { pairingSession?.cancel() }
 
     // MARK: - Identity Relay (persistent background relay for TUI auto-reconnect)
 
@@ -2435,6 +2365,11 @@ class AstationHubManager: ObservableObject {
                 "code=\(closeDescription)\(reasonDescription)\(errorDescription)"
         )
 
+        for client in connectedClients where client.id.hasPrefix("relay-") {
+            if let connection = identityRelayAuthentication.connectionId(for: client.id) {
+                remotePairingConnectionClosed(clientId: client.id, connectionId: connection)
+            }
+        }
         connectedClients
             .filter { $0.id.hasPrefix("relay-") }
             .forEach { removeClient(withId: $0.id) }
@@ -2681,7 +2616,12 @@ class AstationHubManager: ObservableObject {
         identityRelayActive = false
         pendingRelayChallenge = nil
         identityRelayReconnectGeneration &+= 1
-        connectedClients.filter { $0.id.hasPrefix("relay-") }.forEach { removeClient(withId: $0.id) }
+        for client in connectedClients where client.id.hasPrefix("relay-") {
+            if let connection = identityRelayAuthentication.connectionId(for: client.id) {
+                remotePairingConnectionClosed(clientId: client.id, connectionId: connection)
+            }
+            removeClient(withId: client.id)
+        }
         identityRelayAuthentication.removeAll()
         browserAgentChat.invalidateAll()
         refreshSessionConnections()
@@ -3226,13 +3166,16 @@ class AstationHubManager: ObservableObject {
         if clientId.hasPrefix("relay-browser-") { return }
         switch event {
         case "connected":
+            let previous = identityRelayAuthentication.connectionId(for: clientId)
             if identityRelayAuthentication.connect(clientId: clientId, connectionId: connectionId) {
+                if let previous { remotePairingConnectionClosed(clientId: clientId, connectionId: previous) }
                 terminalConnectionsDidChange?()
                 removeClient(withId: clientId)
             }
             requestIdentityRelayAuthentication(clientId: clientId, connectionId: connectionId)
         case "disconnected":
             if identityRelayAuthentication.disconnect(clientId: clientId, connectionId: connectionId) {
+                remotePairingConnectionClosed(clientId: clientId, connectionId: connectionId)
                 terminalConnectionsDidChange?()
                 removeClient(withId: clientId)
             }
@@ -3377,7 +3320,7 @@ class AstationHubManager: ObservableObject {
             return
         }
 
-        guard let pairingCode = data["pairing_code"],
+        guard let pairingCode = data["pairing_code"], let pairingAttemptID = data["pairing_attempt_id"],
               let rawHostname = data["hostname"],
               DeviceAuthentication.isValidPairingCode(pairingCode) else {
             sendHandler?(.error(message: "Invalid relay authentication credentials"), clientId)
@@ -3386,6 +3329,11 @@ class AstationHubManager: ObservableObject {
 
         let hostname = DeviceAuthentication.deviceLabel(rawHostname)
         dispatchPrecondition(condition: .onQueue(.main))
+        guard MainActor.assumeIsolated({ pairingSession?.beginAuthentication(code: pairingCode,
+            attemptID: pairingAttemptID, device: atemId, connection: connectionId) == true }) else {
+            sendHandler?(.error(message: "Start a current token-free pairing attempt in Astation first"), clientId)
+            return
+        }
         let alert = NSAlert()
         alert.messageText = "Remote Atem Pairing Request"
         alert.informativeText = "Device: \(hostname)\nCode: \(pairingCode)\n\nAllow this Atem to connect through the relay?"
@@ -3393,17 +3341,24 @@ class AstationHubManager: ObservableObject {
         alert.addButton(withTitle: "Deny")
         alert.alertStyle = .informational
 
-        guard alert.runModal() == .alertFirstButtonReturn else {
+        let response = alert.runModal()
+        guard identityRelayAuthentication.connectionId(for: clientId) == connectionId,
+              MainActor.assumeIsolated({ pairingSession?.canFinishAuthentication(code: pairingCode,
+                attemptID: pairingAttemptID, device: atemId, connection: connectionId) == true }) else {
+            Log.warn("[AstationHub] Relay connection changed while pairing approval was pending")
+            return
+        }
+        guard response == .alertFirstButtonReturn else {
+            MainActor.assumeIsolated { pairingSession?.reject() }
             identityRelayAuthentication.reject(clientId: clientId, connectionId: connectionId)
             sendHandler?(.auth(info: ["status": "denied", "message": "Pairing denied by user"]), clientId)
             return
         }
-
-        guard identityRelayAuthentication.connectionId(for: clientId) == connectionId else {
-            Log.warn("[AstationHub] Relay connection changed while pairing approval was pending")
-            return
-        }
         let session = deviceSessionStore.create(hostname: hostname, atemId: atemId)
+        MainActor.assumeIsolated {
+            pairingSession?.authenticated(.init(device: atemId, session: session.id, connection: connectionId),
+                code: pairingCode, attemptID: pairingAttemptID)
+        }
         finishIdentityRelayAuthentication(
             clientId: clientId,
             atemId: atemId,

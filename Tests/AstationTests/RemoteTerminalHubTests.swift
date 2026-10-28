@@ -220,18 +220,17 @@ final class RemoteTerminalHubTests: XCTestCase {
         XCTAssertTrue(f.sessionFrames.isEmpty)
     }
 
-    func testPairingRoomTransfersMessagesWithoutBecomingAnOnlineAtem() async throws {
+    func testSignedOutPairingCannotReplaceAgentTransportOrCreateAnOnlineAtem() async throws {
         let f = try TerminalHubFixture()
         var forwarded: [String] = []
         f.hub.sendHandler = { _, id in forwarded.append(id) }
-        f.hub.connectToRelay(code: "TEST-CODE")
+        f.hub.connectToRelay(code: "ABCD-2345")
         await f.drain()
         XCTAssertTrue(f.hub.connectedClients.isEmpty)
         XCTAssertTrue(f.hub.agentsByClientId.isEmpty)
         XCTAssertTrue(f.hub.sessionStatusByClientId.isEmpty)
-        f.hub.sendHandler?(.statusUpdate(status: "test", data: [:]), "relay-TEST-CODE")
-        XCTAssertEqual(f.socket.sent.last?["type"] as? String, "statusUpdate")
-        XCTAssertTrue(forwarded.isEmpty)
+        XCTAssertEqual(f.hub.pairingState, .failed("Sign in to Agora.Build before pairing Atem."))
+        XCTAssertTrue(f.socket.sent.isEmpty)
         f.hub.sendHandler?(.statusUpdate(status: "test", data: [:]), "actual-host")
         XCTAssertEqual(forwarded, ["actual-host"])
         XCTAssertTrue(f.sessionFrames.isEmpty)
@@ -325,10 +324,10 @@ final class RemoteTerminalHubTests: XCTestCase {
         try await f.start(); try await f.authenticate()
         _ = try XCTUnwrap(f.hub.sessionClient(for: f.clientId))
         let before = f.sessionFrames.count
-        f.hub.connectToRelay(code: "TEST-CODE"); await f.drain()
+        f.hub.connectToRelay(code: "ABCD-2345"); await f.drain()
         XCTAssertEqual(f.hub.connectedClients.map(\.id), [f.clientId])
         XCTAssertEqual(f.sessionFrames.count, before)
-        XCTAssertNil(f.hub.sessionStatusByClientId["relay-TEST-CODE"])
+        XCTAssertNil(f.hub.sessionStatusByClientId["relay-ABCD-2345"])
         f.sockets.pairing.fail(); await f.drain()
         XCTAssertEqual(f.hub.connectedClients.map(\.id), [f.clientId])
         XCTAssertEqual(f.sessionFrames.count, before)

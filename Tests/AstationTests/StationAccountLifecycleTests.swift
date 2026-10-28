@@ -54,6 +54,8 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
     let defaults: UserDefaults
     var sockets: [StationTestSocket] = []
     var urls: [URL] = []
+    let pairingSocket = StationTestSocket()
+    var pairingURLs: [URL] = []
     var hub: AstationHubManager!
 
     init(stationSubject: String = "test-owner", origin: String = "https://station-tests.example") throws {
@@ -81,6 +83,8 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
             atemE2EIdentity: AtemE2EIdentity(storage: TestAtemStorage(), crypto: TestAtemCryptography()),
             dispatchMigration: { _ in }, makeIdentityRelayTask: { [weak self] url in
                 let socket = StationTestSocket(); self?.urls.append(url); self?.sockets.append(socket); return socket
+            }, makePairingRelayTask: { [unowned self] url in
+                self.pairingURLs.append(url); return self.pairingSocket
             }, portalSettings: settings, portalAuth: portal, stationAuth: station, portalAPI: PortalAPIClient(http: http),
             projectCache: PortalProjectCache(storage: StationTestCache()), accountDefaults: defaults)
         hub._testRelayUrlOverride = origin
@@ -112,6 +116,44 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
         let hub = AstationHubManager(skipProjectLoad: true, accountDefaults: fixture.defaults)
         XCTAssertEqual(hub.accountAuth.configuration?.resource, hub.stationRelayUrl)
         XCTAssertEqual(hub.accountAuth.configuration?.requiredScope, "astation.remote")
+    }
+
+    func testAgoraBuildLoginPairsWithoutLegacySessionOrSharingAccountTokens() async throws {
+        let fixture = try StationAccountFixture(); defer { fixture.hub.cancelRemotePairing(); fixture.cleanup() }
+        let socket = try await connected(fixture)
+        socket.emit(#"{"type":"relayAck","for":"relayRegisterAccount","ok":true}"#)
+        try await fixture.hub.prepareAccountSecurityAccess()
+        XCTAssertNil(fixture.hub.sessionStore.load(), "Only Agora.Build login is present")
+        var agentTargets: [String] = []
+        fixture.hub.sendHandler = { _, clientID in agentTargets.append(clientID) }
+        fixture.hub.connectToRelay(code: "ABCD-2345")
+        try await waitUntil { fixture.hub.pairingState == .waitingForHost }
+        XCTAssertEqual(fixture.pairingURLs.first?.host, "station-tests.example")
+        fixture.pairingSocket.emit(#"{"atem_id":"device","connection_id":"11111111-2222-4333-8444-555555555555","payload":{"type":"pairing","data":{"v":1,"op":"hello","id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}}}"#)
+        try await waitUntil { fixture.hub.pairingState == .waitingForVerification }
+        let sent = try XCTUnwrap(fixture.pairingSocket.sent.first)
+        XCTAssertEqual(fixture.pairingSocket.sent.count, 1)
+        XCTAssertTrue(sent.contains("introduction"))
+        XCTAssertTrue(sent.contains(AstationIdentity.shared.id))
+        for forbidden in ["credentialSync", "test-portal-token", "test-station-token", "refresh_token", "access_token", "test-owner"] {
+            XCTAssertFalse(sent.contains(forbidden), "Pairing leaked \(forbidden)")
+        }
+        XCTAssertTrue(fixture.hub.connectedClients.isEmpty)
+        XCTAssertEqual(fixture.hub.deviceSessionStore.getAllActive().count, 1, "Introduction cannot enroll a host")
+        fixture.hub.sendHandler?(.statusUpdate(status: "test", data: [:]), "existing-agent")
+        XCTAssertEqual(agentTargets, ["existing-agent"], "Pairing cannot replace the agent transport handler")
+    }
+
+    func testPairingWaitingForRegistrationIsCancelledOnSignOut() async throws {
+        let fixture = try StationAccountFixture(); defer { fixture.cleanup() }
+        let socket = try await connected(fixture)
+        fixture.hub.connectToRelay(code: "ABCD-2345")
+        try await waitUntil { fixture.hub.pairingState == .preparing }
+        try await fixture.hub.signOutAccount()
+        socket.emit(#"{"type":"relayAck","for":"relayRegisterAccount","ok":true}"#)
+        try await waitUntil { !fixture.hub.pairingState.active }
+        XCTAssertTrue(fixture.pairingURLs.isEmpty)
+        XCTAssertTrue(fixture.pairingSocket.sent.isEmpty)
     }
 
     func testSecurityAccessWaitsForRegistrationAckAndUsesOnlyStationToken() async throws {

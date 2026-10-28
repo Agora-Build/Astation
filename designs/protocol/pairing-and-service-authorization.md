@@ -1,9 +1,11 @@
 # Pairing and service authorization
 
-Status: **draft for owner review**, 2026-10-28. This records the proposed
-product flow and security boundaries. It does not approve a new wire format,
-authorize implementation or enable hosted execution. Atem owns its protocol
-and host implementation; Astation owns native UX and integration.
+Status: **product design approved; native candidate implemented**,
+2026-10-28. The owner approved the separation and requested implementation.
+The v1 wire below is the Astation implementation candidate awaiting Atem's
+joint confirmation and receiver build. Atem owns its protocol and host
+implementation; Astation owns native UX and integration. Hosted execution
+remains disabled pending the real joint end-to-end gates.
 
 ## Recommendation
 
@@ -21,7 +23,7 @@ verify again whenever they use an agent. Existing verified membership remains
 the basis for access, subject to permissions, revocation and the R9 freshness
 rules. Each process/session is not a new device.
 
-## Proposed flow
+## Guided flow
 
 ![One guided pairing flow with separate optional service authorization](pairing-and-service-authorization.svg)
 
@@ -43,8 +45,8 @@ flowchart TD
 
 </details>
 
-The diagram shows the intended user experience, not an already implemented
-protocol. Device messages travel through the selected Station; the native
+The diagram shows the approved user experience. Native and host delivery
+still require joint validation. Device messages travel through the selected Station; the native
 device and Atem verify the cryptographic evidence themselves.
 
 | Step | Establishes | Does not establish |
@@ -82,15 +84,17 @@ work without connecting an Agora.io account.
 The integration approval screen is a later stage: load requests, select a
 verified host, review the requested permissions, then authenticate the owner
 to approve the service identity. It must explain the verified-host
-prerequisite when no host is available. This proposal does not bypass the
+prerequisite when no host is available. This flow does not bypass the
 joint verification gate for hosted execution.
 
 ## Pairing introduction without service tokens
 
 Replace the pairing path's dependency on `credentialSync` with an explicit,
 versioned introduction that supplies only the information necessary to find
-the native identity connection. The exact message name and field encoding
-remain subject to joint review on Atem #81.
+the native identity connection. The candidate below is posted for joint
+confirmation on [Atem #81](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6477978879),
+with the relay wrapper and authentication correlation in the
+[implementation follow-up](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6478324332).
 
 The contract must specify:
 
@@ -113,6 +117,96 @@ The existing device-key proofs, fresh challenges, safety-code comparison,
 owner confirmation and signed membership checks establish authority after
 the introduction. Reuse the signed R9 primitives and reviewed membership
 lifecycle; do not invent a second trust protocol for this transport change.
+
+### Pairing-only wire v1
+
+The host sends this payload on the temporary pairing socket:
+
+```json
+{"type":"pairing","data":{"v":1,"op":"hello","id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}}
+```
+
+The UUID is fresh for each attempt and remains identical on retransmission.
+Station does not buffer a hello sent before the native owner joins. The
+host must therefore retransmit the same hello at a bounded interval until
+it receives the introduction, or send again when the owner arrives.
+
+After preparing its selected-Station account access and waiting for the
+registration acknowledgment, native responds with this payload:
+
+```json
+{"type":"pairing","data":{"v":1,"op":"introduction","id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","astation_id":"native-routing-identity"}}
+```
+
+The Station wraps host-to-native payloads with `atem_id`, `connection_id`
+and `payload`. Native validates and pins that route on the first hello,
+then responds in the same targeted wrapper. Station strips the wrapper
+before delivering to that exact host socket. A changed host, connection or
+attempt ID fails the attempt. Neither the wrapper nor the introduction
+authenticates a device. The hello is not sent as an agent session message
+and does not negotiate a lower R9 revision.
+
+Each frame, including its wrapper, is limited to 4096 bytes. Duplicate JSON
+keys, extra fields, noninteger versions, unknown operations and malformed
+UUIDs are rejected. The native routing identity is 1–128 ASCII bytes from
+`[A-Za-z0-9._:-]`. The existing bounded device/connection identifiers apply
+to the transport wrapper. Relay connection notices are transport hints.
+
+Errors use `type: "pairing"` and `data` with `v: 1`, `op: "error"`, the
+attempt `id` and `code`. The bounded candidate codes are
+`unsupported_version`, `invalid_request`, `not_signed_in`,
+`pairing_cancelled` and `pairing_expired`. Native accepts a matching host
+error, shows actionable local failures and closes its pending socket on
+cancellation or failure. Socket closure is not a durable host receipt; the
+host must also bound its own waiting. An old or silent host receives no
+fabricated credentials and leaves native with an upgrade/retry message.
+
+### Identity connection and completion
+
+The host next opens the existing identity connection at the **same selected
+Station**, using the introduced routing identity. Its `atem_id` must match
+the pairing socket. For a new pairing, the existing `statusUpdate` with
+`status: "auth"` carries the original room code as `pairing_code` and the
+hello UUID as `pairing_attempt_id`, alongside its existing hostname and
+host identity. These are correlation hints, not identity proofs. Native
+requires all three to match its pending introduction before opening the
+owner prompt. The original code is reused; a second unrelated OTP cannot
+attach a connection to the attempt. Saved-session proof reconnects retain
+their existing authentication path and need no fresh introduction.
+
+Native captures the authenticated session and the new identity socket's
+connection generation after owner confirmation. Completion is accepted only
+for this exact device/session/connection and the unchanged native account
+and Station. The existing R9 verification checks the safety code, requires
+owner authentication, publishes and verifies signed membership, then
+durably saves verified device state. Only its successful completion
+callback may show **verified**. Closing the code socket after introduction
+merely means the host may be moving to the identity connection.
+
+An active native attempt has a monotonic 10-minute outer deadline. After
+opening its code socket, native allows 20 seconds for a compatible hello,
+so a silent legacy host cannot leave the user waiting indefinitely. Host
+timeouts and room expiry are independent bounds. Duplicate hellos receive
+identical introductions on the original route, with bounded repetition;
+they cannot reopen a prompt or reset verification progress. Cancellation,
+account changes and Station changes invalidate queued asynchronous work.
+Cancellation during verification cancels only that pending ceremony;
+saved pairing and already verified membership are preserved. Interrupted
+verification can use `atem pair verify`, subject to the existing R9 gates.
+
+The native pairing socket has its own lifecycle and never wraps or replaces
+the application's global agent transport handler. A room code never becomes
+an online Atem row. Pairing, login reload, connection and activity no longer
+automatically trigger legacy service credential sharing; explicit service
+authorization remains a separate responsibility.
+
+This introduction replaces the relay room's bootstrap. Same-user loopback
+connections retain their existing local bootstrap proof and learn the native
+routing identity from the existing authentication challenge. Atem must remove
+the service-credential prerequisite from that local pairing path too. Local
+authentication does not replace safety-code/device verification, account
+membership or feature authorization. This change does not remove local
+WebSocket access or create a second device identity for a local process.
 
 ## Trust and lifecycle invariants
 
@@ -151,10 +245,12 @@ lifecycle; do not invent a second trust protocol for this transport change.
 | Station | Preserve bounded pairing-room transport; keep routing and API admission distinct from device trust |
 | Agora.Build/Auth | Retain existing account/API grants; review a separate host/service grant only if a feature actually needs it |
 
-First agree the token-free introduction, capability/version handling and
-durable transition with Atem. Then implement and test the native and host
-sides separately, pin the new joint builds, and run the real native ceremony.
-No production merge/deploy or live enrollment is authorized by this draft.
+Native implementation and tests can proceed against this bounded candidate
+while Atem reviews and implements its receiver. Confirm the exact wire and
+new host source/build pin on #81 before the real pairing attempt. Then pin
+both builds and run the native ceremony with the owner. Product approval
+does not authorize impersonating safety-code/biometric confirmation or
+merging/deploying production.
 
 Minimum joint tests:
 
@@ -189,10 +285,36 @@ record the observed failure. The relay's earlier ten-second ownerless-pairing
 bug is fixed separately; that transport fix does not remove this native/host
 dependency.
 
-## Review before implementation
+## Implementation and verification status
 
-The owner is reviewing the separation and user experience. The proposed
-flow keeps one guided pairing action; optional service access remains
-independent. Atem and Astation must jointly confirm the wire shape, version
-negotiation, retry/persistence semantics and the host build pin before coding
-this change. This document is the review draft, not that confirmation.
+The native candidate lives in `NativePairingSession`, with a guided
+`PairRemoteAtemWindowController` and existing hub verification integration.
+Tests cover Agora.Build-only login and Station registration without a legacy
+session; targeted relay delivery; duplicates; replacement routes; context
+changes; cancellation; timeout; token isolation; and exact durable-completion
+correlation. A synthetic native URLSession test through the isolated deployed
+Station passes; it supplies no real identity or owner confirmation and proves
+only the transport handoff. Run it only against a disposable test Station:
+
+```sh
+swift test --filter 'NativePairing|StationAccountLifecycleTests|RemoteTerminalHubTests'
+ASTATION_PAIRING_LIVE_STATION=https://your-isolated-station.example \
+  swift test --skip-build --filter NativePairingLiveTransportTests
+```
+
+Local results on 2026-10-28: 59 focused tests pass, with the opt-in live test
+skipped in that run; the live test passes separately against the isolated
+Station. The full provisioned run executes 1,074 tests with eight skips and
+13 failures: ten protected-storage tests fail while macOS reports the console
+locked (`-25308` / storage unavailable), and two existing UI tests fail
+(queued biometric cancellation and caption scrolling, three assertions).
+Their source is unchanged by this increment. An unlocked-Mac rerun and
+investigation of any remaining UI failures are required; this is not a full
+suite pass or a release sign-off. No test was excluded or weakened to obtain
+a passing result.
+
+Still required: Atem's wire confirmation and receiver build, actual native
+safety-code/owner verification, protected integration approval/enrollment,
+actual agent execution and the policy/revocation/reconnect/Mac-off/replica
+checks. A synthetic relay pass does not satisfy these gates. Hosted execution
+remains disabled.

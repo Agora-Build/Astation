@@ -13,6 +13,7 @@ class StatusBarController: NSObject, NSMenuDelegate {
     private lazy var devConsoleController = DevConsoleController(hubManager: hubManager)
     private lazy var projectsWindowController = ProjectsWindowController(hubManager: hubManager)
     private lazy var joinChannelWindowController = JoinChannelWindowController(hubManager: hubManager)
+    private lazy var pairingWindowController = MainActor.assumeIsolated { PairRemoteAtemWindowController(hub: hubManager) }
     private lazy var connectionsWindowController = ConnectionsWindowController(hubManager: hubManager, androidDeviceManager: androidDeviceManager)
     let hotkeyManager: HotkeyManager
     let recordingManager: AudioRecordingManager
@@ -494,33 +495,11 @@ class StatusBarController: NSObject, NSMenuDelegate {
 
     @objc private func showApprovalNotificationSettings() { approvalNotificationSettings?() }
 
-    @objc private func pairRemoteAtem() {
-        Log.info(" Pair Remote Atem requested from status bar")
-
-        let alert = NSAlert()
-        alert.messageText = "Pair Remote Atem"
-        alert.informativeText = "Enter the relay pairing code shown by 'atem pair':"
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Connect")
-        alert.addButton(withTitle: "Cancel")
-
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        input.placeholderString = "e.g. ABCD-1234"
-        alert.accessoryView = input
-        alert.window.initialFirstResponder = input
-
-        let response = alert.runModal()
-        guard response == .alertFirstButtonReturn else { return }
-
-        let code = input.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !code.isEmpty else {
-            Log.warn(" Pair Remote Atem: empty code entered")
-            return
-        }
-
-        Log.info(" Pair Remote Atem: connecting with code \(code)")
-        hubManager.connectToRelay(code: code)
+    @MainActor @objc private func pairRemoteAtem() {
+        pairingWindowController.showWindow()
     }
+
+    @MainActor func showPairing(code: String) { pairingWindowController.showWindow(code: code) }
 
     @objc private func copyWebSocketURL() {
         let url = "ws://127.0.0.1:8080/ws"

@@ -18,7 +18,7 @@
   </defs>
   <rect width="1040" height="1100" rx="18" fill="#f4f7f8"/>
   <text x="520" y="44" text-anchor="middle" class="heading">One pairing flow. Separate service access.</text>
-  <text x="520" y="72" text-anchor="middle" class="subtitle">Proposed design for review</text>
+  <text x="520" y="72" text-anchor="middle" class="subtitle">Approved flow - joint verification pending</text>
 
   <rect x="245" y="102" width="550" height="76" rx="12" class="box"/>
   <text x="267" y="131" class="step">01</text>
