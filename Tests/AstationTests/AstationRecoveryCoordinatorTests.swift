@@ -390,6 +390,25 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertThrowsError(try coordinator.channelMembership(hostID: "host-a"))
     }
 
+    func testMultipleMembershipCommitsNotifyOnceAfterAccountOperationCompletes() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        var heads: [LogHead] = []
+        coordinator.onMembershipCommit = { head in
+            heads.append(head)
+            do {
+                try coordinator.checkpointPendingWaits()
+                let entries = try XCTUnwrap(self.checkpoint(h.store)["entries"] as? [String])
+                XCTAssertEqual(try signedObjectInfo(json: XCTUnwrap(entries.last)).entryHash, head.hash)
+            } catch { XCTFail("Membership notification preceded its durable checkpoint: \(error)") }
+        }
+        _ = try await coordinator.setup()
+        XCTAssertEqual(heads.count, 1, "Genesis and backup publication should reconcile channels once")
+        XCTAssertGreaterThan(try XCTUnwrap(heads.last).seq, 1)
+        _ = try await coordinator.serviceMembership()
+        XCTAssertEqual(heads.count, 1, "Unchanged refreshes must not replace channels again")
+        coordinator.onMembershipCommit = nil
+    }
+
     func testServiceApprovalResumesAfterLostPortalReplyWithoutResigningOrReposting() async throws {
         let h = RecoveryCoordinatorHarness()
         var coordinator: AstationRecoveryCoordinator? = try h.coordinator()

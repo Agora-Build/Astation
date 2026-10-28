@@ -63,6 +63,7 @@ final class AstationR9Connection {
                 try await signer.prepare(isCurrent: { self?.current() == true && self?.closed == false })
                 guard let self, !Task.isCancelled, !closed, current() else { return }
                 preparation = nil
+                Log.info("[R9] Opening encrypted channel to \(context.device) with membership seq \(log.head().seq)")
                 channel = try router.open(hostID: context.device, identity: identity, log: log,
                     sign: { [weak self] request in
                         try await signer.sign(request, isCurrent: { self?.current() == true && self?.closed == false })
@@ -120,6 +121,7 @@ final class AstationR9Connection {
                 refresh(head: info.head); return
             }
             guard let membershipLog else { finish("Account membership is unavailable."); return }
+            Log.info("[R9] Encrypted channel to \(context.device) ready; local membership seq \(membershipLog.head().seq), host seq \(info.head.seq)")
             hostPolicyBinding = AtemHostPolicyBinding(genesis: membershipLog.genesisHash(), manager: AstationIdentity.shared.id,
                 trust: info.hostTrustGen, channel: info.channelId, attachment: info.attachmentGen,
                 supported: info.features.contains("host.policy"))

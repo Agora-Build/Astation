@@ -1160,6 +1160,18 @@ final class AtemSessionClientTests: XCTestCase {
         XCTAssertEqual(f.closes, closes)
     }
 
+    func testLateLeaseReplyCannotRestoreControlAfterMembershipRefresh() throws {
+        let f = SessionFixture(); try f.ready()
+        f.client.acquire(f.target)
+        let request = try XCTUnwrap(f.sent.last(where: { $0.op == "acquire" })).id
+        f.client.channelMembershipRefreshed(context: try XCTUnwrap(f.source))
+        try f.handshake(attachment: "77777777-7777-4777-8777-777777777777")
+        try f.snapshot()
+        try f.lease(replyTo: request)
+        XCTAssertFalse(f.client.controls(f.target))
+        XCTAssertEqual(f.client.welcome?.attachment_gen, "77777777-7777-4777-8777-777777777777")
+    }
+
     func testVerificationAfterAWelcomeNeverReplacesTheAttachmentOrAcquiresControl() throws {
         let f = SessionFixture(); try f.ready(); try f.takeControl()
         let originalCount = f.sent.count

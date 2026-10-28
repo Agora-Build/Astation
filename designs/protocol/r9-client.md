@@ -35,6 +35,18 @@ fetches and verifies the chain, commits it and opens a fresh channel. A head
 already held on the same chain does not reconnect. Divergence, failed storage
 or a removed member requires review and cannot silently resume.
 
+A locally published membership change follows the same rule. After its
+protected checkpoint commits and the account operation releases its lock,
+the coordinator notifies the hub once with the latest committed head. Native
+and policy channels holding an older snapshot are replaced on their current
+authenticated transport. Their new handshake carries the committed signed
+log to the host; ordinary terminal-window reopening is not a membership sync.
+Account, Station and transport-generation checks fence stale callbacks. The
+replacement clears attachment and lease state, then queries outstanding
+receipts without replaying commands or acquiring control. Lost Portal replies
+cannot hide an already committed update; uncertain local writes never advertise
+a new head. Unchanged checkpoints do not loop channel replacement.
+
 Each live host socket has its own generation-bound router, with unique handles
 even if a router is replaced on that socket. Writes are ordered and bounded to
 64 frames/4 MiB. Failure closes the affected channel; ciphertext and uncertain

@@ -106,10 +106,10 @@ final class IntegrationApprovalViewController: NSViewController {
         picker.isEnabled = !busy && !records.isEmpty && approval == nil
         let pendingSelection = records.indices.contains(picker.indexOfSelectedItem)
             && records[picker.indexOfSelectedItem].state == "awaiting_approval"
-        let canSelectHosts = !busy && log != nil && approval == nil && contextCurrent?() == true
+        let canSelectHosts = !busy && pendingSelection && log != nil && approval == nil && contextCurrent?() == true
         let hasSelectedHost = hostButtons.contains { $0.1.state == .on }
         reviewButton.isEnabled = canSelectHosts && pendingSelection && hasSelectedHost
-        hostStatus.isHidden = log == nil || approval != nil
+        hostStatus.isHidden = log == nil || approval != nil || !pendingSelection
         hostStatus.stringValue = hostButtons.isEmpty
             ? "No verified Atem hosts are enrolled in this account. Pair and verify an Atem host, then load requests again."
             : "Select at least one host to review access."
@@ -123,7 +123,11 @@ final class IntegrationApprovalViewController: NSViewController {
         for (_, button) in hostButtons { button.isEnabled = canSelectHosts }
     }
 
-    @objc private func selectionChanged() { approval = nil; reviewText.stringValue = ""; render() }
+    @objc private func selectionChanged() {
+        approval = nil; reviewText.stringValue = ""
+        status.stringValue = selectedRequestGuidance()
+        render()
+    }
     @objc private func hostSelectionChanged() { render() }
     @objc private func setupSecurity() { openSecurity() }
 
@@ -214,7 +218,7 @@ final class IntegrationApprovalViewController: NSViewController {
                     }
                     approval = saved; try showReview(saved)
                     status.stringValue = "A saved approval is ready to resume. Its original signature is retained."
-                } else { status.stringValue = self.records.isEmpty ? "No requests are waiting on this Station." : "Choose an integration and its allowed hosts, then review access." }
+                } else { status.stringValue = selectedRequestGuidance() }
                 render()
             } catch { fail(error, epoch: epoch) }
         }
@@ -291,6 +295,17 @@ final class IntegrationApprovalViewController: NSViewController {
     private func fail(_ error: Error, epoch: UUID) {
         guard epoch == generation else { return }
         status.stringValue = error.localizedDescription; render()
+    }
+    private func selectedRequestGuidance() -> String {
+        guard records.indices.contains(picker.indexOfSelectedItem) else { return "No requests are waiting on this Station." }
+        switch records[picker.indexOfSelectedItem].state {
+        case "waiting_for_host":
+            return "Access is already approved and saved. Hosted execution awaits end-to-end verification."
+        case "provisioning":
+            return "Access is already approved. The Station is preparing this integration."
+        default:
+            return "Choose the allowed hosts, then review access."
+        }
     }
     private static func items(_ text: String) -> [String]? {
         let values = text.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
