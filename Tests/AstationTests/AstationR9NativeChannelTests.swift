@@ -82,6 +82,55 @@ private final class NativeChannelFixture {
 
 final class AstationR9NativeChannelTests: XCTestCase {
     @MainActor
+    func testNativeConnectionWaitsForActivationBeforeAndAfterAuthentication() async throws {
+        let f = try NativeChannelFixture()
+        var active = false
+        let awaitingPrompt = expectation(description: "Foreground prompt")
+        var answer: CheckedContinuation<Bool, Never>?
+        let signer = try AstationChannelSigner(identity: f.identity, keyID: "manager-a", active: { active }, confirm: {
+            XCTAssertTrue(active)
+            return await withCheckedContinuation { answer = $0; awaitingPrompt.fulfill() }
+        })
+        let context = AtemSessionContext(route: RemoteTerminalConnection(clientId: "local-host", connectionId: "connection-a"),
+            account: "account-a", device: "host-a", pairingSession: "pairing-a", transportGeneration: "transport-a")
+        var writes: [Data] = []
+        let opened = expectation(description: "Channel opened after restored activation")
+        let channel = AstationR9Connection(context: context, current: { true },
+            write: { bytes, completion in
+                XCTAssertTrue(active)
+                writes.append(bytes); completion(nil)
+                if writes.count == 2 { opened.fulfill() }
+            }, welcomed: { _ in }, receive: { _ in },
+            failed: { message, _ in XCTFail("Unexpected failure: \(message)") }, refreshMembership: { _ in })
+        try channel.start(identity: ClientIdentity(kind: .native, deviceId: "manager-a", keyId: "manager-a", grantJson: nil),
+            log: f.log, signer: signer)
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertNil(answer)
+        XCTAssertTrue(writes.isEmpty)
+        active = true
+        await fulfillment(of: [awaitingPrompt], timeout: 1)
+        active = false
+        NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: nil)
+        try XCTUnwrap(answer).resume(returning: true)
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertTrue(writes.isEmpty, "Authentication callback can precede restored app activation")
+        active = true
+        await fulfillment(of: [opened], timeout: 1)
+        channel.disconnect()
+    }
+
+    @MainActor
+    func testNativeForegroundWaitIsBoundedAndCancellationAware() async throws {
+        do {
+            try await AstationChannelSigner.waitForForeground(active: { false }, timeout: .milliseconds(10))
+            XCTFail("Background wait did not expire")
+        } catch { XCTAssertEqual(error as? RemoteOwnerAuthenticationError, .notForeground) }
+        let task = Task { try await AstationChannelSigner.waitForForeground(active: { false }) }
+        task.cancel()
+        do { try await task.value; XCTFail("Cancelled activation wait succeeded") } catch { }
+    }
+
+    @MainActor
     func testOwnerConfirmationPrecedesAnyChannelTrafficAndDisconnectFencesItsCompletion() async throws {
         for outcome in ["confirmed", "disconnected", "system-auth-focus"] {
             let f = try NativeChannelFixture()
@@ -120,6 +169,8 @@ final class AstationR9NativeChannelTests: XCTestCase {
     @MainActor
     func testConnectionErrorsDistinguishOwnerConfirmationTimeoutAndTransportClosure() {
         XCTAssertTrue(AstationR9Connection.connectionFailureMessage(RemoteRecoveryError.confirmationRequired).contains("Touch ID"))
+        XCTAssertTrue(AstationR9Connection.connectionFailureMessage(RemoteOwnerAuthenticationError.notForeground).contains("foreground"))
+        XCTAssertTrue(AstationR9Connection.connectionFailureMessage(RemoteOwnerAuthenticationError.denied).contains("not completed"))
         XCTAssertTrue(AstationR9Connection.connectionFailureMessage(RemoteChannelError.deadlineExceeded).contains("timed out"))
         XCTAssertFalse(AstationR9Connection.connectionFailureMessage(nil).contains("complete r9 device verification"))
     }

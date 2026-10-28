@@ -162,7 +162,19 @@ final class AstationR9Connection {
     }
 
     static func connectionFailureMessage(_ error: Error?) -> String {
-        if error is RemoteOwnerAuthenticationError || error as? RemoteRecoveryError == .confirmationRequired {
+        if let error = error as? RemoteOwnerAuthenticationError {
+            switch error {
+            case .notForeground:
+                return "Bring Astation to the foreground, then retry. The encrypted connection has not started."
+            case .denied:
+                return "Touch ID or password confirmation was not completed. Retry to confirm access."
+            case .expired:
+                return "Your owner confirmation expired. Retry to confirm access."
+            case .cancelled, .invalidated, .staleContext:
+                return "Connection confirmation was interrupted. Retry to confirm access."
+            }
+        }
+        if error as? RemoteRecoveryError == .confirmationRequired {
             return "Open Astation and confirm with Touch ID or your password, then retry the connection."
         }
         if error as? RemoteChannelError == .deadlineExceeded {

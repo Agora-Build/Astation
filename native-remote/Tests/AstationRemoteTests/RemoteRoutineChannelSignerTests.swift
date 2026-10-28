@@ -12,9 +12,11 @@ private final class RoutineSignerHarness {
     var confirmations = 0
     var signed: [SignRequest] = []
     var confirmation: (() async -> Bool)?
+    var foregroundWait: (() async throws -> Void)?
     var signError: Error?
     lazy var signer = RemoteRoutineChannelSigner(keyID: "device-key", now: { [unowned self] in now },
-        active: { [unowned self] in active }, confirm: { [unowned self] in
+        active: { [unowned self] in active },
+        waitForForeground: { [unowned self] in try await foregroundWait?() }, confirm: { [unowned self] in
             confirmations += 1
             return await confirmation?() ?? accepted
         }, sign: { [unowned self] request in
@@ -32,6 +34,51 @@ private final class RoutineSignerHarness {
 }
 
 final class RemoteRoutineChannelSignerTests: XCTestCase {
+    @MainActor
+    func testActivationMayFinishBeforePromptAndAfterSuccessfulSystemAuthentication() async throws {
+        let h = RoutineSignerHarness()
+        h.active = false
+        var waits = 0
+        h.foregroundWait = {
+            waits += 1
+            XCTAssertTrue(h.signed.isEmpty)
+            h.active = true
+        }
+        h.confirmation = { h.active = false; h.signer.clearReuse(); return true }
+        try await h.signer.prepare(isCurrent: { h.current })
+        XCTAssertEqual(waits, 2)
+        XCTAssertEqual(h.confirmations, 1)
+        XCTAssertTrue(h.signed.isEmpty)
+        _ = try await h.sign()
+        XCTAssertEqual(h.confirmations, 1)
+    }
+
+    @MainActor
+    func testForegroundWaitCannotExtendConfirmationOrBypassFences() async throws {
+        for outcome in ["expired", "locked", "stale", "cancelled"] {
+            let h = RoutineSignerHarness()
+            let waiting = expectation(description: "Waiting for activation")
+            var restore: CheckedContinuation<Void, Never>?
+            h.confirmation = { h.active = false; return true }
+            h.foregroundWait = { await withCheckedContinuation { restore = $0; waiting.fulfill() } }
+            let task = Task { try await h.sign() }
+            await fulfillment(of: [waiting], timeout: 1)
+            switch outcome {
+            case "expired": h.now += 300_000
+            case "locked": h.signer.invalidate()
+            case "stale": h.current = false
+            default: task.cancel()
+            }
+            h.active = true
+            try XCTUnwrap(restore).resume()
+            do { _ = try await task.value; XCTFail("Foreground wait bypassed \(outcome)") } catch { }
+            XCTAssertTrue(h.signed.isEmpty)
+            h.current = true; h.confirmation = nil; h.foregroundWait = nil
+            _ = try await h.sign()
+            XCTAssertEqual(h.confirmations, 2, "Fenced confirmation cannot be reused")
+        }
+    }
+
     @MainActor
     func testSystemAuthenticationFocusChangeDoesNotDiscardFreshForegroundConfirmation() async throws {
         let h = RoutineSignerHarness()

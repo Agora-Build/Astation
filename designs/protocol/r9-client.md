@@ -55,8 +55,15 @@ An application focus change clears cached reuse. It does not discard a fresh
 in-flight system-authentication result solely because the authentication UI
 took focus: that result is usable only after foreground state is restored,
 with the same live connection. Lock, sleep and explicit invalidation still
-cancel the in-flight authorization. A result received while the app remains
-in the background cannot be cached or used.
+cancel the in-flight authorization. The native adapter allows at most two
+seconds for activation to settle before prompting and after a successful
+system-authentication callback. No channel opens, signature occurs or result
+is cached during that wait. The confirmation timestamp remains the original
+authentication time; waiting cannot extend the five-minute reuse window.
+Foreground, cancellation, connection and invalidation fences are rechecked
+after waiting. A result that remains backgrounded is discarded. Explicit
+Retry Session Connection requests app activation; automatic connection
+attempts do not steal focus.
 
 `RemoteRelayClient` also opens its own outbound WebSocket without this Mac's
 identity-room connection. See the [independent API](../../docs/remote-api.md)

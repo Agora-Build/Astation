@@ -12,14 +12,22 @@ final class AstationChannelSigner {
     init(identity: AtemE2EIdentity, keyID: String,
          active: (() -> Bool)? = nil, confirm: (() async -> Bool)? = nil) throws {
         let expected = try identity.remotePublicKeys().signing
-        routine = RemoteRoutineChannelSigner(keyID: keyID,
-            now: { RemoteSystemClock.now().monoMs }, active: active ?? { NSApplication.shared.isActive },
-            confirm: confirm ?? {
-                await withCheckedContinuation { continuation in
-                    DeviceOwnerAuth.authenticate(reason: "connect to your verified Atem hosts") {
-                        continuation.resume(returning: $0)
-                    }
+        let foreground = active ?? { NSApplication.shared.isActive }
+        let authenticate = confirm ?? {
+            await withCheckedContinuation { continuation in
+                DeviceOwnerAuth.authenticate(reason: "connect to your verified Atem hosts") {
+                    continuation.resume(returning: $0)
                 }
+            }
+        }
+        routine = RemoteRoutineChannelSigner(keyID: keyID,
+            now: { RemoteSystemClock.now().monoMs }, active: foreground,
+            waitForForeground: { try await Self.waitForForeground(active: foreground) },
+            confirm: {
+                Log.info("[R9] Requesting owner authentication; foreground=\(foreground())")
+                let approved = await authenticate()
+                Log.info("[R9] Owner authentication returned; approved=\(approved), foreground=\(foreground())")
+                return approved
             }, sign: { request in try identity.signChannel(request, keyID: keyID, expectedPublicKey: expected) })
         for (center, name) in [(NotificationCenter.default, NSApplication.didResignActiveNotification),
                                (NSWorkspace.shared.notificationCenter, NSWorkspace.sessionDidResignActiveNotification),
@@ -44,6 +52,18 @@ final class AstationChannelSigner {
     }
 
     func invalidate() { routine.invalidate() }
+
+    /// AppKit may restore activation after the system authentication callback.
+    /// No channel traffic starts during this bounded, cancellable wait.
+    static func waitForForeground(active: () -> Bool, timeout: Duration = .seconds(2)) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while !active() {
+            guard !Task.isCancelled else { throw RemoteOwnerAuthenticationError.cancelled }
+            guard clock.now < deadline else { throw RemoteOwnerAuthenticationError.notForeground }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+    }
 
     deinit { for (center, observer) in observers { center.removeObserver(observer) } }
 }
