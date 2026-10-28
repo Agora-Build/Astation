@@ -304,14 +304,15 @@ ASTATION_PAIRING_LIVE_STATION=https://your-isolated-station.example \
 
 Local results on 2026-10-28: 59 focused tests pass, with the opt-in live test
 skipped in that run; the live test passes separately against the isolated
-Station. The full provisioned run executes 1,074 tests with eight skips and
-13 failures: ten protected-storage tests fail while macOS reports the console
-locked (`-25308` / storage unavailable), and two existing UI tests fail
-(queued biometric cancellation and caption scrolling, three assertions).
-Their source is unchanged by this increment. An unlocked-Mac rerun and
-investigation of any remaining UI failures are required; this is not a full
-suite pass or a release sign-off. No test was excluded or weakened to obtain
-a passing result.
+Station. After the owner unlocked the Mac, the full provisioned run passes
+all 1,074 tests with seven optional skips and zero failures. Protected
+Keychain, Secure Enclave, recovery, migration and credential tests run and
+pass, as do the two UI tests that failed during the earlier locked-console
+run. No test was excluded or weakened. The unlocked results supersede the
+earlier failures. Native implementation pin `a96b62e` also passes macOS,
+relay and web [CI 40755408435](https://github.com/Agora-Build/Astation/actions/runs/40755408435).
+These results do not substitute for the real joint device ceremony or the
+hosted execution release gates.
 
 Still required: Atem's wire confirmation and receiver build, actual native
 safety-code/owner verification, protected integration approval/enrollment,
