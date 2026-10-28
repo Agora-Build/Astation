@@ -74,7 +74,12 @@ final class AstationRecoveryCoordinator {
     private var backup: RemoteRecoveryBackup?
     private var restoreOperation: RemoteRecoveryRestore?
     private var membershipLog: MembershipLog?
-    private var busy = false
+    /// Deliver only durable head changes, after the account operation releases its lock.
+    var onMembershipCommit: ((LogHead) -> Void)?
+    private var pendingMembershipHead: LogHead?
+    private var busy = false {
+        didSet { notifyMembershipCommit() }
+    }
     private var uncertain = false
 
     convenience init(accountID: String, managerID: String, identity: AtemE2EIdentity, relayURL: String,
@@ -168,9 +173,18 @@ final class AstationRecoveryCoordinator {
         do {
             let state = try log.storedJson()
             let entries = log.entries()
+            let headChanged = membershipLog?.head() != log.head()
             try persist { $0.entries = entries; $0.membership = state; change(&$0) }
             membershipLog = log.snapshot()
+            if headChanged { pendingMembershipHead = log.head() }
+            notifyMembershipCommit()
         } catch { uncertain = true; throw error }
+    }
+
+    private func notifyMembershipCommit() {
+        guard !busy, let head = pendingMembershipHead else { return }
+        pendingMembershipHead = nil
+        onMembershipCommit?(head)
     }
 
     private func persist(_ change: (inout Saved) -> Void) throws {

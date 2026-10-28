@@ -185,10 +185,13 @@ final class AtemSessionClient {
     }
 
     func channelMembershipRefreshed(context refreshed: AtemSessionContext) {
-        guard phase == .failed, context == refreshed, refreshed == currentContext(), !journal.loadFailed else { return }
+        guard [.connecting, .ready, .failed].contains(phase),
+              context == refreshed, refreshed == currentContext(), !journal.loadFailed else { return }
+        closeChannel(refreshed)
         clearAttachment()
         retriedAfterVerification = true
         phase = .connecting
+        status = "Account membership changed; opening a fresh encrypted r9 channel..."
         connectingSince = now()
         openChannel(refreshed)
         changed()

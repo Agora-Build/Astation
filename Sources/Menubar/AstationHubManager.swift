@@ -254,8 +254,33 @@ class AstationHubManager: ObservableObject {
             identity: atemE2EIdentity, relayURL: targetRelay,
             accessToken: { [accountAuth] in try await accountAuth.accessToken(relayURL: targetRelay) },
             allowNewDataKey: { [weak self] in self?.e2eDataAccount == account && self?.relayEncryptionState?.mode == "off" })
+        coordinator.onMembershipCommit = { [weak self, weak coordinator] head in
+            guard let self, let coordinator, self.accountRecovery === coordinator,
+                  self.e2eDataAccount == account, self.stationRelayUrl == targetRelay else { return }
+            self.refreshChannelsAfterMembershipCommit(head)
+        }
         accountRecovery = coordinator
         return coordinator
+    }
+
+    @MainActor private func refreshChannelsAfterMembershipCommit(_ head: LogHead) {
+        for (id, link) in Array(r9Connections) where link.membershipHead != head {
+            guard link.context.account == e2eDataAccount,
+                  sessionContext(for: id) == link.context else { continue }
+            nativeSessionClients[id]?.channelMembershipRefreshed(context: link.context)
+        }
+        for (id, link) in Array(policyR9Connections) where link.membershipHead != head {
+            guard link.context.account == e2eDataAccount,
+                  let context = transportPolicyContext(for: id, includeBinding: false),
+                  context.route.deviceId == link.context.device,
+                  context.route.connectionId == link.context.route.connectionId,
+                  context.pairingSession == link.context.pairingSession,
+                  context.transportGeneration == link.context.transportGeneration else { continue }
+            policyR9Connections.removeValue(forKey: id)?.disconnect()
+            transportPolicy.disconnected(clientID: id)
+            openPolicyR9Channel(context)
+        }
+        updateTransportPolicyPresentation()
     }
     private lazy var atemVerification = AtemVerificationController(
         identity: atemE2EIdentity,

@@ -1124,6 +1124,42 @@ final class AtemSessionClientTests: XCTestCase {
         XCTAssertFalse(f.client.controls(f.target))
     }
 
+    func testCommittedMembershipReopensExistingChannelAndQueriesReceiptsWithoutRestoringControl() throws {
+        let f = SessionFixture(); try f.ready(); try f.takeControl()
+        let request = try XCTUnwrap(f.client.submit(f.target, kind: "prompt", text: "run once"))
+        let context = try XCTUnwrap(f.source)
+        // Reopening a window keeps this context and therefore keeps the old channel.
+        f.client.connectionChanged()
+        XCTAssertEqual(f.opens.count, 1)
+        f.client.channelMembershipRefreshed(context: context)
+        XCTAssertEqual(f.client.phase, .connecting)
+        XCTAssertEqual(f.closes, [context])
+        XCTAssertEqual(f.opens, [context, context])
+        XCTAssertFalse(f.client.controls(f.target))
+        XCTAssertNil(f.client.welcome)
+        XCTAssertTrue(f.client.registry.isEmpty)
+        XCTAssertNil(f.client.submit(f.target, kind: "prompt", text: "must wait"))
+        try f.handshake(attachment: "77777777-7777-4777-8777-777777777777")
+        try f.snapshot()
+        XCTAssertEqual(f.sent.last(where: { $0.op == "receipt_query" })?.request_ids, [request])
+        XCTAssertEqual(f.sent.filter { $0.op == "submit" }.count, 1)
+        XCTAssertEqual(f.sent.filter { $0.op == "acquire" }.count, 1)
+        XCTAssertFalse(f.client.controls(f.target))
+        XCTAssertTrue(f.reconnects.isEmpty, "Only the encrypted channel is replaced")
+    }
+
+    func testMembershipRefreshFromAnOldContextCannotReplaceTheCurrentChannel() throws {
+        let f = SessionFixture(); try f.ready()
+        let old = try XCTUnwrap(f.source)
+        f.source = AtemSessionContext(route: old.route, account: old.account, device: old.device,
+            pairingSession: old.pairingSession, transportGeneration: "replacement-socket")
+        f.client.connectionChanged()
+        let opens = f.opens, closes = f.closes
+        f.client.channelMembershipRefreshed(context: old)
+        XCTAssertEqual(f.opens, opens)
+        XCTAssertEqual(f.closes, closes)
+    }
+
     func testVerificationAfterAWelcomeNeverReplacesTheAttachmentOrAcquiresControl() throws {
         let f = SessionFixture(); try f.ready(); try f.takeControl()
         let originalCount = f.sent.count

@@ -1,5 +1,30 @@
 # Astation and Atem coordination
 
+## Membership propagation correction, 2026-10-28
+
+Atem's [seq-5 report](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6483384778)
+and the [source diagnosis](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6483449858)
+identify an Astation propagation gap. The approved service entry is committed
+at Station/native seq 6, but reopening Remote Terminal reuses the existing
+seq-5 channel. A local membership commit had no channel-refresh notification.
+
+The coordinator now reports a changed durable head after its account operation
+releases the lock, including when a later Portal reply is lost. The hub replaces
+affected native and policy channels within the current account, Station and
+transport generation. New channels carry the verified committed log through
+the existing shared r9 handshake. Native replacement clears attachment/control
+state and queries durable receipts without resending prompts or acquiring a
+lease. Unchanged checkpoints do not trigger replacement; stale contexts cannot
+replace a current channel. An uncertain checkpoint does not advertise a new head.
+
+The focused native-channel, recovery, session and policy suites pass 85 tests.
+The running app is unchanged, and host ingestion of seq 6 remains unverified;
+this source correction does not establish a live service execution pass.
+PR #89 remains `e7dff6d`, with the same tree as reviewed `f943b3a`, ten passing
+checks and three automation skips. Shared artifacts stay at `ed0b45b`.
+Hosted execution remains disabled. Memory/vault access still refuses the saved
+Mac session; pairing and credential processes are unchanged.
+
 ## Pairing bootstrap correction, 2026-10-28
 
 Atem's [disposable-host handoff](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6473810294)

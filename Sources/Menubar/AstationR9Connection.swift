@@ -13,7 +13,7 @@ final class AstationR9Connection {
     private var router: RemoteChannelRouter!
     private var queue: RemoteSocketQueue!
     private var channel: RemoteAgentChannel?
-    private var membershipHead: LogHead?
+    private(set) var membershipHead: LogHead?
     private var membershipLog: MembershipLog?
     private var preparation: Task<Void, Never>?
     private var closed = false

@@ -8,11 +8,18 @@ import XCTest
 private final class RecoveryMemoryCheckpoint: AstationRecoveryCheckpointStorage {
     var bytes: Data?
     var failAfterWrite = false
+    var failAtEntryCount: Int?
     var writes = 0
     func read() throws -> Data? { bytes }
     func write(_ data: Data) throws {
         writes += 1
         bytes = data
+        if let count = failAtEntryCount,
+           let saved = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+           (saved["entries"] as? [String])?.count == count {
+            failAtEntryCount = nil
+            throw RemoteRecoveryError.storageUncertain
+        }
         if failAfterWrite { failAfterWrite = false; throw RemoteRecoveryError.storageUncertain }
     }
 }
@@ -328,6 +335,59 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             requiredScope: "integrations:read", additionalScopes: ["integrations:approve"])
         return try PortalIntegrationHTTP(configuration: config, portalOrigin: "https://portal.example",
             ownerAccount: "ab01234567890123456789012345", http: http, accessToken: { "test-only-token" })
+    }
+
+    func testServiceCommitNotifiesAfterDurabilityAndUnlockEvenWhenPortalReplyIsLost() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        let (commit, reveal, keys) = try await hostAttempt(coordinator, generation: 1)
+        let request = try await coordinator.prepareHost(commit: commit, reveal: reveal, keys: keys)
+        _ = try await coordinator.commitHost(request: request,
+            confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true })
+        var heads: [LogHead] = []
+        coordinator.onMembershipCommit = { head in
+            heads.append(head)
+            do {
+                // This read refuses a busy coordinator and any uncommitted log.
+                let log = try coordinator.channelMembership(hostID: "host-a")
+                XCTAssertEqual(log.head(), head)
+                XCTAssertEqual(log.member(deviceId: "service-test")?.roles, ["service"])
+                let saved = try XCTUnwrap(self.checkpoint(h.store)["entries"] as? [String])
+                XCTAssertEqual(saved, log.entries())
+            } catch { XCTFail("Committed head was not available to the channel: \(error)") }
+        }
+        let approval = try await service(coordinator)
+        try await coordinator.prepareService(approval)
+        XCTAssertTrue(heads.isEmpty, "Preparing an unsigned draft must not replace channels")
+        let transport = ServiceApprovalPortal()
+        await transport.dropNextReply()
+        do { try await coordinator.approveService(approval, portal: portal(transport), current: { true }); XCTFail("lost reply") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .unavailable) }
+        let committed = try coordinator.channelMembership(hostID: "host-a").head()
+        XCTAssertEqual(heads, [committed], "A lost Portal reply cannot hide a durable membership change")
+        try await coordinator.approveService(approval, portal: portal(transport), current: { true })
+        _ = try await coordinator.serviceMembership()
+        try coordinator.checkpointPendingWaits()
+        XCTAssertEqual(heads, [committed], "Retries and unchanged checkpoints cannot loop channel replacement")
+        coordinator.onMembershipCommit = nil
+    }
+
+    func testUncertainCheckpointDoesNotAdvertiseANewMembershipHead() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        _ = try await coordinator.setup()
+        let approval = try await service(coordinator)
+        try await coordinator.prepareService(approval)
+        var heads: [LogHead] = []
+        coordinator.onMembershipCommit = { heads.append($0) }
+        h.store.failAtEntryCount = try XCTUnwrap(checkpoint(h.store)["entries"] as? [String]).count + 1
+        do {
+            try await coordinator.approveService(approval, portal: portal(ServiceApprovalPortal()), current: { true })
+            XCTFail("uncertain checkpoint")
+        }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .storageUncertain) }
+        let remote = await h.relay.log
+        XCTAssertNotNil(remote?.member(deviceId: "service-test"), "The relay stored the entry before local persistence failed")
+        XCTAssertTrue(heads.isEmpty)
+        XCTAssertThrowsError(try coordinator.channelMembership(hostID: "host-a"))
     }
 
     func testServiceApprovalResumesAfterLostPortalReplyWithoutResigningOrReposting() async throws {
