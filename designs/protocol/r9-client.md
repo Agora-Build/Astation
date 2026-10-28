@@ -209,3 +209,14 @@ owner approval is complete. Protected service token/channel execution,
 approvals, durable policy acknowledgment, old-service removal, reconnect,
 Mac-off and replicas remain to be verified. Hosted execution stays hard
 disabled. See the [integration lifecycle](station-integration-lifecycle.md).
+
+Live membership catch-up on October 28 at 23:47:42 UTC: provisioned native
+`98d66b8` opened a fresh encrypted channel carrying seq 6 after foreground
+owner confirmation. The authenticated host welcome reports seq 6, independently
+confirmed with the isolated host binary's `pinned at seq 6 (1 remote client)`
+status. Connections again lists Codex `ses-emcvcza5lnsj`. The same account,
+Station, verified host generation and native signing identity were retained;
+neither re-pairing nor a repeated integration approval was required. This
+validates membership ingestion and native discovery, not the remaining service
+execution gates. The full provisioned app suite passes 1,089 tests, eight
+optional skips and no failures.

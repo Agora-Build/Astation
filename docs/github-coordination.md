@@ -17,13 +17,35 @@ state and queries durable receipts without resending prompts or acquiring a
 lease. Unchanged checkpoints do not trigger replacement; stale contexts cannot
 replace a current channel. An uncertain checkpoint does not advertise a new head.
 
-The focused native-channel, recovery, session and policy suites pass 85 tests.
-The running app is unchanged, and host ingestion of seq 6 remains unverified;
-this source correction does not establish a live service execution pass.
+Source fix `dabbf15` and follow-up `98d66b8` also replace the misleading review
+instructions for already approved integrations, hide host editing after
+approval, and add safe channel membership-sequence diagnostics. The full
+provisioned app suite passes 1,089 tests, with eight optional skips and no
+failures, including coalesced commits, failed checkpoints, stale contexts,
+receipt recovery without replay and rejection of late lease replies.
+
+Provisioned `98d66b8` was packaged at 23:44:13 UTC and relaunched at
+23:46:36 UTC on October 28, retaining the existing personal signing identity,
+Agora.Build login, selected dev Station and verified host. Strict signature
+and all four bundled-resource checks pass. Startup in the background correctly
+refused owner authentication; foreground Retry and the user's confirmation
+then completed admission at 23:47:42 UTC. Native logs report local membership
+seq 6 and authenticated host seq 6. Independently, the isolated host's own
+binary reports `pinned at seq 6 (1 remote client)` and the Connections window
+shows the current Codex session `ses-emcvcza5lnsj`. No re-pair or repeated
+integration approval was needed.
+
+This closes the live membership-propagation failure. It does not establish
+service execution, durable host-policy acknowledgment, old-service removal,
+approval operations, revocation/reconnect or Mac-off/replica behavior. The
+isolated binary's legacy Authorization status still says no session hello,
+despite successful encrypted admission/discovery; that status projection is
+reported separately to Atem and is not used as the R9 admission check.
 PR #89 remains `e7dff6d`, with the same tree as reviewed `f943b3a`, ten passing
 checks and three automation skips. Shared artifacts stay at `ed0b45b`.
-Hosted execution remains disabled. Memory/vault access still refuses the saved
-Mac session; pairing and credential processes are unchanged.
+Hosted execution remains disabled. Shared memory/vault publication uses the
+working Genie CLI route because the saved Mac CLI session still refuses it.
+Pairing, protected identities, host runtime and credential processes are unchanged.
 
 ## Pairing bootstrap correction, 2026-10-28
 
