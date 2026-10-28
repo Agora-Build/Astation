@@ -48,6 +48,40 @@ late refresh/login replies and does not remove device keys or recovery state.
 Portal 401s share a single refresh and one retry; `reconnect:true` instead
 retains the Agora.Build login and asks for Agora Console reconnection.
 
+## Live pairing bootstrap gap (2026-10-28)
+
+The provisioned native app reaches the selected dev Station. For the
+`DP4E-QG58` attempt, the native log records the dev WebSocket URL at
+18:22:01.996 UTC; the Station records the native owner joining the host's
+existing pairing room at 18:22:02.051 UTC. The host subsequently times out.
+Changing the relay URL is not the remedy for this attempt.
+
+The current native `connectToRelay` path calls `sendCredentials`, which
+requires the legacy Agora service session. With only Agora.Build login, it
+logs `No session - skipping credentialSync` and sends no identity handoff.
+Read-only inspection of joint Atem source `e7dff6d` confirms its
+`runtime/ops.rs::credentials_from` waits for `CredentialSync` before learning
+the Astation identity and opening its authenticated identity connection.
+Pairing therefore still depends on an obsolete service-token prerequisite.
+
+The joint correction must separate host pairing from optional upstream
+service credentials. A token-free, explicitly versioned bootstrap may supply
+the native routing identity; it must not grant device membership or supply
+trusted account identity. The existing authenticated identity connection,
+safety-code comparison, owner authentication and signed membership ceremony
+remain required. Portal and Station access/refresh tokens must never be
+substituted into legacy `credentialSync`, and empty or fabricated credentials
+must not be used to make the old receiver proceed.
+
+Atem owns the receiver and CLI state changes; Astation owns the sender and
+visible pairing progress/errors. The exact message shape and new joint host
+pin require confirmation on Atem #81 before implementation. Regression
+coverage must include Agora.Build-only login with no legacy session, refusal
+without the required native account state, expired/missing rooms, disconnect,
+account/relay changes during asynchronous work, duplicate attempts, and
+absence of account bearer/refresh tokens from pairing traffic. This remains
+a live pairing blocker, not a completed fix or an integration approval.
+
 ## Relay boundary
 
 The relay accepts API access tokens only: ES256, `typ=at+jwt`, the configured
