@@ -81,6 +81,48 @@ private final class NativeChannelFixture {
 
 final class AstationR9NativeChannelTests: XCTestCase {
     @MainActor
+    func testOwnerConfirmationPrecedesAnyChannelTrafficAndDisconnectFencesItsCompletion() async throws {
+        for disconnect in [false, true] {
+            let f = try NativeChannelFixture()
+            let prompted = expectation(description: "Owner confirmation")
+            var answer: CheckedContinuation<Bool, Never>?
+            let signer = try AstationChannelSigner(identity: f.identity, keyID: "manager-a", active: { true }, confirm: {
+                await withCheckedContinuation { answer = $0; prompted.fulfill() }
+            })
+            let context = AtemSessionContext(route: RemoteTerminalConnection(clientId: "local-host", connectionId: "connection-a"),
+                account: "account-a", device: "host-a", pairingSession: "pairing-a", transportGeneration: "transport-a")
+            var writes: [Data] = []
+            let channel = AstationR9Connection(context: context, current: { true },
+                write: { bytes, completion in writes.append(bytes); completion(nil) }, welcomed: { _ in }, receive: { _ in },
+                failed: { message, _ in XCTFail("Unexpected failure: \(message)") }, refreshMembership: { _ in })
+            try channel.start(identity: ClientIdentity(kind: .native, deviceId: "manager-a", keyId: "manager-a", grantJson: nil),
+                log: f.log, signer: signer)
+            await fulfillment(of: [prompted], timeout: 1)
+            XCTAssertTrue(writes.isEmpty, "The host handshake cannot start while waiting for owner authentication")
+            if disconnect { channel.disconnect() }
+            try XCTUnwrap(answer).resume(returning: true)
+            let drained = expectation(description: "Authorization completion drained")
+            Task { @MainActor in
+                for _ in 0..<20 { await Task.yield() }
+                drained.fulfill()
+            }
+            await fulfillment(of: [drained], timeout: 1)
+            if disconnect { XCTAssertTrue(writes.isEmpty) }
+            else {
+                XCTAssertEqual(writes.count, 2, "Open and init follow owner authentication")
+                channel.disconnect()
+            }
+        }
+    }
+
+    @MainActor
+    func testConnectionErrorsDistinguishOwnerConfirmationTimeoutAndTransportClosure() {
+        XCTAssertTrue(AstationR9Connection.connectionFailureMessage(RemoteRecoveryError.confirmationRequired).contains("Touch ID"))
+        XCTAssertTrue(AstationR9Connection.connectionFailureMessage(RemoteChannelError.deadlineExceeded).contains("timed out"))
+        XCTAssertFalse(AstationR9Connection.connectionFailureMessage(nil).contains("complete r9 device verification"))
+    }
+
+    @MainActor
     func testProductionBindingVerifiesHostThenRequestsAnOwnerAuthorizedEnclaveDomainSignature() async throws {
         let f = try NativeChannelFixture()
         let channel = try f.open()

@@ -9,11 +9,12 @@ final class AstationChannelSigner {
     private let routine: RemoteRoutineChannelSigner
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
 
-    init(identity: AtemE2EIdentity, keyID: String) throws {
+    init(identity: AtemE2EIdentity, keyID: String,
+         active: (() -> Bool)? = nil, confirm: (() async -> Bool)? = nil) throws {
         let expected = try identity.remotePublicKeys().signing
         routine = RemoteRoutineChannelSigner(keyID: keyID,
-            now: { RemoteSystemClock.now().monoMs }, active: { NSApplication.shared.isActive },
-            confirm: {
+            now: { RemoteSystemClock.now().monoMs }, active: active ?? { NSApplication.shared.isActive },
+            confirm: confirm ?? {
                 await withCheckedContinuation { continuation in
                     DeviceOwnerAuth.authenticate(reason: "connect to your verified Atem hosts") {
                         continuation.resume(returning: $0)
@@ -33,6 +34,10 @@ final class AstationChannelSigner {
 
     func sign(_ request: SignRequest, isCurrent: () -> Bool) async throws -> Data {
         try await routine.sign(request, isCurrent: isCurrent)
+    }
+
+    func prepare(isCurrent: () -> Bool) async throws {
+        try await routine.prepare(isCurrent: isCurrent)
     }
 
     func invalidate() { routine.invalidate() }

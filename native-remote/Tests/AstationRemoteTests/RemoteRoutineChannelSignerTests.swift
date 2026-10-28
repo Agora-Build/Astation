@@ -33,6 +33,42 @@ private final class RoutineSignerHarness {
 
 final class RemoteRoutineChannelSignerTests: XCTestCase {
     @MainActor
+    func testPreparationCanOutlastTheHandshakeWindowWithoutSigningAnything() async throws {
+        let h = RoutineSignerHarness()
+        h.confirmation = { h.now += 20_000; return true }
+        try await h.signer.prepare(isCurrent: { h.current })
+        XCTAssertEqual(h.confirmations, 1)
+        XCTAssertTrue(h.signed.isEmpty)
+        _ = try await h.sign()
+        XCTAssertEqual(h.confirmations, 1)
+        XCTAssertEqual(h.signed.count, 1)
+        var membership = h.request(); membership.purpose = .enroll
+        do { _ = try await h.sign(membership); XCTFail("Preparation authorized membership signing") } catch { }
+        XCTAssertEqual(h.signed.count, 1)
+    }
+
+    @MainActor
+    func testCancelledOrStalePreparationCannotLeaveReusableConfirmation() async throws {
+        for cancelled in [false, true] {
+            let h = RoutineSignerHarness()
+            let prompted = expectation(description: "Owner prompt")
+            var answer: CheckedContinuation<Bool, Never>?
+            h.confirmation = {
+                await withCheckedContinuation { answer = $0; prompted.fulfill() }
+            }
+            let task = Task { try await h.signer.prepare(isCurrent: { h.current }) }
+            await fulfillment(of: [prompted], timeout: 1)
+            if cancelled { task.cancel() } else { h.current = false }
+            try XCTUnwrap(answer).resume(returning: true)
+            do { try await task.value; XCTFail("Fenced preparation succeeded") } catch { }
+            XCTAssertTrue(h.signed.isEmpty)
+            h.current = true; h.confirmation = nil
+            _ = try await h.sign()
+            XCTAssertEqual(h.confirmations, 2)
+        }
+    }
+
+    @MainActor
     func testOneConfirmationCoversRoutineTranscriptsForLessThanFiveMinutesOnly() async throws {
         let h = RoutineSignerHarness()
         _ = try await h.sign()

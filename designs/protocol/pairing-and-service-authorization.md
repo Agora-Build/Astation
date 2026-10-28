@@ -1,12 +1,11 @@
 # Pairing and service authorization
 
-Status: **product design approved; native candidate implemented**,
+Status: **joint device verification and native service approval completed**,
 2026-10-28. The owner approved the separation and requested implementation.
-The v1 wire below is the Astation implementation candidate awaiting Atem's
-joint confirmation and committed receiver pin. The corrected trial completed
-native owner approval, but Atem declined its half of the first ceremony. A
-retry with a fresh host key exposed the nonincreasing host-generation case
-described below; joint verification remains open.
+The isolated host on Atem `03ca230` completed both halves of verification at
+trust generation 2, after the earlier fresh-key retry problem described below.
+The Mac subsequently approved the protected service member. Source review and
+actual R9 session/execution release checks remain open.
 Atem owns its protocol and host
 implementation; Astation owns native UX and integration. Hosted execution
 remains disabled pending the real joint end-to-end gates.
@@ -364,9 +363,25 @@ The updated provisioned suite passes 1,078 tests with eight optional skips
 and zero failures. Its regressions cover higher-generation replacement,
 retained invalid-draft evidence and restart after a lost committed reply.
 
-Still required: Atem's generation lifecycle correction, wire confirmation
-and committed receiver pin, joint safety-code/owner verification,
-protected integration approval/enrollment,
-actual agent execution and the policy/revocation/reconnect/Mac-off/replica
-checks. A synthetic relay pass does not satisfy these gates. Hosted execution
-remains disabled.
+At 21:40 UTC, Atem `03ca230d823b93e867d7a026a2723755034932f6`
+completed joint verification at generation 2 on the preserved isolated profile.
+The user compared the safety code and confirmed on the Mac before the host
+confirmed. Atem reports verified, credentials unlocked and membership seq 4.
+The native protected service approval then committed the service add at seq 5;
+the authenticated Portal feed reports `waiting_for_host` with the approved
+service fingerprint. These are real ceremony results, not source sign-off.
+The receiver's strict pairing-reader correction and restart/post-rename fault
+evidence remain under review on Atem PR #101.
+
+The subsequent native session attempt received the host's accept but expired
+after ten seconds while owner authentication was pending. Native now prepares
+owner presence before sending channel init; preparation signs nothing, and
+the shared core still verifies the pinned host before requesting a transcript
+signature. See [the R9 client lifecycle](r9-client.md). The approved test service
+expired at 21:52:56 UTC. Renewal needs a supported Portal operation and another
+native review of any changed signed grant; an operator must not extend it in
+storage.
+
+Still required: renewed service access, actual R9 session admission and agent
+execution, and the policy/revocation/reconnect/Mac-off/replica checks. A synthetic
+relay pass does not satisfy these gates. Hosted execution remains disabled.

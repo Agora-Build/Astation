@@ -15,6 +15,7 @@ final class AstationR9Connection {
     private var channel: RemoteAgentChannel?
     private var membershipHead: LogHead?
     private var membershipLog: MembershipLog?
+    private var preparation: Task<Void, Never>?
     private var closed = false
     private let current: () -> Bool
     private let welcomed: (AtemSessionMessage) -> Void
@@ -23,6 +24,8 @@ final class AstationR9Connection {
     private let refreshMembership: (LogHead) -> Void
     private let policyWelcomed: () -> Void
     private let policyEvent: (ClientEvent, Bool) -> Void
+
+    deinit { preparation?.cancel() }
 
     init(context: AtemSessionContext, current: @escaping () -> Bool,
          write: @escaping (Data, @escaping (Error?) -> Void) -> Void,
@@ -52,12 +55,24 @@ final class AstationR9Connection {
     }
 
     func start(identity: ClientIdentity, log: MembershipLog, signer: AstationChannelSigner) throws {
+        guard preparation == nil, channel == nil, !closed, current() else { throw RemoteChannelError.staleLink }
         membershipHead = log.head()
         membershipLog = log.snapshot()
-        channel = try router.open(hostID: context.device, identity: identity, log: log,
-            sign: { [weak self] request in
-                try await signer.sign(request, isCurrent: { self?.current() == true && self?.closed == false })
-            }, observe: { [weak self] event in self?.observe(event) })
+        preparation = Task { [weak self] in
+            do {
+                try await signer.prepare(isCurrent: { self?.current() == true && self?.closed == false })
+                guard let self, !Task.isCancelled, !closed, current() else { return }
+                preparation = nil
+                channel = try router.open(hostID: context.device, identity: identity, log: log,
+                    sign: { [weak self] request in
+                        try await signer.sign(request, isCurrent: { self?.current() == true && self?.closed == false })
+                    }, observe: { [weak self] event in self?.observe(event) })
+            } catch {
+                guard let self, !closed, current() else { return }
+                preparation = nil
+                finish(Self.connectionFailureMessage(error))
+            }
+        }
     }
 
     func receive(_ bytes: Data) {
@@ -83,6 +98,7 @@ final class AstationR9Connection {
     func disconnect(sendClose: Bool = true) {
         guard !closed else { return }
         closed = true
+        preparation?.cancel(); preparation = nil
         hostPolicyBinding = nil
         if !sendClose { queue.drain() }
         else if current(), let channel { queue.finish(with: RemoteChannelEnvelope.close(route: channel.route)) }
@@ -137,9 +153,19 @@ final class AstationR9Connection {
             if let error = error as? AtemError, case .Refused(let code, _, _, _) = error { unsupported = code == "unsupported_version" }
             else { unsupported = false }
             finish(unsupported ? "Upgrade Atem to a supported r9 build."
-                : "The encrypted r9 channel closed. Reconnect or complete r9 device verification.", unsupported: unsupported, sendClose: false)
+                : Self.connectionFailureMessage(error), unsupported: unsupported, sendClose: false)
         default: break
         }
+    }
+
+    static func connectionFailureMessage(_ error: Error?) -> String {
+        if error as? RemoteRecoveryError == .confirmationRequired {
+            return "Open Astation and confirm with Touch ID or your password, then retry the connection."
+        }
+        if error as? RemoteChannelError == .deadlineExceeded {
+            return "The encrypted r9 connection timed out. Retry the connection."
+        }
+        return "The encrypted r9 channel closed. Retry the connection to verify current account access."
     }
 
     private func acceptPolicyHead(_ json: String) -> Bool {

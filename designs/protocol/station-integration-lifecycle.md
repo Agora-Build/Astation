@@ -219,11 +219,15 @@ Latest native pairing checks:
 - The subsequent diagnostic change passes all 21 provisioned pairing-state
   tests. Two opt-in tests against the deployed dev Station pass the stable
   host-route case and refusal of a Station-assigned mismatched host route.
-- The corrected trial reached native enrollment, but the host declined its
-  half. A fresh host key at the same generation cannot reuse that entry.
-  Native now rejects this case before owner approval and tests replacement
-  by a higher generation without removing the host. Atem's generation
-  lifecycle fix, committed source pin and joint verification remain open.
+- The retry-generation correction on Atem `03ca230` completed joint
+  verification at generation 2 and membership seq 4. The real native service
+  approval then published the service add at seq 5; Portal reports
+  `waiting_for_host` with the approved fingerprint. Receiver source approval
+  remains pending the strict reader and persistence-fault evidence on #101.
+  The next session attempt expired during owner authentication; native now
+  prepares owner presence before channel init while retaining shared host
+  verification and handshake bounds. The signed test grant expired at
+  21:52:56 UTC and requires supported renewal plus fresh native review.
   See the [pairing lifecycle](pairing-and-service-authorization.md).
 
 Earlier R9.8a integration checks:
@@ -257,16 +261,16 @@ no integration or native approval is inferred from registration.
 Portal supplied the awaiting-approval integration ID and Atem delivered the
 disposable policy-capable host and binding E2E, accepted for test integration
 at `e7dff6d`. Those deliveries are no longer missing. The current live handoff
-is Atem's retry-generation correction and exact committed pin, followed by the
-joint safety-code/owner ceremony. The separate provisioning refusal is fixed
+is Atem `03ca230`, whose generation-2 joint ceremony and native service approval
+have completed. Session admission and a renewed test service grant remain
+open. The separate provisioning refusal is fixed
 by resolving the external owner to its exact issuer-scoped storage principal;
 policy/token/service-key bindings keep the external owner. Thirteen account
 tests, five isolated provisioning tests and three isolated hosted API tests
 pass, including different owner/principal namespaces and wrong-issuer denial.
 The hosted API tests use a controlled encrypted host, not a real coding agent.
-Then run native integration approval,
-protected service enrollment, actual agent
-execution, policy durability, revocation/reconnect, Mac-off and replica checks.
+Then run actual R9 session admission and agent execution, policy durability,
+revocation/reconnect, Mac-off and replica checks.
 Hosted execution remains hard disabled without an override. No production
 trust reset, credential-agent restart, Atem checkout edit/build or production
 merge/deploy is part of this verification.

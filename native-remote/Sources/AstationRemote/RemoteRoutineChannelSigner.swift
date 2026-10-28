@@ -33,6 +33,19 @@ public final class RemoteRoutineChannelSigner {
 
     public func sign(_ request: SignRequest, isCurrent: () -> Bool) async throws -> Data {
         try Self.validate(request, keyID: keyID)
+        try await prepare(isCurrent: isCurrent)
+        let time = now()
+        guard active(), isCurrent(), !Task.isCancelled,
+              let confirmedAt, time >= confirmedAt, time - confirmedAt < 300_000 else {
+            throw RemoteRecoveryError.confirmationRequired
+        }
+        do { return try primitive(request) }
+        catch { invalidate(); throw error }
+    }
+
+    /// Prepare owner presence before starting a time-bounded network handshake.
+    /// This grants no signing authority beyond routine, validated channel transcripts.
+    public func prepare(isCurrent: () -> Bool) async throws {
         guard active() else { invalidate(); throw RemoteRecoveryError.confirmationRequired }
         guard isCurrent(), !Task.isCancelled else { throw RemoteRecoveryError.confirmationRequired }
         let time = now()
@@ -60,8 +73,6 @@ public final class RemoteRoutineChannelSigner {
               let confirmedAt, signingTime >= confirmedAt, signingTime - confirmedAt < 300_000 else {
             throw RemoteRecoveryError.confirmationRequired
         }
-        do { return try primitive(request) }
-        catch { invalidate(); throw error }
     }
 
     public func invalidate() {

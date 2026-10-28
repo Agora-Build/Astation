@@ -45,6 +45,12 @@ verification notifications do not restart an in-progress signing prompt.
 Native owner confirmation can be reused for less than five minutes while
 foregrounded. Background, lock and sleep clear that reuse. Membership changes
 always require their separate fresh, body-bound confirmation.
+The native connection prepares that owner confirmation before sending channel
+`init`, so time spent answering Touch ID or a password prompt does not consume
+the host's ten-second handshake window. Preparation signs nothing. The shared
+core must still verify the pinned host's accept before requesting the exact
+channel transcript signature. Cancellation, a changed connection or loss of
+foreground state while confirming prevents opening the channel.
 
 `RemoteRelayClient` also opens its own outbound WebSocket without this Mac's
 identity-room connection. See the [independent API](../../docs/remote-api.md)
