@@ -10,9 +10,12 @@ final class AstationChannelSigner {
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
 
     init(identity: AtemE2EIdentity, keyID: String,
-         active: (() -> Bool)? = nil, confirm: (() async -> Bool)? = nil) throws {
+         active: (() -> Bool)? = nil, confirm: (() async -> Bool)? = nil,
+         restoreForeground: (() -> Void)? = nil) throws {
         let expected = try identity.remotePublicKeys().signing
         let foreground = active ?? { NSApplication.shared.isActive }
+        weak var authenticationWindow: NSWindow?
+        var hadAuthenticationWindow = false
         let authenticate = confirm ?? {
             await withCheckedContinuation { continuation in
                 DeviceOwnerAuth.authenticate(reason: "connect to your verified Atem hosts") {
@@ -22,8 +25,20 @@ final class AstationChannelSigner {
         }
         routine = RemoteRoutineChannelSigner(keyID: keyID,
             now: { RemoteSystemClock.now().monoMs }, active: foreground,
-            waitForForeground: { try await Self.waitForForeground(active: foreground) },
+            waitForForeground: { stage in
+                if stage == .afterConfirmation {
+                    Log.info("[R9] Restoring Astation focus after successful owner authentication")
+                    if let restoreForeground { restoreForeground() }
+                    else if !hadAuthenticationWindow || authenticationWindow?.isVisible == true {
+                        authenticationWindow?.makeKeyAndOrderFront(nil)
+                        NSApplication.shared.activate(ignoringOtherApps: true)
+                    }
+                }
+                try await Self.waitForForeground(active: foreground)
+            },
             confirm: {
+                authenticationWindow = NSApp?.keyWindow ?? NSApp?.mainWindow
+                hadAuthenticationWindow = authenticationWindow != nil
                 Log.info("[R9] Requesting owner authentication; foreground=\(foreground())")
                 let approved = await authenticate()
                 Log.info("[R9] Owner authentication returned; approved=\(approved), foreground=\(foreground())")

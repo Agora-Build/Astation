@@ -213,7 +213,7 @@ escrow and protected refresh/project/credential storage all pass.
 
 Latest native pairing checks:
 
-- The full unlocked-Mac provisioned suite passes 1,082 tests, with eight
+- The full unlocked-Mac provisioned suite passes 1,083 tests, with eight
   optional skips, zero failures and no exclusions. Protected Keychain,
   Secure Enclave, recovery, migration and credential tests run and pass.
 - The subsequent diagnostic change passes all 21 provisioned pairing-state
@@ -223,15 +223,19 @@ Latest native pairing checks:
   verification at generation 2 and membership seq 4. The real native service
   approval then published the service add at seq 5; Portal reports
   `waiting_for_host` with the approved fingerprint. Atem #101 `15311db`
-  closes the strict reader in source and passes macOS persistence-fault tests;
-  Linux evidence and replacement runtime/package approval remain pending.
+  closes the strict reader in source, with macOS/Linux evidence reviewed;
+  replacement runtime/package approval remains separate.
   The next session attempt expired during owner authentication; native now
   prepares owner presence before channel init while retaining shared host
   verification and handshake bounds. The `548c486` retry failed locally with
   `notForeground` before init. Native now explicitly activates on Retry and
   waits up to two seconds for AppKit activation to settle, preserving all
-  authorization fences and the original confirmation time. The library's
-  147 tests pass, with one optional skip. Live session admission is still
+  authorization fences and the original confirmation time. The subsequent
+  live log shows successful authentication leaving Astation inactive. The
+  adapter now explicitly restores its originating visible window and requests
+  activation after a successful, current confirmation, before the bounded
+  wait. Denied or fenced contexts cannot request focus. The library's
+  148 tests pass, with one optional skip. Live session admission is still
   unconfirmed. The signed test grant expired at
   21:52:56 UTC and requires supported renewal plus fresh native review.
   See the [pairing lifecycle](pairing-and-service-authorization.md).

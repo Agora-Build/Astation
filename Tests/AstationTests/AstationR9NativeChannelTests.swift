@@ -90,7 +90,7 @@ final class AstationR9NativeChannelTests: XCTestCase {
         let signer = try AstationChannelSigner(identity: f.identity, keyID: "manager-a", active: { active }, confirm: {
             XCTAssertTrue(active)
             return await withCheckedContinuation { answer = $0; awaitingPrompt.fulfill() }
-        })
+        }, restoreForeground: {})
         let context = AtemSessionContext(route: RemoteTerminalConnection(clientId: "local-host", connectionId: "connection-a"),
             account: "account-a", device: "host-a", pairingSession: "pairing-a", transportGeneration: "transport-a")
         var writes: [Data] = []
@@ -115,6 +115,37 @@ final class AstationR9NativeChannelTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(60))
         XCTAssertTrue(writes.isEmpty, "Authentication callback can precede restored app activation")
         active = true
+        await fulfillment(of: [opened], timeout: 1)
+        channel.disconnect()
+    }
+
+    @MainActor
+    func testSuccessfulNativeAuthenticationExplicitlyRestoresForegroundBeforeOpening() async throws {
+        let f = try NativeChannelFixture()
+        var active = true
+        var restorations = 0
+        let signer = try AstationChannelSigner(identity: f.identity, keyID: "manager-a", active: { active }, confirm: {
+            active = false
+            NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: nil)
+            return true
+        }, restoreForeground: {
+            restorations += 1
+            active = true
+        })
+        let context = AtemSessionContext(route: RemoteTerminalConnection(clientId: "local-host", connectionId: "connection-a"),
+            account: "account-a", device: "host-a", pairingSession: "pairing-a", transportGeneration: "transport-a")
+        let opened = expectation(description: "Restored foreground before channel init")
+        var writes = 0
+        let channel = AstationR9Connection(context: context, current: { true },
+            write: { _, completion in
+                XCTAssertTrue(active)
+                XCTAssertEqual(restorations, 1)
+                writes += 1; completion(nil)
+                if writes == 2 { opened.fulfill() }
+            }, welcomed: { _ in }, receive: { _ in },
+            failed: { message, _ in XCTFail("Unexpected failure: \(message)") }, refreshMembership: { _ in })
+        try channel.start(identity: ClientIdentity(kind: .native, deviceId: "manager-a", keyId: "manager-a", grantJson: nil),
+            log: f.log, signer: signer)
         await fulfillment(of: [opened], timeout: 1)
         channel.disconnect()
     }

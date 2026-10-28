@@ -371,8 +371,9 @@ The native protected service approval then committed the service add at seq 5;
 the authenticated Portal feed reports `waiting_for_host` with the approved
 service fingerprint. These are real ceremony results, not source sign-off.
 The receiver's strict pairing-reader correction is closed in source at Atem
-PR #101 `15311db`; its macOS tests pass, with Linux evidence and any replacement
-runtime/package approval still under review. The running host remains `03ca230`.
+PR #101 `15311db`; its macOS and Linux execution evidence has been reviewed.
+Replacement runtime/package approval is separate. The running host remains
+`03ca230`.
 
 The subsequent native session attempt received the host's accept but expired
 after ten seconds while owner authentication was pending. Native now prepares
@@ -382,7 +383,11 @@ signature. A retry on `548c486` still failed locally with `notForeground`
 before channel init. The follow-up explicitly activates on Retry and permits
 a bounded wait for AppKit activation before prompting and after successful
 authentication, with context fences and the original confirmation timestamp
-preserved. All 1,082 provisioned app tests and 147 reusable native tests pass
+preserved. The next live attempts confirmed `approved=true` but remained
+inactive after the system prompt closed. The adapter now explicitly restores
+the originating visible window and requests activation after successful,
+current authentication. It never requests this for a denial or fenced context.
+All 1,083 provisioned app tests and 148 reusable native tests pass
 (eight and one optional skips respectively). This does not claim a successful
 live R9 welcome. See [the R9 client lifecycle](r9-client.md). The approved test service
 expired at 21:52:56 UTC. Renewal needs a supported Portal operation and another

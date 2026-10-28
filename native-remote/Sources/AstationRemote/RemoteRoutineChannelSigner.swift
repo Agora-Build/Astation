@@ -10,13 +10,18 @@ public enum RemoteOwnerAuthenticationError: String, Error, Equatable {
     case expired
 }
 
+public enum RemoteOwnerAuthenticationStage: Equatable {
+    case beforeConfirmation
+    case afterConfirmation
+}
+
 /// R9.6 owner-confirmation reuse applies only to channel transcript signatures.
 @MainActor
 public final class RemoteRoutineChannelSigner {
     private let keyID: String
     private let now: () -> UInt64
     private let active: () -> Bool
-    private let waitForForeground: () async throws -> Void
+    private let waitForForeground: (RemoteOwnerAuthenticationStage) async throws -> Void
     private let confirm: () async -> Bool
     private let primitive: (SignRequest) throws -> Data
     private var confirmedAt: UInt64?
@@ -24,7 +29,7 @@ public final class RemoteRoutineChannelSigner {
     private var generation = UUID()
 
     public init(keyID: String, now: @escaping () -> UInt64, active: @escaping () -> Bool,
-        waitForForeground: @escaping () async throws -> Void = {},
+        waitForForeground: @escaping (RemoteOwnerAuthenticationStage) async throws -> Void = { _ in },
         confirm: @escaping () async -> Bool, sign: @escaping (SignRequest) throws -> Data) {
         self.keyID = keyID
         self.now = now
@@ -57,7 +62,7 @@ public final class RemoteRoutineChannelSigner {
     /// This grants no signing authority beyond routine, validated channel transcripts.
     public func prepare(isCurrent: () -> Bool) async throws {
         var context = generation
-        try await requireForeground(context: context, isCurrent: isCurrent)
+        try await requireForeground(context: context, isCurrent: isCurrent, stage: .beforeConfirmation)
         let time = now()
         if let confirmedAt, time < confirmedAt { invalidate() }
         context = generation
@@ -72,7 +77,7 @@ public final class RemoteRoutineChannelSigner {
             defer { if pending?.id == confirmation.id { pending = nil } }
             guard generation == context else { throw RemoteOwnerAuthenticationError.invalidated }
             guard let acceptedAt else { throw RemoteOwnerAuthenticationError.denied }
-            try await requireForeground(context: context, isCurrent: isCurrent)
+            try await requireForeground(context: context, isCurrent: isCurrent, stage: .afterConfirmation)
             confirmedAt = max(confirmedAt ?? acceptedAt, acceptedAt)
         }
         let signingTime = now()
@@ -81,13 +86,13 @@ public final class RemoteRoutineChannelSigner {
         guard let confirmedAt, signingTime >= confirmedAt, signingTime - confirmedAt < 300_000 else { throw RemoteOwnerAuthenticationError.expired }
     }
 
-    private func requireForeground(context: UUID, isCurrent: () -> Bool) async throws {
+    private func requireForeground(context: UUID, isCurrent: () -> Bool, stage: RemoteOwnerAuthenticationStage) async throws {
         guard generation == context else { throw RemoteOwnerAuthenticationError.invalidated }
         guard isCurrent() else { throw RemoteOwnerAuthenticationError.staleContext }
         guard !Task.isCancelled else { throw RemoteOwnerAuthenticationError.cancelled }
         if !active() {
             clearReuse()
-            try await waitForForeground()
+            try await waitForForeground(stage)
         }
         guard generation == context else { throw RemoteOwnerAuthenticationError.invalidated }
         try checkContext(isCurrent)

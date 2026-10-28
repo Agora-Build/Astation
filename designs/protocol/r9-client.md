@@ -62,8 +62,14 @@ is cached during that wait. The confirmation timestamp remains the original
 authentication time; waiting cannot extend the five-minute reuse window.
 Foreground, cancellation, connection and invalidation fences are rechecked
 after waiting. A result that remains backgrounded is discarded. Explicit
-Retry Session Connection requests app activation; automatic connection
-attempts do not steal focus.
+Retry Session Connection requests app activation. After successful system
+authentication, the adapter requests activation again and returns to the
+original visible window: macOS can otherwise leave this menu-bar app inactive
+when the authentication UI closes. This restoration is requested only after
+the shared signer rechecks generation, current connection and cancellation.
+It is never requested for a denial or to start a background authentication;
+closed originating windows are not reopened. A new background connection
+attempt merely waits briefly and requires foreground before prompting.
 
 `RemoteRelayClient` also opens its own outbound WebSocket without this Mac's
 identity-room connection. See the [independent API](../../docs/remote-api.md)

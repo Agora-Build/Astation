@@ -13,10 +13,14 @@ private final class RoutineSignerHarness {
     var signed: [SignRequest] = []
     var confirmation: (() async -> Bool)?
     var foregroundWait: (() async throws -> Void)?
+    var foregroundStages: [RemoteOwnerAuthenticationStage] = []
     var signError: Error?
     lazy var signer = RemoteRoutineChannelSigner(keyID: "device-key", now: { [unowned self] in now },
         active: { [unowned self] in active },
-        waitForForeground: { [unowned self] in try await foregroundWait?() }, confirm: { [unowned self] in
+        waitForForeground: { [unowned self] stage in
+            foregroundStages.append(stage)
+            try await foregroundWait?()
+        }, confirm: { [unowned self] in
             confirmations += 1
             return await confirmation?() ?? accepted
         }, sign: { [unowned self] request in
@@ -47,10 +51,31 @@ final class RemoteRoutineChannelSignerTests: XCTestCase {
         h.confirmation = { h.active = false; h.signer.clearReuse(); return true }
         try await h.signer.prepare(isCurrent: { h.current })
         XCTAssertEqual(waits, 2)
+        XCTAssertEqual(h.foregroundStages, [.beforeConfirmation, .afterConfirmation])
         XCTAssertEqual(h.confirmations, 1)
         XCTAssertTrue(h.signed.isEmpty)
         _ = try await h.sign()
         XCTAssertEqual(h.confirmations, 1)
+    }
+
+    @MainActor
+    func testOnlyCurrentSuccessfulConfirmationMayRequestFocusRestoration() async throws {
+        for outcome in ["denied", "locked", "stale", "cancelled"] {
+            let h = RoutineSignerHarness()
+            let prompted = expectation(description: "Owner confirmation")
+            var answer: CheckedContinuation<Bool, Never>?
+            h.confirmation = { await withCheckedContinuation { answer = $0; prompted.fulfill() } }
+            let task = Task { try await h.sign() }
+            await fulfillment(of: [prompted], timeout: 1)
+            h.active = false
+            if outcome == "locked" { h.signer.invalidate() }
+            if outcome == "stale" { h.current = false }
+            if outcome == "cancelled" { task.cancel() }
+            try XCTUnwrap(answer).resume(returning: outcome != "denied")
+            do { _ = try await task.value; XCTFail("Invalid confirmation succeeded: \(outcome)") } catch { }
+            XCTAssertTrue(h.foregroundStages.isEmpty, "No focus restoration after \(outcome)")
+            XCTAssertTrue(h.signed.isEmpty)
+        }
     }
 
     @MainActor
