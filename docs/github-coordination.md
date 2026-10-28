@@ -23,7 +23,12 @@ the subsequent pairing exchange, identity-candidate timeout, expired pairing
 rejoin, refusal of independent routing from unproved pairing presence, and
 allocation collisions that must not convert or refresh existing rooms. The
 shared allocation scenario is also registered for Redis, but its Redis run is
-not executed locally because no isolated Redis server is available.
+not executed locally because no isolated Redis server is available. On exact
+source `109a2313833bb67e441541be76d76a6117537c20`,
+[CI 40722969438](https://github.com/Agora-Build/Astation/actions/runs/40722969438)
+passes macOS, web and relay checks, including all 66 explicit Postgres cases,
+all 66 explicit Redis/Valkey cases and eight load-client tests. The Redis
+allocation collision regression passes there.
 
 PR #89 remains at `e7dff6d7784f7cfbc6037d74568b63b3dad0c511`, with ten
 successful checks and three automation skips. Its complete tree is identical
@@ -33,12 +38,22 @@ build provenance and reported binary SHA256. Astation's shared Rust/Apple
 artifacts remain at `ed0b45bad5db0a278c63efe8a464f12d4d548465`.
 Contract PR #80 and both PRs' inline/review activity are unchanged.
 
-This source correction does not update the running test Station. A readiness
-handoff on #81 must precede another pairing attempt, followed by the user's
-native confirmation and the remaining joint live gates. Hosted execution
-remains disabled. Atem memory and vault access currently fail because the
-saved Astation session is expired or refused; direct GitHub handoffs remain
-authoritative until access returns. No pairing reset is performed.
+The isolated dev Station at
+`https://sandless-karl-uncollectively.ngrok-free.dev` now runs `109a231`; its
+public health response confirms that exact commit. The update preserves the
+existing protected keys, database and report-client registration. A live
+synthetic HTTP/WebSocket check keeps the host connected for 12 seconds with
+no challenge and no owner, then confirms a later owner discovers it and
+messages pass in both directions. The synthetic room is removed afterward.
+This verifies the deployed pairing transport; it does not exercise real
+native credentials, safety-code confirmation or owner service approval.
+
+A readiness handoff on #81 precedes another real pairing attempt, followed by
+the user's native confirmation and the remaining joint live gates. The
+canonical native app is unchanged; hosted execution remains disabled. Atem
+memory and vault access currently fail because the saved Astation session is
+expired or refused; direct GitHub handoffs remain authoritative until access
+returns. No pairing reset or production change is performed.
 
 ## Current implementation, 2026-10-22
 
