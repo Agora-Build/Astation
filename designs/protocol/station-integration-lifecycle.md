@@ -16,7 +16,7 @@ The implementation is available for review and controlled tests, not activation.
   `code: cursor_ahead` requires a full cursor-zero reconciliation.
 - R9 contract and host pins remain `c685abab` and `6526e1cf`. The consumed
   Rust and verified Apple client package now pin
-  `04140840fc0cec4086072ab6326b7a1b46b25be4` (Atem PR #98). Fingerprinting
+  `ed0b45bad5db0a278c63efe8a464f12d4d548465` (Atem PR #100). Fingerprinting
   delegates to the shared helper; wire and signature formats are unchanged.
 - [Portal #18](https://github.com/Agora-Build/Portal/issues/18) is closed by
   test-only Portal #19, tested `998301e8` and merged `7319e365`.
@@ -200,17 +200,31 @@ Ready reports. Before opening it, verify actual encrypted policy and service
 admission, revocation/reconnect, Mac-off and replicas; native cached readiness
 is not Station authority. See the [review and security invariants](host-policy-r9-review.md).
 
-## Verification status (2026-10-27)
+## Verification status (2026-10-28)
 
 Personal provisioning is resolved after Xcode reauthentication, using the
 existing personal team and bundle. The renewed profile expires
-**2026-11-02 23:59:57 UTC**. The signed bundle in the task worktree passes strict
-signature and bundled-resource checks; the canonical running app is retained.
+**2026-11-02 23:59:57 UTC**. The signed pairing candidate in the task worktree
+passes strict signature and bundled-resource checks and now replaces the
+older running app.
 No protected identity test is excluded. Secure Enclave signing, protected
 identity/recovery-pin reload, migration journal restart/commit, storage-key
 escrow and protected refresh/project/credential storage all pass.
 
-Latest R9.8a integration checks:
+Latest native pairing checks:
+
+- The full unlocked-Mac provisioned suite passes 1,074 tests, with seven
+  optional skips, zero failures and no exclusions. Protected Keychain,
+  Secure Enclave, recovery, migration and credential tests run and pass.
+- The subsequent diagnostic change passes all 21 provisioned pairing-state
+  tests. Two opt-in tests against the deployed dev Station pass the stable
+  host-route case and refusal of a Station-assigned mismatched host route.
+- The running native implementation is `be0bd00`; the first host trial's
+  missing pairing-socket `atem_id` is fixed in Atem's next trial, which still
+  needs a committed source pin and actual safety-code/owner verification.
+  See the [pairing lifecycle](pairing-and-service-authorization.md).
+
+Earlier R9.8a integration checks:
 
 - **1,032 provisioned app tests, six environment skips, zero failures**, with
   `ASTATION_REQUIRE_KEYCHAIN_TESTS=1` and no exclusions. The skips concern live
@@ -238,11 +252,13 @@ persisting cursor/revision 1 with denial false. Public health returns 200 and
 unauthenticated details returns 401. These are real Auth/Portal/Station results;
 no integration or native approval is inferred from registration.
 
-Remaining live handoffs: Portal supplies the awaiting-approval integration ID
-([Portal #20](https://github.com/Agora-Build/Portal/issues/20)); Atem supplies a
-disposable actual host on the agreed policy lineage and completes binding E2E.
-Then run native PKCE/owner approval, protected service enrollment, actual agent
+Portal supplied the awaiting-approval integration ID and Atem delivered the
+disposable policy-capable host and binding E2E, accepted for test integration
+at `e7dff6d`. Those deliveries are no longer missing. The current live handoff
+is Atem's corrected pairing receiver and exact committed pin, followed by the
+actual native safety-code/owner ceremony. Then run native integration approval,
+protected service enrollment, actual agent
 execution, policy durability, revocation/reconnect, Mac-off and replica checks.
 Hosted execution remains hard disabled without an override. No production
-trust reset, credential-agent restart, Atem checkout edit/build, canonical app
-replacement or production merge/deploy is part of this verification.
+trust reset, credential-agent restart, Atem checkout edit/build or production
+merge/deploy is part of this verification.

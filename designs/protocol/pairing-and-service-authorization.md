@@ -4,7 +4,8 @@ Status: **product design approved; native candidate implemented**,
 2026-10-28. The owner approved the separation and requested implementation.
 The v1 wire below is the Astation implementation candidate awaiting Atem's
 joint confirmation and committed receiver pin. A trial host completed the
-introduction; identity-connection correlation still needs joint diagnosis.
+introduction. Its omitted pairing-socket host ID explained the subsequent
+identity mismatch; Atem has prepared a corrected trial for the next ceremony.
 Atem owns its protocol and host
 implementation; Astation owns native UX and integration. Hosted execution
 remains disabled pending the real joint end-to-end gates.
@@ -319,16 +320,23 @@ hosted execution release gates.
 The provisioned native candidate is now running on the Mac. The first live
 trial reached the introduction at 20:43:10 UTC on 2026-10-28, but native
 refused the subsequent identity authentication before showing the owner
-prompt. The attempt was still waiting for verification; account/Station
-changes and timeouts did not end it. Atem's uncommitted trial receiver is
-not a release pin. [The live report](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6480239881)
-and [native correlation review](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6480270680)
-track the exact code, attempt UUID and host-route checks. Native diagnostics
-name only the rejected check and never log the pairing code or routing IDs.
-The 21 provisioned pairing-state tests pass after this diagnostic change;
-it does not relax authentication or establish trusted enrollment.
+prompt. [Atem confirmed](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6480336199)
+that its trial omitted `atem_id` on the pairing-code socket. Station assigned
+that socket a different routing ID from the identity socket, so native's
+same-host check correctly refused it. The attempt was still active, and its
+code and hello UUID matched. Atem's corrected trial sends the same host ID
+on both sockets; it is not yet a committed release pin.
 
-Still required: resolving live identity correlation, Atem's wire confirmation
+Native diagnostics name only the rejected check and never log the pairing
+code or routing IDs. The 21 provisioned pairing-state tests pass after this
+diagnostic change. Two opt-in tests also pass against the deployed dev
+Station: a stable explicit host ID reaches the pending owner-confirmation
+state, while an omitted ID cannot match an unrelated identity. Both close
+the temporary host socket after the introduction and clean up their
+synthetic rooms. These tests neither relax authentication nor perform real
+owner confirmation or trusted enrollment.
+
+Still required: retrying with the corrected host, Atem's wire confirmation
 and committed receiver pin, actual native
 safety-code/owner verification, protected integration approval/enrollment,
 actual agent execution and the policy/revocation/reconnect/Mac-off/replica

@@ -53,7 +53,8 @@ retains the Agora.Build login and asks for Agora Console reconnection.
 The [pairing and service authorization design](pairing-and-service-authorization.md)
 records the owner-approved separation, guided native flow, diagram, trust
 boundaries, candidate v1 wire and joint tests. The native candidate is
-implemented; Atem's wire confirmation and receiver build remain required.
+implemented and running. Atem has prepared a corrected trial receiver;
+its wire confirmation, committed source pin and real ceremony remain required.
 
 The provisioned native app reaches the selected dev Station. For the
 `DP4E-QG58` attempt, the native log records the dev WebSocket URL at
@@ -87,8 +88,16 @@ real joint ceremony. Regression
 coverage must include Agora.Build-only login with no legacy session, refusal
 without the required native account state, expired/missing rooms, disconnect,
 account/relay changes during asynchronous work, duplicate attempts, and
-absence of account bearer/refresh tokens from pairing traffic. This remains
-a live pairing blocker, not a completed fix or an integration approval.
+absence of account bearer/refresh tokens from pairing traffic.
+
+The first token-free live trial completed the introduction at 20:43:10 UTC.
+Its identity authentication was then correctly refused: Atem had omitted
+`atem_id` on the code socket, so its assigned route did not match the explicit
+host ID on the identity socket. [Atem's corrected trial](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6480336199)
+uses the same ID on both. Native's 21 pairing-state tests and two opt-in
+deployed-Station route tests pass; those tests do not perform real consent.
+The corrected trial, committed host pin and actual safety-code/owner ceremony
+remain the live gate before integration approval.
 
 ## Relay boundary
 
