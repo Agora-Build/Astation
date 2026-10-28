@@ -56,6 +56,7 @@ private final class PortalCacheStorage: AccountDataStorage {
     let suite = "Astation.portal-hub.\(UUID())"
     let defaults: UserDefaults
     let storage: PortalAccountStorage
+    let stationStorage: PortalAccountStorage
     let auth: AstationAccountAuth
     let hub: AstationHubManager
     let legacy: SsoSessionStore
@@ -70,6 +71,11 @@ private final class PortalCacheStorage: AccountDataStorage {
         storage = PortalAccountStorage(AccountLoginSession(configuration: authConfig, subject: subject,
             accessToken: "portal-access", refreshToken: "test-refresh", expiresAt: Date().addingTimeInterval(600), authenticatedAt: nil))
         auth = AstationAccountAuth(configuration: authConfig, storage: storage, http: http)
+        let stationConfig = try AccountOIDCConfiguration(issuer: config.issuer, clientID: config.clientID,
+            resource: "https://station.portal-tests.example", requiredScope: "astation.remote")
+        stationStorage = PortalAccountStorage(AccountLoginSession(configuration: stationConfig, subject: subject,
+            accessToken: "station-access", refreshToken: "station-refresh", expiresAt: Date().addingTimeInterval(600), authenticatedAt: nil))
+        let stationAuth = AstationAccountAuth(configuration: stationConfig, storage: stationStorage, http: http)
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         legacy = SsoSessionStore(storageURL: directory.appendingPathComponent("sso"))
@@ -77,8 +83,9 @@ private final class PortalCacheStorage: AccountDataStorage {
         hub = AstationHubManager(skipProjectLoad: true,
             deviceSessionStore: SessionStore(storageURL: directory.appendingPathComponent("devices")), sessionStore: legacy,
             atemE2EIdentity: AtemE2EIdentity(storage: TestAtemStorage(), crypto: TestAtemCryptography()), sessionJournal: AtemSessionJournal(),
-            portalSettings: config, portalAuth: auth, portalAPI: PortalAPIClient(http: http),
+            portalSettings: config, portalAuth: auth, stationAuth: stationAuth, portalAPI: PortalAPIClient(http: http),
             projectCache: PortalProjectCache(storage: cacheStorage), accountDefaults: defaults)
+        hub._testRelayUrlOverride = stationConfig.resource
     }
     func cleanup() { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: directory) }
 }
@@ -527,6 +534,7 @@ final class AccountServiceSettingsTests: XCTestCase {
         await waitUntil { hub.projectLoadError != nil }
         XCTAssertTrue(hub.projects.isEmpty); XCTAssertNil(hub.selectedProject); XCTAssertNil(hub.signedInAccount)
         XCTAssertNil(try fixture.storage.read())
+        XCTAssertNil(try fixture.stationStorage.read())
         XCTAssertNil(try fixture.cacheStorage.read())
         XCTAssertEqual(fixture.legacy.load(), fixture.legacySession)
         let calls = await http.requests()
