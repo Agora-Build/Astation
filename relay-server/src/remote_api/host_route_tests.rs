@@ -174,6 +174,86 @@ async fn owner_present_bootstrap_without_a_membership_pin_keeps_carrier_a() {
 }
 
 #[tokio::test]
+async fn pairing_host_waits_without_route_proof_for_later_owner() {
+    let mut app = state(RecoveryStore::memory());
+    app.relay = crate::relay::RelayHub::with_auth_timeout(Duration::from_millis(50));
+    let (base, server) = spawn_relay(app.clone()).await;
+    let http_base = base.replace("ws://", "http://").trim_end_matches("/ws").to_string();
+    let client = reqwest::Client::new();
+    let created: Value = client.post(format!("{http_base}/api/pair"))
+        .json(&json!({"hostname":"disposable-pairing-host"}))
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let code = created["code"].as_str().unwrap();
+    let mut host = connect_atem(&base, code, "new-host").await;
+
+    // A human can take longer than the independent route-proof deadline.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let status: Value = client.get(format!("{http_base}/api/pair/{code}"))
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(status["atem_connected"], true, "{status}");
+    assert_eq!(status["astation_connected"], false);
+
+    let (mut owner, _) = crate::relay::tests::connect_astation(&base, code).await;
+    let connected = next_client_json(&mut owner).await;
+    assert_eq!(connected["atem_id"], "new-host");
+    assert!(!app.relay.room(code).await.unwrap().unwrap().verified);
+    send_json(&mut owner, json!({"type":"auth_required","nonce":"owner"})).await;
+    // A pairing link must receive the ceremony, not a host-route challenge.
+    assert_eq!(next_client_json(&mut host).await["nonce"], "owner");
+    send_json(&mut host, json!({"type":"auth_request","nonce":"pairing"})).await;
+    assert_eq!(next_client_json(&mut owner).await["payload"]["nonce"], "pairing");
+    server.abort();
+}
+
+#[tokio::test]
+async fn ownerless_identity_requires_proof_and_expired_pairing_cannot_rejoin() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::{Error, Message};
+
+    let mut app = state(RecoveryStore::memory());
+    app.relay = crate::relay::RelayHub::with_auth_timeout(Duration::from_millis(50));
+    let now = chrono::Utc::now().timestamp();
+    app.relay.ensure_room("identity", "identity", now).await.unwrap();
+    let expired = app.relay.create_pair_room("old-host", now - 601, || "OLD-PAIR".into())
+        .await.unwrap().unwrap();
+    let (base, server) = spawn_relay(app.clone()).await;
+    let mut host = connect_atem(&base, "identity", "unproved-host").await;
+    assert_eq!(next_client_json(&mut host).await["op"], "host_challenge");
+    let closed = tokio::time::timeout(Duration::from_secs(2), host.next()).await.unwrap();
+    assert!(matches!(closed, None | Some(Ok(Message::Close(_))) | Some(Err(_))));
+    assert!(app.relay.room("identity").await.unwrap().is_none_or(|room| room.atems.is_empty()));
+
+    let result = tokio_tungstenite::connect_async(
+        format!("{base}?role=atem&code={expired}&atem_id=old-host")
+    ).await;
+    assert!(matches!(result, Err(Error::Http(response)) if response.status() == StatusCode::GONE));
+    server.abort();
+}
+
+#[tokio::test]
+async fn unproved_pairing_presence_does_not_supply_an_independent_route() {
+    let store = RecoveryStore::memory();
+    let now = chrono::Utc::now();
+    let f = Fixture::new(now.timestamp_millis() as u64);
+    f.publish(&store).await;
+    let app = state(store);
+    app.relay.create_pair_room("new-host", now.timestamp(), || "phone".into())
+        .await.unwrap().unwrap();
+    let (base, server) = spawn_relay(app.clone()).await;
+    let _host = connect_atem(&base, "phone", "host-a").await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !app.relay.room("phone").await.unwrap().unwrap().atems.contains_key("host-a") {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    let reply = super::recovery::host_target(&app, &f.log.genesis_hash().to_hex(), "alice", "host-a")
+        .await.unwrap_err();
+    assert_eq!(reply.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(reply.1.0["error"]["code"], "host_unreachable");
+    server.abort();
+}
+
+#[tokio::test]
 async fn proved_host_survives_auth_deadline_and_ownerless_room_expiry() {
     let store = RecoveryStore::memory();
     let f = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);

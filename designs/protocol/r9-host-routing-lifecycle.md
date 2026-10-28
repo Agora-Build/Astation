@@ -28,6 +28,27 @@ The upstream runtime tests exercise a fake relay. Astation must still prove
 its own directory, database and replica lifecycle with the real runtime;
 accepting the shared contract does not close #64.
 
+## Pairing before the owner arrives
+
+The disposable runtime's first live attempt exposed an ordering gap: it opens
+its pairing socket immediately after `POST /api/pair`, before the user can
+enter the code in Astation. Treating that socket as carrier B closes it after
+the ten-second proof deadline, although it has no enrolled host key yet.
+
+Pairing rooms now carry an explicit server-created marker, set atomically only
+when a fresh code is allocated. Neither a query parameter, code shape nor
+hostname can set it or convert an existing identity room. A fresh pairing
+socket waits in that room without a route challenge, using the existing
+600-second ownerless room lifetime and cleanup. Expired pairing rooms refuse
+rejoin. The native owner then performs the existing pairing/safety ceremony.
+
+This waiting transport creates no signed host binding and cannot supply an
+independent route without the exact room owner. Identity rooms, including
+missing or expired identity rooms, still require the carrier-B proof while
+ownerless. Historical Redis rooms without the marker receive no exemption.
+The correction changes relay bookkeeping, not the r9 wire format or owner
+authentication requirements.
+
 ## Original failure
 
 `/ws?role=atem&code=<identity-room>&atem_id=<host>` requires the room to exist.

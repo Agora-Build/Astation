@@ -1,5 +1,45 @@
 # Astation and Atem coordination
 
+## Pairing bootstrap correction, 2026-10-28
+
+Atem's [disposable-host handoff](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6473810294)
+reports its isolated runtime running on the confirmed dev Station. The first
+pairing attempt failed before native approval: the relay treated the ownerless
+pairing link as an independent host-route candidate and closed it after the
+ten-second proof deadline, then removed the empty room. A real HTTP/WebSocket
+regression reproduces that failure with a shortened deadline.
+
+This increment records pairing-room origin atomically in the in-memory and
+Redis directories. Only a fresh room allocated by `POST /api/pair` can wait
+for its native owner without a host-route proof. Its existing 600-second
+ownerless expiry and cleanup remain; expired pairing rooms refuse rejoin.
+Identity routes retain candidate isolation, proof deadlines and durable
+binding. Pairing presence alone cannot supply an independent controller route.
+Native safety-code verification and owner consent are still required.
+
+Validation passes all 549 enabled relay tests; 132 environment-gated tests
+are explicitly ignored. New regressions cover the host-before-owner wait,
+the subsequent pairing exchange, identity-candidate timeout, expired pairing
+rejoin, refusal of independent routing from unproved pairing presence, and
+allocation collisions that must not convert or refresh existing rooms. The
+shared allocation scenario is also registered for Redis, but its Redis run is
+not executed locally because no isolated Redis server is available.
+
+PR #89 remains at `e7dff6d7784f7cfbc6037d74568b63b3dad0c511`, with ten
+successful checks and three automation skips. Its complete tree is identical
+to the reviewed `f943b3a0a0852b90449047f9006c6b3b5780ed63`; the immutable
+comparison contains no changed files. The prepared host retains that original
+build provenance and reported binary SHA256. Astation's shared Rust/Apple
+artifacts remain at `ed0b45bad5db0a278c63efe8a464f12d4d548465`.
+Contract PR #80 and both PRs' inline/review activity are unchanged.
+
+This source correction does not update the running test Station. A readiness
+handoff on #81 must precede another pairing attempt, followed by the user's
+native confirmation and the remaining joint live gates. Hosted execution
+remains disabled. Atem memory and vault access currently fail because the
+saved Astation session is expired or refused; direct GitHub handoffs remain
+authoritative until access returns. No pairing reset is performed.
+
 ## Current implementation, 2026-10-22
 
 The Apple package and relay shared-library dependency now use Atem

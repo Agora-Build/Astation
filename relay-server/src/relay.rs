@@ -965,7 +965,8 @@ impl RelayHub {
     ) -> Result<Option<String>, StoreError> {
         for _ in 0..MAX_PAIR_CODE_ATTEMPTS {
             let code = next_code();
-            if self.ensure_room(&code, hostname, now).await? {
+            if self.inner.directory.ensure_pairing_room(&code, hostname, now).await? {
+                self.room_changed(&code).await;
                 return Ok(Some(code));
             }
             tracing::warn!("Pairing code collision on {}, retrying", mask_code(&code));
@@ -1432,11 +1433,18 @@ pub async fn ws_handler(
             Err(error) => return ws_unavailable(&error),
         }
     } else if role == "atem" && state.recovery.route_storage_enabled() {
-        // An absent/expired room admits a challenge candidate, not presence.
-        // Current signed membership and key possession are checked after upgrade.
         if code.is_empty() || code.len() > atem_client::host_route::MAX_ID_BYTES {
             return StatusCode::BAD_REQUEST.into_response();
         }
+        match hub.room(&code).await {
+            Err(error) => return ws_unavailable(&error),
+            Ok(Some(room)) if room.pairing && room.is_expired(now) => {
+                return (StatusCode::GONE, "Pairing code has expired").into_response();
+            }
+            _ => {}
+        }
+        // An absent/expired room admits a challenge candidate, not presence.
+        // Current signed membership and key possession are checked after upgrade.
     } else {
         match hub.room(&code).await {
             Err(error) => return ws_unavailable(&error),
@@ -2729,7 +2737,14 @@ async fn handle_ws(
         return;
     }
 
-    let mut host_challenge = (role == "atem" && recovery.route_storage_enabled())
+    // A fresh API-created pairing room waits for the native owner. It has no
+    // enrolled host key yet and creates no independent proved-route authority.
+    let pairing = if role == "atem" {
+        matches!(hub.room(&code).await, Ok(Some(room)) if room.pairing && !room.is_expired(chrono::Utc::now().timestamp()))
+    } else {
+        false
+    };
+    let mut host_challenge = (role == "atem" && recovery.route_storage_enabled() && !pairing)
         .then(|| atem_client::host_route::HostChallenge::new(&code));
     if let Some(challenge) = &host_challenge {
         local.send(&connection_id, challenge.to_json().to_string());
@@ -6454,6 +6469,9 @@ pub(crate) mod tests {
         }
         async fn ensure_room(&self, code: &str, hostname: &str, now: i64) -> Result<bool, ClusterError> {
             self.inner.ensure_room(code, hostname, now).await
+        }
+        async fn ensure_pairing_room(&self, code: &str, hostname: &str, now: i64) -> Result<bool, ClusterError> {
+            self.inner.ensure_pairing_room(code, hostname, now).await
         }
         async fn get(&self, code: &str) -> Result<Option<RoomInfo>, ClusterError> {
             self.inner.get(code).await
