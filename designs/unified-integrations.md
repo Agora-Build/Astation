@@ -58,6 +58,13 @@ Native Astation apps continue using account login and their own enrolled
 device keys. Browser clients retain the existing native-approved companion
 model; this proposal does not turn browsers into standalone native members.
 
+The [pairing and service authorization draft](protocol/pairing-and-service-authorization.md)
+proposes one guided native pairing experience independent of optional service
+credential grants. Agora.Build-only login must not depend on an old Agora.io
+session to enroll an Atem host. The diagram and trust/lifecycle requirements
+are for owner and joint protocol review; the draft does not authorize a wire
+change or enable hosted execution.
+
 ## Ownership and Station API
 
 Agora.Build is the control plane: account/login/API authentication, integration

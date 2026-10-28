@@ -50,6 +50,11 @@ retains the Agora.Build login and asks for Agora Console reconnection.
 
 ## Live pairing bootstrap gap (2026-10-28)
 
+The [pairing and service authorization draft](pairing-and-service-authorization.md)
+describes the proposed separation, guided native flow, diagram, trust
+boundaries and joint tests. It is awaiting owner review; the wire change has
+not been agreed or implemented.
+
 The provisioned native app reaches the selected dev Station. For the
 `DP4E-QG58` attempt, the native log records the dev WebSocket URL at
 18:22:01.996 UTC; the Station records the native owner joining the host's
