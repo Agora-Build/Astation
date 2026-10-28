@@ -96,8 +96,11 @@ Its identity authentication was then correctly refused: Atem had omitted
 host ID on the identity socket. [Atem's corrected trial](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6480336199)
 uses the same ID on both. Native's 21 pairing-state tests and two opt-in
 deployed-Station route tests pass; those tests do not perform real consent.
-The corrected trial, committed host pin and actual safety-code/owner ceremony
-remain the live gate before integration approval.
+The corrected trial reached native enrollment, but the host declined its
+half and discarded that attempt's channel key. Retrying with a fresh key at
+the same generation is correctly invalid. See the
+[pairing retry lifecycle](pairing-and-service-authorization.md#implementation-and-verification-status).
+Joint verification and a committed host pin remain open.
 
 ## Relay boundary
 
@@ -115,6 +118,17 @@ pending recovery operations or merge requests. New OIDC identities cannot
 collide with or silently claim those legacy bindings. A registered device's
 login principal cannot be changed by ordinary registration; an explicit
 verified migration is required. No email matching or automatic account merge.
+
+Integration policy, API tokens and sealed service-key context retain the
+external issuer and owner subject. Recovery storage and proved host routes
+use the existing internal principal. Provisioning, readiness and hosted
+connections resolve that owner through an exact, read-only `(issuer, subject)`
+lookup before accessing recovery records or registering channel ownership.
+A feed or service request cannot create an identity, fall back to a bare
+subject, select another issuer or alias a principal as a subject. Missing
+bindings and storage failures deny access without rotating service keys or
+moving account data. Regression fixtures deliberately use different external
+owners and storage principals.
 
 Login grants visibility to stored signed logs and sealed backups. Membership,
 genesis, device keys, host-signed freshness proofs and recovery signatures

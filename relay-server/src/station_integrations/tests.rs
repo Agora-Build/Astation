@@ -3,6 +3,7 @@ use crate::remote_api::{push_ingress::tests::Fixture, recovery::RecoveryStore};
 use atem_client::membership::Head;
 use ring::{rand::SystemRandom, signature};
 pub(crate) const OWNER: &str = "ab01234567890123456789012345";
+pub(crate) const PRINCIPAL: &str = "principal-12345678-1234-4567-89ab-123456789abc";
 pub(crate) const ID: &str = "i-01234567890123456789012345";
 
 pub(crate) async fn fixture() -> (
@@ -23,13 +24,21 @@ pub(crate) async fn fixture_with_issuer(
     let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 8).await;
     let mut app = crate::tests::test_state();
     app.recovery = RecoveryStore::postgres(db.pool.clone());
+    app.accounts = Arc::new(crate::account_store::PgAccountStore::new(db.pool.clone()));
+    sqlx::query("INSERT INTO account_identities (issuer,subject,principal) VALUES ($1,$2,$3)")
+        .bind(issuer)
+        .bind(OWNER)
+        .bind(PRINCIPAL)
+        .execute(&db.pool)
+        .await
+        .unwrap();
     let f = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
     for entry in f.log.entries() {
         assert_eq!(
             app.recovery
                 .append_test_entry(
                     &f.log.genesis_hash().to_hex(),
-                    OWNER,
+                    PRINCIPAL,
                     entry.clone(),
                     Head {
                         seq: entry.seq - 1,
@@ -102,6 +111,11 @@ async fn postgres_provisioning_binds_owner_root_exact_scope_and_durable_key() {
     assert_eq!(body["member"]["roles"], json!(["service"]));
     assert!(body["member"].get("enc_key").is_none());
     assert_eq!(first["hostedExecutionEnabled"], false);
+    let stored: String = sqlx::query_scalar("SELECT context FROM station_integration_provisioning")
+        .fetch_one(&db.pool).await.unwrap();
+    let context: ServiceKeyContext = serde_json::from_str(&stored).unwrap();
+    assert_eq!(context.owner, OWNER, "external owner stays bound to tokens and sealed service keys");
+    assert_eq!(runtime.owner_principal(OWNER).await.unwrap(), PRINCIPAL);
     let mut stale = request(&f);
     stale.expected_head["hash"] = json!("f".repeat(64));
     assert!(runtime.prepare(ID, OWNER, stale).await.is_err());
@@ -110,6 +124,27 @@ async fn postgres_provisioning_binds_owner_root_exact_scope_and_durable_key() {
     assert!(runtime.prepare(ID, OWNER, overbroad).await.is_err());
     runtime.policies.deny(&runtime.binding).await.unwrap();
     assert!(runtime.prepare(ID, OWNER, request(&f)).await.is_err());
+    drop(runtime);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_provisioning_never_aliases_another_issuer_or_creates_an_owner() {
+    let (db, runtime, f) = fixture().await;
+    sqlx::query("UPDATE account_identities SET issuer='https://another-issuer.example'")
+        .execute(&db.pool).await.unwrap();
+    assert_eq!(runtime.prepare(ID, OWNER, request(&f)).await.unwrap_err().status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(runtime.owner_principal(PRINCIPAL).await.is_err(), "a principal is not an external subject alias");
+    let identities: i64 = sqlx::query_scalar("SELECT count(*) FROM account_identities")
+        .fetch_one(&db.pool).await.unwrap();
+    let keys: i64 = sqlx::query_scalar("SELECT count(*) FROM station_service_keys")
+        .fetch_one(&db.pool).await.unwrap();
+    assert_eq!(identities, 1, "a policy feed cannot enroll an account identity");
+    assert_eq!(keys, 0);
+    sqlx::query("UPDATE account_identities SET issuer=$1, principal='unrelated-principal'")
+        .bind(&runtime.binding.issuer).execute(&db.pool).await.unwrap();
+    assert!(runtime.prepare(ID, OWNER, request(&f)).await.is_err(), "the mapped principal must own the recovery root");
     drop(runtime);
     db.cleanup().await;
 }

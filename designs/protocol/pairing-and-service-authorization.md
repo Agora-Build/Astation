@@ -3,9 +3,10 @@
 Status: **product design approved; native candidate implemented**,
 2026-10-28. The owner approved the separation and requested implementation.
 The v1 wire below is the Astation implementation candidate awaiting Atem's
-joint confirmation and committed receiver pin. A trial host completed the
-introduction. Its omitted pairing-socket host ID explained the subsequent
-identity mismatch; Atem has prepared a corrected trial for the next ceremony.
+joint confirmation and committed receiver pin. The corrected trial completed
+native owner approval, but Atem declined its half of the first ceremony. A
+retry with a fresh host key exposed the nonincreasing host-generation case
+described below; joint verification remains open.
 Atem owns its protocol and host
 implementation; Astation owns native UX and integration. Hosted execution
 remains disabled pending the real joint end-to-end gates.
@@ -336,9 +337,36 @@ the temporary host socket after the introduction and clean up their
 synthetic rooms. These tests neither relax authentication nor perform real
 owner confirmation or trusted enrollment.
 
-Still required: retrying with the corrected host, Atem's wire confirmation
-and committed receiver pin, actual native
-safety-code/owner verification, protected integration approval/enrollment,
+The corrected host reached native durable enrollment at 20:53:33 UTC, but
+the host subsequently answered `n` and discarded its fresh channel-key seed.
+That is native completion only, not a jointly verified host. Atem's next
+`pair verify` generated a different channel key while still advertising host
+trust generation 1. A second `add_host` at generation 1 is invalid under
+`host_trust_gen_not_increasing`. The old generic recovery error did not
+explain this failure.
+
+Native now refuses a nonincreasing generation before preparing a draft or
+presenting owner approval. A new key must never reuse the old key's signed
+entry. A valid higher-generation `add_host` can supersede the existing host
+without `remove_host`, subject to a fresh ceremony and owner confirmation.
+Atem owns durable generation/key handling for an aborted ceremony. Neither
+agent may silently unpair or reset trust to repeat a test.
+
+After a restart, native may retire a pending host publication once the
+anchored chain proves its exact signed entry committed. A pending duplicate
+is superseded only when the shared verifier proves its exact signed body
+invalid for a nonincreasing generation at the current anchored head. Native
+durably retains that draft as evidence before preparing a replacement.
+Other unresolved signed publications remain pending. No chain truncation,
+key substitution or owner-consent bypass is permitted.
+
+The updated provisioned suite passes 1,078 tests with eight optional skips
+and zero failures. Its regressions cover higher-generation replacement,
+retained invalid-draft evidence and restart after a lost committed reply.
+
+Still required: Atem's generation lifecycle correction, wire confirmation
+and committed receiver pin, joint safety-code/owner verification,
+protected integration approval/enrollment,
 actual agent execution and the policy/revocation/reconnect/Mac-off/replica
 checks. A synthetic relay pass does not satisfy these gates. Hosted execution
 remains disabled.

@@ -167,6 +167,87 @@ private final class RecoveryCoordinatorHarness {
 
 @MainActor
 final class AstationRecoveryCoordinatorTests: XCTestCase {
+    private func hostAttempt(_ coordinator: AstationRecoveryCoordinator, generation: UInt64) async throws
+        -> (RemotePairingCommit, RemotePairingReveal, AtemVerifyKeys) {
+        let keys = try await coordinator.pairingKeys(nonce: Data(repeating: 8, count: 32))
+        let reveal = try RemotePairingReveal(originalJSON: JSONSerialization.data(withJSONObject: [
+            "type": "verifyReveal", "data": [
+                "device_pub": Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation.base64EncodedString(),
+                "device_sign_pub": Curve25519.Signing.PrivateKey().publicKey.rawRepresentation.base64EncodedString(),
+                "unlock_auth_pub": Curve25519.Signing.PrivateKey().publicKey.rawRepresentation.base64EncodedString(),
+                "host_channel_pub": recoveryTestBase64(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation),
+                "nonce": Data(repeating: 9, count: 32).base64EncodedString()
+            ]]))
+        let commit = try RemotePairingCommit(context: RemotePairingContext(accountID: "account-a", hostID: "host-a", linkGeneration: UUID()),
+            hostTrustGeneration: generation, commitment: reveal.commitment())
+        return (commit, reveal, keys)
+    }
+
+    func testHostRetryRejectsSameGenerationBeforeDraftAndAcceptsHigherGenerationWithoutRemoval() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        let (commit, reveal, keys) = try await hostAttempt(coordinator, generation: 1)
+        let first = try await coordinator.prepareHost(commit: commit, reveal: reveal, keys: keys)
+        _ = try await coordinator.commitHost(request: first, confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true })
+        let count = await h.relay.appends.count
+        let (retry, retryReveal, retryKeys) = try await hostAttempt(coordinator, generation: 1)
+        do { _ = try await coordinator.prepareHost(commit: retry, reveal: retryReveal, keys: retryKeys); XCTFail("duplicate generation") }
+        catch { XCTAssertTrue(error is AstationHostEnrollmentError) }
+        XCTAssertNil(try checkpoint(h.store)["publication"])
+        let afterRefusal = await h.relay.appends.count
+        XCTAssertEqual(count, afterRefusal)
+        let (replacement, replacementReveal, replacementKeys) = try await hostAttempt(coordinator, generation: 2)
+        let draft = try await coordinator.prepareHost(commit: replacement, reveal: replacementReveal, keys: replacementKeys)
+        _ = try await coordinator.commitHost(request: draft, confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true })
+        let log = try coordinator.channelMembership(hostID: "host-a")
+        XCTAssertEqual(log.host(hostId: "host-a")?.hostTrustGen, 2)
+        XCTAssertEqual(log.host(hostId: "host-a")?.hostKey.raw, replacementReveal.hostChannelPublicKey)
+        _ = try replacementKeys.remote().membershipEntries(log: log, managerID: "manager-a", commit: replacement, reveal: replacementReveal)
+    }
+
+    func testHostHigherGenerationReconcilesLostCommittedReplyAcrossRestart() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        let (commit, reveal, keys) = try await hostAttempt(coordinator!, generation: 1)
+        let first = try await coordinator!.prepareHost(commit: commit, reveal: reveal, keys: keys)
+        await h.relay.dropNextAppendReply()
+        do { _ = try await coordinator!.commitHost(request: first, confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true }); XCTFail("lost reply") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .unavailable) }
+        coordinator = nil
+        coordinator = try h.coordinator()
+        let (replacement, replacementReveal, replacementKeys) = try await hostAttempt(coordinator!, generation: 2)
+        let draft = try await coordinator!.prepareHost(commit: replacement, reveal: replacementReveal, keys: replacementKeys)
+        _ = try await coordinator!.commitHost(request: draft, confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true })
+        XCTAssertEqual(try coordinator!.channelMembership(hostID: "host-a").host(hostId: "host-a")?.hostTrustGen, 2)
+        XCTAssertNil(try checkpoint(h.store)["publication"])
+    }
+
+    func testHostHigherGenerationPreservesEvidenceOfInvalidSignedDuplicate() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        let (commit, reveal, keys) = try await hostAttempt(coordinator!, generation: 1)
+        let first = try await coordinator!.prepareHost(commit: commit, reveal: reveal, keys: keys)
+        _ = try await coordinator!.commitHost(request: first, confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true })
+        let log = try coordinator!.channelMembership(hostID: "host-a")
+        var pendingCheckpoint: Data?
+        var invalid: RemoteMembershipPublication? = RemoteMembershipPublication(log: log, persist: { pendingCheckpoint = $0 })
+        let body = try invalid!.prepareHost(commit: commit, hostChannelKey: PublicKeyData(alg: .ed25519, raw: reveal.hostChannelPublicKey),
+            signer: "manager-a", signedAt: AstationRecoveryCoordinator.clock().wallMs)
+        let provider = AstationMembershipKeyProvider(identity: h.identity, keyID: "manager-a", publicKey: try h.identity.remotePublicKeys().signing)
+        _ = try invalid!.sign(provider: provider, keyID: "manager-a")
+        invalid = nil
+        coordinator = nil
+        var stored = try checkpoint(h.store)
+        stored["publication"] = try XCTUnwrap(pendingCheckpoint)
+        stored["hostBody"] = body
+        h.store.bytes = try PropertyListSerialization.data(fromPropertyList: stored, format: .binary, options: 0)
+        coordinator = try h.coordinator()
+        let (replacement, replacementReveal, replacementKeys) = try await hostAttempt(coordinator!, generation: 2)
+        let draft = try await coordinator!.prepareHost(commit: replacement, reveal: replacementReveal, keys: replacementKeys)
+        _ = try await coordinator!.commitHost(request: draft, confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true })
+        XCTAssertEqual((try checkpoint(h.store)["supersededHostPublications"] as? [Data])?.count, 1)
+        XCTAssertEqual(try coordinator!.channelMembership(hostID: "host-a").host(hostId: "host-a")?.hostTrustGen, 2)
+    }
+
     func testAccountSecurityRequiresExplicitSetupAndSavedKit() async throws {
         let h = RecoveryCoordinatorHarness()
         let coordinator = try h.coordinator()

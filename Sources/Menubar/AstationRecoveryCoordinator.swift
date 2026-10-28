@@ -18,6 +18,14 @@ protocol AstationRecoveryDataKeys {
 }
 extension DataEncryptionKeyManager: AstationRecoveryDataKeys {}
 
+enum AstationHostEnrollmentError: LocalizedError {
+    case generationNotAdvanced
+
+    var errorDescription: String? {
+        "A previous verification already registered this Atem generation. Atem must start verification with a newer trust generation. Your pairing and account data were retained."
+    }
+}
+
 /// One account, one protected checkpoint and one process owner for all v2 operations.
 /// A relay reply cannot replace this independently saved genesis or authorize a device.
 @MainActor
@@ -32,6 +40,7 @@ final class AstationRecoveryCoordinator {
         var membership: String?
         var publication: Data?
         var hostBody: String?
+        var supersededHostPublications: [Data]?
         var serviceApproval: Data?
         var supersededServiceReviews: [Data]?
         var backup: Data?
@@ -303,11 +312,17 @@ final class AstationRecoveryCoordinator {
         guard saved.serviceApproval == nil else { throw RemoteRecoveryError.busy }
         guard let genesis = keys.genesisHash else { throw AtemIdentityError.invalidState }
         let log = try await refreshedLog(genesis: genesis)
+        try requireManager(log)
+        guard log.host(hostId: commit.context.hostID).map({ $0.hostTrustGen < commit.hostTrustGeneration }) ?? true else {
+            throw AstationHostEnrollmentError.generationNotAdvanced
+        }
         if let checkpoint = saved.publication {
             publication = nil
             publication = try RemoteMembershipPublication(checkpoint: checkpoint, accountID: accountID,
                 genesisHash: log.genesisHash(), now: now(), persist: { [unowned self] bytes in try self.persist { $0.publication = bytes } })
-            if let body = saved.hostBody, try publication?.outstanding() != nil {
+            if let body = saved.hostBody, let outstanding = try publication?.outstanding(),
+               try !archiveInvalidHostDraft(body: body, outstanding: outstanding, checkpoint: checkpoint,
+                   log: log, hostID: commit.context.hostID) {
                 let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: managerID)
                 let object = try JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any]
                 let host = object?["host"] as? [String: Any]
@@ -327,6 +342,35 @@ final class AstationRecoveryCoordinator {
             hostChannelKey: PublicKeyData(alg: .ed25519, raw: reveal.hostChannelPublicKey), signer: managerID, signedAt: now().wallMs)
         try persist { $0.hostBody = body }
         return try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: managerID)
+    }
+
+    private func archiveInvalidHostDraft(body: String, outstanding: AppendRequest, checkpoint: Data,
+        log: MembershipLog, hostID: String) throws -> Bool {
+        guard try signedObjectInfo(json: outstanding.entryJson).bodyJcs == body else { throw RemoteRecoveryError.requiresReview }
+        if try log.entries().contains(where: { try signedObjectInfo(json: $0).entryHash == outstanding.entryHash }) {
+            try persist { $0.publication = nil; $0.hostBody = nil }
+            publication = nil
+            return true
+        }
+        let object = try JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any]
+        let host = object?["host"] as? [String: Any]
+        guard object?["action"] as? String == "add_host", object?["signer"] as? String == managerID,
+              host?["host_id"] as? String == hostID, let generation = host?["host_trust_gen"] as? NSNumber,
+              let currentHost = log.host(hostId: hostID), generation.uint64Value <= currentHost.hostTrustGen,
+              outstanding.expected == log.head(), try signedObjectInfo(json: outstanding.entryJson).bodyJcs == body else { return false }
+        let evaluation = try log.snapshot().extend(entries: [outstanding.entryJson], now: now())
+        guard evaluation.appended == 0, case .invalid(_, let code) = evaluation.stop,
+              code == "host_trust_gen_not_increasing" else { return false }
+        guard (saved.supersededHostPublications?.count ?? 0) < 16 else { throw RemoteRecoveryError.requiresReview }
+        // Only the anchored verifier can prove this signed draft invalid.
+        // Preserve its evidence before preparing a higher-generation replacement.
+        let evidence = try PropertyListEncoder().encode(["publication": checkpoint, "body": Data(body.utf8)])
+        try persist {
+            $0.supersededHostPublications = ($0.supersededHostPublications ?? []) + [evidence]
+            $0.publication = nil; $0.hostBody = nil
+        }
+        publication = nil
+        return true
     }
 
     func commitHost(request: SignRequest, confirmedAt: UInt64, current: () -> Bool) async throws -> [String] {

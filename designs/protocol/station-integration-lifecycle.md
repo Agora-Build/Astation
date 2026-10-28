@@ -213,15 +213,17 @@ escrow and protected refresh/project/credential storage all pass.
 
 Latest native pairing checks:
 
-- The full unlocked-Mac provisioned suite passes 1,074 tests, with seven
+- The full unlocked-Mac provisioned suite passes 1,078 tests, with eight
   optional skips, zero failures and no exclusions. Protected Keychain,
   Secure Enclave, recovery, migration and credential tests run and pass.
 - The subsequent diagnostic change passes all 21 provisioned pairing-state
   tests. Two opt-in tests against the deployed dev Station pass the stable
   host-route case and refusal of a Station-assigned mismatched host route.
-- The running native implementation is `be0bd00`; the first host trial's
-  missing pairing-socket `atem_id` is fixed in Atem's next trial, which still
-  needs a committed source pin and actual safety-code/owner verification.
+- The corrected trial reached native enrollment, but the host declined its
+  half. A fresh host key at the same generation cannot reuse that entry.
+  Native now rejects this case before owner approval and tests replacement
+  by a higher generation without removing the host. Atem's generation
+  lifecycle fix, committed source pin and joint verification remain open.
   See the [pairing lifecycle](pairing-and-service-authorization.md).
 
 Earlier R9.8a integration checks:
@@ -255,8 +257,14 @@ no integration or native approval is inferred from registration.
 Portal supplied the awaiting-approval integration ID and Atem delivered the
 disposable policy-capable host and binding E2E, accepted for test integration
 at `e7dff6d`. Those deliveries are no longer missing. The current live handoff
-is Atem's corrected pairing receiver and exact committed pin, followed by the
-actual native safety-code/owner ceremony. Then run native integration approval,
+is Atem's retry-generation correction and exact committed pin, followed by the
+joint safety-code/owner ceremony. The separate provisioning refusal is fixed
+by resolving the external owner to its exact issuer-scoped storage principal;
+policy/token/service-key bindings keep the external owner. Thirteen account
+tests, five isolated provisioning tests and three isolated hosted API tests
+pass, including different owner/principal namespaces and wrong-issuer denial.
+The hosted API tests use a controlled encrypted host, not a real coding agent.
+Then run native integration approval,
 protected service enrollment, actual agent
 execution, policy durability, revocation/reconnect, Mac-off and replica checks.
 Hosted execution remains hard disabled without an override. No production

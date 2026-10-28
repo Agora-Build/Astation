@@ -4,7 +4,7 @@ use crate::{
     relay::tests::{connect_atem, next_client_json, send_json, spawn_relay},
     remote_api::push_ingress::tests::Fixture,
     service_keys::ServiceKeyContext,
-    station_integrations::tests::{fixture, request, ID, OWNER},
+    station_integrations::tests::{fixture, request, ID, OWNER, PRINCIPAL},
 };
 use atem_client::{
     channel::responder::{HostContext, Responder},
@@ -124,7 +124,7 @@ async fn service(
         runtime
             .app
             .recovery
-            .append_test_entry(&f.log.genesis_hash().to_hex(), OWNER, entry, f.log.head())
+            .append_test_entry(&f.log.genesis_hash().to_hex(), PRINCIPAL, entry, f.log.head())
             .await,
         StatusCode::OK
     );
@@ -329,7 +329,7 @@ async fn postgres_service_registry_without_mac_and_membership_policy_fences() {
     let log = runtime
         .app
         .recovery
-        .integration_log(&context.genesis, OWNER)
+        .integration_log(&context.genesis, PRINCIPAL)
         .await
         .unwrap();
     let mut app = runtime.app.clone();
@@ -345,7 +345,7 @@ async fn postgres_service_registry_without_mac_and_membership_policy_fences() {
         while !crate::remote_api::recovery::host_target(
             &runtime.app,
             &context.genesis,
-            OWNER,
+            PRINCIPAL,
             "host-a",
         )
         .await
@@ -424,7 +424,7 @@ async fn postgres_service_registry_without_mac_and_membership_policy_fences() {
     let current = runtime
         .app
         .recovery
-        .integration_log(&admission.context.genesis, OWNER)
+        .integration_log(&admission.context.genesis, PRINCIPAL)
         .await
         .unwrap();
     let expiry = atem_client::membership::service_grant(&current, &admission.context.service_id)
@@ -453,7 +453,7 @@ async fn postgres_service_registry_without_mac_and_membership_policy_fences() {
         runtime
             .app
             .recovery
-            .append_test_entry(&admission.context.genesis, OWNER, entry, current.head())
+            .append_test_entry(&admission.context.genesis, PRINCIPAL, entry, current.head())
             .await,
         StatusCode::OK
     );
@@ -476,7 +476,7 @@ async fn postgres_event_socket_keeps_rich_messages_and_closes_on_policy_denial()
     let log = runtime
         .app
         .recovery
-        .integration_log(&context.genesis, OWNER)
+        .integration_log(&context.genesis, PRINCIPAL)
         .await
         .unwrap();
     let mut app = runtime.app.clone();
@@ -491,7 +491,7 @@ async fn postgres_event_socket_keeps_rich_messages_and_closes_on_policy_denial()
         while !crate::remote_api::recovery::host_target(
             &runtime.app,
             &context.genesis,
-            OWNER,
+            PRINCIPAL,
             "host-a",
         )
         .await
@@ -597,7 +597,7 @@ async fn postgres_http_api_authentication_operations_reconnect_and_revocation_wi
     let log = runtime
         .app
         .recovery
-        .integration_log(&context.genesis, OWNER)
+        .integration_log(&context.genesis, PRINCIPAL)
         .await
         .unwrap();
     let mut app = runtime.app.clone();
@@ -612,7 +612,7 @@ async fn postgres_http_api_authentication_operations_reconnect_and_revocation_wi
         while !crate::remote_api::recovery::host_target(
             &runtime.app,
             &context.genesis,
-            OWNER,
+            PRINCIPAL,
             "host-a",
         )
         .await

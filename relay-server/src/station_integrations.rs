@@ -10,7 +10,7 @@ use crate::{
 };
 use atem_client::{
     keys::{Alg, PublicKey},
-    membership::{service_add, MemberStatus, ServiceScope},
+    membership::{service_add, MemberStatus, Membership, ServiceScope},
     provider::{KeyId, KeyProvider},
 };
 use axum::{
@@ -95,6 +95,16 @@ fn protected_file(path: &str, limit: u64) -> Result<Zeroizing<Vec<u8>>, ()> {
 }
 
 impl StationIntegrations {
+    pub(crate) async fn owner_principal(&self, owner: &str) -> Result<String, Response> {
+        self.app.accounts.principal_for_identity(&self.binding.issuer, owner)
+            .await.map_err(|_| unavailable())?.ok_or_else(unavailable)
+    }
+
+    pub(crate) async fn recovery_log(&self, genesis: &str, owner: &str) -> Result<Membership, Response> {
+        let principal = self.owner_principal(owner).await?;
+        self.app.recovery.integration_log(genesis, &principal).await.ok_or_else(unavailable)
+    }
+
     fn from_env(app: AppState) -> Result<Option<Arc<Self>>, ()> {
         let get = |key| std::env::var(key).map_err(|_| ());
         if std::env::var_os("STATION_REPORT_CLIENT_ID").is_none() {
@@ -262,12 +272,7 @@ impl StationIntegrations {
             return Err(unavailable());
         }
         let fingerprint = policy.r9_svc.as_deref().ok_or_else(unavailable)?;
-        let log = self
-            .app
-            .recovery
-            .integration_log(&context.genesis, &context.owner)
-            .await
-            .ok_or_else(unavailable)?;
+        let log = self.recovery_log(&context.genesis, &context.owner).await?;
         let (scope, _) = atem_client::membership::service_grant(&log, &context.service_id)
             .ok_or_else(unavailable)?;
         if scope.hosts.is_empty() {
@@ -441,12 +446,7 @@ impl StationIntegrations {
         if policy.state != "awaiting_approval" || policy.r9_svc.is_some() {
             return Err(denied());
         }
-        let log = self
-            .app
-            .recovery
-            .integration_log(&request.genesis_hash, owner)
-            .await
-            .ok_or_else(denied)?;
+        let log = self.recovery_log(&request.genesis_hash, owner).await?;
         let wall = chrono::Utc::now().timestamp_millis().max(0) as u64;
         if log.frozen().is_some()
             || log.head().to_json() != request.expected_head

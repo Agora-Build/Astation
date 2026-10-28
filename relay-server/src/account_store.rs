@@ -149,6 +149,14 @@ pub trait AccountStore: Send + Sync {
         access_token: &str,
     ) -> Result<VerifiedAccount, VerifyError>;
 
+    /// Read an existing issuer-scoped binding after the caller authenticates
+    /// that identity. This lookup never enrolls an identity or aliases a subject.
+    async fn principal_for_identity(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<String>, AccountError>;
+
     async fn resolve_data_account(&self, astation_id: &str) -> Result<String, AccountError>;
 
     async fn subject_for_astation(
@@ -466,12 +474,19 @@ impl AccountStore for InMemoryAccountStore {
         access_token: &str,
     ) -> Result<VerifiedAccount, VerifyError> {
         let identity = self.verifier.verify(access_token).await?;
-        let subject = if identity.issuer == LEGACY_ISSUER { identity.subject }
-        else {
-            self.state.lock().await.identities.entry((identity.issuer, identity.subject))
-                .or_insert_with(|| format!("principal-{}", Uuid::new_v4())).clone()
-        };
+        let candidate = if identity.issuer == LEGACY_ISSUER { identity.subject.clone() }
+            else { format!("principal-{}", Uuid::new_v4()) };
+        let subject = self.state.lock().await.identities.entry((identity.issuer, identity.subject))
+            .or_insert(candidate).clone();
         Ok(VerifiedAccount { subject, authenticated_at: identity.authenticated_at })
+    }
+
+    async fn principal_for_identity(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<String>, AccountError> {
+        Ok(self.state.lock().await.identities.get(&(issuer.into(), subject.into())).cloned())
     }
 
     async fn resolve_data_account(&self, astation_id: &str) -> Result<String, AccountError> {
@@ -1240,6 +1255,19 @@ impl AccountStore for PgAccountStore {
         Ok(VerifiedAccount { subject, authenticated_at: identity.authenticated_at })
     }
 
+    async fn principal_for_identity(
+        &self,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<Option<String>, AccountError> {
+        sqlx::query_scalar("SELECT principal FROM account_identities WHERE issuer = $1 AND subject = $2")
+            .bind(issuer)
+            .bind(subject)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)
+    }
+
     async fn resolve_data_account(&self, astation_id: &str) -> Result<String, AccountError> {
         let mapped: Option<String> = sqlx::query_scalar(
             "SELECT data_account FROM astation_accounts WHERE astation_id = $1",
@@ -1884,11 +1912,16 @@ mod tests {
     async fn equal_subjects_from_different_issuers_never_share_an_account() {
         let store = InMemoryAccountStore::with_verifier(Arc::new(InMemoryKnowledgeStore::new()),
             Arc::new(InMemoryVaultStore::new()), Arc::new(NamespacedVerifier));
+        assert_eq!(store.principal_for_identity("https://one.example", "same-subject").await.unwrap(), None);
         let one = store.verify_access_token("one").await.unwrap().subject;
         let two = store.verify_access_token("two").await.unwrap().subject;
         let legacy = store.verify_access_token("legacy").await.unwrap().subject;
         assert_ne!(one,two); assert_ne!(one,legacy); assert_eq!(legacy,"same-subject");
         assert_eq!(store.verify_access_token("one").await.unwrap().subject,one);
+        assert_eq!(store.principal_for_identity("https://one.example", "same-subject").await.unwrap(), Some(one.clone()));
+        assert_eq!(store.principal_for_identity("https://two.example", "same-subject").await.unwrap(), Some(two));
+        assert_eq!(store.principal_for_identity("https://missing.example", "same-subject").await.unwrap(), None);
+        assert_eq!(store.principal_for_identity("https://one.example", &one).await.unwrap(), None);
         store.register("device",&legacy,"Mac",1).await.unwrap();
         assert!(matches!(store.register("device",&one,"Mac",2).await,Err(AccountError::IdentityChangeRequiresMigration)));
         assert_eq!(store.subject_for_astation("device").await.unwrap().as_deref(),Some("same-subject"));
@@ -1905,6 +1938,9 @@ mod tests {
         let principal = store.verify_access_token("one").await.unwrap().subject;
         store.register("new",&principal,"New Mac",1).await.unwrap();
         let restart = PgAccountStore { pool:pool.clone(), verifier:Arc::new(NamespacedVerifier) };
+        assert_eq!(restart.principal_for_identity("https://one.example", "same-subject").await.unwrap(), Some(principal.clone()));
+        assert_eq!(restart.principal_for_identity("https://missing.example", "same-subject").await.unwrap(), None);
+        assert_eq!(restart.principal_for_identity("https://one.example", &principal).await.unwrap(), None);
         assert_eq!(restart.verify_access_token("one").await.unwrap().subject,principal);
         assert_ne!(restart.verify_access_token("two").await.unwrap().subject,principal);
         assert_eq!(restart.verify_access_token("legacy").await.unwrap().subject,"same-subject");

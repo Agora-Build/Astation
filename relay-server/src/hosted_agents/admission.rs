@@ -103,12 +103,7 @@ impl StationIntegrations {
         fingerprint: &str,
         host: &str,
     ) -> Result<Membership, Response> {
-        let log = self
-            .app
-            .recovery
-            .integration_log(&context.genesis, &context.owner)
-            .await
-            .ok_or_else(lost)?;
+        let log = self.recovery_log(&context.genesis, &context.owner).await?;
         let (scope, expiry) = service_grant(&log, &context.service_id).ok_or_else(stale)?;
         if log.frozen().is_some()
             || expiry <= chrono::Utc::now().timestamp_millis().max(0) as u64

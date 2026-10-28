@@ -34,12 +34,13 @@ private final class PairingTestFixture {
     var authorize: () async throws -> Void = {}
     var timeout: UInt64 = 600_000_000_000
     var introductionTimeout: UInt64 = 20_000_000_000
+    var changed: (NativePairingState) -> Void = { _ in }
     lazy var pairing = NativePairingSession(context: { [unowned self] in self.context },
         authorize: { [unowned self] in try await self.authorize() }, makeSocket: { [unowned self] url in
             self.urls.append(url)
             let socket = PairingTestSocket(); self.sockets.append(socket); return socket
         }, deadline: timeout, introductionDeadline: introductionTimeout,
-        changed: { _ in }, cancelPeer: { [unowned self] in self.cancelledPeers.append($0) })
+        changed: { [unowned self] in self.changed($0) }, cancelPeer: { [unowned self] in self.cancelledPeers.append($0) })
     let id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
     func wrap(_ payload: String) -> String { #"{"atem_id":"device","connection_id":"11111111-2222-4333-8444-555555555555","payload":\#(payload)}"# }
     var hello: String { wrap(#"{"type":"pairing","data":{"v":1,"op":"hello","id":"\#(id)"}}"#) }
@@ -281,8 +282,10 @@ final class NativePairingSessionTests: XCTestCase {
 
     func testExpiryAndSendFailuresAreActionable() async throws {
         let f = PairingTestFixture(); f.timeout = 10_000_000
+        let expired = expectation(description: "Pairing deadline reported")
+        f.changed = { if case .failed = $0 { expired.fulfill() } }
         _ = try await f.start()
-        try await Task.sleep(nanoseconds: 40_000_000)
+        await fulfillment(of: [expired], timeout: 2)
         guard case .failed(let message) = f.pairing.state else { return XCTFail("Pairing never expired") }
         XCTAssertTrue(message.contains("expired"))
         let g = PairingTestFixture(); let socket = try await g.start()
@@ -294,8 +297,10 @@ final class NativePairingSessionTests: XCTestCase {
 
     func testSilentLegacyHostDoesNotLeaveTheUserWaitingIndefinitely() async throws {
         let f = PairingTestFixture(); f.introductionTimeout = 10_000_000
+        let expired = expectation(description: "Missing introduction reported")
+        f.changed = { if case .failed = $0 { expired.fulfill() } }
         let socket = try await f.start()
-        try await Task.sleep(nanoseconds: 40_000_000)
+        await fulfillment(of: [expired], timeout: 2)
         guard case .failed(let message) = f.pairing.state else { return XCTFail("Silent host left pairing pending") }
         XCTAssertTrue(message.contains("Upgrade Atem"))
         XCTAssertTrue(socket.sent.isEmpty)

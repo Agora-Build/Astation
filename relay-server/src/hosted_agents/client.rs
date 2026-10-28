@@ -33,10 +33,11 @@ impl RelayTransport {
         context: &ServiceKeyContext,
         host: &str,
     ) -> Result<Self, Response> {
+        let principal = runtime.owner_principal(&context.owner).await?;
         let (_, target, binding, _) = crate::remote_api::recovery::host_target(
             &runtime.app,
             &context.genesis,
-            &context.owner,
+            &principal,
             host,
         )
         .await
@@ -46,7 +47,7 @@ impl RelayTransport {
         let hub = runtime.app.relay.clone();
         let (handle, replies, closed) = hub
             .channels()
-            .register(hub.replica_id(), &context.owner, target.clone(), &new_id())
+            .register(hub.replica_id(), &principal, target.clone(), &new_id())
             .ok_or_else(lost)?;
         hub.channels().bind_host(&handle, binding);
         let transport = Self {
