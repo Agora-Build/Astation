@@ -49,8 +49,14 @@ The native connection prepares that owner confirmation before sending channel
 `init`, so time spent answering Touch ID or a password prompt does not consume
 the host's ten-second handshake window. Preparation signs nothing. The shared
 core must still verify the pinned host's accept before requesting the exact
-channel transcript signature. Cancellation, a changed connection or loss of
-foreground state while confirming prevents opening the channel.
+channel transcript signature. Cancellation, a changed connection or lack of
+foreground state at confirmation completion prevents opening the channel.
+An application focus change clears cached reuse. It does not discard a fresh
+in-flight system-authentication result solely because the authentication UI
+took focus: that result is usable only after foreground state is restored,
+with the same live connection. Lock, sleep and explicit invalidation still
+cancel the in-flight authorization. A result received while the app remains
+in the background cannot be cached or used.
 
 `RemoteRelayClient` also opens its own outbound WebSocket without this Mac's
 identity-room connection. See the [independent API](../../docs/remote-api.md)

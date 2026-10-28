@@ -1,3 +1,4 @@
+import AppKit
 import AtemClient
 import AstationRemote
 import CryptoKit
@@ -82,7 +83,7 @@ private final class NativeChannelFixture {
 final class AstationR9NativeChannelTests: XCTestCase {
     @MainActor
     func testOwnerConfirmationPrecedesAnyChannelTrafficAndDisconnectFencesItsCompletion() async throws {
-        for disconnect in [false, true] {
+        for outcome in ["confirmed", "disconnected", "system-auth-focus"] {
             let f = try NativeChannelFixture()
             let prompted = expectation(description: "Owner confirmation")
             var answer: CheckedContinuation<Bool, Never>?
@@ -99,7 +100,8 @@ final class AstationR9NativeChannelTests: XCTestCase {
                 log: f.log, signer: signer)
             await fulfillment(of: [prompted], timeout: 1)
             XCTAssertTrue(writes.isEmpty, "The host handshake cannot start while waiting for owner authentication")
-            if disconnect { channel.disconnect() }
+            if outcome == "disconnected" { channel.disconnect() }
+            if outcome == "system-auth-focus" { NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: nil) }
             try XCTUnwrap(answer).resume(returning: true)
             let drained = expectation(description: "Authorization completion drained")
             Task { @MainActor in
@@ -107,7 +109,7 @@ final class AstationR9NativeChannelTests: XCTestCase {
                 drained.fulfill()
             }
             await fulfillment(of: [drained], timeout: 1)
-            if disconnect { XCTAssertTrue(writes.isEmpty) }
+            if outcome == "disconnected" { XCTAssertTrue(writes.isEmpty) }
             else {
                 XCTAssertEqual(writes.count, 2, "Open and init follow owner authentication")
                 channel.disconnect()

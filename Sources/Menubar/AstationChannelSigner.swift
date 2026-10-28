@@ -26,7 +26,10 @@ final class AstationChannelSigner {
                                (NSWorkspace.shared.notificationCenter, NSWorkspace.willSleepNotification),
                                (DistributedNotificationCenter.default(), Notification.Name("com.apple.screenIsLocked"))] {
             let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.invalidate() }
+                MainActor.assumeIsolated {
+                    if name == NSApplication.didResignActiveNotification { self?.routine.clearReuse() }
+                    else { self?.invalidate() }
+                }
             }
             observers.append((center, observer))
         }

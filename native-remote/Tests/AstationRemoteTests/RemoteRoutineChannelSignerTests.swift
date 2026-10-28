@@ -33,6 +33,36 @@ private final class RoutineSignerHarness {
 
 final class RemoteRoutineChannelSignerTests: XCTestCase {
     @MainActor
+    func testSystemAuthenticationFocusChangeDoesNotDiscardFreshForegroundConfirmation() async throws {
+        let h = RoutineSignerHarness()
+        h.confirmation = {
+            h.active = false
+            h.signer.clearReuse()
+            h.active = true
+            return true
+        }
+        try await h.signer.prepare(isCurrent: { h.current })
+        XCTAssertTrue(h.signed.isEmpty)
+        _ = try await h.sign()
+        XCTAssertEqual(h.confirmations, 1)
+        h.active = false; h.signer.clearReuse(); h.active = true
+        _ = try await h.sign()
+        XCTAssertEqual(h.confirmations, 2, "Background always clears a completed confirmation's reuse")
+    }
+
+    @MainActor
+    func testSuccessfulPromptWhileStillBackgroundCannotAuthorizeOrBeReused() async throws {
+        let h = RoutineSignerHarness()
+        h.confirmation = { h.active = false; h.signer.clearReuse(); return true }
+        do { try await h.signer.prepare(isCurrent: { h.current }); XCTFail("Background confirmation accepted") }
+        catch { XCTAssertEqual(error as? RemoteOwnerAuthenticationError, .notForeground) }
+        XCTAssertTrue(h.signed.isEmpty)
+        h.active = true; h.confirmation = nil
+        _ = try await h.sign()
+        XCTAssertEqual(h.confirmations, 2)
+    }
+
+    @MainActor
     func testPreparationCanOutlastTheHandshakeWindowWithoutSigningAnything() async throws {
         let h = RoutineSignerHarness()
         h.confirmation = { h.now += 20_000; return true }

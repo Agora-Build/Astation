@@ -1,6 +1,15 @@
 import AtemClient
 import Foundation
 
+public enum RemoteOwnerAuthenticationError: String, Error, Equatable {
+    case notForeground
+    case staleContext
+    case cancelled
+    case invalidated
+    case denied
+    case expired
+}
+
 /// R9.6 owner-confirmation reuse applies only to channel transcript signatures.
 @MainActor
 public final class RemoteRoutineChannelSigner {
@@ -35,10 +44,8 @@ public final class RemoteRoutineChannelSigner {
         try Self.validate(request, keyID: keyID)
         try await prepare(isCurrent: isCurrent)
         let time = now()
-        guard active(), isCurrent(), !Task.isCancelled,
-              let confirmedAt, time >= confirmedAt, time - confirmedAt < 300_000 else {
-            throw RemoteRecoveryError.confirmationRequired
-        }
+        try checkContext(isCurrent)
+        guard let confirmedAt, time >= confirmedAt, time - confirmedAt < 300_000 else { throw RemoteOwnerAuthenticationError.expired }
         do { return try primitive(request) }
         catch { invalidate(); throw error }
     }
@@ -46,8 +53,7 @@ public final class RemoteRoutineChannelSigner {
     /// Prepare owner presence before starting a time-bounded network handshake.
     /// This grants no signing authority beyond routine, validated channel transcripts.
     public func prepare(isCurrent: () -> Bool) async throws {
-        guard active() else { invalidate(); throw RemoteRecoveryError.confirmationRequired }
-        guard isCurrent(), !Task.isCancelled else { throw RemoteRecoveryError.confirmationRequired }
+        try checkContext(isCurrent)
         let time = now()
         if let confirmedAt, time < confirmedAt { invalidate() }
         let context = generation
@@ -59,20 +65,28 @@ public final class RemoteRoutineChannelSigner {
                 pending = confirmation
             }
             let acceptedAt = await confirmation.task.value
-            guard generation == context else { throw RemoteRecoveryError.confirmationRequired }
+            guard generation == context else { throw RemoteOwnerAuthenticationError.invalidated }
             if pending?.id == confirmation.id { pending = nil }
-            guard active() else { invalidate(); throw RemoteRecoveryError.confirmationRequired }
-            guard isCurrent(), !Task.isCancelled else {
-                throw RemoteRecoveryError.confirmationRequired
-            }
-            guard let acceptedAt else { throw RemoteRecoveryError.confirmationRequired }
+            try checkContext(isCurrent)
+            guard let acceptedAt else { throw RemoteOwnerAuthenticationError.denied }
             confirmedAt = max(confirmedAt ?? acceptedAt, acceptedAt)
         }
         let signingTime = now()
-        guard generation == context, active(), isCurrent(), !Task.isCancelled,
-              let confirmedAt, signingTime >= confirmedAt, signingTime - confirmedAt < 300_000 else {
-            throw RemoteRecoveryError.confirmationRequired
-        }
+        guard generation == context else { throw RemoteOwnerAuthenticationError.invalidated }
+        try checkContext(isCurrent)
+        guard let confirmedAt, signingTime >= confirmedAt, signingTime - confirmedAt < 300_000 else { throw RemoteOwnerAuthenticationError.expired }
+    }
+
+    private func checkContext(_ isCurrent: () -> Bool) throws {
+        guard active() else { clearReuse(); throw RemoteOwnerAuthenticationError.notForeground }
+        guard isCurrent() else { throw RemoteOwnerAuthenticationError.staleContext }
+        guard !Task.isCancelled else { throw RemoteOwnerAuthenticationError.cancelled }
+    }
+
+    /// System authentication can temporarily take focus. Retain its in-flight
+    /// result, but never cache or use it until the app is foreground again.
+    public func clearReuse() {
+        confirmedAt = nil
     }
 
     public func invalidate() {

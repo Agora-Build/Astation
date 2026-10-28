@@ -70,6 +70,9 @@ final class AstationR9Connection {
             } catch {
                 guard let self, !closed, current() else { return }
                 preparation = nil
+                if let failure = error as? RemoteOwnerAuthenticationError {
+                    Log.warn("[R9] Owner authentication stopped before channel init: \(failure.rawValue)")
+                }
                 finish(Self.connectionFailureMessage(error))
             }
         }
@@ -159,7 +162,7 @@ final class AstationR9Connection {
     }
 
     static func connectionFailureMessage(_ error: Error?) -> String {
-        if error as? RemoteRecoveryError == .confirmationRequired {
+        if error is RemoteOwnerAuthenticationError || error as? RemoteRecoveryError == .confirmationRequired {
             return "Open Astation and confirm with Touch ID or your password, then retry the connection."
         }
         if error as? RemoteChannelError == .deadlineExceeded {
