@@ -207,8 +207,24 @@ final class NativePairingSession {
     }
 
     func beginAuthentication(code: String, attemptID: String, device: String, connection: String) -> Bool {
-        guard state == .waitingForVerification, self.code == code, helloID == attemptID,
-              route?.matches(device: device) == true, current(generation) else { return false }
+        // Record only fixed failure names; pairing codes and routing IDs stay out of diagnostics.
+        guard state == .waitingForVerification else {
+            Log.warn("[Pairing] Identity introduction rejected: unexpected_state")
+            return false
+        }
+        guard self.code == code else {
+            Log.warn("[Pairing] Identity introduction rejected: code_mismatch")
+            return false
+        }
+        guard helloID == attemptID else {
+            Log.warn("[Pairing] Identity introduction rejected: attempt_mismatch")
+            return false
+        }
+        guard route?.matches(device: device) == true else {
+            Log.warn("[Pairing] Identity introduction rejected: host_mismatch")
+            return false
+        }
+        guard current(generation) else { return false }
         identityConnection = connection
         state = .confirmingPairing
         return true

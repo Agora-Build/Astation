@@ -3,7 +3,9 @@
 Status: **product design approved; native candidate implemented**,
 2026-10-28. The owner approved the separation and requested implementation.
 The v1 wire below is the Astation implementation candidate awaiting Atem's
-joint confirmation and receiver build. Atem owns its protocol and host
+joint confirmation and committed receiver pin. A trial host completed the
+introduction; identity-connection correlation still needs joint diagnosis.
+Atem owns its protocol and host
 implementation; Astation owns native UX and integration. Hosted execution
 remains disabled pending the real joint end-to-end gates.
 
@@ -314,7 +316,20 @@ relay and web [CI 40755408435](https://github.com/Agora-Build/Astation/actions/r
 These results do not substitute for the real joint device ceremony or the
 hosted execution release gates.
 
-Still required: Atem's wire confirmation and receiver build, actual native
+The provisioned native candidate is now running on the Mac. The first live
+trial reached the introduction at 20:43:10 UTC on 2026-10-28, but native
+refused the subsequent identity authentication before showing the owner
+prompt. The attempt was still waiting for verification; account/Station
+changes and timeouts did not end it. Atem's uncommitted trial receiver is
+not a release pin. [The live report](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6480239881)
+and [native correlation review](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6480270680)
+track the exact code, attempt UUID and host-route checks. Native diagnostics
+name only the rejected check and never log the pairing code or routing IDs.
+The 21 provisioned pairing-state tests pass after this diagnostic change;
+it does not relax authentication or establish trusted enrollment.
+
+Still required: resolving live identity correlation, Atem's wire confirmation
+and committed receiver pin, actual native
 safety-code/owner verification, protected integration approval/enrollment,
 actual agent execution and the policy/revocation/reconnect/Mac-off/replica
 checks. A synthetic relay pass does not satisfy these gates. Hosted execution
