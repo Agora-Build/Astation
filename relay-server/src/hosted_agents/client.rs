@@ -41,7 +41,10 @@ impl RelayTransport {
             host,
         )
         .await
-        .map_err(|_| lost())?;
+        .map_err(|_| {
+            tracing::debug!("Hosted channel has no current proved host route");
+            lost()
+        })?;
         // An unattended service requires the proved carrier, never Mac presence.
         let binding: HostBinding = binding.ok_or_else(lost)?;
         let hub = runtime.app.relay.clone();
@@ -88,7 +91,10 @@ impl RelayTransport {
         };
         let frame = RelayEnvelope::parse(&reply.text)
             .and_then(|e| e.frame)
-            .ok_or_else(lost)?;
+            .ok_or_else(|| {
+                tracing::debug!("Hosted channel received a close or invalid transport envelope");
+                lost()
+            })?;
         Ok(frame.get().as_bytes().to_vec())
     }
 }
@@ -131,7 +137,10 @@ impl HostedConnection {
         let log = runtime.service_log(context, fingerprint, host).await?;
         let signer = load_approved(&runtime.policies.0, &runtime.vault, context, fingerprint)
             .await
-            .map_err(|_| lost())?;
+            .map_err(|_| {
+                tracing::debug!("Hosted channel approved key could not be opened");
+                lost()
+            })?;
         let start = Instant::now();
         let mut transport = RelayTransport::open(runtime, context, host).await?;
         let (connecting, init) = Connector::new(host).start(&log, 0).map_err(|_| lost())?;
@@ -146,12 +155,18 @@ impl HostedConnection {
                 &identity,
                 start.elapsed().as_millis() as u64,
             )
-            .map_err(|_| lost())?;
+            .map_err(|_| {
+                tracing::debug!("Hosted channel accept refused");
+                lost()
+            })?;
         transport.send(finish).await?;
         let welcome = transport.receive().await?;
         let attached = welcoming
             .on_frame(&welcome, &log, start.elapsed().as_millis() as u64)
-            .map_err(|_| lost())?;
+            .map_err(|_| {
+                tracing::debug!("Hosted channel welcome refused");
+                lost()
+            })?;
         let mut connection = Self {
             attached,
             transport,

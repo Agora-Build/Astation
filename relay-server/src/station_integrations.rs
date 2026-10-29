@@ -105,7 +105,7 @@ impl StationIntegrations {
         self.app.recovery.integration_log(genesis, &principal).await.ok_or_else(unavailable)
     }
 
-    fn from_env(app: AppState) -> Result<Option<Arc<Self>>, ()> {
+    pub(crate) fn from_env(app: AppState) -> Result<Option<Arc<Self>>, ()> {
         let get = |key| std::env::var(key).map_err(|_| ());
         if std::env::var_os("STATION_REPORT_CLIENT_ID").is_none() {
             return Ok(None);

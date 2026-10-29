@@ -164,3 +164,73 @@ real channel cryptography but supplies test session replies; its accepted
 receipt is not evidence that Claude or Codex performed an operation. Real Auth
 issuance, protected native approval, the fixing Atem host, relay-only policy,
 Mac-off routing and replica failover remain separate live release checks.
+
+### Real-host service verification
+
+The ignored test `hosted_agents::live::protected_service_against_real_host_keeps_public_execution_closed`
+uses an already registered **disposable** Station and an owner-approved service,
+without publishing readiness or exposing an execution bypass. The module is
+compiled only for tests. It binds the dedicated Station's existing loopback
+port and runs the complete public router, whose hosted endpoints still return
+`503 hosted_execution_not_verified`. The existing listener must be stopped
+first and restored afterward; keep the tunnel, database, protected key files,
+host runtime and coding-agent process intact.
+
+Supply the Station's normal protected configuration and these test inputs:
+
+| Variable | Value |
+| --- | --- |
+| `LIVE_HOSTED_DISPOSABLE` | Explicit `yes`; never use a production Station or agent. |
+| `LIVE_HOSTED_INTEGRATION` | Existing approved integration ID. |
+| `LIVE_HOSTED_HOST` | Existing verified host ID. |
+| `LIVE_HOSTED_SESSION` | Current disposable agent session ID. |
+| `LIVE_HOSTED_PROCESS_GEN` | Its authoritative current process generation. |
+| `LIVE_HOSTED_TOKEN_FILE` | Mode-0600 JSON containing a fresh real Auth `access_token`. |
+| `LIVE_HOSTED_EVIDENCE_FILE` | File in an operator-private directory; new for a submission, existing for receipt recovery. |
+| `LIVE_HOSTED_RECOVER` | Optional `receipts`: query the saved request only; never submit a prompt. |
+| `LIVE_HOSTED_WITHOUT_NATIVE` | Optional `yes`: refuse native identity-room WebSocket connections and assert no Astation room owner before and after execution. |
+
+Run only that ignored test, with `--exact --ignored --nocapture`. It verifies
+the real token's issuer, Station audience, client, owner, operation and service
+fingerprint against a fresh non-denied policy. The policy may be
+`waiting_for_host`: readiness is what this test measures, while the existing
+signed membership remains the host's authorization. No stored state is
+changed to `ready`, no native consent is synthesized and no replacement key is
+generated.
+
+The native-unavailable case blocks `/ws?role=astation` in the test router only;
+host connections and the independently authenticated service channel remain
+available. It checks operation without the native identity-room connection,
+not physical Mac shutdown or every independent native transport. A Station
+running on the same Mac cannot prove physical Mac-off availability.
+
+The runner opens the production service client using the protected approved
+key and proved relay carrier, checks the current registry/process, and sends
+one marker-only prompt with no tools or file changes. It saves and fsyncs the
+request ID and complete target **before** sending, closes after the initial
+receipt, and then reconnects to query that receipt and the ordered history.
+A pass requires a completed receipt and the exact marker in an assistant
+message. A saved evidence file refuses a new submission run. To recover an
+interrupted or uncertain submission, set `LIVE_HOSTED_RECOVER=receipts` and
+reuse that evidence file with a fresh token. Recovery verifies the complete
+saved target against the current registry, then queries receipts and history
+without submitting a prompt. Read-only connection attempts have a bounded
+retry; no mutation is retried automatically.
+
+Use ordinary words and a short number for the marker. High-entropy random
+strings may correctly be removed by Atem's secret filter; a scrubbed marker
+does not prove execution failed. Preserve the filter and inspect the durable
+receipt and protected correlated history instead of replaying the request.
+
+This is real Auth/key/channel/agent/disconnect evidence, separate from the
+controlled-host HTTP adapter tests. It does not by itself verify public HTTP
+admission, actual approvals, durable relay-only policy, revocation, the Mac-off
+matrix or replica failover, and does not enable the hosted release gate.
+
+On 2026-10-29, both the normal and native-identity-unavailable cases passed
+against the disposable Codex host built from the accepted Atem source
+`a2cc6711117b79a73298c27baee337e25f9d87af`, with shared client `ed0b45b`.
+Each recovered its own completed request and matching assistant response after
+disconnect, without resubmitting. The isolated Station was restored healthy
+after each run and public hosted routes remained closed. Full evidence and
+the remaining gates are tracked in [Atem #81](https://github.com/Agora-Build/Atem/issues/81).

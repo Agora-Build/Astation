@@ -12,6 +12,8 @@ pub(crate) mod client;
 mod operations;
 
 #[cfg(test)]
+mod live;
+#[cfg(test)]
 mod tests;
 
 // Deliberately not an environment switch. Enable only after recorded live E2E.
