@@ -96,6 +96,7 @@ final class AtemSessionClient {
     private let openChannel: (AtemSessionContext) -> Void
     private let closeChannel: (AtemSessionContext) -> Void
     private var connectingSince: TimeInterval = 0
+    private var awaitingChannelAuthorization = false
     private var retriedAfterVerification = false
     private lazy var chat = AtemSessionChat(now: now, features: { [weak self] in self?.features ?? [] }) { [weak self] message in
         guard let self, let context = self.context, context == self.currentContext(),
@@ -184,6 +185,22 @@ final class AtemSessionClient {
         if unsupported { failUnsupportedVersion() } else { fail(text); changed() }
     }
 
+    func channelAuthorizationStarted(context preparing: AtemSessionContext) {
+        guard phase == .connecting, context == preparing, preparing == currentContext() else { return }
+        awaitingChannelAuthorization = true
+        status = "Confirm access with Touch ID or your password..."
+        changed()
+    }
+
+    func channelHandshakeStarted(context prepared: AtemSessionContext) {
+        guard phase == .connecting, awaitingChannelAuthorization,
+              context == prepared, prepared == currentContext() else { return }
+        awaitingChannelAuthorization = false
+        connectingSince = now()
+        status = "Opening an encrypted r9 channel..."
+        changed()
+    }
+
     func channelMembershipRefreshed(context refreshed: AtemSessionContext,
                                    reopenChannel: ((AtemSessionContext) -> Void)? = nil) {
         guard [.connecting, .ready, .failed].contains(phase),
@@ -211,6 +228,7 @@ final class AtemSessionClient {
     }
 
     private func clearAttachment() {
+        awaitingChannelAuthorization = false
         retriedAfterVerification = false
         chat.reset(sendClose: false)
         approvalRules = [:]
@@ -644,7 +662,7 @@ final class AtemSessionClient {
     func tick() {
         connectionChanged()
         guard phase == .ready else {
-            if phase == .connecting, now() - connectingSince >= 25 {
+            if phase == .connecting, !awaitingChannelAuthorization, now() - connectingSince >= 25 {
                 if let context { closeChannel(context) }
                 fail("Atem did not complete the encrypted r9 connection. Check its status or upgrade Atem, then reconnect.")
                 changed()
@@ -930,6 +948,7 @@ final class AtemSessionClient {
         return sendMessage(message, context.route)
     }
     private func fail(_ text: String) {
+        awaitingChannelAuthorization = false
         chat.reset()
         approvalRules = [:]
         features = []

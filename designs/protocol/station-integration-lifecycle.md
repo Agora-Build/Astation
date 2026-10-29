@@ -335,6 +335,10 @@ the membership read to a queued task can race that refresh's lock and leave the
 session failed until manual retry. A replacement requires a new authenticated
 welcome, drops old control leases and queries uncertain receipts without
 resubmitting work.
+The session's network timeout starts only after owner authentication and restored
+foreground activation, immediately before channel traffic. Waiting at the
+system authentication prompt cannot consume that timeout. Disconnects and
+context changes still fence a delayed authentication result.
 
 Station reports `revoked` only for a fresh, non-denied authenticated `revoking`
 policy whose owner, provisioning context and service fingerprint agree with a

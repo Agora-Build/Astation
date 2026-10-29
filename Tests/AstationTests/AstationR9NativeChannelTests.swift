@@ -173,12 +173,18 @@ final class AstationR9NativeChannelTests: XCTestCase {
             let context = AtemSessionContext(route: RemoteTerminalConnection(clientId: "local-host", connectionId: "connection-a"),
                 account: "account-a", device: "host-a", pairingSession: "pairing-a", transportGeneration: "transport-a")
             var writes: [Data] = []
+            var handshakes = 0
             let channel = AstationR9Connection(context: context, current: { true },
-                write: { bytes, completion in writes.append(bytes); completion(nil) }, welcomed: { _ in }, receive: { _ in },
-                failed: { message, _ in XCTFail("Unexpected failure: \(message)") }, refreshMembership: { _ in })
+                write: { bytes, completion in
+                    XCTAssertEqual(handshakes, 1, "The network timeout starts before the first write")
+                    writes.append(bytes); completion(nil)
+                }, welcomed: { _ in }, receive: { _ in },
+                failed: { message, _ in XCTFail("Unexpected failure: \(message)") }, refreshMembership: { _ in },
+                handshakeStarted: { handshakes += 1 })
             try channel.start(identity: ClientIdentity(kind: .native, deviceId: "manager-a", keyId: "manager-a", grantJson: nil),
                 log: f.log, signer: signer)
             await fulfillment(of: [prompted], timeout: 1)
+            XCTAssertEqual(handshakes, 0)
             XCTAssertTrue(writes.isEmpty, "The host handshake cannot start while waiting for owner authentication")
             if outcome == "disconnected" { channel.disconnect() }
             if outcome == "system-auth-focus" { NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: nil) }
@@ -189,7 +195,7 @@ final class AstationR9NativeChannelTests: XCTestCase {
                 drained.fulfill()
             }
             await fulfillment(of: [drained], timeout: 1)
-            if outcome == "disconnected" { XCTAssertTrue(writes.isEmpty) }
+            if outcome == "disconnected" { XCTAssertTrue(writes.isEmpty); XCTAssertEqual(handshakes, 0) }
             else {
                 XCTAssertEqual(writes.count, 2, "Open and init follow owner authentication")
                 channel.disconnect()

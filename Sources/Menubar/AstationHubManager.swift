@@ -1775,8 +1775,11 @@ class AstationHubManager: ObservableObject {
                     self?.nativeSessionClients[context.route.clientId]?.channelFailed(message, unsupported: unsupported)
                 }, refreshMembership: { [weak self] head in
                     self?.refreshR9Membership(context, requiredHead: head)
+                }, handshakeStarted: { [weak self] in
+                    self?.nativeSessionClients[context.route.clientId]?.channelHandshakeStarted(context: context)
                 })
             r9Connections[context.route.clientId] = link
+            nativeSessionClients[context.route.clientId]?.channelAuthorizationStarted(context: context)
             try link.start(identity: ClientIdentity(kind: .native, deviceId: AstationIdentity.shared.id,
                 keyId: AstationIdentity.shared.id, grantJson: nil), log: log, signer: r9Signer!)
         } catch {

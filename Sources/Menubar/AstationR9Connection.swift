@@ -22,6 +22,7 @@ final class AstationR9Connection {
     private let receiveMessage: (AstationMessage) -> Void
     private let failed: (String, Bool) -> Void
     private let refreshMembership: (LogHead) -> Void
+    private let handshakeStarted: () -> Void
     private let policyWelcomed: () -> Void
     private let policyEvent: (ClientEvent, Bool) -> Void
 
@@ -33,6 +34,7 @@ final class AstationR9Connection {
          receive: @escaping (AstationMessage) -> Void,
          failed: @escaping (String, Bool) -> Void,
          refreshMembership: @escaping (LogHead) -> Void,
+         handshakeStarted: @escaping () -> Void = {},
          policyWelcomed: @escaping () -> Void = {}, policyEvent: @escaping (ClientEvent, Bool) -> Void = { _, _ in },
          generation: UUID = UUID()) {
         self.context = context
@@ -42,6 +44,7 @@ final class AstationR9Connection {
         receiveMessage = receive
         self.failed = failed
         self.refreshMembership = refreshMembership
+        self.handshakeStarted = handshakeStarted
         self.policyWelcomed = policyWelcomed
         self.policyEvent = policyEvent
         queue = RemoteSocketQueue(write: write, failed: { [weak self] _ in
@@ -63,6 +66,8 @@ final class AstationR9Connection {
                 try await signer.prepare(isCurrent: { self?.current() == true && self?.closed == false })
                 guard let self, !Task.isCancelled, !closed, current() else { return }
                 preparation = nil
+                handshakeStarted()
+                guard !closed, current() else { return }
                 Log.info("[R9] Opening encrypted channel to \(context.device) with membership seq \(log.head().seq)")
                 channel = try router.open(hostID: context.device, identity: identity, log: log,
                     sign: { [weak self] request in

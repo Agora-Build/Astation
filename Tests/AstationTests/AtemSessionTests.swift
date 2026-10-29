@@ -1029,6 +1029,54 @@ final class AtemSessionWireTests: XCTestCase {
 }
 
 final class AtemSessionClientTests: XCTestCase {
+    func testOwnerConfirmationDoesNotConsumeTheNetworkTimeout() throws {
+        let f = SessionFixture()
+        f.client.start()
+        let context = try XCTUnwrap(f.source)
+        f.client.channelAuthorizationStarted(context: context)
+        f.time = 120; f.client.tick()
+        XCTAssertEqual(f.client.phase, .connecting)
+        XCTAssertTrue(f.closes.isEmpty)
+        XCTAssertTrue(f.sent.isEmpty)
+        f.client.channelHandshakeStarted(context: context)
+        f.time = 144; f.client.tick()
+        XCTAssertEqual(f.client.phase, .connecting)
+        try f.ready()
+        XCTAssertEqual(f.client.phase, .ready)
+        XCTAssertNotNil(f.client.target(sessionId: sessionID, process: processID))
+    }
+
+    func testNetworkTimeoutStillAppliesAfterDelayedOwnerConfirmation() throws {
+        let f = SessionFixture()
+        f.client.start()
+        let context = try XCTUnwrap(f.source)
+        f.client.channelAuthorizationStarted(context: context)
+        f.time = 120; f.client.tick()
+        f.client.channelHandshakeStarted(context: context)
+        f.time = 145; f.client.tick()
+        XCTAssertEqual(f.client.phase, .failed)
+        XCTAssertEqual(f.closes, [context])
+        f.client.channelHandshakeStarted(context: context)
+        XCTAssertEqual(f.client.phase, .failed, "Delayed callbacks cannot revive a failed channel")
+    }
+
+    func testDisconnectedOwnerConfirmationCannotPauseTheNextConnectionsTimeout() throws {
+        let f = SessionFixture()
+        f.client.start()
+        let old = try XCTUnwrap(f.source)
+        f.client.channelAuthorizationStarted(context: old)
+        f.source = nil; f.client.connectionChanged()
+        f.client.channelHandshakeStarted(context: old)
+        XCTAssertEqual(f.client.phase, .offline)
+        f.source = AtemSessionContext(route: RemoteTerminalConnection(clientId: "host", connectionId: "socket-2"),
+            account: old.account, device: old.device, pairingSession: old.pairingSession)
+        f.client.connectionChanged()
+        f.client.channelAuthorizationStarted(context: old)
+        f.client.channelHandshakeStarted(context: old)
+        f.time = 25; f.client.tick()
+        XCTAssertEqual(f.client.phase, .failed, "Stale authorization cannot delay the replacement's timeout")
+    }
+
     func testOpeningR9NeverEmitsPlaintextAndRepeatedVerificationDoesNotCancelSigning() throws {
         let f = SessionFixture()
         f.client.start()
