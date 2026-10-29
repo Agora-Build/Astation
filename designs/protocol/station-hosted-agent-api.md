@@ -188,8 +188,9 @@ Supply the Station's normal protected configuration and these test inputs:
 | `LIVE_HOSTED_TOKEN_FILE` | Mode-0600 JSON containing a fresh real Auth `access_token`. |
 | `LIVE_HOSTED_EVIDENCE_FILE` | File in an operator-private directory; new for a submission, existing for receipt recovery. |
 | `LIVE_HOSTED_RECOVER` | Optional `receipts`: query the saved request only; never submit a prompt. |
-| `LIVE_HOSTED_WITHOUT_NATIVE` | Optional `yes`: refuse native identity-room WebSocket connections and assert no Astation room owner before and after execution. |
-| `LIVE_HOSTED_EXISTING_CLUSTER` | Optional `yes`: join an already running, isolated Redis-backed Station as a socket-free observer. Requires its protected `REDIS_URL` and database/key configuration. Do not combine with `LIVE_HOSTED_WITHOUT_NATIVE`. |
+| `LIVE_HOSTED_WITHOUT_NATIVE` | Optional `yes`: assert no Astation room owner before and after execution. A dedicated test listener also refuses native identity-room WebSocket connections. In existing-cluster mode, quit the native app separately and monitor the distributed directory throughout the run. |
+| `LIVE_HOSTED_EXISTING_CLUSTER` | Optional `yes`: join an already running, isolated Redis-backed Station as a socket-free observer. Requires its protected `REDIS_URL` and database/key configuration. No listener is replaced and no native-refusal middleware is installed. |
+| `LIVE_HOSTED_FAILOVER_FILE` | Optional protected marker path, initially absent; existing-cluster submission runs only. After the accepted receipt, interrupt only the isolated replica carrying the host socket. Wait for the actual host to reconnect to a different replica, then atomically write mode-0600 JSON with the saved `request_id`. Never supply this flag during receipt recovery. |
 
 Run only that ignored test, with `--exact --ignored --nocapture`. It verifies
 the real token's issuer, Station audience, client, owner, operation and service
@@ -231,8 +232,20 @@ encrypted service traffic must cross the replica bus. `PORT` selects an
 existing replica or private proxy for the closed-public-route assertion;
 the test never binds that port. The observer drains and withdraws on success.
 Run this on the independent Station server to remove the Mac-hosted relay
-dependency. It does not block native connections, prove physical Mac shutdown,
-or replace actual public HTTP admission tests. Public execution stays gated.
+dependency. It does not block native connections or prove physical Mac shutdown.
+For native-absence verification, close the native app and use
+`LIVE_HOSTED_WITHOUT_NATIVE=yes`; independently monitor the shared room directory
+while the test runs. Always restore the same provisioned app afterward. Public
+execution stays gated, and public HTTP admission remains a separate check.
+
+With `LIVE_HOSTED_FAILOVER_FILE`, the test saves the host connection/replica
+alongside the accepted request, drops its service attachment, and waits at most
+60 seconds for the operator's request-bound marker. It verifies that both the
+host connection and replica changed before opening a fresh service attachment.
+It queries the original receipt and history without resubmitting. The operator
+must bound every wait, restore the stopped replica on failure as well as success,
+and remove disposable bearer input. An interrupted run is recovered with
+`LIVE_HOSTED_RECOVER=receipts`, the same evidence file and no failover flag.
 
 This is real Auth/key/channel/agent/disconnect evidence, separate from the
 controlled-host HTTP adapter tests. It does not by itself verify public HTTP
@@ -254,5 +267,19 @@ The socket-free observer authenticated a real service channel, sent a harmless
 Codex prompt, disconnected and recovered its completed receipt and matching
 assistant response across the replica bus. The observer then withdrew; the
 host, agent and deployed listeners were not restarted. The old Mac listener
-and tunnel were stopped throughout. Native absence, real approval operations,
-durable relay-only policy and public HTTP admission remain separate checks.
+and tunnel were stopped throughout.
+
+A subsequent live run passed in 32.93 seconds with the provisioned Astation app
+closed and no native room owner throughout execution and receipt recovery.
+After the actual Codex host accepted request
+`093af94a-fb32-4684-9d51-ddd9b803f58d`, the operator stopped only the isolated
+Station replica carrying its WebSocket. The host reconnected to the surviving
+replica; a fresh service attachment recovered the same completed receipt and
+matching assistant response. Neither the host nor Codex process was restarted,
+and no prompt was replayed. Both Station replicas were restored healthy, the
+temporary bearer file was removed, and the same provisioned app was relaunched.
+The native durable relay-only policy acknowledgment also passed separately; see
+[host-policy verification](host-policy-r9-review.md). These results establish
+service independence from the native process and actual host replica failover,
+not physical Mac power-off. Genuine approval/rule cases and public HTTP admission
+remain release checks; public hosted execution is still disabled.

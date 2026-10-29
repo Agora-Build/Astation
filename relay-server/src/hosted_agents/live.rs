@@ -145,10 +145,23 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
     let recovering = std::env::var("LIVE_HOSTED_RECOVER").as_deref() == Ok("receipts");
     let without_native = std::env::var("LIVE_HOSTED_WITHOUT_NATIVE").as_deref() == Ok("yes");
     let existing_cluster = std::env::var("LIVE_HOSTED_EXISTING_CLUSTER").as_deref() == Ok("yes");
+    let failover_file = std::env::var("LIVE_HOSTED_FAILOVER_FILE")
+        .ok()
+        .map(PathBuf::from);
     assert!(
-        !(existing_cluster && without_native),
-        "existing-cluster mode does not install the native-connection refusal middleware"
+        failover_file.is_none() || existing_cluster,
+        "replica failover needs the existing cluster"
     );
+    assert!(
+        !recovering || failover_file.is_none(),
+        "receipt recovery must not request another replica interruption"
+    );
+    if let Some(path) = &failover_file {
+        assert!(
+            !path.exists(),
+            "a previous failover marker cannot satisfy a new run"
+        );
+    }
     // A rerun must query the saved receipt instead of replaying a lost submit.
     assert!(
         recovering || !evidence_path.exists(),
@@ -272,7 +285,7 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
             .await
             .unwrap()
             .is_none_or(|r| r.owner.is_none()));
-        println!("LIVE: native identity connections blocked; no Astation room owner is online");
+        println!("LIVE: distributed directory confirms no Astation room owner is online");
     }
     println!(
         "LIVE: real Auth, protected key, encrypted service welcome and replacement registry pass"
@@ -302,7 +315,8 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
         let prompt = format!(
             "Reply with exactly {marker}. Do not use tools, run commands or change any files."
         );
-        json!({"request_id":request,"target":target,"marker":marker,"native_clients_blocked":without_native,
+        json!({"request_id":request,"target":target,"marker":marker,"native_clients_blocked":without_native && !existing_cluster,
+            "native_absence_required":without_native,
             "phase":"prepared","integration_id":id,"host":host,"prompt":prompt})
     };
     let request = evidence["request_id"].as_str().unwrap().to_owned();
@@ -360,7 +374,54 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
         save_evidence(&evidence_path, &evidence);
         println!("LIVE: prompt receipt received; closing service attachment immediately");
     }
-    let mut query_connection = if recovering {
+    if let Some(path) = &failover_file {
+        let old = runtime
+            .app
+            .relay
+            .room(&target.account_id)
+            .await
+            .unwrap()
+            .and_then(|room| room.atems.get(&host).cloned())
+            .expect("current host socket");
+        evidence["failover_from"] = json!({"connection":old.conn,"replica":old.replica});
+        evidence["phase"] = json!("awaiting_replica_failover");
+        save_evidence(&evidence_path, &evidence);
+        drop(connection);
+        println!(
+            "LIVE: accepted request saved; awaiting operator interruption of its host replica"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while !path.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "replica failover marker deadline; recover the saved receipt only"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let marker = protected_json("LIVE_HOSTED_FAILOVER_FILE");
+        assert_eq!(marker["request_id"], request);
+        let next = runtime
+            .app
+            .relay
+            .room(&target.account_id)
+            .await
+            .unwrap()
+            .and_then(|room| room.atems.get(&host).cloned())
+            .expect("reconnected host socket");
+        assert_ne!(next.conn, old.conn, "host must have reconnected");
+        assert_ne!(
+            next.replica, old.replica,
+            "host must be on the other replica"
+        );
+        evidence["failover_to"] = json!({"connection":next.conn,"replica":next.replica});
+        evidence["phase"] = json!("replica_failover_observed");
+        save_evidence(&evidence_path, &evidence);
+        println!(
+            "LIVE: actual host socket moved to another replica; only querying the accepted request"
+        );
+        connection = open(&runtime, &id, raw, &host).await;
+    }
+    let mut query_connection = if recovering || failover_file.is_some() {
         Some(connection)
     } else {
         drop(connection);

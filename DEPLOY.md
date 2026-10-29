@@ -1271,8 +1271,14 @@ pinned shared client: only a current, correlated, durable response inside an
 admitted native-manager `atem-ch1` channel confirms the selected relay policy.
 Plaintext policy/ACK messages are removed. A confirmation on a direct
 migration channel never establishes relay readiness. Policy confirmation
-against the disposable actual host remains a live activation gate; see the
-[policy review and lifecycle](designs/protocol/host-policy-r9-review.md).
+against the disposable actual host passed on 2026-10-29. A separate real Codex
+test also passed with native Astation closed while the host reconnected to a
+surviving Station replica and its accepted receipt/response were recovered
+without replay. Both replicas and the same provisioned app were restored.
+Genuine approval/rule cases and actual public HTTP admission still need live
+verification before activation. See the
+[policy review and lifecycle](designs/protocol/host-policy-r9-review.md) and
+[service verification procedure](designs/protocol/station-hosted-agent-api.md#real-host-service-verification).
 MCP, LLM and Discord activation are separate later work.
 See the [typed API](designs/protocol/station-hosted-agent-api.md) and
 [lifecycle](designs/protocol/station-integration-lifecycle.md).
