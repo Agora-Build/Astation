@@ -318,12 +318,16 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(retried, original)
     }
 
-    private func service(_ coordinator: AstationRecoveryCoordinator) async throws -> RemoteServiceApproval {
+    private func service(_ coordinator: AstationRecoveryCoordinator, sessions: [String]? = nil,
+                         projects: [String]? = nil) async throws -> RemoteServiceApproval {
         let log = try await coordinator.serviceMembership()
         let time = AstationRecoveryCoordinator.clock()
+        var scope: [String: Any] = ["hosts": ["host-a"], "ops": ["prompt", "view"]]
+        if let sessions { scope["sessions"] = sessions }
+        if let projects { scope["projects"] = projects }
         let action: [String: Any] = ["action": "add", "member": ["device_id": "service-test", "kind": "service", "roles": ["service"],
             "auth_key": ["alg": "ed25519", "pub": recoveryTestBase64(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)],
-            "scope": ["hosts": ["host-a"], "ops": ["prompt", "view"]], "expires_at": time.wallMs + 600_000]]
+            "scope": scope, "expires_at": time.wallMs + 600_000]]
         return try RemoteServiceApproval(operationID: UUID().uuidString, integrationID: "i-01234567890123456789012345",
             issuer: "https://auth.example", ownerAccount: "ab01234567890123456789012345", stationOrigin: "https://configured.example",
             bodyJSON: log.draftEntry(signer: "manager-a", signedAt: time.wallMs, actionJson: recoveryTestJSON(action)),
@@ -335,6 +339,61 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             requiredScope: "integrations:read", additionalScopes: ["integrations:approve"])
         return try PortalIntegrationHTTP(configuration: config, portalOrigin: "https://portal.example",
             ownerAccount: "ab01234567890123456789012345", http: http, accessToken: { "test-only-token" })
+    }
+
+    func testApprovedIntegrationScopeReloadsFromCommittedMembership() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        _ = try await coordinator.setup()
+        let approval = try await service(coordinator, sessions: ["ses-aaaaaaaaaaaa"], projects: ["h1.0123abcd." + String(repeating: "a", count: 64)])
+        try await coordinator.prepareService(approval)
+        try await coordinator.approveService(approval, portal: portal(transport), current: { true })
+        let records = try await portal(transport).owned(stationOrigin: "https://configured.example")
+        let record = try XCTUnwrap(records.first)
+        let reloaded = try h.coordinator()
+        let log = try await reloaded.serviceMembership()
+        let scope = try XCTUnwrap(IntegrationApprovalViewController.approvedScope(record: record, log: log))
+        XCTAssertEqual(scope.hosts, ["host-a"])
+        XCTAssertEqual(scope.sessions, ["ses-aaaaaaaaaaaa"])
+        XCTAssertEqual(scope.projects, ["h1.0123abcd." + String(repeating: "a", count: 64)])
+        XCTAssertNil(try reloaded.pendingServiceApproval(), "Display must not depend on a completed approval's draft")
+    }
+
+    func testApprovedIntegrationUnrestrictedScopeDoesNotInventSessionRestrictions() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        _ = try await coordinator.setup()
+        let approval = try await service(coordinator)
+        try await coordinator.prepareService(approval)
+        try await coordinator.approveService(approval, portal: portal(transport), current: { true })
+        let records = try await portal(transport).owned(stationOrigin: "https://configured.example")
+        let record = try XCTUnwrap(records.first)
+        let log = try await coordinator.serviceMembership()
+        let scope = try XCTUnwrap(IntegrationApprovalViewController.approvedScope(record: record, log: log))
+        XCTAssertEqual(scope.hosts, ["host-a"])
+        XCTAssertNil(scope.sessions)
+        XCTAssertNil(scope.projects)
+        let clock = AstationRecoveryCoordinator.clock()
+        let now = HostClock(wallMs: clock.wallMs + 700_000, monoMs: clock.monoMs + 700_000, bootId: clock.bootId)
+        XCTAssertNil(try IntegrationApprovalViewController.approvedScope(record: record, log: log, now: now), "An expired service must not appear active")
+    }
+
+    func testApprovedIntegrationDoesNotUseAnUncommittedOrDifferentServiceKey() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        _ = try await coordinator.setup()
+        let before = try await coordinator.serviceMembership()
+        let approval = try await service(coordinator)
+        try await coordinator.prepareService(approval)
+        try await coordinator.approveService(approval, portal: portal(transport), current: { true })
+        let records = try await portal(transport).owned(stationOrigin: "https://configured.example")
+        let record = try XCTUnwrap(records.first)
+        XCTAssertNil(try IntegrationApprovalViewController.approvedScope(record: record, log: before))
+        let object: [String: Any] = ["id": record.id, "name": record.name, "stationOrigin": record.stationOrigin, "state": record.state,
+                  "scopes": record.scopes, "expiresAt": record.expiresAt, "role": record.role, "r9Svc": String(repeating: "0", count: 64)]
+        let differentKey = try JSONDecoder().decode(PortalIntegrationRecord.self, from: JSONSerialization.data(withJSONObject: object))
+        let log = try await coordinator.serviceMembership()
+        XCTAssertNil(try IntegrationApprovalViewController.approvedScope(record: differentKey, log: log))
+        try await append(["action": "remove", "device_id": "service-test"], harness: h)
+        let removed = await h.relay.log
+        XCTAssertNil(try IntegrationApprovalViewController.approvedScope(record: record, log: XCTUnwrap(removed)), "A removed service must not appear approved")
     }
 
     func testServiceCommitNotifiesAfterDurabilityAndUnlockEvenWhenPortalReplyIsLost() async throws {

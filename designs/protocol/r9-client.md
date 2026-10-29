@@ -220,3 +220,13 @@ neither re-pairing nor a repeated integration approval was required. This
 validates membership ingestion and native discovery, not the remaining service
 execution gates. The full provisioned app suite passes 1,089 tests, eight
 optional skips and no failures.
+
+The locked integration view resolves Portal's `r9Svc` fingerprint against the
+current verified log's active service members. Host/session/project controls
+show that member's effective scope, including later narrowing, rather than
+Portal state, a previous request's draft or the live session registry. Missing,
+ambiguous, removed or expired members do not imply unrestricted access; the
+view hides those controls and asks to refresh the verified scope. Unrestricted
+dimensions explicitly say all sessions/projects on approved hosts. Loading or
+switching requests resets draft selections. These display rules do not grant
+authority or change the hosted execution gate.

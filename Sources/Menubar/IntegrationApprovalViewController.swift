@@ -31,6 +31,7 @@ final class IntegrationApprovalViewController: NSViewController {
     private var coordinator: AstationRecoveryCoordinator?
     private var log: MembershipLog?
     private var approval: RemoteServiceApproval?
+    private var approvedScope: ApprovedScope?
     private var task: Task<Void, Never>?
     private var generation = UUID()
     private var contextCurrent: (() -> Bool)?
@@ -96,6 +97,8 @@ final class IntegrationApprovalViewController: NSViewController {
     func cancelPending() {
         generation = UUID(); task?.cancel(); task = nil
         approval = nil; contextCurrent = nil; log = nil; reviewText.stringValue = ""
+        approvedScope = nil
+        showScope(hosts: [], sessions: nil, projects: nil, approved: false)
         render()
     }
 
@@ -109,11 +112,17 @@ final class IntegrationApprovalViewController: NSViewController {
         let canSelectHosts = !busy && pendingSelection && log != nil && approval == nil && contextCurrent?() == true
         let hasSelectedHost = hostButtons.contains { $0.1.state == .on }
         reviewButton.isEnabled = canSelectHosts && pendingSelection && hasSelectedHost
-        hostStatus.isHidden = log == nil || approval != nil || !pendingSelection
-        hostStatus.stringValue = hostButtons.isEmpty
+        let missingApprovedScope = log != nil && !pendingSelection && !records.isEmpty
+            && approval == nil && approvedScope == nil
+        hosts.isHidden = missingApprovedScope
+        sessions.isHidden = missingApprovedScope; projects.isHidden = missingApprovedScope
+        hostStatus.isHidden = log == nil || approval != nil || (!pendingSelection && !missingApprovedScope)
+        hostStatus.stringValue = missingApprovedScope
+            ? "The approved scope is not available in this Mac's verified account log. Load requests again to refresh it."
+            : hostButtons.isEmpty
             ? "No verified Atem hosts are enrolled in this account. Pair and verify an Atem host, then load requests again."
             : "Select at least one host to review access."
-        if hasSelectedHost { hostStatus.isHidden = true }
+        if hasSelectedHost && !missingApprovedScope { hostStatus.isHidden = true }
         setupButton.isHidden = contextCurrent?() != true || log != nil
         setupButton.isEnabled = !busy && contextCurrent?() == true
         approveButton.isEnabled = !busy && approval != nil && contextCurrent?() == true
@@ -125,6 +134,7 @@ final class IntegrationApprovalViewController: NSViewController {
 
     @objc private func selectionChanged() {
         approval = nil; reviewText.stringValue = ""
+        showSelectedScope()
         status.stringValue = selectedRequestGuidance()
         render()
     }
@@ -193,7 +203,10 @@ final class IntegrationApprovalViewController: NSViewController {
                 }
                 self.portal = portal
                 self.records = records.filter { $0.state == "awaiting_approval" || ["provisioning", "waiting_for_host"].contains($0.state) }
-                picker.removeAllItems(); picker.addItems(withTitles: self.records.map { "\($0.name) · \($0.state.replacingOccurrences(of: "_", with: " "))" })
+                picker.removeAllItems(); picker.addItems(withTitles: self.records.map {
+                    let state = $0.state == "waiting_for_host" ? "approved; verification pending" : $0.state.replacingOccurrences(of: "_", with: " ")
+                    return "\($0.name) · \(state)"
+                })
                 for child in hosts.arrangedSubviews { hosts.removeArrangedSubview(child); child.removeFromSuperview() }
                 hostButtons = []
                 try await hub.prepareAccountSecurityAccess()
@@ -207,15 +220,15 @@ final class IntegrationApprovalViewController: NSViewController {
                 let log = try await coordinator.serviceMembership()
                 guard contextCurrent?() == true else { throw AccountLoginError.changed }
                 self.log = log
-                hostButtons = try Self.hostIDs(log).map { id in
-                    let button = NSButton(checkboxWithTitle: id, target: self, action: #selector(hostSelectionChanged))
-                    self.hosts.addArrangedSubview(button)
-                    return (id, button)
-                }
+                showSelectedScope()
                 if let saved = try coordinator.pendingServiceApproval() {
                     guard saved.issuer == settings.issuer, saved.ownerAccount == owner, saved.stationOrigin == origin else {
                         throw AccountLoginError.changed
                     }
+                    guard let index = self.records.firstIndex(where: { $0.id == saved.integrationID }) else {
+                        throw AccountLoginError.changed
+                    }
+                    picker.selectItem(at: index)
                     approval = saved; try showReview(saved)
                     status.stringValue = "A saved approval is ready to resume. Its original signature is retained."
                 } else { status.stringValue = selectedRequestGuidance() }
@@ -290,7 +303,56 @@ final class IntegrationApprovalViewController: NSViewController {
 
     private func showReview(_ approval: RemoteServiceApproval) throws {
         let value = try RemoteServiceReview(approval: approval)
+        showScope(hosts: value.hosts, sessions: value.sessions, projects: value.projects, approved: false)
         reviewText.stringValue = "Account: \(approval.ownerAccount)\nStation: \(approval.stationOrigin)\nActions: \(value.operations.joined(separator: ", "))\nHosts: \(value.hosts.joined(separator: ", "))\nSessions: \(value.sessions?.joined(separator: ", ") ?? "All on allowed hosts")\nProjects: \(value.projects?.joined(separator: ", ") ?? "All on allowed hosts")\nExpires: \(value.expiresAt.formatted())\nService: \(value.serviceID)\nKey SHA-256: \(approval.fingerprint)\nAccount root: \(approval.genesisHash)\nPrevious entry: \(value.predecessor)"
+    }
+
+    struct ApprovedScope: Equatable {
+        let hosts: [String]
+        let sessions: [String]?
+        let projects: [String]?
+    }
+
+    /// Resolve the Portal fingerprint against active membership verified by the
+    /// shared core. Portal status alone cannot supply an approved host scope.
+    static func approvedScope(record: PortalIntegrationRecord, log: MembershipLog,
+                              now: HostClock = AstationRecoveryCoordinator.clock()) throws -> ApprovedScope? {
+        guard ["provisioning", "waiting_for_host", "ready"].contains(record.state),
+              let fingerprint = record.r9Svc else { return nil }
+        let log = log.snapshot()
+        _ = try log.advance(now: now)
+        guard log.frozen() == nil else { return nil }
+        let matches = try log.members().filter { member in
+            guard member.kind == "service", member.status == .active, (member.expiresAt ?? 0) > now.wallMs else { return false }
+            return try RemoteServiceKeyFingerprint.compute(member.authKey) == fingerprint
+        }
+        guard matches.count == 1, let scopeJSON = matches[0].scopeJson,
+              let scope = try JSONSerialization.jsonObject(with: Data(scopeJSON.utf8)) as? [String: Any],
+              let hosts = scope["hosts"] as? [String] else { return nil }
+        return ApprovedScope(hosts: hosts, sessions: scope["sessions"] as? [String], projects: scope["projects"] as? [String])
+    }
+
+    private func showSelectedScope() {
+        approvedScope = nil
+        guard records.indices.contains(picker.indexOfSelectedItem), let log else { return }
+        let record = records[picker.indexOfSelectedItem]
+        approvedScope = try? Self.approvedScope(record: record, log: log)
+        showScope(hosts: approvedScope?.hosts ?? [], sessions: approvedScope?.sessions,
+                  projects: approvedScope?.projects, approved: record.state != "awaiting_approval")
+    }
+
+    private func showScope(hosts selected: [String], sessions allowedSessions: [String]?,
+                           projects allowedProjects: [String]?, approved: Bool) {
+        for child in hosts.arrangedSubviews { hosts.removeArrangedSubview(child); child.removeFromSuperview() }
+        let enrolled = log.flatMap { try? Self.hostIDs($0) } ?? []
+        hostButtons = Set(enrolled + selected).sorted().map { id in
+            let button = NSButton(checkboxWithTitle: id, target: self, action: #selector(hostSelectionChanged))
+            button.state = selected.contains(id) ? .on : .off
+            hosts.addArrangedSubview(button)
+            return (id, button)
+        }
+        sessions.stringValue = allowedSessions?.joined(separator: ", ") ?? (approved && approvedScope != nil ? "All sessions on approved hosts" : "")
+        projects.stringValue = allowedProjects?.joined(separator: ", ") ?? (approved && approvedScope != nil ? "All projects on approved hosts" : "")
     }
     private func fail(_ error: Error, epoch: UUID) {
         guard epoch == generation else { return }
