@@ -124,7 +124,12 @@ async fn service(
         runtime
             .app
             .recovery
-            .append_test_entry(&f.log.genesis_hash().to_hex(), PRINCIPAL, entry, f.log.head())
+            .append_test_entry(
+                &f.log.genesis_hash().to_hex(),
+                PRINCIPAL,
+                entry,
+                f.log.head()
+            )
             .await,
         StatusCode::OK
     );
@@ -159,6 +164,16 @@ async fn controlled_host_attachments(
     f: Arc<Fixture>,
     log: atem_client::membership::Membership,
     attachments: usize,
+) {
+    controlled_host_catchup(base, f, log, attachments, false).await;
+}
+
+async fn controlled_host_catchup(
+    base: String,
+    f: Arc<Fixture>,
+    log: atem_client::membership::Membership,
+    attachments: usize,
+    pending_approval: bool,
 ) {
     let mut socket = connect_atem(&base, "phone", "host-a").await;
     crate::remote_api::host_route_tests::prove(&mut socket, &f.keys, &f.host_key, &log, "host-a")
@@ -247,6 +262,24 @@ async fn controlled_host_attachments(
             .seal(&serde_json::to_vec(&sessions).unwrap(), 0)
             .unwrap();
         send_json(&mut socket, json!({"type":"channel","event":"frame","channel":handle,"frame":serde_json::from_slice::<Value>(&bytes).unwrap()})).await;
+        if pending_approval {
+            let approval = json!({"type":"session","data":{"v":1,"op":"approval_request","id":new_id(),
+                "approval_id":"88888888-8888-4888-8888-888888888888","session_id":"ses-aaaaaaaaaaaa",
+                "process_gen":"11111111-1111-4111-8111-111111111111","tool":"Bash","summary":"touch /test/probe",
+                "created_at":clock.wall_ms,"always_rules":[{"rule_id":"offered-rule","label":"Only this test command","scope":"session"}]}});
+            let rules = json!({"type":"session","data":{"v":1,"op":"approval_rules","id":new_id(),
+                "session_id":"ses-aaaaaaaaaaaa","process_gen":"11111111-1111-4111-8111-111111111111",
+                "rules":[{"rule_id":"active-rule","label":"Previously approved command","scope":"session"}]}});
+            let mut previous_rules = rules.clone();
+            previous_rules["data"]["id"] = json!(new_id());
+            previous_rules["data"]["rules"][0]["rule_id"] = json!("superseded-rule");
+            for item in [approval, previous_rules, rules] {
+                let bytes = channel
+                    .seal(&serde_json::to_vec(&item).unwrap(), 0)
+                    .unwrap();
+                send_json(&mut socket,json!({"type":"channel","event":"frame","channel":handle,"frame":serde_json::from_slice::<Value>(&bytes).unwrap()})).await;
+            }
+        }
         loop {
             let frame = next_client_json(&mut socket).await;
             if frame["event"] == "close" {
@@ -319,6 +352,68 @@ async fn controlled_host_attachments(
             send_json(&mut socket, json!({"type":"channel","event":"frame","channel":handle,"frame":serde_json::from_slice::<Value>(&bytes).unwrap()})).await;
         }
     }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_registry_includes_approval_catchup_after_snapshot() {
+    let (db, runtime, f) = fixture().await;
+    let (context, fingerprint) = service(&runtime, &f).await;
+    let log = runtime
+        .app
+        .recovery
+        .integration_log(&context.genesis, PRINCIPAL)
+        .await
+        .unwrap();
+    let mut app = runtime.app.clone();
+    app.accounts = Arc::new(crate::account_store::InMemoryAccountStore::with_verifier(
+        app.knowledge.clone(),
+        app.vault.clone(),
+        Arc::new(crate::remote_api::recovery::tests::TestAccountVerifier),
+    ));
+    let (base, server) = spawn_relay(app).await;
+    let host = tokio::spawn(controlled_host_catchup(base, Arc::new(f), log, 1, true));
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !crate::remote_api::recovery::host_target(
+            &runtime.app,
+            &context.genesis,
+            PRINCIPAL,
+            "host-a",
+        )
+        .await
+        .is_ok_and(|(_, _, binding, _)| binding.is_some())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let connection = client::HostedConnection::open(&runtime, &context, &fingerprint, "host-a")
+        .await
+        .unwrap();
+    assert_eq!(
+        connection.attached.registry().pending_approvals().count(),
+        1
+    );
+    assert_eq!(
+        connection
+            .attached
+            .registry()
+            .pending_approvals()
+            .next()
+            .unwrap()
+            .approval_id,
+        "88888888-8888-4888-8888-888888888888"
+    );
+    assert_eq!(connection.initial_rules.len(), 1);
+    assert_eq!(
+        connection.initial_rules[0]["rules"][0]["rule_id"],
+        "active-rule"
+    );
+    drop(connection);
+    host.await.unwrap();
+    server.abort();
+    db.cleanup().await;
 }
 
 #[tokio::test]

@@ -81,7 +81,8 @@ pub(super) async fn sessions(
         Ok::<_, Response>(
             Json(
                 json!({"sessions":connection.attached.registry().sessions().collect::<Vec<_>>(),"targets":connection.attached.registry().sessions().filter_map(|s|connection.attached.target(&s.session_id)).collect::<Vec<_>>(),
-            "approvals":connection.attached.registry().pending_approvals().collect::<Vec<_>>()}),
+            "approvals":connection.attached.registry().pending_approvals().collect::<Vec<_>>(),
+            "approval_rules":connection.initial_rules}),
             )
             .into_response(),
         )
@@ -118,6 +119,7 @@ pub(super) async fn approvals(
         Ok::<_, Response>(
             Json(json!({
                 "target": connection.attached.target(&session),
+                "approval_rules": connection.initial_rules.iter().filter(|v|v["session_id"] == session).collect::<Vec<_>>(),
                 "approvals": connection.attached.registry().pending_approvals()
                     .filter(|a| a.session_id == session).collect::<Vec<_>>()
             }))
@@ -527,7 +529,7 @@ pub(super) async fn event_socket(
     if connection.recheck(&runtime, &admission).await.is_err() {
         return;
     }
-    let initial = json!({"type":"snapshot","sessions":connection.attached.registry().sessions().collect::<Vec<_>>(),"targets":connection.attached.registry().sessions().filter_map(|s|connection.attached.target(&s.session_id)).collect::<Vec<_>>(),"approvals":connection.attached.registry().pending_approvals().collect::<Vec<_>>()});
+    let initial = json!({"type":"snapshot","sessions":connection.attached.registry().sessions().collect::<Vec<_>>(),"targets":connection.attached.registry().sessions().filter_map(|s|connection.attached.target(&s.session_id)).collect::<Vec<_>>(),"approvals":connection.attached.registry().pending_approvals().collect::<Vec<_>>(),"approval_rules":connection.initial_rules});
     if !matches!(
         tokio::time::timeout(
             Duration::from_secs(5),

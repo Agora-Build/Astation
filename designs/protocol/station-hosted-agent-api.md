@@ -91,6 +91,14 @@ The adapter never reruns a mutation after losing its reply. A bounded wait
 that loses the outcome returns `delivery_uncertain` with the caller's
 request ID and target; reconnect and query receipts using the same ID.
 
+Session discovery, approval lookup and the initial WebSocket snapshot include
+`approval_rules`, an array of the host's current session/process rule payloads.
+The adapter waits for pending approvals and rules that follow the session-list
+reply: a read-only receipt query provides an ordered boundary on the same
+attachment. It does not use a sleep or infer that an empty socket means no
+approvals. Only the latest rule list for each current process appears in the
+snapshot; subsequent rule changes arrive through WebSocket events.
+
 Prompt Send acquires atomically when nobody holds control. A takeover carries
 the exact `{controller_session,lease_epoch}` shown to the user. Interrupt and
 stop require explicit control and acquire only an unheld lease; they cannot
@@ -191,6 +199,9 @@ Supply the Station's normal protected configuration and these test inputs:
 | `LIVE_HOSTED_WITHOUT_NATIVE` | Optional `yes`: assert no Astation room owner before and after execution. A dedicated test listener also refuses native identity-room WebSocket connections. In existing-cluster mode, quit the native app separately and monitor the distributed directory throughout the run. |
 | `LIVE_HOSTED_EXISTING_CLUSTER` | Optional `yes`: join an already running, isolated Redis-backed Station as a socket-free observer. Requires its protected `REDIS_URL` and database/key configuration. No listener is replaced and no native-refusal middleware is installed. |
 | `LIVE_HOSTED_FAILOVER_FILE` | Optional protected marker path, initially absent; existing-cluster submission runs only. After the accepted receipt, interrupt only the isolated replica carrying the host socket. Wait for the actual host to reconnect to a different replica, then atomically write mode-0600 JSON with the saved `request_id`. Never supply this flag during receipt recovery. |
+| `LIVE_HOSTED_APPROVAL_CASE` | Optional `allow_once`, `deny`, `allow_always`, `auto_allow`, `revoke` or `after_revoke`. Existing-cluster mode only; incompatible with failover. Runs one explicit genuine Codex probe case instead of the marker prompt. |
+| `LIVE_HOSTED_APPROVAL_RULE_FILE` | Protected file binding the exact offered rule to the complete target. Created after `allow_always` succeeds; required for `auto_allow`, `revoke` and `after_revoke`. |
+| `LIVE_HOSTED_APPROVAL_RESUME` | Optional explicit `pending`: continue the saved prompt only if its exact approval is still pending and no answer request has been prepared. Never submits the prompt again. Use receipt recovery instead when an answer's delivery is uncertain. |
 
 Run only that ignored test, with `--exact --ignored --nocapture`. It verifies
 the real token's issuer, Station audience, client, owner, operation and service
@@ -283,3 +294,41 @@ The native durable relay-only policy acknowledgment also passed separately; see
 service independence from the native process and actual host replica failover,
 not physical Mac power-off. Genuine approval/rule cases and public HTTP admission
 remain release checks; public hosted execution is still disabled.
+
+### Genuine Codex approval procedure
+
+Use Atem's [approved disposable-host recipe](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6489281726),
+not a synthetic approval or a direct shell command on the host. The prompt must
+reach the real agent through the protected service, and the resulting request
+must come from its actual permission hook. The prepared probe directory is
+outside the agent's sandbox. The operator test accepts only the recipe's exact
+harmless `touch` commands, uses the actual offered session rule, and never
+supplies a fabricated rule ID.
+
+With the normal protected live-test inputs, run the same ignored test once per
+case, refreshing the short-lived Auth token between cases. Each submission uses
+a new evidence path. Execute `allow_once`, `deny`, `allow_always`, `auto_allow`,
+`revoke`, then `after_revoke`, waiting for each turn's terminal receipt before
+the next. `allow_once` disconnects with its genuine request pending, reconnects,
+requires exactly the same pending card, and then answers. Answers and revocation
+do not acquire a lease. The final case denies the newly required approval so
+the disposable agent is not left waiting.
+
+The test saves prompt, answer and revocation IDs before sending. An uncertain
+outcome stops the sequence. Set `LIVE_HOSTED_RECOVER=receipts` with the same case
+and evidence to inspect saved receipts, history and pending cards without
+replaying a mutation. Resume an unanswered pending card only through the explicit
+`pending` mode; an expired or replaced card and an already prepared answer are
+refused. Revocation must remove the selected rule while preserving unrelated
+rules. Auto-allow requires a new correlated `auto_allowed` card for the offered
+rule, not merely identical prompt text. Atem independently checks probe files
+and host logs using the recorded request IDs.
+
+The first live attempt on 2026-10-29 produced a genuine approval and exposed the
+service's early session-snapshot return. The ordered-boundary fix and its
+Postgres regression are implemented. That unanswered approval expired during
+the fix and was recovered as a completed turn with no pending card. A second
+explicit attempt returned `outcome_unknown` before an approval appeared; it is
+retained for host-side diagnosis on [Atem #81](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6489560705).
+No success for the allow/deny/rule matrix is claimed from those attempts, and
+further submissions wait for receipt/history and host-log inspection.

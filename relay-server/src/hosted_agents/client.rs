@@ -120,6 +120,7 @@ impl Drop for RelayTransport {
 
 pub(crate) struct HostedConnection {
     pub attached: Attached,
+    pub initial_rules: Vec<Value>,
     transport: RelayTransport,
     start: Instant,
     membership_head: atem_client::membership::Head,
@@ -169,6 +170,7 @@ impl HostedConnection {
             })?;
         let mut connection = Self {
             attached,
+            initial_rules: Vec::new(),
             transport,
             start,
             membership_head: log.head().clone(),
@@ -178,12 +180,53 @@ impl HostedConnection {
             .list(connection.now())
             .map_err(|_| lost())?;
         connection.send(frame).await?;
-        connection
+        let mut catchup = connection
             .until(|v| v["type"] == "session" && v["data"]["re"] == id)
             .await?;
         if connection.attached.registry().awaiting_snapshot() {
             return Err(lost());
         }
+        // Pending approvals and active rules follow the list reply. A read-only
+        // receipt query provides an ordered boundary without a timing heuristic.
+        let session = connection
+            .attached
+            .registry()
+            .sessions()
+            .next()
+            .map(|s| s.session_id.clone());
+        if let Some(session) = session {
+            let (id, frame) = connection
+                .attached
+                .receipt_query(&session, &[new_id()], connection.now())
+                .map_err(|_| lost())?;
+            connection.send(frame).await?;
+            let boundary = connection
+                .until(|v| v["type"] == "session" && v["data"]["re"] == id)
+                .await?;
+            if !boundary
+                .iter()
+                .any(|v| v["data"]["re"] == id && v["data"]["op"] == "receipts")
+            {
+                return Err(lost());
+            }
+            catchup.extend(boundary);
+        }
+        let mut rules = std::collections::BTreeMap::new();
+        for event in catchup {
+            let data = &event["data"];
+            if event["type"] == "session" && data["op"] == "approval_rules" {
+                if let Some(session) = data["session_id"].as_str().filter(|session| {
+                    connection
+                        .attached
+                        .registry()
+                        .session(session)
+                        .is_some_and(|d| data["process_gen"] == d.process_gen)
+                }) {
+                    rules.insert(session.to_owned(), data.clone());
+                }
+            }
+        }
+        connection.initial_rules = rules.into_values().collect();
         Ok(connection)
     }
     /// A membership change may narrow or renew this service without changing

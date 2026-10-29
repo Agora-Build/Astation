@@ -6,6 +6,8 @@ use axum::http::StatusCode;
 use serde_json::{json, Value};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+mod approvals;
+
 fn required(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"))
 }
@@ -143,6 +145,10 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
     let raw = token["access_token"].as_str().expect("access token");
     let evidence_path = PathBuf::from(required("LIVE_HOSTED_EVIDENCE_FILE"));
     let recovering = std::env::var("LIVE_HOSTED_RECOVER").as_deref() == Ok("receipts");
+    let approval_case = std::env::var("LIVE_HOSTED_APPROVAL_CASE").ok();
+    let resuming_approval =
+        std::env::var("LIVE_HOSTED_APPROVAL_RESUME").as_deref() == Ok("pending");
+    assert!(!resuming_approval || approval_case.is_some());
     let without_native = std::env::var("LIVE_HOSTED_WITHOUT_NATIVE").as_deref() == Ok("yes");
     let existing_cluster = std::env::var("LIVE_HOSTED_EXISTING_CLUSTER").as_deref() == Ok("yes");
     let failover_file = std::env::var("LIVE_HOSTED_FAILOVER_FILE")
@@ -156,6 +162,7 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
         !recovering || failover_file.is_none(),
         "receipt recovery must not request another replica interruption"
     );
+    assert!(approval_case.is_none() || (existing_cluster && failover_file.is_none()));
     if let Some(path) = &failover_file {
         assert!(
             !path.exists(),
@@ -164,7 +171,7 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
     }
     // A rerun must query the saved receipt instead of replaying a lost submit.
     assert!(
-        recovering || !evidence_path.exists(),
+        recovering || resuming_approval || !evidence_path.exists(),
         "existing evidence: recover its request via receipts first"
     );
     let _ = tracing_subscriber::fmt()
@@ -290,6 +297,27 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
     println!(
         "LIVE: real Auth, protected key, encrypted service welcome and replacement registry pass"
     );
+
+    if let Some(case) = approval_case {
+        approvals::run(
+            &runtime,
+            &id,
+            raw,
+            &host,
+            &session,
+            connection,
+            &evidence_path,
+            &case,
+            recovering,
+        )
+        .await;
+        assert!(!super::HOSTED_EXECUTION_ENABLED);
+        if let Some(cluster) = cluster {
+            cluster.relay.drain(Duration::from_secs(1)).await;
+            cluster.abort();
+        }
+        return;
+    }
 
     let mut evidence = if recovering {
         let saved = protected_json("LIVE_HOSTED_EVIDENCE_FILE");
