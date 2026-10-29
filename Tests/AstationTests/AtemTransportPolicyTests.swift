@@ -61,6 +61,20 @@ private final class TransportPolicyFixture {
 }
 
 final class AtemTransportPolicyTests: XCTestCase {
+    func testSharedSessionChannelRequiresTheExactAuthenticatedContext() {
+        let f = TransportPolicyFixture(), policy = f.context()
+        func session(account: String = "account-a", device: String = "host-a", client: String = "relay-host-a",
+                     connection: String = "link-1", pairing: String = "pairing-1", transport: String = "link-1") -> AtemSessionContext {
+            AtemSessionContext(route: RemoteTerminalConnection(clientId: client, connectionId: connection),
+                account: account, device: device, pairingSession: pairing, transportGeneration: transport)
+        }
+        XCTAssertTrue(policy.matches(session()))
+        for changed in [session(account: "account-b"), session(device: "host-b"), session(client: "direct-host-a"),
+                        session(connection: "link-2"), session(pairing: "pairing-2"), session(transport: "transport-2")] {
+            XCTAssertFalse(policy.matches(changed), "A policy cannot borrow authority from a different authenticated link")
+        }
+    }
+
     func testRemovedPlaintextMessagesCannotBeDecodedOrEstablishAuthority() throws {
         for wire in [#"{"type":"transportPolicy","data":{"relay_only":true}}"#,
                      #"{"type":"transportPolicyAck","data":{"relay_only":true,"stored":true}}"#] {

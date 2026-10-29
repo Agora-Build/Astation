@@ -1,9 +1,10 @@
 import CryptoKit
 import AppKit
+import class AtemClient.MembershipLog
 import XCTest
 @testable import Menubar
 
-private final class TerminalHubSocket: IdentityRelaySocket, @unchecked Sendable {
+final class TerminalHubSocket: IdentityRelaySocket, @unchecked Sendable {
     var sent: [[String: Any]] = []
     var closeCode = URLSessionWebSocketTask.CloseCode.invalid
     var closeReason: Data?
@@ -35,7 +36,7 @@ private final class TerminalHubSocket: IdentityRelaySocket, @unchecked Sendable 
 }
 
 @MainActor
-private final class TerminalHubSockets {
+final class TerminalHubSockets {
     var identity: [TerminalHubSocket] = []
     let pairing = TerminalHubSocket()
     var current: TerminalHubSocket { identity.last ?? pairing }
@@ -47,7 +48,7 @@ private final class TerminalHubSockets {
 }
 
 @MainActor
-private final class TerminalHubFixture {
+final class TerminalHubFixture {
     let sockets = TerminalHubSockets()
     var socket: TerminalHubSocket { sockets.current }
     let workspaceNotifications = NotificationCenter()
@@ -75,7 +76,8 @@ private final class TerminalHubFixture {
         }
     }
 
-    init(verified: Bool = true, relayOnly: Bool? = nil) throws {
+    init(verified: Bool = true, relayOnly: Bool? = nil,
+         prepareR9Channel: (@MainActor (AtemSessionContext) throws -> (MembershipLog, AstationChannelSigner))? = nil) throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -107,7 +109,8 @@ private final class TerminalHubFixture {
             sessionStore: SsoSessionStore(storageURL: directory.appendingPathComponent("sso.enc")),
             relayIdentityKeyManager: manager, relayIdentityRepairDefaults: defaults,
             atemE2EIdentity: identity, sessionJournal: journal, makeIdentityRelayTask: { _ in sockets.makeIdentity() },
-            makePairingRelayTask: { _ in sockets.pairing }, workspaceNotifications: workspaceNotifications)
+            makePairingRelayTask: { _ in sockets.pairing }, workspaceNotifications: workspaceNotifications,
+            prepareR9Channel: prepareR9Channel)
     }
 
     func drain() async {

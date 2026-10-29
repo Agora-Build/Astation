@@ -31,12 +31,12 @@ private final class NativeChannelFixture {
         bytes.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
     }
 
-    init() throws {
+    init(account: String = "account-a", manager: String = "manager-a", device: String = "host-a") throws {
         identity = AtemE2EIdentity(storage: TestAtemStorage(), crypto: crypto)
         let keys = try identity.remotePublicKeys()
-        let body: [String: Any] = ["type": "atem-membership-entry", "v": 1, "account_id": "account-a", "seq": 1,
-            "prev_hash": String(repeating: "0", count: 64), "action": "genesis", "signer": "manager-a", "signed_at": 1_792_400_000_000,
-            "member": ["device_id": "manager-a", "kind": "native", "roles": ["control", "manage", "view"],
+        let body: [String: Any] = ["type": "atem-membership-entry", "v": 1, "account_id": account, "seq": 1,
+            "prev_hash": String(repeating: "0", count: 64), "action": "genesis", "signer": manager, "signed_at": 1_792_400_000_000,
+            "member": ["device_id": manager, "kind": "native", "roles": ["control", "manage", "view"],
                 "auth_key": ["alg": "p256", "pub": Self.base64(keys.signing)],
                 "enc_key": ["alg": "x25519", "pub": Self.base64(keys.encryption)]],
             "recovery_key": ["alg": "ed25519", "pub": Self.base64(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)]]
@@ -48,10 +48,10 @@ private final class NativeChannelFixture {
         }
         let genesis = try signed(body)
         let clock = HostClock(wallMs: 1_792_400_000_000, monoMs: 100, bootId: "test-boot")
-        log = try MembershipLog.verify(accountId: "account-a", genesisHash: XCTUnwrap(signedObjectInfo(json: genesis).entryHash),
+        log = try MembershipLog.verify(accountId: account, genesisHash: XCTUnwrap(signedObjectInfo(json: genesis).entryHash),
             entries: [genesis], now: clock)
-        let hostBody = try log.draftEntry(signer: "manager-a", signedAt: clock.wallMs,
-            actionJson: Self.json(["action": "add_host", "host": ["host_id": "host-a", "host_trust_gen": 3,
+        let hostBody = try log.draftEntry(signer: manager, signedAt: clock.wallMs,
+            actionJson: Self.json(["action": "add_host", "host": ["host_id": device, "host_trust_gen": 3,
                 "host_key": ["alg": "ed25519", "pub": Self.base64(host.publicKey.rawRepresentation)]]]))
         let result = try log.extend(entries: [signed(XCTUnwrap(JSONSerialization.jsonObject(with: Data(hostBody.utf8)) as? [String: Any]))], now: clock)
         XCTAssertNil(result.stop)
@@ -81,6 +81,50 @@ private final class NativeChannelFixture {
 }
 
 final class AstationR9NativeChannelTests: XCTestCase {
+    @MainActor
+    func testRelayOnlyAndSessionsOpenOneHandshakeAfterOwnerConfirmation() async throws {
+        let manager = AstationIdentity.shared.id
+        let membership = try NativeChannelFixture(account: manager, manager: manager, device: "selected-host")
+        var answer: CheckedContinuation<Bool, Never>?
+        var confirmations = 0
+        let prompted = expectation(description: "One owner confirmation for session and policy")
+        let signer = try AstationChannelSigner(identity: membership.identity, keyID: manager, active: { true }, confirm: {
+            confirmations += 1
+            return await withCheckedContinuation { answer = $0; prompted.fulfill() }
+        })
+        var preparations = 0
+        let f = try TerminalHubFixture(relayOnly: true, prepareR9Channel: { _ in
+            preparations += 1
+            return (membership.log, signer)
+        })
+        try await f.start(); try await f.authenticate()
+        await fulfillment(of: [prompted], timeout: 1)
+        let client = try XCTUnwrap(f.hub.sessionClient(for: f.clientId))
+        for _ in 0..<3 { f.hub.requestAgentList(from: f.clientId) }
+        await f.drain()
+        XCTAssertEqual(client.phase, .connecting)
+        XCTAssertFalse(f.hub.relayOnlyPolicyReady)
+        try XCTUnwrap(answer).resume(returning: true)
+        for _ in 0..<20 { await Task.yield() }
+        await f.drain()
+        let envelopes = f.socket.sent.compactMap { $0["payload"] as? [String: Any] }.filter { $0["type"] as? String == "channel" }
+        let opens = envelopes.filter { $0["event"] as? String == "open" }
+        let inits = envelopes.filter { ($0["frame"] as? [String: Any])?["op"] as? String == "init" }
+        XCTAssertEqual(confirmations, 1)
+        XCTAssertEqual(preparations, 1)
+        XCTAssertEqual(opens.count, 1, "Policy must not race a second init against the session on the same host link")
+        XCTAssertEqual(inits.count, 1)
+        XCTAssertEqual(opens.first?["channel"] as? String, inits.first?["channel"] as? String)
+        XCTAssertFalse(f.hub.relayOnlyPolicyReady, "A successful owner check alone is not a durable host ACK")
+        f.hub.refreshNativeSessionMembership(try XCTUnwrap(client.context))
+        await f.drain()
+        let closes = f.socket.sent.compactMap { $0["payload"] as? [String: Any] }.filter { $0["event"] as? String == "close" }
+        XCTAssertEqual(closes.count, 1, "Replacing a shared attachment must close its old host channel")
+        XCTAssertEqual(closes.first?["channel"] as? String, opens.first?["channel"] as? String)
+        XCTAssertFalse(f.hub.relayOnlyPolicyReady, "Replacement cannot retain the previous attachment's policy readiness")
+        f.socket.fail(); await f.drain()
+    }
+
     @MainActor
     func testNativeConnectionWaitsForActivationBeforeAndAfterAuthentication() async throws {
         let f = try NativeChannelFixture()

@@ -55,6 +55,12 @@ policy tests. No main merge or hosted-execution release is approved here.
   hosts, unverified replacements, uncertain writes, storage errors, timeouts
   and membership changes cannot count as confirmed.
 - Persisting relay-only intent blocks direct agent operations immediately.
+  Session-capable connections carry policy operations on the same encrypted
+  native attachment as the registry, terminal and chat. Opening a second
+  policy handshake concurrently violates the host's one-init-per-second
+  bound; no extra handshake is needed to confirm policy. Both consumers
+  lose readiness when that attachment ends, and a replacement reads policy
+  again before counting as confirmed.
   An existing direct connection may open a restricted encrypted policy channel
   to migrate the host; it cannot carry terminal, chat or session operations.
   Close that connection after confirmation or bounded timeout. Only a fresh
@@ -73,6 +79,18 @@ received no durable confirmation: it stays unready and reconciles on reconnect.
 Neither an uncertain response nor the old plaintext ACK enables execution.
 
 ## Validation
+
+The 2026-10-29 native check confirmed owner authentication and a seq7 R9
+welcome, but a concurrent policy init received `close{reason:"busy"}`.
+The host's one-init-per-second admission limit is working as specified.
+The native adapter now shares the session attachment for policy operations.
+A provisioned regression covers delayed owner confirmation, one handshake
+for both consumers, and closing the old channel on membership refresh.
+Restoring the separate policy path makes the regression fail. Exact account,
+host, pairing, route and transport-generation changes prevent channel sharing.
+The full provisioned suite passes 1,109 tests, with eight optional skips and
+no failures. These checks do not claim a live durable policy acknowledgment;
+that still requires the corrected native build against the actual host.
 
 Source was read through GitHub at the immutable commit; selected Git blobs
 were hash-verified. Atem reports eight actual-runtime scenarios / 114 checks

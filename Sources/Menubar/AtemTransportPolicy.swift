@@ -34,6 +34,12 @@ struct AtemTransportPolicyContext: Equatable {
     let verifiedPin: AtemDevicePin?
     var binding: AtemHostPolicyBinding?
     var isRelay: Bool { route.clientId.hasPrefix("relay-") }
+
+    func matches(_ context: AtemSessionContext) -> Bool {
+        account == context.account && route.deviceId == context.device && pairingSession == context.pairingSession
+            && route.clientId == context.route.clientId && route.connectionId == context.route.connectionId
+            && transportGeneration == context.transportGeneration
+    }
 }
 
 /// Mutation identity survives a reconnect; channel confirmation never does.
