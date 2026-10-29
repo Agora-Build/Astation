@@ -165,24 +165,40 @@ async fn controlled_host_attachments(
     log: atem_client::membership::Membership,
     attachments: usize,
 ) {
-    controlled_host_catchup(base, f, log, attachments, false).await;
+    controlled_host_scenario(base, f, log, attachments, HostScenario::default()).await;
 }
 
-async fn controlled_host_catchup(
+#[derive(Default)]
+struct HostScenario {
+    pending_approval: bool,
+    lose_submit_reply: bool,
+    handles: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+}
+
+async fn controlled_host_scenario(
     base: String,
     f: Arc<Fixture>,
     log: atem_client::membership::Membership,
     attachments: usize,
-    pending_approval: bool,
+    scenario: HostScenario,
 ) {
     let mut socket = connect_atem(&base, "phone", "host-a").await;
     crate::remote_api::host_route_tests::prove(&mut socket, &f.keys, &f.host_key, &log, "host-a")
         .await;
     let mut receipts = std::collections::BTreeMap::new();
+    let approval_created_at = chrono::Utc::now().timestamp_millis() as u64;
     for _ in 0..attachments {
-        let open = next_client_json(&mut socket).await;
+        let open = loop {
+            let event = next_client_json(&mut socket).await;
+            if event["event"] != "close" {
+                break event;
+            }
+        };
         assert_eq!(open["event"], "open");
         let handle = open["channel"].as_str().unwrap().to_owned();
+        if let Some(handles) = &scenario.handles {
+            handles.send(handle.clone()).unwrap();
+        }
         let init = next_client_json(&mut socket).await;
         let clock = atem_client::membership::HostNow {
             wall_ms: chrono::Utc::now().timestamp_millis() as u64,
@@ -262,11 +278,11 @@ async fn controlled_host_catchup(
             .seal(&serde_json::to_vec(&sessions).unwrap(), 0)
             .unwrap();
         send_json(&mut socket, json!({"type":"channel","event":"frame","channel":handle,"frame":serde_json::from_slice::<Value>(&bytes).unwrap()})).await;
-        if pending_approval {
+        if scenario.pending_approval {
             let approval = json!({"type":"session","data":{"v":1,"op":"approval_request","id":new_id(),
                 "approval_id":"88888888-8888-4888-8888-888888888888","session_id":"ses-aaaaaaaaaaaa",
                 "process_gen":"11111111-1111-4111-8111-111111111111","tool":"Bash","summary":"touch /test/probe",
-                "created_at":clock.wall_ms,"always_rules":[{"rule_id":"offered-rule","label":"Only this test command","scope":"session"}]}});
+                "created_at":approval_created_at,"always_rules":[{"rule_id":"offered-rule","label":"Only this test command","scope":"session"}]}});
             let rules = json!({"type":"session","data":{"v":1,"op":"approval_rules","id":new_id(),
                 "session_id":"ses-aaaaaaaaaaaa","process_gen":"11111111-1111-4111-8111-111111111111",
                 "rules":[{"rule_id":"active-rule","label":"Previously approved command","scope":"session"}]}});
@@ -326,10 +342,19 @@ async fn controlled_host_catchup(
                     }
                     let receipt = json!({"request_id":data["request_id"],"target":data["binding"]["target"],
                     "kind":data["kind"],"state":"accepted","updated_at":clock.wall_ms});
-                    receipts.insert(
-                        data["request_id"].as_str().unwrap().to_owned(),
-                        receipt.clone(),
+                    assert!(
+                        receipts
+                            .insert(
+                                data["request_id"].as_str().unwrap().to_owned(),
+                                receipt.clone(),
+                            )
+                            .is_none(),
+                        "the adapter must not replay a submitted mutation"
                     );
+                    if scenario.lose_submit_reply {
+                        send_json(&mut socket, json!({"type":"channel","event":"close","channel":handle,"reason":"closed"})).await;
+                        break;
+                    }
                     let mut message = receipt;
                     message["v"] = json!(1);
                     message["op"] = json!("receipt");
@@ -372,7 +397,16 @@ async fn postgres_registry_includes_approval_catchup_after_snapshot() {
         Arc::new(crate::remote_api::recovery::tests::TestAccountVerifier),
     ));
     let (base, server) = spawn_relay(app).await;
-    let host = tokio::spawn(controlled_host_catchup(base, Arc::new(f), log, 1, true));
+    let host = tokio::spawn(controlled_host_scenario(
+        base,
+        Arc::new(f),
+        log,
+        1,
+        HostScenario {
+            pending_approval: true,
+            ..Default::default()
+        },
+    ));
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         while !crate::remote_api::recovery::host_target(
             &runtime.app,
@@ -681,6 +715,284 @@ async fn http_json(response: reqwest::Response, status: StatusCode) -> Value {
 
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
+async fn postgres_dispatch_failure_preserves_mutation_recovery_without_replaying() {
+    let (db, runtime, f) = fixture().await;
+    let (context, fingerprint) = service(&runtime, &f).await;
+    let log = runtime
+        .app
+        .recovery
+        .integration_log(&context.genesis, PRINCIPAL)
+        .await
+        .unwrap();
+    let mut app = runtime.app.clone();
+    app.accounts = Arc::new(crate::account_store::InMemoryAccountStore::with_verifier(
+        app.knowledge.clone(),
+        app.vault.clone(),
+        Arc::new(crate::remote_api::recovery::tests::TestAccountVerifier),
+    ));
+    let (base, relay) = spawn_relay(app).await;
+    let (handles, mut incoming_handles) = tokio::sync::mpsc::unbounded_channel();
+    let host = tokio::spawn(controlled_host_scenario(
+        base,
+        Arc::new(f),
+        log,
+        4,
+        HostScenario {
+            handles: Some(handles),
+            ..Default::default()
+        },
+    ));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let route = loop {
+        if let Ok((_, route, Some(_), _)) = crate::remote_api::recovery::host_target(
+            &runtime.app,
+            &context.genesis,
+            PRINCIPAL,
+            "host-a",
+        )
+        .await
+        {
+            break route;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    };
+    for (operation, fields, scope) in [
+        (
+            operations::Operation::Prompt,
+            json!({"request_id":new_id(),"text":"private test prompt"}),
+            "agent.prompt",
+        ),
+        (
+            operations::Operation::Approval,
+            json!({"request_id":new_id(),"approval":{"approval_id":new_id(),"decision":"deny","message":"private test answer"}}),
+            "agent.approve",
+        ),
+        (
+            operations::Operation::Revoke,
+            json!({"request_id":new_id(),"rule_id":"offered-rule"}),
+            "agent.approve",
+        ),
+        (
+            operations::Operation::Receipts,
+            json!({"request_ids":[new_id()]}),
+            "agent.view",
+        ),
+    ] {
+        let mut connection =
+            client::HostedConnection::open(&runtime, &context, &fingerprint, "host-a")
+                .await
+                .unwrap();
+        let handle = incoming_handles.recv().await.unwrap();
+        let target = json!(connection.attached.target("ses-aaaaaaaaaaaa").unwrap());
+        let mut body = fields.clone();
+        body["target"] = target.clone();
+        let call = serde_json::from_value(body).unwrap();
+        let admission = admission::Admission {
+            token: VerifiedServiceToken {
+                identity: VerifiedIdentity {
+                    issuer: runtime.binding.issuer.clone(),
+                    subject: OWNER.into(),
+                    authenticated_at: None,
+                },
+                client_id: ID.into(),
+                service_fingerprint: fingerprint.clone(),
+                scopes: vec![scope.into()],
+                expires_at: chrono::Utc::now().timestamp() + 60,
+            },
+            context: context.clone(),
+            operation: scope,
+        };
+        // A malformed carrier envelope synchronously closes the real transport
+        // before dispatch; the fake host must see no submit or receipt query.
+        assert!(!runtime
+            .app
+            .relay
+            .channels()
+            .reply(&handle, &route, "invalid envelope"));
+        let response = operations::perform(&mut connection, &call, operation, &runtime, &admission)
+            .await
+            .unwrap_err();
+        let readonly = matches!(operation, operations::Operation::Receipts);
+        assert_eq!(
+            response.status(),
+            if readonly {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::GATEWAY_TIMEOUT
+            }
+        );
+        let result: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        if readonly {
+            assert_eq!(result["error"]["code"], "host_connection_lost");
+            assert!(result.get("recovery").is_none());
+        } else {
+            assert_eq!(
+                result,
+                json!({"error":{"code":"delivery_uncertain"},"request_id":fields["request_id"],"target":target,"recovery":"query_receipts"})
+            );
+        }
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(3), host)
+        .await
+        .unwrap()
+        .unwrap();
+    relay.abort();
+    let _ = relay.await;
+    drop(runtime);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_http_lost_mutation_replies_recover_on_new_attachments_without_replay() {
+    use crate::{
+        account_identity::tests::Fixture as AuthFixture,
+        station_integrations::tests::fixture_with_issuer,
+    };
+    let auth = AuthFixture::new().await;
+    let (db, runtime, f) = fixture_with_issuer(&auth.issuer).await;
+    let (context, fingerprint) = service(&runtime, &f).await;
+    let log = runtime
+        .app
+        .recovery
+        .integration_log(&context.genesis, PRINCIPAL)
+        .await
+        .unwrap();
+    let mut app = runtime.app.clone();
+    app.accounts = Arc::new(crate::account_store::InMemoryAccountStore::with_verifier(
+        app.knowledge.clone(),
+        app.vault.clone(),
+        Arc::new(crate::remote_api::recovery::tests::TestAccountVerifier),
+    ));
+    let (base, relay) = spawn_relay(app).await;
+    let host = tokio::spawn(controlled_host_scenario(
+        base,
+        Arc::new(f),
+        log,
+        7,
+        HostScenario {
+            lose_submit_reply: true,
+            ..Default::default()
+        },
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !crate::remote_api::recovery::host_target(
+            &runtime.app,
+            &context.genesis,
+            PRINCIPAL,
+            "host-a",
+        )
+        .await
+        .is_ok_and(|(_, _, binding, _)| binding.is_some())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let router = operation_routes().with_state(crate::station_integrations::IntegrationState(
+        Some(runtime.clone()),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let api = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let prefix = format!("{origin}/api/agent/v1/integrations/{ID}/hosts/host-a");
+    let mut claims = auth.claims();
+    claims["aud"] = json!(runtime.binding.station_origin);
+    claims["client_id"] = json!(ID);
+    claims["r9_svc"] = json!(fingerprint);
+    claims["scope"] = json!("agent.view agent.prompt agent.approve");
+    claims["exp"] = json!(chrono::Utc::now().timestamp() + 300);
+    let token = auth.token(auth.header(), claims);
+    let snapshot = http_json(
+        http.get(format!("{prefix}/sessions"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::OK,
+    )
+    .await;
+    let target = &snapshot["targets"][0];
+    let session_url = format!("{prefix}/sessions/ses-aaaaaaaaaaaa");
+    for (suffix, fields, kind) in [
+        (
+            "prompts",
+            json!({"text":"**One submission only**"}),
+            "prompt",
+        ),
+        (
+            "approvals",
+            json!({"approval":{"approval_id":new_id(),"decision":"deny","message":"Do not run"}}),
+            "approval",
+        ),
+        (
+            "rules/revoke",
+            json!({"rule_id":"offered-rule"}),
+            "approval_rule_revoke",
+        ),
+    ] {
+        let request = new_id();
+        let mut body = fields;
+        body["target"] = target.clone();
+        body["request_id"] = json!(request);
+        let uncertain = http_json(
+            http.post(format!("{session_url}/{suffix}"))
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::GATEWAY_TIMEOUT,
+        )
+        .await;
+        assert_eq!(
+            uncertain,
+            json!({"error":{"code":"delivery_uncertain"},"request_id":request,"target":target,"recovery":"query_receipts"})
+        );
+        let recovered = http_json(
+            http.post(format!("{session_url}/receipts"))
+                .bearer_auth(&token)
+                .json(&json!({"target":target,"request_ids":[request]}))
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::OK,
+        )
+        .await;
+        let receipts: Vec<_> = recovered["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|e| e["data"]["receipts"].as_array().into_iter().flatten())
+            .collect();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0]["request_id"], request);
+        assert_eq!(receipts[0]["target"], *target);
+        assert_eq!(receipts[0]["kind"], kind);
+        assert_eq!(receipts[0]["state"], "accepted");
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(3), host)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!HOSTED_EXECUTION_ENABLED);
+    api.abort();
+    let _ = api.await;
+    relay.abort();
+    let _ = relay.await;
+    drop(runtime);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
 async fn postgres_http_api_authentication_operations_reconnect_and_revocation_without_app() {
     use crate::{
         account_identity::tests::Fixture as AuthFixture,
@@ -702,7 +1014,16 @@ async fn postgres_http_api_authentication_operations_reconnect_and_revocation_wi
         Arc::new(crate::remote_api::recovery::tests::TestAccountVerifier),
     ));
     let (base, relay) = spawn_relay(app).await;
-    let host = tokio::spawn(controlled_host_attachments(base, Arc::new(f), log, 9));
+    let host = tokio::spawn(controlled_host_scenario(
+        base,
+        Arc::new(f),
+        log,
+        9,
+        HostScenario {
+            pending_approval: true,
+            ..Default::default()
+        },
+    ));
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         while !crate::remote_api::recovery::host_target(
             &runtime.app,
@@ -806,6 +1127,16 @@ async fn postgres_http_api_authentication_operations_reconnect_and_revocation_wi
     )
     .await;
     assert_eq!(snapshot["sessions"][0]["session_id"], "ses-aaaaaaaaaaaa");
+    assert_eq!(snapshot["approvals"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        snapshot["approvals"][0]["approval_id"],
+        "88888888-8888-4888-8888-888888888888"
+    );
+    assert_eq!(snapshot["approval_rules"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        snapshot["approval_rules"][0]["rules"][0]["rule_id"],
+        "active-rule"
+    );
     let target = snapshot["targets"][0].clone();
     let session_url = format!("{prefix}/sessions/ses-aaaaaaaaaaaa");
     for (suffix, body, status) in [
@@ -909,7 +1240,11 @@ async fn postgres_http_api_authentication_operations_reconnect_and_revocation_wi
     )
     .await;
     assert_eq!(approvals["target"], target);
-    assert_eq!(approvals["approvals"], json!([]));
+    assert_eq!(approvals["approvals"], snapshot["approvals"]);
+    assert_eq!(
+        approvals["approval_rules"][0]["rules"],
+        snapshot["approval_rules"][0]["rules"]
+    );
 
     let mut stale_target = target.clone();
     stale_target["process_gen"] = json!(new_id());
@@ -944,7 +1279,13 @@ async fn postgres_http_api_authentication_operations_reconnect_and_revocation_wi
         .await
         .unwrap()
         .0;
-    assert_eq!(next_client_json(&mut socket).await["type"], "snapshot");
+    let stream_snapshot = next_client_json(&mut socket).await;
+    assert_eq!(stream_snapshot["type"], "snapshot");
+    assert_eq!(stream_snapshot["approvals"], snapshot["approvals"]);
+    assert_eq!(
+        stream_snapshot["approval_rules"][0]["rules"],
+        snapshot["approval_rules"][0]["rules"]
+    );
     send_json(&mut socket, json!({"target":target})).await;
     assert_eq!(next_client_json(&mut socket).await["data"]["op"], "opened");
     assert_eq!(

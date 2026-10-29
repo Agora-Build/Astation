@@ -91,6 +91,39 @@ The adapter never reruns a mutation after losing its reply. A bounded wait
 that loses the outcome returns `delivery_uncertain` with the caller's
 request ID and target; reconnect and query receipts using the same ID.
 
+The same recovery response applies when sending the mutation fails: a carrier
+or replica failure cannot prove that the host did not accept it. Authorization
+and target refusals detected before dispatch keep their original error. A
+read-only receipt query or `approval-seen` failure also keeps its original
+error; neither operation creates a durable command receipt.
+
+For a prompt, approval answer, rule revocation, interrupt or stop whose delivery
+is uncertain, HTTP 504 returns only the recovery identity, without prompt or
+approval content:
+
+```json
+{
+  "error": {"code": "delivery_uncertain"},
+  "request_id": "22222222-2222-4222-8222-222222222222",
+  "target": {
+    "account_id": "the-verified-data-account",
+    "atem_device_id": "the-verified-host",
+    "host_trust_gen": 3,
+    "session_id": "ses-aaaaaaaaaaaa",
+    "process_gen": "11111111-1111-4111-8111-111111111111"
+  },
+  "recovery": "query_receipts"
+}
+```
+
+Reconnect and POST that target and `request_ids: [request_id]` to the receipts
+route. An `accepted` or `executing` receipt is still pending; `completed`,
+`rejected` and `outcome_unknown` are terminal outcomes. An empty query is not
+proof that a disconnected submission failed: keep the saved identity and
+reconcile it without automatically replaying the mutation or assigning a new
+request ID. An approval answer with an uncertain result must not fall back to
+typing into the terminal.
+
 Session discovery, approval lookup and the initial WebSocket snapshot include
 `approval_rules`, an array of the host's current session/process rule payloads.
 The adapter waits for pending approvals and rules that follow the session-list
@@ -162,6 +195,12 @@ cargo test --locked --manifest-path relay-server/Cargo.toml \
 The test covers session discovery, prompt acceptance, receipt lookup on a new
 attachment, approval-answer and rule-revocation requests, formatted history,
 authenticated WebSocket updates, and closing that stream after policy denial.
+It checks that pending approvals and the latest active rule list following the
+registry reply appear in HTTP discovery, approval lookup and the initial
+WebSocket snapshot. A separate isolated test closes the encrypted channel after
+recording each prompt, approval answer and rule revocation, then recovers its
+receipt through a new authenticated HTTP request. The controlled host rejects
+any repeated mutation, so a passing recovery cannot conceal a submit replay.
 It also refuses missing/invalid tokens, wrong issuer/resource/owner/client/key,
 native tokens, expired tokens, insufficient scopes, stale process targets,
 invalid control flags, unknown fields and oversized bodies.
@@ -326,9 +365,19 @@ and host logs using the recorded request IDs.
 
 The first live attempt on 2026-10-29 produced a genuine approval and exposed the
 service's early session-snapshot return. The ordered-boundary fix and its
-Postgres regression are implemented. That unanswered approval expired during
-the fix and was recovered as a completed turn with no pending card. A second
-explicit attempt returned `outcome_unknown` before an approval appeared; it is
-retained for host-side diagnosis on [Atem #81](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6489560705).
-No success for the allow/deny/rule matrix is claimed from those attempts, and
-further submissions wait for receipt/history and host-log inspection.
+Postgres regression are implemented. Subsequent host inspection found that a
+plain Codex turn end closed the unanswered hook before its timeout, leaving
+Codex's terminal approval dialog open while Atem reported ready. The second
+prompt's paste reached that dialog and selected its default; its receipt became
+`outcome_unknown`. Astation had sent no approval decision. A completed prompt
+receipt therefore did not establish that its approval was resolved or that the
+session was safe for another prompt.
+
+The [host correction](https://github.com/Agora-Build/Atem/pull/102) must preserve
+waiting across turn completion, keep unresolved dialog identity unambiguous,
+and fence prompt bytes at the actual PTY write boundary. Lost or delayed hook
+events must never turn another call's completion into an approval. Genuine
+approval tests remain paused pending review of that correction, completed
+regressions and the exact corrected worker/session handoff. No success for the
+allow/deny/rule matrix is claimed from the earlier attempts. The public hosted
+execution gate remains closed.

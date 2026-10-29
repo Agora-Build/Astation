@@ -467,18 +467,36 @@ pub(super) async fn perform(
                 .map_err(|_| stale())?
         }
     };
-    send_checked(connection, runtime, admission, frame).await?;
+    // A policy refusal precedes dispatch. Once sending starts, a transport
+    // failure cannot prove that the host did not durably accept a mutation.
+    connection.recheck(runtime, admission).await?;
+    if let Err(error) = connection.send(frame).await {
+        return Err(delivery_failure(call, operation, error));
+    }
     // Never replay a mutation on timeout: reconnect and query its durable receipt.
     match connection.until(|v| v["data"]["re"] == id).await {
         Ok(events) => Ok(events),
-        Err(e) if matches!(operation, Operation::Receipts | Operation::Seen) => Err(e),
-        Err(_) => Err((
-            StatusCode::GATEWAY_TIMEOUT,
-            Json(json!({"error":{"code":"delivery_uncertain"},
-            "request_id":call.request_id,"target":call.target,"recovery":"query_receipts"})),
-        )
-            .into_response()),
+        Err(error) => Err(delivery_failure(call, operation, error)),
     }
+}
+
+fn delivery_failure(call: &Call, operation: Operation, error: Response) -> Response {
+    if !matches!(
+        operation,
+        Operation::Prompt
+            | Operation::Interrupt
+            | Operation::Stop
+            | Operation::Approval
+            | Operation::Revoke
+    ) {
+        return error;
+    }
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        Json(json!({"error":{"code":"delivery_uncertain"},
+            "request_id":call.request_id,"target":call.target,"recovery":"query_receipts"})),
+    )
+        .into_response()
 }
 fn history_done(v: &Value) -> bool {
     v["type"] == "agentChat" && matches!(v["data"]["op"].as_str(), Some("history_end" | "error"))
