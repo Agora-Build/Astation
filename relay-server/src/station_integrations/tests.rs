@@ -307,6 +307,103 @@ async fn postgres_background_poll_nudge_restart_and_closed_readiness() {
     db.cleanup().await;
 }
 
+async fn signed_action(runtime: &StationIntegrations, f: &Fixture, action: atem_client::membership::Action) {
+    let log = runtime.recovery_log(&f.log.genesis_hash().to_hex(), OWNER).await.unwrap();
+    let body = log.draft("phone", chrono::Utc::now().timestamp_millis() as u64, &action);
+    append_body(runtime, f, body).await;
+}
+
+async fn append_body(runtime: &StationIntegrations, f: &Fixture, body: Value) {
+    use atem_client::{membership::Entry, signed::SignedObject};
+    let log = runtime.recovery_log(&f.log.genesis_hash().to_hex(), OWNER).await.unwrap();
+    let entry = Entry::parse_bytes(SignedObject::sign(&f.keys, &KeyId::new("manager"), body).unwrap()
+        .to_json().to_string().as_bytes()).unwrap();
+    assert_eq!(runtime.app.recovery.append_test_entry(&f.log.genesis_hash().to_hex(), PRINCIPAL,
+        entry, log.head()).await, StatusCode::OK);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_revocation_requires_signed_removal_and_durable_key_deletion_before_report() {
+    let mut portal = crate::integration_portal::tests::Fixture::new().await;
+    let (db, mut runtime, f) = fixture_with_issuer(&portal.binding.issuer).await;
+    let original = runtime.policies.load(&runtime.binding).await.unwrap();
+    {
+        let r = Arc::get_mut(&mut runtime).unwrap();
+        r.binding = portal.binding.clone();
+        r.portal = PortalReportClient::new(r.binding.clone(), portal.key.take().unwrap()).unwrap();
+    }
+    let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+    let mut next = previous.clone();
+    next.integrations = original.integrations;
+    next.revision += 1; next.denied = false; next.received_at = chrono::Utc::now().timestamp();
+    runtime.policies.commit(&previous, &next).await.unwrap();
+    let draft = runtime.prepare(ID, OWNER, request(&f)).await.unwrap();
+    let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+    let mut next = previous.clone();
+    next.revision += 1;
+    let policy = next.integrations.get_mut(ID).unwrap();
+    policy.state = "revoking".into();
+    policy.r9_svc = Some(draft["fingerprint"].as_str().unwrap().into());
+    policy.expires_at = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+    runtime.policies.commit(&previous, &next).await.unwrap();
+    assert!(runtime.revoked_context(ID).await.is_err(), "a never-added member is not a signed removal");
+    runtime.report_revocations().await;
+    assert!(portal.shared.reports.lock().await.is_empty());
+
+    append_body(&runtime, &f, serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap()).await;
+    assert!(runtime.revoked_context(ID).await.is_err(), "revoking policy alone cannot remove membership");
+    signed_action(&runtime, &f, atem_client::membership::Action::Remove { device_id: format!("svc-{ID}") }).await;
+    let context = runtime.revoked_context(ID).await.unwrap();
+
+    sqlx::query("UPDATE account_identities SET issuer='https://unrelated-issuer.example'").execute(&db.pool).await.unwrap();
+    assert!(runtime.revoked_context(ID).await.is_err(), "revocation cannot alias a different issuer's owner");
+    runtime.report_revocations().await;
+    assert!(portal.shared.reports.lock().await.is_empty());
+    sqlx::query("UPDATE account_identities SET issuer=$1").bind(&runtime.binding.issuer).execute(&db.pool).await.unwrap();
+
+    // A wrong fingerprint or a denied feed cannot authorize cleanup, even
+    // though a valid signature removed some service from the account.
+    let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+    let mut wrong = previous.clone(); wrong.revision += 1;
+    wrong.integrations.get_mut(ID).unwrap().r9_svc = Some("f".repeat(64));
+    runtime.policies.commit(&previous, &wrong).await.unwrap();
+    runtime.report_revocations().await;
+    assert!(portal.shared.reports.lock().await.is_empty());
+    let mut restored = wrong.clone(); restored.revision += 1;
+    restored.integrations = previous.integrations;
+    runtime.policies.commit(&wrong, &restored).await.unwrap();
+    runtime.policies.deny(&runtime.binding).await.unwrap();
+    assert!(runtime.revoked_context(ID).await.is_err());
+    let denied = runtime.policies.load(&runtime.binding).await.unwrap();
+    let mut renewed = denied.clone(); renewed.revision += 1; renewed.denied = false;
+    runtime.policies.commit(&denied, &renewed).await.unwrap();
+
+    sqlx::query("CREATE FUNCTION fail_service_key_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test delete failure'; END $$")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_service_key_delete BEFORE DELETE ON station_service_keys FOR EACH ROW EXECUTE FUNCTION fail_service_key_delete()")
+        .execute(&db.pool).await.unwrap();
+    runtime.report_revocations().await;
+    assert!(portal.shared.reports.lock().await.is_empty(), "never report completion after failed durable cleanup");
+    let keys: i64 = sqlx::query_scalar("SELECT count(*) FROM station_service_keys").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(keys, 1);
+    sqlx::query("DROP TRIGGER fail_service_key_delete ON station_service_keys").execute(&db.pool).await.unwrap();
+    portal.set_status(503);
+    runtime.report_revocations().await;
+    assert_eq!(*portal.shared.reports.lock().await, vec![json!({"integrationId":ID,"state":"revoked"})]);
+    let keys: i64 = sqlx::query_scalar("SELECT count(*) FROM station_service_keys").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(keys, 0);
+    assert!(service_keys::load_approved(&db.pool, &runtime.vault, &context, draft["fingerprint"].as_str().unwrap()).await.is_err());
+    assert!(runtime.prepare(ID, OWNER, request(&f)).await.is_err(), "a retry must not regenerate a revoked key");
+    portal.set_status(200);
+    runtime.report_revocations().await;
+    assert_eq!(portal.shared.reports.lock().await.len(), 2, "a failed report retries with the key already deleted");
+    runtime.report_revocations().await;
+    assert_eq!(portal.shared.reports.lock().await.len(), 3, "repeated cleanup reports are idempotent");
+    assert!(!crate::hosted_agents::HOSTED_EXECUTION_ENABLED);
+    drop(runtime); drop(portal); db.cleanup().await;
+}
+
 #[cfg(unix)]
 #[test]
 fn operator_keys_refuse_world_readable_symlink_empty_and_oversized_files() {

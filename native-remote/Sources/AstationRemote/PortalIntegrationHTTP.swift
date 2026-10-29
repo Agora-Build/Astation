@@ -64,7 +64,7 @@ public struct PortalIntegrationRecord: Decodable, Equatable, Sendable {
 public struct PortalIntegrationHTTP: Sendable {
     public let configuration: AccountOIDCConfiguration
     private let portalOrigin: String
-    private let ownerAccount: String
+    public let ownerAccount: String
     private let http: AccountOIDCHTTP
     private let accessToken: @Sendable () async throws -> String
 

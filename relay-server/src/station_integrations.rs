@@ -36,11 +36,13 @@ pub(crate) struct StationIntegrations {
     pub portal: PortalReportClient,
     nudge: Notify,
     readiness_offset: std::sync::atomic::AtomicUsize,
+    revocation_offset: std::sync::atomic::AtomicUsize,
     pub requests: Arc<Semaphore>,
 }
 
 #[cfg(test)]
 pub(crate) mod tests;
+mod revocation;
 
 #[derive(Clone)]
 pub(crate) struct IntegrationState(pub Option<Arc<StationIntegrations>>);
@@ -154,6 +156,7 @@ impl StationIntegrations {
             portal,
             nudge: Notify::new(),
             readiness_offset: std::sync::atomic::AtomicUsize::new(0),
+            revocation_offset: std::sync::atomic::AtomicUsize::new(0),
             requests: Arc::new(Semaphore::new(8)),
         }))
     }
@@ -169,6 +172,7 @@ impl StationIntegrations {
             // Even a full page or an unsigned nudge cannot exceed 120 polls/min.
             let result = self.portal.poll(&self.policies, reconcile).await;
             if result.is_ok() {
+                self.report_revocations().await;
                 self.report_readiness().await;
             }
             reconcile = matches!(result, Err(PortalError::CursorAhead));

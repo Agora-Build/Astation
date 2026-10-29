@@ -19,6 +19,7 @@ final class IntegrationApprovalViewController: NSViewController {
     private let reviewButton = NSButton(title: "Review Access", target: nil, action: nil)
     private let approveButton = NSButton(title: "Approve on This Mac…", target: nil, action: nil)
     private let reviewAgainButton = NSButton(title: "Review Changed Request", target: nil, action: nil)
+    private let removeButton = NSButton(title: "Remove Revoked Access…", target: nil, action: nil)
     private let setupButton = NSButton(title: "Set Up Account Security…", target: nil, action: nil)
     private let openSecurity: () -> Void
     private let relayOnlyButton = NSButton(title: "Use Selected Relay Only…", target: nil, action: nil)
@@ -63,7 +64,7 @@ final class IntegrationApprovalViewController: NSViewController {
         relayStatus.textColor = .secondaryLabelColor
         let stack = NSStackView(views: [title, intro, relayOnlyButton, relayStatus, actions,
             NSTextField(labelWithString: "Integration request"), picker,
-            setupButton, NSTextField(labelWithString: "Allowed Atem hosts"), hosts, hostStatus, sessions, projects, reviewText, reviewAgainButton, status])
+            setupButton, NSTextField(labelWithString: "Allowed Atem hosts"), hosts, hostStatus, sessions, projects, reviewText, reviewAgainButton, removeButton, status])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 14
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.drawsBackground = false
         let document = NSView(); scroll.documentView = document
@@ -88,6 +89,7 @@ final class IntegrationApprovalViewController: NSViewController {
         reviewButton.target = self; reviewButton.action = #selector(reviewAccess)
         approveButton.target = self; approveButton.action = #selector(approveAccess)
         reviewAgainButton.target = self; reviewAgainButton.action = #selector(reviewAgain)
+        removeButton.target = self; removeButton.action = #selector(removeRevokedAccess)
         relayOnlyButton.target = self; relayOnlyButton.action = #selector(changeRelayPolicy)
         setupButton.target = self; setupButton.action = #selector(setupSecurity)
         policySubscription = hub.$relayOnlyPolicyStatus.sink { [weak self] value in self?.relayStatus.stringValue = value }
@@ -109,6 +111,14 @@ final class IntegrationApprovalViewController: NSViewController {
         picker.isEnabled = !busy && !records.isEmpty && approval == nil
         let pendingSelection = records.indices.contains(picker.indexOfSelectedItem)
             && records[picker.indexOfSelectedItem].state == "awaiting_approval"
+        let revoking = records.indices.contains(picker.indexOfSelectedItem)
+            && ["revoking", "revoked"].contains(records[picker.indexOfSelectedItem].state)
+        let removable = revoking && log.map { log in
+            (try? AstationRecoveryCoordinator.removableService(record: records[picker.indexOfSelectedItem], log: log)) != nil
+                || (try? coordinator?.pendingServiceRemovalID()) == records[picker.indexOfSelectedItem].id
+        } == true
+        removeButton.isHidden = !revoking
+        removeButton.isEnabled = !busy && removable && approval == nil && contextCurrent?() == true
         let canSelectHosts = !busy && pendingSelection && log != nil && approval == nil && contextCurrent?() == true
         let hasSelectedHost = hostButtons.contains { $0.1.state == .on }
         reviewButton.isEnabled = canSelectHosts && pendingSelection && hasSelectedHost
@@ -116,7 +126,7 @@ final class IntegrationApprovalViewController: NSViewController {
             && approval == nil && approvedScope == nil
         hosts.isHidden = missingApprovedScope
         sessions.isHidden = missingApprovedScope; projects.isHidden = missingApprovedScope
-        hostStatus.isHidden = log == nil || approval != nil || (!pendingSelection && !missingApprovedScope)
+        hostStatus.isHidden = revoking || log == nil || approval != nil || (!pendingSelection && !missingApprovedScope)
         hostStatus.stringValue = missingApprovedScope
             ? "The approved scope is not available in this Mac's verified account log. Load requests again to refresh it."
             : hostButtons.isEmpty
@@ -202,9 +212,9 @@ final class IntegrationApprovalViewController: NSViewController {
                         && hub?.accountSignInRequired == false && hub?.stationRelayUrl == origin
                 }
                 self.portal = portal
-                self.records = records.filter { $0.state == "awaiting_approval" || ["provisioning", "waiting_for_host"].contains($0.state) }
+                self.records = records.filter { $0.state == "awaiting_approval" || ["provisioning", "waiting_for_host", "revoking", "revoked"].contains($0.state) }
                 picker.removeAllItems(); picker.addItems(withTitles: self.records.map {
-                    let state = $0.state == "waiting_for_host" ? "approved; verification pending" : $0.state.replacingOccurrences(of: "_", with: " ")
+                    let state = $0.state == "waiting_for_host" ? "approved; activation pending" : $0.state.replacingOccurrences(of: "_", with: " ")
                     return "\($0.name) · \(state)"
                 })
                 for child in hosts.arrangedSubviews { hosts.removeArrangedSubview(child); child.removeFromSuperview() }
@@ -231,7 +241,12 @@ final class IntegrationApprovalViewController: NSViewController {
                     picker.selectItem(at: index)
                     approval = saved; try showReview(saved)
                     status.stringValue = "A saved approval is ready to resume. Its original signature is retained."
-                } else { status.stringValue = selectedRequestGuidance() }
+                } else {
+                    if let id = try coordinator.pendingServiceRemovalID(), let index = self.records.firstIndex(where: { $0.id == id }) {
+                        picker.selectItem(at: index); showSelectedScope()
+                    }
+                    status.stringValue = selectedRequestGuidance()
+                }
                 render()
             } catch { fail(error, epoch: epoch) }
         }
@@ -301,6 +316,32 @@ final class IntegrationApprovalViewController: NSViewController {
         }
     }
 
+    @objc private func removeRevokedAccess() {
+        guard records.indices.contains(picker.indexOfSelectedItem), let coordinator, let portal, let log,
+              let owner = hub.signedInAccount, contextCurrent?() == true else { return }
+        let record = records[picker.indexOfSelectedItem]
+        guard ["revoking", "revoked"].contains(record.state) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Remove revoked integration access?"
+        alert.informativeText = "\(record.name)\nStation: \(record.stationOrigin)\nService: \((try? AstationRecoveryCoordinator.removableService(record: record, log: log)) ?? "Resume saved removal")\nKey: \(record.r9Svc ?? "Unavailable")\n\nThis signs a removal from your verified account device list. It does not change other integrations."
+        alert.addButton(withTitle: "Remove Access"); alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let epoch = generation; render(busy: true)
+        task = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await coordinator.removeRevokedService(record, ownerAccount: owner, portal: portal,
+                    current: { [weak self] in self?.contextCurrent?() == true && !Task.isCancelled })
+                guard epoch == generation else { return }
+                self.log = try await coordinator.serviceMembership()
+                guard epoch == generation else { return }
+                showSelectedScope()
+                status.stringValue = "Service removed from the verified account log. The Station will report revocation completion."
+                render()
+            } catch { fail(error, epoch: epoch) }
+        }
+    }
+
     private func showReview(_ approval: RemoteServiceApproval) throws {
         let value = try RemoteServiceReview(approval: approval)
         showScope(hosts: value.hosts, sessions: value.sessions, projects: value.projects, approved: false)
@@ -365,6 +406,8 @@ final class IntegrationApprovalViewController: NSViewController {
             return "Access is already approved and saved. Hosted execution awaits end-to-end verification."
         case "provisioning":
             return "Access is already approved. The Station is preparing this integration."
+        case "revoking", "revoked":
+            return "Access has been revoked. Remove its service from the verified account log to complete cleanup."
         default:
             return "Choose the allowed hosts, then review access."
         }

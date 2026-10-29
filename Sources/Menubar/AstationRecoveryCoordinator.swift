@@ -43,6 +43,8 @@ final class AstationRecoveryCoordinator {
         var supersededHostPublications: [Data]?
         var serviceApproval: Data?
         var supersededServiceReviews: [Data]?
+        var serviceRemoval: Data?
+        var supersededServiceRemovals: [Data]?
         var backup: Data?
         var restoreKit: String?
         var restore: Data?
@@ -127,7 +129,7 @@ final class AstationRecoveryCoordinator {
         self.now = now
         if let data = try store.read() {
             saved = try PropertyListDecoder().decode(Saved.self, from: data)
-            guard saved.version == 2, saved.accountID == accountID, saved.managerID == managerID else {
+            guard [2, 3].contains(saved.version), saved.accountID == accountID, saved.managerID == managerID else {
                 throw RemoteRecoveryError.invalidCheckpoint
             }
         } else { saved = Saved(accountID: accountID, managerID: managerID) }
@@ -323,7 +325,7 @@ final class AstationRecoveryCoordinator {
 
     func prepareHost(commit: RemotePairingCommit, reveal: RemotePairingReveal, keys: AtemVerifyKeys) async throws -> SignRequest {
         try begin(); defer { busy = false }
-        guard saved.serviceApproval == nil else { throw RemoteRecoveryError.busy }
+        guard saved.serviceApproval == nil, saved.serviceRemoval == nil else { throw RemoteRecoveryError.busy }
         guard let genesis = keys.genesisHash else { throw AtemIdentityError.invalidState }
         let log = try await refreshedLog(genesis: genesis)
         try requireManager(log)
@@ -433,7 +435,8 @@ final class AstationRecoveryCoordinator {
 
     func prepareService(_ approval: RemoteServiceApproval) async throws {
         try begin(); defer { busy = false }
-        guard saved.hostBody == nil, let kit = try currentKit(), kit.genesisHash == approval.genesisHash else {
+        guard saved.hostBody == nil, saved.serviceRemoval == nil,
+              let kit = try currentKit(), kit.genesisHash == approval.genesisHash else {
             throw RemoteRecoveryError.busy
         }
         if let pending = try pendingServiceApproval() {
@@ -527,6 +530,169 @@ final class AstationRecoveryCoordinator {
             throw RemoteRecoveryError.requiresReview
         }
         try persist { $0.publication = nil; $0.serviceApproval = nil }
+        publication = nil
+    }
+
+    private struct ServiceRemoval: Codable, Equatable {
+        let integrationID: String
+        let issuer: String
+        let ownerAccount: String
+        let stationOrigin: String
+        let genesisHash: String
+        let serviceID: String
+        let fingerprint: String
+        let bodyJSON: String
+
+        func checkpoint() throws -> Data {
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+            return try encoder.encode(self)
+        }
+    }
+
+    static func removableService(record: PortalIntegrationRecord, log: MembershipLog) throws -> String? {
+        guard ["revoking", "revoked"].contains(record.state), let fingerprint = record.r9Svc,
+              log.frozen() == nil else { return nil }
+        let matches = try log.members().filter {
+            guard $0.kind == "service", $0.status == .active else { return false }
+            return try RemoteServiceKeyFingerprint.compute($0.authKey) == fingerprint
+        }
+        guard matches.count == 1 else { return nil }
+        return matches[0].deviceId
+    }
+
+    func pendingServiceRemovalID() throws -> String? {
+        guard !uncertain else { throw RemoteRecoveryError.storageUncertain }
+        return try saved.serviceRemoval.map { try JSONDecoder().decode(ServiceRemoval.self, from: $0).integrationID }
+    }
+
+    /// Remove only already-revoked access. Portal never supplies the member ID;
+    /// the signed account log binds the reviewed fingerprint to the exact key.
+    func removeRevokedService(_ record: PortalIntegrationRecord, ownerAccount: String,
+        portal: PortalIntegrationHTTP, current: @escaping () -> Bool) async throws {
+        try begin(); defer { busy = false }
+        guard current(), portal.ownerAccount == ownerAccount,
+              record.stationOrigin == relayURL, ["revoking", "revoked"].contains(record.state),
+              let fingerprint = record.r9Svc, saved.hostBody == nil, saved.serviceApproval == nil,
+              let kit = try currentKit() else { throw RemoteRecoveryError.requiresReview }
+        let records = try await portal.owned(stationOrigin: relayURL)
+        guard current(), let fresh = records.first(where: { $0.id == record.id }),
+              ["revoking", "revoked"].contains(fresh.state), fresh.r9Svc == fingerprint else {
+            throw AccountLoginError.changed
+        }
+        let removal: ServiceRemoval
+        if let data = saved.serviceRemoval {
+            removal = try JSONDecoder().decode(ServiceRemoval.self, from: data)
+            guard removal.integrationID == record.id, removal.issuer == portal.configuration.issuer,
+                  removal.ownerAccount == ownerAccount, removal.stationOrigin == relayURL,
+                  removal.genesisHash == kit.genesisHash, removal.fingerprint == fingerprint,
+                  let checkpoint = saved.publication else { throw RemoteRecoveryError.requiresReview }
+            if publication == nil {
+                publication = try RemoteMembershipPublication(checkpoint: checkpoint, accountID: accountID,
+                    genesisHash: kit.genesisHash, now: now(), persist: { [unowned self] bytes in
+                        try self.persist { $0.publication = bytes }
+                    })
+            }
+        } else {
+            let log = try await refreshedLog(genesis: kit.genesisHash)
+            try requireManager(log)
+            guard current(), let id = try Self.removableService(record: fresh, log: log) else {
+                throw RemoteRecoveryError.requiresReview
+            }
+            let signedAt = now().wallMs
+            let action = String(decoding: try JSONSerialization.data(withJSONObject: ["action": "remove", "device_id": id]), as: UTF8.self)
+            let body = try log.draftEntry(signer: managerID, signedAt: signedAt, actionJson: action)
+            removal = ServiceRemoval(integrationID: record.id, issuer: portal.configuration.issuer,
+                ownerAccount: ownerAccount, stationOrigin: relayURL, genesisHash: kit.genesisHash,
+                serviceID: id, fingerprint: fingerprint, bodyJSON: body)
+            let context = try removal.checkpoint()
+            let candidate = RemoteMembershipPublication(log: log, persist: { [unowned self] bytes in
+                try self.persist { $0.version = 3; $0.publication = bytes; $0.serviceRemoval = context }
+            })
+            guard try candidate.prepare(actionJSON: action, signer: managerID, signedAt: signedAt,
+                operationContext: context) == body else { throw RemoteRecoveryError.requiresReview }
+            publication = candidate
+        }
+        guard let publication, publication.operationContext == (try removal.checkpoint()) else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        let reconciled = try await refreshedLog(genesis: removal.genesisHash)
+        try requireManager(reconciled)
+        guard current(), let member = reconciled.member(deviceId: removal.serviceID), member.kind == "service",
+              try RemoteServiceKeyFingerprint.compute(member.authKey) == removal.fingerprint else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        if member.status == .removed {
+            if try !reconciled.entries().contains(where: { try signedObjectInfo(json: $0).bodyJcs == removal.bodyJSON }) {
+                try archiveSupersededRemoval(removal, latest: reconciled)
+            }
+            try persist { $0.publication = nil; $0.serviceRemoval = nil }
+            self.publication = nil
+            return
+        }
+        guard member.status == .active else { throw RemoteRecoveryError.requiresReview }
+        if publication.requiresRefresh || reconciled.head() != publication.head {
+            try archiveSupersededRemoval(removal, latest: reconciled)
+            throw RemoteRecoveryError.requiresReview
+        }
+        let committed = try publication.committedLog()
+        let stored = try committed.entries().contains { try signedObjectInfo(json: $0).bodyJcs == removal.bodyJSON }
+        if !stored {
+            let append: AppendRequest
+            if let retry = try publication.outstanding() { append = retry }
+            else {
+                let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: removal.bodyJSON, keyID: managerID)
+                guard await confirmOwner(request), current() else { throw RemoteRecoveryError.confirmationRequired }
+                let confirmedAt = Self.clock().monoMs
+                let latest = try await refreshedLog(genesis: removal.genesisHash)
+                try requireManager(latest)
+                guard current(), latest.head() == publication.head,
+                      try Self.removableService(record: fresh, log: latest) == removal.serviceID else {
+                    try archiveSupersededRemoval(removal, latest: latest)
+                    throw RemoteRecoveryError.requiresReview
+                }
+                let signer = try await confirmed(request, at: confirmedAt)
+                guard current() else { signer.invalidate(); throw RemoteChannelError.staleLink }
+                append = try publication.sign(provider: signer, keyID: managerID)
+            }
+            guard current(), try signedObjectInfo(json: append.entryJson).bodyJcs == removal.bodyJSON else {
+                throw RemoteChannelError.staleLink
+            }
+            switch try await http.append(genesisHash: removal.genesisHash, request: append) {
+            case .stored:
+                guard case .committed = try publication.relayStored(now: now()) else { throw RemoteRecoveryError.requiresReview }
+            case .conflict(let page):
+                _ = try publication.relayConflict(head: page.head, entries: page.entries, more: page.more, now: now())
+                let latest = try publication.committedLog()
+                try commitLog(latest)
+                try archiveSupersededRemoval(removal, latest: latest)
+                throw RemoteRecoveryError.requiresReview
+            }
+            try commitLog(publication.committedLog())
+        }
+        guard current() else { throw RemoteChannelError.staleLink }
+        let latest = try await refreshedLog(genesis: removal.genesisHash)
+        try requireManager(latest)
+        guard current(), latest.frozen() == nil,
+              latest.member(deviceId: removal.serviceID)?.status == .removed else { throw RemoteRecoveryError.requiresReview }
+        try persist { $0.publication = nil; $0.serviceRemoval = nil }
+        self.publication = nil
+    }
+
+    private func archiveSupersededRemoval(_ removal: ServiceRemoval, latest: MembershipLog) throws {
+        let body = try JSONSerialization.jsonObject(with: Data(removal.bodyJSON.utf8)) as? [String: Any]
+        guard let sequence = body?["seq"] as? NSNumber, let checkpoint = saved.publication,
+              (saved.supersededServiceRemovals?.count ?? 0) < 16 else { throw RemoteRecoveryError.requiresReview }
+        let replaced = try latest.entries().contains {
+            let info = try signedObjectInfo(json: $0)
+            let fields = try JSONSerialization.jsonObject(with: Data(info.bodyJcs.utf8)) as? [String: Any]
+            return fields?["seq"] as? NSNumber == sequence && info.bodyJcs != removal.bodyJSON
+        }
+        guard replaced else { throw RemoteRecoveryError.requiresReview }
+        let evidence = try PropertyListEncoder().encode(["publication": checkpoint, "removal": removal.checkpoint()])
+        try persist {
+            $0.supersededServiceRemovals = ($0.supersededServiceRemovals ?? []) + [evidence]
+            $0.publication = nil; $0.serviceRemoval = nil
+        }
         publication = nil
     }
 

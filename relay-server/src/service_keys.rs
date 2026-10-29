@@ -260,6 +260,13 @@ pub(crate) async fn load_approved(
     Ok(signer)
 }
 
+pub(crate) async fn forget(pool: &sqlx::PgPool, context: &ServiceKeyContext) -> Result<(), ()> {
+    let binding = String::from_utf8(context.aad()?).map_err(|_| ())?;
+    sqlx::query("DELETE FROM station_service_keys WHERE context=$1")
+        .bind(binding).execute(pool).await.map_err(|_| ())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

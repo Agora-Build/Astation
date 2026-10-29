@@ -9,11 +9,17 @@ private final class RecoveryMemoryCheckpoint: AstationRecoveryCheckpointStorage 
     var bytes: Data?
     var failAfterWrite = false
     var failAtEntryCount: Int?
+    var failOnRemoval = false
     var writes = 0
     func read() throws -> Data? { bytes }
     func write(_ data: Data) throws {
         writes += 1
         bytes = data
+        if failOnRemoval, let saved = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+           saved["serviceRemoval"] != nil {
+            failOnRemoval = false
+            throw RemoteRecoveryError.storageUncertain
+        }
         if let count = failAtEntryCount,
            let saved = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
            (saved["entries"] as? [String])?.count == count {
@@ -127,6 +133,12 @@ private actor ServiceApprovalPortal: AccountOIDCHTTP {
     var fingerprint: String?
     var posts = 0
     var loseReply = false
+    var expired = false
+    func revoke(expired: Bool = false, fingerprint: String? = nil) {
+        state = "revoking"; self.expired = expired
+        if let fingerprint { self.fingerprint = fingerprint }
+    }
+    func setState(_ value: String) { state = value }
     func dropNextReply() { loseReply = true }
     func count() -> Int { posts }
     func send(_ request: URLRequest) async throws -> (Data, Int) {
@@ -137,7 +149,7 @@ private actor ServiceApprovalPortal: AccountOIDCHTTP {
             if loseReply { loseReply = false; throw AccountLoginError.unavailable }
         }
         var record: [String: Any] = ["id": "i-01234567890123456789012345", "name": "Test bot", "stationOrigin": "https://configured.example",
-            "state": state, "scopes": ["agent.prompt", "agent.view"], "expiresAt": ISO8601DateFormatter().string(from: Date().addingTimeInterval(3600)), "role": "owner"]
+            "state": state, "scopes": ["agent.prompt", "agent.view"], "expiresAt": ISO8601DateFormatter().string(from: Date().addingTimeInterval(expired ? -3600 : 3600)), "role": "owner"]
         if let fingerprint { record["r9Svc"] = fingerprint }
         return (try JSONSerialization.data(withJSONObject: request.httpMethod == "POST" ? record : ["stale": false, "integrations": [record]]), 200)
     }
@@ -466,6 +478,181 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         _ = try await coordinator.serviceMembership()
         XCTAssertEqual(heads.count, 1, "Unchanged refreshes must not replace channels again")
         coordinator.onMembershipCommit = nil
+    }
+
+    private func revokedService(_ coordinator: AstationRecoveryCoordinator, transport: ServiceApprovalPortal,
+                                expired: Bool = false) async throws -> PortalIntegrationRecord {
+        _ = try await coordinator.setup()
+        let approval = try await service(coordinator)
+        try await coordinator.prepareService(approval)
+        try await coordinator.approveService(approval, portal: portal(transport), current: { true })
+        await transport.revoke(expired: expired)
+        let records = try await portal(transport).owned(stationOrigin: "https://configured.example")
+        return try XCTUnwrap(records.first)
+    }
+
+    func testRevokedServiceRemovalPersistsAndNotifiesWithoutChangingOtherAccess() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        let record = try await revokedService(coordinator, transport: transport, expired: true)
+        let before = try await coordinator.serviceMembership()
+        let host = before.host(hostId: "host-a")
+        var notified = false
+        coordinator.onMembershipCommit = { head in
+            let entries = (try? self.checkpoint(h.store)["entries"] as? [String]) ?? []
+            notified = head.seq == before.head().seq + 1 && entries.count == Int(head.seq)
+        }
+        XCTAssertEqual(try AstationRecoveryCoordinator.removableService(record: record, log: before), "service-test")
+        try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345",
+            portal: portal(transport), current: { true })
+        let after = try await coordinator.serviceMembership()
+        XCTAssertEqual(after.member(deviceId: "service-test")?.status, .removed)
+        XCTAssertEqual(after.host(hostId: "host-a"), host)
+        XCTAssertEqual(after.member(deviceId: "manager-a")?.roles, before.member(deviceId: "manager-a")?.roles)
+        XCTAssertNil(try coordinator.pendingServiceRemovalID())
+        XCTAssertEqual(try checkpoint(h.store)["version"] as? Int, 3, "older readers must reject an account with removal state")
+        XCTAssertTrue(notified)
+        XCTAssertEqual(h.ownerRequests.last?.purpose, .remove)
+        XCTAssertNil(try AstationRecoveryCoordinator.removableService(record: record, log: after))
+    }
+
+    func testRemovalLostReplyResumesExactSignatureWithoutAnotherOwnerPrompt() async throws {
+        let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        let record = try await revokedService(coordinator!, transport: transport)
+        await h.relay.dropNextAppendReply()
+        do {
+            try await coordinator!.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+            XCTFail("lost relay reply")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .unavailable) }
+        let first = await h.relay.appends.last, confirmations = h.ownerRequests.count
+        XCTAssertEqual(try coordinator!.pendingServiceRemovalID(), record.id)
+        coordinator = nil; coordinator = try h.coordinator()
+        try await coordinator!.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+        let retry = await h.relay.appends.last
+        XCTAssertEqual(first, retry)
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        XCTAssertNil(try coordinator!.pendingServiceRemovalID())
+        let log = try await coordinator!.serviceMembership()
+        XCTAssertEqual(log.member(deviceId: "service-test")?.status, .removed)
+    }
+
+    func testRemovalAccountChangeOrDeclinedOwnerSendsNoEntry() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        let record = try await revokedService(coordinator, transport: transport)
+        let count = await h.relay.appends.count
+        var current = true
+        h.ownerConfirmation = { _ in current = false; return true }
+        do {
+            try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { current })
+            XCTFail("stale account")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .confirmationRequired) }
+        current = true; h.ownerConfirmation = { _ in false }
+        do {
+            try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { current })
+            XCTFail("declined owner")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .confirmationRequired) }
+        let after = await h.relay.appends.count
+        XCTAssertEqual(after, count)
+    }
+
+    func testRemovalRejectsActiveGrantAndChangedFingerprint() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        let record = try await revokedService(coordinator, transport: transport)
+        await transport.revoke(fingerprint: String(repeating: "f", count: 64))
+        let count = h.ownerRequests.count
+        do {
+            try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+            XCTFail("changed key")
+        } catch { XCTAssertEqual(error as? AccountLoginError, .changed) }
+        let records = try await portal(transport).owned(stationOrigin: "https://configured.example")
+        let log = try await coordinator.serviceMembership()
+        XCTAssertNil(try AstationRecoveryCoordinator.removableService(record: XCTUnwrap(records.first), log: log))
+        await transport.setState("provisioning")
+        let activeRecords = try await portal(transport).owned(stationOrigin: "https://configured.example")
+        do {
+            try await coordinator.removeRevokedService(XCTUnwrap(activeRecords.first), ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+            XCTFail("an active grant needs Portal revocation first")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        XCTAssertEqual(h.ownerRequests.count, count)
+    }
+
+    func testRemovalUncertainPreparedCheckpointCannotSendUntilReloaded() async throws {
+        let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        let record = try await revokedService(coordinator!, transport: transport)
+        let count = await h.relay.appends.count
+        h.store.failOnRemoval = true
+        do {
+            try await coordinator!.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+            XCTFail("uncertain durable store")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .storageUncertain) }
+        let after = await h.relay.appends.count
+        XCTAssertEqual(after, count)
+        XCTAssertThrowsError(try coordinator!.pendingServiceRemovalID())
+        coordinator = nil; coordinator = try h.coordinator()
+        try await coordinator!.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+        let log = try await coordinator!.serviceMembership()
+        XCTAssertEqual(log.member(deviceId: "service-test")?.status, .removed)
+    }
+
+    func testRemovalCompetingHeadRetainsEvidenceAndRequiresFreshConfirmation() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        let record = try await revokedService(coordinator, transport: transport)
+        let manager = try await addSecondManager(harness: h)
+        h.ownerConfirmation = { _ in
+            try await self.append(["action": "add_host", "host": ["host_id": "other-host", "host_trust_gen": 1,
+                "host_key": ["alg": "ed25519", "pub": recoveryTestBase64(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)]]],
+                harness: h, signer: "manager-b", identity: manager)
+            return true
+        }
+        do {
+            try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+            XCTFail("head changed during confirmation")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        XCTAssertNil(try coordinator.pendingServiceRemovalID())
+        XCTAssertEqual((try checkpoint(h.store)["supersededServiceRemovals"] as? [Data])?.count, 1)
+        let confirmations = h.ownerRequests.count
+        h.ownerConfirmation = nil
+        try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+        XCTAssertEqual(h.ownerRequests.count, confirmations + 1)
+    }
+
+    func testRemovalAcceptedBeforeUncertainCommitResumesWithoutAnotherAppend() async throws {
+        let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        let record = try await revokedService(coordinator!, transport: transport)
+        let before = try await coordinator!.serviceMembership()
+        h.store.failAtEntryCount = Int(before.head().seq + 1)
+        do {
+            try await coordinator!.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+            XCTFail("uncertain committed checkpoint")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .storageUncertain) }
+        let count = await h.relay.appends.count, confirmations = h.ownerRequests.count
+        coordinator = nil; coordinator = try h.coordinator()
+        try await coordinator!.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+        let after = await h.relay.appends.count
+        XCTAssertEqual(after, count)
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        XCTAssertNil(try coordinator!.pendingServiceRemovalID())
+    }
+
+    func testRemovalManagerRevokedDuringConfirmationCannotSignOrSend() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        let record = try await revokedService(coordinator, transport: transport)
+        let manager = try await addSecondManager(harness: h)
+        h.ownerConfirmation = { _ in
+            try await self.append(["action": "remove", "device_id": "manager-a"], harness: h,
+                signer: "manager-b", identity: manager)
+            return true
+        }
+        do {
+            try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+            XCTFail("removed manager")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        let log = await h.relay.log
+        XCTAssertEqual(log?.member(deviceId: "manager-a")?.status, .removed)
+        XCTAssertEqual(log?.member(deviceId: "service-test")?.status, .active)
+        h.ownerConfirmation = nil
     }
 
     func testServiceApprovalResumesAfterLostPortalReplyWithoutResigningOrReposting() async throws {

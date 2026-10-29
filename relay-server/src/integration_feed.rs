@@ -228,7 +228,7 @@ impl PolicyCheckpoint {
         Ok(next)
     }
 
-    pub fn current(&self, id: &str, owner: &str, now: i64) -> Result<&IntegrationPolicy, ()> {
+    fn owned(&self, id: &str, owner: &str, now: i64) -> Result<&IntegrationPolicy, ()> {
         if self.denied
             || self.revision == 0
             || now < self.received_at
@@ -238,9 +238,23 @@ impl PolicyCheckpoint {
         }
         let policy = self.integrations.get(id).ok_or(())?;
         policy.validate()?;
-        if policy.owner_account != owner || now >= policy.expires_at()? {
+        if policy.owner_account != owner {
             return Err(());
         }
+        Ok(policy)
+    }
+
+    pub fn current(&self, id: &str, owner: &str, now: i64) -> Result<&IntegrationPolicy, ()> {
+        let policy = self.owned(id, owner, now)?;
+        if now >= policy.expires_at()? { return Err(()); }
+        Ok(policy)
+    }
+
+    /// Cleanup needs fresh authenticated policy, including after grant expiry.
+    /// This does not authorize execution or signing a membership removal.
+    pub fn revoking(&self, id: &str, owner: &str, now: i64) -> Result<&IntegrationPolicy, ()> {
+        let policy = self.owned(id, owner, now)?;
+        if policy.state != "revoking" { return Err(()); }
         Ok(policy)
     }
 }
@@ -370,6 +384,22 @@ mod tests {
             "kind":"future_kind","state":"ready","integration":policy(state)}],"cursor":id}))
         .unwrap()
     }
+    #[test]
+    fn revocation_cleanup_requires_fresh_owner_policy_but_not_unexpired_execution() {
+        let mut saved = PolicyCheckpoint::empty(binding()).unwrap().apply(0, initial(), 100).unwrap();
+        assert!(saved.revoking(ID, OWNER, 100).is_err());
+        let policy = saved.integrations.get_mut(ID).unwrap();
+        policy.state = "revoking".into();
+        policy.expires_at = "1970-01-01T00:00:01Z".into();
+        assert!(saved.current(ID, OWNER, 100).is_err());
+        assert!(saved.revoking(ID, OWNER, 100).is_ok());
+        assert!(saved.revoking(ID, OWNER, 99).is_err());
+        assert!(saved.revoking(ID, OWNER, 220).is_err());
+        assert!(saved.revoking(ID, "ab11234567890123456789012345", 100).is_err());
+        saved.denied = true;
+        assert!(saved.revoking(ID, OWNER, 100).is_err());
+    }
+
     #[test]
     fn current_snapshots_override_historical_events_and_global_id_gaps_are_valid() {
         let saved = PolicyCheckpoint::empty(binding())

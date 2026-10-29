@@ -305,3 +305,49 @@ not establish this service pipeline.
 Hosted execution remains hard disabled without an override. No production
 trust reset, credential-agent restart, Atem checkout edit/build or production
 merge/deploy is part of this verification.
+
+### Revoked service cleanup
+
+Auth/Portal revocation denies new execution before native membership cleanup.
+A native manager can then remove an integration already marked `revoking` or
+`revoked` by the authenticated Portal. Resolve its exact service fingerprint
+against the independently anchored signed membership, show the integration,
+Station, service ID and key, and require owner confirmation of the existing R9
+`remove` body. Expired grants remain removable; expiry never authorizes a new
+grant. Portal metadata cannot supply a different member ID or signing key.
+
+Persist the removal context, prepared body and signature in the same protected
+account checkpoint used for enrollment. A lost reply or restart reuses the
+exact signed entry. Preparing the first removal upgrades that checkpoint to
+version 3 so older native readers fail closed instead of overwriting a saved
+removal. Existing version-2 accounts remain readable. Account/Station changes, a changed fingerprint, manager
+removal and uncertain storage fence the operation. A competing signed entry
+requires review; retain the losing publication as evidence before replacing
+it. Only a durable independently verified head change notifies active channels.
+
+Station reports `revoked` only for a fresh, non-denied authenticated `revoking`
+policy whose owner, provisioning context and service fingerprint agree with a
+verified membership showing that exact service as removed. Missing membership,
+an expired-but-present service, or Portal state alone is insufficient. Delete
+the corresponding sealed service key durably before reporting completion.
+Retries and replicas may repeat the idempotent report; they never manufacture
+a membership signature or replacement key. Cleanup remains available while
+hosted execution is disabled and after the integration expiry. No live trust
+edit is performed without the native owner's actual confirmation.
+
+Implementation verification on 2026-10-29: the native Integrations screen loads
+revoking/revoked records and offers **Remove Revoked Access** for a matching
+verified service or saved removal. Its action uses the existing coordinator,
+publisher and owner-confirmed signer. Station's bounded background worker
+verifies removal and deletes only that service's sealed key before reporting.
+
+The full provisioned native suite passes **1,100 tests, eight optional skips**;
+the shared library passes **148 tests, one optional skip**; the regular relay
+suite passes **550 tests**. Six separately executed isolated Postgres cases
+include signed-removal enforcement, issuer/owner binding, expired-policy
+cleanup, failed key deletion, failed-report retry and refusal to regenerate a
+revoked key. Native regressions cover eight removal lifecycle cases, including
+lost replies, uncertain storage, changed context/key, manager revocation and
+competing signed heads. No failures occur. These are implementation tests;
+the actual old service still needs an owner-confirmed removal on the live
+account. The hosted execution gate remains closed.

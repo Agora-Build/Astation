@@ -327,6 +327,9 @@ pub(crate) mod tests {
         }
     }
     impl Fixture {
+        pub fn set_status(&self, status: usize) {
+            self.shared.status.store(status, Ordering::SeqCst);
+        }
         pub async fn new() -> Self {
             let bytes = signature::EcdsaKeyPair::generate_pkcs8(
                 &signature::ECDSA_P256_SHA256_FIXED_SIGNING,
