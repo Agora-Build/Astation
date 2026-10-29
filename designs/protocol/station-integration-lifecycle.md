@@ -234,7 +234,10 @@ Latest native pairing checks:
   live log shows successful authentication leaving Astation inactive. The
   adapter now explicitly restores its originating visible window and requests
   activation after a successful, current confirmation, before the bounded
-  wait. Denied or fenced contexts cannot request focus. The library's
+  wait. Capture the visible presenting/main window rather than a just-dismissed
+  modal Apply alert, which may temporarily remain key. Dismissing that alert
+  must not prevent focus restoration; actually closing the captured window
+  still prevents its restoration. Denied or fenced contexts cannot request focus. The library's
   148 tests pass, with one optional skip. At 22:26:49 UTC the user's retry on
   `34efe40` succeeded: native R9 admission delivered the real Codex registry
   entry `ses-i5py5pldao4d`, matching Atem's disposable-host handoff. Native

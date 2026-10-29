@@ -37,7 +37,7 @@ final class AstationChannelSigner {
                 try await Self.waitForForeground(active: foreground)
             },
             confirm: {
-                authenticationWindow = NSApp?.keyWindow ?? NSApp?.mainWindow
+                authenticationWindow = Self.presentationWindow(keyWindow: NSApp?.keyWindow, mainWindow: NSApp?.mainWindow)
                 hadAuthenticationWindow = authenticationWindow != nil
                 Log.info("[R9] Requesting owner authentication; foreground=\(foreground())")
                 let approved = await authenticate()
@@ -67,6 +67,11 @@ final class AstationChannelSigner {
     }
 
     func invalidate() { routine.invalidate() }
+
+    static func presentationWindow(keyWindow: NSWindow?, mainWindow: NSWindow?) -> NSWindow? {
+        // A dismissed modal alert can remain key while its Settings window stays visible.
+        [keyWindow?.sheetParent, mainWindow, keyWindow].compactMap { $0 }.first { $0.isVisible }
+    }
 
     /// AppKit may restore activation after the system authentication callback.
     /// No channel traffic starts during this bounded, cancellable wait.

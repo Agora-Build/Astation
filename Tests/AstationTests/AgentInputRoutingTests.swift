@@ -103,7 +103,8 @@ private final class ScopedInputFixture {
                 expectedSigningKey: keys.signPub, key: nil)
         }
         hub = AstationHubManager(skipProjectLoad: true, deviceSessionStore: sessions,
-            sessionStore: SsoSessionStore(storageURL: directory.appendingPathComponent("sso.enc")), atemE2EIdentity: identity)
+            sessionStore: SsoSessionStore(storageURL: directory.appendingPathComponent("sso.enc")),
+            atemE2EIdentity: identity, sessionJournal: AtemSessionJournal())
         hub.connectedClients = ["direct-one", "direct-two"].map { clientId in
             let session = sessions.create(hostname: "Host", atemId: "host")
             return ConnectedClient(id: clientId, clientType: "Atem", connectedAt: Date(),
