@@ -144,6 +144,11 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
     let evidence_path = PathBuf::from(required("LIVE_HOSTED_EVIDENCE_FILE"));
     let recovering = std::env::var("LIVE_HOSTED_RECOVER").as_deref() == Ok("receipts");
     let without_native = std::env::var("LIVE_HOSTED_WITHOUT_NATIVE").as_deref() == Ok("yes");
+    let existing_cluster = std::env::var("LIVE_HOSTED_EXISTING_CLUSTER").as_deref() == Ok("yes");
+    assert!(
+        !(existing_cluster && without_native),
+        "existing-cluster mode does not install the native-connection refusal middleware"
+    );
     // A rerun must query the saved receipt instead of replaying a lost submit.
     assert!(
         recovering || !evidence_path.exists(),
@@ -159,8 +164,26 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
         .connect(&required("DATABASE_URL"))
         .await
         .expect("dedicated Station database");
-    let relay = crate::relay::RelayHub::new();
     let identity = Arc::new(crate::identity_store::PgIdentityStore::new(pool.clone()));
+    // Join as a socket-free observer to force service traffic over the replica bus.
+    // Existing host/native sockets and the deployed HTTP router remain untouched.
+    let cluster = if existing_cluster {
+        Some(
+            crate::cluster::redis::connect_cluster(
+                &required("REDIS_URL"),
+                identity.clone(),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("existing isolated Redis cluster"),
+        )
+    } else {
+        None
+    };
+    let relay = cluster
+        .as_ref()
+        .map(|cluster| cluster.relay.clone())
+        .unwrap_or_else(crate::relay::RelayHub::new);
     relay
         .load_keys(identity.as_ref())
         .await
@@ -185,35 +208,40 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
         .expect("protected Station configuration")
         .expect("configured Station");
     let port: u16 = required("PORT").parse().expect("isolated Station port");
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-        .await
-        .expect("exclusive isolated Station port");
-    let mut router = crate::router(state);
-    if without_native {
-        router = router.layer(axum::middleware::from_fn(
-            |request: axum::extract::Request, next: axum::middleware::Next| async move {
-                let native = request.uri().path() == "/ws"
-                    && request.uri().query().is_some_and(|query| {
-                        url::form_urlencoded::parse(query.as_bytes())
-                            .any(|(key, value)| key == "role" && value == "astation")
-                    });
-                if native {
-                    return axum::response::IntoResponse::into_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                    );
-                }
-                next.run(request).await
-            },
-        ));
-    }
-    let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
-        .expect("isolated Station listener")
-    });
+    let server = if existing_cluster {
+        println!("LIVE: observing existing isolated cluster; no listener or host restart");
+        None
+    } else {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("exclusive isolated Station port");
+        let mut router = crate::router(state);
+        if without_native {
+            router = router.layer(axum::middleware::from_fn(
+                |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                    let native = request.uri().path() == "/ws"
+                        && request.uri().query().is_some_and(|query| {
+                            url::form_urlencoded::parse(query.as_bytes())
+                                .any(|(key, value)| key == "role" && value == "astation")
+                        });
+                    if native {
+                        return axum::response::IntoResponse::into_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                        );
+                    }
+                    next.run(request).await
+                },
+            ));
+        }
+        Some(tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("isolated Station listener")
+        }))
+    };
 
     let public = reqwest::Client::new()
         .get(format!(
@@ -441,5 +469,12 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
         println!("LIVE: completed prompt and recovered response with native clients unavailable");
     }
     println!("LIVE: protected service smoke passed; public release gate still closed");
-    server.abort();
+    if let Some(server) = server {
+        server.abort();
+    }
+    if let Some(cluster) = cluster {
+        cluster.relay.drain(Duration::from_secs(1)).await;
+        cluster.abort();
+        println!("LIVE: service round trip crossed the existing replica bus; observer withdrawn");
+    }
 }

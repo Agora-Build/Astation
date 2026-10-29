@@ -189,6 +189,7 @@ Supply the Station's normal protected configuration and these test inputs:
 | `LIVE_HOSTED_EVIDENCE_FILE` | File in an operator-private directory; new for a submission, existing for receipt recovery. |
 | `LIVE_HOSTED_RECOVER` | Optional `receipts`: query the saved request only; never submit a prompt. |
 | `LIVE_HOSTED_WITHOUT_NATIVE` | Optional `yes`: refuse native identity-room WebSocket connections and assert no Astation room owner before and after execution. |
+| `LIVE_HOSTED_EXISTING_CLUSTER` | Optional `yes`: join an already running, isolated Redis-backed Station as a socket-free observer. Requires its protected `REDIS_URL` and database/key configuration. Do not combine with `LIVE_HOSTED_WITHOUT_NATIVE`. |
 
 Run only that ignored test, with `--exact --ignored --nocapture`. It verifies
 the real token's issuer, Station audience, client, owner, operation and service
@@ -222,6 +223,17 @@ strings may correctly be removed by Atem's secret filter; a scrubbed marker
 does not prove execution failed. Preserve the filter and inspect the durable
 receipt and protected correlated history instead of replaying the request.
 
+Existing-cluster mode leaves the deployed listeners and all host/native
+sockets running. It joins the existing Redis directory and bus, loads the
+same protected approved signer, and executes the same prompt/disconnect/
+receipt/history checks. Because this observer owns no host socket, its
+encrypted service traffic must cross the replica bus. `PORT` selects an
+existing replica or private proxy for the closed-public-route assertion;
+the test never binds that port. The observer drains and withdraws on success.
+Run this on the independent Station server to remove the Mac-hosted relay
+dependency. It does not block native connections, prove physical Mac shutdown,
+or replace actual public HTTP admission tests. Public execution stays gated.
+
 This is real Auth/key/channel/agent/disconnect evidence, separate from the
 controlled-host HTTP adapter tests. It does not by itself verify public HTTP
 admission, actual approvals, durable relay-only policy, revocation, the Mac-off
@@ -234,3 +246,13 @@ Each recovered its own completed request and matching assistant response after
 disconnect, without resubmitting. The isolated Station was restored healthy
 after each run and public hosted routes remained closed. Full evidence and
 the remaining gates are tracked in [Atem #81](https://github.com/Agora-Build/Atem/issues/81).
+
+An additional existing-cluster run passed on Volumetric in 4.27 seconds after
+moving the registered dev origin off the Mac. It used the same approved keys
+and membership, two running Station replicas and password-protected Redis.
+The socket-free observer authenticated a real service channel, sent a harmless
+Codex prompt, disconnected and recovered its completed receipt and matching
+assistant response across the replica bus. The observer then withdrew; the
+host, agent and deployed listeners were not restarted. The old Mac listener
+and tunnel were stopped throughout. Native absence, real approval operations,
+durable relay-only policy and public HTTP admission remain separate checks.

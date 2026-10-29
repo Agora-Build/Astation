@@ -1178,6 +1178,27 @@ pg_restore --clean --if-exists --dbname="$DATABASE_URL" station-YYYY-MM-DD.dump
 
 ## Custom Station Integrations
 
+The production relay already runs independently of the Mac on Volumetric.
+Use `mosh Volumetric` for interactive administration, or the same saved SSH
+alias for automation. Its Cloudflare route is `http://10.0.0.1:3010`; the
+webapp on that port proxies to the two Coolify relays. Check that origin and
+each replica before treating a public failure as a relay outage. Cloudflare
+may return error 1010 for Python's default User-Agent; use the actual native
+client or a normal `curl` request to distinguish that from the hosted API's
+`hosted_execution_not_verified` response.
+
+Keep a development integration on a separate registered origin and isolated
+database/Redis resources, even when using the same server. Moving its backend
+off the Mac must preserve that exact origin, the complete durable database,
+and its report/wrapping keys. Take a fresh snapshot after stopping the old
+listener, restore it into the isolated destination, verify both replicas,
+then move the tunnel with a saved rollback command. Retain the source
+database. Hosts reprove their routes after reconnecting; do not regenerate
+keys, re-pair, or transfer an approval to a different origin. Native R9
+connections may require a fresh foreground owner confirmation after the
+transport changes. Already approved service access remains independent of
+that native connection.
+
 The provisioning endpoints and authenticated feed worker require durable
 Postgres. The public `station.agora.build` relay does not host integration
 execution. Configure a registered **custom** HTTPS origin, exactly matching
