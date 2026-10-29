@@ -89,8 +89,18 @@ for both consumers, and closing the old channel on membership refresh.
 Restoring the separate policy path makes the regression fail. Exact account,
 host, pairing, route and transport-generation changes prevent channel sharing.
 The full provisioned suite passes 1,109 tests, with eight optional skips and
-no failures. These checks do not claim a live durable policy acknowledgment;
-that still requires the corrected native build against the actual host.
+no failures.
+
+Live validation then passed at 2026-10-29 05:33:22 UTC with provisioned native
+source `dcd65848acb30b2fef730e35ce322ba09733ae5f` and actual host source
+`a2cc6711117b79a73298c27baee337e25f9d87af`. After real user owner confirmation,
+one native channel welcomed with local and host membership seq7. The exact
+host/trust-generation-2 relay-only checkpoint is durably saved as completed
+in the native journal. This closes the live policy-acknowledgment gate; it
+does not enable hosted execution or replace the remaining API, approval,
+revocation and availability checks. No new pairing or integration approval
+was needed. The registered dev Station remains on the independent Volumetric
+server with two replicas.
 
 Source was read through GitHub at the immutable commit; selected Git blobs
 were hash-verified. Atem reports eight actual-runtime scenarios / 114 checks
