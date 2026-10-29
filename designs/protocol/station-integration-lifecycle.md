@@ -298,10 +298,14 @@ policy/token/service-key bindings keep the external owner. Thirteen account
 tests, five isolated provisioning tests and three isolated hosted API tests
 pass, including different owner/principal namespaces and wrong-issuer denial.
 The hosted API tests use a controlled encrypted host, not a real coding agent.
-Next verify actual protected service token/channel execution and approvals,
-host policy durability, old-service removal, revocation/reconnect, Mac-off and
-replica behavior. Native discovery and Atem's reported real model replies do
-not establish this service pipeline.
+Actual protected service token/channel execution now passes against the joint
+Atem build `a2cc6711117b79a73298c27baee337e25f9d87af`, including an immediate
+disconnect and recovery of the completed receipt and correlated Codex response.
+A second run passes with the native identity link unavailable; physical
+Mac-off remains separate. Owner-confirmed old-service cleanup also passes as
+recorded below. Remaining checks include actual service approval/rule operations,
+host policy durability, revocation/reconnect, public HTTP admission, Mac-off and
+replica behavior.
 Hosted execution remains hard disabled without an override. No production
 trust reset, credential-agent restart, Atem checkout edit/build or production
 merge/deploy is part of this verification.
@@ -324,6 +328,13 @@ removal. Existing version-2 accounts remain readable. Account/Station changes, a
 removal and uncertain storage fence the operation. A competing signed entry
 requires review; retain the losing publication as evidence before replacing
 it. Only a durable independently verified head change notifies active channels.
+The notification captures channel membership synchronously after the account
+operation releases its lock, before the UI starts a follow-up account refresh.
+Owner authentication and the encrypted handshake remain asynchronous. Deferring
+the membership read to a queued task can race that refresh's lock and leave the
+session failed until manual retry. A replacement requires a new authenticated
+welcome, drops old control leases and queries uncertain receipts without
+resubmitting work.
 
 Station reports `revoked` only for a fresh, non-denied authenticated `revoking`
 policy whose owner, provisioning context and service fingerprint agree with a
@@ -341,13 +352,22 @@ verified service or saved removal. Its action uses the existing coordinator,
 publisher and owner-confirmed signer. Station's bounded background worker
 verifies removal and deletes only that service's sealed key before reporting.
 
-The full provisioned native suite passes **1,100 tests, eight optional skips**;
+The full provisioned native suite passes **1,102 tests, eight optional skips**;
 the shared library passes **148 tests, one optional skip**; the regular relay
 suite passes **550 tests**. Six separately executed isolated Postgres cases
 include signed-removal enforcement, issuer/owner binding, expired-policy
 cleanup, failed key deletion, failed-report retry and refusal to regenerate a
 revoked key. Native regressions cover eight removal lifecycle cases, including
 lost replies, uncertain storage, changed context/key, manager revocation and
-competing signed heads. No failures occur. These are implementation tests;
-the actual old service still needs an owner-confirmed removal on the live
-account. The hosted execution gate remains closed.
+competing signed heads. No failures occur.
+
+Live cleanup passes on 2026-10-29 after the user confirms **Remove Revoked
+Access**. The verified log advances from sequence 6 to 7 with removal of
+`svc-i-01m5znm96jfztp4nx95v8wg7b2`. Its sealed key is absent, the current
+integration's key is retained and the authenticated feed records `revoked`
+at cursor 9. Native and host accept the sequence-7 head. The initial build
+requires manual session retry because of the channel-open/account-refresh
+race described above; automatic recovery is covered separately by the native
+regressions. Completion text requires the exact fingerprint in verified removed
+membership; Portal state alone never establishes cleanup. The hosted execution
+gate remains closed.

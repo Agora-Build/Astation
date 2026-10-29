@@ -560,6 +560,23 @@ final class AstationRecoveryCoordinator {
         return matches[0].deviceId
     }
 
+    static func serviceRemovalComplete(record: PortalIntegrationRecord, log: MembershipLog) throws -> Bool {
+        guard ["revoking", "revoked"].contains(record.state), let fingerprint = record.r9Svc,
+              log.frozen() == nil else { return false }
+        // The core's members() lists active members; removed keys remain in the signed history.
+        let ids = try log.entries().compactMap { entry -> String? in
+            let body = try JSONSerialization.jsonObject(with: Data(signedObjectInfo(json: entry).bodyJcs.utf8)) as? [String: Any]
+            guard body?["action"] as? String == "add", let member = body?["member"] as? [String: Any],
+                  member["kind"] as? String == "service" else { return nil }
+            return member["device_id"] as? String
+        }
+        let matches = try Set(ids).compactMap { log.member(deviceId: $0) }.filter {
+            guard $0.kind == "service" else { return false }
+            return try RemoteServiceKeyFingerprint.compute($0.authKey) == fingerprint
+        }
+        return matches.count == 1 && matches[0].status == .removed
+    }
+
     func pendingServiceRemovalID() throws -> String? {
         guard !uncertain else { throw RemoteRecoveryError.storageUncertain }
         return try saved.serviceRemoval.map { try JSONDecoder().decode(ServiceRemoval.self, from: $0).integrationID }

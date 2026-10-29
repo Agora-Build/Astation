@@ -489,6 +489,20 @@ final class RemoteTerminalHubTests: XCTestCase {
         XCTAssertNil(client.welcome)
     }
 
+    func testMembershipRefreshCapturesAccountStateBeforeReturningToTheCaller() async throws {
+        let f = try TerminalHubFixture()
+        try await f.start(); try await f.authenticate()
+        let client = try XCTUnwrap(f.hub.sessionClient(for: f.clientId))
+        let context = try XCTUnwrap(client.context)
+        f.hub.refreshNativeSessionMembership(context)
+        // This fixture has no account membership. Its read must finish inline,
+        // rather than racing the next account operation in a deferred Task.
+        XCTAssertEqual(client.phase, .failed)
+        XCTAssertTrue(client.status.contains("account membership is unavailable"))
+        XCTAssertTrue(f.sessionFrames.isEmpty)
+        XCTAssertEqual(f.sockets.identity.count, 1, "Membership refresh must not replace the relay socket")
+    }
+
     func testRemovedCommandsReturnUnsupportedVersionAndConsoleNeverSends() async throws {
         let f = try TerminalHubFixture()
         try await f.start(); try await f.authenticate()

@@ -184,7 +184,8 @@ final class AtemSessionClient {
         if unsupported { failUnsupportedVersion() } else { fail(text); changed() }
     }
 
-    func channelMembershipRefreshed(context refreshed: AtemSessionContext) {
+    func channelMembershipRefreshed(context refreshed: AtemSessionContext,
+                                   reopenChannel: ((AtemSessionContext) -> Void)? = nil) {
         guard [.connecting, .ready, .failed].contains(phase),
               context == refreshed, refreshed == currentContext(), !journal.loadFailed else { return }
         closeChannel(refreshed)
@@ -193,7 +194,7 @@ final class AtemSessionClient {
         phase = .connecting
         status = "Account membership changed; opening a fresh encrypted r9 channel..."
         connectingSince = now()
-        openChannel(refreshed)
+        (reopenChannel ?? openChannel)(refreshed)
         changed()
     }
 

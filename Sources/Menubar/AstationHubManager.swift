@@ -267,7 +267,8 @@ class AstationHubManager: ObservableObject {
         for (id, link) in Array(r9Connections) where link.membershipHead != head {
             guard link.context.account == e2eDataAccount,
                   sessionContext(for: id) == link.context else { continue }
-            nativeSessionClients[id]?.channelMembershipRefreshed(context: link.context)
+            Log.info("[R9] Refreshing native channel to \(link.context.device) for committed membership seq \(head.seq)")
+            refreshNativeSessionMembership(link.context)
         }
         for (id, link) in Array(policyR9Connections) where link.membershipHead != head {
             guard link.context.account == e2eDataAccount,
@@ -1869,6 +1870,15 @@ class AstationHubManager: ObservableObject {
         }
     }
 
+    @MainActor func refreshNativeSessionMembership(_ context: AtemSessionContext) {
+        guard sessionContext(for: context.route.clientId) == context else { return }
+        // Capture the committed head before the UI can start another account operation.
+        nativeSessionClients[context.route.clientId]?.channelMembershipRefreshed(context: context,
+            reopenChannel: { [weak self] context in
+                MainActor.assumeIsolated { self?.openR9Channel(context) }
+            })
+    }
+
     @MainActor private func refreshR9Membership(_ context: AtemSessionContext, requiredHead: LogHead) {
         guard let previous = r9Connections[context.route.clientId] else { return }
         Task { @MainActor [weak self] in
@@ -1878,7 +1888,7 @@ class AstationHubManager: ObservableObject {
                     .refreshChannelMembership(hostID: context.device, requiredHead: requiredHead)
                 guard self.sessionContext(for: context.route.clientId) == context,
                       self.r9Connections[context.route.clientId] === previous else { return }
-                self.nativeSessionClients[context.route.clientId]?.channelMembershipRefreshed(context: context)
+                self.refreshNativeSessionMembership(context)
             } catch {
                 guard self.sessionContext(for: context.route.clientId) == context,
                       self.r9Connections[context.route.clientId] === previous else { return }

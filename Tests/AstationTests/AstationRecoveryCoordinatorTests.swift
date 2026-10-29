@@ -502,6 +502,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             notified = head.seq == before.head().seq + 1 && entries.count == Int(head.seq)
         }
         XCTAssertEqual(try AstationRecoveryCoordinator.removableService(record: record, log: before), "service-test")
+        XCTAssertFalse(try AstationRecoveryCoordinator.serviceRemovalComplete(record: record, log: before))
         try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345",
             portal: portal(transport), current: { true })
         let after = try await coordinator.serviceMembership()
@@ -513,6 +514,33 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertTrue(notified)
         XCTAssertEqual(h.ownerRequests.last?.purpose, .remove)
         XCTAssertNil(try AstationRecoveryCoordinator.removableService(record: record, log: after))
+        XCTAssertTrue(try AstationRecoveryCoordinator.serviceRemovalComplete(record: record, log: after))
+    }
+
+    func testServiceRemovalReopensChannelBeforeTheUIRefreshesAccountMembership() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        let (commit, reveal, keys) = try await hostAttempt(coordinator, generation: 1)
+        let enrollment = try await coordinator.prepareHost(commit: commit, reveal: reveal, keys: keys)
+        _ = try await coordinator.commitHost(request: enrollment,
+            confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true })
+        let record = try await revokedService(coordinator, transport: transport)
+        let context = AtemSessionContext(route: RemoteTerminalConnection(clientId: "local-host", connectionId: "connection-a"),
+            account: "account-a", device: "host-a", pairingSession: "pairing-a")
+        var opened: [LogHead] = []
+        let client = AtemSessionClient(context: { context }, send: { _, _ in false }, openChannel: { _ in
+            do { opened.append(try coordinator.channelMembership(hostID: "host-a").head()) }
+            catch { XCTFail("Channel initialization raced another account operation: \(error)") }
+        })
+        client.start()
+        let before = try XCTUnwrap(opened.last)
+        coordinator.onMembershipCommit = { _ in client.channelMembershipRefreshed(context: context) }
+        try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345",
+            portal: portal(transport), current: { true })
+        let after = try await coordinator.serviceMembership()
+        XCTAssertEqual(opened.map(\.seq), [before.seq, after.head().seq])
+        XCTAssertEqual(after.head().seq, before.seq + 1)
+        XCTAssertEqual(client.phase, .connecting)
+        XCTAssertNil(client.welcome, "The replacement channel still requires an authenticated welcome")
     }
 
     func testRemovalLostReplyResumesExactSignatureWithoutAnotherOwnerPrompt() async throws {

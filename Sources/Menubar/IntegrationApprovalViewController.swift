@@ -113,11 +113,15 @@ final class IntegrationApprovalViewController: NSViewController {
             && records[picker.indexOfSelectedItem].state == "awaiting_approval"
         let revoking = records.indices.contains(picker.indexOfSelectedItem)
             && ["revoking", "revoked"].contains(records[picker.indexOfSelectedItem].state)
+        let pendingRemoval = revoking && (try? coordinator?.pendingServiceRemovalID()) == records[picker.indexOfSelectedItem].id
+        let removed = revoking && log.map {
+            (try? AstationRecoveryCoordinator.serviceRemovalComplete(record: records[picker.indexOfSelectedItem], log: $0)) == true
+        } == true
         let removable = revoking && log.map { log in
             (try? AstationRecoveryCoordinator.removableService(record: records[picker.indexOfSelectedItem], log: log)) != nil
-                || (try? coordinator?.pendingServiceRemovalID()) == records[picker.indexOfSelectedItem].id
+                || pendingRemoval
         } == true
-        removeButton.isHidden = !revoking
+        removeButton.isHidden = !revoking || (removed && !pendingRemoval)
         removeButton.isEnabled = !busy && removable && approval == nil && contextCurrent?() == true
         let canSelectHosts = !busy && pendingSelection && log != nil && approval == nil && contextCurrent?() == true
         let hasSelectedHost = hostButtons.contains { $0.1.state == .on }
@@ -407,6 +411,11 @@ final class IntegrationApprovalViewController: NSViewController {
         case "provisioning":
             return "Access is already approved. The Station is preparing this integration."
         case "revoking", "revoked":
+            if let log, (try? AstationRecoveryCoordinator.serviceRemovalComplete(record: records[picker.indexOfSelectedItem], log: log)) == true {
+                return records[picker.indexOfSelectedItem].state == "revoked"
+                    ? "Access revoked. The service is removed from the verified account log and Station cleanup is complete."
+                    : "The service is removed from the verified account log. Waiting for the Station to confirm cleanup."
+            }
             return "Access has been revoked. Remove its service from the verified account log to complete cleanup."
         default:
             return "Choose the allowed hosts, then review access."
