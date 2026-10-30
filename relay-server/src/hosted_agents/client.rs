@@ -135,6 +135,33 @@ impl HostedConnection {
         fingerprint: &str,
         host: &str,
     ) -> Result<Self, Response> {
+        // R9 admits one init per second on the host's carrier. HTTP calls open
+        // independent channels; retry only a clear busy before authentication,
+        // never a welcome, registry operation or submitted mutation.
+        for attempt in 0..4 {
+            if let Some(connection) = Self::open_once(runtime, context, fingerprint, host).await? {
+                return Ok(connection);
+            }
+            if attempt < 3 {
+                tokio::time::sleep(Duration::from_millis(1_050 + rand::random::<u64>() % 200))
+                    .await;
+            }
+        }
+        let mut response = crate::station_integrations::error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "host_connection_busy",
+        );
+        response
+            .headers_mut()
+            .insert("retry-after", "1".parse().unwrap());
+        Err(response)
+    }
+    async fn open_once(
+        runtime: &StationIntegrations,
+        context: &ServiceKeyContext,
+        fingerprint: &str,
+        host: &str,
+    ) -> Result<Option<Self>, Response> {
         let log = runtime.service_log(context, fingerprint, host).await?;
         let signer = load_approved(&runtime.policies.0, &runtime.vault, context, fingerprint)
             .await
@@ -148,18 +175,25 @@ impl HostedConnection {
         transport.send(init).await?;
         let accept = transport.receive().await?;
         let identity = Identity::service(&context.service_id, KeyId::new(&context.service_id));
-        let (welcoming, finish) = connecting
-            .on_accept(
-                &accept,
-                &log,
-                &signer,
-                &identity,
-                start.elapsed().as_millis() as u64,
-            )
-            .map_err(|_| {
+        let (welcoming, finish) = match connecting.on_accept(
+            &accept,
+            &log,
+            &signer,
+            &identity,
+            start.elapsed().as_millis() as u64,
+        ) {
+            Ok(accepted) => accepted,
+            Err(atem_client::connect::ConnectError::Channel(
+                atem_client::channel::ChannelError::Advisory { code },
+            )) if code == "busy" => {
+                tracing::debug!("Hosted channel init busy; bounded pre-authentication retry");
+                return Ok(None);
+            }
+            Err(_) => {
                 tracing::debug!("Hosted channel accept refused");
-                lost()
-            })?;
+                return Err(lost());
+            }
+        };
         transport.send(finish).await?;
         let welcome = transport.receive().await?;
         let attached = welcoming
@@ -227,7 +261,7 @@ impl HostedConnection {
             }
         }
         connection.initial_rules = rules.into_values().collect();
-        Ok(connection)
+        Ok(Some(connection))
     }
     /// A membership change may narrow or renew this service without changing
     /// its fingerprint. Never reuse the channel authenticated at the old head.

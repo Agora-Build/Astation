@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 mod approvals;
+mod http;
 
 fn required(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"))
@@ -146,6 +147,7 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
     let evidence_path = PathBuf::from(required("LIVE_HOSTED_EVIDENCE_FILE"));
     let recovering = std::env::var("LIVE_HOSTED_RECOVER").as_deref() == Ok("receipts");
     let approval_case = std::env::var("LIVE_HOSTED_APPROVAL_CASE").ok();
+    let http_check = std::env::var("LIVE_HOSTED_HTTP_CHECK").as_deref() == Ok("yes");
     let resuming_approval =
         std::env::var("LIVE_HOSTED_APPROVAL_RESUME").as_deref() == Ok("pending");
     assert!(!resuming_approval || approval_case.is_some());
@@ -163,6 +165,9 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
         "receipt recovery must not request another replica interruption"
     );
     assert!(approval_case.is_none() || (existing_cluster && failover_file.is_none()));
+    assert!(
+        !http_check || (existing_cluster && approval_case.is_none() && failover_file.is_none())
+    );
     if let Some(path) = &failover_file {
         assert!(
             !path.exists(),
@@ -298,6 +303,25 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
         "LIVE: real Auth, protected key, encrypted service welcome and replacement registry pass"
     );
 
+    if http_check {
+        drop(connection);
+        http::run(
+            runtime.clone(),
+            &id,
+            raw,
+            &host,
+            &session,
+            &target,
+            &evidence_path,
+            recovering,
+        )
+        .await;
+        if let Some(cluster) = cluster {
+            cluster.relay.drain(Duration::from_secs(1)).await;
+            cluster.abort();
+        }
+        return;
+    }
     if let Some(case) = approval_case {
         approvals::run(
             &runtime,

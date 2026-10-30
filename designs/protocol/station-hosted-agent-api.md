@@ -241,6 +241,7 @@ Supply the Station's normal protected configuration and these test inputs:
 | `LIVE_HOSTED_APPROVAL_CASE` | Optional `allow_once`, `deny`, `allow_always`, `auto_allow`, `revoke` or `after_revoke`. Existing-cluster mode only; incompatible with failover. Runs one explicit genuine Codex probe case instead of the marker prompt. |
 | `LIVE_HOSTED_APPROVAL_RULE_FILE` | Protected file binding the exact offered rule to the complete target. Created after `allow_always` succeeds; required for `auto_allow`, `revoke` and `after_revoke`. |
 | `LIVE_HOSTED_APPROVAL_RESUME` | Optional explicit `pending`: continue the saved prompt only if its exact approval is still pending and no answer request has been prepared. Never submits the prompt again. Use receipt recovery instead when an answer's delivery is uncertain. |
+| `LIVE_HOSTED_HTTP_CHECK` | Optional `yes`: existing-cluster private HTTP/WebSocket check with an isolated readiness fixture. Incompatible with approval and failover modes. Never changes deployed policy or the public release gate. |
 
 Run only that ignored test, with `--exact --ignored --nocapture`. It verifies
 the real token's issuer, Station audience, client, owner, operation and service
@@ -373,11 +374,78 @@ prompt's paste reached that dialog and selected its default; its receipt became
 receipt therefore did not establish that its approval was resolved or that the
 session was safe for another prompt.
 
-The [host correction](https://github.com/Agora-Build/Atem/pull/102) must preserve
-waiting across turn completion, keep unresolved dialog identity unambiguous,
-and fence prompt bytes at the actual PTY write boundary. Lost or delayed hook
-events must never turn another call's completion into an approval. Genuine
-approval tests remain paused pending review of that correction, completed
-regressions and the exact corrected worker/session handoff. No success for the
-allow/deny/rule matrix is claimed from the earlier attempts. The public hosted
-execution gate remains closed.
+The [host correction](https://github.com/Agora-Build/Atem/pull/102) preserves
+waiting across turn completion, keeps unresolved dialog identity unambiguous,
+and fences prompt bytes at the actual PTY write boundary. A tool result never
+resolves an unanswered approval; result matching is limited to a decision that
+was already remotely claimed. An explicit local action can release the terminal
+dialog hold. Source review and independently checked Linux/macOS CI passed at
+`b61a6c39a0fdb88b7b87c33ca632030be6dc18fe`.
+
+On 2026-10-30, the authorized replacement runtime and worker were independently
+matched to the handed-off binary SHA-256. All six genuine approval cases passed
+on session `ses-ugqyqctgy3pe`: allow once with a pending-card reconnect, deny with
+a message, the exact offered always-allow rule, a correlated auto-allowed repeat,
+lease-free rule revocation, and a newly required approval denied after revocation.
+All eleven mutation receipts completed. Each case then passed read-only receipt
+and history recovery over a fresh authenticated attachment; all eleven recovered
+receipts still report completed. No mutation was replayed, and answers did not
+change the controller. Per-request IDs and the request for Atem's independent
+probe-file/log verification are in [the live handoff](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6514775094).
+
+The old revoked integration's native removal already passed: membership head
+advanced from six to seven, its exact sealed service key was deleted, and the
+actual Portal feed reports revoked. It is not a new user cleanup blocker. The
+current approved integration remains waiting for host readiness while the global
+release gate is closed. Positive public HTTP admission and the current
+integration's actual Portal revocation/reconnect remain separate release checks,
+tracked with Portal in [issue #21](https://github.com/Agora-Build/Portal/issues/21).
+Hosted execution stays disabled pending their completion and user approval.
+
+### Private real-host HTTP verification
+
+`LIVE_HOSTED_HTTP_CHECK=yes` runs the same ignored operator test against the
+existing cluster. It requires the normal protected inputs and a fresh real Auth
+token. It proves the real service connection and authoritative registry target
+before starting a loopback HTTP/WebSocket listener using the production operation
+handlers. The public release gate stays closed.
+
+Only a unique local Postgres test schema assumes ready policy and isolates quota
+accounting. Its policy is copied from the fresh authenticated feed; owner, issuer,
+scopes, service fingerprint, expiry and all other fields are preserved. Protected
+service keys, native-signed consent, membership and the actual host remain real.
+No fixture feed worker runs, no deployed policy is edited, and no readiness report
+is sent to Portal. Cleanup drops the test schema and verifies the deployed
+integration policy is unchanged.
+
+The check exercises missing/invalid Bearer rejection, discovery, approval lookup,
+stale-process refusal, an authenticated WebSocket subscription, one harmless real
+Codex prompt, fresh-attachment receipt/history recovery and its correlated
+Markdown response. Denying only the fixture checkpoint must refuse new HTTP
+requests and close the existing WebSocket. Request identity is fsynced before the
+single prompt POST. An uncertain or interrupted run uses
+`LIVE_HOSTED_RECOVER=receipts` with the same evidence file; it never resubmits.
+
+This is real-host HTTP adapter evidence with an explicit readiness fixture. It
+does not establish positive public-origin rollout admission or an actual Portal
+revocation. Those checks and the user's enablement decision remain distinct.
+
+The 2026-10-30 run passed in 21.46 seconds through real Auth and the protected
+approved service against the same `b61a6c3` Codex runtime. HTTP prompt
+`51fb3d28-c623-49f4-abb9-aa85a7d8b7d6` completed; fresh HTTP attachments recovered
+its receipt and matching assistant Markdown, and the WebSocket carried the same
+response. Fixture denial blocked new HTTP requests and closed the stream. The
+test schema was removed, actual policy remained waiting for host, and no deployed
+listener, native app, Atem runtime or Codex process was restarted.
+An additional read-only run passed in 16.62 seconds, recovering the same original
+HTTP receipt, formatted history and subscribed response without submitting again.
+
+The real-host HTTP preflight exposed the R9 carrier's one-init-per-second limit:
+back-to-back HTTP requests can receive a clear `busy` before authentication.
+Station now retries only that specific handshake refusal, with a fresh channel
+and reloaded signed service grant, at most four attempts separated by just over
+one second plus jitter. Other handshake failures and every post-authentication
+failure return immediately; no prompt or approval submission is retried. If the
+host stays busy, HTTP returns `503 host_connection_busy` and `Retry-After: 1`.
+This bounded behavior handles short bursts; it is not a high-throughput channel
+pool or a guarantee that the per-integration quota can be sustained by one host.

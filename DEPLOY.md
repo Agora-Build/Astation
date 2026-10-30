@@ -400,6 +400,14 @@ uses nginx's default: retry only on a connection error or timeout, and never
 retry a request with a non-idempotent method (POST) once it has been sent to a
 relay.
 
+Preserve these path-specific retry rules in custom proxies. In the isolated
+hosted-API test deployment, a global `http_503` retry treated the intentional
+`503 hosted_execution_not_verified` response as an upstream failure, marked
+both healthy replicas unavailable, and turned subsequent requests into `502`.
+Removing `http_503` from that proxy's general retry list restored twenty
+consecutive expected gate responses without restarting either replica. An API
+policy refusal must not mark a healthy relay unavailable or replay a mutation.
+
 **Valkey resource:** on the private `coolify` network only (no public port),
 password protected (the password lives only in the `REDIS_URL` Coolify
 secret; the relay never logs it), `maxmemory-policy noeviction` (live state

@@ -170,6 +170,7 @@ async fn controlled_host_attachments(
 
 #[derive(Default)]
 struct HostScenario {
+    busy_initializations: usize,
     pending_approval: bool,
     lose_submit_reply: bool,
     handles: Option<tokio::sync::mpsc::UnboundedSender<String>>,
@@ -187,7 +188,7 @@ async fn controlled_host_scenario(
         .await;
     let mut receipts = std::collections::BTreeMap::new();
     let approval_created_at = chrono::Utc::now().timestamp_millis() as u64;
-    for _ in 0..attachments {
+    for attachment in 0..attachments {
         let open = loop {
             let event = next_client_json(&mut socket).await;
             if event["event"] != "close" {
@@ -200,6 +201,21 @@ async fn controlled_host_scenario(
             handles.send(handle.clone()).unwrap();
         }
         let init = next_client_json(&mut socket).await;
+        if attachment < scenario.busy_initializations {
+            let reply = atem_client::channel::responder::InitLimiter::busy()
+                .reply
+                .unwrap();
+            send_json(
+                &mut socket,
+                json!({"type":"channel","event":"frame","channel":handle,
+                "frame":serde_json::from_slice::<Value>(&reply).unwrap()}),
+            )
+            .await;
+            if attachment + 1 == attachments {
+                assert_eq!(next_client_json(&mut socket).await["event"], "close");
+            }
+            continue;
+        }
         let clock = atem_client::membership::HostNow {
             wall_ms: chrono::Utc::now().timestamp_millis() as u64,
             mono_ms: 0,
@@ -376,6 +392,79 @@ async fn controlled_host_scenario(
                 .unwrap();
             send_json(&mut socket, json!({"type":"channel","event":"frame","channel":handle,"frame":serde_json::from_slice::<Value>(&bytes).unwrap()})).await;
         }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_host_init_busy_has_bounded_pre_authentication_retries() {
+    use std::time::{Duration, Instant};
+    for refused in [1, 4] {
+        let (db, runtime, f) = fixture().await;
+        let (context, fingerprint) = service(&runtime, &f).await;
+        let log = runtime
+            .app
+            .recovery
+            .integration_log(&context.genesis, PRINCIPAL)
+            .await
+            .unwrap();
+        let mut app = runtime.app.clone();
+        app.accounts = Arc::new(crate::account_store::InMemoryAccountStore::with_verifier(
+            app.knowledge.clone(),
+            app.vault.clone(),
+            Arc::new(crate::remote_api::recovery::tests::TestAccountVerifier),
+        ));
+        let (base, relay) = spawn_relay(app).await;
+        let host = tokio::spawn(controlled_host_scenario(
+            base,
+            Arc::new(f),
+            log,
+            if refused == 1 { 2 } else { 4 },
+            HostScenario {
+                busy_initializations: refused,
+                ..Default::default()
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !crate::remote_api::recovery::host_target(
+                &runtime.app,
+                &context.genesis,
+                PRINCIPAL,
+                "host-a",
+            )
+            .await
+            .is_ok_and(|(_, _, proof, _)| proof.is_some())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let start = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            client::HostedConnection::open(&runtime, &context, &fingerprint, "host-a"),
+        )
+        .await
+        .expect("busy retries must be bounded");
+        assert!(start.elapsed() >= Duration::from_secs(1));
+        if refused == 1 {
+            let connection = result.unwrap();
+            assert!(connection.attached.target("ses-aaaaaaaaaaaa").is_some());
+            drop(connection);
+        } else {
+            let response = result.err().expect("four busy handshakes must stop");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()["retry-after"], "1");
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"]["code"], "host_connection_busy");
+        }
+        host.await.unwrap();
+        relay.abort();
+        drop(runtime);
+        db.cleanup().await;
     }
 }
 
