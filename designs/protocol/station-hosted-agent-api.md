@@ -1,22 +1,24 @@
 # Station hosted agent API
 
-These typed handlers are wired on custom Stations, using the pinned shared
-atem-client R9 service channel. **Production admission is hard disabled** until
+These typed handlers are wired on built-in and custom Stations, using the pinned
+shared atem-client R9 service channel. **Production admission is hard disabled** until
 the live Auth/native/host/relay-only/Mac-off flow is verified. Requests currently
-return `hosted_execution_not_verified` (503) on a custom Station, or
-`custom_station_required` (403) on the public relay. No environment variable
-enables execution. This document describes the implemented adapter for review
+return `hosted_execution_not_verified` (503) for a valid configured Station
+origin, including the built-in default. Invalid origin configuration is refused.
+No environment variable enables execution. This document describes the implemented adapter for review
 and controlled tests, not a deployed service.
 
 ## Provisioning and approval
 
-1. Register the custom HTTPS Station in Portal with its exact public origin
-   and separate report-client public JWK. Configure the protected operator
-   files described in [DEPLOY](../../DEPLOY.md#station-integrations).
+1. For a custom HTTPS Station, register it in Portal with its exact public origin
+   and separate report-client public JWK. The built-in Station is seeded by
+   Auth from operator configuration and requires no user Station registration.
+   Configure the protected operator files described in
+   [DEPLOY](../../DEPLOY.md#station-integrations).
 2. Sign in to Agora.Build in Astation. Select that Station in General and
    open Settings > Integrations > Load Requests. The native app requests
    `integrations:read integrations:approve` for Portal and `astation.remote`
-   for the exact custom Station, in separate Auth profiles. Both verified
+   for the exact selected Station, in separate Auth profiles. Both verified
    subjects must equal the signed-in owner. Two browser authorization prompts
    are expected when these grants have not been saved yet. The native app
    waits for account registration on the selected Station before recovery

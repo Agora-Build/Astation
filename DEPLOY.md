@@ -1211,8 +1211,9 @@ transport changes. Already approved service access remains independent of
 that native connection.
 
 The provisioning endpoints and authenticated feed worker require durable
-Postgres. The built-in Station retains its static Auth resource and internal
-operator report identity. Custom Stations require registration/proof first.
+Postgres. Auth seeds the built-in Station and stable report identity from
+operator configuration, replacing its static resource entry while preserving
+native token claims. Custom Stations require registration/proof first.
 Both use the same protected keys and native service consent. Configure an
 HTTPS origin, exactly matching
 the Auth resource, without paths, credentials, query parameters or a trailing
@@ -1256,7 +1257,10 @@ Station, and issue `station.report` for its configured Portal origin.
 
 #### Default Station validation with dev Auth and Portal
 
-The owner authorized this validation arrangement on 2026-10-30:
+The owner initially authorized this validation arrangement on 2026-10-30.
+The companion later specified `https://station.dev.agora.build` for dev;
+Q6 is pending with the owner. The following is the earlier arrangement,
+not an instruction to change production before Q6 is resolved:
 
 ```text
 PUBLIC_BASE_URL=https://station.agora.build
@@ -1266,8 +1270,10 @@ ACCOUNT_OIDC_REQUIRED_SCOPE=astation.remote
 STATION_PORTAL_ORIGIN=https://dev.agora.build
 ```
 
-Retain `https://station.agora.build` as Auth's static resource. Configure its
-report client and public key internally in Auth/Portal, and mount its protected
+Preserve the selected built-in origin's native token contract. Auth replaces
+its static resource entry with an internally seeded Station and report client;
+Auth/Portal must implement this before provisioning the report identity.
+Configure the public report key internally, and mount the protected
 report and wrapping keys on both replicas. Reuse the existing ES256
 `private_key_jwt`, Portal-resource `station.report` token and changes/reports
 API schemas. The built-in report client resolves to the default origin and
@@ -1277,6 +1283,10 @@ without requiring account membership in a custom Station. Platform operators
 manage its report key; end users cannot share/remove the built-in Station.
 This is internal service configuration, not another user enrollment path.
 Coordination: [Portal #21](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6531544904).
+The [review](designs/protocol/built-in-station-auth-portal-review.md) confirms
+the public RFC 7638 key thumbprint and records the remaining disclosure,
+environment and live-verification requirements. Keep execution disabled until
+those requirements pass.
 
 Native Astation uses the dev Portal for account/project and approval tokens,
 and requests separate `station.agora.build` tokens from the same dev issuer

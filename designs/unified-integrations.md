@@ -12,9 +12,10 @@ of the default `https://station.agora.build` using the existing
 The Station audience remains its exact public origin. Default-origin
 validation and native service review now support the same scoped model
 as custom Stations; neither origin selection nor login enables agent execution.
-The default is a built-in managed Station. Its existing static Auth resource
-is retained; users never register it, prove domain control or request Station
-membership. Platform operators configure its reporting identity internally.
+The default is a built-in managed Station; users never register it, prove
+domain control or request Station membership. Auth seeds its Station record
+and reporting identity from platform configuration, retiring the static
+resource entry while preserving the native token contract.
 Custom Stations retain their registration flow. This implements the owner's
 original default/custom distinction and supersedes the earlier request to
 enroll the default like a custom server. Internal Portal/Auth configuration is
@@ -22,6 +23,10 @@ tracked in [Portal #21](https://github.com/Agora-Build/Portal/issues/21#issuecom
 The release gate remains closed until the outstanding live revocation check
 and default-origin deployment checks pass. This test arrangement does not
 claim that production Auth is deployed or make dev accounts production accounts.
+The companion now proposes a separate `https://station.dev.agora.build` for
+dev. Q6 awaits reconciliation with the earlier test arrangement before a live
+environment binding is changed. The [Auth/Portal review](protocol/built-in-station-auth-portal-review.md)
+accepts the shared contract for implementation and records the rollout gates.
 
 ## Shared design and coordination
 
@@ -39,7 +44,7 @@ The existing signed R9 contract remains authoritative for wire/security behavior
 this document neither expands current service scopes nor replaces that review.
 Keep Portal/Auth and joint Atem handoff vaults aligned with the same revision.
 
-The companion records D1-D23 and the Portal/Auth work, not a second system
+The companion records D1-D25 and the Portal/Auth work, not a second system
 architecture. Its 2026-10-24 snapshot has SHA-256
 `2882551f944cf98a0cf39a18187884267c6bb1f11266ad544c73812ca815c8a0`.
 The [Auth/Station admission contract](protocol/station-auth-validation.md)
@@ -191,8 +196,10 @@ Register a custom Station in Portal using proof of control at
 accounts; initially only the registering owner may use it. Owners can invite
 other accounts; open public/shared-relay discovery is deferred. Each account
 configures that relay in Astation/Atem without fallback to the public default.
-The built-in retains Auth's static default resource and gets an operator
-configured report identity and protected report/wrapping keys. Reuse the
+Auth seeds the built-in Station and stable report identity from operator
+configuration, replacing its static resource entry without changing native
+token claims or requiring user enrollment. Station holds protected
+report/wrapping keys. Reuse the
 existing `station.report` token grant, changes/reports endpoints and schemas;
 these are internal deployment configuration, not user Station enrollment.
 Portal offers it to signed-in accounts without custom-Station membership.
@@ -200,6 +207,9 @@ Each integration remains bound to its own issuer, account, root and service
 identity; a feed can carry multiple accounts without sharing their authority.
 Ordinary users cannot replace the built-in report key, share/remove the
 platform Station or administer another account's integrations.
+The exact native review must identify Agora.Build as the built-in operator
+and explain that its server can read and process the agent content permitted
+by the approved scope. Station AI requires its own equivalent opt-in.
 
 Both modes use the same APIs, authenticated feed, durable policies and R9
 service-key implementation. Pairing/verification and fresh native approval of

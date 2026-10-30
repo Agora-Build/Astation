@@ -84,8 +84,9 @@ Station validation uses `https://auth.dev.agora.build` as issuer and
 `https://station.agora.build`. This is explicit configuration, never issuer
 fallback. Tokens with a Portal or Auth audience cannot authorize Station.
 
-The built-in Station uses its existing static Auth resource and operator
-configured reporting identity. Only custom Stations require user registration
+Auth seeds the built-in Station and reporting identity from operator
+configuration, replacing the static resource entry while preserving native
+token claims and scopes. Only custom Stations require user registration
 and proof of domain control. Both need protected report/service keys, an
 authenticated policy feed and exact native service approval for agent
 integration access. Registration and origin selection alone grant no
@@ -94,7 +95,7 @@ validation completes. MCP/LLM execution and the old voice bridge stay
 unavailable. Relay-only policy still requires a durable acknowledgment from
 every enrolled host. Auth validation is required on both kinds of Station.
 
-Keep Auth's static default resource. Its report identity is provisioned
+Preserve the default's native access contract. Its report identity is provisioned
 internally and uses the existing `station.report` grant and Portal changes/
 reports schemas; there is no separate default-Station registration ceremony.
 Portal makes it available to signed-in accounts while retaining per-account
@@ -102,6 +103,13 @@ integration ownership and native consent. Operators, not end users, manage
 the default's report key. [Portal #21](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6531544904)
 tracks that internal setup. A custom origin remains pinned on failure; no
 default-origin or issuer fallback is allowed.
+The [Auth/Portal review](built-in-station-auth-portal-review.md) accepts this
+internal representation change. Q6 remains open because the companion now
+specifies `https://station.dev.agora.build` for dev, while the earlier test
+arrangement above uses the production origin. Resolve that deployment binding
+before changing a live environment; implementation can proceed independently.
+Explicit Agora.Build content disclosure and the missing live revocation checks
+remain hosted-release requirements.
 
 No credential payload is exported into assistant context. New custom LLM or
 Discord credentials are separately consented, write-only provisioning directly
