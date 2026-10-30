@@ -13,7 +13,9 @@ use serde_json::{json, Value};
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
 
-async fn response(request: reqwest::RequestBuilder, status: StatusCode) -> Value {
+mod lifecycle;
+
+pub(super) async fn response(request: reqwest::RequestBuilder, status: StatusCode) -> Value {
     let reply = request.send().await.expect("bounded HTTP response");
     let actual = reply.status();
     let value: Value = reply.json().await.expect("JSON HTTP response");
@@ -21,7 +23,7 @@ async fn response(request: reqwest::RequestBuilder, status: StatusCode) -> Value
     value
 }
 
-fn formatted_reply(event: &Value, replies: &[Value], marker: &str) -> bool {
+pub(super) fn formatted_reply(event: &Value, replies: &[Value], marker: &str) -> bool {
     let data = &event["data"];
     data["op"] == "message"
         && data["role"] == "assistant"
@@ -169,6 +171,56 @@ pub(super) async fn run(
         .send(json!({"target":target}).to_string().into())
         .await
         .unwrap();
+
+    let lifecycle = std::env::var("LIVE_HOSTED_PORTAL_LIFECYCLE").as_deref() == Ok("yes");
+    let revocation = std::env::var("LIVE_HOSTED_PORTAL_REVOKE").as_deref() == Ok("yes");
+    assert!(
+        !(lifecycle && revocation),
+        "choose one owner lifecycle action"
+    );
+    if lifecycle || revocation {
+        assert!(
+            !recovering,
+            "lifecycle observation submits no agent mutations"
+        );
+        if revocation {
+            lifecycle::observe_revocation(
+                &original,
+                &pool,
+                &binding,
+                id,
+                raw,
+                &client,
+                &prefix,
+                &mut socket,
+                target,
+                evidence_path,
+            )
+            .await;
+        } else {
+            lifecycle::observe(
+                &original,
+                &pool,
+                &binding,
+                id,
+                raw,
+                &client,
+                &prefix,
+                &mut socket,
+                target,
+                evidence_path,
+            )
+            .await;
+        }
+        server.abort();
+        let _ = server.await;
+        drop(socket);
+        drop(runtime);
+        pool.close().await;
+        fixture.cleanup().await;
+        assert!(!super::super::HOSTED_EXECUTION_ENABLED);
+        return;
+    }
 
     let mut evidence = if recovering {
         let saved = protected_json("LIVE_HOSTED_EVIDENCE_FILE");

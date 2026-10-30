@@ -8,6 +8,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 mod approvals;
 mod http;
+mod public;
 
 fn required(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"))

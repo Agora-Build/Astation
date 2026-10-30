@@ -37,4 +37,4 @@ redis = { version = "0.27", default-features = false, features = ["aio", "tokio-
 atem-client = { git = "https://github.com/Agora-Build/Atem.git", rev = "ed0b45bad5db0a278c63efe8a464f12d4d548465", features = ["software-keys"] }
 tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
