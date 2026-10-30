@@ -1270,7 +1270,7 @@ Current backend rollout (2026-10-30):
 
 | Component | Deployment |
 | --- | --- |
-| Public origin | `https://station.dev.agora.build`; Cloudflare DNS/tunnel publication is still pending. |
+| Public origin | `https://station.dev.agora.build`; DNS/tunnel routing is published, but public TLS still fails as of 2026-10-30 21:26 UTC. |
 | Relay A | Existing Coolify `oss4444o8ss40ckgwc40og4c`, renamed `station-dev-relay-a`. |
 | Relay B | Existing Coolify `am8lrcacts572trbli1bmvnu`, renamed `station-dev-relay-b`. |
 | Webapp | Existing Coolify `c0wwgk4c0owk0w4gsww4k0ss`, renamed `station-dev-webapp`; host port `3010`. |
@@ -1289,26 +1289,39 @@ dump, dev runtime credentials and new dev-only report/wrapping keys; modes are
 RFC 7638 thumbprint are in `public-handoff.json` and Portal/Auth vault
 `v-xZDT9aGD` e96. The earlier production-origin report key remains unused.
 
-The previous hostname still reaches this backend through its existing tunnel
-while DNS is pending; it is not a verified production deployment. The relays
+The previous hostname `station.agora.build` now returns NXDOMAIN from both
+Cloudflare and Google public resolvers. Existing clients still configured for
+that hostname, including the shared-vault CLI, cannot connect. Migrate their
+transport configuration after the dev origin passes HTTPS/WSS verification;
+do not introduce an issuer or audience alias. The relays
 are explicitly pinned to the dev issuer and dev audience. Their temporary
 `station-relay-server` alias preserves the old webapp's route during rolling
 replacement; it grants no additional token audience or hosted access.
 
-To publish the dev hostname, add its proxied CNAME to tunnel
+The dev hostname uses a proxied CNAME to tunnel
 `d7e78923-8981-4fda-9f12-7aa9e36a739a.cfargotunnel.com` and a tunnel public
 hostname `station.dev.agora.build` with service `http://10.0.0.1:3010`.
-Preserve unrelated ingress rules and confirm the edge certificate covers the
-exact hostname. This needs Cloudflare DNS/tunnel management access; the
-running connector's tunnel token alone cannot publish hostnames. The request
-is recorded in Portal #21 and vault e95. Do not redirect bearer-authenticated
-API calls between Station origins.
+The owner published routing on 2026-10-30. Public HTTP `/health` reaches the
+expected relay build and reports PostgreSQL, Redis and two replicas. HTTPS
+still fails during the Cloudflare edge handshake from both the Mac and
+Volumetric, before an HTTP response or peer certificate is available. Check
+SSL/TLS -> Edge Certificates for an active certificate covering this exact
+hostname. A certificate for `*.agora.build` does not cover
+`station.dev.agora.build`; Advanced Certificate Manager or Total TLS may be
+needed for that nested hostname. Preserve unrelated ingress rules. Cloudflare
+DNS/tunnel/certificate management access is separate from the connector's
+runtime token. Do not redirect bearer-authenticated API calls between Station
+origins.
 
 Both relays and the webapp passed Coolify health checks. Actual backend
 checks confirm PostgreSQL, Redis, two replicas and exact dev issuer/audience
-configuration. Public checks through the existing hostname passed Stoa/Agent
-assets and identity WebSocket upgrades. These checks do not prove public
-HTTPS/WSS on the new hostname while its DNS record is missing. Provisioning
+configuration. Earlier public checks through the previous hostname passed
+Stoa/Agent assets and identity WebSocket upgrades, before its DNS removal.
+Those checks do not prove public HTTPS/WSS on the new hostname. The full
+`verify-station.mjs` check currently fails on TLS. Public HTTP diagnostics
+used only unauthenticated health/details/metrics routes: health is 200,
+details is the expected closed-state 503, and metrics is 404. Authenticated
+verification awaits valid HTTPS. Provisioning
 and details return `station_integration_unavailable` until Auth/Portal's
 built-in report identity is delivered; hosted APIs return
 `hosted_execution_not_verified`. Both are intentional closed states, not a
