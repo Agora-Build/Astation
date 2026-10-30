@@ -174,7 +174,8 @@ final class RemoteMembershipPublicationTests: XCTestCase {
         XCTAssertThrowsError(try RemoteServiceKeyFingerprint.compute(PublicKeyData(alg: .x25519, raw: Data(repeating: 1, count: 32))))
     }
     @MainActor
-    private func serviceApproval(_ f: PublicationFixture) throws -> RemoteServiceApproval {
+    private func serviceApproval(_ f: PublicationFixture, station: String = "https://custom.example",
+                                 issuer: String = "https://auth.example") throws -> RemoteServiceApproval {
         let action = try json(["action": "add", "member": [
             "device_id": "service-a", "kind": "service", "roles": ["service"],
             "auth_key": ["alg": "ed25519", "pub": b64u(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)],
@@ -183,8 +184,48 @@ final class RemoteMembershipPublicationTests: XCTestCase {
         ]])
         let body = try f.log.draftEntry(signer: "manager-a", signedAt: f.clock.wallMs, actionJson: action)
         return try RemoteServiceApproval(operationID: "setup-a", integrationID: "i-01234567890123456789012345",
-            issuer: "https://auth.example", ownerAccount: "ab01234567890123456789012345",
-            stationOrigin: "https://custom.example", bodyJSON: body, log: f.log, managerID: "manager-a", now: f.clock)
+            issuer: issuer, ownerAccount: "ab01234567890123456789012345",
+            stationOrigin: station, bodyJSON: body, log: f.log, managerID: "manager-a", now: f.clock)
+    }
+
+    @MainActor
+    func testDefaultStationWithDevPortalSeparatesTokensAndStillRequiresFreshConsent() async throws {
+        let origin = "https://station.agora.build"
+        let f = try PublicationFixture(), approval = try serviceApproval(f, station: origin, issuer: "https://auth.dev.agora.build")
+        let config = try AccountOIDCConfiguration(issuer: "https://auth.dev.agora.build", clientID: "astation",
+            resource: "https://dev.agora.build", requiredScope: "integrations:read", additionalScopes: ["integrations:approve"])
+        let portalHTTP = IntegrationApprovalTestHTTP(), stationHTTP = IntegrationApprovalTestHTTP()
+        let portal = try PortalIntegrationHTTP(configuration: config, portalOrigin: config.resource,
+            ownerAccount: approval.ownerAccount, http: portalHTTP, accessToken: { "portal-resource-token" })
+        let row: [String: Any] = ["id": approval.integrationID, "name": "Default Station test",
+            "stationOrigin": origin, "state": "awaiting_approval", "scopes": ["agent.view", "agent.prompt"],
+            "expiresAt": "2099-01-01T00:00:00Z", "role": "owner"]
+        try await portalHTTP.set(["integrations": [row], "stale": false])
+        let records = try await portal.owned(stationOrigin: origin)
+        XCTAssertEqual(records.map(\.stationOrigin), [origin])
+        let portalLast = await portalHTTP.last()
+        let portalRequest = try XCTUnwrap(portalLast)
+        XCTAssertEqual(portalRequest.url?.absoluteString, "https://dev.agora.build/api/v1/integrations")
+        XCTAssertEqual(portalRequest.value(forHTTPHeaderField: "Authorization"), "Bearer portal-resource-token")
+        let station = try StationIntegrationHTTP(origin: origin, http: stationHTTP, accessToken: { "station-resource-token" })
+        try await stationHTTP.set(["integrationId": approval.integrationID, "ownerAccount": approval.ownerAccount,
+            "issuer": approval.issuer, "stationOrigin": origin, "genesisHash": approval.genesisHash,
+            "bodyJSON": approval.bodyJSON, "fingerprint": approval.fingerprint])
+        _ = try await station.prepare(record: XCTUnwrap(records.first), ownerAccount: approval.ownerAccount,
+            issuer: approval.issuer, log: f.log, managerID: "manager-a", hosts: ["host-a"],
+            sessions: nil, projects: nil, signedAt: f.clock.wallMs)
+        let stationLast = await stationHTTP.last()
+        let stationRequest = try XCTUnwrap(stationLast)
+        XCTAssertEqual(stationRequest.url?.host, "station.agora.build")
+        XCTAssertEqual(stationRequest.value(forHTTPHeaderField: "Authorization"), "Bearer station-resource-token")
+        let consent = try approval.prepare(publication: f.publication, managerID: "manager-a", now: f.clock)
+        XCTAssertTrue(consent.freshConfirmation)
+        XCTAssertTrue(f.keys.requests.isEmpty, "Origin support must not sign or enroll a service")
+        XCTAssertNil(f.log.member(deviceId: "service-a"))
+        for invalid in ["https://station.agora.build/", "https://station.agora.build:443", "http://station.agora.build",
+                        "https://station.agora.build.", "https://station.agora.build?token=secret"] {
+            XCTAssertFalse(PortalIntegrationRecord.validOrigin(invalid))
+        }
     }
 
     @MainActor

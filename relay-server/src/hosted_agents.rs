@@ -71,15 +71,15 @@ async fn release_gate(request: axum::extract::Request, next: axum::middleware::N
     if HOSTED_EXECUTION_ENABLED {
         return next.run(request).await;
     }
-    let custom = std::env::var("PUBLIC_BASE_URL")
-        .is_ok_and(|v| crate::account_identity::custom_station_origin(&v));
+    let configured = std::env::var("PUBLIC_BASE_URL")
+        .is_ok_and(|v| crate::account_identity::integration_station_origin(&v));
     error(
-        if custom {
+        if configured {
             StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::FORBIDDEN
         },
-        if custom {
+        if configured {
             "hosted_execution_not_verified"
         } else {
             "custom_station_required"

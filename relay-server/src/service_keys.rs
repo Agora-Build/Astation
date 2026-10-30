@@ -25,7 +25,7 @@ pub(crate) struct ServiceKeyContext {
 
 impl ServiceKeyContext {
     fn aad(&self) -> Result<Vec<u8>, ()> {
-        if !crate::account_identity::custom_station_origin(&self.station_origin)
+        if !crate::account_identity::integration_station_origin(&self.station_origin)
             || !crate::account_identity::station_origin(&self.issuer)
             || self.owner.len() != 28
             || !self.owner.starts_with("ab")
@@ -340,7 +340,10 @@ mod tests {
         assert!(vault.open(&context, &damaged).is_err());
         let mut public = context.clone();
         public.station_origin = "https://station.agora.build".into();
-        assert!(vault.generate(&public).is_err());
+        let default_key = vault.generate(&public).unwrap();
+        assert!(vault.open(&public, &sealed).is_err());
+        assert!(vault.open(&context, &default_key).is_err());
+        assert!(vault.open(&public, &default_key).is_ok());
     }
 
     #[tokio::test]

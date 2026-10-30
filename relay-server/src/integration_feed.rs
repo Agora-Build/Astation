@@ -21,7 +21,7 @@ impl FeedBinding {
                 return Err(());
             }
         }
-        if !crate::account_identity::custom_station_origin(&self.station_origin)
+        if !crate::account_identity::integration_station_origin(&self.station_origin)
             || !client_id(&self.report_client_id, "s-")
         {
             return Err(());
@@ -474,8 +474,6 @@ mod tests {
                 .is_err());
         }
         for origin in [
-            "https://station.agora.build",
-            "https://station.agora.build:8443",
             "https://station.agora.build.",
             "https://127.0.0.1",
             "https://custom.example:0",
@@ -485,6 +483,22 @@ mod tests {
             config.station_origin = origin.into();
             assert!(config.validate().is_err(), "{origin}");
         }
+    }
+
+    #[test]
+    fn default_station_with_dev_auth_keeps_an_exact_separate_binding() {
+        let mut config = binding();
+        config.issuer = "https://auth.dev.agora.build".into();
+        config.portal_origin = "https://dev.agora.build".into();
+        config.station_origin = "https://station.agora.build".into();
+        let checkpoint = PolicyCheckpoint::empty(config.clone()).unwrap();
+        assert!(checkpoint.denied);
+        assert!(checkpoint.integrations.is_empty());
+        let key = config.storage_key().unwrap();
+        config.station_origin = "https://dev.agora.build".into();
+        assert_ne!(key, config.storage_key().unwrap());
+        config.station_origin = "https://station.agora.build:8443".into();
+        assert_ne!(key, config.storage_key().unwrap());
     }
     #[tokio::test]
     #[ignore]

@@ -350,10 +350,13 @@ principals or changing pairings/encryption. `/health` and `verify-station.mjs`
 prove infrastructure availability, not Auth interoperability or R9 authority.
 
 For a custom Station, first register its exact origin in Portal > Stations.
+The managed default origin needs the distinct Auth reporting/enrollment
+contract described under "Default Station validation with dev Auth and Portal".
 Set the Portal-generated public `STATION_REGISTRATION_CHALLENGE` on every
 replica. `GET /.well-known/agora-build-station` serves that exact value as
 `text/plain` with `Cache-Control: no-store`; unset it after verification. This
-proof endpoint is absent on the default relay. It never activates Station AI
+proof endpoint is absent unless an operator sets the challenge, including on
+the default relay. It never activates Station AI
 or enrolls an account/device. Confirm the proof-response schema with Portal
 before live registration; no control-plane secrets belong in the challenge.
 
@@ -362,9 +365,9 @@ it can be issued. Agent access additionally needs Auth's five-minute
 client-credentials tokens and the matching native-approved R9 service binding.
 The [admission contract](designs/protocol/station-auth-validation.md) records
 purpose isolation, key rotation/outage rules and remaining interoperability
-work. `/api/agent/v1`, `/mcp` and `/v1/chat/completions` remain closed: the public
-relay requires a custom Station, and a custom Station awaits verified runtime
-provisioning. Existing live R9 gates remain separate. No deployment is
+work. `/api/agent/v1`, `/mcp` and `/v1/chat/completions` remain closed
+until their respective runtime verification. Default and custom agent
+endpoints require the same protected provisioning. Existing live R9 gates remain separate. No deployment is
 authorized by adding configuration/examples to this document.
 The old `/api/llm/chat` and `/api/voice-sessions` bridge now uses that closed
 gate too; its session-ID-only authentication cannot substitute for the new
@@ -1208,14 +1211,15 @@ transport changes. Already approved service access remains independent of
 that native connection.
 
 The provisioning endpoints and authenticated feed worker require durable
-Postgres. The public `station.agora.build` relay does not host integration
-execution. Configure a registered **custom** HTTPS origin, exactly matching
+Postgres. Default and custom Stations need the same explicit registration,
+operator key configuration and native service consent. Configure a registered
+HTTPS origin, exactly matching
 the Auth resource, without paths, credentials, query parameters or a trailing
 slash. Each replica uses the same binding and protected keys:
 
 | Variable | Purpose |
 | --- | --- |
-| `PUBLIC_BASE_URL` | Exact registered custom Station origin. |
+| `PUBLIC_BASE_URL` | Exact registered Station origin. |
 | `ACCOUNT_OIDC_ISSUER` | Pinned Agora.Build Auth issuer; dev is `https://auth.dev.agora.build`. |
 | `ACCOUNT_OIDC_AUDIENCE` | Must equal `PUBLIC_BASE_URL` exactly. |
 | `ACCOUNT_OIDC_REQUIRED_SCOPE` | Native account scope `astation.remote`. |
@@ -1246,7 +1250,43 @@ Portal approval/report tokens scoped to their own resource. A localhost
 Portal process may sit behind the configured public HTTPS origin; do not send
 public-resource bearer credentials to an unrelated transport origin. Confirm
 Auth permits native `astation` issuance of `astation.remote` for this exact
-custom Station, and issue `station.report` for its configured Portal origin.
+Station, and issue `station.report` for its configured Portal origin.
+
+#### Default Station validation with dev Auth and Portal
+
+The owner authorized this validation arrangement on 2026-10-30:
+
+```text
+PUBLIC_BASE_URL=https://station.agora.build
+ACCOUNT_OIDC_ISSUER=https://auth.dev.agora.build
+ACCOUNT_OIDC_AUDIENCE=https://station.agora.build
+ACCOUNT_OIDC_REQUIRED_SCOPE=astation.remote
+STATION_PORTAL_ORIGIN=https://dev.agora.build
+```
+
+Auth currently configures `https://station.agora.build` as a static resource.
+Its Station-token contract section B3 explicitly rejects dynamic registration
+of an origin that is already static. Do not register it through the ordinary
+custom-Station flow, remove its static resource, or invent a report client.
+Portal/Auth must supply a supported managed-default reporting/integration
+enrollment contract, or a reviewed migration preserving native issuance and
+existing account access. Track that prerequisite in
+[Portal #21](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6527125126).
+Once available, obtain its report client and mount its protected report and
+wrapping keys on both replicas.
+Native Astation uses the dev Portal for account/project and approval tokens,
+and requests separate `station.agora.build` tokens from the same dev issuer
+for Station calls. Never reuse a Portal-audience token at Station, silently
+fall back between issuers, or import dev account data into a production issuer.
+Production Auth is a separate later configuration/registration, not an alias.
+
+Before rollout, retain the current image/configuration and back up the durable
+database and operator keys. Change one replica at a time; verify discovery,
+native login, exact-origin token refusal, native service approval, host
+admission, actual HTTP/WSS execution and revocation/reconnect. Use a new
+disposable integration for terminal revocation; never restore the already
+revoked integration. Do not reset existing principals, memberships, paired
+hosts, keys or encrypted data to make a test pass. Health alone is insufficient.
 
 Migrations 0012/0013 persist authenticated policy/cursor/denial, encrypted
 service keys, immutable owner/root/integration mappings and exposed key

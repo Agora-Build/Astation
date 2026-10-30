@@ -234,13 +234,13 @@ pub(crate) fn station_origin(value: &str) -> bool {
     safe_url(value).is_ok_and(|url| url.origin().ascii_serialization() == value)
 }
 
-pub(crate) fn custom_station_origin(value: &str) -> bool {
+pub(crate) fn integration_station_origin(value: &str) -> bool {
     station_origin(value)
         && url::Url::parse(value).is_ok_and(|url| {
             url.scheme() == "https"
                 && url.port() != Some(0)
                 && matches!(url.host(), Some(url::Host::Domain(host)) if host.contains('.')
-                && !host.ends_with('.') && host != "station.agora.build")
+                && !host.ends_with('.'))
         })
 }
 

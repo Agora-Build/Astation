@@ -80,7 +80,7 @@ fn configured_routes(config: Configuration) -> Router<crate::AppState> {
 }
 
 async fn proof(State(config): State<Arc<Configuration>>) -> Response {
-    match config.challenge.as_ref().filter(|_| config.custom) {
+    match config.challenge.as_ref() {
         Some(challenge) => ([(CACHE_CONTROL, "no-store")], challenge.clone()).into_response(),
         None => (StatusCode::NOT_FOUND, [(CACHE_CONTROL, "no-store")]).into_response(),
     }
@@ -241,10 +241,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registration_is_absent_by_default_and_cannot_be_advertised_by_the_public_relay() {
+    async fn registration_is_absent_without_an_operator_challenge() {
         for (origin, challenge) in [
             (None, None),
-            (Some(DEFAULT_STATION), Some("public-proof")),
+            (Some(DEFAULT_STATION), None),
             (Some("https://custom.example"), None),
         ] {
             let app = configured_routes(Configuration::new(origin, None, challenge).unwrap())
@@ -260,6 +260,45 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
+    }
+
+    #[tokio::test]
+    async fn default_station_control_proof_does_not_enable_agent_execution() {
+        let app = configured_routes(
+            Configuration::new(
+                Some(DEFAULT_STATION),
+                Some(DEFAULT_STATION),
+                Some("operator-proof"),
+            )
+            .unwrap(),
+        )
+        .with_state(crate::tests::test_state());
+        let proof = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/.well-known/agora-build-station")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(proof.status(), StatusCode::OK);
+        assert_eq!(proof.headers()[CACHE_CONTROL], "no-store");
+        assert_eq!(
+            to_bytes(proof.into_body(), 4096).await.unwrap(),
+            "operator-proof"
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agent/v1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

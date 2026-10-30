@@ -174,7 +174,7 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
         XCTAssertNotNil(fixture.hub.deviceSessionStore.getAllActive().first { $0.id == "retained-pairing" })
     }
 
-    func testAccountSecurityAllowsDefaultAndLoopbackStationsWithoutAllowingHostedIntegrations() async throws {
+    func testDefaultIntegrationConfigurationPreservesAuthorityAndLoopbackRemainsLocalOnly() async throws {
         for origin in ["https://station.agora.build", "http://127.0.0.1:18573"] {
             let fixture = try StationAccountFixture(origin: origin); defer { fixture.cleanup() }
             let socket = try await connected(fixture)
@@ -182,9 +182,19 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
             try await fixture.hub.prepareAccountSecurityAccess()
             XCTAssertEqual(fixture.hub.accountAuth.configuration?.resource, origin)
             XCTAssertTrue(socket.registrations[0].contains("test-station-token"))
-            XCTAssertThrowsError(try fixture.hub.configureIntegrationRelayAuth()) {
-                XCTAssertEqual($0 as? AccountLoginError, .configuration)
+            let generation = fixture.hub.integrationAccountGeneration
+            let sent = socket.sent
+            if origin == "https://station.agora.build" {
+                XCTAssertNoThrow(try fixture.hub.configureIntegrationRelayAuth())
+            } else {
+                XCTAssertThrowsError(try fixture.hub.configureIntegrationRelayAuth()) {
+                    XCTAssertEqual($0 as? AccountLoginError, .configuration)
+                }
             }
+            XCTAssertEqual(fixture.hub.integrationAccountGeneration, generation)
+            XCTAssertEqual(socket.sent, sent, "Configuration cannot send an enrollment or new authority")
+            XCTAssertFalse(socket.cancelled)
+            XCTAssertEqual(fixture.hub.deviceSessionStore.getAllActive().map(\.id), ["retained-pairing"])
         }
     }
 

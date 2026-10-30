@@ -45,7 +45,7 @@ public struct PortalIntegrationRecord: Decodable, Equatable, Sendable {
     public static func validOrigin(_ value: String) -> Bool {
         guard let parts = URLComponents(string: value), parts.scheme == "https", let host = parts.host,
               host.contains("."), host == host.lowercased(), !host.hasSuffix("."), !host.contains(":"),
-              !host.allSatisfy({ $0.isNumber || $0 == "." }), host != "station.agora.build",
+              !host.allSatisfy({ $0.isNumber || $0 == "." }),
               parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil, parts.path.isEmpty,
               parts.port == nil || ((1...65535).contains(parts.port!) && parts.port != 443),
               parts.url?.absoluteString == value else { return false }

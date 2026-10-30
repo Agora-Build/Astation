@@ -13,7 +13,7 @@ async fn approved_public_origin_recovers_one_prompt_without_replay() {
     assert_eq!(required("LIVE_HOSTED_DISPOSABLE"), "yes");
     assert_eq!(required("LIVE_HOSTED_PUBLIC_ROLLOUT"), "approved");
     let origin = required("PUBLIC_BASE_URL");
-    assert!(crate::account_identity::custom_station_origin(&origin));
+    assert!(crate::account_identity::integration_station_origin(&origin));
     let id = required("LIVE_HOSTED_INTEGRATION");
     let host = required("LIVE_HOSTED_HOST");
     let session = required("LIVE_HOSTED_SESSION");

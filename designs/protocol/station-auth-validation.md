@@ -78,11 +78,27 @@ retrieval failure 503 with a five-second Retry-After. No token is logged.
 
 ## Runtime placement
 
-`station.agora.build` stays an opaque relay and encrypted store. MCP, LLM and
-agent modules are disabled there. A registered custom Station is required to
-enable Station AI. Its MCP/LLM/Agent switches default off. Any enabled switch
-requires the whole account to use its selected relay rather than direct
-port 8080. Auth validation remains required on both kinds of Station.
+The relay and encrypted store remain opaque. The owner-authorized default
+Station validation uses `https://auth.dev.agora.build` as issuer and
+`https://dev.agora.build` as Portal, with the exact resource
+`https://station.agora.build`. This is explicit configuration, never issuer
+fallback. Tokens with a Portal or Auth audience cannot authorize Station.
+
+Default and custom Stations require registration, protected report/service
+keys, an authenticated policy feed and exact native service approval for
+agent integration access. Registration and origin selection alone grant no
+execution authority. The hosted release gate remains closed until live
+validation completes. MCP/LLM execution and the old voice bridge stay
+unavailable. Relay-only policy still requires a durable acknowledgment from
+every enrolled host. Auth validation is required on both kinds of Station.
+
+Auth's current static default resource is not an ordinary dynamic Station:
+section B3 of its Station-token contract forbids registering the same origin
+again. Managed-default report-client and integration enrollment must be
+confirmed with Portal/Auth before default-origin rollout. Do not remove the
+static resource, create an alias audience, or bypass registration to fill this
+gap. [Portal #21](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6527125126)
+tracks the required contract.
 
 No credential payload is exported into assistant context. New custom LLM or
 Discord credentials are separately consented, write-only provisioning directly

@@ -8,7 +8,7 @@ import Combine
 @MainActor
 final class IntegrationApprovalViewController: NSViewController {
     private let hub: AstationHubManager
-    private let status = NSTextField(wrappingLabelWithString: "Choose a custom Station in General, then load your integration requests.")
+    private let status = NSTextField(wrappingLabelWithString: "Load integration requests for your selected Station.")
     private let picker = NSPopUpButton()
     private let hosts = NSStackView()
     private let hostStatus = NSTextField(wrappingLabelWithString: "")
@@ -47,7 +47,7 @@ final class IntegrationApprovalViewController: NSViewController {
         view = NSView()
         let title = NSTextField(labelWithString: "Integration Access")
         title.font = .systemFont(ofSize: 22, weight: .semibold)
-        let intro = NSTextField(wrappingLabelWithString: "Review which agents an integration can use. Approval requires this Mac’s owner authentication.")
+        let intro = NSTextField(wrappingLabelWithString: "Review which agents an integration can use. Your selected Station can read its permitted agent messages. Approval requires this Mac’s owner authentication.")
         intro.textColor = .secondaryLabelColor
         hosts.orientation = .vertical; hosts.alignment = .leading; hosts.spacing = 6
         hostStatus.textColor = .secondaryLabelColor
@@ -184,7 +184,7 @@ final class IntegrationApprovalViewController: NSViewController {
     @objc private func loadRequests() {
         cancelPending(); render(busy: true)
         do { try hub.configureIntegrationRelayAuth() }
-        catch { status.stringValue = "Select a registered custom HTTPS Station in General to review integration access."; render(); return }
+        catch { status.stringValue = "Select a registered HTTPS Station in General to review integration access."; render(); return }
         let epoch = generation, accountEpoch = hub.integrationAccountGeneration, origin = hub.stationRelayUrl
         task = Task { [weak self] in
             guard let self else { return }
