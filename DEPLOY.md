@@ -96,6 +96,14 @@ webapp plus the final check about 30 more, so raise it in
 
 ### Station on Volumetric (Coolify)
 
+2026-10-30: the owner chose to reuse these resources for the development
+Station at `https://station.dev.agora.build`. Production deployment is deferred
+until verification. The original configuration/database are backed up; the
+existing encrypted store is retained. The original production workflow and
+resource table below describe the previous setup: its deployment hooks now
+point at the reused dev applications. Keep them separate from a future
+production rollout; do not treat a main workflow run as dev verification.
+
 This is the production setup, and a worked example of the section above.
 
 Every push to `main` runs `.github/workflows/deploy-station.yml`. It builds both
@@ -1255,17 +1263,16 @@ public-resource bearer credentials to an unrelated transport origin. Confirm
 Auth permits native `astation` issuance of `astation.remote` for this exact
 Station, and issue `station.report` for its configured Portal origin.
 
-#### Default Station validation with dev Auth and Portal
+#### Development built-in Station
 
-The owner initially authorized this validation arrangement on 2026-10-30.
-The companion later specified `https://station.dev.agora.build` for dev;
-Q6 is pending with the owner. The following is the earlier arrangement,
-not an instruction to change production before Q6 is resolved:
+The owner resolved Q6 on 2026-10-30: reuse the current Volumetric deployment
+with the dev origin; deploy production after verification. This supersedes
+the earlier proposal to combine the production origin with dev Auth.
 
 ```text
-PUBLIC_BASE_URL=https://station.agora.build
+PUBLIC_BASE_URL=https://station.dev.agora.build
 ACCOUNT_OIDC_ISSUER=https://auth.dev.agora.build
-ACCOUNT_OIDC_AUDIENCE=https://station.agora.build
+ACCOUNT_OIDC_AUDIENCE=https://station.dev.agora.build
 ACCOUNT_OIDC_REQUIRED_SCOPE=astation.remote
 STATION_PORTAL_ORIGIN=https://dev.agora.build
 ```
@@ -1289,7 +1296,7 @@ environment and live-verification requirements. Keep execution disabled until
 those requirements pass.
 
 Native Astation uses the dev Portal for account/project and approval tokens,
-and requests separate `station.agora.build` tokens from the same dev issuer
+and requests separate `station.dev.agora.build` tokens from the same dev issuer
 for Station calls. Never reuse a Portal-audience token at Station, silently
 fall back between issuers, or import dev account data into a production issuer.
 Production Auth is a separate later configuration/registration, not an alias.

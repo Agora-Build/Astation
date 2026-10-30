@@ -6,9 +6,13 @@ The first Station increment is Auth validation and closed runtime admission;
 integration execution is not yet enabled. This does not change the R9 contract
 or authorize production deployment.
 
-2026-10-30 rollout update: the owner requests hosted execution and validation
-of the default `https://station.agora.build` using the existing
+2026-10-30 rollout update: the owner resolved Q6 by selecting
+`https://station.dev.agora.build` with the existing
 `https://auth.dev.agora.build` issuer and `https://dev.agora.build` Portal.
+Reuse the current Volumetric deployment for dev; a production
+`https://station.agora.build` deployment follows verification. Preserve the
+existing encrypted store and rollback configuration during the rename; do not
+rebind hosted approvals or change their account/issuer/origin bindings.
 The Station audience remains its exact public origin. Default-origin
 validation and native service review now support the same scoped model
 as custom Stations; neither origin selection nor login enables agent execution.
@@ -23,9 +27,8 @@ tracked in [Portal #21](https://github.com/Agora-Build/Portal/issues/21#issuecom
 The release gate remains closed until the outstanding live revocation check
 and default-origin deployment checks pass. This test arrangement does not
 claim that production Auth is deployed or make dev accounts production accounts.
-The companion now proposes a separate `https://station.dev.agora.build` for
-dev. Q6 awaits reconciliation with the earlier test arrangement before a live
-environment binding is changed. The [Auth/Portal review](protocol/built-in-station-auth-portal-review.md)
+The separate dev origin supersedes the earlier production-origin test
+arrangement. The [Auth/Portal review](protocol/built-in-station-auth-portal-review.md)
 accepts the shared contract for implementation and records the rollout gates.
 
 ## Shared design and coordination

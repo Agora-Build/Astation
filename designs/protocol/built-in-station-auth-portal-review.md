@@ -34,13 +34,14 @@ starting that implementation. Hosted execution remains disabled.
    the exact integration review before owner authentication, and to Station AI
    opt-in when that feature is built. Custom Station consent must likewise
    identify the selected operator/origin. This is an Astation rollout item.
-3. **Environment decision: Q6 is unresolved.** The earlier owner-authorized
+3. **Environment decision: Q6 is resolved.** The earlier owner-authorized
    test arrangement used `station.agora.build` with dev Auth/Portal. The newer
    companion records a separate `station.dev.agora.build` decision. Astation
-   recommends the separate dev origin and has asked the owner to reconcile
-   the two instructions. Do not rebind keys, pairings or approved services to
-   a different origin automatically. Q6 blocks choosing the live deployment
-   binding; it does not block the shared Auth/Portal implementation.
+   recommended the separate dev origin. The owner then chose
+   `station.dev.agora.build`, reusing the current deployment and deferring
+   production until verification. Preserve the encrypted store and rollback
+   configuration; do not automatically rebind a hosted approval to another
+   origin. Q6 no longer blocks the shared implementation or dev deployment.
 
 ## Answers to Auth/Portal's four concerns
 
@@ -67,9 +68,9 @@ identity. Astation's earlier description of this as configuration-only was
 incomplete. The report/wrapping keys are prepared but remain unmounted and
 unregistered; private keys stay on Station.
 
-### 2. Dev origin: Q6 remains an owner decision
+### 2. Dev origin: Q6 resolved by the owner
 
-Prefer isolated dev and production Station origins, each with its exact issuer,
+Use isolated dev and production Station origins, each with its exact issuer,
 Portal, protected keys, database and audience. No issuer/audience alias or
 fallback is needed. The implementation must accept the configured origin;
 neither dev nor production may inherit consent from the other.

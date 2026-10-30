@@ -81,7 +81,8 @@ retrieval failure 503 with a five-second Retry-After. No token is logged.
 The relay and encrypted store remain opaque. The owner-authorized default
 Station validation uses `https://auth.dev.agora.build` as issuer and
 `https://dev.agora.build` as Portal, with the exact resource
-`https://station.agora.build`. This is explicit configuration, never issuer
+`https://station.dev.agora.build` (owner's Q6 decision, 2026-10-30).
+This is explicit configuration, never issuer
 fallback. Tokens with a Portal or Auth audience cannot authorize Station.
 
 Auth seeds the built-in Station and reporting identity from operator
@@ -104,10 +105,11 @@ the default's report key. [Portal #21](https://github.com/Agora-Build/Portal/iss
 tracks that internal setup. A custom origin remains pinned on failure; no
 default-origin or issuer fallback is allowed.
 The [Auth/Portal review](built-in-station-auth-portal-review.md) accepts this
-internal representation change. Q6 remains open because the companion now
-specifies `https://station.dev.agora.build` for dev, while the earlier test
-arrangement above uses the production origin. Resolve that deployment binding
-before changing a live environment; implementation can proceed independently.
+internal representation change. The owner resolved Q6 in favor of the separate
+dev origin, superseding the earlier production-origin/dev-issuer test plan.
+The current Volumetric deployment is reused for dev, with production deferred
+until verification. Preserve its existing encrypted store and rollback
+configuration; never transplant a hosted approval to another origin.
 Explicit Agora.Build content disclosure and the missing live revocation checks
 remain hosted-release requirements.
 
