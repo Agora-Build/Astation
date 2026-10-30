@@ -184,7 +184,7 @@ final class IntegrationApprovalViewController: NSViewController {
     @objc private func loadRequests() {
         cancelPending(); render(busy: true)
         do { try hub.configureIntegrationRelayAuth() }
-        catch { status.stringValue = "Select a registered HTTPS Station in General to review integration access."; render(); return }
+        catch { status.stringValue = "Select the built-in Station or a registered custom HTTPS Station in General."; render(); return }
         let epoch = generation, accountEpoch = hub.integrationAccountGeneration, origin = hub.stationRelayUrl
         task = Task { [weak self] in
             guard let self else { return }

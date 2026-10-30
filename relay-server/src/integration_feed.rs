@@ -500,6 +500,63 @@ mod tests {
         config.station_origin = "https://station.agora.build:8443".into();
         assert_ne!(key, config.storage_key().unwrap());
     }
+
+    #[test]
+    fn built_in_and_custom_configuration_never_alias_another_audience() {
+        use crate::account_identity::{configured_integration_origin, BUILT_IN_STATION_ORIGIN};
+        assert_eq!(
+            configured_integration_origin(None, BUILT_IN_STATION_ORIGIN).unwrap(),
+            BUILT_IN_STATION_ORIGIN
+        );
+        assert_eq!(
+            configured_integration_origin(Some("https://private.example"), "https://private.example")
+                .unwrap(),
+            "https://private.example"
+        );
+        for (origin, audience) in [
+            (None, "https://private.example"),
+            (None, "https://dev.agora.build"),
+            (Some("https://private.example"), BUILT_IN_STATION_ORIGIN),
+            (Some(""), BUILT_IN_STATION_ORIGIN),
+            (Some("https://private.example/"), "https://private.example"),
+            (Some("http://private.example"), "http://private.example"),
+        ] {
+            assert!(configured_integration_origin(origin, audience).is_err());
+        }
+    }
+
+    #[test]
+    fn built_in_feed_isolates_accounts_and_revokes_only_the_matching_integration() {
+        const OTHER_ID: &str = "i-11234567890123456789012345";
+        const OTHER_OWNER: &str = "ab11234567890123456789012345";
+        let mut config = binding();
+        config.station_origin = crate::account_identity::BUILT_IN_STATION_ORIGIN.into();
+        let mut first = policy("ready");
+        first["id"] = json!(ID);
+        let mut other = policy("ready");
+        other["id"] = json!(OTHER_ID);
+        other["ownerAccount"] = json!(OTHER_OWNER);
+        other["r9Svc"] = json!("b".repeat(64));
+        let snapshot: FeedPage = serde_json::from_value(json!({
+            "changes":[{"id":1,"kind":"checkpoint"}],"cursor":1,"integrations":[first,other]
+        }))
+        .unwrap();
+        let saved = PolicyCheckpoint::empty(config)
+            .unwrap()
+            .apply(0, snapshot, 100)
+            .unwrap();
+        assert!(saved.current(ID, OWNER, 100).is_ok());
+        assert!(saved.current(OTHER_ID, OTHER_OWNER, 100).is_ok());
+        assert!(saved.current(ID, OTHER_OWNER, 100).is_err());
+        assert!(saved.current(OTHER_ID, OWNER, 100).is_err());
+        let revoked = saved.apply(1, page(2, "revoking"), 102).unwrap();
+        assert!(revoked.revoking(ID, OWNER, 102).is_ok());
+        assert_eq!(
+            revoked.current(OTHER_ID, OTHER_OWNER, 102).unwrap(),
+            saved.current(OTHER_ID, OTHER_OWNER, 100).unwrap()
+        );
+        assert!(revoked.revoking(ID, OTHER_OWNER, 102).is_err());
+    }
     #[tokio::test]
     #[ignore]
     async fn postgres_integration_feed_commits_policy_and_cursor_atomically_across_replicas() {

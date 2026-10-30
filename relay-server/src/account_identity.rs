@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use crate::account_store::{AccountIdentityVerifier, VerifyError};
 
 pub const LEGACY_ISSUER: &str = "legacy:agora";
+pub(crate) const BUILT_IN_STATION_ORIGIN: &str = "https://station.agora.build";
 const MAX_DOCUMENT: usize = 64 * 1024;
 const CACHE_TTL: Duration = Duration::from_secs(60);
 const MAX_CACHE_AGE: Duration = Duration::from_secs(60 * 60);
@@ -242,6 +243,17 @@ pub(crate) fn integration_station_origin(value: &str) -> bool {
                 && matches!(url.host(), Some(url::Host::Domain(host)) if host.contains('.')
                 && !host.ends_with('.'))
         })
+}
+
+pub(crate) fn configured_integration_origin(
+    public_origin: Option<&str>,
+    audience: &str,
+) -> Result<String, ()> {
+    let origin = public_origin.unwrap_or(BUILT_IN_STATION_ORIGIN);
+    if origin != audience || !integration_station_origin(origin) {
+        return Err(());
+    }
+    Ok(origin.into())
 }
 
 impl OidcVerifier {

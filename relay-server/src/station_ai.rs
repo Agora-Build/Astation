@@ -1,6 +1,6 @@
 //! Registration proof and closed runtime routes until verified provisioning.
 use axum::{
-    extract::State,
+    extract::{OriginalUri, State},
     http::{header::CACHE_CONTROL, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get},
@@ -9,7 +9,7 @@ use axum::{
 use serde_json::json;
 use std::sync::Arc;
 
-const DEFAULT_STATION: &str = "https://station.agora.build";
+const DEFAULT_STATION: &str = crate::account_identity::BUILT_IN_STATION_ORIGIN;
 const CUSTOM_REQUIRED: &str = "Station AI needs your own Station. Register a custom relay in Portal (Stations > Add Station) and select it in Astation.";
 
 struct Configuration {
@@ -86,8 +86,11 @@ async fn proof(State(config): State<Arc<Configuration>>) -> Response {
     }
 }
 
-async fn unavailable(State(config): State<Arc<Configuration>>) -> Response {
-    let (status, code, message) = if config.custom {
+async fn unavailable(
+    State(config): State<Arc<Configuration>>,
+    OriginalUri(uri): OriginalUri,
+) -> Response {
+    let (status, code, message) = if config.custom || uri.path().starts_with("/api/agent/v1") {
         (StatusCode::SERVICE_UNAVAILABLE, "station_ai_unavailable",
             "Station AI is not provisioned. Auth validation, native approval and runtime setup must complete before access is enabled.")
     } else {
@@ -146,12 +149,28 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                let agent = path.starts_with("/api/agent/v1");
+                assert_eq!(
+                    response.status(),
+                    if agent {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::FORBIDDEN
+                    }
+                );
                 assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
                 let body: serde_json::Value =
                     serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
                         .unwrap();
-                assert_eq!(body["error"]["message"], CUSTOM_REQUIRED);
+                if agent {
+                    assert_eq!(body["error"]["code"], "station_ai_unavailable");
+                    assert!(!body["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("custom"));
+                } else {
+                    assert_eq!(body["error"]["message"], CUSTOM_REQUIRED);
+                }
                 assert_eq!(body["admission_enabled"], false);
             }
         }
@@ -298,7 +317,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

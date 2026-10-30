@@ -71,8 +71,9 @@ async fn release_gate(request: axum::extract::Request, next: axum::middleware::N
     if HOSTED_EXECUTION_ENABLED {
         return next.run(request).await;
     }
-    let configured = std::env::var("PUBLIC_BASE_URL")
-        .is_ok_and(|v| crate::account_identity::integration_station_origin(&v));
+    let origin = std::env::var("PUBLIC_BASE_URL")
+        .unwrap_or_else(|_| crate::account_identity::BUILT_IN_STATION_ORIGIN.into());
+    let configured = crate::account_identity::integration_station_origin(&origin);
     error(
         if configured {
             StatusCode::SERVICE_UNAVAILABLE
@@ -82,7 +83,7 @@ async fn release_gate(request: axum::extract::Request, next: axum::middleware::N
         if configured {
             "hosted_execution_not_verified"
         } else {
-            "custom_station_required"
+            "invalid_station_configuration"
         },
     )
 }

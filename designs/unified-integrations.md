@@ -12,10 +12,13 @@ of the default `https://station.agora.build` using the existing
 The Station audience remains its exact public origin. Default-origin
 validation and native service review now support the same scoped model
 as custom Stations; neither origin selection nor login enables agent execution.
-Auth reserves the default as a static resource and rejects ordinary dynamic
-registration of that origin. Its managed-default reporting and integration
-enrollment contract remains a Portal/Auth prerequisite, tracked in
-[Portal #21](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6527125126).
+The default is a built-in managed Station. Its existing static Auth resource
+is retained; users never register it, prove domain control or request Station
+membership. Platform operators configure its reporting identity internally.
+Custom Stations retain their registration flow. This implements the owner's
+original default/custom distinction and supersedes the earlier request to
+enroll the default like a custom server. Internal Portal/Auth configuration is
+tracked in [Portal #21](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6531544904).
 The release gate remains closed until the outstanding live revocation check
 and default-origin deployment checks pass. This test arrangement does not
 claim that production Auth is deployed or make dev accounts production accounts.
@@ -97,8 +100,8 @@ Expose one Station API rather than requiring another publicly named service
 or a separate gateway deployment. Implement agent integrations as a module in
 the existing Rust Station server, using the shared `atem-client` crate. One
 Station deployment and API origin can serve all modules on a registered
-custom Station; the agent module also supports the explicitly configured
-managed default once its enrollment contract is supplied. Its relay and
+custom Station; the agent module also supports the internally configured
+built-in Station. Its relay and
 encrypted storage stay opaque. A separately native-approved integration may
 use the agent module as a scoped decrypting endpoint; selecting the default
 Station alone creates no such grant. MCP and LLM execution remain unavailable
@@ -169,16 +172,40 @@ Use the same Station server/package for both deployments:
   native manager. Installing/enabling the module enrolls nobody and grants
   access to no account by itself.
 
+### Built-in and custom Stations
+
+| Selection | Setup | Routing |
+| --- | --- | --- |
+| Built-in `https://station.agora.build` | Platform configured; users sign in. | Used when no custom Station is selected. |
+| Custom Station | Register and prove control in Portal. | Used while selected, including across reconnects. |
+
+Settings exposes a built-in/custom choice. Selecting the built-in clears the
+custom override; selecting a custom server preserves its exact configured
+origin. An unavailable or invalid custom server produces an error and never
+silently routes to the built-in. Environment overrides remain explicit and
+read-only. Changing servers does not transfer pairings, membership, service
+consent or encrypted account data to the new origin.
+
 Register a custom Station in Portal using proof of control at
 `/.well-known/agora-build-station`. Auth registers its exact origin and allowed
 accounts; initially only the registering owner may use it. Owners can invite
 other accounts; open public/shared-relay discovery is deferred. Each account
 configures that relay in Astation/Atem without fallback to the public default.
-The managed default needs an Auth-supported exact-origin reporting/enrollment
-path and the same protected report/service-key configuration for dev-backed
-validation. It receives no implicit account-wide membership or exception to
-the owner/native ceremony. Its static resource cannot be registered again
-through the custom-Station flow.
+The built-in retains Auth's static default resource and gets an operator
+configured report identity and protected report/wrapping keys. Reuse the
+existing `station.report` token grant, changes/reports endpoints and schemas;
+these are internal deployment configuration, not user Station enrollment.
+Portal offers it to signed-in accounts without custom-Station membership.
+Each integration remains bound to its own issuer, account, root and service
+identity; a feed can carry multiple accounts without sharing their authority.
+Ordinary users cannot replace the built-in report key, share/remove the
+platform Station or administer another account's integrations.
+
+Both modes use the same APIs, authenticated feed, durable policies and R9
+service-key implementation. Pairing/verification and fresh native approval of
+integration access are required on either Station. Built-in availability
+does not enroll a device or grant access to its hosts. No changes to the R9
+wire contract are needed for this setup distinction.
 
 Settings > Station AI has independent MCP, LLM and Agent switches, all off by
 default, with explicit feature/Station/provider consent and Off/Starting/On/Error
@@ -288,7 +315,7 @@ are not existing transports or extra R9 message definitions. An authorized
 context or agent handler may read its permitted data; the relay/storage paths
 remain opaque. Credential payloads never flow into the context/model paths.
 LLM/MCP require a registered custom Station. The agent module may also run on
-the managed default after its enrollment and live rollout gates pass. The
+the built-in default after its operator setup and live rollout gates pass. The
 official Discord adapter sees interactions/replies
 transiently. The explicitly enabled voice pipeline receives audio/transcripts/
 replies and stores conversation history as described below; neither path gets

@@ -5,17 +5,14 @@ import AstationRemote
 class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, NSTableViewDataSource, NSTableViewDelegate {
     static let astationRelayUrlKey = "AstationRelayUrl"
 
-    static let defaultStationURL = "https://station.agora.build"
+    static let defaultStationURL = StationRelayURL.builtInBase
 
     /// Returns the persisted Station relay URL.
     /// Env var ASTATION_RELAY_URL takes priority over UserDefaults.
     static var currentAstationRelayUrl: String {
-        if let envUrl = ProcessInfo.processInfo.environment["ASTATION_RELAY_URL"] {
-            let normalized = StationRelayURL.normalizedBase(envUrl)
-            if !normalized.isEmpty { return normalized }
-        }
-        let saved = StationRelayURL.normalizedBase(UserDefaults.standard.string(forKey: astationRelayUrlKey) ?? "")
-        return saved.isEmpty ? defaultStationURL : saved
+        StationRelayURL.selectedBase(
+            saved: UserDefaults.standard.string(forKey: astationRelayUrlKey),
+            environmentOverride: ProcessInfo.processInfo.environment["ASTATION_RELAY_URL"])
     }
 
     private var window: NSWindow?
@@ -40,6 +37,8 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var portalUrlField = NSTextField()
     private var accountServerStatus = NSTextField(wrappingLabelWithString: "")
     private var stationUrlField: NSTextField!
+    private let stationChoice = NSPopUpButton()
+    private let stationSelectionHint = NSTextField(wrappingLabelWithString: "")
     private var serverInfoLabel: NSTextField!
     private var recoveryStatusLabel: NSTextField?
     private var recoverySetupButton: NSButton?
@@ -305,10 +304,8 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         content.addArrangedSubview(wrappingInfo("Account services and Atem connections. Account server changes require sign-in again."))
         let settings = hubManager.portalSettings
         portalUrlField.stringValue = settings?.portalURL ?? ""
-        stationUrlField = NSTextField(string: SettingsWindowController.currentAstationRelayUrl)
         let fields: [(String, String, NSTextField, String)] = [
-            ("Portal URL", "Account and linked projects", portalUrlField, "ASTATION_PORTAL_URL"),
-            ("Relay URL", "Remote Atem connections", stationUrlField, "ASTATION_RELAY_URL")
+            ("Portal URL", "Account and linked projects", portalUrlField, "ASTATION_PORTAL_URL")
         ]
         var rows = fields.map { title, hint, field, env -> [NSView] in
             field.setAccessibilityLabel(title)
@@ -324,6 +321,28 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
             description.widthAnchor.constraint(equalTo: input.widthAnchor).isActive = true
             return [NSTextField(labelWithString: title), input]
         }
+        let origin = Self.currentAstationRelayUrl
+        stationChoice.removeAllItems()
+        stationChoice.addItems(withTitles: ["Built-in (station.agora.build)", "Custom Station"])
+        stationChoice.selectItem(at: origin == Self.defaultStationURL ? 0 : 1)
+        stationChoice.setAccessibilityLabel("Station")
+        stationChoice.target = self; stationChoice.action = #selector(stationSelectionChanged)
+        stationUrlField = NSTextField(string: origin == Self.defaultStationURL ? "" : origin)
+        stationUrlField.placeholderString = "https://station.example"
+        stationUrlField.setAccessibilityLabel("Custom Station URL")
+        if !(ProcessInfo.processInfo.environment["ASTATION_RELAY_URL"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            stationChoice.isEnabled = false; stationChoice.toolTip = "Set by ASTATION_RELAY_URL"
+            stationUrlField.isEditable = false; stationUrlField.toolTip = "Set by ASTATION_RELAY_URL"
+        }
+        stationSelectionHint.font = .systemFont(ofSize: 11); stationSelectionHint.textColor = .secondaryLabelColor
+        let stationInput = NSStackView(views: [stationChoice, stationUrlField, stationSelectionHint])
+        stationInput.orientation = .vertical; stationInput.alignment = .leading; stationInput.spacing = 4
+        for field in [stationUrlField!, stationSelectionHint] {
+            field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            field.widthAnchor.constraint(equalTo: stationInput.widthAnchor).isActive = true
+        }
+        rows.append([NSTextField(labelWithString: "Station"), stationInput])
+        renderStationSelection()
         serverInfoLabel = NSTextField(wrappingLabelWithString: "")
         serverInfoLabel.font = .systemFont(ofSize: 11); serverInfoLabel.textColor = .secondaryLabelColor
         serverInfoLabel.isSelectable = true
@@ -344,14 +363,27 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         return scroll
     }
 
+    @objc private func stationSelectionChanged(_ sender: NSPopUpButton) {
+        renderStationSelection()
+    }
+
+    private func renderStationSelection() {
+        let builtIn = stationChoice.indexOfSelectedItem == 0
+        stationUrlField.isHidden = builtIn
+        stationSelectionHint.stringValue = builtIn
+            ? "Built-in relay. No server registration required."
+            : "Register your server in Agora.Build. Connections stay on this Station."
+    }
+
     @objc private func saveAccountServers(_ sender: NSButton) {
         do {
             let settings = try AccountServiceSettings(portalURL: portalUrlField.stringValue,
                 issuer: AccountServiceSettings.issuerURL(forPortalURL: portalUrlField.stringValue),
                 clientID: hubManager.portalSettings?.clientID ?? AccountServiceSettings.defaultClient,
                 resource: AccountServiceSettings.resourceURL(forPortalURL: portalUrlField.stringValue))
-            guard let relayURL = StationRelayURL.validatedBase(stationUrlField.stringValue) else {
-                accountServerStatus.stringValue = "Enter a valid relay URL."
+            guard let relayURL = stationChoice.indexOfSelectedItem == 0 ? Self.defaultStationURL
+                    : StationRelayURL.validatedBase(stationUrlField.stringValue) else {
+                accountServerStatus.stringValue = "Enter a valid custom Station URL."
                 accountServerStatus.textColor = .systemRed
                 return
             }
@@ -364,10 +396,17 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
                         portalUrlField.stringValue = effective.portalURL
                     }
                     if relayURL != SettingsWindowController.currentAstationRelayUrl {
-                        UserDefaults.standard.set(relayURL, forKey: SettingsWindowController.astationRelayUrlKey)
+                        if relayURL == Self.defaultStationURL {
+                            UserDefaults.standard.removeObject(forKey: Self.astationRelayUrlKey)
+                        } else {
+                            UserDefaults.standard.set(relayURL, forKey: Self.astationRelayUrlKey)
+                        }
                         NotificationCenter.default.post(name: .serverInfoChanged, object: nil)
                     }
-                    stationUrlField.stringValue = SettingsWindowController.currentAstationRelayUrl
+                    let selected = Self.currentAstationRelayUrl
+                    stationChoice.selectItem(at: selected == Self.defaultStationURL ? 0 : 1)
+                    if selected != Self.defaultStationURL { stationUrlField.stringValue = selected }
+                    renderStationSelection()
                     accountServerStatus.stringValue = hubManager.signedInAccount == nil
                         ? "Servers saved. Sign in to Agora.Build to continue." : "Servers saved."
                     accountServerStatus.textColor = .secondaryLabelColor

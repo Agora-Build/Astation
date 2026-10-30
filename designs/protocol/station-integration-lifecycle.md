@@ -86,7 +86,7 @@ Re-enrollment is an explicit new native approval. Operator key files are bounded
 permissions, and are never generated or replaced at startup. The separate
 durable fingerprint is saved before public-key exposure, so deleting a pending
 key after a draft was exposed cannot silently rotate it either. See
-[deployment instructions](../../DEPLOY.md#custom-station-integrations) for
+[deployment instructions](../../DEPLOY.md#station-integrations) for
 operator backup and replacement procedures.
 
 The service key implements the shared `KeyProvider` and signs only the

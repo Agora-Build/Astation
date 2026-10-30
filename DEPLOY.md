@@ -350,8 +350,8 @@ principals or changing pairings/encryption. `/health` and `verify-station.mjs`
 prove infrastructure availability, not Auth interoperability or R9 authority.
 
 For a custom Station, first register its exact origin in Portal > Stations.
-The managed default origin needs the distinct Auth reporting/enrollment
-contract described under "Default Station validation with dev Auth and Portal".
+The built-in default uses internal operator setup, described under "Default
+Station validation with dev Auth and Portal"; users do not register it.
 Set the Portal-generated public `STATION_REGISTRATION_CHALLENGE` on every
 replica. `GET /.well-known/agora-build-station` serves that exact value as
 `text/plain` with `Cache-Control: no-store`; unset it after verification. This
@@ -1187,7 +1187,7 @@ pg_restore --clean --if-exists --dbname="$DATABASE_URL" station-YYYY-MM-DD.dump
   backup. An Astation whose key was reset after the backup is taken is
   rejected until you repeat the admin reset.
 
-## Custom Station Integrations
+## Station Integrations
 
 The production relay already runs independently of the Mac on Volumetric.
 Use `mosh Volumetric` for interactive administration, or the same saved SSH
@@ -1211,20 +1211,21 @@ transport changes. Already approved service access remains independent of
 that native connection.
 
 The provisioning endpoints and authenticated feed worker require durable
-Postgres. Default and custom Stations need the same explicit registration,
-operator key configuration and native service consent. Configure a registered
+Postgres. The built-in Station retains its static Auth resource and internal
+operator report identity. Custom Stations require registration/proof first.
+Both use the same protected keys and native service consent. Configure an
 HTTPS origin, exactly matching
 the Auth resource, without paths, credentials, query parameters or a trailing
 slash. Each replica uses the same binding and protected keys:
 
 | Variable | Purpose |
 | --- | --- |
-| `PUBLIC_BASE_URL` | Exact registered Station origin. |
+| `PUBLIC_BASE_URL` | Exact Station origin; defaults to `https://station.agora.build` when absent. Required explicitly for custom Stations. |
 | `ACCOUNT_OIDC_ISSUER` | Pinned Agora.Build Auth issuer; dev is `https://auth.dev.agora.build`. |
 | `ACCOUNT_OIDC_AUDIENCE` | Must equal `PUBLIC_BASE_URL` exactly. |
 | `ACCOUNT_OIDC_REQUIRED_SCOPE` | Native account scope `astation.remote`. |
 | `STATION_PORTAL_ORIGIN` | Exact Portal transport/resource origin; dev is `https://dev.agora.build`. |
-| `STATION_REPORT_CLIENT_ID` | Registered Station's `s-...` client ID. |
+| `STATION_REPORT_CLIENT_ID` | Operator-provisioned built-in or registered custom Station's `s-...` report client ID. |
 | `STATION_REPORT_KEY_FILE` | Mounted P-256 PKCS8 DER report-signing key, separate from service/native keys. |
 | `STATION_SERVICE_WRAPPING_KEY_FILE` | Mounted raw 32-byte AES wrapping key for integration service keys. |
 | `STATION_SERVICE_WRAPPING_KEY_ID` | Stable operator label binding every encrypted service-key envelope. |
@@ -1243,7 +1244,8 @@ openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 |
 openssl rand -out station-service-wrapping.bin 32
 ```
 
-Register only the report key's public JWK in Portal. The authenticated
+Provision only the report key's public JWK in the platform configuration for
+the built-in, or register it in Portal for a custom Station. The authenticated
 `GET /agora-build/v1/details` (`station.read`) returns it; exact Portal-origin
 preflight is supported for that path. Keep native Station access tokens and
 Portal approval/report tokens scoped to their own resource. A localhost
@@ -1264,16 +1266,18 @@ ACCOUNT_OIDC_REQUIRED_SCOPE=astation.remote
 STATION_PORTAL_ORIGIN=https://dev.agora.build
 ```
 
-Auth currently configures `https://station.agora.build` as a static resource.
-Its Station-token contract section B3 explicitly rejects dynamic registration
-of an origin that is already static. Do not register it through the ordinary
-custom-Station flow, remove its static resource, or invent a report client.
-Portal/Auth must supply a supported managed-default reporting/integration
-enrollment contract, or a reviewed migration preserving native issuance and
-existing account access. Track that prerequisite in
-[Portal #21](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6527125126).
-Once available, obtain its report client and mount its protected report and
-wrapping keys on both replicas.
+Retain `https://station.agora.build` as Auth's static resource. Configure its
+report client and public key internally in Auth/Portal, and mount its protected
+report and wrapping keys on both replicas. Reuse the existing ES256
+`private_key_jwt`, Portal-resource `station.report` token and changes/reports
+API schemas. The built-in report client resolves to the default origin and
+its feed carries integrations from multiple accounts; every request still
+matches its integration's exact owner. Portal must expose the built-in choice
+without requiring account membership in a custom Station. Platform operators
+manage its report key; end users cannot share/remove the built-in Station.
+This is internal service configuration, not another user enrollment path.
+Coordination: [Portal #21](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6531544904).
+
 Native Astation uses the dev Portal for account/project and approval tokens,
 and requests separate `station.agora.build` tokens from the same dev issuer
 for Station calls. Never reuse a Portal-audience token at Station, silently

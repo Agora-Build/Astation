@@ -486,13 +486,28 @@ final class AccountServiceSettingsTests: XCTestCase {
         window.contentView?.layoutSubtreeIfNeeded()
         func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
         let all = descendants(general)
-        let fields = all.compactMap { $0 as? NSTextField }.filter { ["Portal URL", "Relay URL"].contains($0.accessibilityLabel() ?? "") }
+        let fields = all.compactMap { $0 as? NSTextField }.filter { ["Portal URL", "Custom Station URL"].contains($0.accessibilityLabel() ?? "") }
         XCTAssertEqual(fields.count, 2)
+        let station = try XCTUnwrap(all.compactMap { $0 as? NSPopUpButton }.first { $0.accessibilityLabel() == "Station" })
+        let customURL = try XCTUnwrap(fields.first { $0.accessibilityLabel() == "Custom Station URL" })
+        let originalStation = UserDefaults.standard.string(forKey: SettingsWindowController.astationRelayUrlKey)
+        XCTAssertEqual(station.itemTitles, ["Built-in (station.agora.build)", "Custom Station"])
+        station.selectItem(at: 1)
+        XCTAssertTrue(station.sendAction(try XCTUnwrap(station.action), to: station.target))
+        window.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertFalse(customURL.isHidden)
         XCTAssertFalse(all.compactMap { $0 as? NSTextField }.contains { ["Client ID", "Auth URL", "API resource"].contains($0.accessibilityLabel() ?? "") })
         for field in fields {
             XCTAssertGreaterThan(field.bounds.width, 240)
             XCTAssertLessThanOrEqual(field.convert(field.bounds, to: general).maxX, general.bounds.width)
         }
+        station.selectItem(at: 0)
+        XCTAssertTrue(station.sendAction(try XCTUnwrap(station.action), to: station.target))
+        window.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertTrue(customURL.isHidden)
+        XCTAssertTrue(all.compactMap { $0 as? NSTextField }.contains { $0.stringValue == "Built-in relay. No server registration required." })
+        XCTAssertEqual(UserDefaults.standard.string(forKey: SettingsWindowController.astationRelayUrlKey), originalStation,
+            "Previewing the selection cannot change the active Station before Save")
         XCTAssertTrue(all.compactMap { $0 as? NSTextField }.contains { $0.stringValue == "Servers & Connections" })
         XCTAssertTrue(all.compactMap { $0 as? NSTextField }.contains { $0.stringValue.contains("Direct Atem connections") })
         XCTAssertTrue(all.compactMap { $0 as? NSButton }.contains { $0.title == "Save Servers" })

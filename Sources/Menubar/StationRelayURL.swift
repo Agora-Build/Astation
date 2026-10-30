@@ -1,6 +1,17 @@
 import Foundation
 
 enum StationRelayURL {
+    static let builtInBase = "https://station.agora.build"
+
+    static func selectedBase(saved: String?, environmentOverride: String?) -> String {
+        for value in [environmentOverride, saved] {
+            if let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return normalizedBase(value)
+            }
+        }
+        return builtInBase
+    }
+
     static func normalizedBase(_ value: String) -> String {
         var base = value.trimmingCharacters(in: .whitespacesAndNewlines)
         while base.hasSuffix("/") {

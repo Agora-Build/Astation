@@ -84,21 +84,24 @@ Station validation uses `https://auth.dev.agora.build` as issuer and
 `https://station.agora.build`. This is explicit configuration, never issuer
 fallback. Tokens with a Portal or Auth audience cannot authorize Station.
 
-Default and custom Stations require registration, protected report/service
-keys, an authenticated policy feed and exact native service approval for
-agent integration access. Registration and origin selection alone grant no
+The built-in Station uses its existing static Auth resource and operator
+configured reporting identity. Only custom Stations require user registration
+and proof of domain control. Both need protected report/service keys, an
+authenticated policy feed and exact native service approval for agent
+integration access. Registration and origin selection alone grant no
 execution authority. The hosted release gate remains closed until live
 validation completes. MCP/LLM execution and the old voice bridge stay
 unavailable. Relay-only policy still requires a durable acknowledgment from
 every enrolled host. Auth validation is required on both kinds of Station.
 
-Auth's current static default resource is not an ordinary dynamic Station:
-section B3 of its Station-token contract forbids registering the same origin
-again. Managed-default report-client and integration enrollment must be
-confirmed with Portal/Auth before default-origin rollout. Do not remove the
-static resource, create an alias audience, or bypass registration to fill this
-gap. [Portal #21](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6527125126)
-tracks the required contract.
+Keep Auth's static default resource. Its report identity is provisioned
+internally and uses the existing `station.report` grant and Portal changes/
+reports schemas; there is no separate default-Station registration ceremony.
+Portal makes it available to signed-in accounts while retaining per-account
+integration ownership and native consent. Operators, not end users, manage
+the default's report key. [Portal #21](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6531544904)
+tracks that internal setup. A custom origin remains pinned on failure; no
+default-origin or issuer fallback is allowed.
 
 No credential payload is exported into assistant context. New custom LLM or
 Discord credentials are separately consented, write-only provisioning directly

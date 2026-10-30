@@ -1,4 +1,4 @@
-//! Custom Station provisioning. Portal supplies policy; native managers sign R9.
+//! Built-in and custom Station provisioning. Native managers sign R9 authority.
 use crate::{
     account_identity::{OidcVerifier, VerifiedAccessToken},
     account_store::VerifyError,
@@ -112,16 +112,18 @@ impl StationIntegrations {
         if std::env::var_os("STATION_REPORT_CLIENT_ID").is_none() {
             return Ok(None);
         }
+        let public_origin = std::env::var("PUBLIC_BASE_URL").ok();
+        let station_origin = crate::account_identity::configured_integration_origin(
+            public_origin.as_deref(),
+            &get("ACCOUNT_OIDC_AUDIENCE")?,
+        )?;
         let binding = FeedBinding {
             issuer: get("ACCOUNT_OIDC_ISSUER")?,
             portal_origin: get("STATION_PORTAL_ORIGIN")?,
-            station_origin: get("PUBLIC_BASE_URL")?,
+            station_origin,
             report_client_id: get("STATION_REPORT_CLIENT_ID")?,
         };
         binding.validate()?;
-        if get("ACCOUNT_OIDC_AUDIENCE")? != binding.station_origin {
-            return Err(());
-        }
         let wrapping = protected_file(&get("STATION_SERVICE_WRAPPING_KEY_FILE")?, 32)?;
         let key: &[u8; 32] = wrapping.as_slice().try_into().map_err(|_| ())?;
         let vault = ServiceKeyVault::new(key, &get("STATION_SERVICE_WRAPPING_KEY_ID")?)?;

@@ -59,7 +59,7 @@ async fn production_hosted_routes_are_closed_even_with_no_runtime() {
             serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
         assert!(matches!(
             value["error"]["code"].as_str(),
-            Some("custom_station_required" | "hosted_execution_not_verified")
+            Some("invalid_station_configuration" | "hosted_execution_not_verified")
         ));
     }
     assert!(!HOSTED_EXECUTION_ENABLED);

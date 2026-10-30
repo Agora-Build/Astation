@@ -12,7 +12,7 @@ and controlled tests, not a deployed service.
 
 1. Register the custom HTTPS Station in Portal with its exact public origin
    and separate report-client public JWK. Configure the protected operator
-   files described in [DEPLOY](../../DEPLOY.md#custom-station-integrations).
+   files described in [DEPLOY](../../DEPLOY.md#station-integrations).
 2. Sign in to Agora.Build in Astation. Select that Station in General and
    open Settings > Integrations > Load Requests. The native app requests
    `integrations:read integrations:approve` for Portal and `astation.remote`
