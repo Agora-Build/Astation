@@ -34,6 +34,7 @@ final class IntegrationApprovalViewController: NSViewController {
     private var approval: RemoteServiceApproval?
     private var approvedScope: ApprovedScope?
     private var task: Task<Void, Never>?
+    private var revocationRefresh: Task<Void, Never>?
     private var generation = UUID()
     private var contextCurrent: (() -> Bool)?
 
@@ -97,6 +98,7 @@ final class IntegrationApprovalViewController: NSViewController {
     }
 
     func cancelPending() {
+        revocationRefresh?.cancel(); revocationRefresh = nil
         generation = UUID(); task?.cancel(); task = nil
         approval = nil; contextCurrent = nil; log = nil; reviewText.stringValue = ""
         approvedScope = nil
@@ -147,10 +149,12 @@ final class IntegrationApprovalViewController: NSViewController {
     }
 
     @objc private func selectionChanged() {
+        revocationRefresh?.cancel(); revocationRefresh = nil
         approval = nil; reviewText.stringValue = ""
         showSelectedScope()
         status.stringValue = selectedRequestGuidance()
         render()
+        refreshRemovedServiceStatus()
     }
     @objc private func hostSelectionChanged() { render() }
     @objc private func setupSecurity() { openSecurity() }
@@ -165,6 +169,7 @@ final class IntegrationApprovalViewController: NSViewController {
             : "Atem hosts may connect directly again after they save this change. This does not enable hosted integrations."
         alert.addButton(withTitle: "Apply"); alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
+        revocationRefresh?.cancel(); revocationRefresh = nil
         let epoch = generation; render(busy: true)
         task = Task { [weak self] in
             guard let self else { return }
@@ -217,10 +222,7 @@ final class IntegrationApprovalViewController: NSViewController {
                 }
                 self.portal = portal
                 self.records = records.filter { $0.state == "awaiting_approval" || ["provisioning", "waiting_for_host", "revoking", "revoked"].contains($0.state) }
-                picker.removeAllItems(); picker.addItems(withTitles: self.records.map {
-                    let state = $0.state == "waiting_for_host" ? "approved; activation pending" : $0.state.replacingOccurrences(of: "_", with: " ")
-                    return "\($0.name) · \(state)"
-                })
+                picker.removeAllItems(); picker.addItems(withTitles: self.records.map(Self.requestTitle))
                 for child in hosts.arrangedSubviews { hosts.removeArrangedSubview(child); child.removeFromSuperview() }
                 hostButtons = []
                 try await hub.prepareAccountSecurityAccess()
@@ -252,6 +254,7 @@ final class IntegrationApprovalViewController: NSViewController {
                     status.stringValue = selectedRequestGuidance()
                 }
                 render()
+                refreshRemovedServiceStatus()
             } catch { fail(error, epoch: epoch) }
         }
     }
@@ -340,9 +343,52 @@ final class IntegrationApprovalViewController: NSViewController {
                 self.log = try await coordinator.serviceMembership()
                 guard epoch == generation else { return }
                 showSelectedScope()
-                status.stringValue = "Service removed from the verified account log. The Station will report revocation completion."
+                status.stringValue = selectedRequestGuidance()
                 render()
+                refreshRemovedServiceStatus()
             } catch { fail(error, epoch: epoch) }
+        }
+    }
+
+    private static func requestTitle(_ record: PortalIntegrationRecord) -> String {
+        let state = record.state == "waiting_for_host" ? "approved; activation pending"
+            : record.state.replacingOccurrences(of: "_", with: " ")
+        return "\(record.name) · \(state)"
+    }
+
+    private func refreshRemovedServiceStatus() {
+        revocationRefresh?.cancel(); revocationRefresh = nil
+        guard records.indices.contains(picker.indexOfSelectedItem), let portal, let log else { return }
+        let record = records[picker.indexOfSelectedItem]
+        guard record.state == "revoking",
+              (try? AstationRecoveryCoordinator.serviceRemovalComplete(record: record, log: log)) == true else { return }
+        let epoch = generation
+        let current = { [weak self] in
+            guard let self, self.generation == epoch, self.contextCurrent?() == true,
+                  self.records.indices.contains(self.picker.indexOfSelectedItem) else { return false }
+            return self.records[self.picker.indexOfSelectedItem].id == record.id
+        }
+        revocationRefresh = Task { [weak self] in
+            do {
+                let complete = try await IntegrationRevocationRefresh.run(record: record, current: current,
+                    fetch: { try await portal.owned(stationOrigin: record.stationOrigin) },
+                    update: { [weak self] next in
+                        guard let self, current() else { return }
+                        let index = self.picker.indexOfSelectedItem
+                        self.records[index] = next
+                        self.picker.item(at: index)?.title = Self.requestTitle(next)
+                        self.status.stringValue = self.selectedRequestGuidance()
+                        self.render()
+                    })
+                if !complete, let self, current(), !Task.isCancelled {
+                    self.status.stringValue = "Service removed from the verified account log. Station cleanup is still pending. Load requests to check again."
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self, current(), !Task.isCancelled else { return }
+                self.status.stringValue = "Service removed from the verified account log. Could not refresh Station cleanup status. Load requests to try again."
+            }
         }
     }
 
