@@ -1270,7 +1270,7 @@ Current backend rollout (2026-10-30):
 
 | Component | Deployment |
 | --- | --- |
-| Public origin | `https://station-dev.agora.build`; owner-selected replacement for the nested hostname. Cloudflare publication and public HTTPS/WSS verification are pending. |
+| Public origin | `https://station-dev.agora.build`; published and public HTTPS/WSS verification passed on 2026-10-30 at 22:02 UTC. |
 | Relay A | Existing Coolify `oss4444o8ss40ckgwc40og4c`, renamed `station-dev-relay-a`. |
 | Relay B | Existing Coolify `am8lrcacts572trbli1bmvnu`, renamed `station-dev-relay-b`. |
 | Webapp | Existing Coolify `c0wwgk4c0owk0w4gsww4k0ss`, renamed `station-dev-webapp`; host port `3010`. |
@@ -1306,8 +1306,9 @@ observing its Cloudflare edge TLS handshake failure. That earlier nested name
 is not covered by `*.agora.build`. In the tunnel's published application,
 change Subdomain from `station.dev` to `station-dev`, retain domain
 `agora.build` and service `http://10.0.0.1:3010`, and preserve unrelated rules.
-The replacement fits ordinary `*.agora.build` certificate coverage; still
-verify the real public HTTPS and WSS endpoints before using them. Cloudflare
+The owner published this replacement on 2026-10-30. It uses Cloudflare's
+Google Trust Services certificate for `agora.build` and `*.agora.build`, valid
+through 2027-01-27. Public HTTPS and WSS checks pass. Cloudflare
 DNS/tunnel/certificate management access is separate from the connector's
 runtime token. Do not redirect bearer-authenticated API calls between Station
 origins or accept the earlier hostname as another token audience.
@@ -1323,12 +1324,20 @@ Both relays and the webapp passed Coolify health checks. Actual backend
 checks confirm PostgreSQL, Redis, two replicas and exact dev issuer/audience
 configuration. Earlier public checks through the previous hostname passed
 Stoa/Agent assets and identity WebSocket upgrades, before its DNS removal.
-Those checks do not prove public HTTPS/WSS on the new hostname. The earlier
-nested hostname also passed unauthenticated HTTP health/details/metrics
-diagnostics (200/503/404), but failed the full `verify-station.mjs` TLS check.
-The replacement's DNS record was still absent at 21:55 UTC; public verification
-awaits publication. Authenticated verification awaits valid HTTPS. Provisioning
-and details return `station_integration_unavailable` until Auth/Portal's
+The earlier nested hostname also passed unauthenticated HTTP
+health/details/metrics diagnostics (200/503/404), but failed TLS. The final
+hostname now passes the full `verify-station.mjs` public check: root/health,
+Stoa/Agent assets, privacy/MIME/CSP headers and both `/ws` and `//ws` identity
+WebSocket upgrades. Health confirms relay source `9004ca9`, PostgreSQL, Redis
+and two replicas. HTTPS succeeds against both published Cloudflare IPv4
+addresses, and independently from Volumetric. Initial OS resolvers still
+cached the earlier NXDOMAIN; the diagnostic used a process-local public-DNS
+lookup for this exact hostname, retaining normal SNI and TLS certificate
+verification. No hosts file, system DNS setting or TLS verification was changed.
+
+These are unauthenticated transport/deployment checks, not a completed hosted
+integration flow. The public integration details endpoint returns
+`station_integration_unavailable` until Auth/Portal's
 built-in report identity is delivered; hosted APIs return
 `hosted_execution_not_verified`. Both are intentional closed states, not a
 completed integration test. Source/report configuration and native approvals
