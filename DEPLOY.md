@@ -104,7 +104,8 @@ resource table below describe the previous setup: its deployment hooks now
 point at the reused dev applications. Keep them separate from a future
 production rollout; do not treat a main workflow run as dev verification.
 
-This is the production setup, and a worked example of the section above.
+The following workflow description is the previous production setup, and a
+worked example of the section above. The current dev state is recorded below.
 
 Every push to `main` runs `.github/workflows/deploy-station.yml`. It builds both
 Linux AMD64 images, publishes `:main` and `:sha-<commit>` tags to GHCR, then
@@ -1264,6 +1265,60 @@ Auth permits native `astation` issuance of `astation.remote` for this exact
 Station, and issue `station.report` for its configured Portal origin.
 
 #### Development built-in Station
+
+Current backend rollout (2026-10-30):
+
+| Component | Deployment |
+| --- | --- |
+| Public origin | `https://station.dev.agora.build`; Cloudflare DNS/tunnel publication is still pending. |
+| Relay A | Existing Coolify `oss4444o8ss40ckgwc40og4c`, renamed `station-dev-relay-a`. |
+| Relay B | Existing Coolify `am8lrcacts572trbli1bmvnu`, renamed `station-dev-relay-b`. |
+| Webapp | Existing Coolify `c0wwgk4c0owk0w4gsww4k0ss`, renamed `station-dev-webapp`; host port `3010`. |
+| Relay image | `127.0.0.1:5051/station-relay-server:dev-9004ca9`; source `9004ca9424add5e42df0e35e6598ad070d79e387`. |
+| Webapp image | `127.0.0.1:5051/station-webapp:dev-6076bf9`; includes `/agora-build/` API forwarding. |
+| Image storage | Persistent `station-dev-registry-data` volume; registry listens on host loopback only. Preserve it when redeploying these pinned images. |
+| Durable store | Existing encrypted PostgreSQL store retained; no account reset or hosted approval is created by renaming the deployment. |
+| Live state | Dedicated private `station-dev-redis` on the `coolify` network; no public Redis port. |
+| Nginx upstream | `station-dev-relay:3000`; both relays carry this alias. |
+
+Operator files and non-secret verification are in
+`/home/guohai/astation-dev-20261030` on Volumetric. Its `protected/` directory
+contains the original Coolify/container configuration, pre-rollout database
+dump, dev runtime credentials and new dev-only report/wrapping keys; modes are
+0700/0600. Do not copy those files into Git or logs. Public report JWK and
+RFC 7638 thumbprint are in `public-handoff.json` and Portal/Auth vault
+`v-xZDT9aGD` e96. The earlier production-origin report key remains unused.
+
+The previous hostname still reaches this backend through its existing tunnel
+while DNS is pending; it is not a verified production deployment. The relays
+are explicitly pinned to the dev issuer and dev audience. Their temporary
+`station-relay-server` alias preserves the old webapp's route during rolling
+replacement; it grants no additional token audience or hosted access.
+
+To publish the dev hostname, add its proxied CNAME to tunnel
+`d7e78923-8981-4fda-9f12-7aa9e36a739a.cfargotunnel.com` and a tunnel public
+hostname `station.dev.agora.build` with service `http://10.0.0.1:3010`.
+Preserve unrelated ingress rules and confirm the edge certificate covers the
+exact hostname. This needs Cloudflare DNS/tunnel management access; the
+running connector's tunnel token alone cannot publish hostnames. The request
+is recorded in Portal #21 and vault e95. Do not redirect bearer-authenticated
+API calls between Station origins.
+
+Both relays and the webapp passed Coolify health checks. Actual backend
+checks confirm PostgreSQL, Redis, two replicas and exact dev issuer/audience
+configuration. Public checks through the existing hostname passed Stoa/Agent
+assets and identity WebSocket upgrades. These checks do not prove public
+HTTPS/WSS on the new hostname while its DNS record is missing. Provisioning
+and details return `station_integration_unavailable` until Auth/Portal's
+built-in report identity is delivered; hosted APIs return
+`hosted_execution_not_verified`. Both are intentional closed states, not a
+completed integration test. Source/report configuration and native approvals
+still need their own end-to-end verification.
+
+The saved database/configuration are rollback evidence. Never restore a dump
+over the retained live database or discard writes made after the snapshot.
+Check migration compatibility before rolling back the executable; use a
+separate restored database if the old image cannot read the newer schema.
 
 The owner resolved Q6 on 2026-10-30: reuse the current Volumetric deployment
 with the dev origin; deploy production after verification. This supersedes
