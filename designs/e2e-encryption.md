@@ -5,6 +5,37 @@ This documents Astation's authority and durable processing of
 grants, escrow and recovery, is maintained in Atem's
 `designs/e2e-encryption.md`.
 
+## R9 Pairing Integration
+
+The account's signed membership chain will authorize independent clients;
+relay presence or a relay account label cannot enroll a manager or host. The
+current implementation stages and remaining gates are recorded in
+[the remote API design](protocol/remote-agent-api.md#pairing-integration-progress-2026-10-21).
+
+An incoming verification commit is checked from its original JSON by the shared
+client before platform numeric decoding. Its host generation and authenticated
+account/device/connection are immutable for that attempt. A reconnect or account
+change invalidates deferred work and owner confirmation. The subsequent signed
+`add_host` must carry that exact host id/generation and the channel key from the
+verified reveal. It is not usable until the verified relay CAS result and local
+membership checkpoint commit. Relay acknowledgment alone cannot authorize a
+membership entry: the shared verifier still checks the complete chain.
+
+The native publisher checkpoints the body before signing, the signature before
+sending, and the committed head with the cleared pending body before exposing
+success. Interrupted publication resends the same durable bytes. A failed store
+halts publication pending reconciliation; an unresolved conflict durably blocks
+another signature. Production protected storage must serialize one publisher
+per manager and resume its checkpoint rather than discard it after a crash.
+The app now connects the v2 ceremony to protected Keychain storage, an exact
+fresh-confirmation Enclave signer, account genesis, Recovery Kit export/import,
+K backup/restore and relay CAS. Key rotation/import backs up current and retained
+keys before installation. Encryption-off setup does not enable encryption.
+See [Recovery Kit v2](recovery-kit-v2.md) for lifecycle/security details and
+remaining gates. Durable native wait-state bindings, a live provisioned ceremony,
+independent routers/push and platform conformance still gate r9 admission.
+This grants no new independent access and preserves the migration invariants.
+
 ## Owner Approval
 
 Device verification and storage-key unlock accept a fresh macOS device-owner

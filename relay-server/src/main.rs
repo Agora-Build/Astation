@@ -1,18 +1,30 @@
 mod admin;
+mod approval_escalation;
+mod account_identity;
 mod account_store;
 mod auth;
 mod cluster;
 mod encryption;
 mod identity_store;
+mod integration_auth;
+mod integration_feed;
+mod integration_portal;
+mod station_integrations;
+mod hosted_agents;
 mod knowledge_routes;
 mod knowledge_secrets;
 mod knowledge_store;
 mod relay;
+mod remote_api;
 mod routes;
 mod rtc_session;
 mod session_store;
+mod station_ai;
+mod service_keys;
 mod voice_session;
+#[cfg(test)]
 mod voice_routes;
+#[cfg(test)]
 mod llm_proxy;
 mod push_tokens;
 mod push_delivery;
@@ -57,8 +69,9 @@ pub struct AppState {
     pub knowledge: Arc<dyn knowledge_store::KnowledgeStore>,
     /// Astation keys + durable session bindings (Postgres when DATABASE_URL is set).
     pub identity: Arc<dyn identity_store::IdentityStore>,
-    /// Optional Agora-account registration and Astation-to-data-account mapping.
+    /// Verified login registration and explicit Astation-to-data-account mapping.
     pub accounts: Arc<dyn account_store::AccountStore>,
+    pub recovery: Arc<remote_api::recovery::RecoveryStore>,
 }
 
 fn redis_url() -> Option<String> {
@@ -291,11 +304,9 @@ fn spawn_upkeep(
 
     // Room upkeep every 60 s (pre-flight 7). In-memory: sweep expired rooms.
     // Redis: rooms expire on their own (EXPIRE 600), so each replica
-    // refreshes every room where it holds an Astation socket (owner or
-    // pending) and closes its Atem sockets whose room no longer exists.
-    // A Redis outage longer than ~9 minutes (600 s TTL minus one interval)
-    // lets live rooms expire: their sockets are then closed and clients
-    // reconnect, recreating them.
+    // refreshes owner rooms and reconstructs presence for proved host routes.
+    // Ordinary carrier-A sockets close when their room is gone; independently
+    // proved sockets survive directory loss while their durable binding is current.
     let cleanup_relay = relay.clone();
     let rooms_sweep = tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
@@ -454,15 +465,24 @@ fn cors_layer() -> CorsLayer {
     let allowed_origin = std::env::var("CORS_ORIGIN")
         .unwrap_or_else(|_| "https://station.agora.build".to_string());
 
+    cors_layer_for(&allowed_origin, std::env::var("STATION_PORTAL_ORIGIN").ok().as_deref())
+}
+
+fn cors_layer_for(allowed_origin: &str, portal_origin: Option<&str>) -> CorsLayer {
     if allowed_origin == "*" {
         // Development mode: allow all origins
         tracing::warn!("CORS configured to allow ALL origins - only use in development!");
         CorsLayer::permissive()
     } else {
+        let allowed = allowed_origin.parse::<HeaderValue>().expect("Invalid CORS_ORIGIN");
+        let portal = portal_origin.filter(|v| crate::account_identity::station_origin(v))
+            .and_then(|v| v.parse::<HeaderValue>().ok());
         // Production mode: whitelist specific domain
         tracing::info!("CORS configured to allow origin: {}", allowed_origin);
         CorsLayer::new()
-            .allow_origin(allowed_origin.parse::<HeaderValue>().expect("Invalid CORS_ORIGIN"))
+            .allow_origin(tower_http::cors::AllowOrigin::predicate(move |origin: &HeaderValue, parts: &axum::http::request::Parts| {
+                origin == allowed || (parts.uri.path() == "/agora-build/v1/details" && portal.as_ref() == Some(origin))
+            }))
             .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
             .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
             .allow_credentials(true)
@@ -517,6 +537,9 @@ fn router(state: AppState) -> Router {
 
     // General rate limiting for other API endpoints
     let general_routes = Router::new()
+        .merge(station_ai::routes())
+        .merge(station_integrations::routes(state.clone()))
+        .nest("/api/remote/v1", remote_api::routes())
         // Auth API routes
         .route("/api/sessions", post(routes::create_session_handler))
         .route(
@@ -540,30 +563,6 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/rtc-sessions/:id/join",
             post(rtc_session::join_rtc_session_handler),
-        )
-        // Voice Session API routes
-        .route(
-            "/api/voice-sessions",
-            post(voice_routes::create_voice_session_handler)
-                .get(voice_routes::list_voice_sessions_handler),
-        )
-        .route(
-            "/api/voice-sessions/:id",
-            get(voice_routes::get_voice_session_handler)
-                .delete(voice_routes::delete_voice_session_handler),
-        )
-        .route(
-            "/api/voice-sessions/:id/trigger",
-            post(voice_routes::trigger_voice_session_handler),
-        )
-        .route(
-            "/api/voice-sessions/response",
-            post(voice_routes::atem_response_handler),
-        )
-        // LLM Proxy (for Agora ConvoAI)
-        .route(
-            "/api/llm/chat",
-            post(llm_proxy::llm_chat_handler),
         )
         // Vault API routes
         .route(
@@ -724,17 +723,18 @@ async fn serve() {
         tracing::error!("Push configuration error: {}", error.0);
         std::process::exit(1);
     }));
-    tracing::info!("Push providers configured: {}; host push ingress awaits authenticated membership", push_delivery.enabled());
+    tracing::info!("Push providers configured: {}; provider dispatch awaits membership-bound registration and durable jobs", push_delivery.enabled());
 
     // Vault + knowledge (Atem Memory) + identity stores: Postgres, sharing one
     // pool, when DATABASE_URL is set (the durable path), else in-memory
     // fallbacks so the rest of the server still runs without a DB.
-    let (vault, knowledge, identity, accounts, push_tokens): (
+    let (vault, knowledge, identity, accounts, push_tokens, recovery): (
         Arc<dyn vault_store::VaultStore>,
         Arc<dyn knowledge_store::KnowledgeStore>,
         Arc<dyn identity_store::IdentityStore>,
         Arc<dyn account_store::AccountStore>,
         Arc<dyn push_tokens::PushTokenStore>,
+        Arc<remote_api::recovery::RecoveryStore>,
     ) = match std::env::var("DATABASE_URL") {
         Ok(url) if !url.is_empty() => {
             tracing::info!("Connecting to Postgres for vault + knowledge storage...");
@@ -753,7 +753,8 @@ async fn serve() {
                 Arc::new(knowledge_store::PgKnowledgeStore::new(pool.clone())),
                 Arc::new(identity_store::PgIdentityStore::new(pool.clone())),
                 Arc::new(account_store::PgAccountStore::new(pool.clone())),
-                Arc::new(push_tokens::PgPushTokenStore::new(pool)),
+                Arc::new(push_tokens::PgPushTokenStore::new(pool.clone())),
+                remote_api::recovery::RecoveryStore::postgres(pool),
             )
         }
         _ => {
@@ -774,6 +775,7 @@ async fn serve() {
                 Arc::new(identity_store::InMemoryIdentityStore::new()),
                 accounts,
                 Arc::new(push_tokens::InMemoryPushTokenStore::default()),
+                remote_api::recovery::RecoveryStore::disabled(),
             )
         }
     };
@@ -838,6 +840,7 @@ async fn serve() {
 
     relay.configure_push_tokens(push_tokens);
     relay.configure_push_delivery(push_delivery);
+    relay.configure_recovery(recovery.clone());
 
     // Background tasks run for the life of the process; one that stops
     // outside a drain stops the relay (exit 1) so it is restarted.
@@ -849,11 +852,23 @@ async fn serve() {
         &voice_sessions,
         &accounts,
     ));
+    let recovery_cleanup = recovery.clone();
+    background.push(("recovery backup collection", tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(error) = recovery_cleanup.collect_expired().await {
+                tracing::error!("Recovery backup collection failed: {}", error);
+            }
+        }
+    })));
     tokio::spawn(run_supervisor(background, relay.clone(), relay::DRAIN_GRACE, |_| {
         std::process::exit(1)
     }));
 
     let state = AppState {
+        recovery,
         sessions,
         relay,
         rtc_sessions,
@@ -877,7 +892,11 @@ async fn serve() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
 
-    let addr = format!("0.0.0.0:{}", port);
+    let bind_ip: std::net::IpAddr = std::env::var("RELAY_BIND_IP")
+        .unwrap_or_else(|_| "0.0.0.0".into())
+        .parse()
+        .expect("RELAY_BIND_IP must be an IP address");
+    let addr = SocketAddr::new(bind_ip, port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|_| panic!("Failed to bind to {}", addr));
@@ -907,8 +926,9 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    fn test_state() -> AppState {
+    pub(crate) fn test_state() -> AppState {
         AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -999,6 +1019,7 @@ mod tests {
             }
         }
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             relay: RelayHub::with_health(Arc::new(Down)),
             ..test_state()
         };

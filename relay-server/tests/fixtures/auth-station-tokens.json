@@ -1,0 +1,510 @@
+{
+  "issuer": "https://auth.example",
+  "origin": "https://station.example",
+  "jwks": {
+    "keys": [
+      {
+        "kty": "EC",
+        "crv": "P-256",
+        "x": "a9EiUEKG-XE7MVRBrnQzb7YZ1LTtogx9BdxcmSbQg7Y",
+        "y": "qvbBHdblFuIdcmf-uQSWPE7xbEi_jWw2dTmnvkCFH-c",
+        "kid": "p3nuJbuyX2OrUJNeZWu5laWB0MMQH25-jTFRo9G8ybc",
+        "alg": "ES256",
+        "use": "sig"
+      }
+    ]
+  },
+  "now": 1793000000,
+  "cases": [
+    {
+      "name": "ok-user-astation-remote",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.d-fxA4RtkgPmoxjz8Ddi8alUsAngFYDkMiwE9QEPhr1-SR3ejng7E_goVRGGsBuCf4N6-3g-wjPgVi65pnAZKw",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": "ok",
+      "result": {
+        "sub": "ab01JB2X7Q8K9M3N4P5R6S7T8VWX",
+        "clientId": "astation",
+        "scopes": [
+          "astation.remote"
+        ]
+      }
+    },
+    {
+      "name": "ok-integration-agent",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImktMDFqYjJ4N3E4azltM240cDVyNnM3dDh2d3kiLCJzY29wZSI6ImFnZW50LnZpZXcgYWdlbnQucHJvbXB0Iiwicjlfc3ZjIjoiOWFmNTlkY2UxMjkyZjk0MDFiM2ZhODliYmQwNTBiMTY3MWJkZGZjY2M1YWNlMDRhMjQwMmJhY2ZmZGE1ZTVkNiIsImlhdCI6MTc5Mjk5OTk3MCwiZXhwIjoxNzkzMDAwMjcwLCJqdGkiOiJ2ZWN0b3ItaW50ZWdyYXRpb24ifQ.hGD1oqI7DNRyvZ99jr2FIe3ms-_KCMeNJ78WM6316VEILwiwpinzEYMAsZ-VoJCJJxSGaFxs6i5lkLxiN0FJnQ",
+      "scope": "agent.prompt",
+      "r9Svc": "9af59dce1292f9401b3fa89bbd050b1671bddfccc5ace04a2402bacffda5e5d6",
+      "r9Key": {
+        "alg": "p256",
+        "publicKey": "BNa0CKl9dCuZMEg6WPNIaZatMGhIKeCElX2Pc8FA3H2v8Iezbt5Glq2FKvXNzpwYxjaRpx_aqnXuXSTjG4kQq90"
+      },
+      "expect": "ok",
+      "result": {
+        "sub": "ab01JB2X7Q8K9M3N4P5R6S7T8VWX",
+        "clientId": "i-01jb2x7q8k9m3n4p5r6s7t8vwy",
+        "scopes": [
+          "agent.view",
+          "agent.prompt"
+        ]
+      }
+    },
+    {
+      "name": "ok-integration-ed25519",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImktMDFqYjJ4N3E4azltM240cDVyNnM3dDh2d3kiLCJzY29wZSI6ImFnZW50LnZpZXcgYWdlbnQucHJvbXB0Iiwicjlfc3ZjIjoiODM3ZTkxNzZlOWJjYWZmYWU2Y2E2MzBkNTZkZWQxMGZiN2Q4ZDJiNmNmZTJkN2QxOTQ5OWE0ODNjM2JhMmNmNCIsImlhdCI6MTc5Mjk5OTk3MCwiZXhwIjoxNzkzMDAwMjcwLCJqdGkiOiJ2ZWN0b3ItaW50ZWdyYXRpb24ifQ.87bTXl0J78pF5YQMVBaT-lO7LEM9p7-4WU6RF-goZf5w8GWGYtYeI3wK0YI2KpTDDCvxdHPwLFjV2j1py-4rqw",
+      "scope": "agent.view",
+      "r9Svc": "837e9176e9bcaffae6ca630d56ded10fb7d8d2b6cfe2d7d19499a483c3ba2cf4",
+      "r9Key": {
+        "alg": "ed25519",
+        "publicKey": "ggpM_o3M3L3H4slbWlvWcIkSew9H-qMEWi49Py_wbkE"
+      },
+      "expect": "ok",
+      "result": {
+        "sub": "ab01JB2X7Q8K9M3N4P5R6S7T8VWX",
+        "clientId": "i-01jb2x7q8k9m3n4p5r6s7t8vwy",
+        "scopes": [
+          "agent.view",
+          "agent.prompt"
+        ]
+      }
+    },
+    {
+      "name": "ok-browser-station-read",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6InBvcnRhbCIsInNjb3BlIjoic3RhdGlvbi5yZWFkIiwiaWF0IjoxNzkyOTk5OTkwLCJleHAiOjE3OTMwMDAyOTAsImp0aSI6InZlY3Rvci1icm93c2VyIn0.h5x8nIFRlDl2cH_OQpHbzYuil2f5yUncdbgL6Cp4kfPqaZuiIUFCiDcA8R0mUzFj-ZbSyNXr6M675gBCbn9rPA",
+      "scope": "station.read",
+      "r9Svc": null,
+      "expect": "ok",
+      "result": {
+        "sub": "ab01JB2X7Q8K9M3N4P5R6S7T8VWX",
+        "clientId": "portal",
+        "scopes": [
+          "station.read"
+        ]
+      }
+    },
+    {
+      "name": "ok-typ-application-at-jwt",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImFwcGxpY2F0aW9uL2F0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.Rsy61BQ5hVDfMrRjNwq_o7QzhLgdSYKU5YfHPBtwsvNdmfE3fSyLgSfDn3h6TznTjUpb1YyBBHNKckzbejDytA",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": "ok",
+      "result": {
+        "sub": "ab01JB2X7Q8K9M3N4P5R6S7T8VWX",
+        "clientId": "astation",
+        "scopes": [
+          "astation.remote"
+        ]
+      }
+    },
+    {
+      "name": "ok-typ-uppercase",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkFUK0pXVCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.q-KzlPoXny4R3GqGjHNyXexUTAasOfLRj9yVeBtTZ1Zp8jc1pwHfFJG9ppfuaC_5vOdQ6ygN0kKgSP-hwc43bA",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": "ok",
+      "result": {
+        "sub": "ab01JB2X7Q8K9M3N4P5R6S7T8VWX",
+        "clientId": "astation",
+        "scopes": [
+          "astation.remote"
+        ]
+      }
+    },
+    {
+      "name": "ok-aud-array",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6WyJodHRwczovL290aGVyLmV4YW1wbGUiLCJodHRwczovL3N0YXRpb24uZXhhbXBsZSJdLCJzdWIiOiJhYjAxSkIyWDdROEs5TTNONFA1UjZTN1Q4VldYIiwiY2xpZW50X2lkIjoiYXN0YXRpb24iLCJzY29wZSI6ImFzdGF0aW9uLnJlbW90ZSIsImlhdCI6MTc5Mjk5OTk0MCwiZXhwIjoxNzkzMDAwODQwLCJhdXRoX3RpbWUiOjE3OTI5OTY0MDAsImp0aSI6InZlY3Rvci11c2VyIn0.RcyNToXilxG1cK4fOJtSXiwM6T9P_sbgHcXV5VqJdOmsrfT1XZh99yUBpu862hEUXdiZm_-PEISGz0GDmCgfHw",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": "ok",
+      "result": {
+        "sub": "ab01JB2X7Q8K9M3N4P5R6S7T8VWX",
+        "clientId": "astation",
+        "scopes": [
+          "astation.remote"
+        ]
+      }
+    },
+    {
+      "name": "ok-exp-within-skew",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTkxMDAsImV4cCI6MTc5Mjk5OTk0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.yCx8bog4LdovZ2-BaWYVdB-wBh-bstraDqoUdRSelgYelzXHCneOH_Rh9u30ABaC9UpAF-_wg_9Ukc1Duh5Kng",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": "ok",
+      "result": {
+        "sub": "ab01JB2X7Q8K9M3N4P5R6S7T8VWX",
+        "clientId": "astation",
+        "scopes": [
+          "astation.remote"
+        ]
+      }
+    },
+    {
+      "name": "ok-iat-within-skew",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTMwMDAwNjAsImV4cCI6MTc5MzAwMDk2MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.DmJAJ6qoPV81AeDrR4KAeBhushPC47c8HrCbwyVnMLpZy-wgIFsmf5EkN8jdoVV4q4IV-mUIftz7a5Bsj2Ku4Q",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": "ok",
+      "result": {
+        "sub": "ab01JB2X7Q8K9M3N4P5R6S7T8VWX",
+        "clientId": "astation",
+        "scopes": [
+          "astation.remote"
+        ]
+      }
+    },
+    {
+      "name": "ok-user-ignores-r9-svc",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.d-fxA4RtkgPmoxjz8Ddi8alUsAngFYDkMiwE9QEPhr1-SR3ejng7E_goVRGGsBuCf4N6-3g-wjPgVi65pnAZKw",
+      "scope": "astation.remote",
+      "r9Svc": "0000000000000000000000000000000000000000000000000000000000000000",
+      "expect": "ok",
+      "result": {
+        "sub": "ab01JB2X7Q8K9M3N4P5R6S7T8VWX",
+        "clientId": "astation",
+        "scopes": [
+          "astation.remote"
+        ]
+      }
+    },
+    {
+      "name": "typ-jwt",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.jXZEZtCUNzg7Vl00AQf_tNNBaH-I-j_QWgCYThw0K275ih2I4PyslgLveP8fltxoaOcWLFCS8S0ga0Mmmz7knA",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "typ-missing",
+      "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.62m25-dpY3J-vXfXz6PkyFq0Al1x85gC8HE9RhB60CzFRpIT6IHw6Xo0M_stmVyh3juc-PvVXPTwkgPSpz3HsA",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "alg-none",
+      "token": "eyJhbGciOiJub25lIiwidHlwIjoiYXQrand0Iiwia2lkIjoicDNudUpidXlYMk9yVUpOZVpXdTVsYVdCME1NUUgyNS1qVEZSbzlHOHliYyJ9.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "alg-hs256-public-key-as-secret",
+      "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.nxULVES3OWlF-OsDSDo0YMOgBlTxPUHWrd1R8khUbaY",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "alg-rs256",
+      "token": "eyJhbGciOiJSUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.mxCcUGG3wu954axaUPckW_9aRyalJpG3QKPM24RMuKszSlkIItJo0BjpLy_wAtq0Zni5aXnSrkJKTUrOJOuVIrDgGIuSJOalntMRuj6sg8TkzXER1pVZN4PqvPxbPf_gNIcfP84sxYaJDsxAgvL8CgtI-6W8MIQmCnNAKbeLr8znA80w5j4NKDiSqIIXiKfbDk7zniVBWoQt0AICA6JhUwETZodYgQuOYX-XSg_JjiZ48-Ls8rQ9S_XrQDLnjRPXH02p081dN1KFjT_K-GKPYIeuJiBlncUbMQptf1s1eoKXuW6U-f6M8Yf8wnn1i90TilJ_FKQ70ozP9R_C7fEkfw",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "kid-missing",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCJ9.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.lCYuShvNYoZmXtbpRfnt1GzLpPbtULrfnBrgZnnkt7NgDAOr5m-vC1mcZhPvWYtm9iuS84Op2jWfQG_vYj-Uqw",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "kid-unknown",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6Im5vdC1hLXB1Ymxpc2hlZC1raWQifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.Li1MvCz8bhzQgUq8RS7sRYK5qcZFbzYxt8sxtA8XNzOkwWQfsdMar6aGIvSPltD-z2GwhjVHdPhwRuoLo_gepQ",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "foreign-key",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.QzgQucl4Ut6RTWAV_nNyJyrvarDyGJzy0GwMvLp-AT0qrPBUDnM2YXGyMJXKZPIGBw8wM32jAzGFPbtden031Q",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "payload-tampered",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWiIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.d-fxA4RtkgPmoxjz8Ddi8alUsAngFYDkMiwE9QEPhr1-SR3ejng7E_goVRGGsBuCf4N6-3g-wjPgVi65pnAZKw",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "iss-wrong",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2V2aWwuZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.RbzlZr2I6kJ0WeXuPwXtTlRSZUowReMvJ5Ch7zfcWISsW-TQIZcX7vvNCbhYU-5yzZSV74xTn9cLxmIxEKjbRg",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "iss-trailing-slash",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS8iLCJhdWQiOiJodHRwczovL3N0YXRpb24uZXhhbXBsZSIsInN1YiI6ImFiMDFKQjJYN1E4SzlNM040UDVSNlM3VDhWV1giLCJjbGllbnRfaWQiOiJhc3RhdGlvbiIsInNjb3BlIjoiYXN0YXRpb24ucmVtb3RlIiwiaWF0IjoxNzkyOTk5OTQwLCJleHAiOjE3OTMwMDA4NDAsImF1dGhfdGltZSI6MTc5Mjk5NjQwMCwianRpIjoidmVjdG9yLXVzZXIifQ.5Td2F4BpKfcBJW7BJ7ioGU5tfIDkyWuexixwHBf-j3dDrEpaDq6I0NYXTnxlGLHkwk87JxcicTU1FMfLqXN9Ww",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "aud-other-station",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vb3RoZXItc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.JAys4uDruPoY0_iII6G7KelSYZrWUWzF1V8s8nsNABNQc7XDddX75zdpCMuMDbrd6CMyFtbzAwO99HP_GgrXcw",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "aud-trailing-slash",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlLyIsInN1YiI6ImFiMDFKQjJYN1E4SzlNM040UDVSNlM3VDhWV1giLCJjbGllbnRfaWQiOiJhc3RhdGlvbiIsInNjb3BlIjoiYXN0YXRpb24ucmVtb3RlIiwiaWF0IjoxNzkyOTk5OTQwLCJleHAiOjE3OTMwMDA4NDAsImF1dGhfdGltZSI6MTc5Mjk5NjQwMCwianRpIjoidmVjdG9yLXVzZXIifQ.shNHI-U-aGmNsUIjsLEZGKEi5b5PYvqyRAZjTiKEPODkmsDwuw7Jrx_XglTgPH8fXZRsNJw3lHE-1XCIhu72WQ",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "aud-array-without-origin",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6WyJodHRwczovL290aGVyLmV4YW1wbGUiLCJodHRwczovL3N0YXRpb24uZXhhbXBsZS8iXSwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.GREfTNFvmscEgwBDVKvdEXYozgrbeCYzVfJsdqJxi4yA9DrG0a0-wA773rakWkggIR_yoQuWkgoTBdTASdneow",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "aud-missing",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsInN1YiI6ImFiMDFKQjJYN1E4SzlNM040UDVSNlM3VDhWV1giLCJjbGllbnRfaWQiOiJhc3RhdGlvbiIsInNjb3BlIjoiYXN0YXRpb24ucmVtb3RlIiwiaWF0IjoxNzkyOTk5OTQwLCJleHAiOjE3OTMwMDA4NDAsImF1dGhfdGltZSI6MTc5Mjk5NjQwMCwianRpIjoidmVjdG9yLXVzZXIifQ.ut2lnPP3bxyalaKlgWHxETZ3klwz1AYTPYo9AzhxVjckc0enMZpclSx3jZa3-uF8NhlpDfCj5UJbu76WqzuOcw",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "exp-beyond-skew",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTkxMDAsImV4cCI6MTc5Mjk5OTkzOSwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.vUk5uk7UlTkqakaK6tI7v_W9J3KEOG8gRwfdkTD9bXnctZq8TTjtbppxOqbkwQ1Xma1huUn9QR02nARMNx3-BA",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "exp-missing",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImF1dGhfdGltZSI6MTc5Mjk5NjQwMCwianRpIjoidmVjdG9yLXVzZXIifQ.1Z6Xibsz22TMxzR5qJbYeMuWMrjXoPH66AZUyP65_JH4MiVvBgdIMPIK6kaK32ZWqxe31ZRFbX1PdS8lY6IeAQ",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "iat-future-beyond-skew",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTMwMDAwNjEsImV4cCI6MTc5MzAwMDk2MSwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.Q3pOMTt3FjP1IP9EkbAOyofL_ed49RE5vKs6cE46X6ZzThWQOkupbmVDIYd35oty_ar3WmviZBN3ckxsZuDRhQ",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "iat-missing",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJleHAiOjE3OTMwMDA4NDAsImF1dGhfdGltZSI6MTc5Mjk5NjQwMCwianRpIjoidmVjdG9yLXVzZXIifQ.UBsyeJ-VjrFdsCkSSULnzn6AlnImDgOqq5Te_9Iu7JjyGyH6KpzfL_ZSNYZPlrmBIEpR2-e5N6sniOK-Q33e3Q",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "nbf-future",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciIsIm5iZiI6MTc5MzAwMDA2MX0.zkY_vXcsP64tqk6LDeWAlCKuubrbI90lXWmQKEzJQcaHRQdgDGpwAUDOV3pu44c77odDBABd7BsJwDJJBihHmw",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "sub-bad",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMWpiMng3cThrOW0zbjRwNXI2czd0OHZ3eCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.vbUpiOs-ustg-3Wac8s4XVIDq7YPniPjVcndQAoZiAf_VpineRJVFzY3jTdRVEg6jBwVHG2NN0w06WnWR1wrpQ",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "sub-missing",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwiY2xpZW50X2lkIjoiYXN0YXRpb24iLCJzY29wZSI6ImFzdGF0aW9uLnJlbW90ZSIsImlhdCI6MTc5Mjk5OTk0MCwiZXhwIjoxNzkzMDAwODQwLCJhdXRoX3RpbWUiOjE3OTI5OTY0MDAsImp0aSI6InZlY3Rvci11c2VyIn0.pgQTmLDrV8A_iE1xtTd0ghgf2ct0SiQQirNg5vTdvNMurN061BDmCUCKqdtGKDWWSfwyMm3kwzE0nf3NVfXi3g",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "client-id-missing",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsInNjb3BlIjoiYXN0YXRpb24ucmVtb3RlIiwiaWF0IjoxNzkyOTk5OTQwLCJleHAiOjE3OTMwMDA4NDAsImF1dGhfdGltZSI6MTc5Mjk5NjQwMCwianRpIjoidmVjdG9yLXVzZXIifQ.InwQ19hKsU1o_CKSQzJeJkBXI7MaNDJBV1t202VnEM0s-cpeaMPjs_0eWz3hJAAIsPxwb5Ek5GDVGDajCmctoQ",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "client-id-integration-malformed",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6Imktc2hvcnQiLCJzY29wZSI6ImFnZW50LnZpZXcgYWdlbnQucHJvbXB0Iiwicjlfc3ZjIjoiOWFmNTlkY2UxMjkyZjk0MDFiM2ZhODliYmQwNTBiMTY3MWJkZGZjY2M1YWNlMDRhMjQwMmJhY2ZmZGE1ZTVkNiIsImlhdCI6MTc5Mjk5OTk3MCwiZXhwIjoxNzkzMDAwMjcwLCJqdGkiOiJ2ZWN0b3ItaW50ZWdyYXRpb24ifQ.Ftps1TmYDu9o_X2fyN_hoesSV2Z85FJLAeGZWr0-crf00MbH_2pydhLz_UtleaLaMrUnxfW1lTe4gwGEAhEgrQ",
+      "scope": "agent.prompt",
+      "r9Svc": "9af59dce1292f9401b3fa89bbd050b1671bddfccc5ace04a2402bacffda5e5d6",
+      "r9Key": {
+        "alg": "p256",
+        "publicKey": "BNa0CKl9dCuZMEg6WPNIaZatMGhIKeCElX2Pc8FA3H2v8Iezbt5Glq2FKvXNzpwYxjaRpx_aqnXuXSTjG4kQq90"
+      },
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "scope-missing",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwiaWF0IjoxNzkyOTk5OTQwLCJleHAiOjE3OTMwMDA4NDAsImF1dGhfdGltZSI6MTc5Mjk5NjQwMCwianRpIjoidmVjdG9yLXVzZXIifQ.InU5yzqz0xu5CmjkZcsWHYgzc6jMRHp_EYbZUHkMTeOWVni6PFm99s6Z50f3ZoRvvEnt38cZdDHHI2ZMbndgHQ",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 403,
+        "error": "insufficient_scope"
+      }
+    },
+    {
+      "name": "scope-insufficient",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGUiLCJpYXQiOjE3OTI5OTk5NDAsImV4cCI6MTc5MzAwMDg0MCwiYXV0aF90aW1lIjoxNzkyOTk2NDAwLCJqdGkiOiJ2ZWN0b3ItdXNlciJ9.d-fxA4RtkgPmoxjz8Ddi8alUsAngFYDkMiwE9QEPhr1-SR3ejng7E_goVRGGsBuCf4N6-3g-wjPgVi65pnAZKw",
+      "scope": "station.read",
+      "r9Svc": null,
+      "expect": {
+        "status": 403,
+        "error": "insufficient_scope"
+      }
+    },
+    {
+      "name": "scope-prefix-only",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImFzdGF0aW9uIiwic2NvcGUiOiJhc3RhdGlvbi5yZW1vdGVzIGFzdGF0aW9uIiwiaWF0IjoxNzkyOTk5OTQwLCJleHAiOjE3OTMwMDA4NDAsImF1dGhfdGltZSI6MTc5Mjk5NjQwMCwianRpIjoidmVjdG9yLXVzZXIifQ.sTsrakcWSebJ3PnrlARRfyVPniCzV0cikr_oTJeKjoGkIdxBTRSPzLi0gmqdXxc412cpGvDtRTKBT1ilB4iSfg",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 403,
+        "error": "insufficient_scope"
+      }
+    },
+    {
+      "name": "r9-svc-wrong",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImktMDFqYjJ4N3E4azltM240cDVyNnM3dDh2d3kiLCJzY29wZSI6ImFnZW50LnZpZXcgYWdlbnQucHJvbXB0Iiwicjlfc3ZjIjoiNmUwY2M0ZTg4Y2JmZTliNDdkOWIzN2ZkZWRhYzg1ZTdkY2Y4MjZjYTIzMWExMjliYzk1YjUwODcxYzljNmY4YSIsImlhdCI6MTc5Mjk5OTk3MCwiZXhwIjoxNzkzMDAwMjcwLCJqdGkiOiJ2ZWN0b3ItaW50ZWdyYXRpb24ifQ.5sTecuHNP3Nxl7J6GER5gnb2CX5YzPax54wZFJJbd-CVp3QsEyX9UiTrLZFCMTgNo202njEke5iYJ-nA7JONbA",
+      "scope": "agent.prompt",
+      "r9Svc": "9af59dce1292f9401b3fa89bbd050b1671bddfccc5ace04a2402bacffda5e5d6",
+      "r9Key": {
+        "alg": "p256",
+        "publicKey": "BNa0CKl9dCuZMEg6WPNIaZatMGhIKeCElX2Pc8FA3H2v8Iezbt5Glq2FKvXNzpwYxjaRpx_aqnXuXSTjG4kQq90"
+      },
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "r9-svc-missing",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImktMDFqYjJ4N3E4azltM240cDVyNnM3dDh2d3kiLCJzY29wZSI6ImFnZW50LnZpZXcgYWdlbnQucHJvbXB0IiwiaWF0IjoxNzkyOTk5OTcwLCJleHAiOjE3OTMwMDAyNzAsImp0aSI6InZlY3Rvci1pbnRlZ3JhdGlvbiJ9.5FHtFcPhLb0ho26vKd2nP5IogCkEMcWsoL0IkHE6YejxX_Ll0vw_Q5ThnMJjw9zchQkC6TBYuFOdLPH6zU71rA",
+      "scope": "agent.prompt",
+      "r9Svc": "9af59dce1292f9401b3fa89bbd050b1671bddfccc5ace04a2402bacffda5e5d6",
+      "r9Key": {
+        "alg": "p256",
+        "publicKey": "BNa0CKl9dCuZMEg6WPNIaZatMGhIKeCElX2Pc8FA3H2v8Iezbt5Glq2FKvXNzpwYxjaRpx_aqnXuXSTjG4kQq90"
+      },
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "r9-svc-uppercase",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImktMDFqYjJ4N3E4azltM240cDVyNnM3dDh2d3kiLCJzY29wZSI6ImFnZW50LnZpZXcgYWdlbnQucHJvbXB0Iiwicjlfc3ZjIjoiOUFGNTlEQ0UxMjkyRjk0MDFCM0ZBODlCQkQwNTBCMTY3MUJEREZDQ0M1QUNFMDRBMjQwMkJBQ0ZGREE1RTVENiIsImlhdCI6MTc5Mjk5OTk3MCwiZXhwIjoxNzkzMDAwMjcwLCJqdGkiOiJ2ZWN0b3ItaW50ZWdyYXRpb24ifQ.NpVtWG-3SVXViYemysRI7Xe7NfLJJr7jqx83jHAdpAeUQyix8FBVEI4e3RbW_WlGklPz8w7iRXqhoa_AvIfx0w",
+      "scope": "agent.prompt",
+      "r9Svc": "9af59dce1292f9401b3fa89bbd050b1671bddfccc5ace04a2402bacffda5e5d6",
+      "r9Key": {
+        "alg": "p256",
+        "publicKey": "BNa0CKl9dCuZMEg6WPNIaZatMGhIKeCElX2Pc8FA3H2v8Iezbt5Glq2FKvXNzpwYxjaRpx_aqnXuXSTjG4kQq90"
+      },
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "r9-svc-wrong-beats-scope",
+      "token": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InAzbnVKYnV5WDJPclVKTmVaV3U1bGFXQjBNTVFIMjUtalRGUm85Rzh5YmMifQ.eyJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZSIsImF1ZCI6Imh0dHBzOi8vc3RhdGlvbi5leGFtcGxlIiwic3ViIjoiYWIwMUpCMlg3UThLOU0zTjRQNVI2UzdUOFZXWCIsImNsaWVudF9pZCI6ImktMDFqYjJ4N3E4azltM240cDVyNnM3dDh2d3kiLCJzY29wZSI6ImFnZW50LnZpZXcgYWdlbnQucHJvbXB0Iiwicjlfc3ZjIjoiNmUwY2M0ZTg4Y2JmZTliNDdkOWIzN2ZkZWRhYzg1ZTdkY2Y4MjZjYTIzMWExMjliYzk1YjUwODcxYzljNmY4YSIsImlhdCI6MTc5Mjk5OTk3MCwiZXhwIjoxNzkzMDAwMjcwLCJqdGkiOiJ2ZWN0b3ItaW50ZWdyYXRpb24ifQ.dQzM_27NUEG3H-qGDfh_MBV5RCauRZI-0YNuA9sPz2dDuIyQFzTH3RhmxNQ7JpfJqzIaqPK5aU2D_W3bx2B1kA",
+      "scope": "agent.approve",
+      "r9Svc": "9af59dce1292f9401b3fa89bbd050b1671bddfccc5ace04a2402bacffda5e5d6",
+      "r9Key": {
+        "alg": "p256",
+        "publicKey": "BNa0CKl9dCuZMEg6WPNIaZatMGhIKeCElX2Pc8FA3H2v8Iezbt5Glq2FKvXNzpwYxjaRpx_aqnXuXSTjG4kQq90"
+      },
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    },
+    {
+      "name": "malformed",
+      "token": "not-a-jwt",
+      "scope": "astation.remote",
+      "r9Svc": null,
+      "expect": {
+        "status": 401,
+        "error": "invalid_token"
+      }
+    }
+  ]
+}

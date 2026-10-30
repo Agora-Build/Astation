@@ -19,6 +19,8 @@ pub const IDENTITY_HOSTNAME: &str = "identity";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoomInfo {
     pub hostname: String,
+    /// Created by POST /api/pair, never inferred from a code or hostname.
+    pub pairing: bool,
     /// Unix seconds.
     pub created_at: i64,
     pub owner: Option<ConnRef>,
@@ -52,6 +54,7 @@ impl RoomInfo {
     pub fn new(hostname: &str, created_at: i64) -> Self {
         Self {
             hostname: hostname.to_string(),
+            pairing: false,
             created_at,
             owner: None,
             verified: false,
@@ -178,6 +181,8 @@ pub trait RoomDirectory: Send + Sync {
     async fn create_room(&self, code: &str, hostname: &str, now: i64) -> Result<(), StoreError>;
     /// Create the room if missing. True when it was created.
     async fn ensure_room(&self, code: &str, hostname: &str, now: i64) -> Result<bool, StoreError>;
+    /// Allocate a short-lived pairing room atomically, without converting an existing room.
+    async fn ensure_pairing_room(&self, code: &str, hostname: &str, now: i64) -> Result<bool, StoreError>;
     async fn get(&self, code: &str) -> Result<Option<RoomInfo>, StoreError>;
     async fn join_atem(&self, code: &str, atem_id: &str, conn: &ConnRef) -> Result<AtemJoin, StoreError>;
     /// A legacy (keyless) Astation takes the room, creating it if missing,
@@ -256,6 +261,17 @@ impl RoomDirectory for InMemoryRoomDirectory {
             return Ok(false);
         }
         rooms.insert(code.to_string(), RoomInfo::new(hostname, now));
+        Ok(true)
+    }
+
+    async fn ensure_pairing_room(&self, code: &str, hostname: &str, now: i64) -> Result<bool, StoreError> {
+        let mut rooms = self.lock();
+        if rooms.contains_key(code) {
+            return Ok(false);
+        }
+        let mut room = RoomInfo::new(hostname, now);
+        room.pairing = true;
+        rooms.insert(code.to_string(), room);
         Ok(true)
     }
 
@@ -440,6 +456,19 @@ pub(crate) mod scenarios {
         assert!(!d.ensure_room("astation-1", "other", T0 + 5).await.unwrap());
         let room = d.get("astation-1").await.unwrap().unwrap();
         assert_eq!((room.hostname.as_str(), room.created_at), (IDENTITY_HOSTNAME, T0));
+    }
+
+    pub async fn pairing_allocation_does_not_convert_or_refresh_existing_rooms(d: &dyn RoomDirectory) {
+        assert!(d.ensure_room("identity", IDENTITY_HOSTNAME, T0).await.unwrap());
+        assert!(!d.ensure_pairing_room("identity", "host", T0 + 5).await.unwrap());
+        assert!(!d.get("identity").await.unwrap().unwrap().pairing);
+        assert!(d.ensure_pairing_room("PAIR", "host", T0).await.unwrap());
+        assert!(!d.ensure_pairing_room("PAIR", "other", T0 + 5).await.unwrap());
+        assert!(!d.ensure_room("PAIR", IDENTITY_HOSTNAME, T0 + 10).await.unwrap());
+        let room = d.get("PAIR").await.unwrap().unwrap();
+        assert!(room.pairing);
+        assert_eq!((room.hostname.as_str(), room.created_at), ("host", T0));
+        assert!(room.is_expired(T0 + ROOM_EXPIRY_SECS));
     }
 
     pub async fn atem_join_requires_a_room_and_replaces(d: &dyn RoomDirectory) {
@@ -760,6 +789,7 @@ mod tests {
     memory_directory_tests!(
         create_get_and_expiry,
         ensure_room_is_idempotent,
+        pairing_allocation_does_not_convert_or_refresh_existing_rooms,
         atem_join_requires_a_room_and_replaces,
         claim_owner_creates_the_room_and_replaces_the_owner,
         claim_owner_waits_behind_a_verified_owner,

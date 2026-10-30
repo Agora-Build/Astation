@@ -1,0 +1,291 @@
+import AtemClient
+import Foundation
+import XCTest
+@testable import AstationRemote
+
+@MainActor
+private final class RoutineSignerHarness {
+    var now: UInt64 = 100
+    var active = true
+    var current = true
+    var accepted = true
+    var confirmations = 0
+    var signed: [SignRequest] = []
+    var confirmation: (() async -> Bool)?
+    var foregroundWait: (() async throws -> Void)?
+    var foregroundStages: [RemoteOwnerAuthenticationStage] = []
+    var signError: Error?
+    lazy var signer = RemoteRoutineChannelSigner(keyID: "device-key", now: { [unowned self] in now },
+        active: { [unowned self] in active },
+        waitForForeground: { [unowned self] stage in
+            foregroundStages.append(stage)
+            try await foregroundWait?()
+        }, confirm: { [unowned self] in
+            confirmations += 1
+            return await confirmation?() ?? accepted
+        }, sign: { [unowned self] request in
+            if let signError { throw signError }
+            signed.append(request)
+            return Data("signature".utf8)
+        })
+    func request(_ hash: UInt8 = 1) -> SignRequest {
+        SignRequest(keyId: "device-key", purpose: .channel, freshConfirmation: false,
+            label: "atem-ch1-client-sig-v1", input: signingInput(label: .channelClient, payload: Data(repeating: hash, count: 32)), bodyJson: nil)
+    }
+    func sign(_ request: SignRequest? = nil) async throws -> Data {
+        try await signer.sign(request ?? self.request(), isCurrent: { current })
+    }
+}
+
+final class RemoteRoutineChannelSignerTests: XCTestCase {
+    @MainActor
+    func testActivationMayFinishBeforePromptAndAfterSuccessfulSystemAuthentication() async throws {
+        let h = RoutineSignerHarness()
+        h.active = false
+        var waits = 0
+        h.foregroundWait = {
+            waits += 1
+            XCTAssertTrue(h.signed.isEmpty)
+            h.active = true
+        }
+        h.confirmation = { h.active = false; h.signer.clearReuse(); return true }
+        try await h.signer.prepare(isCurrent: { h.current })
+        XCTAssertEqual(waits, 2)
+        XCTAssertEqual(h.foregroundStages, [.beforeConfirmation, .afterConfirmation])
+        XCTAssertEqual(h.confirmations, 1)
+        XCTAssertTrue(h.signed.isEmpty)
+        _ = try await h.sign()
+        XCTAssertEqual(h.confirmations, 1)
+    }
+
+    @MainActor
+    func testOnlyCurrentSuccessfulConfirmationMayRequestFocusRestoration() async throws {
+        for outcome in ["denied", "locked", "stale", "cancelled"] {
+            let h = RoutineSignerHarness()
+            let prompted = expectation(description: "Owner confirmation")
+            var answer: CheckedContinuation<Bool, Never>?
+            h.confirmation = { await withCheckedContinuation { answer = $0; prompted.fulfill() } }
+            let task = Task { try await h.sign() }
+            await fulfillment(of: [prompted], timeout: 1)
+            h.active = false
+            if outcome == "locked" { h.signer.invalidate() }
+            if outcome == "stale" { h.current = false }
+            if outcome == "cancelled" { task.cancel() }
+            try XCTUnwrap(answer).resume(returning: outcome != "denied")
+            do { _ = try await task.value; XCTFail("Invalid confirmation succeeded: \(outcome)") } catch { }
+            XCTAssertTrue(h.foregroundStages.isEmpty, "No focus restoration after \(outcome)")
+            XCTAssertTrue(h.signed.isEmpty)
+        }
+    }
+
+    @MainActor
+    func testForegroundWaitCannotExtendConfirmationOrBypassFences() async throws {
+        for outcome in ["expired", "locked", "stale", "cancelled"] {
+            let h = RoutineSignerHarness()
+            let waiting = expectation(description: "Waiting for activation")
+            var restore: CheckedContinuation<Void, Never>?
+            h.confirmation = { h.active = false; return true }
+            h.foregroundWait = { await withCheckedContinuation { restore = $0; waiting.fulfill() } }
+            let task = Task { try await h.sign() }
+            await fulfillment(of: [waiting], timeout: 1)
+            switch outcome {
+            case "expired": h.now += 300_000
+            case "locked": h.signer.invalidate()
+            case "stale": h.current = false
+            default: task.cancel()
+            }
+            h.active = true
+            try XCTUnwrap(restore).resume()
+            do { _ = try await task.value; XCTFail("Foreground wait bypassed \(outcome)") } catch { }
+            XCTAssertTrue(h.signed.isEmpty)
+            h.current = true; h.confirmation = nil; h.foregroundWait = nil
+            _ = try await h.sign()
+            XCTAssertEqual(h.confirmations, 2, "Fenced confirmation cannot be reused")
+        }
+    }
+
+    @MainActor
+    func testSystemAuthenticationFocusChangeDoesNotDiscardFreshForegroundConfirmation() async throws {
+        let h = RoutineSignerHarness()
+        h.confirmation = {
+            h.active = false
+            h.signer.clearReuse()
+            h.active = true
+            return true
+        }
+        try await h.signer.prepare(isCurrent: { h.current })
+        XCTAssertTrue(h.signed.isEmpty)
+        _ = try await h.sign()
+        XCTAssertEqual(h.confirmations, 1)
+        h.active = false; h.signer.clearReuse(); h.active = true
+        _ = try await h.sign()
+        XCTAssertEqual(h.confirmations, 2, "Background always clears a completed confirmation's reuse")
+    }
+
+    @MainActor
+    func testSuccessfulPromptWhileStillBackgroundCannotAuthorizeOrBeReused() async throws {
+        let h = RoutineSignerHarness()
+        h.confirmation = { h.active = false; h.signer.clearReuse(); return true }
+        do { try await h.signer.prepare(isCurrent: { h.current }); XCTFail("Background confirmation accepted") }
+        catch { XCTAssertEqual(error as? RemoteOwnerAuthenticationError, .notForeground) }
+        XCTAssertTrue(h.signed.isEmpty)
+        h.active = true; h.confirmation = nil
+        _ = try await h.sign()
+        XCTAssertEqual(h.confirmations, 2)
+    }
+
+    @MainActor
+    func testPreparationCanOutlastTheHandshakeWindowWithoutSigningAnything() async throws {
+        let h = RoutineSignerHarness()
+        h.confirmation = { h.now += 20_000; return true }
+        try await h.signer.prepare(isCurrent: { h.current })
+        XCTAssertEqual(h.confirmations, 1)
+        XCTAssertTrue(h.signed.isEmpty)
+        _ = try await h.sign()
+        XCTAssertEqual(h.confirmations, 1)
+        XCTAssertEqual(h.signed.count, 1)
+        var membership = h.request(); membership.purpose = .enroll
+        do { _ = try await h.sign(membership); XCTFail("Preparation authorized membership signing") } catch { }
+        XCTAssertEqual(h.signed.count, 1)
+    }
+
+    @MainActor
+    func testCancelledOrStalePreparationCannotLeaveReusableConfirmation() async throws {
+        for cancelled in [false, true] {
+            let h = RoutineSignerHarness()
+            let prompted = expectation(description: "Owner prompt")
+            var answer: CheckedContinuation<Bool, Never>?
+            h.confirmation = {
+                await withCheckedContinuation { answer = $0; prompted.fulfill() }
+            }
+            let task = Task { try await h.signer.prepare(isCurrent: { h.current }) }
+            await fulfillment(of: [prompted], timeout: 1)
+            if cancelled { task.cancel() } else { h.current = false }
+            try XCTUnwrap(answer).resume(returning: true)
+            do { try await task.value; XCTFail("Fenced preparation succeeded") } catch { }
+            XCTAssertTrue(h.signed.isEmpty)
+            h.current = true; h.confirmation = nil
+            _ = try await h.sign()
+            XCTAssertEqual(h.confirmations, 2)
+        }
+    }
+
+    @MainActor
+    func testOneConfirmationCoversRoutineTranscriptsForLessThanFiveMinutesOnly() async throws {
+        let h = RoutineSignerHarness()
+        _ = try await h.sign()
+        h.now += 299_999
+        _ = try await h.sign(h.request(2))
+        XCTAssertEqual(h.confirmations, 1)
+        h.now += 1
+        _ = try await h.sign(h.request(3))
+        XCTAssertEqual(h.confirmations, 2)
+        XCTAssertEqual(h.signed.count, 3)
+    }
+
+    @MainActor
+    func testConcurrentCallsShareTheConfirmationWithoutExtendingItsWindow() async throws {
+        let h = RoutineSignerHarness()
+        var answer: CheckedContinuation<Bool, Never>?
+        h.confirmation = { await withCheckedContinuation { answer = $0 } }
+        let a = Task { try await h.sign() }
+        let b = Task { try await h.sign(h.request(2)) }
+        for _ in 0..<10 { await Task.yield() }
+        XCTAssertEqual(h.confirmations, 1)
+        try XCTUnwrap(answer).resume(returning: true)
+        _ = try await a.value; _ = try await b.value
+        XCTAssertEqual(h.signed.count, 2)
+        h.confirmation = nil
+        h.now += 300_000
+        _ = try await h.sign()
+        XCTAssertEqual(h.confirmations, 2)
+    }
+
+    @MainActor
+    func testInvalidationFencesAnOutstandingConfirmationAndDoesNotRestoreReuse() async throws {
+        let h = RoutineSignerHarness()
+        var answer: CheckedContinuation<Bool, Never>?
+        h.confirmation = { await withCheckedContinuation { answer = $0 } }
+        let task = Task { try await h.sign() }
+        for _ in 0..<10 { await Task.yield() }
+        h.signer.invalidate()
+        try XCTUnwrap(answer).resume(returning: true)
+        do { _ = try await task.value; XCTFail("Late confirmation signed") } catch { }
+        XCTAssertTrue(h.signed.isEmpty)
+        h.confirmation = nil
+        _ = try await h.sign()
+        XCTAssertEqual(h.confirmations, 2)
+    }
+
+    @MainActor
+    func testBackgroundStaleRouteAndCancellationFenceSigningAfterOwnerPrompt() async throws {
+        for outcome in ["background", "stale", "cancel"] {
+            let h = RoutineSignerHarness()
+            var answer: CheckedContinuation<Bool, Never>?
+            h.confirmation = { await withCheckedContinuation { answer = $0 } }
+            let task = Task { try await h.sign() }
+            for _ in 0..<10 { await Task.yield() }
+            if outcome == "background" { h.active = false }
+            if outcome == "stale" { h.current = false }
+            if outcome == "cancel" { task.cancel() }
+            try XCTUnwrap(answer).resume(returning: true)
+            do { _ = try await task.value; XCTFail("Fenced signing: \(outcome)") } catch { }
+            XCTAssertTrue(h.signed.isEmpty)
+        }
+    }
+
+    @MainActor
+    func testMalformedOrOtherPurposeRequestsNeverPromptOrUseThePrimitive() async throws {
+        let h = RoutineSignerHarness()
+        let original = h.request()
+        var invalid: [SignRequest] = []
+        var wrong = original; wrong.keyId = "other"; invalid.append(wrong)
+        wrong = original; wrong.purpose = .enroll; invalid.append(wrong)
+        wrong = original; wrong.freshConfirmation = true; invalid.append(wrong)
+        wrong = original; wrong.label = "atem-membership-entry-v1"; invalid.append(wrong)
+        wrong = original; wrong.bodyJson = "{}"; invalid.append(wrong)
+        wrong = original; wrong.input = signingInput(label: .channelHost, payload: Data(repeating: 1, count: 32)); invalid.append(wrong)
+        wrong = original; wrong.input.append(0); invalid.append(wrong)
+        for request in invalid {
+            do { _ = try await h.sign(request); XCTFail("Invalid signing request accepted") } catch { }
+        }
+        XCTAssertEqual(h.confirmations, 0)
+        XCTAssertTrue(h.signed.isEmpty)
+    }
+
+    @MainActor
+    func testDenialSigningFailureAndClockRegressionRequireConfirmationAgain() async throws {
+        let h = RoutineSignerHarness()
+        h.accepted = false
+        do { _ = try await h.sign(); XCTFail("Denied signature") } catch { }
+        h.accepted = true
+        _ = try await h.sign()
+        XCTAssertEqual(h.confirmations, 2)
+        h.signError = RemoteChannelError.invalidInput
+        do { _ = try await h.sign(); XCTFail("Broken key signed") } catch { }
+        h.signError = nil
+        _ = try await h.sign()
+        XCTAssertEqual(h.confirmations, 3)
+        h.now = 50
+        _ = try await h.sign()
+        XCTAssertEqual(h.confirmations, 4)
+        XCTAssertEqual(h.signed.count, 3)
+    }
+
+    @MainActor
+    func testAStaleCompletionCannotLeaveAnExpiredPromptCachedAndBackgroundClearsReuse() async throws {
+        let h = RoutineSignerHarness()
+        h.confirmation = { h.current = false; return true }
+        do { _ = try await h.sign(); XCTFail("Stale route signed") } catch { }
+        h.current = true
+        h.now += 300_000
+        h.confirmation = nil
+        _ = try await h.sign()
+        XCTAssertEqual(h.confirmations, 2)
+        h.active = false
+        do { _ = try await h.sign(); XCTFail("Background signed") } catch { }
+        h.active = true
+        _ = try await h.sign()
+        XCTAssertEqual(h.confirmations, 3)
+    }
+}

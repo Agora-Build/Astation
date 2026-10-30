@@ -1,0 +1,22 @@
+{
+  "init": {
+    "ch": "atem-ch1",
+    "e": "px8a-ejWDV7NMkaxrGU01vNDggusEpO08nMaP5eK4TY",
+    "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+    "host_id": "host-a",
+    "host_trust_gen": 1,
+    "n": "UsiRUamW-37Ducn_FAmgZIEGnAbci3XcxjNus4tTEhk",
+    "op": "init"
+  },
+  "accept": {
+    "ch": "atem-ch1",
+    "e": "L8Wq439GLx3qdATFogDeVWVlB5fzXpcMUIRJ1pSUNEA",
+    "head": {
+      "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+      "seq": 6
+    },
+    "n": "_0-i8sC3QDgT8EndqDyphgSeZ3paA0AMJw848HSKGjg",
+    "op": "accept",
+    "sig": "xFwUNITnXDq4eXGwDfCPC9T3QfnnQ8cjOWWEml-QdXwHmuc68z6lKmLJfAIyN_L1kEBu5PWu2QPNXoCTRgdLDw"
+  }
+}

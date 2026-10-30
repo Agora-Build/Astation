@@ -2,6 +2,8 @@ import CryptoKit
 import Foundation
 import Security
 import LocalAuthentication
+import AtemClient
+import AstationRemote
 
 enum AtemIdentityError: LocalizedError {
     case keychain(OSStatus)
@@ -313,6 +315,34 @@ final class AtemE2EIdentity {
         )
     }
 
+    func remotePublicKeys() throws -> (signing: Data, encryption: Data) {
+        lock.lock(); defer { lock.unlock() }
+        guard let record = try read() else { throw AtemIdentityError.invalidStoredIdentity }
+        try crypto.validate(record.material)
+        return (try crypto.signingPublicKey(record.material), record.material.encryptionPublicKey)
+    }
+
+    func signMembership(_ request: SignRequest, expectedPublicKey: Data) throws -> Data {
+        lock.lock(); defer { lock.unlock() }
+        guard let body = request.bodyJson,
+              request == (try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: request.keyId)),
+              let record = try read(create: false),
+              try crypto.signingPublicKey(record.material) == expectedPublicKey else {
+            throw AtemIdentityError.identityChanged
+        }
+        return try crypto.sign(request.input, material: record.material)
+    }
+
+    func signChannel(_ request: SignRequest, keyID: String, expectedPublicKey: Data) throws -> Data {
+        try RemoteRoutineChannelSigner.validate(request, keyID: keyID)
+        lock.lock(); defer { lock.unlock() }
+        guard let record = try read(create: false),
+              try crypto.signingPublicKey(record.material) == expectedPublicKey else {
+            throw AtemIdentityError.identityChanged
+        }
+        return try crypto.sign(request.input, material: record.material)
+    }
+
     func recoveryKit(astationId: String, relayURL: String) throws -> String {
         lock.lock(); defer { lock.unlock() }
         guard let record = try read() else { throw AtemIdentityError.invalidStoredIdentity }
@@ -340,6 +370,17 @@ final class AtemE2EIdentity {
     func state(account: String) throws -> AtemAccountState? {
         lock.lock(); defer { lock.unlock() }
         return try read(create: false)?.accounts[account]
+    }
+
+    func initializeEncryptionOff(account: String) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard var record = try read() else { throw AtemIdentityError.invalidStoredIdentity }
+        if let state = record.accounts[account] {
+            guard state.mode == "off" else { throw AtemIdentityError.invalidState }
+            return
+        }
+        record.accounts[account] = AtemAccountState(mode: "off", kid: nil, epoch: try record.advance())
+        try save(record)
     }
 
     @discardableResult

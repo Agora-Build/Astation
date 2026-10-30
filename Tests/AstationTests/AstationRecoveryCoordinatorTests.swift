@@ -1,0 +1,1288 @@
+import AtemClient
+import AstationRemote
+import CryptoKit
+import XCTest
+@testable import Menubar
+
+@MainActor
+private final class RecoveryMemoryCheckpoint: AstationRecoveryCheckpointStorage {
+    var bytes: Data?
+    var failAfterWrite = false
+    var failAtEntryCount: Int?
+    var failOnRemoval = false
+    var writes = 0
+    func read() throws -> Data? { bytes }
+    func write(_ data: Data) throws {
+        writes += 1
+        bytes = data
+        if failOnRemoval, let saved = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+           saved["serviceRemoval"] != nil {
+            failOnRemoval = false
+            throw RemoteRecoveryError.storageUncertain
+        }
+        if let count = failAtEntryCount,
+           let saved = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+           (saved["entries"] as? [String])?.count == count {
+            failAtEntryCount = nil
+            throw RemoteRecoveryError.storageUncertain
+        }
+        if failAfterWrite { failAfterWrite = false; throw RemoteRecoveryError.storageUncertain }
+    }
+}
+
+private final class RecoveryMemoryKeys: AstationRecoveryDataKeys {
+    var keys: [AccountDataKey] = []
+    var installs = 0
+    var failNextInstall = false
+    var didInstall: (() -> Void)?
+    func recoveryKeys(dataAccount: String) throws -> [AccountDataKey] { keys }
+    func generate() throws -> AccountDataKey { AccountDataKey(kid: "0123abcd", key: Data(repeating: 0x19, count: 32)) }
+    func install(_ value: AccountDataKey, dataAccount: String) throws {
+        if failNextInstall { failNextInstall = false; throw RemoteRecoveryError.storageUncertain }
+        keys = [value] + keys.filter { $0.kid != value.kid }
+        installs += 1
+        didInstall?()
+    }
+    func installRecovered(_ values: [AccountDataKey], dataAccount: String) throws { keys = values; installs += 1 }
+}
+
+private actor RecoveryMemoryRelay: RemoteRecoveryTransport {
+    var log: MembershipLog?
+    var account = "account-a"
+    var appends: [AppendRequest] = []
+    var uploads: [String] = []
+    var envelopes: [UInt64: String] = [:]
+    var loseAppendReply = false
+    var loseUploadReply = false
+    var hostOnline = false
+    var nextEntries: [String]?
+    var entriesUnavailable = false
+    let hostKey = Curve25519.Signing.PrivateKey()
+
+    func dropNextAppendReply() { loseAppendReply = true }
+    func dropNextUploadReply() { loseUploadReply = true }
+    func setHostOnline(_ value: Bool) { hostOnline = value }
+    func hostPublicKey() -> Data { hostKey.publicKey.rawRepresentation }
+    func injectNextEntries(_ entries: [String]) { nextEntries = entries }
+    func setEntriesUnavailable(_ value: Bool) { entriesUnavailable = value }
+
+    func entries(genesisHash: String, after: UInt64) async throws -> RemoteRecoveryLogPage {
+        if entriesUnavailable { throw RemoteRecoveryTransportError.unavailable }
+        let log = try XCTUnwrap(log)
+        XCTAssertEqual(log.genesisHash(), genesisHash)
+        let page = nextEntries ?? log.entriesAfter(seq: after)
+        nextEntries = nil
+        return RemoteRecoveryLogPage(head: log.head(), entries: page, more: false)
+    }
+    func append(genesisHash: String, request: AppendRequest) async throws -> RemoteRecoveryAppendReply {
+        appends.append(request)
+        if log == nil {
+            log = try MembershipLog.verify(accountId: account, genesisHash: genesisHash, entries: [request.entryJson], now: AstationRecoveryCoordinator.clock())
+        } else if log!.head() == request.expected {
+            let result = try log!.extend(entries: [request.entryJson], now: AstationRecoveryCoordinator.clock())
+            XCTAssertNil(result.stop)
+            XCTAssertEqual(result.appended, 1)
+        } else {
+            let entry = try signedObjectInfo(json: request.entryJson)
+            if try !log!.entries().contains(where: { try signedObjectInfo(json: $0).entryHash == entry.entryHash }) {
+                return .conflict(RemoteRecoveryLogPage(head: log!.head(),
+                    entries: log!.entriesAfter(seq: request.expected.seq), more: false))
+            }
+        }
+        if loseAppendReply { loseAppendReply = false; throw RemoteRecoveryTransportError.unavailable }
+        return .stored
+    }
+    func uploadBackup(genesisHash: String, envelopeJSON: String, signedEntryJSON: String) async throws -> UInt64? {
+        let info = try parseKBackup(envelopeJson: envelopeJSON)
+        XCTAssertEqual(log?.genesisHash(), genesisHash)
+        XCTAssertEqual(try signedObjectInfo(json: signedEntryJSON).bodyType, "atem-membership-entry")
+        uploads.append(envelopeJSON)
+        if let existing = envelopes[info.blobVersion], existing != envelopeJSON { return info.blobVersion }
+        envelopes[info.blobVersion] = envelopeJSON
+        if loseUploadReply { loseUploadReply = false; throw RemoteRecoveryTransportError.unavailable }
+        return nil
+    }
+    func backup(log: MembershipLog) async throws -> String { try XCTUnwrap(envelopes[try XCTUnwrap(log.kBackup()).blobVersion]) }
+    func hostAccept(genesisHash: String, hostID: String, initFrame: Data) async throws -> Data {
+        guard hostOnline, let log else { throw RemoteRecoveryTransportError.unavailable }
+        XCTAssertEqual(log.genesisHash(), genesisHash)
+        XCTAssertEqual(hostID, "host-a")
+        var accept: [String: Any] = ["ch": "atem-ch1", "op": "accept",
+            "e": recoveryTestBase64(Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation),
+            "n": recoveryTestBase64(Data(repeating: 2, count: 32)),
+            "head": ["seq": log.head().seq, "hash": log.head().hash], "sig": recoveryTestBase64(Data(repeating: 0, count: 64))]
+        let th2 = try hostAcceptTh2(initJson: String(decoding: initFrame, as: UTF8.self), acceptJson: recoveryTestJSON(accept))
+        let raw = Data(stride(from: 0, to: th2.count, by: 2).map { i in
+            UInt8(th2.dropFirst(i).prefix(2), radix: 16)!
+        })
+        accept["sig"] = recoveryTestBase64(try hostKey.signature(for: signingInput(label: .channelHost, payload: raw)))
+        return Data(try recoveryTestJSON(accept).utf8)
+    }
+}
+
+private func recoveryTestBase64(_ data: Data) -> String {
+    data.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+}
+
+private func recoveryTestJSON(_ object: Any) throws -> String {
+    String(decoding: try JSONSerialization.data(withJSONObject: object), as: UTF8.self)
+}
+
+private actor ServiceApprovalPortal: AccountOIDCHTTP {
+    var state = "awaiting_approval"
+    var fingerprint: String?
+    var posts = 0
+    var loseReply = false
+    var expired = false
+    func revoke(expired: Bool = false, fingerprint: String? = nil) {
+        state = "revoking"; self.expired = expired
+        if let fingerprint { self.fingerprint = fingerprint }
+    }
+    func setState(_ value: String) { state = value }
+    func dropNextReply() { loseReply = true }
+    func count() -> Int { posts }
+    func send(_ request: URLRequest) async throws -> (Data, Int) {
+        if request.httpMethod == "POST" {
+            posts += 1
+            fingerprint = (try JSONSerialization.jsonObject(with: request.httpBody!) as? [String: String])?["r9Svc"]
+            state = "provisioning"
+            if loseReply { loseReply = false; throw AccountLoginError.unavailable }
+        }
+        var record: [String: Any] = ["id": "i-01234567890123456789012345", "name": "Test bot", "stationOrigin": "https://configured.example",
+            "state": state, "scopes": ["agent.prompt", "agent.view"], "expiresAt": ISO8601DateFormatter().string(from: Date().addingTimeInterval(expired ? -3600 : 3600)), "role": "owner"]
+        if let fingerprint { record["r9Svc"] = fingerprint }
+        return (try JSONSerialization.data(withJSONObject: request.httpMethod == "POST" ? record : ["stale": false, "integrations": [record]]), 200)
+    }
+}
+
+@MainActor
+private final class RecoveryCoordinatorHarness {
+    let store = RecoveryMemoryCheckpoint()
+    let keys = RecoveryMemoryKeys()
+    let relay = RecoveryMemoryRelay()
+    let identity = AtemE2EIdentity(storage: TestAtemStorage(), crypto: TestAtemCryptography())
+    var ownerRequests: [SignRequest] = []
+    var savedKits: [String] = []
+    var approve = true
+    var save = true
+    var ownerConfirmation: ((SignRequest) async throws -> Bool)?
+
+    func coordinator(relayURL: String = "https://configured.example") throws -> AstationRecoveryCoordinator {
+        try AstationRecoveryCoordinator(accountID: "account-a", managerID: "manager-a", identity: identity,
+            relayURL: relayURL, store: store, transport: relay, dataKeys: keys,
+            allowNewDataKey: { true }, confirmOwner: { [unowned self] request in
+                ownerRequests.append(request)
+                if let ownerConfirmation {
+                    do { return try await ownerConfirmation(request) }
+                    catch { XCTFail("owner-confirmation test hook failed: \(error)"); return false }
+                }
+                return approve
+            }, confirmReplacement: { _ in true }, saveKit: { [unowned self] kit in
+                savedKits.append(kit)
+                return save
+            })
+    }
+}
+
+@MainActor
+final class AstationRecoveryCoordinatorTests: XCTestCase {
+    private func hostAttempt(_ coordinator: AstationRecoveryCoordinator, generation: UInt64) async throws
+        -> (RemotePairingCommit, RemotePairingReveal, AtemVerifyKeys) {
+        let keys = try await coordinator.pairingKeys(nonce: Data(repeating: 8, count: 32))
+        let reveal = try RemotePairingReveal(originalJSON: JSONSerialization.data(withJSONObject: [
+            "type": "verifyReveal", "data": [
+                "device_pub": Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation.base64EncodedString(),
+                "device_sign_pub": Curve25519.Signing.PrivateKey().publicKey.rawRepresentation.base64EncodedString(),
+                "unlock_auth_pub": Curve25519.Signing.PrivateKey().publicKey.rawRepresentation.base64EncodedString(),
+                "host_channel_pub": recoveryTestBase64(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation),
+                "nonce": Data(repeating: 9, count: 32).base64EncodedString()
+            ]]))
+        let commit = try RemotePairingCommit(context: RemotePairingContext(accountID: "account-a", hostID: "host-a", linkGeneration: UUID()),
+            hostTrustGeneration: generation, commitment: reveal.commitment())
+        return (commit, reveal, keys)
+    }
+
+    func testHostRetryRejectsSameGenerationBeforeDraftAndAcceptsHigherGenerationWithoutRemoval() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        let (commit, reveal, keys) = try await hostAttempt(coordinator, generation: 1)
+        let first = try await coordinator.prepareHost(commit: commit, reveal: reveal, keys: keys)
+        _ = try await coordinator.commitHost(request: first, confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true })
+        let count = await h.relay.appends.count
+        let (retry, retryReveal, retryKeys) = try await hostAttempt(coordinator, generation: 1)
+        do { _ = try await coordinator.prepareHost(commit: retry, reveal: retryReveal, keys: retryKeys); XCTFail("duplicate generation") }
+        catch { XCTAssertTrue(error is AstationHostEnrollmentError) }
+        XCTAssertNil(try checkpoint(h.store)["publication"])
+        let afterRefusal = await h.relay.appends.count
+        XCTAssertEqual(count, afterRefusal)
+        let (replacement, replacementReveal, replacementKeys) = try await hostAttempt(coordinator, generation: 2)
+        let draft = try await coordinator.prepareHost(commit: replacement, reveal: replacementReveal, keys: replacementKeys)
+        _ = try await coordinator.commitHost(request: draft, confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true })
+        let log = try coordinator.channelMembership(hostID: "host-a")
+        XCTAssertEqual(log.host(hostId: "host-a")?.hostTrustGen, 2)
+        XCTAssertEqual(log.host(hostId: "host-a")?.hostKey.raw, replacementReveal.hostChannelPublicKey)
+        _ = try replacementKeys.remote().membershipEntries(log: log, managerID: "manager-a", commit: replacement, reveal: replacementReveal)
+    }
+
+    func testHostHigherGenerationReconcilesLostCommittedReplyAcrossRestart() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        let (commit, reveal, keys) = try await hostAttempt(coordinator!, generation: 1)
+        let first = try await coordinator!.prepareHost(commit: commit, reveal: reveal, keys: keys)
+        await h.relay.dropNextAppendReply()
+        do { _ = try await coordinator!.commitHost(request: first, confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true }); XCTFail("lost reply") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .unavailable) }
+        coordinator = nil
+        coordinator = try h.coordinator()
+        let (replacement, replacementReveal, replacementKeys) = try await hostAttempt(coordinator!, generation: 2)
+        let draft = try await coordinator!.prepareHost(commit: replacement, reveal: replacementReveal, keys: replacementKeys)
+        _ = try await coordinator!.commitHost(request: draft, confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true })
+        XCTAssertEqual(try coordinator!.channelMembership(hostID: "host-a").host(hostId: "host-a")?.hostTrustGen, 2)
+        XCTAssertNil(try checkpoint(h.store)["publication"])
+    }
+
+    func testHostHigherGenerationPreservesEvidenceOfInvalidSignedDuplicate() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        let (commit, reveal, keys) = try await hostAttempt(coordinator!, generation: 1)
+        let first = try await coordinator!.prepareHost(commit: commit, reveal: reveal, keys: keys)
+        _ = try await coordinator!.commitHost(request: first, confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true })
+        let log = try coordinator!.channelMembership(hostID: "host-a")
+        var pendingCheckpoint: Data?
+        var invalid: RemoteMembershipPublication? = RemoteMembershipPublication(log: log, persist: { pendingCheckpoint = $0 })
+        let body = try invalid!.prepareHost(commit: commit, hostChannelKey: PublicKeyData(alg: .ed25519, raw: reveal.hostChannelPublicKey),
+            signer: "manager-a", signedAt: AstationRecoveryCoordinator.clock().wallMs)
+        let provider = AstationMembershipKeyProvider(identity: h.identity, keyID: "manager-a", publicKey: try h.identity.remotePublicKeys().signing)
+        _ = try invalid!.sign(provider: provider, keyID: "manager-a")
+        invalid = nil
+        coordinator = nil
+        var stored = try checkpoint(h.store)
+        stored["publication"] = try XCTUnwrap(pendingCheckpoint)
+        stored["hostBody"] = body
+        h.store.bytes = try PropertyListSerialization.data(fromPropertyList: stored, format: .binary, options: 0)
+        coordinator = try h.coordinator()
+        let (replacement, replacementReveal, replacementKeys) = try await hostAttempt(coordinator!, generation: 2)
+        let draft = try await coordinator!.prepareHost(commit: replacement, reveal: replacementReveal, keys: replacementKeys)
+        _ = try await coordinator!.commitHost(request: draft, confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true })
+        XCTAssertEqual((try checkpoint(h.store)["supersededHostPublications"] as? [Data])?.count, 1)
+        XCTAssertEqual(try coordinator!.channelMembership(hostID: "host-a").host(hostId: "host-a")?.hostTrustGen, 2)
+    }
+
+    func testAccountSecurityRequiresExplicitSetupAndSavedKit() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let coordinator = try h.coordinator()
+        XCTAssertFalse(try coordinator.securitySetupComplete)
+        do { _ = try await coordinator.serviceMembership(); XCTFail("uninitialized account admitted a service") }
+        catch { XCTAssertTrue(h.ownerRequests.isEmpty); XCTAssertTrue(h.savedKits.isEmpty) }
+        h.save = false
+        do { _ = try await coordinator.setup(); XCTFail("unsaved kit completed setup") }
+        catch { XCTAssertFalse(try coordinator.securitySetupComplete) }
+        h.save = true
+        _ = try await coordinator.setup()
+        XCTAssertTrue(try coordinator.securitySetupComplete)
+        let entries = try await coordinator.serviceMembership().entries()
+        XCTAssertFalse(entries.isEmpty)
+    }
+
+    func testResumedSetupAndLaterExportsUseVerifiedConfiguredRelay() async throws {
+        let h = RecoveryCoordinatorHarness()
+        h.save = false
+        do { _ = try await h.coordinator().setup(); XCTFail("unsaved kit completed setup") }
+        catch { XCTAssertEqual(error.localizedDescription, AtemIdentityError.recoveryNotSaved.localizedDescription) }
+        let original = try RemoteRecoveryKit(text: XCTUnwrap(h.savedKits.first))
+        let previousBootstrap = try XCTUnwrap(checkpoint(h.store)["bootstrap"] as? Data)
+        h.save = true
+        let relay = "https://new-station.example"
+        let resumed = try await h.coordinator(relayURL: relay).setup()
+        let saved = try RemoteRecoveryKit(text: XCTUnwrap(h.savedKits.last))
+        XCTAssertEqual(resumed.relayURL, relay)
+        XCTAssertEqual(saved, resumed)
+        XCTAssertEqual(resumed.genesisHash, original.genesisHash)
+        XCTAssertEqual(resumed.recoveryKey, original.recoveryKey)
+        XCTAssertEqual(resumed.text().replacingOccurrences(of: relay, with: original.relayURL), original.text())
+        XCTAssertEqual(h.ownerRequests.filter { $0.purpose == .genesis }.count, 1)
+        let before = try XCTUnwrap(PropertyListSerialization.propertyList(from: previousBootstrap, format: nil) as? [String: Any])
+        let current = try XCTUnwrap(checkpoint(h.store)["bootstrap"] as? Data)
+        let after = try XCTUnwrap(PropertyListSerialization.propertyList(from: current, format: nil) as? [String: Any])
+        XCTAssertEqual(before["body"] as? String, after["body"] as? String)
+        XCTAssertEqual(before["entry"] as? String, after["entry"] as? String)
+        XCTAssertEqual(after["relayURL"] as? String, original.relayURL)
+        let exported = try await h.coordinator(relayURL: "https://third-station.example").exportedKit()
+        XCTAssertEqual(exported.relayURL, "https://third-station.example")
+        XCTAssertEqual(exported.genesisHash, original.genesisHash)
+        XCTAssertEqual(h.savedKits.count, 2, "Exporting a routing hint must not create another kit-saving acknowledgment")
+    }
+
+    func testRelayHintIsNotExportedWhenConfiguredStationCannotConfirmHistory() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let original = try await h.coordinator().setup()
+        let bootstrap = try XCTUnwrap(checkpoint(h.store)["bootstrap"] as? Data)
+        let approvals = h.ownerRequests.count
+        await h.relay.setEntriesUnavailable(true)
+        do {
+            _ = try await h.coordinator(relayURL: "https://unavailable-station.example").exportedKit()
+            XCTFail("unavailable Station was exported as the recovery destination")
+        } catch { XCTAssertTrue(error is RemoteRecoveryTransportError) }
+        XCTAssertEqual(h.savedKits.count, 1)
+        XCTAssertEqual(h.ownerRequests.count, approvals)
+        XCTAssertEqual(try checkpoint(h.store)["bootstrap"] as? Data, bootstrap)
+        await h.relay.setEntriesUnavailable(false)
+        let retried = try await h.coordinator().exportedKit()
+        XCTAssertEqual(retried, original)
+    }
+
+    private func service(_ coordinator: AstationRecoveryCoordinator, sessions: [String]? = nil,
+                         projects: [String]? = nil) async throws -> RemoteServiceApproval {
+        let log = try await coordinator.serviceMembership()
+        let time = AstationRecoveryCoordinator.clock()
+        var scope: [String: Any] = ["hosts": ["host-a"], "ops": ["prompt", "view"]]
+        if let sessions { scope["sessions"] = sessions }
+        if let projects { scope["projects"] = projects }
+        let action: [String: Any] = ["action": "add", "member": ["device_id": "service-test", "kind": "service", "roles": ["service"],
+            "auth_key": ["alg": "ed25519", "pub": recoveryTestBase64(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)],
+            "scope": scope, "expires_at": time.wallMs + 600_000]]
+        return try RemoteServiceApproval(operationID: UUID().uuidString, integrationID: "i-01234567890123456789012345",
+            issuer: "https://auth.example", ownerAccount: "ab01234567890123456789012345", stationOrigin: "https://configured.example",
+            bodyJSON: log.draftEntry(signer: "manager-a", signedAt: time.wallMs, actionJson: recoveryTestJSON(action)),
+            log: log, managerID: "manager-a", now: time)
+    }
+
+    private func portal(_ http: ServiceApprovalPortal) throws -> PortalIntegrationHTTP {
+        let config = try AccountOIDCConfiguration(issuer: "https://auth.example", clientID: "astation", resource: "https://portal.example",
+            requiredScope: "integrations:read", additionalScopes: ["integrations:approve"])
+        return try PortalIntegrationHTTP(configuration: config, portalOrigin: "https://portal.example",
+            ownerAccount: "ab01234567890123456789012345", http: http, accessToken: { "test-only-token" })
+    }
+
+    func testApprovedIntegrationScopeReloadsFromCommittedMembership() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        _ = try await coordinator.setup()
+        let approval = try await service(coordinator, sessions: ["ses-aaaaaaaaaaaa"], projects: ["h1.0123abcd." + String(repeating: "a", count: 64)])
+        try await coordinator.prepareService(approval)
+        try await coordinator.approveService(approval, portal: portal(transport), current: { true })
+        let records = try await portal(transport).owned(stationOrigin: "https://configured.example")
+        let record = try XCTUnwrap(records.first)
+        let reloaded = try h.coordinator()
+        let log = try await reloaded.serviceMembership()
+        let scope = try XCTUnwrap(IntegrationApprovalViewController.approvedScope(record: record, log: log))
+        XCTAssertEqual(scope.hosts, ["host-a"])
+        XCTAssertEqual(scope.sessions, ["ses-aaaaaaaaaaaa"])
+        XCTAssertEqual(scope.projects, ["h1.0123abcd." + String(repeating: "a", count: 64)])
+        XCTAssertNil(try reloaded.pendingServiceApproval(), "Display must not depend on a completed approval's draft")
+    }
+
+    func testApprovedIntegrationUnrestrictedScopeDoesNotInventSessionRestrictions() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        _ = try await coordinator.setup()
+        let approval = try await service(coordinator)
+        try await coordinator.prepareService(approval)
+        try await coordinator.approveService(approval, portal: portal(transport), current: { true })
+        let records = try await portal(transport).owned(stationOrigin: "https://configured.example")
+        let record = try XCTUnwrap(records.first)
+        let log = try await coordinator.serviceMembership()
+        let scope = try XCTUnwrap(IntegrationApprovalViewController.approvedScope(record: record, log: log))
+        XCTAssertEqual(scope.hosts, ["host-a"])
+        XCTAssertNil(scope.sessions)
+        XCTAssertNil(scope.projects)
+        let clock = AstationRecoveryCoordinator.clock()
+        let now = HostClock(wallMs: clock.wallMs + 700_000, monoMs: clock.monoMs + 700_000, bootId: clock.bootId)
+        XCTAssertNil(try IntegrationApprovalViewController.approvedScope(record: record, log: log, now: now), "An expired service must not appear active")
+    }
+
+    func testApprovedIntegrationDoesNotUseAnUncommittedOrDifferentServiceKey() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        _ = try await coordinator.setup()
+        let before = try await coordinator.serviceMembership()
+        let approval = try await service(coordinator)
+        try await coordinator.prepareService(approval)
+        try await coordinator.approveService(approval, portal: portal(transport), current: { true })
+        let records = try await portal(transport).owned(stationOrigin: "https://configured.example")
+        let record = try XCTUnwrap(records.first)
+        XCTAssertNil(try IntegrationApprovalViewController.approvedScope(record: record, log: before))
+        let object: [String: Any] = ["id": record.id, "name": record.name, "stationOrigin": record.stationOrigin, "state": record.state,
+                  "scopes": record.scopes, "expiresAt": record.expiresAt, "role": record.role, "r9Svc": String(repeating: "0", count: 64)]
+        let differentKey = try JSONDecoder().decode(PortalIntegrationRecord.self, from: JSONSerialization.data(withJSONObject: object))
+        let log = try await coordinator.serviceMembership()
+        XCTAssertNil(try IntegrationApprovalViewController.approvedScope(record: differentKey, log: log))
+        try await append(["action": "remove", "device_id": "service-test"], harness: h)
+        let removed = await h.relay.log
+        XCTAssertNil(try IntegrationApprovalViewController.approvedScope(record: record, log: XCTUnwrap(removed)), "A removed service must not appear approved")
+    }
+
+    func testServiceCommitNotifiesAfterDurabilityAndUnlockEvenWhenPortalReplyIsLost() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        let (commit, reveal, keys) = try await hostAttempt(coordinator, generation: 1)
+        let request = try await coordinator.prepareHost(commit: commit, reveal: reveal, keys: keys)
+        _ = try await coordinator.commitHost(request: request,
+            confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true })
+        var heads: [LogHead] = []
+        coordinator.onMembershipCommit = { head in
+            heads.append(head)
+            do {
+                // This read refuses a busy coordinator and any uncommitted log.
+                let log = try coordinator.channelMembership(hostID: "host-a")
+                XCTAssertEqual(log.head(), head)
+                XCTAssertEqual(log.member(deviceId: "service-test")?.roles, ["service"])
+                let saved = try XCTUnwrap(self.checkpoint(h.store)["entries"] as? [String])
+                XCTAssertEqual(saved, log.entries())
+            } catch { XCTFail("Committed head was not available to the channel: \(error)") }
+        }
+        let approval = try await service(coordinator)
+        try await coordinator.prepareService(approval)
+        XCTAssertTrue(heads.isEmpty, "Preparing an unsigned draft must not replace channels")
+        let transport = ServiceApprovalPortal()
+        await transport.dropNextReply()
+        do { try await coordinator.approveService(approval, portal: portal(transport), current: { true }); XCTFail("lost reply") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .unavailable) }
+        let committed = try coordinator.channelMembership(hostID: "host-a").head()
+        XCTAssertEqual(heads, [committed], "A lost Portal reply cannot hide a durable membership change")
+        try await coordinator.approveService(approval, portal: portal(transport), current: { true })
+        _ = try await coordinator.serviceMembership()
+        try coordinator.checkpointPendingWaits()
+        XCTAssertEqual(heads, [committed], "Retries and unchanged checkpoints cannot loop channel replacement")
+        coordinator.onMembershipCommit = nil
+    }
+
+    func testUncertainCheckpointDoesNotAdvertiseANewMembershipHead() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        _ = try await coordinator.setup()
+        let approval = try await service(coordinator)
+        try await coordinator.prepareService(approval)
+        var heads: [LogHead] = []
+        coordinator.onMembershipCommit = { heads.append($0) }
+        h.store.failAtEntryCount = try XCTUnwrap(checkpoint(h.store)["entries"] as? [String]).count + 1
+        do {
+            try await coordinator.approveService(approval, portal: portal(ServiceApprovalPortal()), current: { true })
+            XCTFail("uncertain checkpoint")
+        }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .storageUncertain) }
+        let remote = await h.relay.log
+        XCTAssertNotNil(remote?.member(deviceId: "service-test"), "The relay stored the entry before local persistence failed")
+        XCTAssertTrue(heads.isEmpty)
+        XCTAssertThrowsError(try coordinator.channelMembership(hostID: "host-a"))
+    }
+
+    func testMultipleMembershipCommitsNotifyOnceAfterAccountOperationCompletes() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        var heads: [LogHead] = []
+        coordinator.onMembershipCommit = { head in
+            heads.append(head)
+            do {
+                try coordinator.checkpointPendingWaits()
+                let entries = try XCTUnwrap(self.checkpoint(h.store)["entries"] as? [String])
+                XCTAssertEqual(try signedObjectInfo(json: XCTUnwrap(entries.last)).entryHash, head.hash)
+            } catch { XCTFail("Membership notification preceded its durable checkpoint: \(error)") }
+        }
+        _ = try await coordinator.setup()
+        XCTAssertEqual(heads.count, 1, "Genesis and backup publication should reconcile channels once")
+        XCTAssertGreaterThan(try XCTUnwrap(heads.last).seq, 1)
+        _ = try await coordinator.serviceMembership()
+        XCTAssertEqual(heads.count, 1, "Unchanged refreshes must not replace channels again")
+        coordinator.onMembershipCommit = nil
+    }
+
+    private func revokedService(_ coordinator: AstationRecoveryCoordinator, transport: ServiceApprovalPortal,
+                                expired: Bool = false) async throws -> PortalIntegrationRecord {
+        _ = try await coordinator.setup()
+        let approval = try await service(coordinator)
+        try await coordinator.prepareService(approval)
+        try await coordinator.approveService(approval, portal: portal(transport), current: { true })
+        await transport.revoke(expired: expired)
+        let records = try await portal(transport).owned(stationOrigin: "https://configured.example")
+        return try XCTUnwrap(records.first)
+    }
+
+    func testRevokedServiceRemovalPersistsAndNotifiesWithoutChangingOtherAccess() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        let record = try await revokedService(coordinator, transport: transport, expired: true)
+        let before = try await coordinator.serviceMembership()
+        let host = before.host(hostId: "host-a")
+        var notified = false
+        coordinator.onMembershipCommit = { head in
+            let entries = (try? self.checkpoint(h.store)["entries"] as? [String]) ?? []
+            notified = head.seq == before.head().seq + 1 && entries.count == Int(head.seq)
+        }
+        XCTAssertEqual(try AstationRecoveryCoordinator.removableService(record: record, log: before), "service-test")
+        XCTAssertFalse(try AstationRecoveryCoordinator.serviceRemovalComplete(record: record, log: before))
+        try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345",
+            portal: portal(transport), current: { true })
+        let after = try await coordinator.serviceMembership()
+        XCTAssertEqual(after.member(deviceId: "service-test")?.status, .removed)
+        XCTAssertEqual(after.host(hostId: "host-a"), host)
+        XCTAssertEqual(after.member(deviceId: "manager-a")?.roles, before.member(deviceId: "manager-a")?.roles)
+        XCTAssertNil(try coordinator.pendingServiceRemovalID())
+        XCTAssertEqual(try checkpoint(h.store)["version"] as? Int, 3, "older readers must reject an account with removal state")
+        XCTAssertTrue(notified)
+        XCTAssertEqual(h.ownerRequests.last?.purpose, .remove)
+        XCTAssertNil(try AstationRecoveryCoordinator.removableService(record: record, log: after))
+        XCTAssertTrue(try AstationRecoveryCoordinator.serviceRemovalComplete(record: record, log: after))
+    }
+
+    func testServiceRemovalReopensChannelBeforeTheUIRefreshesAccountMembership() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        let (commit, reveal, keys) = try await hostAttempt(coordinator, generation: 1)
+        let enrollment = try await coordinator.prepareHost(commit: commit, reveal: reveal, keys: keys)
+        _ = try await coordinator.commitHost(request: enrollment,
+            confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true })
+        let record = try await revokedService(coordinator, transport: transport)
+        let context = AtemSessionContext(route: RemoteTerminalConnection(clientId: "local-host", connectionId: "connection-a"),
+            account: "account-a", device: "host-a", pairingSession: "pairing-a")
+        var opened: [LogHead] = []
+        let client = AtemSessionClient(context: { context }, send: { _, _ in false }, openChannel: { _ in
+            do { opened.append(try coordinator.channelMembership(hostID: "host-a").head()) }
+            catch { XCTFail("Channel initialization raced another account operation: \(error)") }
+        })
+        client.start()
+        let before = try XCTUnwrap(opened.last)
+        coordinator.onMembershipCommit = { _ in client.channelMembershipRefreshed(context: context) }
+        try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345",
+            portal: portal(transport), current: { true })
+        let after = try await coordinator.serviceMembership()
+        XCTAssertEqual(opened.map(\.seq), [before.seq, after.head().seq])
+        XCTAssertEqual(after.head().seq, before.seq + 1)
+        XCTAssertEqual(client.phase, .connecting)
+        XCTAssertNil(client.welcome, "The replacement channel still requires an authenticated welcome")
+    }
+
+    func testRemovalLostReplyResumesExactSignatureWithoutAnotherOwnerPrompt() async throws {
+        let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        let record = try await revokedService(coordinator!, transport: transport)
+        await h.relay.dropNextAppendReply()
+        do {
+            try await coordinator!.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+            XCTFail("lost relay reply")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .unavailable) }
+        let first = await h.relay.appends.last, confirmations = h.ownerRequests.count
+        XCTAssertEqual(try coordinator!.pendingServiceRemovalID(), record.id)
+        coordinator = nil; coordinator = try h.coordinator()
+        try await coordinator!.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+        let retry = await h.relay.appends.last
+        XCTAssertEqual(first, retry)
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        XCTAssertNil(try coordinator!.pendingServiceRemovalID())
+        let log = try await coordinator!.serviceMembership()
+        XCTAssertEqual(log.member(deviceId: "service-test")?.status, .removed)
+    }
+
+    func testRemovalAccountChangeOrDeclinedOwnerSendsNoEntry() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        let record = try await revokedService(coordinator, transport: transport)
+        let count = await h.relay.appends.count
+        var current = true
+        h.ownerConfirmation = { _ in current = false; return true }
+        do {
+            try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { current })
+            XCTFail("stale account")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .confirmationRequired) }
+        current = true; h.ownerConfirmation = { _ in false }
+        do {
+            try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { current })
+            XCTFail("declined owner")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .confirmationRequired) }
+        let after = await h.relay.appends.count
+        XCTAssertEqual(after, count)
+    }
+
+    func testRemovalRejectsActiveGrantAndChangedFingerprint() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        let record = try await revokedService(coordinator, transport: transport)
+        await transport.revoke(fingerprint: String(repeating: "f", count: 64))
+        let count = h.ownerRequests.count
+        do {
+            try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+            XCTFail("changed key")
+        } catch { XCTAssertEqual(error as? AccountLoginError, .changed) }
+        let records = try await portal(transport).owned(stationOrigin: "https://configured.example")
+        let log = try await coordinator.serviceMembership()
+        XCTAssertNil(try AstationRecoveryCoordinator.removableService(record: XCTUnwrap(records.first), log: log))
+        await transport.setState("provisioning")
+        let activeRecords = try await portal(transport).owned(stationOrigin: "https://configured.example")
+        do {
+            try await coordinator.removeRevokedService(XCTUnwrap(activeRecords.first), ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+            XCTFail("an active grant needs Portal revocation first")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        XCTAssertEqual(h.ownerRequests.count, count)
+    }
+
+    func testRemovalUncertainPreparedCheckpointCannotSendUntilReloaded() async throws {
+        let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        let record = try await revokedService(coordinator!, transport: transport)
+        let count = await h.relay.appends.count
+        h.store.failOnRemoval = true
+        do {
+            try await coordinator!.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+            XCTFail("uncertain durable store")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .storageUncertain) }
+        let after = await h.relay.appends.count
+        XCTAssertEqual(after, count)
+        XCTAssertThrowsError(try coordinator!.pendingServiceRemovalID())
+        coordinator = nil; coordinator = try h.coordinator()
+        try await coordinator!.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+        let log = try await coordinator!.serviceMembership()
+        XCTAssertEqual(log.member(deviceId: "service-test")?.status, .removed)
+    }
+
+    func testRemovalCompetingHeadRetainsEvidenceAndRequiresFreshConfirmation() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        let record = try await revokedService(coordinator, transport: transport)
+        let manager = try await addSecondManager(harness: h)
+        h.ownerConfirmation = { _ in
+            try await self.append(["action": "add_host", "host": ["host_id": "other-host", "host_trust_gen": 1,
+                "host_key": ["alg": "ed25519", "pub": recoveryTestBase64(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)]]],
+                harness: h, signer: "manager-b", identity: manager)
+            return true
+        }
+        do {
+            try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+            XCTFail("head changed during confirmation")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        XCTAssertNil(try coordinator.pendingServiceRemovalID())
+        XCTAssertEqual((try checkpoint(h.store)["supersededServiceRemovals"] as? [Data])?.count, 1)
+        let confirmations = h.ownerRequests.count
+        h.ownerConfirmation = nil
+        try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+        XCTAssertEqual(h.ownerRequests.count, confirmations + 1)
+    }
+
+    func testRemovalAcceptedBeforeUncertainCommitResumesWithoutAnotherAppend() async throws {
+        let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        let record = try await revokedService(coordinator!, transport: transport)
+        let before = try await coordinator!.serviceMembership()
+        h.store.failAtEntryCount = Int(before.head().seq + 1)
+        do {
+            try await coordinator!.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+            XCTFail("uncertain committed checkpoint")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .storageUncertain) }
+        let count = await h.relay.appends.count, confirmations = h.ownerRequests.count
+        coordinator = nil; coordinator = try h.coordinator()
+        try await coordinator!.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+        let after = await h.relay.appends.count
+        XCTAssertEqual(after, count)
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        XCTAssertNil(try coordinator!.pendingServiceRemovalID())
+    }
+
+    func testRemovalManagerRevokedDuringConfirmationCannotSignOrSend() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        let record = try await revokedService(coordinator, transport: transport)
+        let manager = try await addSecondManager(harness: h)
+        h.ownerConfirmation = { _ in
+            try await self.append(["action": "remove", "device_id": "manager-a"], harness: h,
+                signer: "manager-b", identity: manager)
+            return true
+        }
+        do {
+            try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345", portal: portal(transport), current: { true })
+            XCTFail("removed manager")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        let log = await h.relay.log
+        XCTAssertEqual(log?.member(deviceId: "manager-a")?.status, .removed)
+        XCTAssertEqual(log?.member(deviceId: "service-test")?.status, .active)
+        h.ownerConfirmation = nil
+    }
+
+    func testServiceApprovalResumesAfterLostPortalReplyWithoutResigningOrReposting() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        _ = try await coordinator!.setup()
+        let approval = try await service(coordinator!)
+        try await coordinator!.prepareService(approval)
+        let transport = ServiceApprovalPortal()
+        await transport.dropNextReply()
+        do { try await coordinator!.approveService(approval, portal: portal(transport), current: { true }); XCTFail("reply should be lost") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .unavailable) }
+        XCTAssertEqual(try coordinator!.pendingServiceApproval(), approval)
+        let confirmations = h.ownerRequests.count
+        coordinator = nil
+        coordinator = try h.coordinator()
+        try await coordinator!.approveService(approval, portal: portal(transport), current: { true })
+        XCTAssertNil(try coordinator!.pendingServiceApproval())
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        let count = await transport.count(); XCTAssertEqual(count, 1)
+        let remote = await h.relay.log
+        XCTAssertEqual(remote?.member(deviceId: "service-test")?.roles, ["service"])
+    }
+
+    func testServiceApprovalAccountChangeDuringConfirmationSendsNoEntryOrPortalRequest() async throws {
+        let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        let coordinator = try h.coordinator(); _ = try await coordinator.setup()
+        let approval = try await service(coordinator)
+        try await coordinator.prepareService(approval)
+        var current = true
+        h.ownerConfirmation = { _ in current = false; return true }
+        do { try await coordinator.approveService(approval, portal: portal(transport), current: { current }); XCTFail("account changed") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .confirmationRequired) }
+        let remote = await h.relay.log, count = await transport.count()
+        XCTAssertNil(remote?.member(deviceId: "service-test")); XCTAssertEqual(count, 0)
+    }
+
+    func testServiceApprovalLostRelayReplyRetriesItsDurablySavedSignature() async throws {
+        let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator(); _ = try await coordinator!.setup()
+        let approval = try await service(coordinator!)
+        try await coordinator!.prepareService(approval)
+        await h.relay.dropNextAppendReply()
+        do { try await coordinator!.approveService(approval, portal: portal(transport), current: { true }); XCTFail("lost relay reply") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .unavailable) }
+        let first = await h.relay.appends.last, confirmations = h.ownerRequests.count
+        coordinator = nil; coordinator = try h.coordinator()
+        XCTAssertThrowsError(try coordinator!.cancelUnsignedService(approval), "a signed retry must survive a new process")
+        XCTAssertEqual(try coordinator!.pendingServiceApproval(), approval)
+        try await coordinator!.approveService(approval, portal: portal(transport), current: { true })
+        let retry = await h.relay.appends.last
+        XCTAssertEqual(first, retry); XCTAssertEqual(h.ownerRequests.count, confirmations)
+        XCTAssertNil(try coordinator!.pendingServiceApproval())
+    }
+
+    func testServiceReviewCanBeReplacedOnlyAfterAnAnchoredHeadSupersedesIt() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let coordinator = try h.coordinator(); _ = try await coordinator.setup()
+        let otherManager = try await addSecondManager(harness: h)
+        let approval = try await service(coordinator)
+        try await coordinator.prepareService(approval)
+        do { try await coordinator.reviewServiceAgain(approval); XCTFail("unresolved draft must remain") } catch {}
+        try await append(["action": "add_host", "host": ["host_id": "other-host", "host_trust_gen": 1,
+            "host_key": ["alg": "ed25519", "pub": recoveryTestBase64(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)]]],
+            harness: h, signer: "manager-b", identity: otherManager)
+        try await coordinator.reviewServiceAgain(approval)
+        XCTAssertNil(try coordinator.pendingServiceApproval())
+        XCTAssertEqual((try checkpoint(h.store)["supersededServiceReviews"] as? [Data])?.count, 1)
+    }
+    func testChannelRefreshCommitsSignedMembershipAndAllowsViewOnlyButNeverRemovedDevices() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        _ = try await coordinator!.setup()
+        try await append(["action": "add_host", "host": ["host_id": "host-a", "host_trust_gen": 1,
+            "host_key": ["alg": "ed25519", "pub": recoveryTestBase64(await h.relay.hostPublicKey())]]], harness: h)
+        let manager = try await addSecondManager(harness: h)
+        try await append(["action": "set_roles", "device_id": "manager-a", "roles": ["view"]],
+            harness: h, signer: "manager-b", identity: manager)
+        let updatedValue = await h.relay.log
+        let updated = try XCTUnwrap(updatedValue)
+        try await coordinator!.refreshChannelMembership(hostID: "host-a", requiredHead: updated.head())
+        XCTAssertEqual(try coordinator!.channelMembership(hostID: "host-a").member(deviceId: "manager-a")?.roles, ["view"])
+        coordinator = nil
+        coordinator = try h.coordinator()
+        XCTAssertEqual(try coordinator!.channelMembership(hostID: "host-a").head(), updated.head())
+        XCTAssertThrowsError(try coordinator!.channelMembership(hostID: "unknown-host"))
+        do {
+            try await coordinator!.refreshChannelMembership(hostID: "host-a", requiredHead: LogHead(seq: updated.head().seq, hash: String(repeating: "f", count: 64)))
+            XCTFail("An authenticated head still needs a verified matching chain")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        try await append(["action": "remove", "device_id": "manager-a"], harness: h, signer: "manager-b", identity: manager)
+        let removedValue = await h.relay.log
+        let removed = try XCTUnwrap(removedValue)
+        try await coordinator!.refreshChannelMembership(hostID: "host-a", requiredHead: removed.head())
+        XCTAssertThrowsError(try coordinator!.channelMembership(hostID: "host-a"))
+    }
+
+    private func checkpoint(_ store: RecoveryMemoryCheckpoint) throws -> [String: Any] {
+        try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(store.bytes), format: nil) as? [String: Any])
+    }
+
+    func testOldEntryOnlyCheckpointMigratesAndCommitsImmediatelyWithoutNetworkOrResigning() async throws {
+        let h = RecoveryCoordinatorHarness()
+        _ = try await h.coordinator().setup()
+        var old = try checkpoint(h.store)
+        old.removeValue(forKey: "membership")
+        h.store.bytes = try PropertyListSerialization.data(fromPropertyList: old, format: .binary, options: 0)
+        let writes = h.store.writes
+        let signatures = h.ownerRequests.count
+        let appends = await h.relay.appends.count
+        let loaded = try h.coordinator()
+        XCTAssertEqual(h.store.writes, writes + 1)
+        XCTAssertNotNil(try checkpoint(h.store)["membership"] as? String)
+        XCTAssertEqual(h.ownerRequests.count, signatures)
+        let after = await h.relay.appends.count
+        XCTAssertEqual(after, appends)
+        try loaded.checkpointPendingWaits()
+    }
+
+    func testFailedImmediateLoadCommitPreventsAnyOperationAndReloadReconcilesCommittedBytes() async throws {
+        let h = RecoveryCoordinatorHarness()
+        _ = try await h.coordinator().setup()
+        let appends = await h.relay.appends.count
+        let installs = h.keys.installs
+        h.store.failAfterWrite = true
+        XCTAssertThrowsError(try h.coordinator())
+        XCTAssertEqual(h.keys.installs, installs)
+        let after = await h.relay.appends.count
+        XCTAssertEqual(after, appends)
+        let resumed = try h.coordinator()
+        _ = try await resumed.exportedKit()
+        XCTAssertEqual(h.keys.installs, installs)
+    }
+
+    func testCorruptMembershipSnapshotFailsClosedWithoutDiscardingCheckpoint() async throws {
+        let h = RecoveryCoordinatorHarness()
+        _ = try await h.coordinator().setup()
+        var corrupt = try checkpoint(h.store)
+        corrupt["membership"] = "{}"
+        h.store.bytes = try PropertyListSerialization.data(fromPropertyList: corrupt, format: .binary, options: 0)
+        let before = h.store.bytes
+        let writes = h.store.writes
+        XCTAssertThrowsError(try h.coordinator())
+        XCTAssertEqual(h.store.bytes, before)
+        XCTAssertEqual(h.store.writes, writes)
+    }
+
+    func testConflictFreezeIsCommittedBeforeRefusalAndSurvivesAppRestart() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        let kit = try await coordinator!.setup()
+        let storedChain = await h.relay.log
+        let chain = try XCTUnwrap(storedChain)
+        let genesis = try MembershipLog.verify(accountId: "account-a", genesisHash: kit.genesisHash,
+            entries: [XCTUnwrap(chain.entries().first)], now: AstationRecoveryCoordinator.clock())
+        let body = try genesis.draftEntry(signer: "manager-a", signedAt: AstationRecoveryCoordinator.clock().wallMs,
+            actionJson: recoveryTestJSON(["action": "add_host", "host": ["host_id": "fork-host", "host_trust_gen": 1,
+                "host_key": ["alg": "ed25519", "pub": recoveryTestBase64(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)]]]))
+        let provider = AstationMembershipKeyProvider(identity: h.identity, keyID: "manager-a", publicKey: try h.identity.remotePublicKeys().signing)
+        let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: "manager-a")
+        let entry = try recoveryTestJSON(["body": JSONSerialization.jsonObject(with: Data(body.utf8)),
+            "sig": recoveryTestBase64(provider.sign(request: request))])
+        await h.relay.injectNextEntries([entry])
+        do { _ = try await coordinator!.exportedKit(); XCTFail("fork must stop the operation") } catch {}
+        let stored = try XCTUnwrap(checkpoint(h.store)["membership"] as? String)
+        XCTAssertNotNil(try MembershipLog.fromStored(accountId: "account-a", genesisHash: kit.genesisHash,
+            storedJson: stored, now: AstationRecoveryCoordinator.clock()).frozen())
+        coordinator = nil
+        coordinator = try h.coordinator()
+        let signatures = h.ownerRequests.count
+        do { _ = try await coordinator!.pairingKeys(nonce: Data(repeating: 8, count: 32)); XCTFail("freeze survives restart") } catch {}
+        XCTAssertEqual(h.ownerRequests.count, signatures)
+    }
+
+    func testPendingRecoveryPeriodicCheckpointSurvivesRestartAndHaltsOnWriteFailure() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let kit = try await h.coordinator().setup()
+        let hostKey = await h.relay.hostPublicKey()
+        try await append(["action": "add_host", "host": ["host_id": "host-a", "host_trust_gen": 3,
+            "host_key": ["alg": "ed25519", "pub": recoveryTestBase64(hostKey)]]], harness: h)
+        await h.relay.setHostOnline(true)
+        let store = RecoveryMemoryCheckpoint()
+        let identity = AtemE2EIdentity(storage: TestAtemStorage(), crypto: TestAtemCryptography())
+        let keys = RecoveryMemoryKeys()
+        let first = AstationRecoveryCoordinator.clock()
+        var time = first
+        func replacement() throws -> AstationRecoveryCoordinator {
+            try AstationRecoveryCoordinator(accountID: "account-a", managerID: "replacement-a", identity: identity,
+                relayURL: "https://configured.example", store: store, transport: h.relay, dataKeys: keys,
+                allowNewDataKey: { false }, confirmOwner: { _ in false }, confirmReplacement: { _ in true },
+                saveKit: { _ in false }, now: { time })
+        }
+        var coordinator: AstationRecoveryCoordinator? = try replacement()
+        _ = try await coordinator!.restoreAccount(kit: kit)
+        func at(_ hours: UInt64) -> HostClock {
+            HostClock(wallMs: first.wallMs + hours * 3_600_000,
+                monoMs: first.monoMs + hours * 3_600_000, bootId: first.bootId)
+        }
+        func deadline() throws -> UInt64? {
+            let saved = try XCTUnwrap(checkpoint(store)["membership"] as? String)
+            let log = try MembershipLog.fromStored(accountId: "account-a", genesisHash: kit.genesisHash, storedJson: saved, now: time)
+            return try log.pendingRecovery(now: time).first?.effectiveAt
+        }
+        let original = try XCTUnwrap(deadline())
+        time = at(10)
+        try coordinator!.checkpointPendingWaits()
+        coordinator = nil
+        time = at(12)
+        coordinator = try replacement()
+        XCTAssertEqual(try deadline(), original, "An app restart must not restart the 24-hour wait")
+        let appends = await h.relay.appends.count
+        let installs = keys.installs
+        store.failAfterWrite = true
+        time = at(13)
+        XCTAssertThrowsError(try coordinator!.checkpointPendingWaits())
+        do { _ = try await coordinator!.exportedKit(); XCTFail("Uncertain periodic write must halt") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .storageUncertain) }
+        let after = await h.relay.appends.count
+        XCTAssertEqual(after, appends)
+        XCTAssertEqual(keys.installs, installs)
+    }
+
+    private func append(_ action: [String: Any], harness h: RecoveryCoordinatorHarness,
+        signer: String = "manager-a", identity: AtemE2EIdentity? = nil) async throws {
+        let stored = await h.relay.log
+        let log = try XCTUnwrap(stored)
+        let publisher = RemoteMembershipPublication(log: log, persist: { _ in })
+        _ = try publisher.prepare(actionJSON: recoveryTestJSON(action), signer: signer, signedAt: AstationRecoveryCoordinator.clock().wallMs)
+        let identity = identity ?? h.identity
+        let provider = AstationMembershipKeyProvider(identity: identity, keyID: signer, publicKey: try identity.remotePublicKeys().signing)
+        let request = try publisher.sign(provider: provider, keyID: signer)
+        _ = try await h.relay.append(genesisHash: log.genesisHash(), request: request)
+        _ = try publisher.relayStored(now: AstationRecoveryCoordinator.clock())
+    }
+
+    private func addSecondManager(harness h: RecoveryCoordinatorHarness) async throws -> AtemE2EIdentity {
+        let identity = AtemE2EIdentity(storage: TestAtemStorage(), crypto: TestAtemCryptography())
+        let keys = try identity.remotePublicKeys()
+        try await append(["action": "add", "member": ["device_id": "manager-b", "kind": "native",
+            "roles": ["control", "manage", "view"],
+            "auth_key": ["alg": "p256", "pub": recoveryTestBase64(keys.signing)],
+            "enc_key": ["alg": "x25519", "pub": recoveryTestBase64(keys.encryption)]]], harness: h)
+        return identity
+    }
+
+    func testRepeatedSetupReusesTheCommittedBackupWithoutSigningAgain() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let coordinator = try h.coordinator()
+        let kit = try await coordinator.setup()
+        let reexported = try await coordinator.exportedKit()
+        XCTAssertEqual(kit, reexported)
+        XCTAssertEqual(h.ownerRequests.map(\.purpose), [.genesis, .keyBackup])
+        let uploads = await h.relay.uploads
+        XCTAssertEqual(uploads.count, 1)
+    }
+
+    func testKeyRotationBacksUpCurrentAndRetainedKeysBeforeInstallAndRetriesExactBytes() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        let kit = try await coordinator!.setup()
+        let old = h.keys.keys
+        let next = AccountDataKey(kid: "89abcdef", key: Data(repeating: 0x72, count: 32))
+        await h.relay.dropNextUploadReply()
+        do { try await coordinator!.installBackedUpKey(next); XCTFail("the upload reply was lost") } catch {}
+        XCTAssertEqual(h.keys.keys, old)
+        coordinator = nil
+        coordinator = try h.coordinator()
+        try await coordinator!.installBackedUpKey(next)
+        XCTAssertEqual(h.keys.keys, [next] + old)
+        let logValue = await h.relay.log
+        let log = try XCTUnwrap(logValue)
+        let envelope = try await h.relay.backup(log: log)
+        XCTAssertEqual(try kit.openBackup(envelope), ([next] + old).map { AccountKey(kid: $0.kid, k: $0.key) })
+        let uploads = await h.relay.uploads
+        XCTAssertEqual(uploads[1], uploads[2])
+        XCTAssertEqual(h.ownerRequests.map(\.purpose), [.genesis, .keyBackup, .keyBackup])
+        XCTAssertEqual(try h.identity.state(account: "account-a")?.mode, "off")
+    }
+
+    func testRestoreWaitsForHostThenPublishesExactlyOneReplacementAndCanResumeAfterApproval() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let kit = try await h.coordinator().setup()
+        let hostKey = await h.relay.hostPublicKey()
+        try await append(["action": "add_host", "host": ["host_id": "host-a", "host_trust_gen": 3,
+            "host_key": ["alg": "ed25519", "pub": recoveryTestBase64(hostKey)]]], harness: h)
+        let restoredStore = RecoveryMemoryCheckpoint()
+        let restoredKeys = RecoveryMemoryKeys()
+        let restoredIdentity = AtemE2EIdentity(storage: TestAtemStorage(), crypto: TestAtemCryptography())
+        var replacementApprovals = 0
+        func replacement() throws -> AstationRecoveryCoordinator {
+            try AstationRecoveryCoordinator(accountID: "account-a", managerID: "replacement-a", identity: restoredIdentity,
+                relayURL: "https://configured.example", store: restoredStore, transport: h.relay, dataKeys: restoredKeys,
+                allowNewDataKey: { false }, confirmOwner: { _ in XCTFail("no new genesis or backup needed"); return false },
+                confirmReplacement: { _ in replacementApprovals += 1; return true }, saveKit: { _ in XCTFail("retain the imported kit"); return false })
+        }
+        var coordinator: AstationRecoveryCoordinator? = try replacement()
+        let waiting = try await coordinator!.restoreAccount(kit: kit)
+        XCTAssertTrue(waiting.contains("reach one"))
+        XCTAssertEqual(restoredKeys.installs, 0)
+        XCTAssertEqual(replacementApprovals, 0)
+        await h.relay.setHostOnline(true)
+        let status = try await coordinator!.restoreAccount(kit: kit)
+        XCTAssertTrue(status.contains("Recovery requested"))
+        XCTAssertEqual(restoredKeys.keys, h.keys.keys)
+        XCTAssertTrue(try restoredIdentity.recoveryIsSaved())
+        XCTAssertEqual(replacementApprovals, 1)
+        do {
+            _ = try await coordinator!.pairingKeys(nonce: Data(repeating: 9, count: 32))
+            XCTFail("a pending replacement cannot pair")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .enrollmentPending) }
+        coordinator = nil
+        coordinator = try replacement()
+        _ = try await coordinator!.restoreAccount(kit: kit)
+        XCTAssertEqual(replacementApprovals, 1)
+        let storedLog = await h.relay.log
+        let log = try XCTUnwrap(storedLog)
+        let recovery = try XCTUnwrap(log.entries().last)
+        let target = try XCTUnwrap(signedObjectInfo(json: recovery).entryHash)
+        try await append(["action": "recovery_approve", "target": target], harness: h)
+        let keys = try await coordinator!.pairingKeys(nonce: Data(repeating: 9, count: 32))
+        XCTAssertEqual(keys.genesisHash, kit.genesisHash)
+        let reexported = try await coordinator!.exportedKit()
+        XCTAssertEqual(reexported, kit)
+        XCTAssertEqual(replacementApprovals, 1)
+        let published = await h.relay.appends
+        XCTAssertEqual(try published.filter {
+            let object = try JSONSerialization.jsonObject(with: Data($0.entryJson.utf8)) as? [String: Any]
+            return (object?["body"] as? [String: Any])?["action"] as? String == "recovery_add"
+        }.count, 1)
+    }
+
+    func testSetupPublishesGenesisAndBackupBeforeInstallingKAndPreservesEncryptionOff() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let kit = try await h.coordinator().setup()
+        XCTAssertEqual(kit.accountID, "account-a")
+        XCTAssertEqual(h.ownerRequests.map(\.purpose), [.genesis, .keyBackup])
+        XCTAssertEqual(h.savedKits, [kit.text()])
+        XCTAssertEqual(h.keys.installs, 1)
+        XCTAssertEqual(try h.identity.state(account: "account-a")?.mode, "off")
+        let storedLog = await h.relay.log
+        let log = try XCTUnwrap(storedLog)
+        XCTAssertEqual(log.kBackup()?.kids, ["0123abcd"])
+        XCTAssertEqual(log.head().seq, 2)
+        XCTAssertEqual(kit.genesisHash, log.genesisHash())
+    }
+
+    func testLostGenesisReplyRestartsWithTheExactSignedEntryAndNoSecondGenesisConfirmation() async throws {
+        let h = RecoveryCoordinatorHarness()
+        await h.relay.dropNextAppendReply()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        do { _ = try await coordinator!.setup(); XCTFail("lost reply must be reported") } catch {}
+        XCTAssertTrue(h.savedKits.isEmpty)
+        XCTAssertTrue(h.keys.keys.isEmpty)
+        coordinator = nil
+        coordinator = try h.coordinator()
+        _ = try await coordinator!.setup()
+        let requests = await h.relay.appends
+        XCTAssertEqual(requests[0], requests[1])
+        XCTAssertEqual(h.ownerRequests.filter { $0.purpose == .genesis }.count, 1)
+        XCTAssertEqual(h.keys.installs, 1)
+    }
+
+    func testLostBackupUploadReplyRestartsWithoutResealingOrSigningASibling() async throws {
+        let h = RecoveryCoordinatorHarness()
+        await h.relay.dropNextUploadReply()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        do { _ = try await coordinator!.setup(); XCTFail("lost reply must be reported") } catch {}
+        XCTAssertEqual(h.keys.installs, 0)
+        coordinator = nil
+        coordinator = try h.coordinator()
+        _ = try await coordinator!.setup()
+        let uploads = await h.relay.uploads
+        XCTAssertEqual(uploads.count, 2)
+        XCTAssertEqual(uploads[0], uploads[1])
+        XCTAssertEqual(h.ownerRequests.filter { $0.purpose == .keyBackup }.count, 1)
+        XCTAssertEqual(h.keys.installs, 1)
+    }
+
+    func testKeychainInstallFailureAfterBackupCommitResumesWithoutAnotherSignatureOrUpload() async throws {
+        let h = RecoveryCoordinatorHarness()
+        h.keys.failNextInstall = true
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        do { _ = try await coordinator!.setup(); XCTFail("Keychain failure must be reported") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .storageUncertain) }
+        XCTAssertTrue(h.keys.keys.isEmpty)
+        let committedValue = await h.relay.log
+        let committed = try XCTUnwrap(committedValue)
+        XCTAssertEqual(committed.head().seq, 2)
+        let requests = h.ownerRequests
+        let uploads = await h.relay.uploads
+        coordinator = nil
+        coordinator = try h.coordinator()
+        let kit = try await coordinator!.setup()
+        XCTAssertEqual(kit.genesisHash, committed.genesisHash())
+        XCTAssertEqual(h.ownerRequests, requests)
+        let retriedUploads = await h.relay.uploads
+        XCTAssertEqual(retriedUploads, uploads)
+        XCTAssertEqual(h.keys.keys.map(\.kid), committed.kBackup()?.kids)
+        XCTAssertEqual(h.keys.installs, 1)
+        XCTAssertEqual(try h.identity.state(account: "account-a")?.mode, "off")
+    }
+
+    func testUncertainCheckpointAfterKeyInstallHaltsThenRestartsIdempotently() async throws {
+        let h = RecoveryCoordinatorHarness()
+        h.keys.didInstall = { h.store.failAfterWrite = true }
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        do { _ = try await coordinator!.setup(); XCTFail("the final checkpoint reply was lost") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .storageUncertain) }
+        let installed = h.keys.keys
+        XCTAssertEqual(installed.count, 1)
+        let appends = await h.relay.appends
+        let uploads = await h.relay.uploads
+        do { _ = try await coordinator!.setup(); XCTFail("uncertain storage must halt this instance") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .storageUncertain) }
+        h.keys.didInstall = nil
+        coordinator = nil
+        coordinator = try h.coordinator()
+        _ = try await coordinator!.setup()
+        XCTAssertEqual(h.keys.keys, installed)
+        XCTAssertEqual(h.keys.installs, 1)
+        let finalAppends = await h.relay.appends
+        let finalUploads = await h.relay.uploads
+        XCTAssertEqual(finalAppends, appends)
+        XCTAssertEqual(finalUploads, uploads)
+        XCTAssertEqual(h.ownerRequests.map(\.purpose), [.genesis, .keyBackup])
+    }
+
+    func testRotationWithLostCommitReplyKeepsOldKeyUntilRestartConfirmsTheExactBackup() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        let kit = try await coordinator!.setup()
+        let old = h.keys.keys
+        let next = AccountDataKey(kid: "89abcdef", key: Data(repeating: 0x72, count: 32))
+        await h.relay.dropNextAppendReply()
+        do { try await coordinator!.installBackedUpKey(next); XCTFail("the commit reply was lost") } catch {}
+        XCTAssertEqual(h.keys.keys, old)
+        let committedValue = await h.relay.log
+        let committed = try XCTUnwrap(committedValue)
+        let committedHead = committed.head()
+        let envelope = try await h.relay.backup(log: committed)
+        XCTAssertEqual(try kit.openBackup(envelope), ([next] + old).map { AccountKey(kid: $0.kid, k: $0.key) })
+        coordinator = nil
+        coordinator = try h.coordinator()
+        try await coordinator!.installBackedUpKey(next)
+        XCTAssertEqual(h.keys.keys, [next] + old)
+        let finalLogValue = await h.relay.log
+        let finalLog = try XCTUnwrap(finalLogValue)
+        XCTAssertEqual(finalLog.head(), committedHead)
+        XCTAssertEqual(h.ownerRequests.map(\.purpose), [.genesis, .keyBackup, .keyBackup])
+        let uploads = await h.relay.uploads
+        XCTAssertTrue(uploads.dropFirst().allSatisfy { $0 == envelope })
+    }
+
+    func testConcurrentSetupWhileOwnerDialogIsOpenIsBusyAndCreatesOnlyOneRoot() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let entered = expectation(description: "owner confirmation is open")
+        var release: CheckedContinuation<Bool, Never>?
+        h.ownerConfirmation = { request in
+            if request.purpose == .genesis {
+                return await withCheckedContinuation { release = $0; entered.fulfill() }
+            }
+            return true
+        }
+        let coordinator = try h.coordinator()
+        let first = Task { try await coordinator.setup() }
+        await fulfillment(of: [entered], timeout: 5)
+        do { _ = try await coordinator.exportedKit(); XCTFail("overlapping operations must be refused") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .busy) }
+        let beforeApproval = await h.relay.appends
+        XCTAssertTrue(beforeApproval.isEmpty)
+        release?.resume(returning: true)
+        let kit = try await first.value
+        let reexported = try await coordinator.exportedKit()
+        XCTAssertEqual(kit, reexported)
+        XCTAssertEqual(h.ownerRequests.map(\.purpose), [.genesis, .keyBackup])
+    }
+
+    func testMembershipCASRaceRequiresConfirmationOfTheNewExactBackupBody() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let coordinator = try h.coordinator()
+        let kit = try await coordinator.setup()
+        let old = h.keys.keys
+        let manager = try await addSecondManager(harness: h)
+        var raced = false
+        h.ownerConfirmation = { [self] request in
+            if request.purpose == .keyBackup, !raced {
+                raced = true
+                let hostKey = await h.relay.hostPublicKey()
+                try await append(["action": "add_host", "host": ["host_id": "host-a", "host_trust_gen": 3,
+                    "host_key": ["alg": "ed25519", "pub": recoveryTestBase64(hostKey)]]], harness: h,
+                    signer: "manager-b", identity: manager)
+            }
+            XCTAssertEqual(h.keys.keys, old)
+            return true
+        }
+        defer { h.ownerConfirmation = nil }
+        let next = AccountDataKey(kid: "89abcdef", key: Data(repeating: 0x72, count: 32))
+        try await coordinator.installBackedUpKey(next)
+        let backups = Array(h.ownerRequests.filter { $0.purpose == .keyBackup }.dropFirst())
+        XCTAssertEqual(backups.count, 2)
+        XCTAssertNotEqual(backups.first?.bodyJson, backups.last?.bodyJson)
+        let logValue = await h.relay.log
+        let log = try XCTUnwrap(logValue)
+        XCTAssertNotNil(log.host(hostId: "host-a"))
+        XCTAssertEqual(log.head().seq, 5)
+        let envelope = try await h.relay.backup(log: log)
+        XCTAssertEqual(try kit.openBackup(envelope).map(\.kid), h.keys.keys.map(\.kid))
+        XCTAssertEqual(h.keys.keys, [next] + old)
+        XCTAssertEqual(h.keys.installs, 2)
+    }
+
+    func testManagerRemovalDuringOwnerConfirmationCannotCommitBackupOrInstallKey() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        _ = try await coordinator!.setup()
+        let old = h.keys.keys
+        let manager = try await addSecondManager(harness: h)
+        h.ownerConfirmation = { [self] request in
+            if request.purpose == .keyBackup {
+                try await append(["action": "remove", "device_id": "manager-a"], harness: h,
+                    signer: "manager-b", identity: manager)
+            }
+            return true
+        }
+        defer { h.ownerConfirmation = nil }
+        let next = AccountDataKey(kid: "89abcdef", key: Data(repeating: 0x72, count: 32))
+        do { try await coordinator!.installBackedUpKey(next); XCTFail("a removed manager cannot commit") } catch {}
+        XCTAssertEqual(h.keys.keys, old)
+        let logValue = await h.relay.log
+        let log = try XCTUnwrap(logValue)
+        XCTAssertEqual(log.kBackup()?.kids, old.map(\.kid))
+        coordinator = nil
+        coordinator = try h.coordinator()
+        do { _ = try await coordinator!.setup(); XCTFail("restart must retain the removal") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        XCTAssertEqual(h.keys.installs, 1)
+        XCTAssertEqual(h.ownerRequests.map(\.purpose), [.genesis, .keyBackup, .keyBackup])
+    }
+
+    func testRestoreWithLostEnrollmentReplyResumesWithoutASecondConsentOrReplacementEntry() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let kit = try await h.coordinator().setup()
+        let hostKey = await h.relay.hostPublicKey()
+        try await append(["action": "add_host", "host": ["host_id": "host-a", "host_trust_gen": 3,
+            "host_key": ["alg": "ed25519", "pub": recoveryTestBase64(hostKey)]]], harness: h)
+        await h.relay.setHostOnline(true)
+        let store = RecoveryMemoryCheckpoint()
+        let keys = RecoveryMemoryKeys()
+        let identity = AtemE2EIdentity(storage: TestAtemStorage(), crypto: TestAtemCryptography())
+        var approvals = 0
+        func replacement() throws -> AstationRecoveryCoordinator {
+            try AstationRecoveryCoordinator(accountID: "account-a", managerID: "replacement-a", identity: identity,
+                relayURL: "https://configured.example", store: store, transport: h.relay, dataKeys: keys,
+                allowNewDataKey: { false }, confirmOwner: { _ in XCTFail("retain the original genesis"); return false },
+                confirmReplacement: { _ in approvals += 1; return true }, saveKit: { _ in false })
+        }
+        await h.relay.dropNextAppendReply()
+        var coordinator: AstationRecoveryCoordinator? = try replacement()
+        do { _ = try await coordinator!.restoreAccount(kit: kit); XCTFail("the enrollment reply was lost") } catch {}
+        XCTAssertEqual(keys.keys, h.keys.keys)
+        XCTAssertEqual(approvals, 1)
+        let committedValue = await h.relay.log
+        let head = try XCTUnwrap(committedValue).head()
+        coordinator = nil
+        coordinator = try replacement()
+        _ = try await coordinator!.restoreAccount(kit: kit)
+        XCTAssertEqual(approvals, 1)
+        let resumedValue = await h.relay.log
+        XCTAssertEqual(try XCTUnwrap(resumedValue).head(), head)
+        let requests = await h.relay.appends
+        let recovery = try requests.filter {
+            let object = try JSONSerialization.jsonObject(with: Data($0.entryJson.utf8)) as? [String: Any]
+            return (object?["body"] as? [String: Any])?["action"] as? String == "recovery_add"
+        }
+        XCTAssertFalse(recovery.isEmpty)
+        XCTAssertTrue(recovery.allSatisfy { $0 == recovery.first })
+        do { _ = try await coordinator!.pairingKeys(nonce: Data(repeating: 9, count: 32)); XCTFail("still pending") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .enrollmentPending) }
+    }
+
+    func testOwnerOrKitSaveCancellationRetainsThePreparedOperationAndNeverInstallsKeys() async throws {
+        for denyOwner in [false, true] {
+            let h = RecoveryCoordinatorHarness()
+            h.approve = !denyOwner; h.save = denyOwner
+            let coordinator = try h.coordinator()
+            do { _ = try await coordinator.setup(); XCTFail("cancellation must be reported") } catch {}
+            XCTAssertNotNil(h.store.bytes)
+            XCTAssertEqual(h.keys.installs, 0)
+            if denyOwner { let requests = await h.relay.appends; XCTAssertTrue(requests.isEmpty) }
+        }
+    }
+
+    func testUncertainCheckpointHaltsTheInstanceBeforeAnyNetworkEffect() async throws {
+        let h = RecoveryCoordinatorHarness()
+        h.store.failAfterWrite = true
+        let coordinator = try h.coordinator()
+        for _ in 0..<2 {
+            do { _ = try await coordinator.setup(); XCTFail("uncertain storage must halt") } catch {}
+        }
+        let requests = await h.relay.appends
+        XCTAssertTrue(requests.isEmpty)
+        XCTAssertTrue(h.ownerRequests.isEmpty)
+        XCTAssertEqual(h.keys.installs, 0)
+    }
+}

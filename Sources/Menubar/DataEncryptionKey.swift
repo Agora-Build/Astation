@@ -53,6 +53,24 @@ final class DataEncryptionKeyManager {
         return try value(from: stored, kid: requestedKid)
     }
 
+    func recoveryKeys(dataAccount: String) throws -> [AccountDataKey] {
+        guard let stored = try readStored(dataAccount: dataAccount) else { return [] }
+        return try ([stored.kid] + (stored.previous ?? []).map(\.kid)).map { kid in
+            guard let key = try value(from: stored, kid: kid) else { throw DataEncryptionKeyError.invalidKey }
+            return key
+        }
+    }
+
+    func installRecovered(_ values: [AccountDataKey], dataAccount: String) throws {
+        guard let current = values.first, values.count <= 32,
+              Set(values.map(\.kid)).count == values.count,
+              values.allSatisfy({ Self.validKid($0.kid) && $0.key.count == 32 }) else { throw DataEncryptionKeyError.invalidKey }
+        if let existing = try load(dataAccount: dataAccount), existing != current {
+            throw AtemIdentityError.identityChanged
+        }
+        try write(current, previous: values.dropFirst().map { StoredKey(kid: $0.kid, key: $0.key.base64EncodedString()) }, dataAccount: dataAccount)
+    }
+
     /// Account grouping can change the server-side data-account id while the
     /// same key remains authoritative. Re-home that key before granting it to
     /// Atems connected through the newly grouped account.

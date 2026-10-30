@@ -4,6 +4,23 @@ import XCTest
 @testable import Menubar
 
 final class AtemVerificationUITests: XCTestCase {
+    private final class SavePanel: NSSavePanel {
+        var destination: URL?
+        var presentations = 0
+        var presentedFor: NSWindow?
+        var reply: ((NSApplication.ModalResponse) -> Void)?
+        override var url: URL? { destination }
+
+        override func beginSheetModal(for window: NSWindow,
+                                      completionHandler handler: @escaping (NSApplication.ModalResponse) -> Void) {
+            presentations += 1
+            presentedFor = window
+            reply = handler
+        }
+
+        override func cancel(_ sender: Any?) { reply?(.cancel) }
+    }
+
     private final class AuthenticationContext: LAContext, @unchecked Sendable {
         var available = true
         var preflightPolicies: [LAPolicy] = []
@@ -43,6 +60,11 @@ final class AtemVerificationUITests: XCTestCase {
 
     private func textFields(in view: NSView) -> [NSTextField] {
         (view as? NSTextField).map { [$0] } ?? view.subviews.flatMap { textFields(in: $0) }
+    }
+
+    private func button(_ title: String, in view: NSView) -> NSButton? {
+        if let button = view as? NSButton, button.title == title { return button }
+        return view.subviews.compactMap { button(title, in: $0) }.first
     }
 
     private func dialog(completion: @escaping (Bool) -> Void) -> AtemVerificationDialog {
@@ -119,6 +141,127 @@ final class AtemVerificationUITests: XCTestCase {
         XCTAssertTrue(prompt.alert.buttons[0].isEnabled)
         prompt.alert.buttons[0].performClick(nil)
         XCTAssertEqual(results, [true])
+    }
+
+    func testRecoveryPromptStaysInteractiveWhenCallerDiscardsCancellationHandle() throws {
+        _ = NSApplication.shared
+        var results: [Bool] = []
+        _ = AtemVerificationUI.saveRecovery("synthetic recovery kit") { results.append($0) }
+        let window = try XCTUnwrap(NSApp.windows.first { window in
+            window.isVisible && window.contentView.map {
+                textFields(in: $0).contains { $0.stringValue == "synthetic recovery kit" }
+            } == true
+        })
+        defer { window.close() }
+        let content = try XCTUnwrap(window.contentView)
+        let checkbox = try XCTUnwrap(button("I've saved this recovery kit somewhere safe", in: content))
+        let next = try XCTUnwrap(button("Continue Verification", in: content))
+        checkbox.performClick(nil)
+        XCTAssertTrue(next.isEnabled)
+        next.performClick(nil)
+        XCTAssertEqual(results, [true])
+        XCTAssertFalse(window.isVisible)
+        var nextResults: [Bool] = []
+        let cancelNext = AtemVerificationUI.saveRecovery("next synthetic kit") { nextResults.append($0) }
+        XCTAssertTrue(nextResults.isEmpty)
+        cancelNext()
+        XCTAssertEqual(nextResults, [false])
+    }
+
+    func testRecoverySaveSheetWritesPrivateFileAndStillRequiresUserConfirmation() throws {
+        _ = NSApplication.shared
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let panel = SavePanel()
+        let destination = directory.appendingPathComponent("synthetic-kit.txt")
+        panel.destination = destination
+        var results: [Bool] = []
+        let prompt = AtemRecoveryKitPrompt(text: "synthetic kit", makeSavePanel: { panel }) { results.append($0) }
+        prompt.show()
+        defer { prompt.cancel() }
+        let content = try XCTUnwrap(prompt.alert.accessoryView)
+        let save = try XCTUnwrap(button("Save to File...", in: content))
+        save.performClick(nil)
+        save.performClick(nil)
+        XCTAssertEqual(panel.presentations, 1)
+        XCTAssertTrue(panel.presentedFor === prompt.alert.window)
+        XCTAssertEqual(panel.nameFieldStringValue, "Astation Recovery Kit.txt")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        panel.reply?(.OK)
+        XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), "synthetic kit")
+        let attributes = try FileManager.default.attributesOfItem(atPath: destination.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+        XCTAssertTrue(textFields(in: content).contains { $0.stringValue == "Recovery kit saved. Keep an off-Mac copy." })
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertFalse(prompt.alert.buttons[0].isEnabled)
+        let checkbox = try XCTUnwrap(button("I've saved this recovery kit somewhere safe", in: content))
+        checkbox.performClick(nil)
+        XCTAssertTrue(prompt.alert.buttons[0].isEnabled)
+        prompt.alert.buttons[0].performClick(nil)
+        XCTAssertEqual(results, [true])
+    }
+
+    func testCancelledOrFailedSaveDoesNotConfirmRecoveryAndCanRetry() throws {
+        _ = NSApplication.shared
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let panel = SavePanel()
+        panel.destination = directory.appendingPathComponent("missing/synthetic-kit.txt")
+        var results: [Bool] = []
+        let prompt = AtemRecoveryKitPrompt(text: "synthetic kit", makeSavePanel: { panel }) { results.append($0) }
+        prompt.show()
+        defer { prompt.cancel() }
+        let content = try XCTUnwrap(prompt.alert.accessoryView)
+        let save = try XCTUnwrap(button("Save to File...", in: content))
+        save.performClick(nil)
+        panel.reply?(.cancel)
+        XCTAssertFalse(prompt.alert.buttons[0].isEnabled)
+        XCTAssertTrue(results.isEmpty)
+        save.performClick(nil)
+        XCTAssertEqual(panel.presentations, 2)
+        panel.reply?(.OK)
+        XCTAssertTrue(textFields(in: content).contains { $0.stringValue.hasPrefix("Couldn't save the recovery kit:") })
+        XCTAssertFalse(prompt.alert.buttons[0].isEnabled)
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+        save.performClick(nil)
+        XCTAssertEqual(panel.presentations, 3)
+    }
+
+    func testRealRecoverySavePanelOpensAsSheetAndCanBeCancelled() throws {
+        _ = NSApplication.shared
+        let panel = NSSavePanel()
+        var results: [Bool] = []
+        let prompt = AtemRecoveryKitPrompt(text: "synthetic kit", makeSavePanel: { panel }) { results.append($0) }
+        prompt.show()
+        defer { prompt.cancel() }
+        let save = try XCTUnwrap(button("Save to File...", in: XCTUnwrap(prompt.alert.accessoryView)))
+        save.performClick(nil)
+        XCTAssertTrue(prompt.alert.window.attachedSheet === panel)
+        XCTAssertTrue(panel.sheetParent === prompt.alert.window)
+        panel.cancel(nil)
+        XCTAssertTrue(results.isEmpty)
+        XCTAssertTrue(prompt.alert.window.isVisible)
+        XCTAssertFalse(prompt.alert.buttons[0].isEnabled)
+    }
+
+    func testRecoveryDismissalCancelsSaveSheetAndIgnoresLateSaveReply() throws {
+        _ = NSApplication.shared
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let panel = SavePanel()
+        panel.destination = destination
+        var results: [Bool] = []
+        let prompt = AtemRecoveryKitPrompt(text: "synthetic kit", makeSavePanel: { panel }) { results.append($0) }
+        prompt.show()
+        let save = try XCTUnwrap(button("Save to File...", in: XCTUnwrap(prompt.alert.accessoryView)))
+        save.performClick(nil)
+        prompt.cancel()
+        panel.reply?(.OK)
+        XCTAssertEqual(results, [false])
+        XCTAssertFalse(prompt.alert.window.isVisible)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        prompt.cancel()
+        XCTAssertEqual(results, [false])
     }
 
     func testSafetyCodeAndTouchIDStayInOneWindowAndWaitForCodeConfirmation() throws {

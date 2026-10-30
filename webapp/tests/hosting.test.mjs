@@ -51,4 +51,18 @@ test("webapp serves Stoa and Agent without obsolete routes or a running relay", 
         assert.equal(response.headers.get("content-type")?.split(";")[0], "text/javascript", path);
         assert.doesNotMatch(await response.text(), /<!doctype/i);
     }
+
+    // This fixture deliberately has no relay. An upstream failure proves these
+    // requests were proxied instead of falling through to static-file 404s.
+    for (const [path, method] of [
+        ["/agora-build/v1/details", "GET"],
+        ["/agora-build/v1/changes", "POST"],
+        ["/agora-build/v1/integrations/i-test/provision", "POST"],
+    ]) {
+        const response = await fetch(new URL(path, origin), {
+            method,
+            ...(method === "POST" ? { headers: { "Content-Type": "application/json" }, body: "{}" } : {}),
+        });
+        assert.equal(response.status, 502, `${method} ${path} must reach the relay upstream`);
+    }
 });

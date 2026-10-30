@@ -7,7 +7,7 @@ edition = "2021"
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 uuid = { version = "1", features = ["v4"] }
 tower-http = { version = "0.5", features = ["cors"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -24,13 +24,17 @@ sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio",
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
 base64 = "0.22"
+# Consume only the shared client library at the same reviewed native pin.
+atem-client = { git = "https://github.com/Agora-Build/Atem.git", rev = "ed0b45bad5db0a278c63efe8a464f12d4d548465" }
 # Astation relay-identity proofs (ECDSA P-256); already in the tree via rustls.
 ring = "0.17"
+zeroize = "1"
 # Shared relay state across replicas (REDIS_URL): commands with automatic
 # reconnect, pub/sub, Lua scripts. Valkey-compatible.
 redis = { version = "0.27", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "keep-alive"] }
 
 [dev-dependencies]
+atem-client = { git = "https://github.com/Agora-Build/Atem.git", rev = "ed0b45bad5db0a278c63efe8a464f12d4d548465", features = ["software-keys"] }
 tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }

@@ -35,6 +35,7 @@ ctest --output-on-failure    # Run core tests
 cd ..
 
 # 2. Build Swift app
+python3 scripts/check-atem-client-apple.py --install # Verify/install the pinned prebuilt r9 client
 swift build                  # Debug build
 swift build -c release       # Release build
 swift run astation           # Run app

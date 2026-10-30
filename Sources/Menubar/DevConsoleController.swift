@@ -209,7 +209,7 @@ class DevConsoleController: NSObject, NSWindowDelegate {
         }
 
         appendLog("Connecting to relay with code: \(code)...")
-        hubManager.connectToRelay(code: code)
+        MainActor.assumeIsolated { hubManager.connectToRelay(code: code) }
         pairCodeField.stringValue = ""
         appendLog("Relay connection initiated for code: \(code)")
 

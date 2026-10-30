@@ -575,6 +575,7 @@ mod tests {
 
     fn create_test_app() -> Router {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -927,6 +928,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_session_handler() {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -986,6 +988,7 @@ mod tests {
     #[tokio::test]
     async fn test_join_session_handler() {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -1054,6 +1057,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_session_handler() {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -1111,6 +1115,7 @@ mod tests {
     #[tokio::test]
     async fn test_full_lifecycle() {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -1238,6 +1243,7 @@ mod tests {
     #[tokio::test]
     async fn test_join_session_full_handler() {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),

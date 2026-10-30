@@ -1,4 +1,5 @@
 import Foundation
+import AstationRemote
 import AppKit
 import WebSocketKit
 import NIO
@@ -130,6 +131,14 @@ class AstationWebSocketServer {
     }
     
     private func handleIncomingMessage(_ text: String, from clientId: String, ws: WebSocket) {
+        if RemoteRelayEnvelope.isChannel(Data(text.utf8)) {
+            guard hasCurrentSession(clientId) else { _ = ws.close(code: .policyViolation); return }
+            let bytes = Data(text.utf8)
+            Task { @MainActor in
+                self.hubManager.receiveR9Envelope(bytes, clientID: clientId, connectionID: clientId)
+            }
+            return
+        }
         NetworkDebugLogger.logWebSocket(direction: "recv", context: "local \(clientId.prefix(8))", message: text)
 
         guard let data = text.data(using: .utf8),
@@ -425,6 +434,22 @@ class AstationWebSocketServer {
     func sendMessageToClient(_ message: AstationMessage, clientId: String) {
         executeOnStateEventLoop {
             self.sendMessage(message, to: clientId)
+        }
+    }
+
+    func sendChannel(_ bytes: Data, clientID: String, completion: @escaping (Error?) -> Void) {
+        guard stateEventLoop != nil else { completion(RemoteChannelError.staleLink); return }
+        executeOnStateEventLoop {
+            guard self.hasCurrentSession(clientID), let ws = self.connectedClients[clientID], !ws.isClosed,
+                  bytes.count <= RemoteChannelEnvelope.maximumBytes,
+                  let text = String(data: bytes, encoding: .utf8) else {
+                completion(RemoteChannelError.staleLink); return
+            }
+            let promise = ws.eventLoop.makePromise(of: Void.self)
+            promise.futureResult.whenComplete { result in
+                switch result { case .success: completion(nil); case .failure(let error): completion(error) }
+            }
+            ws.send(text, promise: promise)
         }
     }
 

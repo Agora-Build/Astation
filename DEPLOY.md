@@ -96,7 +96,16 @@ webapp plus the final check about 30 more, so raise it in
 
 ### Station on Volumetric (Coolify)
 
-This is the production setup, and a worked example of the section above.
+2026-10-30: the owner chose to reuse these resources for the development
+Station at `https://station-dev.agora.build`. Production deployment is deferred
+until verification. The original configuration/database are backed up; the
+existing encrypted store is retained. The original production workflow and
+resource table below describe the previous setup: its deployment hooks now
+point at the reused dev applications. Keep them separate from a future
+production rollout; do not treat a main workflow run as dev verification.
+
+The following workflow description is the previous production setup, and a
+worked example of the section above. The current dev state is recorded below.
 
 Every push to `main` runs `.github/workflows/deploy-station.yml`. It builds both
 Linux AMD64 images, publishes `:main` and `:sha-<commit>` tags to GHCR, then
@@ -173,10 +182,11 @@ Runtime configuration:
   (exit 1), and a value that isn't a positive integer also exits 1. Both apps
   carry the `station-relay-server` network alias, so nginx sees every replica.
   Health check `GET /health` on port 3000.
-- Account registration: leave `AGORA_ACCOUNT_USERINFO_URL`,
-  `AGORA_ACCOUNT_SUBJECT_FIELD`, and `AGORA_ACCOUNT_AUTH_TIME_FIELD` unset
-  while unified agora.build SSO is built. See the account-registration section
-  below for the disabled-mode behavior and migration plan.
+- Account registration: configure the three `ACCOUNT_OIDC_*` settings with the
+  registered Auth issuer, exact Station origin and `astation.remote` scope.
+  `ACCOUNT_OIDC_AUDIENCE` must equal `PUBLIC_BASE_URL` exactly. Missing or partial
+  configuration fails closed; the old `AGORA_ACCOUNT_*` userinfo verifier has
+  been removed. Existing identity/data rows are retained.
 - Webapp: `STATION_RELAY_UPSTREAM=station-relay-server:3000`. All containers
   must use the `coolify` Docker network. nginx re-resolves the alias through
   Docker DNS every 10 s and spreads requests across every address it returns,
@@ -269,37 +279,109 @@ relay, signed control membership, r7 catch-up/atomic decisions and a durable
 dispatch outbox must be integrated first. A raw Atem room connection and an SSO
 account login are not authorization for approval delivery or decisions.
 
-#### Optional Agora account registration
+#### Unified account login and recovery storage
 
-Leave `AGORA_ACCOUNT_USERINFO_URL`, `AGORA_ACCOUNT_SUBJECT_FIELD`, and
-`AGORA_ACCOUNT_AUTH_TIME_FIELD` unset while unified agora.build SSO is built.
-These settings enable optional Agora-specific registration and explicit data
-grouping. Ordinary pairing, memory/skills/vault sync, and E2EE do not require
-this feature; unregistered Astations keep using their Astation ID as the data
-account. Removing verifier configuration does not undo existing registrations
-or data groups in Postgres.
+Astation #63 separates agora.build login from Agora service credentials. The
+implemented Auth contract is pinned at Agora-Build/Auth `bc1bfe7`,
+`docs/integrating.md`. Its issuer is `https://auth.agora.build`; the issuer must
+actually resolve and serve discovery before live account setup can work.
 
-A warning that the URL and subject field are not configured means account
-registration is unavailable. Check relay authentication and encryption
-migration status separately when diagnosing connection or migration failures.
-`/health` and `verify-station.mjs` verify infrastructure, not account login or
-registration.
+Ask the Auth operator to register Astation in its private clients file. The
+following is a proposed registration, not an existing deployed client:
 
-The planned replacement is [unified agora.build identity](docs/specs/2026-10-10-unified-agora-build-identity.md),
-with permanent agora.build accounts and linked GitHub, Google, Apple, and Agora
-sign-in providers. The portal team does not need these legacy settings to build
-that service. Product APIs will verify the trusted issuer and intended audience
-through signing keys/JWKS or supported token introspection. Sensitive actions
-may require fresh-authentication proof, separate from device approval and E2EE
-recovery. Changing only the current userinfo URL is insufficient.
+```json
+{
+  "resources": [{
+    "indicator": "https://station.agora.build",
+    "name": "Astation account storage",
+    "scopes": ["station:account"]
+  }],
+  "clients": [{
+    "id": "astation", "name": "Astation", "type": "native", "firstParty": true,
+    "redirectUris": ["http://127.0.0.1/callback"],
+    "grants": ["authorization_code", "refresh_token"],
+    "scopes": ["openid", "profile", "offline_access", "astation.remote"],
+    "resources": ["https://station.agora.build"]
+  }]
+}
+```
 
-Keep the runtime compatibility implementation until the new integration and
-safe account/data migration are verified, then remove its settings and code.
-The [relay environment reference](relay-server/README.md#environment-variables)
-describes the existing verifier contract; the unified identity specification
-contains the migration and acceptance requirements. Any future authentication
-rollout must verify each replica's configuration and product login behavior in
-addition to infrastructure health.
+Use the operator-confirmed values consistently; do not assume the example is
+registered. The relay needs all three settings on every replica:
+
+```text
+ACCOUNT_OIDC_ISSUER=https://auth.agora.build
+ACCOUNT_OIDC_AUDIENCE=https://station.agora.build
+ACCOUNT_OIDC_REQUIRED_SCOPE=astation.remote
+```
+
+Set matching app build variables. The package build stamps these public values
+into Info.plist before signing, so a Finder-launched app retains configuration:
+
+```text
+ASTATION_ACCOUNT_ISSUER=https://auth.agora.build
+ASTATION_ACCOUNT_CLIENT_ID=astation
+ASTATION_ACCOUNT_RESOURCE=https://station.agora.build
+ASTATION_ACCOUNT_SCOPE=astation.remote
+```
+
+Settings > Account signs in to Agora.Build. Agora Projects uses its separately
+scoped Portal grant and protected certificate cache. Recovery HTTP and relay
+account registration use only the Station token. The app sends it only
+to the registered API origin; pasted Recovery Kit URLs cannot choose a token
+recipient. Keychain stores the rotating refresh token and a durable refresh
+intent. An interrupted refresh requires sign-in instead of replaying an old
+one-use token. This does not delete recovery checkpoints, keys or paired hosts.
+
+Migration `0010_account_identities.sql` preserves existing legacy principal
+strings and records their `legacy:agora` namespace. Data-account IDs, signed
+roots and backups do not change. Inventory legacy registrations before rollout:
+ordinary registration refuses an identity change and retains the old binding.
+An explicit verified legacy-to-unified binding migration is separate work.
+Never relabel subjects, match by email, or clear live state to pass a test.
+
+Validate discovery, a real registered native login, relay registration, and
+recovery storage over the provisioned app/deployed relay before retrying the
+retained isolated `atem pair verify` operation. Signing-key outage must fail
+closed after a maximum one-hour JWKS outage window; keys refresh normally after
+60 seconds, and removed keys do not survive a successful JWKS replacement.
+Access-token expiration applies throughout the outage. JWT `iat` is not fresh-authentication
+proof: if API tokens omit `auth_time`, offline data merges remain unavailable;
+online owner approval still works. Login never authorizes membership or K.
+Main merge/deployment still requires user approval. Atem #93 and other r9
+admission gates remain independent.
+
+#### Auth validation and custom Station registration
+
+There is no legacy userinfo fallback. An unavailable or misconfigured issuer
+leaves account registration/recovery unavailable without relabeling existing
+principals or changing pairings/encryption. `/health` and `verify-station.mjs`
+prove infrastructure availability, not Auth interoperability or R9 authority.
+
+For a custom Station, first register its exact origin in Portal > Stations.
+The built-in default uses internal operator setup, described under "Default
+Station validation with dev Auth and Portal"; users do not register it.
+Set the Portal-generated public `STATION_REGISTRATION_CHALLENGE` on every
+replica. `GET /.well-known/agora-build-station` serves that exact value as
+`text/plain` with `Cache-Control: no-store`; unset it after verification. This
+proof endpoint is absent unless an operator sets the challenge, including on
+the default relay. It never activates Station AI
+or enrolls an account/device. Confirm the proof-response schema with Portal
+before live registration; no control-plane secrets belong in the challenge.
+
+Auth must register the origin/resource and allowed accounts before a token for
+it can be issued. Agent access additionally needs Auth's five-minute
+client-credentials tokens and the matching native-approved R9 service binding.
+The [admission contract](designs/protocol/station-auth-validation.md) records
+purpose isolation, key rotation/outage rules and remaining interoperability
+work. `/api/agent/v1`, `/mcp` and `/v1/chat/completions` remain closed
+until their respective runtime verification. Default and custom agent
+endpoints require the same protected provisioning. Existing live R9 gates remain separate. No deployment is
+authorized by adding configuration/examples to this document.
+The old `/api/llm/chat` and `/api/voice-sessions` bridge now uses that closed
+gate too; its session-ID-only authentication cannot substitute for the new
+assistant session contract. The former voice coding bridge stops working in
+this branch until the replacement is provisioned. RTC sharing is unaffected.
 
 #### Relay replicas and Valkey
 
@@ -329,6 +411,14 @@ only on these two locations. Everything else (`/api/*`, `/pair`, `/auth`)
 uses nginx's default: retry only on a connection error or timeout, and never
 retry a request with a non-idempotent method (POST) once it has been sent to a
 relay.
+
+Preserve these path-specific retry rules in custom proxies. In the isolated
+hosted-API test deployment, a global `http_503` retry treated the intentional
+`503 hosted_execution_not_verified` response as an upstream failure, marked
+both healthy replicas unavailable, and turned subsequent requests into `502`.
+Removing `http_503` from that proxy's general retry list restored twenty
+consecutive expected gate responses without restarting either replica. An API
+policy refusal must not mark a healthy relay unavailable or replay a mutation.
 
 **Valkey resource:** on the private `coolify` network only (no public port),
 password protected (the password lives only in the `REDIS_URL` Coolify
@@ -1105,6 +1195,245 @@ pg_restore --clean --if-exists --dbname="$DATABASE_URL" station-YYYY-MM-DD.dump
 - **Keys and admin resets:** a restore brings back `astation_keys` as of the
   backup. An Astation whose key was reset after the backup is taken is
   rejected until you repeat the admin reset.
+
+## Station Integrations
+
+The production relay already runs independently of the Mac on Volumetric.
+Use `mosh Volumetric` for interactive administration, or the same saved SSH
+alias for automation. Its Cloudflare route is `http://10.0.0.1:3010`; the
+webapp on that port proxies to the two Coolify relays. Check that origin and
+each replica before treating a public failure as a relay outage. Cloudflare
+may return error 1010 for Python's default User-Agent; use the actual native
+client or a normal `curl` request to distinguish that from the hosted API's
+`hosted_execution_not_verified` response.
+
+Keep a development integration on a separate registered origin and isolated
+database/Redis resources, even when using the same server. Moving its backend
+off the Mac must preserve that exact origin, the complete durable database,
+and its report/wrapping keys. Take a fresh snapshot after stopping the old
+listener, restore it into the isolated destination, verify both replicas,
+then move the tunnel with a saved rollback command. Retain the source
+database. Hosts reprove their routes after reconnecting; do not regenerate
+keys, re-pair, or transfer an approval to a different origin. Native R9
+connections may require a fresh foreground owner confirmation after the
+transport changes. Already approved service access remains independent of
+that native connection.
+
+The provisioning endpoints and authenticated feed worker require durable
+Postgres. Auth seeds the built-in Station and stable report identity from
+operator configuration, replacing its static resource entry while preserving
+native token claims. Custom Stations require registration/proof first.
+Both use the same protected keys and native service consent. Configure an
+HTTPS origin, exactly matching
+the Auth resource, without paths, credentials, query parameters or a trailing
+slash. Each replica uses the same binding and protected keys:
+
+| Variable | Purpose |
+| --- | --- |
+| `PUBLIC_BASE_URL` | Exact Station origin; defaults to `https://station.agora.build` when absent. Required explicitly for custom Stations. |
+| `ACCOUNT_OIDC_ISSUER` | Pinned Agora.Build Auth issuer; dev is `https://auth.dev.agora.build`. |
+| `ACCOUNT_OIDC_AUDIENCE` | Must equal `PUBLIC_BASE_URL` exactly. |
+| `ACCOUNT_OIDC_REQUIRED_SCOPE` | Native account scope `astation.remote`. |
+| `STATION_PORTAL_ORIGIN` | Exact Portal transport/resource origin; dev is `https://dev.agora.build`. |
+| `STATION_REPORT_CLIENT_ID` | Operator-provisioned built-in or registered custom Station's `s-...` report client ID. |
+| `STATION_REPORT_KEY_FILE` | Mounted P-256 PKCS8 DER report-signing key, separate from service/native keys. |
+| `STATION_SERVICE_WRAPPING_KEY_FILE` | Mounted raw 32-byte AES wrapping key for integration service keys. |
+| `STATION_SERVICE_WRAPPING_KEY_ID` | Stable operator label binding every encrypted service-key envelope. |
+
+Mount regular files with mode 0600 or stricter, readable only by the service
+user. Symlinks, empty/oversized files and group/world permissions are refused.
+Missing/invalid configuration leaves provisioning and hosted admission closed.
+Startup never creates replacement keys. Prepare files outside the container
+image, using a protected operator directory (example commands generate new
+keys and must never overwrite an established deployment's files):
+
+```sh
+umask 077
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 |
+  openssl pkcs8 -topk8 -nocrypt -outform DER -out station-report.der
+openssl rand -out station-service-wrapping.bin 32
+```
+
+Provision only the report key's public JWK in the platform configuration for
+the built-in, or register it in Portal for a custom Station. The authenticated
+`GET /agora-build/v1/details` (`station.read`) returns it; exact Portal-origin
+preflight is supported for that path. Keep native Station access tokens and
+Portal approval/report tokens scoped to their own resource. A localhost
+Portal process may sit behind the configured public HTTPS origin; do not send
+public-resource bearer credentials to an unrelated transport origin. Confirm
+Auth permits native `astation` issuance of `astation.remote` for this exact
+Station, and issue `station.report` for its configured Portal origin.
+
+#### Development built-in Station
+
+Current backend rollout (2026-10-30):
+
+| Component | Deployment |
+| --- | --- |
+| Public origin | `https://station-dev.agora.build`; published and public HTTPS/WSS verification passed on 2026-10-30 at 22:02 UTC. |
+| Relay A | Existing Coolify `oss4444o8ss40ckgwc40og4c`, renamed `station-dev-relay-a`. |
+| Relay B | Existing Coolify `am8lrcacts572trbli1bmvnu`, renamed `station-dev-relay-b`. |
+| Webapp | Existing Coolify `c0wwgk4c0owk0w4gsww4k0ss`, renamed `station-dev-webapp`; host port `3010`. |
+| Relay image | `127.0.0.1:5051/station-relay-server:dev-9004ca9`; source `9004ca9424add5e42df0e35e6598ad070d79e387`. |
+| Webapp image | `127.0.0.1:5051/station-webapp:dev-6076bf9`; includes `/agora-build/` API forwarding. |
+| Image storage | Persistent `station-dev-registry-data` volume; registry listens on host loopback only. Preserve it when redeploying these pinned images. |
+| Durable store | Existing encrypted PostgreSQL store retained; no account reset or hosted approval is created by renaming the deployment. |
+| Live state | Dedicated private `station-dev-redis` on the `coolify` network; no public Redis port. |
+| Nginx upstream | `station-dev-relay:3000`; both relays carry this alias. |
+
+Operator files and non-secret verification are in
+`/home/guohai/astation-dev-20261030` on Volumetric. Its `protected/` directory
+contains the original Coolify/container configuration, pre-rollout database
+dump, dev runtime credentials and new dev-only report/wrapping keys; modes are
+0700/0600. Do not copy those files into Git or logs. Public report JWK and
+RFC 7638 thumbprint are in `public-handoff.json` and Portal/Auth vault
+`v-xZDT9aGD` e96. The earlier production-origin report key remains unused.
+
+The previous hostname `station.agora.build` now returns NXDOMAIN from both
+Cloudflare and Google public resolvers. Existing clients still configured for
+that hostname, including the shared-vault CLI, cannot connect. Migrate their
+transport configuration after the dev origin passes HTTPS/WSS verification;
+do not introduce an issuer or audience alias. The relays
+are explicitly pinned to the dev issuer and dev audience. Their temporary
+`station-relay-server` alias preserves the old webapp's route during rolling
+replacement; it grants no additional token audience or hosted access.
+
+Publish the dev hostname using a proxied CNAME to tunnel
+`d7e78923-8981-4fda-9f12-7aa9e36a739a.cfargotunnel.com` and a tunnel public
+hostname `station-dev.agora.build` with service `http://10.0.0.1:3010`.
+The owner chose this name after publishing `station.dev.agora.build` and
+observing its Cloudflare edge TLS handshake failure. That earlier nested name
+is not covered by `*.agora.build`. In the tunnel's published application,
+change Subdomain from `station.dev` to `station-dev`, retain domain
+`agora.build` and service `http://10.0.0.1:3010`, and preserve unrelated rules.
+The owner published this replacement on 2026-10-30. It uses Cloudflare's
+Google Trust Services certificate for `agora.build` and `*.agora.build`, valid
+through 2027-01-27. Public HTTPS and WSS checks pass. Cloudflare
+DNS/tunnel/certificate management access is separate from the connector's
+runtime token. Do not redirect bearer-authenticated API calls between Station
+origins or accept the earlier hostname as another token audience.
+
+Auth remains `https://auth.dev.agora.build`. Its discovery endpoint returned
+HTTPS 200 on 2026-10-30, with issuer exactly matching that origin and a valid
+Let's Encrypt certificate covering the exact hostname through 2027-01-20.
+It is served through Caddy and does not share Station's observed Cloudflare
+edge certificate failure. Do not rename the OIDC issuer as part of this
+Station-only change. Portal remains `https://dev.agora.build`.
+
+Both relays and the webapp passed Coolify health checks. Actual backend
+checks confirm PostgreSQL, Redis, two replicas and exact dev issuer/audience
+configuration. Earlier public checks through the previous hostname passed
+Stoa/Agent assets and identity WebSocket upgrades, before its DNS removal.
+The earlier nested hostname also passed unauthenticated HTTP
+health/details/metrics diagnostics (200/503/404), but failed TLS. The final
+hostname now passes the full `verify-station.mjs` public check: root/health,
+Stoa/Agent assets, privacy/MIME/CSP headers and both `/ws` and `//ws` identity
+WebSocket upgrades. Health confirms relay source `9004ca9`, PostgreSQL, Redis
+and two replicas. HTTPS succeeds against both published Cloudflare IPv4
+addresses, and independently from Volumetric. Initial OS resolvers still
+cached the earlier NXDOMAIN; the diagnostic used a process-local public-DNS
+lookup for this exact hostname, retaining normal SNI and TLS certificate
+verification. No hosts file, system DNS setting or TLS verification was changed.
+
+These are unauthenticated transport/deployment checks, not a completed hosted
+integration flow. The public integration details endpoint returns
+`station_integration_unavailable` until Auth/Portal's
+built-in report identity is delivered; hosted APIs return
+`hosted_execution_not_verified`. Both are intentional closed states, not a
+completed integration test. Source/report configuration and native approvals
+still need their own end-to-end verification.
+
+The saved database/configuration are rollback evidence. Never restore a dump
+over the retained live database or discard writes made after the snapshot.
+Check migration compatibility before rolling back the executable; use a
+separate restored database if the old image cannot read the newer schema.
+
+The owner resolved Q6 on 2026-10-30: reuse the current Volumetric deployment
+with the dev origin; deploy production after verification. This supersedes
+the earlier proposal to combine the production origin with dev Auth.
+
+```text
+PUBLIC_BASE_URL=https://station-dev.agora.build
+ACCOUNT_OIDC_ISSUER=https://auth.dev.agora.build
+ACCOUNT_OIDC_AUDIENCE=https://station-dev.agora.build
+ACCOUNT_OIDC_REQUIRED_SCOPE=astation.remote
+STATION_PORTAL_ORIGIN=https://dev.agora.build
+```
+
+Preserve the selected built-in origin's native token contract. Auth replaces
+its static resource entry with an internally seeded Station and report client;
+Auth/Portal must implement this before provisioning the report identity.
+Configure the public report key internally, and mount the protected
+report and wrapping keys on both replicas. Reuse the existing ES256
+`private_key_jwt`, Portal-resource `station.report` token and changes/reports
+API schemas. The built-in report client resolves to the default origin and
+its feed carries integrations from multiple accounts; every request still
+matches its integration's exact owner. Portal must expose the built-in choice
+without requiring account membership in a custom Station. Platform operators
+manage its report key; end users cannot share/remove the built-in Station.
+This is internal service configuration, not another user enrollment path.
+Coordination: [Portal #21](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6531544904).
+The [review](designs/protocol/built-in-station-auth-portal-review.md) confirms
+the public RFC 7638 key thumbprint and records the remaining disclosure,
+environment and live-verification requirements. Keep execution disabled until
+those requirements pass.
+
+Native Astation uses the dev Portal for account/project and approval tokens,
+and requests separate `station-dev.agora.build` tokens from the same dev issuer
+for Station calls. Never reuse a Portal-audience token at Station, silently
+fall back between issuers, or import dev account data into a production issuer.
+Production Auth is a separate later configuration/registration, not an alias.
+
+Before rollout, retain the current image/configuration and back up the durable
+database and operator keys. Change one replica at a time; verify discovery,
+native login, exact-origin token refusal, native service approval, host
+admission, actual HTTP/WSS execution and revocation/reconnect. Use a new
+disposable integration for terminal revocation; never restore the already
+revoked integration. Do not reset existing principals, memberships, paired
+hosts, keys or encrypted data to make a test pass. Health alone is insufficient.
+
+Migrations 0012/0013 persist authenticated policy/cursor/denial, encrypted
+service keys, immutable owner/root/integration mappings and exposed key
+fingerprints, fleet poll pacing and quota counters. Back up these records
+with the R9 membership/recovery tables and operator wrapping/report keys.
+Protect the operator keys separately from database backups; test restoration
+together. Losing a key must fail closed. Do not delete rows or regenerate
+keys to recover an approved identity. Re-enrollment requires a new explicit
+native approval. Wrapping-key rotation needs an offline, verified rewrap of
+every envelope before restarting replicas; automatic key-ring rotation is
+not implemented. Report-key replacement must also update Portal's registered
+public key before the worker resumes.
+
+Workers reconcile a current snapshot from cursor zero at startup, poll every
+minute, and coalesce unsigned POST `/agora-build/v1/changes` hints. A durable
+fleet claim caps feed requests at one per second. Only authenticated
+`409 code:cursor_ahead` resets via a committed denial fence. After a known
+Portal database restore, restart the worker replicas to reconcile from zero,
+even if their old cursors are not ahead. Failed polls do not refresh policy;
+admission refuses snapshots aged 120 seconds or more.
+
+Settings > Integrations in Astation supplies the native review/owner approval
+flow. The exact reviewed body and signature survive uncertain replies and
+restarts. Provisioning returns a draft, not readiness. Hosted endpoints under
+`/api/agent/v1/integrations/...` remain **hard disabled**, with no environment
+override, until actual Auth/native/host/encrypted relay-only confirmation, reconnect/revocation,
+Mac-off and replica tests pass. Readiness reports cannot advertise Ready with
+this gate closed. Native host-policy reconciliation uses R9.8a through the
+pinned shared client: only a current, correlated, durable response inside an
+admitted native-manager `atem-ch1` channel confirms the selected relay policy.
+Plaintext policy/ACK messages are removed. A confirmation on a direct
+migration channel never establishes relay readiness. Policy confirmation
+against the disposable actual host passed on 2026-10-29. A separate real Codex
+test also passed with native Astation closed while the host reconnected to a
+surviving Station replica and its accepted receipt/response were recovered
+without replay. Both replicas and the same provisioned app were restored.
+Genuine approval/rule cases and actual public HTTP admission still need live
+verification before activation. See the
+[policy review and lifecycle](designs/protocol/host-policy-r9-review.md) and
+[service verification procedure](designs/protocol/station-hosted-agent-api.md#real-host-service-verification).
+MCP, LLM and Discord activation are separate later work.
+See the [typed API](designs/protocol/station-hosted-agent-api.md) and
+[lifecycle](designs/protocol/station-integration-lifecycle.md).
 
 ## Support
 

@@ -1,5 +1,13 @@
 # Astation Agent Handoff
 
+Current r9 integration (2026-10-21): draft PR #58 now wires native encrypted
+channels and independent relay WebSockets, with no r8 fallback. See
+[coordination status](github-coordination.md), [API usage](remote-api.md) and
+[r9 lifecycle](../designs/protocol/r9-client.md). Production Auth/deployment,
+complete live ceremony and sealed push remain separate gates. The release
+and production records below are historical; they do not describe this
+unmerged worktree or establish a live r9 pass.
+
 Updated on 2026-10-11 for release preparation against `main` at `a174a41`,
 including merged encryption, credential UI and documentation work.
 The prior operational audit on 2026-10-10 checked `b426292`,
@@ -174,7 +182,27 @@ PR #38 records the product requirements in the
 [unified identity specification](specs/2026-10-10-unified-agora-build-identity.md).
 The agora.build/portal project is to implement shared accounts for Astation,
 Atem, Vox, and future products, with GitHub, Google, Apple, and Agora as linked
-sign-in providers. The proposed SSO service and hostname are not deployed.
+sign-in providers. Agora-Build/Auth now implements the OIDC contract (pinned
+at `bc1bfe7`), including GitHub and Google; Apple/Agora federation remains
+future work. Actual Auth reachability and Astation registration are unverified.
+See [the #63 integration](../designs/protocol/account-identity-integration.md).
+
+The #63 implementation separates Settings > Account (native OIDC/PKCE with
+rotating refresh tokens in Keychain) from General > Agora Services. Relay
+registration and recovery use only resource-bound account tokens, and the
+relay maps verified issuer/subject tuples without changing existing data
+accounts or signed recovery records. Ordinary registration refuses identity
+changes; verified legacy-binding migration remains separate work. Local
+validation now passes 987 app tests (15 skips), 109 native tests, 487 relay tests
+(113 ignored), four isolated account Postgres cases, four provisioned account
+boundary cases and two provisioned recovery signing/storage cases. Auth is
+deferred while r9 implementation proceeds; production login still needs actual
+client/resource registration, reachability and approved deployment. Atem #93's
+durable MembershipLog binding is delivered and consumed at 1493ca6, with
+protected snapshots, immediate/before-effect commits, stable OS boot ID and
+periodic wait checkpoints. Independent routers, push/provider and platform
+integration plus the complete live ceremony remain; r9 admission stays off.
+See [current coordination](github-coordination.md) for authoritative task status.
 
 Keep `AGORA_ACCOUNT_USERINFO_URL`, `AGORA_ACCOUNT_SUBJECT_FIELD`, and
 `AGORA_ACCOUNT_AUTH_TIME_FIELD` unset in the current deployment. They are an
