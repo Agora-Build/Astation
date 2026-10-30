@@ -81,7 +81,7 @@ retrieval failure 503 with a five-second Retry-After. No token is logged.
 The relay and encrypted store remain opaque. The owner-authorized default
 Station validation uses `https://auth.dev.agora.build` as issuer and
 `https://dev.agora.build` as Portal, with the exact resource
-`https://station.dev.agora.build` (owner's Q6 decision, 2026-10-30).
+`https://station-dev.agora.build` (owner's Q6 decision, 2026-10-30).
 This is explicit configuration, never issuer
 fallback. Tokens with a Portal or Auth audience cannot authorize Station.
 

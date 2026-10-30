@@ -36,10 +36,12 @@ starting that implementation. Hosted execution remains disabled.
    identify the selected operator/origin. This is an Astation rollout item.
 3. **Environment decision: Q6 is resolved.** The earlier owner-authorized
    test arrangement used `station.agora.build` with dev Auth/Portal. The newer
-   companion records a separate `station.dev.agora.build` decision. Astation
-   recommended the separate dev origin. The owner then chose
-   `station.dev.agora.build`, reusing the current deployment and deferring
-   production until verification. Preserve the encrypted store and rollback
+   companion records a separate dev Station decision. The owner finalized
+   `station-dev.agora.build` after the earlier nested hostname needed extra
+   Cloudflare certificate coverage, reusing the current deployment and
+   deferring production until verification. Keep `auth.dev.agora.build` as
+   the issuer: its exact-host HTTPS certificate and discovery are valid.
+   Preserve the encrypted store and rollback
    configuration; do not automatically rebind a hosted approval to another
    origin. Q6 no longer blocks the shared implementation or dev deployment.
 

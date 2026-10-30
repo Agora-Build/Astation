@@ -7,8 +7,12 @@ integration execution is not yet enabled. This does not change the R9 contract
 or authorize production deployment.
 
 2026-10-30 rollout update: the owner resolved Q6 by selecting
-`https://station.dev.agora.build` with the existing
+`https://station-dev.agora.build` with the existing
 `https://auth.dev.agora.build` issuer and `https://dev.agora.build` Portal.
+The final hyphenated Station name replaces the earlier
+`station.dev.agora.build` choice to fit standard Cloudflare wildcard
+certificate coverage. Auth's exact hostname already has valid HTTPS and is
+unchanged; this does not rename the OIDC issuer.
 Reuse the current Volumetric deployment for dev; a production
 `https://station.agora.build` deployment follows verification. Preserve the
 existing encrypted store and rollback configuration during the rename; do not

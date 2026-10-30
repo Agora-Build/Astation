@@ -97,7 +97,7 @@ webapp plus the final check about 30 more, so raise it in
 ### Station on Volumetric (Coolify)
 
 2026-10-30: the owner chose to reuse these resources for the development
-Station at `https://station.dev.agora.build`. Production deployment is deferred
+Station at `https://station-dev.agora.build`. Production deployment is deferred
 until verification. The original configuration/database are backed up; the
 existing encrypted store is retained. The original production workflow and
 resource table below describe the previous setup: its deployment hooks now
@@ -1270,7 +1270,7 @@ Current backend rollout (2026-10-30):
 
 | Component | Deployment |
 | --- | --- |
-| Public origin | `https://station.dev.agora.build`; DNS/tunnel routing is published, but public TLS still fails as of 2026-10-30 21:26 UTC. |
+| Public origin | `https://station-dev.agora.build`; owner-selected replacement for the nested hostname. Cloudflare publication and public HTTPS/WSS verification are pending. |
 | Relay A | Existing Coolify `oss4444o8ss40ckgwc40og4c`, renamed `station-dev-relay-a`. |
 | Relay B | Existing Coolify `am8lrcacts572trbli1bmvnu`, renamed `station-dev-relay-b`. |
 | Webapp | Existing Coolify `c0wwgk4c0owk0w4gsww4k0ss`, renamed `station-dev-webapp`; host port `3010`. |
@@ -1298,30 +1298,36 @@ are explicitly pinned to the dev issuer and dev audience. Their temporary
 `station-relay-server` alias preserves the old webapp's route during rolling
 replacement; it grants no additional token audience or hosted access.
 
-The dev hostname uses a proxied CNAME to tunnel
+Publish the dev hostname using a proxied CNAME to tunnel
 `d7e78923-8981-4fda-9f12-7aa9e36a739a.cfargotunnel.com` and a tunnel public
-hostname `station.dev.agora.build` with service `http://10.0.0.1:3010`.
-The owner published routing on 2026-10-30. Public HTTP `/health` reaches the
-expected relay build and reports PostgreSQL, Redis and two replicas. HTTPS
-still fails during the Cloudflare edge handshake from both the Mac and
-Volumetric, before an HTTP response or peer certificate is available. Check
-SSL/TLS -> Edge Certificates for an active certificate covering this exact
-hostname. A certificate for `*.agora.build` does not cover
-`station.dev.agora.build`; Advanced Certificate Manager or Total TLS may be
-needed for that nested hostname. Preserve unrelated ingress rules. Cloudflare
+hostname `station-dev.agora.build` with service `http://10.0.0.1:3010`.
+The owner chose this name after publishing `station.dev.agora.build` and
+observing its Cloudflare edge TLS handshake failure. That earlier nested name
+is not covered by `*.agora.build`. In the tunnel's published application,
+change Subdomain from `station.dev` to `station-dev`, retain domain
+`agora.build` and service `http://10.0.0.1:3010`, and preserve unrelated rules.
+The replacement fits ordinary `*.agora.build` certificate coverage; still
+verify the real public HTTPS and WSS endpoints before using them. Cloudflare
 DNS/tunnel/certificate management access is separate from the connector's
 runtime token. Do not redirect bearer-authenticated API calls between Station
-origins.
+origins or accept the earlier hostname as another token audience.
+
+Auth remains `https://auth.dev.agora.build`. Its discovery endpoint returned
+HTTPS 200 on 2026-10-30, with issuer exactly matching that origin and a valid
+Let's Encrypt certificate covering the exact hostname through 2027-01-20.
+It is served through Caddy and does not share Station's observed Cloudflare
+edge certificate failure. Do not rename the OIDC issuer as part of this
+Station-only change. Portal remains `https://dev.agora.build`.
 
 Both relays and the webapp passed Coolify health checks. Actual backend
 checks confirm PostgreSQL, Redis, two replicas and exact dev issuer/audience
 configuration. Earlier public checks through the previous hostname passed
 Stoa/Agent assets and identity WebSocket upgrades, before its DNS removal.
-Those checks do not prove public HTTPS/WSS on the new hostname. The full
-`verify-station.mjs` check currently fails on TLS. Public HTTP diagnostics
-used only unauthenticated health/details/metrics routes: health is 200,
-details is the expected closed-state 503, and metrics is 404. Authenticated
-verification awaits valid HTTPS. Provisioning
+Those checks do not prove public HTTPS/WSS on the new hostname. The earlier
+nested hostname also passed unauthenticated HTTP health/details/metrics
+diagnostics (200/503/404), but failed the full `verify-station.mjs` TLS check.
+The replacement's DNS record was still absent at 21:55 UTC; public verification
+awaits publication. Authenticated verification awaits valid HTTPS. Provisioning
 and details return `station_integration_unavailable` until Auth/Portal's
 built-in report identity is delivered; hosted APIs return
 `hosted_execution_not_verified`. Both are intentional closed states, not a
@@ -1338,9 +1344,9 @@ with the dev origin; deploy production after verification. This supersedes
 the earlier proposal to combine the production origin with dev Auth.
 
 ```text
-PUBLIC_BASE_URL=https://station.dev.agora.build
+PUBLIC_BASE_URL=https://station-dev.agora.build
 ACCOUNT_OIDC_ISSUER=https://auth.dev.agora.build
-ACCOUNT_OIDC_AUDIENCE=https://station.dev.agora.build
+ACCOUNT_OIDC_AUDIENCE=https://station-dev.agora.build
 ACCOUNT_OIDC_REQUIRED_SCOPE=astation.remote
 STATION_PORTAL_ORIGIN=https://dev.agora.build
 ```
@@ -1364,7 +1370,7 @@ environment and live-verification requirements. Keep execution disabled until
 those requirements pass.
 
 Native Astation uses the dev Portal for account/project and approval tokens,
-and requests separate `station.dev.agora.build` tokens from the same dev issuer
+and requests separate `station-dev.agora.build` tokens from the same dev issuer
 for Station calls. Never reuse a Portal-audience token at Station, silently
 fall back between issuers, or import dev account data into a production issuer.
 Production Auth is a separate later configuration/registration, not an alias.
