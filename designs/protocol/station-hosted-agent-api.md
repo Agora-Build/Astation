@@ -445,6 +445,16 @@ It returns before every prompt or approval submission path, saves evidence with
 deployed policy is unchanged. This establishes a protected read baseline only;
 it grants no additional scopes and leaves public hosted execution disabled.
 
+On 2026-11-01 at 20:50 UTC, the station-dev view-only baseline passed in
+10.89 seconds against the retained Genie Codex session on source `b61a6c3`.
+Native admission carried membership head 10, and the durable relay-only policy
+was already confirmed at host trust generation 2 and revision 1. Real Auth token
+verification, HTTP discovery/history, scoped WebSocket history completion,
+stale-target refusal and approval-scope refusal passed. The isolated schema was
+removed and deployed policy remained unchanged. No agent mutations were sent.
+Public HTTP/WSS continued to refuse with `hosted_execution_not_verified`; this
+does not constitute a public rollout or approval to enable hosted execution.
+
 The 2026-10-30 run passed in 21.46 seconds through real Auth and the protected
 approved service against the same `b61a6c3` Codex runtime. HTTP prompt
 `51fb3d28-c623-49f4-abb9-aa85a7d8b7d6` completed; fresh HTTP attachments recovered
@@ -473,6 +483,12 @@ simulated denial. Only `waiting_for_host` becomes `ready` inside its unique test
 schema. Paused, revoked and unavailable policy stays denied. The test never
 reports fixture readiness to Portal or opens public admission, and sends no
 agent mutations.
+
+The lifecycle observer also supports an `agent.view`-only grant: approval lookup
+must return `403 insufficient_scope` when approval permission is absent. It
+does not require a broader grant. A policy-driven stream closure may precede
+the observer's next polling tick; it counts as pause evidence only after the
+observer reads an actual paused checkpoint with an advanced cursor.
 
 The coordinator announces **ready for pause** only after real Auth/R9 admission,
 the subscribed history boundary and the first token renewal are verified. The

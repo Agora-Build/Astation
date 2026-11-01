@@ -261,6 +261,7 @@ pub(super) async fn observe(
     println!("LIVE: ready for pause; actual feed observer, issued token and subscribed event stream live");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1_200);
     let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut socket_closed = false;
     let paused = loop {
         tokio::select! {
             _ = tick.tick() => {
@@ -294,8 +295,18 @@ pub(super) async fn observe(
                 }
             },
             frame = socket.next() => {
-                let frame = frame.expect("stream must remain open before observed pause").unwrap();
-                assert!(!frame.is_close(), "stream closed before actual pause was observed");
+                match frame {
+                    Some(Ok(frame)) if !frame.is_close() => {},
+                    _ => {
+                        // The stream's policy check can observe pause before this tick.
+                        let actual = mirror(original, pool, binding, id).await;
+                        assert_eq!(actual.integrations[id].state, "paused",
+                            "stream closed before actual pause");
+                        assert!(actual.cursor > baseline.cursor);
+                        socket_closed = true;
+                        break actual;
+                    }
+                }
             }
         }
     };
@@ -310,16 +321,18 @@ pub(super) async fn observe(
         StatusCode::UNAUTHORIZED,
     )
     .await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while let Some(frame) = socket.next().await {
-            match frame {
-                Ok(frame) if !frame.is_close() => {}
-                _ => break,
+    if !socket_closed {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(frame) = socket.next().await {
+                match frame {
+                    Ok(frame) if !frame.is_close() => {}
+                    _ => break,
+                }
             }
-        }
-    })
-    .await
-    .expect("actual pause closes existing event stream");
+        })
+        .await
+        .expect("actual pause closes existing event stream");
+    }
     evidence["phase"] = json!("paused_observed");
     evidence["paused_cursor"] = json!(paused.cursor);
     evidence["paused_revision"] = json!(paused.revision);

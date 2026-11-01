@@ -125,18 +125,22 @@ pub(super) async fn run(
         .as_array()
         .unwrap()
         .contains(&json!(target)));
+    let approval_scope = checkpoint.integrations[id]
+        .scopes
+        .iter()
+        .any(|scope| scope == "agent.approve");
     let approvals = response(
         client
             .get(format!("{session_url}/approvals"))
             .bearer_auth(raw),
-        if read_only {
+        if read_only || !approval_scope {
             StatusCode::FORBIDDEN
         } else {
             StatusCode::OK
         },
     )
     .await;
-    if read_only {
+    if read_only || !approval_scope {
         assert_eq!(approvals["error"], "insufficient_scope");
     } else {
         assert_eq!(approvals["target"], json!(target));
