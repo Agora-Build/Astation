@@ -64,6 +64,7 @@ final class AstationRecoveryCoordinator {
     let relayURL: String
     private let allowNewDataKey: () -> Bool
     private let confirmOwner: (SignRequest) async -> Bool
+    private let confirmServiceOwner: (RemoteServiceApproval, SignRequest) async -> Bool
     private let confirmReplacement: (String) async -> Bool
     private let saveKit: (String) async -> Bool
     private let dataKeys: AstationRecoveryDataKeys
@@ -107,6 +108,12 @@ final class AstationRecoveryCoordinator {
                 await withCheckedContinuation { continuation in
                     _ = AtemVerificationUI.saveRecovery(text) { continuation.resume(returning: $0) }
                 }
+            }, confirmServiceOwner: { approval, _ in
+                await withCheckedContinuation { continuation in
+                    DeviceOwnerAuth.authenticate(reason: IntegrationAccessNotice.ownerAuthenticationReason(stationOrigin: approval.stationOrigin)) {
+                        continuation.resume(returning: $0)
+                    }
+                }
             })
     }
 
@@ -114,6 +121,7 @@ final class AstationRecoveryCoordinator {
         store: AstationRecoveryCheckpointStorage, transport: RemoteRecoveryTransport, dataKeys: AstationRecoveryDataKeys,
         allowNewDataKey: @escaping () -> Bool, confirmOwner: @escaping (SignRequest) async -> Bool,
         confirmReplacement: @escaping (String) async -> Bool, saveKit: @escaping (String) async -> Bool,
+        confirmServiceOwner: ((RemoteServiceApproval, SignRequest) async -> Bool)? = nil,
         now: @escaping () -> HostClock = { AstationRecoveryCoordinator.clock() }) throws {
         self.accountID = accountID
         self.managerID = managerID
@@ -124,6 +132,7 @@ final class AstationRecoveryCoordinator {
         http = transport
         self.dataKeys = dataKeys
         self.confirmOwner = confirmOwner
+        self.confirmServiceOwner = confirmServiceOwner ?? { _, request in await confirmOwner(request) }
         self.confirmReplacement = confirmReplacement
         self.saveKit = saveKit
         self.now = now
@@ -475,7 +484,7 @@ final class AstationRecoveryCoordinator {
             if let retry = try publication.outstanding() { append = retry }
             else {
                 let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: approval.bodyJSON, keyID: managerID)
-                guard await confirmOwner(request), current() else { throw RemoteRecoveryError.confirmationRequired }
+                guard await confirmServiceOwner(approval, request), current() else { throw RemoteRecoveryError.confirmationRequired }
                 let latest = try await refreshedLog(genesis: approval.genesisHash)
                 try requireManager(latest)
                 guard current(), latest.head() == publication.head else { throw RemoteRecoveryError.requiresReview }

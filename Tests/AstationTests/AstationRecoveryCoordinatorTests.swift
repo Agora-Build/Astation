@@ -166,6 +166,7 @@ private final class RecoveryCoordinatorHarness {
     var approve = true
     var save = true
     var ownerConfirmation: ((SignRequest) async throws -> Bool)?
+    var serviceOwnerConfirmation: ((RemoteServiceApproval, SignRequest) async -> Bool)?
 
     func coordinator(relayURL: String = "https://configured.example") throws -> AstationRecoveryCoordinator {
         try AstationRecoveryCoordinator(accountID: "account-a", managerID: "manager-a", identity: identity,
@@ -180,7 +181,7 @@ private final class RecoveryCoordinatorHarness {
             }, confirmReplacement: { _ in true }, saveKit: { [unowned self] kit in
                 savedKits.append(kit)
                 return save
-            })
+            }, confirmServiceOwner: serviceOwnerConfirmation)
     }
 }
 
@@ -351,6 +352,37 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             requiredScope: "integrations:read", additionalScopes: ["integrations:approve"])
         return try PortalIntegrationHTTP(configuration: config, portalOrigin: "https://portal.example",
             ownerAccount: "ab01234567890123456789012345", http: http, accessToken: { "test-only-token" })
+    }
+
+    func testServiceConfirmationUsesTheExactReviewedApprovalAndCannotBeBypassed() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var presented: [RemoteServiceApproval] = []
+        var confirmed = false
+        h.serviceOwnerConfirmation = { approval, _ in
+            presented.append(approval)
+            return confirmed
+        }
+        let coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        _ = try await coordinator.setup()
+        let approval = try await service(coordinator)
+        try await coordinator.prepareService(approval)
+        let before = await h.relay.appends.count
+        let genericConfirmations = h.ownerRequests.count
+        do {
+            try await coordinator.approveService(approval, portal: portal(transport), current: { true })
+            XCTFail("A refused integration confirmation cannot use the generic owner confirmation")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .confirmationRequired) }
+        let refusedAppends = await h.relay.appends.count
+        let refusedPosts = await transport.count()
+        XCTAssertEqual(refusedAppends, before)
+        XCTAssertEqual(refusedPosts, 0)
+        XCTAssertEqual(presented, [approval])
+        XCTAssertEqual(h.ownerRequests.count, genericConfirmations)
+        confirmed = true
+        try await coordinator.approveService(approval, portal: portal(transport), current: { true })
+        XCTAssertEqual(presented, [approval, approval])
+        let posts = await transport.count()
+        XCTAssertEqual(posts, 1)
     }
 
     func testApprovedIntegrationScopeReloadsFromCommittedMembership() async throws {

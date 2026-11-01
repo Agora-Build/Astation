@@ -175,7 +175,7 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
     }
 
     func testDefaultIntegrationConfigurationPreservesAuthorityAndLoopbackRemainsLocalOnly() async throws {
-        for origin in ["https://station.agora.build", "http://127.0.0.1:18573"] {
+        for origin in ["https://station.agora.build", "https://station-dev.agora.build", "http://127.0.0.1:18573"] {
             let fixture = try StationAccountFixture(origin: origin); defer { fixture.cleanup() }
             let socket = try await connected(fixture)
             socket.emit(#"{"type":"relayAck","for":"relayRegisterAccount","ok":true}"#)
@@ -184,7 +184,7 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
             XCTAssertTrue(socket.registrations[0].contains("test-station-token"))
             let generation = fixture.hub.integrationAccountGeneration
             let sent = socket.sent
-            if origin == "https://station.agora.build" {
+            if origin.hasPrefix("https://") {
                 XCTAssertNoThrow(try fixture.hub.configureIntegrationRelayAuth())
             } else {
                 XCTAssertThrowsError(try fixture.hub.configureIntegrationRelayAuth()) {

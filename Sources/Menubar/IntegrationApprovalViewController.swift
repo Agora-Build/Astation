@@ -47,7 +47,7 @@ final class IntegrationApprovalViewController: NSViewController {
         view = NSView()
         let title = NSTextField(labelWithString: "Integration Access")
         title.font = .systemFont(ofSize: 22, weight: .semibold)
-        let intro = NSTextField(wrappingLabelWithString: "Review which agents an integration can use. Your selected Station can read its permitted agent messages. Approval requires this Mac’s owner authentication.")
+        let intro = NSTextField(wrappingLabelWithString: "Review which agents an integration can use and who processes their content. Approval requires this Mac’s owner authentication.")
         intro.textColor = .secondaryLabelColor
         hosts.orientation = .vertical; hosts.alignment = .leading; hosts.spacing = 6
         hostStatus.textColor = .secondaryLabelColor
@@ -395,7 +395,7 @@ final class IntegrationApprovalViewController: NSViewController {
     private func showReview(_ approval: RemoteServiceApproval) throws {
         let value = try RemoteServiceReview(approval: approval)
         showScope(hosts: value.hosts, sessions: value.sessions, projects: value.projects, approved: false)
-        reviewText.stringValue = "Account: \(approval.ownerAccount)\nStation: \(approval.stationOrigin)\nActions: \(value.operations.joined(separator: ", "))\nHosts: \(value.hosts.joined(separator: ", "))\nSessions: \(value.sessions?.joined(separator: ", ") ?? "All on allowed hosts")\nProjects: \(value.projects?.joined(separator: ", ") ?? "All on allowed hosts")\nExpires: \(value.expiresAt.formatted())\nService: \(value.serviceID)\nKey SHA-256: \(approval.fingerprint)\nAccount root: \(approval.genesisHash)\nPrevious entry: \(value.predecessor)"
+        reviewText.stringValue = "\(IntegrationAccessNotice.disclosure(stationOrigin: approval.stationOrigin))\n\nAccount: \(approval.ownerAccount)\nStation: \(approval.stationOrigin)\nActions: \(value.operations.joined(separator: ", "))\nHosts: \(value.hosts.joined(separator: ", "))\nSessions: \(value.sessions?.joined(separator: ", ") ?? "All on allowed hosts")\nProjects: \(value.projects?.joined(separator: ", ") ?? "All on allowed hosts")\nExpires: \(value.expiresAt.formatted())\nService: \(value.serviceID)\nKey SHA-256: \(approval.fingerprint)\nAccount root: \(approval.genesisHash)\nPrevious entry: \(value.predecessor)"
     }
 
     struct ApprovedScope: Equatable {

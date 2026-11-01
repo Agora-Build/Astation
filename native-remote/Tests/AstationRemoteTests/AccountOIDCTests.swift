@@ -85,8 +85,9 @@ private struct AccountFixture {
     let client: AccountOIDCClient
     static let subject = "ab01234567890123456789012345"
 
-    init() throws {
-        config = try AccountOIDCConfiguration(issuer: "https://auth.example", clientID: "astation", resource: "https://station.example", requiredScope: "station:account")
+    init(issuer: String = "https://auth.example", resource: String = "https://station.example",
+         requiredScope: String = "station:account") throws {
+        config = try AccountOIDCConfiguration(issuer: issuer, clientID: "astation", resource: resource, requiredScope: requiredScope)
         attempt = try AccountLoginAttempt()
         client = AccountOIDCClient(configuration: config, http: http, now: { [clock] in clock.now() })
     }
@@ -104,7 +105,7 @@ private struct AccountFixture {
     func jwt(_ overrides: [String: Any] = [:], id: Bool = false, header: [String: Any] = [:], signer: P256.Signing.PrivateKey? = nil) throws -> String {
         let now = Int64(clock.now().timeIntervalSince1970)
         var payload: [String: Any] = ["iss": config.issuer, "sub": Self.subject, "aud": id ? config.clientID : config.resource,
-            "iat": now, "exp": now + (id ? 3600 : 900), "client_id": config.clientID, "scope": "openid station:account"]
+            "iat": now, "exp": now + (id ? 3600 : 900), "client_id": config.clientID, "scope": "openid " + config.requiredScope]
         if id { payload["nonce"] = attempt.nonce; payload["auth_time"] = now }
         payload.merge(overrides) { _, next in next }
         var fields: [String: Any] = ["typ": id ? "JWT" : "at+jwt", "alg": "ES256", "kid": "one"]
@@ -334,6 +335,36 @@ final class AccountOIDCTests: XCTestCase {
         try await f.http.set("/token", ["token_type":"Bearer", "refresh_token":"test", "id_token":f.jwt(id:true),
             "access_token":f.jwt(signer:P256.Signing.PrivateKey())])
         do { _ = try await f.exchange(); XCTFail("accepted invalid signature") } catch {}
+    }
+
+    func testDevStationIssuanceAndRefreshKeepTheExactAudience() async throws {
+        let origin = "https://station-dev.agora.build"
+        let f = try AccountFixture(issuer: "https://auth.dev.agora.build", resource: origin, requiredScope: "astation.remote")
+        try await f.prepare()
+        let session = try await f.exchange()
+        let store = AccountTestStorage(session), provider = f.provider(store)
+        func resource(_ request: URLRequest) -> String? {
+            var components = URLComponents()
+            components.percentEncodedQuery = String(decoding: request.httpBody!, as: UTF8.self)
+            return components.queryItems?.first { $0.name == "resource" }?.value
+        }
+        let exchange = await f.http.last("/token")!
+        XCTAssertEqual(resource(exchange), origin)
+        f.clock.advance(850)
+        try await f.response(refresh: "dev-refresh-two", includeID: false)
+        _ = try await provider.validToken()
+        let refresh = await f.http.last("/token")!
+        XCTAssertEqual(resource(refresh), origin)
+        XCTAssertTrue(String(decoding: refresh.httpBody!, as: UTF8.self).contains("grant_type=refresh_token"))
+        XCTAssertEqual(try store.read()?.session.configuration.resource, origin)
+        XCTAssertEqual(try store.read()?.session.refreshToken, "dev-refresh-two")
+        for other in ["https://station.agora.build", "https://station.dev.agora.build", origin + "/", origin + ":8443"] {
+            try await f.response(access: ["aud": other])
+            do { _ = try await f.exchange(); XCTFail("Accepted another Station audience: \(other)") } catch {}
+        }
+        f.clock.advance(850)
+        try await f.response(access: ["aud": "https://station.agora.build"], includeID: false)
+        do { _ = try await provider.validToken(); XCTFail("Refreshed into the production audience") } catch {}
     }
 
     func testDiscoveryIssuerAndEndpointSubstitutionAreRejectedBeforeTokenRequest() async throws {

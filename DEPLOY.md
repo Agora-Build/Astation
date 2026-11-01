@@ -1266,7 +1266,7 @@ Station, and issue `station.report` for its configured Portal origin.
 
 #### Development built-in Station
 
-Current backend rollout (2026-10-30):
+Current backend rollout (reporting enabled 2026-11-01):
 
 | Component | Deployment |
 | --- | --- |
@@ -1335,13 +1335,68 @@ cached the earlier NXDOMAIN; the diagnostic used a process-local public-DNS
 lookup for this exact hostname, retaining normal SNI and TLS certificate
 verification. No hosts file, system DNS setting or TLS verification was changed.
 
-These are unauthenticated transport/deployment checks, not a completed hosted
-integration flow. The public integration details endpoint returns
-`station_integration_unavailable` until Auth/Portal's
-built-in report identity is delivered; hosted APIs return
-`hosted_execution_not_verified`. Both are intentional closed states, not a
-completed integration test. Source/report configuration and native approvals
-still need their own end-to-end verification.
+Protected reporting is enabled on both replicas using the existing e96 key and
+report client `s-01m681q0dz8b74nq8sdypjgrrp`. Coolify retains two persistent
+file bindings from the protected operator directory to
+`/run/secrets/station-report.der` and
+`/run/secrets/station-service-wrapping.bin`. On this Coolify version, the
+persistent storage destination includes `:ro`; Docker inspection must confirm
+`RW: false` for each resulting mount. The files remain mode 0600. Both replicas
+use `STATION_SERVICE_WRAPPING_KEY_ID=station-dev-wrapping-v1`; preserve this
+label and the original wrapping key across deployments. The protected
+`reporting-before-20261101.json` rollback snapshot retains the prior Coolify
+settings; `dev-runtime.json` now includes the reporting configuration.
+
+The exact report public-key thumbprint is checked against e96 before rollout.
+Roll one relay at a time, verify health and the protected mounts, then verify
+the durable `station_integration_policy` checkpoint has the exact dev binding,
+a recent `received_at` and `denied: false`. The initial observed checkpoint
+was cursor 20, revision 7, with no integrations. These values change during
+normal authenticated polling. An unsigned nudge is only a poll hint.
+
+`GET /agora-build/v1/details` now returns 401 without a bearer token, rather
+than 503; a valid exact-audience `station.read` token is required for 200 and
+the public report JWK. This does not enable integrations or hosted execution.
+Auth's built-in integration switch remains off until separately requested on
+Portal #21. Hosted APIs still return `hosted_execution_not_verified` until
+the joint live gate passes.
+
+Native approval review and owner authentication name Agora.Build as the
+operator for the exact built-in origins and disclose that it can read and
+process permitted agent content. Custom Station consent identifies its
+operator by origin. Neither approval grants vault or saved-credential access.
+
+For a live native grant check, stop Astation to prevent concurrent refreshes
+of the same Keychain item. After building the tests with
+`scripts/verify-local-signing.sh`, run the provisioned XCTest driver with
+`ASTATION_LIVE_DEV_ACCOUNT=1` and filter
+`AstationTests.DevStationAccountLiveTests`. The owner completes the browser
+authorization. The check uses the app's exact dev Station credential namespace,
+verifies real issuance, refresh-only Keychain persistence and refresh after a
+new provider is created, and refuses production-origin use. It never logs
+tokens. Relaunch the provisioned app afterwards. Fixture OIDC tests alone do
+not establish live issuance or refresh.
+
+On 2026-11-01 at 16:32:58 UTC this live native check passed against dev Auth
+with the exact `https://station-dev.agora.build` audience and `astation.remote`
+scope: authorization-code issuance, Keychain refresh-only persistence, a
+successful rotating refresh from a new provider, and production-origin refusal.
+The updated provisioned app was then relaunched with the dev Station selected.
+This proves the native token path, not integration approval or agent execution.
+
+For the new disposable integration's Pause/Resume/Revoke test, start the
+observer immediately before announcing readiness on Portal #21. Keep it alive
+through owner action, refusal and stream closure; a missed click window is
+not a pass. Record its PID and heartbeat, actual feed cursor/revision, an open
+stream and a still-valid issued token before the click. Keep refreshing the
+baseline while waiting, opening each replacement stream before closing its
+predecessor. Record both new-token `invalid_client` refusal (the deployed Auth
+may use 400 or 401) and denial of the already-issued token. Keep observing after
+expected HTTP errors and stream closure; only finish the stage after all its
+evidence is saved. Terminal revocation stays last. A global hosted 503 or an
+expired token does not demonstrate policy enforcement. The observer must not
+click owner actions, fabricate readiness, edit cached policy or open the
+public execution gate.
 
 The saved database/configuration are rollback evidence. Never restore a dump
 over the retained live database or discard writes made after the snapshot.
