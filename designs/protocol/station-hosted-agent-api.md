@@ -582,6 +582,13 @@ completion again, without submitting a prompt or any agent mutation. Its
 `public_origin_view_rollout` evidence is distinct from a public prompt/receipt
 execution result; it cannot claim broader consent or execution coverage.
 
+The webapp proxy must forward HTTP/1.1 and WebSocket Upgrade/Connection headers
+for `/api/agent/v1/`, including its nested `/events` endpoints. Ordinary HTTP
+requests use the same route without an upgrade. The first 2026-11-01 public run
+passed HTTPS admission but failed the event upgrade with HTTP 400 because only
+the native `/ws` route forwarded these headers. Its controller restored the
+original closed-gate replicas before the proxy fix and a fresh read-only run.
+
 This check needs a separately approved temporary activation on the isolated
 Station. Its ordinary worker must prove the real enrolled host and obtain
 `ready` through the authenticated Portal feed before the check runs. Neither
