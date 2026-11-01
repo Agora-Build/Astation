@@ -1275,6 +1275,21 @@ does not require custom-Station registration. Explicit saved Station URLs
 and `ASTATION_RELAY_URL` still take priority; changing build configuration
 does not reinterpret an explicitly selected origin or its credentials.
 
+Debug builds also default to `https://dev.agora.build` and
+`https://auth.dev.agora.build`. General offers **Dev Servers / Production
+Servers** presets and an editable Portal URL. Presets preview the matching
+Portal and built-in Station; **Save Servers** applies them through the normal
+account/session invalidation path. Explicit server environment overrides disable
+the preset control. Release builds default to the production Portal/Auth and
+show a read-only Portal URL, without the preset control. Custom Station selection
+remains available in both builds.
+
+If the selected Station lacks this Mac's existing account-security record,
+Integrations offers **Connect Account Security to This Station**. This is
+owner-confirmed publication of the original signed chain and a same-key encrypted
+backup, not account registration or a new trust anchor. Preserve the previous
+Station and checkpoint. See [publication invariants](designs/protocol/station-security-publication.md).
+
 Current backend rollout (reporting enabled 2026-11-01):
 
 | Component | Deployment |

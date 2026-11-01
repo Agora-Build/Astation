@@ -983,6 +983,10 @@ class AstationHubManager: ObservableObject {
         transportPolicy.blocksDirect(account: e2eDataAccount, issuer: portalSettings?.issuer ?? "")
     }
 
+    var relayOnlyPolicyAppliesToSelectedStation: Bool {
+        transportPolicy.applies(account: e2eDataAccount, issuer: portalSettings?.issuer ?? "", station: stationRelayUrl)
+    }
+
     var relayOnlyPolicyReady: Bool {
         transportPolicy.ready(account: e2eDataAccount, issuer: portalSettings?.issuer ?? "", station: stationRelayUrl)
     }

@@ -11,8 +11,8 @@ struct AccountServiceSettings: Equatable, Sendable {
     static let issuerKey = "AstationAccountIssuer"
     static let clientKey = "AstationAccountClientID"
     static let resourceKey = "AstationPortalResource"
-    static let defaultPortal = "https://agora.build"
-    static let defaultIssuer = "https://auth.agora.build"
+    static let defaultPortal = AccountServerEnvironment.buildDefault.portalURL
+    static let defaultIssuer = AccountServerEnvironment.buildDefault.issuerURL
     static let defaultClient = "astation"
 
     let portalURL: String

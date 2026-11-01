@@ -119,6 +119,10 @@ final class AtemTransportPolicyController {
         journal.loadFailed || policy(account: account, issuer: issuer)?.relayOnly == true
     }
 
+    func applies(account: String, issuer: String, station: String) -> Bool {
+        !journal.loadFailed && policy(account: account, issuer: issuer)?.station == station
+    }
+
     func set(_ policy: AtemTransportPolicyRecord, connections: [AtemTransportPolicyContext]) throws {
         guard policy.valid else { throw AtemSessionJSON.Invalid.json }
         try journal.update { snapshot in

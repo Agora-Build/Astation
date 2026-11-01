@@ -37,6 +37,7 @@ final class IntegrationApprovalViewController: NSViewController {
     private var revocationRefresh: Task<Void, Never>?
     private var generation = UUID()
     private var contextCurrent: (() -> Bool)?
+    private var securityMissingOnStation = false
 
     init(hub: AstationHubManager, openSecurity: @escaping () -> Void = {}) {
         self.hub = hub; self.openSecurity = openSecurity; super.init(nibName: nil, bundle: nil)
@@ -101,6 +102,8 @@ final class IntegrationApprovalViewController: NSViewController {
         revocationRefresh?.cancel(); revocationRefresh = nil
         generation = UUID(); task?.cancel(); task = nil
         approval = nil; contextCurrent = nil; log = nil; reviewText.stringValue = ""
+        coordinator = nil
+        securityMissingOnStation = false
         approvedScope = nil
         showScope(hosts: [], sessions: nil, projects: nil, approved: false)
         render()
@@ -109,7 +112,8 @@ final class IntegrationApprovalViewController: NSViewController {
     private func render(busy: Bool = false) {
         loadButton.isEnabled = !busy
         relayOnlyButton.isEnabled = !busy && log != nil && contextCurrent?() == true
-        relayOnlyButton.title = hub.relayOnlyPolicyRequired ? "Allow Direct Connections…" : "Use Selected Relay Only…"
+        relayOnlyButton.title = hub.relayOnlyPolicyRequired && hub.relayOnlyPolicyAppliesToSelectedStation
+            ? "Allow Direct Connections…" : "Use Selected Relay Only…"
         picker.isEnabled = !busy && !records.isEmpty && approval == nil
         let pendingSelection = records.indices.contains(picker.indexOfSelectedItem)
             && records[picker.indexOfSelectedItem].state == "awaiting_approval"
@@ -140,6 +144,7 @@ final class IntegrationApprovalViewController: NSViewController {
             : "Select at least one host to review access."
         if hasSelectedHost && !missingApprovedScope { hostStatus.isHidden = true }
         setupButton.isHidden = contextCurrent?() != true || log != nil
+        setupButton.title = securityMissingOnStation ? "Connect Account Security to This Station…" : "Set Up Account Security…"
         setupButton.isEnabled = !busy && contextCurrent?() == true
         approveButton.isEnabled = !busy && approval != nil && contextCurrent?() == true
         reviewAgainButton.isHidden = approval == nil
@@ -157,11 +162,36 @@ final class IntegrationApprovalViewController: NSViewController {
         refreshRemovedServiceStatus()
     }
     @objc private func hostSelectionChanged() { render() }
-    @objc private func setupSecurity() { openSecurity() }
+    @objc private func setupSecurity() {
+        guard securityMissingOnStation else { openSecurity(); return }
+        guard let coordinator, let current = contextCurrent, current() else { return }
+        let origin = coordinator.relayURL
+        let alert = NSAlert()
+        alert.messageText = "Connect your existing account security?"
+        alert.informativeText = "Publish your saved, signed device list and an encrypted key backup to \(origin). Your identity, Recovery Kit, keys and verified devices are retained. Integration access still requires a separate approval."
+        alert.addButton(withTitle: "Connect…"); alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn, current() else { return }
+        let epoch = generation; render(busy: true)
+        status.stringValue = "Connecting your saved account security to the selected Station…"
+        task = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await coordinator.connectAccountSecurity(current: current, confirm: {
+                    await withCheckedContinuation { continuation in
+                        DeviceOwnerAuth.authenticate(reason: "connect your existing account security to \(origin)") {
+                            continuation.resume(returning: $0)
+                        }
+                    }
+                })
+                guard epoch == generation, current() else { return }
+                loadRequests()
+            } catch { fail(error, epoch: epoch) }
+        }
+    }
 
     @objc private func changeRelayPolicy() {
         guard contextCurrent?() == true else { return }
-        let required = !hub.relayOnlyPolicyRequired
+        let required = !hub.relayOnlyPolicyAppliesToSelectedStation || !hub.relayOnlyPolicyRequired
         let alert = NSAlert()
         alert.messageText = required ? "Use only the selected Station?" : "Allow direct Atem connections?"
         alert.informativeText = required
@@ -447,6 +477,9 @@ final class IntegrationApprovalViewController: NSViewController {
     }
     private func fail(_ error: Error, epoch: UUID) {
         guard epoch == generation else { return }
+        if error as? RemoteRecoveryTransportError == .recordNotFound, log == nil, coordinator != nil {
+            securityMissingOnStation = true
+        }
         status.stringValue = error.localizedDescription; render()
     }
     private func selectedRequestGuidance() -> String {

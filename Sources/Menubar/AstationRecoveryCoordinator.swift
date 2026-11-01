@@ -437,6 +437,33 @@ final class AstationRecoveryCoordinator {
         return log.snapshot()
     }
 
+    /// A new Station receives the existing signed chain, never a new genesis or K.
+    /// Signed replay is idempotent, so a lost reply can resume from its verified prefix.
+    func connectAccountSecurity(current: () -> Bool, confirm: () async -> Bool) async throws {
+        try begin(); defer { busy = false }
+        guard current(), let kit = try currentKit(), let retained = membershipLog,
+              saved.publication == nil, saved.restore == nil else { throw RemoteRecoveryError.requiresReview }
+        var log = retained.snapshot()
+        try requireManager(log)
+        guard await confirm(), current(), !Task.isCancelled else { throw RemoteRecoveryError.confirmationRequired }
+        do {
+            let page = try await http.entries(genesisHash: kit.genesisHash, after: 0)
+            guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+            if page.head.seq > log.head().seq {
+                // A lost backup-append reply can leave this Station one entry ahead.
+                // Verify and durably retain the extension before resuming its writer.
+                log = try await refreshedLog(genesis: kit.genesisHash)
+                try requireManager(log)
+            }
+        } catch RemoteRecoveryTransportError.recordNotFound {}
+        try await RemoteRecoveryLogReplication.publish(log: log.snapshot(), transport: http, current: current)
+        guard current() else { throw RemoteChannelError.staleLink }
+        let latest = try await refreshedLog(genesis: kit.genesisHash)
+        try requireManager(latest)
+        try await finishBackup(current: current)
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+    }
+
     func pendingServiceApproval() throws -> RemoteServiceApproval? {
         guard !uncertain else { throw RemoteRecoveryError.storageUncertain }
         return try saved.serviceApproval.map { try JSONDecoder().decode(RemoteServiceApproval.self, from: $0) }
@@ -816,7 +843,12 @@ final class AstationRecoveryCoordinator {
               manager.encKey == PublicKeyData(alg: .x25519, raw: keys.encryption) else { throw RemoteRecoveryError.requiresReview }
     }
 
-    private func finishBackup() async throws {
+    private func finishBackup(current: () -> Bool = { true }) async throws {
+        func check() throws {
+            try Task.checkCancellation()
+            guard current() else { throw RemoteChannelError.staleLink }
+        }
+        try check()
         var keys = try dataKeys.recoveryKeys(dataAccount: accountID)
         if let pending = saved.pendingDataKey {
             let candidate = AccountDataKey(kid: pending.kid, key: pending.bytes)
@@ -833,16 +865,24 @@ final class AstationRecoveryCoordinator {
         guard let kit = try currentKit() else { throw RemoteRecoveryError.notCommitted }
         let genesis = kit.genesisHash
         let log = try await refreshedLog(genesis: genesis)
+        try check()
         try requireManager(log)
         if saved.backup == nil, let committed = log.kBackup(), committed.kids == keys.map(\.kid),
            committed.recoveryKey == kit.recoveryKey {
-            let envelope = try await http.backup(log: log)
-            guard try kit.openBackup(envelope) == keys.map({ AccountKey(kid: $0.kid, k: $0.key) }) else {
-                throw AtemIdentityError.identityChanged
+            do {
+                let envelope = try await http.backup(log: log)
+                try check()
+                guard try kit.openBackup(envelope) == keys.map({ AccountKey(kid: $0.kid, k: $0.key) }) else {
+                    throw AtemIdentityError.identityChanged
+                }
+                try installPendingKey()
+                return
+            } catch RemoteRecoveryTransportError.recordNotFound {
+                // A new Station has the signed log but not the old encrypted blob.
+                // Use the normal durable backup writer with the same keys and kit.
             }
-            try installPendingKey()
-            return
         }
+        try check()
         if backup == nil {
             if let checkpoint = saved.backup {
                 backup = try RemoteRecoveryBackup(checkpoint: checkpoint, accountID: accountID, genesisHash: genesis,
@@ -854,6 +894,7 @@ final class AstationRecoveryCoordinator {
         }
         let operation = backup!
         for _ in 0..<128 {
+            try check()
             guard !operation.storageUncertain else { throw RemoteRecoveryError.storageUncertain }
             switch operation.step {
             case .seal:
@@ -863,6 +904,7 @@ final class AstationRecoveryCoordinator {
                 let signingLog = try operation.committedLog()
                 try requireManager(signingLog)
                 let signer = try await confirmed(RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: managerID))
+                try check()
                 _ = try operation.sign(provider: signer, keyID: managerID)
             case .put(_, let bytes):
                 let occupied = try await http.uploadBackup(genesisHash: genesis, envelopeJSON: bytes, signedEntryJSON: operation.uploadEntryJSON())

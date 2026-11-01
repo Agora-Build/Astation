@@ -108,6 +108,22 @@ final class RemoteRecoveryHTTPTests: XCTestCase {
         }
     }
 
+    func testMissingSecurityRecordIsDistinctFromAnOutageOrAnUnknownRoute() async throws {
+        let cases: [(Int, String, RemoteRecoveryTransportError)] = [
+            (404, #"{"error":{"code":"recovery_record_not_found"}}"#, .recordNotFound),
+            (404, #"{"error":{"code":"not_found"}}"#, .unavailable),
+            (404, "<html>Not Found</html>", .unavailable),
+            (503, #"{"error":{"code":"recovery_record_not_found"}}"#, .unavailable),
+            (401, #"{"error":{"code":"recovery_record_not_found"}}"#, .authenticationRequired)
+        ]
+        for (status, body, expected) in cases {
+            let (http, host) = try transport { _ in (status, Data(body.utf8)) }
+            defer { RecoveryHTTPStub.remove(host: host) }
+            do { _ = try await http.entries(genesisHash: genesis, after: 0); XCTFail("accepted HTTP \(status)") }
+            catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, expected) }
+        }
+    }
+
     func testProbeUsesOneEscapedHostComponentAndReturnsOnlyBoundedStrictJSON() async throws {
         let (http, host) = try transport { request in
             XCTAssertEqual(request.httpMethod, "POST")

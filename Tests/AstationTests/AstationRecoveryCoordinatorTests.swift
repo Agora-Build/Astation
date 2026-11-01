@@ -53,29 +53,37 @@ private actor RecoveryMemoryRelay: RemoteRecoveryTransport {
     var uploads: [String] = []
     var envelopes: [UInt64: String] = [:]
     var loseAppendReply = false
+    var loseAppendNumber: Int?
     var loseUploadReply = false
     var hostOnline = false
     var nextEntries: [String]?
     var entriesUnavailable = false
+    var ignoreAppends = false
+    var pageSize = 64
     let hostKey = Curve25519.Signing.PrivateKey()
 
     func dropNextAppendReply() { loseAppendReply = true }
+    func dropAppendReply(number: Int) { loseAppendNumber = number }
     func dropNextUploadReply() { loseUploadReply = true }
     func setHostOnline(_ value: Bool) { hostOnline = value }
     func hostPublicKey() -> Data { hostKey.publicKey.rawRepresentation }
     func injectNextEntries(_ entries: [String]) { nextEntries = entries }
     func setEntriesUnavailable(_ value: Bool) { entriesUnavailable = value }
+    func setIgnoreAppends(_ value: Bool) { ignoreAppends = value }
+    func setPageSize(_ value: Int) { pageSize = value }
+    func replaceLog(_ value: MembershipLog) { log = value.snapshot() }
 
     func entries(genesisHash: String, after: UInt64) async throws -> RemoteRecoveryLogPage {
         if entriesUnavailable { throw RemoteRecoveryTransportError.unavailable }
-        let log = try XCTUnwrap(log)
-        XCTAssertEqual(log.genesisHash(), genesisHash)
-        let page = nextEntries ?? log.entriesAfter(seq: after)
+        guard let log else { throw RemoteRecoveryTransportError.recordNotFound }
+        // Reads are untrusted: tests may deliberately return a different root.
+        let page = nextEntries ?? Array(log.entriesAfter(seq: after).prefix(pageSize))
         nextEntries = nil
-        return RemoteRecoveryLogPage(head: log.head(), entries: page, more: false)
+        return RemoteRecoveryLogPage(head: log.head(), entries: page, more: after + UInt64(page.count) < log.head().seq)
     }
     func append(genesisHash: String, request: AppendRequest) async throws -> RemoteRecoveryAppendReply {
         appends.append(request)
+        if ignoreAppends { return .stored }
         if log == nil {
             log = try MembershipLog.verify(accountId: account, genesisHash: genesisHash, entries: [request.entryJson], now: AstationRecoveryCoordinator.clock())
         } else if log!.head() == request.expected {
@@ -89,7 +97,10 @@ private actor RecoveryMemoryRelay: RemoteRecoveryTransport {
                     entries: log!.entriesAfter(seq: request.expected.seq), more: false))
             }
         }
-        if loseAppendReply { loseAppendReply = false; throw RemoteRecoveryTransportError.unavailable }
+        if loseAppendReply || loseAppendNumber == appends.count {
+            loseAppendReply = false; loseAppendNumber = nil
+            throw RemoteRecoveryTransportError.unavailable
+        }
         return .stored
     }
     func uploadBackup(genesisHash: String, envelopeJSON: String, signedEntryJSON: String) async throws -> UInt64? {
@@ -102,7 +113,12 @@ private actor RecoveryMemoryRelay: RemoteRecoveryTransport {
         if loseUploadReply { loseUploadReply = false; throw RemoteRecoveryTransportError.unavailable }
         return nil
     }
-    func backup(log: MembershipLog) async throws -> String { try XCTUnwrap(envelopes[try XCTUnwrap(log.kBackup()).blobVersion]) }
+    func backup(log: MembershipLog) async throws -> String {
+        guard let value = envelopes[try XCTUnwrap(log.kBackup()).blobVersion] else {
+            throw RemoteRecoveryTransportError.recordNotFound
+        }
+        return value
+    }
     func hostAccept(genesisHash: String, hostID: String, initFrame: Data) async throws -> Data {
         guard hostOnline, let log else { throw RemoteRecoveryTransportError.unavailable }
         XCTAssertEqual(log.genesisHash(), genesisHash)
@@ -168,9 +184,9 @@ private final class RecoveryCoordinatorHarness {
     var ownerConfirmation: ((SignRequest) async throws -> Bool)?
     var serviceOwnerConfirmation: ((RemoteServiceApproval, SignRequest) async -> Bool)?
 
-    func coordinator(relayURL: String = "https://configured.example") throws -> AstationRecoveryCoordinator {
+    func coordinator(relayURL: String = "https://configured.example", transport: RemoteRecoveryTransport? = nil) throws -> AstationRecoveryCoordinator {
         try AstationRecoveryCoordinator(accountID: "account-a", managerID: "manager-a", identity: identity,
-            relayURL: relayURL, store: store, transport: relay, dataKeys: keys,
+            relayURL: relayURL, store: store, transport: transport ?? relay, dataKeys: keys,
             allowNewDataKey: { true }, confirmOwner: { [unowned self] request in
                 ownerRequests.append(request)
                 if let ownerConfirmation {
@@ -187,6 +203,155 @@ private final class RecoveryCoordinatorHarness {
 
 @MainActor
 final class AstationRecoveryCoordinatorTests: XCTestCase {
+    func testNewStationRetainsIdentityKeysKitAndHostsAndPublishesAnEncryptedBackup() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        let (commit, reveal, keys) = try await hostAttempt(coordinator!, generation: 1)
+        let request = try await coordinator!.prepareHost(commit: commit, reveal: reveal, keys: keys)
+        _ = try await coordinator!.commitHost(request: request, confirmedAt: AstationRecoveryCoordinator.clock().monoMs, current: { true })
+        let oldLog = try await coordinator!.serviceMembership()
+        let oldKit = try XCTUnwrap(h.savedKits.first)
+        let dataKeys = h.keys.keys, identity = try h.identity.remotePublicKeys()
+        coordinator = nil
+        let target = RecoveryMemoryRelay()
+        coordinator = try h.coordinator(relayURL: "https://new-station.example", transport: target)
+        do { _ = try await coordinator!.serviceMembership(); XCTFail("Station has no account log") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .recordNotFound) }
+        try await coordinator!.connectAccountSecurity(current: { true }, confirm: { true })
+        let connected = try await coordinator!.serviceMembership()
+        XCTAssertEqual(connected.genesisHash(), oldLog.genesisHash())
+        XCTAssertEqual(connected.host(hostId: "host-a"), oldLog.host(hostId: "host-a"))
+        XCTAssertEqual(Array(connected.entries().prefix(oldLog.entries().count)), oldLog.entries())
+        XCTAssertEqual(try h.identity.remotePublicKeys().signing, identity.signing)
+        XCTAssertEqual(try h.identity.remotePublicKeys().encryption, identity.encryption)
+        XCTAssertEqual(h.keys.keys, dataKeys)
+        XCTAssertEqual(h.savedKits, [oldKit])
+        let envelope = try await target.backup(log: connected)
+        XCTAssertEqual(try RemoteRecoveryKit(text: oldKit).openBackup(envelope), dataKeys.map { AccountKey(kid: $0.kid, k: $0.key) })
+        let count = await target.appends.count
+        try await coordinator!.connectAccountSecurity(current: { true }, confirm: { true })
+        let retryCount = await target.appends.count
+        XCTAssertEqual(retryCount, count, "A duplicate connect must not append or rotate keys again")
+    }
+
+    func testStationPublicationRequiresOwnerConfirmationAndTheCurrentSelection() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        _ = try await coordinator!.setup()
+        coordinator = nil
+        let target = RecoveryMemoryRelay()
+        coordinator = try h.coordinator(relayURL: "https://new-station.example", transport: target)
+        do {
+            try await coordinator!.connectAccountSecurity(current: { true }, confirm: { false })
+            XCTFail("Owner refused publication")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .confirmationRequired) }
+        var current = true
+        do {
+            try await coordinator!.connectAccountSecurity(current: { current }, confirm: { current = false; return true })
+            XCTFail("Selection changed during confirmation")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .confirmationRequired) }
+        let count = await target.appends.count
+        XCTAssertEqual(count, 0)
+    }
+
+    func testStationPublicationResumesAfterLostReplyAndAProcessRestart() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        _ = try await coordinator!.setup()
+        let old = try await coordinator!.serviceMembership()
+        coordinator = nil
+        let target = RecoveryMemoryRelay()
+        await target.dropNextAppendReply()
+        coordinator = try h.coordinator(relayURL: "https://new-station.example", transport: target)
+        do {
+            try await coordinator!.connectAccountSecurity(current: { true }, confirm: { true })
+            XCTFail("Lost the stored genesis reply")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .unavailable) }
+        coordinator = nil
+        coordinator = try h.coordinator(relayURL: "https://new-station.example", transport: target)
+        try await coordinator!.connectAccountSecurity(current: { true }, confirm: { true })
+        let connected = try await coordinator!.serviceMembership()
+        XCTAssertEqual(connected.genesisHash(), old.genesisHash())
+        let requests = await target.appends
+        XCTAssertEqual(requests.filter { $0.expected.seq == 0 }.count, 1)
+        XCTAssertEqual(h.savedKits.count, 1)
+    }
+
+    func testStationPublicationRejectsAConflictingLogAndAnUnavailableStationBeforeWriting() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        _ = try await coordinator.setup()
+        let log = try await coordinator.serviceMembership()
+        let other = RecoveryCoordinatorHarness(), otherCoordinator = try other.coordinator()
+        _ = try await otherCoordinator.setup()
+        let different = try await otherCoordinator.serviceMembership()
+        let target = RecoveryMemoryRelay()
+        await target.replaceLog(different)
+        do {
+            try await RemoteRecoveryLogReplication.publish(log: log, transport: target, current: { true })
+            XCTFail("A different genesis is not a prefix")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        await target.setEntriesUnavailable(true)
+        do {
+            try await RemoteRecoveryLogReplication.publish(log: log, transport: target, current: { true })
+            XCTFail("An outage is not an empty Station")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .unavailable) }
+        let count = await target.appends.count
+        XCTAssertEqual(count, 0)
+    }
+
+    func testStationPublicationRequiresReadbackAfterAcknowledgements() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        _ = try await coordinator.setup()
+        let log = try await coordinator.serviceMembership(), target = RecoveryMemoryRelay()
+        await target.setIgnoreAppends(true)
+        do {
+            try await RemoteRecoveryLogReplication.publish(log: log, transport: target, current: { true })
+            XCTFail("Acknowledgements without persisted entries cannot enable access")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .invalidResponse) }
+    }
+
+    func testStationPublicationChecksEveryPageAndRejectsADifferentEntryUnderTheSameHead() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        _ = try await coordinator.setup()
+        let log = try await coordinator.serviceMembership(), target = RecoveryMemoryRelay()
+        await target.replaceLog(log)
+        await target.setPageSize(1)
+        try await RemoteRecoveryLogReplication.publish(log: log, transport: target, current: { true })
+        await target.injectNextEntries([try XCTUnwrap(log.entries().last)])
+        do {
+            try await RemoteRecoveryLogReplication.publish(log: log, transport: target, current: { true })
+            XCTFail("The advertised head cannot hide a mismatched prefix")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        let count = await target.appends.count
+        XCTAssertEqual(count, 0)
+    }
+
+    func testStationConnectionRecoversALostBackupCommitReplyWithoutReplacingTheKeys() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        _ = try await coordinator!.setup()
+        let old = try await coordinator!.serviceMembership(), keys = h.keys.keys
+        coordinator = nil
+        let target = RecoveryMemoryRelay()
+        await target.dropAppendReply(number: old.entries().count + 1)
+        coordinator = try h.coordinator(relayURL: "https://new-station.example", transport: target)
+        do {
+            try await coordinator!.connectAccountSecurity(current: { true }, confirm: { true })
+            XCTFail("Lost the new encrypted backup commit reply")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .unavailable) }
+        XCTAssertNotNil(try checkpoint(h.store)["backup"])
+        coordinator = nil
+        coordinator = try h.coordinator(relayURL: "https://new-station.example", transport: target)
+        try await coordinator!.connectAccountSecurity(current: { true }, confirm: { true })
+        XCTAssertNil(try checkpoint(h.store)["backup"])
+        XCTAssertEqual(h.keys.keys, keys)
+        let connected = try await coordinator!.serviceMembership()
+        XCTAssertEqual(connected.head().seq, old.head().seq + 1)
+        XCTAssertEqual(connected.genesisHash(), old.genesisHash())
+        let envelopes = await target.envelopes
+        XCTAssertEqual(envelopes.count, 1)
+    }
+
     private func hostAttempt(_ coordinator: AstationRecoveryCoordinator, generation: UInt64) async throws
         -> (RemotePairingCommit, RemotePairingReveal, AtemVerifyKeys) {
         let keys = try await coordinator.pairingKeys(nonce: Data(repeating: 8, count: 32))

@@ -1,4 +1,5 @@
 import AstationRemote
+import AtemClient
 import CryptoKit
 import Foundation
 import XCTest
@@ -28,6 +29,38 @@ private actor DevAccountHTTP: AccountOIDCHTTP {
 /// Opt-in operator check: uses the real browser and the provisioned app's Keychain.
 /// Stop Astation first so two processes cannot rotate the same refresh token.
 final class DevStationAccountLiveTests: XCTestCase {
+    @MainActor func testDevSavedSecurityRecordIsAvailable() async throws {
+        guard ProcessInfo.processInfo.environment["ASTATION_LIVE_DEV_SECURITY"] == "1" else {
+            throw XCTSkip("Opt-in read-only check of the saved security record on the dev Station")
+        }
+        let account = AstationIdentity.shared.id
+        let store = try RemoteRecoveryStore(accountID: account)
+        let bytes = try XCTUnwrap(store.read())
+        let saved = try XCTUnwrap(PropertyListSerialization.propertyList(from: bytes, format: nil) as? [String: Any])
+        let entries = try XCTUnwrap(saved["entries"] as? [String])
+        let genesis = try XCTUnwrap(signedObjectInfo(json: XCTUnwrap(entries.first)).entryHash)
+        let log = try RemoteMembershipCheckpoint.load(accountID: account, genesisHash: genesis,
+            entries: entries, storedJSON: saved["membership"] as? String, now: AstationRecoveryCoordinator.clock())
+        let origin = "https://station-dev.agora.build", issuer = "https://auth.dev.agora.build"
+        let config = try AccountOIDCConfiguration(issuer: issuer, clientID: "astation", resource: origin, requiredScope: "astation.remote")
+        let context = SHA256.hash(data: Data([issuer, config.clientID, origin].joined(separator: "|").utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        let storage = AccountKeychainStorage(service: "build.agora.astation.station-account-v1." + context)
+        let auth = AstationAccountAuth(configuration: config, storage: storage)
+        let http = try RemoteRecoveryHTTP(relayURL: origin, accessToken: { try await auth.accessToken(relayURL: origin) })
+        do {
+            let page = try await http.entries(genesisHash: genesis, after: log.head().seq)
+            let result = try log.extend(entries: page.entries, now: AstationRecoveryCoordinator.clock())
+            XCTAssertNil(result.stop)
+            XCTAssertEqual(log.head(), page.head)
+            XCTAssertFalse(page.more)
+            print("DEV_SECURITY_RECORD available; verified saved genesis and head; no local checkpoint changes")
+        } catch RemoteRecoveryTransportError.recordNotFound {
+            print("DEV_SECURITY_RECORD recovery_record_not_found; saved signed chain retained locally (\(entries.count) entries)")
+            XCTFail("The selected dev Station does not yet have this Mac's saved account-security record. Connect it in Integrations.")
+        }
+    }
+
     @MainActor func testDevNativeIssuancePersistenceAndRefresh() async throws {
         guard ProcessInfo.processInfo.environment["ASTATION_LIVE_DEV_ACCOUNT"] == "1" else {
             throw XCTSkip("Opt-in browser sign-in against the dev built-in Station")

@@ -96,9 +96,14 @@ final class AccountServiceSettingsTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let initial = try AccountServiceSettings.load(defaults: defaults, environment: [:], info: [:])
+        #if DEBUG
+        XCTAssertEqual(initial.portalURL, "https://dev.agora.build")
+        XCTAssertEqual(initial.issuer, "https://auth.dev.agora.build")
+        #else
         XCTAssertEqual(initial.portalURL, "https://agora.build")
         XCTAssertEqual(initial.issuer, "https://auth.agora.build")
-        XCTAssertEqual(initial.resource, "https://agora.build")
+        #endif
+        XCTAssertEqual(initial.resource, initial.portalURL)
         XCTAssertEqual(try initial.oidcConfiguration.apiScopes, ["agora:projects", "agora:certificates"])
         let settings = try AccountServiceSettings(portalURL: " https://portal.example/ ", issuer: "https://auth.portal.example/",
             clientID: "native-test", resource: "https://portal.example")
@@ -490,10 +495,15 @@ final class AccountServiceSettingsTests: XCTestCase {
         XCTAssertEqual(fields.count, 2)
         let station = try XCTUnwrap(all.compactMap { $0 as? NSPopUpButton }.first { $0.accessibilityLabel() == "Station" })
         let customURL = try XCTUnwrap(fields.first { $0.accessibilityLabel() == "Custom Station URL" })
+        let portalURL = try XCTUnwrap(fields.first { $0.accessibilityLabel() == "Portal URL" })
         let originalStation = UserDefaults.standard.string(forKey: SettingsWindowController.astationRelayUrlKey)
         #if DEBUG
+        XCTAssertTrue(portalURL.isEditable)
+        XCTAssertEqual(all.compactMap { $0 as? NSSegmentedControl }.filter { $0.accessibilityLabel() == "Server environment" }.count, 1)
         XCTAssertEqual(station.itemTitles, ["Built-in (station-dev.agora.build)", "Custom Station"])
         #else
+        XCTAssertFalse(portalURL.isEditable)
+        XCTAssertFalse(all.compactMap { $0 as? NSSegmentedControl }.contains { $0.accessibilityLabel() == "Server environment" })
         XCTAssertEqual(station.itemTitles, ["Built-in (station.agora.build)", "Custom Station"])
         #endif
         station.selectItem(at: 1)
@@ -524,6 +534,43 @@ final class AccountServiceSettingsTests: XCTestCase {
             try bitmap.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: directory).appendingPathComponent("general-minimum.png"))
         }
     }
+
+    #if DEBUG
+    func testDevServerPresetsPreviewMatchingOriginsWithoutChangingTheActiveServers() throws {
+        _ = NSApplication.shared
+        let fixture = try PortalHubFixture(config: settings(), http: PortalHTTP())
+        defer { fixture.cleanup() }
+        let controller = SettingsWindowController(hubManager: fixture.hub,
+            hotkeyManager: HotkeyManager(defaults: fixture.defaults),
+            recordingManager: AudioRecordingManager(defaults: fixture.defaults, applicationCatalog: { [] }))
+        let general = controller.makeGeneralView()
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        let all = descendants(general)
+        let choice = try XCTUnwrap(all.compactMap { $0 as? NSSegmentedControl }.first { $0.accessibilityLabel() == "Server environment" })
+        let portal = try XCTUnwrap(all.compactMap { $0 as? NSTextField }.first { $0.accessibilityLabel() == "Portal URL" })
+        let station = try XCTUnwrap(all.compactMap { $0 as? NSPopUpButton }.first { $0.accessibilityLabel() == "Station" })
+        let custom = try XCTUnwrap(all.compactMap { $0 as? NSTextField }.first { $0.accessibilityLabel() == "Custom Station URL" })
+        let savedPortal = UserDefaults.standard.string(forKey: AccountServiceSettings.portalKey)
+        let savedStation = UserDefaults.standard.string(forKey: SettingsWindowController.astationRelayUrlKey)
+        XCTAssertTrue(choice.isEnabled)
+        for environment in [AccountServerEnvironment.production, .development] {
+            station.selectItem(at: 1)
+            XCTAssertTrue(station.sendAction(try XCTUnwrap(station.action), to: station.target))
+            custom.stringValue = "https://custom.example"
+            choice.selectedSegment = environment.rawValue
+            XCTAssertTrue(choice.sendAction(try XCTUnwrap(choice.action), to: choice.target))
+            XCTAssertEqual(portal.stringValue, environment.portalURL)
+            XCTAssertEqual(try AccountServiceSettings.issuerURL(forPortalURL: portal.stringValue, environment: [:], info: [:]), environment.issuerURL)
+            XCTAssertEqual(station.indexOfSelectedItem, 0)
+            XCTAssertEqual(station.titleOfSelectedItem, "Built-in (\(URL(string: environment.stationURL)!.host!))")
+            XCTAssertTrue(custom.isHidden)
+            XCTAssertTrue(custom.stringValue.isEmpty)
+        }
+        XCTAssertEqual(UserDefaults.standard.string(forKey: AccountServiceSettings.portalKey), savedPortal)
+        XCTAssertEqual(UserDefaults.standard.string(forKey: SettingsWindowController.astationRelayUrlKey), savedStation)
+        XCTAssertEqual(fixture.hub.portalSettings, try settings())
+    }
+    #endif
 
     func testSignOutDropsDelayedProjectResponseAndKeepsLegacyServiceCredentials() async throws {
         try await checkDelayedProjectResponse(changeServers: false)

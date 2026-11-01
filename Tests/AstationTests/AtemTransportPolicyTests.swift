@@ -61,6 +61,18 @@ private final class TransportPolicyFixture {
 }
 
 final class AtemTransportPolicyTests: XCTestCase {
+    func testAChangedStationKeepsDirectConnectionsBlockedAndRequiresAnExplicitNewPolicy() throws {
+        let f = TransportPolicyFixture(), policy = f.policy()
+        try f.controller.set(policy, connections: [])
+        XCTAssertTrue(f.controller.blocksDirect(account: policy.account, issuer: policy.issuer))
+        XCTAssertFalse(f.controller.applies(account: policy.account, issuer: policy.issuer, station: "https://station-dev.agora.build"))
+        XCTAssertTrue(f.controller.applies(account: policy.account, issuer: policy.issuer, station: policy.station))
+        let selected = AtemTransportPolicyRecord(account: policy.account, issuer: policy.issuer,
+            station: "https://station-dev.agora.build", relayOnly: true, hosts: policy.hosts)
+        try f.controller.set(selected, connections: [])
+        XCTAssertTrue(f.controller.applies(account: policy.account, issuer: policy.issuer, station: selected.station))
+        XCTAssertTrue(f.controller.blocksDirect(account: policy.account, issuer: policy.issuer))
+    }
     func testSharedSessionChannelRequiresTheExactAuthenticatedContext() {
         let f = TransportPolicyFixture(), policy = f.context()
         func session(account: String = "account-a", device: String = "host-a", client: String = "relay-host-a",

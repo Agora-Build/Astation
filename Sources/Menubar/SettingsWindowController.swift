@@ -39,6 +39,10 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var stationUrlField: NSTextField!
     private let stationChoice = NSPopUpButton()
     private let stationSelectionHint = NSTextField(wrappingLabelWithString: "")
+    private var previewBuiltInStation = StationRelayURL.builtInBase
+    #if DEBUG
+    private var serverEnvironmentChoice: NSSegmentedControl?
+    #endif
     private var serverInfoLabel: NSTextField!
     private var recoveryStatusLabel: NSTextField?
     private var recoverySetupButton: NSButton?
@@ -304,6 +308,23 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         content.addArrangedSubview(wrappingInfo("Account services and Atem connections. Account server changes require sign-in again."))
         let settings = hubManager.portalSettings
         portalUrlField.stringValue = settings?.portalURL ?? ""
+        let origin = Self.currentAstationRelayUrl
+        #if DEBUG
+        let environmentChoice = NSSegmentedControl(labels: ["Dev Servers", "Production Servers"],
+            trackingMode: .selectOne, target: self, action: #selector(serverEnvironmentChanged))
+        environmentChoice.setAccessibilityLabel("Server environment")
+        environmentChoice.selectedSegment = AccountServerEnvironment.matching(portalURL: portalUrlField.stringValue, stationURL: origin)?.rawValue ?? -1
+        environmentChoice.isEnabled = !["ASTATION_PORTAL_URL", "ASTATION_ACCOUNT_ISSUER", "ASTATION_PORTAL_RESOURCE", "ASTATION_ACCOUNT_CLIENT_ID", "ASTATION_RELAY_URL"]
+            .contains { ProcessInfo.processInfo.environment[$0] != nil }
+        if !environmentChoice.isEnabled { environmentChoice.toolTip = "Servers are set by environment overrides." }
+        serverEnvironmentChoice = environmentChoice
+        content.addArrangedSubview(environmentChoice)
+        #else
+        portalUrlField.isEditable = false
+        portalUrlField.isSelectable = true
+        portalUrlField.isBezeled = false
+        portalUrlField.drawsBackground = false
+        #endif
         let fields: [(String, String, NSTextField, String)] = [
             ("Portal URL", "Account and linked projects", portalUrlField, "ASTATION_PORTAL_URL")
         ]
@@ -321,13 +342,16 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
             description.widthAnchor.constraint(equalTo: input.widthAnchor).isActive = true
             return [NSTextField(labelWithString: title), input]
         }
-        let origin = Self.currentAstationRelayUrl
+        #if DEBUG
+        previewBuiltInStation = AccountServerEnvironment.allCases.first { $0.stationURL == origin }?.stationURL
+            ?? AccountServerEnvironment.buildDefault.stationURL
+        #endif
         stationChoice.removeAllItems()
-        stationChoice.addItems(withTitles: ["Built-in (\(StationRelayURL.builtInHost))", "Custom Station"])
-        stationChoice.selectItem(at: origin == Self.defaultStationURL ? 0 : 1)
+        stationChoice.addItems(withTitles: ["Built-in (\(URL(string: previewBuiltInStation)!.host!))", "Custom Station"])
+        stationChoice.selectItem(at: origin == previewBuiltInStation ? 0 : 1)
         stationChoice.setAccessibilityLabel("Station")
         stationChoice.target = self; stationChoice.action = #selector(stationSelectionChanged)
-        stationUrlField = NSTextField(string: origin == Self.defaultStationURL ? "" : origin)
+        stationUrlField = NSTextField(string: origin == previewBuiltInStation ? "" : origin)
         stationUrlField.placeholderString = "https://station.example"
         stationUrlField.setAccessibilityLabel("Custom Station URL")
         if !(ProcessInfo.processInfo.environment["ASTATION_RELAY_URL"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -364,8 +388,25 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     }
 
     @objc private func stationSelectionChanged(_ sender: NSPopUpButton) {
+        #if DEBUG
+        if sender.indexOfSelectedItem != 0 { serverEnvironmentChoice?.selectedSegment = -1 }
+        #endif
         renderStationSelection()
     }
+
+    #if DEBUG
+    @objc private func serverEnvironmentChanged(_ sender: NSSegmentedControl) {
+        guard sender.isEnabled, let environment = AccountServerEnvironment(rawValue: sender.selectedSegment) else { return }
+        portalUrlField.stringValue = environment.portalURL
+        previewBuiltInStation = environment.stationURL
+        stationChoice.item(at: 0)?.title = "Built-in (\(URL(string: previewBuiltInStation)!.host!))"
+        stationChoice.selectItem(at: 0)
+        stationUrlField.stringValue = ""
+        renderStationSelection()
+        accountServerStatus.stringValue = "Server selection changed. Save Servers to apply."
+        accountServerStatus.textColor = .secondaryLabelColor
+    }
+    #endif
 
     private func renderStationSelection() {
         let builtIn = stationChoice.indexOfSelectedItem == 0
@@ -381,15 +422,29 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
                 issuer: AccountServiceSettings.issuerURL(forPortalURL: portalUrlField.stringValue),
                 clientID: hubManager.portalSettings?.clientID ?? AccountServiceSettings.defaultClient,
                 resource: AccountServiceSettings.resourceURL(forPortalURL: portalUrlField.stringValue))
-            guard let relayURL = stationChoice.indexOfSelectedItem == 0 ? Self.defaultStationURL
+            guard let relayURL = stationChoice.indexOfSelectedItem == 0 ? previewBuiltInStation
                     : StationRelayURL.validatedBase(stationUrlField.stringValue) else {
                 accountServerStatus.stringValue = "Enter a valid custom Station URL."
                 accountServerStatus.textColor = .systemRed
                 return
             }
             sender.isEnabled = false
+            let portalEditable = portalUrlField.isEditable, stationEnabled = stationChoice.isEnabled
+            let customEditable = stationUrlField.isEditable
+            portalUrlField.isEditable = false; stationChoice.isEnabled = false; stationUrlField.isEditable = false
+            #if DEBUG
+            let environmentEnabled = serverEnvironmentChoice?.isEnabled ?? false
+            serverEnvironmentChoice?.isEnabled = false
+            #endif
             Task { @MainActor in
-                defer { sender.isEnabled = true }
+                defer {
+                    sender.isEnabled = true
+                    portalUrlField.isEditable = portalEditable; stationChoice.isEnabled = stationEnabled
+                    stationUrlField.isEditable = customEditable
+                    #if DEBUG
+                    serverEnvironmentChoice?.isEnabled = environmentEnabled
+                    #endif
+                }
                 do {
                     try await hubManager.updateAccountServices(settings)
                     if let effective = hubManager.portalSettings {
@@ -404,8 +459,8 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
                         NotificationCenter.default.post(name: .serverInfoChanged, object: nil)
                     }
                     let selected = Self.currentAstationRelayUrl
-                    stationChoice.selectItem(at: selected == Self.defaultStationURL ? 0 : 1)
-                    if selected != Self.defaultStationURL { stationUrlField.stringValue = selected }
+                    stationChoice.selectItem(at: selected == previewBuiltInStation ? 0 : 1)
+                    if selected != previewBuiltInStation { stationUrlField.stringValue = selected }
                     renderStationSelection()
                     accountServerStatus.stringValue = hubManager.signedInAccount == nil
                         ? "Servers saved. Sign in to Agora.Build to continue." : "Servers saved."
