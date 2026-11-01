@@ -627,6 +627,24 @@ removed the temporary bearer. The first attempt stopped before submission
 because the operator lacked WSS/TLS support; the test dependency was corrected
 before retrying. Evidence: [Portal #21 public result](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6517743443).
 
+On 2026-11-01, the built-in dev Station's public view-only run passed in
+17.64 seconds for the same `i-01m6c16g7nsz0k0pmfshs1fwwk` integration used by
+the admin Pause/Resume check. HTTPS discovery/history, invalid-token and
+approval-scope refusal, stale-target refusal, subscribed WSS history and fresh
+WSS reconnect/history all passed with zero agent mutations and no readiness
+fixture. The ordinary worker and authenticated feed established readiness.
+The public proxy fix is deployed to dev as `dev-agent-ws-20261101`; production
+is unchanged. Both original relay containers were restored and independently
+verified healthy at build `9004ca9424add5e42df0e35e6598ad070d79e387`, with Redis
+and both replicas healthy. Public admission again returns
+`503 hosted_execution_not_verified`. The actual policy cursor advanced from
+29 before the successful canary to 31 after restoration; the view-only native
+service binding is unchanged. Evidence `public-view-20261101T225228Z.json`
+reached `completed`, and the controller recorded operator exit zero and
+`public_gate_closed: true`. This proves public view access, not prompt
+execution under this view-only grant. Keep the integration active, and arm the
+final owner Revoke observer only after the owner returns.
+
 ### Final owner revocation observation
 
 After the public check and any receipt recovery finish,
