@@ -1266,6 +1266,15 @@ Station, and issue `station.report` for its configured Portal origin.
 
 #### Development built-in Station
 
+Native development builds (`swift build`, Debug, including the provisioned
+local app) default to `https://station-dev.agora.build`. Release builds
+(`swift build -c release`, including the public release workflow) default to
+`https://station.agora.build`. Settings derives the built-in selector label
+from that same build default. The dev Station is built-in in dev builds and
+does not require custom-Station registration. Explicit saved Station URLs
+and `ASTATION_RELAY_URL` still take priority; changing build configuration
+does not reinterpret an explicitly selected origin or its credentials.
+
 Current backend rollout (reporting enabled 2026-11-01):
 
 | Component | Deployment |
@@ -1357,9 +1366,9 @@ normal authenticated polling. An unsigned nudge is only a poll hint.
 `GET /agora-build/v1/details` now returns 401 without a bearer token, rather
 than 503; a valid exact-audience `station.read` token is required for 200 and
 the public report JWK. This does not enable integrations or hosted execution.
-Auth's built-in integration switch remains off until separately requested on
-Portal #21. Hosted APIs still return `hosted_execution_not_verified` until
-the joint live gate passes.
+Auth's built-in integration switch was enabled on Portal #21 at 16:37:44 UTC
+on 2026-11-01; Portal confirmed the same flag at 16:57:31 UTC. Hosted APIs
+still return `hosted_execution_not_verified` until the joint live gate passes.
 
 Native approval review and owner authentication name Agora.Build as the
 operator for the exact built-in origins and disclose that it can read and

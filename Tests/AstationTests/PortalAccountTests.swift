@@ -491,7 +491,11 @@ final class AccountServiceSettingsTests: XCTestCase {
         let station = try XCTUnwrap(all.compactMap { $0 as? NSPopUpButton }.first { $0.accessibilityLabel() == "Station" })
         let customURL = try XCTUnwrap(fields.first { $0.accessibilityLabel() == "Custom Station URL" })
         let originalStation = UserDefaults.standard.string(forKey: SettingsWindowController.astationRelayUrlKey)
+        #if DEBUG
+        XCTAssertEqual(station.itemTitles, ["Built-in (station-dev.agora.build)", "Custom Station"])
+        #else
         XCTAssertEqual(station.itemTitles, ["Built-in (station.agora.build)", "Custom Station"])
+        #endif
         station.selectItem(at: 1)
         XCTAssertTrue(station.sendAction(try XCTUnwrap(station.action), to: station.target))
         window.contentView?.layoutSubtreeIfNeeded()

@@ -323,7 +323,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         }
         let origin = Self.currentAstationRelayUrl
         stationChoice.removeAllItems()
-        stationChoice.addItems(withTitles: ["Built-in (station.agora.build)", "Custom Station"])
+        stationChoice.addItems(withTitles: ["Built-in (\(StationRelayURL.builtInHost))", "Custom Station"])
         stationChoice.selectItem(at: origin == Self.defaultStationURL ? 0 : 1)
         stationChoice.setAccessibilityLabel("Station")
         stationChoice.target = self; stationChoice.action = #selector(stationSelectionChanged)

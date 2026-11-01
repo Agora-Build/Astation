@@ -1,7 +1,12 @@
 import Foundation
 
 enum StationRelayURL {
-    static let builtInBase = "https://station.agora.build"
+    #if DEBUG
+    static let builtInHost = "station-dev.agora.build"
+    #else
+    static let builtInHost = "station.agora.build"
+    #endif
+    static let builtInBase = "https://" + builtInHost
 
     static func selectedBase(saved: String?, environmentOverride: String?) -> String {
         for value in [environmentOverride, saved] {

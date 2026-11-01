@@ -3,13 +3,21 @@ import XCTest
 
 final class StationRelayURLTests: XCTestCase {
     func testBuiltInStationNeedsNoSavedConfiguration() {
+        #if DEBUG
+        let expected = "https://station-dev.agora.build"
+        #else
+        let expected = "https://station.agora.build"
+        #endif
         for saved in [nil, "", " \n"] as [String?] {
             XCTAssertEqual(StationRelayURL.selectedBase(saved: saved, environmentOverride: nil),
-                "https://station.agora.build")
+                expected)
         }
     }
 
     func testExplicitStationSelectionDoesNotFallBackToBuiltIn() {
+        for origin in ["https://station.agora.build", "https://station-dev.agora.build"] {
+            XCTAssertEqual(StationRelayURL.selectedBase(saved: origin, environmentOverride: nil), origin)
+        }
         XCTAssertEqual(StationRelayURL.selectedBase(saved: " https://private.example/// ", environmentOverride: nil),
             "https://private.example")
         XCTAssertEqual(StationRelayURL.selectedBase(saved: "https://private.example", environmentOverride: "https://dev.example/"),
