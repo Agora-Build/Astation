@@ -97,6 +97,9 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         if let existingWindow = window {
             shortcutsController.refresh()
             if tabView?.selectedTabViewItem?.identifier as? String == "credentials" { credentialsController.refreshForDisplay() }
+            if tabView?.selectedTabViewItem?.identifier as? String == "integrations" {
+                MainActor.assumeIsolated { integrationController.refreshForDisplay() }
+            }
             renderRelayAccountState()
             hubManager.requestRelayAccountState()
             renderEncryptionState()
@@ -1439,6 +1442,9 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
         guard let tabViewItem else { return }
         if tabViewItem.identifier as? String == "credentials" { credentialsController.refreshForDisplay() }
+        if tabViewItem.identifier as? String == "integrations" {
+            MainActor.assumeIsolated { integrationController.refreshForDisplay() }
+        }
         if tabViewItem.identifier as? String == "security" { MainActor.assumeIsolated { renderRecoverySetup() } }
         recordingController.setPageVisible((tabViewItem.identifier as? String) == "recording")
         let index = tabView.indexOfTabViewItem(tabViewItem)

@@ -264,6 +264,20 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
         XCTAssertEqual(socket.registrations.count, 1)
     }
 
+    func testBackgroundSecurityAccessUsesSavedAuthorizationAndNeverStartsSignIn() async throws {
+        let fixture = try StationAccountFixture(); defer { fixture.cleanup() }
+        let socket = try await connected(fixture)
+        socket.emit(#"{"type":"relayAck","for":"relayRegisterAccount","ok":true}"#)
+        try await fixture.hub.prepareAccountSecurityAccess(allowSignIn: false)
+        try await fixture.hub.accountAuth.clearSession()
+        do {
+            try await fixture.hub.prepareAccountSecurityAccess(allowSignIn: false)
+            XCTFail("Missing saved authorization requires an explicit sign-in")
+        } catch { XCTAssertEqual(error as? AccountLoginError, .signInRequired) }
+        XCTAssertEqual(fixture.sockets.count, 1)
+        XCTAssertEqual(socket.registrations.count, 1)
+    }
+
     func testRegistrationTimeoutReconnectsAndCannotAcceptTheOldSocketAck() async throws {
         let fixture = try StationAccountFixture(); defer { fixture.cleanup() }
         let old = try await connected(fixture)

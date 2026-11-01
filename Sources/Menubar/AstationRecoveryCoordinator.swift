@@ -494,8 +494,9 @@ final class AstationRecoveryCoordinator {
 
     /// Retain the exact publication across lost relay/Portal replies. A retry
     /// uses its saved signature; a conflicting head requires another review.
+    @discardableResult
     func approveService(_ approval: RemoteServiceApproval, portal: PortalIntegrationHTTP,
-        current: @escaping () -> Bool) async throws {
+        current: @escaping () -> Bool) async throws -> (record: PortalIntegrationRecord, membership: MembershipLog) {
         try begin(); defer { busy = false }
         guard current(), try pendingServiceApproval() == approval, let checkpoint = saved.publication else {
             throw RemoteChannelError.staleLink
@@ -544,16 +545,19 @@ final class AstationRecoveryCoordinator {
         // Listing reconciles an uncertain previous POST before any new POST.
         let records = try await portal.owned(stationOrigin: approval.stationOrigin)
         guard current(), let record = records.first(where: { $0.id == approval.integrationID }) else { throw AccountLoginError.changed }
+        let approved: PortalIntegrationRecord
         if record.state == "awaiting_approval" {
-            _ = try await portal.approve(approval, publication: publication, current: current)
+            approved = try await portal.approve(approval, publication: publication, current: current)
         } else {
             guard ["provisioning", "waiting_for_host", "ready"].contains(record.state), record.r9Svc == approval.fingerprint else {
                 throw AccountLoginError.changed
             }
+            approved = record
         }
         guard current() else { throw RemoteChannelError.staleLink }
         try persist { $0.publication = nil; $0.serviceApproval = nil }
         self.publication = nil
+        return (approved, latest.snapshot())
     }
 
     func cancelUnsignedService(_ approval: RemoteServiceApproval) throws {

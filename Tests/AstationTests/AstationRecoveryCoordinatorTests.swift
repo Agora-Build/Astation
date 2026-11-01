@@ -1,3 +1,4 @@
+import AppKit
 import AtemClient
 import AstationRemote
 import CryptoKit
@@ -535,6 +536,101 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             requiredScope: "integrations:read", additionalScopes: ["integrations:approve"])
         return try PortalIntegrationHTTP(configuration: config, portalOrigin: "https://portal.example",
             ownerAccount: "ab01234567890123456789012345", http: http, accessToken: { "test-only-token" })
+    }
+
+    func testIntegrationApprovalRetainsSelectionAndVerifiedScopeWhenReopened() async throws {
+        _ = NSApplication.shared
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        _ = try await coordinator.setup()
+        let approval = try await service(coordinator, sessions: ["ses-aaaaaaaaaaaa"])
+        try await coordinator.prepareService(approval)
+        let portal = try portal(transport)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let suite = "Astation.integration-reopen.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let settings = try AccountServiceSettings(portalURL: "https://portal.example", issuer: "https://auth.example",
+            clientID: "astation", resource: "https://portal.example")
+        let hub = AstationHubManager(skipProjectLoad: true,
+            deviceSessionStore: SessionStore(storageURL: directory.appendingPathComponent("devices")),
+            sessionStore: SsoSessionStore(storageURL: directory.appendingPathComponent("sso")),
+            relayIdentityRepairDefaults: defaults, atemE2EIdentity: h.identity,
+            sessionJournal: AtemSessionJournal(), portalSettings: settings, accountDefaults: defaults)
+        hub._testRelayUrlOverride = "https://configured.example"
+        let controller = IntegrationApprovalViewController(hub: hub)
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
+        let views = descendants(controller.view)
+        let picker = try XCTUnwrap(views.compactMap { $0 as? NSPopUpButton }.first)
+        func button(_ title: String) throws -> NSButton {
+            try XCTUnwrap(descendants(controller.view).compactMap { $0 as? NSButton }.first { $0.title == title })
+        }
+        let approve = try button("Approve on This Mac…"), review = try button("Review Access")
+        let load = try button("Load Requests")
+        let sessions = try XCTUnwrap(views.compactMap { $0 as? NSTextField }.first { $0.accessibilityLabel() == "Session restrictions" })
+        func shows(_ text: String) -> Bool {
+            views.compactMap { $0 as? NSTextField }.contains { $0.stringValue.contains(text) }
+        }
+        var records = try await portal.owned(stationOrigin: coordinator.relayURL)
+        let initialMembership = try await coordinator.serviceMembership()
+        try controller.presentRequests(records, membership: initialMembership, coordinator: coordinator,
+            portal: portal, current: { true })
+        XCTAssertEqual(picker.titleOfSelectedItem, "Test bot · awaiting approval")
+        XCTAssertTrue(approve.isEnabled)
+        approve.performClick(nil)
+        for _ in 0..<200 {
+            if load.isEnabled { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(load.isEnabled, "Approval must complete")
+        XCTAssertEqual(picker.titleOfSelectedItem, "Test bot · provisioning", "Approval must not clear the integration selector")
+        XCTAssertTrue(shows("The Station is preparing this integration"))
+        XCTAssertFalse(approve.isEnabled)
+        XCTAssertFalse(review.isEnabled)
+        XCTAssertFalse(sessions.isEnabled)
+        XCTAssertEqual(sessions.stringValue, "ses-aaaaaaaaaaaa")
+        let posts = await transport.count()
+        XCTAssertEqual(posts, 1)
+
+        controller.cancelPending()
+        XCTAssertEqual(picker.titleOfSelectedItem, "Load requests to choose an integration")
+        XCTAssertFalse(shows("The Station is preparing this integration"), "Closing clears stale status text")
+        XCTAssertEqual(sessions.stringValue, "")
+        XCTAssertFalse(picker.isEnabled)
+        await transport.setState("ready")
+        records = try await portal.owned(stationOrigin: coordinator.relayURL)
+        let membership = try await coordinator.serviceMembership()
+        try controller.presentRequests(records, membership: membership, coordinator: coordinator,
+            portal: portal, current: { true }, selectedID: approval.integrationID)
+        XCTAssertEqual(picker.titleOfSelectedItem, "Test bot · ready")
+        XCTAssertTrue(shows("The Station reports this integration as ready"))
+        XCTAssertEqual(sessions.stringValue, "ses-aaaaaaaaaaaa")
+        let host = try button("host-a")
+        XCTAssertEqual(host.state, .on)
+        XCTAssertFalse(host.isEnabled, "Approved scope is visible but cannot silently change")
+        XCTAssertFalse(approve.isEnabled)
+        XCTAssertFalse(review.isEnabled)
+        XCTAssertThrowsError(try controller.presentRequests([], membership: membership, coordinator: coordinator,
+            portal: portal, current: { false }))
+        XCTAssertEqual(picker.titleOfSelectedItem, "Test bot · ready", "A delayed response from an old context cannot replace the list")
+
+        // Reopening with no saved account authorization must finish without starting browser login.
+        controller.cancelPending()
+        controller.refreshForDisplay()
+        for _ in 0..<200 {
+            if load.isEnabled { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(load.isEnabled)
+        XCTAssertTrue(shows("Authorization needs to be renewed"))
+        XCTAssertFalse(approve.isEnabled)
+        XCTAssertFalse(review.isEnabled)
+        let finalPosts = await transport.count()
+        XCTAssertEqual(finalPosts, 1, "Reopening must not resubmit the approval")
+        controller.cancelPending()
     }
 
     func testServiceConfirmationUsesTheExactReviewedApprovalAndCannotBeBypassed() async throws {

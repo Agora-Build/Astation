@@ -89,13 +89,16 @@ class AstationHubManager: ObservableObject {
         if reconnect { startIdentityRelay() }
     }
 
-    @MainActor func prepareAccountSecurityAccess(registrationTimeout: TimeInterval = 15) async throws {
+    @MainActor func prepareAccountSecurityAccess(registrationTimeout: TimeInterval = 15, allowSignIn: Bool = true) async throws {
         try Task.checkCancellation()
         try configureStationAccountAuth()
         guard let owner = signedInAccount, !accountSignInRequired else { throw AccountLoginError.signInRequired }
         let epoch = accountGeneration, origin = stationRelayUrl, auth = accountAuth
         do { _ = try await auth.accessToken(relayURL: origin) }
-        catch AccountLoginError.signInRequired { try await auth.signIn() }
+        catch AccountLoginError.signInRequired {
+            guard allowSignIn else { throw AccountLoginError.signInRequired }
+            try await auth.signIn()
+        }
         try Task.checkCancellation()
         guard epoch == accountGeneration, origin == stationRelayUrl, signedInAccount == owner,
               try await auth.current()?.session.subject == owner else { throw AccountLoginError.changed }

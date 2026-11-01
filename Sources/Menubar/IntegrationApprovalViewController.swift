@@ -38,6 +38,8 @@ final class IntegrationApprovalViewController: NSViewController {
     private var generation = UUID()
     private var contextCurrent: (() -> Bool)?
     private var securityMissingOnStation = false
+    private var hasLoadedRequests = false
+    private var selectedIntegrationID: String?
 
     init(hub: AstationHubManager, openSecurity: @escaping () -> Void = {}) {
         self.hub = hub; self.openSecurity = openSecurity; super.init(nibName: nil, bundle: nil)
@@ -59,7 +61,7 @@ final class IntegrationApprovalViewController: NSViewController {
         reviewText.isSelectable = true
         reviewText.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         picker.setAccessibilityLabel("Integration request")
-        picker.addItem(withTitle: "Load requests to choose an integration")
+        if picker.numberOfItems == 0 { picker.addItem(withTitle: "Load requests to choose an integration") }
         status.textColor = .secondaryLabelColor
         let actions = NSStackView(views: [loadButton, reviewButton, approveButton])
         actions.spacing = 10
@@ -99,14 +101,23 @@ final class IntegrationApprovalViewController: NSViewController {
     }
 
     func cancelPending() {
+        if records.indices.contains(picker.indexOfSelectedItem) { selectedIntegrationID = records[picker.indexOfSelectedItem].id }
         revocationRefresh?.cancel(); revocationRefresh = nil
         generation = UUID(); task?.cancel(); task = nil
         approval = nil; contextCurrent = nil; log = nil; reviewText.stringValue = ""
         coordinator = nil
         securityMissingOnStation = false
         approvedScope = nil
+        records = []; picker.removeAllItems(); picker.addItem(withTitle: "Load requests to choose an integration")
+        status.stringValue = "Load integration requests for your selected Station."
         showScope(hosts: [], sessions: nil, projects: nil, approved: false)
         render()
+    }
+
+    func refreshForDisplay() {
+        _ = view
+        guard hasLoadedRequests else { render(); return }
+        reloadRequests(allowSignIn: false)
     }
 
     private func render(busy: Bool = false) {
@@ -156,6 +167,7 @@ final class IntegrationApprovalViewController: NSViewController {
     @objc private func selectionChanged() {
         revocationRefresh?.cancel(); revocationRefresh = nil
         approval = nil; reviewText.stringValue = ""
+        if records.indices.contains(picker.indexOfSelectedItem) { selectedIntegrationID = records[picker.indexOfSelectedItem].id }
         showSelectedScope()
         status.stringValue = selectedRequestGuidance()
         render()
@@ -211,14 +223,21 @@ final class IntegrationApprovalViewController: NSViewController {
         }
     }
 
-    @objc private func loadRequests() {
+    @objc private func loadRequests() { reloadRequests(allowSignIn: true) }
+
+    private func reloadRequests(allowSignIn: Bool) {
         cancelPending(); render(busy: true)
+        status.stringValue = "Loading integration access for the selected Station…"
         do { try hub.configureIntegrationRelayAuth() }
         catch { status.stringValue = "Select the built-in Station or a registered custom HTTPS Station in General."; render(); return }
         let epoch = generation, accountEpoch = hub.integrationAccountGeneration, origin = hub.stationRelayUrl
         task = Task { [weak self] in
             guard let self else { return }
             do {
+                func signIn(_ provider: AstationAccountAuth) async throws {
+                    guard allowSignIn else { throw AccountLoginError.signInRequired }
+                    try await provider.signIn()
+                }
                 guard let settings = hub.portalSettings, let owner = hub.signedInAccount, !hub.accountSignInRequired,
                       hub.accountAuth.configuration?.resource == origin else { throw AccountLoginError.signInRequired }
                 let config = try AccountOIDCConfiguration(issuer: settings.issuer, clientID: settings.clientID,
@@ -227,15 +246,15 @@ final class IntegrationApprovalViewController: NSViewController {
                     storage: AccountKeychainStorage(service: "build.agora.astation.integrations-v1." + settings.storageContext))
                 self.auth = auth
                 do { _ = try await auth.accessToken() }
-                catch AccountLoginError.signInRequired { try await auth.signIn() }
+                catch AccountLoginError.signInRequired { try await signIn(auth) }
                 do { _ = try await hub.accountAuth.accessToken() }
-                catch AccountLoginError.signInRequired { try await hub.accountAuth.signIn() }
+                catch AccountLoginError.signInRequired { try await signIn(hub.accountAuth) }
                 let nativeSession = try await hub.accountAuth.current()
                 if try await auth.current()?.session.subject != owner {
-                    try await auth.signIn()
+                    try await signIn(auth)
                 }
                 if nativeSession?.session.subject != owner {
-                    try await hub.accountAuth.signIn()
+                    try await signIn(hub.accountAuth)
                 }
                 guard try await auth.current()?.session.subject == owner,
                       try await hub.accountAuth.current()?.session.subject == owner else {
@@ -251,11 +270,11 @@ final class IntegrationApprovalViewController: NSViewController {
                         && hub?.accountSignInRequired == false && hub?.stationRelayUrl == origin
                 }
                 self.portal = portal
-                self.records = records.filter { $0.state == "awaiting_approval" || ["provisioning", "waiting_for_host", "revoking", "revoked"].contains($0.state) }
-                picker.removeAllItems(); picker.addItems(withTitles: self.records.map(Self.requestTitle))
+                hasLoadedRequests = true
+                setRequests(records, selectedID: selectedIntegrationID)
                 for child in hosts.arrangedSubviews { hosts.removeArrangedSubview(child); child.removeFromSuperview() }
                 hostButtons = []
-                try await hub.prepareAccountSecurityAccess()
+                try await hub.prepareAccountSecurityAccess(allowSignIn: allowSignIn)
                 guard contextCurrent?() == true else { throw AccountLoginError.changed }
                 let coordinator = try hub.recoveryCoordinator()
                 self.coordinator = coordinator
@@ -265,28 +284,48 @@ final class IntegrationApprovalViewController: NSViewController {
                 }
                 let log = try await coordinator.serviceMembership()
                 guard contextCurrent?() == true else { throw AccountLoginError.changed }
-                self.log = log
-                showSelectedScope()
-                if let saved = try coordinator.pendingServiceApproval() {
-                    guard saved.issuer == settings.issuer, saved.ownerAccount == owner, saved.stationOrigin == origin else {
-                        throw AccountLoginError.changed
-                    }
-                    guard let index = self.records.firstIndex(where: { $0.id == saved.integrationID }) else {
-                        throw AccountLoginError.changed
-                    }
-                    picker.selectItem(at: index)
-                    approval = saved; try showReview(saved)
-                    status.stringValue = "A saved approval is ready to resume. Its original signature is retained."
-                } else {
-                    if let id = try coordinator.pendingServiceRemovalID(), let index = self.records.firstIndex(where: { $0.id == id }) {
-                        picker.selectItem(at: index); showSelectedScope()
-                    }
-                    status.stringValue = selectedRequestGuidance()
-                }
-                render()
-                refreshRemovedServiceStatus()
+                try presentRequests(records, membership: log, coordinator: coordinator, portal: portal,
+                    current: contextCurrent ?? { false }, selectedID: selectedIntegrationID)
             } catch { fail(error, epoch: epoch) }
         }
+    }
+
+    private func setRequests(_ records: [PortalIntegrationRecord], selectedID: String?) {
+        self.records = records
+        picker.removeAllItems()
+        if records.isEmpty { picker.addItem(withTitle: "No integrations on this Station") }
+        else {
+            picker.addItems(withTitles: records.map(Self.requestTitle))
+            if let index = records.firstIndex(where: { $0.id == selectedID }) { picker.selectItem(at: index) }
+            self.selectedIntegrationID = records[picker.indexOfSelectedItem].id
+        }
+    }
+
+    /// Display one validated account/Station snapshot; controls still require its live context.
+    func presentRequests(_ records: [PortalIntegrationRecord], membership: MembershipLog,
+        coordinator: AstationRecoveryCoordinator, portal: PortalIntegrationHTTP,
+        current: @escaping () -> Bool, selectedID: String? = nil) throws {
+        guard current() else { throw AccountLoginError.changed }
+        self.coordinator = coordinator; self.portal = portal; log = membership.snapshot(); contextCurrent = current
+        hasLoadedRequests = true
+        approval = nil; reviewText.stringValue = ""
+        setRequests(records, selectedID: selectedID)
+        showSelectedScope()
+        if let saved = try coordinator.pendingServiceApproval() {
+            guard saved.issuer == portal.configuration.issuer, saved.ownerAccount == portal.ownerAccount,
+                  saved.stationOrigin == coordinator.relayURL,
+                  let index = records.firstIndex(where: { $0.id == saved.integrationID }) else { throw AccountLoginError.changed }
+            picker.selectItem(at: index); selectedIntegrationID = saved.integrationID
+            approval = saved; try showReview(saved)
+            status.stringValue = "A saved approval is ready to resume. Its original signature is retained."
+        } else {
+            if let id = try coordinator.pendingServiceRemovalID(), let index = records.firstIndex(where: { $0.id == id }) {
+                picker.selectItem(at: index); selectedIntegrationID = id; showSelectedScope()
+            }
+            status.stringValue = selectedRequestGuidance()
+        }
+        render()
+        refreshRemovedServiceStatus()
     }
 
     @objc private func reviewAccess() {
@@ -330,11 +369,12 @@ final class IntegrationApprovalViewController: NSViewController {
         task = Task { [weak self] in
             guard let self else { return }
             do {
-                try await coordinator.approveService(approval, portal: portal, current: { [weak self] in self?.contextCurrent?() == true && !Task.isCancelled })
-                guard epoch == generation else { return }
+                let result = try await coordinator.approveService(approval, portal: portal, current: { [weak self] in self?.contextCurrent?() == true && !Task.isCancelled })
+                guard epoch == generation, let current = contextCurrent, current() else { return }
                 self.approval = nil; reviewText.stringValue = ""
-                status.stringValue = "Access approved and saved. Hosted execution stays disabled until end-to-end verification is complete."
-                records = []; picker.removeAllItems(); render()
+                let updated = records.map { $0.id == result.record.id ? result.record : $0 }
+                try presentRequests(updated, membership: result.membership, coordinator: coordinator, portal: portal,
+                    current: current, selectedID: result.record.id)
             } catch { fail(error, epoch: epoch) }
         }
     }
@@ -480,15 +520,21 @@ final class IntegrationApprovalViewController: NSViewController {
         if error as? RemoteRecoveryTransportError == .recordNotFound, log == nil, coordinator != nil {
             securityMissingOnStation = true
         }
+        if error as? AccountLoginError == .signInRequired {
+            status.stringValue = "Authorization needs to be renewed. Click Load Requests to sign in and refresh integration access."
+            render(); return
+        }
         status.stringValue = error.localizedDescription; render()
     }
     private func selectedRequestGuidance() -> String {
-        guard records.indices.contains(picker.indexOfSelectedItem) else { return "No requests are waiting on this Station." }
+        guard records.indices.contains(picker.indexOfSelectedItem) else { return "No integrations are available on this Station." }
         switch records[picker.indexOfSelectedItem].state {
         case "waiting_for_host":
             return "Access is already approved and saved. Hosted execution awaits end-to-end verification."
         case "provisioning":
             return "Access is already approved. The Station is preparing this integration."
+        case "ready":
+            return "Access is approved and saved. The Station reports this integration as ready."
         case "revoking", "revoked":
             if let log, (try? AstationRecoveryCoordinator.serviceRemovalComplete(record: records[picker.indexOfSelectedItem], log: log)) == true {
                 return records[picker.indexOfSelectedItem].state == "revoked"
@@ -496,8 +542,10 @@ final class IntegrationApprovalViewController: NSViewController {
                     : "The service is removed from the verified account log. Waiting for the Station to confirm cleanup."
             }
             return "Access has been revoked. Remove its service from the verified account log to complete cleanup."
-        default:
+        case "awaiting_approval":
             return "Choose the allowed hosts, then review access."
+        default:
+            return "Integration status: \(records[picker.indexOfSelectedItem].state.replacingOccurrences(of: "_", with: " ")). Load requests to refresh."
         }
     }
     private static func items(_ text: String) -> [String]? {

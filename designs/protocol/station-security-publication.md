@@ -44,6 +44,20 @@ Station selection remain current throughout the operation.
   an integration on the new origin. Hosts still require the normal live route and
   cryptographic freshness checks.
 
+## Integration tab lifecycle
+
+Successful approval keeps the integration selected and displays the Portal's
+verified response together with the durably committed membership scope. Approved
+and ready integrations remain visible; only awaiting-approval records allow scope
+editing. Portal status alone never establishes an approved host scope.
+
+Leaving the tab cancels outstanding UI work and clears transient consent, scope
+and status. Returning after a successful listing refreshes the exact account and
+Station using saved authorization and restores the selected integration by ID.
+This refresh may renew a token but never starts browser authorization. If sign-in
+is required, the user explicitly chooses Load Requests. Responses from a previous
+account, Station or tab generation cannot update the screen or authorize work.
+
 This uses the existing R9 membership and backup endpoints. Atem needs no wire or
 host implementation change. Hosts on a different Station still need an explicit
 transport change and authenticated reconnection; copying their signed enrollment
