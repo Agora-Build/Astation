@@ -542,6 +542,22 @@ The test exited successfully, removed its fixture schema and disposable bearer,
 and submitted zero agent mutations. Public hosted admission and terminal
 revocation remain separate gates. Evidence: [Portal #21 result](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6516660614).
 
+The 2026-11-01 admin-site run on the built-in dev Station,
+`https://station-dev.agora.build`, passed in 506.27 seconds for view-only
+integration `i-01m6c16g7nsz0k0pmfshs1fwwk`. The authenticated feed advanced
+25 -> 26 -> 27. Admin Pause at 22:20:50 UTC refused a still-valid token,
+closed its subscribed stream and refused new Auth issuance with
+`401 invalid_client`. Admin Resume at 22:23:04 UTC restored fresh-token HTTP
+and WebSocket access. Evidence `step1-pause-20261101T221522Z.json` reached
+`completed`, and the actual operator exited zero with no agent mutations.
+Portal/Auth corroborated admin audit entries 2924/2930, the typed reasons,
+admin-site attempt/change records and zero tokens issued during the paused
+window. The admin-lock state was confirmed; a live owner-Resume refusal was
+not attempted. This is protected operator-path evidence; the public hosted
+gate remains closed, and the grant must remain active for the separate public
+rollout check before final Revoke. Results: [Astation observation](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6564784010)
+and [Portal/Auth records](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6564787778).
+
 ### Public-origin rollout check
 
 The separate ignored test
@@ -612,7 +628,7 @@ requires new Auth issuance to return 401 `invalid_client` and a successful test
 exit before reporting success. Native member removal and Portal's final
 `revoked` report remain distinct owner-confirmed steps.
 
-The owner completed native removal for the current integration on 2026-10-30.
+The owner completed native removal for the then-current integration on 2026-10-30.
 The independent read-only observer confirmed membership head 7 -> 8 with the
 exact service removal, deletion of its sealed Station key, and actual feed
 cursor 18 -> 19 reporting `revoked` at 15:17:36 UTC. Evidence:
