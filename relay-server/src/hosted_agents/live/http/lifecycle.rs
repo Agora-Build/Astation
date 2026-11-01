@@ -16,6 +16,17 @@ use tokio_tungstenite::{
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+fn owner_wait(default_seconds: u64) -> Duration {
+    let seconds = std::env::var("LIVE_HOSTED_OWNER_WAIT_SECONDS")
+        .map(|value| value.parse::<u64>().expect("owner wait in seconds"))
+        .unwrap_or(default_seconds);
+    assert!(
+        (60..=14_400).contains(&seconds),
+        "owner wait must be 1 minute to 4 hours"
+    );
+    Duration::from_secs(seconds)
+}
+
 async fn history_boundary(socket: &mut Socket) {
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -126,15 +137,16 @@ pub(super) async fn observe_revocation(
     let baseline = mirror(original, pool, binding, id).await;
     assert_eq!(baseline.integrations[id].state, "waiting_for_host");
     let fingerprint = baseline.integrations[id].r9_svc.as_deref().unwrap();
+    let wait = owner_wait(1_200);
     let mut evidence = json!({"kind":"actual_portal_revocation","phase":"ready_for_revoke",
         "integration_id":id,"target":target,"baseline_cursor":baseline.cursor,
         "baseline_revision":baseline.revision,
-        "revoke_deadline_at":chrono::Utc::now().timestamp()+1_200,
+        "revoke_deadline_at":chrono::Utc::now().timestamp()+wait.as_secs() as i64,
         "pre_revoke_token_expires_at":expiry,"readiness_fixture_only":true,
         "agent_mutations_submitted":0});
     save_evidence(path, &evidence);
     println!("LIVE: ready for revoke; actual feed, issued token and subscribed stream live");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1_200);
+    let deadline = tokio::time::Instant::now() + wait;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     let mut socket_closed = false;
     let revoked = loop {
@@ -251,15 +263,16 @@ pub(super) async fn observe(
     history_boundary(socket).await;
     let baseline = mirror(original, pool, binding, id).await;
     assert_eq!(baseline.integrations[id].state, "waiting_for_host");
+    let wait = owner_wait(1_200);
     let mut evidence = json!({"kind":"actual_portal_lifecycle","phase":"ready_for_pause",
         "integration_id":id,"target":target,"baseline_cursor":baseline.cursor,
         "baseline_revision":baseline.revision,
-        "pause_deadline_at":chrono::Utc::now().timestamp()+1_200,
+        "pause_deadline_at":chrono::Utc::now().timestamp()+wait.as_secs() as i64,
         "pre_pause_token_expires_at":expiry,"readiness_fixture_only":true,
         "agent_mutations_submitted":0});
     save_evidence(path, &evidence);
     println!("LIVE: ready for pause; actual feed observer, issued token and subscribed event stream live");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1_200);
+    let deadline = tokio::time::Instant::now() + wait;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     let mut socket_closed = false;
     let paused = loop {
@@ -345,7 +358,7 @@ pub(super) async fn observe(
         "LIVE: actual pause observed; still-valid issued token denied and existing stream closed"
     );
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(900);
+    let deadline = tokio::time::Instant::now() + owner_wait(900);
     let resumed = loop {
         let actual = mirror(original, pool, binding, id).await;
         match actual.integrations[id].state.as_str() {

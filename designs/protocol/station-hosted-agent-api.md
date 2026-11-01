@@ -247,6 +247,7 @@ Supply the Station's normal protected configuration and these test inputs:
 | `LIVE_HOSTED_READ_ONLY_BASELINE` | Optional `yes` with the HTTP check: use an `agent.view`-only grant for registry, history and subscribed stream checks. Verify approval lookup is refused for insufficient scope. No prompt or approval mutations; incompatible with recovery, approval cases and Portal lifecycle modes. |
 | `LIVE_HOSTED_PORTAL_LIFECYCLE` | Optional `yes` with the HTTP check: observe actual owner Pause/Resume, without agent mutations. Requires bounded token renewal and a coordinator for the owner actions. |
 | `LIVE_HOSTED_PORTAL_REVOKE` | Optional `yes` with the HTTP check: observe final owner revocation, without agent mutations. Mutually exclusive with pause/resume; run only after all checks requiring the grant have finished. |
+| `LIVE_HOSTED_OWNER_WAIT_SECONDS` | Optional operator observation window, 60–14,400 seconds. Applies to each owner Pause, Resume or Revoke wait; it does not extend token validity. Defaults remain 20 minutes for Pause/Revoke and 15 minutes for Resume. Keep the external supervisor and renewal lifetime longer than the chosen windows. |
 
 Run only that ignored test, with `--exact --ignored --nocapture`. It verifies
 the real token's issuer, Station audience, client, owner, operation and service
@@ -492,11 +493,25 @@ observer reads an actual paused checkpoint with an advanced cursor.
 
 The coordinator announces **ready for pause** only after real Auth/R9 admission,
 the subscribed history boundary and the first token renewal are verified. The
-owner gets a 20-minute window. Auth tokens still expire within five minutes:
+owner gets a 20-minute default window, configurable up to four hours with
+`LIVE_HOSTED_OWNER_WAIT_SECONDS`. Auth tokens still expire within five minutes:
 renew them through Auth and atomically replace the mode-0600 token file, which
 contains `access_token` and Unix-seconds `expires_at`. The observer establishes
 each replacement subscription before closing the previous one. Tokens and
 assertion keys never enter evidence or coordination messages.
+
+If the owner acts after the observation deadline, retain the real feed and Auth
+refusal evidence but do not claim an open-stream or still-valid-token check.
+On 2026-11-01, the owner Pause at 22:05:04 UTC advanced Station cursor 23 to 24
+and a matching fresh token request returned `401 invalid_client`. The earlier
+live observer had ended at 21:14:21 UTC, so it did not capture that stream
+closure. Recovery starts from the actual paused checkpoint, observes owner
+Resume and fresh-token reconnection, then arms the separately planned admin
+Pause/Resume cycle. That cycle must record its own live denial/closure evidence
+and Portal/Auth actor, reason and lock evidence; it does not retroactively prove
+the earlier owner's stream closure. The recovery coordinator uses two-hour
+action windows with a longer bounded renewal lifetime and announces expiration
+or failure before any further action is requested. Hosted execution stays closed.
 
 An actual paused checkpoint must advance the cursor and carry an authenticated
 `integration_paused` event. The issued token must still verify cryptographically
