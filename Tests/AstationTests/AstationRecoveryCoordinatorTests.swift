@@ -352,6 +352,24 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(envelopes.count, 1)
     }
 
+    func testStationConnectionNeverCreatesAReplacementForAMissingAccountKey() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        _ = try await coordinator!.setup()
+        coordinator = nil
+        h.keys.keys = []
+        let target = RecoveryMemoryRelay()
+        coordinator = try h.coordinator(relayURL: "https://new-station.example", transport: target)
+        do {
+            try await coordinator!.connectAccountSecurity(current: { true }, confirm: { XCTFail("Missing keys require recovery first"); return true })
+            XCTFail("A Station switch cannot generate replacement keys")
+        } catch { XCTAssertEqual(error.localizedDescription, DataEncryptionKeyError.invalidKey.localizedDescription) }
+        XCTAssertTrue(h.keys.keys.isEmpty)
+        XCTAssertEqual(h.savedKits.count, 1)
+        let requests = await target.appends
+        XCTAssertTrue(requests.isEmpty)
+    }
+
     private func hostAttempt(_ coordinator: AstationRecoveryCoordinator, generation: UInt64) async throws
         -> (RemotePairingCommit, RemotePairingReveal, AtemVerifyKeys) {
         let keys = try await coordinator.pairingKeys(nonce: Data(repeating: 8, count: 32))

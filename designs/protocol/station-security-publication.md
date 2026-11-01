@@ -36,7 +36,9 @@ Station selection remain current throughout the operation.
 - If the current encrypted backup is absent, use the existing durable backup
   writer and fresh local signing confirmation to seal the same data keys for the
   same Recovery Kit. Plaintext keys and the kit secret never go to Station. No
-  fallback occurs for authentication, availability or integrity errors.
+  fallback occurs for authentication, availability or integrity errors. If this
+  Mac has lost its account keys, stop for recovery; a Station switch never
+  generates a replacement key.
 - Existing revoked entries, pending evidence and origin-bound service approvals
   remain intact. Publication does not reapprove a revoked integration or authorize
   an integration on the new origin. Hosts still require the normal live route and

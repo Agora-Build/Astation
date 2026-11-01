@@ -445,6 +445,9 @@ final class AstationRecoveryCoordinator {
               saved.publication == nil, saved.restore == nil else { throw RemoteRecoveryError.requiresReview }
         var log = retained.snapshot()
         try requireManager(log)
+        guard !(try dataKeys.recoveryKeys(dataAccount: accountID)).isEmpty || saved.pendingDataKey != nil else {
+            throw DataEncryptionKeyError.invalidKey
+        }
         guard await confirm(), current(), !Task.isCancelled else { throw RemoteRecoveryError.confirmationRequired }
         do {
             let page = try await http.entries(genesisHash: kit.genesisHash, after: 0)
