@@ -572,6 +572,16 @@ requests require HTTPS and refuse redirects; credentials never enter a URL.
 The test WebSocket dependency enables Rustls with public certificate roots so
 the check exercises `wss://` with certificate verification.
 
+For an existing `agent.view`-only integration, use
+`hosted_agents::live::public::approved_public_origin_views_history_without_mutation`
+with the same public-origin inputs. It requires the token's scope to remain
+exactly `agent.view`, checks missing/invalid-token refusal, approval-scope
+refusal, current target discovery, stale-target refusal, HTTP history and
+subscribed history. It reconnects a fresh public WebSocket and verifies history
+completion again, without submitting a prompt or any agent mutation. Its
+`public_origin_view_rollout` evidence is distinct from a public prompt/receipt
+execution result; it cannot claim broader consent or execution coverage.
+
 This check needs a separately approved temporary activation on the isolated
 Station. Its ordinary worker must prove the real enrolled host and obtain
 `ready` through the authenticated Portal feed before the check runs. Neither

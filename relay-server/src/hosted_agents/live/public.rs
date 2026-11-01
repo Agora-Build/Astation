@@ -5,11 +5,25 @@ use axum::http::StatusCode;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{path::PathBuf, time::Duration};
-use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
+use tokio_tungstenite::{
+    connect_async, tungstenite::client::IntoClientRequest, MaybeTlsStream, WebSocketStream,
+};
+
+type PublicSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[tokio::test]
 #[ignore = "approved public canary, current protected token and disposable real agent required"]
 async fn approved_public_origin_recovers_one_prompt_without_replay() {
+    run(false).await;
+}
+
+#[tokio::test]
+#[ignore = "approved public canary and current view-only protected token required"]
+async fn approved_public_origin_views_history_without_mutation() {
+    run(true).await;
+}
+
+async fn run(read_only: bool) {
     assert_eq!(required("LIVE_HOSTED_DISPOSABLE"), "yes");
     assert_eq!(required("LIVE_HOSTED_PUBLIC_ROLLOUT"), "approved");
     let origin = required("PUBLIC_BASE_URL");
@@ -22,13 +36,29 @@ async fn approved_public_origin_recovers_one_prompt_without_replay() {
     let token = protected_json("LIVE_HOSTED_TOKEN_FILE");
     assert!(token["expires_at"].as_i64().unwrap() > chrono::Utc::now().timestamp() + 150);
     let raw = token["access_token"].as_str().unwrap();
+    if read_only {
+        use base64::Engine;
+        // Narrow operator inputs; the public Station verifies the signature.
+        let claims: Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(raw.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims["scope"], "agent.view");
+    }
     let path = PathBuf::from(required("LIVE_HOSTED_EVIDENCE_FILE"));
     let recovering = std::env::var("LIVE_HOSTED_RECOVER").as_deref() == Ok("receipts");
+    assert!(
+        !(read_only && recovering),
+        "view check submits no request to recover"
+    );
     assert!(
         recovering || !path.exists(),
         "existing evidence: recover, never resubmit"
     );
     let client = reqwest::Client::builder()
+        .user_agent("Astation-Canary/1")
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
@@ -69,11 +99,19 @@ async fn approved_public_origin_recovers_one_prompt_without_replay() {
         client
             .get(format!("{session_url}/approvals"))
             .bearer_auth(raw),
-        StatusCode::OK,
+        if read_only {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::OK
+        },
     )
     .await;
-    assert_eq!(approvals["target"], json!(target));
-    assert!(approvals["approvals"].as_array().unwrap().is_empty());
+    if read_only {
+        assert_eq!(approvals["error"], "insufficient_scope");
+    } else {
+        assert_eq!(approvals["target"], json!(target));
+        assert!(approvals["approvals"].as_array().unwrap().is_empty());
+    }
     let mut stale = json!(target);
     stale["process_gen"] = json!(new_id());
     response(
@@ -91,6 +129,9 @@ async fn approved_public_origin_recovers_one_prompt_without_replay() {
         request
             .headers_mut()
             .insert("authorization", format!("Bearer {raw}").parse().unwrap());
+        request
+            .headers_mut()
+            .insert("user-agent", "Astation-Canary/1".parse().unwrap());
         request
     };
     let (mut socket, _) = tokio::time::timeout(Duration::from_secs(30), connect_async(upgrade()))
@@ -112,6 +153,39 @@ async fn approved_public_origin_recovers_one_prompt_without_replay() {
         .send(json!({"target":target}).to_string().into())
         .await
         .unwrap();
+    if read_only {
+        let history = response(
+            client
+                .post(format!("{session_url}/history"))
+                .bearer_auth(raw)
+                .json(&json!({"target":target})),
+            StatusCode::OK,
+        )
+        .await;
+        let events = history["events"].as_array().unwrap();
+        assert!(events
+            .iter()
+            .any(|event| { event["type"] == "agentChat" && event["data"]["op"] == "history_end" }));
+        history_end(&mut socket).await;
+        socket.close(None).await.unwrap();
+        reconnect(&stream_url, raw, &target, true).await;
+        save_evidence(
+            &path,
+            &json!({
+                "kind":"public_origin_view_rollout", "phase":"completed",
+                "origin":origin, "integration_id":id, "target":target,
+                "health":health, "http_authenticated":true,
+                "invalid_tokens_refused":true, "approval_scope_refused":true,
+                "stale_target_refused":true, "http_history_verified":true,
+                "http_history_event_count":events.len(),
+                "subscribed_history_verified":true, "fresh_public_ws_reconnect":true,
+                "reconnected_history_verified":true, "readiness_fixture":false,
+                "agent_mutations_submitted":0
+            }),
+        );
+        println!("LIVE: public view-only HTTPS/WSS, subscribed history and fresh reconnect pass; zero agent mutations");
+        return;
+    }
     let mut evidence = if recovering {
         let saved = protected_json("LIVE_HOSTED_EVIDENCE_FILE");
         assert_eq!(saved["kind"], "public_origin_rollout");
@@ -217,12 +291,51 @@ async fn approved_public_origin_recovers_one_prompt_without_replay() {
     .await
     .expect("matching formatted response over the public event stream");
     socket.close(None).await.unwrap();
-    let (mut reconnect, _) =
-        tokio::time::timeout(Duration::from_secs(30), connect_async(upgrade()))
-            .await
-            .unwrap()
-            .expect("fresh public event-stream attachment");
-    let frame = tokio::time::timeout(Duration::from_secs(15), reconnect.next())
+    reconnect(&stream_url, raw, &target, false).await;
+    evidence["phase"] = json!("completed");
+    evidence["formatted_history_and_stream"] = json!(true);
+    evidence["fresh_public_ws_reconnect"] = json!(true);
+    save_evidence(&path, &evidence);
+    println!("LIVE: public HTTPS/WSS, one real prompt, original receipt recovery and formatted response pass");
+}
+
+async fn history_end(socket: &mut PublicSocket) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(frame) = socket.next().await {
+            let frame = frame.expect("public subscribed frame");
+            assert!(
+                !frame.is_close(),
+                "public stream closed before history completion"
+            );
+            if let Ok(text) = frame.to_text() {
+                let event: Value = serde_json::from_str(text).unwrap();
+                if event["type"] == "agentChat" {
+                    assert_ne!(event["data"]["op"], "error", "history subscription refused");
+                    if event["data"]["op"] == "history_end" {
+                        return;
+                    }
+                }
+            }
+        }
+        panic!("public stream ended before history completion");
+    })
+    .await
+    .expect("subscribed public real-host history completion");
+}
+
+async fn reconnect(stream_url: &str, raw: &str, target: &Target, subscribe: bool) {
+    let mut request = stream_url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {raw}").parse().unwrap());
+    request
+        .headers_mut()
+        .insert("user-agent", "Astation-Canary/1".parse().unwrap());
+    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(30), connect_async(request))
+        .await
+        .unwrap()
+        .expect("fresh public event-stream attachment");
+    let frame = tokio::time::timeout(Duration::from_secs(15), socket.next())
         .await
         .unwrap()
         .unwrap()
@@ -233,10 +346,12 @@ async fn approved_public_origin_recovers_one_prompt_without_replay() {
         .as_array()
         .unwrap()
         .contains(&json!(target)));
-    reconnect.close(None).await.unwrap();
-    evidence["phase"] = json!("completed");
-    evidence["formatted_history_and_stream"] = json!(true);
-    evidence["fresh_public_ws_reconnect"] = json!(true);
-    save_evidence(&path, &evidence);
-    println!("LIVE: public HTTPS/WSS, one real prompt, original receipt recovery and formatted response pass");
+    if subscribe {
+        socket
+            .send(json!({"target":target}).to_string().into())
+            .await
+            .unwrap();
+        history_end(&mut socket).await;
+    }
+    socket.close(None).await.unwrap();
 }
