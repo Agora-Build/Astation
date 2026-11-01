@@ -48,6 +48,7 @@ pub(super) async fn run(
     target: &Target,
     evidence_path: &Path,
     recovering: bool,
+    read_only: bool,
 ) {
     let checkpoint = original.policies.load(&original.binding).await.unwrap();
     assert!(!checkpoint.denied);
@@ -128,11 +129,19 @@ pub(super) async fn run(
         client
             .get(format!("{session_url}/approvals"))
             .bearer_auth(raw),
-        StatusCode::OK,
+        if read_only {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::OK
+        },
     )
     .await;
-    assert_eq!(approvals["target"], json!(target));
-    assert!(approvals["approvals"].as_array().unwrap().is_empty());
+    if read_only {
+        assert_eq!(approvals["error"], "insufficient_scope");
+    } else {
+        assert_eq!(approvals["target"], json!(target));
+        assert!(approvals["approvals"].as_array().unwrap().is_empty());
+    }
     let mut stale = json!(target);
     stale["process_gen"] = json!(new_id());
     let refused = response(
@@ -144,7 +153,9 @@ pub(super) async fn run(
     )
     .await;
     assert_eq!(refused["error"]["code"], "stale_target");
-    println!("LIVE: real JWT HTTP discovery, approval lookup and stale-target refusal pass");
+    println!(
+        "LIVE: real JWT HTTP discovery, approval scope enforcement and stale-target refusal pass"
+    );
 
     let mut upgrade = format!("ws://{address}/api/agent/v1/integrations/{id}/hosts/{host}/events")
         .into_client_request()
@@ -171,6 +182,69 @@ pub(super) async fn run(
         .send(json!({"target":target}).to_string().into())
         .await
         .unwrap();
+
+    if read_only {
+        // View-only consent must never reach the prompt/approval test paths.
+        assert!(!recovering);
+        let history = response(
+            client
+                .post(format!("{session_url}/history"))
+                .bearer_auth(raw)
+                .json(&json!({"target":target})),
+            StatusCode::OK,
+        )
+        .await;
+        assert!(history["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| { event["type"] == "agentChat" && event["data"]["op"] == "history_end" }));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(frame) = socket.next().await {
+                let frame = frame.expect("read-only subscribed frame");
+                assert!(!frame.is_close(), "stream closed before history completion");
+                if let Ok(text) = frame.to_text() {
+                    let event: Value = serde_json::from_str(text).unwrap();
+                    if event["type"] == "agentChat" {
+                        assert_ne!(event["data"]["op"], "error", "history subscription refused");
+                        if event["data"]["op"] == "history_end" {
+                            return;
+                        }
+                    }
+                }
+            }
+            panic!("stream ended before history completion");
+        })
+        .await
+        .expect("subscribed real-host history completion");
+        socket.close(None).await.unwrap();
+        server.abort();
+        let _ = server.await;
+        drop(socket);
+        drop(runtime);
+        pool.close().await;
+        fixture.cleanup().await;
+        let actual = original.policies.load(&original.binding).await.unwrap();
+        assert!(!actual.denied);
+        assert_eq!(actual.integrations[id], checkpoint.integrations[id]);
+        assert!(!super::super::HOSTED_EXECUTION_ENABLED);
+        save_evidence(
+            evidence_path,
+            &json!({
+                "kind":"protected_view_http_baseline", "phase":"completed",
+                "integration_id":id, "host":host, "target":target,
+                "http_authenticated":true, "ws_authenticated":true,
+                "initial_snapshot_verified":true, "stale_target_refused":true,
+                "approval_scope_refused":true, "http_history_verified":true,
+                "subscribed_history_verified":true, "isolated_schema_removed":true,
+                "deployed_policy_unchanged":true,
+                "readiness_fixture":true, "public_execution_enabled":false,
+                "agent_mutations_submitted":0
+            }),
+        );
+        println!("LIVE: view-only HTTP and stream baseline pass; zero agent mutations; public gate closed");
+        return;
+    }
 
     let lifecycle = std::env::var("LIVE_HOSTED_PORTAL_LIFECYCLE").as_deref() == Ok("yes");
     let revocation = std::env::var("LIVE_HOSTED_PORTAL_REVOKE").as_deref() == Ok("yes");

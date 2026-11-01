@@ -149,9 +149,16 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
     let recovering = std::env::var("LIVE_HOSTED_RECOVER").as_deref() == Ok("receipts");
     let approval_case = std::env::var("LIVE_HOSTED_APPROVAL_CASE").ok();
     let http_check = std::env::var("LIVE_HOSTED_HTTP_CHECK").as_deref() == Ok("yes");
+    let read_only = std::env::var("LIVE_HOSTED_READ_ONLY_BASELINE").as_deref() == Ok("yes");
     let resuming_approval =
         std::env::var("LIVE_HOSTED_APPROVAL_RESUME").as_deref() == Ok("pending");
     assert!(!resuming_approval || approval_case.is_some());
+    assert!(!read_only || (http_check && !recovering && approval_case.is_none()));
+    if read_only {
+        for flag in ["LIVE_HOSTED_PORTAL_LIFECYCLE", "LIVE_HOSTED_PORTAL_REVOKE"] {
+            assert_ne!(std::env::var(flag).as_deref(), Ok("yes"));
+        }
+    }
     let without_native = std::env::var("LIVE_HOSTED_WITHOUT_NATIVE").as_deref() == Ok("yes");
     let existing_cluster = std::env::var("LIVE_HOSTED_EXISTING_CLUSTER").as_deref() == Ok("yes");
     let failover_file = std::env::var("LIVE_HOSTED_FAILOVER_FILE")
@@ -269,9 +276,17 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
         }))
     };
 
-    let public = reqwest::Client::new()
+    let public_origin = if existing_cluster {
+        runtime.binding.station_origin.clone()
+    } else {
+        format!("http://127.0.0.1:{port}")
+    };
+    let public = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("bounded public gate client")
         .get(format!(
-            "http://127.0.0.1:{port}/api/agent/v1/integrations/{id}/hosts/{host}/sessions"
+            "{public_origin}/api/agent/v1/integrations/{id}/hosts/{host}/sessions"
         ))
         .bearer_auth(raw)
         .send()
@@ -315,6 +330,7 @@ async fn protected_service_against_real_host_keeps_public_execution_closed() {
             &target,
             &evidence_path,
             recovering,
+            read_only,
         )
         .await;
         if let Some(cluster) = cluster {

@@ -244,6 +244,7 @@ Supply the Station's normal protected configuration and these test inputs:
 | `LIVE_HOSTED_APPROVAL_RULE_FILE` | Protected file binding the exact offered rule to the complete target. Created after `allow_always` succeeds; required for `auto_allow`, `revoke` and `after_revoke`. |
 | `LIVE_HOSTED_APPROVAL_RESUME` | Optional explicit `pending`: continue the saved prompt only if its exact approval is still pending and no answer request has been prepared. Never submits the prompt again. Use receipt recovery instead when an answer's delivery is uncertain. |
 | `LIVE_HOSTED_HTTP_CHECK` | Optional `yes`: existing-cluster private HTTP/WebSocket check with an isolated readiness fixture. Incompatible with approval and failover modes. Never changes deployed policy or the public release gate. |
+| `LIVE_HOSTED_READ_ONLY_BASELINE` | Optional `yes` with the HTTP check: use an `agent.view`-only grant for registry, history and subscribed stream checks. Verify approval lookup is refused for insufficient scope. No prompt or approval mutations; incompatible with recovery, approval cases and Portal lifecycle modes. |
 | `LIVE_HOSTED_PORTAL_LIFECYCLE` | Optional `yes` with the HTTP check: observe actual owner Pause/Resume, without agent mutations. Requires bounded token renewal and a coordinator for the owner actions. |
 | `LIVE_HOSTED_PORTAL_REVOKE` | Optional `yes` with the HTTP check: observe final owner revocation, without agent mutations. Mutually exclusive with pause/resume; run only after all checks requiring the grant have finished. |
 
@@ -412,7 +413,8 @@ Hosted execution stays disabled pending their completion and user approval.
 existing cluster. It requires the normal protected inputs and a fresh real Auth
 token. It proves the real service connection and authoritative registry target
 before starting a loopback HTTP/WebSocket listener using the production operation
-handlers. The public release gate stays closed.
+handlers. In existing-cluster mode, the separate public gate probe uses the
+configured Station origin. The public release gate stays closed.
 
 Only a unique local Postgres test schema assumes ready policy and isolates quota
 accounting. Its policy is copied from the fresh authenticated feed; owner, issuer,
@@ -433,6 +435,15 @@ single prompt POST. An uncertain or interrupted run uses
 This is real-host HTTP adapter evidence with an explicit readiness fixture. It
 does not establish positive public-origin rollout admission or an actual Portal
 revocation. Those checks and the user's enablement decision remain distinct.
+
+For a grant containing only `agent.view`, set
+`LIVE_HOSTED_READ_ONLY_BASELINE=yes`. The check verifies authenticated session
+discovery, HTTP history, WebSocket snapshot and subscribed history completion,
+stale-process refusal and refusal of approval lookup without `agent.approve`.
+It returns before every prompt or approval submission path, saves evidence with
+`agent_mutations_submitted: 0`, removes its isolated schema and verifies the
+deployed policy is unchanged. This establishes a protected read baseline only;
+it grants no additional scopes and leaves public hosted execution disabled.
 
 The 2026-10-30 run passed in 21.46 seconds through real Auth and the protected
 approved service against the same `b61a6c3` Codex runtime. HTTP prompt
