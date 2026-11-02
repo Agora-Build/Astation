@@ -1,4 +1,4 @@
-//! Typed hosted APIs stay closed until the joint Auth/native/host release gate.
+//! Typed hosted APIs require an approved build and current integration authority.
 use crate::station_integrations::{error, IntegrationState};
 use axum::{
     http::StatusCode,
@@ -16,8 +16,8 @@ mod live;
 #[cfg(test)]
 mod tests;
 
-// Deliberately not an environment switch. Enable only after recorded live E2E.
-pub(crate) const HOSTED_EXECUTION_ENABLED: bool = false;
+// Runtime configuration cannot enable an unapproved build.
+pub(crate) const HOSTED_EXECUTION_ENABLED: bool = cfg!(feature = "hosted-agent-api");
 
 pub(crate) fn routes() -> Router<IntegrationState> {
     operation_routes().layer(axum::middleware::from_fn(release_gate))

@@ -1254,6 +1254,25 @@ openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 |
 openssl rand -out station-service-wrapping.bin 32
 ```
 
+Hosted agent APIs also require an approved build. The default image keeps
+them closed; runtime environment variables cannot enable them. After the live
+release checks and owner rollout approval, build the reviewed commit with:
+
+```sh
+docker build --build-arg ASTATION_BUILD_COMMIT="$(git rev-parse HEAD)" \
+  --build-arg ASTATION_HOSTED_AGENT_API=true \
+  --tag station-relay-server:hosted-approved relay-server
+```
+
+The equivalent Cargo feature is `hosted-agent-api`. Deploy the same immutable
+image to both replicas, preserving their exact origin, protected keys, durable
+database, Redis and network aliases. Verify each replica's build, the public
+HTTPS/WSS route and refusal of missing/invalid or revoked credentials. Keep the
+previous image for rollback; no database restore or new key generation is
+needed. Activation allows the ordinary worker to probe enrolled hosts and
+report `ready`. It does not approve integrations or expand their scopes.
+Production builds/deploys remain unchanged unless separately approved.
+
 Provision only the report key's public JWK in the platform configuration for
 the built-in, or register it in Portal for a custom Station. The authenticated
 `GET /agora-build/v1/details` (`station.read`) returns it; exact Portal-origin

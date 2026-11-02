@@ -400,7 +400,6 @@ async fn postgres_revocation_requires_signed_removal_and_durable_key_deletion_be
     assert_eq!(portal.shared.reports.lock().await.len(), 2, "a failed report retries with the key already deleted");
     runtime.report_revocations().await;
     assert_eq!(portal.shared.reports.lock().await.len(), 3, "repeated cleanup reports are idempotent");
-    assert!(!crate::hosted_agents::HOSTED_EXECUTION_ENABLED);
     drop(runtime); drop(portal); db.cleanup().await;
 }
 

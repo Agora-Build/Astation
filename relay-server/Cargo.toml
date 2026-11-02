@@ -3,6 +3,10 @@ name = "station-relay-server"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Enabled only in builds approved for hosted API rollout.
+hosted-agent-api = []
+
 [dependencies]
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }

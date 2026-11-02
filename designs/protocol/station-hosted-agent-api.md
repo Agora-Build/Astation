@@ -1,12 +1,23 @@
 # Station hosted agent API
 
-These typed handlers are wired on built-in and custom Stations, using the pinned
-shared atem-client R9 service channel. **Production admission is hard disabled** until
-the live Auth/native/host/relay-only/Mac-off flow is verified. Requests currently
-return `hosted_execution_not_verified` (503) for a valid configured Station
-origin, including the built-in default. Invalid origin configuration is refused.
-No environment variable enables execution. This document describes the implemented adapter for review
-and controlled tests, not a deployed service.
+These typed handlers serve built-in and custom Stations through the pinned
+shared atem-client R9 service channel. Approved builds enable the
+`hosted-agent-api` Cargo feature after the live release checks. Builds without
+that feature return `hosted_execution_not_verified` (503) for a valid configured
+Station origin; invalid configuration is refused. Runtime environment variables
+cannot enable a closed build.
+
+The owner approved lasting activation on `https://station-dev.agora.build` on
+2026-11-02, after the public HTTPS/WSS, Pause/Resume, live Revoke and signed
+native-removal checks passed. Approval is recorded on
+[Portal #21](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6569576785)
+and [Atem #81](https://github.com/Agora-Build/Atem/issues/81#issuecomment-6569577007).
+Production builds remain closed by default. Build with
+`cargo build --release --features hosted-agent-api`, or Docker build argument
+`ASTATION_HOSTED_AGENT_API=true`, only for an approved deployment. This enables
+the existing admission path, including readiness probes; it does not grant
+integration permissions. Auth tokens, current authenticated policy,
+native-signed service membership and R9 host admission remain mandatory.
 
 ## Provisioning and approval
 
@@ -695,9 +706,10 @@ advanced to cursor 37, state `revoked`, confirming the Station's completion
 report. Protected evidence `final-removal-20261102.json` records these checks.
 Both retained relay replicas and Redis are healthy. This closes the live
 revocation and removal gates for this disposable integration. Public hosted
-execution remains disabled pending the separately reviewed lasting rollout;
-command access requires a new appropriately scoped integration and native
-approval because this revoked grant was view-only.
+execution was still disabled when this evidence was collected. The owner then
+approved the dev rollout linked at the start of this document. Command access
+requires a new appropriately scoped integration and native approval because
+this revoked grant was view-only.
 
 After native removal, Integrations refreshes the selected Portal record with
 bounded backoff for up to two minutes, allowing Station's feed worker to finish

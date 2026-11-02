@@ -18,8 +18,14 @@ COPY src/ src/
 # so it must be present for the real build.
 COPY migrations/ migrations/
 ARG ASTATION_BUILD_COMMIT=unknown
+ARG ASTATION_HOSTED_AGENT_API=false
 # Touch main.rs so cargo knows it changed (avoids "nothing to compile").
-RUN touch src/main.rs && ASTATION_BUILD_COMMIT="$ASTATION_BUILD_COMMIT" cargo build --release
+RUN touch src/main.rs && \
+    case "$ASTATION_HOSTED_AGENT_API" in \
+      true) ASTATION_BUILD_COMMIT="$ASTATION_BUILD_COMMIT" cargo build --release --features hosted-agent-api ;; \
+      false) ASTATION_BUILD_COMMIT="$ASTATION_BUILD_COMMIT" cargo build --release ;; \
+      *) echo 'ASTATION_HOSTED_AGENT_API must be true or false' >&2; exit 1 ;; \
+    esac
 
 FROM debian:bookworm-slim
 

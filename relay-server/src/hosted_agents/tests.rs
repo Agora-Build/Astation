@@ -28,7 +28,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 #[tokio::test]
-async fn production_hosted_routes_are_closed_even_with_no_runtime() {
+async fn hosted_routes_respect_build_gate_and_require_runtime() {
     let router = routes().with_state(crate::station_integrations::IntegrationState(None));
     for (method, path) in [
         ("GET", "sessions"),
@@ -46,23 +46,43 @@ async fn production_hosted_routes_are_closed_even_with_no_runtime() {
                     .uri(format!(
                         "/api/agent/v1/integrations/{ID}/hosts/host-a/{path}"
                     ))
-                    .body(Body::empty())
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"target":{
+                        "account_id":"account-test", "atem_device_id":"host-a", "host_trust_gen":1,
+                        "session_id":"ses-aaaaaaaaaaaa", "process_gen":"11111111-1111-4111-8111-111111111111"
+                    }}).to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert!(matches!(
-            response.status(),
-            StatusCode::FORBIDDEN | StatusCode::SERVICE_UNAVAILABLE
-        ));
+        if HOSTED_EXECUTION_ENABLED && path == "events" {
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            continue;
+        }
+        assert!(
+            matches!(response.status(), StatusCode::FORBIDDEN | StatusCode::SERVICE_UNAVAILABLE),
+            "unexpected status for {method} {path}: {}",
+            response.status()
+        );
         let value: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
-        assert!(matches!(
-            value["error"]["code"].as_str(),
-            Some("invalid_station_configuration" | "hosted_execution_not_verified")
-        ));
+        if HOSTED_EXECUTION_ENABLED {
+            assert_eq!(value["error"]["code"], "host_connection_lost");
+        } else {
+            assert!(matches!(
+                value["error"]["code"].as_str(),
+                Some("invalid_station_configuration" | "hosted_execution_not_verified")
+            ));
+        }
     }
-    assert!(!HOSTED_EXECUTION_ENABLED);
+}
+
+fn http_test_routes() -> Router<IntegrationState> {
+    if HOSTED_EXECUTION_ENABLED {
+        routes()
+    } else {
+        operation_routes()
+    }
 }
 
 #[tokio::test]
@@ -981,7 +1001,7 @@ async fn postgres_http_lost_mutation_replies_recover_on_new_attachments_without_
     })
     .await
     .unwrap();
-    let router = operation_routes().with_state(crate::station_integrations::IntegrationState(
+    let router = http_test_routes().with_state(crate::station_integrations::IntegrationState(
         Some(runtime.clone()),
     ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1071,7 +1091,6 @@ async fn postgres_http_lost_mutation_replies_recover_on_new_attachments_without_
         .await
         .unwrap()
         .unwrap();
-    assert!(!HOSTED_EXECUTION_ENABLED);
     api.abort();
     let _ = api.await;
     relay.abort();
@@ -1129,9 +1148,9 @@ async fn postgres_http_api_authentication_operations_reconnect_and_revocation_wi
     .await
     .unwrap();
 
-    // Only this loopback test listener omits the release gate. Real JWT
-    // verification, policy checks and encrypted R9 handlers still run.
-    let router = operation_routes()
+    // Approved builds exercise the public routes; closed builds use a private
+    // listener to test the same JWT, policy and encrypted R9 admission.
+    let router = http_test_routes()
         .layer(axum::extract::DefaultBodyLimit::max(65_536))
         .with_state(crate::station_integrations::IntegrationState(Some(
             runtime.clone(),
@@ -1406,7 +1425,6 @@ async fn postgres_http_api_authentication_operations_reconnect_and_revocation_wi
             .status(),
         StatusCode::UNAUTHORIZED
     );
-    assert!(!HOSTED_EXECUTION_ENABLED);
     api.abort();
     let _ = api.await;
     relay.abort();
