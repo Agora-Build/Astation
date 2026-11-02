@@ -841,6 +841,12 @@ final class AstationRecoveryCoordinator {
         return log.snapshot()
     }
 
+    func stationRouteAnchor(hostID: String) throws -> RemoteStationRoute.Anchor? {
+        guard let log = membershipLog, let host = log.host(hostId: hostID) else { return nil }
+        return RemoteStationRoute.Anchor(account: accountID, genesis: log.genesisHash(),
+            host: host.hostId, trust: host.hostTrustGen)
+    }
+
     private func requireManager(_ log: MembershipLog) throws {
         let keys = try identity.remotePublicKeys()
         guard let manager = log.member(deviceId: managerID) else { throw RemoteRecoveryError.requiresReview }

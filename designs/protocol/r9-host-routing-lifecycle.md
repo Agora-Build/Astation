@@ -143,6 +143,27 @@ matrix below and the provisioned owner ceremony remain release gates. Deploy
 the relay replicas at the same revision, draining older replicas before
 admitting independent routes; mixed revisions do not share these fences.
 
+## Actual dev evidence and remaining matrix
+
+The merged hosted API increment passed a narrower actual-runtime recovery
+check: with the native Astation process absent, stopping the host-carrying
+relay replica made the retained Genie host reconnect to the surviving replica.
+The independent client recovered the original completed receipt and reply
+without replaying a prompt or restarting Atem or its agent. See the
+[recorded evidence](https://github.com/Agora-Build/Astation/pull/58#issuecomment-6489161916).
+The subsequent [public command and reconnect](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6570174233)
+also passed on the built-in dev Station. Native-process absence does not prove
+physical Mac shutdown, a full relay-cluster restart or directory reconstruction.
+
+[Astation #64](https://github.com/Agora-Build/Astation/issues/64) remains open
+for the additional actual-host matrix below. The
+[disposable-host handoff](https://github.com/Agora-Build/Atem/issues/110)
+requests an isolated Station and actual Atem runtime with disposable test
+identities. Preserve the retained Genie runtime, its active integration and
+the working shared dev Station while running destructive membership/routing
+cases on that isolated setup. Atem owns host/shared-client changes; Astation
+owns the relay observer and independent-controller validation.
+
 ## Acceptance tests
 
 Run the actual host connection path with no Mac connected: disconnect/reconnect

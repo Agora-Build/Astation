@@ -421,7 +421,7 @@ final class IntegrationApprovalViewController: NSViewController {
     }
 
     private static func requestTitle(_ record: PortalIntegrationRecord) -> String {
-        let state = record.state == "waiting_for_host" ? "approved; activation pending"
+        let state = record.state == "waiting_for_host" ? "approved; waiting for host"
             : record.state.replacingOccurrences(of: "_", with: " ")
         return "\(record.name) · \(state)"
     }
@@ -530,7 +530,7 @@ final class IntegrationApprovalViewController: NSViewController {
         guard records.indices.contains(picker.indexOfSelectedItem) else { return "No integrations are available on this Station." }
         switch records[picker.indexOfSelectedItem].state {
         case "waiting_for_host":
-            return "Access is already approved and saved. Hosted execution awaits end-to-end verification."
+            return "Access is approved and saved. Waiting for an approved Atem host to connect to this Station."
         case "provisioning":
             return "Access is already approved. The Station is preparing this integration."
         case "ready":

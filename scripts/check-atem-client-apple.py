@@ -114,7 +114,11 @@ def main():
         blob = hashlib.sha1(b"blob " + str(len(fixture_bytes)).encode() + b"\0" + fixture_bytes).hexdigest()
         if blob != pin["fixture"]["git_blob_sha1"]:
             raise ValueError("pairing fixture differs from the immutable reviewed blob")
-        subprocess.run([str(executable), str(fixture)], check=True)
+        route_fixture = REPO / "native-remote/Tests/AstationRemoteTests/Fixtures/station-route-v1.json"
+        route_payload = payloads / pin["station_route_fixture"]["payload"]
+        if route_fixture.read_bytes() != route_payload.read_bytes():
+            raise ValueError("station-route fixture differs from the immutable packaged vector")
+        subprocess.run([str(executable), str(fixture), str(route_fixture)], check=True)
         if args.install:
             destination = REPO / "build/atem-client" / pin["revision"] / "AtemClient"
             install_package(root, destination)

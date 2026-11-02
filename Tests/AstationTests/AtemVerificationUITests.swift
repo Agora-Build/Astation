@@ -58,6 +58,13 @@ final class AtemVerificationUITests: XCTestCase {
         wait(for: [drained], timeout: 2)
     }
 
+    private func sendAction(_ button: NSButton) {
+        guard button.isEnabled else { return }
+        // performClick animates and can pump the run loop before returning.
+        // Race tests need the action to finish before queued work is delivered.
+        XCTAssertTrue(NSApp.sendAction(button.action!, to: button.target, from: button))
+    }
+
     private func textFields(in view: NSView) -> [NSTextField] {
         (view as? NSTextField).map { [$0] } ?? view.subviews.flatMap { textFields(in: $0) }
     }
@@ -296,9 +303,9 @@ final class AtemVerificationUITests: XCTestCase {
             XCTAssertTrue(content.bounds.contains(frame), "Verification control is clipped: \(type(of: view))")
         }
         prompt.alert.buttons[0].performClick(nil)
-        prompt.alert.buttons[0].performClick(nil)
         XCTAssertFalse(prompt.alert.buttons[0].isEnabled)
-        XCTAssertTrue(context.policies.isEmpty)
+        drainMainQueue()
+        prompt.alert.buttons[0].performClick(nil)
         drainMainQueue()
         XCTAssertEqual(context.preflightPolicies, [.deviceOwnerAuthenticationWithBiometrics])
         XCTAssertEqual(context.policies, [.deviceOwnerAuthenticationWithBiometrics])
@@ -348,7 +355,7 @@ final class AtemVerificationUITests: XCTestCase {
         var results: [Bool] = []
         let prompt = AtemSafetyCodePrompt(request: verificationRequest, context: context) { results.append($0) }
         prompt.show()
-        prompt.alert.buttons[0].performClick(nil)
+        sendAction(prompt.alert.buttons[0])
         prompt.finish(false)
         drainMainQueue()
         XCTAssertEqual(results, [false])
@@ -700,9 +707,9 @@ final class AtemVerificationUITests: XCTestCase {
         XCTAssertFalse(prompt.passwordButton.isEnabled)
         prompt.passwordButton.performClick(nil)
         XCTAssertTrue(password.policies.isEmpty)
-        prompt.alert.buttons[0].performClick(nil)
-        prompt.passwordButton.performClick(nil)
-        prompt.passwordButton.performClick(nil)
+        sendAction(prompt.alert.buttons[0])
+        sendAction(prompt.passwordButton)
+        sendAction(prompt.passwordButton)
         drainMainQueue()
         XCTAssertTrue(biometric.policies.isEmpty)
         XCTAssertEqual(biometric.invalidations, 1)
@@ -838,8 +845,8 @@ final class AtemVerificationUITests: XCTestCase {
             let prompt = AtemSafetyCodePrompt(request: verificationRequest, context: biometric,
                 makePasswordContext: { password }) { results.append($0) }
             prompt.show()
-            prompt.alert.buttons[0].performClick(nil)
-            prompt.passwordButton.performClick(nil)
+            sendAction(prompt.alert.buttons[0])
+            sendAction(prompt.passwordButton)
             password.replies[0](true, nil)
             if closeWindow { prompt.alert.window.close() }
             else { prompt.finish(false) }

@@ -9,6 +9,10 @@ struct AtemSessionRequestRecord: Codable, Equatable {
     var approvalID: String?
     var receipt: AtemSessionReceipt?
     var refusal: AtemSessionRefusal?
+
+    var canEvict: Bool {
+        receipt.map { $0.state.final } ?? (refusal != nil)
+    }
 }
 
 struct AtemSessionRefusal: Codable, Equatable {
@@ -98,12 +102,12 @@ final class AtemSessionJournal {
         guard !loadFailed else { throw AtemSessionJSON.Invalid.json }
         var next = snapshot
         try mutation(&next)
-        guard next.requests.count <= 4096, next.hosts.count <= 128 else { throw AtemSessionJSON.Invalid.limit }
-        // Reply identifiers can enlarge final receipts. Evict old final
-        // metadata before the file limit blocks new durable submissions.
+        guard next.hosts.count <= 128 else { throw AtemSessionJSON.Invalid.limit }
+        // Definitive refusals need no recovery; unresolved work must survive
+        // both count and byte pressure, including across a restart.
         var bytes = try JSONEncoder().encode(next).count
-        while bytes > 4_194_304 {
-            guard let index = next.requests.firstIndex(where: { $0.receipt?.state.final == true }) else {
+        while next.requests.count > 4096 || bytes > 4_194_304 {
+            guard let index = next.requests.firstIndex(where: \.canEvict) else {
                 throw AtemSessionJSON.Invalid.limit
             }
             bytes -= try JSONEncoder().encode(next.requests[index]).count + 1

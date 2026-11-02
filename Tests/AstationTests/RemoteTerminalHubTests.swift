@@ -1,6 +1,7 @@
 import CryptoKit
 import AppKit
 import class AtemClient.MembershipLog
+import AstationRemote
 import XCTest
 @testable import Menubar
 
@@ -77,7 +78,9 @@ final class TerminalHubFixture {
     }
 
     init(verified: Bool = true, relayOnly: Bool? = nil,
-         prepareR9Channel: (@MainActor (AtemSessionContext) throws -> (MembershipLog, AstationChannelSigner))? = nil) throws {
+         prepareR9Channel: (@MainActor (AtemSessionContext) throws -> (MembershipLog, AstationChannelSigner))? = nil,
+         stationRouteCodec: RemoteStationRoute.Codec? = nil,
+         loadStationRouteAnchor: @escaping @MainActor (String) throws -> RemoteStationRoute.Anchor? = { _ in nil }) throws {
         directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -110,7 +113,7 @@ final class TerminalHubFixture {
             relayIdentityKeyManager: manager, relayIdentityRepairDefaults: defaults,
             atemE2EIdentity: identity, sessionJournal: journal, makeIdentityRelayTask: { _ in sockets.makeIdentity() },
             makePairingRelayTask: { _ in sockets.pairing }, workspaceNotifications: workspaceNotifications,
-            prepareR9Channel: prepareR9Channel)
+            prepareR9Channel: prepareR9Channel, stationRouteCodec: stationRouteCodec, loadStationRouteAnchor: loadStationRouteAnchor)
     }
 
     func drain() async {
@@ -191,7 +194,7 @@ final class RemoteTerminalHubTests: XCTestCase {
         XCTAssertFalse(f.hub.relayOnlyPolicyReady)
     }
 
-    func testRelayOnlyBlocksExistingAndNewDirectAgentChannelsWithoutRemovingPairing() async throws {
+    func testRelayOnlyMissingMembershipKeepsDirectPresenceStableAndAgentAccessBlocked() async throws {
         let f = try TerminalHubFixture(relayOnly: true)
         var sent: [AstationMessage] = [], closed: [String] = []
         f.hub.sendHandler = { message, _ in sent.append(message) }
@@ -201,14 +204,44 @@ final class RemoteTerminalHubTests: XCTestCase {
             atemId: f.deviceId, authenticationSessionId: f.session.id))
         await f.drain()
         XCTAssertNil(f.hub.terminalConnection(for: id))
-        XCTAssertEqual(f.hub.remoteAccessBlockReason(for: id), .offline, "An unavailable migration channel closes the direct connection")
+        XCTAssertNil(f.hub.sessionClient(for: id))
+        XCTAssertEqual(f.hub.remoteAccessBlockReason(for: id), .selectedRelayRequired)
         let types = try sent.map { try JSONSerialization.jsonObject(with: JSONEncoder().encode($0)) as? [String: Any] }
         XCTAssertFalse(types.contains { ["transportPolicy", "transportPolicyAck"].contains($0?["type"] as? String ?? "") })
         XCTAssertNotNil(f.hub.deviceSessionStore.get(sessionId: f.session.id))
         await f.drain()
-        XCTAssertEqual(closed, [id])
+        XCTAssertTrue(closed.isEmpty, "Missing membership must not trigger a direct reconnect loop")
+        XCTAssertEqual(f.hub.connectedClients.map(\.id), [id])
+        XCTAssertTrue(f.hub.supportedAtemClients.isEmpty, "A blocked direct socket is not an available agent route")
+        XCTAssertNil(f.hub.routeToFocusedAtem())
+        XCTAssertEqual(AtemClientListModel.offlineSessions(
+            activeSessions: f.hub.deviceSessionStore.getAllActive(),
+            connectedClients: f.hub.supportedAtemClients
+        ).map(\.atemId), [f.deviceId], "A local socket cannot make a host online on the selected relay")
+        XCTAssertTrue(f.hub.sessionStatusByClientId.isEmpty)
         XCTAssertFalse(f.hub.relayOnlyPolicyReady, "A direct link is never selected-relay readiness")
         XCTAssertNotNil(f.hub.deviceSessionStore.get(sessionId: f.session.id))
+    }
+
+    func testRelayOnlyRoutesToTheRelayWhenTheSameHostAlsoHasADirectConnection() async throws {
+        let f = try TerminalHubFixture(relayOnly: true)
+        try await f.start()
+        try await f.authenticate()
+        var closed: [String] = []
+        f.hub.disconnectDirectClient = { closed.append($0) }
+        let directID = UUID().uuidString
+        f.hub.addClient(ConnectedClient(id: directID, clientType: "Atem", connectedAt: Date(),
+            hostname: "Host", atemId: f.deviceId, authenticationSessionId: f.session.id,
+            isFocused: true))
+        await f.drain()
+        f.hub.pinClient(id: directID)
+        await f.drain()
+
+        XCTAssertTrue(closed.isEmpty)
+        XCTAssertEqual(f.hub.supportedAtemClients.map(\.id), [f.clientId])
+        XCTAssertEqual(f.hub.routeToFocusedAtem(), f.clientId, "A pinned direct socket cannot override relay-only")
+        XCTAssertNil(f.hub.terminalConnection(for: directID))
+        XCTAssertNotNil(f.hub.terminalConnection(for: f.clientId))
     }
 
     func testUnsupportedHostIsHiddenWithoutLosingItsPairingOrFallingBack() async throws {

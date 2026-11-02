@@ -240,20 +240,31 @@ final class FloatingSpeechControlsTests: XCTestCase {
         let content = try XCTUnwrap(toast.panel?.contentView)
         content.layoutSubtreeIfNeeded()
         let scroll = try XCTUnwrap(content.subviews.compactMap { $0 as? NSScrollView }.first)
-        return (scroll, try XCTUnwrap(scroll.documentView as? NSTextView))
+        scroll.tile()
+        let text = try XCTUnwrap(scroll.documentView as? NSTextView)
+        if let container = text.textContainer { text.layoutManager?.ensureLayout(for: container) }
+        return (scroll, text)
     }
 
-    private func scrollCaptions(_ scroll: NSScrollView, delta: Int32) async throws {
-        scroll.scrollWheel(with: try scrollEvent(delta: delta))
-        var previous = scroll.contentView.bounds.origin, settled = 0
-        for _ in 0..<100 {
+    private func scrollCaptions(_ scroll: NSScrollView, delta: Int32,
+                                deliver: ((NSEvent) -> Void)? = nil) async throws {
+        let initial = scroll.contentView.bounds.origin
+        let maximum = max(0, (scroll.documentView?.bounds.height ?? 0) - scroll.contentView.bounds.height)
+        let canMove = delta > 0 ? initial.y > 1 : initial.y < maximum - 1
+        let event = try scrollEvent(delta: delta)
+        if let deliver { deliver(event) } else { scroll.scrollWheel(with: event) }
+        var previous = initial, settled = 0, moved = false
+        // AppKit can delay the first bounds change and animate subsequent ones.
+        // Unchanged bounds before movement are not evidence of a settled scroll.
+        for _ in 0..<300 {
             try await Task.sleep(nanoseconds: 10_000_000)
             let current = scroll.contentView.bounds.origin
+            moved = moved || (delta > 0 ? current.y < initial.y : current.y > initial.y)
             settled = current == previous ? settled + 1 : 0
             previous = current
-            if settled >= 5 { return }
+            if (!canMove || moved) && settled >= 20 { return }
         }
-        XCTFail("Native caption scrolling did not settle")
+        XCTFail("Native caption scrolling did not move and settle: initial=\(initial), final=\(previous), delta=\(delta)")
     }
 
     func testManualCaptionScrollHoldsSnapshotFor15SecondsAndResumesWithoutNewSpeech() async throws {
@@ -268,7 +279,9 @@ final class FloatingSpeechControlsTests: XCTestCase {
         try await wait { manager.floatingCaptionBuffer.lines.count == 1 }
         let (scroll, text) = try captionViews(toast)
         XCTAssertGreaterThan(text.bounds.height, scroll.contentView.bounds.height)
-        try await scrollCaptions(scroll, delta: 60)
+        try await scrollCaptions(scroll, delta: 60) { event in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { scroll.scrollWheel(with: event) }
+        }
         let position = scroll.contentView.bounds.origin, snapshot = text.string
         XCTAssertLessThan(scroll.contentView.bounds.maxY, text.bounds.maxY - 1)
         text.setSelectedRange((text.string as NSString).range(of: "Earlier caption"))

@@ -16,6 +16,7 @@ private final class TransportPolicyFixture {
     var contexts: [String: AtemTransportPolicyContext] = [:]
     var sent: [Sent] = []
     var reconnects: [AtemTransportPolicyContext] = []
+    var routingFence: UInt64?
     lazy var journal = AtemSessionJournal(load: { [unowned self] in snapshot }, save: { [unowned self] state in
         if failSave { throw CocoaError(.fileWriteNoPermission) }
         snapshot = state
@@ -28,7 +29,8 @@ private final class TransportPolicyFixture {
                 let id = UUID().uuidString.lowercased()
                 sent.append(Sent(id: id, operation: operation, context: context, saved: snapshot.hostPolicies ?? []))
                 return id
-            }, reconnect: { [unowned self] in reconnects.append($0) })
+            }, reconnect: { [unowned self] in reconnects.append($0) },
+            directRestriction: { [unowned self] _ in routingFence })
     }
     func context(host: String = "host-a", relay: Bool = true, generation: String = "link-1",
                  pairing: String = "pairing-1", account: String = "account-a", verified: Bool = true,
@@ -61,6 +63,59 @@ private final class TransportPolicyFixture {
 }
 
 final class AtemTransportPolicyTests: XCTestCase {
+    func testAllowDirectAlignsPolicyBeforeClearingARoutingOnlyRestriction() throws {
+        let f = TransportPolicyFixture()
+        f.routingFence = 0
+        try f.controller.set(f.policy(false), connections: [])
+        let context = f.context()
+        f.connect(context)
+        f.reply(context, value: false, revision: 0)
+        guard case .hostPolicyRetry(true, let alignID, 0) = f.sent.last?.operation else {
+            return XCTFail("First commit relay-only at the routing fence")
+        }
+        XCTAssertEqual(f.sent.last?.saved.last?.requestID, alignID)
+        XCTAssertFalse(f.sent.last?.saved.last?.completed ?? true)
+        f.reply(context, value: true, revision: 1, outcome: "committed")
+        XCTAssertEqual(f.sent.last?.operation, .hostPolicyGet(desired: false))
+        f.reply(context, value: true, revision: 1, confirmed: false)
+        guard case .hostPolicyRetry(false, let allowID, 1) = f.sent.last?.operation else {
+            return XCTFail("Then commit the requested allow-direct decision")
+        }
+        XCTAssertNotEqual(alignID, allowID)
+        f.reply(context, value: false, revision: 2, outcome: "committed")
+        XCTAssertTrue(f.journal.snapshot.hostPolicies?.last?.completed == true)
+        XCTAssertEqual(f.journal.snapshot.hostPolicies?.last?.relayOnly, false)
+    }
+
+    func testAllowDirectAboveTheRoutingFenceStillNeedsAnExplicitManagerMutation() throws {
+        let f = TransportPolicyFixture()
+        f.routingFence = 3
+        try f.controller.set(f.policy(false), connections: [])
+        let context = f.context()
+        f.connect(context)
+        f.reply(context, value: false, revision: 4)
+        guard case .hostPolicyRetry(false, _, 4) = f.sent.last?.operation else {
+            return XCTFail("A policy read cannot clear a routing restriction")
+        }
+        f.reply(context, value: false, revision: 4, outcome: "unchanged")
+        XCTAssertTrue(f.journal.snapshot.hostPolicies?.last?.completed == true)
+    }
+
+    func testFailedAlignmentCannotSendAllowDirectOrCompleteTheDecision() throws {
+        let f = TransportPolicyFixture()
+        f.routingFence = 0
+        try f.controller.set(f.policy(false), connections: [])
+        let context = f.context()
+        f.connect(context)
+        f.reply(context, value: false, revision: 0)
+        let count = f.sent.count
+        f.reply(context, value: false, revision: 0, outcome: "save_failed", confirmed: false)
+        XCTAssertEqual(f.sent.count, count)
+        XCTAssertFalse(f.journal.snapshot.hostPolicies?.last?.completed ?? true)
+        XCTAssertTrue(f.controller.status(account: context.account, issuer: context.issuer,
+            station: context.station).contains("could not durably save"))
+    }
+
     func testAChangedStationKeepsDirectConnectionsBlockedAndRequiresAnExplicitNewPolicy() throws {
         let f = TransportPolicyFixture(), policy = f.policy()
         try f.controller.set(policy, connections: [])

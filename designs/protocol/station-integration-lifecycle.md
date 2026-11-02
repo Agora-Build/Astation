@@ -14,10 +14,12 @@ The implementation is available for review and controlled tests, not activation.
   `efde3bc1a7aa796ac301e776c5512350dcf5f6ac`. It closes Portal #16:
   authenticated snapshots include `ownerAccount`; HTTP 409 with
   `code: cursor_ahead` requires a full cursor-zero reconciliation.
-- R9 contract and host pins remain `c685abab` and `6526e1cf`. The consumed
-  Rust and verified Apple client package now pin
-  `ed0b45bad5db0a278c63efe8a464f12d4d548465` (Atem PR #100). Fingerprinting
-  delegates to the shared helper; wire and signature formats are unchanged.
+- R9 contract and host pins remain `c685abab` and `6526e1cf`. The relay Rust
+  client pins `ed0b45bad5db0a278c63efe8a464f12d4d548465` (Atem PR #100).
+  The verified prebuilt native Apple package pins
+  `623c89ad1441c7f310596f43428c851cf00590d1` (Atem PR #113), adding the
+  station-route offer/acknowledgment helpers and independent vectors.
+  Fingerprinting and route authentication delegate to the shared helpers.
 - [Portal #18](https://github.com/Agora-Build/Portal/issues/18) is closed by
   test-only Portal #19, tested `998301e8` and merged `7319e365`.
   Real-HTTP device-flow tests against Auth `ca657bb` and its reference Station
@@ -158,7 +160,8 @@ writer-receipt barrier and fail-closed policy reads remain part of the host.
 A subsequent review found that the outer policy ACK was forgeable by the
 relay. [Atem #99](https://github.com/Agora-Build/Atem/issues/99) is answered by
 PR #100 at `ed0b45bad5db0a278c63efe8a464f12d4d548465`. Astation accepts R9.8a
-for integration and consumes that exact shared Rust/Apple client pin. The
+for integration; the relay Rust client retains that pin and the native
+Apple package includes it through the newer PR #113 source above. The
 format review has no remaining critical objection; binding E2E and disposable
 actual-host verification are still release obligations.
 
@@ -187,10 +190,18 @@ new unreviewed hosts keep readiness false. Plaintext policy/ACK codecs and
 handlers are removed entirely.
 
 Saving relay-only intent immediately blocks direct terminal/chat/session
-operations. An existing direct link may perform the restricted encrypted
-migration, then closes on confirmation, refusal, conflict, save failure or
-bounded timeout without deleting its pairing. A direct confirmation never
-counts as relay readiness. Journal version 3 retains version-1/2 receipts and
+operations. Before an encrypted direct-to-relay policy mutation, stage the
+current selected endpoint using the authenticated station-route handoff.
+Atem flushes its durable result before replacing the transport; native does
+not force a reconnect to a host's stale configured endpoint. A direct
+confirmation never counts as relay readiness. If R9 preparation fails or the
+policy is refused, retain the authenticated control connection with direct
+agent access blocked and request a routing-only relay restriction. A verified
+routing acknowledgment confirms the saved endpoint, not R9 policy readiness.
+Closing an unstaged socket here can trigger an immediate host reconnect loop.
+Direct sockets are excluded from client selection and agent routing. A host
+appears online in relay-only mode only through its authenticated relay link.
+Journal version 3 retains version-1/2 receipts and
 trust floors; old readers fail closed instead of dropping mutation identity. Settings >
 Integrations exposes explicit relay-only and allow-direct actions.
 
