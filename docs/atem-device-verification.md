@@ -226,6 +226,12 @@ entitlements fail instead of skipping these integration tests.
 Personal Team profiles expire after seven days. Rerun the command to renew
 the profile and re-sign the app. All build products,
 profiles, certificate metadata, and logs stay under ignored `.build/`.
+If renewal reports `No Accounts` or cannot load account credentials, sign back
+into your personal Apple ID in Xcode Settings > Accounts, then retry the same
+command. An account listed in Xcode does not guarantee that its saved sign-in
+is usable for provisioning. Keep the same team and bundle identity; renewing
+the profile does not require resetting app identities, pairings or Keychain
+items, or switching to an organization account.
 The command executes only the probe, bundled-resource check, and tests;
 it does not start Astation's UI or a relay connection. The local app does
 not register the production `astation` SSO callback URL scheme.

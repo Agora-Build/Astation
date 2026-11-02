@@ -17,6 +17,7 @@ let package = Package(
         )
     ],
     dependencies: [
+        .package(path: "native-remote"),
         .package(url: "https://github.com/vapor/websocket-kit.git", from: "2.0.0"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.0.0"),
         .package(url: "https://github.com/AgoraIO/AgoraRtcEngine_macOS.git", exact: "4.7.0"),
@@ -37,6 +38,7 @@ let package = Package(
             dependencies: [
                 "CStationCore",
                 "CAtemCore",
+                .product(name: "AstationRemote", package: "native-remote"),
                 .product(name: "WebSocketKit", package: "websocket-kit"),
                 .product(name: "NIO", package: "swift-nio"),
                 .product(name: "RtcBasic", package: "AgoraRtcEngine_macOS"),

@@ -35,7 +35,7 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
         terminal.session.flatMap { sessions.target(sessionId: $0.terminalId, process: $0.generation) }
     }
 
-    private lazy var offlineSessions = AtemSessionClient(context: { nil }, send: { _, _ in false })
+    private lazy var offlineSessions = AtemSessionClient(context: { nil }, send: { _, _ in false }, openChannel: { _ in })
     private var sessions: AtemSessionClient {
         guard let id = targetClientId else { return offlineSessions }
         return hubManager.sessionClient(for: id, atemId: targetAtemId) ?? offlineSessions

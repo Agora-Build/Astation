@@ -2,7 +2,8 @@ import AppKit
 import LocalAuthentication
 
 enum AtemVerificationUI {
-    private static var activePrompt: UUID?
+    // AppKit does not retain targets; own modeless prompts until they complete.
+    private static var activePrompt: (id: UUID, controller: NSObject)?
 
     static func approve(_ request: AtemVerificationApproval, completion: @escaping (Bool) -> Void) -> (() -> Void) {
         approve(request, context: LAContext(), completion: completion)
@@ -12,11 +13,11 @@ enum AtemVerificationUI {
                         completion: @escaping (Bool) -> Void) -> (() -> Void) {
         guard activePrompt == nil else { completion(false); return {} }
         let id = UUID()
-        activePrompt = id
         let prompt = AtemSafetyCodePrompt(request: request, context: context) { accepted in
-            if activePrompt == id { activePrompt = nil }
+            if activePrompt?.id == id { activePrompt = nil }
             completion(accepted)
         }
+        activePrompt = (id, prompt)
         prompt.show()
         return { prompt.finish(false) }
     }
@@ -32,11 +33,11 @@ enum AtemVerificationUI {
     static func saveRecovery(_ text: String, completion: @escaping (Bool) -> Void) -> (() -> Void) {
         guard activePrompt == nil else { completion(false); return {} }
         let id = UUID()
-        activePrompt = id
         let prompt = AtemRecoveryKitPrompt(text: text) { saved in
-            if activePrompt == id { activePrompt = nil }
+            if activePrompt?.id == id { activePrompt = nil }
             completion(saved)
         }
+        activePrompt = (id, prompt)
         prompt.show()
         return { prompt.cancel() }
     }
@@ -49,11 +50,11 @@ enum AtemVerificationUI {
                        completion: @escaping (AtemUnlockDecision) -> Void) -> (() -> Void) {
         guard activePrompt == nil else { completion(.deny); return {} }
         let id = UUID()
-        activePrompt = id
         let prompt = AtemUnlockPrompt(request: request, context: context) { decision in
-            if activePrompt == id { activePrompt = nil }
+            if activePrompt?.id == id { activePrompt = nil }
             completion(decision)
         }
+        activePrompt = (id, prompt)
         prompt.show()
         return { prompt.finish(.deny) }
     }
@@ -124,12 +125,15 @@ final class AtemVerificationDialog: NSObject, NSWindowDelegate {
 final class AtemRecoveryKitPrompt: NSObject {
     private let text: String
     private let dialog: AtemVerificationDialog
+    private let makeSavePanel: () -> NSSavePanel
     private var savePanel: NSSavePanel?
     private let status = NSTextField(wrappingLabelWithString: "")
     var alert: NSAlert { dialog.alert }
 
-    init(text: String, completion: @escaping (Bool) -> Void) {
+    init(text: String, makeSavePanel: @escaping () -> NSSavePanel = { NSSavePanel() },
+         completion: @escaping (Bool) -> Void) {
         self.text = text
+        self.makeSavePanel = makeSavePanel
         dialog = AtemVerificationDialog(alert: NSAlert(), completion: completion)
     }
 
@@ -182,7 +186,7 @@ final class AtemRecoveryKitPrompt: NSObject {
 
     @objc private func saveKit() {
         guard dialog.isActive, savePanel == nil else { return }
-        let panel = NSSavePanel()
+        let panel = makeSavePanel()
         savePanel = panel
         panel.nameFieldStringValue = "Astation Recovery Kit.txt"
         panel.beginSheetModal(for: alert.window) { [weak self] result in

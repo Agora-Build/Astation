@@ -16,7 +16,7 @@ so the client and host need a coordinated rollout.
 
 Merged-pin update (2026-10-18): Atem #78 merged at `4f87bab1289848cb6a0da5707d2e7830eb5c057d`.
 The contract and complete fixture set match this review byte for byte.
-Astation's [r8 implementation](r8-client.md) now replaces the historical
+Astation's [r8 implementation](r9-client.md) now replaces the historical
 r7.3 client mentioned in the review. The four decisions remain confirmed.
 
 ## Confirmed decisions

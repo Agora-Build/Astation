@@ -29,7 +29,10 @@ cmake .. -DBUILD_TESTING=ON
 make -j$(sysctl -n hw.ncpu)
 cd ..
 
-# 2. Build the Swift app (SPM auto-downloads Agora frameworks)
+# 2. Verify/install the pinned prebuilt Atem client (requires gh sign-in)
+python3 scripts/check-atem-client-apple.py --install
+
+# 3. Build the Swift app (SPM auto-downloads Agora frameworks)
 swift build -c release
 
 # Binary at .build/release/astation
@@ -44,7 +47,7 @@ swift build -c release
 **Troubleshooting:**
 - If CMake fails with "SDK not found": Run `cmake ..` again to retry download
 - If SPM fails: Try `swift package resolve --force-resolution`
-- Clean build: `rm -rf build third_party/agora .build && swift build`
+- After deleting build products, prepare the pinned Atem client again before `swift build`.
 
 **Offline / pre-downloaded SDK**
 - Skip auto-download and use a local SDK root:
@@ -514,6 +517,7 @@ A failed build stops the script without launching an older executable.
 ```bash
 # Run these from the repo root after building both components.
 ctest --test-dir build --output-on-failure
+swift test --package-path native-remote
 swift test
 ```
 

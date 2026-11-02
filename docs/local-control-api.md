@@ -2,8 +2,8 @@
 
 The optional local API operates agents launched by `atem agent launch` using
 the running native Astation's verified session, shared chat coordinator,
-approval inbox and durable request journal. It requires Atem session r8,
-pinned to Atem main `4f87bab1289848cb6a0da5707d2e7830eb5c057d` (PR #78).
+approval inbox and durable request journal. It requires Atem session r9 inside the shared encrypted channel,
+using the pinned library described in the r9 client lifecycle.
 There is no fallback to an older protocol. An incompatible Atem is hidden
 from the session list; status reports `atem_upgrade_required: "true"`.
 Upgrade Atem and reconnect it.
@@ -11,7 +11,7 @@ Upgrade Atem and reconnect it.
 The API does not enroll devices or bypass verification, permissions, full
 target/attachment/process checks or control leases. The relay transports
 messages and is never an authority for identity or encryption state.
-See [r8 lifecycle and security invariants](../designs/protocol/r8-client.md).
+See [r9 lifecycle and security invariants](../designs/protocol/r9-client.md).
 
 ## Enable locally
 
@@ -68,7 +68,7 @@ python3 scripts/astation-api.py post chat/read --file /private/path/read.json
 
 | Route | Input or output |
 | --- | --- |
-| GET /api/v1/status | r8 implementation, lease-free answers/revocation, atomic Send, history polling, explicit API renewal, upgrade requirement and trust/push gates. |
+| GET /api/v1/status | r9 implementation, lease-free answers/revocation, atomic Send, history polling, explicit API renewal, upgrade requirement and trust/push gates. |
 | GET /api/v1/sessions | client_id, current descriptor, full target, phase/status, negotiated features, controls and control_owner. Target may be absent while connecting. Unsupported hosts are excluded. |
 | GET /api/v1/approvals | Exact request, full target, client_id, provider/host, can_answer, status and authoritative resolution. |
 | GET /api/v1/approval-rules | Active rules with client_id, target, exact rule, provider/host, can_revoke and status. Requires control permission, without a held lease. |
@@ -167,12 +167,12 @@ provisioning, provider credentials and delivery verification.
 ## Verification
 
 Automated tests run all seven pinned upstream client scenarios and native/API
-integration cases: r8 negotiation, incompatible-host filtering, Send/takeover,
+integration cases: r9 channel admission, incompatible-host filtering, Send/takeover,
 lease ownership/renewal/expiry, release before late receipts, lease-free
 approval races, result projection, ordered history, null recovered predecessors,
 coverage, stale contexts, strict JSON and HTTP admission.
 
-Live mutation tests use disposable Claude/Codex sessions with an r8 runtime
+Live mutation tests use disposable Claude/Codex sessions with an r9 runtime
 and configured hooks. Check prompts and receipts, allow once, exact always
 rules, deny, terminal/remote answer races, expiry, reconnect and revocation.
 Check the unchanged controller/deadline around each approval action. Codex

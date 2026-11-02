@@ -483,7 +483,10 @@ private struct AgentListPanel: View {
                         .multilineTextAlignment(.center)
                         .textSelection(.enabled)
                     if sessionStatus.canReconnect, let id = clientId {
-                        Button("Retry Session Connection") { hubManager.requestAgentList(from: id) }
+                        Button("Retry Session Connection") {
+                            NSApp.activate(ignoringOtherApps: true)
+                            hubManager.requestAgentList(from: id)
+                        }
                             .buttonStyle(.borderedProminent)
                     }
                 }

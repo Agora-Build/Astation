@@ -110,7 +110,7 @@ enum NetworkDebugLogger {
         "accesstoken", "apikey", "appcertificate", "authtoken", "authorization",
         "bearer", "bootstraptoken", "cookie", "credential", "encryptionkey", "otp",
         "pairingcode", "password", "proof", "refreshtoken", "secret", "session",
-        "sessionid", "sessiontoken", "token", "key", "mac"
+        "sessionid", "sessiontoken", "token", "key", "mac", "r9hint"
     ]
 
     private static func sanitizeUnstructuredText(_ text: String) -> String {
@@ -121,7 +121,9 @@ enum NetworkDebugLogger {
         if text.range(of: #""type"\s*:\s*"(session|agentChat|browserChat|push_approval|push_resolved|relayPushRegister)""#, options: .regularExpression) != nil {
             return "<agent chat content redacted; malformed envelope>"
         }
-        if text.range(of: #""op"\s*:\s*"push_(approval|resolved)""#, options: .regularExpression) != nil {
+        if text.range(of: #""op"\s*:\s*"push_(approval|resolved|hint|seen|ack)""#, options: .regularExpression) != nil
+            || text.range(of: #""type"\s*:\s*"(atem-push-hint|atem-seen)""#, options: .regularExpression) != nil
+            || text.range(of: #""r9_hint"\s*:"#, options: .regularExpression) != nil {
             return "<approval content redacted; malformed envelope>"
         }
         let replacements = [
@@ -149,12 +151,12 @@ enum NetworkDebugLogger {
     private static func sanitizeJSONObject(_ value: Any) -> Any {
         if let dictionary = value as? [String: Any] {
             if dictionary["type"] as? String == "relay",
-               let operation = (dictionary["data"] as? [String: Any])?["op"] as? String,
-               ["push_approval", "push_resolved"].contains(operation) {
+               let operation = dictionary["op"] as? String ?? (dictionary["data"] as? [String: Any])?["op"] as? String,
+               ["push_approval", "push_resolved", "push_hint", "push_seen", "push_ack"].contains(operation) {
                 return ["type": "relay", "data": ["op": operation, "content": "<redacted>"]]
             }
             if let type = dictionary["type"] as? String,
-               ["push_approval", "push_resolved", "relayPushRegister"].contains(type) {
+               ["push_approval", "push_resolved", "relayPushRegister", "atem-push-hint", "atem-seen"].contains(type) {
                 return ["type": type, "content": "<redacted>"]
             }
             if let type = dictionary["type"] as? String,

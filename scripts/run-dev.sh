@@ -75,6 +75,8 @@ if [[ "$force_build" == true || "$build_only" == true || ! -f "$repo_dir/build/l
 
 fi
 
+printf 'Preparing verified Atem client package...\n'
+python3 scripts/check-atem-client-apple.py --install
 if [[ "$force_build" == true ]]; then
     printf 'Cleaning Swift build products...\n'
     swift package clean

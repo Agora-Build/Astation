@@ -253,6 +253,7 @@ mod tests {
 
     fn create_test_state() -> AppState {
         AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),

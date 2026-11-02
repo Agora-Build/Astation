@@ -443,7 +443,7 @@ The implemented r8 host in [Atem #78](https://github.com/Agora-Build/Atem/pull/7
 is confirmed at `4f87bab1289848cb6a0da5707d2e7830eb5c057d`; see the
 [four contract decisions and review evidence](protocol/agent-control-api-atem-r6-review.md).
 The merged contract and fixture hashes are verified. Astation requires r8,
-implements the [r8 client lifecycle](protocol/r8-client.md), and hides
+implements the [r8 client lifecycle](protocol/r9-client.md), and hides
 incompatible Atem instances with an upgrade instruction. The protected local
 API supports Send/takeover, approvals and bounded history polling. Joint live
 provider tests remain separate, as recorded in the

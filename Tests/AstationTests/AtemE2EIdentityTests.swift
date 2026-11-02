@@ -164,6 +164,72 @@ final class AtemE2EIdentityTests: XCTestCase {
         XCTAssertThrowsError(try id.keyGrant(account: account, deviceId: deviceId, publicKey: device.publicKey.rawRepresentation, key: AccountDataKey(kid: "aaaaaaaa", key: key.key)))
     }
 
+    func testReverificationReplacesAllDeviceKeysDurablyAndGrantsOnlyToTheNewKey() throws {
+        let storage = TestAtemStorage(), crypto = TestAtemCryptography()
+        let id = identity(storage, crypto)
+        let keys = try prepare(id)
+        _ = try id.completeVerification(account: account, deviceId: deviceId, reveal: reveal,
+            transcript: Data(repeating: 9, count: 32), expectedSigningKey: keys.signPub, key: key)
+        let previousState = try XCTUnwrap(id.state(account: account))
+        let replacement = Curve25519.KeyAgreement.PrivateKey()
+        let replacementReveal = AtemVerifyReveal(devicePub: replacement.publicKey.rawRepresentation,
+            deviceSignPub: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation,
+            unlockAuthPub: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation,
+            nonce: Data(repeating: 5, count: 32))
+        let result = try id.completeVerification(account: account, deviceId: deviceId, reveal: replacementReveal,
+            transcript: Data(repeating: 10, count: 32), expectedSigningKey: keys.signPub, key: key)
+
+        let reloaded = identity(storage, crypto)
+        let pin = try XCTUnwrap(reloaded.credentialProjectPin(account: account, deviceId: deviceId))
+        XCTAssertEqual(pin.devicePub, replacementReveal.devicePub)
+        XCTAssertEqual(pin.deviceSignPub, replacementReveal.deviceSignPub)
+        XCTAssertEqual(pin.unlockAuthPub, replacementReveal.unlockAuthPub)
+        XCTAssertGreaterThan(try XCTUnwrap(reloaded.state(account: account)).epoch, previousState.epoch)
+        XCTAssertThrowsError(try reloaded.keyGrant(account: account, deviceId: deviceId,
+            publicKey: device.publicKey.rawRepresentation, key: key))
+        let laterGrant = try reloaded.keyGrant(account: account, deviceId: deviceId,
+            publicKey: replacementReveal.devicePub, key: key)
+        let verificationGrant = try XCTUnwrap(result.grants.first)
+        let info = try AtemStatements.grantInfo(account: account, deviceId: deviceId,
+            devicePub: replacementReveal.devicePub, kid: key.kid)
+        for grant in [verificationGrant, laterGrant] {
+            var recipient = try HPKE.Recipient(privateKey: replacement, ciphersuite: .Curve25519_SHA256_ChachaPoly,
+                info: info, encapsulatedKey: grant.encappedKey)
+            XCTAssertEqual(try recipient.open(grant.ciphertext, authenticating: Data()), key.key)
+            var oldRecipient = try HPKE.Recipient(privateKey: device, ciphersuite: .Curve25519_SHA256_ChachaPoly,
+                info: info, encapsulatedKey: grant.encappedKey)
+            XCTAssertThrowsError(try oldRecipient.open(grant.ciphertext, authenticating: Data()))
+            XCTAssertTrue(AtemE2ECrypto.verifyP256Signature(grant.signed.signature,
+                message: grant.signed.statement, publicKey: keys.signPub))
+        }
+        XCTAssertEqual(crypto.creates, 1)
+    }
+
+    func testReverificationFailurePreservesThePreviousDeviceAndAccountState() throws {
+        for failSigning in [true, false] {
+            let storage = TestAtemStorage(), crypto = TestAtemCryptography()
+            let id = identity(storage, crypto)
+            let keys = try prepare(id)
+            _ = try id.completeVerification(account: account, deviceId: deviceId, reveal: reveal,
+                transcript: Data(repeating: 9, count: 32), expectedSigningKey: keys.signPub, key: key)
+            let previousPin = try id.credentialProjectPin(account: account, deviceId: deviceId)
+            let previousState = try id.state(account: account)
+            let before = storage.data
+            let replacementReveal = AtemVerifyReveal(devicePub: Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation,
+                deviceSignPub: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation,
+                unlockAuthPub: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation,
+                nonce: Data(repeating: 5, count: 32))
+            crypto.failSign = failSigning
+            storage.failWrite = !failSigning
+            XCTAssertThrowsError(try id.completeVerification(account: account, deviceId: deviceId, reveal: replacementReveal,
+                transcript: Data(repeating: 10, count: 32), expectedSigningKey: keys.signPub, key: key))
+            XCTAssertEqual(storage.data, before)
+            let reloaded = identity(storage, crypto)
+            XCTAssertEqual(try reloaded.credentialProjectPin(account: account, deviceId: deviceId), previousPin)
+            XCTAssertEqual(try reloaded.state(account: account), previousState)
+        }
+    }
+
     func testPlainAccountVerificationHasNoGrantAndRequiresSavedRecovery() throws {
         let storage = TestAtemStorage(), crypto = TestAtemCryptography()
         let id = identity(storage, crypto)

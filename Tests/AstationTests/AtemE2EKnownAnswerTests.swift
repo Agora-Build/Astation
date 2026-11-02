@@ -78,24 +78,30 @@ final class AtemE2EKnownAnswerTests: XCTestCase {
     }
 
     func testMessagesUseTheExactAtemWireNamesAndBase64() throws {
-        let commit = AstationMessage.verifyCommit(AtemVerifyCommit(deviceId: "dev-1", commitment: bytes(AtemKnownAnswers.commitment)))
+        let commit = AstationMessage.verifyCommit(AtemVerifyCommit(deviceId: "dev-1", commitment: bytes(AtemKnownAnswers.commitment), hostTrustGeneration: 3))
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(commit)) as? [String: Any])
         XCTAssertEqual(object["type"] as? String, "verifyCommit")
-        let data = try XCTUnwrap(object["data"] as? [String: String])
-        XCTAssertEqual(data, ["device_id": "dev-1", "commitment": bytes(AtemKnownAnswers.commitment).base64EncodedString()])
+        let data = try XCTUnwrap(object["data"] as? [String: Any])
+        XCTAssertEqual(data["device_id"] as? String, "dev-1")
+        XCTAssertEqual(data["commitment"] as? String, bytes(AtemKnownAnswers.commitment).base64EncodedString())
+        XCTAssertEqual(data["host_trust_gen"] as? Int, 3)
         let certificate = AtemSignedWire(statement: bytes(AtemKnownAnswers.deviceVerified), signature: bytes(AtemKnownAnswers.deviceVerifiedSignature))
         let state = AtemSignedWire(statement: bytes(AtemKnownAnswers.accountState), signature: Data(repeating: 1, count: 64))
         let grant = AtemGrantWire(
             signed: AtemSignedWire(statement: bytes(AtemKnownAnswers.grantStatement), signature: bytes(AtemKnownAnswers.grantSignature)),
             encappedKey: bytes(AtemKnownAnswers.encappedKey), ciphertext: bytes(AtemKnownAnswers.ciphertext)
         )
+        var wireKeys = keys
+        wireKeys.genesisHash = String(repeating: "bb", count: 32)
+        var wireReveal = reveal
+        wireReveal.hostChannelPub = try Curve25519.Signing.PrivateKey(rawRepresentation: repeated(0xaa)).publicKey.rawRepresentation
         for message in [
-            commit, .verifyKeys(keys), .verifyReveal(reveal),
+            commit, .verifyKeys(wireKeys), .verifyReveal(wireReveal),
             .deviceVerified(AtemDeviceVerified(deviceVerified: certificate, accountState: state, grants: [grant])),
             .encryptionMode(accountState: state), .keyGrant(grant: grant), .verifyAbort(reason: "denied"),
         ] {
             let encoded = try JSONEncoder().encode(message)
-            XCTAssertEqual(try JSONSerialization.jsonObject(with: JSONEncoder().encode(JSONDecoder().decode(AstationMessage.self, from: encoded))) as? NSDictionary,
+            XCTAssertEqual(try JSONSerialization.jsonObject(with: JSONEncoder().encode(AstationMessage.decodePacket(encoded))) as? NSDictionary,
                            try JSONSerialization.jsonObject(with: encoded) as? NSDictionary)
         }
         XCTAssertThrowsError(try JSONDecoder().decode(AstationMessage.self, from: Data(#"{"type":"encryptionMode","data":{"mode":"off"}}"#.utf8)))

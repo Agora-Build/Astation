@@ -1,5 +1,12 @@
 # Atem and Astation session integration handoff
 
+Historical review/handoff: this records the earlier implementation and is not
+the current remote-admission or approval contract. Use [r9-client.md](r9-client.md)
+for shipped behavior and [remote-agent-api.md](remote-agent-api.md) for the
+aligned r9 plan. Atem #81 owns handoffs; PR #80 owns the new shared contract.
+Old freshness attestations, lease-taking approval answers and recovery/push
+policies in this snapshot are superseded by those documents.
+
 Updated 2026-10-16. The consolidated Astation work is in
 [draft PR #50](https://github.com/Agora-Build/Astation/pull/50),
 `feat/push-approvals`, against main. It includes the session client from the closed

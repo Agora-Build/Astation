@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import AtemClient
 @testable import Menubar
 
 final class ApprovalPushTests: XCTestCase {
@@ -8,6 +9,31 @@ final class ApprovalPushTests: XCTestCase {
     private func hint(_ kind: String, host: String = "genie") throws -> ApprovalPushHint {
         try XCTUnwrap(ApprovalPushHint(userInfo: ["kind": kind, "approval_id": id,
             "atem_device_id": host, "session_id": "claude-session"]))
+    }
+
+    func testVerifiedResolutionUsesTheFullR9IdentityAndUnsignedFieldsCannotSupplyItsScope() throws {
+        let target = ApprovalRef(accountId: "account", genesisHash: String(repeating: "a", count: 64),
+            hostId: "genie", hostTrustGen: 1, sessionId: "session", processGen: "process", approvalId: id)
+        let now = Date()
+        var inbox = ApprovalPushReconciliation()
+        XCTAssertTrue(inbox.receive(ApprovalPushHint(verified: target, resolved: true), now: now))
+        XCTAssertTrue(inbox.receive(ApprovalPushHint(verified: target, resolved: false), now: now))
+        for field in 0..<6 {
+            var changed = target
+            switch field {
+            case 0: changed.accountId = "other"
+            case 1: changed.genesisHash = String(repeating: "b", count: 64)
+            case 2: changed.hostId = "other"
+            case 3: changed.hostTrustGen = 2
+            case 4: changed.sessionId = "other"
+            default: changed.processGen = "other"
+            }
+            XCTAssertFalse(inbox.receive(ApprovalPushHint(verified: changed, resolved: false), now: now))
+        }
+        let unsigned = try XCTUnwrap(ApprovalPushHint(userInfo: ["kind":"approval","approval_id":id,
+            "atem_device_id":"genie","session_id":"session","scope":ApprovalPushHint(verified: target, resolved: true).cacheKey]))
+        XCTAssertNil(unsigned.scope)
+        XCTAssertFalse(inbox.receive(unsigned, now: now))
     }
 
     func testRegistrationUsesTheSignedBuildEnvironmentAndSendsNoAccountOrDeviceClaim() throws {
@@ -82,6 +108,20 @@ final class ApprovalPushTests: XCTestCase {
                 XCTAssertFalse(sanitized.contains("private-tool-summary"))
                 XCTAssertTrue(sanitized.contains("redacted"))
             }
+        }
+    }
+
+    func testSealedRelayAndOSPushDoNotLogCiphertextOrApprovalMetadata() throws {
+        let privateFields = ["sealed-ciphertext", "approval-identity", "device-identity"]
+        for op in ["push_hint", "push_seen", "push_ack"] {
+            let text = "{\"type\":\"relay\",\"op\":\"\(op)\",\"hints\":[{\"ct\":\"sealed-ciphertext\",\"approval_id\":\"approval-identity\",\"device_id\":\"device-identity\"}]}"
+            for wire in [text, String(text.dropLast()), "{\"atem_id\":\"host\",\"payload\":\(text)}"] {
+                let sanitized = NetworkDebugLogger.sanitizedPayload(wire)
+                for field in privateFields { XCTAssertFalse(sanitized.contains(field)) }
+            }
+        }
+        for text in ["{\"r9_hint\":\"sealed-ciphertext\"}", "{\"r9_hint\":\"sealed-ciphertext\","] {
+            XCTAssertFalse(NetworkDebugLogger.sanitizedPayload(text).contains("sealed-ciphertext"))
         }
     }
 }

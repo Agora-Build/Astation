@@ -204,6 +204,7 @@ async fn start_replica(shared: &Shared) -> Replica {
         &shared.accounts,
     );
     let state = AppState {
+        recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
         sessions: cluster.sessions.clone(),
         relay: cluster.relay.clone(),
         rtc_sessions: cluster.rtc_sessions.clone(),
@@ -545,82 +546,52 @@ async fn redis_pairing_session_create_grant_poll_and_websocket_across_replicas()
 }
 
 async fn voice_session(replica: &Replica) -> String {
-    let (status, created) = http(
-        &replica.state,
-        "POST",
-        "/api/voice-sessions",
-        r#"{"atem_id":"atem-v","channel":"ch"}"#,
-        &[],
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    created["session_id"].as_str().unwrap().to_string()
-}
-
-async fn llm_chat(state: &AppState, id: &str) -> (StatusCode, serde_json::Value) {
-    http(
-        state,
-        "POST",
-        &format!("/api/llm/chat?session_id={id}"),
-        r#"{"messages":[{"role":"user","content":"go"}]}"#,
-        &[],
-    )
-    .await
+    let id = uuid::Uuid::new_v4().to_string();
+    replica.state.voice_sessions.create(id.clone(), "atem-v".into(), "ch".into()).await.unwrap();
+    id
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn redis_voice_wait_on_one_replica_is_answered_on_the_other() {
+    use crate::voice_session::WaitOutcome;
+
     let _guard = REDIS_LOCK.lock().await;
     let (_shared, one, two) = two_replicas().await;
 
-    // Waiting on 1, answered on 2.
+    // Exercise the store directly: the legacy HTTP bridge is closed.
     let id = voice_session(&one).await;
-    let (status, _) = http(&one.state, "POST", &format!("/api/voice-sessions/{id}/trigger"), "", &[]).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(one.state.voice_sessions.trigger(&id).await.unwrap(), Some(String::new()));
     let waiting = tokio::spawn({
-        let state = one.state.clone();
+        let store = one.state.voice_sessions.clone();
         let id = id.clone();
-        async move { llm_chat(&state, &id).await }
+        async move { store.wait_reply(&id, Duration::from_secs(5)).await }
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let answer = serde_json::json!({"session_id": id, "response": "done on two"}).to_string();
     let answered = std::time::Instant::now();
-    let (status, _) = http(&two.state, "POST", "/api/voice-sessions/response", &answer, &[]).await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, body) = waiting.await.unwrap();
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["choices"][0]["message"]["content"], "done on two");
+    assert_eq!(two.state.voice_sessions.set_response(&id, "done on two".into()).await.unwrap(), Some(()));
+    assert_eq!(waiting.await.unwrap().unwrap(), WaitOutcome::Reply("done on two".into()));
     // Woken by replica 2's publish, not by the 1 s re-read of :reply (which
     // would land at least 700 ms after the answer).
     assert!(answered.elapsed() < Duration::from_millis(500), "woken after {:?}", answered.elapsed());
 
     // The answer arrives before anyone waits.
     let early = voice_session(&one).await;
-    let (status, _) = http(&one.state, "POST", &format!("/api/voice-sessions/{early}/trigger"), "", &[]).await;
-    assert_eq!(status, StatusCode::OK);
-    let answer = serde_json::json!({"session_id": early, "response": "early"}).to_string();
-    let (status, _) = http(&two.state, "POST", "/api/voice-sessions/response", &answer, &[]).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(one.state.voice_sessions.trigger(&early).await.unwrap(), Some(String::new()));
+    assert_eq!(two.state.voice_sessions.set_response(&early, "early".into()).await.unwrap(), Some(()));
     // Let replica 2's publish reach replica 1 and find no waiter there, so
     // only the stored answer can satisfy the wait below.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let started = std::time::Instant::now();
     assert_eq!(
         one.state.voice_sessions.wait_reply(&early, Duration::from_secs(5)).await.unwrap(),
-        crate::voice_session::WaitOutcome::Reply("early".to_string())
+        WaitOutcome::Reply("early".to_string())
     );
     // Found by the read before waiting, not by the 1 s re-read.
     assert!(started.elapsed() < Duration::from_millis(500), "found after {:?}", started.elapsed());
-    let (status, body) = llm_chat(&one.state, &early).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["choices"][0]["message"]["content"], "early");
-
-    // Nobody answers: the wait times out (the handler's 30 s is the same
-    // wait with LLM_WAIT_SECS; see llm_proxy::test_triggered_times_out_with_504).
+    // Nobody answers: the store wait ends at its deadline.
     let silent = voice_session(&one).await;
-    let (status, _) = http(&one.state, "POST", &format!("/api/voice-sessions/{silent}/trigger"), "", &[]).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(one.state.voice_sessions.trigger(&silent).await.unwrap(), Some(String::new()));
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(
         Duration::from_secs(5),
@@ -628,8 +599,55 @@ async fn redis_voice_wait_on_one_replica_is_answered_on_the_other() {
     )
     .await
     .expect("the wait ends at its deadline");
-    assert_eq!(outcome.unwrap(), crate::voice_session::WaitOutcome::TimedOut);
+    assert_eq!(outcome.unwrap(), WaitOutcome::TimedOut);
     assert!(started.elapsed() >= Duration::from_millis(950), "gave up after {:?}", started.elapsed());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn redis_legacy_voice_bridge_stays_closed_across_replicas_and_outages() {
+    let _guard = REDIS_LOCK.lock().await;
+    let (_shared, one, two) = two_replicas().await;
+    let id = voice_session(&one).await;
+    one.state.voice_sessions.add_transcription(&id, "private transcript".into()).await.unwrap().unwrap();
+    one.state.voice_sessions.set_response(&id, "private response".into()).await.unwrap().unwrap();
+
+    for outage in [false, true] {
+        if outage {
+            one.proxy.cut();
+        }
+        for state in [&one.state, &two.state] {
+            for (method, uri) in [
+                ("POST", "/api/voice-sessions".to_string()),
+                ("GET", format!("/api/voice-sessions/{id}")),
+                ("DELETE", format!("/api/voice-sessions/{id}")),
+                ("POST", format!("/api/voice-sessions/{id}/trigger")),
+                ("POST", "/api/voice-sessions/response".to_string()),
+                ("POST", format!("/api/llm/chat?session_id={id}")),
+            ] {
+                let request = serde_json::json!({
+                    "session_id": id,
+                    "atem_id": "atem-v",
+                    "channel": "ch",
+                    "response": "injected response",
+                    "messages": [{"role": "user", "content": "injected prompt"}],
+                });
+                let (status, body) = http(state, method, &uri, &request.to_string(), &[]).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}, outage={outage}");
+                assert_eq!(body["error"]["code"], "custom_station_required");
+                assert_eq!(body["admission_enabled"], false);
+                let response = body.to_string();
+                for private in [&id, "private transcript", "private response", "injected response", "injected prompt"] {
+                    assert!(!response.contains(private), "legacy route disclosed private content");
+                }
+            }
+        }
+        let retained = two.state.voice_sessions.get(&id).await.unwrap().unwrap();
+        assert_eq!(retained.get_accumulated_text(), "private transcript");
+        assert_eq!(retained.response.as_deref(), Some("private response"));
+        assert_eq!(retained.request_count, 0);
+        assert_eq!(two.state.voice_sessions.list_session_ids().await.unwrap(), vec![id.clone()]);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -844,8 +862,6 @@ async fn redis_down_means_503s_but_vault_and_memory_keep_working() {
             r#"{"app_id":"a","channel":"c","token":"t","host_uid":1}"#,
             serde_json::json!({"error": "Temporarily unavailable"}),
         ),
-        // The voice routes answer with a bare status, no body.
-        ("POST", "/api/voice-sessions", r#"{"atem_id":"a","channel":"c"}"#, serde_json::Value::Null),
     ] {
         let (status, response) = http(&one.state, method, uri, body, &[]).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{method} {uri}");

@@ -5,7 +5,7 @@ The contract and fixtures are pinned to Atem main `4f87bab1289848cb6a0da5707d2e7
 ([Atem #78](https://github.com/Agora-Build/Atem/pull/78)).
 All four implementation contract edits are confirmed in the
 [r6 review](agent-control-api-atem-r6-review.md). See the
-[r8 client lifecycle](r8-client.md) for the implemented negotiation, ownership,
+[r8 client lifecycle](r9-client.md) for the implemented negotiation, ownership,
 receipt, history and security invariants, and the
 [local API guide](../../docs/local-control-api.md) for callable routes.
 Astation requires revision 8 and does not fall back to r7. Unsupported Atem
@@ -16,7 +16,11 @@ This document also describes later conversation/event interfaces; proposed
 routes are labeled below. The shared session/chat service and polling API
 are implemented. Full conversation UI, SSE replay and offline push delivery
 remain separate milestones. Atem owns its implementation; communication uses
-published docs and memory, without editing or building an Atem checkout.
+GitHub [Atem #81](https://github.com/Agora-Build/Atem/issues/81) for handoffs
+and [PR #80](https://github.com/Agora-Build/Atem/pull/80) for r9 design/review,
+without editing or building an Atem checkout. New remote admission follows
+the aligned [remote API plan](remote-agent-api.md); this document describes
+the implemented r8 local API and its application behavior.
 
 ## Required first milestone
 
@@ -34,6 +38,13 @@ Chat must include both prompts typed locally in the terminal and prompts sent
 remotely, with their real origin. Return text and safe tool summaries as
 structured parts. Do not reconstruct a conversation from ANSI screen output,
 infer success from an idle indicator, or return private reasoning.
+
+Text parts already carry Markdown. Preserve that original source and typed
+tool/approval parts in API results; mobile/native chat should render paragraphs,
+headings, emphasis, clickable links, lists, code and tables instead of plain
+flattened text. The [rich message requirements](remote-agent-api.md#rich-message-presentation)
+define the shared content profile, mobile behavior and rendering boundaries.
+Images/files remain separate capabilities, not implied by Markdown support.
 
 Provider baseline: Claude Code 2.1.x (Atem verified 2.1.301) and Codex 0.162.1.
 Codex needs enabled/trusted Atem hooks and a first prompt typed in the terminal
@@ -63,10 +74,19 @@ it cannot invent an agent response, approval resolution or successful receipt.
 The existing BrowserAgentChat bridge is not a native session chat service:
 managed-session browser access remains gated by section 9.
 
+The next [remote API design](remote-agent-api.md) removes the Mac from the
+request path for enrolled native clients and scoped services/bots. Mobile
+Astation connects independently whether the Mac is online or offline; Mac and
+mobile can access the same original sessions simultaneously, with one control
+lease per agent session and lease-free approval answers. It retains the host's
+r8 operation semantics and requires joint membership and encrypted
+channel admission. The local bearer token is not remote authority. That proposal
+includes the Atem implementation handoff and headless tests.
+
 **Joint work** is the chat history boundary, recovery/correlation contract,
 provider capability expectations and shared fixtures. The Atem owner makes
-all Atem implementation changes. Shared memory and published documents are
-the handoff; Astation must not edit or build an Atem checkout.
+all Atem implementation changes. GitHub #81 and PR #80 are the handoff;
+Astation must not edit or build an Atem checkout.
 
 ## API surface and later additions
 
@@ -163,7 +183,17 @@ authoritative state before offering any action.
 APNs/FCM is the offline delivery channel and is not established by SSE or
 in-app alerts. It still needs provisioned provider credentials, authenticated
 host proof, recipient authorization and the durable relay outbox in
-[the push proposal](approval-push-proof.md). Completion push, if desired,
+[the push integration plan](approval-push-proof.md). Approval cards/live events
+are immediate. The confirmed policy sends desktop OS push immediately if no
+desktop is connected, and mobile at 60 seconds if unanswered and not actively
+seen. Optional desktop reminders and mobile immediate preference are allowed.
+Authenticated active-user seen suppresses mobile escalation, while answer or
+closure cancels every pending stage. Desktop presence is a routing hint only.
+Signed immutable creation time, expiry margin, sealed recipient hints and seen
+proofs follow the forthcoming r9 contract on Atem #80; the former 60/180 plan
+is superseded. An expiry margin suppresses delivery without disabling a valid
+approval early. These features are not implemented by provider adapters; PC
+OS delivery also needs its platform adapter. Completion push, if desired,
 needs its own agreed event and payload rules. No raw transcript belongs in
 push metadata. API and native tests can run without mobile clients; actual
 offline delivery requires a push-enabled test device and credentials.

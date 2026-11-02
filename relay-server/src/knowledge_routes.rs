@@ -815,6 +815,7 @@ mod tests {
     /// `astation_id`. Returns (state, session_id).
     async fn test_state(astation_id: &str) -> (AppState, String) {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -1535,6 +1536,7 @@ mod tests {
 
         let accounts = Arc::new(InMemoryAccountStore::default());
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -1697,6 +1699,7 @@ mod tests {
         let vault = Arc::new(InMemoryVaultStore::new());
         let accounts = Arc::new(InMemoryAccountStore::new(knowledge.clone(), vault.clone()));
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),

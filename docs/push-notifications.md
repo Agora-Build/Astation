@@ -2,64 +2,82 @@
 
 Push notifications deliver a request to a device with control permission even
 when that device has no lease. A tap reconnects and reads the approval from an
-authenticated Atem. Only an explicit answer may atomically acquire control and
-answer the exact request. The relay and the notification payload cannot approve
-anything.
+authenticated Atem. An explicit answer uses the exact pending request and
+current control permission without changing the lease. The relay and the
+notification payload cannot approve anything.
 
-The accepted product flow is now in Atem PR #72, `designs/account-trust.md`,
-"Push-based approvals". That section supersedes the earlier requirement that a
-lease must already exist to receive an approval. See the
-[implementation handoff](../designs/protocol/push-approvals-handoff.md) for the
-remaining wire-contract gates.
+Current application behavior is r9: approval answers and rule revocation need
+control permission and the exact authoritative request/rule, without acquiring
+or changing a terminal lease. The relay/notification cannot authorize an answer.
+See the [r9 client](../designs/protocol/r9-client.md) and
+[local approval API](local-control-api.md) for implemented behavior and tests.
 
-The [local approval API](local-control-api.md) supports headless integration
-tests using the real native inbox and durable journal. Mobile UI is unnecessary
-for session/answer/reconnect tests. See the [account-trust review](../designs/protocol/account-trust-review.md)
-and [host push proof draft](../designs/protocol/approval-push-proof.md) before
-enabling relay host ingress or account-wide recipients. Neither an API test nor
-a provider fake establishes real APNs delivery.
+Remote multi-device admission and sealed escalation are designed on
+[Atem PR #80](https://github.com/Agora-Build/Atem/pull/80), coordinated through
+[#81](https://github.com/Agora-Build/Atem/issues/81). The approved policy is:
+desktop OS push immediately if no desktop is connected; mobile at 60 seconds
+if unanswered and not actively seen; optional desktop reminder/mobile immediate
+preference; suppression near expiry without disabling a valid answer early.
+See the [aligned push integration plan](../designs/protocol/approval-push-proof.md).
+Signed ingress, native verification, sealed provider payloads and foreground
+attendance are implemented using the pinned shared verifier. Durable provider
+stage jobs and membership-bound token registration still gate actual dispatch.
+Neither a headless API test nor a provider fake proves actual APNs delivery.
 
 ## Current implementation boundary
 
 - **In-app alerts** show a nonmodal banner and an approval inbox while Astation
   is running. They require neither APNs nor OS notification permission. The
-  menu is directly under Astation Hub and shows the pending request count.
+  menu is directly under Astation and shows the pending request count.
   Turning alerts off retains the inbox and does not change offline push.
-- The inbox reads r7 `approval_request` / `approval_closed` from authenticated,
-  safety-code-verified Atem session clients. Requests arrive independently of
+- The inbox reads r9 `approval_request` / `approval_closed` from authenticated,
+  encrypted Atem channels. Requests arrive independently of
   control leases. Catch-up replaces existing cards without repeating alerts;
   disconnect, permission loss and process changes disable stale answers.
-- Allow once, Deny (with an optional message) and Claude's offered Always allow
-  rules use a durable r7 approval submission with `acquire:true`. The exact
-  Claude rule and scope are confirmed before sending. Codex has no Always
-  allow. Reconnect queries receipts and never repeats a decision. An unknown
-  outcome requires checking the agent instead of answering again.
+- Allow once, Deny (with an optional message) and Claude/Codex offered Always
+  allow rules use durable lease-free r9 approval submissions. Show and confirm
+  the exact offered rule and scope. Reconnect queries receipts and never
+  repeats a decision. An unknown outcome requires checking the agent instead
+  of answering again.
 - **Offline APNs push** is a separate opt-in. Native macOS can request OS
   notification permission and register its APNs
   token, re-register on an authenticated relay reconnect and unregister on opt-out.
   A build without the APNs entitlement disables only this option, with an
   explanation; the in-app option and inbox remain usable.
-- The relay persists registrations in Postgres (`0008_device_push_tokens.sql`).
+- The relay persists legacy registrations in Postgres (`0008_device_push_tokens.sql`).
   Only the current native socket that proved the Astation key can change its
-  address. Body fields cannot select an account or another device.
+  address. Body fields cannot select an account or another device. These
+  registrations prove a separate relay key and are **not** r9 push destinations.
+  A device-ID match cannot substitute for membership-key proof.
 - APNs and FCM provider adapters validate configuration, authenticate provider
-  requests, set collapse/tag identity, bound payloads, redact detected secrets
+  requests, set collapse/tag identity, bound complete payloads
   and distinguish invalid addresses from temporary or configuration failures.
 - A resolution removes matching delivered/pending notifications on the client.
   Bounded persisted tombstones suppress late duplicate transport alerts.
-- Host push ingress and account-wide recipients remain disabled.
-  The relay currently authenticates Astation keys, not an Atem device's key on
-  its room socket. A push tap reconnects, requests fresh session lists and opens
+- Signed host `push_hint` / `push_seen` ingress verifies the current membership
+  chain, host key/trust generation and captured carrier context. Postgres
+  commits sealed records, dispositions and resolution tombstones before ACK.
+  Retries and replica failover preserve original receipt and signed times.
+  Plaintext push messages are refused.
+- Visible cards in a focused foreground window with physical input in the
+  last 60 seconds report `approval_seen` with a read binding, without a lease.
+  Background deliveries and unattended windows do not report attendance.
+- Native OS delivery verifies the signed envelope, current recipient/key and
+  membership before protected checkpointing or presentation. Taps verify again.
+  The current Mac adapter uses generic OS text; it does not decrypt a summary.
+  A push tap reconnects, requests fresh session lists and opens
   the same inbox; push metadata never supplies an actionable request or rule.
   If no authoritative matching request is available, the UI says its status is
   unconfirmed. An unavailable or partial catch-up is never called "answered".
 
-In-app review targets Atem PR #72 at `5ce333e505e77429ffbfd443bdb0794b45136a03`
-([r7 contract](https://github.com/Agora-Build/Atem/blob/5ce333e505e77429ffbfd443bdb0794b45136a03/designs/protocol/atem-session-v1.md#6a-approvals-r7)).
-The session compatibility trust gate still limits access to the verified paired
-native Astation. Live APNs delivery, phones and account-wide approval access
-are not enabled or verified. Offline push requires the host authentication and
-dispatch integration as well as provider credentials and provisioning.
+The shared r9 contract is pinned at
+`c685abab92535b167f5f2658c814f0f72541d9a1`; there is no older protocol fallback.
+See the [r9 lifecycle](../designs/protocol/r9-client.md) and
+[sealed ingress implementation](../designs/protocol/sealed-push-relay.md).
+Provider dispatch remains disabled (`push_ready: false`). Live APNs delivery
+and phone workflows are not verified. Offline push still requires the durable
+delivery worker, membership-bound registration, provider credentials and
+provisioning. Independent encrypted relay channels do not require an online Mac.
 
 ## Apple setup
 
@@ -77,7 +95,7 @@ dispatch integration as well as provider credentials and provisioning.
 4. Mount the key read-only in each relay container and set the four APNs
    variables in the table below. Set the topic to the signed app's actual bundle
    identifier. Use a separate test relay for a different local bundle id/topic.
-5. In Astation, choose Astation Hub > Approval Notifications and enable
+5. In Astation, choose Astation > Approval Notifications and enable
    **Offline APNs push**. **In-app alerts** work with a free Xcode Personal Team
    profile; APNs requires an eligible paid Apple Developer Program team.
    If macOS refuses permission, allow Astation in System Settings > Notifications
@@ -101,8 +119,9 @@ additional app topics need an allowlisted registration design before shipping.
    the relay credential. An Android client must create the `agent_approvals`
    notification channel, request notification permission, register/rotate its
    token as an authenticated member device and cancel resolutions by approval id.
-4. Phones are not eligible until signed membership and connection proofs land.
-   An account login or the existing storage-device list is insufficient.
+4. Phones must enroll as control members and prove their membership key when
+   registering. That registration flow is still pending. An account login or
+   the existing storage-device list is insufficient.
 
 ## Relay configuration and deployment
 
@@ -125,24 +144,26 @@ For Coolify, mount the same secret files and configure the same topic/project
 on relay-a and relay-b. Apply the additive migration before enabling delivery.
 Roll one replica at a time with `/health` checks, following the existing relay
 deployment procedure. Configuring credentials alone does not turn on the gated
-host ingress. A merge to main deploys production and requires user approval.
+provider dispatcher. A merge to main deploys production and requires user approval.
 
 ## Delivery and privacy limits
 
 APNs collapse ids coalesce pending notifications, but do not guarantee removal
 of a delivered alert. Resolutions use background APNs/data-only FCM messages;
 the client cancels matching notifications. The FCM alert's Android tag is
-`approval_id`; resolution data carries the same id for cancellation. Background
+`approval_id`; signed resolution data carries the same full approval identity
+for cancellation. Background
 delivery is best effort, so foreground/reconnect catch-up must reconcile every
 pending card before it can be answered. A failed catch-up is not "already
 answered".
 
 Alerts use `mutable-content:1` for a future iOS notification service extension.
-There is no extension or push E2EE in this change. Today's redacted text remains
-visible to the relay and push provider; mutable-content is not encryption.
-The host must redact summaries before sending them. The relay additionally
-replaces summaries with detected credential patterns, but this is not a complete
-secret detector. Do not include raw tool inputs or transcript content.
+The provider payload's `r9_hint` carries one original signed recipient envelope;
+tool and summary remain HPKE ciphertext. Provider-visible alert text is generic.
+There is no iOS extension yet. If the protected encryption key is unavailable,
+show generic text and fetch current state after unlock, without an interactive
+biometric prompt from notification code. Do not include raw tool inputs or
+transcript content in push hints.
 
 Before enabling live delivery, the membership integration must revalidate
 control membership/revocation at send time and bind registrations to the enrolled

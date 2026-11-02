@@ -4,6 +4,30 @@ import XCTest
 final class RecoveryKitTests: XCTestCase {
     private let id = "astation-46307CB4-1707-433C-855D-8B6B27279625"
 
+    func testV2AndNewerKitsCannotDowngradeIntoABareIDRestore() {
+        for marker in ["Astation Recovery Kit v2", "Astation Recovery Kit v3", "Recovery Secret: damaged",
+            "Genesis Fingerprint: damaged", "Recovery Kit Integrity Check: damaged"] {
+            let text = marker + "\nAstation ID: " + id + "\nRelay: https://station.agora.build"
+            XCTAssertNil(RecoveryKit.parse(text))
+            XCTAssertThrowsError(try RecoveryKitInput.parse(text))
+        }
+    }
+
+    func testV2InputChecksTheReviewedIntegrityValueBeforeChoosingAnyRestoreFlow() throws {
+        let text = """
+        Astation Recovery Kit v2
+        Account ID: acct-test-1
+        Relay: https://station.agora.build
+        Recovery Secret: 3nsHwXNgHbzZBT73Z5_NOmhkrwcQBTlxeRNGgqQ43MY
+        Genesis Fingerprint: 93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89
+        Recovery Kit Integrity Check: ONWurrrQrwNrp7r9yGqyWQ
+        """
+        guard case .v2(let kit) = try RecoveryKitInput.parse(text) else { return XCTFail("v2 kit used the legacy flow") }
+        XCTAssertEqual(kit.accountID, "acct-test-1")
+        XCTAssertNil(RecoveryKit.parse(text))
+        XCTAssertThrowsError(try RecoveryKitInput.parse(text.replacingOccurrences(of: "acct-test-1", with: "acct-test-2")))
+    }
+
     func testValidatesTheGeneratedIdForm() {
         XCTAssertTrue(RecoveryKit.isValidAstationId(id))
         XCTAssertTrue(RecoveryKit.isValidAstationId("astation-\(UUID().uuidString)"))

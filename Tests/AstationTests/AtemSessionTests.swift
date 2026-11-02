@@ -27,6 +27,8 @@ private final class SessionFixture {
     var sent: [AtemSessionMessage] = []
     var chats: [AgentChatWire] = []
     var reconnects: [AtemSessionContext] = []
+    var opens: [AtemSessionContext] = []
+    var closes: [AtemSessionContext] = []
     var nextID: String?
     var canSend = true
     let disk: SessionDisk
@@ -43,7 +45,7 @@ private final class SessionFixture {
     }, sendChat: { message, _ in
         self.chats.append(message)
         return self.canSend
-    }) }
+    }, openChannel: { self.opens.append($0) }, closeChannel: { self.closes.append($0) }) }
 
     init(disk: SessionDisk = SessionDisk()) { self.disk = disk }
     var route: RemoteTerminalConnection { source!.route }
@@ -52,12 +54,12 @@ private final class SessionFixture {
     func handshake(trust: UInt64 = 1, runtime: String = runtimeID, attachment: String = attachmentID,
                    permissions: [String] = ["view", "control"], helloID: String? = nil,
                    controller: String = controllerID, remaining: UInt64 = 60_000,
-                   features: [String] = AtemSessionWire.features.sorted()) throws {
-        if sent.isEmpty { client.start() }
-        let hello = try XCTUnwrap(sent.last(where: { $0.op == "hello" }))
+                   features: [String] = AtemSessionWire.features.sorted(),
+                   mutate: (inout AtemSessionMessage) -> Void = { _ in }) throws {
+        if opens.isEmpty { client.start() }
         var reply = AtemSessionMessage(op: "welcome")
-        reply.re = helloID ?? hello.id
-        reply.revision = 8
+        reply.re = helloID
+        reply.revision = 9
         reply.features = features
         reply.account_id = "account-a"
         reply.atem_device_id = "host-a"
@@ -69,6 +71,7 @@ private final class SessionFixture {
         reply.permissions = permissions
         reply.authorization_ms_left = remaining
         reply.server_time = 1_760_500_000_000
+        mutate(&reply)
         try receive(reply)
     }
 
@@ -110,7 +113,8 @@ private final class SessionFixture {
     func receive(_ message: AtemSessionMessage, route: RemoteTerminalConnection? = nil) throws {
         let bytes = try JSONEncoder().encode(AstationMessage.session(message))
         guard case .session(let decoded) = try AstationMessage.decodePacket(bytes) else { throw AtemSessionJSON.Invalid.json }
-        client.receive(decoded, from: route ?? self.route)
+        if decoded.op == "welcome" { client.channelWelcomed(decoded, from: route ?? self.route) }
+        else { client.receive(decoded, from: route ?? self.route) }
     }
 
     func receipt(_ request: String, state: AtemReceiptState, time: UInt64 = 100) throws {
@@ -340,41 +344,6 @@ final class AtemSessionRuleTests: XCTestCase {
         AgentChatPart(id: "approval", kind: "approval", summary: "npm test",
             approval_id: "88888888-8888-4888-8888-888888888888", tool: "Bash", always_rules: [],
             state: "auto_allowed", rule_id: rule.rule_id)
-    }
-
-    func testPublishedR8RevokeFixturePinsAndValidatesEveryClientRequest() throws {
-        let directory = try XCTUnwrap(Bundle.module.url(forResource: "atem-session-v1", withExtension: nil, subdirectory: "Fixtures"))
-        let source = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: directory.appendingPathComponent("source.json"))) as? [String: Any])
-        XCTAssertEqual(source["commit"] as? String, "4f87bab1289848cb6a0da5707d2e7830eb5c057d")
-        XCTAssertEqual(source["revision"] as? String, "r8")
-        let hashes = try XCTUnwrap(source["sha256"] as? [String: String])
-        let name = "approval-rule-revoke-needs-control-not-the-lease.json"
-        let data = try Data(contentsOf: directory.appendingPathComponent(name))
-        XCTAssertEqual(SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(), hashes[name])
-        let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        let steps = try XCTUnwrap(fixture["steps"] as? [[String: Any]])
-        var revokes: [AtemSessionMessage] = []
-        var invalidPayloads = 0
-        for step in steps where step["send"] != nil {
-            let envelope = try XCTUnwrap(step["json"] as? [String: Any])
-            let fields = try XCTUnwrap(envelope["data"] as? [String: Any])
-            let bytes = try JSONSerialization.data(withJSONObject: envelope)
-            if fields["kind"] as? String == "approval_rule_revoke",
-               (fields["payload"] as? [String: Any])?["acquire"] != nil {
-                XCTAssertThrowsError(try AstationMessage.decodePacket(bytes))
-                invalidPayloads += 1
-                continue
-            }
-            guard case .session(let message) = try AstationMessage.decodePacket(bytes) else {
-                return XCTFail("Expected a session request")
-            }
-            if message.kind == "approval_rule_revoke" { revokes.append(message) }
-        }
-        XCTAssertEqual(invalidPayloads, 1)
-        XCTAssertEqual(revokes.count, 7)
-        XCTAssertTrue(revokes.contains { $0.binding?.lease_epoch == nil })
-        XCTAssertTrue(revokes.contains { $0.binding?.lease_epoch == 1 })
-        XCTAssertTrue(revokes.contains { $0.payload?["rule_id"] == .string(rule.rule_id) })
     }
 
     func testRulesRequireCurrentControlPermissionProcessAndRoute() throws {
@@ -781,7 +750,7 @@ final class AtemApprovalTests: XCTestCase {
         message.payload = AtemApprovalAnswer(approvalID: id, decision: .allowOnce).payload
         XCTAssertNoThrow(try message.validate())
         message.binding?.lease_epoch = 1
-        XCTAssertNoThrow(try message.validate(), "r8 ignores an approval answer lease epoch")
+        XCTAssertNoThrow(try message.validate(), "Approval answers ignore lease epochs")
         message.binding?.lease_epoch = nil
         message.payload = .object(["approval_id": .string(id), "decision": .string("allow_once"), "acquire": .bool(true), "rule": .string("anything")])
         XCTAssertThrowsError(try message.validate())
@@ -855,53 +824,93 @@ final class AtemApprovalTests: XCTestCase {
     }
 }
 
+final class AtemApprovalAttendanceTests: XCTestCase {
+    func testAttendanceNeedsVisibleFocusedCardAndRecentPhysicalInput() {
+        for idle in [0.0, 30, 60] {
+            XCTAssertTrue(ApprovalAttendance.eligible(appActive: true, keyWindow: true, visible: true, idleSeconds: idle))
+        }
+        for idle in [-1.0, 60.001, .infinity, .nan] {
+            XCTAssertFalse(ApprovalAttendance.eligible(appActive: true, keyWindow: true, visible: true, idleSeconds: idle))
+        }
+        XCTAssertFalse(ApprovalAttendance.eligible(appActive: false, keyWindow: true, visible: true, idleSeconds: 0))
+        XCTAssertFalse(ApprovalAttendance.eligible(appActive: true, keyWindow: false, visible: true, idleSeconds: 0))
+        XCTAssertFalse(ApprovalAttendance.eligible(appActive: true, keyWindow: true, visible: false, idleSeconds: 0))
+    }
+
+    func testSeenUsesReadBindingAndCorrelatedAcknowledgmentWithoutChangingControl() throws {
+        let f = SessionFixture(); try f.ready()
+        let approval = try f.approval()
+        XCTAssertTrue(f.client.markApprovalSeen(approval))
+        let seen = try XCTUnwrap(f.sent.last)
+        XCTAssertEqual(seen.op, "approval_seen")
+        XCTAssertEqual(seen.binding?.target, f.target)
+        XCTAssertEqual(seen.approval_id, approval.approval_id)
+        XCTAssertNil(seen.binding?.lease_epoch)
+        XCTAssertNil(seen.acquire)
+        XCTAssertFalse(f.client.markApprovalSeen(approval), "Only one report may be in flight")
+        var ack = AtemSessionMessage(op: "seen"); ack.re = UUID().uuidString.lowercased()
+        try f.receive(ack)
+        XCTAssertFalse(f.client.markApprovalSeen(approval), "Uncorrelated ACK cannot suppress reporting")
+        ack.re = seen.id; try f.receive(ack)
+        XCTAssertTrue(f.client.markApprovalSeen(approval))
+        XCTAssertEqual(f.sent.filter { $0.op == "approval_seen" }.count, 1)
+        XCTAssertTrue(f.client.canAnswer(approval), "Seen is neither an answer nor a lease operation")
+        XCTAssertFalse(f.client.controls(f.target))
+        XCTAssertFalse(f.sent.contains { ["acquire", "renew", "submit"].contains($0.op) })
+    }
+
+    func testSeenAcknowledgmentCannotConsumeAnotherOperation() throws {
+        let f = SessionFixture(); try f.ready()
+        XCTAssertTrue(f.client.acquire(f.target))
+        let acquire = try XCTUnwrap(f.sent.last)
+        var ack = AtemSessionMessage(op: "seen"); ack.re = acquire.id
+        try f.receive(ack)
+        try f.lease(replyTo: acquire.id)
+        XCTAssertTrue(f.client.controls(f.target))
+    }
+
+    func testSeenRetriesAfterTimeoutButNeverReportsClosedStaleOrUnauthorizedCards() throws {
+        let f = SessionFixture(); try f.ready()
+        let approval = try f.approval()
+        XCTAssertTrue(f.client.markApprovalSeen(approval))
+        f.time = 16; f.client.tick()
+        XCTAssertTrue(f.client.markApprovalSeen(approval))
+        try f.closeApproval(approval.approval_id)
+        XCTAssertFalse(f.client.markApprovalSeen(approval))
+
+        let stale = SessionFixture(); try stale.ready()
+        let old = try stale.approval()
+        try stale.snapshot(sequence: 2, descriptors: [SessionFixture.descriptor(process: UUID().uuidString.lowercased())])
+        XCTAssertFalse(stale.client.markApprovalSeen(old))
+        let viewer = SessionFixture(); try viewer.handshake(permissions: ["view"]); try viewer.snapshot()
+        XCTAssertFalse(viewer.client.markApprovalSeen(try viewer.approval()))
+        let noFeature = SessionFixture()
+        try noFeature.handshake(features: AtemSessionWire.features.subtracting(["approval.seen"]).sorted()); try noFeature.snapshot()
+        XCTAssertFalse(noFeature.client.markApprovalSeen(try noFeature.approval()))
+    }
+
+    func testReconnectNeedsFreshCatchupAndCanReportTheSameApprovalAgain() throws {
+        let f = SessionFixture(); try f.ready()
+        let approval = try f.approval()
+        XCTAssertTrue(f.client.markApprovalSeen(approval))
+        var ack = AtemSessionMessage(op: "seen"); ack.re = f.sent.last?.id; try f.receive(ack)
+        f.source = nil
+        XCTAssertFalse(f.client.markApprovalSeen(approval))
+        f.client.tick()
+        f.source = AtemSessionContext(route: RemoteTerminalConnection(clientId: "host", connectionId: "socket-2"),
+            account: "account-a", device: "host-a", pairingSession: "pairing-1")
+        f.client.connectionChanged()
+        try f.handshake(attachment: UUID().uuidString.lowercased()); try f.snapshot()
+        XCTAssertFalse(f.client.markApprovalSeen(approval))
+        XCTAssertTrue(f.client.markApprovalSeen(try f.approval()))
+        XCTAssertEqual(f.sent.filter { $0.op == "approval_seen" }.count, 2)
+    }
+}
+
 final class AtemSessionWireTests: XCTestCase {
     private func fixture(_ name: String) throws -> [String: Any] {
-        let url = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "json", subdirectory: "Fixtures/atem-session-v1"))
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "session-" + name, withExtension: "json", subdirectory: "Fixtures"))
         return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
-    }
-
-    func testPinnedR8FixturesMatchPublishedCommit() throws {
-        let source = try fixture("source")
-        XCTAssertEqual(source["revision"] as? String, "r8")
-        XCTAssertEqual(source["commit"] as? String, "4f87bab1289848cb6a0da5707d2e7830eb5c057d")
-        let hashes = try XCTUnwrap(source["sha256"] as? [String: String])
-        XCTAssertNotNil(hashes["second-hello-replaces-the-attachment.json"])
-        let directory = try XCTUnwrap(Bundle.module.url(forResource: "atem-session-v1", withExtension: nil, subdirectory: "Fixtures"))
-        let files = try FileManager.default.contentsOfDirectory(atPath: directory.path).filter { $0 != "source.json" }
-        XCTAssertEqual(Set(hashes.keys), Set(files))
-        for (name, expected) in hashes {
-            let digest = SHA256.hash(data: try Data(contentsOf: directory.appendingPathComponent(name)))
-                .map { String(format: "%02x", $0) }.joined()
-            XCTAssertEqual(digest, expected, name)
-        }
-    }
-
-    func testSecondHelloHostFixtureRequestsDecodeWithUUIDCapture() throws {
-        let scenario = try fixture("second-hello-replaces-the-attachment")
-        let replacement = "77777777-7777-4777-8777-777777777777"
-        let steps = try XCTUnwrap(scenario["steps"] as? [[String: Any]])
-        var operations: [String] = []
-        for step in steps where step["send"] != nil {
-            let object = try XCTUnwrap(step["json"])
-            let unresolved = try JSONSerialization.data(withJSONObject: object)
-            let raw = try XCTUnwrap(String(data: unresolved, encoding: .utf8))
-            // Captures are real protocol values, never literal placeholder strings.
-            if raw.contains("${gen2}") { XCTAssertThrowsError(try AstationMessage.decodePacket(unresolved)) }
-            let resolved = Data(raw.replacingOccurrences(of: "${gen2}", with: replacement).utf8)
-            guard case .session(let message) = try AstationMessage.decodePacket(resolved) else { return XCTFail("Expected session message") }
-            operations.append(message.op)
-            if message.op == "renew" { XCTAssertEqual(message.binding?.attachment_gen, attachmentID) }
-            if ["receipt_query", "acquire"].contains(message.op) {
-                XCTAssertEqual(message.binding?.attachment_gen, replacement)
-                XCTAssertNil(message.binding?.lease_epoch)
-            }
-            guard case .session(let roundTrip) = try AstationMessage.decodePacket(JSONEncoder().encode(AstationMessage.session(message))) else {
-                return XCTFail("Expected round trip")
-            }
-            XCTAssertEqual(roundTrip, message)
-        }
-        XCTAssertEqual(operations, ["submit", "hello", "renew", "receipt_query", "acquire", "hello"])
     }
 
     func testSharedDigestAndRawRejectionVectorsUseActualParser() throws {
@@ -929,7 +938,7 @@ final class AtemSessionWireTests: XCTestCase {
     func testCanonicalizationPreservesDistinctUnicodeKeySpellings() throws {
         let payload = try AtemSessionJSON.parse(Data(#"{"\u00e9":1,"e\u0301":2}"#.utf8))
         XCTAssertEqual(try payload.canonical(), "{\"e\u{301}\":2,\"\u{e9}\":1}")
-        let packet = Data(#"{"type":"session","data":{"v":1,"op":"hello","revision":8,"id":"11111111-1111-4111-8111-000000000001","payload":{"\u00e9":1,"e\u0301":2}}}"#.utf8)
+        let packet = Data(#"{"type":"session","data":{"v":1,"op":"list","revision":9,"id":"11111111-1111-4111-8111-000000000001","payload":{"\u00e9":1,"e\u0301":2}}}"#.utf8)
         guard case .session(let decoded) = try AstationMessage.decodePacket(packet) else { return XCTFail("session") }
         XCTAssertEqual(try decoded.payload?.canonical(), try payload.canonical())
         XCTAssertThrowsError(try AtemSessionJSON.parse(Data(#"{"a":1,"\u0061":2}"#.utf8)))
@@ -1017,143 +1026,94 @@ final class AtemSessionWireTests: XCTestCase {
         XCTAssertNoThrow(try AstationMessage.decodePacket(JSONEncoder().encode(AstationMessage.agentChat(notice))))
     }
 
-    func testEverySharedClientScenarioUsesRealWireMessages() throws {
-        let directory = try XCTUnwrap(Bundle.module.url(forResource: "atem-session-v1", withExtension: nil, subdirectory: "Fixtures"))
-        var scenarios = 0
-        for url in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).sorted(by: { $0.path < $1.path }) where url.pathExtension == "json" {
-            let scenario = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
-            guard scenario["side"] as? String == "client" else { continue }
-            scenarios += 1
-            let f = SessionFixture()
-            let setup = try XCTUnwrap(scenario["setup"] as? [String: Any])
-            let clients = try XCTUnwrap(setup["clients"] as? [[String: Any]])
-            let steps = try XCTUnwrap(scenario["steps"] as? [[String: Any]])
-            let explicitHello = steps.contains { ($0["json"] as? [String: Any])?["data"].flatMap { $0 as? [String: Any] }?["op"] as? String == "hello" && $0["send"] != nil }
-            if !explicitHello {
-                try f.handshake(permissions: XCTUnwrap(clients.first?["permissions"] as? [String]))
-                if let sessions = setup["sessions"] as? [[String: Any]], !sessions.isEmpty { try f.snapshot() }
-            }
-            var conversations: [String: String] = [:]
-            var sentBaseline = f.sent.count
-            var chatBaseline = f.chats.count
-            for (index, step) in steps.enumerated() {
-                let location = "\(url.lastPathComponent) step \(index)"
-                if let advance = step["advance_ms"] as? Double { f.time += advance / 1000 }
-                else if step["send"] != nil {
-                    let object = try XCTUnwrap(step["json"] as? [String: Any])
-                    guard case .session(let message) = try AstationMessage.decodePacket(JSONSerialization.data(withJSONObject: object)) else { return XCTFail(location) }
-                    f.nextID = message.id
-                    switch message.op {
-                    case "hello":
-                        if f.sent.isEmpty { f.client.start() }
-                        else {
-                            // Production reconnects the authenticated transport
-                            // before replacing the attachment; no authority resumes.
-                            let old = try XCTUnwrap(f.source)
-                            f.source = AtemSessionContext(route: old.route, account: old.account, device: old.device,
-                                pairingSession: old.pairingSession, transportGeneration: "fixture-\(index)")
-                            f.client.connectionChanged()
-                        }
-                    case "list":
-                        // Welcome sends list automatically. Correlation ids are
-                        // opaque; subsequent fixture replies use the actual id.
-                        f.nextID = nil
-                    case "acquire": f.client.acquire(f.target, takeover: message.takeover ?? false)
-                    case "renew": f.client.renew(f.target)
-                    case "submit":
-                        XCTAssertNotNil(f.client.submit(f.target, kind: try XCTUnwrap(message.kind), text: message.payload?["text"]?.string,
-                            requestID: try XCTUnwrap(message.request_id), takeover: message.expected_controller), location)
-                    default: return XCTFail("Unexpected client op: " + location)
-                    }
-                    let actual = try XCTUnwrap(f.sent.last(where: { $0.op == message.op }), location)
-                    if message.op != "list" { XCTAssertEqual(actual.id, message.id, location) }
-                    XCTAssertEqual(actual.revision, message.revision, location)
-                    if message.op == "submit" {
-                        XCTAssertEqual(actual.binding, message.binding, location)
-                        XCTAssertEqual(actual.acquire, message.acquire, location)
-                        XCTAssertEqual(actual.payload, message.payload, location)
-                    }
-                    sentBaseline = f.sent.count; chatBaseline = f.chats.count
-                } else if step["client_open_chat"] != nil {
-                    if f.client.registry.isEmpty { try f.snapshot() }
-                    let fixtureID = try XCTUnwrap(step["conversation"] as? String)
-                    conversations[fixtureID] = try XCTUnwrap(f.client.chatSnapshot(f.target)?.chat_id)
-                    XCTAssertEqual(f.chats.last?.op, "open", location)
-                    XCTAssertNil(f.chats.last?.generation, location)
-                    XCTAssertNil(f.chats.last?.before, location)
-                    sentBaseline = f.sent.count; chatBaseline = f.chats.count
-                } else if step["client_try"] != nil {
-                    let object = try XCTUnwrap(step["json"] as? [String: Any])
-                    guard case .agentChat(let message) = try AstationMessage.decodePacket(JSONSerialization.data(withJSONObject: object)) else { return XCTFail(location) }
-                    sentBaseline = f.sent.count; chatBaseline = f.chats.count
-                    XCTAssertNil(f.client.chatHistory(f.target, before: message.before, next: message.next, turn: message.turn_id,
-                        request: message.request_id), location)
-                } else if step["deliver_to_client"] != nil {
-                    let object = try XCTUnwrap(step["json"] as? [String: Any])
-                    let packet = try AstationMessage.decodePacket(JSONSerialization.data(withJSONObject: object))
-                    switch packet {
-                    case .session(var message):
-                        if message.op == "welcome" {
-                            if f.client.phase == .ready {
-                                let old = try XCTUnwrap(f.source)
-                                f.source = AtemSessionContext(route: old.route, account: old.account, device: old.device,
-                                    pairingSession: old.pairingSession, transportGeneration: "welcome-\(index)")
-                                f.client.connectionChanged()
-                            }
-                            message.re = try XCTUnwrap(f.sent.last(where: { $0.op == "hello" })).id
-                        }
-                        try f.receive(message)
-                    case .agentChat(var message):
-                        message.conversationId = conversations[message.conversationId] ?? message.conversationId
-                        f.client.receiveChat(message, from: f.route)
-                    default: return XCTFail("Unexpected fixture family: " + location)
-                    }
-                } else if let expected = step["assert_client"] as? [String: Any] {
-                    let supported: Set<String> = ["controls", "input_enabled", "deadline_ms", "registry", "registry_state", "runtime_epoch", "seq", "sent_list",
-                        "admitted", "revision", "features_enabled", "lookup_enabled", "coverage_enabled", "chat_enabled", "sent",
-                        "chat_truncated", "chat_reopens", "chat_loaded", "chat_messages"]
-                    XCTAssertTrue(Set(expected.keys).isSubset(of: supported), location)
-                    if let controls = expected["controls"] as? Bool { XCTAssertEqual(f.client.controls(f.target), controls, location) }
-                    if let input = expected["input_enabled"] as? Bool { XCTAssertEqual(f.client.binding(for: f.target, mutation: true) != nil, input, location) }
-                    if let deadline = expected["deadline_ms"] as? Double { XCTAssertEqual(try XCTUnwrap(f.client.controlDeadline(for: f.target)) * 1000, deadline, accuracy: 0.001, location) }
-                    if let ids = expected["registry"] as? [String] { XCTAssertEqual(f.client.registry.keys.sorted(), ids.sorted(), location) }
-                    if let epoch = expected["runtime_epoch"] as? UInt64 { XCTAssertEqual(f.client.runtimeEpoch, epoch, location) }
-                    if let seq = expected["seq"] as? UInt64 { XCTAssertEqual(f.client.sequence, seq, location) }
-                    if let listed = expected["sent_list"] as? Bool {
-                        if listed { XCTAssertGreaterThan(f.sent.filter { $0.op == "list" }.count, 1, location) }
-                        else { XCTAssertFalse(f.sent.contains { $0.op == "list" }, location) }
-                    }
-                    if let admitted = expected["admitted"] as? Bool { XCTAssertEqual(f.client.phase == .ready, admitted, location) }
-                    if let revision = expected["revision"] as? UInt64 { XCTAssertEqual(f.client.welcome?.revision, revision, location) }
-                    else if expected["revision"] is NSNull { XCTAssertNil(f.client.welcome?.revision, location) }
-                    if let features = expected["features_enabled"] as? [String] { XCTAssertEqual(f.client.features, Set(features), location) }
-                    for (key, feature) in [("lookup_enabled", "chat.lookup"), ("coverage_enabled", "chat.coverage"), ("chat_enabled", "chat.history_end")] {
-                        if let enabled = expected[key] as? Bool { XCTAssertEqual(f.client.features.contains(feature), enabled, location) }
-                    }
-                    if let states = expected["registry_state"] as? [String: String] {
-                        for (id, state) in states { XCTAssertEqual(f.client.registry[id]?.state, state, location) }
-                    }
-                    let chat = f.client.chatSnapshot(f.target)
-                    if let truncated = expected["chat_truncated"] as? Bool { XCTAssertEqual(chat?.truncated, truncated, location) }
-                    if let loaded = expected["chat_loaded"] as? Bool { XCTAssertEqual(chat?.loaded, loaded, location) }
-                    if let reopens = expected["chat_reopens"] as? Int { XCTAssertEqual(chat?.reopens, reopens, location) }
-                    if let ids = expected["chat_messages"] as? [String] { XCTAssertEqual(chat?.messages.compactMap(\.messageId), ids, location) }
-                    if let sent = expected["sent"] as? [Any] {
-                        XCTAssertTrue(sent.isEmpty, "Add matcher before accepting non-empty sent assertions")
-                        XCTAssertEqual(f.sent.count, sentBaseline, location)
-                        XCTAssertEqual(f.chats.count, chatBaseline, location)
-                    }
-                    sentBaseline = f.sent.count; chatBaseline = f.chats.count
-                } else { XCTFail("Unhandled fixture step: " + location) }
-            }
-        }
-        XCTAssertEqual(scenarios, 7, "Every pinned r8 client-side scenario must execute")
-    }
-
 }
 
 final class AtemSessionClientTests: XCTestCase {
-    func testR71ClientReplacementOnSameTransportFencesAuthorityAndQueriesDurableReceipt() throws {
+    func testOwnerConfirmationDoesNotConsumeTheNetworkTimeout() throws {
+        let f = SessionFixture()
+        f.client.start()
+        let context = try XCTUnwrap(f.source)
+        f.client.channelAuthorizationStarted(context: context)
+        f.time = 120; f.client.tick()
+        XCTAssertEqual(f.client.phase, .connecting)
+        XCTAssertTrue(f.closes.isEmpty)
+        XCTAssertTrue(f.sent.isEmpty)
+        f.client.channelHandshakeStarted(context: context)
+        f.time = 144; f.client.tick()
+        XCTAssertEqual(f.client.phase, .connecting)
+        try f.ready()
+        XCTAssertEqual(f.client.phase, .ready)
+        XCTAssertNotNil(f.client.target(sessionId: sessionID, process: processID))
+    }
+
+    func testNetworkTimeoutStillAppliesAfterDelayedOwnerConfirmation() throws {
+        let f = SessionFixture()
+        f.client.start()
+        let context = try XCTUnwrap(f.source)
+        f.client.channelAuthorizationStarted(context: context)
+        f.time = 120; f.client.tick()
+        f.client.channelHandshakeStarted(context: context)
+        f.time = 145; f.client.tick()
+        XCTAssertEqual(f.client.phase, .failed)
+        XCTAssertEqual(f.closes, [context])
+        f.client.channelHandshakeStarted(context: context)
+        XCTAssertEqual(f.client.phase, .failed, "Delayed callbacks cannot revive a failed channel")
+    }
+
+    func testDisconnectedOwnerConfirmationCannotPauseTheNextConnectionsTimeout() throws {
+        let f = SessionFixture()
+        f.client.start()
+        let old = try XCTUnwrap(f.source)
+        f.client.channelAuthorizationStarted(context: old)
+        f.source = nil; f.client.connectionChanged()
+        f.client.channelHandshakeStarted(context: old)
+        XCTAssertEqual(f.client.phase, .offline)
+        f.source = AtemSessionContext(route: RemoteTerminalConnection(clientId: "host", connectionId: "socket-2"),
+            account: old.account, device: old.device, pairingSession: old.pairingSession)
+        f.client.connectionChanged()
+        f.client.channelAuthorizationStarted(context: old)
+        f.client.channelHandshakeStarted(context: old)
+        f.time = 25; f.client.tick()
+        XCTAssertEqual(f.client.phase, .failed, "Stale authorization cannot delay the replacement's timeout")
+    }
+
+    func testOpeningR9NeverEmitsPlaintextAndRepeatedVerificationDoesNotCancelSigning() throws {
+        let f = SessionFixture()
+        f.client.start()
+        XCTAssertEqual(f.opens.count, 1)
+        XCTAssertTrue(f.sent.isEmpty)
+        let context = try XCTUnwrap(f.source)
+        f.client.verificationDidComplete(context: context)
+        f.client.verificationDidComplete(context: context)
+        XCTAssertEqual(f.opens.count, 2)
+        XCTAssertEqual(f.closes.count, 1)
+        XCTAssertTrue(f.sent.isEmpty)
+        f.time = 25
+        f.client.tick()
+        XCTAssertEqual(f.client.phase, .failed)
+        XCTAssertEqual(f.opens.count, 2, "A timeout cannot negotiate or retry an older protocol")
+        XCTAssertFalse(f.client.unsupportedVersion, "Silence is not an authenticated version refusal")
+        XCTAssertTrue(f.sent.isEmpty)
+        XCTAssertEqual(f.closes.count, 2)
+    }
+
+    func testPlaintextWelcomeCannotEstablishAnR9PresentationSession() throws {
+        let f = SessionFixture()
+        f.client.start()
+        var welcome = AtemSessionMessage(op: "welcome")
+        welcome.revision = 9; welcome.features = AtemSessionWire.features.sorted()
+        welcome.account_id = "account-a"; welcome.atem_device_id = "host-a"
+        welcome.host_trust_gen = 1; welcome.runtime_gen = runtimeID
+        welcome.controller_session = controllerID; welcome.attachment_gen = attachmentID
+        welcome.client_kind = "native"; welcome.permissions = ["view", "control"]
+        welcome.authorization_ms_left = 60_000; welcome.server_time = 1_760_500_000_000
+        f.client.receive(welcome, from: f.route)
+        XCTAssertNil(f.client.welcome)
+        XCTAssertEqual(f.client.phase, .connecting)
+        XCTAssertTrue(f.sent.isEmpty)
+    }
+
+    func testR9ChannelReplacementOnSameTransportFencesAuthorityAndQueriesDurableReceipt() throws {
         let f = SessionFixture()
         try f.ready(); try f.takeControl()
         let request = try XCTUnwrap(f.client.submit(f.target, kind: "prompt", text: "run the tests",
@@ -1169,11 +1129,11 @@ final class AtemSessionClientTests: XCTestCase {
         f.source = source
         f.time = 2
         // A recreated client has lost attachment state but retains the protected
-        // journal. r7.1 welcomes its second hello on this same authenticated link.
+        // journal. A new r9 channel gets a fresh attachment on the authenticated link.
         f.client = f.makeClient()
         f.client.start()
-        let hello = try XCTUnwrap(f.sent.last)
-        XCTAssertEqual(hello.op, "hello")
+        XCTAssertEqual(f.opens.count, 2)
+        XCTAssertFalse(f.sent.contains { $0.op == "hello" })
         let replacement = "77777777-7777-4777-8777-777777777777"
         try f.handshake(attachment: replacement, controller: "99999999-9999-4999-8999-999999999999", remaining: 58_000)
         let query = try XCTUnwrap(f.sent.last(where: { $0.op == "receipt_query" }))
@@ -1206,88 +1166,58 @@ final class AtemSessionClientTests: XCTestCase {
         XCTAssertTrue(f.client.controls(f.target))
         XCTAssertEqual(f.client.binding(for: f.target, mutation: true)?.lease_epoch, 3)
         XCTAssertTrue(f.reconnects.isEmpty)
-        XCTAssertEqual(f.source, source, "The replacement hello uses the same authenticated transport")
+        XCTAssertEqual(f.source, source, "The replacement r9 channel uses the same authenticated transport")
         f.time = 60; f.client.tick()
         XCTAssertEqual(f.client.phase, .failed, "Replacement preserves the host's original authorization deadline")
         XCTAssertFalse(f.client.controls(f.target))
     }
 
-    func testVerificationRetriesAnUnauthorizedInitialHelloOnceAndFencesItsOldReply() throws {
-        for correlated in [false, true] {
-            let f = SessionFixture(); f.client.start()
-            let original = try XCTUnwrap(f.sent.last?.id)
-            var refusal = AtemSessionMessage(op: "error")
-            refusal.re = correlated ? original : nil
-            refusal.code = "unauthorized"
-            try f.receive(refusal)
-            f.time = 9; f.client.tick()
-            XCTAssertEqual(f.sent.count, 1)
-            f.client.verificationDidComplete(context: try XCTUnwrap(f.source))
-            let retry = try XCTUnwrap(f.sent.last?.id)
-            XCTAssertNotEqual(retry, original)
-            XCTAssertEqual(f.sent.count, 2)
-            XCTAssertEqual(f.sent.last?.revision, 8)
-            XCTAssertTrue(f.reconnects.isEmpty)
-            f.client.verificationDidComplete(context: try XCTUnwrap(f.source))
-            try f.handshake(helloID: original)
-            XCTAssertNil(f.client.welcome)
-            refusal.re = correlated ? retry : nil
-            try f.receive(refusal)
-            f.client.verificationDidComplete(context: try XCTUnwrap(f.source))
-            f.time = 30; f.client.tick()
-            XCTAssertEqual(f.client.phase, .failed)
-            XCTAssertEqual(f.sent.count, 2, "Duplicates and a refused retry never loop")
-        }
-        let f = SessionFixture(); f.client.start()
-        var refusal = AtemSessionMessage(op: "error"); refusal.code = "unauthorized"
-        try f.receive(refusal)
-        f.client.verificationDidComplete(context: try XCTUnwrap(f.source))
-        try f.handshake(); try f.snapshot()
-        XCTAssertTrue(f.client.hasRegistrySnapshot)
-        f.client.verificationDidComplete(context: try XCTUnwrap(f.source))
-        XCTAssertEqual(f.sent.filter { $0.op == "hello" }.count, 2)
+    func testCommittedMembershipReopensExistingChannelAndQueriesReceiptsWithoutRestoringControl() throws {
+        let f = SessionFixture(); try f.ready(); try f.takeControl()
+        let request = try XCTUnwrap(f.client.submit(f.target, kind: "prompt", text: "run once"))
+        let context = try XCTUnwrap(f.source)
+        // Reopening a window keeps this context and therefore keeps the old channel.
+        f.client.connectionChanged()
+        XCTAssertEqual(f.opens.count, 1)
+        f.client.channelMembershipRefreshed(context: context)
+        XCTAssertEqual(f.client.phase, .connecting)
+        XCTAssertEqual(f.closes, [context])
+        XCTAssertEqual(f.opens, [context, context])
+        XCTAssertFalse(f.client.controls(f.target))
+        XCTAssertNil(f.client.welcome)
+        XCTAssertTrue(f.client.registry.isEmpty)
+        XCTAssertNil(f.client.submit(f.target, kind: "prompt", text: "must wait"))
+        try f.handshake(attachment: "77777777-7777-4777-8777-777777777777")
+        try f.snapshot()
+        XCTAssertEqual(f.sent.last(where: { $0.op == "receipt_query" })?.request_ids, [request])
+        XCTAssertEqual(f.sent.filter { $0.op == "submit" }.count, 1)
+        XCTAssertEqual(f.sent.filter { $0.op == "acquire" }.count, 1)
+        XCTAssertFalse(f.client.controls(f.target))
+        XCTAssertTrue(f.reconnects.isEmpty, "Only the encrypted channel is replaced")
     }
 
-    func testVerificationCompletionRacingTheInitialRefusalStillRetriesOnce() throws {
-        for correlated in [false, true] {
-            let f = SessionFixture(); f.client.start()
-            let original = try XCTUnwrap(f.sent.last?.id)
-            f.client.verificationDidComplete(context: try XCTUnwrap(f.source))
-            XCTAssertEqual(f.sent.count, 1, "Wait for the outstanding hello instead of replacing it")
-            var refusal = AtemSessionMessage(op: "error")
-            refusal.code = "unauthorized"; refusal.re = correlated ? original : nil
-            try f.receive(refusal)
-            XCTAssertEqual(f.sent.count, 2)
-            try f.handshake(); try f.snapshot()
-            XCTAssertTrue(f.client.hasRegistrySnapshot)
-        }
+    func testMembershipRefreshFromAnOldContextCannotReplaceTheCurrentChannel() throws {
+        let f = SessionFixture(); try f.ready()
+        let old = try XCTUnwrap(f.source)
+        f.source = AtemSessionContext(route: old.route, account: old.account, device: old.device,
+            pairingSession: old.pairingSession, transportGeneration: "replacement-socket")
+        f.client.connectionChanged()
+        let opens = f.opens, closes = f.closes
+        f.client.channelMembershipRefreshed(context: old)
+        XCTAssertEqual(f.opens, opens)
+        XCTAssertEqual(f.closes, closes)
     }
 
-    func testVerificationCannotRetryAnotherContextOrAnUnrelatedFailure() throws {
-        for code in ["unsupported_version", "busy", "forbidden", "paused"] {
-            let f = SessionFixture(); f.client.start()
-            var refusal = AtemSessionMessage(op: "error")
-            refusal.code = code; refusal.re = f.sent.last?.id
-            try f.receive(refusal)
-            f.client.verificationDidComplete(context: try XCTUnwrap(f.source))
-            XCTAssertEqual(f.sent.count, 1, code)
-        }
-        let f = SessionFixture(); f.client.start()
-        let original = try XCTUnwrap(f.source)
-        var refusal = AtemSessionMessage(op: "error"); refusal.code = "unauthorized"
-        try f.receive(refusal)
-        for stale in [
-            AtemSessionContext(route: original.route, account: "other", device: original.device, pairingSession: original.pairingSession),
-            AtemSessionContext(route: original.route, account: original.account, device: "other", pairingSession: original.pairingSession),
-            AtemSessionContext(route: original.route, account: original.account, device: original.device, pairingSession: "other"),
-            AtemSessionContext(route: original.route, account: original.account, device: original.device,
-                pairingSession: original.pairingSession, transportGeneration: "old-socket")
-        ] { f.client.verificationDidComplete(context: stale) }
-        XCTAssertEqual(f.sent.count, 1)
-        f.source = nil
-        f.client.verificationDidComplete(context: original)
-        XCTAssertEqual(f.sent.count, 1)
-        XCTAssertTrue(f.reconnects.isEmpty)
+    func testLateLeaseReplyCannotRestoreControlAfterMembershipRefresh() throws {
+        let f = SessionFixture(); try f.ready()
+        f.client.acquire(f.target)
+        let request = try XCTUnwrap(f.sent.last(where: { $0.op == "acquire" })).id
+        f.client.channelMembershipRefreshed(context: try XCTUnwrap(f.source))
+        try f.handshake(attachment: "77777777-7777-4777-8777-777777777777")
+        try f.snapshot()
+        try f.lease(replyTo: request)
+        XCTAssertFalse(f.client.controls(f.target))
+        XCTAssertEqual(f.client.welcome?.attachment_gen, "77777777-7777-4777-8777-777777777777")
     }
 
     func testVerificationAfterAWelcomeNeverReplacesTheAttachmentOrAcquiresControl() throws {
@@ -1304,58 +1234,6 @@ final class AtemSessionClientTests: XCTestCase {
         XCTAssertFalse(f.client.controls(f.target))
     }
 
-    func testUnauthorizedHelloRetryReconnectsTransportAndFencesOldReply() throws {
-        for correlated in [false, true] {
-            let f = SessionFixture(); f.client.start()
-            let first = try XCTUnwrap(f.sent.last?.id)
-            var refusal = AtemSessionMessage(op: "error")
-            refusal.re = correlated ? first : nil
-            refusal.code = "unauthorized"
-            try f.receive(refusal)
-            XCTAssertTrue(f.client.connectionStatus.canReconnect)
-            XCTAssertFalse(f.client.status.contains("Complete verification"))
-            f.time = 9; f.client.tick()
-            XCTAssertEqual(f.sent.count, 1, "Discovery never retries on a timer")
-            XCTAssertTrue(f.reconnects.isEmpty)
-            f.client.refresh()
-            f.client.refresh()
-            XCTAssertEqual(f.reconnects, [f.source!], "Repeated clicks coalesce while reconnecting")
-            XCTAssertEqual(f.sent.count, 1, "Never send a second hello on the old socket")
-            try f.handshake(helloID: first)
-            XCTAssertEqual(f.client.phase, .reconnecting)
-            f.source = AtemSessionContext(route: f.route, account: "account-a", device: "host-a",
-                pairingSession: "pairing-1", transportGeneration: "fresh-mac-socket")
-            f.client.connectionChanged()
-            XCTAssertEqual(f.sent.count, 2)
-            XCTAssertNotEqual(f.sent.last?.id, first)
-            try f.handshake(); try f.snapshot(); try f.takeControl()
-            refusal.re = nil
-            try f.receive(refusal)
-            XCTAssertEqual(f.client.phase, .reconnecting)
-            XCTAssertEqual(f.reconnects.count, 2)
-            XCTAssertFalse(f.client.status.contains("verification"))
-            XCTAssertFalse(f.client.connectionStatus.canReconnect)
-            let sent = f.sent.count
-            f.client.refresh()
-            XCTAssertEqual(f.sent.count, sent)
-            XCTAssertFalse(f.client.controls(f.target))
-        }
-    }
-
-    func testUnauthorizedHelloCannotRetryAfterAuthenticatedContextIsRevoked() throws {
-        let f = SessionFixture(); f.client.start()
-        var refusal = AtemSessionMessage(op: "error")
-        refusal.code = "unauthorized"
-        try f.receive(refusal)
-        f.source = nil
-        f.client.refresh()
-        XCTAssertEqual(f.sent.count, 1)
-        f.client.tick()
-        XCTAssertEqual(f.client.phase, .offline)
-        XCTAssertFalse(f.client.connectionStatus.canReconnect)
-        XCTAssertTrue(f.reconnects.isEmpty)
-    }
-
     func testContextRestorationOnSameSocketReconnectsWithoutReplayingRequestsOrControl() throws {
         let f = SessionFixture()
         try f.ready(); try f.takeControl()
@@ -1364,16 +1242,15 @@ final class AtemSessionClientTests: XCTestCase {
         f.source = nil; f.client.connectionChanged()
         XCTAssertFalse(f.client.controls(f.target))
         f.source = original; f.client.connectionChanged()
-        XCTAssertEqual(f.client.phase, .reconnecting)
-        XCTAssertEqual(f.reconnects, [original])
-        XCTAssertEqual(f.sent.filter { $0.op == "hello" }.count, 1)
-        try f.handshake()
+        XCTAssertEqual(f.client.phase, .connecting)
+        XCTAssertTrue(f.reconnects.isEmpty)
+        XCTAssertEqual(f.opens.count, 2)
         XCTAssertNil(f.client.welcome)
         f.source = AtemSessionContext(route: original.route, account: original.account, device: original.device,
             pairingSession: original.pairingSession, transportGeneration: "socket-2")
         f.client.connectionChanged()
         try f.handshake(attachment: "99999999-9999-4999-8999-999999999999"); try f.snapshot()
-        XCTAssertEqual(f.sent.filter { $0.op == "hello" }.count, 2)
+        XCTAssertEqual(f.opens.count, 3)
         XCTAssertEqual(f.sent.filter { $0.op == "submit" }.count, 1)
         XCTAssertEqual(f.sent.filter { $0.op == "acquire" }.count, 1)
         XCTAssertEqual(f.sent.last(where: { $0.op == "receipt_query" })?.request_ids, [request])
@@ -1391,7 +1268,7 @@ final class AtemSessionClientTests: XCTestCase {
         XCTAssertEqual(f.reconnects.count, 1)
         XCTAssertFalse(f.client.controls(f.target))
         XCTAssertTrue(f.client.registry.isEmpty)
-        XCTAssertEqual(f.sent.filter { $0.op == "hello" }.count, 1)
+        XCTAssertFalse(f.sent.contains { $0.op == "hello" })
         try f.receive(refusal)
         XCTAssertEqual(f.reconnects.count, 1)
     }
@@ -1592,6 +1469,66 @@ final class AtemSessionClientTests: XCTestCase {
         let stale = SessionFixture(disk: disk)
         try stale.handshake(trust: 1)
         XCTAssertEqual(stale.client.phase, .failed)
+    }
+
+    func testWelcomeReportsTrustRollbackWithoutReplacingTheSavedRuntimeFloor() throws {
+        let disk = SessionDisk()
+        let original = SessionFixture(disk: disk)
+        try original.handshake(trust: 5)
+        try original.snapshot(epoch: 10)
+        let saved = disk.state
+
+        let stale = SessionFixture(disk: disk)
+        try stale.handshake(trust: 3)
+        XCTAssertEqual(stale.client.phase, .failed)
+        XCTAssertTrue(stale.client.status.contains("older trust generation (3; previously accepted 5)"))
+        XCTAssertEqual(disk.state, saved)
+        XCTAssertFalse(stale.client.journal.loadFailed, "A rejected rollback is not a storage fault")
+        XCTAssertFalse(stale.sent.contains { ["list", "receipt_query", "acquire", "submit"].contains($0.op) })
+
+        let newer = SessionFixture(disk: disk)
+        try newer.handshake(trust: 6)
+        try newer.snapshot(epoch: 1)
+        XCTAssertTrue(newer.client.hasRegistrySnapshot)
+        XCTAssertEqual(disk.state.hosts.first?.trust, 6)
+        XCTAssertEqual(disk.state.hosts.first?.runtimeEpoch, 1)
+    }
+
+    func testWelcomeDiagnosticsNameTheFailedCheckWithoutExposingPayloads() throws {
+        let cases: [(String, (inout AtemSessionMessage) -> Void)] = [
+            ("account_id", { $0.account_id = "private-other-account" }),
+            ("atem_device_id", { $0.atem_device_id = "private-other-device" }),
+            ("client_kind", { $0.client_kind = "browser" }),
+            ("permissions", { $0.permissions = ["control"] }),
+            ("authorization_ms_left", { $0.authorization_ms_left = 0 }),
+            ("authorization_ms_left", { $0.authorization_ms_left = 86_400_001 }),
+            ("host_error", { $0.host_error = "private-host-error" }),
+        ]
+        for (field, mutate) in cases {
+            let f = SessionFixture()
+            try f.handshake(mutate: mutate)
+            XCTAssertEqual(f.client.phase, .failed, field)
+            XCTAssertTrue(f.client.status.contains("(\(field))"), f.client.status)
+            XCTAssertFalse(f.client.status.contains("private-"))
+            XCTAssertTrue(f.disk.state.hosts.isEmpty)
+            XCTAssertFalse(f.sent.contains { $0.op == "list" })
+        }
+    }
+
+    func testWelcomeJournalFailureIsDistinctFromTrustRollbackAndKeepsTheFence() throws {
+        let disk = SessionDisk()
+        disk.state.hosts = [AtemSessionHostFence(account: "account-a", device: "host-a", trust: 5,
+            runtimeEpoch: 10, runtimeGeneration: runtimeID)]
+        let f = SessionFixture(disk: disk)
+        let saved = disk.state
+        disk.fail = true
+        try f.handshake(trust: 6)
+        XCTAssertEqual(f.client.phase, .failed)
+        XCTAssertEqual(f.client.status, "Could not save the session's verification state. Check this Mac's local storage before reconnecting.")
+        XCTAssertTrue(f.client.journal.loadFailed)
+        XCTAssertFalse(f.client.connectionStatus.canReconnect)
+        XCTAssertEqual(disk.state, saved)
+        XCTAssertFalse(f.sent.contains { $0.op == "list" })
     }
 
     func testLocalTakeoverFencesOutstandingRenewalAndQueuedControlReply() throws {
@@ -1885,7 +1822,7 @@ final class AtemSessionTerminalTests: XCTestCase {
     }
 }
 
-final class AtemR8IntegrationTests: XCTestCase {
+final class AtemR9PresentationTests: XCTestCase {
     private func admit(_ f: SessionFixture, _ request: String, epoch: UInt64 = 1) throws {
         let submit = try XCTUnwrap(f.sent.last { $0.op == "submit" && $0.request_id == request })
         var reply = AtemSessionMessage(op: "receipt")
@@ -2081,15 +2018,15 @@ final class AtemR8IntegrationTests: XCTestCase {
         XCTAssertFalse(f.client.controls(f.target), "A fresh snapshot says there is no holder")
     }
 
-    func testR8CountersRefuseFractionalSpellingsBeforeFoundationCoercion() throws {
-        for (field, value) in [("revision", "8.0"), ("revision", "8e0")] {
+    func testR9CountersRefuseFractionalSpellingsBeforeFoundationCoercion() throws {
+        for (field, value) in [("revision", "9.0"), ("revision", "9e0")] {
             let raw = "{\"type\":\"session\",\"data\":{\"v\":1,\"op\":\"hello\",\"id\":\"11111111-1111-4111-8111-000000000001\",\"\(field)\":\(value)}}"
             XCTAssertThrowsError(try AstationMessage.decodePacket(Data(raw.utf8)))
         }
     }
 }
 
-extension AtemR8IntegrationTests {
+extension AtemR9PresentationTests {
     private func api(_ f: SessionFixture) throws -> LocalControlAPI {
         let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: file) }
@@ -2108,11 +2045,11 @@ extension AtemR8IntegrationTests {
         return api.handle(method: .POST, path: "/api/v1/" + path, body: try JSONSerialization.data(withJSONObject: input))
     }
 
-    func testAPISendRenewReleaseAndOwnershipUseTheR8SessionService() throws {
+    func testAPISendRenewReleaseAndOwnershipUseTheR9SessionService() throws {
         let f = SessionFixture(); try f.ready()
         let api = try api(f)
         let status = api.handle(method: .GET, path: "/api/v1/status", body: Data())
-        XCTAssertEqual((try JSONSerialization.jsonObject(with: status.body) as? [String: String])?["session_contract"], "r8")
+        XCTAssertEqual((try JSONSerialization.jsonObject(with: status.body) as? [String: String])?["session_contract"], "r9")
         let request = UUID().uuidString.lowercased()
         XCTAssertEqual(try post(api, f, "sessions/submit", ["request_id": request, "kind": "prompt", "text": "inspect"]).status, .accepted)
         XCTAssertEqual(f.sent.last?.acquire, true)
@@ -2190,7 +2127,7 @@ extension AtemR8IntegrationTests {
     }
 }
 
-extension AtemR8IntegrationTests {
+extension AtemR9PresentationTests {
     func testHistoryContentLimitIsMeasuredWithoutTrustingThePageDeclaration() throws {
         let f = SessionFixture(); try f.ready()
         try event(f, "opened", 0, fields: ["status": ["state": "ready", "since": 1_760_500_000_000]])

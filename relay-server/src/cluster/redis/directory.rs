@@ -38,7 +38,7 @@ end
 local function new_room(hostname, created_at, ttl)
   redis.call('DEL', KEYS[2], KEYS[3])
   redis.call('HSET', KEYS[1], 'hostname', hostname, 'created_at', created_at,
-    'owner_conn', '', 'owner_replica', '', 'verified', '0', 'paired', '0')
+    'owner_conn', '', 'owner_replica', '', 'verified', '0', 'paired', '0', 'pairing', '0')
   redis.call('EXPIRE', KEYS[1], ttl)
 end
 local function keep_alive(ttl)
@@ -82,10 +82,11 @@ new_room(ARGV[1], ARGV[2], ARGV[3])
 return '1'
 "#;
 
-// ARGV: hostname, created_at, ttl → '1' created | '0' existed
+// ARGV: hostname, created_at, ttl, pairing → '1' created | '0' existed
 const ENSURE_ROOM: &str = r#"
 if redis.call('EXISTS', KEYS[1]) == 1 then return '0' end
 new_room(ARGV[1], ARGV[2], ARGV[3])
+redis.call('HSET', KEYS[1], 'pairing', ARGV[4])
 return '1'
 "#;
 
@@ -264,6 +265,7 @@ fn room_info(
     pending.sort();
     RoomInfo {
         hostname: field("hostname").to_string(),
+        pairing: field("pairing") == "1",
         created_at: field("created_at").parse().unwrap_or(0),
         owner: conn_ref(field("owner_conn"), field("owner_replica")),
         verified: field("verified") == "1",
@@ -348,7 +350,18 @@ impl RoomDirectory for RedisRoomDirectory {
             .eval(
                 &self.ensure_room,
                 code,
-                vec![hostname.to_string(), now.to_string(), ROOM_EXPIRY_SECS.to_string()],
+                vec![hostname.to_string(), now.to_string(), ROOM_EXPIRY_SECS.to_string(), "0".to_string()],
+            )
+            .await?;
+        Ok(created == "1")
+    }
+
+    async fn ensure_pairing_room(&self, code: &str, hostname: &str, now: i64) -> Result<bool, StoreError> {
+        let created: String = self
+            .eval(
+                &self.ensure_room,
+                code,
+                vec![hostname.to_string(), now.to_string(), ROOM_EXPIRY_SECS.to_string(), "1".to_string()],
             )
             .await?;
         Ok(created == "1")
@@ -577,6 +590,7 @@ mod tests {
         redis_directory_tests!(
             create_get_and_expiry,
             ensure_room_is_idempotent,
+            pairing_allocation_does_not_convert_or_refresh_existing_rooms,
             atem_join_requires_a_room_and_replaces,
             claim_owner_creates_the_room_and_replaces_the_owner,
             claim_owner_waits_behind_a_verified_owner,

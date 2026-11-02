@@ -11,100 +11,43 @@ use std::{path::Path, time::Duration};
 use tokio::sync::Mutex;
 
 use crate::push_tokens::{PushPlatform, RegisteredPushToken};
+use atem_client::push::{guard, Hint, HintState, CLIENT_SKEW_MS};
 
-pub struct ApprovalNotice {
-    pub approval_id: String,
-    pub atem_device_id: String,
-    pub session_id: String,
-    pub tool: String,
-    pub summary: String,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
-}
-
-pub enum PushNotice {
-    Approval(ApprovalNotice),
-    Resolved {
-        approval_id: String,
-        atem_device_id: String,
-    },
-}
+/// Only the shared verifier can construct a Hint. No plaintext provider path.
+pub struct PushNotice(pub Hint);
 
 impl PushNotice {
     pub fn approval_id(&self) -> &str {
-        match self {
-            Self::Approval(value) => &value.approval_id,
-            Self::Resolved { approval_id, .. } => approval_id,
-        }
+        &self.0.key().approval_id
     }
 
     fn valid(&self) -> bool {
-        let (id, host) = match self {
-            Self::Approval(value) => (&value.approval_id, &value.atem_device_id),
-            Self::Resolved {
-                approval_id,
-                atem_device_id,
-            } => (approval_id, atem_device_id),
-        };
-        let opaque = |text: &str| {
-            !text.is_empty()
-                && text.len() <= 128
-                && text.bytes().all(|byte| byte.is_ascii_graphic())
-        };
-        uuid::Uuid::parse_str(id).is_ok()
-            && id.len() == 36
-            && opaque(host)
-            && match self {
-                Self::Approval(value) => {
-                    opaque(&value.session_id)
-                        && !value.tool.is_empty()
-                        && value.tool.len() <= 128
-                        && !value.tool.chars().any(char::is_control)
-                        && value.summary.len() <= 4096
-                }
-                Self::Resolved { .. } => true,
-            }
+        let id = self.approval_id();
+        uuid::Uuid::parse_str(id).is_ok() && id.len() == 36 && self.0.check_sealed().is_ok()
     }
 
     fn data(&self) -> Value {
-        match self {
-            Self::Approval(value) => {
-                let summary = if crate::knowledge_secrets::find_secrets(&value.summary).is_empty() {
-                    value
-                        .summary
-                        .chars()
-                        .filter(|character| !character.is_control())
-                        .take(240)
-                        .collect::<String>()
-                } else {
-                    "Review the request in Astation.".into()
-                };
-                json!({"kind":"approval", "approval_id":value.approval_id, "atem_device_id":value.atem_device_id,
-                    "session_id":value.session_id, "tool":value.tool, "summary":summary,
-                    "expires_at":value.expires_at.timestamp().to_string()})
-            }
-            Self::Resolved {
-                approval_id,
-                atem_device_id,
-            } => {
-                json!({"kind":"resolved", "approval_id":approval_id, "atem_device_id":atem_device_id})
-            }
-        }
+        // FCM data values must be strings. Both providers carry identical
+        // signed bytes; unsigned outer fields never supply approval identity.
+        json!({"r9_hint":self.0.object().to_json().to_string()})
     }
 
-    fn expiration(&self, now: i64) -> i64 {
-        match self {
-            Self::Approval(value) => value.expires_at.timestamp(),
-            Self::Resolved { .. } => now + 24 * 60 * 60,
-        }
+    fn expiration(&self, _now: i64) -> i64 {
+        let end = if self.resolved() { self.0.expires_at().saturating_add(CLIENT_SKEW_MS) }
+            else { guard(self.0.expires_at()) };
+        (end / 1000).min(i64::MAX as u64) as i64
+    }
+
+    fn resolved(&self) -> bool {
+        matches!(self.0.state(), HintState::Resolved { .. })
     }
 
     fn apns_payload(&self) -> Value {
         let mut payload = self.data();
-        payload["aps"] = match self {
-            Self::Approval(value) => json!({"alert":{"title":"Agent approval requested",
-                "body":format!("{}: {}", value.tool, payload["summary"].as_str().unwrap_or("Review in Astation"))},
-                "sound":"default", "mutable-content":1, "category":"AGENT_APPROVAL"}),
-            Self::Resolved { .. } => json!({"content-available":1}),
+        payload["aps"] = if self.resolved() { json!({"content-available":1}) } else {
+            json!({"alert":{"title":"Agent approval requested",
+                "body":"Open Astation to review this request."},
+                "sound":"default", "mutable-content":1, "category":"AGENT_APPROVAL"})
         };
         payload
     }
@@ -113,9 +56,9 @@ impl PushNotice {
         let data = self.data();
         let mut message = json!({"token":token, "data":data, "android":{
             "priority":"HIGH", "ttl":format!("{}s", (self.expiration(now) - now).clamp(0, 86400))}});
-        if let Self::Approval(value) = self {
+        if !self.resolved() {
             message["notification"] = json!({"title":"Agent approval requested",
-                "body":format!("{}: {}", value.tool, message["data"]["summary"].as_str().unwrap_or("Review in Astation"))});
+                "body":"Open Astation to review this request."});
             message["android"]["notification"] =
                 json!({"tag":self.approval_id(), "channel_id":"agent_approvals"});
         }
@@ -438,6 +381,9 @@ impl PushDelivery {
         if !notice.valid() || !token.registration.valid() {
             return PushDeliveryResult::Rejected;
         }
+        if matches!(notice.0.state(), HintState::Open { device_id, .. } if *device_id != token.device_id) {
+            return PushDeliveryResult::Rejected;
+        }
         if notice.expiration(now) <= now {
             return PushDeliveryResult::Expired;
         }
@@ -461,7 +407,7 @@ impl PushDelivery {
                 } else {
                     "api.push.apple.com"
                 };
-                let resolved = matches!(notice, PushNotice::Resolved { .. });
+                let resolved = notice.resolved();
                 self.http
                     .post(format!(
                         "https://{endpoint}/3/device/{}",
@@ -492,6 +438,9 @@ impl PushDelivery {
             Ok(value) => value,
             Err(_) => return PushDeliveryResult::Rejected,
         };
+        if request.body().and_then(|body| body.as_bytes()).is_none_or(|body| body.len() > 4096) {
+            return PushDeliveryResult::Rejected;
+        }
         let response = match self.transport.execute(request).await {
             Ok(value) => value,
             Err(result) => return result,
@@ -563,14 +512,11 @@ mod tests {
     use ring::signature::KeyPair;
 
     fn notice() -> PushNotice {
-        PushNotice::Approval(ApprovalNotice {
-            approval_id: "11111111-1111-4111-8111-111111111111".into(),
-            atem_device_id: "genie".into(),
-            session_id: "claude-session".into(),
-            tool: "Bash".into(),
-            summary: "npm test".into(),
-            expires_at: chrono::DateTime::from_timestamp(1000, 0).unwrap(),
-        })
+        PushNotice(crate::remote_api::push_ingress::tests::Fixture::new(700_000).verified(false))
+    }
+
+    fn resolution() -> PushNotice {
+        PushNotice(crate::remote_api::push_ingress::tests::Fixture::new(700_000).verified(true))
     }
 
     struct RecordingTransport {
@@ -808,7 +754,7 @@ mod tests {
             fcm_access_token: Mutex::new(None),
         };
         let token = RegisteredPushToken {
-            device_id: "mac".into(),
+            device_id: "phone".into(),
             generation: "generation".into(),
             registration: crate::push_tokens::PushRegistration {
                 platform: PushPlatform::ApnsSandbox,
@@ -825,10 +771,7 @@ mod tests {
             delivery.send_at(&token, &approval, 900).await,
             PushDeliveryResult::Sent
         );
-        let resolved = PushNotice::Resolved {
-            approval_id: approval.approval_id().into(),
-            atem_device_id: "genie".into(),
-        };
+        let resolved = resolution();
         assert_eq!(
             delivery.send_at(&token, &resolved, 901).await,
             PushDeliveryResult::InvalidToken
@@ -848,7 +791,7 @@ mod tests {
             approval.approval_id()
         );
         assert_eq!(requests[0].headers()["apns-topic"], "build.agora.astation");
-        assert_eq!(requests[0].headers()["apns-expiration"], "1000");
+        assert_eq!(requests[0].headers()["apns-expiration"], "985");
         assert_eq!(requests[0].headers()["apns-push-type"], "alert");
         assert_eq!(requests[0].headers()["apns-priority"], "10");
         assert_eq!(requests[1].headers()["apns-push-type"], "background");
@@ -860,16 +803,40 @@ mod tests {
     }
 
     #[test]
-    fn a_detected_secret_never_enters_notification_payloads() {
-        let mut approval = notice();
-        if let PushNotice::Approval(value) = &mut approval {
-            value.summary = "sk-synthetic-test-credential-value".into();
+    fn sealed_tool_and_summary_never_enter_notification_payloads_in_plaintext() {
+        let approval = notice();
+        for payload in [approval.apns_payload(), approval.fcm_payload("device-token", 900)] {
+            let bytes = payload.to_string();
+            assert!(!bytes.contains("npm test"));
+            assert!(!bytes.contains("Bash"));
+            assert!(bytes.len() <= 4096);
         }
-        assert!(!approval.apns_payload().to_string().contains("synthetic"));
-        assert!(!approval
-            .fcm_payload("device-token", 900)
-            .to_string()
-            .contains("synthetic"));
+        let envelope: Value = serde_json::from_str(approval.apns_payload()["r9_hint"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope, approval.0.object().to_json());
+    }
+
+    #[tokio::test]
+    async fn wrong_recipient_and_oversized_provider_wrapper_never_reach_transport() {
+        let (delivery, transport, _) = fcm_delivery(vec![]);
+        let mut token = fcm_token();
+        token.device_id = "other".into();
+        assert_eq!(delivery.send_at(&token, &notice(), 900).await, PushDeliveryResult::Rejected);
+        assert!(transport.requests.lock().unwrap().is_empty());
+
+        // Individually valid fields still must fit the whole provider budget,
+        // including the address, signed envelope and provider wrapper.
+        let large = notice();
+        let (delivery, transport, _) = fcm_delivery(vec![ProviderResponse {
+            status:200, body:json!({"access_token":"synthetic-oauth", "expires_in":3600})
+        }]);
+        token = fcm_token();
+        token.registration.token = "t".repeat(4096);
+        assert!(token.registration.valid());
+        assert!(large.fcm_payload(&token.registration.token, 900).to_string().len() > 4096);
+        assert_eq!(delivery.send_at(&token, &large, 900).await, PushDeliveryResult::Rejected);
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url().host_str(), Some("oauth2.googleapis.com"));
     }
 
     #[test]
@@ -878,22 +845,19 @@ mod tests {
         assert!(approval.valid());
         let apns = approval.apns_payload();
         assert_eq!(apns["aps"]["mutable-content"], 1);
-        assert_eq!(apns["aps"]["alert"]["body"], "Bash: npm test");
+        assert_eq!(apns["aps"]["alert"]["body"], "Open Astation to review this request.");
         let fcm = approval.fcm_payload("device-token", 900);
         assert_eq!(
             fcm["message"]["android"]["notification"]["tag"],
             approval.approval_id()
         );
-        assert_eq!(fcm["message"]["android"]["ttl"], "100s");
+        assert_eq!(fcm["message"]["android"]["ttl"], "85s");
         assert!(fcm["message"]["data"]
             .as_object()
             .unwrap()
             .values()
             .all(Value::is_string));
-        let resolved = PushNotice::Resolved {
-            approval_id: approval.approval_id().into(),
-            atem_device_id: "genie".into(),
-        };
+        let resolved = resolution();
         assert_eq!(
             resolved.apns_payload()["aps"],
             json!({"content-available":1})

@@ -1,5 +1,12 @@
 # Astation review of one pairing, many devices
 
+Historical review/handoff: this records the earlier implementation and is not
+the current remote-admission or approval contract. Use [r9-client.md](r9-client.md)
+for shipped behavior and [remote-agent-api.md](remote-agent-api.md) for the
+aligned r9 plan. Atem #81 owns handoffs; PR #80 owns the new shared contract.
+Old freshness attestations, lease-taking approval answers and recovery/push
+policies in this snapshot are superseded by those documents.
+
 Reviewed Atem PR #70, `designs/account-trust.md`, at
 `1e5f4d004ef3cca5adb0a21a01ca745f1602b2c8` on 2026-10-16.
 This is a joint review, not an enabled wire contract. The published r7 session

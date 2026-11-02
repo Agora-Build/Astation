@@ -66,6 +66,36 @@ final class TokenToolsUITests: XCTestCase {
         XCTAssertFalse(try find(controller.view, NSButton.self) { $0.title == "Copy Token" }.isEnabled)
     }
 
+    func testSavedProjectGeneratesLocallyWithoutCallingTheResolver() throws {
+        var requests = 0
+        let controller = TokenToolsViewController(projects: { [self.project()] }, initialProjectID: "demo", resolveProject: { _ in
+            requests += 1
+            throw URLError(.notConnectedToInternet)
+        })
+        let window = host(controller); defer { window.close() }
+        let output = try generate(controller)
+        XCTAssertTrue(try AgoraTokenService.verify(output.string, certificate: certificate))
+        XCTAssertEqual(requests, 0)
+    }
+
+    func testDelayedCertificateCannotGenerateAfterTheProjectIsRemoved() async throws {
+        let empty = AgoraProject(id: "demo", name: "Voice Lab", vendorKey: app, signKey: "", status: "active", created: 0)
+        var projects = [empty]
+        var reply: CheckedContinuation<AgoraProject, Error>?
+        let controller = TokenToolsViewController(projects: { projects }, initialProjectID: "demo", resolveProject: { _ in
+            try await withCheckedThrowingContinuation { reply = $0 }
+        })
+        let window = host(controller); defer { window.close() }
+        let output = try generate(controller)
+        for _ in 0..<100 where reply == nil { await Task.yield() }
+        XCTAssertNotNil(reply)
+        projects = []
+        reply?.resume(returning: project()); reply = nil
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertTrue(output.string.isEmpty)
+        XCTAssertFalse(try find(controller.view, NSButton.self) { $0.title == "Copy Token" }.isEnabled)
+    }
+
     func testInspectionRequiresExplicitVerificationAndInvalidatesOnEdit() throws {
         let controller = TokenToolsViewController(projects: { [self.project()] }, initialProjectID: "demo")
         let window = host(controller); defer { window.close() }

@@ -341,6 +341,25 @@ final class AtemEncryptionMigrationTests: XCTestCase {
         XCTAssertEqual(try f.identity.state(account: f.account)?.mode, "enabling")
     }
 
+    func testReverificationWithNewKeysFencesAcceptedAndReplayedMigrationReportsAfterReload() throws {
+        let f = try MigrationFixture(), oldReport = try f.report()
+        _ = try f.accept(oldReport)
+        let replacement = AtemVerifyReveal(devicePub: Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation,
+            deviceSignPub: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation,
+            unlockAuthPub: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation,
+            nonce: Data(repeating: 5, count: 32))
+        _ = try f.identity.completeVerification(account: f.account, deviceId: f.deviceId, reveal: replacement,
+            transcript: Data(repeating: 10, count: 32), expectedSigningKey: f.keys.signPub, key: f.key)
+        let reloaded = AtemE2EIdentity(storage: f.storage, crypto: f.crypto)
+        XCTAssertThrowsError(try reloaded.finishAcceptedMigration(account: f.account, key: f.key))
+        XCTAssertTrue(try reloaded.pendingMigrationAccounts().isEmpty)
+        let before = f.storage.data
+        XCTAssertThrowsError(try reloaded.acceptMigrationCompletion(oldReport, mode: "on", kid: f.key.kid,
+            account: f.account, route: f.route, key: f.key))
+        XCTAssertEqual(f.storage.data, before)
+        XCTAssertEqual(try reloaded.state(account: f.account)?.mode, "enabling")
+    }
+
     func testOldReportCannotAcquireNewAuthorizationAfterRevocationAndIdenticalKeyReverification() throws {
         let f = try MigrationFixture(), oldReport = try f.report()
         try f.revoke()

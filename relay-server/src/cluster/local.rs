@@ -57,6 +57,7 @@ impl Default for QueueLimits {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SocketRole {
     Atem { atem_id: String },
+    HostCandidate,
     Astation,
 }
 
@@ -110,6 +111,12 @@ pub struct LocalSockets {
 }
 
 impl LocalSockets {
+    pub(crate) fn role(&self, connection_id: &str) -> Option<SocketRole> {
+        self.lock().get(connection_id).map(|connection| connection.role.clone())
+    }
+    pub(crate) fn set_role(&self, connection_id: &str, role: SocketRole) {
+        if let Some(connection) = self.lock().get_mut(connection_id) { connection.role = role; }
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -205,6 +212,13 @@ impl LocalSockets {
         false
     }
 
+    /// A ciphertext gap is a connection failure, never a best-effort frame drop.
+    pub fn send_required(&self, connection_id: &str, frame: String) -> bool {
+        if self.send(connection_id, frame) { return true; }
+        self.close_with(connection_id, CLOSE_SLOW_CLIENT, "r9 queue unavailable");
+        false
+    }
+
     fn close_slow(&self, conn: LocalConn) {
         self.slow_closed.fetch_add(1, Ordering::Relaxed);
         crate::cluster::metrics::metrics()
@@ -286,7 +300,8 @@ impl LocalSockets {
         let codes: BTreeSet<String> = self
             .lock()
             .values()
-            .filter(|conn| (conn.role == SocketRole::Astation) == astation)
+            .filter(|conn| if astation { conn.role == SocketRole::Astation }
+                else { matches!(conn.role, SocketRole::Atem { .. }) })
             .map(|conn| conn.code.clone())
             .collect();
         codes.into_iter().collect()

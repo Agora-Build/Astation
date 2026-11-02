@@ -240,6 +240,7 @@ mod tests {
 
     fn create_app() -> Router {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -305,6 +306,7 @@ mod tests {
     #[tokio::test]
     async fn test_full_grant_lifecycle() {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -408,6 +410,7 @@ mod tests {
     #[tokio::test]
     async fn test_full_deny_lifecycle() {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -481,6 +484,7 @@ mod tests {
     #[tokio::test]
     async fn test_grant_of_expired_session_is_gone_for_any_otp() {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -524,6 +528,7 @@ mod tests {
     #[tokio::test]
     async fn test_grant_with_wrong_otp() {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -615,6 +620,7 @@ mod tests {
     #[tokio::test]
     async fn test_auth_page_handler() {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -671,6 +677,7 @@ mod tests {
     #[tokio::test]
     async fn test_double_grant_returns_conflict() {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -739,6 +746,7 @@ mod tests {
     #[tokio::test]
     async fn test_double_deny_returns_conflict() {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -806,6 +814,7 @@ mod tests {
     #[tokio::test]
     async fn test_grant_after_deny_returns_conflict() {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -917,6 +926,7 @@ mod tests {
     #[tokio::test]
     async fn test_session_token_uniqueness() {
         let state = AppState {
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
@@ -985,6 +995,8 @@ mod tests {
         use chrono::{Duration, Utc};
 
         let state = AppState {
+
+            recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
             relay: RelayHub::new(),
             rtc_sessions: RtcSessionStore::new(),
