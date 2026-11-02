@@ -642,8 +642,8 @@ and both replicas healthy. Public admission again returns
 service binding is unchanged. Evidence `public-view-20261101T225228Z.json`
 reached `completed`, and the controller recorded operator exit zero and
 `public_gate_closed: true`. This proves public view access, not prompt
-execution under this view-only grant. Keep the integration active, and arm the
-final owner Revoke observer only after the owner returns.
+execution under this view-only grant. The final live Revoke and native removal
+for this integration passed on 2026-11-02, as recorded below.
 
 ### Final owner revocation observation
 
@@ -652,8 +652,9 @@ After the public check and any receipt recovery finish,
 authenticated feed. Like pause/resume, only `waiting_for_host` readiness is
 translated inside a private test schema; no deployed policy is changed and no
 agent mutation is sent. Announce **ready for revoke** only after the live
-subscription and its first overlapping token renewal succeed. The owner has a
-20-minute window, with the coordinator refreshing the protected token file.
+subscription and its first overlapping token renewal succeed. The default
+window is 20 minutes; an explicitly bounded owner window may be longer, with
+the coordinator refreshing the protected token file throughout it.
 
 Require a later cursor, the actual `integration_revoked` event and a `revoking`
 or `revoked` checkpoint. A still-valid issued token must be denied by HTTP,
@@ -671,6 +672,32 @@ cursor 18 -> 19 reporting `revoked` at 15:17:36 UTC. Evidence:
 The earlier live revocation observer had expired before the owner clicked
 Revoke; it did not capture denial of a still-valid token or stream closure.
 Final removal is confirmed, while that live-transition evidence remains absent.
+
+The replacement integration `i-01m6c16g7nsz0k0pmfshs1fwwk` completed the full
+live revocation check on 2026-11-02. After the actual subscription and two
+overlapping token renewals, the owner's admin-site Revoke at 04:58:18 UTC
+advanced the Station policy cursor from 35 to 36 (`revoking`). A still-valid
+issued token was refused by HTTP, the open subscribed WebSocket closed, and a
+fresh WebSocket upgrade returned 401. New Auth token issuance independently
+returned 401 `invalid_client`. The real operator exited zero with evidence
+`step1-revoke-20261102T045634Z.json`, phase `revocation_denied`, and zero agent
+mutations. Portal/Auth independently recorded the passkey sign-in, admin
+actor/reason, Auth audit 3764, Portal event 36, and zero tokens issued after
+revocation. Evidence: [Astation live result](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6569439586)
+and [Portal/Auth audit](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6569458412).
+
+The owner's subsequent native removal was independently confirmed at
+05:04 UTC: membership advanced from head 10 to head 11 with the exact
+`svc-i-01m6c16g7nsz0k0pmfshs1fwwk` removal; its sealed Station service key is
+absent; the retained provisioning binding still matches the approved owner,
+Station origin, genesis and service fingerprint. The fresh authenticated policy
+advanced to cursor 37, state `revoked`, confirming the Station's completion
+report. Protected evidence `final-removal-20261102.json` records these checks.
+Both retained relay replicas and Redis are healthy. This closes the live
+revocation and removal gates for this disposable integration. Public hosted
+execution remains disabled pending the separately reviewed lasting rollout;
+command access requires a new appropriately scoped integration and native
+approval because this revoked grant was view-only.
 
 After native removal, Integrations refreshes the selected Portal record with
 bounded backoff for up to two minutes, allowing Station's feed worker to finish
