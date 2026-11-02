@@ -213,14 +213,14 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
         XCTAssertEqual(fixture.hub.deviceSessionStore.getAllActive().count, 1)
     }
 
-    func testRelayChangeClosesOldSocketAndFencesItsLateRegistrationAck() async throws {
+    func testRelayChangeRetainsRoutingSocketButFencesItsLateRegistrationAck() async throws {
         let fixture = try StationAccountFixture(); defer { fixture.cleanup() }
         let old = try await connected(fixture)
         let access = Task { try await fixture.hub.prepareAccountSecurityAccess() }
         try await Task.sleep(nanoseconds: 30_000_000)
         fixture.hub._testRelayUrlOverride = "https://second-station.example"
         NotificationCenter.default.post(name: .serverInfoChanged, object: nil)
-        XCTAssertTrue(old.cancelled)
+        XCTAssertFalse(old.cancelled, "Existing pairings retain a routing-only handoff socket")
         XCTAssertEqual(fixture.urls.last?.host, "second-station.example")
         XCTAssertEqual(fixture.hub.accountAuth.configuration?.resource, "https://second-station.example")
         old.emit(#"{"type":"relayAck","for":"relayRegisterAccount","ok":true}"#)
@@ -228,6 +228,9 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
         catch { XCTAssertEqual(error as? AccountLoginError, .changed) }
         XCTAssertFalse(fixture.hub.identityRelayVerified)
         XCTAssertEqual(fixture.hub.deviceSessionStore.getAllActive().count, 1)
+        XCTAssertEqual(old.registrations.count, 1, "A retired socket cannot register the new Station account")
+        fixture.hub.accountSessionChanged()
+        XCTAssertTrue(old.cancelled, "Account invalidation also closes routing-only sockets")
     }
 
     func testCancelledRegistrationWaitDoesNotResumeOnLateAck() async throws {

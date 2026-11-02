@@ -211,6 +211,67 @@ authentication does not replace safety-code/device verification, account
 membership or feature authorization. This change does not remove local
 WebSocket access or create a second device identity for a local process.
 
+### Selected-relay handoff
+
+User requirement (2026-11-02): when direct connections are disabled, Atem
+connects through Astation's current selected Station, including a custom
+Station. It must not silently fall back to the production/default relay or
+alternate between a blocked local socket and an old configured relay.
+
+The native connection picker and agent router exclude direct links while
+relay-only is active. A local control socket without R9 membership stays
+authenticated but cannot carry agent operations; a missing migration
+prerequisite must not repeatedly tear it down and churn presence.
+
+Atem's `station-route-v1.md` defines the concrete paired-session handoff:
+the host sends a fresh, generation-bound challenge; native validates its
+authenticated host/session and known membership context, then uses shared
+`stationRouteOffer` with its effective `stationRelayUrl`. The shared
+`stationRouteVerifyAccepted` verifies the exact pending offer's durable
+acknowledgment. Native captures and rechecks account, Station, session,
+trust and socket state before signing, sending and applying the reply.
+The shared package owns strict parsing, URL normalization and MAC bytes.
+
+A routing acknowledgment cannot enroll a host, grant permission, change
+trust or establish R9 policy readiness. Existing pairing, sessions,
+receipts and running agents survive the transport change. Native neither
+unpairs nor restarts the runtime to change Stations. Memory/vault HTTP
+endpoint configuration and credential audiences are separate from this
+runtime WebSocket handoff.
+
+The native orchestration is implemented locally with these sequences:
+
+- Direct to relay with R9 available: stage the current endpoint with
+  `relay_only:false`, verify the acknowledgment, then commit the existing
+  encrypted relay-only policy. Atem flushes its result before switching.
+- Missing R9 preparation: request a fresh challenge and offer
+  `relay_only:true`; keep direct agent authority blocked and retain the
+  socket until Atem durably accepts the selection and migrates itself.
+- Station changes: connect the newly selected Station and retain the old
+  relay socket for routing only. A retired socket can prove existing
+  pairings and carry routing messages, never agent or credential traffic.
+  Replies always use the latest effective selection; older offers cannot
+  complete the new selection. Retired sockets close after three minutes,
+  with at most four retained, and immediately on account invalidation.
+- Re-enabling direct access: a routing-only block requires an explicit
+  manager policy mutation newer than the routing fence. When the policy
+  was already false at the fence, first commit true and then false. A
+  routing hint or policy read cannot clear the block.
+
+Native consumes the verified prebuilt Apple package from
+`623c89ad1441c7f310596f43428c851cf00590d1` (Atem PR #113), with its bundled
+independent station-route vectors. The production codec calls the shared
+offer and acknowledgment helpers. The artifact gate checks all payload
+hashes and runs the actual static library, including wrong-session,
+tampered-acknowledgment and stale-offer refusals. Real-codec controller
+tests complement the injected orchestration tests.
+
+Release gate: run provisioned live dev/custom-relay switching tests,
+including unavailable selected relays and direct re-enable. Package and
+fixture success alone do not establish live-host migration.
+Host/shared-client coordination and the artifact handoff are in
+[Atem #112](https://github.com/Agora-Build/Atem/issues/112).
+
 ## Trust and lifecycle invariants
 
 - Agora.Build/Auth verifies account access. The native device and Atem

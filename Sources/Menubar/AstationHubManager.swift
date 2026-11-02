@@ -59,6 +59,7 @@ class AstationHubManager: ObservableObject {
     private var stationRegistrationPending: StationRegistrationContext?
     private var stationRegistrationWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
     private var configuredStationOrigin: String
+    private var stationRouteAccountDuringTransition: String?
 
     private static func stationAccountAuth(settings: AccountServiceSettings, origin: String) throws -> AstationAccountAuth {
         let configuration = try AccountOIDCConfiguration(issuer: settings.issuer, clientID: settings.clientID,
@@ -196,7 +197,13 @@ class AstationHubManager: ObservableObject {
     @Published private(set) var relayMergeRequests: [RelayMergeRequest] = []
     @Published private(set) var relayAccountStatusMessage: String?
     @Published private(set) var relayEncryptionState: RelayEncryptionState? {
-        didSet { refreshDirectMigrationContexts() }
+        didSet {
+            refreshDirectMigrationContexts()
+            if relayEncryptionState != nil, stationRouteAccountDuringTransition != nil {
+                stationRouteAccountDuringTransition = nil
+                MainActor.assumeIsolated { for bridge in retainedRouteRelays.values { bridge.wakeHosts() } }
+            }
+        }
     }
     @Published var relayEncryptionStatusMessage: String?
     private var encryptionMigrationRetryDelay: TimeInterval = 1
@@ -372,17 +379,44 @@ class AstationHubManager: ObservableObject {
     @MainActor private var r9Connections: [String: AstationR9Connection] = [:]
     @MainActor private var policyR9Connections: [String: AstationR9Connection] = [:]
     @MainActor private var r9Signer: AstationChannelSigner?
+    private let stationRouteCodec: RemoteStationRoute.Codec?
+    private let loadStationRouteAnchor: (@MainActor (String) throws -> RemoteStationRoute.Anchor?)?
+    @MainActor private var retainedRouteRelays: [String: StationRouteRelayBridge] = [:]
+    @MainActor private lazy var stationRoutes: RemoteStationRouteController? = {
+        guard let stationRouteCodec else { return nil }
+        return RemoteStationRouteController(codec: stationRouteCodec,
+            current: { [weak self] in self?.stationRouteIsCurrent($0) == true },
+            token: { [weak self] context in
+                guard let self, self.stationRouteIsCurrent(context) else { return nil }
+                return self.deviceSessionStore.get(sessionId: context.session)?.token
+            }, send: { [weak self] bytes, context in self?.sendStationRoute(bytes, context: context) },
+            accepted: { [weak self] context, result in self?.stationRouteAccepted(context, result: result) })
+    }()
     private let prepareR9Channel: (@MainActor (AtemSessionContext) throws -> (MembershipLog, AstationChannelSigner))?
     private var sessionTimer: Timer?
     private let sessionJournal: AtemSessionJournal
     private lazy var transportPolicy = AtemTransportPolicyController(journal: sessionJournal,
         current: { [weak self] context in self?.transportPolicyContext(for: context.route.clientId) == context },
         send: { [weak self] operation, context in
-            MainActor.assumeIsolated { self?.hostPolicyChannel(for: context)?.sendPolicy(operation) }
+            MainActor.assumeIsolated {
+                guard let self else { return nil }
+                if !context.isRelay, case .hostPolicyRetry(true, _, _) = operation, self.stationRouteCodec != nil {
+                    guard let route = self.stationRouteContext(clientID: context.route.clientId, connectionID: context.route.connectionId),
+                          self.stationRoutes?.stagedSelection(route) != nil else { return nil }
+                }
+                return self.hostPolicyChannel(for: context)?.sendPolicy(operation)
+            }
         }, reconnect: { [weak self] context in
             guard let self, self.transportPolicyContext(for: context.route.clientId) == context else { return }
             if context.isRelay { self.pauseIdentityRelay(); self.startIdentityRelay() }
-            else { self.disconnectDirectClient?(context.route.clientId); self.removeClient(withId: context.route.clientId) }
+            else { MainActor.assumeIsolated { self.requireSelectedRelay(clientID: context.route.clientId) } }
+        }, directRestriction: { [weak self] context in
+            MainActor.assumeIsolated {
+                guard let self,
+                      let route = self.stationRouteContext(clientID: context.route.clientId, connectionID: context.route.connectionId),
+                      let selection = self.stationRoutes?.stagedSelection(route), selection.directBlocked else { return nil }
+                return selection.policyRevision
+            }
         })
     private var transportPolicyTimer: Timer?
     lazy var browserAgentChat = BrowserAgentChat(
@@ -417,9 +451,13 @@ class AstationHubManager: ObservableObject {
         portalAPI: PortalAPIClient = PortalAPIClient(),
         projectCache: PortalProjectCache? = nil,
         accountDefaults: UserDefaults = .standard,
-        prepareR9Channel: (@MainActor (AtemSessionContext) throws -> (MembershipLog, AstationChannelSigner))? = nil
+        prepareR9Channel: (@MainActor (AtemSessionContext) throws -> (MembershipLog, AstationChannelSigner))? = nil,
+        stationRouteCodec: RemoteStationRoute.Codec? = .shared,
+        loadStationRouteAnchor: (@MainActor (String) throws -> RemoteStationRoute.Anchor?)? = nil
     ) {
         self.prepareR9Channel = prepareR9Channel
+        self.stationRouteCodec = stationRouteCodec
+        self.loadStationRouteAnchor = loadStationRouteAnchor
         self.accountDefaults = accountDefaults
         let station = SettingsWindowController.currentAstationRelayUrl
         self.configuredStationOrigin = station
@@ -642,7 +680,12 @@ class AstationHubManager: ObservableObject {
 
     func accountSessionChanged() {
         accountGeneration = UUID()
-        MainActor.assumeIsolated { pairingSession?.contextChanged() }
+        stationRouteAccountDuringTransition = nil
+        MainActor.assumeIsolated {
+            pairingSession?.contextChanged()
+            stationRoutes?.invalidate()
+            closeRetainedRouteRelays()
+        }
         let reconnect = identityRelayActive
         pauseIdentityRelay()
         if reconnect { startIdentityRelay() }
@@ -657,6 +700,8 @@ class AstationHubManager: ObservableObject {
         defer { accountSignInInProgress = false }
         guard let portalAuth else { throw AccountLoginError.configuration }
         accountGeneration = UUID()
+        stationRouteAccountDuringTransition = nil
+        stationRoutes?.invalidate(); closeRetainedRouteRelays()
         pairingSession?.contextChanged()
         projectLoadTask?.cancel()
         projects = []; selectedProject = nil; portalProjects = [:]; agoraConnection = nil; signedInAccount = nil
@@ -685,6 +730,8 @@ class AstationHubManager: ObservableObject {
 
     @MainActor func signOutAccount() async throws {
         accountGeneration = UUID()
+        stationRouteAccountDuringTransition = nil
+        stationRoutes?.invalidate(); closeRetainedRouteRelays()
         pairingSession?.contextChanged()
         let epoch = accountGeneration
         let oldPortal = portalAuth, oldRelay = accountAuth
@@ -718,9 +765,11 @@ class AstationHubManager: ObservableObject {
     @MainActor @objc private func stationServerChanged() {
         dispatchPrecondition(condition: .onQueue(.main))
         guard configuredStationOrigin != stationRelayUrl else { return }
-        pauseIdentityRelay()
-        accountGeneration = UUID(); accountRecovery = nil
+        stationRouteAccountDuringTransition = stationRouteDataAccount
+        accountGeneration = UUID()
         pairingSession?.contextChanged()
+        stationRoutes?.invalidate()
+        pauseIdentityRelay(retainForRouting: true)
         configuredStationOrigin = stationRelayUrl
         if let settings = portalSettings,
            let auth = try? Self.stationAccountAuth(settings: settings, origin: stationRelayUrl) { accountAuth = auth }
@@ -731,6 +780,10 @@ class AstationHubManager: ObservableObject {
         relayIdentityKeyRepairPending = relayIdentityKeyRepairRecord != nil
         relayIdentityRepairReconnectRequested = false
         startIdentityRelay()
+        for bridge in retainedRouteRelays.values { bridge.wakeHosts() }
+        for client in connectedClients where !client.id.hasPrefix("relay-") {
+            if let route = stationRouteContext(clientID: client.id, connectionID: client.id) { stationRoutes?.selectionChanged(route) }
+        }
         NotificationCenter.default.post(name: .relayAccountChanged, object: nil)
         NotificationCenter.default.post(name: .relayEncryptionChanged, object: nil)
     }
@@ -977,7 +1030,15 @@ class AstationHubManager: ObservableObject {
             relayOnly: required, hosts: Set(hosts).filter { log.host(hostId: $0) != nil }.sorted())
         defer {
             updateTransportPolicyPresentation(); refreshSessionConnections(); refreshDirectMigrationContexts()
-            for client in connectedClients { reconcileTransportPolicy(clientID: client.id) }
+            for client in connectedClients {
+                let connection = client.id.hasPrefix("relay-")
+                    ? identityRelayAuthentication.connectionId(for: client.id) : client.id
+                if let connection, let route = stationRouteContext(clientID: client.id, connectionID: connection) {
+                    stationRoutes?.selectionChanged(route)
+                }
+                reconcileTransportPolicy(clientID: client.id)
+            }
+            for bridge in retainedRouteRelays.values { bridge.wakeHosts() }
         }
         try transportPolicy.set(policy, connections: connectedClients.compactMap { transportPolicyContext(for: $0.id) })
     }
@@ -1046,6 +1107,13 @@ class AstationHubManager: ObservableObject {
 
             self.sendEncryptionMode(to: client.id, relayConnectionId: relayConnectionId)
 
+            MainActor.assumeIsolated {
+                if let route = self.stationRouteContext(clientID: client.id, connectionID: relayConnectionId ?? client.id) {
+                    self.stationRoutes?.selectionChanged(route)
+                    if !route.direct { for bridge in self.retainedRouteRelays.values { bridge.remove(host: route.atem) } }
+                }
+            }
+
             self.broadcastInstanceList()
             self.requestAgentList(from: client.id)
         }
@@ -1056,6 +1124,7 @@ class AstationHubManager: ObservableObject {
             self.atemVerification.disconnect(clientId: clientId)
             self.atemStorageKeys.disconnect(clientId: clientId)
             self.transportPolicy.disconnected(clientID: clientId)
+            MainActor.assumeIsolated { self.stationRoutes?.disconnected(client: clientId) }
             self.connectedClients.removeAll { $0.id == clientId }
             self.agentsByClientId.removeValue(forKey: clientId)
             self.sessionStatusByClientId.removeValue(forKey: clientId)
@@ -1518,8 +1587,131 @@ class AstationHubManager: ObservableObject {
 
     // MARK: - Client & Agent Management
 
+    private var stationRouteDataAccount: String { stationRouteAccountDuringTransition ?? e2eDataAccount }
+
+    @MainActor private func stationRouteAnchor(host: String) throws -> RemoteStationRoute.Anchor? {
+        if let loadStationRouteAnchor { return try loadStationRouteAnchor(host) }
+        return try recoveryCoordinator(account: stationRouteDataAccount).stationRouteAnchor(hostID: host)
+    }
+
+    @MainActor private func stationRouteContext(clientID: String, connectionID: String) -> RemoteStationRoute.Context? {
+        guard stationRouteCodec != nil, !systemIsSleeping,
+              let client = connectedClients.first(where: { $0.id == clientID && $0.clientType == "Atem" }),
+              let host = client.atemId, let sessionID = client.authenticationSessionId,
+              let session = deviceSessionStore.get(sessionId: sessionID), session.atemId == host,
+              let route = verificationRoute(clientId: clientID,
+                relayConnectionId: clientID.hasPrefix("relay-") ? connectionID : nil),
+              route.connectionId == connectionID else { return nil }
+        do {
+            return RemoteStationRoute.Context(client: clientID, connection: connectionID,
+                transport: clientID.hasPrefix("relay-") ? identityRelaySocketGeneration : clientID,
+                accountGeneration: accountGeneration, account: stationRouteDataAccount, astation: AstationIdentity.shared.id,
+                atem: host, session: sessionID, station: stationRelayUrl, relayOnly: relayOnlyPolicyRequired,
+                direct: !clientID.hasPrefix("relay-"), anchor: try stationRouteAnchor(host: host))
+        } catch { return nil }
+    }
+
+    @MainActor private func stationRouteContext(bridge: StationRouteRelayBridge, host: String,
+                                               connection: String) -> RemoteStationRoute.Context? {
+        guard !systemIsSleeping, retainedRouteRelays[bridge.generation] === bridge,
+              bridge.account == stationRouteDataAccount, bridge.issuer == portalSettings?.issuer,
+              let session = bridge.session(host: host, connection: connection) else { return nil }
+        do {
+            return RemoteStationRoute.Context(client: "route-\(bridge.generation)-\(host)", connection: connection,
+                transport: bridge.generation, accountGeneration: accountGeneration, account: stationRouteDataAccount,
+                astation: AstationIdentity.shared.id, atem: host, session: session, station: stationRelayUrl,
+                relayOnly: relayOnlyPolicyRequired, direct: false, anchor: try stationRouteAnchor(host: host))
+        } catch { return nil }
+    }
+
+    @MainActor private func stationRouteIsCurrent(_ context: RemoteStationRoute.Context) -> Bool {
+        if let bridge = retainedRouteRelays[context.transport] {
+            return stationRouteContext(bridge: bridge, host: context.atem, connection: context.connection) == context
+        }
+        return stationRouteContext(clientID: context.client, connectionID: context.connection) == context
+    }
+
+    @MainActor func receiveStationRoute(_ bytes: Data, clientID: String, connectionID: String) {
+        guard let context = stationRouteContext(clientID: clientID, connectionID: connectionID) else { return }
+        stationRoutes?.receive(bytes, context: context)
+    }
+
+    @MainActor private func sendStationRoute(_ bytes: Data, context: RemoteStationRoute.Context) {
+        guard stationRouteIsCurrent(context) else { return }
+        if let bridge = retainedRouteRelays[context.transport] {
+            bridge.sendPayload(bytes, host: context.atem, connection: context.connection)
+        } else if context.direct {
+            sendDirectChannel?(bytes, context.client, { _ in })
+        } else {
+            guard let socket = identityRelayTask,
+                  let envelope = try? RemoteRelayEnvelope.wrap(bytes, host: context.atem, connection: context.connection),
+                  let text = String(data: envelope, encoding: .utf8) else { return }
+            socket.send(.string(text)) { _ in }
+        }
+    }
+
+    @MainActor private func requireSelectedRelay(clientID: String) {
+        guard let context = stationRouteContext(clientID: clientID, connectionID: clientID) else { return }
+        stationRoutes?.requireRelay(context)
+    }
+
+    @MainActor private func stationRouteAccepted(_ context: RemoteStationRoute.Context,
+                                                result: RemoteStationRoute.Acceptance) {
+        guard stationRouteIsCurrent(context) else { return }
+        Log.info("[StationRoute] Atem saved selected relay at routing revision \(result.revision)")
+        guard retainedRouteRelays[context.transport] == nil else { return }
+        if context.direct, context.relayOnly {
+            guard !result.directBlocked else { return }
+            guard relayOnlyPolicyAppliesToSelectedStation,
+                  transportPolicyContext(for: context.client, includeBinding: false)?.verifiedPin != nil else {
+                stationRoutes?.requireRelay(context); return
+            }
+        }
+        if !context.relayOnly, result.directBlocked, let policy = transportPolicyContext(for: context.client) {
+            transportPolicy.receivedChange(context: policy)
+        }
+        reconcileTransportPolicy(clientID: context.client)
+    }
+
+    @MainActor private func retainStationRouteRelay(_ task: IdentityRelaySocket) {
+        guard !deviceSessionStore.getAllActive().isEmpty else { task.cancel(with: .goingAway, reason: nil); return }
+        if retainedRouteRelays.count >= 4,
+           let oldest = retainedRouteRelays.values.min(by: { $0.createdAt < $1.createdAt }) {
+            retainedRouteRelays.removeValue(forKey: oldest.generation)?.close()
+        }
+        let generation = identityRelaySocketGeneration, account = stationRouteDataAccount, issuer = portalSettings?.issuer
+        let bridge = StationRouteRelayBridge(generation: generation, account: account, issuer: issuer,
+            socket: task, verified: identityRelayVerified, authentication: identityRelayAuthentication,
+            clients: connectedClients.filter { $0.id.hasPrefix("relay-") }, store: deviceSessionStore,
+            astation: AstationIdentity.shared.id, key: { [weak self] in
+                guard case .loaded(let key) = self?.relayIdentityKeyManager.state else { return nil }
+                return key
+            }, current: { [weak self] in
+                guard let self else { return false }
+                return self.stationRouteDataAccount == account && self.portalSettings?.issuer == issuer && !self.systemIsSleeping
+            }, receive: { [weak self] bytes, host, _, connection in
+                guard let self, let bridge = self.retainedRouteRelays[generation],
+                      let context = self.stationRouteContext(bridge: bridge, host: host, connection: connection) else { return }
+                self.stationRoutes?.receive(bytes, context: context)
+            })
+        retainedRouteRelays[generation] = bridge
+        DispatchQueue.main.asyncAfter(deadline: .now() + 180) { [weak self, weak bridge] in
+            guard let self, let bridge, self.retainedRouteRelays[generation] === bridge else { return }
+            self.retainedRouteRelays.removeValue(forKey: generation)?.close()
+        }
+    }
+
+    @MainActor private func closeRetainedRouteRelays() {
+        for bridge in retainedRouteRelays.values { bridge.close() }
+        retainedRouteRelays.removeAll()
+    }
+
     var supportedAtemClients: [ConnectedClient] {
-        connectedClients.filter { $0.clientType == "Atem" && sessionStatusByClientId[$0.id]?.unsupportedVersion != true }
+        let relayOnly = relayOnlyPolicyRequired
+        return connectedClients.filter {
+            $0.clientType == "Atem" && sessionStatusByClientId[$0.id]?.unsupportedVersion != true
+                && (!relayOnly || $0.id.hasPrefix("relay-"))
+        }
     }
 
     private func refreshCredentialProjectSuggestions() {
@@ -1834,6 +2026,10 @@ class AstationHubManager: ObservableObject {
         guard transportPolicyContext(for: id, includeBinding: false) == policyContext, policyContext.verifiedPin != nil,
               let intent = transportPolicy.policy(account: policyContext.account, issuer: policyContext.issuer),
               intent.station == policyContext.station, !sessionJournal.loadFailed else { return }
+        if !policyContext.isRelay, intent.relayOnly, stationRouteCodec != nil {
+            guard let route = stationRouteContext(clientID: id, connectionID: policyContext.route.connectionId),
+                  stationRoutes?.stagedSelection(route) != nil else { return }
+        }
         // Session and policy operations share one attachment. Atem admits only one init per second per host link.
         if let context = sessionContext(for: id), policyContext.matches(context) {
             if let link = hostPolicyChannel(for: policyContext) {
@@ -1868,7 +2064,7 @@ class AstationHubManager: ObservableObject {
                     self.updateTransportPolicyPresentation()
                     Log.warn("[AstationHub] Encrypted host policy channel closed: \(message)")
                     if !policyContext.isRelay && self.transportPolicy.blocksDirect(account: policyContext.account, issuer: policyContext.issuer) {
-                        self.disconnectDirectClient?(id); self.removeClient(withId: id)
+                        self.requireSelectedRelay(clientID: id)
                     }
                 }, refreshMembership: { [weak self] head in
                     Task { @MainActor in
@@ -1891,10 +2087,10 @@ class AstationHubManager: ObservableObject {
                 keyId: AstationIdentity.shared.id, grantJson: nil), log: log, signer: signer)
         } catch {
             policyR9Connections.removeValue(forKey: id)?.disconnect()
-            Log.warn("[AstationHub] Encrypted host policy needs verified account membership")
-            if !policyContext.isRelay && intent.relayOnly {
-                disconnectDirectClient?(id); removeClient(withId: id)
-            }
+            // No migration channel opened. Keep the authenticated socket so a
+            // reconnecting host cannot churn presence; direct agent access stays blocked.
+            Log.warn("[AstationHub] Encrypted host policy needs verified account membership; retaining the authenticated connection")
+            requireSelectedRelay(clientID: id)
         }
     }
 
@@ -2355,11 +2551,22 @@ class AstationHubManager: ObservableObject {
             case .success(let message):
                 switch message {
                 case .string(let text):
+                    if let self {
+                        Task { @MainActor in
+                            if let bridge = self.retainedRouteRelays.values.first(where: { $0.socket === task }) { bridge.handle(text) }
+                        }
+                    }
                     NetworkDebugLogger.logWebSocket(direction: "recv", context: "identity-relay", message: text)
                     if let frame = RelayIdentityProtocol.parseControlFrame(text) {
                         // Raw relay control frame (relay-auth-1), not an Atem envelope.
                         DispatchQueue.main.async {
                             self?.handleRelayControlFrame(frame, task: task)
+                        }
+                    } else if let envelope = try? RemoteRelayEnvelope(Data(text.utf8)),
+                              RemoteStationRoute.isEnvelope(envelope.payload) {
+                        Task { @MainActor in
+                            guard let self, self.identityRelayTask === task else { return }
+                            self.receiveStationRoute(envelope.payload, clientID: "relay-\(envelope.host)", connectionID: envelope.connection)
                         }
                     } else if let envelope = try? RemoteRelayEnvelope(Data(text.utf8)),
                               RemoteRelayEnvelope.isChannel(envelope.payload) {
@@ -2425,6 +2632,10 @@ class AstationHubManager: ObservableObject {
                     .flatMap { String(data: $0, encoding: .utf8) }
                     .flatMap { $0.isEmpty ? nil : $0 }
                 DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        guard let self, let entry = self.retainedRouteRelays.first(where: { $0.value.socket === task }) else { return }
+                        self.retainedRouteRelays.removeValue(forKey: entry.key)?.close()
+                    }
                     self?.handleIdentityRelayDisconnect(
                         task: task,
                         error: error,
@@ -2700,9 +2911,13 @@ class AstationHubManager: ObservableObject {
         NotificationCenter.default.post(name: .relayIdentityKeyChanged, object: nil)
     }
 
-    private func pauseIdentityRelay() {
+    private func pauseIdentityRelay(retainForRouting: Bool = false) {
         invalidateStationRegistration()
+        if !retainForRouting { MainActor.assumeIsolated { closeRetainedRouteRelays() } }
         let task = identityRelayTask
+        if retainForRouting, stationRouteCodec != nil, let task {
+            MainActor.assumeIsolated { retainStationRouteRelay(task) }
+        }
         identityRelayTask = nil
         identityRelaySocketGeneration = UUID().uuidString
         identityRelayVerified = false
@@ -2719,7 +2934,7 @@ class AstationHubManager: ObservableObject {
         browserAgentChat.invalidateAll()
         refreshSessionConnections()
         terminalConnectionsDidChange?()
-        task?.cancel(with: .goingAway, reason: nil)
+        if !retainForRouting || stationRouteCodec == nil { task?.cancel(with: .goingAway, reason: nil) }
     }
 
     private func finishRelayIdentityKeyLoad(_ state: RelayIdentityKeyLoadState) {

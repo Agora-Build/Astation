@@ -6,6 +6,34 @@ import XCTest
 
 final class DirectConnectionTests: XCTestCase {
     @MainActor
+    func testRelayOnlyMissingMembershipDoesNotCloseAuthenticatedLoopbackSocket() async throws {
+        let hub = try TerminalHubFixture(relayOnly: true)
+        let fixture = try DirectServerFixture(host: "127.0.0.1", hub: hub.hub)
+        defer { fixture.shutdown() }
+        hub.hub.disconnectDirectClient = { fixture.server.disconnectClientForSessionReset($0) }
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+
+        let (result, socket) = try await connect(host: "127.0.0.1", fixture: fixture, group: group,
+            authMessage: loopbackAuthMessage(fixture: fixture, atemId: hub.deviceId)).get()
+        defer { _ = socket.close() }
+        XCTAssertEqual(result, "authenticated:local_proof")
+        let closed = expectation(description: "Missing membership does not disconnect the local host")
+        closed.isInverted = true
+        socket.onClose.whenComplete { _ in closed.fulfill() }
+        await hub.drain()
+        await fulfillment(of: [closed], timeout: 0.15)
+
+        XCTAssertFalse(socket.isClosed)
+        XCTAssertEqual(fixture.server.getConnectedClientsCount(), 1)
+        let client = try XCTUnwrap(hub.hub.connectedClients.first)
+        XCTAssertEqual(hub.hub.remoteAccessBlockReason(for: client.id), .selectedRelayRequired)
+        XCTAssertNil(hub.hub.sessionClient(for: client.id))
+        XCTAssertTrue(hub.hub.supportedAtemClients.isEmpty)
+        XCTAssertNotNil(fixture.sessions.get(sessionId: hub.session.id))
+    }
+
+    @MainActor
     func testLocalAPIIsOptInAuthenticatedAndRejectsBrowserRequests() async throws {
         let fixture = try DirectServerFixture(host: "127.0.0.1")
         defer { fixture.shutdown() }
@@ -383,13 +411,13 @@ private final class DirectServerFixture {
     let server: AstationWebSocketServer
     private var stopped = false
 
-    init(host: String) throws {
+    init(host: String, hub: AstationHubManager? = nil) throws {
         directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AstationDirectTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        sessions = SessionStore(storageURL: directory.appendingPathComponent("sessions.json"))
+        sessions = hub?.deviceSessionStore ?? SessionStore(storageURL: directory.appendingPathComponent("sessions.json"))
         bootstrap = try LocalBootstrapStore(directory: directory)
-        let hub = AstationHubManager(skipProjectLoad: true, deviceSessionStore: sessions)
+        let hub = hub ?? AstationHubManager(skipProjectLoad: true, deviceSessionStore: sessions)
         server = AstationWebSocketServer(
             hubManager: hub,
             sessionStore: sessions,

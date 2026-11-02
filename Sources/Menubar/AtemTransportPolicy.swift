@@ -100,15 +100,18 @@ final class AtemTransportPolicyController {
     private let current: (AtemTransportPolicyContext) -> Bool
     private let send: (RemoteAgentOperation, AtemTransportPolicyContext) -> String?
     private let reconnect: (AtemTransportPolicyContext) -> Void
+    private let directRestriction: (AtemTransportPolicyContext) -> UInt64?
     private var attempts: [String: Attempt] = [:]
     var changed: (() -> Void)?
 
     init(journal: AtemSessionJournal, now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
          current: @escaping (AtemTransportPolicyContext) -> Bool,
          send: @escaping (RemoteAgentOperation, AtemTransportPolicyContext) -> String?,
-         reconnect: @escaping (AtemTransportPolicyContext) -> Void) {
+         reconnect: @escaping (AtemTransportPolicyContext) -> Void,
+         directRestriction: @escaping (AtemTransportPolicyContext) -> UInt64? = { _ in nil }) {
         self.journal = journal; self.now = now; self.current = current
         self.send = send; self.reconnect = reconnect
+        self.directRestriction = directRestriction
     }
 
     func policy(account: String, issuer: String) -> AtemTransportPolicyRecord? {
@@ -162,6 +165,28 @@ final class AtemTransportPolicyController {
             changed?(); return
         }
         do {
+            // A routing-only restriction needs a newer manager policy mutation.
+            // If policy was already false at the fence, commit true before false.
+            if let mutation = attempt.mutation, mutation.relayOnly != attempt.value,
+               reply.confirmed, reply.state == "durable", reply.relayOnly == mutation.relayOnly,
+               ["committed", "unchanged"].contains(reply.outcome) {
+                try save(checkpoint(context, value: mutation.relayOnly, request: mutation.requestID,
+                    revision: mutation.expectedRevision, completed: true))
+                attempt.mutation = nil; attempts[context.route.clientId] = attempt
+                transmit(.hostPolicyGet(desired: attempt.value), context: context)
+                changed?(); return
+            }
+            if !attempt.value, attempt.mutation == nil, reply.outcome == "current", !reply.relayOnly,
+               let fence = directRestriction(context) {
+                let align = reply.revision <= fence
+                let mutation = checkpoint(context, value: align, request: UUID().uuidString.lowercased(),
+                    revision: reply.revision, completed: false)
+                try save(mutation)
+                attempt.mutation = mutation; attempts[context.route.clientId] = attempt
+                transmit(.hostPolicyRetry(relayOnly: align, request: mutation.requestID!,
+                    expectedRevision: mutation.expectedRevision), context: context)
+                changed?(); return
+            }
             if reply.confirmed, reply.state == "durable", reply.relayOnly == attempt.value,
                ["current", "committed", "unchanged"].contains(reply.outcome) {
                 let saved = checkpoint(context, value: attempt.value, request: attempt.mutation?.requestID,

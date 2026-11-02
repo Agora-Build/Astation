@@ -1,6 +1,19 @@
 import SwiftUI
 
 enum AtemClientListModel {
+    static func displayName(hostname: String, atemId: String?, fallbackId: String) -> String {
+        let hostname = hostname.hasPrefix("relay:") ? String(hostname.dropFirst("relay:".count)) : hostname
+        guard let atemId, !atemId.isEmpty else {
+            return hostname == "unknown" ? String(fallbackId.prefix(8)) + "…" : hostname
+        }
+        if hostname == "unknown"
+            || atemId.caseInsensitiveCompare(hostname) == .orderedSame
+            || atemId.range(of: hostname + "-", options: [.anchored, .caseInsensitive]) != nil {
+            return atemId
+        }
+        return "\(hostname)(\(atemId))"
+    }
+
     static func onlineClients(
         _ connectedClients: [ConnectedClient],
         preferredClientId: String? = nil
@@ -143,7 +156,9 @@ private struct ClientListPanel: View {
     private var offlineAtems: [SessionInfo] {
         AtemClientListModel.offlineSessions(
             activeSessions: hubManager.deviceSessionStore.getAllActive(),
-            connectedClients: hubManager.connectedClients
+            connectedClients: hubManager.connectedClients.filter {
+                !hubManager.relayOnlyPolicyRequired || $0.id.hasPrefix("relay-")
+            }
         )
     }
 
@@ -257,9 +272,11 @@ private struct OnlineClientRow: View {
     let onRefreshAgents: () -> Void
 
     private var displayName: String {
-        client.hostname == "unknown"
-            ? String(client.id.prefix(8)) + "…"
-            : client.hostname
+        AtemClientListModel.displayName(
+            hostname: client.hostname,
+            atemId: client.atemId,
+            fallbackId: client.id
+        )
     }
 
     var body: some View {
@@ -273,6 +290,8 @@ private struct OnlineClientRow: View {
                     Text(displayName)
                         .font(.subheadline)
                         .fontWeight(isPinned ? .semibold : .regular)
+                        .lineLimit(2)
+                        .help(displayName)
                     if isPinned {
                         Image(systemName: "star.fill")
                             .font(.caption2)
@@ -328,13 +347,11 @@ private struct OfflineClientRow: View {
     let session: SessionInfo
 
     private var displayName: String {
-        if session.hostname != "unknown" {
-            return session.hostname
-        }
-        return session.atemId.map { id in
-            id.count > 18 ? String(id.prefix(18)) + "…" : id
-        }
-            ?? String(session.id.prefix(8)) + "…"
+        AtemClientListModel.displayName(
+            hostname: session.hostname,
+            atemId: session.atemId,
+            fallbackId: session.id
+        )
     }
 
     var body: some View {
@@ -346,6 +363,8 @@ private struct OfflineClientRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(displayName)
                     .font(.subheadline)
+                    .lineLimit(2)
+                    .help(displayName)
                 Text("Paired · last seen \(relativeTime(from: session.lastActivity))")
                     .font(.caption)
                     .foregroundColor(.secondary)
@@ -395,7 +414,11 @@ private struct AgentListPanel: View {
         guard let c = selectedClient else {
             return clientId.map { String($0.prefix(8)) + "…" } ?? "No client selected"
         }
-        return c.hostname == "unknown" ? String(c.id.prefix(8)) + "…" : c.hostname
+        return AtemClientListModel.displayName(
+            hostname: c.hostname,
+            atemId: c.atemId,
+            fallbackId: c.id
+        )
     }
 
     var body: some View {
@@ -409,6 +432,9 @@ private struct AgentListPanel: View {
                     Text(panelTitle)
                         .font(.caption)
                         .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(panelTitle)
                     if clientIsOnline, let id = clientId {
                         Button {
                             onRemoteControl(id, nil)

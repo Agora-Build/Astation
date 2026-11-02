@@ -131,6 +131,14 @@ class AstationWebSocketServer {
     }
     
     private func handleIncomingMessage(_ text: String, from clientId: String, ws: WebSocket) {
+        if RemoteStationRoute.isEnvelope(Data(text.utf8)) {
+            guard hasCurrentSession(clientId) else { _ = ws.close(code: .policyViolation); return }
+            let bytes = Data(text.utf8)
+            Task { @MainActor in
+                self.hubManager.receiveStationRoute(bytes, clientID: clientId, connectionID: clientId)
+            }
+            return
+        }
         if RemoteRelayEnvelope.isChannel(Data(text.utf8)) {
             guard hasCurrentSession(clientId) else { _ = ws.close(code: .policyViolation); return }
             let bytes = Data(text.utf8)
