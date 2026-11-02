@@ -1402,7 +1402,39 @@ than 503; a valid exact-audience `station.read` token is required for 200 and
 the public report JWK. This does not enable integrations or hosted execution.
 Auth's built-in integration switch was enabled on Portal #21 at 16:37:44 UTC
 on 2026-11-01; Portal confirmed the same flag at 16:57:31 UTC. Hosted APIs
-still return `hosted_execution_not_verified` until the joint live gate passes.
+remained closed until the subsequent live checks and owner rollout approval.
+
+### Approved dev hosted API deployment
+
+On 2026-11-02, the owner approved lasting hosted execution on
+`https://station-dev.agora.build`. Both existing dev relays now use the
+Coolify-persisted image tag `dev-hosted-70b9bb5b3956`, source
+`70b9bb5b395628af4a848806bd8a1c89f3ce7f7f`, built with `hosted-agent-api`:
+
+| Replica | Coolify deployment | Finished (UTC) |
+| --- | --- | --- |
+| `station-dev-relay-a` | `c10jebqm70xs83gqfmgv53km` | 2026-11-02 05:18:01 |
+| `station-dev-relay-b` | `e10vy7u9pzku9dcgz84jywba` | 2026-11-02 05:19:28 |
+
+Both exact runtime containers passed direct health/build checks with Redis and
+two replicas healthy, unchanged dev origin/issuer/audience, and both protected
+key mounts read-only. Five public health samples matched that build. Missing
+or invalid credentials are refused with 401 by direct and public HTTPS agent
+routes and TLS WebSocket upgrades. The revoked test integration stays revoked
+at authenticated policy cursor 37 and has no sealed Station service key.
+The proved Genie route is present; the retained Atem/Codex processes were not
+restarted. No new agent command was submitted during activation. The next
+positive command test needs a new appropriately scoped integration and real
+native owner approval. Source, tests and evidence are linked in the
+[deployment result](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6569748603).
+
+The rollout retained `dev-9004ca9`, protected keys and the durable database.
+To roll back, restore that image tag on the affected dev Coolify application,
+redeploy one replica at a time, and verify its direct old-build health and
+the closed public gate. Do not restore a database snapshot or regenerate keys.
+Protected rollout metadata, tests and `live-verification.json` remain in
+`/home/guohai/astation-hosted-enabled-20261102` on Volumetric. This dev
+deployment does not change the production build or merge `main`.
 
 Native approval review and owner authentication name Agora.Build as the
 operator for the exact built-in origins and disclose that it can read and

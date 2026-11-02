@@ -19,6 +19,22 @@ the existing admission path, including readiness probes; it does not grant
 integration permissions. Auth tokens, current authenticated policy,
 native-signed service membership and R9 host admission remain mandatory.
 
+The approved dev deployment is **enabled** as of 2026-11-02 05:21 UTC. Both
+Coolify replicas run source `70b9bb5b395628af4a848806bd8a1c89f3ce7f7f`, image
+`dev-hosted-70b9bb5b3956`. Sequential deployments completed at 05:18:01 and
+05:19:28 UTC. Direct health on each exact runtime and five public health
+samples confirm the expected build, Redis and two healthy replicas. Direct
+and public HTTPS sessions and TLS WebSocket upgrades reject missing/invalid
+credentials with 401, rather than the former release-gate 503. The old test
+integration remains revoked at fresh feed cursor 37, with its sealed service
+key absent; the proved Genie route and retained runtime/agent processes remain
+available. Protected `live-verification.json` records `enabled_verified` under
+`/home/guohai/astation-hosted-enabled-20261102`. All seven isolated enabled-build
+Postgres/API tests passed; real-host and public live evidence is recorded
+separately. The new deployment submitted no agent mutation: its next positive
+command test requires a new owner-created, native-approved integration.
+See [deployment evidence](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6569748603).
+
 ## Provisioning and approval
 
 1. For a custom HTTPS Station, register it in Portal with its exact public origin
