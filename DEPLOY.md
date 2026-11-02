@@ -1423,10 +1423,20 @@ or invalid credentials are refused with 401 by direct and public HTTPS agent
 routes and TLS WebSocket upgrades. The revoked test integration stays revoked
 at authenticated policy cursor 37 and has no sealed Station service key.
 The proved Genie route is present; the retained Atem/Codex processes were not
-restarted. No new agent command was submitted during activation. The next
-positive command test needs a new appropriately scoped integration and real
-native owner approval. Source, tests and evidence are linked in the
+restarted. No new agent command was submitted during activation. Source,
+tests and evidence are linked in the
 [deployment result](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6569748603).
+
+The subsequent first public command passed at 2026-11-02 05:53:01 UTC with
+native-approved integration `i-01m6dc9yx5dmcem4pqjhd990j3`. A new app-key token
+passed independent issuer/signature/audience/owner/scope/service checks. One
+harmless prompt to Genie's Codex session returned HTTP 200; request
+`4154aae7-eae7-4a2b-91c3-3dd637378ac5` was accepted and its original durable
+receipt recovered as `completed`/`done`. The correlated formatted reply passed
+HTTP history, live WSS and an independent exact reread; fresh WSS reconnect
+passed as well. No replay, gate bypass or readiness fixture was used. Protected
+evidence is `/home/guohai/astation-hosted-command-20261102/first-real-hosted-command.json`
+on Volumetric. See [the command result](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6570174233).
 
 The rollout retained `dev-9004ca9`, protected keys and the durable database.
 To roll back, restore that image tag on the affected dev Coolify application,

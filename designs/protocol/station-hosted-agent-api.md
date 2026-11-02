@@ -31,9 +31,24 @@ key absent; the proved Genie route and retained runtime/agent processes remain
 available. Protected `live-verification.json` records `enabled_verified` under
 `/home/guohai/astation-hosted-enabled-20261102`. All seven isolated enabled-build
 Postgres/API tests passed; real-host and public live evidence is recorded
-separately. The new deployment submitted no agent mutation: its next positive
-command test requires a new owner-created, native-approved integration.
+separately. The deployment itself submitted no agent mutation.
 See [deployment evidence](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6569748603).
+
+The first real public command passed on 2026-11-02 at 05:53:01 UTC using the
+new native-approved integration `i-01m6dc9yx5dmcem4pqjhd990j3`. A freshly issued
+app-key token passed independent Auth signature, audience, owner, scope and
+service-binding verification. Exactly one harmless prompt reached Genie's
+Codex session `ses-ugqyqctgy3pe`; request
+`4154aae7-eae7-4a2b-91c3-3dd637378ac5` returned HTTP 200 and progressed from
+`accepted` to the recovered durable `completed` receipt with outcome `done`.
+The receipt-correlated reply preserved its Markdown emphasis, paragraph break
+and link in public HTTP history and the live WebSocket stream. An independent
+exact reply reread and a fresh authenticated WebSocket reconnect also passed.
+The operator exited 0 in 23.97 seconds, without replay, a readiness fixture or
+an approval action. Protected raw evidence is
+`/home/guohai/astation-hosted-command-20261102/first-real-hosted-command.json`
+on Volumetric, phase `completed`.
+See [the public command result](https://github.com/Agora-Build/Portal/issues/21#issuecomment-6570174233).
 
 ## Provisioning and approval
 
