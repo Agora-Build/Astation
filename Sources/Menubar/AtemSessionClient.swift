@@ -319,7 +319,8 @@ final class AtemSessionClient {
         guard controlOwner(for: target).map({ $0 == owner }) != false else { return }
         let binding = binding(for: target, mutation: true, owner: owner)
         leases.removeValue(forKey: target.session_id)
-        pending = pending.filter { $0.value.message.binding?.target != target || !["acquire", "renew"].contains($0.value.message.op) }
+        pending = pending.filter { $0.value.owner != owner || $0.value.message.binding?.target != target
+            || !["acquire", "renew"].contains($0.value.message.op) }
         // Keep receipt recovery, but a reply to a closed/backgrounded view
         // must never restore its authority.
         for (id, operation) in pending where operation.owner == owner && operation.message.binding?.target == target {
@@ -521,9 +522,6 @@ final class AtemSessionClient {
                 }
             } else {
                 try journal.update { state in
-                    if state.requests.count >= 4096, let oldestFinal = state.requests.firstIndex(where: { $0.receipt?.state.final == true }) {
-                        state.requests.remove(at: oldestFinal)
-                    }
                     state.requests.append(record)
                 }
             }

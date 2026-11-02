@@ -1598,6 +1598,76 @@ final class AtemSessionClientTests: XCTestCase {
 }
 
 final class AtemSessionJournalTests: XCTestCase {
+    private func record(_ target: AtemSessionTarget, state: AtemReceiptState? = nil, refused: Bool = false) -> AtemSessionRequestRecord {
+        let id = UUID().uuidString.lowercased()
+        return AtemSessionRequestRecord(requestId: id, target: target, kind: "prompt", digest: String(repeating: "a", count: 64),
+            receipt: state.map { AtemSessionReceipt(request_id: id, target: target, kind: "prompt", state: $0,
+                detail: $0 == .completed ? "done" : nil, updated_at: 1) },
+            refusal: refused ? AtemSessionRefusal(code: "lease_held",
+                controller: AtemSessionController(controller_session: controllerID, lease_epoch: 7)) : nil)
+    }
+
+    func testDefinitiveRefusalsAgeOutAtCountLimitWithoutEvictingUnresolvedWork() throws {
+        let f = SessionFixture()
+        let protected = [record(f.target), record(f.target, state: .accepted), record(f.target, state: .executing)]
+        let refused = (0..<4093).map { _ in record(f.target, refused: true) }
+        f.disk.state.requests = protected + refused
+        let journal = f.disk.journal()
+        let next = record(f.target)
+        try journal.update { $0.requests.append(next) }
+        XCTAssertEqual(journal.snapshot.requests.count, 4096)
+        XCTAssertEqual(Array(journal.snapshot.requests.prefix(3)), protected)
+        XCTAssertFalse(journal.snapshot.requests.contains { $0.requestId == refused[0].requestId })
+        XCTAssertEqual(journal.snapshot.requests.last, next)
+        let reloaded = f.disk.journal()
+        XCTAssertFalse(reloaded.loadFailed)
+        XCTAssertEqual(reloaded.snapshot, journal.snapshot)
+    }
+
+    func testRefusalFullJournalCanSubmitAfterRestartWithoutReplayingOldPrompts() throws {
+        let f = SessionFixture()
+        let uncertain = record(f.target)
+        let refused = (0..<4095).map { _ in record(f.target, refused: true) }
+        f.disk.state.requests = [uncertain] + refused
+        try f.ready()
+        XCTAssertFalse(f.sent.contains { $0.op == "submit" })
+        XCTAssertEqual(f.sent.filter { $0.op == "receipt_query" }.flatMap { $0.request_ids ?? [] }, [uncertain.requestId])
+        let request = try XCTUnwrap(f.client.submit(f.target, kind: "prompt", text: "new explicit prompt"))
+        XCTAssertEqual(f.sent.filter { $0.op == "submit" }.map(\.request_id), [request])
+        XCTAssertEqual(f.disk.state.requests.count, 4096)
+        XCTAssertTrue(f.disk.state.requests.contains { $0.requestId == uncertain.requestId })
+        XCTAssertFalse(f.disk.state.requests.contains { $0.requestId == refused[0].requestId })
+        let restarted = SessionFixture(disk: f.disk)
+        try restarted.ready()
+        XCTAssertFalse(restarted.sent.contains { $0.op == "submit" })
+        XCTAssertEqual(Set(restarted.sent.filter { $0.op == "receipt_query" }.flatMap { $0.request_ids ?? [] }), [uncertain.requestId, request])
+    }
+
+    func testCapacityFailurePreservesUncertainAcceptedAndExecutingRequests() throws {
+        let f = SessionFixture()
+        f.disk.state.requests = (0..<4096).map { record(f.target, state: [nil, .accepted, .executing][$0 % 3]) }
+        let journal = f.disk.journal(), original = journal.snapshot
+        XCTAssertThrowsError(try journal.update { $0.requests.append(record(f.target)) })
+        XCTAssertEqual(journal.snapshot, original)
+        XCTAssertFalse(journal.loadFailed)
+        XCTAssertEqual(f.disk.state, original)
+    }
+
+    func testByteEvictionIncludesRefusalsAndKeepsUnresolvedWork() throws {
+        let f = SessionFixture()
+        let refusal = record(f.target, refused: true), uncertain = record(f.target)
+        let result = AtemSessionResult(turn_id: "turn-1", user_message_id: "user-1", outcome: "done",
+            reply_message_ids: (0..<32).map { "reply-\($0)-" + String(repeating: "a", count: 116) }, more: false, replies: "complete")
+        var finals = (0..<1100).map { _ in record(f.target, state: .completed) }
+        for index in finals.indices { finals[index].receipt?.result = result }
+        let journal = f.disk.journal()
+        try journal.update { $0.requests = [refusal, uncertain] + finals }
+        XCTAssertLessThanOrEqual(try JSONEncoder().encode(journal.snapshot).count, 4_194_304)
+        XCTAssertFalse(journal.snapshot.requests.contains { $0.requestId == refusal.requestId })
+        XCTAssertTrue(journal.snapshot.requests.contains { $0.requestId == uncertain.requestId })
+        XCTAssertFalse(f.disk.journal().loadFailed)
+    }
+
     func testRealFileReloadRestrictsPermissionsAndPreservesOnlyRecoveryMetadata() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -1912,6 +1982,42 @@ final class AtemR9PresentationTests: XCTestCase {
         XCTAssertFalse(f.client.renew(f.target, owner: "api:test"))
     }
 
+    func testReleaseOnlyCancelsTheReleasingOwnersPendingControl() throws {
+        for owner in ["native", "api:operator-a"] {
+            let f = SessionFixture(); try f.ready()
+            XCTAssertTrue(f.client.acquire(f.target, owner: owner))
+            let acquire = try XCTUnwrap(f.sent.last)
+            f.client.release(f.target, owner: "api:operator-b")
+            try f.lease(replyTo: acquire.id)
+            XCTAssertEqual(f.client.controlOwner(for: f.target), owner)
+            XCTAssertTrue(f.client.renew(f.target, owner: owner))
+            let renew = try XCTUnwrap(f.sent.last)
+            f.client.release(f.target, owner: "api:operator-b")
+            f.time = 1
+            try f.lease(replyTo: renew.id)
+            XCTAssertEqual(f.client.controlOwner(for: f.target), owner)
+            XCTAssertEqual(f.client.controlDeadline(for: f.target), 15)
+            f.client.release(f.target, owner: owner)
+            XCTAssertNil(f.client.controlOwner(for: f.target))
+        }
+    }
+
+    func testOwnerReleaseFencesItsOwnLateAcquireAndRenew() throws {
+        for operation in ["acquire", "renew"] {
+            let f = SessionFixture(); try f.ready()
+            XCTAssertTrue(f.client.acquire(f.target, owner: "api:operator-a"))
+            if operation == "renew" {
+                try f.lease(replyTo: XCTUnwrap(f.sent.last).id)
+                XCTAssertTrue(f.client.renew(f.target, owner: "api:operator-a"))
+            }
+            let request = try XCTUnwrap(f.sent.last)
+            f.client.release(f.target, owner: "api:operator-a")
+            try f.lease(replyTo: request.id)
+            XCTAssertNil(f.client.controlOwner(for: f.target))
+            XCTAssertFalse(f.client.renew(f.target, owner: "api:operator-a"))
+        }
+    }
+
     func testTakeoverRequiresTheRefusedHolderAndKeepsSameRequestIdentity() throws {
         let f = SessionFixture(); try f.ready()
         let request = try XCTUnwrap(f.client.submit(f.target, kind: "prompt", text: "review"))
@@ -1962,6 +2068,89 @@ final class AtemR9PresentationTests: XCTestCase {
         try event(f, "error", 11, fields: ["page_id": lookup, "code": "stale_target"])
         XCTAssertEqual(f.client.chatPage(f.target, pageID: lookup)?.error, "stale_target")
         XCTAssertEqual(f.client.chatSnapshot(f.target)?.closed, false)
+    }
+
+    func testOverlappingAndRepeatedMiddleHistoryPreservesTheNewestSnapshot() throws {
+        let f = SessionFixture(); try f.ready()
+        try event(f, "opened", 0, fields: ["status": ["state": "ready", "since": 1_760_500_000_000]])
+        var sequence: UInt64 = 1
+        for index in 1...100 {
+            try event(f, "message", sequence, fields: message("m\(index)", text: "message \(index)", history: index <= 50))
+            sequence += 1
+            if index == 50 {
+                try event(f, "history_end", sequence, fields: ["page": page(50)])
+                sequence += 1
+            }
+        }
+        for boundary in [100, 75, 100] {
+            let pageID = try XCTUnwrap(f.client.chatHistory(f.target, before: "m\(boundary)"))
+            for index in (boundary - 25)..<boundary {
+                var older = message("m\(index)", text: "page \(index)", history: true)
+                older["page_id"] = pageID
+                try event(f, "message", sequence, fields: older); sequence += 1
+            }
+            try event(f, "history_end", sequence, fields: ["page_id": pageID, "page": page(25, selector: "before")])
+            sequence += 1
+            XCTAssertEqual(f.client.chatSnapshot(f.target)?.messages.compactMap(\.messageId), (51...100).map { "m\($0)" })
+        }
+    }
+
+    func testHistoryFillsItsRequestedBoundaryWithoutMovingRecoveredMessagesOrNewerVersions() throws {
+        let f = SessionFixture(); try f.ready()
+        try event(f, "opened", 0, fields: ["status": ["state": "ready", "since": 1_760_500_000_000]])
+        try event(f, "message", 1, fields: message("m1", text: "first", history: true))
+        try event(f, "message", 2, fields: message("m5", text: "last", history: true))
+        try event(f, "history_end", 3, fields: ["page": page(2)])
+        let pageID = try XCTUnwrap(f.client.chatHistory(f.target, before: "m5"))
+        for (offset, id) in ["m2", "m3", "m4"].enumerated() {
+            var older = message(id, text: "page version", history: true); older["page_id"] = pageID
+            try event(f, "message", UInt64(4 + offset), fields: older)
+        }
+        try event(f, "message", 7, fields: message("m3", text: "new whole message"))
+        var recovered = message("recovered", text: "recovered", history: true)
+        recovered["after_message_id"] = "m1"
+        try event(f, "message", 8, fields: recovered)
+        try event(f, "history_end", 9, fields: ["page_id": pageID, "page": page(3, selector: "before")])
+        let view = try XCTUnwrap(f.client.chatSnapshot(f.target))
+        XCTAssertEqual(view.messages.compactMap(\.messageId), ["m1", "recovered", "m2", "m3", "m4", "m5"])
+        XCTAssertEqual(view.messages.first { $0.messageId == "m3" }?.parts?.first?.markdown, "new whole message")
+        XCTAssertEqual(view.reopens, 0)
+    }
+
+    func testDisjointHistoryContinuationKeepsTheOriginalBeforeBoundary() throws {
+        let f = SessionFixture(); try f.ready()
+        try event(f, "opened", 0, fields: ["status": ["state": "ready", "since": 1_760_500_000_000]])
+        try event(f, "message", 1, fields: message("m1", text: "first", history: true))
+        try event(f, "message", 2, fields: message("m5", text: "last", history: true))
+        try event(f, "history_end", 3, fields: ["page": page(2)])
+        let first = try XCTUnwrap(f.client.chatHistory(f.target, before: "m5"))
+        var older = message("m4", text: "fourth", history: true); older["page_id"] = first
+        try event(f, "message", 4, fields: older)
+        var more = page(1, selector: "before"); more["end"] = false; more["next"] = "continuation"
+        try event(f, "history_end", 5, fields: ["page_id": first, "page": more])
+        let second = try XCTUnwrap(f.client.chatHistory(f.target, next: "continuation"))
+        for (offset, id) in ["m2", "m3"].enumerated() {
+            var message = message(id, text: id, history: true); message["page_id"] = second
+            try event(f, "message", UInt64(6 + offset), fields: message)
+        }
+        try event(f, "history_end", 8, fields: ["page_id": second, "page": page(2, selector: "before")])
+        XCTAssertEqual(f.client.chatSnapshot(f.target)?.messages.compactMap(\.messageId), ["m1", "m2", "m3", "m4", "m5"])
+    }
+
+    func testOverlappingHistoryUsesExistingAnchorsToFillMultipleGaps() throws {
+        let f = SessionFixture(); try f.ready()
+        try event(f, "opened", 0, fields: ["status": ["state": "ready", "since": 1_760_500_000_000]])
+        for (offset, index) in [1, 4, 7, 10].enumerated() {
+            try event(f, "message", UInt64(offset + 1), fields: message("m\(index)", text: "existing", history: true))
+        }
+        try event(f, "history_end", 5, fields: ["page": page(4)])
+        let pageID = try XCTUnwrap(f.client.chatHistory(f.target, before: "m10"))
+        for index in 2...9 {
+            var older = message("m\(index)", text: "page", history: true); older["page_id"] = pageID
+            try event(f, "message", UInt64(index + 4), fields: older)
+        }
+        try event(f, "history_end", 14, fields: ["page_id": pageID, "page": page(8, selector: "before")])
+        XCTAssertEqual(f.client.chatSnapshot(f.target)?.messages.compactMap(\.messageId), (1...10).map { "m\($0)" })
     }
 
     func testMissingHistoryBoundaryIsUnconfirmedAndNeverAnEmptyCompletedHistory() throws {

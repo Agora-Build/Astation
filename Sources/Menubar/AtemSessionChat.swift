@@ -23,6 +23,7 @@ final class AtemSessionChat {
     }
     struct HistoryReply: Encodable {
         let page_id: String
+        var before: String?
         var pending = true
         var error: String?
         var page: AtemChatPage?
@@ -137,7 +138,9 @@ final class AtemSessionChat {
         guard view.historyTimes.count < 8, view.replies.values.filter(\.pending).count < 4 else { return nil }
         let pageID = makeID()
         view.historyTimes.append(now())
-        view.replies[pageID] = HistoryReply(page_id: pageID)
+        let predecessor = view.pageIDs.reversed().compactMap { view.replies[$0] }.first { $0.page?.next == next && next != nil }
+        view.replies[pageID] = HistoryReply(page_id: pageID,
+            before: before ?? predecessor?.messages.first?.messageId ?? predecessor?.before)
         view.pageTimes[pageID] = now()
         view.pageIDs.append(pageID)
         while view.pageIDs.count > 4 {
@@ -146,6 +149,10 @@ final class AtemSessionChat {
             view.replies.removeValue(forKey: oldest); view.pageTimes.removeValue(forKey: oldest)
             view.pageBytes.removeValue(forKey: oldest)
             view.pageContent.removeValue(forKey: oldest)
+        }
+        let retained = Set(view.order + view.replies.values.flatMap { $0.messages.compactMap(\.messageId) })
+        for id in view.messages.keys where !retained.contains(id) {
+            view.messages.removeValue(forKey: id); view.sizes.removeValue(forKey: id); view.versions.removeValue(forKey: id)
         }
         views[target.session_id] = view
         var event = AgentChatWire(op: "history", conversationId: view.snapshot.chat_id, agentId: target.session_id,
@@ -239,10 +246,7 @@ final class AtemSessionChat {
                     if event.recovered {
                         if let after = event.after_message_id, let i = view.order.firstIndex(of: after) { view.order.insert(id, at: i + 1) }
                         else { view.order.insert(id, at: 0) }
-                    } else if let pageID = event.page_id, view.replies[pageID]?.messages.count == 1 {
-                        // Older pages are prepended at their explicit boundary.
-                        view.order.append(id)
-                    } else { view.order.append(id) }
+                    } else if event.page_id == nil { view.order.append(id) }
                 }
                 view.messages[id] = event; view.sizes[id] = wireBytes; view.versions[id] = sequence
             }
@@ -253,11 +257,7 @@ final class AtemSessionChat {
                 guard (reply.pending || reply.error == "history_unconfirmed"), reply.messages.count == page.count,
                       view.pageBytes[pageID, default: 0] + wireBytes <= 1_048_576 else { valid = false; break }
                 reply.pending = false; reply.error = nil; reply.page = page; reply.sequence = sequence; view.replies[pageID] = reply
-                if ["newest", "before"].contains(page.selector) {
-                    let ids = reply.messages.compactMap(\.messageId)
-                    let known = Set(ids)
-                    view.order = ids + view.order.filter { !known.contains($0) }
-                }
+                mergeHistory(reply, into: &view)
             } else {
                 guard !view.snapshot.loaded, page.selector == "newest", page.count == view.initial.count,
                       view.initialBytes + wireBytes <= 1_048_576 else { valid = false; break }
@@ -304,6 +304,21 @@ final class AtemSessionChat {
     private func close(_ snapshot: Snapshot) {
         _ = send(AgentChatWire(op: "close", conversationId: snapshot.chat_id,
             agentId: snapshot.binding.target.session_id, binding: snapshot.binding))
+    }
+
+    private func mergeHistory(_ reply: HistoryReply, into view: inout View) {
+        let ids = reply.messages.compactMap(\.messageId).filter { view.messages[$0] != nil }
+        let older = ["newest", "before"].contains(reply.page?.selector ?? "")
+        var position = reply.before.flatMap { view.order.firstIndex(of: $0) } ?? (older ? 0 : view.order.count)
+        for (offset, id) in ids.enumerated() {
+            // Existing messages anchor a page; replaying an overlapping page
+            // must not move them past live or recovered timeline entries.
+            if let index = view.order.firstIndex(of: id) { position = index + 1; continue }
+            let following = ids.dropFirst(offset + 1).compactMap { view.order.firstIndex(of: $0) }.first
+            let index = following ?? position
+            view.order.insert(id, at: index)
+            position = index + 1
+        }
     }
 
     private func resync(_ old: View) {
