@@ -11,12 +11,14 @@ public struct PortalIntegrationRecord: Decodable, Equatable, Sendable {
     public let expiresAt: String
     public let role: String
 
-    fileprivate func validate() throws {
+    func validate() throws {
         guard Self.validID(id), !name.isEmpty, name.utf8.count <= 320,
               !name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
               ["owner", "station_owner"].contains(role),
-              !scopes.isEmpty, scopes.count <= 5, Set(scopes).count == scopes.count,
-              scopes.allSatisfy({ ["agent.view", "agent.prompt", "agent.approve", "agent.interrupt", "agent.terminal"].contains($0) }),
+              scopes.contains("agent.view"), scopes.count <= 8, Set(scopes).count == scopes.count,
+              scopes.allSatisfy({ ["agent.view", "agent.prompt", "agent.approve", "agent.interrupt", "agent.terminal",
+                  "agent.launch", "agent.message", "agent.notify"].contains($0) }),
+              !scopes.contains("agent.notify") || Set(scopes).isSuperset(of: ["agent.message", "agent.prompt"]),
               Self.validOrigin(stationOrigin), expiry != nil,
               r9Svc == nil || (r9Svc!.utf8.count == 64 && r9Svc!.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }))
         else { throw AccountLoginError.invalidResponse }

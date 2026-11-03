@@ -4,11 +4,13 @@ import Foundation
 public enum StationIntegrationError: Error, LocalizedError {
     case hostSelectionRequired
     case hostWorkNotEnabled
+    case hostUpgradeRequired
 
     public var errorDescription: String? {
         switch self {
         case .hostSelectionRequired: return "Select at least one verified Atem host before reviewing access."
-        case .hostWorkNotEnabled: return "Mark tasks are not available on this Station yet. Leave this option off to approve the existing permissions."
+        case .hostWorkNotEnabled: return "Agent launch and messaging are not enabled on this Station yet."
+        case .hostUpgradeRequired: return "Connect each selected host with Atem 0.8.2 or later, then retry. All devices that verify this account must also be upgraded before approving these permissions."
         }
     }
 }
@@ -40,6 +42,7 @@ public struct StationIntegrationHTTP: Sendable {
     public func prepare(record: PortalIntegrationRecord, ownerAccount: String, issuer: String,
         log: MembershipLog, managerID: String, hosts: [String], sessions: [String]?, projects: [String]?,
         signedAt: UInt64, markTasks: Bool = false) async throws -> StationServiceDraft {
+        try record.validate()
         guard record.stationOrigin == origin, record.role == "owner", record.state == "awaiting_approval",
               PortalIntegrationRecord.validID(record.id),
               hosts.count <= 64, Set(hosts).count == hosts.count else { throw AccountLoginError.changed }
@@ -88,8 +91,10 @@ public struct RemoteServiceReview: Equatable, Sendable {
     public let expiresAt: Date
 
     public func check(record: PortalIntegrationRecord, hosts: [String], sessions: [String]?, projects: [String]?, now: Date = Date(), markTasks: Bool = false) throws {
+        try record.validate()
         let mapping: [String: [String]] = ["agent.view": ["view"], "agent.prompt": ["prompt"],
-            "agent.approve": ["approval", "rule_revoke"], "agent.interrupt": ["interrupt", "stop"], "agent.terminal": ["terminal"]]
+            "agent.approve": ["approval", "rule_revoke"], "agent.interrupt": ["interrupt", "stop"], "agent.terminal": ["terminal"],
+            "agent.launch": ["launch"], "agent.message": ["message"], "agent.notify": ["notify"]]
         var expected = Set(record.scopes.flatMap { mapping[$0] ?? [] }).union(["view"])
         if markTasks {
             guard Set(record.scopes).isSuperset(of: ["agent.view", "agent.prompt"]) else { throw AccountLoginError.changed }
@@ -98,6 +103,11 @@ public struct RemoteServiceReview: Equatable, Sendable {
         guard Set(self.hosts) == Set(hosts), self.sessions.map(Set.init) == sessions.map(Set.init),
               self.projects.map(Set.init) == projects.map(Set.init), Set(operations) == expected,
               let expiry = record.expiry, expiresAt <= expiry, expiresAt > now else { throw AccountLoginError.changed }
+    }
+
+    public var requiredHostFeatures: Set<String> {
+        let mapping = ["launch": "host.launch", "message": "host.messages", "notify": "host.work"]
+        return Set(operations.compactMap { mapping[$0] })
     }
 
     public init(approval: RemoteServiceApproval) throws {

@@ -496,6 +496,7 @@ final class AstationRecoveryCoordinator {
     /// uses its saved signature; a conflicting head requires another review.
     @discardableResult
     func approveService(_ approval: RemoteServiceApproval, portal: PortalIntegrationHTTP,
+        authorizeNewOperations: ((MembershipLog) throws -> Void)? = nil,
         current: @escaping () -> Bool) async throws -> (record: PortalIntegrationRecord, membership: MembershipLog) {
         try begin(); defer { busy = false }
         guard current(), try pendingServiceApproval() == approval, let checkpoint = saved.publication else {
@@ -514,11 +515,18 @@ final class AstationRecoveryCoordinator {
             let append: AppendRequest
             if let retry = try publication.outstanding() { append = retry }
             else {
+                let review = try RemoteServiceReview(approval: approval)
+                if !review.requiredHostFeatures.isEmpty {
+                    guard let authorizeNewOperations else { throw StationIntegrationError.hostUpgradeRequired }
+                    try authorizeNewOperations(committed)
+                }
                 let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: approval.bodyJSON, keyID: managerID)
                 guard await confirmServiceOwner(approval, request), current() else { throw RemoteRecoveryError.confirmationRequired }
                 let latest = try await refreshedLog(genesis: approval.genesisHash)
                 try requireManager(latest)
                 guard current(), latest.head() == publication.head else { throw RemoteRecoveryError.requiresReview }
+                // A disconnect or host replacement during owner authentication cancels unsigned consent.
+                if !review.requiredHostFeatures.isEmpty { try authorizeNewOperations?(latest) }
                 let stamp = now().monoMs
                 append = try approval.sign(publication: publication, provider: provider(), managerID: managerID,
                     validationClock: now(), confirmedAt: stamp, now: { Self.clock().monoMs }, current: current)

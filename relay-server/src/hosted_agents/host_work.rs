@@ -88,8 +88,8 @@ enum Operation {
     WorkQuery,
 }
 
-// Scope names are the pending Auth #14 / Portal #25 contract. The separate
-// build gate must stay off until those owners confirm issuance and consent.
+// Auth #14 / Portal #25 confirmed these scopes. The separate build gate
+// remains off until participating verifiers and live acceptance are ready.
 impl Operation {
     fn scope(self) -> &'static str {
         match self {
@@ -207,6 +207,12 @@ async fn execute(
     let mut admission = runtime
         .admit(&integration, &headers, operation.scope())
         .await?;
+    if matches!(operation, Operation::WorkQuery) {
+        admission
+            .additional_operations
+            .extend(["agent.message", "agent.prompt"]);
+        runtime.recheck(&admission).await?;
+    }
     // An executable recipient additionally needs both token permissions. The
     // host independently enforces message/notify/prompt membership and route consent.
     if let Some(WorkRequest::Publish { message, .. }) = &request {

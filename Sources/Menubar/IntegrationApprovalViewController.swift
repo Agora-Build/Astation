@@ -362,6 +362,7 @@ final class IntegrationApprovalViewController: NSViewController {
                     bodyJSON: draft.bodyJSON, log: log, managerID: coordinator.managerID, now: AstationRecoveryCoordinator.clock())
                 let review = try RemoteServiceReview(approval: candidate)
                 try review.check(record: record, hosts: selectedHosts, sessions: Self.items(sessions.stringValue), projects: Self.items(projects.stringValue), markTasks: marks)
+                try hub.validateServiceHosts(review, log: log)
                 guard candidate.fingerprint == draft.fingerprint else { throw AccountLoginError.invalidResponse }
                 try await coordinator.prepareService(candidate)
                 guard contextCurrent?() == true else { throw AccountLoginError.changed }
@@ -378,7 +379,10 @@ final class IntegrationApprovalViewController: NSViewController {
         task = Task { [weak self] in
             guard let self else { return }
             do {
-                let result = try await coordinator.approveService(approval, portal: portal, current: { [weak self] in self?.contextCurrent?() == true && !Task.isCancelled })
+                let review = try RemoteServiceReview(approval: approval)
+                let result = try await coordinator.approveService(approval, portal: portal,
+                    authorizeNewOperations: { [hub] log in try hub.validateServiceHosts(review, log: log) },
+                    current: { [weak self] in self?.contextCurrent?() == true && !Task.isCancelled })
                 guard epoch == generation, let current = contextCurrent, current() else { return }
                 self.approval = nil; reviewText.stringValue = ""
                 let updated = records.map { $0.id == result.record.id ? result.record : $0 }
@@ -475,6 +479,9 @@ final class IntegrationApprovalViewController: NSViewController {
         let value = try RemoteServiceReview(approval: approval)
         showScope(hosts: value.hosts, sessions: value.sessions, projects: value.projects, approved: false)
         reviewText.stringValue = "\(IntegrationAccessNotice.disclosure(stationOrigin: approval.stationOrigin))\n\nAccount: \(approval.ownerAccount)\nStation: \(approval.stationOrigin)\nActions: \(value.operations.joined(separator: ", "))\nHosts: \(value.hosts.joined(separator: ", "))\nSessions: \(value.sessions?.joined(separator: ", ") ?? "All on allowed hosts")\nProjects: \(value.projects?.joined(separator: ", ") ?? "All on allowed hosts")\nExpires: \(value.expiresAt.formatted())\nService: \(value.serviceID)\nKey SHA-256: \(approval.fingerprint)\nAccount root: \(approval.genesisHash)\nPrevious entry: \(value.predecessor)"
+        if !value.requiredHostFeatures.isEmpty {
+            reviewText.stringValue += "\n\nRequires Atem 0.8.2 or later on every selected host. Upgrade all other devices that verify this account before approving these permissions."
+        }
     }
 
     struct ApprovedScope: Equatable {

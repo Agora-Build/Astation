@@ -61,17 +61,26 @@ All routes are under
 `/api/agent/v1/integrations/:id/hosts/:host`. Their normal authentication remains
 Auth-issued integration JWTs bound to issuer, Station audience, owner,
 integration, approved service-key fingerprint, expiry and current Portal policy.
-The following scope names are **proposals pending Auth #14 and Portal #25**.
-They are only accepted by policy readers in a `host-work-api` build.
+The three new scopes are confirmed by Auth #14 and Portal #25 and deployed to
+dev (Auth `ad12f8a`, Portal `26e97ed`). They are accepted by Station policy
+readers only in a `host-work-api` build.
 
-| Method / suffix | Body | Proposed token scope |
+| Method / suffix | Body | Token scope |
 | --- | --- | --- |
 | GET `profiles` | none | `agent.launch` |
 | POST `launches` | host, request_id, profile_id, profile_revision, expires_at | `agent.launch` |
 | POST `launches/:request_id` | host | `agent.launch` |
 | POST `messages` | host, immutable message envelope | `agent.message` |
 | POST `messages/:message_id` | host | `agent.message` |
-| POST `tasks/:task_id` | host | `agent.notify` |
+| POST `tasks/:task_id` | host | `agent.notify` + `agent.message` + `agent.prompt` |
+
+`agent.view` is required on every integration. `agent.notify` requires both
+`agent.message` and `agent.prompt`; launch and message remain independent.
+New scopes require a new integration and fresh native consent. Auth issues
+five-minute tokens using a fresh private-key JWT assertion, without a refresh
+token. Audience/resource is the exact Station origin; owner, client ID and
+`r9_svc` retain their existing bindings. The policy feed carries exact stored
+scopes. Existing integrations gain no authority.
 
 `host` is the exact account/device/trust-generation triple. It must match the
 authenticated channel welcome and route. Requests reject unknown fields.
@@ -115,14 +124,21 @@ encrypted record is replayed on a different channel.
 | --- | --- |
 | Atem | Supply the immutable `Astation-online-mark` sender commit/patch mentioned in its handoff; isolated runtime/profile/route setup for native live acceptance |
 | Astation / Station | Integrate that publisher and publish the local marks endpoint; complete actual-host native launch/attach and hosted result-routing acceptance |
-| Auth #14 | Finalize and enforce launch/message/notify token issuance, audience, refresh and validation contract |
-| Portal #25 | Validate scopes, show separate launch/message/execution consent, and deliver exact scopes through the authenticated change feed |
+| Auth #14 | Contract confirmed and issuance deployed to dev; joint live acceptance remains |
+| Portal #25 | Scope consent/validation and exact change feed deployed to dev; joint live acceptance remains |
 | Portal Admin | Optional capability/diagnostic visibility; no required protocol change |
 
-Native integration-list parsing and signed review still accept the established
-five token scopes only. Once Auth/Portal confirm the three proposed scope names,
-Astation must adopt their exact consent contract there before generic service
-enrollment. Native member launch does not depend on those service-token scopes.
+Native integration parsing and review accept all eight exact token scopes and
+enforce notify prerequisites. Before signing new operations, native approval
+checks live authenticated capabilities and host trust generations for every
+selected host, both before and after owner authentication. Disconnection or
+replacement cancels unsigned consent; saved signatures retain exact retry
+behavior. The review also requires upgrading other strict account verifiers.
+Native member launch does not depend on service-token scopes.
+
+Atem v0.8.2 (`953afb7`) contains PR #114 and clears the release gate. Running
+host upgrades and locally approved launch profiles/routes still require live
+verification; a published release does not upgrade the disposable Genie host.
 
 Before enrolling `launch`, `message` or `notify`, upgrade **every participating
 strict membership verifier**: Atem hosts, Station replicas, native controllers
