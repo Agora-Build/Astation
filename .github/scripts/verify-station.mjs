@@ -35,11 +35,30 @@ export function settingsFromEnv(env = process.env) {
     throw new Error('STATION_EXPECTED_COMMIT must be a full 40-character Git commit');
   }
   return {
-    origin: env.STATION_URL || 'https://station.agora.build',
+    origin: env.STATION_URL?.trim() || 'https://station.agora.build',
     minReplicas,
     requireRedis: env.STATION_REQUIRE_REDIS === '1',
     expectedCommit,
   };
+}
+
+export function deploymentSettingsFromEnv(env = process.env) {
+  const origin = env.STATION_URL?.trim();
+  if (!origin) throw new Error('STATION_URL is required: set the deployment Station origin in repository variables');
+  let url;
+  try {
+    url = new URL(origin);
+  } catch {
+    throw new Error('STATION_URL must be an HTTPS origin');
+  }
+  if (url.protocol !== 'https:' || url.origin !== origin) {
+    throw new Error('STATION_URL must be an HTTPS origin without credentials, path, query or fragment');
+  }
+  const hostedAgentApi = env.STATION_HOSTED_AGENT_API || 'false';
+  if (!['true', 'false'].includes(hostedAgentApi)) {
+    throw new Error('STATION_HOSTED_AGENT_API must be true or false');
+  }
+  return { ...settingsFromEnv({ ...env, STATION_URL: origin }), hostedAgentApi };
 }
 
 async function fetchHealth(origin, fetchImpl) {
@@ -73,6 +92,9 @@ export async function waitForHealth({
       last = problems.join('; ');
     } catch (error) {
       last = error.message;
+      // Node's fetch message omits DNS, connection and TLS failure codes.
+      const code = error.cause?.code;
+      if (typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code)) last += ` (${code})`;
     }
     log(`Waiting for relay health: ${last}`);
     await sleep(5_000);
@@ -185,6 +207,11 @@ export async function verifyStation({ origin, minReplicas, requireRedis, expecte
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const run = async () => {
+    if (process.argv.includes('--check-deployment')) {
+      const { origin, hostedAgentApi } = deploymentSettingsFromEnv();
+      console.log(`Deployment Station: ${origin}; hosted agent API: ${hostedAgentApi}`);
+      return;
+    }
     const settings = settingsFromEnv();
     if (process.argv.includes('--wait-health')) {
       await waitForHealth(settings);

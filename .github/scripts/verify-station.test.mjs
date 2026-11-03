@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { healthProblems, settingsFromEnv, waitForHealth, verifyAgentChat, verifyStoa } from './verify-station.mjs';
+import { deploymentSettingsFromEnv, healthProblems, settingsFromEnv, waitForHealth, verifyAgentChat, verifyStoa } from './verify-station.mjs';
 
 const healthy = { status: 'ok', knowledge_store: 'postgres', redis: 'ok', replicas: 2 };
 
@@ -41,6 +41,20 @@ test('settings come from the environment', () => {
     { origin: 'https://x.test', minReplicas: 2, requireRedis: true, expectedCommit: null },
   );
   assert.throws(() => settingsFromEnv({ STATION_MIN_REPLICAS: 'two' }), /STATION_MIN_REPLICAS/);
+});
+
+test('deployment requires an explicit HTTPS origin and a valid hosted build gate', () => {
+  assert.throws(() => deploymentSettingsFromEnv({}), /STATION_URL is required/);
+  for (const origin of ['not a URL', 'http://station.test', 'https://user:password@station.test',
+    'https://station.test/path', 'https://station.test?key=value', 'https://station.test#fragment']) {
+    assert.throws(() => deploymentSettingsFromEnv({ STATION_URL: origin }), /STATION_URL/);
+  }
+  const env = { STATION_URL: 'https://station-dev.agora.build', STATION_MIN_REPLICAS: '2', STATION_REQUIRE_REDIS: '1' };
+  assert.deepEqual(deploymentSettingsFromEnv(env), {
+    origin: env.STATION_URL, minReplicas: 2, requireRedis: true, expectedCommit: null, hostedAgentApi: 'false',
+  });
+  assert.equal(deploymentSettingsFromEnv({ ...env, STATION_HOSTED_AGENT_API: 'true' }).hostedAgentApi, 'true');
+  assert.throws(() => deploymentSettingsFromEnv({ ...env, STATION_HOSTED_AGENT_API: '1' }), /STATION_HOSTED_AGENT_API/);
 });
 
 test('build verification is optional and rejects a stale or missing commit', () => {
@@ -112,6 +126,16 @@ test('waitForHealth gives up', async () => {
     }),
     /did not become healthy: \/health returned HTTP 503/,
   );
+});
+
+test('health fetch failures retain the DNS error code', async () => {
+  const logs = [];
+  await assert.rejects(waitForHealth({
+    origin: 'https://station.test',
+    fetchImpl: async () => { throw new TypeError('fetch failed', { cause: { code: 'ENOTFOUND' } }); },
+    sleep: async () => {}, log: line => logs.push(line), attempts: 1,
+  }), /Relay did not become healthy: fetch failed \(ENOTFOUND\)/);
+  assert.match(logs[0], /ENOTFOUND/);
 });
 
 function chatAsset(path) {
