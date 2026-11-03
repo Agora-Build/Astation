@@ -98,22 +98,28 @@ webapp plus the final check about 30 more, so raise it in
 
 2026-10-30: the owner chose to reuse these resources for the development
 Station at `https://station-dev.agora.build`. Production deployment is deferred
-until verification. The original configuration/database are backed up; the
-existing encrypted store is retained. The original production workflow and
-resource table below describe the previous setup: its deployment hooks now
-point at the reused dev applications. Keep them separate from a future
-production rollout; do not treat a main workflow run as dev verification.
+until verification. The original configuration/database are backed up and the
+encrypted store is retained. The deployment hooks point at the reused dev
+applications. The workflow requires the repository variable `STATION_URL` to
+name the exact public HTTPS origin; set it to `https://station-dev.agora.build`
+for this deployment. An unset or invalid origin fails before publishing images
+or triggering deployment. It does not fall back to the deferred production host.
 
-The following workflow description is the previous production setup, and a
-worked example of the section above. The current dev state is recorded below.
+The owner approved hosted execution on the dev Station after live verification.
+Its repository variable `STATION_HOSTED_AGENT_API=true` preserves that enabled
+build when the workflow publishes the relay image. The default is `false`;
+enable it only for an approved deployment. Release-tag builds retain their
+separate default-disabled configuration. Keep the dev resources separate from
+a future production rollout.
 
 Every push to `main` runs `.github/workflows/deploy-station.yml`. It builds both
-Linux AMD64 images, publishes `:main` and `:sha-<commit>` tags to GHCR, then
+Linux AMD64 images, publishes `:main` and `:sha-<commit>` tags to GHCR (the
+enabled relay uses separate `:main-hosted` and `:sha-<commit>-hosted` tags), then
 deploys one application at a time, waiting for each Coolify deployment to
 finish:
 
 1. each relay in `RELAY_DEPLOY_HOOKS` order (relay-a, then relay-b), waiting
-   after each until `https://station.agora.build/health` is healthy (polled
+   after each until `${STATION_URL}/health` is healthy (polled
    every 5 s, up to 36 times);
 2. the webapp;
 3. the final check: public HTTPS, a healthy `/health` (Postgres knowledge
@@ -121,7 +127,7 @@ finish:
    those checks are switched on, see below), the expected relay build commit,
    the `/agent/` app and its assets with the expected MIME and security headers,
    and an identity WebSocket
-   connection to `wss://station.agora.build/ws`.
+   connection to the selected origin's `/ws` endpoint.
 
 The workflow can also be run manually on `main` from GitHub Actions.
 
@@ -133,8 +139,8 @@ The Coolify resources on Volumetric are:
 
 | Resource | Coolify UUID | Image | Host port |
 | --- | --- | --- | --- |
-| Relay A (`relay-a`, the original relay) | `oss4444o8ss40ckgwc40og4c` | `ghcr.io/agora-build/station-relay-server:main` | `3000` |
-| Relay B (`relay-b`) | `am8lrcacts572trbli1bmvnu` | `ghcr.io/agora-build/station-relay-server:main` | none |
+| Relay A (`relay-a`, the original relay) | `oss4444o8ss40ckgwc40og4c` | `ghcr.io/agora-build/station-relay-server:main-hosted` | none |
+| Relay B (`relay-b`) | `am8lrcacts572trbli1bmvnu` | `ghcr.io/agora-build/station-relay-server:main-hosted` | none |
 | Valkey (relay live state) | `minf9gdzuc2fwzxoq188eiw8` | `valkey/valkey:8` | none |
 | Webapp | `c0wwgk4c0owk0w4gsww4k0ss` | `ghcr.io/agora-build/station-webapp:main` | `3010` |
 
@@ -151,14 +157,25 @@ Required GitHub Actions secrets:
   older per-relay secrets, which are no longer read and can be deleted.
 - `COOLIFY_WEBAPP_WEBHOOK_URL`: `https://smt.agora.build/api/v1/deploy?uuid=c0wwgk4c0owk0w4gsww4k0ss&force=false`.
 
-GitHub Actions repository variables (both checks are **off while unset**, so
-a single relay without Redis still deploys):
+GitHub Actions repository variables:
 
+- `STATION_URL`: required exact HTTPS deployment origin. Currently
+  `https://station-dev.agora.build`.
+- `STATION_HOSTED_AGENT_API`: `true` builds the relay with the approved hosted
+  execution feature. Unset means `false`. This is a build-time release gate,
+  not a runtime permission or bypass of Auth, policy or R9 admission.
 - `STATION_REQUIRE_REDIS`: `1` makes the health waits and the final check
   require `"redis":"ok"`. Any other value, or unset, skips the check.
 - `STATION_MIN_REPLICAS`: the minimum live relay replicas (`"replicas"` in
   `/health`) the health waits and the final check require: `2` for the current
-  production deployment. Unset or `0` skips the check.
+  dev deployment. Unset or `0` skips the check.
+
+Coolify must track the workflow's `ghcr.io/agora-build/*:main` images, or
+`:main-hosted` for the approved enabled relay. Enabled relay builds never
+replace the default-disabled `:main` image. A manually pinned local-registry image will restart
+successfully but fail the final expected-commit check because it was not
+updated. Changing the image reference must retain existing environment,
+protected mounts, aliases and network settings.
 
 Set both explicitly (`STATION_REQUIRE_REDIS=1`, `STATION_MIN_REPLICAS=2`) so a
 deploy cannot pass with Redis down or with a production replica missing.

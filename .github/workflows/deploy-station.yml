@@ -9,6 +9,12 @@ permissions:
   contents: read
   packages: write
 
+env:
+  # Required: the existing Volumetric applications now serve the dev Station.
+  STATION_URL: ${{ vars.STATION_URL }}
+  # Enable only for a deployment that passed the hosted execution release gate.
+  STATION_HOSTED_AGENT_API: ${{ vars.STATION_HOSTED_AGENT_API || 'false' }}
+
 # Keep image publication and the relay and webapp deployments in one serial run.
 concurrency:
   group: station-production
@@ -29,6 +35,8 @@ jobs:
             image: station-webapp
     steps:
       - uses: actions/checkout@v4
+      - name: Validate deployment configuration
+        run: node .github/scripts/verify-station.mjs --check-deployment
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -39,7 +47,14 @@ jobs:
         id: meta
         env:
           OWNER: ${{ github.repository_owner }}
-        run: echo "owner=${OWNER,,}" >> "$GITHUB_OUTPUT"
+          IMAGE_NAME: ${{ matrix.image }}
+        run: |
+          echo "owner=${OWNER,,}" >> "$GITHUB_OUTPUT"
+          suffix=""
+          if [ "$IMAGE_NAME" = station-relay-server ] && [ "$STATION_HOSTED_AGENT_API" = true ]; then
+            suffix="-hosted"
+          fi
+          echo "suffix=$suffix" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
@@ -47,9 +62,10 @@ jobs:
           push: true
           build-args: |
             ASTATION_BUILD_COMMIT=${{ github.sha }}
+            ASTATION_HOSTED_AGENT_API=${{ env.STATION_HOSTED_AGENT_API }}
           tags: |
-            ghcr.io/${{ steps.meta.outputs.owner }}/${{ matrix.image }}:main
-            ghcr.io/${{ steps.meta.outputs.owner }}/${{ matrix.image }}:sha-${{ github.sha }}
+            ghcr.io/${{ steps.meta.outputs.owner }}/${{ matrix.image }}:main${{ steps.meta.outputs.suffix }}
+            ghcr.io/${{ steps.meta.outputs.owner }}/${{ matrix.image }}:sha-${{ github.sha }}${{ steps.meta.outputs.suffix }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -57,7 +73,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
   deploy:
-    name: Deploy and verify production
+    name: Deploy and verify Station
     needs: build
     runs-on: ubuntu-latest
     # Each relay hook can take ~20 min (Coolify wait up to 15 min + health
@@ -69,6 +85,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Validate deployment configuration
+        run: node .github/scripts/verify-station.mjs --check-deployment
       # Relays deploy one at a time, in RELAY_DEPLOY_HOOKS order (one deploy
       # hook URL per line, any webhook-capable platform). For each: trigger,
       # wait for the Coolify deployment when COOLIFY_API_TOKEN is set, then
