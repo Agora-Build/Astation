@@ -1054,6 +1054,27 @@ final class AtemSessionClientTests: XCTestCase {
         XCTAssertNotNil(f.client.target(sessionId: sessionID, process: processID))
     }
 
+    func testBackgroundSessionWaitsForForegroundThenStartsWithoutTransportRetry() throws {
+        let f = SessionFixture()
+        f.client.start()
+        let context = try XCTUnwrap(f.source)
+        f.client.channelAuthorizationStarted(context: context, waitingForForeground: true)
+        f.time = 3_600; f.client.tick()
+        XCTAssertEqual(f.client.phase, .connecting)
+        XCTAssertFalse(f.client.connectionStatus.canReconnect)
+        XCTAssertTrue(f.client.status.contains("automatically"))
+        XCTAssertEqual(f.opens, [context])
+        XCTAssertTrue(f.closes.isEmpty)
+        XCTAssertTrue(f.sent.isEmpty)
+        f.client.channelAuthorizationStarted(context: context)
+        XCTAssertTrue(f.client.status.contains("Touch ID"))
+        f.client.channelHandshakeStarted(context: context)
+        try f.ready()
+        XCTAssertEqual(f.client.phase, .ready)
+        XCTAssertEqual(f.opens, [context])
+        XCTAssertTrue(f.closes.isEmpty)
+    }
+
     func testNetworkTimeoutStillAppliesAfterDelayedOwnerConfirmation() throws {
         let f = SessionFixture()
         f.client.start()

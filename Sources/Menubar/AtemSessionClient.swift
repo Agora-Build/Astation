@@ -185,10 +185,12 @@ final class AtemSessionClient {
         if unsupported { failUnsupportedVersion() } else { fail(text); changed() }
     }
 
-    func channelAuthorizationStarted(context preparing: AtemSessionContext) {
+    func channelAuthorizationStarted(context preparing: AtemSessionContext, waitingForForeground: Bool = false) {
         guard phase == .connecting, context == preparing, preparing == currentContext() else { return }
         awaitingChannelAuthorization = true
-        status = "Confirm access with Touch ID or your password..."
+        status = waitingForForeground
+            ? "Open Astation to confirm access. The session will connect automatically."
+            : "Confirm access with Touch ID or your password..."
         changed()
     }
 

@@ -2039,6 +2039,9 @@ class AstationHubManager: ObservableObject {
                     self.nativeSessionClients[context.route.clientId]?.channelFailed(message, unsupported: unsupported)
                 }, refreshMembership: { [weak self] head in
                     self?.refreshR9Membership(context, requiredHead: head)
+                }, authorizationChanged: { [weak self] stage in
+                    self?.nativeSessionClients[context.route.clientId]?.channelAuthorizationStarted(
+                        context: context, waitingForForeground: stage == .waitingForForeground)
                 }, handshakeStarted: { [weak self] in
                     self?.nativeSessionClients[context.route.clientId]?.channelHandshakeStarted(context: context)
                 }, policyWelcomed: { [weak self] in
