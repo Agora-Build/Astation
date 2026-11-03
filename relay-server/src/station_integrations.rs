@@ -38,6 +38,7 @@ pub(crate) struct StationIntegrations {
     readiness_offset: std::sync::atomic::AtomicUsize,
     revocation_offset: std::sync::atomic::AtomicUsize,
     pub requests: Arc<Semaphore>,
+    pub mark_streams: Arc<Semaphore>,
 }
 
 #[cfg(test)]
@@ -160,6 +161,7 @@ impl StationIntegrations {
             readiness_offset: std::sync::atomic::AtomicUsize::new(0),
             revocation_offset: std::sync::atomic::AtomicUsize::new(0),
             requests: Arc::new(Semaphore::new(8)),
+            mark_streams: Arc::new(Semaphore::new(4)),
         }))
     }
 
@@ -410,7 +412,7 @@ pub(crate) struct ProvisionRequest {
     sessions: Option<Vec<String>>,
     projects: Option<Vec<String>>,
     #[serde(default)]
-    mark_tasks: bool,
+    pub(crate) mark_tasks: bool,
 }
 
 async fn provision(

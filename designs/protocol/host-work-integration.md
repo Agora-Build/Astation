@@ -72,6 +72,7 @@ They are only accepted by policy readers in a `host-work-api` build.
 | POST `messages` | host, immutable message envelope | `agent.message` |
 | POST `messages/:message_id` | host | `agent.message` |
 | POST `tasks/:task_id` | host | `agent.notify` |
+| POST `sessions/:session/marks` | exact target, PNG bytes and typed mark | existing `agent.prompt`; lookup uses `agent.view` |
 
 `host` is the exact account/device/trust-generation triple. It must match the
 authenticated channel welcome and route. Requests reject unknown fields.
@@ -95,7 +96,11 @@ prevent results from being routed to another request or principal.
 
 This first generic message adapter accepts inline text only. It refuses typed
 marks and context snapshots rather than treating a digest as proof of committed
-publication or access. PNG marks use their separate authenticated publisher.
+publication or access. PNG marks use their separate authenticated publisher,
+now included behind the same disabled host-work gate. Its HTTP response owns
+the live encrypted channel through verified attachment upload, durable message
+acceptance and task progress. See `station-online-marks.md` for the request,
+limits, uncertainty rules and Chisel sender fixture.
 Atomic memory/vault write-and-notify and durable cross-host delivery remain
 separate work. Task queries return an explicit result already recorded by an
 authorized coordinator; these adapters do not publish context or call
@@ -113,8 +118,8 @@ encrypted record is replayed on a different channel.
 
 | Owner | Remaining acceptance |
 | --- | --- |
-| Atem | Supply the immutable `Astation-online-mark` sender commit/patch mentioned in its handoff; isolated runtime/profile/route setup for native live acceptance |
-| Astation / Station | Integrate that publisher and publish the local marks endpoint; complete actual-host native launch/attach and hosted result-routing acceptance |
+| Atem | Supply this immutable sender patch and companion Chisel patch; isolated runtime/profile/route setup for native live acceptance |
+| Astation / Station | Review/integrate the supplied sender patch; complete actual-host native launch/attach, mark delivery and hosted result-routing acceptance |
 | Auth #14 | Finalize and enforce launch/message/notify token issuance, audience, refresh and validation contract |
 | Portal #25 | Validate scopes, show separate launch/message/execution consent, and deliver exact scopes through the authenticated change feed |
 | Portal Admin | Optional capability/diagnostic visibility; no required protocol change |
@@ -150,8 +155,11 @@ provisioned app is changed by these tests.
 - Portable native adapter: 178 tests, one platform skip, no failures. Covers
   launch loss/restart, feature/control gates, pending-exchange bounds, task
   versus turn completion, and exact opt-in mark scope review.
-- Relay: 560 unit tests pass in the host-work build. Eight isolated Postgres
-  hosted API tests and the mark enrollment test pass. The new real-HTTP case
+- Relay: 562 unit tests pass in the host-work build. The focused HTTP/R9 suite
+  passes all 13 tests, including nine isolated Postgres cases. The marks case
+  checks real Chisel middleware, exact PNG chunks, durable acceptance, grant
+  opt-in, stale processes, policy denial, disconnect, heartbeats and lost replies.
+  The generic host-work real-HTTP case
   verifies JWT scope separation, original launch identity recovery, authenticated
   message senders, per-recipient task result routing, stale hosts and revocation.
 - The pinned production Apple library passes 36 consumer checks; artifact,
