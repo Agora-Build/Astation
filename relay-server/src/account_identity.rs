@@ -643,7 +643,7 @@ pub(crate) mod tests {
             }
         }
         pub(crate) fn claims(&self) -> Value {
-            let now = chrono::Utc::now().timestamp();
+            let now = (self.verifier.now)();
             json!({"iss":self.issuer,"sub":"ab01234567890123456789012345","aud":"https://station.example",
                 "exp":now+900,"iat":now,"client_id":"astation","scope":"openid station:account"})
         }
@@ -679,7 +679,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn signed_access_tokens_enforce_issuer_audience_type_scope_and_lifetime() {
-        let f = Fixture::new().await;
+        let mut f = Fixture::new().await;
+        let now = 1_800_000_000;
+        f.verifier.now = Arc::new(move || now);
         let token = f.token(f.header(), f.claims());
         let identity = f.verifier.verify(&token).await.unwrap();
         assert_eq!(identity.issuer, f.issuer);
@@ -693,10 +695,10 @@ pub(crate) mod tests {
             ("sub", json!("ab0123456789012345678901234I")),
             ("sub", json!("ab0123456789012345678901234a")),
             ("scope", json!("openid station:account-extra")),
-            ("exp", json!(chrono::Utc::now().timestamp() - 61)),
-            ("iat", json!(chrono::Utc::now().timestamp() + 61)),
-            ("exp", json!(chrono::Utc::now().timestamp() + 3600)),
-            ("nbf", json!(chrono::Utc::now().timestamp() + 61)),
+            ("exp", json!(now - 61)),
+            ("iat", json!(now + 61)),
+            ("exp", json!(now + 3600)),
+            ("nbf", json!(now + 61)),
             ("iat", json!(true)),
             ("client_id", json!("")),
         ] {
@@ -738,6 +740,33 @@ pub(crate) mod tests {
             Err(VerifyError::Rejected)
         ));
         assert_eq!(f.state.gets.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn signed_access_tokens_enforce_exact_clock_skew_boundaries() {
+        let mut f = Fixture::new().await;
+        let now = 1_800_000_000;
+        f.verifier.now = Arc::new(move || now);
+        for field in ["iat", "nbf", "exp"] {
+            for offset in [59, 60, 61] {
+                let mut claims = f.claims();
+                if field == "exp" {
+                    claims["iat"] = json!(now - 900);
+                    claims[field] = json!(now - offset);
+                } else {
+                    claims[field] = json!(now + offset);
+                }
+                let result = f.verifier.verify(&f.token(f.header(), claims)).await;
+                if offset <= 60 {
+                    assert!(result.is_ok(), "{field} at {offset}s: {result:?}");
+                } else {
+                    assert!(
+                        matches!(result, Err(VerifyError::Rejected)),
+                        "{field} at {offset}s"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
