@@ -44,6 +44,10 @@ pub(super) fn routes() -> Router<IntegrationState> {
             post(work_query),
         )
         .layer(DefaultBodyLimit::max(262_144))
+        .route(
+            "/api/agent/v1/integrations/:id/hosts/:host/sessions/:session/marks",
+            post(super::marks::publish).layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
+        )
         .layer(axum::middleware::from_fn(gate))
 }
 

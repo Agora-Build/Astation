@@ -27,6 +27,9 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
 
+#[path = "mark_tests.rs"]
+mod mark_tests;
+
 #[tokio::test]
 async fn hosted_routes_respect_build_gate_and_require_runtime() {
     let router = routes().with_state(crate::station_integrations::IntegrationState(None));
@@ -34,10 +37,19 @@ async fn hosted_routes_respect_build_gate_and_require_runtime() {
         ("GET", "sessions"),
         ("GET", "events"),
         ("POST", "sessions/ses-aaaaaaaaaaaa/prompts"),
+        ("POST", "sessions/ses-aaaaaaaaaaaa/marks"),
         ("POST", "sessions/ses-aaaaaaaaaaaa/approvals"),
         ("POST", "sessions/ses-aaaaaaaaaaaa/rules/revoke"),
         ("POST", "sessions/ses-aaaaaaaaaaaa/receipts"),
     ] {
+        let body = if path.ends_with("/marks") {
+            mark_tests::call(&mark_tests::png())
+        } else {
+            json!({"target":{
+                "account_id":"account-test", "atem_device_id":"host-a", "host_trust_gen":1,
+                "session_id":"ses-aaaaaaaaaaaa", "process_gen":"11111111-1111-4111-8111-111111111111"
+            }})
+        };
         let response = router
             .clone()
             .oneshot(
@@ -47,10 +59,7 @@ async fn hosted_routes_respect_build_gate_and_require_runtime() {
                         "/api/agent/v1/integrations/{ID}/hosts/host-a/{path}"
                     ))
                     .header("content-type", "application/json")
-                    .body(Body::from(json!({"target":{
-                        "account_id":"account-test", "atem_device_id":"host-a", "host_trust_gen":1,
-                        "session_id":"ses-aaaaaaaaaaaa", "process_gen":"11111111-1111-4111-8111-111111111111"
-                    }}).to_string()))
+                    .body(Body::from(body.to_string()))
                     .unwrap(),
             )
             .await
@@ -60,14 +69,21 @@ async fn hosted_routes_respect_build_gate_and_require_runtime() {
             continue;
         }
         assert!(
-            matches!(response.status(), StatusCode::FORBIDDEN | StatusCode::SERVICE_UNAVAILABLE),
+            matches!(
+                response.status(),
+                StatusCode::FORBIDDEN | StatusCode::SERVICE_UNAVAILABLE
+            ),
             "unexpected status for {method} {path}: {}",
             response.status()
         );
         let value: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
         if HOSTED_EXECUTION_ENABLED {
-            assert_eq!(value["error"]["code"], "host_connection_lost");
+            assert_eq!(value["error"]["code"], if path.ends_with("/marks") && !cfg!(feature = "host-work-api") {
+                "host_work_not_verified"
+            } else {
+                "host_connection_lost"
+            });
         } else {
             assert!(matches!(
                 value["error"]["code"].as_str(),
@@ -130,7 +146,17 @@ async fn service(
     runtime: &crate::station_integrations::StationIntegrations,
     f: &Fixture,
 ) -> (ServiceKeyContext, String) {
-    let draft = runtime.prepare(ID, OWNER, request(f)).await.unwrap();
+    service_for_marks(runtime, f, false).await
+}
+
+async fn service_for_marks(
+    runtime: &crate::station_integrations::StationIntegrations,
+    f: &Fixture,
+    marks: bool,
+) -> (ServiceKeyContext, String) {
+    let mut provision = request(f);
+    provision.mark_tasks = marks;
+    let draft = runtime.prepare(ID, OWNER, provision).await.unwrap();
     let body = serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap();
     let entry = Entry::parse_bytes(
         SignedObject::sign(&f.keys, &KeyId::new("manager"), body)
@@ -195,6 +221,9 @@ struct HostScenario {
     lose_submit_reply: bool,
     handles: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     host_work: bool,
+    mark_png: Option<Vec<u8>>,
+    mark_hold: bool,
+    mark_drop_publish: bool,
 }
 
 async fn controlled_host_scenario(
@@ -212,6 +241,10 @@ async fn controlled_host_scenario(
     let mut messages: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
     let mut tasks: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
     let approval_created_at = chrono::Utc::now().timestamp_millis() as u64;
+    let mut uploaded = Vec::new();
+    let mut published: Option<atem_client::session::messages::Message> = None;
+    let receipt_id = new_id();
+    let mut work_queries = 0;
     for attachment in 0..attachments {
         let open = loop {
             let event = next_client_json(&mut socket).await;
@@ -294,6 +327,11 @@ async fn controlled_host_scenario(
                 .iter()
                 .chain(R9_FEATURES)
                 .chain(if scenario.host_work { &["host.launch", "host.work", "host.messages"][..] } else { &[] })
+                .chain(if scenario.mark_png.is_some() {
+                    ["host.work", "host.messages", "host.attachments"].as_slice()
+                } else {
+                    &[]
+                })
                 .map(|s| s.to_string())
                 .collect(),
             principal: authority.name(),
@@ -350,6 +388,115 @@ async fn controlled_host_scenario(
             .unwrap();
             let data = &plain["data"];
             let reply = match data["op"].as_str().unwrap() {
+                "attachment_put" => {
+                    use atem_client::session::{
+                        attachments::AttachmentStatus,
+                        host_work::{self, Request, ResultBody},
+                    };
+                    use base64::Engine;
+                    let request = Request::from_data(data).unwrap();
+                    let Request::AttachmentPut {
+                        attachment,
+                        offset,
+                        data: chunk,
+                        ..
+                    } = &request
+                    else {
+                        unreachable!()
+                    };
+                    assert_eq!(*offset, uploaded.len() as u64);
+                    let chunk = base64::engine::general_purpose::STANDARD
+                        .decode(chunk)
+                        .unwrap();
+                    assert!(chunk.len() <= atem_client::session::attachments::CHUNK_BYTES);
+                    uploaded.extend(chunk);
+                    let expected = scenario.mark_png.as_ref().unwrap();
+                    assert_eq!(uploaded, expected[..uploaded.len()]);
+                    let ready = uploaded.len() == expected.len();
+                    if ready {
+                        assert_eq!(host_work::digest(&uploaded), attachment.digest);
+                    }
+                    host_work::result(
+                        &new_id(),
+                        request.id(),
+                        request.host(),
+                        &welcome.attachment_gen,
+                        &welcome.channel_id,
+                        ResultBody::Attachment {
+                            upload: AttachmentStatus {
+                                attachment: attachment.clone(),
+                                received: uploaded.len() as u64,
+                                ready,
+                            },
+                        },
+                    )
+                }
+                "message_publish" | "work_query" if scenario.mark_png.is_some() => {
+                    use atem_client::session::{
+                        host_work::{self, Request, ResultBody, WorkState, WorkStatus},
+                        messages::{Delivery, MessageReceipt, RecipientReceipt, WorkProgress},
+                    };
+                    let request = Request::from_data(data).unwrap();
+                    let work = WorkStatus {
+                        task_id: match &request {
+                            Request::Publish { message, .. } => {
+                                message.recipients[0].recipient_id.clone()
+                            }
+                            Request::WorkQuery { task_id, .. } => task_id.clone(),
+                            _ => unreachable!(),
+                        },
+                        receipt_id: receipt_id.clone(),
+                        state: if work_queries < 2 || scenario.mark_hold {
+                            WorkState::Queued
+                        } else {
+                            WorkState::AwaitingResult
+                        },
+                        detail: "controlled host online mark".into(),
+                        result: None,
+                    };
+                    let body = if let Request::Publish { message, host, .. } = &request {
+                        assert_eq!(uploaded, *scenario.mark_png.as_ref().unwrap());
+                        assert_eq!(message.sender, format!("service:svc-{ID}"));
+                        assert!(message.mark.is_some());
+                        assert!(published.is_none(), "no automatic publish replay");
+                        let atem_client::session::messages::Destination::Agent { target, .. } =
+                            &message.recipients[0].destination
+                        else {
+                            panic!("mark agent recipient")
+                        };
+                        assert!(host.contains(target));
+                        published = Some(message.clone());
+                        if scenario.mark_drop_publish {
+                            send_json(&mut socket, json!({"type":"channel","event":"close","channel":handle,"reason":"closed"})).await;
+                            break;
+                        }
+                        ResultBody::Message {
+                            message: MessageReceipt {
+                                message_id: message.message_id.clone(),
+                                digest: message.digest(),
+                                sender: message.sender.clone(),
+                                recipients: vec![RecipientReceipt {
+                                    recipient_id: work.task_id.clone(),
+                                    delivery: Delivery::Work {
+                                        work: WorkProgress::from(&work),
+                                    },
+                                }],
+                            },
+                        }
+                    } else {
+                        assert!(published.is_some());
+                        work_queries += 1;
+                        ResultBody::Work { work }
+                    };
+                    host_work::result(
+                        &new_id(),
+                        request.id(),
+                        request.host(),
+                        &welcome.attachment_gen,
+                        &welcome.channel_id,
+                        body,
+                    )
+                }
                 "open" => {
                     let chat = |op: &str, sequence: u64| {
                         json!({"type":"agentChat","data":{"v":1,"op":op,
@@ -445,7 +592,9 @@ async fn controlled_host_scenario(
                 }
                 other => panic!("unexpected controlled-host request: {other}"),
             };
-            if reply["type"] == "session" && reply["data"]["op"] != "host_work_result" {
+            if reply["data"]["op"] == "host_work_result" {
+                atem_client::session::host_work::Response::from_data(&reply["data"]).unwrap();
+            } else if reply["type"] == "session" {
                 atem_client::session::wire::decode(&serde_json::to_vec(&reply).unwrap()).unwrap();
             }
             let bytes = channel
