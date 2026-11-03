@@ -1,16 +1,17 @@
 {
   "repository": "Agora-Build/Atem",
-  "revision": "623c89ad1441c7f310596f43428c851cf00590d1",
-  "run_id": 41542356551,
-  "artifact_id": 13187730745,
-  "archive_sha256": "34e18ea8f2cb01b6624ce0fa153b18b3c5ef534ae06d58a2165af1b9c0af1f1a",
-  "package": "atem-client-0.1.0-623c89ad1441-apple-swiftpm.zip",
-  "source": "atem-client-0.1.0-623c89ad1441-SOURCE.json",
+  "revision": "2b0c384e7213e5d4637cdba1f0a78ccbc53a2083",
+  "run_id": 41558426367,
+  "artifact_id": 13196905981,
+  "archive_sha256": "39044087ffe0f7cf01c799761bd98f659414a517401343c872e854e24e829e30",
+  "package": "atem-client-0.1.0-2b0c384e7213-apple-swiftpm.zip",
+  "source": "atem-client-0.1.0-2b0c384e7213-SOURCE.json",
   "payload_sha256": {
-    "atem-client-0.1.0-623c89ad1441-apple-swiftpm.zip": "752ef7bbd589762b6e4d6a609202be7a0d555cf4982a301ed8702c1466134c98",
-    "atem-client-0.1.0-623c89ad1441-atem_client_ffiFFI.h": "1422b9470b0b829603ed6a314343ab60173cdfef254a1fa9cdc1080d8dba522f",
-    "atem-client-0.1.0-623c89ad1441-SOURCE.json": "a20178aef7f99e87a94e9fee5ea97c4c6d549294b3f71a16cc3d6a0eac2da612",
-    "atem-client-0.1.0-623c89ad1441-station-route-v1.json": "557516203b77b6739f7a6968eee5fa7ac38438bfb9afcc9c3b08298cdbfa49ce"
+    "atem-client-0.1.0-2b0c384e7213-apple-swiftpm.zip": "bc1ad71ebb0d04f49b0d20421211746c258aea50017006e4789835168a21e864",
+    "atem-client-0.1.0-2b0c384e7213-atem_client_ffiFFI.h": "1422b9470b0b829603ed6a314343ab60173cdfef254a1fa9cdc1080d8dba522f",
+    "atem-client-0.1.0-2b0c384e7213-SOURCE.json": "ad0d8caff4671555e65d2704080d071c0e40ab035a8f69911bc65b97d43afc23",
+    "atem-client-0.1.0-2b0c384e7213-station-route-v1.json": "557516203b77b6739f7a6968eee5fa7ac38438bfb9afcc9c3b08298cdbfa49ce",
+    "atem-client-0.1.0-2b0c384e7213-host-work-requests-v1.json": "9ab10b55124629c840a87a6a925e080cd3495f59c92493e6e688f21e24f65c75"
   },
   "fixture": {
     "path": "designs/protocol/fixtures/r9-vectors-pairing.json",
@@ -18,6 +19,10 @@
   },
   "station_route_fixture": {
     "path": "designs/protocol/fixtures/station-route/v1.json",
-    "payload": "atem-client-0.1.0-623c89ad1441-station-route-v1.json"
+    "payload": "atem-client-0.1.0-2b0c384e7213-station-route-v1.json"
+  },
+  "host_work_fixture": {
+    "path": "designs/protocol/fixtures/host-work/requests-v1.json",
+    "payload": "atem-client-0.1.0-2b0c384e7213-host-work-requests-v1.json"
   }
 }

@@ -1029,6 +1029,14 @@ final class AtemSessionWireTests: XCTestCase {
 }
 
 final class AtemSessionClientTests: XCTestCase {
+    func testHostWorkFeaturesAreAvailableOnlyWhenAdvertisedByTheAuthenticatedWelcome() throws {
+        let f = SessionFixture()
+        try f.handshake(features: ["host.launch", "host.work", "host.messages", "host.attachments", "future.feature"])
+        XCTAssertEqual(f.client.features, ["host.launch", "host.work", "host.messages", "host.attachments"])
+        let old = SessionFixture()
+        try old.handshake(features: [])
+        XCTAssertFalse(old.client.features.contains("host.launch"))
+    }
     func testOwnerConfirmationDoesNotConsumeTheNetworkTimeout() throws {
         let f = SessionFixture()
         f.client.start()

@@ -266,6 +266,11 @@ final class AtemSessionClient {
         }
     }
 
+    func reconnectForHostWorkRecovery() {
+        guard phase == .ready else { return }
+        reconnect()
+    }
+
     func target(sessionId: String, process: String) -> AtemSessionTarget? {
         guard phase == .ready, context == currentContext(), now() < authorizationDeadline, !resyncing,
               let context, let welcome, let trust = welcome.host_trust_gen,

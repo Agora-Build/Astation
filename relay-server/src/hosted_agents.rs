@@ -10,6 +10,7 @@ use axum::{
 mod admission;
 pub(crate) mod client;
 mod operations;
+mod host_work;
 
 #[cfg(test)]
 mod live;
@@ -25,6 +26,7 @@ pub(crate) fn routes() -> Router<IntegrationState> {
 
 fn operation_routes() -> Router<IntegrationState> {
     Router::new()
+        .merge(host_work::routes())
         .route(
             "/api/agent/v1/integrations/:id/hosts/:host/sessions",
             get(operations::sessions),

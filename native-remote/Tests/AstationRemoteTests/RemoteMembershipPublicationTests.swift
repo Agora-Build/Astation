@@ -159,6 +159,60 @@ final class RemoteMembershipPublicationTests: XCTestCase {
         } catch { XCTAssertEqual(error as? AccountLoginError, .changed) }
     }
 
+    @MainActor
+    func testMarksRequireExplicitConsentAndPromptScopeAndAreBoundToTheSignedReview() async throws {
+        let f = try PublicationFixture(), ordinary = try serviceApproval(f), marks = try serviceApproval(f, markTasks: true)
+        let record = try JSONDecoder().decode(PortalIntegrationRecord.self, from: JSONSerialization.data(withJSONObject: [
+            "id": marks.integrationID, "name": "Marks integration", "stationOrigin": marks.stationOrigin, "state": "awaiting_approval",
+            "scopes": ["agent.view", "agent.prompt"], "expiresAt": "2099-01-01T00:00:00Z", "role": "owner"]))
+        let now = Date(timeIntervalSince1970: Double(f.clock.wallMs) / 1000)
+        let review = try RemoteServiceReview(approval: marks)
+        XCTAssertThrowsError(try review.check(record: record, hosts: ["host-a"], sessions: nil, projects: nil, now: now))
+        try review.check(record: record, hosts: ["host-a"], sessions: nil, projects: nil, now: now, markTasks: true)
+        XCTAssertThrowsError(try RemoteServiceReview(approval: ordinary).check(record: record, hosts: ["host-a"],
+            sessions: nil, projects: nil, now: now, markTasks: true))
+        let transport = IntegrationApprovalTestHTTP()
+        try await transport.set(["integrationId": marks.integrationID, "ownerAccount": marks.ownerAccount, "issuer": marks.issuer,
+            "stationOrigin": marks.stationOrigin, "genesisHash": marks.genesisHash, "bodyJSON": marks.bodyJSON, "fingerprint": marks.fingerprint])
+        let client = try StationIntegrationHTTP(origin: marks.stationOrigin, http: transport, accessToken: { "test-token" })
+        _ = try await client.prepare(record: record, ownerAccount: marks.ownerAccount, issuer: marks.issuer, log: f.log,
+            managerID: "manager-a", hosts: ["host-a"], sessions: nil, projects: nil, signedAt: f.clock.wallMs, markTasks: true)
+        let request = await transport.last()
+        let payload = try JSONSerialization.jsonObject(with: XCTUnwrap(request?.httpBody)) as? [String: Any]
+        XCTAssertEqual(payload?["markTasks"] as? Bool, true)
+        let viewOnly = try JSONDecoder().decode(PortalIntegrationRecord.self, from: JSONSerialization.data(withJSONObject: [
+            "id": marks.integrationID, "name": "View only", "stationOrigin": marks.stationOrigin, "state": "awaiting_approval",
+            "scopes": ["agent.view"], "expiresAt": "2099-01-01T00:00:00Z", "role": "owner"]))
+        do {
+            _ = try await client.prepare(record: viewOnly, ownerAccount: marks.ownerAccount, issuer: marks.issuer, log: f.log,
+                managerID: "manager-a", hosts: ["host-a"], sessions: nil, projects: nil, signedAt: f.clock.wallMs, markTasks: true)
+            XCTFail("View permission cannot opt into executable marks")
+        } catch { XCTAssertEqual(error as? AccountLoginError, .changed) }
+        let count = await transport.count()
+        XCTAssertEqual(count, 1)
+    }
+
+    @MainActor
+    func testDisabledMarkRolloutExplainsWhyApprovalCannotProceed() async throws {
+        let f = try PublicationFixture(), approval = try serviceApproval(f)
+        let record = try JSONDecoder().decode(PortalIntegrationRecord.self, from: JSONSerialization.data(withJSONObject: [
+            "id": approval.integrationID, "name": "Marks integration", "stationOrigin": approval.stationOrigin,
+            "state": "awaiting_approval", "scopes": ["agent.view", "agent.prompt"],
+            "expiresAt": "2099-01-01T00:00:00Z", "role": "owner"]))
+        let http = IntegrationApprovalTestHTTP()
+        try await http.set(["error": ["code": "host_work_not_verified"]], status: 503)
+        let client = try StationIntegrationHTTP(origin: approval.stationOrigin, http: http, accessToken: { "test-token" })
+        do {
+            _ = try await client.prepare(record: record, ownerAccount: approval.ownerAccount, issuer: approval.issuer,
+                log: f.log, managerID: "manager-a", hosts: ["host-a"], sessions: nil, projects: nil,
+                signedAt: f.clock.wallMs, markTasks: true)
+            XCTFail("Disabled rollout cannot prepare a mark grant")
+        } catch StationIntegrationError.hostWorkNotEnabled {
+            XCTAssertTrue(StationIntegrationError.hostWorkNotEnabled.localizedDescription.contains("Station"))
+        }
+        XCTAssertTrue(f.keys.requests.isEmpty)
+    }
+
     func testServiceFingerprintMatchesBothPublicAuthVectors() throws {
         let cases: [(KeyAlg, String, Int, String)] = [
             (.p256, "BNa0CKl9dCuZMEg6WPNIaZatMGhIKeCElX2Pc8FA3H2v8Iezbt5Glq2FKvXNzpwYxjaRpx_aqnXuXSTjG4kQq90", 65,
@@ -175,11 +229,11 @@ final class RemoteMembershipPublicationTests: XCTestCase {
     }
     @MainActor
     private func serviceApproval(_ f: PublicationFixture, station: String = "https://custom.example",
-                                 issuer: String = "https://auth.example") throws -> RemoteServiceApproval {
+                                 issuer: String = "https://auth.example", markTasks: Bool = false) throws -> RemoteServiceApproval {
         let action = try json(["action": "add", "member": [
             "device_id": "service-a", "kind": "service", "roles": ["service"],
             "auth_key": ["alg": "ed25519", "pub": b64u(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)],
-            "scope": ["hosts": ["host-a"], "ops": ["prompt", "view"]],
+            "scope": ["hosts": ["host-a"], "ops": markTasks ? ["message", "notify", "prompt", "view"] : ["prompt", "view"]],
             "expires_at": f.clock.wallMs + 60_000
         ]])
         let body = try f.log.draftEntry(signer: "manager-a", signedAt: f.clock.wallMs, actionJson: action)

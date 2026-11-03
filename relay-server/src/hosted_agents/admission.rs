@@ -16,6 +16,7 @@ pub(super) struct Admission {
     pub token: VerifiedServiceToken,
     pub context: ServiceKeyContext,
     pub(super) operation: &'static str,
+    pub(super) additional_operations: Vec<&'static str>,
 }
 
 impl StationIntegrations {
@@ -48,6 +49,7 @@ impl StationIntegrations {
             token,
             context: self.context(id).await?,
             operation,
+            additional_operations: Vec::new(),
         };
         self.recheck(&admission).await?;
         let second = chrono::Utc::now().timestamp();
@@ -95,7 +97,16 @@ impl StationIntegrations {
         };
         binding
             .authorize(&admission.token, admission.operation, now)
-            .map_err(|e| token_error(&e, admission.operation))
+            .map_err(|e| token_error(&e, admission.operation))?;
+        for operation in &admission.additional_operations {
+            if !admission.token.scopes.iter().any(|scope| scope == operation) {
+                return Err(token_error(&VerifyError::InsufficientScope, operation));
+            }
+            binding
+                .authorize(&admission.token, operation, now)
+                .map_err(|e| token_error(&e, operation))?;
+        }
+        Ok(())
     }
     pub(super) async fn service_log(
         &self,

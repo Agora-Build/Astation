@@ -72,16 +72,17 @@ impl IntegrationPolicy {
                     | "revoked"
             )
             || self.scopes.is_empty()
-            || self.scopes.len() > 5
+            || self.scopes.len() > if cfg!(feature = "host-work-api") { 8 } else { 5 }
             || self.scopes.iter().any(|s| {
-                !matches!(
+                !(matches!(
                     s.as_str(),
                     "agent.view"
                         | "agent.prompt"
                         | "agent.approve"
                         | "agent.interrupt"
                         | "agent.terminal"
-                )
+                ) || (cfg!(feature = "host-work-api")
+                    && matches!(s.as_str(), "agent.launch" | "agent.message" | "agent.notify")))
             })
             || self.scopes.iter().collect::<BTreeSet<_>>().len() != self.scopes.len()
             || !(1..=10_000).contains(&self.quota_per_second)

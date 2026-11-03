@@ -89,6 +89,7 @@ pub(crate) fn request(f: &Fixture) -> ProvisionRequest {
         hosts: vec!["host-a".into()],
         sessions: None,
         projects: None,
+        mark_tasks: false,
     }
 }
 
@@ -126,6 +127,33 @@ async fn postgres_provisioning_binds_owner_root_exact_scope_and_durable_key() {
     assert!(runtime.prepare(ID, OWNER, request(&f)).await.is_err());
     drop(runtime);
     db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_mark_tasks_need_opt_in_and_cannot_elevate_view_only_consent() {
+    let (db, runtime, f) = fixture().await;
+    let ordinary = runtime.prepare(ID, OWNER, request(&f)).await.unwrap();
+    let ordinary: Value = serde_json::from_str(ordinary["bodyJSON"].as_str().unwrap()).unwrap();
+    assert!(!ordinary["member"]["scope"]["ops"].as_array().unwrap().contains(&json!("notify")));
+    let mut opted_in = request(&f);
+    opted_in.mark_tasks = true;
+    if !cfg!(feature = "host-work-api") {
+        assert_eq!(runtime.prepare(ID, OWNER, opted_in).await.unwrap_err().status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(runtime); db.cleanup().await;
+        return;
+    }
+    let draft = runtime.prepare(ID, OWNER, opted_in).await.unwrap();
+    let draft: Value = serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap();
+    assert_eq!(draft["member"]["scope"]["ops"], json!(["approval", "message", "notify", "prompt", "rule_revoke", "view"]));
+    let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+    let mut narrowed = previous.clone();
+    narrowed.revision += 1;
+    narrowed.integrations.get_mut(ID).unwrap().scopes = vec!["agent.view".into()];
+    runtime.policies.commit(&previous, &narrowed).await.unwrap();
+    let mut opted_in = request(&f); opted_in.mark_tasks = true;
+    assert!(runtime.prepare(ID, OWNER, opted_in).await.is_err());
+    drop(runtime); db.cleanup().await;
 }
 
 #[tokio::test]

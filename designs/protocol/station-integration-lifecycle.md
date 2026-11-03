@@ -2,9 +2,11 @@
 
 The native approval screen, protected provisioning endpoints, authenticated
 background feed polling and typed hosted agent adapter are wired. Hosted
-execution remains hard disabled by `HOSTED_EXECUTION_ENABLED = false` in
-`hosted_agents.rs`; MCP/LLM and legacy voice routes retain their closed gates.
-The implementation is available for review and controlled tests, not activation.
+execution is controlled by the `hosted-agent-api` build feature; the existing
+dev deployment is approved and enabled. MCP/LLM and legacy voice routes retain
+their closed gates. New launch/message APIs and mark permission enrollment have
+a separate, default-off `host-work-api` gate. See
+[host-work integration](host-work-integration.md) for its remaining rollout gates.
 
 ## Contract pins and remaining interoperability
 
@@ -14,12 +16,11 @@ The implementation is available for review and controlled tests, not activation.
   `efde3bc1a7aa796ac301e776c5512350dcf5f6ac`. It closes Portal #16:
   authenticated snapshots include `ownerAccount`; HTTP 409 with
   `code: cursor_ahead` requires a full cursor-zero reconciliation.
-- R9 contract and host pins remain `c685abab` and `6526e1cf`. The relay Rust
-  client pins `ed0b45bad5db0a278c63efe8a464f12d4d548465` (Atem PR #100).
-  The verified prebuilt native Apple package pins
-  `623c89ad1441c7f310596f43428c851cf00590d1` (Atem PR #113), adding the
-  station-route offer/acknowledgment helpers and independent vectors.
-  Fingerprinting and route authentication delegate to the shared helpers.
+- R9's historical contract/host review pins were `c685abab` and `6526e1cf`.
+  Native Apple and Station Rust now both consume
+  `2b0c384e7213e5d4637cdba1f0a78ccbc53a2083` (Atem PR #114), including
+  selected-relay helpers, host launch/messages and the upgraded strict scope
+  verifier. Fingerprinting and route authentication delegate to shared helpers.
 - [Portal #18](https://github.com/Agora-Build/Portal/issues/18) is closed by
   test-only Portal #19, tested `998301e8` and merged `7319e365`.
   Real-HTTP device-flow tests against Auth `ca657bb` and its reference Station

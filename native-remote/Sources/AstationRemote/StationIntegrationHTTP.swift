@@ -3,9 +3,13 @@ import Foundation
 
 public enum StationIntegrationError: Error, LocalizedError {
     case hostSelectionRequired
+    case hostWorkNotEnabled
 
     public var errorDescription: String? {
-        "Select at least one verified Atem host before reviewing access."
+        switch self {
+        case .hostSelectionRequired: return "Select at least one verified Atem host before reviewing access."
+        case .hostWorkNotEnabled: return "Mark tasks are not available on this Station yet. Leave this option off to approve the existing permissions."
+        }
     }
 }
 
@@ -35,15 +39,19 @@ public struct StationIntegrationHTTP: Sendable {
     @MainActor
     public func prepare(record: PortalIntegrationRecord, ownerAccount: String, issuer: String,
         log: MembershipLog, managerID: String, hosts: [String], sessions: [String]?, projects: [String]?,
-        signedAt: UInt64) async throws -> StationServiceDraft {
+        signedAt: UInt64, markTasks: Bool = false) async throws -> StationServiceDraft {
         guard record.stationOrigin == origin, record.role == "owner", record.state == "awaiting_approval",
               PortalIntegrationRecord.validID(record.id),
               hosts.count <= 64, Set(hosts).count == hosts.count else { throw AccountLoginError.changed }
         guard !hosts.isEmpty else { throw StationIntegrationError.hostSelectionRequired }
+        guard !markTasks || Set(record.scopes).isSuperset(of: ["agent.view", "agent.prompt"]) else {
+            throw AccountLoginError.changed
+        }
         var body: [String: Any] = ["genesisHash": log.genesisHash(), "managerId": managerID,
             "expectedHead": ["seq": log.head().seq, "hash": log.head().hash], "signedAt": signedAt, "hosts": hosts]
         if let sessions { body["sessions"] = sessions }
         if let projects { body["projects"] = projects }
+        if markTasks { body["markTasks"] = true }
         var request = URLRequest(url: URL(string: origin + "/agora-build/v1/integrations/\(record.id)/provision")!)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -51,6 +59,11 @@ public struct StationIntegrationHTTP: Sendable {
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (bytes, code) = try await http.send(request)
         guard code == 200 else {
+            if code == 503, bytes.count <= 65_536,
+               let value = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+               let error = value["error"] as? [String: Any], error["code"] as? String == "host_work_not_verified" {
+                throw StationIntegrationError.hostWorkNotEnabled
+            }
             if code == 401 { throw AccountLoginError.signInRequired }
             if [403, 404, 409].contains(code) { throw AccountLoginError.changed }
             throw AccountLoginError.unavailable
@@ -74,10 +87,14 @@ public struct RemoteServiceReview: Equatable, Sendable {
     public let operations: [String]
     public let expiresAt: Date
 
-    public func check(record: PortalIntegrationRecord, hosts: [String], sessions: [String]?, projects: [String]?, now: Date = Date()) throws {
+    public func check(record: PortalIntegrationRecord, hosts: [String], sessions: [String]?, projects: [String]?, now: Date = Date(), markTasks: Bool = false) throws {
         let mapping: [String: [String]] = ["agent.view": ["view"], "agent.prompt": ["prompt"],
             "agent.approve": ["approval", "rule_revoke"], "agent.interrupt": ["interrupt", "stop"], "agent.terminal": ["terminal"]]
-        let expected = Set(record.scopes.flatMap { mapping[$0] ?? [] }).union(["view"])
+        var expected = Set(record.scopes.flatMap { mapping[$0] ?? [] }).union(["view"])
+        if markTasks {
+            guard Set(record.scopes).isSuperset(of: ["agent.view", "agent.prompt"]) else { throw AccountLoginError.changed }
+            expected.formUnion(["message", "notify"])
+        }
         guard Set(self.hosts) == Set(hosts), self.sessions.map(Set.init) == sessions.map(Set.init),
               self.projects.map(Set.init) == projects.map(Set.init), Set(operations) == expected,
               let expiry = record.expiry, expiresAt <= expiry, expiresAt > now else { throw AccountLoginError.changed }

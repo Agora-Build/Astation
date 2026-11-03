@@ -389,6 +389,7 @@ private struct AgentListPanel: View {
     @ObservedObject var hubManager: AstationHubManager
     let clientId: String?
     let onRemoteControl: (String, AtemAgentInfo?) -> Void
+    @State private var showingLaunch = false
 
     private var agents: [AtemAgentInfo] {
         guard let id = clientId else { return [] }
@@ -436,6 +437,14 @@ private struct AgentListPanel: View {
                         .truncationMode(.middle)
                         .help(panelTitle)
                     if clientIsOnline, let id = clientId {
+                        Button {
+                            showingLaunch = true
+                        } label: {
+                            Label("New Agent", systemImage: "plus")
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                        .disabled(accessBlockReason != nil || sessionStatus?.phase != .ready)
                         Button {
                             onRemoteControl(id, nil)
                         } label: {
@@ -571,6 +580,15 @@ private struct AgentListPanel: View {
             }
         }
         .background(Color(NSColor.windowBackgroundColor))
+        .sheet(isPresented: $showingLaunch) {
+            if let id = clientId {
+                AgentLaunchView(hub: hubManager, clientID: id, onAttach: { agent in
+                    showingLaunch = false
+                    onRemoteControl(id, agent)
+                })
+                .id(id)
+            }
+        }
     }
 }
 

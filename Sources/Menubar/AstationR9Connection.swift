@@ -25,6 +25,7 @@ final class AstationR9Connection {
     private let handshakeStarted: () -> Void
     private let policyWelcomed: () -> Void
     private let policyEvent: (ClientEvent, Bool) -> Void
+    private let hostWorkEvent: (String) -> Bool
 
     deinit { preparation?.cancel() }
 
@@ -36,6 +37,7 @@ final class AstationR9Connection {
          refreshMembership: @escaping (LogHead) -> Void,
          handshakeStarted: @escaping () -> Void = {},
          policyWelcomed: @escaping () -> Void = {}, policyEvent: @escaping (ClientEvent, Bool) -> Void = { _, _ in },
+         hostWorkEvent: @escaping (String) -> Bool = { _ in false },
          generation: UUID = UUID()) {
         self.context = context
         self.generation = generation
@@ -47,6 +49,7 @@ final class AstationR9Connection {
         self.handshakeStarted = handshakeStarted
         self.policyWelcomed = policyWelcomed
         self.policyEvent = policyEvent
+        self.hostWorkEvent = hostWorkEvent
         queue = RemoteSocketQueue(write: write, failed: { [weak self] _ in
             self?.finish("The r9 connection was interrupted. Reconnect to query pending requests.")
         })
@@ -104,6 +107,12 @@ final class AstationR9Connection {
         }
     }
 
+    func sendHostWork(_ json: String) -> Bool {
+        guard !closed, current(), let channel, channel.phase == .ready else { return false }
+        do { try channel.perform(.message(json)); return true }
+        catch { return false }
+    }
+
     func disconnect(sendClose: Bool = true) {
         guard !closed else { return }
         closed = true
@@ -145,7 +154,10 @@ final class AstationR9Connection {
                  .hostPolicyChanged(_, _, _, let observed, let json):
                 guard observed != "foreign", acceptPolicyHead(json) else { return }
                 policyEvent(update, channel?.hostPolicyReady == true)
+            case .family(let family, let op, let json) where family == "session" && op == "host_work_result":
+                _ = hostWorkEvent(json)
             case .session(_, _, _, let json), .family(_, _, let json), .error(_, _, _, let json):
+                if case .error = update, hostWorkEvent(json) { return }
                 if case .error = update { policyEvent(update, false) }
                 guard let message = try? AstationMessage.decodePacket(Data(json.utf8)) else {
                     finish("Atem sent an invalid r9 application message."); return

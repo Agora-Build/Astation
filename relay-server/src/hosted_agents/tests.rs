@@ -194,6 +194,7 @@ struct HostScenario {
     pending_approval: bool,
     lose_submit_reply: bool,
     handles: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    host_work: bool,
 }
 
 async fn controlled_host_scenario(
@@ -207,6 +208,9 @@ async fn controlled_host_scenario(
     crate::remote_api::host_route_tests::prove(&mut socket, &f.keys, &f.host_key, &log, "host-a")
         .await;
     let mut receipts = std::collections::BTreeMap::new();
+    let mut launches: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    let mut messages: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    let mut tasks: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
     let approval_created_at = chrono::Utc::now().timestamp_millis() as u64;
     for attachment in 0..attachments {
         let open = loop {
@@ -289,6 +293,7 @@ async fn controlled_host_scenario(
             features: KNOWN_FEATURES
                 .iter()
                 .chain(R9_FEATURES)
+                .chain(if scenario.host_work { &["host.launch", "host.work", "host.messages"][..] } else { &[] })
                 .map(|s| s.to_string())
                 .collect(),
             principal: authority.name(),
@@ -402,9 +407,45 @@ async fn controlled_host_scenario(
                     json!({"type":"session","data":{"v":1,"op":"receipts","id":new_id(),"re":data["id"],
                 "receipts":data["request_ids"].as_array().unwrap().iter().filter_map(|v|receipts.get(v.as_str().unwrap()).cloned()).collect::<Vec<_>>()}})
                 }
+                "host_profiles" | "host_launch" | "host_launch_query" | "message_publish" | "message_query" | "work_query" if scenario.host_work => {
+                    use atem_client::session::host_work::{Request, Response};
+                    let request = Request::decode(&serde_json::to_vec(&plain).unwrap()).unwrap();
+                    let result = match &request {
+                        Request::Profiles { .. } => json!({"kind":"profiles","profiles":[{"id":"backend","revision":2,"label":"Backend","provider":"codex"}]}),
+                        Request::Launch { request_id, .. } => launches.entry(request_id.clone()).or_insert_with(||
+                            json!({"kind":"launch","launch":{"request_id":request_id,"session_id":"ses-aaaaaaaaaaaa",
+                                "process_gen":"11111111-1111-4111-8111-111111111111","state":"started"}})).clone(),
+                        Request::LaunchQuery { request_id, .. } => launches[request_id].clone(),
+                        Request::Publish { message, host, .. } => messages.entry(message.message_id.clone()).or_insert_with(|| {
+                            let recipients: Vec<Value> = message.recipients.iter().filter(|r| &r.host == host).map(|r| {
+                                let delivery = if matches!(r.destination, atem_client::session::messages::Destination::Agent { .. }) {
+                                    let work = json!({"task_id":r.recipient_id,"receipt_id":new_id(),"state":"awaiting_result","detail":"turn finished","result":null});
+                                    tasks.insert(r.recipient_id.clone(), work.clone());
+                                    json!({"state":"work","work":work})
+                                } else { json!({"state":"stored"}) };
+                                json!({"recipient_id":r.recipient_id,"delivery":delivery})
+                            }).collect();
+                            json!({"kind":"message","message":{"message_id":message.message_id,"digest":message.digest(),
+                                "sender":message.sender,"recipients":recipients}})
+                        }).clone(),
+                        Request::MessageQuery { message_id, .. } => messages[message_id].clone(),
+                        Request::WorkQuery { task_id, .. } => {
+                            let mut work = tasks[task_id].clone();
+                            work["state"] = json!("completed");
+                            work["result"] = json!({"kind":"memory","id":"result-a","version":1,
+                                "text":"Isolated task result", "digest":atem_client::session::host_work::digest(b"Isolated task result")});
+                            json!({"kind":"work","work":work})
+                        },
+                        _ => unreachable!(),
+                    };
+                    let reply = json!({"type":"session","data":{"v":1,"op":"host_work_result","id":new_id(),"re":request.id(),
+                        "host":request.host(),"attachment_gen":welcome.attachment_gen,"channel_id":welcome.channel_id,"result":result}});
+                    assert!(Response::from_data(&reply["data"]).unwrap().answers(&request));
+                    reply
+                }
                 other => panic!("unexpected controlled-host request: {other}"),
             };
-            if reply["type"] == "session" {
+            if reply["type"] == "session" && reply["data"]["op"] != "host_work_result" {
                 atem_client::session::wire::decode(&serde_json::to_vec(&reply).unwrap()).unwrap();
             }
             let bytes = channel
@@ -620,6 +661,7 @@ async fn postgres_service_registry_without_mac_and_membership_policy_fences() {
         },
         context,
         operation: "agent.view",
+        additional_operations: Vec::new(),
     };
     connection.recheck(&runtime, &admission).await.unwrap();
     let target = connection.attached.target("ses-aaaaaaaaaaaa").unwrap();
@@ -769,6 +811,7 @@ async fn postgres_event_socket_keeps_rich_messages_and_closes_on_policy_denial()
                         },
                         context,
                         operation: "agent.view",
+                        additional_operations: Vec::new(),
                     };
                     let permit = runtime.requests.clone().try_acquire_owned().unwrap();
                     upgrade
@@ -820,6 +863,87 @@ async fn postgres_event_socket_keeps_rich_messages_and_closes_on_policy_denial()
 async fn http_json(response: reqwest::Response, status: StatusCode) -> Value {
     assert_eq!(response.status(), status);
     response.json().await.unwrap()
+}
+
+#[cfg(feature = "host-work-api")]
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_host_work_http_scopes_correlation_reconnect_and_revocation() {
+    use crate::{account_identity::tests::Fixture as AuthFixture, station_integrations::tests::fixture_with_issuer};
+    let auth = AuthFixture::new().await;
+    let (db, runtime, f) = fixture_with_issuer(&auth.issuer).await;
+    let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+    let mut next = previous.clone(); next.revision += 1;
+    let policy = next.integrations.get_mut(ID).unwrap();
+    policy.scopes.extend(["agent.launch", "agent.message", "agent.notify"].map(String::from));
+    policy.quota_per_second = 100;
+    runtime.policies.commit(&previous, &next).await.unwrap();
+    let (context, fingerprint) = service(&runtime, &f).await;
+    let log = runtime.app.recovery.integration_log(&context.genesis, PRINCIPAL).await.unwrap();
+    let mut app = runtime.app.clone();
+    app.accounts = Arc::new(crate::account_store::InMemoryAccountStore::with_verifier(app.knowledge.clone(), app.vault.clone(),
+        Arc::new(crate::remote_api::recovery::tests::TestAccountVerifier)));
+    let (base, relay) = spawn_relay(app).await;
+    let host = tokio::spawn(controlled_host_scenario(base, Arc::new(f), log, 9, HostScenario { host_work: true, ..Default::default() }));
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !crate::remote_api::recovery::host_target(&runtime.app, &context.genesis, PRINCIPAL, "host-a").await
+            .is_ok_and(|(_, _, binding, _)| binding.is_some()) { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    let router = operation_routes().with_state(IntegrationState(Some(runtime.clone())));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let api = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().unwrap();
+    let prefix = format!("{origin}/api/agent/v1/integrations/{ID}/hosts/host-a");
+    let mut claims = auth.claims();
+    claims["aud"] = json!(runtime.binding.station_origin); claims["client_id"] = json!(ID); claims["r9_svc"] = json!(fingerprint);
+    claims["scope"] = json!("agent.view agent.prompt agent.launch agent.message agent.notify");
+    claims["exp"] = json!(chrono::Utc::now().timestamp() + 300);
+    let token = auth.token(auth.header(), claims.clone());
+    assert_eq!(http.get(format!("{prefix}/profiles")).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    let mut prompt_only = claims.clone(); prompt_only["scope"] = json!("agent.view agent.prompt");
+    assert_eq!(http.get(format!("{prefix}/profiles")).bearer_auth(auth.token(auth.header(), prompt_only)).send().await.unwrap().status(), StatusCode::FORBIDDEN);
+    let profiles = http_json(http.get(format!("{prefix}/profiles")).bearer_auth(&token).send().await.unwrap(), StatusCode::OK).await;
+    assert_eq!(profiles["result"]["profiles"][0]["id"], "backend");
+    let target = json!({"account_id":"account-test","atem_device_id":"host-a","host_trust_gen":1});
+    let request_id = new_id();
+    let launch = json!({"host":target,"request_id":request_id,"profile_id":"backend","profile_revision":2,"expires_at":chrono::Utc::now().timestamp_millis() + 60_000});
+    let result = http_json(http.post(format!("{prefix}/launches")).bearer_auth(&token).json(&launch).send().await.unwrap(), StatusCode::OK).await;
+    let recovered = http_json(http.post(format!("{prefix}/launches/{request_id}")).bearer_auth(&token).json(&json!({"host":target})).send().await.unwrap(), StatusCode::OK).await;
+    let retried = http_json(http.post(format!("{prefix}/launches")).bearer_auth(&token).json(&launch).send().await.unwrap(), StatusCode::OK).await;
+    assert_eq!(result["result"], recovered["result"]); assert_eq!(result["result"], retried["result"]);
+    let message_id = new_id();
+    let message = json!({"message_id":message_id,"workflow_id":new_id(),"sender":format!("service:{}",context.service_id),
+        "created_at":chrono::Utc::now().timestamp_millis(),"expires_at":chrono::Utc::now().timestamp_millis()+60_000,
+        "text":"Harmless test notice","context":[],"recipients":[{"recipient_id":new_id(),"host":target,"destination":{"kind":"host"}}]});
+    let published = http_json(http.post(format!("{prefix}/messages")).bearer_auth(&token).json(&json!({"host":target,"message":message})).send().await.unwrap(), StatusCode::OK).await;
+    let queried = http_json(http.post(format!("{prefix}/messages/{message_id}")).bearer_auth(&token).json(&json!({"host":target})).send().await.unwrap(), StatusCode::OK).await;
+    assert_eq!(published["result"], queried["result"]);
+    let mut wrong_sender = message.clone(); wrong_sender["sender"] = json!("member:manager");
+    assert_eq!(http.post(format!("{prefix}/messages")).bearer_auth(&token).json(&json!({"host":target,"message":wrong_sender})).send().await.unwrap().status(), StatusCode::FORBIDDEN);
+    let mut executing = message.clone(); executing["recipients"][0]["destination"] = json!({"kind":"agent","route_id":"marks","route_revision":1,
+        "target":{"account_id":"account-test","atem_device_id":"host-a","host_trust_gen":1,"session_id":"ses-aaaaaaaaaaaa","process_gen":"11111111-1111-4111-8111-111111111111"}});
+    let mut notice_only = claims.clone(); notice_only["scope"] = json!("agent.view agent.message");
+    assert_eq!(http.post(format!("{prefix}/messages")).bearer_auth(auth.token(auth.header(), notice_only)).json(&json!({"host":target,"message":executing})).send().await.unwrap().status(), StatusCode::FORBIDDEN);
+    for scopes in ["agent.view agent.message agent.notify", "agent.view agent.message agent.prompt"] {
+        let mut limited = claims.clone(); limited["scope"] = json!(scopes);
+        assert_eq!(http.post(format!("{prefix}/messages")).bearer_auth(auth.token(auth.header(), limited)).json(&json!({"host":target,"message":executing})).send().await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
+    executing["message_id"] = json!(new_id());
+    let task_id = executing["recipients"][0]["recipient_id"].as_str().unwrap();
+    let accepted = http_json(http.post(format!("{prefix}/messages")).bearer_auth(&token).json(&json!({"host":target,"message":executing})).send().await.unwrap(), StatusCode::OK).await;
+    assert_eq!(accepted["result"]["message"]["recipients"][0]["delivery"]["work"]["state"], "awaiting_result");
+    let completed = http_json(http.post(format!("{prefix}/tasks/{task_id}")).bearer_auth(&token).json(&json!({"host":target})).send().await.unwrap(), StatusCode::OK).await;
+    assert_eq!(completed["result"]["work"]["task_id"], task_id);
+    assert_eq!(completed["result"]["work"]["state"], "completed");
+    assert_eq!(completed["result"]["work"]["result"]["text"], "Isolated task result");
+    let mut stale_host = target.clone(); stale_host["host_trust_gen"] = json!(2);
+    assert_eq!(http.post(format!("{prefix}/launches/{request_id}")).bearer_auth(&token).json(&json!({"host":stale_host})).send().await.unwrap().status(), StatusCode::CONFLICT);
+    tokio::time::timeout(std::time::Duration::from_secs(3), host).await.unwrap().unwrap();
+    runtime.policies.deny(&runtime.binding).await.unwrap();
+    assert_eq!(http.get(format!("{prefix}/profiles")).bearer_auth(&token).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    api.abort(); let _ = api.await; relay.abort(); let _ = relay.await;
+    drop(runtime); db.cleanup().await;
 }
 
 #[tokio::test]
@@ -911,6 +1035,7 @@ async fn postgres_dispatch_failure_preserves_mutation_recovery_without_replaying
             },
             context: context.clone(),
             operation: scope,
+            additional_operations: Vec::new(),
         };
         // A malformed carrier envelope synchronously closes the real transport
         // before dispatch; the fake host must see no submit or receipt query.
