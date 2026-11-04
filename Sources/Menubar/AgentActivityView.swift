@@ -38,8 +38,14 @@ struct AgentActivityView: View {
                     if let client {
                         if let snapshot {
                             if let status = snapshot.status {
-                                Label(status.detail ?? status.state.capitalized, systemImage: "circle.fill")
-                                    .font(.callout).foregroundStyle(.secondary)
+                                Label {
+                                    Text(status.detail ?? status.state.capitalized)
+                                        .foregroundStyle(.secondary)
+                                } icon: {
+                                    Image(systemName: "circle.fill")
+                                        .foregroundStyle(status.state == "ready" ? Color.green : Color.secondary)
+                                }
+                                .font(.callout)
                             }
                             historyNotice(snapshot)
                             if !snapshot.loaded && !snapshot.closed {
