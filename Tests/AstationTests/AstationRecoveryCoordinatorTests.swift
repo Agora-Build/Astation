@@ -516,10 +516,10 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
     }
 
     private func service(_ coordinator: AstationRecoveryCoordinator, sessions: [String]? = nil,
-                         projects: [String]? = nil) async throws -> RemoteServiceApproval {
+                         projects: [String]? = nil, operations: [String] = ["prompt", "view"]) async throws -> RemoteServiceApproval {
         let log = try await coordinator.serviceMembership()
         let time = AstationRecoveryCoordinator.clock()
-        var scope: [String: Any] = ["hosts": ["host-a"], "ops": ["prompt", "view"]]
+        var scope: [String: Any] = ["hosts": ["host-a"], "ops": operations]
         if let sessions { scope["sessions"] = sessions }
         if let projects { scope["projects"] = projects }
         let action: [String: Any] = ["action": "add", "member": ["device_id": "service-test", "kind": "service", "roles": ["service"],
@@ -631,6 +631,35 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         let finalPosts = await transport.count()
         XCTAssertEqual(finalPosts, 1, "Reopening must not resubmit the approval")
         controller.cancelPending()
+    }
+
+    func testHostWorkApprovalCannotSignWithoutHostAuthorizationOrAfterHostDisconnectsDuringConfirmation() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        _ = try await coordinator.setup()
+        let approval = try await service(coordinator, operations: ["launch", "view"])
+        try await coordinator.prepareService(approval)
+        let before = await h.relay.appends.count
+        let confirmations = h.ownerRequests.count
+        do {
+            try await coordinator.approveService(approval, portal: portal(transport), current: { true })
+            XCTFail("New operations require host authorization before signing")
+        } catch StationIntegrationError.hostUpgradeRequired { }
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        var checks = 0
+        do {
+            try await coordinator.approveService(approval, portal: portal(transport), authorizeNewOperations: { log in
+                XCTAssertEqual(log.accountId(), "account-a")
+                checks += 1
+                if checks == 2 { throw StationIntegrationError.hostUpgradeRequired }
+            }, current: { true })
+            XCTFail("A host that disconnected during owner authentication cannot be enrolled")
+        } catch StationIntegrationError.hostUpgradeRequired { }
+        XCTAssertEqual(checks, 2)
+        XCTAssertEqual(h.ownerRequests.count, confirmations + 1)
+        let appends = await h.relay.appends.count, posts = await transport.count()
+        XCTAssertEqual(appends, before)
+        XCTAssertEqual(posts, 0)
+        XCTAssertEqual(try coordinator.pendingServiceApproval(), approval)
     }
 
     func testServiceConfirmationUsesTheExactReviewedApprovalAndCannotBeBypassed() async throws {

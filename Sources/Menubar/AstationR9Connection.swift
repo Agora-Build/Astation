@@ -22,9 +22,11 @@ final class AstationR9Connection {
     private let receiveMessage: (AstationMessage) -> Void
     private let failed: (String, Bool) -> Void
     private let refreshMembership: (LogHead) -> Void
+    private let authorizationChanged: (AstationChannelSigner.PreparationStage) -> Void
     private let handshakeStarted: () -> Void
     private let policyWelcomed: () -> Void
     private let policyEvent: (ClientEvent, Bool) -> Void
+    private let hostWorkEvent: (String) -> Bool
 
     deinit { preparation?.cancel() }
 
@@ -34,8 +36,10 @@ final class AstationR9Connection {
          receive: @escaping (AstationMessage) -> Void,
          failed: @escaping (String, Bool) -> Void,
          refreshMembership: @escaping (LogHead) -> Void,
+         authorizationChanged: @escaping (AstationChannelSigner.PreparationStage) -> Void = { _ in },
          handshakeStarted: @escaping () -> Void = {},
          policyWelcomed: @escaping () -> Void = {}, policyEvent: @escaping (ClientEvent, Bool) -> Void = { _, _ in },
+         hostWorkEvent: @escaping (String) -> Bool = { _ in false },
          generation: UUID = UUID()) {
         self.context = context
         self.generation = generation
@@ -44,9 +48,11 @@ final class AstationR9Connection {
         receiveMessage = receive
         self.failed = failed
         self.refreshMembership = refreshMembership
+        self.authorizationChanged = authorizationChanged
         self.handshakeStarted = handshakeStarted
         self.policyWelcomed = policyWelcomed
         self.policyEvent = policyEvent
+        self.hostWorkEvent = hostWorkEvent
         queue = RemoteSocketQueue(write: write, failed: { [weak self] _ in
             self?.finish("The r9 connection was interrupted. Reconnect to query pending requests.")
         })
@@ -63,7 +69,11 @@ final class AstationR9Connection {
         membershipLog = log.snapshot()
         preparation = Task { [weak self] in
             do {
-                try await signer.prepare(isCurrent: { self?.current() == true && self?.closed == false })
+                try await signer.prepare(isCurrent: { self?.current() == true && self?.closed == false },
+                    stageChanged: { [weak self] stage in
+                        guard let self, !closed, current() else { return }
+                        authorizationChanged(stage)
+                    })
                 guard let self, !Task.isCancelled, !closed, current() else { return }
                 preparation = nil
                 handshakeStarted()
@@ -102,6 +112,12 @@ final class AstationR9Connection {
         case .hostPolicyGet, .hostPolicyRetry: return try? channel.perform(operation)
         default: return nil
         }
+    }
+
+    func sendHostWork(_ json: String) -> Bool {
+        guard !closed, current(), let channel, channel.phase == .ready else { return false }
+        do { try channel.perform(.message(json)); return true }
+        catch { return false }
     }
 
     func disconnect(sendClose: Bool = true) {
@@ -145,7 +161,10 @@ final class AstationR9Connection {
                  .hostPolicyChanged(_, _, _, let observed, let json):
                 guard observed != "foreign", acceptPolicyHead(json) else { return }
                 policyEvent(update, channel?.hostPolicyReady == true)
+            case .family(let family, let op, let json) where family == "session" && op == "host_work_result":
+                _ = hostWorkEvent(json)
             case .session(_, _, _, let json), .family(_, _, let json), .error(_, _, _, let json):
+                if case .error = update, hostWorkEvent(json) { return }
                 if case .error = update { policyEvent(update, false) }
                 guard let message = try? AstationMessage.decodePacket(Data(json.utf8)) else {
                     finish("Atem sent an invalid r9 application message."); return

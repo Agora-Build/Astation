@@ -4,7 +4,8 @@ enum AtemSessionWire {
     static let revision: UInt64 = 9
     static let features: Set<String> = ["chat.history_end", "chat.history", "chat.lookup", "chat.coverage",
         "receipt.result", "approval.session_rules", "approval.card_reason", "chat.send_acquire", "approval.lease_free",
-        "membership.carry", "push.sealed", "approval.seen", "grant.revoke", "recovery.wait"]
+        "membership.carry", "push.sealed", "approval.seen", "grant.revoke", "recovery.wait",
+        "host.launch", "host.work", "host.messages", "host.attachments"]
     static let maximumCounter = UInt64(AtemSessionJSON.maximumInteger)
     static let submissionKinds = ["prompt", "interrupt", "stop", "approval", "approval_rule_revoke"]
     static func diagnosticErrorCode(_ value: String?) -> String {

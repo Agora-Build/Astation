@@ -26,6 +26,10 @@ class AstationHubManager: ObservableObject {
     /// Agents reported by each Atem, keyed by clientId.
     @Published var agentsByClientId: [String: [AtemAgentInfo]] = [:]
     @Published private(set) var sessionStatusByClientId: [String: AtemSessionClient.ConnectionStatus] = [:]
+    @Published private(set) var hostWorkRevision: UInt64 = 0
+    @MainActor private var hostWorkClients: [String: RemoteHostWork] = [:]
+    @MainActor private var hostWorkAccounts: [String: String] = [:]
+    private let hostWorkJournal = AtemHostWorkJournal()
     @Published private(set) var credentialProjectSuggestions: [String] = []
     private var credentialProjectReports: [String: AtemReportedProjects] = [:]
     /// User-pinned active client ID. Overrides focus-based routing when set.
@@ -1755,6 +1759,53 @@ class AstationHubManager: ObservableObject {
         sessionClient(for: clientId)?.refresh()
     }
 
+    @MainActor func hostWorkClient(for clientID: String) -> RemoteHostWork? {
+        guard let context = sessionContext(for: clientID) else { return nil }
+        let owner = context.account + "\u{0}" + context.device
+        if hostWorkAccounts[clientID] == owner, let client = hostWorkClients[clientID] { return client }
+        hostWorkClients[clientID]?.connected(host: nil, attachment: nil, features: [], control: false)
+        let work = RemoteHostWork(load: { [hostWorkJournal] in
+            try hostWorkJournal.load(account: context.account, device: context.device)
+        }, save: { [hostWorkJournal] in try hostWorkJournal.save($0) }, send: { [weak self] json in
+            guard let self, let current = self.sessionContext(for: clientID),
+                  current.account == context.account, current.device == context.device else { return false }
+            return self.r9Connections[clientID]?.sendHostWork(json) ?? false
+        })
+        work.onChange = { [weak self] in self?.hostWorkRevision &+= 1 }
+        work.onStarted = { [weak self] _ in self?.requestAgentList(from: clientID) }
+        hostWorkClients[clientID] = work
+        hostWorkAccounts[clientID] = owner
+        updateHostWork(clientID: clientID)
+        return work
+    }
+
+    @MainActor private func updateHostWork(clientID: String) {
+        guard let work = hostWorkClients[clientID] else { return }
+        let session = nativeSessionClients[clientID]
+        let welcome = session?.hasRegistrySnapshot == true ? session?.welcome : nil
+        let host = welcome.flatMap { value in
+            value.account_id.flatMap { account in value.atem_device_id.flatMap { device in
+                value.host_trust_gen.map { RemoteWorkHost(account: account, device: device, trust: $0) }
+            } }
+        }
+        work.connected(host: host, attachment: welcome?.attachment_gen, features: session?.features ?? [],
+            control: session?.canReviewApprovals == true)
+    }
+
+    @MainActor func validateServiceHosts(_ review: RemoteServiceReview, log: MembershipLog) throws {
+        guard !review.requiredHostFeatures.isEmpty else { return }
+        guard log.accountId() == e2eDataAccount, log.frozen() == nil else { throw AccountLoginError.changed }
+        for hostID in review.hosts {
+            guard let enrolled = log.host(hostId: hostID), nativeSessionClients.contains(where: { id, client in
+                guard let context = sessionContext(for: id), let welcome = client.welcome else { return false }
+                return context.account == log.accountId() && context.device == hostID
+                    && welcome.account_id == context.account && welcome.atem_device_id == hostID
+                    && welcome.host_trust_gen == enrolled.hostTrustGen && client.canReviewApprovals
+                    && client.features.isSuperset(of: review.requiredHostFeatures)
+            }) else { throw StationIntegrationError.hostUpgradeRequired }
+        }
+    }
+
     func localControlAPI(key: LocalAPIKey, inbox: ApprovalInbox) -> LocalControlAPI {
         LocalControlAPI(key: key, clients: { [weak self] in
             guard let self else { return [:] }
@@ -1785,6 +1836,7 @@ class AstationHubManager: ObservableObject {
             self.sessionStatusByClientId[id] = client.connectionStatus
             self.agentsByClientId[id] = client.hasRegistrySnapshot
                 ? client.registry.values.sorted { $0.session_id < $1.session_id }.map(AtemAgentInfo.init(session:)) : []
+            MainActor.assumeIsolated { self.updateHostWork(clientID: id) }
             self.sessionStateDidChange?(id)
             let host = DeviceAuthentication.deviceLabel(self.connectedClients.first(where: { $0.id == id })?.hostname ?? "Atem")
             self.approvalSessionDidChange?(id, client, host)
@@ -1794,6 +1846,7 @@ class AstationHubManager: ObservableObject {
             sessionTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
                 guard let self else { return }
                 for client in Array(self.nativeSessionClients.values) { client.tick() }
+                MainActor.assumeIsolated { for client in Array(self.hostWorkClients.values) { client.tick() } }
             }
         }
         return client
@@ -1986,12 +2039,17 @@ class AstationHubManager: ObservableObject {
                     self.nativeSessionClients[context.route.clientId]?.channelFailed(message, unsupported: unsupported)
                 }, refreshMembership: { [weak self] head in
                     self?.refreshR9Membership(context, requiredHead: head)
+                }, authorizationChanged: { [weak self] stage in
+                    self?.nativeSessionClients[context.route.clientId]?.channelAuthorizationStarted(
+                        context: context, waitingForForeground: stage == .waitingForForeground)
                 }, handshakeStarted: { [weak self] in
                     self?.nativeSessionClients[context.route.clientId]?.channelHandshakeStarted(context: context)
                 }, policyWelcomed: { [weak self] in
                     self?.hostPolicyWelcomed(clientID: context.route.clientId, generation: generation)
                 }, policyEvent: { [weak self] event, confirmed in
                     self?.receiveHostPolicy(event, confirmed: confirmed, clientID: context.route.clientId, generation: generation)
+                }, hostWorkEvent: { [weak self] json in
+                    self?.hostWorkClients[context.route.clientId]?.receive(json) ?? false
                 }, generation: generation)
             r9Connections[context.route.clientId] = link
             nativeSessionClients[context.route.clientId]?.channelAuthorizationStarted(context: context)

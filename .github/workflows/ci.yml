@@ -191,6 +191,14 @@ jobs:
         run: |
           cargo test --locked --features hosted-agent-api hosted_agents
           cargo test --locked --features hosted-agent-api hosted_agents::tests::postgres -- --ignored --test-threads=2
+      - name: Test gated host launch and messages API
+        working-directory: relay-server
+        env:
+          RECOVERY_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:55433/postgres
+        run: |
+          cargo test --locked --features host-work-api hosted_agents
+          cargo test --locked --features host-work-api hosted_agents::tests::postgres -- --ignored --test-threads=2
+          cargo test --locked --features host-work-api station_integrations::tests::postgres_mark_tasks -- --ignored
       - name: Run relay Redis (Valkey) suites
         working-directory: relay-server
         env:

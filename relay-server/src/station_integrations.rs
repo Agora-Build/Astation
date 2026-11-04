@@ -409,6 +409,8 @@ pub(crate) struct ProvisionRequest {
     hosts: Vec<String>,
     sessions: Option<Vec<String>>,
     projects: Option<Vec<String>>,
+    #[serde(default)]
+    mark_tasks: bool,
 }
 
 async fn provision(
@@ -450,6 +452,19 @@ impl StationIntegrations {
         let now = chrono::Utc::now().timestamp();
         let policy = checkpoint.current(id, owner, now).map_err(|_| denied())?;
         if policy.state != "awaiting_approval" || policy.r9_svc.is_some() {
+            return Err(denied());
+        }
+        if request.mark_tasks && !cfg!(feature = "host-work-api") {
+            return Err(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "host_work_not_verified",
+            ));
+        }
+        if request.mark_tasks
+            && !["agent.view", "agent.prompt"]
+                .iter()
+                .all(|scope| policy.scopes.iter().any(|s| s == scope))
+        {
             return Err(denied());
         }
         let log = self.recovery_log(&request.genesis_hash, owner).await?;
@@ -521,7 +536,7 @@ impl StationIntegrations {
         if saved.as_deref() != Some(&fingerprint) {
             return Err(unavailable());
         }
-        let ops: BTreeSet<&str> = policy
+        let mut ops: BTreeSet<&str> = policy
             .scopes
             .iter()
             .flat_map(|scope| match scope.as_str() {
@@ -530,9 +545,15 @@ impl StationIntegrations {
                 "agent.approve" => vec!["approval", "rule_revoke"],
                 "agent.interrupt" => vec!["interrupt", "stop"],
                 "agent.terminal" => vec!["terminal"],
+                "agent.launch" if cfg!(feature = "host-work-api") => vec!["launch"],
+                "agent.message" if cfg!(feature = "host-work-api") => vec!["message"],
+                "agent.notify" if cfg!(feature = "host-work-api") => vec!["notify"],
                 _ => vec![],
             })
             .collect();
+        if request.mark_tasks {
+            ops.extend(["message", "notify"]);
+        }
         let scope = ServiceScope::new(request.hosts)
             .ops(ops)
             .sessions(request.sessions)

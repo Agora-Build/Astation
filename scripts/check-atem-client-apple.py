@@ -118,6 +118,9 @@ def main():
         route_payload = payloads / pin["station_route_fixture"]["payload"]
         if route_fixture.read_bytes() != route_payload.read_bytes():
             raise ValueError("station-route fixture differs from the immutable packaged vector")
+        host_work_fixture = REPO / "native-remote/Tests/AstationRemoteTests/Fixtures/host-work-requests-v1.json"
+        if host_work_fixture.read_bytes() != (payloads / pin["host_work_fixture"]["payload"]).read_bytes():
+            raise ValueError("host-work fixture differs from the immutable packaged vector")
         subprocess.run([str(executable), str(fixture), str(route_fixture)], check=True)
         if args.install:
             destination = REPO / "build/atem-client" / pin["revision"] / "AtemClient"

@@ -97,7 +97,7 @@ dependencies = [
 [[package]]
 name = "atem-client"
 version = "0.1.0"
-source = "git+https://github.com/Agora-Build/Atem.git?rev=ed0b45bad5db0a278c63efe8a464f12d4d548465#ed0b45bad5db0a278c63efe8a464f12d4d548465"
+source = "git+https://github.com/Agora-Build/Atem.git?rev=2b0c384e7213e5d4637cdba1f0a78ccbc53a2083#2b0c384e7213e5d4637cdba1f0a78ccbc53a2083"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
@@ -111,6 +111,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subtle",
+ "url",
  "x25519-dalek",
  "zeroize",
 ]

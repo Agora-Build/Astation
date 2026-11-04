@@ -14,6 +14,7 @@ final class IntegrationApprovalViewController: NSViewController {
     private let hostStatus = NSTextField(wrappingLabelWithString: "")
     private let sessions = NSTextField()
     private let projects = NSTextField()
+    private let markPermission = NSButton(checkboxWithTitle: "Allow annotated mark tasks", target: nil, action: nil)
     private let reviewText = NSTextField(wrappingLabelWithString: "")
     private let loadButton = NSButton(title: "Load Requests", target: nil, action: nil)
     private let reviewButton = NSButton(title: "Review Access", target: nil, action: nil)
@@ -58,6 +59,7 @@ final class IntegrationApprovalViewController: NSViewController {
         projects.placeholderString = "All projects, or comma-separated h1 project hashes"
         sessions.setAccessibilityLabel("Session restrictions")
         projects.setAccessibilityLabel("Project restrictions")
+        markPermission.toolTip = "Allow this integration to send annotated screenshots to agents on the selected hosts. Atem must have an approved route for these tasks."
         reviewText.isSelectable = true
         reviewText.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         picker.setAccessibilityLabel("Integration request")
@@ -68,7 +70,7 @@ final class IntegrationApprovalViewController: NSViewController {
         relayStatus.textColor = .secondaryLabelColor
         let stack = NSStackView(views: [title, intro, relayOnlyButton, relayStatus, actions,
             NSTextField(labelWithString: "Integration request"), picker,
-            setupButton, NSTextField(labelWithString: "Allowed Atem hosts"), hosts, hostStatus, sessions, projects, reviewText, reviewAgainButton, removeButton, status])
+            setupButton, NSTextField(labelWithString: "Allowed Atem hosts"), hosts, hostStatus, sessions, projects, markPermission, reviewText, reviewAgainButton, removeButton, status])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 14
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.drawsBackground = false
         let document = NSView(); scroll.documentView = document
@@ -105,6 +107,7 @@ final class IntegrationApprovalViewController: NSViewController {
         revocationRefresh?.cancel(); revocationRefresh = nil
         generation = UUID(); task?.cancel(); task = nil
         approval = nil; contextCurrent = nil; log = nil; reviewText.stringValue = ""
+        markPermission.state = .off
         coordinator = nil
         securityMissingOnStation = false
         approvedScope = nil
@@ -141,6 +144,10 @@ final class IntegrationApprovalViewController: NSViewController {
         removeButton.isHidden = !revoking || (removed && !pendingRemoval)
         removeButton.isEnabled = !busy && removable && approval == nil && contextCurrent?() == true
         let canSelectHosts = !busy && pendingSelection && log != nil && approval == nil && contextCurrent?() == true
+        let supportsMarks = records.indices.contains(picker.indexOfSelectedItem)
+            && Set(records[picker.indexOfSelectedItem].scopes).isSuperset(of: ["agent.view", "agent.prompt"])
+        markPermission.isHidden = !pendingSelection || !supportsMarks || approval != nil
+        markPermission.isEnabled = canSelectHosts && supportsMarks
         let hasSelectedHost = hostButtons.contains { $0.1.state == .on }
         reviewButton.isEnabled = canSelectHosts && pendingSelection && hasSelectedHost
         let missingApprovedScope = log != nil && !pendingSelection && !records.isEmpty
@@ -167,6 +174,7 @@ final class IntegrationApprovalViewController: NSViewController {
     @objc private func selectionChanged() {
         revocationRefresh?.cancel(); revocationRefresh = nil
         approval = nil; reviewText.stringValue = ""
+        markPermission.state = .off
         if records.indices.contains(picker.indexOfSelectedItem) { selectedIntegrationID = records[picker.indexOfSelectedItem].id }
         showSelectedScope()
         status.stringValue = selectedRequestGuidance()
@@ -336,6 +344,7 @@ final class IntegrationApprovalViewController: NSViewController {
             status.stringValue = StationIntegrationError.hostSelectionRequired.localizedDescription
             render(); return
         }
+        let marks = markPermission.state == .on
         let epoch = generation
         render(busy: true)
         task = Task { [weak self] in
@@ -346,13 +355,14 @@ final class IntegrationApprovalViewController: NSViewController {
                 let draft = try await transport.prepare(record: record, ownerAccount: owner, issuer: settings.issuer,
                     log: log, managerID: coordinator.managerID, hosts: selectedHosts,
                     sessions: Self.items(sessions.stringValue), projects: Self.items(projects.stringValue),
-                    signedAt: AstationRecoveryCoordinator.clock().wallMs)
+                    signedAt: AstationRecoveryCoordinator.clock().wallMs, markTasks: marks)
                 guard contextCurrent?() == true, !Task.isCancelled else { throw AccountLoginError.changed }
                 let candidate = try RemoteServiceApproval(operationID: UUID().uuidString, integrationID: record.id,
                     issuer: settings.issuer, ownerAccount: owner, stationOrigin: record.stationOrigin,
                     bodyJSON: draft.bodyJSON, log: log, managerID: coordinator.managerID, now: AstationRecoveryCoordinator.clock())
                 let review = try RemoteServiceReview(approval: candidate)
-                try review.check(record: record, hosts: selectedHosts, sessions: Self.items(sessions.stringValue), projects: Self.items(projects.stringValue))
+                try review.check(record: record, hosts: selectedHosts, sessions: Self.items(sessions.stringValue), projects: Self.items(projects.stringValue), markTasks: marks)
+                try hub.validateServiceHosts(review, log: log)
                 guard candidate.fingerprint == draft.fingerprint else { throw AccountLoginError.invalidResponse }
                 try await coordinator.prepareService(candidate)
                 guard contextCurrent?() == true else { throw AccountLoginError.changed }
@@ -369,7 +379,10 @@ final class IntegrationApprovalViewController: NSViewController {
         task = Task { [weak self] in
             guard let self else { return }
             do {
-                let result = try await coordinator.approveService(approval, portal: portal, current: { [weak self] in self?.contextCurrent?() == true && !Task.isCancelled })
+                let review = try RemoteServiceReview(approval: approval)
+                let result = try await coordinator.approveService(approval, portal: portal,
+                    authorizeNewOperations: { [hub] log in try hub.validateServiceHosts(review, log: log) },
+                    current: { [weak self] in self?.contextCurrent?() == true && !Task.isCancelled })
                 guard epoch == generation, let current = contextCurrent, current() else { return }
                 self.approval = nil; reviewText.stringValue = ""
                 let updated = records.map { $0.id == result.record.id ? result.record : $0 }
@@ -466,6 +479,9 @@ final class IntegrationApprovalViewController: NSViewController {
         let value = try RemoteServiceReview(approval: approval)
         showScope(hosts: value.hosts, sessions: value.sessions, projects: value.projects, approved: false)
         reviewText.stringValue = "\(IntegrationAccessNotice.disclosure(stationOrigin: approval.stationOrigin))\n\nAccount: \(approval.ownerAccount)\nStation: \(approval.stationOrigin)\nActions: \(value.operations.joined(separator: ", "))\nHosts: \(value.hosts.joined(separator: ", "))\nSessions: \(value.sessions?.joined(separator: ", ") ?? "All on allowed hosts")\nProjects: \(value.projects?.joined(separator: ", ") ?? "All on allowed hosts")\nExpires: \(value.expiresAt.formatted())\nService: \(value.serviceID)\nKey SHA-256: \(approval.fingerprint)\nAccount root: \(approval.genesisHash)\nPrevious entry: \(value.predecessor)"
+        if !value.requiredHostFeatures.isEmpty {
+            reviewText.stringValue += "\n\nRequires Atem 0.8.2 or later on every selected host. Upgrade all other devices that verify this account before approving these permissions."
+        }
     }
 
     struct ApprovedScope: Equatable {
