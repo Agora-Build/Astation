@@ -111,15 +111,15 @@ final class AtemSessionChat {
         return snapshot.chat_id
     }
 
-    func snapshot(_ target: AtemSessionTarget) -> Snapshot? {
+    func snapshot(_ target: AtemSessionTarget, maximumMessages: Int = 50, maximumBytes: Int = 900_000) -> Snapshot? {
         guard let view = views[target.session_id], view.snapshot.binding.target == target else { return nil }
         var snapshot = view.snapshot
         // The API snapshot is bounded separately from the retained timeline.
         var bytes = 0
-        for id in view.order.reversed().prefix(50) {
+        for id in view.order.reversed().prefix(maximumMessages) {
             guard let message = view.messages[id] else { continue }
             let size = view.sizes[id] ?? 0
-            if bytes + size > 900_000 { snapshot.locally_truncated = true; break }
+            if bytes + size > maximumBytes { snapshot.locally_truncated = true; break }
             bytes += size; snapshot.messages.insert(message, at: 0)
         }
         if snapshot.messages.count < view.order.count { snapshot.locally_truncated = true }

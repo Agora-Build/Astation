@@ -76,6 +76,7 @@ public final class RemoteHostWork {
     public private(set) var available = false
     public private(set) var storageFailed = false
     public private(set) var needsReconnect = false
+    public private(set) var trackingStatus: String?
     public var onChange: (() -> Void)?
     public var onStarted: ((RemoteLaunchStatus) -> Void)?
 
@@ -121,6 +122,7 @@ public final class RemoteHostWork {
         self.host = host; self.attachment = attachment; self.features = features
         available = host != nil && attachment != nil && control && features.contains("host.launch")
         pending = [:]; profiles = []; work = []; messages = []; loadingProfiles = false; lastQuery = 0; needsReconnect = false
+        trackingStatus = nil
         if storageFailed { status = "Launch recovery data is unreadable. New launches are disabled." }
         else if available { status = "Choose a launch profile approved on this host." }
         else if host != nil { status = "Remote launch is unavailable. Enable hosting and approve a profile on Atem." }
@@ -131,6 +133,9 @@ public final class RemoteHostWork {
     }
 
     public var currentLaunches: [RemoteLaunchRecord] { launches.filter { $0.host == host }.reversed() }
+    public var canTrackMessages: Bool { canQueryReceipts && features.contains("host.messages") }
+    public var canTrackTasks: Bool { canQueryReceipts && features.contains("host.work") }
+    private var canQueryReceipts: Bool { host != nil && attachment != nil && !storageFailed && !needsReconnect }
 
     public func refreshProfiles() {
         guard available, !loadingProfiles, !storageFailed else { return }
@@ -194,6 +199,9 @@ public final class RemoteHostWork {
         if !expired.isEmpty {
             needsReconnect = true
             status = "Response delayed. Reconnect to check the original request. No launch is replayed."
+            if expired.values.contains(where: { ["message_query", "work_query"].contains($0.op) }) {
+                trackingStatus = "Receipt response delayed. Reconnect to check again."
+            }
             onChange?()
         }
         if time >= lastQuery && time - lastQuery >= 5_000 { refresh() }
@@ -210,6 +218,9 @@ public final class RemoteHostWork {
             pending.removeValue(forKey: re)
             if exchange.op == "host_profiles" { loadingProfiles = false }
             let code = data["code"] as? String ?? "unknown_error"
+            if ["message_query", "work_query"].contains(exchange.op) {
+                trackingStatus = "Atem refused the receipt lookup: \(code)."
+            }
             if exchange.op == "host_launch", let index = launches.firstIndex(where: { $0.requestID == exchange.identity && $0.host == host }) {
                 var next = launches; next[index].refusal = code
                 guard persist(next) else { return true }
@@ -247,11 +258,13 @@ public final class RemoteHostWork {
                 guard progress.task_id == exchange.identity else { return false }
                 if let index = work.firstIndex(where: { $0.task_id == progress.task_id }) { work[index] = progress }
                 else { work.append(progress) }
+                trackingStatus = nil
             case "message" where exchange.op == "message_query":
                 let message = try Self.decode(RemoteMessageProgress.self, result["message"] as Any)
                 guard message.message_id == exchange.identity else { return false }
                 if let index = messages.firstIndex(where: { $0.message_id == message.message_id }) { messages[index] = message }
                 else { messages.append(message) }
+                trackingStatus = nil
             default: return false
             }
             pending.removeValue(forKey: re); onChange?(); return true
@@ -259,21 +272,25 @@ public final class RemoteHostWork {
     }
 
     public func track(taskID: String) {
-        guard let host, features.contains("host.work") else { return }
-        guard Self.uuid(taskID), (trackedTasks[host]?.count ?? 0) < 16 else {
-            status = "Enter a valid task UUID. Up to 16 tasks can be tracked per host."; onChange?(); return
+        guard let host, canTrackTasks else { return }
+        guard Self.uuid(taskID), trackedTasks[host]?.contains(taskID) == true || (trackedTasks[host]?.count ?? 0) < 16 else {
+            trackingStatus = "Enter a valid task UUID. Up to 16 tasks can be tracked per host."; onChange?(); return
         }
+        trackingStatus = "Tracking task receipt."
         trackedTasks[host, default: []].insert(taskID)
         refresh()
+        onChange?()
     }
 
     public func track(messageID: String) {
-        guard let host, features.contains("host.messages") else { return }
-        guard Self.uuid(messageID), (trackedMessages[host]?.count ?? 0) < 16 else {
-            status = "Enter a valid message UUID. Up to 16 messages can be tracked per host."; onChange?(); return
+        guard let host, canTrackMessages else { return }
+        guard Self.uuid(messageID), trackedMessages[host]?.contains(messageID) == true || (trackedMessages[host]?.count ?? 0) < 16 else {
+            trackingStatus = "Enter a valid message UUID. Up to 16 messages can be tracked per host."; onChange?(); return
         }
+        trackingStatus = "Tracking message receipt."
         trackedMessages[host, default: []].insert(messageID)
         refresh()
+        onChange?()
     }
 
     private func request(_ op: String, identity: String? = nil, fields: [String: Any] = [:]) -> Bool {

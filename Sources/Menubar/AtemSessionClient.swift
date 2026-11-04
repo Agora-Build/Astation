@@ -490,6 +490,18 @@ final class AtemSessionClient {
         return chat.snapshot(target)
     }
 
+    /// Native Activity shows the retained timeline; the API keeps its smaller snapshot budget.
+    func activitySnapshot(_ target: AtemSessionTarget) -> AtemSessionChat.Snapshot? {
+        guard target == self.target(sessionId: target.session_id, process: target.process_gen),
+              features.contains("chat.history_end") else { return nil }
+        return chat.snapshot(target, maximumMessages: 500, maximumBytes: 8_388_608)
+    }
+
+    func activityRequests(_ target: AtemSessionTarget) -> [AtemSessionRequestRecord] {
+        guard target == self.target(sessionId: target.session_id, process: target.process_gen) else { return [] }
+        return journal.snapshot.requests.filter { $0.target == target }.reversed()
+    }
+
     func readChat(_ target: AtemSessionTarget) -> AtemSessionChat.Snapshot? {
         guard features.contains("chat.history_end"), registry[target.session_id]?.state == "running",
               registry[target.session_id]?.capabilities.contains("chat-v1") == true,

@@ -8,8 +8,6 @@ struct AgentLaunchView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var selectedProfile: String?
     @State private var work: RemoteHostWork?
-    @State private var receiptID = ""
-    @State private var trackMessage = true
 
     var body: some View {
         let _ = hub.hostWorkRevision
@@ -78,40 +76,6 @@ struct AgentLaunchView: View {
                             }
                         }
                         .frame(maxHeight: 210)
-                    }
-                    Divider()
-                    HStack {
-                        Picker("Receipt", selection: $trackMessage) {
-                            Text("Message").tag(true)
-                            Text("Task").tag(false)
-                        }.frame(width: 155)
-                        TextField("Message or task ID", text: $receiptID)
-                        Button("Track") {
-                            if trackMessage { work.track(messageID: receiptID.trimmingCharacters(in: .whitespacesAndNewlines)) }
-                            else { work.track(taskID: receiptID.trimmingCharacters(in: .whitespacesAndNewlines)) }
-                        }.disabled(receiptID.isEmpty)
-                    }
-                    ForEach(work.messages) { message in
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Message \(message.id)").font(.caption.monospaced()).textSelection(.enabled)
-                            ForEach(message.recipients) { recipient in
-                                Text(recipient.delivery.work.map { $0.state == "awaiting_result"
-                                    ? "Turn finished - awaiting task result" : $0.state.replacingOccurrences(of: "_", with: " ") }
-                                    ?? (recipient.delivery.state == "stored" ? "Stored on host" : "Refused: \(recipient.delivery.code ?? "forbidden")"))
-                                    .font(.caption).foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                    if !work.work.isEmpty {
-                        Divider()
-                        Text("Tasks").font(.headline)
-                        ForEach(work.work) { task in
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(task.state == "awaiting_result" ? "Turn finished - awaiting task result"
-                                    : task.state.replacingOccurrences(of: "_", with: " ").capitalized)
-                                Text(task.detail).font(.caption).foregroundStyle(.secondary)
-                            }
-                        }
                     }
                 } else {
                     Text("Reconnect and verify this Atem before launching an agent.").foregroundStyle(.secondary)

@@ -48,6 +48,17 @@ notice, a finished agent turn (`awaiting_result`) and explicit task completion
 are separate labels. Tracking IDs can be supplied by the caller; this increment
 does not create a durable native message composer/outbox.
 
+Remote Terminal offers **Activity** immediately after **Release**. It reads the
+selected session's shared ordered chat subscription without acquiring a lease:
+messages, tools, approval cards, the matching launch, and this Astation's request
+outcomes. **Load Earlier Activity** uses the existing bounded history protocol.
+Native can display the retained 500-message/8 MiB timeline; API snapshots retain
+their existing 50-message/900 KB budget. Retention loss, holes and local limits
+are shown explicitly. Connection, account, trust or process replacement fences
+old content. The page's bottom section contains the manual **Receipt Lookup**
+for authorized message/task IDs on the selected host. It is absent from
+**New Agent**. Looking up a receipt never launches an agent or submits work.
+
 Native integration approval has an explicit **Allow annotated mark tasks**
 choice, off by default and reset when changing requests. It requires existing
 `agent.view` and `agent.prompt` consent. The native review checks the exact

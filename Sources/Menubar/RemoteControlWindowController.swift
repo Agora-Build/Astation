@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 
 /// One addressed terminal window. Closing it releases the view, not the agent.
 final class RemoteControlWindowController: NSObject, NSWindowDelegate {
@@ -15,6 +16,8 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
     private var viewButton: NSButton!
     private var controlButton: NSButton!
     private var releaseButton: NSButton!
+    private var activityButton: NSButton!
+    private var activityWindow: NSWindow?
     private var stopButton: NSButton!
     private var pasteAndGoButton: NSButton!
     private let promptField = NSTextField()
@@ -78,6 +81,7 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
     }
 
     func showWindow(clientId: String, agent: AtemAgentInfo?) {
+        closeActivity()
         sessions.releaseAll()
         terminal.close()
         promptDraft = nil
@@ -121,11 +125,13 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
         viewButton = button("View", symbol: "eye", action: #selector(viewSession))
         controlButton = button("Take Control", symbol: "keyboard", action: #selector(takeControl))
         releaseButton = button("Release", symbol: "keyboard.badge.ellipsis", action: #selector(releaseControl))
+        activityButton = button("Activity", symbol: "clock", action: #selector(showActivity))
+        activityButton.toolTip = "View this agent's messages, tools, approvals and request outcomes"
         pasteAndGoButton = button("Paste & Go", symbol: "arrow.turn.down.left", action: #selector(pasteAndGo))
         pasteAndGoButton.toolTip = "Paste the clipboard into the selected remote terminal and press Enter"
         stopButton = button("Stop Agent", symbol: "stop.circle", action: #selector(stopAgent))
         stopButton.toolTip = "Stop this original agent process on the remote machine"
-        let controls = NSStackView(views: [modeLabel, viewButton, controlButton, releaseButton, spacer(), pasteAndGoButton, stopButton])
+        let controls = NSStackView(views: [modeLabel, viewButton, controlButton, releaseButton, activityButton, spacer(), pasteAndGoButton, stopButton])
         controls.orientation = .horizontal
         controls.spacing = 8
         statusLabel.font = .systemFont(ofSize: 11)
@@ -232,6 +238,7 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
             && terminal.session.flatMap { sessions.target(sessionId: $0.terminalId, process: $0.generation) } != nil
         controlButton.isEnabled = terminal.canTakeControl
         releaseButton.isEnabled = terminal.canRelease
+        activityButton.isEnabled = promptTarget != nil
         stopButton.isEnabled = terminal.canInput
         pasteAndGoButton.isEnabled = terminal.canInput
         let supportsPrompts = terminal.session.flatMap { sessions.registry[$0.terminalId] }?.capabilities.contains("chat-v1") == true
@@ -327,6 +334,29 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
     @objc private func viewSession() { terminal.view() }
     @objc private func takeControl() { terminal.takeControl() }
     @objc private func releaseControl() { terminal.release() }
+    @objc private func showActivity() {
+        guard let window, let clientID = sessions.context?.route.clientId, let target = promptTarget else { return }
+        if let activityWindow { activityWindow.makeKeyAndOrderFront(nil); return }
+        let content = AgentActivityView(hub: hubManager, clientID: clientID, target: target,
+            hostName: targetLabel.stringValue, onClose: { [weak self] in self?.closeActivity() })
+        let sheet = NSWindow(contentViewController: NSHostingController(rootView: content))
+        sheet.title = "Activity"
+        sheet.styleMask = [.titled, .resizable]
+        sheet.setContentSize(NSSize(width: 680, height: 600))
+        sheet.minSize = NSSize(width: 560, height: 360)
+        sheet.isReleasedWhenClosed = false
+        activityWindow = sheet
+        window.beginSheet(sheet) { [weak self, weak sheet] _ in
+            if self?.activityWindow === sheet { self?.activityWindow = nil }
+        }
+    }
+
+    private func closeActivity() {
+        guard let activityWindow else { return }
+        activityWindow.sheetParent?.endSheet(activityWindow)
+        activityWindow.orderOut(nil)
+        self.activityWindow = nil
+    }
     @objc private func releaseForegroundControl() {
         sessions.releaseAll()
         terminal.sessionStateChanged()
@@ -356,6 +386,7 @@ final class RemoteControlWindowController: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        closeActivity()
         terminal.close()
         terminal.render = nil
         sessions.releaseAll()

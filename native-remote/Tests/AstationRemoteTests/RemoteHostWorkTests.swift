@@ -63,6 +63,58 @@ private final class HostWorkFixture {
 
 final class RemoteHostWorkTests: XCTestCase {
     @MainActor
+    func testReceiptRefusalAndTimeoutAreVisibleAndReconnectOnlyRepeatsQueries() throws {
+        let f = HostWorkFixture()
+        f.connect(features: ["host.work"], control: false)
+        let id = UUID().uuidString.lowercased()
+        f.client.track(taskID: id)
+        let requestID = try XCTUnwrap(f.sent.last?["id"] as? String)
+        let refusal: [String: Any] = ["type": "session", "data": ["v": 1, "op": "error", "re": requestID, "code": "forbidden"]]
+        XCTAssertTrue(f.client.receive(String(decoding: try JSONSerialization.data(withJSONObject: refusal), as: UTF8.self)))
+        XCTAssertTrue(f.client.trackingStatus?.contains("forbidden") == true)
+        f.client.track(taskID: id)
+        f.time += 16_000; f.client.tick()
+        XCTAssertTrue(f.client.needsReconnect)
+        XCTAssertFalse(f.client.canTrackTasks)
+        XCTAssertTrue(f.client.trackingStatus?.contains("delayed") == true)
+        f.attachment = UUID().uuidString.lowercased()
+        f.connect(features: ["host.work"], control: false)
+        XCTAssertTrue(f.client.canTrackTasks)
+        XCTAssertNil(f.client.trackingStatus)
+        XCTAssertEqual(f.sent.last?["task_id"] as? String, id)
+        XCTAssertTrue(f.sent.allSatisfy { $0["op"] as? String == "work_query" })
+    }
+
+    @MainActor
+    func testReceiptLookupWorksWithoutLaunchOrControlAndKeepsErrorsSeparateFromLaunchStatus() {
+        let f = HostWorkFixture()
+        f.connect(features: ["host.messages", "host.work"], control: false)
+        XCTAssertFalse(f.client.available)
+        XCTAssertTrue(f.client.canTrackMessages)
+        XCTAssertTrue(f.client.canTrackTasks)
+        let launchStatus = f.client.status
+        f.client.track(messageID: "not-an-id")
+        XCTAssertTrue(f.client.trackingStatus?.contains("valid message") == true)
+        XCTAssertEqual(f.client.status, launchStatus)
+        XCTAssertTrue(f.sent.isEmpty)
+        let id = UUID().uuidString.lowercased()
+        f.client.track(messageID: id)
+        XCTAssertEqual(f.sent.last?["op"] as? String, "message_query")
+        XCTAssertTrue(f.client.receive(f.reply(["kind": "message", "message": ["message_id": id,
+            "digest": String(repeating: "a", count: 64), "sender": "service:test", "recipients": []]])))
+        XCTAssertNil(f.client.trackingStatus)
+        XCTAssertEqual(f.client.messages.first?.id, id)
+        f.client.connected(host: nil, attachment: nil, features: [], control: false)
+        XCTAssertFalse(f.client.canTrackMessages)
+        XCTAssertFalse(f.client.canTrackTasks)
+        XCTAssertTrue(f.client.messages.isEmpty)
+        let count = f.sent.count
+        f.client.track(taskID: UUID().uuidString.lowercased())
+        XCTAssertEqual(f.sent.count, count)
+        XCTAssertFalse(f.sent.contains { ["host_launch", "acquire", "submit"].contains($0["op"] as? String ?? "") })
+    }
+
+    @MainActor
     func testPersistsBeforeLaunchAndNeverReplaysAfterLostReplyOrAppRestart() {
         let f = HostWorkFixture(), id = f.launch()
         XCTAssertEqual(f.sent.filter { $0["op"] as? String == "host_launch" }.count, 1)

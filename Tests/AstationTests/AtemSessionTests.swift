@@ -2346,6 +2346,56 @@ extension AtemR9PresentationTests {
 }
 
 extension AtemR9PresentationTests {
+    func testNativeActivityReadsTheRetainedTimelineWithoutExpandingTheAPISnapshotOrTakingControl() throws {
+        let f = SessionFixture()
+        try f.handshake(permissions: ["view"]); try f.snapshot()
+        XCTAssertNotNil(f.client.readChat(f.target))
+        try event(f, "opened", 0, fields: ["status": ["state": "working", "since": 1_760_500_000_000]])
+        try event(f, "history_end", 1, fields: ["page": page(0)])
+        for index in 1...70 {
+            try event(f, "message", UInt64(index + 1), fields: message("m\(index)", text: "**Step \(index)**\n\n[Details](https://example.com)"))
+        }
+        let activity = try XCTUnwrap(f.client.activitySnapshot(f.target))
+        XCTAssertEqual(activity.messages.count, 70)
+        XCTAssertEqual(activity.messages.first?.messageId, "m1")
+        XCTAssertEqual(activity.messages.last?.messageId, "m70")
+        XCTAssertFalse(activity.locally_truncated)
+        XCTAssertEqual(f.client.chatSnapshot(f.target)?.messages.count, 50)
+        XCTAssertTrue(f.client.chatSnapshot(f.target)?.locally_truncated == true)
+        let pageID = try XCTUnwrap(f.client.chatHistory(f.target, before: "m1"))
+        var older = message("m0", text: "Earlier activity", history: true)
+        older["page_id"] = pageID
+        try event(f, "message", 72, fields: older)
+        try event(f, "history_end", 73, fields: ["page_id": pageID, "page": page(1, selector: "before")])
+        XCTAssertEqual(f.client.activitySnapshot(f.target)?.messages.first?.messageId, "m0")
+        XCTAssertEqual(f.chats.filter { $0.op == "open" }.count, 1, "Activity shares the existing ordered subscription")
+        XCTAssertFalse(f.sent.contains { ["acquire", "renew", "submit"].contains($0.op) })
+        f.source = nil; f.client.connectionChanged()
+        XCTAssertNil(f.client.activitySnapshot(f.target), "Disconnects must hide the old target's content")
+    }
+
+    func testActivityRequestHistoryIsBoundToTheExactAccountHostTrustSessionAndProcess() throws {
+        let f = SessionFixture()
+        let selected = f.target
+        let otherTargets = [
+            AtemSessionTarget(account_id: "other-account", atem_device_id: selected.atem_device_id, host_trust_gen: 1, session_id: sessionID, process_gen: processID),
+            AtemSessionTarget(account_id: selected.account_id, atem_device_id: "other-host", host_trust_gen: 1, session_id: sessionID, process_gen: processID),
+            AtemSessionTarget(account_id: selected.account_id, atem_device_id: selected.atem_device_id, host_trust_gen: 2, session_id: sessionID, process_gen: processID),
+            AtemSessionTarget(account_id: selected.account_id, atem_device_id: selected.atem_device_id, host_trust_gen: 1, session_id: "ses-bbbbbbbbbbbb", process_gen: processID),
+            AtemSessionTarget(account_id: selected.account_id, atem_device_id: selected.atem_device_id, host_trust_gen: 1, session_id: sessionID, process_gen: "99999999-9999-4999-8999-999999999999")
+        ]
+        let ownID = UUID().uuidString.lowercased()
+        f.disk.state.requests = ([selected] + otherTargets).enumerated().map { index, target in
+            AtemSessionRequestRecord(requestId: index == 0 ? ownID : UUID().uuidString.lowercased(), target: target,
+                kind: "prompt", digest: String(repeating: "a", count: 64))
+        }
+        try f.ready()
+        XCTAssertEqual(f.client.activityRequests(selected).map(\.requestId), [ownID])
+        for target in otherTargets { XCTAssertTrue(f.client.activityRequests(target).isEmpty) }
+        f.source = nil; f.client.connectionChanged()
+        XCTAssertTrue(f.client.activityRequests(selected).isEmpty)
+    }
+
     func testHistoryContentLimitIsMeasuredWithoutTrustingThePageDeclaration() throws {
         let f = SessionFixture(); try f.ready()
         try event(f, "opened", 0, fields: ["status": ["state": "ready", "since": 1_760_500_000_000]])
