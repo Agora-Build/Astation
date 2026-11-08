@@ -42,6 +42,8 @@ use crate::AppState;
 
 type ErrResp = (StatusCode, Json<Value>);
 
+pub(crate) mod skills_v2;
+
 /// Byte limit on a `/api/memory/batch` body (also the route's `DefaultBodyLimit`).
 pub(crate) const MEMORY_BATCH_BODY_LIMIT: usize = 2 * 1024 * 1024;
 /// Byte limit on a `/api/skills/batch` body (also the route's `DefaultBodyLimit`).
@@ -813,7 +815,7 @@ mod tests {
 
     /// Build an AppState with in-memory stores and a session bound to
     /// `astation_id`. Returns (state, session_id).
-    async fn test_state(astation_id: &str) -> (AppState, String) {
+    pub(super) async fn test_state(astation_id: &str) -> (AppState, String) {
         let state = AppState {
             recovery: crate::remote_api::recovery::RecoveryStore::disabled(),
             sessions: SessionStore::new(),
@@ -881,7 +883,7 @@ mod tests {
         })
     }
 
-    fn sample_skill(name: &str, files: Value) -> Value {
+    pub(super) fn sample_skill(name: &str, files: Value) -> Value {
         json!({
             "scope": "global",
             "project": "",

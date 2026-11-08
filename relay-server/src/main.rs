@@ -596,6 +596,14 @@ fn router(state: AppState) -> Router {
         .route("/api/skills", get(knowledge_routes::skills_pull_handler))
         .route("/api/skills/versions", get(knowledge_routes::skill_versions_handler))
         .route("/api/skills/version", get(knowledge_routes::skill_version_handler))
+        .route("/api/skills/v2", get(knowledge_routes::skills_v2::pull_handler))
+        .route(
+            "/api/skills/v2/batch",
+            post(knowledge_routes::skills_v2::batch_handler)
+                .layer(DefaultBodyLimit::max(knowledge_routes::SKILLS_BATCH_BODY_LIMIT)),
+        )
+        .route("/api/skills/v2/versions", get(knowledge_routes::skills_v2::versions_handler))
+        .route("/api/skills/v2/version", get(knowledge_routes::skills_v2::version_handler))
         // Relay API routes
         .route("/api/pair", post(relay::create_pair_handler))
         .route("/api/pair/:code", get(relay::pair_status_handler).delete(relay::delete_pair_handler))
