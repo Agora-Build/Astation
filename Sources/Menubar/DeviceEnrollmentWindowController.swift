@@ -17,6 +17,7 @@ final class DeviceEnrollmentWindowController: NSWindowController, NSWindowDelega
     private var task: Task<Void, Never>?
     private var generation = UUID()
     private var review: RemoteNativeEnrollment?
+    private var handoffPublished = false
     private var coordinator: AstationRecoveryCoordinator?
     private var current: (() -> Bool)?
     private var scope: (issuer: String, owner: String)?
@@ -88,8 +89,9 @@ final class DeviceEnrollmentWindowController: NSWindowController, NSWindowDelega
     @objc private func showCode() {
         let previous = task
         hidePrivateState()
-        let epoch = generation, accountEpoch = hub.integrationAccountGeneration
+        let epoch = generation
         let origin = hub.stationRelayUrl
+        handoffPublished = false; cancel.title = "Cancel Setup"
         start.isEnabled = false; permissions.isEnabled = false
         status.stringValue = "Preparing a private setup code..."
         task = Task { [weak self] in
@@ -99,8 +101,8 @@ final class DeviceEnrollmentWindowController: NSWindowController, NSWindowDelega
                 guard epoch == generation, !Task.isCancelled else { return }
                 try await hub.prepareAccountSecurityAccess()
                 guard let issuer = hub.portalSettings?.issuer, let owner = hub.signedInAccount,
-                      epoch == generation, accountEpoch == hub.integrationAccountGeneration,
-                      origin == hub.stationRelayUrl else { throw AccountLoginError.changed }
+                      epoch == generation, origin == hub.stationRelayUrl else { throw AccountLoginError.changed }
+                let accountEpoch = hub.integrationAccountGeneration
                 let active: () -> Bool = { [weak self] in
                     guard let self else { return false }
                     return generation == epoch && window?.isVisible == true && NSApp.isActive &&
@@ -120,6 +122,7 @@ final class DeviceEnrollmentWindowController: NSWindowController, NSWindowDelega
                     guard active() else { return }
                     if state.handedOff {
                         qr.image = nil
+                        handoffPublished = true; cancel.title = "Done"
                         status.stringValue = "Access is approved. Finish setup on your phone."
                         return
                     }
@@ -154,6 +157,7 @@ final class DeviceEnrollmentWindowController: NSWindowController, NSWindowDelega
                 try await coordinator.approveDeviceEnrollment(review, issuer: scope.issuer, owner: scope.owner, current: current)
                 guard current() else { return }
                 self.review = nil; code.stringValue = ""
+                handoffPublished = true; cancel.title = "Done"
                 status.stringValue = "Access is approved. Finish setup on your phone."
                 cancel.isEnabled = true
             } catch { fail(error, epoch: epoch) }
@@ -161,6 +165,7 @@ final class DeviceEnrollmentWindowController: NSWindowController, NSWindowDelega
     }
 
     @objc private func cancelSetup() {
+        if handoffPublished { window?.performClose(nil); return }
         guard let coordinator, let scope, let current, current() else { return }
         let previous = task
         previous?.cancel()
