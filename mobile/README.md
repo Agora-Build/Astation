@@ -186,3 +186,7 @@ the real redirect activity and checks that AppAuth reuses its pending activity.
 Keep the main activity's default task affinity: an empty affinity sends the
 callback into another task and loses the pending login. After changing affinity,
 close the old app task before testing; an existing task retains its old affinity.
+The Gradle project keeps test APKs installed after connected tests so cleanup
+does not erase a developer's saved sign-in. The tests remove only their own
+synthetic identity records and keys. Flutter's separate live-login harness has
+its own application lifecycle; use a disposable device for that acceptance run.
