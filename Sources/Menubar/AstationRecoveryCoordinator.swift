@@ -45,6 +45,8 @@ final class AstationRecoveryCoordinator {
         var supersededServiceReviews: [Data]?
         var serviceRemoval: Data?
         var supersededServiceRemovals: [Data]?
+        var deviceEnrollment: Data?
+        var deviceReview: Data?
         var backup: Data?
         var restoreKit: String?
         var restore: Data?
@@ -210,9 +212,9 @@ final class AstationRecoveryCoordinator {
         } catch { uncertain = true; throw error }
     }
 
-    private func begin() throws {
+    private func begin(nativeDevice: Bool = false) throws {
         guard !uncertain else { throw RemoteRecoveryError.storageUncertain }
-        guard !busy else { throw RemoteRecoveryError.busy }
+        guard !busy, nativeDevice || saved.deviceReview == nil else { throw RemoteRecoveryError.busy }
         busy = true
     }
 
@@ -427,6 +429,188 @@ final class AstationRecoveryCoordinator {
         guard !busy, saved.hostBody == request.bodyJson, try publication?.outstanding() == nil else { return }
         try persist { $0.publication = nil; $0.hostBody = nil }
         publication = nil
+    }
+
+    private func deviceTransport() throws -> any RemoteDeviceEnrollmentTransport {
+        guard let transport = http as? any RemoteDeviceEnrollmentTransport else {
+            throw RemoteRecoveryTransportError.unavailable
+        }
+        return transport
+    }
+
+    private func deviceSession(issuer: String, owner: String) throws -> RemoteDeviceEnrollmentSession {
+        guard let checkpoint = saved.deviceEnrollment else { throw RemoteRecoveryError.notCommitted }
+        return try RemoteDeviceEnrollmentSession(checkpoint: checkpoint, issuer: issuer, owner: owner,
+            station: relayURL, now: now(), persist: { [unowned self] bytes in
+                try self.persist { $0.deviceEnrollment = bytes }
+            })
+    }
+
+    /// The QR remains in the native window and protected checkpoint, never the relay or Flutter.
+    func startDeviceEnrollment(issuer: String, owner: String, roles: [String],
+        current: () -> Bool) async throws -> RemoteDeviceEnrollmentInvitation {
+        try begin(nativeDevice: true); defer { busy = false }
+        guard current(), let kit = try currentKit(), saved.hostBody == nil,
+              saved.serviceApproval == nil, saved.serviceRemoval == nil,
+              saved.publication == nil || saved.deviceReview != nil else { throw RemoteRecoveryError.busy }
+        let log = try await refreshedLog(genesis: kit.genesisHash)
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        try requireManager(log)
+        let session: RemoteDeviceEnrollmentSession
+        if saved.deviceEnrollment != nil {
+            session = try deviceSession(issuer: issuer, owner: owner)
+            guard session.invitation.roles == roles else { throw RemoteRecoveryError.requiresReview }
+        } else {
+            let invitation = try RemoteDeviceEnrollmentInvitation(issuer: issuer, owner: owner,
+                station: relayURL, log: log, manager: managerID, roles: roles, now: now())
+            session = try RemoteDeviceEnrollmentSession(invitation: invitation, now: now(), persist: { [unowned self] bytes in
+                try self.persist { $0.deviceEnrollment = bytes }
+            })
+        }
+        _ = try session.qrJSON(now: now())
+        _ = try await deviceTransport().createEnrollment(session.invitation, now: now().wallMs)
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        return session.invitation
+    }
+
+    func readDeviceEnrollment(issuer: String, owner: String, current: () -> Bool) async throws
+        -> (request: RemoteDeviceEnrollmentRequest?, handedOff: Bool) {
+        try begin(nativeDevice: true); defer { busy = false }
+        guard current() else { throw RemoteChannelError.staleLink }
+        let session = try deviceSession(issuer: issuer, owner: owner)
+        let mailbox = try await deviceTransport().readEnrollment(session.invitation, now: now().wallMs)
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        if let request = mailbox.request { _ = try session.bind(requestJSON: request.json(), now: now()) }
+        if let response = mailbox.response {
+            guard try session.matchesHandoff(response, now: now()) else { throw RemoteDeviceEnrollmentError.invalidProof }
+        }
+        return (mailbox.request, mailbox.response != nil)
+    }
+
+    /// Save the exact reviewed add in the same serialized writer used by host and service changes.
+    func prepareDeviceEnrollment(issuer: String, owner: String, request: RemoteDeviceEnrollmentRequest,
+        current: () -> Bool) async throws -> RemoteNativeEnrollment {
+        try begin(nativeDevice: true); defer { busy = false }
+        guard current(), saved.hostBody == nil, saved.serviceApproval == nil,
+              saved.serviceRemoval == nil else { throw RemoteRecoveryError.busy }
+        let session = try deviceSession(issuer: issuer, owner: owner)
+        _ = try session.bind(requestJSON: request.json(), now: now())
+        if let checkpoint = saved.deviceReview {
+            let review = try JSONDecoder().decode(RemoteNativeEnrollment.self, from: checkpoint)
+            guard review.deviceID == request.deviceID, review.requestID == session.invitation.id else {
+                throw RemoteRecoveryError.requiresReview
+            }
+            return review
+        }
+        guard saved.publication == nil else { throw RemoteRecoveryError.busy }
+        let log = try await refreshedLog(genesis: session.invitation.genesis)
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        try requireManager(log)
+        let review = try session.review(log: log, now: now())
+        let context = try review.checkpoint()
+        let candidate = RemoteMembershipPublication(log: log, persist: { [unowned self] bytes in
+            try self.persist { $0.publication = bytes; $0.deviceReview = context }
+        })
+        _ = try review.prepare(publication: candidate, managerID: managerID, now: now())
+        publication = candidate
+        return review
+    }
+
+    func approveDeviceEnrollment(_ review: RemoteNativeEnrollment, issuer: String, owner: String,
+        current: @escaping () -> Bool) async throws {
+        try begin(nativeDevice: true); defer { busy = false }
+        guard current(), saved.deviceReview == (try review.checkpoint()), let checkpoint = saved.publication else {
+            throw RemoteChannelError.staleLink
+        }
+        let session = try deviceSession(issuer: issuer, owner: owner)
+        _ = try session.qrJSON(now: now())
+        if publication == nil {
+            publication = try RemoteMembershipPublication(checkpoint: checkpoint, accountID: accountID,
+                genesisHash: review.genesisHash, now: now(), persist: { [unowned self] bytes in
+                    try self.persist { $0.publication = bytes }
+                })
+        }
+        guard let publication, publication.operationContext == (try review.checkpoint()) else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        var latest = try await refreshedLog(genesis: review.genesisHash)
+        try requireManager(latest)
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        if latest.head() != publication.head {
+            _ = try publication.relayConflict(head: latest.head(), entries: latest.entriesAfter(seq: publication.head.seq), more: false, now: now())
+        }
+        let alreadyStored = try latest.entries().contains { try signedObjectInfo(json: $0).bodyJcs == review.bodyJSON }
+        if !alreadyStored {
+            guard !publication.requiresRefresh else { throw RemoteRecoveryError.requiresReview }
+            let append: AppendRequest
+            if let retry = try publication.outstanding() { append = retry }
+            else {
+                let signRequest = try RemoteConfirmedSigner.membershipRequest(bodyJSON: review.bodyJSON, keyID: managerID)
+                guard await confirmOwner(signRequest), current(), !Task.isCancelled else {
+                    throw RemoteRecoveryError.confirmationRequired
+                }
+                let stamp = Self.clock().monoMs
+                latest = try await refreshedLog(genesis: review.genesisHash)
+                try requireManager(latest)
+                guard current(), latest.head() == publication.head, !Task.isCancelled else {
+                    throw RemoteRecoveryError.requiresReview
+                }
+                append = try review.sign(publication: publication, provider: provider(), managerID: managerID,
+                    confirmedFingerprint: review.fingerprint, validationClock: now(), confirmedAt: stamp,
+                    now: { Self.clock().monoMs }, current: current)
+            }
+            guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+            switch try await http.append(genesisHash: review.genesisHash, request: append) {
+            case .stored:
+                guard case .committed = try publication.relayStored(now: now()) else { throw RemoteRecoveryError.requiresReview }
+            case .conflict(let page):
+                _ = try publication.relayConflict(head: page.head, entries: page.entries, more: page.more, now: now())
+                try commitLog(publication.committedLog())
+                throw RemoteRecoveryError.requiresReview
+            }
+            try commitLog(publication.committedLog())
+        }
+        latest = try await refreshedLog(genesis: review.genesisHash)
+        try requireManager(latest)
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        let keys = try dataKeys.recoveryKeys(dataAccount: accountID).map { AccountKey(kid: $0.kid, k: $0.key) }
+        let response = try session.handoff(committedLog: latest, keys: keys, now: now())
+        let mailbox = try await deviceTransport().readEnrollment(session.invitation, now: now().wallMs)
+        guard current(), !Task.isCancelled, let request = mailbox.request,
+              request.deviceID == review.deviceID else { throw RemoteChannelError.staleLink }
+        _ = try session.bind(requestJSON: request.json(), now: now())
+        let handoff = try RemoteDeviceEnrollmentHandoff(json: response, invitation: session.invitation, request: request, now: now())
+        _ = try await deviceTransport().publishEnrollment(handoff, request: request, invitation: session.invitation, now: now().wallMs)
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        try persist { $0.publication = nil; $0.deviceReview = nil }
+        self.publication = nil
+    }
+
+    /// Cancels setup carriage, not an already committed member. An uncertain signed append must be reconciled first.
+    func cancelDeviceEnrollment(issuer: String, owner: String, current: () -> Bool) async throws {
+        try begin(nativeDevice: true); defer { busy = false }
+        guard current() else { throw RemoteChannelError.staleLink }
+        let ownsPublication = saved.deviceReview != nil
+        if ownsPublication {
+            guard let checkpoint = saved.publication else { throw RemoteRecoveryError.invalidCheckpoint }
+            if publication == nil {
+                let session = try deviceSession(issuer: issuer, owner: owner)
+                publication = try RemoteMembershipPublication(checkpoint: checkpoint, accountID: accountID,
+                    genesisHash: session.invitation.genesis, now: now(), persist: { [unowned self] bytes in
+                        try self.persist { $0.publication = bytes }
+                    })
+            }
+            guard try publication?.outstanding() == nil else { throw RemoteRecoveryError.requiresReview }
+        }
+        let session = try deviceSession(issuer: issuer, owner: owner)
+        try session.cancel()
+        try await deviceTransport().cancelEnrollment(session.invitation)
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        try persist {
+            $0.deviceEnrollment = nil; $0.deviceReview = nil
+            if ownsPublication { $0.publication = nil }
+        }
+        if ownsPublication { publication = nil }
     }
 
     func serviceMembership() async throws -> MembershipLog {

@@ -104,6 +104,8 @@ public final class RemoteAppleDeviceIdentity {
     }
 
     public let publicIdentity: RemoteDevicePublicIdentity
+    private let issuer: String
+    private let accountID: String
     private let material: RemoteAppleIdentityMaterial
     private let crypto: RemoteAppleIdentityCryptography
     private let read: () throws -> Data?
@@ -148,6 +150,8 @@ public final class RemoteAppleDeviceIdentity {
         try checkPublicKey(key: auth)
         try checkPublicKey(key: encryption)
         publicIdentity = RemoteDevicePublicIdentity(deviceID: record.deviceID, authKey: auth, encryptionKey: encryption)
+        self.issuer = issuer
+        self.accountID = accountID
         material = record.material
         self.crypto = crypto
         self.read = read
@@ -166,10 +170,36 @@ public final class RemoteAppleDeviceIdentity {
             })
     }
 
+    /// A fresh, separate confirmation proves these exact applicant keys. Routine
+    /// channel consent cannot authorize this application-level enrollment proof.
+    public func enrollmentRequest(invitation: RemoteDeviceEnrollmentInvitation, station: String, deviceName: String,
+        now: () -> HostClock, current: () -> Bool, confirm: () async -> Bool,
+        persist: (RemoteDeviceEnrollmentRequest) throws -> Void) async throws -> RemoteDeviceEnrollmentRequest {
+        func check() throws {
+            try Task.checkCancellation()
+            guard current() else { throw RemoteChannelError.staleLink }
+            try invitation.validate(issuer: issuer, owner: accountID, station: station, now: now())
+            try checkStorage()
+        }
+        try check()
+        guard await confirm() else { throw RemoteOwnerAuthenticationError.denied }
+        try check()
+        let request = try RemoteDeviceEnrollmentRequest.make(invitation: invitation, identity: publicIdentity,
+            name: deviceName, now: now(), sign: { try crypto.sign($0, material: material) })
+        try persist(request)
+        try check()
+        return request
+    }
+
     public func sharedSecret(peer: Data) throws -> Data {
         try checkStorage()
         guard peer.count == 32 else { throw RemoteChannelError.invalidInput }
         return try crypto.sharedSecret(peer, material: material)
+    }
+
+    func validateEnrollmentContext(_ invitation: RemoteDeviceEnrollmentInvitation, now: HostClock) throws {
+        try checkStorage()
+        try invitation.validate(issuer: issuer, owner: accountID, station: invitation.station, now: now)
     }
 
     public func open(enc: Data, ciphertext: Data, info: Data, aad: Data) throws -> Data {
