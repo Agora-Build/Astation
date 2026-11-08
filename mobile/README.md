@@ -42,6 +42,12 @@ setup status**, which explains the limitation without calling the placeholder
 native operation or asking the user to sign in again. Enrollment failures appear
 inside the setup sheet, including when it opens above an Account sheet.
 
+The follow-up [protected identity and manager-review core](../designs/protocol/mobile-device-enrollment.md)
+is on `feat/mobile-device-enrollment`. Native device keys and exact signed-log
+approval helpers are implemented and tested. The phone/manager ceremony,
+sealed account-key handoff and independent R9 coordinator are not yet wired to
+the app. These primitives do not change the setup-capability flag.
+
 ## Toolchain and dependencies
 
 - Flutter **3.47.9**, framework revision
@@ -50,6 +56,8 @@ inside the setup sheet, including when it opens above an Account sheet.
   runtime; compiling a simulator app does not imply device/runtime testing.
 - Android API **24+**, JDK **21**, the Android SDK and NDK requested by Flutter.
 - Atem SDK **`2b0c384e7213e5d4637cdba1f0a78ccbc53a2083`** on both platforms.
+- Android native X25519/HPKE: Google Tink **1.24.0**, isolated behind the native
+  key adapter and checked against the same published vector used on Apple.
 - Commit `pubspec.lock`. Local IBM Plex font assets use OFL 1.1; their license
   and source hashes are in `assets/fonts`. The Vox mark is the existing official
   Vox favicon, not a replacement logo.
@@ -96,7 +104,10 @@ Builds and tests verified locally on 2026-11-03:
 - Seven Python SDK artifact/integrity checks.
 
 The mobile workflow runs analysis/tests and both platform builds on pull requests
-that affect these modules. Its first remote CI run is still pending publication.
+that affect these modules. PR #72's analysis, iOS, relay and web checks passed.
+macOS and Android CI attempts stopped on upstream GitHub artifact HTTP 504s;
+equivalent local builds/tests passed. The exact merge-time evidence and limitation
+are recorded in [PR #72](https://github.com/Agora-Build/Astation/pull/72#issuecomment-6719718158).
 
 ## Review the interface
 
