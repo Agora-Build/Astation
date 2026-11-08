@@ -1,0 +1,14 @@
+{
+  "repository": "Agora-Build/Atem",
+  "revision": "2b0c384e7213e5d4637cdba1f0a78ccbc53a2083",
+  "run_id": 41558426367,
+  "artifact_id": 13195781514,
+  "archive_sha256": "4f4f90c6719283db53318766dcc87401cdc5246278c84311f7edd10c1bde1e72",
+  "package": "atem-client-0.1.0-2b0c384e7213-android.zip",
+  "source": "atem-client-0.1.0-2b0c384e7213-SOURCE.json",
+  "payload_sha256": {
+    "atem-client-0.1.0-2b0c384e7213-android.zip": "8d3f643c6ab8ea9c30b868c492ad37841401a1b073d7055ce7764888dc916cc4",
+    "atem-client-0.1.0-2b0c384e7213-SOURCE.json": "b4fd0b098529936252e73304083435e0a354916e04d6328ecaf7e73f350c9f3c",
+    "atem-client-0.1.0-2b0c384e7213-host-work-requests-v1.json": "9ab10b55124629c840a87a6a925e080cd3495f59c92493e6e688f21e24f65c75"
+  }
+}

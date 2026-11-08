@@ -1,0 +1,34 @@
+name: astation_mobile
+description: "Astation for iOS and Android: your agents, within reach."
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.13.7
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_markdown_plus: ^1.0.12
+
+dev_dependencies:
+  integration_test:
+    sdk: flutter
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/vox-mark.png
+  fonts:
+    - family: PlexSans
+      fonts:
+        - asset: assets/fonts/PlexSans.ttf
+    - family: PlexSerif
+      fonts:
+        - asset: assets/fonts/PlexSerif.ttf
+    - family: PlexMono
+      fonts:
+        - asset: assets/fonts/PlexMono.ttf

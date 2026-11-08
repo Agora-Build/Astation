@@ -57,6 +57,24 @@ public struct AccountOIDCConfiguration: Codable, Equatable, Sendable {
         return relay.user == nil && relay.password == nil && relay.host == api.host && relay.scheme == api.scheme
             && (relay.port ?? (relay.scheme == "https" ? 443 : 80)) == (api.port ?? (api.scheme == "https" ? 443 : 80))
     }
+
+    public var mobileRedirectURI: String? {
+        switch clientID {
+        case "astation-ios": return "build.agora.astation.ios:/oauth/callback"
+        case "astation-android": return "build.agora.astation.android:/oauth/callback"
+        default: return nil
+        }
+    }
+
+    func validateRedirect(_ value: String) throws {
+        if let mobileRedirectURI {
+            guard value == mobileRedirectURI else { throw AccountLoginError.configuration }
+            return
+        }
+        guard let redirect = URLComponents(string: value), redirect.scheme == "http", redirect.host == "127.0.0.1",
+              redirect.port != nil, redirect.path == "/callback", redirect.user == nil, redirect.password == nil,
+              redirect.query == nil, redirect.fragment == nil else { throw AccountLoginError.configuration }
+    }
 }
 
 public struct AccountLoginAttempt: Sendable {
@@ -87,6 +105,15 @@ public struct AccountLoginAttempt: Sendable {
               let code = codes[0].value, !code.isEmpty, code.utf8.count <= 4096,
               !items.contains(where: { $0.name == "error" }) else { throw AccountLoginError.rejected }
         return code
+    }
+
+    public func mobileCallbackCode(url: URL, configuration: AccountOIDCConfiguration) throws -> String {
+        guard let expected = configuration.mobileRedirectURI, url.absoluteString.utf8.count <= 8192,
+              let parts = URLComponents(url: url, resolvingAgainstBaseURL: false), parts.fragment == nil,
+              let queryStart = url.absoluteString.firstIndex(of: "?"),
+              String(url.absoluteString[..<queryStart]) == expected,
+              let query = parts.percentEncodedQuery else { throw AccountLoginError.rejected }
+        return try callbackCode(method: "GET", uri: "/callback?" + query)
     }
 }
 
@@ -184,10 +211,8 @@ public actor AccountOIDCClient {
     }
 
     public func authorizationURL(attempt: AccountLoginAttempt, redirectURI: String, fresh: Bool = false) async throws -> URL {
+        try configuration.validateRedirect(redirectURI)
         let metadata = try await discovery()
-        guard let redirect = URLComponents(string: redirectURI), redirect.scheme == "http", redirect.host == "127.0.0.1",
-              redirect.port != nil, redirect.path == "/callback", redirect.user == nil, redirect.password == nil,
-              redirect.query == nil, redirect.fragment == nil else { throw AccountLoginError.configuration }
         var parts = URLComponents(url: try endpoint(metadata.authorization_endpoint), resolvingAgainstBaseURL: false)!
         parts.queryItems = [URLQueryItem(name: "response_type", value: "code"),
             URLQueryItem(name: "client_id", value: configuration.clientID), URLQueryItem(name: "redirect_uri", value: redirectURI),
@@ -217,12 +242,17 @@ public actor AccountOIDCClient {
     }
 
     public func exchange(code: String, attempt: AccountLoginAttempt, redirectURI: String) async throws -> AccountLoginSession {
+        try configuration.validateRedirect(redirectURI)
         let result = try await token(["grant_type": "authorization_code", "client_id": configuration.clientID,
             "code": code, "code_verifier": attempt.verifier, "redirect_uri": redirectURI, "resource": configuration.resource])
         guard let idToken = result["id_token"] as? String else { throw AccountLoginError.invalidResponse }
         let id = try await claims(idToken, type: "JWT", audience: configuration.clientID)
         guard id["nonce"] as? String == attempt.nonce, let subject = id["sub"] as? String else { throw AccountLoginError.rejected }
-        return try await session(result, expectedSubject: subject, oldRefresh: nil)
+        let login = try await session(result, expectedSubject: subject, oldRefresh: nil)
+        if configuration.mobileRedirectURI != nil {
+            guard let authenticatedAt = integer(id["auth_time"]), login.authenticatedAt == authenticatedAt else { throw AccountLoginError.rejected }
+        }
+        return login
     }
 
     public func refresh(_ old: AccountLoginSession) async throws -> AccountLoginSession {
@@ -232,8 +262,15 @@ public actor AccountOIDCClient {
         if let idToken = result["id_token"] as? String {
             let id = try await claims(idToken, type: "JWT", audience: configuration.clientID)
             guard id["sub"] as? String == old.subject else { throw AccountLoginError.changed }
+            if let authenticatedAt = old.authenticatedAt {
+                guard integer(id["auth_time"]) == authenticatedAt else { throw AccountLoginError.rejected }
+            }
         }
-        return try await session(result, expectedSubject: old.subject, oldRefresh: old.refreshToken)
+        let next = try await session(result, expectedSubject: old.subject, oldRefresh: old.refreshToken)
+        if let authenticatedAt = old.authenticatedAt {
+            guard next.authenticatedAt == authenticatedAt else { throw AccountLoginError.rejected }
+        }
+        return next
     }
 
     private func session(_ result: [String: Any], expectedSubject: String, oldRefresh: String?) async throws -> AccountLoginSession {
@@ -370,6 +407,12 @@ public actor AccountTokenProvider {
     }
     public func validToken() async throws -> String {
         try await validToken(rejectedToken: nil)
+    }
+
+    /// Explicit renewal shares the same rotation and crash-safety gates as API retries.
+    public func renewToken() async throws -> String {
+        let token = try current()?.session.accessToken
+        return try await validToken(rejectedToken: token)
     }
 
     /// Retry a rejected access token once, sharing rotation with concurrent callers.

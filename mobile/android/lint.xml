@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+    <!-- UniFFI probes for Cleaner with Class.forName and falls back to JNA below API 33. -->
+    <issue id="NewApi">
+        <ignore regexp="Call requires API level 33 .*java\.lang\.ref\.Cleaner(#|\.Cleanable#).*" />
+    </issue>
+</lint>
