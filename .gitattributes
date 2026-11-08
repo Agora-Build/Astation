@@ -1,0 +1,2 @@
+# Preserve the upstream font license bytes recorded in SOURCES.json.
+mobile/assets/fonts/OFL.txt -text whitespace=-blank-at-eol

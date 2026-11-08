@@ -86,8 +86,8 @@ private struct AccountFixture {
     static let subject = "ab01234567890123456789012345"
 
     init(issuer: String = "https://auth.example", resource: String = "https://station.example",
-         requiredScope: String = "station:account") throws {
-        config = try AccountOIDCConfiguration(issuer: issuer, clientID: "astation", resource: resource, requiredScope: requiredScope)
+         requiredScope: String = "station:account", clientID: String = "astation") throws {
+        config = try AccountOIDCConfiguration(issuer: issuer, clientID: clientID, resource: resource, requiredScope: requiredScope)
         attempt = try AccountLoginAttempt()
         client = AccountOIDCClient(configuration: config, http: http, now: { [clock] in clock.now() })
     }
@@ -107,6 +107,7 @@ private struct AccountFixture {
         var payload: [String: Any] = ["iss": config.issuer, "sub": Self.subject, "aud": id ? config.clientID : config.resource,
             "iat": now, "exp": now + (id ? 3600 : 900), "client_id": config.clientID, "scope": "openid " + config.requiredScope]
         if id { payload["nonce"] = attempt.nonce; payload["auth_time"] = now }
+        if config.mobileRedirectURI != nil { payload["auth_time"] = now }
         payload.merge(overrides) { _, next in next }
         var fields: [String: Any] = ["typ": id ? "JWT" : "at+jwt", "alg": "ES256", "kid": "one"]
         fields.merge(header) { _, next in next }
@@ -126,6 +127,62 @@ private struct AccountFixture {
 
 final class AccountOIDCTests: XCTestCase {
     private static let unauthorized: @Sendable (Error) -> Bool = { $0 as? AccountAPIFailure == .unauthorized }
+
+    func testMobileRedirectsAreExactAndCannotChangeTheMacCallback() async throws {
+        for (clientID, redirect) in [
+            ("astation-ios", "build.agora.astation.ios:/oauth/callback"),
+            ("astation-android", "build.agora.astation.android:/oauth/callback")
+        ] {
+            let f = try AccountFixture(requiredScope: "astation.remote", clientID: clientID)
+            try await f.prepare()
+            let url = try await f.client.authorizationURL(attempt: f.attempt, redirectURI: redirect)
+            let items = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems)
+            XCTAssertEqual(items.first { $0.name == "redirect_uri" }?.value, redirect)
+            XCTAssertEqual(items.first { $0.name == "resource" }?.value, f.config.resource)
+            XCTAssertEqual(items.first { $0.name == "code_challenge_method" }?.value, "S256")
+            let callback = URL(string: redirect + "?code=abc&state=" + f.attempt.state)!
+            XCTAssertEqual(try f.attempt.mobileCallbackCode(url: callback, configuration: f.config), "abc")
+            for invalid in [redirect + "/", redirect + "?other=x", "http://127.0.0.1:1234/callback",
+                            "build.agora.other:/oauth/callback", redirect.replacingOccurrences(of: ":/", with: "://")] {
+                do {
+                    _ = try await f.client.authorizationURL(attempt: f.attempt, redirectURI: invalid)
+                    XCTFail("Invalid mobile redirect accepted: \(invalid)")
+                } catch { XCTAssertEqual(error as? AccountLoginError, .configuration) }
+            }
+            for invalid in [redirect + "?code=abc&state=wrong", redirect + "?code=a&code=b&state=" + f.attempt.state,
+                            redirect + "?code=a&state=" + f.attempt.state + "&state=" + f.attempt.state,
+                            redirect + "?code=a&state=" + f.attempt.state + "#fragment",
+                            redirect + "/?code=a&state=" + f.attempt.state] {
+                XCTAssertThrowsError(try f.attempt.mobileCallbackCode(url: URL(string: invalid)!, configuration: f.config))
+            }
+            let session = try await f.client.exchange(code: "abc", attempt: f.attempt, redirectURI: redirect)
+            XCTAssertEqual(session.subject, AccountFixture.subject)
+        }
+        let mac = try AccountFixture(); try await mac.prepare()
+        do {
+            _ = try await mac.client.authorizationURL(attempt: mac.attempt, redirectURI: "build.agora.astation.ios:/oauth/callback")
+            XCTFail("Mac accepted a mobile callback")
+        } catch { XCTAssertEqual(error as? AccountLoginError, .configuration) }
+        _ = try await mac.client.authorizationURL(attempt: mac.attempt, redirectURI: "http://127.0.0.1:1234/callback")
+    }
+
+    func testMobileRenewalRotatesOnceAndPreservesAuthenticationTime() async throws {
+        let f = try AccountFixture(requiredScope: "astation.remote", clientID: "astation-ios")
+        try await f.prepare()
+        let authenticated = Int64(f.clock.now().timeIntervalSince1970)
+        try await f.response(access: ["auth_time": authenticated])
+        let old = try await f.client.exchange(code: "abc", attempt: f.attempt, redirectURI: f.config.mobileRedirectURI!)
+        let store = AccountTestStorage(old), provider = f.provider(store)
+        try await f.response(access: ["auth_time": authenticated], refresh: "refresh-two", includeID: false)
+        _ = try await provider.renewToken()
+        let current = try await provider.current()
+        XCTAssertEqual(current?.session.refreshToken, "refresh-two")
+        XCTAssertEqual(current?.session.authenticatedAt, authenticated)
+        try await f.response(access: ["auth_time": authenticated + 1], refresh: "refresh-three", includeID: false)
+        do { _ = try await provider.renewToken(); XCTFail("Refresh moved auth_time") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .rejected) }
+        XCTAssertTrue(try XCTUnwrap(store.read()).refreshPending)
+    }
 
     private func waitUntil(_ predicate: () async -> Bool) async throws {
         for _ in 0..<500 {
