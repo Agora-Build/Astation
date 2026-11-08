@@ -46,9 +46,11 @@ android.sourceSets.getByName("main") {
     java.srcDir(atemSdk.resolve("kotlin"))
     jniLibs.srcDir(atemSdk.resolve("jniLibs"))
 }
+android.sourceSets.getByName("test").resources.srcDir("../../../native-remote/Tests/AstationRemoteTests/Fixtures")
 dependencies {
     implementation("net.java.dev.jna:jna:5.19.1@aar")
     implementation("net.openid:appauth:0.11.1")
+    implementation("com.google.crypto.tink:tink-android:1.24.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20250517")

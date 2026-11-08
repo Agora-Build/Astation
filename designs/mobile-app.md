@@ -7,7 +7,11 @@ Chats / Agents / Account, rich replies, approval/rule UI, profile selection and
 adaptive panes are implemented. Real dev account sign-in, rotated refresh and
 authenticated Station HTTP admission passed on both platforms on 2026-11-08.
 Protected membership enrollment, live host dispatch and offline push are not
-complete. The native entry point uses the real saved account and displays no
+complete. Protected Apple/Android identity and exact manager-review primitives
+are being built on `feat/mobile-device-enrollment`; see
+[the enrollment implementation](protocol/mobile-device-enrollment.md) for its
+completed parts and remaining ceremony/channel work. The native entry point uses
+the real saved account and displays no
 sample connections. Until enrollment is implemented, it advertises no enrollment
 capability and opens an explicit setup-status sheet instead of an unfinished
 setup action. The separate
@@ -119,8 +123,8 @@ Flutter expose; add a native metrics adapter if hardware testing identifies a ga
    belongs in a native notification service extension with an appropriately
    limited shared Keychain group, separate from the Flutter runtime.
 
-The first foundation build is deliberately explicit about unavailable login,
-enrollment and live host operations. It must not display sample agents as real
+The foundation build is explicit about unavailable enrollment and live host
+operations. It must not display sample agents as real
 connections, claim verification from login or use fixtures as a production backend.
 
 ## Reuse existing services and modules
@@ -151,11 +155,12 @@ a copy of the Mac's protocol implementation. Minimum targets are iOS 17 and
 Android API 24. Flutter is the shared presentation layer.
 
 Portal/Auth registration is tracked in
-[Portal #30](https://github.com/Agora-Build/Portal/issues/30). The proposed public
+[Portal #30](https://github.com/Agora-Build/Portal/issues/30). The confirmed public
 client IDs are `astation-ios` / `astation-android`, with exact redirects
 `build.agora.astation.ios:/oauth/callback` /
-`build.agora.astation.android:/oauth/callback`. These are proposals until Auth
-confirms them, not an implemented server contract. No app secret is embedded.
+`build.agora.astation.android:/oauth/callback`. Both are live and verified on
+dev; production client registration has not been verified here. No app secret
+is embedded.
 
 ## Presentation and lifecycle
 
