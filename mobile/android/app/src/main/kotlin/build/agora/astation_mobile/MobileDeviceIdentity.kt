@@ -23,6 +23,8 @@ import java.security.Signature
 import java.security.interfaces.ECPublicKey
 import java.security.spec.ECGenParameterSpec
 import java.util.UUID
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -163,9 +165,44 @@ internal class MobileDeviceIdentity private constructor(
     private fun signChannel(request: SignRequest): ByteArray {
         checkStorage()
         MobileDeviceChannelSigner.validate(request, deviceId)
+        return sign(request.input)
+    }
+
+    private fun sign(input: ByteArray): ByteArray {
         val privateKey = keyStore.getKey(authAlias, null) as? PrivateKey ?: throw MobileDeviceIdentityFailure("missing_key")
-        val der = Signature.getInstance("SHA256withECDSA").run { initSign(privateKey); update(request.input); sign() }
+        val der = Signature.getInstance("SHA256withECDSA").run { initSign(privateKey); update(input); sign() }
         return MobileP256Signature.fromDER(der)
+    }
+
+    suspend fun enrollmentRequest(invitation: MobileEnrollmentInvitation, station: String, name: String,
+        now: () -> Long, current: () -> Boolean, confirm: suspend () -> Boolean, persist: (String) -> Unit): String {
+        val job = currentCoroutineContext()
+        fun check() {
+            job.ensureActive()
+            if (!current()) throw MobileDeviceIdentityFailure("context_changed")
+            invitation.validate(issuer, accountId, station, now())
+            synchronized(this) { checkStorage() }
+        }
+        check()
+        if (!confirm()) throw MobileDeviceIdentityFailure("owner_denied")
+        check()
+        val request = synchronized(this) {
+            check()
+            MobileDeviceEnrollment.request(invitation, deviceId, authPublicKey, encryptionPublicKey, name, now(), ::sign)
+        }
+        persist(request)
+        check()
+        return request
+    }
+
+    @Synchronized
+    fun acceptEnrollment(handoff: String, invitation: MobileEnrollmentInvitation, request: String, station: String,
+        log: uniffi.atem_client_ffi.MembershipLog, now: uniffi.atem_client_ffi.HostClock,
+        persist: (ByteArray) -> Unit): List<uniffi.atem_client_ffi.AccountKey> {
+        checkStorage()
+        invitation.validate(issuer, accountId, station, now.wallMs.toLong())
+        return MobileDeviceEnrollment.accept(handoff, invitation, request, deviceId, authPublicKey, encryptionPublicKey,
+            log, now, ::open, persist)
     }
 
     @Synchronized

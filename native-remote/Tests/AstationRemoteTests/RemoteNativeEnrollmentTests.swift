@@ -8,7 +8,7 @@ private func enrollmentJSON(_ value: Any) throws -> String {
     try canonicalJson(json: String(decoding: JSONSerialization.data(withJSONObject: value), as: UTF8.self))
 }
 
-private final class EnrollmentManagerKeys: AppKeyProvider, @unchecked Sendable {
+final class EnrollmentManagerKeys: AppKeyProvider, @unchecked Sendable {
     let key = Curve25519.Signing.PrivateKey()
     var signatures = 0
     func publicKey(keyId: String) throws -> PublicKeyData {
@@ -25,7 +25,7 @@ private final class EnrollmentManagerKeys: AppKeyProvider, @unchecked Sendable {
 }
 
 @MainActor
-private final class EnrollmentFixture {
+final class EnrollmentFixture {
     let keys = EnrollmentManagerKeys()
     let phoneAuth = P256.Signing.PrivateKey()
     let phoneEnc = Curve25519.KeyAgreement.PrivateKey()

@@ -3,7 +3,7 @@ import Foundation
 import XCTest
 @testable import AstationRemote
 
-private final class RecoveryHTTPStub: URLProtocol, @unchecked Sendable {
+final class RecoveryHTTPStub: URLProtocol, @unchecked Sendable {
     typealias Handler = (URLRequest) throws -> (Int, Data)
     static let lock = NSLock()
     static var handlers: [String: Handler] = [:]

@@ -132,7 +132,8 @@ internal class MobileAccountAuth(context: Context, val config: MobileOAuthConfig
             uri.userInfo != null || uri.fragment != null || uri.query != null) throw MobileLoginFailure("invalid_response")
         return value
     }
-    private suspend fun http(url: String, fields: Map<String, String>? = null, token: String? = null): Pair<Int, JSONObject> = withContext(Dispatchers.IO) {
+    private suspend fun http(url: String, fields: Map<String, String>? = null, token: String? = null,
+        jsonBody: JSONObject? = null, method: String? = null): Pair<Int, JSONObject> = withContext(Dispatchers.IO) {
         try {
             val connection = URI(url).toURL().openConnection() as HttpURLConnection
             try {
@@ -141,6 +142,12 @@ internal class MobileAccountAuth(context: Context, val config: MobileOAuthConfig
                 connection.readTimeout = 20_000
                 connection.useCaches = false
                 token?.let { connection.setRequestProperty("Authorization", "Bearer $it") }
+                method?.let { connection.requestMethod = it }
+                if (jsonBody != null) {
+                    connection.doOutput = true
+                    connection.setRequestProperty("Content-Type", "application/json")
+                    connection.outputStream.use { it.write(canonicalJson(jsonBody.toString()).toByteArray(Charsets.UTF_8)) }
+                }
                 if (fields != null) {
                     connection.requestMethod = "POST"
                     connection.doOutput = true
@@ -226,6 +233,16 @@ internal class MobileAccountAuth(context: Context, val config: MobileOAuthConfig
         catch (e: Exception) { if (epoch == generation) session = null; throw e }
     }
     suspend fun refresh() { accessToken() }
+
+    fun enrollmentTransport(): MobileDeviceEnrollmentHTTP = MobileDeviceEnrollmentHTTP(config.station) { method, path, body ->
+        val epoch = generation
+        require(Regex("/api/remote/v1/logs/[0-9a-f]{64}/device-enrollments/[A-Za-z0-9_-]{43}").matches(path))
+        val token = accessToken()
+        checked(epoch)
+        val response = http(config.station + path, token = token, jsonBody = body, method = method)
+        checked(epoch)
+        response
+    }
     private suspend fun token(fields: Map<String, String>): JSONObject {
         val (status, value) = http(endpoint(discovery().getString("token_endpoint")),
             fields + mapOf("client_id" to config.clientId, "resource" to config.station))

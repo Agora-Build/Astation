@@ -25,6 +25,9 @@ pub fn routes() -> Router<AppState> {
         .route("/logs/:genesis/entries", get(recovery::entries).post(recovery::append))
         .route("/logs/:genesis/backups/:version", get(recovery::backup).put(recovery::upload))
         .route("/logs/:genesis/probes/:host", axum::routing::post(recovery_probe::probe))
+        .route("/logs/:genesis/device-enrollments/:id", get(recovery::device_enrollment::get)
+            .put(recovery::device_enrollment::create).post(recovery::device_enrollment::publish)
+            .delete(recovery::device_enrollment::cancel))
         .layer(DefaultBodyLimit::max(262_144))
         .layer(axum::middleware::map_response(|mut response: Response| async move {
             response.headers_mut().insert(CACHE_CONTROL, axum::http::HeaderValue::from_static("no-store"));
