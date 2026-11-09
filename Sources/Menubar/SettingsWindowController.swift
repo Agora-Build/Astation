@@ -46,6 +46,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var serverInfoLabel: NSTextField!
     private var recoveryStatusLabel: NSTextField?
     private var recoverySetupButton: NSButton?
+    private var deviceEnrollmentWindow: DeviceEnrollmentWindowController?
     private var relayIdentityKeyStatusLabel: NSTextField?
     private var relayIdentityKeyRetryButton: NSButton?
     private var relayIdentityKeyRepairButton: NSButton?
@@ -627,6 +628,15 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         accountStatus.widthAnchor.constraint(equalToConstant: 410).isActive = true
         relayAccountStatusLabel = accountStatus
         content.addArrangedSubview(accountStatus)
+        content.addArrangedSubview(separator())
+
+        content.addArrangedSubview(sectionTitle("Trusted Phones and Tablets"))
+        content.addArrangedSubview(wrappingInfo(
+            "Scan a private setup code from this Mac, compare it on your phone, then approve the device's permissions."
+        ))
+        let addDevice = NSButton(title: "Add Phone or Tablet...", target: self, action: #selector(showDeviceEnrollment))
+        addDevice.bezelStyle = .rounded
+        content.addArrangedSubview(addDevice)
         content.addArrangedSubview(separator())
 
         content.addArrangedSubview(sectionTitle("Account Recovery"))
@@ -1220,6 +1230,11 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     @MainActor private func renderRecoverySetup() {
         let complete = (try? hubManager.recoveryCoordinator().securitySetupComplete) == true
         recoverySetupButton?.title = complete ? "Show Recovery Kit…" : "Set Up Account Security…"
+    }
+
+    @MainActor @objc private func showDeviceEnrollment() {
+        if deviceEnrollmentWindow == nil { deviceEnrollmentWindow = DeviceEnrollmentWindowController(hub: hubManager) }
+        deviceEnrollmentWindow?.showWindow(nil)
     }
 
     @objc private func showRecoveryKit() {

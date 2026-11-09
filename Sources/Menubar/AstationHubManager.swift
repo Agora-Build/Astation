@@ -1792,6 +1792,20 @@ class AstationHubManager: ObservableObject {
             control: session?.canReviewApprovals == true)
     }
 
+    @MainActor func validateServiceHosts(_ review: RemoteServiceReview, log: MembershipLog) throws {
+        guard !review.requiredHostFeatures.isEmpty else { return }
+        guard log.accountId() == e2eDataAccount, log.frozen() == nil else { throw AccountLoginError.changed }
+        for hostID in review.hosts {
+            guard let enrolled = log.host(hostId: hostID), nativeSessionClients.contains(where: { id, client in
+                guard let context = sessionContext(for: id), let welcome = client.welcome else { return false }
+                return context.account == log.accountId() && context.device == hostID
+                    && welcome.account_id == context.account && welcome.atem_device_id == hostID
+                    && welcome.host_trust_gen == enrolled.hostTrustGen && client.canReviewApprovals
+                    && client.features.isSuperset(of: review.requiredHostFeatures)
+            }) else { throw StationIntegrationError.hostUpgradeRequired }
+        }
+    }
+
     func localControlAPI(key: LocalAPIKey, inbox: ApprovalInbox) -> LocalControlAPI {
         LocalControlAPI(key: key, clients: { [weak self] in
             guard let self else { return [:] }
@@ -2025,6 +2039,9 @@ class AstationHubManager: ObservableObject {
                     self.nativeSessionClients[context.route.clientId]?.channelFailed(message, unsupported: unsupported)
                 }, refreshMembership: { [weak self] head in
                     self?.refreshR9Membership(context, requiredHead: head)
+                }, authorizationChanged: { [weak self] stage in
+                    self?.nativeSessionClients[context.route.clientId]?.channelAuthorizationStarted(
+                        context: context, waitingForForeground: stage == .waitingForForeground)
                 }, handshakeStarted: { [weak self] in
                     self?.nativeSessionClients[context.route.clientId]?.channelHandshakeStarted(context: context)
                 }, policyWelcomed: { [weak self] in

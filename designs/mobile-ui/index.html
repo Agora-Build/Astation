@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <meta name="referrer" content="no-referrer">
+  <title>Astation Mobile · UI Review</title>
+  <link rel="stylesheet" href="style.css?v=7">
+  <script src="prototype.js?v=9" defer></script>
+</head>
+<body>
+  <header class="review-bar">
+    <div><a class="review-title" href="./">ASTATION <span>MOBILE / 01</span></a><p>Interactive design. Sample data only. No sign-in, commands or approvals are sent.</p></div>
+    <nav aria-label="Preview size" class="segmented" id="devices">
+      <button type="button" data-device="phone" aria-pressed="true">Phone</button>
+      <button type="button" data-device="tablet" aria-pressed="false">Tablet</button>
+      <button type="button" data-device="duo" aria-pressed="false">Duo / Fold</button>
+    </nav>
+  </header>
+  <nav class="review-scenes" aria-label="Preview screen">
+    <span>JUMP TO</span>
+    <button data-scene="login">Sign in</button><button data-scene="chats">Chats</button>
+    <button data-scene="instances">Agents</button><button data-scene="chat">Conversation</button>
+    <button data-scene="launch">New agent</button><button data-scene="enroll">New device</button>
+  </nav>
+  <main class="review-stage">
+    <div id="preview" class="preview" data-device="phone">
+      <div class="device-status" aria-hidden="true"><span>9:41</span><span class="status-right">▮▮▮ <span class="battery"></span></span></div>
+      <div id="app" class="app" aria-label="Astation mobile preview"></div>
+      <div class="device-home" aria-hidden="true"></div>
+      <div class="hinge" aria-hidden="true"></div>
+    </div>
+  </main>
+  <footer class="review-footer"><span>iOS + Android · phone, tablet & folding displays</span><a href="mobile-ui.md">Read the flow and behavior notes ↗</a></footer>
+  <div id="announcement" class="sr-only" role="status" aria-live="polite"></div>
+</body>
+</html>

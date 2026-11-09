@@ -22,6 +22,7 @@ final class AstationR9Connection {
     private let receiveMessage: (AstationMessage) -> Void
     private let failed: (String, Bool) -> Void
     private let refreshMembership: (LogHead) -> Void
+    private let authorizationChanged: (AstationChannelSigner.PreparationStage) -> Void
     private let handshakeStarted: () -> Void
     private let policyWelcomed: () -> Void
     private let policyEvent: (ClientEvent, Bool) -> Void
@@ -35,6 +36,7 @@ final class AstationR9Connection {
          receive: @escaping (AstationMessage) -> Void,
          failed: @escaping (String, Bool) -> Void,
          refreshMembership: @escaping (LogHead) -> Void,
+         authorizationChanged: @escaping (AstationChannelSigner.PreparationStage) -> Void = { _ in },
          handshakeStarted: @escaping () -> Void = {},
          policyWelcomed: @escaping () -> Void = {}, policyEvent: @escaping (ClientEvent, Bool) -> Void = { _, _ in },
          hostWorkEvent: @escaping (String) -> Bool = { _ in false },
@@ -46,6 +48,7 @@ final class AstationR9Connection {
         receiveMessage = receive
         self.failed = failed
         self.refreshMembership = refreshMembership
+        self.authorizationChanged = authorizationChanged
         self.handshakeStarted = handshakeStarted
         self.policyWelcomed = policyWelcomed
         self.policyEvent = policyEvent
@@ -66,7 +69,11 @@ final class AstationR9Connection {
         membershipLog = log.snapshot()
         preparation = Task { [weak self] in
             do {
-                try await signer.prepare(isCurrent: { self?.current() == true && self?.closed == false })
+                try await signer.prepare(isCurrent: { self?.current() == true && self?.closed == false },
+                    stageChanged: { [weak self] stage in
+                        guard let self, !closed, current() else { return }
+                        authorizationChanged(stage)
+                    })
                 guard let self, !Task.isCancelled, !closed, current() else { return }
                 preparation = nil
                 handshakeStarted()

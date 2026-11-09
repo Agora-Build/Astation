@@ -109,6 +109,53 @@ private final class PublicationFixture {
 
 final class RemoteMembershipPublicationTests: XCTestCase {
     @MainActor
+    func testConfirmedHostWorkScopesMapExactlyWithoutImplicitAuthority() throws {
+        let f = try PublicationFixture()
+        let cases: [([String], [String])] = [
+            (["agent.view", "agent.launch"], ["launch", "view"]),
+            (["agent.view", "agent.message"], ["message", "view"]),
+            (["agent.view", "agent.prompt", "agent.message", "agent.notify"], ["message", "notify", "prompt", "view"]),
+            (["agent.view", "agent.prompt", "agent.approve", "agent.interrupt", "agent.terminal", "agent.launch", "agent.message", "agent.notify"],
+             ["approval", "interrupt", "launch", "message", "notify", "prompt", "rule_revoke", "stop", "terminal", "view"])
+        ]
+        for (scopes, operations) in cases {
+            let approval = try serviceApproval(f, operations: operations)
+            let record = try integrationRecord(approval, scopes: scopes)
+            _ = try record.checked(stationOrigin: approval.stationOrigin, now: Date(timeIntervalSince1970: Double(f.clock.wallMs) / 1000))
+            let review = try RemoteServiceReview(approval: approval)
+            try review.check(record: record, hosts: ["host-a"], sessions: nil, projects: nil,
+                now: Date(timeIntervalSince1970: Double(f.clock.wallMs) / 1000))
+            let overbroad = try serviceApproval(f, operations: Array(Set(operations).union(["launch", "notify", "message"])).sorted())
+            if Set(operations) != Set(try RemoteServiceReview(approval: overbroad).operations) {
+                XCTAssertThrowsError(try RemoteServiceReview(approval: overbroad).check(record: record, hosts: ["host-a"],
+                    sessions: nil, projects: nil, now: Date(timeIntervalSince1970: Double(f.clock.wallMs) / 1000)))
+            }
+        }
+        let launch = try RemoteServiceReview(approval: serviceApproval(f, operations: ["launch", "view"]))
+        XCTAssertEqual(launch.requiredHostFeatures, ["host.launch"])
+        XCTAssertEqual(try RemoteServiceReview(approval: serviceApproval(f)).requiredHostFeatures, [])
+    }
+
+    @MainActor
+    func testNotifyRequiresMessageAndPromptAndUnknownScopesFailClosed() throws {
+        let f = try PublicationFixture(), approval = try serviceApproval(f)
+        for scopes in [["agent.view", "agent.notify"], ["agent.view", "agent.message", "agent.notify"],
+                       ["agent.view", "agent.prompt", "agent.notify"], ["agent.launch"],
+                       ["agent.view", "agent.future"], ["agent.view", "agent.view"]] {
+            let record = try integrationRecord(approval, scopes: scopes)
+            XCTAssertThrowsError(try record.checked(stationOrigin: approval.stationOrigin, now: Date()))
+            XCTAssertThrowsError(try RemoteServiceReview(approval: approval).check(record: record, hosts: ["host-a"],
+                sessions: nil, projects: nil))
+        }
+    }
+
+    private func integrationRecord(_ approval: RemoteServiceApproval, scopes: [String]) throws -> PortalIntegrationRecord {
+        try JSONDecoder().decode(PortalIntegrationRecord.self, from: JSONSerialization.data(withJSONObject: [
+            "id": approval.integrationID, "name": "Host work", "stationOrigin": approval.stationOrigin,
+            "state": "awaiting_approval", "scopes": scopes, "expiresAt": "2099-01-01T00:00:00Z", "role": "owner"]))
+    }
+
+    @MainActor
     func testUnselectedHostIsExplainedBeforeTokenAccessOrProvisioning() async throws {
         let f = try PublicationFixture(), approval = try serviceApproval(f)
         let transport = IntegrationApprovalTestHTTP()
@@ -229,11 +276,12 @@ final class RemoteMembershipPublicationTests: XCTestCase {
     }
     @MainActor
     private func serviceApproval(_ f: PublicationFixture, station: String = "https://custom.example",
-                                 issuer: String = "https://auth.example", markTasks: Bool = false) throws -> RemoteServiceApproval {
+                                 issuer: String = "https://auth.example", markTasks: Bool = false,
+                                 operations: [String]? = nil) throws -> RemoteServiceApproval {
         let action = try json(["action": "add", "member": [
             "device_id": "service-a", "kind": "service", "roles": ["service"],
             "auth_key": ["alg": "ed25519", "pub": b64u(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)],
-            "scope": ["hosts": ["host-a"], "ops": markTasks ? ["message", "notify", "prompt", "view"] : ["prompt", "view"]],
+            "scope": ["hosts": ["host-a"], "ops": operations ?? (markTasks ? ["message", "notify", "prompt", "view"] : ["prompt", "view"])],
             "expires_at": f.clock.wallMs + 60_000
         ]])
         let body = try f.log.draftEntry(signer: "manager-a", signedAt: f.clock.wallMs, actionJson: action)

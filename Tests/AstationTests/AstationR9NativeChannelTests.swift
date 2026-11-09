@@ -87,8 +87,9 @@ final class AstationR9NativeChannelTests: XCTestCase {
         let membership = try NativeChannelFixture(account: manager, manager: manager, device: "selected-host")
         var answer: CheckedContinuation<Bool, Never>?
         var confirmations = 0
+        var active = false
         let prompted = expectation(description: "One owner confirmation for session and policy")
-        let signer = try AstationChannelSigner(identity: membership.identity, keyID: manager, active: { true }, confirm: {
+        let signer = try AstationChannelSigner(identity: membership.identity, keyID: manager, active: { active }, confirm: {
             confirmations += 1
             return await withCheckedContinuation { answer = $0; prompted.fulfill() }
         })
@@ -98,12 +99,19 @@ final class AstationR9NativeChannelTests: XCTestCase {
             return (membership.log, signer)
         })
         try await f.start(); try await f.authenticate()
-        await fulfillment(of: [prompted], timeout: 1)
         let client = try XCTUnwrap(f.hub.sessionClient(for: f.clientId))
         for _ in 0..<3 { f.hub.requestAgentList(from: f.clientId) }
+        try await Task.sleep(for: .milliseconds(2_200))
         await f.drain()
         XCTAssertEqual(client.phase, .connecting)
+        XCTAssertTrue(client.status.contains("automatically"))
+        XCTAssertFalse(client.connectionStatus.canReconnect, "Background discovery waits rather than requiring Retry")
+        XCTAssertEqual(confirmations, 0)
+        XCTAssertFalse(f.socket.sent.contains { ($0["payload"] as? [String: Any])?["type"] as? String == "channel" })
         XCTAssertFalse(f.hub.relayOnlyPolicyReady)
+        active = true
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        await fulfillment(of: [prompted], timeout: 1)
         try XCTUnwrap(answer).resume(returning: true)
         for _ in 0..<20 { await Task.yield() }
         await f.drain()
@@ -123,6 +131,84 @@ final class AstationR9NativeChannelTests: XCTestCase {
         XCTAssertEqual(closes.first?["channel"] as? String, opens.first?["channel"] as? String)
         XCTAssertFalse(f.hub.relayOnlyPolicyReady, "Replacement cannot retain the previous attachment's policy readiness")
         f.socket.fail(); await f.drain()
+    }
+
+    @MainActor
+    func testBackgroundPreparationCannotSurviveDisconnectReplacementOrInvalidation() async throws {
+        for outcome in ["disconnected", "replaced", "locked"] {
+            let f = try NativeChannelFixture()
+            var active = false
+            var current = true
+            var confirmations = 0
+            var writes = 0
+            var failures = 0
+            let signer = try AstationChannelSigner(identity: f.identity, keyID: "manager-a", active: { active }, confirm: {
+                confirmations += 1; return true
+            })
+            let context = AtemSessionContext(route: RemoteTerminalConnection(clientId: "local-host", connectionId: "connection-a"),
+                account: "account-a", device: "host-a", pairingSession: "pairing-a")
+            let waiting = expectation(description: "Waiting for activation before \(outcome)")
+            let channel = AstationR9Connection(context: context, current: { current },
+                write: { _, completion in writes += 1; completion(nil) },
+                welcomed: { _ in }, receive: { _ in },
+                failed: { _, _ in failures += 1 }, refreshMembership: { _ in },
+                authorizationChanged: { stage in if stage == .waitingForForeground { waiting.fulfill() } })
+            try channel.start(identity: ClientIdentity(kind: .native, deviceId: "manager-a", keyId: "manager-a", grantJson: nil),
+                log: f.log, signer: signer)
+            await fulfillment(of: [waiting], timeout: 1)
+            switch outcome {
+            case "disconnected": channel.disconnect()
+            case "replaced": current = false
+            default:
+                // Use the same invalidation path as screen lock, without changing the real desktop session.
+                signer.invalidate()
+            }
+            active = true
+            NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+            try await Task.sleep(for: .milliseconds(150))
+            XCTAssertEqual(confirmations, 0, outcome)
+            XCTAssertEqual(writes, 0, outcome)
+            XCTAssertEqual(failures, outcome == "locked" ? 1 : 0, outcome)
+            channel.disconnect()
+        }
+    }
+
+    @MainActor
+    func testDeniedOwnerConfirmationDoesNotAutomaticallyPromptAgain() async throws {
+        let f = try NativeChannelFixture()
+        var active = false
+        var confirmations = 0
+        var writes = 0
+        var failures = 0
+        let signer = try AstationChannelSigner(identity: f.identity, keyID: "manager-a", active: { active }, confirm: {
+            confirmations += 1; return false
+        })
+        let context = AtemSessionContext(route: RemoteTerminalConnection(clientId: "local-host", connectionId: "connection-a"),
+            account: "account-a", device: "host-a", pairingSession: "pairing-a")
+        let waiting = expectation(description: "Background session waiting")
+        let denied = expectation(description: "Owner declined")
+        let channel = AstationR9Connection(context: context, current: { true },
+            write: { _, completion in writes += 1; completion(nil) },
+            welcomed: { _ in }, receive: { _ in },
+            failed: { message, _ in
+                XCTAssertTrue(message.contains("not completed")); failures += 1; denied.fulfill()
+            }, refreshMembership: { _ in },
+            authorizationChanged: { stage in if stage == .waitingForForeground { waiting.fulfill() } })
+        try channel.start(identity: ClientIdentity(kind: .native, deviceId: "manager-a", keyId: "manager-a", grantJson: nil),
+            log: f.log, signer: signer)
+        await fulfillment(of: [waiting], timeout: 1)
+        active = true
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        await fulfillment(of: [denied], timeout: 1)
+        active = false
+        NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: nil)
+        active = true
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(confirmations, 1)
+        XCTAssertEqual(failures, 1)
+        XCTAssertEqual(writes, 0)
+        XCTAssertTrue(channel.isClosed)
     }
 
     @MainActor
@@ -152,6 +238,7 @@ final class AstationR9NativeChannelTests: XCTestCase {
         XCTAssertNil(answer)
         XCTAssertTrue(writes.isEmpty)
         active = true
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
         await fulfillment(of: [awaitingPrompt], timeout: 1)
         active = false
         NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: nil)

@@ -1,3 +1,4 @@
+import AstationRemote
 import CryptoKit
 import Foundation
 
@@ -109,15 +110,9 @@ enum AtemE2ECrypto {
     }
 
     static func normalizedP256Signature(_ raw: Data) throws -> Data {
-        guard raw.count == 64 else { throw AtemE2ECryptoError.invalidFieldLength }
-        let r = Array(raw.prefix(32))
-        let s = Array(raw.suffix(32))
-        guard validScalar(r), validScalar(s) else {
-            throw AtemE2ECryptoError.invalidSignatureScalar
-        }
-        var result = Data(r)
-        result.append(contentsOf: halfOrder.lexicographicallyPrecedes(s) ? subtract(order, s) : s)
-        return result
+        do { return try RemoteP256Signature.normalize(raw) }
+        catch RemoteP256SignatureError.invalidLength { throw AtemE2ECryptoError.invalidFieldLength }
+        catch { throw AtemE2ECryptoError.invalidSignatureScalar }
     }
 
     static func verifyP256Signature(_ raw: Data, message: Data, publicKey: Data) -> Bool {
@@ -170,34 +165,4 @@ enum AtemE2ECrypto {
             throw AtemE2ECryptoError.invalidFieldLength
         }
     }
-
-    private static func validScalar(_ scalar: [UInt8]) -> Bool {
-        scalar.contains(where: { $0 != 0 }) && scalar.lexicographicallyPrecedes(order)
-    }
-
-    // P-256 scalars are unsigned big-endian values; high-S becomes n - S.
-    private static func subtract(_ left: [UInt8], _ right: [UInt8]) -> [UInt8] {
-        var result = [UInt8](repeating: 0, count: 32)
-        var borrow = 0
-        for index in (0..<32).reversed() {
-            let difference = Int(left[index]) - Int(right[index]) - borrow
-            result[index] = UInt8(truncatingIfNeeded: difference)
-            borrow = difference < 0 ? 1 : 0
-        }
-        return result
-    }
-
-    private static let order: [UInt8] = [
-        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84,
-        0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
-    ]
-
-    private static let halfOrder: [UInt8] = [
-        0x7f, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00,
-        0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xde, 0x73, 0x7d, 0x56, 0xd3, 0x8b, 0xcf, 0x42,
-        0x79, 0xdc, 0xe5, 0x61, 0x7e, 0x31, 0x92, 0xa8,
-    ]
 }

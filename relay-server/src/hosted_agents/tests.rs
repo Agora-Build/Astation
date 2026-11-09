@@ -1080,6 +1080,11 @@ async fn postgres_host_work_http_scopes_correlation_reconnect_and_revocation() {
     }
     executing["message_id"] = json!(new_id());
     let task_id = executing["recipients"][0]["recipient_id"].as_str().unwrap();
+    for scopes in ["agent.view agent.notify", "agent.view agent.notify agent.message", "agent.view agent.notify agent.prompt"] {
+        let mut limited = claims.clone(); limited["scope"] = json!(scopes);
+        assert_eq!(http.post(format!("{prefix}/tasks/{task_id}")).bearer_auth(auth.token(auth.header(), limited))
+            .json(&json!({"host":target})).send().await.unwrap().status(), StatusCode::FORBIDDEN);
+    }
     let accepted = http_json(http.post(format!("{prefix}/messages")).bearer_auth(&token).json(&json!({"host":target,"message":executing})).send().await.unwrap(), StatusCode::OK).await;
     assert_eq!(accepted["result"]["message"]["recipients"][0]["delivery"]["work"]["state"], "awaiting_result");
     let completed = http_json(http.post(format!("{prefix}/tasks/{task_id}")).bearer_auth(&token).json(&json!({"host":target})).send().await.unwrap(), StatusCode::OK).await;

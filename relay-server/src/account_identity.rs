@@ -743,6 +743,38 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn native_mobile_clients_use_the_station_resource_without_a_client_allowlist() {
+        let f = Fixture::new().await;
+        let verifier = OidcVerifier::new(
+            &f.issuer,
+            "https://station-dev.agora.build",
+            "astation.remote",
+        )
+        .unwrap();
+        for client in ["astation-ios", "astation-android", "another-public-native-client"] {
+            let mut claims = f.claims();
+            claims["client_id"] = json!(client);
+            claims["aud"] = json!("https://station-dev.agora.build");
+            claims["scope"] = json!("openid profile offline_access astation.remote");
+            claims["auth_time"] = claims["iat"].clone();
+            let identity = verifier.verify(&f.token(f.header(), claims.clone())).await.unwrap();
+            assert_eq!(identity.subject, claims["sub"].as_str().unwrap());
+            assert_eq!(identity.authenticated_at, claims["auth_time"].as_i64());
+            for (field, value) in [
+                ("aud", json!("https://station.agora.build")),
+                ("aud", json!("https://dev.agora.build")),
+                ("scope", json!("openid profile")),
+                ("client_id", json!("")),
+                ("client_id", json!("astation-ios\n")),
+            ] {
+                let mut invalid = claims.clone();
+                invalid[field] = value;
+                assert!(verifier.verify(&f.token(f.header(), invalid)).await.is_err(), "{client}: {field}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn signed_access_tokens_enforce_exact_clock_skew_boundaries() {
         let mut f = Fixture::new().await;
         let now = 1_800_000_000;

@@ -85,6 +85,10 @@ impl IntegrationPolicy {
                     && matches!(s.as_str(), "agent.launch" | "agent.message" | "agent.notify")))
             })
             || self.scopes.iter().collect::<BTreeSet<_>>().len() != self.scopes.len()
+            || !self.scopes.iter().any(|s| s == "agent.view")
+            || (self.scopes.iter().any(|s| s == "agent.notify")
+                && (!self.scopes.iter().any(|s| s == "agent.message")
+                    || !self.scopes.iter().any(|s| s == "agent.prompt")))
             || !(1..=10_000).contains(&self.quota_per_second)
             || self.r9_svc.as_ref().is_some_and(|s| {
                 s.len() != 64
@@ -385,6 +389,31 @@ mod tests {
             "kind":"future_kind","state":"ready","integration":policy(state)}],"cursor":id}))
         .unwrap()
     }
+    #[test]
+    fn host_work_scopes_require_view_and_notify_prerequisites() {
+        for scopes in [
+            vec!["agent.view", "agent.launch"],
+            vec!["agent.view", "agent.message"],
+            vec!["agent.view", "agent.prompt", "agent.message", "agent.notify"],
+        ] {
+            let mut value = policy("ready");
+            value["scopes"] = json!(scopes);
+            let row: IntegrationPolicy = serde_json::from_value(value).unwrap();
+            assert_eq!(row.validate().is_ok(), cfg!(feature = "host-work-api"));
+        }
+        for scopes in [
+            vec!["agent.launch"],
+            vec!["agent.view", "agent.notify"],
+            vec!["agent.view", "agent.prompt", "agent.notify"],
+            vec!["agent.view", "agent.message", "agent.notify"],
+        ] {
+            let mut value = policy("ready");
+            value["scopes"] = json!(scopes);
+            let row: IntegrationPolicy = serde_json::from_value(value).unwrap();
+            assert!(row.validate().is_err());
+        }
+    }
+
     #[test]
     fn revocation_cleanup_requires_fresh_owner_policy_but_not_unexpired_execution() {
         let mut saved = PolicyCheckpoint::empty(binding()).unwrap().apply(0, initial(), 100).unwrap();

@@ -2,6 +2,7 @@ import AppKit
 import AtemClient
 import AstationRemote
 import CryptoKit
+import Vision
 import XCTest
 @testable import Menubar
 
@@ -47,7 +48,7 @@ private final class RecoveryMemoryKeys: AstationRecoveryDataKeys {
     func installRecovered(_ values: [AccountDataKey], dataAccount: String) throws { keys = values; installs += 1 }
 }
 
-private actor RecoveryMemoryRelay: RemoteRecoveryTransport {
+private actor RecoveryMemoryRelay: RemoteRecoveryTransport, RemoteDeviceEnrollmentTransport {
     var log: MembershipLog?
     var account = "account-a"
     var appends: [AppendRequest] = []
@@ -62,6 +63,40 @@ private actor RecoveryMemoryRelay: RemoteRecoveryTransport {
     var ignoreAppends = false
     var pageSize = 64
     let hostKey = Curve25519.Signing.PrivateKey()
+    var deviceMailboxes: [String: RemoteDeviceEnrollmentMailbox] = [:]
+    var loseDeviceResponseReply = false
+
+    func dropNextDeviceResponseReply() { loseDeviceResponseReply = true }
+
+    func createEnrollment(_ invitation: RemoteDeviceEnrollmentInvitation, now: UInt64) async throws -> RemoteDeviceEnrollmentMailbox {
+        if deviceMailboxes[invitation.id] == nil {
+            deviceMailboxes[invitation.id] = RemoteDeviceEnrollmentMailbox(expires: invitation.expires, request: nil, response: nil)
+        }
+        return deviceMailboxes[invitation.id]!
+    }
+    func readEnrollment(_ invitation: RemoteDeviceEnrollmentInvitation, now: UInt64) async throws -> RemoteDeviceEnrollmentMailbox {
+        guard let value = deviceMailboxes[invitation.id] else { throw RemoteDeviceEnrollmentTransportError.notFound }
+        return value
+    }
+    func submitEnrollment(_ request: RemoteDeviceEnrollmentRequest, invitation: RemoteDeviceEnrollmentInvitation, now: UInt64) async throws -> RemoteDeviceEnrollmentMailbox {
+        let previous = try await readEnrollment(invitation, now: now)
+        guard previous.request == nil || previous.request == request else { throw RemoteDeviceEnrollmentTransportError.conflict }
+        let value = RemoteDeviceEnrollmentMailbox(expires: invitation.expires, request: request, response: previous.response)
+        deviceMailboxes[invitation.id] = value
+        return value
+    }
+    func publishEnrollment(_ response: RemoteDeviceEnrollmentHandoff, request: RemoteDeviceEnrollmentRequest,
+        invitation: RemoteDeviceEnrollmentInvitation, now: UInt64) async throws -> RemoteDeviceEnrollmentMailbox {
+        let previous = try await readEnrollment(invitation, now: now)
+        guard previous.request == request, previous.response == nil || previous.response == response else {
+            throw RemoteDeviceEnrollmentTransportError.conflict
+        }
+        let value = RemoteDeviceEnrollmentMailbox(expires: invitation.expires, request: request, response: response)
+        deviceMailboxes[invitation.id] = value
+        if loseDeviceResponseReply { loseDeviceResponseReply = false; throw RemoteRecoveryTransportError.unavailable }
+        return value
+    }
+    func cancelEnrollment(_ invitation: RemoteDeviceEnrollmentInvitation) async throws { deviceMailboxes.removeValue(forKey: invitation.id) }
 
     func dropNextAppendReply() { loseAppendReply = true }
     func dropAppendReply(number: Int) { loseAppendNumber = number }
@@ -204,6 +239,155 @@ private final class RecoveryCoordinatorHarness {
 
 @MainActor
 final class AstationRecoveryCoordinatorTests: XCTestCase {
+    func testNativeEnrollmentQRCodePreservesTheCompleteTrustAnchorWhenDecoded() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        _ = try await coordinator.setup()
+        let invitation = try await coordinator.startDeviceEnrollment(issuer: "https://auth.dev.agora.build", owner: "login-owner",
+            roles: ["view"], current: { true })
+        let json = try invitation.qrJSON()
+        let image = try DeviceEnrollmentWindowController.qrImage(json)
+        let cg = try XCTUnwrap(image.cgImage(forProposedRect: nil, context: nil, hints: nil))
+        let request = VNDetectBarcodesRequest()
+        request.symbologies = [.qr]
+        try VNImageRequestHandler(cgImage: cg).perform([request])
+        XCTAssertEqual(request.results?.first?.payloadStringValue, json)
+    }
+
+    private func deviceRequest(_ invitation: RemoteDeviceEnrollmentInvitation) throws -> RemoteDeviceEnrollmentRequest {
+        let value = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(invitation.qrJSON().utf8)) as? [String: Any])
+        let secret = try XCTUnwrap(value["secret"] as? String)
+        let key = P256.Signing.PrivateKey(), encryption = Curve25519.KeyAgreement.PrivateKey()
+        let body: [String: Any] = ["version": 1, "invitation": try invitation.commitment,
+            "device": "phone-" + UUID().uuidString.lowercased(), "name": "Test phone",
+            "auth": recoveryTestBase64(key.publicKey.x963Representation),
+            "encryption": recoveryTestBase64(encryption.publicKey.rawRepresentation), "roles": invitation.roles,
+            "nonce": recoveryTestBase64(Data(repeating: 0x42, count: 32))]
+        let canonical = try canonicalJson(json: recoveryTestJSON(body))
+        let input = encodeFields(fields: [Data("astation-device-applicant-proof-v1".utf8), Data(canonical.utf8)])
+        let signature = try RemoteP256Signature.normalize(key.signature(for: input).rawRepresentation)
+        let macInput = encodeFields(fields: [Data("astation-device-request-auth-v1".utf8), Data(canonical.utf8), signature])
+        let bytes = try XCTUnwrap(Data(base64Encoded: secret.replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/") + "="))
+        let mac = Data(HMAC<SHA256>.authenticationCode(for: macInput, using: SymmetricKey(data: bytes)))
+        return try RemoteDeviceEnrollmentRequest(json: recoveryTestJSON(["body": body,
+            "signature": recoveryTestBase64(signature), "mac": recoveryTestBase64(mac)]),
+            invitation: invitation, now: AstationRecoveryCoordinator.clock())
+    }
+
+    private func deviceReview(_ coordinator: AstationRecoveryCoordinator, harness h: RecoveryCoordinatorHarness) async throws
+        -> (RemoteDeviceEnrollmentInvitation, RemoteDeviceEnrollmentRequest, RemoteNativeEnrollment) {
+        let invitation = try await coordinator.startDeviceEnrollment(issuer: "https://auth.dev.agora.build", owner: "login-owner",
+            roles: ["control", "view"], current: { true })
+        let request = try deviceRequest(invitation)
+        _ = try await h.relay.submitEnrollment(request, invitation: invitation, now: AstationRecoveryCoordinator.clock().wallMs)
+        let received = try await coordinator.readDeviceEnrollment(issuer: invitation.issuer, owner: invitation.owner, current: { true })
+        XCTAssertEqual(received.request, request)
+        XCTAssertFalse(received.handedOff)
+        let review = try await coordinator.prepareDeviceEnrollment(issuer: invitation.issuer, owner: invitation.owner,
+            request: request, current: { true })
+        return (invitation, request, review)
+    }
+
+    func testDeviceManagerUsesTheExistingWriterAndPublishesOnlyAfterFreshConfirmation() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        _ = try await coordinator.setup()
+        let (invitation, request, review) = try await deviceReview(coordinator, harness: h)
+        do { _ = try await coordinator.serviceMembership(); XCTFail("Pending device review must own the writer") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .busy) }
+        let prompts = h.ownerRequests.count
+        try await coordinator.approveDeviceEnrollment(review, issuer: invitation.issuer, owner: invitation.owner, current: { true })
+        XCTAssertEqual(h.ownerRequests.count, prompts + 1)
+        XCTAssertEqual(h.ownerRequests.last?.bodyJson, review.bodyJSON)
+        let log = try await coordinator.serviceMembership()
+        XCTAssertEqual(log.member(deviceId: request.deviceID)?.roles, ["control", "view"])
+        let mailbox = try await coordinator.readDeviceEnrollment(issuer: invitation.issuer, owner: invitation.owner, current: { true })
+        XCTAssertTrue(mailbox.handedOff)
+        let value = try await h.relay.readEnrollment(invitation, now: AstationRecoveryCoordinator.clock().wallMs)
+        XCTAssertNotNil(value.response)
+        for key in h.keys.keys { XCTAssertFalse(try value.response!.json().contains(recoveryTestBase64(key.key))) }
+    }
+
+    func testDeviceManagerRestartReconcilesLostAppendAndHandoffRepliesWithoutResigning() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
+        _ = try await coordinator!.setup()
+        let (invitation, request, review) = try await deviceReview(coordinator!, harness: h)
+        await h.relay.dropNextAppendReply()
+        do {
+            try await coordinator!.approveDeviceEnrollment(review, issuer: invitation.issuer, owner: invitation.owner, current: { true })
+            XCTFail("Lost append reply")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .unavailable) }
+        let prompts = h.ownerRequests.count
+        coordinator = nil
+        coordinator = try h.coordinator()
+        do {
+            try await coordinator!.cancelDeviceEnrollment(issuer: invitation.issuer, owner: invitation.owner, current: { true })
+            XCTFail("A signed uncertain append must not be discarded after restart")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        await h.relay.dropNextDeviceResponseReply()
+        do {
+            try await coordinator!.approveDeviceEnrollment(review, issuer: invitation.issuer, owner: invitation.owner, current: { true })
+            XCTFail("Lost encrypted handoff reply")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .unavailable) }
+        let original = try await h.relay.readEnrollment(invitation, now: AstationRecoveryCoordinator.clock().wallMs)
+        coordinator = nil
+        coordinator = try h.coordinator()
+        try await coordinator!.approveDeviceEnrollment(review, issuer: invitation.issuer, owner: invitation.owner, current: { true })
+        let recovered = try await h.relay.readEnrollment(invitation, now: AstationRecoveryCoordinator.clock().wallMs)
+        XCTAssertEqual(recovered.response, original.response)
+        XCTAssertEqual(h.ownerRequests.count, prompts)
+        let appends = await h.relay.appends
+        XCTAssertEqual(try appends.filter { try signedObjectInfo(json: $0.entryJson).bodyJcs == review.bodyJSON }.count, 1)
+        let log = try await coordinator!.serviceMembership()
+        XCTAssertEqual(log.member(deviceId: request.deviceID)?.status, .active)
+    }
+
+    func testDeviceManagerDenialAndChangedAccountNeverAppendOrReleaseKeys() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        _ = try await coordinator.setup()
+        let (invitation, request, review) = try await deviceReview(coordinator, harness: h)
+        h.approve = false
+        do {
+            try await coordinator.approveDeviceEnrollment(review, issuer: invitation.issuer, owner: invitation.owner, current: { true })
+            XCTFail("Denied confirmation")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .confirmationRequired) }
+        var current = true
+        h.ownerConfirmation = { _ in current = false; return true }
+        do {
+            try await coordinator.approveDeviceEnrollment(review, issuer: invitation.issuer, owner: invitation.owner, current: { current })
+            XCTFail("Account changed during confirmation")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .confirmationRequired) }
+        let log = await h.relay.log
+        XCTAssertNil(log?.member(deviceId: request.deviceID))
+        let mailbox = try await h.relay.readEnrollment(invitation, now: AstationRecoveryCoordinator.clock().wallMs)
+        XCTAssertNil(mailbox.response)
+        try await coordinator.cancelDeviceEnrollment(issuer: invitation.issuer, owner: invitation.owner, current: { true })
+        _ = try await coordinator.serviceMembership()
+    }
+
+    func testDeviceManagerHeadMovementDuringOwnerPromptRequiresAnotherReview() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        _ = try await coordinator.setup()
+        let manager = try await addSecondManager(harness: h)
+        let (invitation, request, review) = try await deviceReview(coordinator, harness: h)
+        h.ownerConfirmation = { _ in
+            try await self.append(["action": "add_host", "host": ["host_id": "other-host", "host_trust_gen": 1,
+                "host_key": ["alg": "ed25519", "pub": recoveryTestBase64(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)]]],
+                harness: h, signer: "manager-b", identity: manager)
+            return true
+        }
+        do {
+            try await coordinator.approveDeviceEnrollment(review, issuer: invitation.issuer, owner: invitation.owner, current: { true })
+            XCTFail("The owner reviewed an older head")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        let log = await h.relay.log
+        XCTAssertNil(log?.member(deviceId: request.deviceID))
+        let mailbox = try await h.relay.readEnrollment(invitation, now: AstationRecoveryCoordinator.clock().wallMs)
+        XCTAssertNil(mailbox.response)
+        try await coordinator.cancelDeviceEnrollment(issuer: invitation.issuer, owner: invitation.owner, current: { true })
+        _ = try await coordinator.serviceMembership()
+    }
+
     func testNewStationRetainsIdentityKeysKitAndHostsAndPublishesAnEncryptedBackup() async throws {
         let h = RecoveryCoordinatorHarness()
         var coordinator: AstationRecoveryCoordinator? = try h.coordinator()
@@ -516,10 +700,10 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
     }
 
     private func service(_ coordinator: AstationRecoveryCoordinator, sessions: [String]? = nil,
-                         projects: [String]? = nil) async throws -> RemoteServiceApproval {
+                         projects: [String]? = nil, operations: [String] = ["prompt", "view"]) async throws -> RemoteServiceApproval {
         let log = try await coordinator.serviceMembership()
         let time = AstationRecoveryCoordinator.clock()
-        var scope: [String: Any] = ["hosts": ["host-a"], "ops": ["prompt", "view"]]
+        var scope: [String: Any] = ["hosts": ["host-a"], "ops": operations]
         if let sessions { scope["sessions"] = sessions }
         if let projects { scope["projects"] = projects }
         let action: [String: Any] = ["action": "add", "member": ["device_id": "service-test", "kind": "service", "roles": ["service"],
@@ -631,6 +815,35 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         let finalPosts = await transport.count()
         XCTAssertEqual(finalPosts, 1, "Reopening must not resubmit the approval")
         controller.cancelPending()
+    }
+
+    func testHostWorkApprovalCannotSignWithoutHostAuthorizationOrAfterHostDisconnectsDuringConfirmation() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        _ = try await coordinator.setup()
+        let approval = try await service(coordinator, operations: ["launch", "view"])
+        try await coordinator.prepareService(approval)
+        let before = await h.relay.appends.count
+        let confirmations = h.ownerRequests.count
+        do {
+            try await coordinator.approveService(approval, portal: portal(transport), current: { true })
+            XCTFail("New operations require host authorization before signing")
+        } catch StationIntegrationError.hostUpgradeRequired { }
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        var checks = 0
+        do {
+            try await coordinator.approveService(approval, portal: portal(transport), authorizeNewOperations: { log in
+                XCTAssertEqual(log.accountId(), "account-a")
+                checks += 1
+                if checks == 2 { throw StationIntegrationError.hostUpgradeRequired }
+            }, current: { true })
+            XCTFail("A host that disconnected during owner authentication cannot be enrolled")
+        } catch StationIntegrationError.hostUpgradeRequired { }
+        XCTAssertEqual(checks, 2)
+        XCTAssertEqual(h.ownerRequests.count, confirmations + 1)
+        let appends = await h.relay.appends.count, posts = await transport.count()
+        XCTAssertEqual(appends, before)
+        XCTAssertEqual(posts, 0)
+        XCTAssertEqual(try coordinator.pendingServiceApproval(), approval)
     }
 
     func testServiceConfirmationUsesTheExactReviewedApprovalAndCannotBeBypassed() async throws {

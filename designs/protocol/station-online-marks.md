@@ -1,7 +1,7 @@
 # Online Chisel marks
 
-Status: sender handoff on PR #70's reviewed SDK, 2026-11-03. No deployment or
-production enrollment. The separate `host-work-api` gate applies to marks as
+Status: Astation #71 integration on current main, 2026-11-08. No feature
+activation or production enrollment. The separate `host-work-api` gate applies to marks as
 well as launch/messages. It remains off in normal and existing `hosted-agent-api`
 builds; existing approved dev hosted execution is unchanged. Offline delivery,
 artifact retention, replay and automatic launch are outside this increment.

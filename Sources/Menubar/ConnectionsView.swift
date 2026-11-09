@@ -510,7 +510,8 @@ private struct AgentListPanel: View {
                             .foregroundColor(.secondary)
                     }
                     Text(sessionStatus.phase == .failed ? "Session connection failed"
-                         : sessionStatus.phase == .reconnecting ? "Reconnecting sessions" : "Loading sessions")
+                         : sessionStatus.phase == .reconnecting ? "Reconnecting sessions"
+                         : sessionStatus.phase == .connecting ? "Connecting securely" : "Loading sessions")
                         .font(.headline)
                     Text(sessionStatus.message)
                         .font(.subheadline)
