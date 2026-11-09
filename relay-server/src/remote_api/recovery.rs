@@ -31,6 +31,9 @@ const MAX_STATE: usize = 16 * 1024 * 1024;
 const MAX_INTEGER: u64 = 9_007_199_254_740_991;
 type Reply = (StatusCode, Json<Value>);
 
+#[path = "device_enrollment.rs"]
+pub(super) mod device_enrollment;
+
 fn error(status: StatusCode, code: &'static str) -> Reply {
     (status, Json(json!({"error":{"code":code}})))
 }
@@ -58,6 +61,8 @@ struct Root {
     push: super::push_ingress::PushState,
     #[serde(default)]
     routes: BTreeMap<String, HostBinding>,
+    #[serde(default)]
+    enrollments: BTreeMap<String, device_enrollment::Record>,
 }
 
 /// A fresh connection is the generation fence. Presence never substitutes for it.
@@ -449,6 +454,7 @@ pub(super) enum Operation {
         host: String,
     },
     Collect,
+    DeviceEnrollment(device_enrollment::Command),
     Push(super::push_ingress::Ingress),
 }
 
@@ -488,6 +494,7 @@ fn apply(
                 blobs: BTreeMap::new(),
                 push: Default::default(),
                 routes: Default::default(),
+                enrollments: Default::default(),
             }
         }
     };
@@ -495,6 +502,7 @@ fn apply(
         .map_err(|_| unavailable())?;
     log.advance(&clock);
     let reply = match operation {
+        Operation::DeviceEnrollment(command) => device_enrollment::apply(&mut root.enrollments, command, clock.wall_ms)?,
         Operation::HostRoute { text, nonce, room, atem_id, connection } => {
             let route = verify_host_route_message(&log, text.as_bytes(), &nonce, &room, &atem_id)
                 .map_err(|refusal| (StatusCode::BAD_REQUEST, Json(RelayReply::refused(&refusal).to_json())))?;
@@ -506,6 +514,7 @@ fn apply(
         Operation::IntegrationSnapshot => (StatusCode::OK, Json(json!({"account":root.account,"membership":log.to_stored()}))),
         Operation::Collect => {
             root.push.collect(clock.wall_ms);
+            device_enrollment::collect(&mut root.enrollments, clock.wall_ms);
             (StatusCode::OK, Json(json!({})))
         }
         Operation::Push(ingress) => {

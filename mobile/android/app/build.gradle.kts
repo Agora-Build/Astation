@@ -47,6 +47,7 @@ android.sourceSets.getByName("main") {
     jniLibs.srcDir(atemSdk.resolve("jniLibs"))
 }
 android.sourceSets.getByName("test").resources.srcDir("../../../native-remote/Tests/AstationRemoteTests/Fixtures")
+android.sourceSets.getByName("androidTest").assets.srcDir("../../../native-remote/Tests/AstationRemoteTests/Fixtures")
 dependencies {
     implementation("net.java.dev.jna:jna:5.19.1@aar")
     implementation("net.openid:appauth:0.11.1")

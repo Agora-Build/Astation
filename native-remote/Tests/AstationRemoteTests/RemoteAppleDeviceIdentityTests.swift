@@ -4,7 +4,7 @@ import Foundation
 import XCTest
 @testable import AstationRemote
 
-private final class SoftwareDeviceCryptography: RemoteAppleIdentityCryptography {
+final class SoftwareDeviceCryptography: RemoteAppleIdentityCryptography {
     var creations = 0
     var signatures = 0
     func create() throws -> RemoteAppleIdentityMaterial {
@@ -39,7 +39,7 @@ private final class SoftwareDeviceCryptography: RemoteAppleIdentityCryptography 
 }
 
 @MainActor
-private final class DeviceIdentityFixture {
+final class DeviceIdentityFixture {
     let crypto = SoftwareDeviceCryptography()
     var stored: Data?
     var locked = false

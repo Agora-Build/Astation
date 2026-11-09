@@ -49,8 +49,9 @@ private final class RecoveryRedirectGuard: NSObject, URLSessionTaskDelegate, @un
 }
 
 /// TLS/account login limits storage access. Only the shared verifier grants cryptographic trust.
-public final class RemoteRecoveryHTTP: RemoteRecoveryTransport, @unchecked Sendable {
+public final class RemoteRecoveryHTTP: RemoteRecoveryTransport, RemoteDeviceEnrollmentTransport, @unchecked Sendable {
     private let baseURL: URL
+    private let stationOrigin: String
     private let session: URLSession
     private let accessToken: @Sendable () async throws -> String
 
@@ -68,6 +69,7 @@ public final class RemoteRecoveryHTTP: RemoteRecoveryTransport, @unchecked Senda
             throw RemoteRecoveryTransportError.insecureURL
         }
         baseURL = url.appendingPathComponent("api/remote/v1/logs", isDirectory: true)
+        stationOrigin = url.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         self.accessToken = accessToken
         let config = configuration
         config.httpShouldSetCookies = false
@@ -140,12 +142,80 @@ public final class RemoteRecoveryHTTP: RemoteRecoveryTransport, @unchecked Senda
         return bytes
     }
 
+    public func createEnrollment(_ invitation: RemoteDeviceEnrollmentInvitation, now: UInt64) async throws -> RemoteDeviceEnrollmentMailbox {
+        try invitation.validate(issuer: invitation.issuer, owner: invitation.owner, station: stationOrigin, now: Self.enrollmentClock(now))
+        let (_, bytes) = try await perform(url: enrollmentPath(invitation), method: "PUT",
+            body: Self.encode(["expires": invitation.expires]), enrollmentErrors: true)
+        return try enrollmentMailbox(bytes, invitation: invitation, now: now)
+    }
+
+    public func readEnrollment(_ invitation: RemoteDeviceEnrollmentInvitation, now: UInt64) async throws -> RemoteDeviceEnrollmentMailbox {
+        try invitation.validate(issuer: invitation.issuer, owner: invitation.owner, station: stationOrigin, now: Self.enrollmentClock(now))
+        let (_, bytes) = try await perform(url: enrollmentPath(invitation), method: "GET", enrollmentErrors: true)
+        return try enrollmentMailbox(bytes, invitation: invitation, now: now)
+    }
+
+    public func submitEnrollment(_ request: RemoteDeviceEnrollmentRequest, invitation: RemoteDeviceEnrollmentInvitation,
+        now: UInt64) async throws -> RemoteDeviceEnrollmentMailbox {
+        try request.validate(invitation: invitation, now: Self.enrollmentClock(now))
+        let (_, bytes) = try await perform(url: enrollmentPath(invitation), method: "POST",
+            body: Self.encode(["stage": "request", "message": Self.object(request.json())]), enrollmentErrors: true)
+        let mailbox = try enrollmentMailbox(bytes, invitation: invitation, now: now)
+        guard mailbox.request == request else { throw RemoteRecoveryTransportError.invalidResponse }
+        return mailbox
+    }
+
+    public func publishEnrollment(_ response: RemoteDeviceEnrollmentHandoff, request: RemoteDeviceEnrollmentRequest,
+        invitation: RemoteDeviceEnrollmentInvitation, now: UInt64) async throws -> RemoteDeviceEnrollmentMailbox {
+        _ = try RemoteDeviceEnrollmentHandoff(json: response.json(), invitation: invitation, request: request, now: Self.enrollmentClock(now))
+        let (_, bytes) = try await perform(url: enrollmentPath(invitation), method: "POST",
+            body: Self.encode(["stage": "response", "message": Self.object(response.json())]), enrollmentErrors: true)
+        let mailbox = try enrollmentMailbox(bytes, invitation: invitation, now: now)
+        guard mailbox.request == request, mailbox.response == response else { throw RemoteRecoveryTransportError.invalidResponse }
+        return mailbox
+    }
+
+    public func cancelEnrollment(_ invitation: RemoteDeviceEnrollmentInvitation) async throws {
+        do {
+            let (_, bytes) = try await perform(url: enrollmentPath(invitation), method: "DELETE", enrollmentErrors: true)
+            guard try Self.dictionary(bytes)["closed"] as? Bool == true else { throw RemoteRecoveryTransportError.invalidResponse }
+        } catch RemoteDeviceEnrollmentTransportError.closed { return }
+    }
+
+    private func enrollmentPath(_ invitation: RemoteDeviceEnrollmentInvitation) throws -> URL {
+        guard RemoteRecoveryKit.validHash(invitation.genesis),
+              let id = RemoteRecoveryKit.decodeBase64URL(invitation.id, count: 32),
+              RemoteRecoveryKit.base64URL(id) == invitation.id,
+              // An invitation cannot redirect an existing account token.
+              stationOrigin == invitation.station else {
+            throw RemoteDeviceEnrollmentError.wrongContext
+        }
+        return path(invitation.genesis, "device-enrollments/" + invitation.id)
+    }
+
+    private func enrollmentMailbox(_ bytes: Data, invitation: RemoteDeviceEnrollmentInvitation, now: UInt64) throws -> RemoteDeviceEnrollmentMailbox {
+        let body = try Self.dictionary(bytes)
+        guard Set(body.keys) == Set(["expires", "request", "response"]),
+              let expires = body["expires"] as? NSNumber, CFGetTypeID(expires) != CFBooleanGetTypeID(),
+              expires.stringValue == String(invitation.expires) else { throw RemoteRecoveryTransportError.invalidResponse }
+        try invitation.validate(issuer: invitation.issuer, owner: invitation.owner, station: invitation.station, now: Self.enrollmentClock(now))
+        let request = try body["request"].flatMap { $0 is NSNull ? nil : try RemoteDeviceEnrollmentRequest(json: Self.json($0), invitation: invitation, now: Self.enrollmentClock(now)) }
+        let response: RemoteDeviceEnrollmentHandoff?
+        if let object = body["response"], !(object is NSNull) {
+            guard let request else { throw RemoteRecoveryTransportError.invalidResponse }
+            response = try RemoteDeviceEnrollmentHandoff(json: Self.json(object), invitation: invitation, request: request, now: Self.enrollmentClock(now))
+        } else { response = nil }
+        return RemoteDeviceEnrollmentMailbox(expires: invitation.expires, request: request, response: response)
+    }
+
+    private static func enrollmentClock(_ wall: UInt64) -> HostClock { HostClock(wallMs: wall, monoMs: 0, bootId: "enrollment-http") }
+
     private func path(_ genesis: String, _ suffix: String) -> URL {
         baseURL.appendingPathComponent(genesis, isDirectory: true).appendingPathComponent(suffix)
     }
 
     private func perform(url: URL, method: String, body: Data? = nil, headers: [String: String] = [:],
-        allowConflict: Bool = false) async throws -> (Int, Data) {
+        allowConflict: Bool = false, enrollmentErrors: Bool = false) async throws -> (Int, Data) {
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.httpBody = body
@@ -162,6 +232,23 @@ public final class RemoteRecoveryHTTP: RemoteRecoveryTransport, @unchecked Senda
         defer { stream.task.cancel() }
         guard let response = response as? HTTPURLResponse else { throw RemoteRecoveryTransportError.invalidResponse }
         if response.statusCode == 401 { throw RemoteRecoveryTransportError.authenticationRequired }
+        if enrollmentErrors && [404, 409, 410, 429].contains(response.statusCode) {
+            var data = Data()
+            for try await byte in stream {
+                guard data.count < 16_384 else { throw RemoteRecoveryTransportError.invalidResponse }
+                data.append(byte)
+            }
+            let body = try Self.dictionary(data)
+            let code = (body["error"] as? [String: Any])?["code"] as? String
+            switch (response.statusCode, code) {
+            case (404, "device_enrollment_not_found"): throw RemoteDeviceEnrollmentTransportError.notFound
+            case (404, "recovery_record_not_found"): throw RemoteRecoveryTransportError.recordNotFound
+            case (409, "device_enrollment_conflict"), (409, "device_enrollment_request_required"): throw RemoteDeviceEnrollmentTransportError.conflict
+            case (410, "device_enrollment_closed"): throw RemoteDeviceEnrollmentTransportError.closed
+            case (429, "device_enrollment_limit"): throw RemoteDeviceEnrollmentTransportError.limit
+            default: throw RemoteRecoveryTransportError.invalidResponse
+            }
+        }
         if response.statusCode == 403 || response.statusCode == 404 {
             var data = Data()
             for try await byte in stream {
