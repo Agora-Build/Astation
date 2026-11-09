@@ -92,6 +92,15 @@ ciphertext; clients retain their decryption checks. Any future signed-write
 contract must bind the underlying ciphertext and metadata independently of this
 outer encoding.
 
+The submitted `files_encoding` is not stored. Read classification depends on
+the paths and underlying bytes, rather than the encoding originally submitted.
+Envelope-shaped text under a plain filename remains `base64`; a mixed row also
+remains `base64` without changing any file. When every path and nonempty value
+has the reserved envelope grammar, the row reads as `e1-text`, including rows
+originally submitted as `base64`. This is a representation choice, not proof
+that the ciphertext is authentic. Account mode checks and client decryption
+remain the authority for those bytes.
+
 `fixtures/skill-file-wire.json` contains exact public storage/wire vectors,
 including a sealed row with an empty file. Its synthetic payloads are structural
 envelopes, not valid AEAD ciphertext or account material.

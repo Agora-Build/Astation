@@ -480,6 +480,31 @@ async fn legacy_binary_history_and_obsolete_ciphertext_are_preserved() {
     assert_eq!(result["skills"][1]["files"], compact_skill()["files"]);
 }
 
+#[test]
+fn envelope_shaped_content_keeps_plain_paths_and_mixed_history_lossless() {
+    let sealed_text = envelope("0123abcd", 2, 40);
+    let files = json!({"notes.txt": STANDARD.encode(sealed_text.as_bytes()), ".keep": ""});
+    let mut plain = sample_skill("plain", files.clone());
+    encode_row(&mut plain);
+    assert_eq!(plain["files_encoding"], "base64");
+    assert_eq!(plain["files"], files);
+
+    let mut stored = skill_with_empty_file();
+    normalize_files(&mut stored).unwrap();
+    let mut mixed = stored.clone();
+    mixed["files"]["notes.txt"] = json!(STANDARD.encode(b"plain history"));
+    let mixed_files = mixed["files"].clone();
+    encode_row(&mut mixed);
+    assert_eq!(mixed["files_encoding"], "base64");
+    assert_eq!(mixed["files"], mixed_files);
+
+    // The submitted encoding is not persisted; sealed paths/bytes determine read encoding.
+    stored["files_encoding"] = json!("base64");
+    encode_row(&mut stored);
+    assert_eq!(stored["files_encoding"], "e1-text");
+    assert_eq!(stored["files"], skill_with_empty_file()["files"]);
+}
+
 #[tokio::test]
 async fn authentication_precedes_body_read_and_accounts_cannot_cross_read() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -712,15 +737,23 @@ async fn postgres_replicas_and_restart_preserve_ciphertext_and_cas() {
     // Simulate the durable mode moving after the HTTP layer read its snapshot.
     sqlx::query("UPDATE data_account_encryption SET mode = 'enabling', kid = '89abcdef' WHERE data_account = $1")
         .bind(ACCOUNT).execute(&database.pool).await.unwrap();
+    let mut next = compact_skill();
+    next["version"] = json!(3);
     let (_, refused) = call(
         &restarted,
         "POST",
         BATCH,
         &session,
-        Some(json!({"ops": [push(compact_skill(), 2)]})),
+        Some(json!({"ops": [push(next.clone(), 2)]})),
     )
     .await;
-    assert_eq!(refused["results"][0]["ok"], false, "{refused}");
+    assert_eq!(
+        refused["results"][0],
+        json!({
+            "ok": false, "error": "content does not match the account encryption mode"
+        }),
+        "{refused}"
+    );
     let (_, unchanged) = call(
         &restarted,
         "GET",
@@ -743,11 +776,7 @@ async fn postgres_replicas_and_restart_preserve_ciphertext_and_cas() {
             "/api/skills/version?id=atem-test&scope=global&name=demo&version=1",
             None,
         ),
-        (
-            "POST",
-            BATCH,
-            Some(json!({"ops": [push(compact_skill(), 2)]})),
-        ),
+        ("POST", BATCH, Some(json!({"ops": [push(next, 2)]}))),
     ] {
         let (status, error) = call(&restarted, method, uri, &session, body).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {error}");
