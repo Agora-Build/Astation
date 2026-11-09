@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 const ACCOUNT: &str = "skill-wire-test";
-const BATCH: &str = "/api/skills/v2/batch?id=atem-test";
+const BATCH: &str = "/api/skills/batch?id=atem-test";
 const KEY: &str = "scope=global&project=&name=demo";
 
 fn envelope(kid: &str, marker: u8, bytes: usize) -> String {
@@ -83,61 +83,152 @@ async fn encrypted_state() -> (AppState, String, Arc<InMemoryAccountStore>) {
     (state, session, accounts)
 }
 
+fn skill_with_empty_file() -> Value {
+    let mut row = compact_skill();
+    row["files"][envelope("0123abcd", 3, 40)] = json!("");
+    row
+}
+
 #[tokio::test]
-async fn old_and_new_routes_share_identical_ciphertext_versions_and_cursors() {
+async fn stored_ciphertext_including_empty_files_reads_without_mutation() {
     let (state, session, accounts) = encrypted_state().await;
     let knowledge = state.knowledge.clone();
+    let compact = skill_with_empty_file();
+    let mut stored = compact.clone();
+    normalize_files(&mut stored).unwrap();
+    // A row stored before this transport change uses the same persistent format.
+    let original = knowledge
+        .push_skill(ACCOUNT, serde_json::from_value(stored).unwrap(), 0)
+        .await
+        .unwrap();
+    let before = knowledge.pull_skills(ACCOUNT, 0, 500).await.unwrap();
     let app = crate::router(state);
-    let compact = compact_skill();
-    let mut legacy = compact.clone();
-    normalize_files(&mut legacy).unwrap();
-    for (uri, skill, base) in [
-        ("/api/skills/batch?id=atem-test", legacy, 0),
-        (BATCH, compact.clone(), 1),
-    ] {
-        let (status, result) = call(
+    let (_, page) = call(&app, "GET", "/api/skills?id=atem-test", &session, None).await;
+    assert_eq!(page["skills"][0]["files"], compact["files"]);
+    assert_eq!(page["skills"][0]["files_encoding"], "e1-text");
+    assert_eq!(page["skills"][0]["seq"], original.seq);
+    assert!(page.get("wire_version").is_none());
+    assert_eq!(
+        knowledge.pull_skills(ACCOUNT, 0, 500).await.unwrap(),
+        before
+    );
+    let counts = accounts.encryption_state(ACCOUNT).await.unwrap();
+    assert_eq!((counts.plaintext_fields, counts.obsolete_fields), (0, 0));
+}
+
+#[tokio::test]
+async fn exact_version_retries_and_concurrent_writes_never_renumber_ciphertext() {
+    let (state, session, _) = encrypted_state().await;
+    let app = crate::router(state);
+    let compact = skill_with_empty_file();
+    let (_, result) = call(
+        &app,
+        "POST",
+        BATCH,
+        &session,
+        Some(json!({"ops": [push(compact.clone(), 0)]})),
+    )
+    .await;
+    assert_eq!(result["results"][0]["ok"], true, "{result}");
+    let seq = result["results"][0]["seq"].as_i64().unwrap();
+    let mut resealed = compact.clone();
+    resealed["files"] = json!({envelope("0123abcd", 4, 40): envelope("0123abcd", 5, 40)});
+    for row in [compact.clone(), resealed] {
+        let (_, refused) = call(
             &app,
             "POST",
-            uri,
+            BATCH,
             &session,
-            Some(json!({"ops": [push(skill, base)]})),
+            Some(json!({"ops": [push(row, 0)]})),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{result}");
-        assert_eq!(result["results"][0]["version"], base + 1);
-        assert_eq!(result["results"][0]["ok"], true, "{result}");
         assert_eq!(
-            result.get("wire_version").cloned(),
-            if uri == BATCH { Some(json!(2)) } else { None }
+            refused["results"][0],
+            json!({"ok": false, "error": "version_conflict", "current_version": 1})
         );
     }
-    let (_, old) = call(&app, "GET", "/api/skills?id=atem-test", &session, None).await;
-    let (_, mut new) = call(&app, "GET", "/api/skills/v2?id=atem-test", &session, None).await;
-    assert_eq!(new["wire_version"], 2);
-    assert!(old.get("wire_version").is_none());
-    for row in new["skills"].as_array_mut().unwrap() {
-        assert_eq!(row["files"], compact["files"]);
-        assert_eq!(row["files_encoding"], "e1-text");
-        normalize_files(row).unwrap();
-    }
-    assert_eq!(old["skills"], new["skills"]);
-    assert_eq!(
-        knowledge.pull_skills(ACCOUNT, 0, 500).await.unwrap().len(),
-        2
+    let mut next = compact.clone();
+    next["version"] = json!(2);
+    let (a, b) = tokio::join!(
+        call(
+            &app,
+            "POST",
+            BATCH,
+            &session,
+            Some(json!({"ops": [push(next.clone(), 1)]}))
+        ),
+        call(
+            &app,
+            "POST",
+            BATCH,
+            &session,
+            Some(json!({"ops": [push(next, 1)]}))
+        )
     );
-    let cursor = old["skills"][0]["seq"].as_i64().unwrap();
-    let (_, page) = call(
+    let outcomes = [a.1["results"][0].clone(), b.1["results"][0].clone()];
+    assert_eq!(outcomes.iter().filter(|r| r["ok"] == true).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|r| r["error"] == "version_conflict" && r["current_version"] == 2)
+            .count(),
+        1
+    );
+    let (_, page) = call(&app, "GET", "/api/skills?id=atem-test", &session, None).await;
+    assert_eq!(page["skills"].as_array().unwrap().len(), 2);
+    assert_eq!(page["skills"][1]["seq"], seq + 1);
+    assert_eq!(page["skills"][1]["files"], compact["files"]);
+    let (_, cursor) = call(
         &app,
         "GET",
-        &format!("/api/skills/v2?id=atem-test&since={cursor}&limit=1"),
+        &format!("/api/skills?id=atem-test&since={seq}&limit=1"),
         &session,
         None,
     )
     .await;
-    assert_eq!(page["skills"].as_array().unwrap().len(), 1);
-    assert_eq!(page["skills"][0]["seq"], old["skills"][1]["seq"]);
-    let counts = accounts.encryption_state(ACCOUNT).await.unwrap();
-    assert_eq!((counts.plaintext_fields, counts.obsolete_fields), (0, 0));
+    assert_eq!(cursor["skills"].as_array().unwrap().len(), 1);
+    assert_eq!(cursor["skills"][0]["version"], 2);
+    for (version, base) in [
+        (0, 0),
+        (4, 2),
+        (1, -1),
+        (9_007_199_254_740_992i64, 9_007_199_254_740_991i64),
+        (i64::MAX, i64::MAX),
+    ] {
+        let mut invalid = compact.clone();
+        invalid["version"] = json!(version);
+        let (_, refused) = call(
+            &app,
+            "POST",
+            BATCH,
+            &session,
+            Some(json!({"ops": [push(invalid, base)]})),
+        )
+        .await;
+        assert_eq!(
+            refused["results"][0],
+            json!({"ok": false, "error": "invalid skill version"})
+        );
+    }
+}
+
+#[tokio::test]
+async fn removed_versioned_routes_are_not_available() {
+    let (state, session) = test_state(ACCOUNT).await;
+    let app = crate::router(state);
+    let fallback = call(&app, "GET", "/missing-api-route", &session, None).await;
+    for uri in [
+        "/api/skills/v2",
+        "/api/skills/v2/batch",
+        "/api/skills/v2/versions",
+        "/api/skills/v2/version",
+    ] {
+        let result = call(&app, "GET", uri, &session, None).await;
+        assert_eq!(
+            result, fallback,
+            "{uri} must use the missing-route fallback"
+        );
+    }
 }
 
 #[tokio::test]
@@ -172,6 +263,10 @@ async fn unknown_missing_malformed_and_mixed_encodings_refuse_the_entire_batch()
         path,
         invalid_base64,
     ] {
+        let expected = match invalid.get("files_encoding").and_then(Value::as_str) {
+            Some("e1-text" | "base64") => "invalid skill files encoding",
+            _ => "unsupported skill files encoding; update Atem",
+        };
         let (status, body) = call(
             &app,
             "POST",
@@ -181,7 +276,7 @@ async fn unknown_missing_malformed_and_mixed_encodings_refuse_the_entire_batch()
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(body, json!({"error": "invalid skill files encoding"}));
+        assert_eq!(body, json!({"error": expected}));
         assert!(knowledge
             .pull_skills(ACCOUNT, 0, 500)
             .await
@@ -269,7 +364,7 @@ async fn migration_history_tombstones_and_purge_keep_legacy_semantics() {
     let (_, plain) = call(
         &app,
         "GET",
-        &format!("/api/skills/v2/version?id=atem-test&{KEY}&version=1"),
+        &format!("/api/skills/version?id=atem-test&{KEY}&version=1"),
         &session,
         None,
     )
@@ -281,7 +376,7 @@ async fn migration_history_tombstones_and_purge_keep_legacy_semantics() {
         .set_encryption_state(ACCOUNT, "enabling", Some("0123abcd"), 1)
         .await
         .unwrap();
-    let compact = compact_skill();
+    let compact = skill_with_empty_file();
     let (_, result) = call(&app, "POST", BATCH, &session, Some(json!({"ops": [{
         "op": "rewrite", "scope": "global", "old_project": "", "name": "demo", "version": 1,
         "project": "", "files": compact["files"], "files_encoding": "e1-text", "content_hash": compact["content_hash"]
@@ -295,7 +390,7 @@ async fn migration_history_tombstones_and_purge_keep_legacy_semantics() {
     let (_, history) = call(
         &app,
         "GET",
-        &format!("/api/skills/v2/version?id=atem-test&{KEY}&version=1"),
+        &format!("/api/skills/version?id=atem-test&{KEY}&version=1"),
         &session,
         None,
     )
@@ -322,12 +417,11 @@ async fn migration_history_tombstones_and_purge_keep_legacy_semantics() {
     let (_, versions) = call(
         &app,
         "GET",
-        &format!("/api/skills/v2/versions?id=atem-test&{KEY}"),
+        &format!("/api/skills/versions?id=atem-test&{KEY}"),
         &session,
         None,
     )
     .await;
-    assert_eq!(versions["wire_version"], 2);
     assert_eq!(versions["versions"].as_array().unwrap().len(), 2);
     assert!(versions["versions"]
         .as_array()
@@ -337,7 +431,7 @@ async fn migration_history_tombstones_and_purge_keep_legacy_semantics() {
     let (_, tombstone) = call(
         &app,
         "GET",
-        &format!("/api/skills/v2/version?id=atem-test&{KEY}&version=2"),
+        &format!("/api/skills/version?id=atem-test&{KEY}&version=2"),
         &session,
         None,
     )
@@ -347,7 +441,7 @@ async fn migration_history_tombstones_and_purge_keep_legacy_semantics() {
     let (status, _) = call(
         &app,
         "GET",
-        &format!("/api/skills/v2/version?id=atem-test&{KEY}&version=1"),
+        &format!("/api/skills/version?id=atem-test&{KEY}&version=1"),
         &session,
         None,
     )
@@ -356,7 +450,7 @@ async fn migration_history_tombstones_and_purge_keep_legacy_semantics() {
     let (status, _) = call(
         &app,
         "GET",
-        &format!("/api/skills/v2/version?id=atem-test&{KEY}&version=99"),
+        &format!("/api/skills/version?id=atem-test&{KEY}&version=99"),
         &session,
         None,
     )
@@ -379,7 +473,7 @@ async fn legacy_binary_history_and_obsolete_ciphertext_are_preserved() {
         .await
         .unwrap();
     let app = crate::router(state);
-    let (_, result) = call(&app, "GET", "/api/skills/v2?id=atem-test", &session, None).await;
+    let (_, result) = call(&app, "GET", "/api/skills?id=atem-test", &session, None).await;
     assert_eq!(result["skills"][0]["files_encoding"], "base64");
     assert_eq!(result["skills"][0]["files"], binary_files);
     assert_eq!(result["skills"][1]["files_encoding"], "e1-text");
@@ -413,30 +507,30 @@ async fn authentication_precedes_body_read_and_accounts_cannot_cross_read() {
         Some(json!({"ops": [push(compact_skill(), 0)]})),
     )
     .await;
-    let (_, result) = call(&app, "GET", "/api/skills/v2?id=atem-test", &other, None).await;
-    assert_eq!(result, json!({"wire_version": 2, "skills": []}));
+    let (_, result) = call(&app, "GET", "/api/skills?id=atem-test", &other, None).await;
+    assert_eq!(result, json!({"skills": []}));
     let (_, result) = call(
         &app,
         "GET",
-        &format!("/api/skills/v2/versions?id=atem-test&{KEY}"),
+        &format!("/api/skills/versions?id=atem-test&{KEY}"),
         &other,
         None,
     )
     .await;
-    assert_eq!(result, json!({"wire_version": 2, "versions": []}));
+    assert_eq!(result, json!({"versions": []}));
     let (status, _) = call(
         &app,
         "GET",
-        &format!("/api/skills/v2/version?id=atem-test&{KEY}&version=1"),
+        &format!("/api/skills/version?id=atem-test&{KEY}&version=1"),
         &other,
         None,
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     for uri in [
-        "/api/skills/v2",
-        "/api/skills/v2/versions?scope=global&name=demo",
-        "/api/skills/v2/version?scope=global&name=demo&version=1",
+        "/api/skills",
+        "/api/skills/versions?scope=global&name=demo",
+        "/api/skills/version?scope=global&name=demo&version=1",
     ] {
         let response = app
             .clone()
@@ -479,7 +573,7 @@ async fn production_limits_cover_wire_size_op_count_and_normalized_size() {
     let (status, result) = call(&app, "POST", BATCH, &session, Some(payload)).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{result}");
     assert_eq!(result["error"], "normalized request body too large");
-    let (_, empty) = call(&app, "GET", "/api/skills/v2?id=atem-test", &session, None).await;
+    let (_, empty) = call(&app, "GET", "/api/skills?id=atem-test", &session, None).await;
     assert_eq!(empty["skills"], json!([]));
 }
 
@@ -500,26 +594,28 @@ async fn large_encrypted_files_travel_once_and_round_trip_without_byte_changes()
     let (status, result) = call(&app, "POST", BATCH, &session, Some(body)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["results"][0]["ok"], true);
-    let (_, page) = call(&app, "GET", "/api/skills/v2?id=atem-test", &session, None).await;
+    let (_, page) = call(&app, "GET", "/api/skills?id=atem-test", &session, None).await;
     assert_eq!(page["skills"][0]["files"], compact["files"]);
 }
 
 #[test]
-fn public_encoding_fixture_matches_both_transport_representations() {
+fn public_encoding_fixture_matches_storage_and_wire_including_empty_files() {
     let fixture: Value = serde_json::from_str(include_str!(
-        "../../../../designs/protocol/fixtures/skill-file-wire-v2.json"
+        "../../../../designs/protocol/fixtures/skill-file-wire.json"
     ))
     .unwrap();
-    let mut compact = fixture["v2_skill"].clone();
-    normalize_files(&mut compact).unwrap();
-    assert_eq!(compact, fixture["legacy_skill"]);
-    encode_row(&mut compact);
-    assert_eq!(compact, fixture["v2_skill"]);
+    for case in fixture["cases"].as_array().unwrap() {
+        let mut row = case["wire_skill"].clone();
+        normalize_files(&mut row).unwrap();
+        assert_eq!(row, case["stored_skill"]);
+        encode_row(&mut row);
+        assert_eq!(row, case["wire_skill"]);
+    }
 }
 
 #[tokio::test]
 #[ignore = "requires KNOWLEDGE_TEST_DATABASE_URL pointing to local Postgres"]
-async fn postgres_replicas_and_restart_preserve_both_skill_transports() {
+async fn postgres_replicas_and_restart_preserve_ciphertext_and_cas() {
     let database =
         crate::test_database::TestDatabase::migrated("KNOWLEDGE_TEST_DATABASE_URL", 4).await;
     let (mut state, session) = test_state(ACCOUNT).await;
@@ -546,47 +642,68 @@ async fn postgres_replicas_and_restart_preserve_both_skill_transports() {
         "POST",
         BATCH,
         &session,
-        Some(json!({"ops": [push(compact_skill(), 0)]})),
+        Some(json!({"ops": [push(skill_with_empty_file(), 0)]})),
     )
     .await;
     assert_eq!(result["results"][0]["ok"], true, "{result}");
     let committed_seq = result["results"][0]["seq"].clone();
     state.knowledge = Arc::new(PgKnowledgeStore::new(database.reconnect(2).await));
     let replica = crate::router(state.clone());
-    let (_, legacy) = call(&replica, "GET", "/api/skills?id=atem-test", &session, None).await;
-    let (_, compact) = call(
-        &replica,
-        "GET",
-        "/api/skills/v2?id=atem-test",
-        &session,
-        None,
-    )
-    .await;
-    let mut normalized = compact["skills"][0].clone();
-    normalize_files(&mut normalized).unwrap();
-    assert_eq!(normalized, legacy["skills"][0]);
-    assert_eq!(normalized["seq"], committed_seq);
-    let mut old = compact_skill();
-    normalize_files(&mut old).unwrap();
-    let (_, appended) = call(
-        &replica,
-        "POST",
-        "/api/skills/batch?id=atem-test",
-        &session,
-        Some(json!({"ops": [push(old, 1)]})),
-    )
-    .await;
-    assert_eq!(appended["results"][0]["version"], 2, "{appended}");
-    let (_, updated) = call(&app, "GET", "/api/skills/v2?id=atem-test", &session, None).await;
+    let (_, compact) = call(&replica, "GET", "/api/skills?id=atem-test", &session, None).await;
+    assert_eq!(
+        compact["skills"][0]["files"],
+        skill_with_empty_file()["files"]
+    );
+    assert_eq!(compact["skills"][0]["seq"], committed_seq);
+    let mut next = skill_with_empty_file();
+    next["version"] = json!(2);
+    let (a, b) = tokio::join!(
+        call(
+            &app,
+            "POST",
+            BATCH,
+            &session,
+            Some(json!({"ops": [push(next.clone(), 1)]}))
+        ),
+        call(
+            &replica,
+            "POST",
+            BATCH,
+            &session,
+            Some(json!({"ops": [push(next, 1)]}))
+        )
+    );
+    let results = [a.1["results"][0].clone(), b.1["results"][0].clone()];
+    assert_eq!(
+        results.iter().filter(|r| r["ok"] == true).count(),
+        1,
+        "{results:?}"
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| r["error"] == "version_conflict" && r["current_version"] == 2)
+            .count(),
+        1,
+        "{results:?}"
+    );
+    let (_, updated) = call(&app, "GET", "/api/skills?id=atem-test", &session, None).await;
     assert_eq!(updated["skills"].as_array().unwrap().len(), 2);
-    assert_eq!(updated["skills"][1]["files"], compact_skill()["files"]);
+    assert_eq!(
+        updated["skills"][1]["files"],
+        skill_with_empty_file()["files"]
+    );
+    assert_eq!(
+        updated["skills"][1]["seq"].as_i64().unwrap(),
+        committed_seq.as_i64().unwrap() + 1
+    );
     let restarted_pool = database.reconnect(1).await;
     state.knowledge = Arc::new(PgKnowledgeStore::new(restarted_pool.clone()));
     let restarted = crate::router(state);
     let (_, replayed) = call(
         &restarted,
         "GET",
-        "/api/skills/v2?id=atem-test",
+        "/api/skills?id=atem-test",
         &session,
         None,
     )
@@ -607,7 +724,7 @@ async fn postgres_replicas_and_restart_preserve_both_skill_transports() {
     let (_, unchanged) = call(
         &restarted,
         "GET",
-        "/api/skills/v2?id=atem-test",
+        "/api/skills?id=atem-test",
         &session,
         None,
     )
@@ -615,15 +732,15 @@ async fn postgres_replicas_and_restart_preserve_both_skill_transports() {
     assert_eq!(unchanged, updated);
     restarted_pool.close().await;
     for (method, uri, body) in [
-        ("GET", "/api/skills/v2?id=atem-test", None),
+        ("GET", "/api/skills?id=atem-test", None),
         (
             "GET",
-            "/api/skills/v2/versions?id=atem-test&scope=global&name=demo",
+            "/api/skills/versions?id=atem-test&scope=global&name=demo",
             None,
         ),
         (
             "GET",
-            "/api/skills/v2/version?id=atem-test&scope=global&name=demo&version=1",
+            "/api/skills/version?id=atem-test&scope=global&name=demo&version=1",
             None,
         ),
         (

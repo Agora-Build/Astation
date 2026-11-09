@@ -1,5 +1,5 @@
-//! Opt-in skill transport. The store and legacy routes retain base64; only
-//! this boundary removes the outer encoding of already sealed file bytes.
+//! Skill transport. Stored file bytes retain base64; the HTTP boundary carries
+//! already sealed files directly, with no format negotiation or fallback.
 
 use super::*;
 use crate::encryption::envelope_kid;
@@ -16,9 +16,17 @@ fn normalize_files(value: &mut Value) -> Result<(), ErrResp> {
     let encoding = value
         .get("files_encoding")
         .and_then(Value::as_str)
-        .ok_or_else(invalid_encoding)?;
+        .ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "unsupported skill files encoding; update Atem",
+            )
+        })?;
     if !matches!(encoding, "e1-text" | "base64") {
-        return Err(invalid_encoding());
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "unsupported skill files encoding; update Atem",
+        ));
     }
     let sealed = encoding == "e1-text";
     let files = value
@@ -28,7 +36,7 @@ fn normalize_files(value: &mut Value) -> Result<(), ErrResp> {
     for (path, value) in files {
         let text = value.as_str().ok_or_else(invalid_encoding)?;
         if sealed {
-            if envelope_kid(path).is_none() || envelope_kid(text).is_none() {
+            if envelope_kid(path).is_none() || (!text.is_empty() && envelope_kid(text).is_none()) {
                 return Err(invalid_encoding());
             }
             *value = Value::String(STANDARD.encode(text.as_bytes()));
@@ -48,7 +56,7 @@ fn normalize_ops(mut ops: Vec<Value>) -> Result<Vec<SkillOp>, ErrResp> {
             _ => {}
         }
     }
-    // Compact transport must not bypass the legacy batch's storage budget.
+    // Compact transport must not bypass the batch's storage budget.
     let normalized = serde_json::to_vec(&ops).map_err(|_| invalid_encoding())?;
     if normalized.len() + b"{\"ops\":}".len() > SKILLS_BATCH_BODY_LIMIT {
         return Err(err(
@@ -74,7 +82,9 @@ fn encode_row(row: &mut Value) {
                     envelope_kid(path)?;
                     let bytes = STANDARD.decode(encoded.as_str()?).ok()?;
                     let text = String::from_utf8(bytes).ok()?;
-                    envelope_kid(&text)?;
+                    if !text.is_empty() {
+                        envelope_kid(&text)?;
+                    }
                     Some((path.clone(), Value::String(text)))
                 })
                 .collect()
@@ -83,7 +93,7 @@ fn encode_row(row: &mut Value) {
         row["files"] = Value::Object(files);
         row["files_encoding"] = json!("e1-text");
     } else {
-        // Legacy binary/plaintext and partial-migration history remain lossless.
+        // Binary/plaintext and partial-migration history remain lossless.
         row["files_encoding"] = json!("base64");
     }
 }
@@ -96,14 +106,14 @@ pub async fn batch_handler(
 ) -> Result<Json<Value>, ErrResp> {
     let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
     let ops: Vec<Value> = read_batch(body, SKILLS_BATCH_BODY_LIMIT, SKILLS_BATCH_MAX_OPS).await?;
-    // Validate the entire transport before applying any op, as on the v1 route.
+    // Validate the entire transport before applying any operation.
     let ops = normalize_ops(ops)?;
     let encryption = encryption_state(&state, &caller.work_session_id).await?;
     let mut results = Vec::with_capacity(ops.len());
     for op in ops {
         results.push(apply_skill_op(&state, &caller.work_session_id, &encryption, op).await?);
     }
-    Ok(Json(json!({"wire_version": 2, "results": results})))
+    Ok(Json(json!({"results": results})))
 }
 
 pub async fn pull_handler(
@@ -115,17 +125,6 @@ pub async fn pull_handler(
     for row in body["skills"].as_array_mut().unwrap() {
         encode_row(row);
     }
-    body["wire_version"] = json!(2);
-    Ok(Json(body))
-}
-
-pub async fn versions_handler(
-    state: State<AppState>,
-    headers: HeaderMap,
-    query: Query<SkillKeyQuery>,
-) -> Result<Json<Value>, ErrResp> {
-    let Json(mut body) = skill_versions_handler(state, headers, query).await?;
-    body["wire_version"] = json!(2);
     Ok(Json(body))
 }
 
@@ -136,6 +135,5 @@ pub async fn version_handler(
 ) -> Result<Json<Value>, ErrResp> {
     let Json(mut body) = skill_version_handler(state, headers, query).await?;
     encode_row(&mut body["skill"]);
-    body["wire_version"] = json!(2);
     Ok(Json(body))
 }

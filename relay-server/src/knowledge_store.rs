@@ -57,8 +57,8 @@ pub struct MemoryRow {
 }
 
 /// One skill version. Also the wire `Skill`. `files` is `{relpath: base64}`,
-/// kept as raw JSON. The client's `version`, `seq` and `deleted` are ignored
-/// on input (the store assigns them).
+/// kept as raw JSON. A push preserves the client's sealed `version`; the
+/// store assigns `seq` and ignores the client's `deleted` flag.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkillRow {
     pub scope: String,
@@ -115,6 +115,8 @@ pub enum KnowledgeError {
     /// The memory id exists under a different account.
     IdConflict,
     EncryptionConflict,
+    InvalidSkillVersion,
+    VersionConflict { current_version: i64 },
     Db(String),
 }
 
@@ -125,6 +127,8 @@ impl std::fmt::Display for KnowledgeError {
             KnowledgeError::EncryptionConflict => {
                 write!(f, "content does not match the account encryption mode")
             }
+            KnowledgeError::InvalidSkillVersion => write!(f, "invalid skill version"),
+            KnowledgeError::VersionConflict { .. } => write!(f, "version_conflict"),
             KnowledgeError::Db(s) => write!(f, "database error: {}", s),
         }
     }
@@ -179,7 +183,9 @@ pub trait KnowledgeStore: Send + Sync {
         limit: i64,
     ) -> Result<Vec<MemoryRow>, KnowledgeError>;
 
-    /// Append `max(version) + 1`; `superseded_concurrent = base_version < max live version`.
+    /// Atomically append the exact sealed version, requiring `base_version`
+    /// to match the current maximum and `s.version == base_version + 1`.
+    /// A stale/replayed push is a conflict, never renumbered or duplicated.
     async fn push_skill(
         &self,
         account: &str,
@@ -309,6 +315,18 @@ impl InMemoryKnowledgeStore {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+const MAX_SKILL_VERSION: i64 = 9_007_199_254_740_991;
+
+fn checked_skill_version(version: i64, base: i64, current: i64) -> Result<i64, KnowledgeError> {
+    if !(0..MAX_SKILL_VERSION).contains(&base) || version != base + 1 || current > MAX_SKILL_VERSION {
+        return Err(KnowledgeError::InvalidSkillVersion);
+    }
+    if base != current {
+        return Err(KnowledgeError::VersionConflict { current_version: current });
+    }
+    Ok(version)
 }
 
 fn skill_key_matches(
@@ -452,16 +470,13 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
         base_version: i64,
     ) -> Result<SkillPushOutcome, KnowledgeError> {
         let mut st = self.state.lock().await;
-        let (mut cur, mut cur_live) = (0i64, 0i64);
+        let mut cur = 0;
         for (acct, r) in &st.skills {
             if skill_key_matches(acct, r, account, &s.scope, &s.project, &s.name) {
                 cur = cur.max(r.version);
-                if !r.deleted {
-                    cur_live = cur_live.max(r.version);
-                }
             }
         }
-        let version = cur + 1;
+        let version = checked_skill_version(s.version, base_version, cur)?;
         let seq = st.next_seq();
         st.skills.push((
             account.to_string(),
@@ -476,7 +491,7 @@ impl KnowledgeStore for InMemoryKnowledgeStore {
         Ok(SkillPushOutcome {
             version,
             seq,
-            superseded_concurrent: base_version < cur_live,
+            superseded_concurrent: false,
         })
     }
 
@@ -1302,9 +1317,8 @@ impl KnowledgeStore for PgKnowledgeStore {
             false,
         )
         .await?;
-        let (cur, cur_live): (i64, i64) = sqlx::query_as(&format!(
-            "SELECT COALESCE(MAX(version), 0)::bigint, \
-             COALESCE(MAX(version) FILTER (WHERE NOT deleted), 0)::bigint \
+        let cur: i64 = sqlx::query_scalar(&format!(
+            "SELECT COALESCE(MAX(version), 0)::bigint \
              FROM skill_versions WHERE {SKILL_KEY}"
         ))
         .bind(account)
@@ -1314,7 +1328,7 @@ impl KnowledgeStore for PgKnowledgeStore {
         .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
-        let version = cur + 1;
+        let version = checked_skill_version(s.version, base_version, cur)?;
         let seq: i64 = sqlx::query_scalar(
             "INSERT INTO skill_versions (account_id, scope, project, name, version, files, \
              content_hash, source_agent, source_machine, created_at, deleted) \
@@ -1337,7 +1351,7 @@ impl KnowledgeStore for PgKnowledgeStore {
         Ok(SkillPushOutcome {
             version,
             seq,
-            superseded_concurrent: base_version < cur_live,
+            superseded_concurrent: false,
         })
     }
 
@@ -1622,7 +1636,7 @@ mod tests {
             scope: "global".to_string(),
             project: String::new(),
             name: name.to_string(),
-            version: 0,
+            version: 1,
             files: skill_files(body),
             content_hash: format!("h:{}", body),
             source_agent: "claude".to_string(),
@@ -1632,6 +1646,16 @@ mod tests {
             purged: false,
             seq: 0,
         }
+    }
+
+    fn skill_at(name: &str, body: &str, version: i64) -> SkillRow {
+        SkillRow { version, ..skill(name, body) }
+    }
+
+    #[test]
+    fn skill_version_accepts_the_inclusive_safe_integer_limit() {
+        assert_eq!(checked_skill_version(MAX_SKILL_VERSION, MAX_SKILL_VERSION - 1,
+            MAX_SKILL_VERSION - 1).unwrap(), MAX_SKILL_VERSION);
     }
 
     /// Scenarios shared by the in-memory and Postgres tests. Each assumes an
@@ -1804,63 +1828,42 @@ mod tests {
             assert_eq!(after[0].name, "s1");
         }
 
-        pub async fn push_skill_appends_versions_and_flags_supersede(s: &dyn KnowledgeStore) {
+        pub async fn push_skill_preserves_sealed_version_with_atomic_cas(s: &dyn KnowledgeStore) {
             let p1 = s.push_skill(A, skill("x", "v1"), 0).await.unwrap();
             assert_eq!((p1.version, p1.superseded_concurrent), (1, false));
-            let p2 = s.push_skill(A, skill("x", "v2"), 1).await.unwrap();
-            assert_eq!((p2.version, p2.superseded_concurrent), (2, false));
-            assert!(p2.seq > p1.seq);
-            // Pushed from a stale base → still appended, flagged.
-            let p3 = s.push_skill(A, skill("x", "v3"), 1).await.unwrap();
-            assert_eq!((p3.version, p3.superseded_concurrent), (3, true));
-            // The client's version/seq/deleted are ignored.
-            let mut forged = skill("x", "v4");
-            forged.version = 99;
-            forged.seq = 99_999;
-            forged.deleted = true;
-            let p4 = s.push_skill(A, forged, 3).await.unwrap();
-            assert_eq!((p4.version, p4.superseded_concurrent), (4, false));
-            // A tombstone doesn't count as live: cur_live stays 4.
+            // Both an exact retry and freshly sealed/different bytes are conflicts.
+            for body in ["v1", "new nonce"] {
+                assert!(matches!(s.push_skill(A, skill("x", body), 0).await,
+                    Err(KnowledgeError::VersionConflict { current_version: 1 })));
+            }
+            assert_eq!(s.pull_skills(A, 0, 100).await.unwrap().len(), 1);
+            let mut v2 = skill_at("x", "v2", 2);
+            v2.seq = 9999;
+            v2.deleted = true;
+            let p2 = s.push_skill(A, v2, 1).await.unwrap();
+            assert_eq!(p2.version, 2);
+            assert_eq!(p2.seq, p1.seq + 1, "conflicts must not allocate sequence numbers");
             let d = s.delete_skill(A, "global", "", "x").await.unwrap();
-            assert_eq!(d.version, 5);
-            let p6 = s.push_skill(A, skill("x", "v6"), 4).await.unwrap();
-            assert_eq!((p6.version, p6.superseded_concurrent), (6, false));
-            // Base 5 (the tombstone) is older than live v6 → flagged.
-            let p7 = s.push_skill(A, skill("x", "v7"), 5).await.unwrap();
-            assert_eq!((p7.version, p7.superseded_concurrent), (7, true));
-            let p8 = s.push_skill(A, skill("x", "v8"), 0).await.unwrap();
-            assert_eq!((p8.version, p8.superseded_concurrent), (8, true));
-            // Keys are independent (name, project, account).
-            assert_eq!(
-                s.push_skill(A, skill("y", "v1"), 0).await.unwrap().version,
-                1
-            );
-            let mut proj = skill("x", "p");
-            proj.scope = "project".into();
-            proj.project = "github.com/x/y".into();
-            assert_eq!(s.push_skill(A, proj, 0).await.unwrap().version, 1);
-            assert_eq!(
-                s.push_skill(B, skill("x", "b"), 0).await.unwrap().version,
-                1
-            );
-            // After purging every version, nothing is live and versions keep growing.
+            assert_eq!(d.version, 3);
+            assert!(matches!(s.push_skill(A, skill_at("x", "stale", 3), 2).await,
+                Err(KnowledgeError::VersionConflict { current_version: 3 })));
             s.purge_skill(A, "global", "", "x", None).await.unwrap();
-            let p9 = s.push_skill(A, skill("x", "v9"), 0).await.unwrap();
-            assert_eq!((p9.version, p9.superseded_concurrent), (9, false));
-            let rows: Vec<SkillRow> = s
-                .pull_skills(A, 0, 500)
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|r| r.name == "x" && r.scope == "global")
-                .collect();
-            let mut versions: Vec<i64> = rows.iter().map(|r| r.version).collect();
-            versions.sort();
-            assert_eq!(versions, (1..=9).collect::<Vec<_>>());
-            let v9 = rows.iter().find(|r| r.version == 9).unwrap();
-            assert!(!v9.deleted);
-            assert_eq!(v9.files, skill_files("v9"));
-            assert_eq!(v9.content_hash, "h:v9");
+            assert!(matches!(s.push_skill(A, skill("x", "reset"), 0).await,
+                Err(KnowledgeError::VersionConflict { current_version: 3 })));
+            let p4 = s.push_skill(A, skill_at("x", "v4", 4), 3).await.unwrap();
+            assert_eq!(p4.version, 4);
+            let rows = s.pull_skills(A, 0, 100).await.unwrap();
+            assert_eq!(rows.len(), 4);
+            assert_eq!(rows.last().unwrap().files, skill_files("v4"));
+            assert!(!rows.last().unwrap().deleted);
+            assert_eq!(s.push_skill(B, skill("x", "other account"), 0).await.unwrap().version, 1);
+            assert_eq!(s.push_skill(A, skill("y", "other name"), 0).await.unwrap().version, 1);
+            for (version, base) in [(0, 0), (2, 0), (1, -1), (1, i64::MAX),
+                (MAX_SKILL_VERSION + 1, MAX_SKILL_VERSION), (i64::MAX, i64::MAX)] {
+                assert!(matches!(s.push_skill(A, skill_at("invalid", "bad", version), base).await,
+                    Err(KnowledgeError::InvalidSkillVersion)));
+            }
+            assert!(s.skill_versions(A, "global", "", "invalid").await.unwrap().is_empty());
         }
 
         pub async fn delete_skill_appends_tombstone(s: &dyn KnowledgeStore) {
@@ -1890,7 +1893,7 @@ mod tests {
 
         pub async fn purge_selected_and_all_versions(s: &dyn KnowledgeStore) {
             for v in 1..=3 {
-                s.push_skill(A, skill("x", &format!("v{v}")), v - 1)
+                s.push_skill(A, skill_at("x", &format!("v{v}"), v), v - 1)
                     .await
                     .unwrap();
             }
@@ -1956,29 +1959,24 @@ mod tests {
             assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
         }
 
-        pub async fn concurrent_skill_pushes_get_distinct_versions(s: Arc<dyn KnowledgeStore>) {
+        pub async fn concurrent_skill_pushes_have_one_cas_winner(s: Arc<dyn KnowledgeStore>) {
             let mut handles = Vec::new();
             for i in 0..10 {
                 let s = s.clone();
                 handles.push(tokio::spawn(async move {
-                    s.push_skill(A, skill("race", &format!("v{i}")), 0)
-                        .await
-                        .unwrap()
+                    s.push_skill(A, skill("race", &format!("v{i}")), 0).await
                 }));
             }
-            let mut versions = Vec::new();
-            let mut seqs = Vec::new();
+            let (mut wins, mut conflicts) = (0, 0);
             for h in handles {
-                let o = h.await.unwrap();
-                versions.push(o.version);
-                seqs.push(o.seq);
+                match h.await.unwrap() {
+                    Ok(out) => { wins += 1; assert_eq!(out.version, 1); },
+                    Err(KnowledgeError::VersionConflict { current_version: 1 }) => conflicts += 1,
+                    other => panic!("unexpected result: {other:?}"),
+                }
             }
-            versions.sort();
-            assert_eq!(versions, (1..=10).collect::<Vec<_>>());
-            seqs.sort();
-            seqs.dedup();
-            assert_eq!(seqs.len(), 10);
-            assert_eq!(s.pull_skills(A, 0, 100).await.unwrap().len(), 10);
+            assert_eq!((wins, conflicts), (1, 9));
+            assert_eq!(s.pull_skills(A, 0, 100).await.unwrap().len(), 1);
         }
 
         /// Concurrent writers on one account while a reader pulls with a
@@ -2045,7 +2043,7 @@ mod tests {
                         if i % 2 == 0 {
                             let name = format!("skill_{w}");
                             let o = s
-                                .push_skill(A, skill(&name, &format!("{i}")), 0)
+                                .push_skill(A, skill_at(&name, &format!("{i}"), (i / 2 + 1) as i64), (i / 2) as i64)
                                 .await
                                 .unwrap();
                             pushed.push((name, o.version));
@@ -2165,7 +2163,7 @@ mod tests {
 
         pub async fn skill_versions_list_newest_first_without_files(s: &dyn KnowledgeStore) {
             for v in 1..=3 {
-                s.push_skill(A, skill("x", &format!("v{v}")), v - 1).await.unwrap();
+                s.push_skill(A, skill_at("x", &format!("v{v}"), v), v - 1).await.unwrap();
             }
             s.delete_skill(A, "global", "", "x").await.unwrap(); // v4: delete marker
             s.purge_skill(A, "global", "", "x", Some(vec![1])).await.unwrap();
@@ -2188,7 +2186,7 @@ mod tests {
 
         pub async fn skill_version_returns_one_version(s: &dyn KnowledgeStore) {
             s.push_skill(A, skill("x", "v1"), 0).await.unwrap();
-            s.push_skill(A, skill("x", "v2"), 1).await.unwrap();
+            s.push_skill(A, skill_at("x", "v2", 2), 1).await.unwrap();
             s.delete_skill(A, "global", "", "x").await.unwrap(); // v3
             s.purge_skill(A, "global", "", "x", Some(vec![1])).await.unwrap();
             let v2 = s.skill_version(A, "global", "", "x", 2).await.unwrap().unwrap();
@@ -2299,7 +2297,7 @@ mod tests {
         delete_blanks_and_is_idempotent,
         pull_is_account_scoped_and_ordered,
         pull_respects_since_and_limit_cap,
-        push_skill_appends_versions_and_flags_supersede,
+        push_skill_preserves_sealed_version_with_atomic_cas,
         delete_skill_appends_tombstone,
         purge_selected_and_all_versions,
         seq_is_global_and_monotonic,
@@ -2313,8 +2311,8 @@ mod tests {
     );
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_skill_pushes_get_distinct_versions() {
-        scenarios::concurrent_skill_pushes_get_distinct_versions(Arc::new(
+    async fn concurrent_skill_pushes_have_one_cas_winner() {
+        scenarios::concurrent_skill_pushes_have_one_cas_winner(Arc::new(
             InMemoryKnowledgeStore::new(),
         ))
         .await;
@@ -2360,9 +2358,9 @@ mod tests {
 
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 #[ignore]
-                async fn concurrent_skill_pushes_get_distinct_versions() {
+                async fn concurrent_skill_pushes_have_one_cas_winner() {
                     let (database, s) = fresh_pg().await;
-                    scenarios::concurrent_skill_pushes_get_distinct_versions(Arc::new(s)).await;
+                    scenarios::concurrent_skill_pushes_have_one_cas_winner(Arc::new(s)).await;
                     database.cleanup().await;
                 }
 
@@ -2402,7 +2400,7 @@ mod tests {
         delete_blanks_and_is_idempotent,
         pull_is_account_scoped_and_ordered,
         pull_respects_since_and_limit_cap,
-        push_skill_appends_versions_and_flags_supersede,
+        push_skill_preserves_sealed_version_with_atomic_cas,
         delete_skill_appends_tombstone,
         purge_selected_and_all_versions,
         seq_is_global_and_monotonic,

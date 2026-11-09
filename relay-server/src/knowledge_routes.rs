@@ -42,7 +42,7 @@ use crate::AppState;
 
 type ErrResp = (StatusCode, Json<Value>);
 
-pub(crate) mod skills_v2;
+pub(crate) mod skills;
 
 /// Byte limit on a `/api/memory/batch` body (also the route's `DefaultBodyLimit`).
 pub(crate) const MEMORY_BATCH_BODY_LIMIT: usize = 2 * 1024 * 1024;
@@ -82,7 +82,10 @@ fn unavailable(e: KnowledgeError) -> ErrResp {
 fn store_result<T>(r: Result<T, KnowledgeError>, ok: impl FnOnce(T) -> Value) -> Result<Value, ErrResp> {
     match r {
         Ok(t) => Ok(ok(t)),
-        Err(e @ (KnowledgeError::IdConflict | KnowledgeError::EncryptionConflict)) => {
+        Err(KnowledgeError::VersionConflict { current_version }) => {
+            Ok(json!({"ok": false, "error": "version_conflict", "current_version": current_version}))
+        }
+        Err(e @ (KnowledgeError::IdConflict | KnowledgeError::EncryptionConflict | KnowledgeError::InvalidSkillVersion)) => {
             Ok(op_err(e.to_string()))
         }
         Err(e @ KnowledgeError::Db(_)) => Err(unavailable(e)),
@@ -589,7 +592,7 @@ fn skill_files_are_encrypted(files: &Value, kid: &str) -> bool {
         let Ok(content) = std::str::from_utf8(&bytes) else {
             return false;
         };
-        valid_envelope(path, kid) && valid_envelope(content, kid)
+        valid_envelope(path, kid) && (content.is_empty() || valid_envelope(content, kid))
     })
 }
 
@@ -695,23 +698,6 @@ async fn apply_skill_op(
             )
         }
     }
-}
-
-/// POST /api/skills/batch {ops:[…]} -> {results:[…]}
-pub async fn skills_batch_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AuthQuery>,
-    body: Body,
-) -> Result<Json<Value>, ErrResp> {
-    let caller = resolve_caller(&state, &headers, query.id.as_deref()).await?;
-    let ops: Vec<SkillOp> = read_batch(body, SKILLS_BATCH_BODY_LIMIT, SKILLS_BATCH_MAX_OPS).await?;
-    let encryption = encryption_state(&state, &caller.work_session_id).await?;
-    let mut results = Vec::with_capacity(ops.len());
-    for op in ops {
-        results.push(apply_skill_op(&state, &caller.work_session_id, &encryption, op).await?);
-    }
-    Ok(Json(json!({ "results": results })))
 }
 
 /// GET /api/skills [?since&limit] -> {skills:[…]}
@@ -835,10 +821,10 @@ mod tests {
         Router::new()
             .route("/api/memory/batch", post(memory_batch_handler))
             .route("/api/memory", get(memory_pull_handler))
-            .route("/api/skills/batch", post(skills_batch_handler))
-            .route("/api/skills", get(skills_pull_handler))
+            .route("/api/skills/batch", post(skills::batch_handler))
+            .route("/api/skills", get(skills::pull_handler))
             .route("/api/skills/versions", get(skill_versions_handler))
-            .route("/api/skills/version", get(skill_version_handler))
+            .route("/api/skills/version", get(skills::version_handler))
             .with_state(state)
     }
 
@@ -888,7 +874,8 @@ mod tests {
             "scope": "global",
             "project": "",
             "name": name,
-            "version": 0,
+            "version": 1,
+            "files_encoding": "base64",
             "files": files,
             "content_hash": "h",
             "source_agent": "claude",
@@ -1651,7 +1638,7 @@ mod tests {
                     let (_, response) = prod_post_json(
                         &app, "/api/skills/batch?id=atem-binary", &session,
                         json!({"ops": [{
-                            "op": "rewrite", "scope": "global", "old_project": "", "project": "",
+                            "op": "rewrite", "files_encoding": "base64", "scope": "global", "old_project": "", "project": "",
                             "name": "binary", "version": 1, "content_hash": "h",
                             "files": {"SKILL.md": b64("# Binary skill"), path: binary}
                         }]}),
@@ -1729,6 +1716,7 @@ mod tests {
 
         for (base_version, body) in [(0, "skill v1"), (1, "skill v2")] {
             let mut skill = sample_skill("migrate", json!({"SKILL.md": b64(body)}));
+            skill["version"] = json!(base_version + 1);
             skill["scope"] = json!("project");
             skill["project"] = json!("project-x");
             skill["content_hash"] = json!(format!("hash-{body}"));
@@ -1811,12 +1799,12 @@ mod tests {
             &session,
             json!({"ops": [
                 {
-                    "op": "rewrite", "scope": "project", "old_project": "project-x",
+                    "op": "rewrite", "files_encoding": "base64", "scope": "project", "old_project": "project-x",
                     "name": "migrate", "version": 1, "project": encrypted_project,
                     "files": encrypted_files('1'), "content_hash": hash('c')
                 },
                 {
-                    "op": "rewrite", "scope": "project", "old_project": "project-x",
+                    "op": "rewrite", "files_encoding": "base64", "scope": "project", "old_project": "project-x",
                     "name": "migrate", "version": 2, "project": encrypted_project,
                     "files": encrypted_files('2'), "content_hash": hash('d')
                 }
@@ -1917,12 +1905,12 @@ mod tests {
             &session,
             json!({"ops": [
                 {
-                    "op": "rewrite", "scope": "project", "old_project": encrypted_project,
+                    "op": "rewrite", "files_encoding": "base64", "scope": "project", "old_project": encrypted_project,
                     "name": "migrate", "version": 1, "project": "project-x",
                     "files": {"SKILL.md": b64("skill v1")}, "content_hash": "hash-skill v1"
                 },
                 {
-                    "op": "rewrite", "scope": "project", "old_project": encrypted_project,
+                    "op": "rewrite", "files_encoding": "base64", "scope": "project", "old_project": encrypted_project,
                     "name": "migrate", "version": 2, "project": "project-x",
                     "files": {"SKILL.md": b64("skill v2")}, "content_hash": "hash-skill v2"
                 }
@@ -2047,7 +2035,7 @@ mod tests {
     // ─────────────────────────── skills batch ───────────────────────────
 
     #[tokio::test]
-    async fn skill_push_pull_and_supersede() {
+    async fn skill_push_pull_and_version_conflict() {
         let (state, sess) = test_state("ws-1").await;
         let app = app(state);
         let files = json!({"SKILL.md": b64("# hi")});
@@ -2068,7 +2056,7 @@ mod tests {
         assert_eq!(r1["results"][0]["version"], 1);
         assert_eq!(r1["results"][0]["superseded_concurrent"], false);
 
-        // Stale base_version → still applied, flagged.
+        // A replay conflicts without writing another sealed version.
         let push2 = json!({ "ops": [{"op": "push", "skill": sample_skill("x", files.clone()), "base_version": 0}] });
         let r2 = body_json(
             app.clone()
@@ -2082,8 +2070,7 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(r2["results"][0]["version"], 2);
-        assert_eq!(r2["results"][0]["superseded_concurrent"], true);
+        assert_eq!(r2["results"][0], json!({"ok": false, "error": "version_conflict", "current_version": 1}));
 
         let pulled = body_json(
             app.oneshot(req("GET", "/api/skills?id=a", &sess, ""))
@@ -2092,7 +2079,7 @@ mod tests {
         )
         .await;
         let rows = pulled["skills"].as_array().unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["files"], files);
     }
 
@@ -2141,9 +2128,9 @@ mod tests {
             ))
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let results = body_json(resp).await;
-        assert_eq!(results["results"][0]["ok"], false);
-        assert_eq!(results["results"][0]["error"], "invalid base64");
+        assert_eq!(results["error"], "invalid skill files encoding");
     }
 
     #[tokio::test]
@@ -2260,9 +2247,10 @@ mod tests {
     async fn skill_purge_all() {
         let (state, sess) = test_state("ws-1").await;
         let app = app(state);
-        for body in ["v1", "v2"] {
-            let files = json!({"SKILL.md": b64(body)});
-            let push = json!({ "ops": [{"op": "push", "skill": sample_skill("x", files), "base_version": 0}] });
+        for (base, body) in ["v1", "v2"].into_iter().enumerate() {
+            let mut skill = sample_skill("x", json!({"SKILL.md": b64(body)}));
+            skill["version"] = json!(base + 1);
+            let push = json!({ "ops": [{"op": "push", "skill": skill, "base_version": base}] });
             app.clone()
                 .oneshot(req(
                     "POST",
@@ -2432,8 +2420,10 @@ mod tests {
         assert_eq!(v["results"][0]["ok"], true, "{v}");
     }
 
-    fn push_op(name: &str, body: &str) -> Value {
-        json!({"op": "push", "skill": sample_skill(name, json!({"SKILL.md": b64(body)})), "base_version": 0})
+    fn push_op(name: &str, body: &str, base: i64) -> Value {
+        let mut skill = sample_skill(name, json!({"SKILL.md": b64(body)}));
+        skill["version"] = json!(base + 1);
+        json!({"op": "push", "skill": skill, "base_version": base})
     }
 
     const X_KEY: &str = "scope=global&project=&name=x";
@@ -2443,8 +2433,8 @@ mod tests {
         let (state, sess) = test_state("ws-1").await;
         let sess2 = bind_session(&state, "ws-2").await;
         let app = app(state);
-        skill_op(&app, &sess, push_op("x", "v1")).await;
-        skill_op(&app, &sess, push_op("x", "v2")).await;
+        skill_op(&app, &sess, push_op("x", "v1", 0)).await;
+        skill_op(&app, &sess, push_op("x", "v2", 1)).await;
         skill_op(&app, &sess, json!({"op": "delete", "scope": "global", "project": "", "name": "x"})).await;
         skill_op(&app, &sess, json!({"op": "purge", "scope": "global", "project": "", "name": "x", "versions": [1]})).await;
         let (st, v) = call(&app, "GET", &format!("/api/skills/versions?id=a&{X_KEY}"), &sess, None).await;
@@ -2469,8 +2459,8 @@ mod tests {
         let (state, sess) = test_state("ws-1").await;
         let sess2 = bind_session(&state, "ws-2").await;
         let app = app(state);
-        skill_op(&app, &sess, push_op("x", "v1")).await;
-        skill_op(&app, &sess, push_op("x", "v2")).await;
+        skill_op(&app, &sess, push_op("x", "v1", 0)).await;
+        skill_op(&app, &sess, push_op("x", "v2", 1)).await;
         skill_op(&app, &sess, json!({"op": "delete", "scope": "global", "project": "", "name": "x"})).await;
         skill_op(&app, &sess, json!({"op": "purge", "scope": "global", "project": "", "name": "x", "versions": [1]})).await;
         let get = |v: i64| format!("/api/skills/version?id=a&{X_KEY}&version={v}");
