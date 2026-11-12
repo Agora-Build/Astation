@@ -1791,6 +1791,60 @@ private final class SessionTerminalFixture {
 }
 
 final class AtemSessionTerminalTests: XCTestCase {
+    func testViewOnlyRestoreWaitsThroughHoldAndResumesWithoutTakingControl() throws {
+        let f = SessionTerminalFixture()
+        try f.protocolFixture.handshake(permissions: ["view"], remaining: 240_000)
+        try f.protocolFixture.snapshot()
+        f.terminal.open(preferredTerminalId: sessionID)
+        try f.receive(.attached(f.session, streamId: "stream"))
+        f.protocolFixture.time = 120
+        f.terminal.checkTimeouts()
+        XCTAssertEqual(f.terminal.phase, .restoring)
+        XCTAssertEqual(f.terminal.stream, f.stream)
+        XCTAssertTrue(f.terminal.status.contains("Waiting for Atem"))
+        try f.receive(.frame(RemoteTerminalFrame(stream: f.stream, offset: 0,
+            bytes: Data("resumed screen".utf8).base64EncodedString(), reset: true, complete: true, rows: 40, cols: 120)))
+        f.terminal.consumed(try XCTUnwrap(f.rendered.last).1)
+        XCTAssertEqual(f.terminal.phase, .viewing)
+        XCTAssertEqual(f.terminal.acknowledgedOffset, 14)
+        XCTAssertTrue(f.terminal.status.contains("view-only"))
+        XCTAssertFalse(f.terminal.canInput)
+        XCTAssertFalse(f.protocolFixture.sent.contains { $0.op == "acquire" })
+        XCTAssertEqual(f.sent.filter { if case .bound(.subscribe, _) = $0 { return true }; return false }.count, 1)
+        f.protocolFixture.source = nil
+        f.terminal.connectionChanged()
+        XCTAssertEqual(f.terminal.phase, .offline)
+    }
+
+    func testViewOnlyStillTimesOutMissingAttachAndControlCapableRestore() throws {
+        for permissions in [["view"], ["view", "control"]] {
+            let f = SessionTerminalFixture()
+            try f.protocolFixture.handshake(permissions: permissions)
+            try f.protocolFixture.snapshot()
+            f.terminal.open(preferredTerminalId: sessionID)
+            if permissions.contains("control") { try f.receive(.attached(f.session, streamId: "stream")) }
+            f.protocolFixture.time = 16
+            f.terminal.checkTimeouts()
+            XCTAssertEqual(f.terminal.phase, .failed)
+            XCTAssertTrue(f.terminal.status.contains("timed out"))
+        }
+    }
+
+    func testDisconnectDuringViewOnlyHoldClosesTheSubscription() throws {
+        let f = SessionTerminalFixture()
+        try f.protocolFixture.handshake(permissions: ["view"])
+        try f.protocolFixture.snapshot()
+        f.terminal.open(preferredTerminalId: sessionID)
+        try f.receive(.attached(f.session, streamId: "stream"))
+        f.protocolFixture.time = 20
+        f.terminal.checkTimeouts()
+        f.protocolFixture.source = nil
+        f.terminal.connectionChanged()
+        XCTAssertEqual(f.terminal.phase, .offline)
+        XCTAssertNil(f.terminal.stream)
+        XCTAssertFalse(f.terminal.canInput)
+    }
+
     func testSelectingAnotherSessionAutomaticallyViewsItAndReleasesPreviousControl() throws {
         let f = SessionTerminalFixture()
         try f.viewing(); try f.control()
@@ -2164,6 +2218,68 @@ final class AtemR9PresentationTests: XCTestCase {
         }
         try event(f, "history_end", 8, fields: ["page_id": second, "page": page(2, selector: "before")])
         XCTAssertEqual(f.client.chatSnapshot(f.target)?.messages.compactMap(\.messageId), ["m1", "m2", "m3", "m4", "m5"])
+    }
+
+    func testRecoveredPredecessorArrivingOnOlderPageReordersItsWholeChain() throws {
+        let f = SessionFixture(); try f.ready()
+        try event(f, "opened", 0, fields: ["status": ["state": "ready", "since": 1_760_500_000_000]])
+        try event(f, "message", 1, fields: message("m5", text: "last", history: true))
+        try event(f, "history_end", 2, fields: ["page": page(1)])
+        var first = message("r1", text: "recovered", history: true)
+        first["after_message_id"] = "m2"
+        try event(f, "message", 3, fields: first)
+        var second = message("r2", text: "chained", history: true)
+        second["after_message_id"] = "r1"
+        try event(f, "message", 4, fields: second)
+        try event(f, "message", 5, fields: message("r1", text: "new whole message"))
+        XCTAssertEqual(f.client.chatSnapshot(f.target)?.messages.compactMap(\.messageId), ["r1", "r2", "m5"])
+        let pageID = try XCTUnwrap(f.client.chatHistory(f.target, before: "m5"))
+        for (offset, id) in ["m2", "m3", "m4"].enumerated() {
+            var older = message(id, text: "older", history: true); older["page_id"] = pageID
+            try event(f, "message", UInt64(6 + offset), fields: older)
+        }
+        try event(f, "history_end", 9, fields: ["page_id": pageID, "page": page(3, selector: "before")])
+        let view = try XCTUnwrap(f.client.chatSnapshot(f.target))
+        XCTAssertEqual(view.messages.compactMap(\.messageId), ["m2", "r1", "r2", "m3", "m4", "m5"])
+        XCTAssertEqual(view.messages.first { $0.messageId == "r1" }?.parts?.first?.markdown, "new whole message")
+        XCTAssertEqual(view.reopens, 0)
+    }
+
+    func testRecoveredChainsResolveWhenTheirAnchorArrivesLiveAndCyclesStayBounded() throws {
+        let f = SessionFixture(); try f.ready()
+        try event(f, "opened", 0, fields: ["status": ["state": "ready", "since": 1_760_500_000_000]])
+        try event(f, "history_end", 1, fields: ["page": page(0)])
+        for (offset, pair) in [("r2", "r1"), ("r1", "m1"), ("cycle1", "cycle2"), ("cycle2", "cycle1")].enumerated() {
+            var recovered = message(pair.0, text: pair.0, history: true)
+            recovered["after_message_id"] = pair.1
+            try event(f, "message", UInt64(2 + offset), fields: recovered)
+        }
+        try event(f, "message", 6, fields: message("m1", text: "anchor"))
+        let view = try XCTUnwrap(f.client.chatSnapshot(f.target))
+        XCTAssertEqual(view.messages.compactMap(\.messageId), ["cycle1", "cycle2", "m1", "r1", "r2"])
+        XCTAssertFalse(view.closed)
+        XCTAssertEqual(view.reopens, 0)
+    }
+
+    func testRecoveredOlderAnchorNeverMovesTheNewestFiftyMessagesBackInTime() throws {
+        let f = SessionFixture(); try f.ready()
+        try event(f, "opened", 0, fields: ["status": ["state": "ready", "since": 1_760_500_000_000]])
+        try event(f, "message", 1, fields: message("m5", text: "initial", history: true))
+        try event(f, "history_end", 2, fields: ["page": page(1)])
+        var recovered = message("r", text: "recovered", history: true)
+        recovered["after_message_id"] = "m2"
+        try event(f, "message", 3, fields: recovered)
+        for index in 6...65 { try event(f, "message", UInt64(index - 2), fields: message("m\(index)", text: "live")) }
+        let pageID = try XCTUnwrap(f.client.chatHistory(f.target, before: "m5"))
+        for (offset, id) in ["m2", "m3", "m4"].enumerated() {
+            var older = message(id, text: "older", history: true); older["page_id"] = pageID
+            try event(f, "message", UInt64(64 + offset), fields: older)
+        }
+        try event(f, "history_end", 67, fields: ["page_id": pageID, "page": page(3, selector: "before")])
+        let snapshot = try XCTUnwrap(f.client.chatSnapshot(f.target))
+        XCTAssertEqual(snapshot.messages.compactMap(\.messageId), (16...65).map { "m\($0)" })
+        XCTAssertTrue(snapshot.locally_truncated)
+        XCTAssertEqual(snapshot.reopens, 0)
     }
 
     func testOverlappingHistoryUsesExistingAnchorsToFillMultipleGaps() throws {

@@ -259,6 +259,33 @@ final class RemoteTerminalControllerTests: XCTestCase {
         }
     }
 
+    func testResetReplacesPartialRestoreWithoutDiscardingRenderCredit() {
+        let f = TerminalFixture()
+        f.start()
+        let bytes = Data(repeating: 65, count: 16 * 1024)
+        // Render more than one credit window, but never receive complete:true.
+        for index in 0..<10 {
+            f.frame(bytes: bytes, offset: UInt64(index * bytes.count), reset: index == 0, complete: false)
+            if index < 8 { f.consume() }
+        }
+        let pendingToken = f.rendered.last!.1
+        let resetOffset = UInt64(10 * bytes.count)
+        f.frame(bytes: Data("replacement".utf8), offset: resetOffset, reset: true)
+        XCTAssertEqual(f.controller.phase, .restoring)
+        XCTAssertEqual(f.controller.queuedBytes, 2 * bytes.count + 11)
+        XCTAssertEqual(f.controller.acknowledgedOffset, UInt64(8 * bytes.count))
+        f.controller.consumed(pendingToken)
+        f.controller.consumed(pendingToken)
+        XCTAssertEqual(f.controller.acknowledgedOffset, UInt64(9 * bytes.count))
+        f.consume()
+        XCTAssertTrue(f.rendered.last!.0.reset)
+        XCTAssertEqual(f.controller.phase, .restoring)
+        f.consume()
+        XCTAssertEqual(f.controller.phase, .viewing)
+        XCTAssertEqual(f.controller.acknowledgedOffset, resetOffset + 11)
+        XCTAssertEqual(f.controller.queuedBytes, 0)
+    }
+
     func testSlowRendererCannotExceedHostCreditWindow() {
         let f = TerminalFixture()
         f.start()
@@ -270,6 +297,27 @@ final class RemoteTerminalControllerTests: XCTestCase {
         XCTAssertEqual(f.controller.phase, .failed)
         XCTAssertEqual(f.controller.queuedBytes, 0)
         XCTAssertTrue(f.acks.isEmpty)
+    }
+
+    func testResetStartsAFreshTransactionButNeverBypassesItsByteLimit() {
+        for reset in [false, true] {
+            let f = TerminalFixture()
+            f.start()
+            let bytes = Data(repeating: 65, count: 16 * 1024)
+            for index in 0..<64 {
+                f.frame(bytes: bytes, offset: UInt64(index * bytes.count), reset: index == 0, complete: false)
+                f.consume()
+            }
+            f.frame(bytes: bytes, offset: 1024 * 1024, reset: reset)
+            if reset {
+                f.consume()
+                XCTAssertEqual(f.controller.phase, .viewing)
+                XCTAssertEqual(f.controller.acknowledgedOffset, 1024 * 1024 + UInt64(bytes.count))
+            } else {
+                XCTAssertEqual(f.controller.phase, .failed)
+                XCTAssertTrue(f.controller.status.contains("limits"))
+            }
+        }
     }
 
     func testControlLeaseAndWrittenAcknowledgmentHaveSeparateMeaning() {

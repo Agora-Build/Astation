@@ -474,6 +474,7 @@ final class RemoteTerminalController {
             attachSince = nil
             phase = session?.exitStatus == nil ? .viewing : .exited
             status = phase == .exited ? "Agent exited. Showing its final screen."
+                : sessionClient?.welcome?.permissions?.contains("control") == false ? "Viewing. This connection has view-only permission."
                 : sessionClient != nil || session?.supportsExpiringControl == true ? "Viewing. Take Control to type in this terminal."
                 : "Viewing. Update Atem to enable control with expiring session leases."
             changed()
@@ -506,7 +507,15 @@ final class RemoteTerminalController {
             } else { status = "The session list did not respond. The current terminal remains open." }
             changed()
         }
-        if let since = attachSince, time - since >= 15 { fail("Terminal restore timed out. Choose View to try again.") }
+        if let since = attachSince, time - since >= 15 {
+            // A framed turn may withhold even the initial snapshot from a
+            // view-only attachment. Its subscription remains valid until reset.
+            if phase == .restoring, stream != nil, sessionClient?.phase == .ready,
+               let permissions = sessionClient?.welcome?.permissions, !permissions.contains("control") {
+                let waiting = "Waiting for Atem to share the terminal screen..."
+                if status != waiting { status = waiting; changed() }
+            } else { fail("Terminal restore timed out. Choose View to try again.") }
+        }
         if let since = rendering?.since, time - since >= 15 { fail("Terminal rendering timed out. Choose View to try again.") }
         if let since = controlSince, time - since >= 8 { fail("Control request timed out. Choose View to reconnect safely.") }
         if let oldest = pendingWrites.values.min(), time - oldest >= 10 {
@@ -525,7 +534,9 @@ final class RemoteTerminalController {
         }
         if !receivedFirstFrame && !frame.reset { fail("The terminal restore is missing its initial snapshot."); return }
         if frame.reset {
-            guard !transactionOpen else { fail("Terminal reset interrupted a screen transaction."); return }
+            // A hold can discard the unsent remainder of a transaction. Keep
+            // received frames queued for rendering/ACK, then apply the new reset.
+            transactionBytes = 0
             frameSize = (frame.rows, frame.cols)
         }
         guard frameSize?.rows == frame.rows, frameSize?.cols == frame.cols else {

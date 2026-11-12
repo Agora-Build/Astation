@@ -279,6 +279,33 @@ final class RemoteTerminalRendererTests: XCTestCase {
         XCTAssertEqual(received.count, 1)
     }
 
+    func testResetAfterAnIncompleteTransactionDiscardsParserAndScreenState() async throws {
+        let renderer = RemoteTerminalRenderer()
+        let window = host(renderer)
+        defer { window.close() }
+        await load(renderer)
+        let stream = RemoteTerminalStream(terminalId: "claude", generation: "test", streamId: "stream")
+        let partial = expectation(description: "Partial transaction rendered")
+        renderer.onAction = { action in if case .consumed = action { partial.fulfill() } }
+        let bytes = Data("OLD SCREEN\u{1b}[31".utf8)
+        renderer.render(RemoteTerminalFrame(stream: stream, offset: 0, bytes: bytes.base64EncodedString(),
+            reset: true, complete: false, rows: 10, cols: 60), token: "partial")
+        await fulfillment(of: [partial], timeout: 10)
+        renderer.setControl(true, epoch: "current-lease")
+        let reset = expectation(description: "Replacement snapshot rendered")
+        renderer.onAction = { action in if case .consumed(let token) = action, token == "reset" { reset.fulfill() } }
+        renderer.render(RemoteTerminalFrame(stream: stream, offset: UInt64(bytes.count),
+            bytes: Data("NEW SCREEN".utf8).base64EncodedString(), reset: true, complete: true, rows: 12, cols: 70), token: "reset")
+        await fulfillment(of: [reset], timeout: 10)
+        let result = try await evaluate(renderer, "window.astationTerminal.inspect()")
+        let state = try XCTUnwrap(result as? [String: Any])
+        XCTAssertTrue((state["text"] as? String ?? "").contains("NEW SCREEN"))
+        XCTAssertFalse((state["text"] as? String ?? "").contains("OLD SCREEN"))
+        XCTAssertEqual(state["rows"] as? Int, 12)
+        XCTAssertEqual(state["cols"] as? Int, 70)
+        XCTAssertEqual(state["enabled"] as? Bool, true)
+    }
+
     func testNewStreamDiscardsOldScreenAndResetsControl() async throws {
         let renderer = RemoteTerminalRenderer()
         let window = host(renderer)

@@ -69,13 +69,16 @@ struct AccountKeychainDataStorage: AccountDataStorage {
 }
 
 final class AstationAccountAuth: Sendable {
+    typealias Authorize = @MainActor @Sendable (AccountOIDCClient, Bool) async throws -> AccountLoginSession
     let configuration: AccountOIDCConfiguration?
     private let client: AccountOIDCClient?
     private let provider: AccountTokenProvider?
+    private let authorize: Authorize
 
     init(environment: [String: String] = ProcessInfo.processInfo.environment,
          info: [String: Any] = Bundle.main.infoDictionary ?? [:], storage: AccountSessionStorage = AccountKeychainStorage(),
          defaults: UserDefaults = .standard) {
+        authorize = { client, fresh in try await Self.authorizeInBrowser(client: client, fresh: fresh) }
         func value(_ env: String, _ key: String) -> String? { environment[env] ?? defaults.string(forKey: key) ?? info[key] as? String }
         let settings = try? AccountServiceSettings.load(defaults: defaults, environment: environment, info: info)
         if let clientID = settings?.clientID,
@@ -91,8 +94,12 @@ final class AstationAccountAuth: Sendable {
     }
 
     init(configuration: AccountOIDCConfiguration, storage: AccountSessionStorage,
-         http: AccountOIDCHTTP = AccountURLSessionHTTP()) {
+         http: AccountOIDCHTTP = AccountURLSessionHTTP(),
+         authorize: @escaping Authorize = { client, fresh in
+             try await AstationAccountAuth.authorizeInBrowser(client: client, fresh: fresh)
+         }) {
         self.configuration = configuration
+        self.authorize = authorize
         let oidc = AccountOIDCClient(configuration: configuration, http: http)
         client = oidc
         provider = AccountTokenProvider(configuration: configuration, client: oidc, storage: storage)
@@ -131,19 +138,23 @@ final class AstationAccountAuth: Sendable {
         guard let client, let provider else { throw AccountLoginError.configuration }
         let generation = try await provider.beginLogin()
         do {
-            let attempt = try AccountLoginAttempt()
-            let listener = try await AccountLoopbackListener.bind(attempt: attempt)
-            let session: AccountLoginSession
-            do {
-                let redirect = "http://127.0.0.1:\(listener.port)/callback"
-                let url = try await client.authorizationURL(attempt: attempt, redirectURI: redirect, fresh: fresh)
-                guard NSWorkspace.shared.open(url) else { throw AccountLoginError.unavailable }
-                let code = try await listener.code()
-                session = try await client.exchange(code: code, attempt: attempt, redirectURI: redirect)
-            } catch { await listener.close(); throw error }
-            await listener.close()
+            let session = try await authorize(client, fresh)
             try await provider.finishLogin(session, attempt: generation)
         } catch { await provider.cancelLogin(generation); throw error }
+    }
+
+    @MainActor static func authorizeInBrowser(client: AccountOIDCClient, fresh: Bool) async throws -> AccountLoginSession {
+        let attempt = try AccountLoginAttempt()
+        let listener = try await AccountLoopbackListener.bind(attempt: attempt)
+        do {
+            let redirect = "http://127.0.0.1:\(listener.port)/callback"
+            let url = try await client.authorizationURL(attempt: attempt, redirectURI: redirect, fresh: fresh)
+            guard NSWorkspace.shared.open(url) else { throw AccountLoginError.unavailable }
+            let code = try await listener.code()
+            let session = try await client.exchange(code: code, attempt: attempt, redirectURI: redirect)
+            await listener.close()
+            return session
+        } catch { await listener.close(); throw error }
     }
 }
 

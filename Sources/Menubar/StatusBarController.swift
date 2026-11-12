@@ -451,7 +451,9 @@ class StatusBarController: NSObject, NSMenuDelegate {
         statusMenu.addItem(NSMenuItem.separator())
 
         let acctTitle = hubManager.accountSignInInProgress ? "Signing in to Agora.Build..."
-            : hubManager.signedInAccount.map { "Agora.Build (\($0))..." } ?? "Sign in to Agora.Build..."
+            : hubManager.needsAccountSignIn
+                ? (hubManager.signedInAccount == nil ? "Sign in to Agora.Build..." : "Sign in again to Agora.Build...")
+                : hubManager.signedInAccount.map { "Agora.Build (\($0))..." } ?? "Sign in to Agora.Build..."
         let acctItem = NSMenuItem(title: acctTitle, action: #selector(openAccount), keyEquivalent: "")
         acctItem.target = self
         acctItem.isEnabled = !hubManager.accountSignInInProgress
@@ -836,14 +838,18 @@ class StatusBarController: NSObject, NSMenuDelegate {
 
     @objc private func openAccount() {
         guard !hubManager.accountSignInInProgress else { return }
-        if hubManager.signedInAccount != nil {
+        if !hubManager.needsAccountSignIn {
             settingsWindowController.showAccount()
             return
         }
         Task { @MainActor [weak self] in
             guard let self, !hubManager.accountSignInInProgress else { return }
             defer { setupMenu() }
-            do { try await hubManager.signInAccount() }
+            do {
+                if hubManager.signedInAccount != nil, !hubManager.accountSignInRequired {
+                    try await hubManager.prepareAccountSecurityAccess()
+                } else { try await hubManager.signInAccount() }
+            }
             catch {
                 guard !(error is CancellationError), error as? AccountLoginError != .cancelled else { return }
                 let alert = NSAlert()
