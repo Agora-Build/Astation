@@ -63,6 +63,7 @@ class AstationHubManager: ObservableObject {
     }
     private var stationRegistration: StationRegistrationContext?
     private var stationRegistrationPending: StationRegistrationContext?
+    private var stationRegistrationGeneration = UUID()
     private var stationRegistrationWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
     private var configuredStationOrigin: String
     private var stationRouteAccountDuringTransition: String?
@@ -111,7 +112,7 @@ class AstationHubManager: ObservableObject {
         guard let owner = signedInAccount ?? primary?.session.subject ?? station?.session.subject else {
             throw AccountLoginError.signInRequired
         }
-        guard [signedInAccount, primary?.session.subject, station?.session.subject]
+        guard [signedInAccount, primary?.session.subject]
             .compactMap({ $0 }).allSatisfy({ $0 == owner }) else { throw AccountLoginError.changed }
         var repairedPortal = false
         defer {
@@ -138,7 +139,13 @@ class AstationHubManager: ObservableObject {
             repairedPortal = true
             NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
         }
-        do { _ = try await auth.accessToken(relayURL: origin) }
+        do {
+            if let station, station.session.subject != owner {
+                invalidateStationRegistration()
+                throw AccountLoginError.signInRequired
+            }
+            _ = try await auth.accessToken(relayURL: origin)
+        }
         catch AccountLoginError.signInRequired {
             guard epoch == accountGeneration, origin == stationRelayUrl else { throw AccountLoginError.changed }
             stationAccountSignInRequired = true
@@ -3488,17 +3495,22 @@ class AstationHubManager: ObservableObject {
     }
 
     private func registerRelayAccountIfPossible() {
-        guard identityRelayVerified, let owner = signedInAccount, !accountSignInRequired else { return }
+        guard identityRelayVerified, let owner = signedInAccount, !accountSignInRequired,
+              !accountSignInInProgress else { return }
         let generation = identityRelaySocketGeneration
         let accountEpoch = accountGeneration
         let relayURL = stationRelayUrl
         let context = StationRegistrationContext(socket: generation, account: accountEpoch, origin: relayURL)
         guard stationRegistration != context, stationRegistrationPending == nil else { return }
         stationRegistrationPending = context
+        // Reauthorization can supersede a task on the same socket and account.
+        let registration = UUID()
+        stationRegistrationGeneration = registration
         let auth = accountAuth
         Task { [weak self] in
             guard let self else { return }
             do {
+                guard try await auth.current()?.session.subject == owner else { throw AccountLoginError.signInRequired }
                 let token = try await auth.accessToken(relayURL: relayURL)
                 guard try await auth.current()?.session.subject == owner else { throw AccountLoginError.changed }
                 let rawLabel = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
@@ -3509,6 +3521,7 @@ class AstationHubManager: ObservableObject {
                 ) else { throw AccountLoginError.invalidResponse }
                 await MainActor.run {
                     guard self.identityRelaySocketGeneration == generation, self.accountGeneration == accountEpoch,
+                          self.stationRegistrationGeneration == registration,
                           self.stationRelayUrl == relayURL, self.identityRelayVerified,
                           self.signedInAccount == owner, self.stationRegistrationPending == context else { return }
                     self.stationAccountSignInRequired = false
@@ -3518,6 +3531,7 @@ class AstationHubManager: ObservableObject {
                 Log.debug("[RelayAccount] Registration deferred: \(error.localizedDescription)")
                 await MainActor.run {
                     guard self.identityRelaySocketGeneration == generation, self.accountGeneration == accountEpoch,
+                          self.stationRegistrationGeneration == registration,
                           self.stationRelayUrl == relayURL else { return }
                     self.stationRegistrationPending = nil
                     if error as? AccountLoginError == .signInRequired {
@@ -3539,6 +3553,7 @@ class AstationHubManager: ObservableObject {
     }
 
     private func invalidateStationRegistration() {
+        stationRegistrationGeneration = UUID()
         stationRegistration = nil; stationRegistrationPending = nil
         finishStationRegistration(.failure(AccountLoginError.changed))
     }

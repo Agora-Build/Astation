@@ -273,9 +273,36 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
         let fixture = try StationAccountFixture(stationSubject: "other-owner"); defer { fixture.cleanup() }
         fixture.hub.refreshProjects()
         try await waitUntil { fixture.hub.signedInAccount == "test-owner" }
-        do { try await fixture.hub.prepareAccountSecurityAccess(); XCTFail("another owner admitted account security") }
-        catch { XCTAssertEqual(error as? AccountLoginError, .changed) }
+        do { try await fixture.hub.prepareAccountSecurityAccess(allowSignIn: false); XCTFail("another owner admitted account security") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .signInRequired) }
+        XCTAssertEqual(fixture.signIns, 0)
         XCTAssertTrue(fixture.sockets.isEmpty)
+    }
+
+    func testMismatchedStationOwnerCanBeCorrectedWithoutSigningOutOfPortal() async throws {
+        let fixture = try StationAccountFixture(stationSubject: "other-owner"); defer { fixture.cleanup() }
+        let saved = try XCTUnwrap(fixture.stationStorage.read())
+        fixture.hub.refreshProjects()
+        try await waitUntil { fixture.hub.signedInAccount == "test-owner" }
+        XCTAssertTrue(fixture.hub.stationAccountSignInRequired)
+        fixture.authorize = {
+            AccountLoginSession(configuration: saved.session.configuration, subject: "test-owner",
+                accessToken: "corrected-station-token", refreshToken: "corrected-refresh", expiresAt: Date().addingTimeInterval(600), authenticatedAt: nil)
+        }
+        fixture.hub.startIdentityRelay()
+        let socket = try XCTUnwrap(fixture.sockets.first)
+        socket.emit(#"{"type":"relayAuthResult","status":"verified"}"#)
+        let pending = Task { try await fixture.hub.prepareAccountSecurityAccess() }
+        try await waitUntil { socket.registrations.count == 1 }
+        socket.emit(#"{"type":"relayAck","for":"relayRegisterAccount","ok":true}"#)
+        try await pending.value
+        XCTAssertEqual(fixture.signIns, 1)
+        XCTAssertEqual(fixture.portalSignIns, 0)
+        XCTAssertEqual(fixture.hub.signedInAccount, "test-owner")
+        XCTAssertFalse(fixture.hub.needsAccountSignIn)
+        XCTAssertTrue(socket.registrations[0].contains("corrected-station-token"))
+        XCTAssertFalse(socket.registrations[0].contains("test-station-token"))
+        XCTAssertFalse(socket.registrations[0].contains("test-portal-token"))
     }
 
     func testCancelledAccessCannotProceedWithAnAlreadyRegisteredAccount() async throws {

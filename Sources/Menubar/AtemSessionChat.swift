@@ -328,6 +328,7 @@ final class AtemSessionChat {
     }
 
     private func reconcileRecoveredMessages(in view: inout View) {
+        guard !view.recoveredAfter.isEmpty else { return }
         // Whole-message updates need not repeat a recovered predecessor. Keep
         // that relationship until older pages supply its missing anchor.
         let retained = Set(view.order)
