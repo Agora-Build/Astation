@@ -100,22 +100,55 @@ class AstationHubManager: ObservableObject {
     @MainActor func prepareAccountSecurityAccess(registrationTimeout: TimeInterval = 15, allowSignIn: Bool = true) async throws {
         try Task.checkCancellation()
         try configureStationAccountAuth()
-        guard let owner = signedInAccount, !accountSignInRequired else { throw AccountLoginError.signInRequired }
         let epoch = accountGeneration, origin = stationRelayUrl, auth = accountAuth
+        guard let portal = portalAuth else { throw AccountLoginError.configuration }
+        let primary = try await portal.current()
+        let station = try await auth.current()
+        try Task.checkCancellation()
+        guard epoch == accountGeneration, origin == stationRelayUrl else { throw AccountLoginError.changed }
+        // A saved Station session can identify the account to recover, but cannot
+        // substitute for a fresh Portal login or authorize a different owner.
+        guard let owner = signedInAccount ?? primary?.session.subject ?? station?.session.subject else {
+            throw AccountLoginError.signInRequired
+        }
+        guard [signedInAccount, primary?.session.subject, station?.session.subject]
+            .compactMap({ $0 }).allSatisfy({ $0 == owner }) else { throw AccountLoginError.changed }
+        var repairedPortal = false
+        defer {
+            if repairedPortal, epoch == accountGeneration, origin == stationRelayUrl, signedInAccount == owner {
+                loadProjects()
+            }
+        }
+        if signedInAccount == nil || accountSignInRequired || primary == nil || primary?.refreshPending == true {
+            projectLoadTask?.cancel()
+            accountSignInRequired = true
+            NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
+            do { _ = try await portal.accessToken() }
+            catch AccountLoginError.signInRequired {
+                guard epoch == accountGeneration, origin == stationRelayUrl else { throw AccountLoginError.changed }
+                try await reauthorizeAccount(portal, owner: owner, allowSignIn: allowSignIn)
+            }
+            try Task.checkCancellation()
+            let recovered = try await portal.current()
+            guard epoch == accountGeneration, origin == stationRelayUrl,
+                  signedInAccount == nil || signedInAccount == owner,
+                  recovered?.session.subject == owner else { throw AccountLoginError.changed }
+            signedInAccount = owner
+            accountSignInRequired = false
+            repairedPortal = true
+            NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
+        }
         do { _ = try await auth.accessToken(relayURL: origin) }
         catch AccountLoginError.signInRequired {
             guard epoch == accountGeneration, origin == stationRelayUrl else { throw AccountLoginError.changed }
             stationAccountSignInRequired = true
             NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
-            guard allowSignIn else { throw AccountLoginError.signInRequired }
-            guard !accountSignInInProgress else { throw AccountLoginError.busy }
-            accountSignInInProgress = true
-            defer { accountSignInInProgress = false }
-            try await auth.signIn()
+            try await reauthorizeAccount(auth, owner: owner, allowSignIn: allowSignIn)
         }
         try Task.checkCancellation()
+        let authorized = try await auth.current()
         guard epoch == accountGeneration, origin == stationRelayUrl, signedInAccount == owner,
-              try await auth.current()?.session.subject == owner else { throw AccountLoginError.changed }
+              authorized?.session.subject == owner else { throw AccountLoginError.changed }
         stationAccountSignInRequired = false
         NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
         let context = StationRegistrationContext(socket: identityRelaySocketGeneration, account: epoch, origin: origin)
@@ -141,6 +174,23 @@ class AstationHubManager: ObservableObject {
         }
         try Task.checkCancellation()
         guard epoch == accountGeneration, origin == stationRelayUrl, signedInAccount == owner else { throw AccountLoginError.changed }
+    }
+
+    @MainActor private func reauthorizeAccount(_ auth: AstationAccountAuth, owner: String, allowSignIn: Bool) async throws {
+        try Task.checkCancellation()
+        guard allowSignIn else { throw AccountLoginError.signInRequired }
+        guard !accountSignInInProgress else { throw AccountLoginError.busy }
+        accountSignInInProgress = true
+        defer { accountSignInInProgress = false }
+        let epoch = accountGeneration, origin = stationRelayUrl
+        try await auth.signIn()
+        try Task.checkCancellation()
+        let recovered = try await auth.current()
+        guard epoch == accountGeneration, origin == stationRelayUrl else { throw AccountLoginError.changed }
+        guard recovered?.session.subject == owner else {
+            try await auth.clearSession()
+            throw AccountLoginError.changed
+        }
     }
 
     @MainActor func prepareVerificationAccount(account: String) async throws {
