@@ -88,19 +88,24 @@
       if (enabled) { term.focus(); measure(); }
     },
     applyFrame(frame, token) {
-      if (displayedStream !== frame.streamId) {
-        // Discard the old emulator and its pending writes across subscriptions.
+      const newStream = displayedStream !== frame.streamId;
+      if (newStream || frame.reset) {
+        // reset() alone retains an unfinished escape/UTF-8 parser sequence.
+        // A replacement snapshot must start with a fresh emulator.
+        const focused = term.textarea === document.activeElement;
         term.dispose();
         document.getElementById('terminal').replaceChildren();
-        enabled = false;
-        epoch = '';
+        if (newStream) { enabled = false; epoch = ''; }
         createTerminal();
         wireInput();
+        term.options.disableStdin = !enabled;
+        term.options.cursorBlink = enabled;
+        if (focused && enabled) term.focus();
         displayedStream = frame.streamId;
       }
       const raw = atob(frame.bytes);
       const bytes = Uint8Array.from(raw, character => character.charCodeAt(0));
-      if (frame.reset) { term.reset(); term.resize(frame.cols, frame.rows); }
+      if (frame.reset) term.resize(frame.cols, frame.rows);
       term.write(bytes, () => post('consumed', { token }));
     },
     paste(text, expectedEpoch, submit = false) {

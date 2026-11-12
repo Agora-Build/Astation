@@ -63,7 +63,9 @@ final class AccountSettingsViewController: NSViewController {
                 identity.stringValue = record.map { $0.session.subject } ?? "Not signed in"
                 status.stringValue = record?.refreshPending == true
                     ? "The last token refresh was interrupted. Sign in again to continue safely."
-                    : record == nil ? "Sign in using your browser." : "Account credentials are saved in this device's Keychain."
+                    : record == nil ? "Sign in using your browser."
+                    : hub.stationAccountSignInRequired ? "Sign in again to authorize the selected Station. Your Agora.Build account is still signed in."
+                    : "Account credentials are saved in this device's Keychain."
                 status.textColor = .secondaryLabelColor
                 signIn.title = record == nil ? "Sign in to Agora.Build" : "Sign in again"
                 signIn.isEnabled = auth?.configuration != nil; signOut.isEnabled = record != nil
@@ -81,7 +83,9 @@ final class AccountSettingsViewController: NSViewController {
         status.stringValue = "Continue sign-in in your browser..."; status.textColor = .secondaryLabelColor
         loginTask = Task { @MainActor in
             do {
-                try await hub.signInAccount()
+                if hub.signedInAccount != nil, !hub.accountSignInRequired, hub.stationAccountSignInRequired {
+                    try await hub.prepareAccountSecurityAccess()
+                } else { try await hub.signInAccount() }
                 guard loginAuth === context else { return }
                 busy = false; refresh()
             }

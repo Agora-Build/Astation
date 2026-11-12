@@ -23,7 +23,12 @@ private final class StationTestCache: AccountDataStorage {
 }
 
 private struct StationTestHTTP: AccountOIDCHTTP {
+    var tokenStatus = 400
     func send(_ request: URLRequest) async throws -> (Data, Int) {
+        if request.url?.path == "/.well-known/openid-configuration" {
+            return (Data(#"{"issuer":"https://auth.example","authorization_endpoint":"https://auth.example/authorize","token_endpoint":"https://auth.example/token","jwks_uri":"https://auth.example/jwks"}"#.utf8), 200)
+        }
+        if request.url?.path == "/token" { return (Data(#"{"error":"invalid_grant"}"#.utf8), tokenStatus) }
         let body = request.url?.path == "/api/v1/connections"
             ? #"{"agora":{"ready":true,"connected":true}}"# : #"{"projects":[]}"#
         return (Data(body.utf8), 200)
@@ -57,8 +62,11 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
     let pairingSocket = StationTestSocket()
     var pairingURLs: [URL] = []
     var hub: AstationHubManager!
+    let stationStorage: StationTestSession
+    var signIns = 0
+    var authorize: (() async throws -> AccountLoginSession)?
 
-    init(stationSubject: String = "test-owner", origin: String = "https://station-tests.example") throws {
+    init(stationSubject: String = "test-owner", origin: String = "https://station-tests.example", tokenStatus: Int = 400) throws {
         self.origin = origin
         defaults = UserDefaults(suiteName: suite)!
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -67,11 +75,17 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
         let portalConfig = try settings.oidcConfiguration
         let stationConfig = try AccountOIDCConfiguration(issuer: settings.issuer, clientID: settings.clientID,
             resource: origin, requiredScope: "astation.remote")
-        let http = StationTestHTTP()
+        let http = StationTestHTTP(tokenStatus: tokenStatus)
         let portal = AstationAccountAuth(configuration: portalConfig,
             storage: StationTestSession(configuration: portalConfig, token: "test-portal-token"), http: http)
-        let station = AstationAccountAuth(configuration: stationConfig,
-            storage: StationTestSession(configuration: stationConfig, token: "test-station-token", subject: stationSubject), http: http)
+        stationStorage = StationTestSession(configuration: stationConfig, token: "test-station-token", subject: stationSubject)
+        let station = AstationAccountAuth(configuration: stationConfig, storage: stationStorage, http: http,
+            authorize: { [weak self] _, _ in
+                guard let self else { throw CancellationError() }
+                self.signIns += 1
+                guard let authorize = self.authorize else { throw AccountLoginError.cancelled }
+                return try await authorize()
+            })
         let key = RelayIdentityKey(softwareKey: P256.Signing.PrivateKey())
         let keyManager = RelayIdentityKeyManager(loadKey: { _ in key }, repairKey: { key },
             perform: { $0() }, deliver: { $0() }, schedule: { _, _ in })
@@ -295,6 +309,123 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
         try await waitUntil { next.registrations.count == 1 }
         next.emit(#"{"type":"relayAck","for":"relayRegisterAccount","ok":true}"#)
         try await retry.value
+    }
+
+    func testVerificationRenewsOnlyStationAuthorizationWhilePortalStaysSignedIn() async throws {
+        for state in ["missing", "refresh_pending", "invalid_grant"] {
+            let fixture = try StationAccountFixture(); defer { fixture.cleanup() }
+            let socket = try await connected(fixture)
+            socket.emit(#"{"type":"relayAck","for":"relayRegisterAccount","ok":true}"#)
+            try await fixture.hub.prepareAccountSecurityAccess()
+            let saved = try XCTUnwrap(fixture.stationStorage.read())
+            if state == "missing" { try fixture.stationStorage.write(nil) }
+            else if state == "refresh_pending" {
+                try fixture.stationStorage.write(AccountSessionRecord(session: saved.session, refreshPending: true))
+            } else {
+                let expired = AccountLoginSession(configuration: saved.session.configuration, subject: saved.session.subject,
+                    accessToken: "expired", refreshToken: saved.session.refreshToken, expiresAt: .distantPast, authenticatedAt: nil)
+                try fixture.stationStorage.write(AccountSessionRecord(session: expired))
+            }
+            fixture.authorize = {
+                XCTAssertEqual(fixture.hub.accountAuth.configuration?.resource, fixture.origin)
+                XCTAssertTrue(fixture.hub.accountSignInInProgress)
+                XCTAssertTrue(fixture.hub.needsAccountSignIn)
+                return saved.session
+            }
+            try await fixture.hub.prepareVerificationAccount(account: AstationIdentity.shared.id)
+            XCTAssertEqual(fixture.signIns, 1, state)
+            XCTAssertEqual(fixture.hub.signedInAccount, "test-owner")
+            XCTAssertFalse(fixture.hub.accountSignInRequired)
+            XCTAssertFalse(fixture.hub.stationAccountSignInRequired)
+            XCTAssertFalse(fixture.hub.needsAccountSignIn)
+            XCTAssertFalse(fixture.hub.accountSignInInProgress)
+            XCTAssertEqual(socket.registrations.count, 1)
+            XCTAssertFalse(socket.registrations[0].contains("test-portal-token"))
+        }
+    }
+
+    func testVerificationCancelledSignInIsVisibleAndBackgroundWorkNeverOpensBrowser() async throws {
+        let fixture = try StationAccountFixture(); defer { fixture.cleanup() }
+        _ = try await connected(fixture)
+        try await fixture.hub.accountAuth.clearSession()
+        do { try await fixture.hub.prepareAccountSecurityAccess(allowSignIn: false); XCTFail("missing Station token admitted access") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .signInRequired) }
+        XCTAssertEqual(fixture.signIns, 0)
+        XCTAssertTrue(fixture.hub.needsAccountSignIn)
+        XCTAssertFalse(fixture.hub.accountSignInRequired, "Station authorization cannot sign out the Portal")
+        do { try await fixture.hub.prepareVerificationAccount(account: AstationIdentity.shared.id); XCTFail("cancelled login admitted verification") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .cancelled) }
+        XCTAssertEqual(fixture.signIns, 1)
+        XCTAssertTrue(fixture.hub.stationAccountSignInRequired)
+        XCTAssertFalse(fixture.hub.accountSignInInProgress)
+    }
+
+    func testSignOutWhileVerificationReauthorizesCannotRestoreTheOldSession() async throws {
+        let fixture = try StationAccountFixture(); defer { fixture.cleanup() }
+        _ = try await connected(fixture)
+        let saved = try XCTUnwrap(fixture.stationStorage.read())
+        try await fixture.hub.accountAuth.clearSession()
+        var reply: CheckedContinuation<AccountLoginSession, Error>?
+        fixture.authorize = { try await withCheckedThrowingContinuation { reply = $0 } }
+        let pending = Task { try await fixture.hub.prepareVerificationAccount(account: AstationIdentity.shared.id) }
+        try await waitUntil { reply != nil }
+        try await fixture.hub.signOutAccount()
+        reply?.resume(returning: saved.session)
+        do { try await pending.value; XCTFail("signed-out verification resumed") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .changed) }
+        XCTAssertNil(try fixture.stationStorage.read())
+        XCTAssertNil(fixture.hub.signedInAccount)
+        XCTAssertTrue(fixture.hub.needsAccountSignIn)
+    }
+
+    func testVerificationRejectsAnotherOwnerAfterReauthorization() async throws {
+        let fixture = try StationAccountFixture(); defer { fixture.cleanup() }
+        let socket = try await connected(fixture)
+        let saved = try XCTUnwrap(fixture.stationStorage.read())
+        try await fixture.hub.accountAuth.clearSession()
+        fixture.authorize = {
+            AccountLoginSession(configuration: saved.session.configuration, subject: "different-owner",
+                accessToken: "different-token", refreshToken: "different-refresh", expiresAt: Date().addingTimeInterval(600), authenticatedAt: nil)
+        }
+        do { try await fixture.hub.prepareVerificationAccount(account: AstationIdentity.shared.id); XCTFail("different owner admitted verification") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .changed) }
+        XCTAssertEqual(socket.registrations.count, 1)
+        XCTAssertTrue(fixture.hub.stationAccountSignInRequired)
+        XCTAssertEqual(fixture.hub.signedInAccount, "test-owner")
+    }
+
+    func testVerificationServiceFailureDoesNotStartBrowserSignIn() async throws {
+        let fixture = try StationAccountFixture(tokenStatus: 503); defer { fixture.cleanup() }
+        _ = try await connected(fixture)
+        let saved = try XCTUnwrap(fixture.stationStorage.read())
+        let expired = AccountLoginSession(configuration: saved.session.configuration, subject: saved.session.subject,
+            accessToken: "expired", refreshToken: saved.session.refreshToken, expiresAt: .distantPast, authenticatedAt: nil)
+        try fixture.stationStorage.write(AccountSessionRecord(session: expired))
+        do { try await fixture.hub.prepareVerificationAccount(account: AstationIdentity.shared.id); XCTFail("unavailable service admitted verification") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .unavailable) }
+        XCTAssertEqual(fixture.signIns, 0)
+        XCTAssertEqual(fixture.hub.signedInAccount, "test-owner")
+        XCTAssertFalse(fixture.hub.accountSignInRequired)
+    }
+
+    func testRelayChangeWhileVerificationReauthorizesCannotRegisterTheNewStation() async throws {
+        let fixture = try StationAccountFixture(); defer { fixture.cleanup() }
+        let old = try await connected(fixture)
+        let saved = try XCTUnwrap(fixture.stationStorage.read())
+        try await fixture.hub.accountAuth.clearSession()
+        var reply: CheckedContinuation<AccountLoginSession, Error>?
+        fixture.authorize = { try await withCheckedThrowingContinuation { reply = $0 } }
+        let pending = Task { try await fixture.hub.prepareVerificationAccount(account: AstationIdentity.shared.id) }
+        try await waitUntil { reply != nil }
+        fixture.hub._testRelayUrlOverride = "https://second-station.example"
+        NotificationCenter.default.post(name: .serverInfoChanged, object: nil)
+        reply?.resume(returning: saved.session)
+        do { try await pending.value; XCTFail("verification crossed Station origins") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .changed) }
+        XCTAssertEqual(fixture.hub.accountAuth.configuration?.resource, "https://second-station.example")
+        XCTAssertEqual(old.registrations.count, 1)
+        XCTAssertTrue(fixture.sockets.dropFirst().allSatisfy { $0.registrations.isEmpty })
+        XCTAssertTrue(fixture.hub.stationAccountSignInRequired)
     }
 
     func testSignOutFencesPendingRegistrationAndRetainsPairing() async throws {

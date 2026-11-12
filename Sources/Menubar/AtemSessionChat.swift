@@ -36,6 +36,7 @@ final class AtemSessionChat {
         var messages: [String: AgentChatWire] = [:]
         var sizes: [String: Int] = [:]
         var versions: [String: UInt64] = [:]
+        var recoveredAfter: [String: String] = [:]
         var replies: [String: HistoryReply] = [:]
         var pageIDs: [String] = []
         var pageTimes: [String: TimeInterval] = [:]
@@ -153,6 +154,7 @@ final class AtemSessionChat {
         let retained = Set(view.order + view.replies.values.flatMap { $0.messages.compactMap(\.messageId) })
         for id in view.messages.keys where !retained.contains(id) {
             view.messages.removeValue(forKey: id); view.sizes.removeValue(forKey: id); view.versions.removeValue(forKey: id)
+            view.recoveredAfter.removeValue(forKey: id)
         }
         views[target.session_id] = view
         var event = AgentChatWire(op: "history", conversationId: view.snapshot.chat_id, agentId: target.session_id,
@@ -249,6 +251,8 @@ final class AtemSessionChat {
                     } else if event.page_id == nil { view.order.append(id) }
                 }
                 view.messages[id] = event; view.sizes[id] = wireBytes; view.versions[id] = sequence
+                if event.recovered { view.recoveredAfter[id] = event.after_message_id }
+                if event.page_id == nil { reconcileRecoveredMessages(in: &view) }
             }
         case "history_end":
             guard let page = event.page, page.valid else { valid = false; break }
@@ -294,6 +298,7 @@ final class AtemSessionChat {
         while view.order.count > 500 || view.sizes.values.reduce(0, +) > 8_388_608 {
             let id = view.order.removeFirst()
             view.messages.removeValue(forKey: id); view.sizes.removeValue(forKey: id); view.versions.removeValue(forKey: id)
+            view.recoveredAfter.removeValue(forKey: id)
             view.snapshot.locally_truncated = true
         }
         if view.snapshot.holes.count > 16 { view.snapshot.holes = Array(view.snapshot.holes.suffix(16)); view.snapshot.holes_more = true }
@@ -319,6 +324,33 @@ final class AtemSessionChat {
             view.order.insert(id, at: index)
             position = index + 1
         }
+        reconcileRecoveredMessages(in: &view)
+    }
+
+    private func reconcileRecoveredMessages(in view: inout View) {
+        // Whole-message updates need not repeat a recovered predecessor. Keep
+        // that relationship until older pages supply its missing anchor.
+        let retained = Set(view.order)
+        let links = view.recoveredAfter.filter { retained.contains($0.key) && retained.contains($0.value) }
+        var acyclic: [String: Bool] = [:]
+        for id in view.order where links[id] != nil && acyclic[id] == nil {
+            var path = Set<String>(), current = id
+            while let next = links[current], acyclic[current] == nil, path.insert(current).inserted { current = next }
+            let valid = acyclic[current] ?? !path.contains(current)
+            for member in path { acyclic[member] = valid }
+        }
+        var children: [String: [String]] = [:]
+        for id in view.order where acyclic[id] == true {
+            if let parent = links[id] { children[parent, default: []].append(id) }
+        }
+        var order: [String] = [], emitted = Set<String>()
+        func append(_ id: String) {
+            guard emitted.insert(id).inserted else { return }
+            order.append(id)
+            for child in children[id] ?? [] { append(child) }
+        }
+        for id in view.order where acyclic[id] != true { append(id) }
+        view.order = order
     }
 
     private func resync(_ old: View) {
