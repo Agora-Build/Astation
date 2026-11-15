@@ -17,6 +17,23 @@ For the current pairing, project-picker and migration steps, use the
 [credentials guide](credentials.md). Its Atem commands also work from another
 machine; Touch ID or Mac-password approval remains on the home Astation Mac.
 
+## Supported Pairing Lifecycle
+
+`atem pair verify` retries an incomplete verification. An already verified host
+gets `Already verified`; the product has no in-place re-verification command.
+To replace a host's key, the supported flow is `atem unpair`, then `atem pair`.
+Unpairing removes the pinned device list and drops the old pairing's link before
+the new ceremony. The configured Atem ID stays the same, and the next signed
+`add_host` replaces that host's previous key in the new trust generation.
+
+That ceremony uses an owner-present link without a proved route. It does not
+exercise replacement of the key on an already route-proved connection. The
+defensive completion/close/reconnect fixes in Astation #81 and Atem #167 remain,
+but the unreachable re-verification case in Astation #80 is not a live-test
+prerequisite for delegated Part I. A future in-place key-rotation feature needs
+its own review and live verification before shipping. See
+[Atem's lifecycle confirmation](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6899199958).
+
 ## Protocol And Trust
 
 The existing authenticated WebSocket carries `verifyCommit`, `verifyKeys`,

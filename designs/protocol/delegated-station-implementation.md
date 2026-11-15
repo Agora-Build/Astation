@@ -152,6 +152,22 @@ Still required before activation:
   fixture runner, and all real Station/native/Atem/Portal joint checks listed
   in #79. Passing fake-host/isolated tests is not activation evidence.
 
+## Pairing Test Scope
+
+The owner and Atem confirmed that the product has no in-place re-verification
+of an already verified, route-proved host. `atem pair verify` returns
+`Already verified`; replacing the key uses `atem unpair`, then `atem pair`,
+which removes the old pin/link before the owner-present unproved ceremony.
+The clarification is recorded in
+[Atem #120](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6899199958).
+
+Astation #80 is resolved as unreachable through the supported product flow.
+The defensive relay fix (#81) and host fix (Atem #167) remain, with regression
+coverage. No live re-verification was run or is required for Part I's joint
+checks. This removes only that unsupported scenario from #79's earlier test
+list; the other real joint checks and activation gates still apply. A future
+lighter host-key rotation path must be reviewed and tested separately.
+
 ## Validation
 
 Tests exercise strict shared fixtures through actual Rust and Swift bindings,
