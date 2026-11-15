@@ -179,6 +179,7 @@ jobs:
       - name: Run isolated Postgres suites in parallel
         working-directory: relay-server
         env:
+          TEST_REDIS_URL: redis://127.0.0.1:56379/
           IDENTITY_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:55433/postgres
           KNOWLEDGE_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:55433/postgres
           ACCOUNT_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:55433/postgres

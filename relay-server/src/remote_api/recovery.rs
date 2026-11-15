@@ -109,6 +109,15 @@ impl HostBinding {
     }
 }
 
+/// Verification transport authority, never a replacement for a host route proof.
+#[derive(Clone)]
+pub(crate) struct VerificationAuthority {
+    manager_key: atem_client::PublicKey,
+    original_host: atem_client::membership::entry::HostRecord,
+    head_seq: u64,
+    generation: u64,
+}
+
 /// One root is the transaction/lock unit, including envelope retention and CAS.
 pub struct RecoveryStore {
     pool: Option<PgPool>,
@@ -187,7 +196,7 @@ impl RecoveryStore {
         self.with_root(
             &binding.genesis,
             |root, log| root.routes.get(&binding.host) == Some(binding) && binding.valid(log),
-            action,
+            |_| action(),
         )
         .await
     }
@@ -195,6 +204,7 @@ impl RecoveryStore {
     pub(crate) async fn with_owner_route<T, F, Fut>(
         &self,
         route: &OwnerRoute,
+        proved: Option<&HostBinding>,
         action: F,
     ) -> Option<T>
     where
@@ -204,7 +214,13 @@ impl RecoveryStore {
         self.with_root(
             &route.genesis,
             |root, log| {
-                log.host(&route.host)
+                // A socket that once proved its identity cannot become an
+                // unproved owner-present route when that proof is invalidated.
+                proved.is_none_or(|binding| {
+                    binding.genesis == route.genesis && binding.host == route.host
+                        && binding.room == route.room && binding.connection == route.connection
+                        && root.routes.get(&binding.host) == Some(binding) && binding.valid(log)
+                }) && log.host(&route.host)
                     .is_some_and(|host| host.host_trust_gen == route.host_trust_gen)
                     && root
                         .routes
@@ -212,15 +228,94 @@ impl RecoveryStore {
                         .filter(|binding| binding.valid(log))
                         .is_none_or(|binding| binding.connection == route.connection)
             },
-            action,
+            |_| action(),
         )
         .await
+    }
+
+    pub(crate) async fn start_verification(
+        &self,
+        binding: &HostBinding,
+        generation: u64,
+    ) -> Option<VerificationAuthority> {
+        self.with_root(
+            &binding.genesis,
+            |root, log| {
+                root.routes.get(&binding.host) == Some(binding)
+                    && binding.valid(log)
+                    && log.frozen().is_none()
+                    && log
+                        .host(&binding.host)
+                        .is_some_and(|h| generation > h.host_trust_gen)
+                    && log
+                        .member(&binding.room)
+                        .is_some_and(|m| m.status == MemberStatus::Active && m.member.is_manager())
+            },
+            |log| {
+                let authority = VerificationAuthority {
+                    manager_key: log.member(&binding.room).unwrap().member.auth_key.clone(),
+                    original_host: log.host(&binding.host).unwrap().clone(),
+                    head_seq: log.head().seq,
+                    generation,
+                };
+                async move { authority }
+            },
+        )
+        .await
+    }
+
+    /// Serialize completion queue admission with membership changes. The old proof
+    /// stays invalid: this admits only a separately bounded verification transport.
+    pub(crate) async fn with_verification<T, F, Fut>(
+        &self,
+        binding: &HostBinding,
+        authority: &VerificationAuthority,
+        completion: bool,
+        action: F,
+    ) -> Option<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        self.with_root(
+            &binding.genesis,
+            |root, log| {
+                let manager_current = log.member(&binding.room).is_some_and(|m| {
+                    m.status == MemberStatus::Active
+                        && m.member.is_manager()
+                        && m.member.auth_key == authority.manager_key
+                });
+                let replaced = root.routes.get(&binding.host).is_some_and(|route| route != binding);
+                let removed = log.entries().iter().any(|entry| {
+                    entry.seq > authority.head_seq
+                        && matches!(&entry.action, Action::RemoveHost { host_id } if host_id == &binding.host)
+                });
+                if log.frozen().is_some() || !manager_current || replaced || removed {
+                    return false;
+                }
+                let original = !completion
+                    && log.host(&binding.host) == Some(&authority.original_host)
+                    && root.routes.get(&binding.host) == Some(binding)
+                    && binding.valid(log);
+                let published = log.host(&binding.host).is_some_and(|host| {
+                    let latest = log.entries().iter().rev().find(|entry| {
+                        matches!(&entry.action, Action::AddHost { host } if host.host_id == binding.host)
+                    });
+                    host.host_trust_gen == authority.generation
+                        && latest.is_some_and(|entry| {
+                            entry.seq > authority.head_seq && entry.signer == binding.room
+                        })
+                });
+                original || published
+            },
+            |_| action(),
+        ).await
     }
 
     async fn with_root<T, P, F, Fut>(&self, genesis: &str, predicate: P, action: F) -> Option<T>
     where
         P: FnOnce(&Root, &Membership) -> bool,
-        F: FnOnce() -> Fut,
+        F: FnOnce(&Membership) -> Fut,
         Fut: std::future::Future<Output = T>,
     {
         tokio::time::timeout(
@@ -240,27 +335,25 @@ impl RecoveryStore {
     ) -> Option<T>
     where
         P: FnOnce(&Root, &Membership) -> bool,
-        F: FnOnce() -> Fut,
+        F: FnOnce(&Membership) -> Fut,
         Fut: std::future::Future<Output = T>,
     {
         let valid = |root: &Root| {
             let Ok(hash) = Hash32::from_hex(genesis) else {
-                return false;
+                return None;
             };
             let Ok(mut log) = Membership::from_stored(&root.account, &hash, &root.membership)
             else {
-                return false;
+                return None;
             };
             log.advance(&now());
-            predicate(root, &log)
+            predicate(root, &log).then_some(log)
         };
         if let Some(memory) = &self.memory {
             let roots = memory.lock().await;
             let (_, root) = roots.get(genesis)?;
-            if !valid(root) {
-                return None;
-            }
-            return Some(action().await);
+            let log = valid(root)?;
+            return Some(action(&log).await);
         }
         let pool = self.pool.as_ref()?;
         let mut tx = pool.begin().await.ok()?;
@@ -277,11 +370,9 @@ impl RecoveryStore {
         .await
         .ok()?;
         let root: Root = serde_json::from_value(saved?.0).ok()?;
-        if !valid(&root) {
-            return None;
-        }
+        let log = valid(&root)?;
         // No state changes: dropping the read transaction releases its locks.
-        Some(action().await)
+        Some(action(&log).await)
     }
 
     pub fn disabled() -> Arc<Self> {

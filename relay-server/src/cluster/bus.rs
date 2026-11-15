@@ -22,6 +22,8 @@ pub const BUS_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub enum InboxMessage {
     /// Carrier A replacement cannot evict an independently proved connection.
     CloseUnproved { connection_id: String },
+    /// Owner-bound verification completion, checked again on the host replica.
+    VerificationDeliver { room: String, connection_id: String, owner: super::ConnRef, frame: String },
     /// r9 ciphertext cannot be silently dropped. Acknowledge queue admission or fail the route.
     ChannelDeliver { connection_id: String, frame: String, reply_to: String, delivery: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,7 +64,8 @@ pub fn drop_if_oversize(replica_id: &str, message: &InboxMessage, payload_len: u
         return false;
     }
     let targets: Vec<String> = match message {
-        InboxMessage::ChannelDeliver { connection_id, .. } => vec![crate::relay::mask_code(connection_id)],
+        InboxMessage::ChannelDeliver { connection_id, .. }
+        | InboxMessage::VerificationDeliver { connection_id, .. } => vec![crate::relay::mask_code(connection_id)],
         InboxMessage::ChannelDelivered { .. } | InboxMessage::ChannelReply { .. } => vec![],
         InboxMessage::Deliver { connection_ids, .. } => {
             connection_ids.iter().map(|id| crate::relay::mask_code(id)).collect()
@@ -85,7 +88,8 @@ pub fn drop_if_oversize(replica_id: &str, message: &InboxMessage, payload_len: u
 /// Apply an inbox message to this replica's sockets.
 pub fn apply_inbox(local: &LocalSockets, message: InboxMessage) {
     match message {
-        InboxMessage::ChannelDeliver { .. } | InboxMessage::ChannelDelivered { .. } | InboxMessage::ChannelReply { .. } | InboxMessage::CloseUnproved { .. } => {
+        InboxMessage::ChannelDeliver { .. } | InboxMessage::ChannelDelivered { .. } | InboxMessage::ChannelReply { .. } | InboxMessage::CloseUnproved { .. }
+        | InboxMessage::VerificationDeliver { .. } => {
             // Requires the hub's r9 broker; dispatched before this legacy socket handler.
         }
         InboxMessage::Deliver { connection_ids, frame } => {
