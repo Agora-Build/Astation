@@ -1,17 +1,30 @@
 {
   "repository": "Agora-Build/Atem",
-  "revision": "2b0c384e7213e5d4637cdba1f0a78ccbc53a2083",
-  "run_id": 41558426367,
-  "artifact_id": 13196905981,
-  "archive_sha256": "39044087ffe0f7cf01c799761bd98f659414a517401343c872e854e24e829e30",
-  "package": "atem-client-0.1.0-2b0c384e7213-apple-swiftpm.zip",
-  "source": "atem-client-0.1.0-2b0c384e7213-SOURCE.json",
+  "revision": "c7b0054fe1208cad1bac98162d9d3ea99b5307cc",
+  "run_id": 43691893760,
+  "artifact_id": 14153425036,
+  "archive_sha256": "1de03b3524d2abb24f04ae4d92af2da2bbeb1f0dc00ee26d150ca419ba1cc7c5",
+  "package": "atem-client-0.1.0-c7b0054fe120-apple-swiftpm.zip",
+  "source": "atem-client-0.1.0-c7b0054fe120-SOURCE.json",
   "payload_sha256": {
-    "atem-client-0.1.0-2b0c384e7213-apple-swiftpm.zip": "bc1ad71ebb0d04f49b0d20421211746c258aea50017006e4789835168a21e864",
-    "atem-client-0.1.0-2b0c384e7213-atem_client_ffiFFI.h": "1422b9470b0b829603ed6a314343ab60173cdfef254a1fa9cdc1080d8dba522f",
-    "atem-client-0.1.0-2b0c384e7213-SOURCE.json": "ad0d8caff4671555e65d2704080d071c0e40ab035a8f69911bc65b97d43afc23",
-    "atem-client-0.1.0-2b0c384e7213-station-route-v1.json": "557516203b77b6739f7a6968eee5fa7ac38438bfb9afcc9c3b08298cdbfa49ce",
-    "atem-client-0.1.0-2b0c384e7213-host-work-requests-v1.json": "9ab10b55124629c840a87a6a925e080cd3495f59c92493e6e688f21e24f65c75"
+    "atem-client-0.1.0-c7b0054fe120-SOURCE.json": "a2c95a9d476065313645ab99b570a790ec90a9892a05a99b161145857fa4ff7c",
+    "atem-client-0.1.0-c7b0054fe120-apple-swiftpm.zip": "cbdad52b0242d6bc5ef647d86de04600d08b790a2ca665909107afd9772f36d1",
+    "atem-client-0.1.0-c7b0054fe120-atem_client_ffiFFI.h": "6303e1688e8670d8fb50dc1311cfe204bbef64f5b9a6970d6b92fa408c7c3cbd",
+    "atem-client-0.1.0-c7b0054fe120-host-work-framing-size-v1.json": "07b3abf0c0bb8737e5003755c93a0c761c84254023414289fe30df5ce5a20eb5",
+    "atem-client-0.1.0-c7b0054fe120-host-work-prompt-framing-v1.json": "fc6ed81aad67d1f7908fe7630290ae3f4391642b5228dd36682897d6abf8187d",
+    "atem-client-0.1.0-c7b0054fe120-host-work-requests-v1.json": "77d9a18cd4c474589cea5bbdb37483a17c64e9b9f95d3047f0f2a4b4a8d56257",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-deadline.json": "07d61914d445333e40a69fc8021fb3662c5afe799f2da2809ddd0c1abcfaa82e",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-durable.json": "5ec894eac5e3aa5974c0c18d7c28f2c324be0f586b9f52e429b72295a90ca9c0",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-per-effect.json": "1329360611185180670fc0f06660b4b8118560442087d931013e0387bc882fac",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-portal-refusals.json": "9578c171975df5cef1251948b4d13769524085571757136dbafe6175e862b14e",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-reasons.json": "9a08d33e59f186648b223a50b6382726244e74d306b919f0b02cd22cebc68fc8",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-resign.json": "ebcbf8b9016f3f81de206bb0b8469fbccc84f6c03e697ce2ba90df11b4016e76",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-delegated-wire.json": "a6383cbca12825dbdc2475ce3e8a5a01fa669e4f6d8efd5695c3ee262610a31a",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-host-envelope.json": "4b94c8336c9a4471cecaccd94ad82b8bec72f707d4f1e6b97e57864ac9c97ad0",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-host-work-control.json": "32fb9480b6832f1be2062a284a2093fd737687f7405d2fa6bfa2cbee737ef7e5",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-push-hint.json": "7ad4e27696ecbdd18140cf469a709622c48310d92231a80719c2845e55206b56",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-station-calls.json": "9f5720c667ee552e06089a8e9ea69d80f4c0e3d73004dc6176d4eb399ec3b8d5",
+    "atem-client-0.1.0-c7b0054fe120-station-route-v1.json": "557516203b77b6739f7a6968eee5fa7ac38438bfb9afcc9c3b08298cdbfa49ce"
   },
   "fixture": {
     "path": "designs/protocol/fixtures/r9-vectors-pairing.json",
@@ -19,10 +32,27 @@
   },
   "station_route_fixture": {
     "path": "designs/protocol/fixtures/station-route/v1.json",
-    "payload": "atem-client-0.1.0-2b0c384e7213-station-route-v1.json"
+    "payload": "atem-client-0.1.0-c7b0054fe120-station-route-v1.json"
   },
   "host_work_fixture": {
     "path": "designs/protocol/fixtures/host-work/requests-v1.json",
-    "payload": "atem-client-0.1.0-2b0c384e7213-host-work-requests-v1.json"
+    "payload": "atem-client-0.1.0-c7b0054fe120-host-work-requests-v1.json"
+  },
+  "delegated_fixtures": [
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-deadline.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-durable.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-per-effect.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-portal-refusals.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-reasons.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-resign.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-delegated-wire.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-host-envelope.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-host-work-control.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-push-hint.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-station-calls.json"
+  ],
+  "delegated_station_fixture": {
+    "path": "native-remote/Tests/AstationRemoteTests/Fixtures/r9-vectors-station-calls.json",
+    "payload": "atem-client-0.1.0-c7b0054fe120-r9-vectors-station-calls.json"
   }
 }

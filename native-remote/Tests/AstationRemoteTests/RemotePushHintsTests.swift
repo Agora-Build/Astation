@@ -27,14 +27,14 @@ final class RemotePushHintsTests: XCTestCase {
         var hints = try RemotePushHints(accountID: log.accountId(), genesisHash: log.genesisHash(), deviceID: "dev-phone", persist: { saved = $0 })
         let notice = try XCTUnwrap(hints.receive(hintJSON: phone, log: log, now: now, open: { _ in
             XCTAssertNotNil(saved)
-            return HintContent(tool: "Bash", summary: "npm test")
+            return .approval(tool: "Bash", summary: "npm test")
         }))
-        XCTAssertEqual(notice.state, .approval(HintContent(tool: "Bash", summary: "npm test")))
+        XCTAssertEqual(notice.state, .approval(.approval(tool: "Bash", summary: "npm test")))
         let bytes = try XCTUnwrap(saved)
         XCTAssertFalse(String(decoding: bytes, as: UTF8.self).contains("npm test"))
         hints = try RemotePushHints(accountID: log.accountId(), genesisHash: log.genesisHash(), deviceID: "dev-phone", checkpoint: bytes, persist: { saved = $0 })
         XCTAssertNil(try hints.receive(hintJSON: phone, log: log, now: now + 1000))
-        XCTAssertEqual(try hints.target(hintJSON: phone, log: log, now: now + 1000), notice.approval)
+        XCTAssertEqual(try hints.target(hintJSON: phone, log: log, now: now + 1000), notice.target)
     }
 
     @MainActor

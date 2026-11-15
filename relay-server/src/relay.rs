@@ -41,6 +41,7 @@ use crate::voice_session::ReplyWaiters;
 use crate::AppState;
 
 mod verification;
+mod delegated;
 
 /// A room code as it may appear in logs: the first 4 characters plus "…".
 /// Astation room codes are bearer-like identifiers (whoever presents one joins
@@ -250,6 +251,7 @@ struct HubInner {
     recovery: std::sync::OnceLock<Arc<crate::remote_api::recovery::RecoveryStore>>,
     host_routes: std::sync::Mutex<HashMap<String, crate::remote_api::recovery::HostBinding>>,
     verifications: std::sync::Mutex<HashMap<String, verification::VerificationWindow>>,
+    delegated_updates: tokio::sync::Notify,
 }
 
 /// The relay: this replica's sockets plus the shared room directory, the
@@ -306,6 +308,7 @@ impl RelayHub {
                 recovery: std::sync::OnceLock::new(),
                 host_routes: std::sync::Mutex::new(HashMap::new()),
                 verifications: std::sync::Mutex::new(HashMap::new()),
+                delegated_updates: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -899,6 +902,9 @@ impl RelayHub {
                     BusEvent::Broadcast(BroadcastMessage::RoomChanged { code }) => {
                         hub.invalidate_room(&code)
                     }
+                    BusEvent::Broadcast(BroadcastMessage::DelegatedChanged { source_replica }) => {
+                        if source_replica != hub.inner.replica_id { hub.inner.delegated_updates.notify_one(); }
+                    }
                     BusEvent::Broadcast(BroadcastMessage::KeyChanged { astation_id }) => {
                         let (keys, identity) = (hub.keys().clone(), identity.clone());
                         let hub = hub.clone();
@@ -911,6 +917,7 @@ impl RelayHub {
                         waiters.wake(&session_id, &reply);
                     }
                     BusEvent::Resubscribed => {
+                        hub.inner.delegated_updates.notify_one();
                         hub.channels().reset();
                         // Anything published while we were away is lost:
                         // drop cached rooms and re-read every key.
@@ -2621,7 +2628,32 @@ async fn register_connection(
 /// change). Ends when the queue's sender is gone (flush, then a plain
 /// close) or on a close request (flush what was queued, then that close
 /// frame).
-async fn write_loop<S>(mut ws_sink: S, mut outbox: SocketOutbox, code: String)
+#[cfg(test)]
+async fn write_loop<S>(ws_sink: S, outbox: SocketOutbox, code: String)
+where S: futures_util::Sink<Message> + Unpin {
+    write_loop_checked(ws_sink, outbox, code, None).await
+}
+
+async fn write_socket_frame<S>(sink: &mut S, frame: crate::cluster::local::SocketFrame, hub: Option<&RelayHub>) -> bool
+where S: futures_util::Sink<Message> + Unpin {
+    let Some(binding) = frame.delegated else { return sink.send(Message::Text(frame.text)).await.is_ok() };
+    let Some(hub) = hub else { return false };
+    let Some(store) = hub.inner.recovery.get() else { return false };
+    let written = store.with_host_route(&binding, || async {
+        if hub.host_binding(&binding.connection.conn).as_ref() != Some(&binding)
+            || !hub.delegated_peer_current(&binding).await { return None; }
+        Some(sink.send(Message::Text(frame.text)).await.is_ok())
+    }).await.flatten();
+    match written {
+        Some(sent) => sent,
+        // Discard obsolete control responses, including during a close flush.
+        // A separately authorized verification completion may follow them.
+        // The reader and periodic heads worker close/fence stale associations.
+        None => true,
+    }
+}
+
+async fn write_loop_checked<S>(mut ws_sink: S, mut outbox: SocketOutbox, code: String, hub: Option<RelayHub>)
 where
     S: futures_util::Sink<Message> + Unpin,
 {
@@ -2646,7 +2678,7 @@ where
                     let flush = async {
                         while let Ok(text) = outbox.frames.try_recv() {
                             outbox.sent(&text);
-                            if ws_sink.send(Message::Text(text)).await.is_err() {
+                            if !write_socket_frame(&mut ws_sink, text, hub.as_ref()).await {
                                 return false;
                             }
                         }
@@ -2670,8 +2702,11 @@ where
                     Some(text) => {
                         // Off the queue: its bytes no longer count toward the cap.
                         outbox.sent(&text);
-                        if ws_sink.send(Message::Text(text)).await.is_err() {
+                        if !write_socket_frame(&mut ws_sink, text, hub.as_ref()).await {
                             tracing::debug!("WS write failed for {}", mask_code(&code));
+                            let _ = ws_sink.send(Message::Close(Some(CloseFrame {
+                                code: CLOSE_TRY_AGAIN, reason: "host authorization changed".into(),
+                            }))).await;
                             break;
                         }
                     }
@@ -2736,7 +2771,7 @@ async fn handle_ws(
     });
 
     // The writer runs from the start, so a refusal below still reaches the client.
-    let mut write_task = tokio::spawn(write_loop(ws_sink, outbox, code.clone()));
+    let mut write_task = tokio::spawn(write_loop_checked(ws_sink, outbox, code.clone(), Some(hub.clone())));
 
     // Upgraded after the drain listed the sockets (SeqCst: a socket is
     // either listed or sees the flag here): close it with 1012 before it
@@ -2956,6 +2991,10 @@ async fn handle_ws(
                                         },
                                     );
                                     hub.room_changed(&code).await;
+                                    if !hub.delegated_heads(&binding).await {
+                                        local.close_with(&connection_id, CLOSE_TRY_AGAIN, "Station synchronization unavailable");
+                                        break;
+                                    }
                                     if let Some(owner) = owner {
                                         hub.deliver(
                                             &owner,
@@ -3034,6 +3073,16 @@ async fn handle_ws(
                         continue;
                     }
 
+                    match tokio::time::timeout(Duration::from_secs(30), hub.delegated_call(&connection_id, &text)).await {
+                        Ok(Ok(true)) => continue,
+                        Ok(Ok(false)) => {},
+                        _ => {
+                            local.close_with(&connection_id, CLOSE_TRY_AGAIN, "Station synchronization unavailable");
+                            flush_writer = true;
+                            break;
+                        }
+                    }
+
                     log_atem_auth_attempt(&code, &atem_id, &text);
                     let is_current = |room: &RoomInfo| {
                         room.atems
@@ -3059,6 +3108,13 @@ async fn handle_ws(
                                 }
                                 Err(_) => continue,
                                 Ok(None) => {}
+                            }
+                            // Station-only frames that no handler consumed must
+                            // never become peer messages or signing challenges.
+                            if serde_json::from_str::<serde_json::Value>(&text)
+                                .is_ok_and(|value| value["type"] == "relay")
+                            {
+                                continue;
                             }
                             if !hub.remote_channel_reply(&hub.me(&connection_id), &text).await
                                 && !hub.recovery_probe_reply(&connection_id, &text, &mut recovery_probe_last_reply).await {

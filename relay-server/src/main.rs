@@ -841,10 +841,20 @@ async fn serve() {
     relay.configure_push_tokens(push_tokens);
     relay.configure_push_delivery(push_delivery);
     relay.configure_recovery(recovery.clone());
+    if std::env::var("STATION_DELEGATED_HOST_WORK").as_deref() == Ok("true") {
+        let origin = std::env::var("PUBLIC_BASE_URL").unwrap_or_default();
+        if recovery.configure_delegated(&origin).is_err() {
+            tracing::error!("Delegated host work requires its opt-in build and normalized PUBLIC_BASE_URL");
+            std::process::exit(1);
+        }
+    }
 
     // Background tasks run for the life of the process; one that stops
     // outside a drain stops the relay (exit 1) so it is restarted.
     let mut background = cluster_tasks;
+    if recovery.delegated_enabled() {
+        background.push(("delegated Station heads", relay.spawn_delegated_heads()));
+    }
     background.extend(spawn_upkeep(
         &relay,
         &sessions,

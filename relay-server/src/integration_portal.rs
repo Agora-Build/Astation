@@ -9,6 +9,28 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use atem_client::control::{Report, ReportAnswer, ReportIntent};
+
+pub(crate) struct DelegatedReportAnswer {
+    pub answer: ReportAnswer,
+    pub retry_after_ms: Option<u64>,
+}
+
+fn delegated_report_body(intent: &ReportIntent) -> Value {
+    let mut body = json!({"integrationId":intent.report.integration_id(),
+        "state":intent.report.kind(), "reportId":intent.report_id});
+    match &intent.report {
+        Report::RevocationApplied { host, record_id, .. } => {
+            body["host"] = json!(host);
+            body["recordId"] = json!(record_id);
+        }
+        Report::Revoked { outcome, pending_hosts, .. } => {
+            body["outcome"] = json!(outcome.code());
+            body["pendingHosts"] = json!(pending_hosts);
+        }
+    }
+    body
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PortalError {
@@ -87,6 +109,24 @@ pub(crate) struct IntegrationReport<'a> {
 }
 
 impl PortalReportClient {
+    /// Called only with an intent from a committed ledger. Unlike legacy
+    /// reports, every HTTP status has a shared, explicit settlement rule.
+    pub(crate) async fn delegated_report(&self, intent: &ReportIntent) -> DelegatedReportAnswer {
+        let retry = || DelegatedReportAnswer { answer: ReportAnswer::Retry, retry_after_ms: None };
+        let Ok(token) = self.access_token().await else { return retry() };
+        let Ok(response) = self.http.post(format!("{}/api/v1/stations/reports", self.binding.portal_origin))
+            .bearer_auth(token).json(&delegated_report_body(intent)).send().await else { return retry() };
+        let status = response.status().as_u16();
+        let retry_after_ms = if status == 429 {
+            response.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok().map(|seconds| seconds.saturating_mul(1000))
+                    .or_else(|| chrono::DateTime::parse_from_rfc2822(value).ok().map(|date|
+                        (date.timestamp_millis() - chrono::Utc::now().timestamp_millis()).max(1000) as u64)))
+        } else { None };
+        if status == 401 { *self.token.lock().await = None; }
+        DelegatedReportAnswer { answer: ReportAnswer::of_status(status), retry_after_ms }
+    }
+
     pub fn public_jwk(&self) -> Value {
         self.key.public_jwk()
     }
@@ -369,7 +409,7 @@ pub(crate) mod tests {
                 task,
             }
         }
-        fn client(&mut self) -> PortalReportClient {
+        pub(crate) fn client(&mut self) -> PortalReportClient {
             PortalReportClient::new(self.binding.clone(), self.key.take().unwrap()).unwrap()
         }
     }
@@ -481,6 +521,32 @@ pub(crate) mod tests {
             Err(PortalError::Conflict)
         );
         assert_eq!(fixture.shared.reports.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delegated_http_reports_keep_exact_body_and_id_across_retries_and_refresh() {
+        let mut fixture = Fixture::new().await;
+        let client = fixture.client();
+        let intent = ReportIntent { report_id: "revocation_applied:test".into(), not_before: vec![],
+            report: Report::RevocationApplied { integration_id: "i-01234567890123456789012345".into(),
+                host: "host-a".into(), record_id: "11111111-1111-4111-8111-111111111111".into() } };
+        let body = json!({"integrationId":"i-01234567890123456789012345", "state":"revocation_applied",
+            "reportId":"revocation_applied:test", "host":"host-a", "recordId":"11111111-1111-4111-8111-111111111111"});
+        for (status, answer) in [(503, ReportAnswer::Retry), (401, ReportAnswer::Retry),
+            (200, ReportAnswer::Confirm), (403, ReportAnswer::StopReporting),
+            (409, ReportAnswer::Refuse), (429, ReportAnswer::Retry), (302, ReportAnswer::Refuse), (204, ReportAnswer::Refuse)] {
+            fixture.set_status(status);
+            assert_eq!(client.delegated_report(&intent).await.answer, answer);
+        }
+        assert_eq!(fixture.shared.tokens.load(Ordering::SeqCst), 2);
+        assert!(fixture.shared.reports.lock().await.iter().all(|report| report == &body));
+        assert_eq!(fixture.shared.reports.lock().await.len(), 8);
+        let final_intent = ReportIntent { report_id: "revoked:test".into(), not_before: vec![],
+            report: Report::Revoked { integration_id: "i-01234567890123456789012345".into(),
+                outcome: atem_client::control::RevokedOutcome::DeadlinePassed,
+                pending_hosts: vec!["host-b".into(), "host-c".into()] } };
+        assert_eq!(delegated_report_body(&final_intent), json!({"integrationId":"i-01234567890123456789012345",
+            "state":"revoked","reportId":"revoked:test","outcome":"deadline_passed","pendingHosts":["host-b","host-c"]}));
     }
     #[tokio::test]
     async fn report_assertions_are_single_use_and_tokens_are_cached_only_for_the_report_resource() {

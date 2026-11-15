@@ -51,6 +51,8 @@ pub(crate) struct IntegrationPolicy {
     pub r9_svc: Option<String>,
     pub expires_at: String,
     pub quota_per_second: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupt_running: Option<bool>,
 }
 
 impl IntegrationPolicy {
@@ -233,7 +235,7 @@ impl PolicyCheckpoint {
         Ok(next)
     }
 
-    fn owned(&self, id: &str, owner: &str, now: i64) -> Result<&IntegrationPolicy, ()> {
+    pub(crate) fn owned(&self, id: &str, owner: &str, now: i64) -> Result<&IntegrationPolicy, ()> {
         if self.denied
             || self.revision == 0
             || now < self.received_at

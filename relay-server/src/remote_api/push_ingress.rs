@@ -202,6 +202,11 @@ pub(crate) async fn handle(
     text: &str,
 ) -> Option<Vec<String>> {
     let value: Value = serde_json::from_str(text).ok()?;
+    if value["type"] == "relay"
+        && !matches!(value["op"].as_str(), Some("push_hint" | "push_seen"))
+    {
+        return None;
+    }
     if value["type"] != "relay"
         && value["type"] != "push_approval"
         && value["type"] != "push_resolved"

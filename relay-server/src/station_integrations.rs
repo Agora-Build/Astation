@@ -37,6 +37,7 @@ pub(crate) struct StationIntegrations {
     nudge: Notify,
     readiness_offset: std::sync::atomic::AtomicUsize,
     revocation_offset: std::sync::atomic::AtomicUsize,
+    control_offset: std::sync::atomic::AtomicUsize,
     pub requests: Arc<Semaphore>,
     pub mark_streams: Arc<Semaphore>,
 }
@@ -44,6 +45,7 @@ pub(crate) struct StationIntegrations {
 #[cfg(test)]
 pub(crate) mod tests;
 mod revocation;
+mod delegated;
 
 #[derive(Clone)]
 pub(crate) struct IntegrationState(pub Option<Arc<StationIntegrations>>);
@@ -160,6 +162,7 @@ impl StationIntegrations {
             nudge: Notify::new(),
             readiness_offset: std::sync::atomic::AtomicUsize::new(0),
             revocation_offset: std::sync::atomic::AtomicUsize::new(0),
+            control_offset: std::sync::atomic::AtomicUsize::new(0),
             requests: Arc::new(Semaphore::new(8)),
             mark_streams: Arc::new(Semaphore::new(4)),
         }))
@@ -176,6 +179,9 @@ impl StationIntegrations {
             // Even a full page or an unsigned nudge cannot exceed 120 polls/min.
             let result = self.portal.poll(&self.policies, reconcile).await;
             if result.is_ok() {
+                if self.app.recovery.delegated_enabled() {
+                    self.reconcile_delegated_services().await;
+                }
                 self.report_revocations().await;
                 self.report_readiness().await;
             }
@@ -320,6 +326,9 @@ pub(crate) fn routes(app: AppState) -> Router<AppState> {
     };
     if let Some(runtime) = &runtime {
         tokio::spawn(runtime.clone().run());
+        if runtime.app.recovery.delegated_enabled() {
+            tokio::spawn(runtime.clone().run_delegated_reports());
+        }
     }
     Router::new()
         .route("/agora-build/v1/changes", post(nudge))

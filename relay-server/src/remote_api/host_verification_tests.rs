@@ -65,8 +65,17 @@ impl Drop for Harness {
 
 impl Harness {
     async fn new(cross_replica: bool) -> Self {
+        Self::new_with_delegated(cross_replica, false).await
+    }
+
+    async fn new_with_delegated(cross_replica: bool, delegated: bool) -> Self {
         let fixture = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
         let base = state(RecoveryStore::memory());
+        if delegated {
+            base.recovery
+                .configure_delegated("https://station-dev.agora.build")
+                .unwrap();
+        }
         fixture.publish(&base.recovery).await;
         let bus = Arc::new(TestBus::default());
         let directory = InMemoryRoomDirectory::new();
@@ -120,6 +129,9 @@ impl Harness {
             "host-a",
         )
         .await;
+        if host_state.recovery.delegated_enabled() {
+            assert_eq!(next_client_json(&mut host).await["op"], "heads");
+        }
         // Carrier A registration and proved admission each publish presence.
         loop {
             let event = next_client_json(&mut owner).await;
@@ -263,6 +275,12 @@ async fn completion_after_rekey(h: &mut Harness) {
         json!({"type":"channel","event":"open","channel":"stale","transport":"relay"}),
     )
     .await;
+    if h.host_state.recovery.delegated_enabled() {
+        send_json(&mut h.host, json!({"type":"relay","op":"control_sync",
+            "request_id":uuid::Uuid::new_v4().to_string(),
+            "origin":"https://station-dev.agora.build", "after":0})).await;
+        send_json(&mut h.host, json!({"type":"relay","op":"membership_fetch","after":0})).await;
+    }
     h.send_owner(json!({"type":"auth_required","nonce":"stale"}))
         .await;
     h.host_state
@@ -320,6 +338,11 @@ async fn completion_after_rekey(h: &mut Harness) {
         next_client_json(&mut reconnect).await["op"],
         "host_route_ok"
     );
+    if h.host_state.recovery.delegated_enabled() {
+        let heads = next_client_json(&mut reconnect).await;
+        assert_eq!(heads["op"], "heads");
+        assert_eq!(heads["membership"], log.head().to_json());
+    }
     // The completion is bound to the original connection, never replayed.
     h.send_owner(completion).await;
     assert_silent(&mut reconnect, 100).await;
@@ -335,9 +358,27 @@ async fn proved_reverification_completion_crosses_replicas_after_rekey() {
     completion_after_rekey(&mut Harness::new(true).await).await;
 }
 
+#[cfg(feature = "delegated-host-work")]
+#[tokio::test]
+async fn delegated_calls_do_not_cut_reverification_completion_after_rekey() {
+    completion_after_rekey(&mut Harness::new_with_delegated(false, true).await).await;
+    completion_after_rekey(&mut Harness::new_with_delegated(true, true).await).await;
+}
+
 #[tokio::test]
 #[ignore = "requires isolated local Redis and Postgres"]
 async fn postgres_proved_reverification_completion_crosses_real_replicas() {
+    postgres_completion(false).await;
+}
+
+#[cfg(feature = "delegated-host-work")]
+#[tokio::test]
+#[ignore = "requires isolated local Redis and Postgres"]
+async fn postgres_delegated_calls_preserve_verification_across_real_replicas() {
+    postgres_completion(true).await;
+}
+
+async fn postgres_completion(delegated: bool) {
     use crate::cluster::{
         keys::KeyCache,
         redis::{test_support, RedisCluster},
@@ -363,6 +404,9 @@ async fn postgres_proved_reverification_completion_crosses_real_replicas() {
         base.recovery.clone(),
         RecoveryStore::postgres(second_pool.clone()),
     ] {
+        if delegated {
+            store.configure_delegated("https://station-dev.agora.build").unwrap();
+        }
         let cluster = crate::start_redis_replica(
             &test_support::test_url(),
             base.identity.clone(),

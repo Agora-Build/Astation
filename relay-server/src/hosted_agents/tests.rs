@@ -310,6 +310,7 @@ async fn controlled_host_scenario(
             .unwrap();
         let runtime_gen = new_id();
         let welcome = Welcome {
+            verifier: None,
             id: new_id(),
             re: hello.id,
             account_id: log.account_id().into(),
@@ -438,6 +439,7 @@ async fn controlled_host_scenario(
                     };
                     let request = Request::from_data(data).unwrap();
                     let work = WorkStatus {
+                        resolved: None,
                         task_id: match &request {
                             Request::Publish { message, .. } => {
                                 message.recipients[0].recipient_id.clone()

@@ -18,6 +18,10 @@ use std::{sync::Arc, time::Duration};
 #[path = "host_verification_tests.rs"]
 mod verification;
 
+#[cfg(feature = "delegated-host-work")]
+#[path = "delegated_wire_tests.rs"]
+mod delegated;
+
 pub(crate) fn proof(
     keys: &SoftwareKeys,
     key: &KeyId,

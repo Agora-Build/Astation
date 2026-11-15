@@ -320,14 +320,16 @@ class AstationHubManager: ObservableObject {
             guard let hints = approvalPushHints else { return nil }
             let now = UInt64(max(0, Date().timeIntervalSince1970 * 1000))
             if tapped {
-                let target = try hints.target(hintJSON: json, log: log, now: now)
+                guard case .approval(let target) = try hints.target(hintJSON: json, log: log, now: now) else { return nil }
                 let hint = try verifyPushHint(hintJson: json, log: log, nowMs: now, verifier: .client)
                 if case .resolved = hint.state() { return ApprovalPushHint(verified: target, resolved: true) }
                 return ApprovalPushHint(verified: target, resolved: false)
             }
-            guard let notice = try hints.receive(hintJSON: json, log: log, now: now) else { return nil }
-            if case .resolved = notice.state { return ApprovalPushHint(verified: notice.approval, resolved: true) }
-            return ApprovalPushHint(verified: notice.approval, resolved: false)
+            guard case .approval = try hints.target(hintJSON: json, log: log, now: now),
+                  let notice = try hints.receive(hintJSON: json, log: log, now: now),
+                  case .approval(let approval) = notice.target else { return nil }
+            if case .resolved = notice.state { return ApprovalPushHint(verified: approval, resolved: true) }
+            return ApprovalPushHint(verified: approval, resolved: false)
         } catch {
             Log.warn("[Approvals] Sealed notification could not be verified; reconnect for current host state")
             return nil

@@ -34,6 +34,12 @@ type Reply = (StatusCode, Json<Value>);
 #[path = "device_enrollment.rs"]
 pub(super) mod device_enrollment;
 
+#[path = "delegated.rs"]
+pub(crate) mod delegated;
+
+#[path = "delegated_http.rs"]
+pub(crate) mod delegated_http;
+
 fn error(status: StatusCode, code: &'static str) -> Reply {
     (status, Json(json!({"error":{"code":code}})))
 }
@@ -63,6 +69,8 @@ struct Root {
     routes: BTreeMap<String, HostBinding>,
     #[serde(default)]
     enrollments: BTreeMap<String, device_enrollment::Record>,
+    #[serde(default)]
+    delegated: BTreeMap<String, delegated::Stored>,
 }
 
 /// A fresh connection is the generation fence. Presence never substitutes for it.
@@ -70,6 +78,9 @@ struct Root {
 pub(crate) struct HostBinding {
     pub genesis: String,
     pub host: String,
+    // Older saved routes have no generation and require a fresh proof.
+    #[serde(default)]
+    host_trust_gen: u64,
     pub connection: crate::cluster::ConnRef,
     pub room: String,
     pub atem_id: String,
@@ -105,6 +116,7 @@ impl HostBinding {
         )
         .is_ok_and(|route| {
             route.host_id == self.host && log.genesis_hash().to_hex() == self.genesis
+                && log.host(&self.host).is_some_and(|host| host.host_trust_gen == self.host_trust_gen)
         })
     }
 }
@@ -122,10 +134,96 @@ pub(crate) struct VerificationAuthority {
 pub struct RecoveryStore {
     pool: Option<PgPool>,
     memory: Option<Mutex<HashMap<String, (String, Root)>>>,
+    delegated_origin: OnceLock<String>,
+    delegated_changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl RecoveryStore {
     pub(crate) fn pool(&self) -> Option<PgPool> { self.pool.clone() }
+
+    pub(crate) fn configure_delegated(&self, origin: &str) -> Result<(), ()> {
+        if !cfg!(feature = "delegated-host-work")
+            || atem_client::station_route::normalize_relay(origin).as_deref() != Ok(origin)
+        { return Err(()); }
+        if let Some(current) = self.delegated_origin.get() {
+            return if current == origin { Ok(()) } else { Err(()) };
+        }
+        self.delegated_origin.set(origin.into()).map_err(|_| ())
+    }
+
+    pub(crate) fn delegated_enabled(&self) -> bool { self.delegated_origin.get().is_some() }
+
+    pub(crate) async fn delegated_operation(&self, genesis: &str, owner: &str, command: delegated::Command) -> Reply {
+        let Some(origin) = self.delegated_origin.get() else { return unavailable() };
+        self.perform(genesis, owner, Operation::Delegated {
+            origin: origin.clone(), binding: None, command,
+        }).await
+    }
+
+    /// Bounded internal scan for report delivery, never exposed to callers.
+    pub(crate) async fn delegated_accounts(&self, after: &str) -> Option<Vec<(String, String)>> {
+        let origin = self.delegated_origin.get()?;
+        if let Some(memory) = &self.memory {
+            let roots = memory.lock().await;
+            let mut page: Vec<_> = roots.iter().filter(|(genesis, (_, root))|
+                genesis.as_str() > after && root.delegated.contains_key(origin))
+                .map(|(genesis, (owner, _))| (genesis.clone(), owner.clone())).collect();
+            page.sort();
+            page.truncate(32);
+            return Some(page);
+        }
+        sqlx::query_as("SELECT genesis_hash,account_subject FROM remote_recovery_roots WHERE genesis_hash>$1 AND state->'delegated' ? $2 ORDER BY genesis_hash LIMIT 32")
+            .bind(after).bind(origin).fetch_all(self.pool.as_ref()?).await.ok()
+    }
+
+    pub(crate) fn delegated_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.delegated_changes.subscribe()
+    }
+
+    pub(crate) async fn prepare_delegated(&self, binding: &HostBinding) -> bool {
+        let Some(origin) = self.delegated_origin.get() else { return false };
+        match self.with_root(&binding.genesis,
+            |root, log| root.routes.get(&binding.host) == Some(binding)
+                && binding.valid(log) && log.frozen().is_none(),
+            |root, _| std::future::ready(root.delegated.contains_key(origin))).await
+        {
+            Some(true) => return true,
+            Some(false) => {},
+            None => return false,
+        }
+        self.perform_scoped(&binding.genesis, None, Operation::Delegated {
+            origin: origin.clone(), binding: Some(binding.clone()), command: delegated::Command::Ensure,
+        }).await.0 == StatusCode::OK
+    }
+
+    /// Snapshot and queue admission share the membership/route lock. A delayed
+    /// result cannot cross a trust-generation change or a replacement socket.
+    pub(crate) async fn with_delegated_response<T, F, Fut>(&self, binding: &HostBinding,
+        call: Option<&atem_client::control::ToStation>, action: F) -> Option<T>
+    where F: FnOnce(Result<Option<Value>, delegated::Fault>) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let origin = self.delegated_origin.get()?;
+        self.with_root(&binding.genesis,
+            |root, log| root.routes.get(&binding.host) == Some(binding)
+                && binding.valid(log) && log.frozen().is_none(),
+            |root, log| {
+                let response = match call {
+                    Some(call) => delegated::response(root, origin, log, call, now().wall_ms),
+                    None => delegated::heads(root, origin, log, now().wall_ms).map(Some),
+                };
+                action(response)
+            }).await
+    }
+
+    pub(crate) async fn acknowledge_delegated(&self, binding: &HostBinding,
+        ack: atem_client::control::ControlAck) -> Reply
+    {
+        let Some(origin) = self.delegated_origin.get() else { return unavailable() };
+        self.perform_scoped(&binding.genesis, None, Operation::Delegated {
+            origin: origin.clone(), binding: Some(binding.clone()), command: delegated::Command::Ack(ack),
+        }).await
+    }
 
     pub(crate) async fn integration_log(&self, genesis: &str, owner: &str) -> Option<Membership> {
         let reply = self.perform(genesis, owner, Operation::IntegrationSnapshot).await;
@@ -196,7 +294,7 @@ impl RecoveryStore {
         self.with_root(
             &binding.genesis,
             |root, log| root.routes.get(&binding.host) == Some(binding) && binding.valid(log),
-            |_| action(),
+            |_, _| action(),
         )
         .await
     }
@@ -228,7 +326,7 @@ impl RecoveryStore {
                         .filter(|binding| binding.valid(log))
                         .is_none_or(|binding| binding.connection == route.connection)
             },
-            |_| action(),
+            |_, _| action(),
         )
         .await
     }
@@ -251,7 +349,7 @@ impl RecoveryStore {
                         .member(&binding.room)
                         .is_some_and(|m| m.status == MemberStatus::Active && m.member.is_manager())
             },
-            |log| {
+            |_, log| {
                 let authority = VerificationAuthority {
                     manager_key: log.member(&binding.room).unwrap().member.auth_key.clone(),
                     original_host: log.host(&binding.host).unwrap().clone(),
@@ -308,14 +406,14 @@ impl RecoveryStore {
                 });
                 original || published
             },
-            |_| action(),
+            |_, _| action(),
         ).await
     }
 
     async fn with_root<T, P, F, Fut>(&self, genesis: &str, predicate: P, action: F) -> Option<T>
     where
         P: FnOnce(&Root, &Membership) -> bool,
-        F: FnOnce(&Membership) -> Fut,
+        F: FnOnce(&Root, &Membership) -> Fut,
         Fut: std::future::Future<Output = T>,
     {
         tokio::time::timeout(
@@ -335,7 +433,7 @@ impl RecoveryStore {
     ) -> Option<T>
     where
         P: FnOnce(&Root, &Membership) -> bool,
-        F: FnOnce(&Membership) -> Fut,
+        F: FnOnce(&Root, &Membership) -> Fut,
         Fut: std::future::Future<Output = T>,
     {
         let valid = |root: &Root| {
@@ -353,7 +451,7 @@ impl RecoveryStore {
             let roots = memory.lock().await;
             let (_, root) = roots.get(genesis)?;
             let log = valid(root)?;
-            return Some(action(&log).await);
+            return Some(action(root, &log).await);
         }
         let pool = self.pool.as_ref()?;
         let mut tx = pool.begin().await.ok()?;
@@ -372,19 +470,23 @@ impl RecoveryStore {
         let root: Root = serde_json::from_value(saved?.0).ok()?;
         let log = valid(&root)?;
         // No state changes: dropping the read transaction releases its locks.
-        Some(action(&log).await)
+        Some(action(&root, &log).await)
     }
 
     pub fn disabled() -> Arc<Self> {
         Arc::new(Self {
             pool: None,
             memory: None,
+            delegated_origin: OnceLock::new(),
+            delegated_changes: tokio::sync::watch::channel(0).0,
         })
     }
     pub fn postgres(pool: PgPool) -> Arc<Self> {
         Arc::new(Self {
             pool: Some(pool),
             memory: None,
+            delegated_origin: OnceLock::new(),
+            delegated_changes: tokio::sync::watch::channel(0).0,
         })
     }
     pub fn is_durable(&self) -> bool {
@@ -423,6 +525,8 @@ impl RecoveryStore {
         Arc::new(Self {
             pool: None,
             memory: Some(Mutex::new(HashMap::new())),
+            delegated_origin: OnceLock::new(),
+            delegated_changes: tokio::sync::watch::channel(0).0,
         })
     }
 
@@ -442,11 +546,15 @@ impl RecoveryStore {
     }
 
     async fn perform_scoped(&self, genesis: &str, subject: Option<&str>, operation: Operation) -> Reply {
+        let changed = matches!(&operation, Operation::Append { .. }
+            | Operation::Delegated { command: delegated::Command::Publish { .. }
+                | delegated::Command::Owner(delegated::OwnerCommand::Publish { .. })
+                | delegated::Command::ReconcileService(_), .. });
         let hash = match Hash32::from_hex(genesis) {
             Ok(h) => h,
             Err(_) => return invalid(),
         };
-        if let Some(memory) = &self.memory {
+        let reply = if let Some(memory) = &self.memory {
             let mut roots = memory.lock().await;
             if roots
                 .get(genesis)
@@ -478,7 +586,11 @@ impl RecoveryStore {
             }
         } else {
             unavailable()
+        };
+        if changed && reply.0 == StatusCode::OK {
+            self.delegated_changes.send_modify(|version| *version = version.wrapping_add(1));
         }
+        reply
     }
 
     async fn database(
@@ -547,6 +659,7 @@ pub(super) enum Operation {
     Collect,
     DeviceEnrollment(device_enrollment::Command),
     Push(super::push_ingress::Ingress),
+    Delegated { origin: String, binding: Option<HostBinding>, command: delegated::Command },
 }
 
 fn now() -> HostNow {
@@ -586,6 +699,7 @@ fn apply(
                 push: Default::default(),
                 routes: Default::default(),
                 enrollments: Default::default(),
+                delegated: Default::default(),
             }
         }
     };
@@ -593,11 +707,23 @@ fn apply(
         .map_err(|_| unavailable())?;
     log.advance(&clock);
     let reply = match operation {
+        Operation::Delegated { origin, binding, command } => {
+            match delegated::apply(&mut root, &log, &origin, binding.as_ref(), command, clock.wall_ms) {
+                Ok(value) => (StatusCode::OK, Json(value)),
+                Err(fault) => return Err(if let Some(refusal) = fault.refusal() {
+                    (StatusCode::FORBIDDEN, Json(refusal))
+                } else { match fault {
+                    delegated::Fault::Unavailable => unavailable(),
+                    _ => error(StatusCode::BAD_REQUEST, "invalid_control_record"),
+                }}),
+            }
+        }
         Operation::DeviceEnrollment(command) => device_enrollment::apply(&mut root.enrollments, command, clock.wall_ms)?,
         Operation::HostRoute { text, nonce, room, atem_id, connection } => {
             let route = verify_host_route_message(&log, text.as_bytes(), &nonce, &room, &atem_id)
                 .map_err(|refusal| (StatusCode::BAD_REQUEST, Json(RelayReply::refused(&refusal).to_json())))?;
             let binding = HostBinding { genesis: hash.to_hex(), host: route.host_id.clone(),
+                host_trust_gen: log.host(&route.host_id).ok_or_else(unavailable)?.host_trust_gen,
                 connection, room, atem_id, nonce, proof: text };
             let replaced = root.routes.insert(route.host_id.clone(), binding.clone());
             (StatusCode::OK, Json(json!({"binding":binding,"replaced":replaced,"verdict":RelayReply::ok(&route).to_json()})))

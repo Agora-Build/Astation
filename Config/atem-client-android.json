@@ -1,14 +1,40 @@
 {
   "repository": "Agora-Build/Atem",
-  "revision": "2b0c384e7213e5d4637cdba1f0a78ccbc53a2083",
-  "run_id": 41558426367,
-  "artifact_id": 13195781514,
-  "archive_sha256": "4f4f90c6719283db53318766dcc87401cdc5246278c84311f7edd10c1bde1e72",
-  "package": "atem-client-0.1.0-2b0c384e7213-android.zip",
-  "source": "atem-client-0.1.0-2b0c384e7213-SOURCE.json",
+  "revision": "c7b0054fe1208cad1bac98162d9d3ea99b5307cc",
+  "run_id": 43691893760,
+  "artifact_id": 14153041481,
+  "archive_sha256": "f23c51d08c5e4f7ae6ce2a8d396389f4d318208f939084268be222fa698ffaa6",
+  "package": "atem-client-0.1.0-c7b0054fe120-android.zip",
+  "source": "atem-client-0.1.0-c7b0054fe120-SOURCE.json",
   "payload_sha256": {
-    "atem-client-0.1.0-2b0c384e7213-android.zip": "8d3f643c6ab8ea9c30b868c492ad37841401a1b073d7055ce7764888dc916cc4",
-    "atem-client-0.1.0-2b0c384e7213-SOURCE.json": "b4fd0b098529936252e73304083435e0a354916e04d6328ecaf7e73f350c9f3c",
-    "atem-client-0.1.0-2b0c384e7213-host-work-requests-v1.json": "9ab10b55124629c840a87a6a925e080cd3495f59c92493e6e688f21e24f65c75"
-  }
+    "atem-client-0.1.0-c7b0054fe120-SOURCE.json": "cfb7b7c68833c0fd39a219a6e15991e0bf4d75a08b4782979b532bd3e1f47a1e",
+    "atem-client-0.1.0-c7b0054fe120-android.zip": "64e0e413f836645aa53a221804f9246137453795bb34ace7b801f766720ae177",
+    "atem-client-0.1.0-c7b0054fe120-host-work-framing-size-v1.json": "07b3abf0c0bb8737e5003755c93a0c761c84254023414289fe30df5ce5a20eb5",
+    "atem-client-0.1.0-c7b0054fe120-host-work-prompt-framing-v1.json": "fc6ed81aad67d1f7908fe7630290ae3f4391642b5228dd36682897d6abf8187d",
+    "atem-client-0.1.0-c7b0054fe120-host-work-requests-v1.json": "77d9a18cd4c474589cea5bbdb37483a17c64e9b9f95d3047f0f2a4b4a8d56257",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-deadline.json": "07d61914d445333e40a69fc8021fb3662c5afe799f2da2809ddd0c1abcfaa82e",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-durable.json": "5ec894eac5e3aa5974c0c18d7c28f2c324be0f586b9f52e429b72295a90ca9c0",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-per-effect.json": "1329360611185180670fc0f06660b4b8118560442087d931013e0387bc882fac",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-portal-refusals.json": "9578c171975df5cef1251948b4d13769524085571757136dbafe6175e862b14e",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-reasons.json": "9a08d33e59f186648b223a50b6382726244e74d306b919f0b02cd22cebc68fc8",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-resign.json": "ebcbf8b9016f3f81de206bb0b8469fbccc84f6c03e697ce2ba90df11b4016e76",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-delegated-wire.json": "a6383cbca12825dbdc2475ce3e8a5a01fa669e4f6d8efd5695c3ee262610a31a",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-host-envelope.json": "4b94c8336c9a4471cecaccd94ad82b8bec72f707d4f1e6b97e57864ac9c97ad0",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-host-work-control.json": "32fb9480b6832f1be2062a284a2093fd737687f7405d2fa6bfa2cbee737ef7e5",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-push-hint.json": "7ad4e27696ecbdd18140cf469a709622c48310d92231a80719c2845e55206b56",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-station-calls.json": "9f5720c667ee552e06089a8e9ea69d80f4c0e3d73004dc6176d4eb399ec3b8d5"
+  },
+  "delegated_fixtures": [
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-deadline.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-durable.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-per-effect.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-portal-refusals.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-reasons.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-control-ack-resign.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-delegated-wire.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-host-envelope.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-host-work-control.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-push-hint.json",
+    "atem-client-0.1.0-c7b0054fe120-r9-vectors-station-calls.json"
+  ]
 }
