@@ -40,6 +40,8 @@ use crate::identity_store::{
 use crate::voice_session::ReplyWaiters;
 use crate::AppState;
 
+mod verification;
+
 /// A room code as it may appear in logs: the first 4 characters plus "…".
 /// Astation room codes are bearer-like identifiers (whoever presents one joins
 /// that room), so logs never carry them in full.
@@ -247,6 +249,7 @@ struct HubInner {
     remote_channels: crate::remote_api::channels::ChannelBroker,
     recovery: std::sync::OnceLock<Arc<crate::remote_api::recovery::RecoveryStore>>,
     host_routes: std::sync::Mutex<HashMap<String, crate::remote_api::recovery::HostBinding>>,
+    verifications: std::sync::Mutex<HashMap<String, verification::VerificationWindow>>,
 }
 
 /// The relay: this replica's sockets plus the shared room directory, the
@@ -302,6 +305,7 @@ impl RelayHub {
                 remote_channels: crate::remote_api::channels::ChannelBroker::default(),
                 recovery: std::sync::OnceLock::new(),
                 host_routes: std::sync::Mutex::new(HashMap::new()),
+                verifications: std::sync::Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -389,7 +393,7 @@ impl RelayHub {
                 return false;
             };
             let sent = store.with_host_route(&binding, send).await;
-            if sent.is_none() {
+            if sent.is_none() && !self.keep_verification(connection).await {
                 self.local()
                     .close_with(connection, CLOSE_TRY_AGAIN, "host route changed");
             }
@@ -414,8 +418,9 @@ impl RelayHub {
             let Some(store) = self.inner.recovery.get() else {
                 return false;
             };
+            let proved = self.host_binding(&source.conn);
             store
-                .with_owner_route(&route, || async {
+                .with_owner_route(&route, proved.as_ref(), || async {
                     self.owner_route_current(&route).await
                         && self.channels().reply(handle, source, frame)
                 })
@@ -446,8 +451,9 @@ impl RelayHub {
             let Some(store) = self.inner.recovery.get() else {
                 return false;
             };
+            let proved = self.host_binding(connection);
             store
-                .with_owner_route(&route, || async {
+                .with_owner_route(&route, proved.as_ref(), || async {
                     self.owner_route_current(&route).await
                         && self.local().send_required(connection, frame)
                 })
@@ -883,6 +889,9 @@ impl RelayHub {
                     BusEvent::Inbox(InboxMessage::Deliver { connection_ids, frame }) => {
                         for connection in connection_ids { hub.send_local_checked(&connection, frame.clone(), false).await; }
                     }
+                    BusEvent::Inbox(InboxMessage::VerificationDeliver { room, connection_id, owner, frame }) => {
+                        hub.send_verification(&room, &connection_id, &owner, frame).await;
+                    }
                     BusEvent::Inbox(InboxMessage::CloseUnproved { connection_id }) => {
                         if hub.host_binding(&connection_id).is_none() { hub.local().evict(&connection_id); }
                     }
@@ -1100,7 +1109,9 @@ impl RelayHub {
         for binding in &bindings {
             if let Some(store) = self.inner.recovery.get() {
                 let current = store.with_host_route(binding, || async { () }).await.is_some();
-                if !current { self.local().close_with(&binding.connection.conn, CLOSE_TRY_AGAIN, "host route changed"); }
+                if !current && !self.keep_verification(&binding.connection.conn).await {
+                    self.local().close_with(&binding.connection.conn, CLOSE_TRY_AGAIN, "host route changed");
+                }
             }
         }
         let now = chrono::Utc::now().timestamp();
@@ -2988,8 +2999,11 @@ async fn handle_ws(
                             .await
                             .is_none()
                         {
+                            if hub.verification_ingress(&connection_id, &text, true).await { continue; }
                             break;
                         }
+                        if hub.verification_ingress(&connection_id, &text, false).await { continue; }
+                        hub.begin_verification(&connection_id, &text).await;
                         let context = crate::remote_api::push_ingress::HostContext {
                             room: code.clone(),
                             host: binding.host.clone(),
@@ -3171,6 +3185,13 @@ async fn handle_ws(
                                 struct TargetPayload<'a> { #[serde(borrow)] payload: &'a serde_json::value::RawValue }
                                 if let Ok(raw) = serde_json::from_str::<TargetPayload>(&text) {
                                     if payload["type"] == "channel" { let _ = hub.deliver_channel(&target, raw.payload.get().into()).await; }
+                                    else if matches!(payload["type"].as_str(), Some("verifyKeys" | "deviceVerified" | "verifyAbort")) {
+                                        // Strictly validate the whole envelope before granting this
+                                        // control-plane path; preserve original signed payload bytes.
+                                        if atem_client::canonical::StrictValue::parse(text.as_bytes(), 16 * 1024 * 1024).is_ok() {
+                                            hub.deliver_verification(&code, &target, &hub.me(&connection_id), raw.payload.get().into()).await;
+                                        }
+                                    }
                                     else { hub.deliver(&target, raw.payload.get().into()).await; }
                                 }
                             },
@@ -3201,6 +3222,7 @@ async fn handle_ws(
     // while directory cleanup is awaiting another replica or an unavailable store.
     local.evict(&connection_id);
     hub.inner.host_routes.lock().unwrap_or_else(|e| e.into_inner()).remove(&connection_id);
+    hub.inner.verifications.lock().unwrap_or_else(|e| e.into_inner()).remove(&connection_id);
 
     // Cleanup: leave the room (a stale close can't remove a newer connection).
     match role.as_str() {

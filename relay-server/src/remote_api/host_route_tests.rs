@@ -15,6 +15,9 @@ use axum::http::StatusCode;
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
 
+#[path = "host_verification_tests.rs"]
+mod verification;
+
 pub(crate) fn proof(
     keys: &SoftwareKeys,
     key: &KeyId,
@@ -296,7 +299,7 @@ async fn new_host_key_fences_an_ancestor_proof_and_current_connection() {
         host_trust_gen: 1,
     };
     assert!(store
-        .with_owner_route(&owner_route, || async { () })
+        .with_owner_route(&owner_route, None, || async { () })
         .await
         .is_some());
     let removed = f.remove_host();
@@ -351,7 +354,7 @@ async fn new_host_key_fences_an_ancestor_proof_and_current_connection() {
         .await
         .is_none());
     assert!(store
-        .with_owner_route(&owner_route, || async { panic!("rekeyed owner route") })
+        .with_owner_route(&owner_route, None, || async { panic!("rekeyed owner route") })
         .await
         .is_none());
     let challenge = HostChallenge::new("phone");
