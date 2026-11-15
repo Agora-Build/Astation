@@ -161,7 +161,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.head_sha || '' }}
-      - uses: dtolnay/rust-toolchain@stable
+      # SQLx 0.7 fails Rust 1.100's never-type inference; use the tested compiler.
+      - uses: dtolnay/rust-toolchain@1.98.0
       - name: Cache cargo registry and build artifacts
         uses: actions/cache@v4
         with:
