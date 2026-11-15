@@ -103,6 +103,43 @@ keeps its exact signed stop and pending mirror rather than accepting a false
 choice as confirmation. The normal first revoke and false-intent retries work;
 the conflicting true-intent mirror needs Portal convergence before activation.
 
+## Unknown Outcomes
+
+Connections now exposes a host-wide Outcomes window; the Activity sheet also
+lists the host's unresolved tasks. This remains available when the original
+agent session has ended. An authenticated native control member lists alerts
+through the same shared SDK channel used by the receipt adapter. A scan uses
+at most 64 rows per page and 256 rows total, ordered by the host's sequence.
+Only a complete scan replaces the prior list. A missing cursor, interrupted
+page or timeout preserves the prior cards and requires a new scan/reconnect.
+
+Explicit review offers Mark failed with a reason or Mark done with an existing
+published memory/vault result snapshot. The SDK validates the entire request,
+digest and correlated response. The review is tied to its connection and
+authority generation. A refused resolution needs another scan and review; a
+lost response is recovered by queries, never an automatic resolution replay.
+Only the host's receipt settles the card. A late reply may instead move the task
+to awaiting_result, which is not success. Unknown task/message receipts continue
+polling so such a change is visible. Resolution remains disabled by default;
+production does not supply the opt-in used by isolated tests.
+
+Hosts advertising host.alerts are polled while the native channel is ready,
+independent of the Outcomes window. New outcomes and daily reminders use the
+existing in-app notification preference. The reminder checkpoint is protected
+by the Data Protection Keychain, scoped to account/genesis/device and host trust
+generation, and committed before presentation. It retains identifiers and
+notification timing, without task text, sender, reason or result contents.
+Uncertain storage suppresses notifications until reload without disabling
+authenticated review. An incomplete scan cannot generate a reminder.
+
+Signed, sealed outcome_unknown push hints are verified by the shared reader
+against current membership and recipient keys, then routed to authenticated
+host catch-up and the Outcomes window. They do not enter the approval inbox or
+create an actionable card from push content. Delivery dedup and a tap's fresh
+verification stay separate. Actual OS push delivery, protected reminder storage,
+and owner resolution on a real delegated host still need VII.A evidence; unit
+tests and notification wiring do not establish that joint result.
+
 ## Reporting recovery
 
 Before any HTTP delivery, Station durably commits an in-flight marker for the
@@ -142,7 +179,8 @@ Still required before activation:
 - Native host-sender Revoke/Readmit/Interrupt UI and its all-verifier signing
   authorization. The service Revoke/Interrupt UI and protected delivery journal
   are implemented but remain gated. Record-specific re-sign/application alerts
-  and unknown-outcome resolution/listing/reminders/push remain required.
+  remain required. Unknown-outcome listing, resolution review, protected reminder
+  policy and push routing are implemented; their real joint checks remain open.
 - Restore/reset/incarnation tooling: a restored database must never reuse a
   `feed_id`. A reset must reissue a complete latest-state snapshot, including
   native records needing a manager. The present storage UUID is restart-stable;
@@ -151,6 +189,23 @@ Still required before activation:
 - Account ownership/mailbox integration, the remaining Kotlin delegated
   fixture runner, and all real Station/native/Atem/Portal joint checks listed
   in #79. Passing fake-host/isolated tests is not activation evidence.
+
+## Host Mail Follow-up
+
+Part I (#79) stays first. The owner confirmed that Atem-to-Atem messages will
+use host senders with sealed, signed mail, skipping the Station-integration
+stage for Atem hosts. The H-0 contract is still awaited on Atem #120. Review
+must cover mailbox put/stored/sync/done and heads, status forms, result_id,
+select only for advertised capability, D3's host encryption-key signature in
+the verification ceremony under the same owner authentication, and D4's first
+version without a vault directory. These are review requirements, not an
+agreement on wire shapes that have not yet been posted.
+
+After agreement, build the Station host-mail mailbox (reuse enrollment mailbox
+storage only where the authority/retention semantics actually fit), native
+project/host-key signing and host-sender Revoke/Readmit, and the complete verifier
+inventory check before new signed actions. VII.B follows VII.A. None of this
+authorizes new signing or displaces the remaining Part I implementation.
 
 ## Pairing Test Scope
 
@@ -174,9 +229,10 @@ Tests exercise strict shared fixtures through actual Rust and Swift bindings,
 real sockets without a Mac, isolated Postgres and Redis, two replicas/restart,
 generation changes behind a queued response, ACK commit failure, service-key
 binding, lifecycle concurrency and expiry, historical coverage, HTTP retries,
-failed stop/marker commits and explicit one-shot resumption. Native approval
-pushes use the SDK's typed approval/unknown-outcome targets; until the unknown
-outcome UI exists, the approval inbox does not consume their deduplication state.
+failed stop/marker commits and explicit one-shot resumption. Outcome tests cover
+all four pages, failure/timeout recovery, stale confirmation and late scan/query
+races, explicit receipt confirmation, daily reminder reload and uncertain writes,
+and actual shared verification of signed alert targets and tampering.
 
 The working branch's exact commands/results are recorded in its PR. Real
 protected owner ceremonies and native local transport remain joint checks.

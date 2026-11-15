@@ -1,4 +1,5 @@
 import AppKit
+import AstationRemote
 import Security
 import SwiftUI
 import UserNotifications
@@ -16,6 +17,7 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
     private let unregister: (ApprovalPushPlatform) -> Void
     private let open: (ApprovalPushHint) -> Void
     private let verifyPush: @MainActor ([AnyHashable: Any], Bool) -> ApprovalPushHint?
+    private let outcomePush: @MainActor ([AnyHashable: Any], Bool) -> Bool
     private var reconciliation: ApprovalPushReconciliation
     private lazy var center = UNUserNotificationCenter.current()
     private let enabledKey = "agentApprovalNotificationsEnabled"
@@ -27,12 +29,17 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
     private var banner: NSPanel?
     private var bannerKey: String?
     private var alerted: [String] = []
+    private var outcomeBanner: NSPanel?
+    private var outcomeBannerSource: String?
+    private var outcomeBannerGeneration = UUID()
+    private var outcomeWindowController: NSWindowController?
     var supportsPush: Bool { pushPlatform != nil }
 
     init(defaults: UserDefaults = .standard, platform: ApprovalPushPlatform? = ApprovalNotifications.platform,
          register: @escaping (ApprovalPushRegistration) -> Void,
          unregister: @escaping (ApprovalPushPlatform) -> Void, open: @escaping (ApprovalPushHint) -> Void,
-         verifyPush: @escaping @MainActor ([AnyHashable: Any], Bool) -> ApprovalPushHint? = { _, _ in nil }) {
+         verifyPush: @escaping @MainActor ([AnyHashable: Any], Bool) -> ApprovalPushHint? = { _, _ in nil },
+         outcomePush: @escaping @MainActor ([AnyHashable: Any], Bool) -> Bool = { _, _ in false }) {
         self.defaults = defaults
         pushPlatform = platform
         inAppEnabled = defaults.object(forKey: inAppKey) as? Bool ?? true
@@ -44,6 +51,7 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
         self.unregister = unregister
         self.open = open
         self.verifyPush = verifyPush
+        self.outcomePush = outcomePush
         reconciliation = ApprovalPushReconciliation(saved: defaults.data(forKey: "agentApprovalNotificationResolutions"))
         super.init()
         inbox.onNew = { [weak self] entry in self?.showInAppAlert(entry) }
@@ -100,7 +108,7 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
     func setInAppEnabled(_ enabled: Bool) {
         inAppEnabled = enabled
         defaults.set(enabled, forKey: inAppKey)
-        if !enabled { banner?.orderOut(nil) }
+        if !enabled { banner?.orderOut(nil); outcomeBanner?.orderOut(nil) }
     }
 
     func setPushEnabled(_ enabled: Bool) {
@@ -160,9 +168,49 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
         }
     }
 
+    @MainActor func outcomesChanged(sourceID: String, work: RemoteHostWork, hub: AstationHubManager) {
+        if outcomeBannerSource == sourceID && (!work.canReviewOutcomes || work.alerts.isEmpty) {
+            outcomeBanner?.orderOut(nil)
+        }
+        guard inAppEnabled, hub.takeOutcomeReminder(clientID: sourceID, work: work),
+              let first = work.alerts.first else { return }
+        let generation = UUID()
+        outcomeBannerGeneration = generation; outcomeBannerSource = sourceID
+        let panel = outcomeBanner ?? NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.level = .floating; panel.isOpaque = false; panel.backgroundColor = .clear
+        panel.hasShadow = true; panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.contentView = NSHostingView(rootView: OutcomeBannerView(alert: first, count: work.alerts.count, review: { [weak self, weak hub] in
+            guard let self, let hub else { return }
+            self.outcomeBanner?.orderOut(nil)
+            self.showOutcomes(sourceID: sourceID, hub: hub)
+        }, dismiss: { [weak self] in self?.outcomeBanner?.orderOut(nil) }))
+        if let frame = NSScreen.main?.visibleFrame {
+            panel.setFrame(NSRect(x: frame.maxX - 424, y: frame.maxY - 256, width: 408, height: 240), display: true)
+        }
+        outcomeBanner = panel
+        panel.orderFrontRegardless()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            if self?.outcomeBannerGeneration == generation { self?.outcomeBanner?.orderOut(nil) }
+        }
+    }
+
+    @MainActor func showOutcomes(sourceID: String, hub: AstationHubManager) {
+        outcomeWindowController?.close()
+        let window = NSWindow(contentViewController: NSHostingController(rootView:
+            HostOutcomeView(hub: hub, clientID: sourceID) { [weak self] in self?.outcomeWindowController?.close() }))
+        window.title = "Host Outcomes"; window.styleMask = [.titled, .closable, .miniaturizable]
+        window.center()
+        outcomeWindowController = NSWindowController(window: window)
+        outcomeWindowController?.showWindow(nil)
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     func received(userInfo: [String: Any]) {
         DispatchQueue.main.async { [weak self] in
-            guard let self, let hint = self.verifyPush(userInfo, false) else { return }
+            guard let self else { return }
+            guard let hint = self.verifyPush(userInfo, false) else { _ = self.outcomePush(userInfo, false); return }
             self.receivedVerified(hint)
         }
     }
@@ -192,11 +240,13 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         DispatchQueue.main.async { [weak self] in
-            if response.actionIdentifier == UNNotificationDefaultActionIdentifier,
-               let hint = self?.verifyPush(response.notification.request.content.userInfo, true) {
-                self?.inbox.notificationHint = hint
-                self?.open(hint)
-                self?.showPreferences()
+            if response.actionIdentifier == UNNotificationDefaultActionIdentifier, let self {
+                let info = response.notification.request.content.userInfo
+                if let hint = self.verifyPush(info, true) {
+                    self.inbox.notificationHint = hint
+                    self.open(hint)
+                    self.showPreferences()
+                } else { _ = self.outcomePush(info, true) }
             }
             completionHandler()
         }
@@ -205,8 +255,11 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         DispatchQueue.main.async { [weak self] in
-            guard let self, self.inAppEnabled, self.pushEnabled,
-                  let hint = self.verifyPush(notification.request.content.userInfo, false) else {
+            guard let self, self.inAppEnabled, self.pushEnabled else {
+                completionHandler([]); return
+            }
+            guard let hint = self.verifyPush(notification.request.content.userInfo, false) else {
+                _ = self.outcomePush(notification.request.content.userInfo, false)
                 completionHandler([]); return
             }
             let remove = self.reconciliation.receive(hint, now: Date())
@@ -251,6 +304,28 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
             if self?.bannerKey == key { self?.banner?.orderOut(nil) }
         }
+    }
+}
+
+private struct OutcomeBannerView: View {
+    let alert: RemoteOutcomeAlert
+    let count: Int
+    let review: () -> Void
+    let dismiss: () -> Void
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Task outcome needs review", systemImage: "exclamationmark.triangle.fill").font(.headline)
+                Spacer()
+                Button(action: dismiss) { Image(systemName: "xmark") }.buttonStyle(.plain).help("Dismiss alert")
+            }
+            Text("\(alert.host_id) / \(alert.session_id)").font(.caption).lineLimit(1)
+            Text("Task: \(alert.task_id)\nSender: \(alert.sender)").font(.caption.monospaced()).lineLimit(3)
+            Text(alert.reason).font(.callout).lineLimit(2)
+            if count > 1 { Text("\(count) unresolved outcomes on this host").font(.caption) }
+            HStack { Spacer(); Button("Review outcomes", action: review).buttonStyle(.borderedProminent) }
+        }.padding(16).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
     }
 }
 

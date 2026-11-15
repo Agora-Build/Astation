@@ -213,6 +213,10 @@ class AstationApp: NSObject, NSApplicationDelegate {
                 }
             }, verifyPush: { [weak hubManager] userInfo, tapped in
                 hubManager?.verifyApprovalPush(userInfo, tapped: tapped)
+            }, outcomePush: { [weak self, weak hubManager] userInfo, tapped in
+                guard let hubManager, let source = hubManager.handleOutcomePush(userInfo, tapped: tapped) else { return false }
+                if tapped { self?.approvalNotifications?.showOutcomes(sourceID: source, hub: hubManager) }
+                return true
             })
         approvalNotifications = notifications
         if let file = ProcessInfo.processInfo.environment["ASTATION_LOCAL_API_TOKEN_FILE"] {
@@ -226,6 +230,10 @@ class AstationApp: NSObject, NSApplicationDelegate {
         }
         hubManager.approvalSessionDidChange = { [weak notifications] source, client, host in
             notifications?.sessionChanged(sourceID: source, client: client, host: host)
+        }
+        hubManager.hostOutcomesDidChange = { [weak notifications, weak hubManager] source, work in
+            guard let hubManager else { return }
+            notifications?.outcomesChanged(sourceID: source, work: work, hub: hubManager)
         }
         statusBarController.approvalNotificationSettings = { [weak notifications] in notifications?.showPreferences() }
         statusBarController.approvalPendingCount = { [weak notifications] in notifications?.inbox.pendingCount ?? 0 }
