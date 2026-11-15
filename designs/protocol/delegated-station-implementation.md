@@ -63,6 +63,46 @@ heads and exact sync correlation, and an anchored local log verifies a manager
 record before publication. The adapter accepts only a matching record ID and a
 Boolean receipt. It does not sign a record or treat a receipt as host application.
 
+## Native stop delivery
+
+The Mac integration screen now has gated Revoke and later Interrupt workflows.
+Revoke's interruption checkbox starts off. A review shows the integration,
+principal, Station, action, interruption choice and exact record ID before a
+separate fresh owner authentication. The ordinary membership key provider still
+refuses control signatures; the authorized stop path uses the same protected
+identity with a one-use `RemoteConfirmedSigner` for the SDK's exact request.
+Managers cannot use this path to sign service cover, hold or release.
+
+`RemoteControlPublication` stores the draft before confirmation and the exact
+signature before either delivery leg. Its protected checkpoint is bound to the
+account, genesis and Station and retains the Portal issuer/owner and explicit
+interruption choice. A changed membership head invalidates an unsigned review.
+A retry revalidates a signed record against the current independently anchored
+membership; a removed manager needs a new review/signature. Its already confirmed
+Portal revoke intent remains available. Checkpoints also verify retained
+signatures with the public key pinned at preparation.
+
+Station storage and Portal mirroring settle independently. A failed or lost
+reply, app restart, or write that committed before throwing never creates a new
+record or signature. An uncertain protected write stops the instance until a
+reload. The account coordinator schedules retries at startup/resumption and
+every 30 seconds, independent of the Settings window; account, Station and
+coordinator generation changes retire its work. It uses the same cached native
+integration authorization as the approval screen, without opening a sign-in
+prompt in the background. These receipts never imply host application.
+
+The production constructor supplies no delegated signing authorization, so
+these controls and retries remain off. This is not the separate all-verifier
+gate for the five new membership actions; that gate also stays off, and
+host-sender Readmit is not implemented by the service-stop UI.
+
+Portal integration follow-up: [Portal #38](https://github.com/Agora-Build/Portal/issues/38).
+At Portal `fd11f8bc7c1dbfe9c89b2a23bd7572b00ac6e440`, an earlier non-interrupting
+revoke wins over a later native mirror with `interruptRunning: true`. Native
+keeps its exact signed stop and pending mirror rather than accepting a false
+choice as confirmation. The normal first revoke and false-intent retries work;
+the conflicting true-intent mirror needs Portal convergence before activation.
+
 ## Reporting recovery
 
 Before any HTTP delivery, Station durably commits an in-flight marker for the
@@ -99,9 +139,10 @@ Still required before activation:
   focused host request is [Atem #120 comment 6892158273](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6892158273).
   A native login token cannot replace the proof. A proxy must not take over a
   normal host route without supporting its encrypted channel routing too.
-- Native manager Revoke/Readmit/Interrupt UI, exact confirmation, durable signed
-  delivery and Portal mirror retries; record-specific re-sign alerts and
-  unknown-outcome resolution/listing/reminders/push.
+- Native host-sender Revoke/Readmit/Interrupt UI and its all-verifier signing
+  authorization. The service Revoke/Interrupt UI and protected delivery journal
+  are implemented but remain gated. Record-specific re-sign/application alerts
+  and unknown-outcome resolution/listing/reminders/push remain required.
 - Restore/reset/incarnation tooling: a restored database must never reuse a
   `feed_id`. A reset must reissue a complete latest-state snapshot, including
   native records needing a manager. The present storage UUID is restart-stable;

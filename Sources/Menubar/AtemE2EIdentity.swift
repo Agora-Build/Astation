@@ -333,6 +333,17 @@ final class AtemE2EIdentity {
         return try crypto.sign(request.input, material: record.material)
     }
 
+    func signControlRecord(_ request: SignRequest, expectedPublicKey: Data) throws -> Data {
+        lock.lock(); defer { lock.unlock() }
+        guard let body = request.bodyJson,
+              request == (try RemoteConfirmedSigner.controlRequest(bodyJSON: body, keyID: request.keyId)),
+              let record = try read(create: false),
+              try crypto.signingPublicKey(record.material) == expectedPublicKey else {
+            throw AtemIdentityError.identityChanged
+        }
+        return try crypto.sign(request.input, material: record.material)
+    }
+
     func signChannel(_ request: SignRequest, keyID: String, expectedPublicKey: Data) throws -> Data {
         try RemoteRoutineChannelSigner.validate(request, keyID: keyID)
         lock.lock(); defer { lock.unlock() }

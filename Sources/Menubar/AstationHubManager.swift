@@ -46,6 +46,7 @@ class AstationHubManager: ObservableObject {
     private let accountDefaults: UserDefaults
     private(set) var portalSettings: AccountServiceSettings?
     private(set) var portalAuth: AstationAccountAuth?
+    @MainActor private var integrationAuth: AstationAccountAuth?
     let portalAPI: PortalAPIClient
     @Published private(set) var signedInAccount: String?
     @Published private(set) var accountSignInRequired = true
@@ -351,7 +352,32 @@ class AstationHubManager: ObservableObject {
             self.refreshChannelsAfterMembershipCommit(head)
         }
         accountRecovery = coordinator
+        if coordinator.delegatedControlsAvailable, let owner = signedInAccount, let settings = portalSettings {
+            let epoch = integrationAccountGeneration
+            let auth = try integrationAuthorization(settings: settings)
+            guard let configuration = auth.configuration else { throw AccountLoginError.configuration }
+            let portal = try PortalIntegrationHTTP(configuration: configuration, portalOrigin: settings.portalURL,
+                ownerAccount: owner, accessToken: {
+                    guard try await auth.current()?.session.subject == owner else { throw AccountLoginError.signInRequired }
+                    return try await auth.accessToken()
+                })
+            coordinator.resumeControlDelivery(portal: portal, current: { [weak self, weak coordinator] in
+                guard let self, let coordinator else { return false }
+                return self.accountRecovery === coordinator && self.integrationAccountGeneration == epoch
+                    && self.signedInAccount == owner && !self.accountSignInRequired && self.stationRelayUrl == targetRelay
+            })
+        }
         return coordinator
+    }
+
+    @MainActor func integrationAuthorization(settings: AccountServiceSettings) throws -> AstationAccountAuth {
+        let config = try AccountOIDCConfiguration(issuer: settings.issuer, clientID: settings.clientID,
+            resource: settings.portalURL, requiredScope: "integrations:read", additionalScopes: ["integrations:approve"])
+        if let integrationAuth, integrationAuth.configuration == config { return integrationAuth }
+        let auth = AstationAccountAuth(configuration: config,
+            storage: AccountKeychainStorage(service: "build.agora.astation.integrations-v1." + settings.storageContext))
+        integrationAuth = auth
+        return auth
     }
 
     @MainActor private func refreshChannelsAfterMembershipCommit(_ head: LogHead) {

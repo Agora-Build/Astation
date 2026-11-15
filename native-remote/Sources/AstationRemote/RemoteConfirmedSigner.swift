@@ -1,7 +1,7 @@
 import AtemClient
 import Foundation
 
-/// A fresh owner approval authorizes one exact membership body, never a later draft.
+/// A fresh owner approval authorizes one exact body, never a later draft.
 public final class RemoteConfirmedSigner: AppKeyProvider, @unchecked Sendable {
     public let request: SignRequest
     private let provider: AppKeyProvider
@@ -17,7 +17,9 @@ public final class RemoteConfirmedSigner: AppKeyProvider, @unchecked Sendable {
         guard request.freshConfirmation, let body = request.bodyJson,
               confirmedAt <= UInt64.max - 30_000, now() >= confirmedAt,
               now() < confirmedAt + 30_000 else { throw RemoteRecoveryError.confirmationRequired }
-        let checked = try Self.membershipRequest(bodyJSON: body, keyID: request.keyId)
+        let checked = try request.purpose == .controlRecord
+            ? Self.controlRequest(bodyJSON: body, keyID: request.keyId)
+            : Self.membershipRequest(bodyJSON: body, keyID: request.keyId)
         guard request == checked else { throw RemoteChannelError.invalidInput }
         self.request = request
         self.provider = provider
@@ -53,6 +55,24 @@ public final class RemoteConfirmedSigner: AppKeyProvider, @unchecked Sendable {
         }
         return SignRequest(keyId: keyID, purpose: purpose, freshConfirmation: true,
             label: "atem-membership-entry-v1", input: info.signingInput, bodyJson: info.bodyJcs)
+    }
+
+    public static func controlRequest(bodyJSON: String, keyID: String) throws -> SignRequest {
+        let body = try canonicalJson(json: bodyJSON)
+        let object = try JSONSerialization.jsonObject(with: Data(body.utf8))
+        let envelope = try JSONSerialization.data(withJSONObject: ["body": object,
+            "sig": RemoteRecoveryKit.base64URL(Data(repeating: 0, count: 64))])
+        let wire = String(decoding: envelope, as: UTF8.self)
+        let record = try parseControlRecord(recordJson: wire)
+        let info = try signedObjectInfo(json: wire)
+        guard record.signer == "member:" + keyID,
+              ["revoke", "interrupt_running"].contains(record.action),
+              info.bodyType == "atem-host-work-control",
+              info.signingInput == (try controlRecordSigningInput(body: record)) else {
+            throw RemoteChannelError.invalidInput
+        }
+        return SignRequest(keyId: keyID, purpose: .controlRecord, freshConfirmation: true,
+            label: "atem-host-work-control-v1", input: info.signingInput, bodyJson: info.bodyJcs)
     }
 
     public func invalidate() {

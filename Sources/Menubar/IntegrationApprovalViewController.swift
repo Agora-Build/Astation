@@ -21,6 +21,8 @@ final class IntegrationApprovalViewController: NSViewController {
     private let approveButton = NSButton(title: "Approve on This Mac…", target: nil, action: nil)
     private let reviewAgainButton = NSButton(title: "Review Changed Request", target: nil, action: nil)
     private let removeButton = NSButton(title: "Remove Revoked Access…", target: nil, action: nil)
+    private let revokeButton = NSButton(title: "Revoke Access…", target: nil, action: nil)
+    private let interruptButton = NSButton(title: "Interrupt Running Tasks…", target: nil, action: nil)
     private let setupButton = NSButton(title: "Set Up Account Security…", target: nil, action: nil)
     private let openSecurity: () -> Void
     private let relayOnlyButton = NSButton(title: "Use Selected Relay Only…", target: nil, action: nil)
@@ -36,6 +38,7 @@ final class IntegrationApprovalViewController: NSViewController {
     private var approvedScope: ApprovedScope?
     private var task: Task<Void, Never>?
     private var revocationRefresh: Task<Void, Never>?
+    private var controlWorking = false
     private var generation = UUID()
     private var contextCurrent: (() -> Bool)?
     private var securityMissingOnStation = false
@@ -70,7 +73,8 @@ final class IntegrationApprovalViewController: NSViewController {
         relayStatus.textColor = .secondaryLabelColor
         let stack = NSStackView(views: [title, intro, relayOnlyButton, relayStatus, actions,
             NSTextField(labelWithString: "Integration request"), picker,
-            setupButton, NSTextField(labelWithString: "Allowed Atem hosts"), hosts, hostStatus, sessions, projects, markPermission, reviewText, reviewAgainButton, removeButton, status])
+            setupButton, NSTextField(labelWithString: "Allowed Atem hosts"), hosts, hostStatus, sessions, projects, markPermission, reviewText, reviewAgainButton,
+            revokeButton, interruptButton, removeButton, status])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 14
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.drawsBackground = false
         let document = NSView(); scroll.documentView = document
@@ -96,6 +100,8 @@ final class IntegrationApprovalViewController: NSViewController {
         approveButton.target = self; approveButton.action = #selector(approveAccess)
         reviewAgainButton.target = self; reviewAgainButton.action = #selector(reviewAgain)
         removeButton.target = self; removeButton.action = #selector(removeRevokedAccess)
+        revokeButton.target = self; revokeButton.action = #selector(revokeAccess)
+        interruptButton.target = self; interruptButton.action = #selector(interruptRunningTasks)
         relayOnlyButton.target = self; relayOnlyButton.action = #selector(changeRelayPolicy)
         setupButton.target = self; setupButton.action = #selector(setupSecurity)
         policySubscription = hub.$relayOnlyPolicyStatus.sink { [weak self] value in self?.relayStatus.stringValue = value }
@@ -105,6 +111,7 @@ final class IntegrationApprovalViewController: NSViewController {
     func cancelPending() {
         if records.indices.contains(picker.indexOfSelectedItem) { selectedIntegrationID = records[picker.indexOfSelectedItem].id }
         revocationRefresh?.cancel(); revocationRefresh = nil
+        controlWorking = false
         generation = UUID(); task?.cancel(); task = nil
         approval = nil; contextCurrent = nil; log = nil; reviewText.stringValue = ""
         markPermission.state = .off
@@ -143,6 +150,12 @@ final class IntegrationApprovalViewController: NSViewController {
         } == true
         removeButton.isHidden = !revoking || (removed && !pendingRemoval)
         removeButton.isEnabled = !busy && removable && approval == nil && contextCurrent?() == true
+        let controlsAvailable = coordinator?.delegatedControlsAvailable == true
+            && records.indices.contains(picker.indexOfSelectedItem) && records[picker.indexOfSelectedItem].r9Svc != nil
+        revokeButton.isHidden = !controlsAvailable || revoking
+        interruptButton.isHidden = !controlsAvailable || !revoking
+        revokeButton.isEnabled = !busy && !controlWorking && approval == nil && contextCurrent?() == true
+        interruptButton.isEnabled = revokeButton.isEnabled
         let canSelectHosts = !busy && pendingSelection && log != nil && approval == nil && contextCurrent?() == true
         let supportsMarks = records.indices.contains(picker.indexOfSelectedItem)
             && Set(records[picker.indexOfSelectedItem].scopes).isSuperset(of: ["agent.view", "agent.prompt"])
@@ -180,6 +193,7 @@ final class IntegrationApprovalViewController: NSViewController {
         status.stringValue = selectedRequestGuidance()
         render()
         refreshRemovedServiceStatus()
+        observeControlDelivery()
     }
     @objc private func hostSelectionChanged() { render() }
     @objc private func setupSecurity() {
@@ -250,8 +264,7 @@ final class IntegrationApprovalViewController: NSViewController {
                       hub.accountAuth.configuration?.resource == origin else { throw AccountLoginError.signInRequired }
                 let config = try AccountOIDCConfiguration(issuer: settings.issuer, clientID: settings.clientID,
                     resource: settings.portalURL, requiredScope: "integrations:read", additionalScopes: ["integrations:approve"])
-                let auth = AstationAccountAuth(configuration: config,
-                    storage: AccountKeychainStorage(service: "build.agora.astation.integrations-v1." + settings.storageContext))
+                let auth = try hub.integrationAuthorization(settings: settings)
                 self.auth = auth
                 do { _ = try await auth.accessToken() }
                 catch AccountLoginError.signInRequired { try await signIn(auth) }
@@ -334,6 +347,7 @@ final class IntegrationApprovalViewController: NSViewController {
         }
         render()
         refreshRemovedServiceStatus()
+        observeControlDelivery()
     }
 
     @objc private func reviewAccess() {
@@ -431,6 +445,76 @@ final class IntegrationApprovalViewController: NSViewController {
                 refreshRemovedServiceStatus()
             } catch { fail(error, epoch: epoch) }
         }
+    }
+
+    @objc private func revokeAccess() { reviewControl(interruptOnly: false) }
+    @objc private func interruptRunningTasks() { reviewControl(interruptOnly: true) }
+
+    private func reviewControl(interruptOnly: Bool) {
+        guard records.indices.contains(picker.indexOfSelectedItem), let coordinator, let portal,
+              coordinator.delegatedControlsAvailable, contextCurrent?() == true else { return }
+        let record = records[picker.indexOfSelectedItem]
+        let choice = NSAlert()
+        choice.messageText = interruptOnly ? "Interrupt this integration's running tasks?" : "Revoke this integration?"
+        choice.informativeText = "\(record.name)\nStation: \(record.stationOrigin)\n\n"
+            + (interruptOnly ? "This requests interruption of work already running. It does not readmit the integration."
+                : "Queued work that has not started will be cancelled. Running work continues unless you also choose to interrupt it.")
+        let interrupt = NSButton(checkboxWithTitle: "Also interrupt the tasks running now", target: nil, action: nil)
+        interrupt.state = .off
+        if !interruptOnly { choice.accessoryView = interrupt }
+        choice.addButton(withTitle: "Review Signed Stop…"); choice.addButton(withTitle: "Cancel")
+        guard choice.runModal() == .alertFirstButtonReturn else { return }
+        let epoch = generation
+        controlWorking = true; render(busy: true)
+        task = Task { [weak self] in
+            guard let self else { return }
+            var review: AstationRecoveryCoordinator.ServiceControlReview?
+            defer { if epoch == generation { controlWorking = false; render() } }
+            do {
+                let current = { [weak self] in self?.contextCurrent?() == true && !Task.isCancelled }
+                let value = try await coordinator.prepareServiceControl(record, portal: portal, interruptOnly: interruptOnly,
+                    interruptRunning: interrupt.state == .on, current: current)
+                review = value
+                guard current() else { throw RemoteChannelError.staleLink }
+                let confirm = NSAlert()
+                confirm.messageText = interruptOnly ? "Confirm interruption" : "Confirm revocation"
+                confirm.informativeText = "\(value.integrationName)\nPrincipal: \(value.body.principal)\nStation: \(value.stationOrigin)\n"
+                    + "Action: \(value.body.action)\nInterrupt running tasks: \(value.body.interruptRunning == true || interruptOnly ? "Yes" : "No")\n"
+                    + "Record: \(value.recordID)\n\nApprove this exact stop with Touch ID or your password."
+                confirm.addButton(withTitle: "Confirm on This Mac…"); confirm.addButton(withTitle: "Cancel")
+                guard confirm.runModal() == .alertFirstButtonReturn else {
+                    try coordinator.cancelUnsignedControl(value)
+                    return
+                }
+                let result = try await coordinator.commitServiceControl(value, portal: portal, current: current)
+                guard epoch == generation else { return }
+                status.stringValue = Self.controlStatus(result)
+                observeControlDelivery()
+            } catch {
+                // Signed records cannot be cancelled; the protected outbox retains them.
+                if let review { try? coordinator.cancelUnsignedControl(review) }
+                fail(error, epoch: epoch)
+            }
+        }
+    }
+
+    private func observeControlDelivery() {
+        guard coordinator?.delegatedControlsAvailable == true else { return }
+        let epoch = generation
+        coordinator?.onControlDelivery = { [weak self] result in
+            guard let self, epoch == self.generation, self.contextCurrent?() == true, !self.controlWorking,
+                  self.records.indices.contains(self.picker.indexOfSelectedItem),
+                  let body = try? parseControlRecord(recordJson: result.recordJSON),
+                  body.integrationId == self.records[self.picker.indexOfSelectedItem].id else { return }
+            self.status.stringValue = Self.controlStatus(result)
+        }
+    }
+
+    static func controlStatus(_ delivery: RemoteControlDelivery) -> String {
+        let station = delivery.stationStored ? "Station stored the signed stop." : "Station delivery pending; the signed stop is saved for retry."
+        let portal = delivery.portalMirror == nil ? "" : delivery.portalMirrored
+            ? " Agora.Build revocation is confirmed." : " Agora.Build revocation is pending and will retry."
+        return station + portal + " Host application is not confirmed by these receipts."
     }
 
     private static func requestTitle(_ record: PortalIntegrationRecord) -> String {

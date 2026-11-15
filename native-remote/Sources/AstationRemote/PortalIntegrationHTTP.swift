@@ -10,6 +10,7 @@ public struct PortalIntegrationRecord: Decodable, Equatable, Sendable {
     public let r9Svc: String?
     public let expiresAt: String
     public let role: String
+    public let interruptRunning: Bool?
 
     func validate() throws {
         guard Self.validID(id), !name.isEmpty, name.utf8.count <= 320,
@@ -101,6 +102,24 @@ public struct PortalIntegrationHTTP: Sendable {
         }.map { try $0.validate(); return $0 }
     }
 
+    /// The protected control journal retains this exact intent until this reply is committed.
+    /// A Portal receipt alone never proves that a host has applied the native stop.
+    public func mirrorRevoke(_ mirror: RemoteControlPortalMirror) async throws -> PortalIntegrationRecord {
+        try mirror.validate()
+        guard mirror.issuer == configuration.issuer, mirror.ownerAccount == ownerAccount else {
+            throw AccountLoginError.changed
+        }
+        let result: PortalIntegrationRecord = try await request(path: "/api/v1/integrations/\(mirror.integrationID)/revoke",
+            jsonBody: JSONEncoder().encode(["interruptRunning": mirror.interruptRunning]))
+        try result.validate()
+        guard result.id == mirror.integrationID, result.stationOrigin == mirror.stationOrigin,
+              result.role == "owner", ["revoking", "revoked"].contains(result.state),
+              result.interruptRunning != nil, !mirror.interruptRunning || result.interruptRunning == true else {
+            throw AccountLoginError.changed
+        }
+        return result
+    }
+
     /// Publish only after the native checkpoint contains the exact signed entry.
     /// A lost HTTP reply is reconciled by listing; this method never retries it.
     @MainActor
@@ -131,13 +150,17 @@ public struct PortalIntegrationHTTP: Sendable {
     }
 
     private func request<T: Decodable>(path: String, body: [String: String]? = nil) async throws -> T {
+        try await request(path: path, jsonBody: body.map { try JSONEncoder().encode($0) })
+    }
+
+    private func request<T: Decodable>(path: String, jsonBody: Data?) async throws -> T {
         var request = URLRequest(url: URL(string: portalOrigin + path)!)
         request.setValue("Bearer \(try await accessToken())", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        if let body {
+        if let jsonBody {
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.httpBody = try JSONEncoder().encode(body)
+            request.httpBody = jsonBody
         }
         let (bytes, code) = try await http.send(request)
         switch code {

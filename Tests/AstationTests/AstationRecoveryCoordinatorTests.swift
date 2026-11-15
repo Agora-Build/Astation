@@ -48,7 +48,7 @@ private final class RecoveryMemoryKeys: AstationRecoveryDataKeys {
     func installRecovered(_ values: [AccountDataKey], dataAccount: String) throws { keys = values; installs += 1 }
 }
 
-private actor RecoveryMemoryRelay: RemoteRecoveryTransport, RemoteDeviceEnrollmentTransport {
+private actor RecoveryMemoryRelay: RemoteRecoveryTransport, RemoteDeviceEnrollmentTransport, RemoteControlTransport {
     var log: MembershipLog?
     var account = "account-a"
     var appends: [AppendRequest] = []
@@ -65,6 +65,35 @@ private actor RecoveryMemoryRelay: RemoteRecoveryTransport, RemoteDeviceEnrollme
     let hostKey = Curve25519.Signing.PrivateKey()
     var deviceMailboxes: [String: RemoteDeviceEnrollmentMailbox] = [:]
     var loseDeviceResponseReply = false
+    let controlFeedID = UUID().uuidString.lowercased()
+    var controlRecords: [String] = []
+    var loseControlReply = false
+    var controlTime: UInt64 = 1
+
+    func dropControlReply() { loseControlReply = true }
+    func controls() -> [String] { controlRecords }
+    func controlHeads(genesisHash: String) async throws -> String {
+        let log = try XCTUnwrap(log)
+        XCTAssertEqual(log.genesisHash(), genesisHash)
+        return try relayHeads(feeds: [RelayFeedHead(origin: "https://configured.example", feedId: controlFeedID,
+            head: UInt64(controlRecords.count), stationTime: AstationRecoveryCoordinator.clock().wallMs)], membership: log.head())
+    }
+    func reserveControlTime(genesisHash: String, principal: String, managerID: String, expected: LogHead) async throws -> UInt64 {
+        XCTAssertEqual(log?.head(), expected)
+        controlTime = max(controlTime + 1, AstationRecoveryCoordinator.clock().wallMs)
+        return controlTime
+    }
+    @MainActor func publishControl(log: MembershipLog, recordJSON: String) async throws -> Bool {
+        guard case .valid = try verifyControlRecord(log: log, recordJson: recordJSON) else { throw RemoteRecoveryTransportError.invalidResponse }
+        return try await acceptControl(recordJSON, expected: log.head())
+    }
+    private func acceptControl(_ record: String, expected: LogHead) throws -> Bool {
+        XCTAssertEqual(log?.head(), expected)
+        let appended = !controlRecords.contains(record)
+        if appended { controlRecords.append(record) }
+        if loseControlReply { loseControlReply = false; throw RemoteRecoveryTransportError.unavailable }
+        return appended
+    }
 
     func dropNextDeviceResponseReply() { loseDeviceResponseReply = true }
 
@@ -186,6 +215,7 @@ private actor ServiceApprovalPortal: AccountOIDCHTTP {
     var posts = 0
     var loseReply = false
     var expired = false
+    var interruptRunning = false
     func revoke(expired: Bool = false, fingerprint: String? = nil) {
         state = "revoking"; self.expired = expired
         if let fingerprint { self.fingerprint = fingerprint }
@@ -196,13 +226,23 @@ private actor ServiceApprovalPortal: AccountOIDCHTTP {
     func send(_ request: URLRequest) async throws -> (Data, Int) {
         if request.httpMethod == "POST" {
             posts += 1
-            fingerprint = (try JSONSerialization.jsonObject(with: request.httpBody!) as? [String: String])?["r9Svc"]
-            state = "provisioning"
+            if request.url?.path.hasSuffix("/revoke") == true {
+                let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
+                let choice = try XCTUnwrap(body["interruptRunning"] as? Bool)
+                if !["revoking", "revoked"].contains(state) {
+                    interruptRunning = choice
+                    state = "revoking"
+                }
+            } else {
+                fingerprint = (try JSONSerialization.jsonObject(with: request.httpBody!) as? [String: String])?["r9Svc"]
+                state = "provisioning"
+            }
             if loseReply { loseReply = false; throw AccountLoginError.unavailable }
         }
         var record: [String: Any] = ["id": "i-01234567890123456789012345", "name": "Test bot", "stationOrigin": "https://configured.example",
             "state": state, "scopes": ["agent.prompt", "agent.view"], "expiresAt": ISO8601DateFormatter().string(from: Date().addingTimeInterval(expired ? -3600 : 3600)), "role": "owner"]
         if let fingerprint { record["r9Svc"] = fingerprint }
+        if ["revoking", "revoked"].contains(state) { record["interruptRunning"] = interruptRunning }
         return (try JSONSerialization.data(withJSONObject: request.httpMethod == "POST" ? record : ["stale": false, "integrations": [record]]), 200)
     }
 }
@@ -220,7 +260,8 @@ private final class RecoveryCoordinatorHarness {
     var ownerConfirmation: ((SignRequest) async throws -> Bool)?
     var serviceOwnerConfirmation: ((RemoteServiceApproval, SignRequest) async -> Bool)?
 
-    func coordinator(relayURL: String = "https://configured.example", transport: RemoteRecoveryTransport? = nil) throws -> AstationRecoveryCoordinator {
+    func coordinator(relayURL: String = "https://configured.example", transport: RemoteRecoveryTransport? = nil,
+        authorizeDelegatedControl: ((MembershipLog) throws -> Void)? = nil) throws -> AstationRecoveryCoordinator {
         try AstationRecoveryCoordinator(accountID: "account-a", managerID: "manager-a", identity: identity,
             relayURL: relayURL, store: store, transport: transport ?? relay, dataKeys: keys,
             allowNewDataKey: { true }, confirmOwner: { [unowned self] request in
@@ -233,7 +274,7 @@ private final class RecoveryCoordinatorHarness {
             }, confirmReplacement: { _ in true }, saveKit: { [unowned self] kit in
                 savedKits.append(kit)
                 return save
-            }, confirmServiceOwner: serviceOwnerConfirmation)
+            }, confirmServiceOwner: serviceOwnerConfirmation, authorizeDelegatedControl: authorizeDelegatedControl)
     }
 }
 
@@ -1011,6 +1052,15 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         try await coordinator.prepareService(approval)
         try await coordinator.approveService(approval, portal: portal(transport), current: { true })
         await transport.revoke(expired: expired)
+        let records = try await portal(transport).owned(stationOrigin: "https://configured.example")
+        return try XCTUnwrap(records.first)
+    }
+
+    private func activeService(_ coordinator: AstationRecoveryCoordinator, transport: ServiceApprovalPortal) async throws -> PortalIntegrationRecord {
+        _ = try await coordinator.setup()
+        let approval = try await service(coordinator)
+        try await coordinator.prepareService(approval)
+        try await coordinator.approveService(approval, portal: portal(transport), current: { true })
         let records = try await portal(transport).owned(stationOrigin: "https://configured.example")
         return try XCTUnwrap(records.first)
     }
@@ -1795,6 +1845,137 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             XCTAssertEqual(h.keys.installs, 0)
             if denyOwner { let requests = await h.relay.appends; XCTAssertTrue(requests.isEmpty) }
         }
+    }
+
+    func testDelegatedControlsStayOffByDefaultBeforeAnySignatureOrDelivery() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        let record = try await revokedService(coordinator, transport: transport)
+        let before = h.ownerRequests.count
+        XCTAssertFalse(coordinator.delegatedControlsAvailable)
+        do {
+            _ = try await coordinator.prepareServiceControl(record, portal: portal(transport), interruptOnly: false,
+                interruptRunning: false, current: { true })
+            XCTFail("production gate was bypassed")
+        } catch { XCTAssertTrue(error is AstationDelegatedControlError) }
+        let controls = await h.relay.controls()
+        XCTAssertTrue(controls.isEmpty)
+        XCTAssertEqual(h.ownerRequests.count, before)
+    }
+
+    func testNativeStopAndPortalMirrorRetryTheirExactSavedIntentAfterBothRepliesAreLost() async throws {
+        let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator(authorizeDelegatedControl: { _ in })
+        let record = try await activeService(coordinator!, transport: transport)
+        let client = try portal(transport)
+        let review = try await coordinator!.prepareServiceControl(record, portal: client, interruptOnly: false,
+            interruptRunning: true, current: { true })
+        let confirmations = h.ownerRequests.count
+        await h.relay.dropControlReply()
+        await transport.dropNextReply()
+        let pending = try await coordinator!.commitServiceControl(review, portal: client, current: { true })
+        XCTAssertFalse(pending.stationStored)
+        XCTAssertFalse(pending.portalMirrored)
+        XCTAssertEqual(h.ownerRequests.count, confirmations + 1)
+        XCTAssertEqual(h.ownerRequests.last, review.request)
+        XCTAssertEqual(review.request.purpose, .controlRecord)
+        let initial = await h.relay.controls()
+        XCTAssertEqual(initial.count, 1)
+        let body = try parseControlRecord(recordJson: XCTUnwrap(initial.first))
+        XCTAssertEqual(body.recordId, review.recordID)
+        XCTAssertEqual(body.interruptRunning, true)
+        let ordinary = AstationMembershipKeyProvider(identity: h.identity, keyID: "manager-a",
+            publicKey: try h.identity.remotePublicKeys().signing)
+        XCTAssertThrowsError(try ordinary.sign(request: review.request), "ordinary account signing must not bypass the delegated gate")
+        coordinator = nil
+        let resumed = try h.coordinator(authorizeDelegatedControl: { _ in })
+        let results = try await resumed.retryPendingControls(portal: client, current: { true })
+        XCTAssertEqual(results.count, 1)
+        let result = try XCTUnwrap(results.first)
+        XCTAssertTrue(result.stationStored)
+        XCTAssertTrue(result.portalMirrored)
+        XCTAssertEqual(result.recordJSON, initial.first)
+        XCTAssertEqual(h.ownerRequests.count, confirmations + 1, "a retry never asks the key to sign again")
+        let final = await h.relay.controls()
+        XCTAssertEqual(final, initial, "no new record or changed signature is emitted")
+        let remaining = try await resumed.retryPendingControls(portal: client, current: { true })
+        XCTAssertTrue(remaining.isEmpty)
+        XCTAssertTrue(IntegrationApprovalViewController.controlStatus(result).contains("Host application is not confirmed"))
+    }
+
+    func testNativeStopDenialAndAnAccountChangeSendNothing() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }), transport = ServiceApprovalPortal()
+        let record = try await revokedService(coordinator, transport: transport)
+        let client = try portal(transport)
+        let review = try await coordinator.prepareServiceControl(record, portal: client, interruptOnly: false,
+            interruptRunning: false, current: { true })
+        h.approve = false
+        do { _ = try await coordinator.commitServiceControl(review, portal: client, current: { true }); XCTFail("denial ignored") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .confirmationRequired) }
+        h.approve = true
+        do { _ = try await coordinator.commitServiceControl(review, portal: client, current: { false }); XCTFail("account change ignored") }
+        catch {}
+        try coordinator.cancelUnsignedControl(review)
+        let controls = await h.relay.controls()
+        XCTAssertTrue(controls.isEmpty)
+    }
+
+    func testLaterNativeInterruptHasItsOwnConfirmationAndNeverRepeatsPortalRevocation() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }), transport = ServiceApprovalPortal()
+        let record = try await revokedService(coordinator, transport: transport)
+        let client = try portal(transport)
+        let review = try await coordinator.prepareServiceControl(record, portal: client, interruptOnly: true,
+            interruptRunning: false, current: { true })
+        let posts = await transport.count()
+        let confirmations = h.ownerRequests.count
+        let result = try await coordinator.commitServiceControl(review, portal: client, current: { true })
+        XCTAssertTrue(result.stationStored)
+        XCTAssertNil(result.portalMirror)
+        XCTAssertEqual(h.ownerRequests.count, confirmations + 1)
+        let finalPosts = await transport.count()
+        XCTAssertEqual(finalPosts, posts)
+        let body = try parseControlRecord(recordJson: result.recordJSON)
+        XCTAssertEqual(body.action, "interrupt_running")
+        XCTAssertNil(body.interruptRunning)
+    }
+
+    func testSavedControlsResumeInTheAccountCoordinatorWithoutAnIntegrationWindow() async throws {
+        let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        var first: AstationRecoveryCoordinator? = try h.coordinator(authorizeDelegatedControl: { _ in })
+        let record = try await revokedService(first!, transport: transport)
+        let client = try portal(transport)
+        let review = try await first!.prepareServiceControl(record, portal: client, interruptOnly: false,
+            interruptRunning: false, current: { true })
+        await h.relay.dropControlReply()
+        let pending = try await first!.commitServiceControl(review, portal: client, current: { true })
+        XCTAssertFalse(pending.stationStored)
+        XCTAssertTrue(pending.portalMirrored)
+        first = nil
+        let resumed = try h.coordinator(authorizeDelegatedControl: { _ in })
+        let finished = expectation(description: "account background delivery")
+        resumed.onControlDelivery = { delivery in
+            XCTAssertEqual(delivery.recordID, review.recordID)
+            XCTAssertTrue(delivery.stationStored)
+            XCTAssertTrue(delivery.portalMirrored)
+            finished.fulfill()
+        }
+        resumed.resumeControlDelivery(portal: client, current: { true })
+        await fulfillment(of: [finished], timeout: 2)
+    }
+
+    func testNativeInterruptingRevokeKeepsItsMirrorPendingIfANonInterruptingRevokeWonFirst() async throws {
+        let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in })
+        let record = try await activeService(coordinator, transport: transport)
+        let client = try portal(transport)
+        let review = try await coordinator.prepareServiceControl(record, portal: client, interruptOnly: false,
+            interruptRunning: true, current: { true })
+        await transport.revoke()
+        let result = try await coordinator.commitServiceControl(review, portal: client, current: { true })
+        XCTAssertTrue(result.stationStored)
+        XCTAssertFalse(result.portalMirrored, "an earlier Portal false must not confirm the native true choice")
+        XCTAssertEqual(result.portalMirror?.interruptRunning, true)
+        let signed = try parseControlRecord(recordJson: result.recordJSON)
+        XCTAssertEqual(signed.interruptRunning, true)
     }
 
     func testUncertainCheckpointHaltsTheInstanceBeforeAnyNetworkEffect() async throws {
