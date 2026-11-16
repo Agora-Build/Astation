@@ -298,6 +298,9 @@ release ciphertext or control responses already queued. The native bridge uses
 the shared control readers and `relayControlSyncAnswers`; it permits one live
 read call, at most 30 seconds, and forwards only results for that generation's
 call and announced feed. Native-owned r9 channels never enter the proxy.
+Retiring the account or Station still closes the tracked proxy channels through
+the captured authenticated local socket. That close-only path grants no further
+forwarding, and the local server refuses it once the socket generation changes.
 
 Each direction has a bounded queue (128 frames / 8 MiB). Encrypted envelopes
 retain their original bytes and existing 2 MiB bound; control messages retain

@@ -2482,6 +2482,8 @@ class AstationHubManager: ObservableObject {
                     completion(RemoteChannelError.staleLink); return
                 }
                 send(bytes, id, completion)
+            }, closeLocal: { [weak self] bytes in
+                self?.sendDirectChannel?(bytes, id) { _ in }
             })
             localStationProxies[id] = (context, proxy)
             proxy.start()

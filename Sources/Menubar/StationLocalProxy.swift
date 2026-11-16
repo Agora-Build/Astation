@@ -39,6 +39,7 @@ final class StationLocalProxy {
     private let connect: () async throws -> IdentityRelaySocket
     private let sign: (String) throws -> String
     private let writeLocal: (Data, @escaping (Error?) -> Void) -> Void
+    private let closeLocal: (Data) -> Void
     private let now: () -> TimeInterval
 
     deinit { timer?.cancel(); socket?.cancel(with: .goingAway, reason: nil) }
@@ -46,9 +47,10 @@ final class StationLocalProxy {
     init(current: @escaping () -> Bool, connect: @escaping () async throws -> IdentityRelaySocket,
          sign: @escaping (String) throws -> String,
          writeLocal: @escaping (Data, @escaping (Error?) -> Void) -> Void,
+         closeLocal: @escaping (Data) -> Void,
          now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.current = current; self.connect = connect; self.sign = sign
-        self.writeLocal = writeLocal; self.now = now
+        self.writeLocal = writeLocal; self.closeLocal = closeLocal; self.now = now
     }
 
     func start() {
@@ -225,11 +227,11 @@ final class StationLocalProxy {
         pending = nil; feeds.removeAll(); challengeForwarded = false
         queue.removeAll(); queuedBytes = 0; sending = false
         localQueue.removeAll(); localBytes = 0; localSending = false
-        if current() {
-            for handle in channels {
-                if let route = try? RemoteChannelRoute(linkGeneration: UUID(), handle: handle) {
-                    writeLocal(RemoteChannelEnvelope.close(route: route)) { _ in }
-                }
+        // Closing old channels remains necessary after account/Station authority
+        // changes. The close-only writer still fences the local socket generation.
+        for handle in channels {
+            if let route = try? RemoteChannelRoute(linkGeneration: UUID(), handle: handle) {
+                closeLocal(RemoteChannelEnvelope.close(route: route))
             }
         }
         channels.removeAll()
