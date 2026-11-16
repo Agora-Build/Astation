@@ -219,22 +219,34 @@ private actor ServiceApprovalPortal: AccountOIDCHTTP {
     var loseReply = false
     var expired = false
     var interruptRunning = false
+    var convergeInterrupt = true
+    var revokeError: (String, Int)?
+    var beforeRevokeReply: (@Sendable () async -> Void)?
     func revoke(expired: Bool = false, fingerprint: String? = nil) {
         state = "revoking"; self.expired = expired
         if let fingerprint { self.fingerprint = fingerprint }
     }
     func setState(_ value: String) { state = value }
     func dropNextReply() { loseReply = true }
+    func keepEarlierInterruptChoice() { convergeInterrupt = false }
+    func refuseRevoke(_ code: String, status: Int = 409) { revokeError = (code, status) }
+    func whenRevokeReplies(_ action: @escaping @Sendable () async -> Void) { beforeRevokeReply = action }
     func count() -> Int { posts }
     func send(_ request: URLRequest) async throws -> (Data, Int) {
         if request.httpMethod == "POST" {
             posts += 1
             if request.url?.path.hasSuffix("/revoke") == true {
+                if let (code, status) = revokeError {
+                    await beforeRevokeReply?()
+                    return (try JSONSerialization.data(withJSONObject: ["error": "Interruption refused.", "code": code]), status)
+                }
                 let body = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: Any])
                 let choice = try XCTUnwrap(body["interruptRunning"] as? Bool)
                 if !["revoking", "revoked"].contains(state) {
                     interruptRunning = choice
                     state = "revoking"
+                } else if convergeInterrupt {
+                    interruptRunning = interruptRunning || choice
                 }
             } else {
                 fingerprint = (try JSONSerialization.jsonObject(with: request.httpBody!) as? [String: String])?["r9Svc"]
@@ -1977,12 +1989,118 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         let review = try await coordinator.prepareServiceControl(record, portal: client, interruptOnly: false,
             interruptRunning: true, current: { true })
         await transport.revoke()
+        await transport.keepEarlierInterruptChoice()
         let result = try await coordinator.commitServiceControl(review, portal: client, current: { true })
         XCTAssertTrue(result.stationStored)
         XCTAssertFalse(result.portalMirrored, "an earlier Portal false must not confirm the native true choice")
         XCTAssertEqual(result.portalMirror?.interruptRunning, true)
         let signed = try parseControlRecord(recordJson: result.recordJSON)
         XCTAssertEqual(signed.interruptRunning, true)
+    }
+
+    func testNativeInterruptingMirrorConvergesWithAnEarlierNoninterruptingPortalRevoke() async throws {
+        let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in })
+        let record = try await activeService(coordinator, transport: transport)
+        let client = try portal(transport)
+        let review = try await coordinator.prepareServiceControl(record, portal: client, interruptOnly: false,
+            interruptRunning: true, current: { true })
+        await transport.revoke()
+        let result = try await coordinator.commitServiceControl(review, portal: client, current: { true })
+        XCTAssertTrue(result.stationStored)
+        XCTAssertTrue(result.portalMirrored)
+        XCTAssertTrue(result.portalSettled)
+        XCTAssertNil(result.portalRefusal)
+    }
+
+    func testFinalPortalConflictsSettleAcrossRestartWhileStationDeliveryStillRetries() async throws {
+        for reason: RemoteControlPortalRefusal in [.tooLate, .stationRemoved] {
+            let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+            var coordinator: AstationRecoveryCoordinator? = try h.coordinator(authorizeDelegatedControl: { _ in })
+            let record = try await activeService(coordinator!, transport: transport)
+            let client = try portal(transport)
+            let review = try await coordinator!.prepareServiceControl(record, portal: client, interruptOnly: false,
+                interruptRunning: true, current: { true })
+            let approvals = h.ownerRequests.count
+            await transport.revoke()
+            await transport.refuseRevoke(reason.rawValue)
+            await h.relay.dropControlReply()
+            let result = try await coordinator!.commitServiceControl(review, portal: client, current: { true })
+            XCTAssertFalse(result.stationStored)
+            XCTAssertFalse(result.portalMirrored)
+            XCTAssertTrue(result.portalSettled)
+            XCTAssertEqual(result.portalRefusal, reason)
+            let posts = await transport.count()
+            let status = IntegrationApprovalViewController.controlStatus(result)
+            XCTAssertTrue(status.contains("mirror settled"))
+            XCTAssertTrue(status.contains(reason == .tooLate ? "window has ended" : "Station was removed"))
+            XCTAssertTrue(status.contains("Host application is not confirmed"))
+            XCTAssertFalse(status.contains("revocation is confirmed"))
+            coordinator = nil
+            let resumed = try h.coordinator(authorizeDelegatedControl: { _ in })
+            let retries = try await resumed.retryPendingControls(portal: client, current: { true })
+            let retry = try XCTUnwrap(retries.first)
+            XCTAssertTrue(retry.stationStored)
+            XCTAssertTrue(retry.portalSettled)
+            XCTAssertFalse(retry.portalMirrored)
+            XCTAssertEqual(retry.portalRefusal, reason)
+            XCTAssertEqual(retry.recordJSON, result.recordJSON)
+            let after = await transport.count()
+            XCTAssertEqual(after, posts, "a final mirror is never resent after restart")
+            XCTAssertEqual(h.ownerRequests.count, approvals + 1, "same signed stop, no repeated owner approval")
+            let controls = await h.relay.controls()
+            XCTAssertEqual(controls, [result.recordJSON])
+            let remaining = try await resumed.retryPendingControls(portal: client, current: { true })
+            XCTAssertTrue(remaining.isEmpty)
+        }
+    }
+
+    func testUnrecognizedOrUnauthenticatedPortalConflictsRemainPending() async throws {
+        for (code, status) in [("invalid_state", 409), ("too_late", 401), ("station_removed", 503)] {
+            let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+            let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in })
+            let record = try await activeService(coordinator, transport: transport)
+            let client = try portal(transport)
+            let review = try await coordinator.prepareServiceControl(record, portal: client, interruptOnly: false,
+                interruptRunning: true, current: { true })
+            await transport.refuseRevoke(code, status: status)
+            let result = try await coordinator.commitServiceControl(review, portal: client, current: { true })
+            XCTAssertTrue(result.stationStored)
+            XCTAssertFalse(result.portalSettled)
+            XCTAssertNil(result.portalRefusal)
+            let posts = await transport.count()
+            _ = try await coordinator.retryPendingControls(portal: client, current: { true })
+            let after = await transport.count()
+            XCTAssertEqual(after, posts + 1)
+        }
+    }
+
+    func testDelayedFinalRefusalCannotSettleAfterTheNativeContextChanges() async throws {
+        @MainActor final class Context { var current = true }
+        let context = Context(), h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator(authorizeDelegatedControl: { _ in })
+        let record = try await activeService(coordinator!, transport: transport)
+        let client = try portal(transport)
+        let review = try await coordinator!.prepareServiceControl(record, portal: client, interruptOnly: false,
+            interruptRunning: true, current: { true })
+        await transport.refuseRevoke("too_late")
+        await transport.whenRevokeReplies { await MainActor.run { context.current = false } }
+        do {
+            _ = try await coordinator!.commitServiceControl(review, portal: client, current: { context.current })
+            XCTFail("retired response settled")
+        } catch { XCTAssertEqual(error as? RemoteChannelError, .staleLink) }
+        let posts = await transport.count()
+        let approvals = h.ownerRequests.count
+        coordinator = nil
+        await transport.whenRevokeReplies {}
+        let resumed = try h.coordinator(authorizeDelegatedControl: { _ in })
+        let retries = try await resumed.retryPendingControls(portal: client, current: { true })
+        let result = try XCTUnwrap(retries.first)
+        XCTAssertTrue(result.stationStored)
+        XCTAssertEqual(result.portalRefusal, .tooLate)
+        let after = await transport.count()
+        XCTAssertEqual(after, posts + 1, "the retired reply left its mirror pending")
+        XCTAssertEqual(h.ownerRequests.count, approvals)
     }
 
     func testUncertainCheckpointHaltsTheInstanceBeforeAnyNetworkEffect() async throws {

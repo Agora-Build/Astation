@@ -62,6 +62,11 @@ public struct PortalIntegrationRecord: Decodable, Equatable, Sendable {
     }
 }
 
+public enum PortalIntegrationRevokeResult: Equatable, Sendable {
+    case confirmed(PortalIntegrationRecord)
+    case finalRefusal(RemoteControlPortalRefusal)
+}
+
 /// Native Portal consent transport. It cannot enroll a service or mark it Ready.
 /// Use a separately scoped AccountTokenProvider; project login need not expand.
 public struct PortalIntegrationHTTP: Sendable {
@@ -104,20 +109,30 @@ public struct PortalIntegrationHTTP: Sendable {
 
     /// The protected control journal retains this exact intent until this reply is committed.
     /// A Portal receipt alone never proves that a host has applied the native stop.
-    public func mirrorRevoke(_ mirror: RemoteControlPortalMirror) async throws -> PortalIntegrationRecord {
+    public func mirrorRevoke(_ mirror: RemoteControlPortalMirror) async throws -> PortalIntegrationRevokeResult {
         try mirror.validate()
         guard mirror.issuer == configuration.issuer, mirror.ownerAccount == ownerAccount else {
             throw AccountLoginError.changed
         }
-        let result: PortalIntegrationRecord = try await request(path: "/api/v1/integrations/\(mirror.integrationID)/revoke",
+        let (bytes, code) = try await send(path: "/api/v1/integrations/\(mirror.integrationID)/revoke",
             jsonBody: JSONEncoder().encode(["interruptRunning": mirror.interruptRunning]))
+        if code == 409, mirror.interruptRunning {
+            let data = try responseJSON(bytes)
+            guard let body = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  Set(body.keys) == ["error", "code"], let message = body["error"] as? String, !message.isEmpty,
+                  let value = body["code"] as? String else { throw AccountLoginError.invalidResponse }
+            guard let refusal = RemoteControlPortalRefusal(rawValue: value) else { throw AccountLoginError.changed }
+            return .finalRefusal(refusal)
+        }
+        try checkStatus(code)
+        let result = try JSONDecoder().decode(PortalIntegrationRecord.self, from: responseJSON(bytes))
         try result.validate()
         guard result.id == mirror.integrationID, result.stationOrigin == mirror.stationOrigin,
               result.role == "owner", ["revoking", "revoked"].contains(result.state),
               result.interruptRunning != nil, !mirror.interruptRunning || result.interruptRunning == true else {
             throw AccountLoginError.changed
         }
-        return result
+        return .confirmed(result)
     }
 
     /// Publish only after the native checkpoint contains the exact signed entry.
@@ -154,6 +169,12 @@ public struct PortalIntegrationHTTP: Sendable {
     }
 
     private func request<T: Decodable>(path: String, jsonBody: Data?) async throws -> T {
+        let (bytes, code) = try await send(path: path, jsonBody: jsonBody)
+        try checkStatus(code)
+        return try JSONDecoder().decode(T.self, from: responseJSON(bytes))
+    }
+
+    private func send(path: String, jsonBody: Data?) async throws -> (Data, Int) {
         var request = URLRequest(url: URL(string: portalOrigin + path)!)
         request.setValue("Bearer \(try await accessToken())", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -162,14 +183,20 @@ public struct PortalIntegrationHTTP: Sendable {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = jsonBody
         }
-        let (bytes, code) = try await http.send(request)
+        return try await http.send(request)
+    }
+
+    private func checkStatus(_ code: Int) throws {
         switch code {
         case 200: break
         case 401: throw AccountLoginError.signInRequired
         case 403, 404, 409: throw AccountLoginError.changed
         default: throw AccountLoginError.unavailable
         }
+    }
+
+    private func responseJSON(_ bytes: Data) throws -> Data {
         guard bytes.count <= 65_536, let text = String(data: bytes, encoding: .utf8) else { throw AccountLoginError.invalidResponse }
-        return try JSONDecoder().decode(T.self, from: Data(canonicalJson(json: text).utf8))
+        return Data(try canonicalJson(json: text).utf8)
     }
 }

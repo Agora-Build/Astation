@@ -162,12 +162,23 @@ paths remain OFF. This increment does not implement authoritative non-host roste
 discovery, standalone host interruption/multi-Station fanout, project/host-key
 signing UI, record-specific re-sign/application alerts or VII.A.
 
-Portal integration follow-up: [Portal #38](https://github.com/Agora-Build/Portal/issues/38).
-At Portal `fd11f8bc7c1dbfe9c89b2a23bd7572b00ac6e440`, an earlier non-interrupting
-revoke wins over a later native mirror with `interruptRunning: true`. Native
-keeps its exact signed stop and pending mirror rather than accepting a false
-choice as confirmation. The normal first revoke and false-intent retries work;
-the conflicting true-intent mirror needs Portal convergence before activation.
+Portal [#38](https://github.com/Agora-Build/Portal/issues/38) is resolved by
+[#39](https://github.com/Agora-Build/Portal/pull/39), `893bf30`, deployed to dev.
+A later interrupting native mirror raises an earlier noninterrupting revoke
+monotonically. The native transport still refuses a successful receipt that
+does not match its exact Station, integration, owner role or interruption choice.
+
+For an interrupting mirror only, authenticated `409 too_late` and
+`409 station_removed` are final settlements. The native transport requires the
+bounded, strict Portal error object from the same owner/issuer-bound revoke
+request. Other status codes, malformed errors and unknown conflicts remain
+pending. The protected journal retains the final reason separately from a
+confirmed mirror, including across restart and uncertain checkpoint writes.
+Neither final reason changes the signed native stop, confirms Station storage
+or proves host application. An unfinished Station leg still retries the exact
+record/signature; a settled Portal leg never retries. The UI displays the final
+reason without claiming the interruption reached the hosts. Real joint
+convergence/24-hour-boundary checks remain required before activation.
 
 ## Unknown Outcomes
 
@@ -240,13 +251,31 @@ New native signing/device-list compatibility gates remain off.
 Still required before activation:
 
 - Native :8080 proxy with fresh host proof and socket/identity generation
-  retirement. Atem confirmed the missing local challenge path and is implementing
-  it in [Atem #120 comment 6907451498](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6907451498).
+  retirement. Astation agreed the domain-separated proxy contract in
+  [Atem #174](https://github.com/Agora-Build/Atem/pull/174#issuecomment-6919776085)
+  at `fb81d081f5a1695a1ddc71ac9b846780543ae018`. This supersedes forwarding a
+  relay-kind proof over the local link: Atem does not authenticate its local
+  peer, which must never obtain a proof usable to claim a relay route.
+  Local links sign `atem-host-route-proxy` with label
+  `atem-host-route-proxy-v1`; relay and proxy verifiers reject each other's kind,
+  including a relabelled signature. Accept proxy proofs only on a forwarding
+  connection independently bound to the selected Station, paired native session
+  and local socket/authentication generation. No relay-kind fallback is allowed.
+  Forward a challenge only after the host's same-socket authentication reply;
+  an early challenge is dropped and requires a new challenge after authentication.
+  One proof is allowed per authenticated generation. Disconnect, reauthentication,
+  native session/Station changes and identity changes retire the old authority
+  and in-flight calls. A refused verdict keeps the owner-present local link
+  usable but authorizes no Station calls. The host's verdict is informational.
   The proof's `room` is the paired Astation's relay room, not the host's own ID;
   `atem_id` remains the host's ID. Encrypted local channel forwarding already
   exists on the host and must be preserved by the native proxy.
   A native login token cannot replace the proof. A proxy must not take over a
   normal host route without supporting its encrypted channel routing too.
+  At review, #174's Linux release check is held by a debug-dump-dependent test;
+  a trust-generation-only change during host reauthentication is a separate
+  Atem before-activation fix. Contract agreement is not native implementation
+  or real joint-test evidence.
 - Authoritative replica/non-host verifier inventory carriage, wiring all live
   inventory invalidations, and standalone host Interrupt/fanout. Native host-sender
   Revoke/Readmit reviews, their UI and the inventory authorization adapter are
@@ -281,6 +310,17 @@ owner authentication, and D4's first version without a vault directory.
 The exact review is in
 [the H-0 review](../reviews/2026-11-15-host-mail-h0.md) and
 [Atem #120 comment 6903887341](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6903887341).
+
+The shared mailbox wire in [Atem #173](https://github.com/Agora-Build/Atem/pull/173#issuecomment-6919736991)
+is signed off at `ec7ca2a6dd7e960fcf9601c043314131e84883c4` (496 independent
+checker cases pass and applicable exact-head CI is green). H-4/H-5 can proceed.
+It subsequently merged as `7a7cbb81b1c86189b6e00f57f90bce9d6523fad0`, with the
+three agreed readings recorded in documentation at head `6511067`.
+Agreed readings: malformed sealed shape is dropped unanswered; invalid put
+lifetimes get `expired`; deterministic result ID validation follows strict
+plaintext parsing and precedes outbox correlation regardless of sender standing.
+This is source/contract sign-off without SDK adoption. The reference mailbox,
+mailbox-call vectors, Station storage and real VII.B remain follow-ups.
 
 Next, build the Station host-mail mailbox (reuse enrollment mailbox
 storage only where the authority/retention semantics actually fit), native
