@@ -314,6 +314,12 @@ Native forwarding additionally requires exact
 `ASTATION_LOCAL_STATION_PROXY=true`, a verified host advertising `host.delegated`,
 and completed account/Station registration. This is an opt-in joint-test path;
 deployment configuration does not enable it or delegated execution.
+For a prepared dev Station and hook-enabled host, launch with
+`ASTATION_LOCAL_STATION_PROXY=true bash scripts/run-dev.sh`; the launcher passes
+the opt-in flag through LaunchServices. For an already provisioned bundle, use
+`open --env ASTATION_LOCAL_STATION_PROXY=true "/path/to/Astation Local.app"`
+after quitting that app. The Station still needs its separate build/runtime
+gates and healthy recovery generation; this native flag changes none of them.
 Station consumes shared proof verification at Atem `d59f98f46816d16bbbf06d39f783fafe2602966d`.
 The Apple SDK remains at its existing reviewed pin: native forwards the proof
 opaquely and already has the shared control readers/correlation helper. This
