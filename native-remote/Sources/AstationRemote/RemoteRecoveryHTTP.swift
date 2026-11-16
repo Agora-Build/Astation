@@ -55,7 +55,7 @@ private final class RecoveryRedirectGuard: NSObject, URLSessionTaskDelegate, @un
 }
 
 /// TLS/account login limits storage access. Only the shared verifier grants cryptographic trust.
-public final class RemoteRecoveryHTTP: RemoteRecoveryTransport, RemoteDeviceEnrollmentTransport, RemoteControlTransport, @unchecked Sendable {
+public final class RemoteRecoveryHTTP: RemoteRecoveryTransport, RemoteDeviceEnrollmentTransport, RemoteControlTransport, RemoteControlStatusTransport, @unchecked Sendable {
     private let baseURL: URL
     private let stationOrigin: String
     private let session: URLSession
@@ -138,6 +138,35 @@ public final class RemoteRecoveryHTTP: RemoteRecoveryTransport, RemoteDeviceEnro
             throw RemoteRecoveryTransportError.invalidResponse
         }
         return time.uint64Value
+    }
+
+    public func controlStatus(genesisHash: String, recordIDs: [String], expected: LogHead) async throws -> [String: RemoteControlApplicationState] {
+        guard RemoteRecoveryKit.validHash(genesisHash), expected.seq > 0,
+              expected.seq <= 9_007_199_254_740_991, RemoteRecoveryKit.validHash(expected.hash),
+              !recordIDs.isEmpty, recordIDs.count <= 64, Set(recordIDs).count == recordIDs.count,
+              recordIDs.allSatisfy({ id in
+                  guard let value = UUID(uuidString: id) else { return false }
+                  return value.uuidString.lowercased() == id && id[id.index(id.startIndex, offsetBy: 14)] == "4"
+              }) else { throw RemoteChannelError.invalidInput }
+        let (_, data) = try await perform(url: path(genesisHash, "control/status"), method: "POST",
+            body: Self.encode(["record_ids": recordIDs, "expected": ["seq": expected.seq, "hash": expected.hash]]))
+        let reply = try Self.dictionary(data)
+        guard Set(reply.keys) == ["head", "records"],
+              let head = reply["head"] as? [String: Any], Set(head.keys) == ["seq", "hash"],
+              let seq = head["seq"] as? NSNumber, CFGetTypeID(seq) != CFBooleanGetTypeID(),
+              seq.stringValue == String(expected.seq), head["hash"] as? String == expected.hash,
+              let records = reply["records"] as? [[String: Any]], records.count == recordIDs.count else {
+            throw RemoteRecoveryTransportError.invalidResponse
+        }
+        var result: [String: RemoteControlApplicationState] = [:]
+        for (index, record) in records.enumerated() {
+            guard Set(record.keys) == ["record_id", "state"], record["record_id"] as? String == recordIDs[index],
+                  let raw = record["state"] as? String, let state = RemoteControlApplicationState(rawValue: raw) else {
+                throw RemoteRecoveryTransportError.invalidResponse
+            }
+            result[recordIDs[index]] = state
+        }
+        return result
     }
 
     /// Only delivers an already-signed, independently verified manager record.

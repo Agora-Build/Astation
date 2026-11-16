@@ -1415,6 +1415,32 @@ extension AstationRecoveryCoordinator {
     // Production supplies no authorization until the real delegated joint checks pass.
     var delegatedControlsAvailable: Bool { authorizeDelegatedControl != nil }
 
+    func localControlActivity() throws -> [RemoteControlActivity] {
+        guard !busy, !uncertain, let log = membershipLog else { throw RemoteRecoveryError.busy }
+        return try controls().activity(log: log)
+    }
+
+    func refreshControlActivity(current: () -> Bool) async throws -> [RemoteControlActivity] {
+        try begin(); defer { busy = false }
+        guard delegatedControlsAvailable, current(), let kit = try currentKit(),
+              let transport = http as? RemoteControlStatusTransport else { throw AstationDelegatedControlError.notVerified }
+        let log = try await refreshedLog(genesis: kit.genesisHash)
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        let activity = try controls().activity(log: log)
+        let ids = activity.filter(\.signed).map { $0.body.recordId }
+        var reports: [String: RemoteControlApplicationState] = [:]
+        for offset in stride(from: 0, to: ids.count, by: 64) {
+            let page = try await transport.controlStatus(genesisHash: kit.genesisHash,
+                recordIDs: Array(ids[offset..<min(offset + 64, ids.count)]), expected: log.head())
+            guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+            reports.merge(page) { _, new in new }
+        }
+        // Reject a changed list even if a delayed status response looked complete.
+        let latest = try await refreshedLog(genesis: kit.genesisHash)
+        guard current(), !Task.isCancelled, latest.head() == log.head() else { throw RemoteChannelError.staleLink }
+        return try controls().activity(log: latest, status: reports)
+    }
+
     func resumeControlDelivery(portal: PortalIntegrationHTTP, current: @escaping () -> Bool) {
         guard delegatedControlsAvailable else { return }
         controlDeliveryContext = (portal, current)

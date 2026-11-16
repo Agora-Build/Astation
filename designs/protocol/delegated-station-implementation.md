@@ -185,7 +185,44 @@ The normal app constructor supplies neither new-action inventory authorization
 nor delegated-control authorization. The view is read-only and the new signing
 paths remain OFF. This increment does not implement authoritative non-host roster
 discovery, multi-Station interruption fanout, project/host-key
-signing UI, record-specific re-sign/application alerts or VII.A.
+signing UI, account-wide re-sign/application alerts or VII.A.
+
+### Control activity and signer alerts
+
+Settings -> Security -> Review Control Activity lists this Mac's retained
+service and host stops for the selected Station, including unsigned reviews and
+already-stored records. Each row identifies its exact record ID, principal and
+signer. The protected journal survives restart; a storage receipt never removes
+the record from this view. The shared verifier identifies a signed stop whose
+manager lost authority and displays a fresh-manager-review warning. No report,
+retry or alert signs a replacement or reuses an owner confirmation.
+
+The account-authenticated `POST /api/remote/v1/logs/:genesis/control/status`
+accepts exactly `record_ids` and `expected` (the independently verified device
+list head). IDs are 1-64 distinct canonical UUID v4 strings. A mismatched head is
+refused, cross-account access returns no record information, and both delegated
+gates and the recovery-generation fence apply. The response contains exactly
+`head` and the ordered `records` array of `{record_id, state}`. Native rejects
+missing, extra, reordered, duplicated or unknown fields/IDs/states, changed
+heads and responses over 256 KiB.
+
+`unknown` means no matching native revoke/interruption is stored in that feed.
+`awaiting_application` comes from the shared ledger's outstanding-record set;
+`effects_reported` means it reports no outstanding effect for that stored native
+stop on its covered hosts. A cursor, refused or pending effect never substitutes
+for application evidence. An original or re-signed copy counts according to the
+shared ledger. This is the selected Station's report, not independent evidence
+that a process stopped or that another Station received the stop. It grants no
+authority. Portal mirroring remains independent.
+
+Native queries signed local records in batches of 64, using the same anchored
+head for every batch, and rechecks the head and account/Station generation after
+the last response. Responses are not cached across window refreshes or restart;
+errors retain local records without displaying old application claims. Closing
+the window or changing account/Station retires the read and clears the view.
+Normal constructors keep server polling gated off. Account-wide discovery of
+other managers' records, proactive notifications, the actual fresh re-sign
+ceremony and multi-Station aggregation remain open.
 
 Portal [#38](https://github.com/Agora-Build/Portal/issues/38) is resolved by
 [#39](https://github.com/Agora-Build/Portal/pull/39), `893bf30`, deployed to dev.
@@ -401,15 +438,20 @@ Still required before activation:
   A native login token cannot replace the proof. A proxy must not take over a
   normal host route without supporting its encrypted channel routing too.
   The release-test correction at `d59f98f` resolves the debug-only dump dependency;
-  a trust-generation-only change during host reauthentication remains a separate
-  Atem before-activation fix. Source tests are not real joint-test evidence.
+  the trust-generation-only change during host reauthentication is corrected in
+  Atem #175 at `d7a066e8505822db86dbb6e713b34cd164beedc7`, source-reviewed with
+  no blocking finding in [Atem #120](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6925943051).
+  Exact-head CI, the owner's merge decision and the final test artifact remain
+  before-joint-test dependencies. Source tests are not real joint-test evidence.
 - Authoritative replica/non-host verifier inventory carriage, wiring all live
   inventory invalidations, and multi-Station Interrupt fanout. Native host-sender
   Revoke/Readmit reviews, their UI and the inventory authorization adapter are
   implemented but remain gated, as are the selected-Station host Interrupt flow
   and the service Revoke/Interrupt journal.
-  Record-specific re-sign/application alerts
-  remain required. Unknown-outcome listing, resolution review, protected reminder
+  Selected-Station activity and record-specific removed-signer warnings for
+  locally saved stops are implemented. Account-wide alert discovery, proactive
+  notifications and the fresh re-sign ceremony remain required.
+  Unknown-outcome listing, resolution review, protected reminder
   policy and push routing are implemented; their real joint checks remain open.
 - Complete restore/reset tooling: a restored database must never reuse a
   `feed_id`. A reset must reissue a complete latest-state snapshot, including

@@ -48,6 +48,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var recoverySetupButton: NSButton?
     private var deviceEnrollmentWindow: DeviceEnrollmentWindowController?
     private var hostSenderAccessWindow: HostSenderAccessWindowController?
+    private var controlActivityWindow: ControlActivityWindowController?
     private var relayIdentityKeyStatusLabel: NSTextField?
     private var relayIdentityKeyRetryButton: NSButton?
     private var relayIdentityKeyRepairButton: NSButton?
@@ -645,6 +646,9 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         let hostAccess = NSButton(title: "Manage Host Senders...", target: self, action: #selector(showHostSenderAccess))
         hostAccess.bezelStyle = .rounded
         content.addArrangedSubview(hostAccess)
+        let controlActivity = NSButton(title: "Review Control Activity...", target: self, action: #selector(showControlActivity))
+        controlActivity.bezelStyle = .rounded
+        content.addArrangedSubview(controlActivity)
         content.addArrangedSubview(separator())
 
         content.addArrangedSubview(sectionTitle("Account Recovery"))
@@ -1248,6 +1252,11 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     @MainActor @objc private func showHostSenderAccess() {
         if hostSenderAccessWindow == nil { hostSenderAccessWindow = HostSenderAccessWindowController(hub: hubManager) }
         hostSenderAccessWindow?.showWindow(nil)
+    }
+
+    @MainActor @objc private func showControlActivity() {
+        if controlActivityWindow == nil { controlActivityWindow = ControlActivityWindowController(hub: hubManager) }
+        controlActivityWindow?.showWindow(nil)
     }
 
     @objc private func showRecoveryKit() {

@@ -90,6 +90,30 @@ private final class ControlPublicationFixture {
 
 final class RemoteControlPublicationTests: XCTestCase {
     @MainActor
+    func testControlActivityDistinguishesDraftStorageAndReportedHostEffectsAcrossRestart() throws {
+        let f = try ControlPublicationFixture(), body = try f.body()
+        _ = try f.prepare(body)
+        let draft = try XCTUnwrap(f.journal.activity(log: f.log, status: [body.recordId: .effectsReported]).first)
+        XCTAssertFalse(draft.signed)
+        XCTAssertNil(draft.application, "a Station cannot give application status to an unsigned review")
+        XCTAssertTrue(draft.summary.contains("confirmation required"))
+        _ = try f.sign(body)
+        try f.journal.stationStored(XCTUnwrap(f.journal.retainedDelivery(recordID: body.recordId)))
+        try f.restore()
+        let stored = try XCTUnwrap(f.journal.activity(log: f.log).first)
+        XCTAssertTrue(stored.stationStored)
+        XCTAssertTrue(stored.summary.contains("not checked"))
+        let pending = try XCTUnwrap(f.journal.activity(log: f.log, status: [body.recordId: .awaitingApplication]).first)
+        XCTAssertTrue(pending.summary.contains("Waiting for covered hosts"))
+        let reported = try XCTUnwrap(f.journal.activity(log: f.log, status: [body.recordId: .effectsReported]).first)
+        XCTAssertTrue(reported.summary.contains("Station reports"))
+        XCTAssertTrue(reported.portalPending, "host evidence never settles the independent Portal mirror")
+        XCTAssertEqual(f.keys.signs, 1)
+        try f.restore()
+        XCTAssertNil(try f.journal.activity(log: f.log).first?.application, "a fresh view must refresh Station reports")
+    }
+
+    @MainActor
     func testPendingReviewsRestoreTheExactHostDraftAndDisappearOnlyAfterStationReceipt() throws {
         let f = try ControlPublicationFixture()
         try f.append(["action": "add_host", "host": ["host_id": "host", "host_trust_gen": 1,
@@ -284,6 +308,13 @@ final class RemoteControlPublicationTests: XCTestCase {
         XCTAssertThrowsError(try f.journal.delivery(recordID: body.recordId, log: f.log)) {
             XCTAssertEqual($0 as? RemoteControlPublicationError, .requiresReview)
         }
+        let alert = try XCTUnwrap(f.journal.activity(log: f.log).first)
+        XCTAssertEqual(alert.body.recordId, body.recordId)
+        XCTAssertTrue(alert.managerReviewRequired)
+        XCTAssertTrue(alert.summary.contains("Fresh manager review"))
+        XCTAssertTrue(alert.portalPending)
+        XCTAssertTrue(try XCTUnwrap(f.journal.activity(log: f.log, status: [body.recordId: .effectsReported]).first)
+            .summary.contains("Station reports"), "an effect already reported in force needs no automatic re-sign")
         XCTAssertEqual(f.keys.signs, 1)
     }
 

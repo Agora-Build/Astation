@@ -267,6 +267,48 @@ fn empty_own_feed_is_durable_and_uses_the_exact_membership_head() {
     ));
 }
 
+#[tokio::test]
+async fn native_status_counts_all_effects_not_cursor_and_survives_restart() {
+    let f = fixture();
+    let store = RecoveryStore::memory();
+    f.publish(&store).await;
+    let binding = admit(&store, &f, "native-status").await;
+    let mut root = root(&f);
+    ensure(&mut root, ORIGIN, &f.log).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let service = record(&f, &root.delegated[ORIGIN], &id,
+        ControlAction::Revoke { interrupt_running: true });
+    let mut body = service.body().clone();
+    body.signer = ControlSigner::Member("phone".into());
+    let native = build_control(&f.keys, &KeyId::new("manager"), &body).unwrap();
+    let native = ControlRecord::from_signed(native).unwrap();
+    publish(&mut root, ORIGIN, &f.log, &native, f.created, &["host-a".into()], f.created).unwrap();
+    let unknown = uuid::Uuid::new_v4().to_string();
+    let status = |root: &Root| root.delegated[ORIGIN]
+        .native_status(ORIGIN, &f.log, &[id.clone(), unknown.clone()]).unwrap();
+    assert_eq!(status(&root)["records"][0]["state"], "awaiting_application");
+    assert_eq!(status(&root)["records"][1]["state"], "unknown");
+    let cursor = ack(&f, &root.delegated[ORIGIN], 1, json!([]));
+    acknowledge(&mut root, ORIGIN, &f.log, &binding, &cursor, f.created).unwrap();
+    assert_eq!(status(&root)["records"][0]["state"], "awaiting_application");
+    let refused = ack(&f, &root.delegated[ORIGIN], 1, json!([
+        {"record_id":id,"effects":[
+            {"effect":"revocation","result":"refused","why":"removed_manager"},
+            {"effect":"interrupt","result":"refused","why":"removed_manager"}]}]));
+    acknowledge(&mut root, ORIGIN, &f.log, &binding, &refused, f.created).unwrap();
+    assert_eq!(status(&root)["records"][0]["state"], "awaiting_application");
+    for (result, expected) in [("pending", "awaiting_application"), ("applied", "effects_reported")] {
+        let ack = ack(&f, &root.delegated[ORIGIN], 1, json!([
+            {"record_id":id,"effects":[
+                {"effect":"revocation","result":"applied"},
+                {"effect":"interrupt","result":result}]}]));
+        acknowledge(&mut root, ORIGIN, &f.log, &binding, &ack, f.created).unwrap();
+        let restarted: Root = serde_json::from_slice(&serde_json::to_vec(&root).unwrap()).unwrap();
+        assert_eq!(status(&restarted)["records"][0]["state"], expected);
+        assert_eq!(status(&restarted)["head"], f.log.head().to_json());
+    }
+}
+
 #[test]
 fn publication_conflicts_and_signature_failures_never_become_visible() {
     let f = fixture();

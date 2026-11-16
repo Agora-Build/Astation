@@ -106,6 +106,33 @@ impl Stored {
         .map_err(|_| Fault::Unavailable)
     }
 
+    fn native_status(&self, origin: &str, log: &Membership, ids: &[String]) -> Result<Value, Fault> {
+        let outstanding: std::collections::BTreeSet<_> =
+            self.ledger(origin, log)?.resign_alerts().into_iter().collect();
+        let mut stored = std::collections::BTreeSet::new();
+        for value in &self.records {
+            let record = ControlRecord::parse(
+                &serde_json::to_vec(value).map_err(|_| Fault::Unavailable)?,
+            ).map_err(|_| Fault::Unavailable)?;
+            if matches!(record.signer(), ControlSigner::Member(_))
+                && matches!(record.action(), ControlAction::Revoke { .. } | ControlAction::InterruptRunning { .. })
+            {
+                stored.insert(record.record_id().to_owned());
+            }
+        }
+        // The shared ledger counts per-effect host evidence. A feed cursor or
+        // an HTTP storage receipt must never stand in for that evidence.
+        Ok(serde_json::json!({
+            "head": log.head().to_json(),
+            "records": ids.iter().map(|id| serde_json::json!({
+                "record_id":id,
+                "state":if !stored.contains(id) { "unknown" }
+                    else if outstanding.contains(id) { "awaiting_application" }
+                    else { "effects_reported" }
+            })).collect::<Vec<_>>()
+        }))
+    }
+
     fn response(
         &self,
         origin: &str,
@@ -602,6 +629,7 @@ pub(crate) enum Command {
 pub(crate) enum OwnerCommand {
     Heads,
     Sync(atem_client::control::ControlSync),
+    Status { record_ids: Vec<String>, expected: Head },
     Reserve {
         principal: ControlPrincipal,
         manager: String,
@@ -655,6 +683,16 @@ fn owner(
         OwnerCommand::Sync(call) => {
             response(root, origin, log, &ToStation::ControlSync(call), now)?
                 .ok_or(Fault::Unavailable)
+        }
+        OwnerCommand::Status { record_ids, expected } => {
+            let unique: std::collections::BTreeSet<_> = record_ids.iter().collect();
+            if expected != log.head() || record_ids.is_empty() || record_ids.len() > 64
+                || unique.len() != record_ids.len()
+                || !record_ids.iter().all(|id| uuid::Uuid::parse_str(id).is_ok_and(|value|
+                    value.get_version_num() == 4 && value.to_string() == *id))
+            { return Err(Fault::Invalid); }
+            root.delegated.get(origin).ok_or(Fault::Unavailable)?
+                .native_status(origin, log, &record_ids)
         }
         OwnerCommand::Reserve {
             principal,

@@ -59,7 +59,7 @@ private final class RecoveryMemoryKeys: AstationRecoveryDataKeys {
     func installRecovered(_ values: [AccountDataKey], dataAccount: String) throws { keys = values; installs += 1 }
 }
 
-private actor RecoveryMemoryRelay: RemoteRecoveryTransport, RemoteDeviceEnrollmentTransport, RemoteControlTransport {
+private actor RecoveryMemoryRelay: RemoteRecoveryTransport, RemoteDeviceEnrollmentTransport, RemoteControlTransport, RemoteControlStatusTransport {
     var log: MembershipLog?
     var account = "account-a"
     var appends: [AppendRequest] = []
@@ -81,6 +81,19 @@ private actor RecoveryMemoryRelay: RemoteRecoveryTransport, RemoteDeviceEnrollme
     var controlRecords: [String] = []
     var loseControlReply = false
     var controlTime: UInt64 = 1
+    var controlStatusWaiter: CheckedContinuation<Void, Never>?
+    var holdControlStatus = false
+    var statusReads: [[String]] = []
+
+    func holdNextControlStatus() { holdControlStatus = true }
+    func releaseControlStatus() { holdControlStatus = false; controlStatusWaiter?.resume(); controlStatusWaiter = nil }
+    func controlStatus(genesisHash: String, recordIDs: [String], expected: LogHead) async throws -> [String: RemoteControlApplicationState] {
+        XCTAssertEqual(log?.genesisHash(), genesisHash)
+        XCTAssertEqual(log?.head(), expected)
+        statusReads.append(recordIDs)
+        if holdControlStatus { await withCheckedContinuation { controlStatusWaiter = $0 } }
+        return Dictionary(uniqueKeysWithValues: recordIDs.map { ($0, .awaitingApplication) })
+    }
 
     func dropControlReply() { loseControlReply = true }
     func controls() -> [String] { controlRecords }
@@ -2369,6 +2382,76 @@ extension AstationRecoveryCoordinatorTests {
         XCTAssertTrue(try on.pendingHostInterrupts().isEmpty)
         let records = await h.relay.controls()
         XCTAssertTrue(records.isEmpty)
+    }
+
+    func testControlActivityShowsStoredHostStopAndRejectsARetiredStatusReply() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(authorizeDelegatedControl: { _ in })
+        _ = try await revokedSender(coordinator, harness: h)
+        let review = try await coordinator.prepareHostInterrupt(hostID: "host-a", current: { true })
+        _ = try await coordinator.commitHostInterrupt(review, current: { true })
+        let confirmations = h.ownerRequests.count
+        let rows = try await coordinator.refreshControlActivity(current: { true })
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows.first?.body.recordId, review.recordID)
+        XCTAssertEqual(rows.first?.application, .awaitingApplication)
+        XCTAssertTrue(ControlActivityWindowController.description(rows[0]).contains(review.recordID))
+        XCTAssertEqual(h.ownerRequests.count, confirmations, "read-only status must never request a signature")
+        await h.relay.holdNextControlStatus()
+        var current = true
+        let delayed = Task { try await coordinator.refreshControlActivity(current: { current }) }
+        for _ in 0..<100 {
+            if await h.relay.controlStatusWaiter != nil { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let waiting = await h.relay.controlStatusWaiter != nil
+        XCTAssertTrue(waiting)
+        current = false
+        await h.relay.releaseControlStatus()
+        do { _ = try await delayed.value; XCTFail("retired context accepted a Station status") }
+        catch { XCTAssertEqual(error as? RemoteChannelError, .staleLink) }
+        XCTAssertNil(try coordinator.localControlActivity().first?.application)
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+    }
+
+    func testControlActivityBatchesSavedRecordsAndStillRequiresTheActivationGate() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(authorizeDelegatedControl: { _ in })
+        _ = try await revokedSender(coordinator, harness: h)
+        for _ in 0..<65 {
+            let review = try await coordinator.prepareHostInterrupt(hostID: "host-a", current: { true })
+            _ = try await coordinator.commitHostInterrupt(review, current: { true })
+        }
+        let confirmations = h.ownerRequests.count
+        let rows = try await coordinator.refreshControlActivity(current: { true })
+        let reads = await h.relay.statusReads
+        XCTAssertEqual(reads.map(\.count), [64, 1])
+        XCTAssertEqual(rows.count, 65)
+        XCTAssertEqual(Set(reads.flatMap { $0 }), Set(rows.map { $0.body.recordId }))
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        let disabled = try h.coordinator()
+        _ = try await disabled.hostSenderMembership()
+        XCTAssertEqual(try disabled.localControlActivity().count, 65)
+        do { _ = try await disabled.refreshControlActivity(current: { true }); XCTFail("queried through a disabled gate") }
+        catch { XCTAssertTrue(error is AstationDelegatedControlError) }
+    }
+
+    func testControlActivityDiscardsReportsWhenMembershipChangesDuringTheRead() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(authorizeDelegatedControl: { _ in })
+        _ = try await revokedSender(coordinator, harness: h)
+        let review = try await coordinator.prepareHostInterrupt(hostID: "host-a", current: { true })
+        _ = try await coordinator.commitHostInterrupt(review, current: { true })
+        await h.relay.holdNextControlStatus()
+        let delayed = Task { try await coordinator.refreshControlActivity(current: { true }) }
+        for _ in 0..<100 {
+            if await h.relay.controlStatusWaiter != nil { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let waiting = await h.relay.controlStatusWaiter != nil
+        XCTAssertTrue(waiting)
+        _ = try await addSecondManager(harness: h)
+        await h.relay.releaseControlStatus()
+        do { _ = try await delayed.value; XCTFail("accepted status across a membership change") }
+        catch { XCTAssertEqual(error as? RemoteChannelError, .staleLink) }
+        XCTAssertNil(try coordinator.localControlActivity().first?.application)
     }
 
     func testHostInterruptBindsHistoricalRevokeAfterReadmitAndHostRemoval() async throws {
