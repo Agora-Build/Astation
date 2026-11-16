@@ -57,6 +57,7 @@ public struct RemoteControlReview: Equatable, Sendable {
     public let body: ControlRecordBody
     public let request: SignRequest
     public let signed: Bool
+    public let resignsRecordID: String?
 }
 
 /// The protected checkpoint owns drafts, exact signatures and both delivery legs.
@@ -69,6 +70,8 @@ public final class RemoteControlPublication {
         let headHash: String
         let signerAlgorithm: String
         let signerPublicKey: Data
+        let resignsRecordID: String?
+        let observed: Bool?
         var recordJSON: String?
         var stationStored = false
         let portalMirror: RemoteControlPortalMirror?
@@ -94,14 +97,31 @@ public final class RemoteControlPublication {
     public func pendingDeliveryIDs() throws -> [String] {
         try available()
         return try saved.operations.filter {
-            $0.recordJSON != nil && (!$0.stationStored || ($0.portalMirror != nil && !$0.portalMirrored && $0.portalRefusal == nil))
+            $0.recordJSON != nil && (needsStation($0) || ($0.portalMirror != nil && !$0.portalMirrored && $0.portalRefusal == nil))
         }.map { try Self.body($0.bodyJSON).recordId }
     }
 
-    public func signingRequest(recordID: String) throws -> SignRequest? {
+    public func stationDeliveryNeeded(recordID: String) throws -> Bool {
+        try available()
+        return needsStation(saved.operations[try index(recordID)])
+    }
+
+    private func needsStation(_ operation: Operation) -> Bool {
+        guard !operation.stationStored, let body = try? Self.body(operation.bodyJSON) else { return false }
+        return !saved.operations.contains { $0.resignsRecordID == body.recordId && $0.recordJSON != nil }
+    }
+
+    public func signingRequest(recordID: String, log: MembershipLog? = nil) throws -> SignRequest? {
         try available()
         let operation = saved.operations[try index(recordID)]
         guard operation.recordJSON == nil else { return nil }
+        if let log {
+            try check(log)
+            guard log.head() == LogHead(seq: operation.headSeq, hash: operation.headHash) else {
+                throw RemoteControlPublicationError.requiresReview
+            }
+            try checkResignSource(operation, log: log)
+        }
         let body = try validate(operation)
         return try RemoteConfirmedSigner.controlRequest(bodyJSON: operation.bodyJSON, keyID: String(body.signer.dropFirst(7)))
     }
@@ -110,12 +130,12 @@ public final class RemoteControlPublication {
     public func pendingReviews() throws -> [RemoteControlReview] {
         try available()
         return try saved.operations.filter {
-            !$0.stationStored || ($0.portalMirror != nil && !$0.portalMirrored && $0.portalRefusal == nil)
+            needsStation($0) || ($0.portalMirror != nil && !$0.portalMirrored && $0.portalRefusal == nil)
         }.map {
             let body = try validate($0)
             return RemoteControlReview(body: body,
                 request: try RemoteConfirmedSigner.controlRequest(bodyJSON: $0.bodyJSON, keyID: String(body.signer.dropFirst(7))),
-                signed: $0.recordJSON != nil)
+                signed: $0.recordJSON != nil, resignsRecordID: $0.resignsRecordID)
         }
     }
 
@@ -138,6 +158,8 @@ public final class RemoteControlPublication {
                 stationStored: operation.stationStored,
                 portalPending: operation.portalMirror != nil && !operation.portalMirrored && operation.portalRefusal == nil,
                 managerReviewRequired: needsManager,
+                replacementRecordID: try saved.operations.first(where: { $0.resignsRecordID == body.recordId })
+                    .map { try Self.body($0.bodyJSON).recordId },
                 application: operation.recordJSON == nil ? nil : status[body.recordId])
         }.sorted {
             if $0.body.issuedAt != $1.body.issuedAt { return $0.body.issuedAt > $1.body.issuedAt }
@@ -172,12 +194,84 @@ public final class RemoteControlPublication {
             let body = try validate(operation)
             guard ids.insert(body.recordId).inserted else { throw RemoteControlPublicationError.invalidCheckpoint }
         }
+        for (offset, operation) in saved.operations.enumerated() {
+            if let source = operation.resignsRecordID {
+                guard let original = saved.operations[..<offset].first(where: { (try? Self.body($0.bodyJSON).recordId) == source }) else {
+                    throw RemoteControlPublicationError.invalidCheckpoint
+                }
+                try validateReplacement(operation, original: original)
+                guard saved.operations.filter({ $0.resignsRecordID == source }).count == 1 else {
+                    throw RemoteControlPublicationError.invalidCheckpoint
+                }
+            }
+        }
     }
 
     /// Reserve the Station timestamp first, then durably prepare before showing confirmation.
     /// The actual SDK builds the SignRequest; this layer has no control-record serializer.
     public func prepare(body: ControlRecordBody, log: MembershipLog,
         portalMirror: RemoteControlPortalMirror? = nil) throws -> SignRequest {
+        try prepare(body: body, log: log, portalMirror: portalMirror, resignsRecordID: nil)
+    }
+
+    public func savedResignReview(recordID: String) throws -> RemoteControlReview? {
+        try available()
+        guard let operation = saved.operations.first(where: { $0.resignsRecordID == recordID }) else { return nil }
+        let body = try validate(operation)
+        return RemoteControlReview(body: body,
+            request: try RemoteConfirmedSigner.controlRequest(bodyJSON: operation.bodyJSON, keyID: String(body.signer.dropFirst(7))),
+            signed: operation.recordJSON != nil, resignsRecordID: recordID)
+    }
+
+    /// Called only for a correlated selected-Station feed page, never an ACK reason.
+    /// Importing evidence neither signs it nor creates an owner's Portal intent.
+    public func retainRemovedManagerStop(recordJSON: String, log: MembershipLog) throws {
+        try available()
+        try check(log)
+        let body = try parseControlRecord(recordJson: recordJSON)
+        guard body.signer.hasPrefix("member:"),
+              case .refused(let reason) = try verifyControlRecord(log: log, recordJson: recordJSON),
+              reason == "removed_manager",
+              let key = log.member(deviceId: String(body.signer.dropFirst(7)))?.authKey else {
+            throw RemoteControlPublicationError.requiresReview
+        }
+        let info = try signedObjectInfo(json: recordJSON)
+        let operation = Operation(bodyJSON: info.bodyJcs, headSeq: log.head().seq, headHash: log.head().hash,
+            signerAlgorithm: key.alg == .p256 ? "p256" : "ed25519", signerPublicKey: key.raw,
+            resignsRecordID: nil, observed: true, recordJSON: recordJSON, stationStored: true, portalMirror: nil)
+        do { _ = try validate(operation) }
+        catch { throw RemoteControlPublicationError.invalidRecord }
+        if let prior = saved.operations.first(where: { (try? Self.body($0.bodyJSON).recordId) == body.recordId }) {
+            guard prior.bodyJSON == info.bodyJcs else { throw RemoteControlPublicationError.requiresReview }
+            return
+        }
+        guard saved.operations.count < 256 else { throw RemoteControlPublicationError.full }
+        try transaction { $0.operations.append(operation) }
+    }
+
+    /// A current manager reviews the same stop under a fresh ID. The original
+    /// signature and its independent Portal intent remain in the journal.
+    public func prepareResign(recordID: String, managerID: String, issuedAt: UInt64,
+        feedID: String?, log: MembershipLog) throws -> RemoteControlReview {
+        try available()
+        try check(log)
+        let original = saved.operations[try index(recordID)]
+        guard let record = original.recordJSON,
+              case .refused(let reason) = try verifyControlRecord(log: log, recordJson: record),
+              reason == "removed_manager" else { throw RemoteControlPublicationError.requiresReview }
+        if let review = try savedResignReview(recordID: recordID) { return review }
+        let old = try validate(original)
+        let body = ControlRecordBody(accountId: old.accountId, genesisHash: old.genesisHash, origin: old.origin,
+            feedId: old.principal.hasPrefix("service:") ? feedID : nil, principal: old.principal,
+            principalKey: old.principalKey, signer: "member:" + managerID, action: old.action,
+            interruptRunning: old.interruptRunning, revokeSeq: old.revokeSeq,
+            recordId: UUID().uuidString.lowercased(), issuedAt: issuedAt, integrationId: old.integrationId, by: old.by)
+        let request = try prepare(body: body, log: log, portalMirror: nil, resignsRecordID: recordID)
+        return RemoteControlReview(body: body, request: request, signed: false, resignsRecordID: recordID)
+    }
+
+    private func prepare(body: ControlRecordBody, log: MembershipLog,
+        portalMirror: RemoteControlPortalMirror?, resignsRecordID: String?) throws -> SignRequest {
         try available()
         try check(log)
         guard body.signer.hasPrefix("member:") else { throw RemoteControlPublicationError.invalidRecord }
@@ -192,14 +286,20 @@ public final class RemoteControlPublication {
         }
         let head = log.head()
         let operation = Operation(bodyJSON: bodyJSON, headSeq: head.seq, headHash: head.hash,
-            signerAlgorithm: key.alg == .p256 ? "p256" : "ed25519", signerPublicKey: key.raw, portalMirror: portalMirror)
+            signerAlgorithm: key.alg == .p256 ? "p256" : "ed25519", signerPublicKey: key.raw,
+            resignsRecordID: resignsRecordID, observed: nil, portalMirror: portalMirror)
         _ = try validate(operation)
+        if let source = resignsRecordID {
+            try validateReplacement(operation, original: saved.operations[try index(source)])
+        }
         // All authority checks precede signature verification in the shared verifier.
         guard case .refused(let reason) = try verifyControlRecord(log: log, recordJson: Self.unsigned(bodyJSON)),
               reason == "bad_signature" else { throw RemoteControlPublicationError.invalidRecord }
         if let prior = saved.operations.first(where: { (try? Self.body($0.bodyJSON).recordId) == body.recordId }) {
             guard prior.bodyJSON == bodyJSON, prior.headSeq == head.seq, prior.headHash == head.hash,
-                  prior.portalMirror == portalMirror else { throw RemoteControlPublicationError.requiresReview }
+                  prior.portalMirror == portalMirror, prior.resignsRecordID == resignsRecordID else {
+                throw RemoteControlPublicationError.requiresReview
+            }
             return request
         }
         guard saved.operations.count < 256 else { throw RemoteControlPublicationError.full }
@@ -222,6 +322,7 @@ public final class RemoteControlPublication {
         guard log.head() == LogHead(seq: operation.headSeq, hash: operation.headHash) else {
             throw RemoteControlPublicationError.requiresReview
         }
+        try checkResignSource(operation, log: log)
         return try transaction { next in
             let body = try validate(operation)
             let manager = String(body.signer.dropFirst(7))
@@ -333,7 +434,8 @@ public final class RemoteControlPublication {
             guard body.principal.hasPrefix("service:"), body.action == "revoke",
                   mirror.stationOrigin == saved.stationOrigin, mirror.integrationID == body.integrationId,
                   mirror.interruptRunning == body.interruptRunning else { throw RemoteControlPublicationError.invalidCheckpoint }
-        } else if body.principal.hasPrefix("service:"), body.action == "revoke" {
+        } else if body.principal.hasPrefix("service:"), body.action == "revoke",
+                  operation.resignsRecordID == nil, operation.observed != true {
             throw RemoteControlPublicationError.invalidCheckpoint
         }
         if let record = operation.recordJSON {
@@ -349,7 +451,30 @@ public final class RemoteControlPublication {
                 throw RemoteControlPublicationError.invalidCheckpoint
             }
         }
+        if operation.observed == true {
+            guard operation.recordJSON != nil, operation.stationStored, operation.portalMirror == nil,
+                  operation.resignsRecordID == nil else { throw RemoteControlPublicationError.invalidCheckpoint }
+        }
         return body
+    }
+
+    private func validateReplacement(_ operation: Operation, original: Operation) throws {
+        let old = try validate(original), body = try validate(operation)
+        guard original.recordJSON != nil, operation.resignsRecordID == old.recordId,
+              operation.portalMirror == nil, body.recordId != old.recordId, body.signer != old.signer,
+              body.issuedAt > old.issuedAt, body.principal == old.principal, body.principalKey == old.principalKey,
+              body.origin == old.origin, body.action == old.action, body.interruptRunning == old.interruptRunning,
+              body.revokeSeq == old.revokeSeq, body.integrationId == old.integrationId, body.by == old.by else {
+            throw RemoteControlPublicationError.invalidRecord
+        }
+    }
+
+    private func checkResignSource(_ operation: Operation, log: MembershipLog) throws {
+        guard let source = operation.resignsRecordID else { return }
+        let original = saved.operations[try index(source)]
+        guard let record = original.recordJSON,
+              case .refused(let reason) = try verifyControlRecord(log: log, recordJson: record),
+              reason == "removed_manager" else { throw RemoteControlPublicationError.requiresReview }
     }
 
     private static func signerKey(_ operation: Operation) throws -> PublicKeyData {

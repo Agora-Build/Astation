@@ -179,7 +179,7 @@ This workflow delivers to the selected Station. The review names that Station,
 the revoke sequence and record ID, and explicitly distinguishes stored delivery
 from host application and delivery to other Stations. Authoritative multi-Station
 discovery and fanout remain unfinished; this is not a global interruption claim.
-Removed-manager records still require the separate fresh re-sign workflow.
+Removed-manager records use the fresh re-sign workflow below.
 
 The normal app constructor supplies neither new-action inventory authorization
 nor delegated-control authorization. The view is read-only and the new signing
@@ -220,9 +220,48 @@ head for every batch, and rechecks the head and account/Station generation after
 the last response. Responses are not cached across window refreshes or restart;
 errors retain local records without displaying old application claims. Closing
 the window or changing account/Station retires the read and clears the view.
-Normal constructors keep server polling gated off. Account-wide discovery of
-other managers' records, proactive notifications, the actual fresh re-sign
-ceremony and multi-Station aggregation remain open.
+Normal constructors keep server polling gated off. Proactive notifications,
+account-wide discovery across Stations and multi-Station aggregation remain open.
+
+### Fresh manager review of retained stops
+
+Control Activity can discover other managers' removed-signer stops in the selected
+Station's own feed. Each Refresh reads one page through the existing shared
+`control_sync` builder, reader and correlation check: at most 64 records, within
+the transport's 256 KiB response bound. The independently verified membership
+head must match the Station's heads response and remain unchanged after the page.
+Continuation requires the same feed and membership head; otherwise discovery
+restarts at zero. A refresh after a completed scan also starts at zero, so a later
+manager demotion is checked against older records. This is bounded discovery for
+one selected Station, not a global notification service.
+
+Only native stops which the shared verifier identifies as `removed_manager` are
+eligible. The original signature is independently checked against the historical
+member key before retaining the evidence in the protected journal. A forged or
+unsupported record is skipped without hiding a later valid stop. An ID/body
+conflict, capacity limit or persistence failure stops the page. Importing a stop
+neither signs it nor creates Portal revocation authority. No host ACK reason can
+request a signature or substitute for this evidence.
+
+The owner selects a stop and reviews a saved copy naming the original and new
+record IDs, current manager, selected Station and exact interruption choice.
+The draft is durable before confirmation. Its fresh UUID v4 and reserved Station
+timestamp preserve the original principal, key, action, reason, integration and
+historical host `revoke_seq`; a host stop still has no service fields. The shared
+verifier checks current authority and the exact membership head before and after
+fresh owner authentication. Denial, a retired account/Station context or a changed
+head produces no signature. An unsigned copy can be cancelled without removing
+the original stop.
+
+The original signature and its independently approved Portal mirror remain
+retained. The fresh copy has no Portal mirror. Once the replacement is signed,
+the original's futile Station retry is suppressed without fabricating a storage
+receipt or settling its Portal leg. Restart and lost-reply recovery reuse the
+exact saved draft or signature. Retrying an already signed copy never requests
+another approval or key signature. The selected Station's shared ledger accounts
+for the original and replacement effects; storing the copy still does not prove
+host application or delivery to other Stations. Normal constructors leave this
+signing and discovery flow gated off pending the real joint checks.
 
 Portal [#38](https://github.com/Agora-Build/Portal/issues/38) is resolved by
 [#39](https://github.com/Agora-Build/Portal/pull/39), `893bf30`, deployed to dev.
@@ -448,9 +487,9 @@ Still required before activation:
   Revoke/Readmit reviews, their UI and the inventory authorization adapter are
   implemented but remain gated, as are the selected-Station host Interrupt flow
   and the service Revoke/Interrupt journal.
-  Selected-Station activity and record-specific removed-signer warnings for
-  locally saved stops are implemented. Account-wide alert discovery, proactive
-  notifications and the fresh re-sign ceremony remain required.
+  Selected-Station activity, bounded discovery of other managers' removed-signer
+  stops and fresh protected re-sign reviews are implemented and gated off.
+  Account-wide alert discovery and proactive notifications remain required.
   Unknown-outcome listing, resolution review, protected reminder
   policy and push routing are implemented; their real joint checks remain open.
 - Complete restore/reset tooling: a restored database must never reuse a
@@ -458,7 +497,8 @@ Still required before activation:
   native records needing a manager. The present storage UUID is restart-stable;
   it is not a completed database-restore procedure. The deployment-generation
   fence and operator status/fence commands now keep uncertain history closed;
-  snapshot reconstruction, manager re-signs and reopening remain unfinished.
+  snapshot reconstruction, recovery-wide manager re-sign orchestration and
+  reopening remain unfinished.
   Retention/compaction must
   preserve required stops, high-water and at least 30 days of records. The
   implementation requirements and recovery sequence are recorded in
