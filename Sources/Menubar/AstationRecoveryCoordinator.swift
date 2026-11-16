@@ -1420,6 +1420,106 @@ extension AstationRecoveryCoordinator {
         return try controls().activity(log: log)
     }
 
+    struct ControlDiscoveryPage {
+        let feedID: String
+        let after: UInt64
+        let more: Bool
+        let membershipHead: LogHead
+    }
+
+    /// One bounded page per refresh. A list change restarts discovery at zero.
+    func discoverControlActivity(previous: ControlDiscoveryPage?, current: () -> Bool) async throws -> ControlDiscoveryPage {
+        try begin(); defer { busy = false }
+        guard delegatedControlsAvailable else { throw AstationDelegatedControlError.notVerified }
+        guard current(), !Task.isCancelled, let kit = try currentKit(), let transport = http as? RemoteControlFeedTransport else {
+            throw RemoteChannelError.staleLink
+        }
+        let log = try await refreshedLog(genesis: kit.genesisHash)
+        try requireManager(log)
+        try requireDelegatedControl(log)
+        let heads = try relayDecodeToHost(message: await transport.controlHeads(genesisHash: kit.genesisHash))
+        guard current(), !Task.isCancelled, case .heads(let feeds, let head) = heads,
+              head == log.head(), feeds.count == 1, feeds[0].origin == relayURL else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        let feed = feeds[0]
+        let after = previous.flatMap { $0.more && $0.feedID == feed.feedId && $0.membershipHead == log.head() ? $0.after : nil } ?? 0
+        let call = try relayControlSync(requestId: UUID().uuidString.lowercased(), origin: relayURL, feedId: feed.feedId, after: after)
+        let result = try await transport.controlSync(genesisHash: kit.genesisHash, callJSON: call)
+        guard current(), !Task.isCancelled, try relayControlSyncAnswers(call: call, result: result) == .answers,
+              case .controlSyncResult(_, _, let feedID, _, let feedHead, _, let records) = try relayDecodeToHost(message: result),
+              records.count <= 64, feedHead >= max(after, feed.head), !records.isEmpty || feedHead == after else {
+            throw RemoteRecoveryTransportError.invalidResponse
+        }
+        let latest = try await refreshedLog(genesis: kit.genesisHash)
+        guard current(), !Task.isCancelled, latest.head() == log.head() else { throw RemoteChannelError.staleLink }
+        let journal = try controls()
+        for row in records {
+            // Feed entries can be future or malformed record types; they grant no authority.
+            guard let body = try? parseControlRecord(recordJson: row.recordJson), body.signer.hasPrefix("member:"),
+                  case .refused(let reason) = try? verifyControlRecord(log: latest, recordJson: row.recordJson),
+                  reason == "removed_manager" else { continue }
+            do { try journal.retainRemovedManagerStop(recordJSON: row.recordJson, log: latest) }
+            catch RemoteControlPublicationError.invalidRecord { continue }
+        }
+        let cursor = records.last?.feedSeq ?? after
+        return ControlDiscoveryPage(feedID: feedID, after: cursor, more: cursor < feedHead, membershipHead: latest.head())
+    }
+
+    func prepareControlResign(recordID: String, current: () -> Bool) async throws -> RemoteControlReview {
+        try begin(); defer { busy = false }
+        guard delegatedControlsAvailable else { throw AstationDelegatedControlError.notVerified }
+        guard current(), !Task.isCancelled, let kit = try currentKit(), let transport = http as? RemoteControlTransport else {
+            throw RemoteChannelError.staleLink
+        }
+        let log = try await refreshedLog(genesis: kit.genesisHash)
+        try requireManager(log)
+        try requireDelegatedControl(log)
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        let journal = try controls()
+        guard try journal.activity(log: log).contains(where: { $0.body.recordId == recordID && $0.managerReviewRequired }) else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        if let saved = try journal.savedResignReview(recordID: recordID) {
+            guard saved.body.signer == "member:" + managerID else { throw RemoteRecoveryError.requiresReview }
+            if !saved.signed { _ = try journal.signingRequest(recordID: saved.body.recordId, log: log) }
+            return saved
+        }
+        let heads = try relayDecodeToHost(message: await transport.controlHeads(genesisHash: kit.genesisHash))
+        guard current(), !Task.isCancelled, case .heads(let feeds, let head) = heads,
+              head == log.head(), feeds.count == 1, feeds[0].origin == relayURL,
+              let source = try journal.activity(log: log).first(where: { $0.body.recordId == recordID }) else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        let time = try await transport.reserveControlTime(genesisHash: kit.genesisHash, principal: source.body.principal,
+            managerID: managerID, expected: log.head())
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        return try journal.prepareResign(recordID: recordID, managerID: managerID, issuedAt: time,
+            feedID: feeds[0].feedId, log: log)
+    }
+
+    func commitControlResign(_ review: RemoteControlReview, current: () -> Bool) async throws -> RemoteControlDelivery {
+        try begin(); defer { busy = false }
+        guard delegatedControlsAvailable else { throw AstationDelegatedControlError.notVerified }
+        guard current(), !Task.isCancelled, let source = review.resignsRecordID, let kit = try currentKit(),
+              let saved = try controls().savedResignReview(recordID: source), saved.body == review.body,
+              saved.request == review.request, review.body.signer == "member:" + managerID else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        if !saved.signed {
+            try await signControl(recordID: review.body.recordId, request: review.request, genesis: kit.genesisHash, current: current)
+        }
+        // The original record retains its independently approved Portal mirror.
+        return try await deliverControl(review.body.recordId, portal: nil, current: current)
+    }
+
+    func cancelUnsignedControlResign(recordID: String) throws {
+        guard !busy, !uncertain, let review = try controls().savedResignReview(recordID: recordID), !review.signed else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        try controls().cancelUnsigned(recordID: review.body.recordId)
+    }
+
     func refreshControlActivity(current: () -> Bool) async throws -> [RemoteControlActivity] {
         try begin(); defer { busy = false }
         guard delegatedControlsAvailable, current(), let kit = try currentKit(),
@@ -1561,6 +1661,9 @@ extension AstationRecoveryCoordinator {
         let before = try await refreshedLog(genesis: genesis)
         try requireManager(before)
         try requireDelegatedControl(before)
+        guard try controls().signingRequest(recordID: recordID, log: before) == request else {
+            throw RemoteRecoveryError.requiresReview
+        }
         guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
         guard await confirmOwner(request), current(), !Task.isCancelled else { throw RemoteRecoveryError.confirmationRequired }
         let confirmedAt = Self.clock().monoMs
@@ -1659,7 +1762,7 @@ extension AstationRecoveryCoordinator {
         }
         let journal = try controls()
         guard let delivery = try journal.retainedDelivery(recordID: id) else { throw RemoteRecoveryError.notCommitted }
-        if !delivery.stationStored {
+        if try journal.stationDeliveryNeeded(recordID: id) {
             do {
                 let log = try await refreshedLog(genesis: kit.genesisHash)
                 try requireDelegatedControl(log)

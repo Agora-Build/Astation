@@ -46,12 +46,22 @@ private final class ControlPublicationFixture {
             persist: { [unowned self] in try persist($0) })
     }
 
-    func append(_ action: [String: Any]) throws {
-        let body = try log.draftEntry(signer: "manager", signedAt: clock.wallMs,
+    func append(_ action: [String: Any], signer: String = "manager", signingKeys: ControlPublicationKeys? = nil) throws {
+        let body = try log.draftEntry(signer: signer, signedAt: clock.wallMs,
             actionJson: String(decoding: JSONSerialization.data(withJSONObject: action), as: UTF8.self))
-        let entry = try Self.signed(JSONSerialization.jsonObject(with: Data(body.utf8)), keys: keys)
+        let entry = try Self.signed(JSONSerialization.jsonObject(with: Data(body.utf8)), keys: signingKeys ?? keys)
         let result = try log.extend(entries: [entry], now: clock)
         XCTAssertEqual(result.appended, 1)
+    }
+
+    func replaceManager() throws -> ControlPublicationKeys {
+        let next = ControlPublicationKeys()
+        try append(["action": "add", "member": ["device_id": "other-manager", "kind": "native",
+            "roles": ["control", "manage", "view"],
+            "auth_key": ["alg": "ed25519", "pub": RemoteRecoveryKit.base64URL(next.key.publicKey.rawRepresentation)],
+            "enc_key": ["alg": "x25519", "pub": RemoteRecoveryKit.base64URL(Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation)]]])
+        try append(["action": "set_roles", "device_id": "manager", "roles": ["control", "view"]])
+        return next
     }
 
     private static func signed(_ body: Any, keys: ControlPublicationKeys) throws -> String {
@@ -89,6 +99,155 @@ private final class ControlPublicationFixture {
 }
 
 final class RemoteControlPublicationTests: XCTestCase {
+    @MainActor
+    func testFreshManagerCopyKeepsExactStopAndIndependentPortalIntentAcrossRestart() throws {
+        let f = try ControlPublicationFixture(), body = try f.body(interrupt: true)
+        _ = try f.prepare(body)
+        let original = try f.sign(body)
+        let keys = try f.replaceManager()
+        let review = try f.journal.prepareResign(recordID: body.recordId, managerID: "other-manager",
+            issuedAt: body.issuedAt + 1, feedID: f.feed, log: f.log)
+        XCTAssertNotEqual(review.body.recordId, body.recordId)
+        XCTAssertEqual(review.resignsRecordID, body.recordId)
+        XCTAssertEqual(review.body.signer, "member:other-manager")
+        XCTAssertEqual(review.body.principal, body.principal)
+        XCTAssertEqual(review.body.principalKey, body.principalKey)
+        XCTAssertEqual(review.body.action, "revoke")
+        XCTAssertEqual(review.body.interruptRunning, true)
+        XCTAssertEqual(review.body.integrationId, body.integrationId)
+        XCTAssertEqual(review.body.by, body.by)
+        XCTAssertTrue(review.request.freshConfirmation)
+        XCTAssertEqual(keys.signs, 0, "preparing a review cannot ask the key to sign")
+        try f.restore()
+        let resumed = try f.journal.prepareResign(recordID: body.recordId, managerID: "other-manager",
+            issuedAt: body.issuedAt + 100, feedID: UUID().uuidString.lowercased(), log: f.log)
+        XCTAssertEqual(resumed, review, "resume the exact saved request instead of reserving another stop")
+        XCTAssertTrue(try f.journal.stationDeliveryNeeded(recordID: body.recordId), "an unsigned draft cannot replace a signed stop")
+        XCTAssertThrowsError(try f.journal.sign(recordID: review.body.recordId, log: f.log, provider: f.keys,
+            confirmedAt: 100, now: { 100 }, current: { true }))
+        XCTAssertEqual(keys.signs, 0)
+        let signed = try f.journal.sign(recordID: review.body.recordId, log: f.log, provider: keys,
+            confirmedAt: 100, now: { 100 }, current: { true })
+        XCTAssertFalse(try f.journal.stationDeliveryNeeded(recordID: body.recordId))
+        let old = try XCTUnwrap(f.journal.retainedDelivery(recordID: body.recordId))
+        XCTAssertEqual(old.recordJSON, original)
+        XCTAssertFalse(old.stationStored, "superseding a retry cannot fabricate a receipt")
+        XCTAssertNotNil(old.portalMirror)
+        let new = try XCTUnwrap(f.journal.delivery(recordID: review.body.recordId, log: f.log))
+        XCTAssertNil(new.portalMirror, "the copy must never create another Portal revoke")
+        XCTAssertEqual(Set(try f.journal.pendingDeliveryIDs()), Set([body.recordId, review.body.recordId]))
+        try f.journal.portalMirrored(old)
+        try f.restore()
+        XCTAssertEqual(try f.journal.pendingDeliveryIDs(), [review.body.recordId])
+        XCTAssertEqual(try f.journal.sign(recordID: review.body.recordId, log: f.log, provider: keys,
+            confirmedAt: 0, now: { 100_000 }, current: { true }), signed, "a signed retry needs no approval or key call")
+        XCTAssertEqual(keys.signs, 1)
+        XCTAssertEqual(try f.journal.activity(log: f.log).first(where: { $0.body.recordId == body.recordId })?.replacementRecordID,
+            review.body.recordId)
+    }
+
+    @MainActor
+    func testFreshManagerCopyRequiresRemovedSignerAndCurrentReviewHead() throws {
+        let f = try ControlPublicationFixture(), body = try f.body()
+        _ = try f.prepare(body)
+        _ = try f.sign(body)
+        XCTAssertThrowsError(try f.journal.prepareResign(recordID: body.recordId, managerID: "manager",
+            issuedAt: body.issuedAt + 1, feedID: f.feed, log: f.log))
+        let keys = try f.replaceManager()
+        XCTAssertThrowsError(try f.journal.prepareResign(recordID: body.recordId, managerID: "other-manager",
+            issuedAt: body.issuedAt, feedID: f.feed, log: f.log), "a stale reservation cannot create the replacement")
+        let review = try f.journal.prepareResign(recordID: body.recordId, managerID: "other-manager",
+            issuedAt: body.issuedAt + 1, feedID: f.feed, log: f.log)
+        try f.append(["action": "set_roles", "device_id": "manager", "roles": ["control", "manage", "view"]],
+            signer: "other-manager", signingKeys: keys)
+        XCTAssertThrowsError(try f.journal.signingRequest(recordID: review.body.recordId, log: f.log))
+        XCTAssertThrowsError(try f.journal.sign(recordID: review.body.recordId, log: f.log, provider: keys,
+            confirmedAt: 100, now: { 100 }, current: { true }))
+        XCTAssertEqual(keys.signs, 0)
+        try f.journal.cancelUnsigned(recordID: review.body.recordId)
+        XCTAssertNil(try f.journal.savedResignReview(recordID: body.recordId))
+        XCTAssertEqual(f.journal.recordIDs, [body.recordId])
+    }
+
+    @MainActor
+    func testImportedRemovedManagerStopHasNoPortalAuthorityAndRetainsItsHistoricalHostRevoke() throws {
+        let f = try ControlPublicationFixture()
+        try f.append(["action": "add_host", "host": ["host_id": "host", "host_trust_gen": 1,
+            "host_key": ["alg": "ed25519", "pub": RemoteRecoveryKit.base64URL(f.keys.key.publicKey.rawRepresentation)]]])
+        try f.append(try XCTUnwrap(JSONSerialization.jsonObject(with: Data(hostSenderRevokeAction(hostId: "host",
+            interruptRunning: false, signedAt: f.clock.wallMs).utf8)) as? [String: Any]))
+        let body = ControlRecordBody(accountId: f.log.accountId(), genesisHash: f.log.genesisHash(), origin: nil,
+            feedId: nil, principal: "host:host", principalKey: nil, signer: "member:manager", action: "interrupt_running",
+            interruptRunning: nil, revokeSeq: f.log.head().seq, recordId: UUID().uuidString.lowercased(),
+            issuedAt: f.clock.wallMs, integrationId: nil, by: "owner")
+        let record = try buildControlRecord(provider: f.keys, keyId: "manager", body: body)
+        let keys = try f.replaceManager()
+        try f.journal.retainRemovedManagerStop(recordJSON: record, log: f.log)
+        try f.restore()
+        XCTAssertTrue(try f.journal.pendingDeliveryIDs().isEmpty)
+        XCTAssertNil(try f.journal.retainedDelivery(recordID: body.recordId)?.portalMirror)
+        let review = try f.journal.prepareResign(recordID: body.recordId, managerID: "other-manager",
+            issuedAt: body.issuedAt + 1, feedID: UUID().uuidString.lowercased(), log: f.log)
+        XCTAssertEqual(review.body.revokeSeq, body.revokeSeq)
+        XCTAssertNil(review.body.origin)
+        XCTAssertNil(review.body.feedId)
+        XCTAssertNil(review.body.principalKey)
+        XCTAssertNil(review.body.integrationId)
+        _ = try f.journal.sign(recordID: review.body.recordId, log: f.log, provider: keys,
+            confirmedAt: 100, now: { 100 }, current: { true })
+        XCTAssertEqual(keys.signs, 1)
+    }
+
+    @MainActor
+    func testImportedServiceStopCannotInventAPortalRevokeOrOverwriteAnotherBodyUnderTheSameID() throws {
+        let f = try ControlPublicationFixture(), body = try f.body()
+        let record = try buildControlRecord(provider: f.keys, keyId: "manager", body: body)
+        XCTAssertThrowsError(try f.journal.retainRemovedManagerStop(recordJSON: record, log: f.log))
+        _ = try f.replaceManager()
+        try f.journal.retainRemovedManagerStop(recordJSON: record, log: f.log)
+        try f.journal.retainRemovedManagerStop(recordJSON: record, log: f.log)
+        XCTAssertEqual(f.journal.recordIDs, [body.recordId])
+        XCTAssertNil(try f.journal.retainedDelivery(recordID: body.recordId)?.portalMirror)
+        var conflict = body
+        conflict.interruptRunning = true
+        XCTAssertThrowsError(try f.journal.retainRemovedManagerStop(
+            recordJSON: buildControlRecord(provider: f.keys, keyId: "manager", body: conflict), log: f.log))
+        var foreign = body
+        foreign.origin = "https://other.example"
+        foreign.recordId = UUID().uuidString.lowercased()
+        XCTAssertThrowsError(try f.journal.retainRemovedManagerStop(
+            recordJSON: buildControlRecord(provider: f.keys, keyId: "manager", body: foreign), log: f.log))
+        XCTAssertEqual(f.journal.recordIDs, [body.recordId])
+        try f.restore()
+        XCTAssertTrue(try f.journal.pendingDeliveryIDs().isEmpty)
+    }
+
+    @MainActor
+    func testUncertainFreshCopyWritesRecoverExactDraftAndSignatureAndRejectTamperedLinks() throws {
+        let f = try ControlPublicationFixture(), body = try f.body()
+        _ = try f.prepare(body)
+        _ = try f.sign(body)
+        let keys = try f.replaceManager()
+        f.failAfterWrite = true
+        XCTAssertThrowsError(try f.journal.prepareResign(recordID: body.recordId, managerID: "other-manager",
+            issuedAt: body.issuedAt + 1, feedID: f.feed, log: f.log))
+        try f.restore()
+        let review = try XCTUnwrap(f.journal.savedResignReview(recordID: body.recordId))
+        f.failAfterWrite = true
+        XCTAssertThrowsError(try f.journal.sign(recordID: review.body.recordId, log: f.log, provider: keys,
+            confirmedAt: 100, now: { 100 }, current: { true }))
+        try f.restore()
+        let signed = try XCTUnwrap(f.journal.retainedDelivery(recordID: review.body.recordId))
+        XCTAssertEqual(try f.journal.sign(recordID: review.body.recordId, log: f.log, provider: keys,
+            confirmedAt: 0, now: { 100_000 }, current: { true }), signed.recordJSON)
+        XCTAssertEqual(keys.signs, 1)
+        var checkpoint = try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(f.stored), format: nil) as? [String: Any])
+        var operations = try XCTUnwrap(checkpoint["operations"] as? [[String: Any]])
+        operations[1]["resignsRecordID"] = UUID().uuidString.lowercased()
+        checkpoint["operations"] = operations
+        XCTAssertThrowsError(try f.restore(PropertyListSerialization.data(fromPropertyList: checkpoint, format: .binary, options: 0)))
+    }
+
     @MainActor
     func testControlActivityDistinguishesDraftStorageAndReportedHostEffectsAcrossRestart() throws {
         let f = try ControlPublicationFixture(), body = try f.body()

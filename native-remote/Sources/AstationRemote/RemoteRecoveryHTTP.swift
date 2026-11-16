@@ -47,6 +47,10 @@ public protocol RemoteControlTransport: Sendable {
     @MainActor func publishControl(log: MembershipLog, recordJSON: String) async throws -> Bool
 }
 
+public protocol RemoteControlFeedTransport: RemoteControlTransport {
+    func controlSync(genesisHash: String, callJSON: String) async throws -> String
+}
+
 private final class RecoveryRedirectGuard: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
         newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
@@ -55,7 +59,7 @@ private final class RecoveryRedirectGuard: NSObject, URLSessionTaskDelegate, @un
 }
 
 /// TLS/account login limits storage access. Only the shared verifier grants cryptographic trust.
-public final class RemoteRecoveryHTTP: RemoteRecoveryTransport, RemoteDeviceEnrollmentTransport, RemoteControlTransport, RemoteControlStatusTransport, @unchecked Sendable {
+public final class RemoteRecoveryHTTP: RemoteRecoveryTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, @unchecked Sendable {
     private let baseURL: URL
     private let stationOrigin: String
     private let session: URLSession

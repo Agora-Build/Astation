@@ -7,6 +7,14 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
     private let text = NSTextView()
     private let status = NSTextField(wrappingLabelWithString: "")
     private let refresh = NSButton(title: "Refresh", target: nil, action: nil)
+    private let stops = NSPopUpButton()
+    private let review = NSButton(title: "Review with Current Manager...", target: nil, action: nil)
+    private let cancel = NSButton(title: "Cancel Unsigned Copy", target: nil, action: nil)
+    private var rows: [RemoteControlActivity] = []
+    private var reviewRows: [RemoteControlActivity] = []
+    private var coordinator: AstationRecoveryCoordinator?
+    private var current: (() -> Bool)?
+    private var discovery: AstationRecoveryCoordinator.ControlDiscoveryPage?
     private var generation = UUID()
     private var task: Task<Void, Never>?
 
@@ -19,7 +27,7 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
         super.init(window: window)
         window.delegate = self
         let intro = NSTextField(wrappingLabelWithString:
-            "Saved stops from this Mac, at the selected Station. Station reports do not confirm delivery to other Stations or guarantee that a running task stopped. A fresh manager review always needs a new owner confirmation.")
+            "Saved stops for the selected Station. Refresh also finds stops whose signer lost manager access. Station reports do not confirm delivery elsewhere or guarantee that a running task stopped. Signing a fresh copy requires owner confirmation.")
         text.isEditable = false; text.isSelectable = true
         text.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         text.textContainerInset = NSSize(width: 8, height: 8)
@@ -29,7 +37,8 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
         text.autoresizingMask = .width
         text.textContainer?.widthTracksTextView = true
         let footer = NSStackView(views: [status, refresh]); footer.spacing = 12
-        let stack = NSStackView(views: [intro, scroll, footer])
+        let actions = NSStackView(views: [review, cancel]); actions.spacing = 8
+        let stack = NSStackView(views: [intro, scroll, stops, actions, footer])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 14
         guard let content = window.contentView else { return }
         content.addSubview(stack); stack.translatesAutoresizingMaskIntoConstraints = false
@@ -41,13 +50,19 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
             intro.widthAnchor.constraint(equalTo: stack.widthAnchor),
             scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
             scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 200),
+            stops.widthAnchor.constraint(equalTo: stack.widthAnchor),
             footer.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
         status.setContentHuggingPriority(.defaultLow, for: .horizontal)
         refresh.target = self; refresh.action = #selector(reload)
+        stops.target = self; stops.action = #selector(selectionChanged)
+        stops.setAccessibilityLabel("Stop requiring a fresh manager review")
+        review.target = self; review.action = #selector(reviewStop)
+        cancel.target = self; cancel.action = #selector(cancelReview)
         for name in [Notification.Name.accountLoginChanged, .serverInfoChanged, .relayIdentityKeyChanged] {
             NotificationCenter.default.addObserver(self, selector: #selector(contextChanged), name: name, object: nil)
         }
+        render()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -67,11 +82,17 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
 
     func windowWillClose(_ notification: Notification) {
         generation = UUID(); task?.cancel(); text.string = ""; status.stringValue = ""
+        clearContext()
     }
 
     @objc private func contextChanged() {
         generation = UUID(); task?.cancel(); text.string = ""
+        clearContext()
         status.stringValue = "Account or Station access changed. Refresh to review current records."
+    }
+
+    private func clearContext() {
+        coordinator = nil; current = nil; discovery = nil; rows = []; reviewRows = []; stops.removeAllItems(); render()
     }
 
     static func description(_ row: RemoteControlActivity) -> String {
@@ -80,14 +101,96 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
         return "\(action) \(row.body.principal)\n\(row.summary)\nRecord: \(row.body.recordId)\nSigner: \(row.body.signer)\(portal)"
     }
 
+    private var selected: RemoteControlActivity? {
+        reviewRows.indices.contains(stops.indexOfSelectedItem) ? reviewRows[stops.indexOfSelectedItem] : nil
+    }
+
+    private func display(_ activity: [RemoteControlActivity]) {
+        let previous = selected?.body.recordId
+        rows = activity
+        reviewRows = activity.filter { $0.managerReviewRequired && $0.application != .effectsReported }
+        stops.removeAllItems()
+        stops.addItems(withTitles: reviewRows.map { $0.body.principal + " - " + $0.body.recordId })
+        if let index = reviewRows.firstIndex(where: { $0.body.recordId == previous }) { stops.selectItem(at: index) }
+        text.string = activity.isEmpty ? "No saved stops found for this Station." : activity.map(Self.description).joined(separator: "\n\n")
+        render()
+    }
+
+    @objc private func selectionChanged() { render() }
+
+    private func render() {
+        let ready = task == nil && current?() == true && coordinator?.delegatedControlsAvailable == true
+        let replacement = selected?.replacementRecordID.flatMap { id in rows.first { $0.body.recordId == id } }
+        review.title = replacement?.signed == true ? "Retry Saved Copy" : "Review with Current Manager..."
+        review.isEnabled = ready && selected != nil
+        cancel.isEnabled = ready && replacement?.signed == false
+        stops.isEnabled = ready && !reviewRows.isEmpty
+        refresh.isEnabled = task == nil
+    }
+
+    static func explanation(_ review: RemoteControlReview, station: String) -> String {
+        let body = review.body
+        let intent: String
+        if body.principal.hasPrefix("host:") {
+            intent = "Request interruption of tasks sent by \(body.principal) before revoke #\(body.revokeSeq ?? 0). New work after readmit is unaffected."
+        } else if body.action == "revoke" {
+            intent = "Revoke \(body.principal). " + (body.interruptRunning == true
+                ? "Also request interruption of its running tasks." : "Running tasks are not interrupted.")
+        } else { intent = "Request interruption of running tasks from \(body.principal)." }
+        return intent + "\n\nThe original stop stays saved. This copy does not confirm that tasks stopped or that other Stations received it." +
+            "\nStation: \(station)\nOriginal record: \(review.resignsRecordID ?? "")\nNew record: \(body.recordId)\nSigner: \(body.signer)"
+    }
+
+    @objc private func reviewStop() {
+        guard task == nil, let row = selected, let coordinator, let current, current() else { return }
+        task = Task { [weak self] in
+            guard let self else { return }
+            defer { task = nil; render() }
+            do {
+                let prepared = try await coordinator.prepareControlResign(recordID: row.body.recordId, current: current)
+                guard current(), !Task.isCancelled else { return }
+                let alert = NSAlert()
+                alert.messageText = prepared.signed ? "Retry the saved stop?" : "Confirm this stop with the current manager?"
+                alert.informativeText = Self.explanation(prepared, station: coordinator.relayURL)
+                alert.addButton(withTitle: prepared.signed ? "Retry Delivery" : "Continue to Confirmation")
+                alert.addButton(withTitle: "Cancel")
+                guard alert.runModal() == .alertFirstButtonReturn, current(), !Task.isCancelled else {
+                    if current() { display(try coordinator.localControlActivity()) }
+                    return
+                }
+                let result = try await coordinator.commitControlResign(prepared, current: current)
+                guard current(), !Task.isCancelled else { return }
+                display(try coordinator.localControlActivity())
+                status.stringValue = result.stationStored
+                    ? "Fresh copy stored at the selected Station. Host application is not confirmed."
+                    : "Fresh copy saved. Station delivery will retry with the same signature."
+            } catch {
+                guard current(), !Task.isCancelled else { return }
+                status.stringValue = error.localizedDescription
+                if let activity = try? coordinator.localControlActivity() { display(activity) }
+            }
+        }
+        render()
+    }
+
+    @objc private func cancelReview() {
+        guard task == nil, let row = selected, let coordinator, current?() == true else { return }
+        do {
+            try coordinator.cancelUnsignedControlResign(recordID: row.body.recordId)
+            display(try coordinator.localControlActivity())
+            status.stringValue = "Unsigned copy cancelled. The original stop is retained."
+        } catch { status.stringValue = error.localizedDescription }
+    }
+
     @objc private func reload() {
         guard task == nil else { return }
         generation = UUID()
         let epoch = generation, origin = hub.stationRelayUrl
         text.string = ""; status.stringValue = "Loading saved control activity..."; refresh.isEnabled = false
+        coordinator = nil; current = nil
         task = Task { [weak self] in
             guard let self else { return }
-            defer { task = nil; refresh.isEnabled = true }
+            defer { task = nil; render() }
             do {
                 try await hub.prepareAccountSecurityAccess()
                 guard generation == epoch, window?.isVisible == true,
@@ -103,25 +206,31 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
                 let coordinator = try hub.recoveryCoordinator()
                 _ = try await coordinator.hostSenderMembership()
                 guard current(), !Task.isCancelled else { return }
+                self.coordinator = coordinator; self.current = current
                 let local = try coordinator.localControlActivity()
-                text.string = local.isEmpty ? "No saved stops on this Mac for this Station." : local.map(Self.description).joined(separator: "\n\n")
-                guard coordinator.delegatedControlsAvailable, !local.isEmpty else {
+                display(local)
+                guard coordinator.delegatedControlsAvailable else {
                     status.stringValue = "Station: " + origin + "\nHost application has not been checked."
                     return
                 }
                 do {
+                    discovery = try await coordinator.discoverControlActivity(previous: discovery, current: current)
+                    guard current(), !Task.isCancelled else { return }
                     let activity = try await coordinator.refreshControlActivity(current: current)
                     guard current(), !Task.isCancelled else { return }
-                    text.string = activity.map(Self.description).joined(separator: "\n\n")
-                    status.stringValue = "Station: " + origin + "\nSelected Station reports refreshed."
+                    display(activity)
+                    status.stringValue = "Station: " + origin + "\nSelected Station reports refreshed." +
+                        (discovery?.more == true ? " Refresh continues the search for other saved stops." : "")
                 } catch {
                     guard current(), !Task.isCancelled else { return }
                     status.stringValue = "Saved records shown. Station reports unavailable; retry Refresh."
+                    if let activity = try? coordinator.localControlActivity() { display(activity) }
                 }
             } catch {
                 guard generation == epoch, window?.isVisible == true, !Task.isCancelled else { return }
                 status.stringValue = error.localizedDescription
             }
         }
+        render()
     }
 }
