@@ -52,6 +52,8 @@ final class AstationRecoveryCoordinator {
         var restore: Data?
         var pendingDataKey: SavedKey?
         var controlPublications: [String: Data]?
+        var hostSenderReview: Data?
+        var supersededHostSenderPublications: [Data]?
     }
 
     nonisolated static let bootID = RemoteSystemClock.bootIdentifier
@@ -69,6 +71,7 @@ final class AstationRecoveryCoordinator {
     private let confirmOwner: (SignRequest) async -> Bool
     private let confirmServiceOwner: (RemoteServiceApproval, SignRequest) async -> Bool
     private let authorizeDelegatedControl: ((MembershipLog) throws -> Void)?
+    private let authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)?
     private let confirmReplacement: (String) async -> Bool
     private let saveKit: (String) async -> Bool
     private let dataKeys: AstationRecoveryDataKeys
@@ -103,6 +106,9 @@ final class AstationRecoveryCoordinator {
                 await withCheckedContinuation { continuation in
                     let reason = request.purpose == .genesis ? "confirm this account's recovery setup"
                         : request.purpose == .controlRecord ? "authorize the reviewed stop of delegated agent work"
+                        : request.purpose == .hostSender ? "confirm the reviewed host sending change"
+                        : request.purpose == .project ? "confirm the reviewed project permissions"
+                        : request.purpose == .hostEncKey ? "confirm the reviewed host encryption key"
                         : request.purpose != .keyBackup ? "approve this account's device or integration access"
                         : "confirm this account's encrypted key backup"
                     DeviceOwnerAuth.authenticate(reason: reason) {
@@ -132,6 +138,7 @@ final class AstationRecoveryCoordinator {
         confirmReplacement: @escaping (String) async -> Bool, saveKit: @escaping (String) async -> Bool,
         confirmServiceOwner: ((RemoteServiceApproval, SignRequest) async -> Bool)? = nil,
         authorizeDelegatedControl: ((MembershipLog) throws -> Void)? = nil,
+        authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)? = nil,
         now: @escaping () -> HostClock = { AstationRecoveryCoordinator.clock() }) throws {
         self.accountID = accountID
         self.managerID = managerID
@@ -144,6 +151,7 @@ final class AstationRecoveryCoordinator {
         self.confirmOwner = confirmOwner
         self.confirmServiceOwner = confirmServiceOwner ?? { _, request in await confirmOwner(request) }
         self.authorizeDelegatedControl = authorizeDelegatedControl
+        self.authorizeNewMembership = authorizeNewMembership
         self.confirmReplacement = confirmReplacement
         self.saveKit = saveKit
         self.now = now
@@ -222,9 +230,10 @@ final class AstationRecoveryCoordinator {
         } catch { uncertain = true; throw error }
     }
 
-    private func begin(nativeDevice: Bool = false) throws {
+    private func begin(nativeDevice: Bool = false, hostSender: Bool = false) throws {
         guard !uncertain else { throw RemoteRecoveryError.storageUncertain }
-        guard !busy, nativeDevice || saved.deviceReview == nil else { throw RemoteRecoveryError.busy }
+        guard !busy, nativeDevice || saved.deviceReview == nil,
+              hostSender || saved.hostSenderReview == nil else { throw RemoteRecoveryError.busy }
         busy = true
     }
 
@@ -1237,6 +1246,149 @@ final class AstationRecoveryCoordinator {
         let result = try log.extend(entries: restored.entries(), now: now())
         try commitLog(log)
         guard result.stop == nil, log.frozen() == nil else { throw RemoteRecoveryError.requiresReview }
+    }
+}
+
+extension AstationRecoveryCoordinator {
+    var hostSenderControlsAvailable: Bool { authorizeNewMembership != nil && delegatedControlsAvailable }
+
+    func pendingHostSenderReview() throws -> RemoteHostSenderReview? {
+        guard !uncertain else { throw RemoteRecoveryError.storageUncertain }
+        return try saved.hostSenderReview.map { try JSONDecoder().decode(RemoteHostSenderReview.self, from: $0) }
+    }
+
+    func hostSenderMembership() async throws -> MembershipLog {
+        try begin(hostSender: true); defer { busy = false }
+        guard let kit = try currentKit() else { throw RemoteRecoveryError.notCommitted }
+        let log = try await refreshedLog(genesis: kit.genesisHash)
+        try requireManager(log)
+        return log.snapshot()
+    }
+
+    func prepareHostSender(hostID: String, operation: RemoteHostSenderReview.Operation,
+        current: () -> Bool) async throws -> RemoteHostSenderReview {
+        try begin(hostSender: true); defer { busy = false }
+        guard hostSenderControlsAvailable, let authorizeNewMembership else { throw AstationDelegatedControlError.notVerified }
+        guard current(), !Task.isCancelled, let kit = try currentKit() else { throw RemoteChannelError.staleLink }
+        if let pending = try pendingHostSenderReview() {
+            guard pending.hostID == hostID, pending.operation == operation else { throw RemoteRecoveryError.requiresReview }
+            return pending
+        }
+        guard saved.publication == nil, saved.restore == nil else { throw RemoteRecoveryError.busy }
+        let log = try await refreshedLog(genesis: kit.genesisHash)
+        try requireManager(log)
+        try requireDelegatedControl(log)
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        let review = try RemoteHostSenderReview(stationOrigin: relayURL, log: log, managerID: managerID,
+            hostID: hostID, operation: operation, now: now())
+        try authorizeNewMembership(review.signingRequest(managerID: managerID), log)
+        let context = try review.checkpoint()
+        let publisher = RemoteMembershipPublication(log: log, persist: { [unowned self] bytes in
+            try self.persist { $0.publication = bytes; $0.hostSenderReview = context }
+        })
+        try review.prepare(publication: publisher, managerID: managerID, now: now())
+        publication = publisher
+        return review
+    }
+
+    /// The saved entry owns retries. A fresh confirmation is required only before its first signature.
+    func commitHostSender(_ review: RemoteHostSenderReview, current: () -> Bool) async throws {
+        try begin(hostSender: true); defer { busy = false }
+        guard hostSenderControlsAvailable, let authorizeNewMembership else { throw AstationDelegatedControlError.notVerified }
+        guard current(), !Task.isCancelled, review.stationOrigin == relayURL,
+              saved.hostSenderReview == (try review.checkpoint()), let checkpoint = saved.publication,
+              let kit = try currentKit(), kit.genesisHash == review.genesisHash else { throw RemoteChannelError.staleLink }
+        if publication == nil {
+            publication = try RemoteMembershipPublication(checkpoint: checkpoint, accountID: accountID,
+                genesisHash: kit.genesisHash, now: now(), persist: { [unowned self] bytes in
+                    try self.persist { $0.publication = bytes }
+                })
+        }
+        guard let publisher = publication, publisher.operationContext == (try review.checkpoint()) else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        var log = try await refreshedLog(genesis: kit.genesisHash)
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        if try reconcileHostSender(review, publisher: publisher, log: log) { return }
+        try requireManager(log)
+        try requireDelegatedControl(log)
+        let append: AppendRequest
+        if let retry = try publisher.outstanding() { append = retry }
+        else {
+            let request = try review.signingRequest(managerID: managerID)
+            try authorizeNewMembership(request, log)
+            try review.validate(log: log, managerID: managerID, now: now())
+            guard await confirmOwner(request), current(), !Task.isCancelled else { throw RemoteRecoveryError.confirmationRequired }
+            let stamp = Self.clock().monoMs
+            log = try await refreshedLog(genesis: kit.genesisHash)
+            guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+            try requireManager(log)
+            try requireDelegatedControl(log)
+            guard log.head() == publisher.head else { throw RemoteRecoveryError.requiresReview }
+            try authorizeNewMembership(request, log)
+            let snapshot = log.snapshot()
+            let provider = AstationMembershipKeyProvider(identity: identity, keyID: managerID,
+                publicKey: try identity.remotePublicKeys().signing,
+                authorizeNewMembership: { request in try authorizeNewMembership(request, snapshot) })
+            append = try review.sign(publication: publisher, provider: provider, managerID: managerID,
+                validationClock: now(), confirmedAt: stamp, now: { Self.clock().monoMs }, current: current)
+        }
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        switch try await http.append(genesisHash: kit.genesisHash, request: append) {
+        case .stored:
+            guard case .committed = try publisher.relayStored(now: now()) else { throw RemoteRecoveryError.requiresReview }
+            try commitLog(publisher.committedLog()) { $0.publication = nil; $0.hostSenderReview = nil }
+            publication = nil
+        case .conflict:
+            log = try await refreshedLog(genesis: kit.genesisHash)
+            guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+            if try reconcileHostSender(review, publisher: publisher, log: log) { return }
+            throw RemoteRecoveryError.requiresReview
+        }
+    }
+
+    /// A verified chain either proves our exact entry stored or proves its old CAS can no longer win.
+    /// Keep a losing signed publication as evidence, and never silently re-sign it at the new head.
+    private func reconcileHostSender(_ review: RemoteHostSenderReview, publisher: RemoteMembershipPublication,
+        log: MembershipLog) throws -> Bool {
+        if try log.entries().contains(where: { try signedObjectInfo(json: $0).bodyJcs == review.bodyJSON }) {
+            try commitLog(log) { $0.publication = nil; $0.hostSenderReview = nil }
+            publication = nil
+            return true
+        }
+        guard log.head() != publisher.head else { return false }
+        guard log.head().seq > publisher.head.seq,
+              (saved.supersededHostSenderPublications?.count ?? 0) < 16,
+              let checkpoint = saved.publication else { throw RemoteRecoveryError.requiresReview }
+        let entries = log.entriesAfter(seq: publisher.head.seq)
+        _ = try publisher.relayConflict(head: log.head(), entries: entries, more: false, now: now())
+        try commitLog(log) {
+            $0.supersededHostSenderPublications = ($0.supersededHostSenderPublications ?? []) + [checkpoint]
+            $0.publication = nil; $0.hostSenderReview = nil
+        }
+        publication = nil
+        // Concurrent Revoke/Readmit is already done only when it has the reviewed effect. A revoke
+        // with interruption cannot be satisfied by another manager's noninterrupting revoke.
+        switch (review.operation, log.hostSenderState(hostId: review.hostID)) {
+        case (.revoke(interruptRunning: false), .revoked), (.readmit, .authorized): return true
+        default: throw RemoteRecoveryError.requiresReview
+        }
+    }
+
+    func cancelUnsignedHostSender(_ review: RemoteHostSenderReview) throws {
+        try begin(hostSender: true); defer { busy = false }
+        guard saved.hostSenderReview == (try review.checkpoint()), let checkpoint = saved.publication else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        if publication == nil {
+            publication = try RemoteMembershipPublication(checkpoint: checkpoint, accountID: accountID,
+                genesisHash: review.genesisHash, now: now(), persist: { [unowned self] bytes in
+                    try self.persist { $0.publication = bytes }
+                })
+        }
+        guard try publication?.outstanding() == nil else { throw RemoteRecoveryError.requiresReview }
+        try persist { $0.publication = nil; $0.hostSenderReview = nil }
+        publication = nil
     }
 }
 

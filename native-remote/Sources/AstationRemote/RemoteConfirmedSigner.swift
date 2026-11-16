@@ -42,6 +42,9 @@ public final class RemoteConfirmedSigner: AppKeyProvider, @unchecked Sendable {
         case "remove": purpose = .remove
         case "set_roles": purpose = .roles
         case "add_host", "remove_host": purpose = .host
+        case "project_set", "project_remove": purpose = .project
+        case "host_sender_revoke", "host_sender_readmit": purpose = .hostSender
+        case "host_enc_key": purpose = .hostEncKey
         case "recovery_add", "recovery_approve", "recovery_veto": purpose = .recovery
         case "set_recovery_key": purpose = .kit
         case "k_backup": purpose = .keyBackup

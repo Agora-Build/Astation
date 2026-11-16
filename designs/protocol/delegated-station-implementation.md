@@ -102,6 +102,66 @@ these controls and retries remain off. This is not the separate all-verifier
 gate for the five new membership actions; that gate also stays off, and
 host-sender Readmit is not implemented by the service-stop UI.
 
+## Native host-sender reviews and verifier authorization
+
+The Security page now opens a separate Host Sending Access window. Its rows come
+from the locally anchored shared device list, including the sending state and
+projects of removed hosts. Removing or replacing a host's key does not readmit it.
+Revoke reviews the exact host and interruption choice (off by default); Readmit
+explains that only newly sent work is accepted and cancelled tasks do not return.
+The view distinguishes a committed device-list entry from receiving-host
+application. Host senders have no Pause/Resume controls.
+
+`RemoteHostSenderReview` uses the shared action builders, publisher and signing
+purposes, without adding a wire format. The account's existing serialized writer
+durably saves the exact review before confirmation and the signature before
+append. Pending reviews exclude other membership writers. Signing checks current
+manager authority and the exact head before and after fresh owner confirmation,
+then checks verifier authorization again at the actual protected-key boundary.
+Neither the ordinary key provider nor a direct identity call can sign the five
+new actions without the additional authorization callback.
+
+A restart or lost append reply resumes the saved publication, reconciling its
+exact entry against the verified chain before sending anything. A signed retry
+reuses its signature. A write that might have committed fences the account writer
+until protected reload. A losing compare-and-swap is archived rather than
+automatically re-signed at another head. Another manager's noninterrupting revoke
+cannot satisfy an interrupting intent; that case requires a fresh review, including
+the later standalone Interrupt workflow that remains to be implemented for hosts.
+The archive is bounded to 16 losing publications; exhausting it requires review,
+never silent evidence deletion. Complete retention tooling remains open.
+
+`RemoteVerifierSigningGate` is an authorization adapter for an independently
+enumerated account, genesis and exact device-list head. The roster must include
+all active signed-list members and current hosts, at least one Station replica,
+and the caller's complete replica/other-SDK inventory. It cannot establish that
+external inventory's completeness or authenticity itself. Omitting/removing an
+obsolete verifier is not automatic discovery and requires an explicit manager
+decision. The production application does not yet supply this authority.
+
+Each consumer starts unconfirmed. Reports are scoped to fresh connection tokens;
+reconnect, missing inventory, offline status, malformed inventory, lower versions
+and narrower action sets invalidate confirmation. Delayed reports/disconnects
+from retired connections cannot restore or invalidate a newer one. Host reports
+must be taken from the shared-core-authenticated welcome, matching account, head
+and host trust generation. The channel owner must retire that evidence on closure,
+authorization expiry or identity change. Non-host reports require their own
+authenticated source. Nothing is confirmed from presence, release version, cached
+inventories or a host feature flag, and no confirmation survives a process restart.
+
+All five actions require version 2 and the requested action in every live report.
+The adapter also implements the proposed version-1 rule for service scopes with
+launch/message/notify, including the prospective service's verifier on add. This
+does not change the existing hosted integration enrollment path: migrating it to
+the all-consumer gate still requires actual non-host inventory carriage and joint
+verification. A version number does not substitute for the reported actions.
+
+The normal app constructor supplies neither new-action inventory authorization
+nor delegated-control authorization. The view is read-only and the new signing
+paths remain OFF. This increment does not implement authoritative non-host roster
+discovery, standalone host interruption/multi-Station fanout, project/host-key
+signing UI, record-specific re-sign/application alerts or VII.A.
+
 Portal integration follow-up: [Portal #38](https://github.com/Agora-Build/Portal/issues/38).
 At Portal `fd11f8bc7c1dbfe9c89b2a23bd7572b00ac6e440`, an earlier non-interrupting
 revoke wins over a later native mirror with `interruptRunning: true`. Native
@@ -180,13 +240,18 @@ New native signing/device-list compatibility gates remain off.
 Still required before activation:
 
 - Native :8080 proxy with fresh host proof and socket/identity generation
-  retirement. Atem main currently ignores a local-link `host_challenge`; the
-  focused host request is [Atem #120 comment 6892158273](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6892158273).
+  retirement. Atem confirmed the missing local challenge path and is implementing
+  it in [Atem #120 comment 6907451498](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6907451498).
+  The proof's `room` is the paired Astation's relay room, not the host's own ID;
+  `atem_id` remains the host's ID. Encrypted local channel forwarding already
+  exists on the host and must be preserved by the native proxy.
   A native login token cannot replace the proof. A proxy must not take over a
   normal host route without supporting its encrypted channel routing too.
-- Native host-sender Revoke/Readmit/Interrupt UI and its all-verifier signing
-  authorization. The service Revoke/Interrupt UI and protected delivery journal
-  are implemented but remain gated. Record-specific re-sign/application alerts
+- Authoritative replica/non-host verifier inventory carriage, wiring all live
+  inventory invalidations, and standalone host Interrupt/fanout. Native host-sender
+  Revoke/Readmit reviews, their UI and the inventory authorization adapter are
+  implemented but remain gated, as are the service Revoke/Interrupt journal.
+  Record-specific re-sign/application alerts
   remain required. Unknown-outcome listing, resolution review, protected reminder
   policy and push routing are implemented; their real joint checks remain open.
 - Complete restore/reset tooling: a restored database must never reuse a

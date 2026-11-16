@@ -47,6 +47,7 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     private var recoveryStatusLabel: NSTextField?
     private var recoverySetupButton: NSButton?
     private var deviceEnrollmentWindow: DeviceEnrollmentWindowController?
+    private var hostSenderAccessWindow: HostSenderAccessWindowController?
     private var relayIdentityKeyStatusLabel: NSTextField?
     private var relayIdentityKeyRetryButton: NSButton?
     private var relayIdentityKeyRepairButton: NSButton?
@@ -637,6 +638,13 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
         let addDevice = NSButton(title: "Add Phone or Tablet...", target: self, action: #selector(showDeviceEnrollment))
         addDevice.bezelStyle = .rounded
         content.addArrangedSubview(addDevice)
+        content.addArrangedSubview(separator())
+
+        content.addArrangedSubview(sectionTitle("Host Sending Access"))
+        content.addArrangedSubview(wrappingInfo("Review which Atem hosts can send agent work to each other, and revoke or readmit a sender."))
+        let hostAccess = NSButton(title: "Manage Host Senders...", target: self, action: #selector(showHostSenderAccess))
+        hostAccess.bezelStyle = .rounded
+        content.addArrangedSubview(hostAccess)
         content.addArrangedSubview(separator())
 
         content.addArrangedSubview(sectionTitle("Account Recovery"))
@@ -1235,6 +1243,11 @@ class SettingsWindowController: NSObject, NSWindowDelegate, NSTabViewDelegate, N
     @MainActor @objc private func showDeviceEnrollment() {
         if deviceEnrollmentWindow == nil { deviceEnrollmentWindow = DeviceEnrollmentWindowController(hub: hubManager) }
         deviceEnrollmentWindow?.showWindow(nil)
+    }
+
+    @MainActor @objc private func showHostSenderAccess() {
+        if hostSenderAccessWindow == nil { hostSenderAccessWindow = HostSenderAccessWindowController(hub: hubManager) }
+        hostSenderAccessWindow?.showWindow(nil)
     }
 
     @objc private func showRecoveryKit() {

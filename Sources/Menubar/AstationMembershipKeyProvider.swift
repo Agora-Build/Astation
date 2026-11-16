@@ -8,12 +8,15 @@ final class AstationMembershipKeyProvider: AppKeyProvider, @unchecked Sendable {
     let keyID: String
     let expectedPublicKey: Data
     private let controlRecordsAllowed: Bool
+    private let authorizeNewMembership: ((SignRequest) throws -> Void)?
 
-    init(identity: AtemE2EIdentity, keyID: String, publicKey: Data, controlRecordsAllowed: Bool = false) {
+    init(identity: AtemE2EIdentity, keyID: String, publicKey: Data, controlRecordsAllowed: Bool = false,
+        authorizeNewMembership: ((SignRequest) throws -> Void)? = nil) {
         self.identity = identity
         self.keyID = keyID
         expectedPublicKey = publicKey
         self.controlRecordsAllowed = controlRecordsAllowed
+        self.authorizeNewMembership = authorizeNewMembership
     }
 
     func publicKey(keyId: String) throws -> PublicKeyData {
@@ -29,7 +32,8 @@ final class AstationMembershipKeyProvider: AppKeyProvider, @unchecked Sendable {
             guard controlRecordsAllowed else { throw AtemIdentityError.invalidState }
             return try identity.signControlRecord(request, expectedPublicKey: expectedPublicKey)
         }
-        return try identity.signMembership(request, expectedPublicKey: expectedPublicKey)
+        return try identity.signMembership(request, expectedPublicKey: expectedPublicKey,
+            authorizeNewMembership: authorizeNewMembership)
     }
 
     func x25519(keyId: String, peer: Data) throws -> Data { throw AtemIdentityError.invalidState }
