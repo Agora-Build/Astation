@@ -1,5 +1,6 @@
 import Cocoa
 import Foundation
+import AstationRemote
 import NIO
 import CStationCore
 
@@ -159,6 +160,10 @@ class AstationApp: NSObject, NSApplicationDelegate {
         hubManager.sendDirectChannel = { [weak webSocketServer] bytes, clientId, completion in
             guard let webSocketServer else { completion(CocoaError(.fileNoSuchFile)); return }
             webSocketServer.sendChannel(bytes, clientID: clientId, completion: completion)
+        }
+        hubManager.sendDirectStationProxy = { [weak webSocketServer] bytes, clientId, completion in
+            guard let webSocketServer else { completion(RemoteChannelError.staleLink); return }
+            webSocketServer.sendStationProxy(bytes, clientID: clientId, completion: completion)
         }
         hubManager.disconnectDirectClient = { [weak webSocketServer] clientId in
             webSocketServer?.disconnectClientForSessionReset(clientId)

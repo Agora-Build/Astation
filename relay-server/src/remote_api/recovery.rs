@@ -10,7 +10,7 @@ use atem_client::{
     canonical::{jcs, StrictValue},
     membership::{Action, Check, Entry, Head, HostNow, MemberStatus, Membership},
     Hash32,
-    host_route::{verify_host_route_message, HostRouteRefusal, RelayReply},
+    host_route::{verify_host_route_message_as, HostRouteRefusal, RelayReply, RouteKind},
 };
 use axum::{
     body::{to_bytes, Body},
@@ -71,6 +71,8 @@ struct Root {
     #[serde(default)]
     routes: BTreeMap<String, HostBinding>,
     #[serde(default)]
+    proxies: BTreeMap<String, HostBinding>,
+    #[serde(default)]
     enrollments: BTreeMap<String, device_enrollment::Record>,
     #[serde(default)]
     delegated: BTreeMap<String, delegated::Stored>,
@@ -89,6 +91,28 @@ pub(crate) struct HostBinding {
     pub atem_id: String,
     nonce: [u8; 32],
     proof: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<ProxyBinding>,
+}
+
+/// Native authentication binds a proxy proof to one paired local socket. It
+/// never occupies or replaces the host's independent relay route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProxyBinding {
+    pub session: String,
+    pub generation: String,
+    pub native: crate::cluster::ConnRef,
+}
+
+impl Root {
+    fn route(&self, binding: &HostBinding) -> Option<&HostBinding> {
+        if binding.proxy.is_some() { self.proxies.get(&binding.host) }
+        else { self.routes.get(&binding.host) }
+    }
+
+    fn current(&self, binding: &HostBinding) -> bool {
+        self.route(binding) == Some(binding)
+    }
 }
 
 #[derive(Debug)]
@@ -110,7 +134,8 @@ pub(crate) struct OwnerRoute {
 
 impl HostBinding {
     fn valid(&self, log: &Membership) -> bool {
-        verify_host_route_message(
+        verify_host_route_message_as(
+            if self.proxy.is_some() { RouteKind::Proxy } else { RouteKind::Relay },
             log,
             self.proof.as_bytes(),
             &self.nonce,
@@ -202,7 +227,7 @@ impl RecoveryStore {
     pub(crate) async fn prepare_delegated(&self, binding: &HostBinding) -> bool {
         let Some(origin) = self.delegated_origin.get() else { return false };
         match self.with_root(&binding.genesis,
-            |root, log| root.routes.get(&binding.host) == Some(binding)
+            |root, log| root.current(binding)
                 && binding.valid(log) && log.frozen().is_none(),
             |root, _| std::future::ready(root.delegated.contains_key(origin))).await
         {
@@ -224,7 +249,7 @@ impl RecoveryStore {
     {
         let origin = self.delegated_origin.get()?;
         self.with_root(&binding.genesis,
-            |root, log| root.routes.get(&binding.host) == Some(binding)
+            |root, log| root.current(binding)
                 && binding.valid(log) && log.frozen().is_none(),
             |root, log| {
                 let response = match call {
@@ -258,6 +283,18 @@ impl RecoveryStore {
         atem_id: &str,
         connection: crate::cluster::ConnRef,
     ) -> Result<(HostBinding, Value), HostRouteError> {
+        self.admit_route(text, nonce, room, atem_id, connection, None, None).await
+    }
+
+    pub(crate) async fn admit_proxy(&self, text: &str, nonce: [u8; 32], room: &str,
+        atem_id: &str, connection: crate::cluster::ConnRef, proxy: ProxyBinding,
+        subject: &str) -> Result<(HostBinding, Value), HostRouteError> {
+        self.admit_route(text, nonce, room, atem_id, connection, Some(proxy), Some(subject)).await
+    }
+
+    async fn admit_route(&self, text: &str, nonce: [u8; 32], room: &str,
+        atem_id: &str, connection: crate::cluster::ConnRef, proxy: Option<ProxyBinding>,
+        subject: Option<&str>) -> Result<(HostBinding, Value), HostRouteError> {
         // This untrusted selector only locates the anchored log. The shared verifier
         // validates the exact message and its account, head, key and challenge.
         let malformed = || {
@@ -272,13 +309,14 @@ impl RecoveryStore {
         let reply = self
             .perform_scoped(
                 genesis,
-                None,
+                subject,
                 Operation::HostRoute {
                     text: text.into(),
                     nonce,
                     room: room.into(),
                     atem_id: atem_id.into(),
                     connection,
+                    proxy,
                 },
             )
             .await;
@@ -299,6 +337,11 @@ impl RecoveryStore {
         ))
     }
 
+    pub(crate) async fn retire_proxy(&self, binding: &HostBinding) {
+        let _ = self.perform_scoped(&binding.genesis, None,
+            Operation::RetireProxy(binding.clone())).await;
+    }
+
     /// Keep the membership/binding lock until queue admission or presence publication.
     /// The action must not recursively enter this store or wait for a peer's ACK.
     pub(crate) async fn with_host_route<T, F, Fut>(
@@ -312,7 +355,7 @@ impl RecoveryStore {
     {
         self.with_root(
             &binding.genesis,
-            |root, log| root.routes.get(&binding.host) == Some(binding) && binding.valid(log),
+            |root, log| root.current(binding) && binding.valid(log),
             |_, _| action(),
         )
         .await
@@ -336,7 +379,7 @@ impl RecoveryStore {
                 proved.is_none_or(|binding| {
                     binding.genesis == route.genesis && binding.host == route.host
                         && binding.room == route.room && binding.connection == route.connection
-                        && root.routes.get(&binding.host) == Some(binding) && binding.valid(log)
+                        && root.current(binding) && binding.valid(log)
                 }) && log.host(&route.host)
                     .is_some_and(|host| host.host_trust_gen == route.host_trust_gen)
                     && root
@@ -358,7 +401,7 @@ impl RecoveryStore {
         self.with_root(
             &binding.genesis,
             |root, log| {
-                root.routes.get(&binding.host) == Some(binding)
+                root.current(binding)
                     && binding.valid(log)
                     && log.frozen().is_none()
                     && log
@@ -402,7 +445,7 @@ impl RecoveryStore {
                         && m.member.is_manager()
                         && m.member.auth_key == authority.manager_key
                 });
-                let replaced = root.routes.get(&binding.host).is_some_and(|route| route != binding);
+                let replaced = root.route(binding).is_some_and(|route| route != binding);
                 let removed = log.entries().iter().any(|entry| {
                     entry.seq > authority.head_seq
                         && matches!(&entry.action, Action::RemoveHost { host_id } if host_id == &binding.host)
@@ -412,7 +455,7 @@ impl RecoveryStore {
                 }
                 let original = !completion
                     && log.host(&binding.host) == Some(&authority.original_host)
-                    && root.routes.get(&binding.host) == Some(binding)
+                    && root.current(binding)
                     && binding.valid(log);
                 let published = log.host(&binding.host).is_some_and(|host| {
                     let latest = log.entries().iter().rev().find(|entry| {
@@ -683,7 +726,8 @@ impl RecoveryStore {
 
 pub(super) enum Operation {
     IntegrationSnapshot,
-    HostRoute { text: String, nonce: [u8; 32], room: String, atem_id: String, connection: crate::cluster::ConnRef },
+    HostRoute { text: String, nonce: [u8; 32], room: String, atem_id: String, connection: crate::cluster::ConnRef, proxy: Option<ProxyBinding> },
+    RetireProxy(HostBinding),
     Append {
         entry: Entry,
         expected: Head,
@@ -744,6 +788,7 @@ fn apply(
                 blobs: BTreeMap::new(),
                 push: Default::default(),
                 routes: Default::default(),
+                proxies: Default::default(),
                 enrollments: Default::default(),
                 delegated: Default::default(),
             }
@@ -765,14 +810,20 @@ fn apply(
             }
         }
         Operation::DeviceEnrollment(command) => device_enrollment::apply(&mut root.enrollments, command, clock.wall_ms)?,
-        Operation::HostRoute { text, nonce, room, atem_id, connection } => {
-            let route = verify_host_route_message(&log, text.as_bytes(), &nonce, &room, &atem_id)
+        Operation::HostRoute { text, nonce, room, atem_id, connection, proxy } => {
+            let kind = if proxy.is_some() { RouteKind::Proxy } else { RouteKind::Relay };
+            let route = verify_host_route_message_as(kind, &log, text.as_bytes(), &nonce, &room, &atem_id)
                 .map_err(|refusal| (StatusCode::BAD_REQUEST, Json(RelayReply::refused(&refusal).to_json())))?;
             let binding = HostBinding { genesis: hash.to_hex(), host: route.host_id.clone(),
                 host_trust_gen: log.host(&route.host_id).ok_or_else(unavailable)?.host_trust_gen,
-                connection, room, atem_id, nonce, proof: text };
-            let replaced = root.routes.insert(route.host_id.clone(), binding.clone());
+                connection, room, atem_id, nonce, proof: text, proxy };
+            let routes = if binding.proxy.is_some() { &mut root.proxies } else { &mut root.routes };
+            let replaced = routes.insert(route.host_id.clone(), binding.clone());
             (StatusCode::OK, Json(json!({"binding":binding,"replaced":replaced,"verdict":RelayReply::ok(&route).to_json()})))
+        }
+        Operation::RetireProxy(binding) => {
+            if binding.proxy.is_some() && root.current(&binding) { root.proxies.remove(&binding.host); }
+            (StatusCode::OK, Json(json!({})))
         }
         Operation::IntegrationSnapshot => (StatusCode::OK, Json(json!({"account":root.account,"membership":log.to_stored()}))),
         Operation::Collect => {
@@ -808,7 +859,8 @@ fn apply(
                 })
                 .ok_or_else(unavailable)?;
             let binding = root.routes.get(&host).filter(|binding| binding.valid(&log));
-            (StatusCode::OK, Json(json!({"room":signer,"binding":binding,"host_trust_gen":current.host_trust_gen})))
+            let proxy = root.proxies.get(&host).filter(|binding| binding.valid(&log));
+            (StatusCode::OK, Json(json!({"room":signer,"binding":binding,"proxy":proxy,"host_trust_gen":current.host_trust_gen})))
         }
         Operation::Append { entry, expected } => {
             if let Some(existing) = log.entry(entry.seq).filter(|e| e.hash() == entry.hash()) {
@@ -934,6 +986,7 @@ fn apply(
         }
     };
     root.routes.retain(|_, binding| binding.valid(&log));
+    root.proxies.retain(|_, binding| binding.valid(&log));
     retain(&mut root, &log, clock.wall_ms);
     root.membership = log.to_stored();
     if serde_json::to_vec(&root).map_err(|_| unavailable())?.len() > MAX_STATE {
@@ -1033,11 +1086,34 @@ pub(crate) async fn host_target(
     if reply.0 != StatusCode::OK {
         return Err(reply);
     }
-    let room = reply.1 .0["room"]
+    let mut room = reply.1 .0["room"]
         .as_str()
         .ok_or_else(unavailable)?
         .to_owned();
-    let binding: Option<HostBinding> = serde_json::from_value(reply.1 .0["binding"].clone()).ok();
+    let relay: Option<HostBinding> = serde_json::from_value(reply.1 .0["binding"].clone()).ok();
+    let proxy: Option<HostBinding> = serde_json::from_value(reply.1 .0["proxy"].clone()).ok();
+    let durable_relay = relay.clone();
+    // A proxy never hides a live independent relay. Check the directory rather
+    // than letting a saved (but disconnected) carrier mask the other one.
+    let mut binding = None;
+    for candidate in relay.into_iter().chain(proxy) {
+        let current = match state.relay.directory().get(&candidate.room).await {
+            Ok(Some(room)) => if let Some(proxy) = &candidate.proxy {
+                room.verified && room.owner.as_ref() == Some(&proxy.native)
+            } else { room.atems.get(&candidate.atem_id) == Some(&candidate.connection) },
+            Ok(None) => false,
+            Err(_) => return Err(unavailable()),
+        };
+        if current {
+            room = candidate.room.clone();
+            binding = Some(candidate);
+            break;
+        }
+    }
+    // Keep the existing proved-relay recovery path when its directory
+    // projection needs rebuilding and there is no current proxy instead.
+    let binding = binding.or(durable_relay);
+    if let Some(binding) = &binding { room = binding.room.clone(); }
     let target = if let Some(binding) = &binding {
         Some(binding.connection.clone())
     } else {

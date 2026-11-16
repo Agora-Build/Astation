@@ -32,8 +32,8 @@ sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio",
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
 base64 = "0.22"
-# Consume only the shared client library at the same reviewed native pin.
-atem-client = { git = "https://github.com/Agora-Build/Atem.git", rev = "c7b0054fe1208cad1bac98162d9d3ea99b5307cc" }
+# Proxy-kind verification uses the reviewed shared core; native forwards proofs opaquely.
+atem-client = { git = "https://github.com/Agora-Build/Atem.git", rev = "d59f98f46816d16bbbf06d39f783fafe2602966d" }
 # Astation relay-identity proofs (ECDSA P-256); already in the tree via rustls.
 ring = "0.17"
 zeroize = "1"
@@ -42,7 +42,7 @@ zeroize = "1"
 redis = { version = "0.27", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "keep-alive"] }
 
 [dev-dependencies]
-atem-client = { git = "https://github.com/Agora-Build/Atem.git", rev = "c7b0054fe1208cad1bac98162d9d3ea99b5307cc", features = ["software-keys"] }
+atem-client = { git = "https://github.com/Agora-Build/Atem.git", rev = "d59f98f46816d16bbbf06d39f783fafe2602966d", features = ["software-keys"] }
 tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }

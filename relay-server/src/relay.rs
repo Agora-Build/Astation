@@ -42,6 +42,7 @@ use crate::AppState;
 
 mod verification;
 mod delegated;
+pub(crate) mod proxy;
 
 /// A room code as it may appear in logs: the first 4 characters plus "…".
 /// Astation room codes are bearer-like identifiers (whoever presents one joins
@@ -250,6 +251,7 @@ struct HubInner {
     remote_channels: crate::remote_api::channels::ChannelBroker,
     recovery: std::sync::OnceLock<Arc<crate::remote_api::recovery::RecoveryStore>>,
     host_routes: std::sync::Mutex<HashMap<String, crate::remote_api::recovery::HostBinding>>,
+    proxy_authorities: std::sync::Mutex<HashMap<String, Arc<proxy::NativeAuthority>>>,
     verifications: std::sync::Mutex<HashMap<String, verification::VerificationWindow>>,
     delegated_updates: tokio::sync::Notify,
 }
@@ -307,6 +309,7 @@ impl RelayHub {
                 remote_channels: crate::remote_api::channels::ChannelBroker::default(),
                 recovery: std::sync::OnceLock::new(),
                 host_routes: std::sync::Mutex::new(HashMap::new()),
+                proxy_authorities: std::sync::Mutex::new(HashMap::new()),
                 verifications: std::sync::Mutex::new(HashMap::new()),
                 delegated_updates: tokio::sync::Notify::new(),
             }),
@@ -384,18 +387,23 @@ impl RelayHub {
         if self.local().role(connection) == Some(SocketRole::HostCandidate) {
             return false;
         }
+        let binding = self.host_binding(connection);
         let send = || async {
+            if let Some(binding) = binding.as_ref().filter(|b| b.proxy.is_some()) {
+                if !self.proxy_current(connection).await { return false; }
+                return self.local().send_delegated(binding, frame);
+            }
             if required {
                 self.local().send_required(connection, frame)
             } else {
                 self.local().send(connection, frame)
             }
         };
-        if let Some(binding) = self.host_binding(connection) {
+        if let Some(binding) = &binding {
             let Some(store) = self.inner.recovery.get() else {
                 return false;
             };
-            let sent = store.with_host_route(&binding, send).await;
+            let sent = store.with_host_route(binding, send).await;
             if sent.is_none() && !self.keep_verification(connection).await {
                 self.local()
                     .close_with(connection, CLOSE_TRY_AGAIN, "host route changed");
@@ -413,7 +421,8 @@ impl RelayHub {
             };
             store
                 .with_host_route(&binding, || async {
-                    self.channels().reply(handle, source, frame)
+                    (binding.proxy.is_none() || self.proxy_current(&source.conn).await)
+                        && self.channels().reply(handle, source, frame)
                 })
                 .await
                 .unwrap_or(false)
@@ -1133,6 +1142,7 @@ impl RelayHub {
         // Rebuild only projections whose durable generation is still current. This
         // also repairs Redis TTL expiry/loss without relying on a cached room.
         for binding in bindings {
+            if binding.proxy.is_some() { continue; }
             let present = matches!(self.directory().get(&binding.room).await,
                 Ok(Some(room)) if room.atems.get(&binding.atem_id) == Some(&binding.connection));
             if !present {

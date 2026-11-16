@@ -19,7 +19,7 @@ public struct RemoteChannelRoute: Equatable, Sendable {
         self.handle = handle
     }
 
-    static func isValidHandle(_ handle: String) -> Bool {
+    public static func isValidHandle(_ handle: String) -> Bool {
         (1...64).contains(handle.utf8.count) && handle.utf8.allSatisfy({
             (65...90).contains($0) || (97...122).contains($0) ||
             (48...57).contains($0) || $0 == 45 || $0 == 95

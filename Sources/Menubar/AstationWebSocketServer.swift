@@ -7,6 +7,7 @@ import NIOHTTP1
 import NIOWebSocket
 
 class AstationWebSocketServer {
+    static let maximumChannelsPerClient = 128
     private var eventLoopGroup: EventLoopGroup!
     private var stateEventLoop: EventLoop?
     private var channel: Channel?
@@ -18,6 +19,14 @@ class AstationWebSocketServer {
     private var authenticatedSessionIds: [String: String] = [:]
     private var pendingAuthentication: [String: DirectAuthenticationContext] = [:]
     private var pairingClients: Set<String> = []
+    private final class SocketIdentity {
+        var id = UUID().uuidString
+        let scope: DirectConnectionScope
+        init(scope: DirectConnectionScope) { self.scope = scope }
+    }
+    private var socketIdentities: [String: SocketIdentity] = [:]
+    private var proxyChallenged: Set<String> = []
+    private var channelHandles: [String: Set<String>] = [:]
     private var localControlAPI: LocalControlAPI?
 
     func configureLocalControlAPI(_ api: LocalControlAPI) {
@@ -42,12 +51,16 @@ class AstationWebSocketServer {
         stateEventLoop = eventLoopGroup.next()
         
         let upgrader = NIOWebSocketServerUpgrader(
+            maxFrameSize: RemoteChannelEnvelope.maximumBytes,
+            automaticErrorHandling: true,
             shouldUpgrade: { channel, _ in
                 return channel.eventLoop.makeSucceededFuture(HTTPHeaders())
             },
             upgradePipelineHandler: { channel, _ in
                 let scope = DirectConnectionScope(peerAddress: channel.remoteAddress?.ipAddress)
-                return WebSocket.server(on: channel) { ws in
+                var configuration = WebSocket.Configuration()
+                configuration.maxAccumulatedFrameSize = RemoteChannelEnvelope.maximumBytes
+                return WebSocket.server(on: channel, config: configuration) { ws in
                     self.handleWebSocketConnection(ws, scope: scope)
                 }
             }
@@ -86,7 +99,9 @@ class AstationWebSocketServer {
     
     private func handleWebSocketConnection(_ ws: WebSocket, scope: DirectConnectionScope) {
         preconditionOnStateEventLoop()
-        let clientId = UUID().uuidString
+        let identity = SocketIdentity(scope: scope)
+        let clientId = identity.id
+        socketIdentities[clientId] = identity
         connectedClients[clientId] = ws
         let challenge = DeviceAuthentication.makeChallenge()
         pendingAuthentication[clientId] = DirectAuthenticationContext(
@@ -98,7 +113,7 @@ class AstationWebSocketServer {
 
         // Handle incoming messages
         ws.onText { ws, text in
-            self.handleIncomingMessage(text, from: clientId, ws: ws)
+            self.handleIncomingMessage(text, from: identity.id, ws: ws)
         }
 
         ws.onBinary { ws, buffer in
@@ -107,11 +122,15 @@ class AstationWebSocketServer {
 
         // Handle connection close
         ws.onClose.whenComplete { _ in
+            let clientId = identity.id
             self.connectedClients.removeValue(forKey: clientId)
             self.authenticatedClients.remove(clientId)
             self.authenticatedSessionIds.removeValue(forKey: clientId)
             self.pendingAuthentication.removeValue(forKey: clientId)
             self.pairingClients.remove(clientId)
+            self.socketIdentities.removeValue(forKey: clientId)
+            self.proxyChallenged.remove(clientId)
+            self.channelHandles.removeValue(forKey: clientId)
             self.hubManager.removeClient(withId: clientId)
             Log.info("WebSocket connection closed: \(clientId.prefix(8))")
         }
@@ -131,6 +150,11 @@ class AstationWebSocketServer {
     }
     
     private func handleIncomingMessage(_ text: String, from clientId: String, ws: WebSocket) {
+        if let fields = try? AtemSessionJSON.validatePacket(Data(text.utf8)), fields["type"]?.string == "relay" {
+            guard hasCurrentSession(clientId) else { return }
+            Task { @MainActor in self.hubManager.receiveLocalStationProxy(Data(text.utf8), clientID: clientId) }
+            return
+        }
         if RemoteStationRoute.isEnvelope(Data(text.utf8)) {
             guard hasCurrentSession(clientId) else { _ = ws.close(code: .policyViolation); return }
             let bytes = Data(text.utf8)
@@ -142,6 +166,9 @@ class AstationWebSocketServer {
         if RemoteRelayEnvelope.isChannel(Data(text.utf8)) {
             guard hasCurrentSession(clientId) else { _ = ws.close(code: .policyViolation); return }
             let bytes = Data(text.utf8)
+            if case .close(let handle, _) = try? RemoteChannelEnvelope.readHost(bytes) {
+                channelHandles[clientId]?.remove(handle)
+            }
             Task { @MainActor in
                 self.hubManager.receiveR9Envelope(bytes, clientID: clientId, connectionID: clientId)
             }
@@ -453,11 +480,64 @@ class AstationWebSocketServer {
                   let text = String(data: bytes, encoding: .utf8) else {
                 completion(RemoteChannelError.staleLink); return
             }
+            if let fields = try? AtemSessionJSON.validatePacket(bytes), fields["type"]?.string == "channel",
+               let handle = fields["channel"]?.string {
+                if fields["event"]?.string == "open" {
+                    guard RemoteChannelRoute.isValidHandle(handle),
+                          self.channelHandles[clientID]?.contains(handle) == true
+                            || (self.channelHandles[clientID]?.count ?? 0) < Self.maximumChannelsPerClient else {
+                        completion(RemoteChannelError.notReady); return
+                    }
+                    self.channelHandles[clientID, default: []].insert(handle)
+                }
+                if fields["event"]?.string == "close" { self.channelHandles[clientID]?.remove(handle) }
+            }
             let promise = ws.eventLoop.makePromise(of: Void.self)
             promise.futureResult.whenComplete { result in
                 switch result { case .success: completion(nil); case .failure(let error): completion(error) }
             }
             ws.send(text, promise: promise)
+        }
+    }
+
+    func sendStationProxy(_ bytes: Data, clientID: String, completion: @escaping (Error?) -> Void) {
+        executeOnStateEventLoop {
+            guard self.hasCurrentSession(clientID) else { completion(RemoteChannelError.staleLink); return }
+            if let fields = try? AtemSessionJSON.validatePacket(bytes), fields["type"]?.string == "relay",
+               fields["op"]?.string == "host_challenge" {
+                // Atem signs once per authentication generation. A new Station
+                // nonce requires fresh local authentication, never proof replay.
+                if !self.proxyChallenged.insert(clientID).inserted {
+                    self.reauthenticate(clientID)
+                    completion(RemoteChannelError.staleLink); return
+                }
+            }
+            self.sendChannel(bytes, clientID: clientID, completion: completion)
+        }
+    }
+
+    private func reauthenticate(_ clientID: String) {
+        guard let ws = connectedClients.removeValue(forKey: clientID), !ws.isClosed,
+              let identity = socketIdentities.removeValue(forKey: clientID) else { return }
+        for handle in channelHandles.removeValue(forKey: clientID) ?? [] {
+            // linkGeneration is a local routing fence, not part of the wire
+            // envelope. The captured socket and channel handle identify the peer.
+            if let route = try? RemoteChannelRoute(linkGeneration: UUID(), handle: handle) {
+                ws.send(String(decoding: RemoteChannelEnvelope.close(route: route), as: UTF8.self))
+            }
+        }
+        authenticatedClients.remove(clientID); authenticatedSessionIds.removeValue(forKey: clientID)
+        pendingAuthentication.removeValue(forKey: clientID); proxyChallenged.remove(clientID)
+        hubManager.removeClient(withId: clientID)
+        identity.id = UUID().uuidString
+        let next = identity.id, challenge = DeviceAuthentication.makeChallenge()
+        connectedClients[next] = ws; socketIdentities[next] = identity
+        pendingAuthentication[next] = DirectAuthenticationContext(scope: identity.scope, challenge: challenge)
+        sendMessage(.statusUpdate(status: "auth_required", data: ["clientId": next,
+            "astation_id": AstationIdentity.shared.id, "challenge": challenge,
+            "transport": identity.scope.rawValue, "protocol": DeviceAuthentication.protocolVersion]), to: next)
+        ws.eventLoop.scheduleTask(in: .seconds(10)) {
+            if self.pendingAuthentication[next] != nil { _ = ws.close(code: .policyViolation) }
         }
     }
 

@@ -1,4 +1,5 @@
 import Foundation
+import AstationRemote
 import NIO
 import WebSocketKit
 import XCTest
@@ -108,6 +109,181 @@ final class DirectConnectionTests: XCTestCase {
         )
         let (result, socket) = try future.wait()
         XCTAssertEqual(result, "authenticated:local_proof")
+        _ = socket.close()
+    }
+
+    func testStationReconnectReauthenticatesSameLocalSocketAndFencesOldGeneration() throws {
+        let fixture = try DirectServerFixture(host: "127.0.0.1")
+        defer { fixture.shutdown() }
+        try assertProxyReauthentication(fixture: fixture, host: "127.0.0.1",
+            auth: loopbackAuthMessage(fixture: fixture, atemId: "proxy-host"))
+    }
+
+    func testStationReconnectReauthenticatesPairedLANSocketWithoutNewPairing() throws {
+        guard let address = Self.nonLoopbackIPv4Address() else { throw XCTSkip("No LAN interface") }
+        let fixture = try DirectServerFixture(host: "0.0.0.0")
+        defer { fixture.shutdown() }
+        let session = fixture.sessions.create(hostname: "LAN host", atemId: "proxy-host")
+        try assertProxyReauthentication(fixture: fixture, host: address, auth: { fields in
+            .statusUpdate(status: "auth", data: ["session_id": session.id, "atem_id": "proxy-host",
+                "proof": DeviceAuthentication.proof(token: session.token, challenge: fields["challenge"] ?? "",
+                    astationId: fields["astation_id"] ?? "", atemId: "proxy-host", sessionId: session.id)])
+        })
+    }
+
+    func testProductionProxySocketReceivesMoreThanOneMiBFromRealWebSocket() async throws {
+        let fixture = try DirectServerFixture(host: "127.0.0.1")
+        defer { fixture.shutdown() }
+        let url = try XCTUnwrap(URL(string: "ws://127.0.0.1:\(fixture.port)/ws"))
+        let socket = StationLocalProxy.socket(request: URLRequest(url: url))
+        defer { socket.cancel(with: .goingAway, reason: nil) }
+        XCTAssertEqual(socket.maximumMessageSize, RemoteChannelEnvelope.maximumBytes)
+        socket.resume()
+        guard case .string(let challenge) = try await socket.receive(),
+              case .statusUpdate(_, let fields) = try AstationMessage.decodePacket(Data(challenge.utf8)) else {
+            return XCTFail("Expected local authentication challenge")
+        }
+        let auth = loopbackAuthMessage(fixture: fixture, atemId: "large-proxy-frame")(fields)
+        try await socket.send(.string(String(decoding: JSONEncoder().encode(auth), as: UTF8.self)))
+        guard case .string(let reply) = try await socket.receive(),
+              case .statusUpdate(let status, _) = try AstationMessage.decodePacket(Data(reply.utf8)),
+              status == "auth" || status == "authenticated" else {
+            return XCTFail("Expected authenticated socket")
+        }
+        let route = try RemoteChannelRoute(linkGeneration: UUID(), handle: "large_1")
+        let frame = try RemoteChannelEnvelope.frame(
+            Data((#"{"ct":""# + String(repeating: "a", count: 1_100_000) + #""}"#).utf8), route: route)
+        XCTAssertGreaterThan(frame.count, 1_048_576)
+        let sent = expectation(description: "Large encrypted envelope written")
+        fixture.server.sendChannel(frame, clientID: try XCTUnwrap(fields["clientId"])) { error in
+            XCTAssertNil(error); sent.fulfill()
+        }
+        guard case .string(let received) = try await socket.receive() else { return XCTFail("Expected text envelope") }
+        XCTAssertEqual(Data(received.utf8), frame)
+        await fulfillment(of: [sent], timeout: 3)
+    }
+
+    func testLocalChannelTrackingIsBoundedAndCloseReleasesCapacity() throws {
+        let fixture = try DirectServerFixture(host: "127.0.0.1")
+        defer { fixture.shutdown() }
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+        var clientID = ""
+        let auth = loopbackAuthMessage(fixture: fixture, atemId: "bounded-channels")
+        let (_, socket) = try connect(host: "127.0.0.1", fixture: fixture, group: group, authMessage: {
+            clientID = $0["clientId"] ?? ""; return auth($0)
+        }).wait()
+        defer { _ = socket.close() }
+        let opened = expectation(description: "Bounded channels opened")
+        opened.expectedFulfillmentCount = AstationWebSocketServer.maximumChannelsPerClient
+        for index in 0..<AstationWebSocketServer.maximumChannelsPerClient {
+            let route = try RemoteChannelRoute(linkGeneration: UUID(), handle: "bounded_\(index)")
+            fixture.server.sendChannel(RemoteChannelEnvelope.open(route: route, transport: .direct), clientID: clientID) {
+                XCTAssertNil($0); opened.fulfill()
+            }
+        }
+        wait(for: [opened], timeout: 3)
+        let overflow = try RemoteChannelRoute(linkGeneration: UUID(), handle: "overflow")
+        let refused = expectation(description: "Extra channel refused")
+        fixture.server.sendChannel(RemoteChannelEnvelope.open(route: overflow, transport: .direct), clientID: clientID) {
+            XCTAssertEqual($0 as? RemoteChannelError, .notReady); refused.fulfill()
+        }
+        wait(for: [refused], timeout: 3)
+        let released = expectation(description: "Close frees capacity on the same socket")
+        let closing = try RemoteChannelRoute(linkGeneration: UUID(), handle: "bounded_0")
+        fixture.server.sendChannel(RemoteChannelEnvelope.close(route: closing), clientID: clientID) { error in
+            XCTAssertNil(error)
+            fixture.server.sendChannel(RemoteChannelEnvelope.open(route: overflow, transport: .direct), clientID: clientID) {
+                XCTAssertNil($0); released.fulfill()
+            }
+        }
+        wait(for: [released], timeout: 3)
+        XCTAssertFalse(socket.isClosed)
+    }
+
+    func testUnansweredProxyReauthenticationTimesOutWithoutClosingOtherLocalSocket() throws {
+        let fixture = try DirectServerFixture(host: "127.0.0.1")
+        defer { fixture.shutdown() }
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+        var clientID = ""
+        let auth = loopbackAuthMessage(fixture: fixture, atemId: "timeout-host")
+        let (_, socket) = try connect(host: "127.0.0.1", fixture: fixture, group: group, authMessage: {
+            clientID = $0["clientId"] ?? ""; return auth($0)
+        }).wait()
+        let (_, other) = try connect(host: "127.0.0.1", fixture: fixture, group: group,
+            authMessage: loopbackAuthMessage(fixture: fixture, atemId: "unrelated-host")).wait()
+        defer { _ = other.close(); _ = socket.close() }
+        let closed = expectation(description: "Unanswered authentication expires")
+        try socket.eventLoop.submit {
+            socket.onText { _, _ in }
+            socket.onClose.whenComplete { _ in closed.fulfill() }
+        }.wait()
+        let challenge = Data(#"{"type":"relay","op":"host_challenge","v":1}"#.utf8)
+        fixture.server.sendStationProxy(challenge, clientID: clientID) { error in
+            XCTAssertNil(error)
+            fixture.server.sendStationProxy(challenge, clientID: clientID) {
+                XCTAssertEqual($0 as? RemoteChannelError, .staleLink)
+            }
+        }
+        wait(for: [closed], timeout: 12)
+        XCTAssertFalse(other.isClosed)
+    }
+
+    private func assertProxyReauthentication(fixture: DirectServerFixture, host: String,
+        auth: @escaping ([String: String]) -> AstationMessage) throws {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+        var firstID = "", nextID = ""
+        let (_, socket) = try connect(host: host, fixture: fixture, group: group, authMessage: {
+            firstID = $0["clientId"] ?? ""
+            return auth($0)
+        }).wait()
+        let firstChallenge = expectation(description: "First proof challenge follows authentication")
+        let reauthenticated = expectation(description: "Fresh authentication on the same socket")
+        let nextChallenge = expectation(description: "New generation gets its own challenge")
+        let closedOldChannel = expectation(description: "Old channel closes before reauthentication")
+        var sawOldClose = false
+        try socket.eventLoop.submit { socket.onText { socket, text in
+            if text == "first-proxy-challenge" { firstChallenge.fulfill(); return }
+            if text == "next-proxy-challenge" { nextChallenge.fulfill(); return }
+            if let fields = try? AtemSessionJSON.validatePacket(Data(text.utf8)), fields["type"]?.string == "channel",
+               fields["channel"]?.string == "old_1", fields["event"]?.string == "close" {
+                sawOldClose = true; closedOldChannel.fulfill(); return
+            }
+            guard let message = try? AstationMessage.decodePacket(Data(text.utf8)),
+                  case .statusUpdate(let status, let fields) = message else { return }
+            if status == "auth_required" {
+                XCTAssertTrue(sawOldClose)
+                nextID = fields["clientId"] ?? ""
+                let response = try! JSONEncoder().encode(auth(fields))
+                socket.send(String(decoding: response, as: UTF8.self))
+            } else if status == "auth" || status == "authenticated" { reauthenticated.fulfill() }
+        } }.wait()
+        fixture.server.sendChannel(Data(#"{"type":"channel","event":"open","channel":"old_1","transport":"direct"}"#.utf8),
+            clientID: firstID) { XCTAssertNil($0) }
+        let challenge = Data(#"{"type":"relay","op":"host_challenge","v":1}"#.utf8)
+        fixture.server.sendStationProxy(challenge, clientID: firstID) { error in
+            XCTAssertNil(error)
+            fixture.server.sendChannel(Data("first-proxy-challenge".utf8), clientID: firstID) { XCTAssertNil($0) }
+        }
+        wait(for: [firstChallenge], timeout: 3)
+        fixture.server.sendStationProxy(challenge, clientID: firstID) { error in
+            XCTAssertEqual(error as? RemoteChannelError, .staleLink)
+        }
+        wait(for: [closedOldChannel, reauthenticated], timeout: 3)
+        XCTAssertNotEqual(nextID, firstID)
+        XCTAssertFalse(nextID.isEmpty)
+        XCTAssertFalse(socket.isClosed)
+        let stale = expectation(description: "Old generation is fenced")
+        fixture.server.sendChannel(Data("stale".utf8), clientID: firstID) { error in
+            XCTAssertEqual(error as? RemoteChannelError, .staleLink); stale.fulfill()
+        }
+        fixture.server.sendStationProxy(challenge, clientID: nextID) { error in
+            XCTAssertNil(error)
+            fixture.server.sendChannel(Data("next-proxy-challenge".utf8), clientID: nextID) { XCTAssertNil($0) }
+        }
+        wait(for: [stale, nextChallenge], timeout: 3)
         _ = socket.close()
     }
 
