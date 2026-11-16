@@ -286,10 +286,73 @@ final class RemoteControlPublicationTests: XCTestCase {
         let one = try XCTUnwrap(f.journal.delivery(recordID: first.recordId, log: f.log))
         let two = try XCTUnwrap(f.journal.delivery(recordID: second.recordId, log: f.log))
         let forged = RemoteControlDelivery(recordID: first.recordId, recordJSON: two.recordJSON, stationOrigin: f.origin,
-            stationStored: false, portalMirror: one.portalMirror, portalMirrored: false)
+            stationStored: false, portalMirror: one.portalMirror, portalMirrored: false, portalRefusal: nil)
         XCTAssertThrowsError(try f.journal.stationStored(forged))
         try f.journal.portalMirrored(one)
         XCTAssertFalse(try XCTUnwrap(f.journal.delivery(recordID: second.recordId, log: f.log)).portalMirrored)
         XCTAssertFalse(try XCTUnwrap(f.journal.delivery(recordID: first.recordId, log: f.log)).stationStored)
+    }
+
+    @MainActor
+    func testFinalPortalRefusalSurvivesRestartWithoutClaimingStationOrHostDelivery() throws {
+        for reason: RemoteControlPortalRefusal in [.tooLate, .stationRemoved] {
+            let f = try ControlPublicationFixture(), body = try f.body(interrupt: true)
+            _ = try f.prepare(body)
+            let signed = try f.sign(body)
+            let delivery = try XCTUnwrap(f.journal.retainedDelivery(recordID: body.recordId))
+            try f.journal.portalRefused(delivery, reason: reason)
+            try f.restore()
+            let settled = try XCTUnwrap(f.journal.retainedDelivery(recordID: body.recordId))
+            XCTAssertTrue(settled.portalSettled)
+            XCTAssertFalse(settled.portalMirrored)
+            XCTAssertEqual(settled.portalRefusal, reason)
+            XCTAssertFalse(settled.stationStored)
+            XCTAssertEqual(settled.recordJSON, signed)
+            XCTAssertEqual(try f.journal.pendingDeliveryIDs(), [body.recordId], "Station leg remains pending")
+            XCTAssertThrowsError(try f.journal.portalMirrored(delivery), "final refusal must not become confirmation")
+            try f.journal.portalRefused(delivery, reason: reason)
+            XCTAssertThrowsError(try f.journal.portalRefused(delivery, reason: reason == .tooLate ? .stationRemoved : .tooLate))
+            try f.journal.stationStored(settled)
+            try f.restore()
+            XCTAssertTrue(try f.journal.pendingDeliveryIDs().isEmpty)
+            XCTAssertEqual(f.keys.signs, 1)
+        }
+    }
+
+    @MainActor
+    func testUncertainFinalSettlementRequiresReloadAndRetainsTheOriginalSignature() throws {
+        for committed in [false, true] {
+            let f = try ControlPublicationFixture(), body = try f.body(interrupt: true)
+            _ = try f.prepare(body)
+            let signed = try f.sign(body)
+            let delivery = try XCTUnwrap(f.journal.retainedDelivery(recordID: body.recordId))
+            try f.journal.stationStored(delivery)
+            f.writeFailure = !committed
+            f.failAfterWrite = committed
+            XCTAssertThrowsError(try f.journal.portalRefused(delivery, reason: .tooLate))
+            XCTAssertTrue(f.journal.storageUncertain)
+            XCTAssertThrowsError(try f.journal.pendingDeliveryIDs())
+            f.writeFailure = false
+            try f.restore()
+            let resumed = try XCTUnwrap(f.journal.retainedDelivery(recordID: body.recordId))
+            XCTAssertEqual(resumed.recordJSON, signed)
+            XCTAssertEqual(resumed.portalRefusal, committed ? .tooLate : nil)
+            XCTAssertEqual(try f.journal.pendingDeliveryIDs(), committed ? [] : [body.recordId])
+            XCTAssertEqual(f.keys.signs, 1)
+        }
+    }
+
+    @MainActor
+    func testFinalRefusalCannotSettleNoninterruptingOrAlreadyConfirmedMirrors() throws {
+        for interrupt in [false, true] {
+            let f = try ControlPublicationFixture(), body = try f.body(interrupt: interrupt)
+            _ = try f.prepare(body)
+            _ = try f.sign(body)
+            let delivery = try XCTUnwrap(f.journal.retainedDelivery(recordID: body.recordId))
+            if interrupt { try f.journal.portalMirrored(delivery) }
+            XCTAssertThrowsError(try f.journal.portalRefused(delivery, reason: .stationRemoved))
+            try f.restore()
+            XCTAssertNil(try f.journal.retainedDelivery(recordID: body.recordId)?.portalRefusal)
+        }
     }
 }

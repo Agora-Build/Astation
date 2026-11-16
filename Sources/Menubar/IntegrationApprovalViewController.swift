@@ -512,8 +512,17 @@ final class IntegrationApprovalViewController: NSViewController {
 
     static func controlStatus(_ delivery: RemoteControlDelivery) -> String {
         let station = delivery.stationStored ? "Station stored the signed stop." : "Station delivery pending; the signed stop is saved for retry."
-        let portal = delivery.portalMirror == nil ? "" : delivery.portalMirrored
-            ? " Agora.Build revocation is confirmed." : " Agora.Build revocation is pending and will retry."
+        let portal: String
+        if delivery.portalMirror == nil { portal = "" }
+        else if let refusal = delivery.portalRefusal {
+            switch refusal {
+            case .tooLate: portal = " Agora.Build mirror settled: the interruption window has ended."
+            case .stationRemoved: portal = " Agora.Build mirror settled: this Station was removed."
+            }
+        } else {
+            portal = delivery.portalMirrored ? " Agora.Build revocation is confirmed."
+                : " Agora.Build revocation is pending and will retry."
+        }
         return station + portal + " Host application is not confirmed by these receipts."
     }
 

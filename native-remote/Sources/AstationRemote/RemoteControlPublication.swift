@@ -10,6 +10,11 @@ public enum RemoteControlPublicationError: Error, Equatable {
     case full
 }
 
+public enum RemoteControlPortalRefusal: String, Codable, Sendable {
+    case tooLate = "too_late"
+    case stationRemoved = "station_removed"
+}
+
 public struct RemoteControlPortalMirror: Codable, Equatable, Sendable {
     public let issuer: String
     public let ownerAccount: String
@@ -44,6 +49,8 @@ public struct RemoteControlDelivery: Equatable, Sendable {
     public let stationStored: Bool
     public let portalMirror: RemoteControlPortalMirror?
     public let portalMirrored: Bool
+    public let portalRefusal: RemoteControlPortalRefusal?
+    public var portalSettled: Bool { portalMirrored || portalRefusal != nil }
 }
 
 /// The protected checkpoint owns drafts, exact signatures and both delivery legs.
@@ -60,6 +67,7 @@ public final class RemoteControlPublication {
         var stationStored = false
         let portalMirror: RemoteControlPortalMirror?
         var portalMirrored = false
+        var portalRefusal: RemoteControlPortalRefusal?
     }
     private struct Checkpoint: Codable {
         let version: Int
@@ -80,7 +88,7 @@ public final class RemoteControlPublication {
     public func pendingDeliveryIDs() throws -> [String] {
         try available()
         return try saved.operations.filter {
-            $0.recordJSON != nil && (!$0.stationStored || ($0.portalMirror != nil && !$0.portalMirrored))
+            $0.recordJSON != nil && (!$0.stationStored || ($0.portalMirror != nil && !$0.portalMirrored && $0.portalRefusal == nil))
         }.map { try Self.body($0.bodyJSON).recordId }
     }
 
@@ -205,7 +213,8 @@ public final class RemoteControlPublication {
         let operation = saved.operations[try index(recordID)]
         guard let record = operation.recordJSON else { return nil }
         return RemoteControlDelivery(recordID: recordID, recordJSON: record, stationOrigin: saved.stationOrigin,
-            stationStored: operation.stationStored, portalMirror: operation.portalMirror, portalMirrored: operation.portalMirrored)
+            stationStored: operation.stationStored, portalMirror: operation.portalMirror, portalMirrored: operation.portalMirrored,
+            portalRefusal: operation.portalRefusal)
     }
 
     public func cancelUnsigned(recordID: String) throws {
@@ -222,8 +231,24 @@ public final class RemoteControlPublication {
 
     public func portalMirrored(_ delivery: RemoteControlDelivery) throws {
         let index = try matching(delivery)
-        guard delivery.portalMirror != nil else { throw RemoteControlPublicationError.invalidRecord }
+        guard delivery.portalMirror != nil, saved.operations[index].portalRefusal == nil else {
+            throw RemoteControlPublicationError.invalidRecord
+        }
         try transaction { $0.operations[index].portalMirrored = true }
+    }
+
+    /// A final Portal refusal settles only the mirror, retaining the signed stop and Station delivery.
+    public func portalRefused(_ delivery: RemoteControlDelivery, reason: RemoteControlPortalRefusal) throws {
+        let index = try matching(delivery)
+        let operation = saved.operations[index]
+        guard delivery.portalMirror?.interruptRunning == true, !operation.portalMirrored else {
+            throw RemoteControlPublicationError.invalidRecord
+        }
+        if let prior = operation.portalRefusal {
+            guard prior == reason else { throw RemoteControlPublicationError.invalidRecord }
+            return
+        }
+        try transaction { $0.operations[index].portalRefusal = reason }
     }
 
     private func matching(_ delivery: RemoteControlDelivery) throws -> Int {
@@ -270,10 +295,15 @@ public final class RemoteControlPublication {
             guard try signedObjectInfo(json: record).bodyJcs == operation.bodyJSON,
                   try parseControlRecord(recordJson: record) == body else { throw RemoteControlPublicationError.invalidCheckpoint }
             try verifySignedObject(json: record, key: signerKey)
-        } else if operation.stationStored || operation.portalMirrored {
+        } else if operation.stationStored || operation.portalMirrored || operation.portalRefusal != nil {
             throw RemoteControlPublicationError.invalidCheckpoint
         }
         guard !operation.portalMirrored || operation.portalMirror != nil else { throw RemoteControlPublicationError.invalidCheckpoint }
+        if operation.portalRefusal != nil {
+            guard !operation.portalMirrored, operation.portalMirror?.interruptRunning == true else {
+                throw RemoteControlPublicationError.invalidCheckpoint
+            }
+        }
         return body
     }
 

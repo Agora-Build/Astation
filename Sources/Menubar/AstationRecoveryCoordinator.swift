@@ -1566,11 +1566,14 @@ extension AstationRecoveryCoordinator {
             }
         }
         // This independent leg remains necessary even if Station is down or the signer lost manage.
-        if let mirror = delivery.portalMirror, !delivery.portalMirrored {
+        if let mirror = delivery.portalMirror, !delivery.portalSettled {
             do {
-                _ = try await portal.mirrorRevoke(mirror)
+                let result = try await portal.mirrorRevoke(mirror)
                 guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
-                try journal.portalMirrored(delivery)
+                switch result {
+                case .confirmed: try journal.portalMirrored(delivery)
+                case .finalRefusal(let reason): try journal.portalRefused(delivery, reason: reason)
+                }
             } catch {
                 guard !uncertain, !journal.storageUncertain else { throw RemoteRecoveryError.storageUncertain }
                 guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
