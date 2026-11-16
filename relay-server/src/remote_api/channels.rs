@@ -206,6 +206,17 @@ impl ChannelBroker {
             .remove(handle);
     }
 
+    pub(crate) fn host_disconnected(&self, target: &ConnRef) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).routes.retain(|_, route| {
+            if &route.target == target {
+                let _ = route.close.send(true);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     pub(crate) fn delivery(&self) -> Option<(String, oneshot::Receiver<bool>)> {
         let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
         inner.deliveries.retain(|_, sender| !sender.is_closed());

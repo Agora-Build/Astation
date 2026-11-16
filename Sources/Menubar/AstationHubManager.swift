@@ -248,6 +248,9 @@ class AstationHubManager: ObservableObject {
     private var identityRelaySocketGeneration = UUID().uuidString
     private let makeIdentityRelayTask: (URL) -> IdentityRelaySocket
     private let makePairingRelayTask: (URL) -> IdentityRelaySocket
+    private let makeStationProxyTask: (URLRequest) -> IdentityRelaySocket
+    private let enableLocalStationProxy: Bool
+    @MainActor private var localStationProxies: [String: (context: AtemTransportPolicyContext, proxy: StationLocalProxy)] = [:]
     private let workspaceNotifications: NotificationCenter
     private var systemIsSleeping = false
     private var resumeRelayAfterSleep = false
@@ -531,6 +534,7 @@ class AstationHubManager: ObservableObject {
     /// Set by AstationApp after wiring up the WebSocket server.
     var sendHandler: ((AstationMessage, String) -> Void)?
     var sendDirectChannel: ((Data, String, @escaping (Error?) -> Void) -> Void)?
+    var sendDirectStationProxy: ((Data, String, @escaping (Error?) -> Void) -> Void)?
     var disconnectDirectClient: ((String) -> Void)?
     var terminalMessageHandler: ((RemoteTerminalMessage, RemoteTerminalConnection) -> Void)?
     var sessionMessageHandler: ((AtemSessionMessage, RemoteTerminalConnection) -> Void)?
@@ -611,6 +615,8 @@ class AstationHubManager: ObservableObject {
         dispatchMigration: @escaping (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) },
         makeIdentityRelayTask: @escaping (URL) -> IdentityRelaySocket = { URLSession.shared.webSocketTask(with: $0) },
         makePairingRelayTask: @escaping (URL) -> IdentityRelaySocket = { URLSession.shared.webSocketTask(with: $0) },
+        makeStationProxyTask: @escaping (URLRequest) -> IdentityRelaySocket = { URLSession.shared.webSocketTask(with: $0) },
+        enableLocalStationProxy: Bool = ProcessInfo.processInfo.environment["ASTATION_LOCAL_STATION_PROXY"] == "true",
         workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
         portalSettings: AccountServiceSettings? = try? AccountServiceSettings.load(),
         portalAuth: AstationAccountAuth? = nil,
@@ -638,6 +644,8 @@ class AstationHubManager: ObservableObject {
         self.sessionStore = sessionStore
         self.makeIdentityRelayTask = makeIdentityRelayTask
         self.makePairingRelayTask = makePairingRelayTask
+        self.makeStationProxyTask = makeStationProxyTask
+        self.enableLocalStationProxy = enableLocalStationProxy
         self.workspaceNotifications = workspaceNotifications
         self.relayIdentityKeyManager = relayIdentityKeyManager
         self.relayIdentityRepairDefaults = relayIdentityRepairDefaults
@@ -2023,7 +2031,10 @@ class AstationHubManager: ObservableObject {
             self.sessionStatusByClientId[id] = client.connectionStatus
             self.agentsByClientId[id] = client.hasRegistrySnapshot
                 ? client.registry.values.sorted { $0.session_id < $1.session_id }.map(AtemAgentInfo.init(session:)) : []
-            MainActor.assumeIsolated { self.updateHostWork(clientID: id) }
+            MainActor.assumeIsolated {
+                self.updateHostWork(clientID: id)
+                self.refreshLocalStationProxies()
+            }
             self.sessionStateDidChange?(id)
             let host = DeviceAuthentication.deviceLabel(self.connectedClients.first(where: { $0.id == id })?.hostname ?? "Atem")
             self.approvalSessionDidChange?(id, client, host)
@@ -2041,6 +2052,7 @@ class AstationHubManager: ObservableObject {
 
     private func refreshSessionConnections() {
         MainActor.assumeIsolated {
+            refreshLocalStationProxies()
             for (id, link) in Array(policyR9Connections) where !link.isCurrent {
                 policyR9Connections.removeValue(forKey: id)?.disconnect()
                 transportPolicy.disconnected(clientID: id)
@@ -2408,11 +2420,71 @@ class AstationHubManager: ObservableObject {
 
     /// Socket adapters capture their authenticated generation before entering the main actor.
     @MainActor func receiveR9Envelope(_ bytes: Data, clientID: String, connectionID: String) {
+        if clientID == connectionID, localStationProxies[clientID]?.proxy.receiveHost(bytes) == true { return }
         if let context = sessionContext(for: clientID), context.route.connectionId == connectionID {
             r9Connections[clientID]?.receive(bytes)
         }
         if let context = transportPolicyContext(for: clientID, includeBinding: false), context.route.connectionId == connectionID {
             policyR9Connections[clientID]?.receive(bytes)
+        }
+    }
+
+    @MainActor func receiveLocalStationProxy(_ bytes: Data, clientID: String) {
+        localStationProxies[clientID]?.proxy.receiveHost(bytes)
+    }
+
+    @MainActor private func refreshLocalStationProxies() {
+        let registration = StationRegistrationContext(socket: identityRelaySocketGeneration,
+            account: accountGeneration, origin: stationRelayUrl)
+        let allowed = enableLocalStationProxy && identityRelayVerified && !needsAccountSignIn
+            && stationRegistration == registration && !systemIsSleeping
+        for (id, entry) in Array(localStationProxies) {
+            if !allowed || transportPolicyContext(for: id, includeBinding: false) != entry.context {
+                localStationProxies.removeValue(forKey: id)?.proxy.close()
+            }
+        }
+        guard allowed, let owner = signedInAccount else { return }
+        for client in connectedClients where !client.id.hasPrefix("relay-") {
+            let id = client.id
+            guard localStationProxies[id] == nil,
+                  nativeSessionClients[id]?.features.contains("host.delegated") == true,
+                  let context = transportPolicyContext(for: id, includeBinding: false),
+                  context.verifiedPin != nil, !context.isRelay else { continue }
+            let account = accountGeneration, station = stationRelayUrl, auth = accountAuth
+            let current = { [weak self] in
+                guard let self else { return false }
+                return self.accountGeneration == account && self.signedInAccount == owner
+                    && self.stationRegistration == registration && self.identityRelayVerified
+                    && !self.needsAccountSignIn && !self.systemIsSleeping
+                    && self.transportPolicyContext(for: id, includeBinding: false) == context
+            }
+            let proxy = StationLocalProxy(current: current, connect: { [weak self] in
+                guard let self, current(), try await auth.current()?.session.subject == owner else {
+                    throw RemoteChannelError.staleLink
+                }
+                let token = try await auth.accessToken(relayURL: station)
+                guard current(), let request = StationLocalProxy.request(station: station,
+                    room: AstationIdentity.shared.id, host: context.route.deviceId,
+                    session: context.pairingSession, generation: id, token: token) else {
+                    throw RemoteChannelError.staleLink
+                }
+                return self.makeStationProxyTask(request)
+            }, sign: { [weak self] challenge in
+                guard current(), case .loaded(let key) = self?.relayIdentityKeyManager.state,
+                      let text = RelayIdentityProtocol.authMessage(astationId: AstationIdentity.shared.id,
+                        publicKeyHex: key.publicKeyHex,
+                        signatureHex: try key.sign(challenge: challenge, astationId: AstationIdentity.shared.id)) else {
+                    throw RemoteChannelError.staleLink
+                }
+                return text
+            }, writeLocal: { [weak self] bytes, completion in
+                guard let self, current(), let send = self.sendDirectStationProxy else {
+                    completion(RemoteChannelError.staleLink); return
+                }
+                send(bytes, id, completion)
+            })
+            localStationProxies[id] = (context, proxy)
+            proxy.start()
         }
     }
 
@@ -2995,6 +3067,7 @@ class AstationHubManager: ObservableObject {
                 if pending == current {
                     if ok { stationRegistration = current }
                     finishStationRegistration(ok ? .success(()) : .failure(RemoteRecoveryTransportError.registrationRequired))
+                    MainActor.assumeIsolated { refreshLocalStationProxies() }
                 }
             }
             if forType == "relayPushRegister" || forType == "relayPushUnregister" {
@@ -3660,6 +3733,10 @@ class AstationHubManager: ObservableObject {
     private func invalidateStationRegistration() {
         stationRegistrationGeneration = UUID()
         stationRegistration = nil; stationRegistrationPending = nil
+        MainActor.assumeIsolated {
+            for entry in localStationProxies.values { entry.proxy.close() }
+            localStationProxies.removeAll()
+        }
         finishStationRegistration(.failure(AccountLoginError.changed))
     }
 

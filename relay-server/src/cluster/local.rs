@@ -58,6 +58,7 @@ impl Default for QueueLimits {
 pub enum SocketRole {
     Atem { atem_id: String },
     HostCandidate,
+    NativeProxy,
     Astation,
 }
 

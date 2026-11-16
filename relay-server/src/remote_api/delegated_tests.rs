@@ -57,6 +57,7 @@ fn root(f: &Fixture) -> Root {
         blobs: Default::default(),
         push: Default::default(),
         routes: Default::default(),
+        proxies: Default::default(),
         enrollments: Default::default(),
         delegated: Default::default(),
     }

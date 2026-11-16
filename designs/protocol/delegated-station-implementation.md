@@ -239,6 +239,93 @@ The ordinary retry path persists its backoff and clears the marker only after
 settlement commits. No redirect is followed. Refused report IDs are retained
 for operator diagnostics rather than retried under a new ID.
 
+## Local/LAN Station Proxy
+
+The local `:8080` and paired LAN connections remain owner-present transports.
+`StationLocalProxy` adds a separate forwarding socket to the **currently selected
+Station**, without joining the native relay room as another host or replacing
+the host's independent relay socket. Both carriers use the same control feed,
+membership readers and acknowledgment ledger; the proxy creates no second feed.
+
+```mermaid
+sequenceDiagram
+    participant H as Atem (local or LAN)
+    participant N as Astation native :8080
+    participant S as Selected Station
+    H->>N: Local bootstrap / paired LAN challenge proof
+    N->>H: Authentication granted on this socket
+    N->>S: WSS /ws/proxy + Station-scoped bearer
+    S->>N: Fresh native identity challenge
+    N->>S: Registered native key signature
+    S->>N: Native authentication verified, host_challenge
+    N->>H: Forward challenge after local authentication
+    H->>N: Proxy-kind host_route proof
+    N->>S: Forward original proof bytes
+    S->>N: Host verdict, heads
+    N->>H: Forward original verdict and heads
+    H->>N: control_sync / membership_fetch / control_ack
+    N->>S: Shared-reader validated call
+    S->>N: Correlated response
+    N->>H: Original response bytes, current generation only
+    S->>N: Encrypted r9 channel open/frame/close
+    N->>H: Original envelope bytes
+    H->>N: Encrypted reply on that channel
+    N->>S: Original reply bytes
+```
+
+The endpoint requires the delegated build/runtime gate. Its query names `room`,
+`atem_id`, the paired `session_id`, and the local authentication `generation`
+(UUID). The account token is sent **only in the Authorization header**, never in
+a URL or persisted route. This token alone grants no host authority. Station
+requires the registered P-256 native key proof, the current verified native room
+owner, the same account, and the live session-to-native binding before issuing a
+host challenge. Proxy admission is scoped to that account's anchored root and
+uses the shared `RouteKind::Proxy` verifier. The normal relay verifier accepts
+only `RouteKind::Relay`.
+
+Proxy bindings have their own durable slot, independent of the host's relay
+binding. Their native parent connection, paired session, local generation, host
+trust generation and proof are captured together. Replacing or retiring a proxy
+cannot remove or publish over the host's real relay route. The independent r9
+API prefers a live proved relay route and otherwise can use the current proxy;
+a stale stored carrier must not hide a live one. No route moves to a different
+Station implicitly.
+
+Station rechecks native ownership, key, pairing and account authorization when
+admitting traffic and again at the actual proxy writer boundary. Membership and
+binding checks retain the existing transaction fence. A removed pairing cannot
+release ciphertext or control responses already queued. The native bridge uses
+the shared control readers and `relayControlSyncAnswers`; it permits one live
+read call, at most 30 seconds, and forwards only results for that generation's
+call and announced feed. Native-owned r9 channels never enter the proxy.
+
+Each direction has a bounded queue (128 frames / 8 MiB). Encrypted envelopes
+retain their original bytes and existing 2 MiB bound; control messages retain
+the shared 256 KiB / 64-record limits. A transport failure closes the proxy's
+virtual channels and retries with backoff. Atem signs one challenge per local
+authentication generation: a subsequent Station challenge causes fresh local
+authentication on the same TCP socket, with old channels closed **before** the
+new authentication request and a new client generation. Both loopback and LAN
+reuse their existing authentication credentials; this requires no new pairing
+ceremony. An explicit host-proof refusal stops that proxy attempt and leaves
+ordinary local/LAN traffic usable. Early challenges are dropped, never buffered.
+
+Native forwarding additionally requires exact
+`ASTATION_LOCAL_STATION_PROXY=true`, a verified host advertising `host.delegated`,
+and completed account/Station registration. This is an opt-in joint-test path;
+deployment configuration does not enable it or delegated execution.
+Station consumes shared proof verification at Atem `d59f98f46816d16bbbf06d39f783fafe2602966d`.
+The Apple SDK remains at its existing reviewed pin: native forwards the proof
+opaquely and already has the shared control readers/correlation helper. This
+does not satisfy the separate all-verifier signing compatibility gate.
+
+Coverage includes real loopback/LAN authentication and reauthentication, native
+proof ordering, unchanged ciphertext, read correlation, refusal and bounded
+queues; real Station WSS native/key/session/account admission, proof-kind
+refusal, concurrent relay/proxy routing, queued-write fencing and stale parent
+retirement; and Postgres replica reload/replacement/revocation of both bindings.
+These are isolated tests, not a claim of a completed real native/Atem joint run.
+
 ## Gates and remaining work
 
 The `delegated-host-work` Cargo feature and exact
@@ -250,8 +337,8 @@ New native signing/device-list compatibility gates remain off.
 
 Still required before activation:
 
-- Native :8080 proxy with fresh host proof and socket/identity generation
-  retirement. Astation agreed the domain-separated proxy contract in
+- Real native/Atem `:8080` joint verification of the implemented proxy described
+  above. Astation agreed the domain-separated proxy contract in
   [Atem #174](https://github.com/Agora-Build/Atem/pull/174#issuecomment-6919776085)
   at `fb81d081f5a1695a1ddc71ac9b846780543ae018`. This supersedes forwarding a
   relay-kind proof over the local link: Atem does not authenticate its local
@@ -272,10 +359,9 @@ Still required before activation:
   exists on the host and must be preserved by the native proxy.
   A native login token cannot replace the proof. A proxy must not take over a
   normal host route without supporting its encrypted channel routing too.
-  At review, #174's Linux release check is held by a debug-dump-dependent test;
-  a trust-generation-only change during host reauthentication is a separate
-  Atem before-activation fix. Contract agreement is not native implementation
-  or real joint-test evidence.
+  The release-test correction at `d59f98f` resolves the debug-only dump dependency;
+  a trust-generation-only change during host reauthentication remains a separate
+  Atem before-activation fix. Source tests are not real joint-test evidence.
 - Authoritative replica/non-host verifier inventory carriage, wiring all live
   inventory invalidations, and standalone host Interrupt/fanout. Native host-sender
   Revoke/Readmit reviews, their UI and the inventory authorization adapter are
