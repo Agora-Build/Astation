@@ -219,6 +219,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_host_interrupt_publishes_the_historical_revoke_without_service_fields() {
+        use atem_client::membership::{sign_entry, Action};
+
+        let (app, f) = app(true).await;
+        let genesis = f.log.genesis_hash().to_hex();
+        let mut log = f.log.clone();
+        let revoke_seq = log.head().seq + 1;
+        for action in [
+            Action::HostSenderRevoke {
+                host_id: "host-a".into(),
+                interrupt_running: false,
+            },
+            Action::HostSenderReadmit {
+                host_id: "host-a".into(),
+            },
+            Action::RemoveHost {
+                host_id: "host-a".into(),
+            },
+        ] {
+            let entry = sign_entry(
+                &f.keys,
+                &KeyId::new("manager"),
+                log.draft("phone", f.created, &action),
+            )
+            .unwrap();
+            assert_eq!(
+                app.recovery
+                    .append_test_entry(&genesis, "alice", entry, log.head())
+                    .await,
+                StatusCode::OK
+            );
+            log = app
+                .recovery
+                .integration_log(&genesis, "alice")
+                .await
+                .unwrap();
+        }
+        let (status, reserved) = http(&app, &genesis, "/reservations", Some("alice"),
+            Some(json!({"principal":"host:host-a","manager":"phone","expected":log.head().to_json()}))).await;
+        assert_eq!(status, StatusCode::OK);
+        let mut body = ControlBody {
+            account_id: log.account_id().into(),
+            genesis_hash: log.genesis_hash(),
+            feed: None,
+            principal: ControlPrincipal::Host("host-a".into()),
+            principal_key: None,
+            signer: ControlSigner::Member("phone".into()),
+            action: ControlAction::InterruptRunning {
+                revoke_seq: Some(f.log.head().seq),
+            },
+            record_id: uuid::Uuid::new_v4().to_string(),
+            issued_at: reserved["issued_at"].as_u64().unwrap(),
+            about: ControlAbout {
+                integration_id: None,
+                by: "owner".into(),
+            },
+        };
+        let request = |record: Value| json!({"record":record,"expected":log.head().to_json()});
+        let wrong_revoke = build_control(&f.keys, &KeyId::new("manager"), &body).unwrap();
+        assert_eq!(
+            http(
+                &app,
+                &genesis,
+                "/records",
+                Some("alice"),
+                Some(request(wrong_revoke.to_json()))
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        body.action = ControlAction::InterruptRunning {
+            revoke_seq: Some(revoke_seq),
+        };
+        let signed = build_control(&f.keys, &KeyId::new("manager"), &body).unwrap();
+        let mut service_fields = signed.to_json();
+        service_fields["body"]["origin"] = json!(ORIGIN);
+        assert_eq!(
+            http(
+                &app,
+                &genesis,
+                "/records",
+                Some("alice"),
+                Some(request(service_fields))
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            http(
+                &app,
+                &genesis,
+                "/records",
+                Some("mallory"),
+                Some(request(signed.to_json()))
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        for appended in [true, false] {
+            let (status, receipt) = http(
+                &app,
+                &genesis,
+                "/records",
+                Some("alice"),
+                Some(request(signed.to_json())),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                receipt,
+                json!({"record_id":body.record_id,"appended":appended})
+            );
+        }
+        assert_eq!(
+            http(&app, &genesis, "", Some("alice"), None).await.1["feeds"][0]["head"],
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn delegated_native_http_gates_storage_and_cannot_submit_host_evidence() {
         let (app, f) = app(false).await;
         let genesis = f.log.genesis_hash().to_hex();

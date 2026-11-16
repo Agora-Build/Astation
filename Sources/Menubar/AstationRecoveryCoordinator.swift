@@ -1393,6 +1393,14 @@ extension AstationRecoveryCoordinator {
 }
 
 extension AstationRecoveryCoordinator {
+    struct HostInterruptReview: Equatable {
+        let stationOrigin: String
+        let body: ControlRecordBody
+        let request: SignRequest
+        var hostID: String { String(body.principal.dropFirst(5)) }
+        var recordID: String { body.recordId }
+    }
+
     struct ServiceControlReview {
         let integrationID: String
         let integrationName: String
@@ -1452,6 +1460,93 @@ extension AstationRecoveryCoordinator {
         return value
     }
 
+    static func latestHostSenderRevocation(log: MembershipLog, hostID: String) throws -> UInt64? {
+        for entry in log.entries().reversed() {
+            let body = try JSONSerialization.jsonObject(with: Data(signedObjectInfo(json: entry).bodyJcs.utf8)) as? [String: Any]
+            if body?["action"] as? String == "host_sender_revoke", body?["host_id"] as? String == hostID,
+               let seq = body?["seq"] as? NSNumber { return seq.uint64Value }
+        }
+        return nil
+    }
+
+    func pendingHostInterrupts() throws -> [HostInterruptReview] {
+        try controls().pendingReviews().filter { $0.body.principal.hasPrefix("host:") }.map {
+            HostInterruptReview(stationOrigin: relayURL, body: $0.body, request: $0.request)
+        }
+    }
+
+    func prepareHostInterrupt(hostID: String, current: () -> Bool) async throws -> HostInterruptReview {
+        try begin(); defer { busy = false }
+        guard delegatedControlsAvailable else { throw AstationDelegatedControlError.notVerified }
+        guard current(), let kit = try currentKit(), let transport = http as? RemoteControlTransport else {
+            throw RemoteChannelError.staleLink
+        }
+        guard try pendingHostInterrupts().isEmpty else { throw RemoteRecoveryError.busy }
+        let log = try await refreshedLog(genesis: kit.genesisHash)
+        try requireManager(log)
+        try requireDelegatedControl(log)
+        guard let revokeSeq = try Self.latestHostSenderRevocation(log: log, hostID: hostID) else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        let heads = try relayDecodeToHost(message: await transport.controlHeads(genesisHash: kit.genesisHash))
+        guard current(), case .heads(let feeds, let head) = heads, head == log.head(), feeds.count == 1,
+              feeds[0].origin == relayURL else { throw RemoteRecoveryError.requiresReview }
+        let time = try await transport.reserveControlTime(genesisHash: kit.genesisHash, principal: "host:" + hostID,
+            managerID: managerID, expected: log.head())
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        // Host interrupts bind to the historical revoke, even after a readmit or key removal.
+        // They have no service feed/key/Portal fields in the shared wire format.
+        let body = ControlRecordBody(accountId: accountID, genesisHash: kit.genesisHash, origin: nil,
+            feedId: nil, principal: "host:" + hostID, principalKey: nil, signer: "member:" + managerID,
+            action: "interrupt_running", interruptRunning: nil, revokeSeq: revokeSeq,
+            recordId: UUID().uuidString.lowercased(), issuedAt: time, integrationId: nil, by: "owner")
+        let request = try controls().prepare(body: body, log: log)
+        return HostInterruptReview(stationOrigin: relayURL, body: body, request: request)
+    }
+
+    func commitHostInterrupt(_ review: HostInterruptReview, current: () -> Bool) async throws -> RemoteControlDelivery {
+        try begin(); defer { busy = false }
+        guard delegatedControlsAvailable else { throw AstationDelegatedControlError.notVerified }
+        guard current(), review.stationOrigin == relayURL, review.body.principal.hasPrefix("host:"),
+              review.body.action == "interrupt_running", let kit = try currentKit() else { throw AccountLoginError.changed }
+        let journal = try controls()
+        let savedRequest = try journal.signingRequest(recordID: review.recordID)
+        if let retained = try journal.retainedDelivery(recordID: review.recordID) {
+            guard try parseControlRecord(recordJson: retained.recordJSON) == review.body else {
+                throw RemoteRecoveryError.requiresReview
+            }
+        } else {
+            guard savedRequest == review.request,
+                  try journal.pendingReviews().contains(where: { $0.body == review.body && $0.request == review.request }) else {
+                throw RemoteRecoveryError.requiresReview
+            }
+            try await signControl(recordID: review.recordID, request: review.request, genesis: kit.genesisHash, current: current)
+        }
+        return try await deliverControl(review.recordID, portal: nil, current: current)
+    }
+
+    func cancelUnsignedHostInterrupt(_ review: HostInterruptReview) throws {
+        guard !busy, !uncertain, review.stationOrigin == relayURL,
+              try controls().signingRequest(recordID: review.recordID) == review.request else { throw RemoteRecoveryError.requiresReview }
+        try controls().cancelUnsigned(recordID: review.recordID)
+    }
+
+    private func signControl(recordID: String, request: SignRequest, genesis: String, current: () -> Bool) async throws {
+        let before = try await refreshedLog(genesis: genesis)
+        try requireManager(before)
+        try requireDelegatedControl(before)
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        guard await confirmOwner(request), current(), !Task.isCancelled else { throw RemoteRecoveryError.confirmationRequired }
+        let confirmedAt = Self.clock().monoMs
+        let log = try await refreshedLog(genesis: genesis)
+        try requireManager(log)
+        try requireDelegatedControl(log)
+        let provider = AstationMembershipKeyProvider(identity: identity, keyID: managerID,
+            publicKey: try identity.remotePublicKeys().signing, controlRecordsAllowed: true)
+        _ = try controls().sign(recordID: recordID, log: log, provider: provider,
+            confirmedAt: confirmedAt, now: { Self.clock().monoMs }, current: current)
+    }
+
     static func controlService(record: PortalIntegrationRecord, log: MembershipLog) throws -> String? {
         guard let fingerprint = record.r9Svc, log.frozen() == nil else { return nil }
         let ids = try log.entries().compactMap { entry -> String? in
@@ -1509,18 +1604,7 @@ extension AstationRecoveryCoordinator {
             guard try journal.signingRequest(recordID: review.recordID) == review.request else {
                 throw RemoteRecoveryError.requiresReview
             }
-            let before = try await refreshedLog(genesis: kit.genesisHash)
-            try requireManager(before)
-            try requireDelegatedControl(before)
-            guard await confirmOwner(review.request), current(), !Task.isCancelled else { throw RemoteRecoveryError.confirmationRequired }
-            let confirmedAt = Self.clock().monoMs
-            let log = try await refreshedLog(genesis: kit.genesisHash)
-            try requireManager(log)
-            try requireDelegatedControl(log)
-            let provider = AstationMembershipKeyProvider(identity: identity, keyID: managerID,
-                publicKey: try identity.remotePublicKeys().signing, controlRecordsAllowed: true)
-            _ = try journal.sign(recordID: review.recordID, log: log, provider: provider,
-                confirmedAt: confirmedAt, now: { Self.clock().monoMs }, current: current)
+            try await signControl(recordID: review.recordID, request: review.request, genesis: kit.genesisHash, current: current)
         }
         return try await deliverControl(review.recordID, portal: portal, current: current)
     }
@@ -1542,7 +1626,7 @@ extension AstationRecoveryCoordinator {
         return results
     }
 
-    private func deliverControl(_ id: String, portal: PortalIntegrationHTTP,
+    private func deliverControl(_ id: String, portal: PortalIntegrationHTTP?,
         current: () -> Bool) async throws -> RemoteControlDelivery {
         guard current(), !Task.isCancelled, let kit = try currentKit(), let transport = http as? RemoteControlTransport else {
             throw RemoteChannelError.staleLink
@@ -1566,7 +1650,7 @@ extension AstationRecoveryCoordinator {
             }
         }
         // This independent leg remains necessary even if Station is down or the signer lost manage.
-        if let mirror = delivery.portalMirror, !delivery.portalSettled {
+        if let mirror = delivery.portalMirror, !delivery.portalSettled, let portal {
             do {
                 let result = try await portal.mirrorRevoke(mirror)
                 guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }

@@ -90,6 +90,38 @@ private final class ControlPublicationFixture {
 
 final class RemoteControlPublicationTests: XCTestCase {
     @MainActor
+    func testPendingReviewsRestoreTheExactHostDraftAndDisappearOnlyAfterStationReceipt() throws {
+        let f = try ControlPublicationFixture()
+        try f.append(["action": "add_host", "host": ["host_id": "host", "host_trust_gen": 1,
+            "host_key": ["alg": "ed25519", "pub": RemoteRecoveryKit.base64URL(f.keys.key.publicKey.rawRepresentation)]]])
+        try f.append(try XCTUnwrap(JSONSerialization.jsonObject(with: Data(hostSenderRevokeAction(hostId: "host",
+            interruptRunning: false, signedAt: f.clock.wallMs).utf8)) as? [String: Any]))
+        let body = ControlRecordBody(accountId: f.log.accountId(), genesisHash: f.log.genesisHash(), origin: nil,
+            feedId: nil, principal: "host:host", principalKey: nil, signer: "member:manager", action: "interrupt_running",
+            interruptRunning: nil, revokeSeq: f.log.head().seq, recordId: UUID().uuidString.lowercased(),
+            issuedAt: f.clock.wallMs, integrationId: nil, by: "owner")
+        let request = try f.journal.prepare(body: body, log: f.log)
+        try f.restore()
+        let unsigned = try XCTUnwrap(f.journal.pendingReviews().first)
+        XCTAssertEqual(unsigned.body, body)
+        XCTAssertEqual(unsigned.request, request)
+        XCTAssertFalse(unsigned.signed)
+        let record = try f.sign(body)
+        try f.restore()
+        let signed = try XCTUnwrap(f.journal.pendingReviews().first)
+        XCTAssertEqual(signed.body, body)
+        XCTAssertEqual(signed.request, request)
+        XCTAssertTrue(signed.signed)
+        let delivery = try XCTUnwrap(f.journal.delivery(recordID: body.recordId, log: f.log))
+        XCTAssertEqual(delivery.recordJSON, record)
+        XCTAssertNil(delivery.portalMirror)
+        try f.journal.stationStored(delivery)
+        try f.restore()
+        XCTAssertTrue(try f.journal.pendingReviews().isEmpty)
+        XCTAssertEqual(try f.journal.retainedDelivery(recordID: body.recordId)?.recordJSON, record)
+    }
+
+    @MainActor
     func testExactSDKRequestIsPersistedBeforeSignAndBothDeliveriesSurviveRestart() throws {
         let f = try ControlPublicationFixture(), body = try f.body(interrupt: true)
         let request = try f.prepare(body)

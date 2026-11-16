@@ -53,6 +53,12 @@ public struct RemoteControlDelivery: Equatable, Sendable {
     public var portalSettled: Bool { portalMirrored || portalRefusal != nil }
 }
 
+public struct RemoteControlReview: Equatable, Sendable {
+    public let body: ControlRecordBody
+    public let request: SignRequest
+    public let signed: Bool
+}
+
 /// The protected checkpoint owns drafts, exact signatures and both delivery legs.
 /// A Station receipt means stored, never that a host has applied the stop.
 @MainActor
@@ -98,6 +104,19 @@ public final class RemoteControlPublication {
         guard operation.recordJSON == nil else { return nil }
         let body = try validate(operation)
         return try RemoteConfirmedSigner.controlRequest(bodyJSON: operation.bodyJSON, keyID: String(body.signer.dropFirst(7)))
+    }
+
+    /// Includes unsigned reviews so closing a window or restarting never loses a prepared stop.
+    public func pendingReviews() throws -> [RemoteControlReview] {
+        try available()
+        return try saved.operations.filter {
+            !$0.stationStored || ($0.portalMirror != nil && !$0.portalMirrored && $0.portalRefusal == nil)
+        }.map {
+            let body = try validate($0)
+            return RemoteControlReview(body: body,
+                request: try RemoteConfirmedSigner.controlRequest(bodyJSON: $0.bodyJSON, keyID: String(body.signer.dropFirst(7))),
+                signed: $0.recordJSON != nil)
+        }
     }
 
     public init(accountID: String, genesisHash: String, stationOrigin: String,
