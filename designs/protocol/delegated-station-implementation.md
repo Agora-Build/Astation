@@ -185,7 +185,9 @@ Still required before activation:
   `feed_id`. A reset must reissue a complete latest-state snapshot, including
   native records needing a manager. The present storage UUID is restart-stable;
   it is not a completed database-restore procedure. Retention/compaction must
-  preserve required stops, high-water and at least 30 days of records.
+  preserve required stops, high-water and at least 30 days of records. The
+  implementation requirements and recovery sequence are recorded in
+  [delegated-station-restore.md](delegated-station-restore.md).
 - Account ownership/mailbox integration, the remaining Kotlin delegated
   fixture runner, and all real Station/native/Atem/Portal joint checks listed
   in #79. Passing fake-host/isolated tests is not activation evidence.
@@ -194,14 +196,17 @@ Still required before activation:
 
 Part I (#79) stays first. The owner confirmed that Atem-to-Atem messages will
 use host senders with sealed, signed mail, skipping the Station-integration
-stage for Atem hosts. The H-0 contract is still awaited on Atem #120. Review
-must cover mailbox put/stored/sync/done and heads, status forms, result_id,
-select only for advertised capability, D3's host encryption-key signature in
-the verification ceremony under the same owner authentication, and D4's first
-version without a vault directory. These are review requirements, not an
-agreement on wire shapes that have not yet been posted.
+stage for Atem hosts. Astation reviewed and agreed to the H-0 contract at
+Atem PR #168 `527a7c89e647bdaecc16bde5b2ac9f02578108d6`, with no Critical or
+High contract finding. The agreement covers mailbox put/stored/sync/done and
+heads, status forms, result_id, select only in host envelopes, D3's host
+encryption-key signature in the normal verification ceremony under the same
+owner authentication, and D4's first version without a vault directory.
+The exact review is in
+[the H-0 review](../reviews/2026-11-15-host-mail-h0.md) and
+[Atem #120 comment 6903887341](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6903887341).
 
-After agreement, build the Station host-mail mailbox (reuse enrollment mailbox
+Next, build the Station host-mail mailbox (reuse enrollment mailbox
 storage only where the authority/retention semantics actually fit), native
 project/host-key signing and host-sender Revoke/Readmit, and the complete verifier
 inventory check before new signed actions. VII.B follows VII.A. None of this
