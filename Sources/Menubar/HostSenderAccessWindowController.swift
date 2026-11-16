@@ -9,6 +9,7 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
         let projects: [String]
         let revoked: Bool
         let removed: Bool
+        let latestRevokeSeq: UInt64?
     }
 
     private let hub: AstationHubManager
@@ -18,6 +19,7 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
     private let refresh = NSButton(title: "Refresh", target: nil, action: nil)
     private let revoke = NSButton(title: "Revoke...", target: nil, action: nil)
     private let readmit = NSButton(title: "Readmit...", target: nil, action: nil)
+    private let interrupt = NSButton(title: "Interrupt...", target: nil, action: nil)
     private let resume = NSButton(title: "Continue Saved Change...", target: nil, action: nil)
     private let cancel = NSButton(title: "Cancel Unsigned Change", target: nil, action: nil)
     private var rows: [Row] = []
@@ -26,10 +28,11 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
     private var coordinator: AstationRecoveryCoordinator?
     private var current: (() -> Bool)?
     private var pending: RemoteHostSenderReview?
+    private var pendingInterrupt: AstationRecoveryCoordinator.HostInterruptReview?
 
     init(hub: AstationHubManager) {
         self.hub = hub
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 400),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 420),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Host Sending Access"
         window.isReleasedWhenClosed = false
@@ -37,7 +40,7 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
         window.delegate = self
         let intro = NSTextField(wrappingLabelWithString:
             "Manage which Atem hosts can send work to other hosts on your account. Previously accepted work can keep running until you revoke the sender or interrupt it.")
-        let actions = NSStackView(views: [revoke, readmit, refresh])
+        let actions = NSStackView(views: [revoke, readmit, interrupt, refresh])
         actions.spacing = 8
         let savedActions = NSStackView(views: [resume, cancel])
         savedActions.spacing = 8
@@ -59,7 +62,8 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
         hosts.target = self; hosts.action = #selector(selectedHost)
         hosts.setAccessibilityLabel("Host sender")
         for (button, action) in [(refresh, #selector(reload)), (revoke, #selector(revokeHost)),
-            (readmit, #selector(readmitHost)), (resume, #selector(resumeChange)), (cancel, #selector(cancelChange))] {
+            (readmit, #selector(readmitHost)), (interrupt, #selector(interruptHost)),
+            (resume, #selector(resumeChange)), (cancel, #selector(cancelChange))] {
             button.bezelStyle = .rounded; button.target = self; button.action = action
         }
         render()
@@ -82,7 +86,7 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
 
     func windowWillClose(_ notification: Notification) {
         generation = UUID(); task?.cancel(); current = nil; coordinator = nil
-        rows = []; pending = nil; hosts.removeAllItems(); details.stringValue = ""
+        rows = []; pending = nil; pendingInterrupt = nil; hosts.removeAllItems(); details.stringValue = ""
         render()
     }
 
@@ -92,11 +96,12 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
             let body = try JSONSerialization.jsonObject(with: Data(signedObjectInfo(json: entry).bodyJcs.utf8)) as? [String: Any]
             if let host = body?["host"] as? [String: Any], let id = host["host_id"] as? String { ids.insert(id) }
         }
-        return ids.sorted().compactMap { id in
+        return try ids.sorted().compactMap { id in
             guard let state = log.hostSenderState(hostId: id) else { return nil }
             let revoked: Bool
             switch state { case .authorized: revoked = false; case .revoked: revoked = true }
-            return Row(hostID: id, projects: log.hostProjects(hostId: id), revoked: revoked, removed: log.host(hostId: id) == nil)
+            return Row(hostID: id, projects: log.hostProjects(hostId: id), revoked: revoked, removed: log.host(hostId: id) == nil,
+                latestRevokeSeq: try AstationRecoveryCoordinator.latestHostSenderRevocation(log: log, hostID: id))
         }
     }
 
@@ -109,6 +114,12 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
         case .readmit:
             return "Readmit \(review.hostID) as a sender. Only newly sent work can be accepted. Cancelled tasks do not return."
         }
+    }
+
+    static func interruptExplanation(_ review: AstationRecoveryCoordinator.HostInterruptReview) -> String {
+        "Request interruption of tasks sent by \(review.hostID) before revoke #\(review.body.revokeSeq ?? 0). " +
+        "New work accepted after a readmit is unaffected. Delivery through this Station does not confirm that tasks stopped " +
+        "or that other Stations received the request.\n\nStation: \(review.stationOrigin)\nRecord: \(review.recordID)"
     }
 
     @objc private func reload() {
@@ -144,10 +155,11 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
     private func populate(log: MembershipLog, coordinator: AstationRecoveryCoordinator) throws {
         let previous = rows.indices.contains(hosts.indexOfSelectedItem) ? rows[hosts.indexOfSelectedItem].hostID : nil
         pending = try coordinator.pendingHostSenderReview()
+        pendingInterrupt = try coordinator.pendingHostInterrupts().first
         rows = try Self.senderRows(log: log)
         hosts.removeAllItems()
         hosts.addItems(withTitles: rows.map { $0.hostID + ($0.revoked ? " - Revoked" : " - Authorized") + ($0.removed ? " (removed)" : "") })
-        if let index = rows.firstIndex(where: { $0.hostID == (pending?.hostID ?? previous) }) { hosts.selectItem(at: index) }
+        if let index = rows.firstIndex(where: { $0.hostID == (pending?.hostID ?? pendingInterrupt?.hostID ?? previous) }) { hosts.selectItem(at: index) }
     }
 
     @objc private func selectedHost() { render() }
@@ -155,16 +167,24 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
         let row = rows.indices.contains(hosts.indexOfSelectedItem) ? rows[hosts.indexOfSelectedItem] : nil
         details.stringValue = row.map { "Projects: " + ($0.projects.isEmpty ? "None" : $0.projects.joined(separator: ", ")) } ?? "No host senders."
         let ready = task == nil && current?() == true && coordinator?.hostSenderControlsAvailable == true
-        revoke.isEnabled = ready && row?.revoked == false && pending == nil
-        readmit.isEnabled = ready && row?.revoked == true && pending == nil
-        resume.isHidden = pending == nil; cancel.isHidden = pending == nil
-        resume.isEnabled = ready && pending != nil; cancel.isEnabled = ready && pending != nil
-        hosts.isEnabled = task == nil && pending == nil
+        let hasSavedChange = pending != nil || pendingInterrupt != nil
+        revoke.isEnabled = ready && row?.revoked == false && !hasSavedChange
+        readmit.isEnabled = ready && row?.revoked == true && !hasSavedChange
+        interrupt.isEnabled = ready && row?.latestRevokeSeq != nil && !hasSavedChange
+        resume.isHidden = !hasSavedChange; cancel.isHidden = !hasSavedChange
+        resume.isEnabled = ready && hasSavedChange; cancel.isEnabled = ready && hasSavedChange
+        hosts.isEnabled = task == nil && !hasSavedChange
         refresh.isEnabled = task == nil
     }
 
     @objc private func revokeHost() { change(readmitting: false) }
     @objc private func readmitHost() { change(readmitting: true) }
+
+    @objc private func interruptHost() {
+        guard rows.indices.contains(hosts.indexOfSelectedItem), let coordinator, let current else { return }
+        let hostID = rows[hosts.indexOfSelectedItem].hostID
+        runInterrupt { try await coordinator.prepareHostInterrupt(hostID: hostID, current: current) }
+    }
 
     private func change(readmitting: Bool) {
         guard task == nil, rows.indices.contains(hosts.indexOfSelectedItem), let coordinator, let current, current() else { return }
@@ -185,8 +205,42 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
     }
 
     @objc private func resumeChange() {
-        guard let pending else { return }
-        runChange { pending }
+        if let pending { runChange { pending } }
+        else if let pendingInterrupt { runInterrupt { pendingInterrupt } }
+    }
+
+    private func runInterrupt(_ prepare: @escaping () async throws -> AstationRecoveryCoordinator.HostInterruptReview) {
+        guard task == nil, let coordinator, let current, current(), NSApp.isActive else { return }
+        let epoch = generation
+        task = Task { [weak self] in
+            guard let self else { return }
+            defer { task = nil; render() }
+            do {
+                let review = try await prepare()
+                guard current(), NSApp.isActive, !Task.isCancelled else { throw AccountLoginError.changed }
+                pendingInterrupt = review
+                let alert = NSAlert()
+                alert.messageText = "Interrupt earlier host work?"
+                alert.informativeText = Self.interruptExplanation(review)
+                alert.addButton(withTitle: "Confirm..."); alert.addButton(withTitle: "Later")
+                guard alert.runModal() == .alertFirstButtonReturn, current(), NSApp.isActive else { return }
+                status.stringValue = "Confirm with Touch ID or your Mac password..."
+                let delivery = try await coordinator.commitHostInterrupt(review, current: { current() && NSApp.isActive })
+                guard current(), !Task.isCancelled else { throw AccountLoginError.changed }
+                let log = try await coordinator.hostSenderMembership()
+                guard current(), !Task.isCancelled else { throw AccountLoginError.changed }
+                try populate(log: log, coordinator: coordinator)
+                status.stringValue = delivery.stationStored
+                    ? "Interruption stored at the selected Station. Host application is not confirmed."
+                    : "Interruption saved. Station delivery will retry; host application is not confirmed."
+            } catch {
+                if generation == epoch {
+                    pendingInterrupt = try? coordinator.pendingHostInterrupts().first
+                    status.stringValue = error.localizedDescription
+                }
+            }
+        }
+        render()
     }
 
     private func runChange(_ prepare: @escaping () async throws -> RemoteHostSenderReview) {
@@ -222,10 +276,16 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
     }
 
     @objc private func cancelChange() {
-        guard task == nil, let coordinator, let pending, current?() == true else { return }
+        guard task == nil, let coordinator, current?() == true else { return }
         do {
-            try coordinator.cancelUnsignedHostSender(pending)
-            self.pending = nil; status.stringValue = "Unsigned change cancelled."
+            if let pending {
+                try coordinator.cancelUnsignedHostSender(pending)
+                self.pending = nil
+            } else if let pendingInterrupt {
+                try coordinator.cancelUnsignedHostInterrupt(pendingInterrupt)
+                self.pendingInterrupt = nil
+            }
+            status.stringValue = "Unsigned change cancelled."
         } catch { status.stringValue = "A signed or uncertain change must be reconciled before it can be removed." }
         render()
     }

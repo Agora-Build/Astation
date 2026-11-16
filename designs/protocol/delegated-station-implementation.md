@@ -126,8 +126,7 @@ exact entry against the verified chain before sending anything. A signed retry
 reuses its signature. A write that might have committed fences the account writer
 until protected reload. A losing compare-and-swap is archived rather than
 automatically re-signed at another head. Another manager's noninterrupting revoke
-cannot satisfy an interrupting intent; that case requires a fresh review, including
-the later standalone Interrupt workflow that remains to be implemented for hosts.
+cannot satisfy an interrupting intent; that case requires a fresh review.
 The archive is bounded to 16 losing publications; exhausting it requires review,
 never silent evidence deletion. Complete retention tooling remains open.
 
@@ -156,10 +155,36 @@ does not change the existing hosted integration enrollment path: migrating it to
 the all-consumer gate still requires actual non-host inventory carriage and joint
 verification. A version number does not substitute for the reported actions.
 
+### Later host interruption
+
+Host Sending Access also provides a separate Interrupt review after a sender has
+been revoked. It selects the latest historical `host_sender_revoke` from the
+anchored device list, including after Readmit or removal of the host key. The
+shared record binds `host:<host_id>` and that exact `revoke_seq`; it has no
+service key, feed, origin or integration fields. The receiving host applies it
+only to tasks admitted before that revoke. New work accepted after Readmit is
+unaffected.
+
+The selected Station reserves the timestamp. The existing protected control
+journal saves the exact unsigned review before confirmation, then the signature
+before delivery. Closing the window or restarting restores the review. A changed
+head, manager demotion, changed account/Station or denied owner authentication
+cannot sign it. A lost receipt or uncertain signature write resumes the exact
+record and signature after protected reload, without reusing an owner approval
+to sign again. Signed pending deliveries use the account's existing background
+retry path, without a Portal revocation request. An unsigned review may be
+cancelled; a signed intent remains retained.
+
+This workflow delivers to the selected Station. The review names that Station,
+the revoke sequence and record ID, and explicitly distinguishes stored delivery
+from host application and delivery to other Stations. Authoritative multi-Station
+discovery and fanout remain unfinished; this is not a global interruption claim.
+Removed-manager records still require the separate fresh re-sign workflow.
+
 The normal app constructor supplies neither new-action inventory authorization
 nor delegated-control authorization. The view is read-only and the new signing
 paths remain OFF. This increment does not implement authoritative non-host roster
-discovery, standalone host interruption/multi-Station fanout, project/host-key
+discovery, multi-Station interruption fanout, project/host-key
 signing UI, record-specific re-sign/application alerts or VII.A.
 
 Portal [#38](https://github.com/Agora-Build/Portal/issues/38) is resolved by
@@ -379,9 +404,10 @@ Still required before activation:
   a trust-generation-only change during host reauthentication remains a separate
   Atem before-activation fix. Source tests are not real joint-test evidence.
 - Authoritative replica/non-host verifier inventory carriage, wiring all live
-  inventory invalidations, and standalone host Interrupt/fanout. Native host-sender
+  inventory invalidations, and multi-Station Interrupt fanout. Native host-sender
   Revoke/Readmit reviews, their UI and the inventory authorization adapter are
-  implemented but remain gated, as are the service Revoke/Interrupt journal.
+  implemented but remain gated, as are the selected-Station host Interrupt flow
+  and the service Revoke/Interrupt journal.
   Record-specific re-sign/application alerts
   remain required. Unknown-outcome listing, resolution review, protected reminder
   policy and push routing are implemented; their real joint checks remain open.
