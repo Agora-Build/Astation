@@ -51,6 +51,10 @@ public protocol RemoteControlFeedTransport: RemoteControlTransport {
     func controlSync(genesisHash: String, callJSON: String) async throws -> String
 }
 
+public protocol RemoteControlStationTransport: RemoteRecoveryTransport, RemoteControlTransport {
+    var controlStationOrigin: String { get }
+}
+
 private final class RecoveryRedirectGuard: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
         newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
@@ -59,9 +63,10 @@ private final class RecoveryRedirectGuard: NSObject, URLSessionTaskDelegate, @un
 }
 
 /// TLS/account login limits storage access. Only the shared verifier grants cryptographic trust.
-public final class RemoteRecoveryHTTP: RemoteRecoveryTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, @unchecked Sendable {
+public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, @unchecked Sendable {
     private let baseURL: URL
     private let stationOrigin: String
+    public var controlStationOrigin: String { stationOrigin }
     private let session: URLSession
     private let accessToken: @Sendable () async throws -> String
 

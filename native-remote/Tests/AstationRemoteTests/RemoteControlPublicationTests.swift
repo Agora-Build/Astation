@@ -90,6 +90,16 @@ private final class ControlPublicationFixture {
         try RemoteControlPortalMirror(issuer: "https://auth.example", ownerAccount: "ab00000000000000000000000000",
             stationOrigin: origin, integrationID: integration, interruptRunning: interrupt)
     }
+    func hostBody() throws -> ControlRecordBody {
+        try append(["action": "add_host", "host": ["host_id": "host", "host_trust_gen": 1,
+            "host_key": ["alg": "ed25519", "pub": RemoteRecoveryKit.base64URL(keys.key.publicKey.rawRepresentation)]]])
+        try append(try XCTUnwrap(JSONSerialization.jsonObject(with: Data(hostSenderRevokeAction(hostId: "host",
+            interruptRunning: false, signedAt: clock.wallMs).utf8)) as? [String: Any]))
+        return ControlRecordBody(accountId: log.accountId(), genesisHash: log.genesisHash(), origin: nil,
+            feedId: nil, principal: "host:host", principalKey: nil, signer: "member:manager", action: "interrupt_running",
+            interruptRunning: nil, revokeSeq: log.head().seq, recordId: UUID().uuidString.lowercased(),
+            issuedAt: clock.wallMs, integrationId: nil, by: "owner")
+    }
     func prepare(_ body: ControlRecordBody) throws -> SignRequest {
         try journal.prepare(body: body, log: log, portalMirror: body.action == "revoke" ? mirror(interrupt: body.interruptRunning!) : nil)
     }
@@ -99,6 +109,150 @@ private final class ControlPublicationFixture {
 }
 
 final class RemoteControlPublicationTests: XCTestCase {
+    @MainActor
+    func testHostFanoutHTTPUsesSeparateOriginCredentialsAndRejectsAFalseReceipt() async throws {
+        let f = try ControlPublicationFixture(), body = try f.hostBody()
+        let second = "https://fanout-" + UUID().uuidString.lowercased() + ".example"
+        _ = try f.journal.prepare(body: body, log: f.log, additionalStationOrigins: [second])
+        let record = try f.sign(body), canonicalRecord = try canonicalJson(json: record)
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RecoveryHTTPStub.self]
+        for (origin, token) in [(f.origin, "primary-test-token"), (second, "secondary-test-token")] {
+            let host = try XCTUnwrap(URL(string: origin)?.host)
+            RecoveryHTTPStub.install(host: host) { request in
+                XCTAssertEqual(request.url?.absoluteString, origin + "/api/remote/v1/logs/" + body.genesisHash + "/control/records")
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer " + token)
+                var data = request.httpBody ?? Data()
+                if data.isEmpty, let stream = request.httpBodyStream {
+                    stream.open(); defer { stream.close() }
+                    var buffer = [UInt8](repeating: 0, count: 4096)
+                    while stream.hasBytesAvailable {
+                        let count = stream.read(&buffer, maxLength: buffer.count)
+                        guard count >= 0 else { throw try XCTUnwrap(stream.streamError) }
+                        if count == 0 { break }
+                        data.append(contentsOf: buffer.prefix(count))
+                    }
+                }
+                let sent = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+                let object = try JSONSerialization.data(withJSONObject: XCTUnwrap(sent["record"]))
+                XCTAssertEqual(try canonicalJson(json: String(decoding: object, as: UTF8.self)), canonicalRecord)
+                // A response naming another record must not become a durable receipt.
+                return (200, try JSONSerialization.data(withJSONObject: [
+                    "record_id": origin == second ? UUID().uuidString.lowercased() : body.recordId, "appended": true]))
+            }
+        }
+        defer {
+            RecoveryHTTPStub.remove(host: URL(string: f.origin)!.host!)
+            RecoveryHTTPStub.remove(host: URL(string: second)!.host!)
+        }
+        let primaryHTTP = try RemoteRecoveryHTTP(relayURL: f.origin, configuration: config, accessToken: { "primary-test-token" })
+        let secondaryHTTP = try RemoteRecoveryHTTP(relayURL: second, configuration: config, accessToken: { "secondary-test-token" })
+        XCTAssertEqual(primaryHTTP.controlStationOrigin, f.origin)
+        XCTAssertEqual(secondaryHTTP.controlStationOrigin, second)
+        _ = try await primaryHTTP.publishControl(log: f.log, recordJSON: record)
+        try f.journal.stationStored(XCTUnwrap(f.journal.delivery(recordID: body.recordId, log: f.log)))
+        do { _ = try await secondaryHTTP.publishControl(log: f.log, recordJSON: record); XCTFail("foreign receipt") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .invalidResponse) }
+        try f.restore()
+        let delivery = try XCTUnwrap(f.journal.delivery(recordID: body.recordId, log: f.log))
+        XCTAssertTrue(delivery.stationStored)
+        XCTAssertEqual(delivery.additionalStations, [second: false])
+        XCTAssertFalse(delivery.allStationsStored)
+    }
+
+    @MainActor
+    func testHostFanoutRetainsIndependentReceiptsAndExactSignatureAcrossRestart() throws {
+        let f = try ControlPublicationFixture(), body = try f.hostBody()
+        let second = "https://second.example", third = "https://third.example"
+        _ = try f.journal.prepare(body: body, log: f.log, additionalStationOrigins: [third, second])
+        XCTAssertEqual(try f.journal.stationOrigins(recordID: body.recordId), [f.origin, second, third])
+        XCTAssertThrowsError(try f.journal.prepare(body: body, log: f.log, additionalStationOrigins: [second]),
+            "a retry cannot narrow the reviewed recipients")
+        let record = try f.sign(body), signs = f.keys.signs
+        var delivery = try XCTUnwrap(f.journal.delivery(recordID: body.recordId, log: f.log))
+        try f.journal.stationStored(delivery, stationOrigin: second)
+        try f.restore()
+        delivery = try XCTUnwrap(f.journal.delivery(recordID: body.recordId, log: f.log))
+        XCTAssertFalse(delivery.stationStored, "another Station's receipt cannot settle the primary")
+        XCTAssertEqual(delivery.additionalStations, [second: true, third: false])
+        XCTAssertFalse(delivery.allStationsStored)
+        XCTAssertTrue(try f.journal.stationDeliveryNeeded(recordID: body.recordId))
+        XCTAssertFalse(try f.journal.stationDeliveryNeeded(recordID: body.recordId, stationOrigin: second))
+        try f.journal.stationStored(delivery)
+        XCTAssertEqual(try f.journal.pendingDeliveryIDs(), [body.recordId])
+        try f.restore()
+        XCTAssertEqual(try f.sign(body), record)
+        XCTAssertEqual(f.keys.signs, signs, "fanout and retry must never sign again")
+        delivery = try XCTUnwrap(f.journal.delivery(recordID: body.recordId, log: f.log))
+        try f.journal.stationStored(delivery, stationOrigin: third)
+        try f.restore()
+        XCTAssertTrue(try XCTUnwrap(f.journal.delivery(recordID: body.recordId, log: f.log)).allStationsStored)
+        XCTAssertTrue(try f.journal.pendingDeliveryIDs().isEmpty)
+        XCTAssertEqual(try f.journal.activity(log: f.log).first?.additionalStations, [second: true, third: true])
+    }
+
+    @MainActor
+    func testFanoutRejectsServiceRecordsBadOriginsChangedTargetsAndInventedReceipts() throws {
+        let f = try ControlPublicationFixture(), service = try f.body(), second = "https://second.example"
+        XCTAssertThrowsError(try f.journal.prepare(body: service, log: f.log, portalMirror: f.mirror(), additionalStationOrigins: [second]))
+        let body = try f.hostBody()
+        for origins in [[f.origin], [second, second], ["http://second.example"], ["https://second.example/"],
+            (0..<64).map { "https://station\($0).example" }] {
+            XCTAssertThrowsError(try f.journal.prepare(body: body, log: f.log, additionalStationOrigins: origins))
+        }
+        _ = try f.journal.prepare(body: body, log: f.log, additionalStationOrigins: [second])
+        var checkpoint = try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(f.stored), format: nil) as? [String: Any])
+        var operations = try XCTUnwrap(checkpoint["operations"] as? [[String: Any]])
+        operations[0]["additionalStations"] = [second: true]
+        checkpoint["operations"] = operations
+        XCTAssertThrowsError(try f.restore(PropertyListSerialization.data(fromPropertyList: checkpoint, format: .binary, options: 0)),
+            "an unsigned record cannot have a delivery receipt")
+        try f.restore()
+        _ = try f.sign(body)
+        let delivery = try XCTUnwrap(f.journal.delivery(recordID: body.recordId, log: f.log))
+        XCTAssertThrowsError(try f.journal.stationStored(delivery, stationOrigin: "https://unreviewed.example"))
+        XCTAssertFalse(try XCTUnwrap(f.journal.retainedDelivery(recordID: body.recordId)).allStationsStored)
+    }
+
+    @MainActor
+    func testUncertainFanoutReceiptFencesUntilReloadAndPreservesOtherTargets() throws {
+        let f = try ControlPublicationFixture(), body = try f.hostBody(), second = "https://second.example"
+        _ = try f.journal.prepare(body: body, log: f.log, additionalStationOrigins: [second])
+        _ = try f.sign(body)
+        let delivery = try XCTUnwrap(f.journal.delivery(recordID: body.recordId, log: f.log))
+        f.failAfterWrite = true
+        XCTAssertThrowsError(try f.journal.stationStored(delivery, stationOrigin: second))
+        XCTAssertThrowsError(try f.journal.pendingDeliveryIDs())
+        try f.restore()
+        let restored = try XCTUnwrap(f.journal.delivery(recordID: body.recordId, log: f.log))
+        XCTAssertTrue(restored.additionalStations[second] == true)
+        XCTAssertFalse(restored.stationStored)
+        XCTAssertEqual(restored.recordJSON, delivery.recordJSON)
+        XCTAssertEqual(try f.journal.pendingDeliveryIDs(), [body.recordId])
+    }
+
+    @MainActor
+    func testFreshManagerHostCopyPreservesFanoutWithoutCopyingReceipts() throws {
+        let f = try ControlPublicationFixture(), body = try f.hostBody(), second = "https://second.example"
+        _ = try f.journal.prepare(body: body, log: f.log, additionalStationOrigins: [second])
+        _ = try f.sign(body)
+        let delivery = try XCTUnwrap(f.journal.delivery(recordID: body.recordId, log: f.log))
+        try f.journal.stationStored(delivery, stationOrigin: second)
+        let keys = try f.replaceManager()
+        let review = try f.journal.prepareResign(recordID: body.recordId, managerID: "other-manager",
+            issuedAt: body.issuedAt + 1, feedID: nil, log: f.log)
+        XCTAssertEqual(try f.journal.stationOrigins(recordID: review.body.recordId), [f.origin, second])
+        _ = try f.journal.sign(recordID: review.body.recordId, log: f.log, provider: keys,
+            confirmedAt: 100, now: { 100 }, current: { true })
+        try f.restore()
+        XCTAssertEqual(try f.journal.pendingDeliveryIDs(), [review.body.recordId])
+        let replacement = try XCTUnwrap(f.journal.delivery(recordID: review.body.recordId, log: f.log))
+        XCTAssertFalse(replacement.stationStored)
+        XCTAssertEqual(replacement.additionalStations, [second: false])
+        XCTAssertEqual(try f.journal.retainedDelivery(recordID: body.recordId)?.additionalStations, [second: true])
+        XCTAssertFalse(try f.journal.stationDeliveryNeeded(recordID: body.recordId, stationOrigin: second))
+    }
+
     @MainActor
     func testFreshManagerCopyKeepsExactStopAndIndependentPortalIntentAcrossRestart() throws {
         let f = try ControlPublicationFixture(), body = try f.body(interrupt: true)

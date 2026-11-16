@@ -59,7 +59,9 @@ private final class RecoveryMemoryKeys: AstationRecoveryDataKeys {
     func installRecovered(_ values: [AccountDataKey], dataAccount: String) throws { keys = values; installs += 1 }
 }
 
-private actor RecoveryMemoryRelay: RemoteRecoveryTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport {
+private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport {
+    nonisolated let controlStationOrigin: String
+    init(stationOrigin: String = "https://configured.example") { controlStationOrigin = stationOrigin }
     var log: MembershipLog?
     var account = "account-a"
     var appends: [AppendRequest] = []
@@ -79,7 +81,9 @@ private actor RecoveryMemoryRelay: RemoteRecoveryTransport, RemoteDeviceEnrollme
     var loseDeviceResponseReply = false
     let controlFeedID = UUID().uuidString.lowercased()
     var controlRecords: [String] = []
+    var controlAttempts = 0
     var loseControlReply = false
+    var outageAfterControlReply = false
     var controlTime: UInt64 = 1
     var controlStatusWaiter: CheckedContinuation<Void, Never>?
     var holdControlStatus = false
@@ -118,12 +122,13 @@ private actor RecoveryMemoryRelay: RemoteRecoveryTransport, RemoteDeviceEnrollme
         return Dictionary(uniqueKeysWithValues: recordIDs.map { ($0, .awaitingApplication) })
     }
 
-    func dropControlReply() { loseControlReply = true }
+    func dropControlReply(disableEntries: Bool = false) { loseControlReply = true; outageAfterControlReply = disableEntries }
     func controls() -> [String] { controlRecords }
+    func controlCallCount() -> Int { controlAttempts }
     func controlHeads(genesisHash: String) async throws -> String {
         let log = try XCTUnwrap(log)
         XCTAssertEqual(log.genesisHash(), genesisHash)
-        return try relayHeads(feeds: [RelayFeedHead(origin: "https://configured.example", feedId: controlFeedID,
+        return try relayHeads(feeds: [RelayFeedHead(origin: controlStationOrigin, feedId: controlFeedID,
             head: UInt64(controlRecords.count), stationTime: AstationRecoveryCoordinator.clock().wallMs)], membership: log.head())
     }
     func reserveControlTime(genesisHash: String, principal: String, managerID: String, expected: LogHead) async throws -> UInt64 {
@@ -136,10 +141,15 @@ private actor RecoveryMemoryRelay: RemoteRecoveryTransport, RemoteDeviceEnrollme
         return try await acceptControl(recordJSON, expected: log.head())
     }
     private func acceptControl(_ record: String, expected: LogHead) throws -> Bool {
+        controlAttempts += 1
         XCTAssertEqual(log?.head(), expected)
         let appended = !controlRecords.contains(record)
         if appended { controlRecords.append(record) }
-        if loseControlReply { loseControlReply = false; throw RemoteRecoveryTransportError.unavailable }
+        if loseControlReply {
+            loseControlReply = false
+            if outageAfterControlReply { entriesUnavailable = true; outageAfterControlReply = false }
+            throw RemoteRecoveryTransportError.unavailable
+        }
         return appended
     }
 
@@ -324,7 +334,8 @@ private final class RecoveryCoordinatorHarness {
 
     func coordinator(relayURL: String = "https://configured.example", transport: RemoteRecoveryTransport? = nil,
         authorizeDelegatedControl: ((MembershipLog) throws -> Void)? = nil,
-        authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)? = nil) throws -> AstationRecoveryCoordinator {
+        authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)? = nil,
+        additionalControlStations: ((MembershipLog) throws -> [String: RemoteControlStationTransport])? = nil) throws -> AstationRecoveryCoordinator {
         try AstationRecoveryCoordinator(accountID: "account-a", managerID: "manager-a", identity: identity,
             relayURL: relayURL, store: store, transport: transport ?? relay, dataKeys: keys,
             allowNewDataKey: { true }, confirmOwner: { [unowned self] request in
@@ -338,7 +349,7 @@ private final class RecoveryCoordinatorHarness {
                 savedKits.append(kit)
                 return save
             }, confirmServiceOwner: serviceOwnerConfirmation, authorizeDelegatedControl: authorizeDelegatedControl,
-            authorizeNewMembership: authorizeNewMembership)
+            authorizeNewMembership: authorizeNewMembership, additionalControlStations: additionalControlStations)
     }
 }
 
@@ -2682,6 +2693,126 @@ extension AstationRecoveryCoordinatorTests {
         XCTAssertNil(delivery.portalMirror)
         XCTAssertEqual(try parseControlRecord(recordJson: delivery.recordJSON), review.body)
         XCTAssertTrue(try coordinator.pendingHostInterrupts().isEmpty)
+    }
+
+    func testHostFanoutLostReplyRetriesOnlyPendingStationWithOneOwnerConfirmation() async throws {
+        let h = RecoveryCoordinatorHarness(), second = RecoveryMemoryRelay(stationOrigin: "https://second.example"), origin = "https://second.example"
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator(authorizeDelegatedControl: { _ in },
+            additionalControlStations: { _ in [origin: second] })
+        _ = try await revokedSender(coordinator!, harness: h)
+        await second.replaceLog(try await coordinator!.hostSenderMembership())
+        let review = try await coordinator!.prepareHostInterrupt(hostID: "host-a", current: { true })
+        XCTAssertEqual(review.additionalStationOrigins, [origin])
+        XCTAssertTrue(HostSenderAccessWindowController.interruptExplanation(review).contains(origin))
+        let confirmations = h.ownerRequests.count
+        await second.dropControlReply()
+        let partial = try await coordinator!.commitHostInterrupt(review, current: { true })
+        XCTAssertTrue(partial.stationStored)
+        XCTAssertEqual(partial.additionalStations, [origin: false])
+        XCTAssertFalse(partial.allStationsStored)
+        XCTAssertEqual(try coordinator!.pendingHostInterrupts(), [review])
+        XCTAssertTrue(ControlActivityWindowController.description(try XCTUnwrap(coordinator!.localControlActivity().first)).contains(origin + ": Delivery pending"))
+        coordinator = nil
+        coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, additionalControlStations: { _ in [origin: second] })
+        XCTAssertEqual(try coordinator!.pendingHostInterrupts(), [review])
+        let delivered = try await coordinator!.commitHostInterrupt(review, current: { true })
+        XCTAssertTrue(delivered.allStationsStored)
+        XCTAssertEqual(delivered.recordJSON, partial.recordJSON)
+        XCTAssertEqual(h.ownerRequests.count, confirmations + 1)
+        XCTAssertTrue(try coordinator!.pendingHostInterrupts().isEmpty)
+        let firstRecords = await h.relay.controls(), secondRecords = await second.controls()
+        XCTAssertEqual(firstRecords, [partial.recordJSON])
+        XCTAssertEqual(secondRecords, firstRecords, "a lost reply must not append another record")
+        let firstCalls = await h.relay.controlCallCount(), secondCalls = await second.controlCallCount()
+        XCTAssertEqual(firstCalls, 1, "a receipt at the primary must prevent another HTTP publication")
+        XCTAssertEqual(secondCalls, 2, "only the missing receipt is retried")
+    }
+
+    func testHostFanoutRejectsAMislabeledTransportBeforeConfirmation() async throws {
+        let h = RecoveryCoordinatorHarness(), wrongStation = RecoveryMemoryRelay()
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in },
+            additionalControlStations: { _ in ["https://second.example": wrongStation] })
+        _ = try await revokedSender(coordinator, harness: h)
+        let confirmations = h.ownerRequests.count
+        do { _ = try await coordinator.prepareHostInterrupt(hostID: "host-a", current: { true }); XCTFail("misdirected transport") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        XCTAssertTrue(try coordinator.pendingHostInterrupts().isEmpty)
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+    }
+
+    func testHostFanoutPrimaryOutageDoesNotPreventAnotherStationStoringTheStop() async throws {
+        let h = RecoveryCoordinatorHarness(), second = RecoveryMemoryRelay(stationOrigin: "https://second.example"), origin = "https://second.example"
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, additionalControlStations: { _ in [origin: second] })
+        _ = try await revokedSender(coordinator, harness: h)
+        await second.replaceLog(try await coordinator.hostSenderMembership())
+        let review = try await coordinator.prepareHostInterrupt(hostID: "host-a", current: { true })
+        // Signing refreshes authority, then the primary goes away on the first publish.
+        await h.relay.dropControlReply(disableEntries: true)
+        var result = try await coordinator.commitHostInterrupt(review, current: { true })
+        XCTAssertFalse(result.stationStored)
+        XCTAssertEqual(result.additionalStations, [origin: true])
+        result = try await coordinator.commitHostInterrupt(review, current: { true })
+        XCTAssertFalse(result.allStationsStored)
+        XCTAssertEqual(result.additionalStations, [origin: true])
+        await h.relay.setEntriesUnavailable(false)
+        result = try await coordinator.commitHostInterrupt(review, current: { true })
+        XCTAssertTrue(result.allStationsStored)
+    }
+
+    func testHostFanoutMissingRosterRetainsTargetsAndCannotRedirectASavedReview() async throws {
+        let h = RecoveryCoordinatorHarness(), second = RecoveryMemoryRelay(stationOrigin: "https://second.example")
+        let third = RecoveryMemoryRelay(stationOrigin: "https://unreviewed.example")
+        let origin = "https://second.example", other = "https://unreviewed.example"
+        var targets: [String: RemoteControlStationTransport] = [origin: second]
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, additionalControlStations: { _ in targets })
+        _ = try await revokedSender(coordinator, harness: h)
+        await second.replaceLog(try await coordinator.hostSenderMembership())
+        let review = try await coordinator.prepareHostInterrupt(hostID: "host-a", current: { true })
+        var altered = review
+        altered.additionalStationOrigins = [other]
+        let confirmations = h.ownerRequests.count
+        do { _ = try await coordinator.commitHostInterrupt(altered, current: { true }); XCTFail("changed review") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        targets = [other: third]
+        let partial = try await coordinator.commitHostInterrupt(review, current: { true })
+        XCTAssertTrue(partial.stationStored)
+        XCTAssertEqual(partial.additionalStations, [origin: false], "an absent target remains pending")
+        let unreviewedRecords = await third.controls()
+        XCTAssertTrue(unreviewedRecords.isEmpty)
+        targets = [origin: second]
+        let delivered = try await coordinator.commitHostInterrupt(review, current: { true })
+        XCTAssertTrue(delivered.allStationsStored)
+        XCTAssertEqual(h.ownerRequests.count, confirmations + 1)
+    }
+
+    func testHostFanoutRechecksManagerAuthorityAtEachStation() async throws {
+        let h = RecoveryCoordinatorHarness(), second = RecoveryMemoryRelay(stationOrigin: "https://second.example"), origin = "https://second.example"
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, additionalControlStations: { _ in [origin: second] })
+        _ = try await revokedSender(coordinator, harness: h)
+        let log = try await coordinator.hostSenderMembership()
+        let other = try await addSecondManager(harness: h)
+        let currentLog = await h.relay.log
+        let fresh = try XCTUnwrap(currentLog)
+        await second.replaceLog(fresh)
+        let review = try await coordinator.prepareHostInterrupt(hostID: "host-a", current: { true })
+        // The secondary has a newer, valid demotion; a stale primary cannot authorize delivery there.
+        let demoted = fresh.snapshot()
+        let draft = try demoted.draftEntry(signer: "manager-b", signedAt: AstationRecoveryCoordinator.clock().wallMs,
+            actionJson: "{\"action\":\"set_roles\",\"device_id\":\"manager-a\",\"roles\":[\"control\",\"view\"]}")
+        let provider = AstationMembershipKeyProvider(identity: other, keyID: "manager-b", publicKey: try other.remotePublicKeys().signing)
+        let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: draft, keyID: "manager-b")
+        let entry = String(decoding: try JSONSerialization.data(withJSONObject: [
+            "body": JSONSerialization.jsonObject(with: Data(draft.utf8)),
+            "sig": recoveryTestBase64(provider.sign(request: request))]), as: UTF8.self)
+        _ = try demoted.extend(entries: [entry], now: AstationRecoveryCoordinator.clock())
+        await second.replaceLog(demoted)
+        let result = try await coordinator.commitHostInterrupt(review, current: { true })
+        XCTAssertTrue(result.stationStored)
+        XCTAssertEqual(result.additionalStations, [origin: false])
+        let records = await second.controls()
+        XCTAssertTrue(records.isEmpty)
+        XCTAssertGreaterThan(demoted.head().seq, log.head().seq)
     }
 
     func testHostInterruptUnsignedReviewAndLostReceiptRecoverAcrossRestart() async throws {

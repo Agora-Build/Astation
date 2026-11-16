@@ -20,6 +20,7 @@ public struct RemoteControlActivity: Equatable, Sendable {
     public let managerReviewRequired: Bool
     public let replacementRecordID: String?
     public let application: RemoteControlApplicationState?
+    public let additionalStations: [String: Bool]
 
     public var summary: String {
         if !signed { return "Saved review - confirmation required" }

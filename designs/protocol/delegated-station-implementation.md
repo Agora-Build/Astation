@@ -175,16 +175,36 @@ to sign again. Signed pending deliveries use the account's existing background
 retry path, without a Portal revocation request. An unsigned review may be
 cancelled; a signed intent remains retained.
 
-This workflow delivers to the selected Station. The review names that Station,
-the revoke sequence and record ID, and explicitly distinguishes stored delivery
-from host application and delivery to other Stations. Authoritative multi-Station
-discovery and fanout remain unfinished; this is not a global interruption claim.
-Removed-manager records use the fresh re-sign workflow below.
+The protected journal and coordinator can deliver a host interrupt to the selected
+Station and up to 63 additional authenticated account Stations. The caller must
+provide an independently established account roster and a separate transport with
+an access token scoped to each exact origin. This adapter does not authenticate or
+establish the completeness of that roster. The normal application supplies no
+roster yet; authoritative discovery and production wiring remain unfinished.
+
+The exact sorted destination set is retained before confirmation and displayed
+with the revoke sequence and record ID. A changed review cannot redirect or narrow
+it. One signature is stored before delivery and the exact bytes are sent through
+the existing publication API, without a new wire format. Each Station has an
+independent durable receipt. A missing destination or failed request remains
+pending; a newly configured origin cannot receive an earlier saved review. A lost
+reply retries only the pending destinations with the same signature. An unavailable
+primary does not prevent delivery through another Station: each attempt refreshes
+and verifies membership from that destination against the independently anchored
+chain. Current manager authority and the current roster are rechecked before
+publication. Uncertain receipt writes fence the account writer until reload.
+
+The UI distinguishes every reviewed Station's storage receipt from host application.
+Removed-manager records use the fresh re-sign workflow below; their copies retain
+the original destination set but never inherit its receipts. Ordinary service
+records remain bound to their one Station and cannot use this fanout. This is not
+an account-wide delivery claim: authoritative Station discovery, adding new routes
+to retained intents, native-channel carriage and the real joint checks remain.
 
 The normal app constructor supplies neither new-action inventory authorization
 nor delegated-control authorization. The view is read-only and the new signing
 paths remain OFF. This increment does not implement authoritative non-host roster
-discovery, multi-Station interruption fanout, project/host-key
+discovery or authoritative Station roster carriage, project/host-key
 signing UI, account-wide re-sign/application alerts or VII.A.
 
 ### Control activity and signer alerts
@@ -483,7 +503,10 @@ Still required before activation:
   Exact-head CI, the owner's merge decision and the final test artifact remain
   before-joint-test dependencies. Source tests are not real joint-test evidence.
 - Authoritative replica/non-host verifier inventory carriage, wiring all live
-  inventory invalidations, and multi-Station Interrupt fanout. Native host-sender
+  inventory invalidations, and complete multi-Station Interrupt routing. The
+  protected per-Station fanout/retry adapter is implemented, but production roster
+  discovery, native-channel carriage and adding newly discovered routes remain.
+  Native host-sender
   Revoke/Readmit reviews, their UI and the inventory authorization adapter are
   implemented but remain gated, as are the selected-Station host Interrupt flow
   and the service Revoke/Interrupt journal.
@@ -576,3 +599,12 @@ feed. These results do not establish complete snapshot recovery or VII.A.
 
 The working branch's exact commands/results are recorded in its PR. Real
 protected owner ceremonies and native local transport remain joint checks.
+
+The native fanout adapter passes the full shared Swift suite (286 executed,
+one optional skip, zero failures) and all 102 recovery-coordinator tests. Added
+cases exercise two real HTTP transports with separate origin credentials and a
+wrong-record receipt, independent receipts, exact lost-reply/restart retry,
+primary outage, an absent or changed roster, a mislabeled transport, manager
+demotion at a destination, uncertain receipt writes and re-sign destination
+preservation. These are isolated adapter tests, not VII.A/VII.B evidence or
+authoritative Station-inventory coverage.
