@@ -61,6 +61,7 @@ private actor RecoveryMemoryRelay: RemoteRecoveryTransport, RemoteDeviceEnrollme
     var nextEntries: [String]?
     var entriesUnavailable = false
     var ignoreAppends = false
+    var nextAppendLog: MembershipLog?
     var pageSize = 64
     let hostKey = Curve25519.Signing.PrivateKey()
     var deviceMailboxes: [String: RemoteDeviceEnrollmentMailbox] = [:]
@@ -137,6 +138,7 @@ private actor RecoveryMemoryRelay: RemoteRecoveryTransport, RemoteDeviceEnrollme
     func setIgnoreAppends(_ value: Bool) { ignoreAppends = value }
     func setPageSize(_ value: Int) { pageSize = value }
     func replaceLog(_ value: MembershipLog) { log = value.snapshot() }
+    func replaceAtNextAppend(_ value: MembershipLog) { nextAppendLog = value.snapshot() }
 
     func entries(genesisHash: String, after: UInt64) async throws -> RemoteRecoveryLogPage {
         if entriesUnavailable { throw RemoteRecoveryTransportError.unavailable }
@@ -148,6 +150,7 @@ private actor RecoveryMemoryRelay: RemoteRecoveryTransport, RemoteDeviceEnrollme
     }
     func append(genesisHash: String, request: AppendRequest) async throws -> RemoteRecoveryAppendReply {
         appends.append(request)
+        if let nextAppendLog { log = nextAppendLog; self.nextAppendLog = nil }
         if ignoreAppends { return .stored }
         if log == nil {
             log = try MembershipLog.verify(accountId: account, genesisHash: genesisHash, entries: [request.entryJson], now: AstationRecoveryCoordinator.clock())
@@ -261,7 +264,8 @@ private final class RecoveryCoordinatorHarness {
     var serviceOwnerConfirmation: ((RemoteServiceApproval, SignRequest) async -> Bool)?
 
     func coordinator(relayURL: String = "https://configured.example", transport: RemoteRecoveryTransport? = nil,
-        authorizeDelegatedControl: ((MembershipLog) throws -> Void)? = nil) throws -> AstationRecoveryCoordinator {
+        authorizeDelegatedControl: ((MembershipLog) throws -> Void)? = nil,
+        authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)? = nil) throws -> AstationRecoveryCoordinator {
         try AstationRecoveryCoordinator(accountID: "account-a", managerID: "manager-a", identity: identity,
             relayURL: relayURL, store: store, transport: transport ?? relay, dataKeys: keys,
             allowNewDataKey: { true }, confirmOwner: { [unowned self] request in
@@ -274,7 +278,8 @@ private final class RecoveryCoordinatorHarness {
             }, confirmReplacement: { _ in true }, saveKit: { [unowned self] kit in
                 savedKits.append(kit)
                 return save
-            }, confirmServiceOwner: serviceOwnerConfirmation, authorizeDelegatedControl: authorizeDelegatedControl)
+            }, confirmServiceOwner: serviceOwnerConfirmation, authorizeDelegatedControl: authorizeDelegatedControl,
+            authorizeNewMembership: authorizeNewMembership)
     }
 }
 
@@ -1478,13 +1483,15 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
     }
 
     private func append(_ action: [String: Any], harness h: RecoveryCoordinatorHarness,
-        signer: String = "manager-a", identity: AtemE2EIdentity? = nil) async throws {
+        signer: String = "manager-a", identity: AtemE2EIdentity? = nil,
+        authorizeNewMembership: ((SignRequest) throws -> Void)? = nil) async throws {
         let stored = await h.relay.log
         let log = try XCTUnwrap(stored)
         let publisher = RemoteMembershipPublication(log: log, persist: { _ in })
         _ = try publisher.prepare(actionJSON: recoveryTestJSON(action), signer: signer, signedAt: AstationRecoveryCoordinator.clock().wallMs)
         let identity = identity ?? h.identity
-        let provider = AstationMembershipKeyProvider(identity: identity, keyID: signer, publicKey: try identity.remotePublicKeys().signing)
+        let provider = AstationMembershipKeyProvider(identity: identity, keyID: signer, publicKey: try identity.remotePublicKeys().signing,
+            authorizeNewMembership: authorizeNewMembership)
         let request = try publisher.sign(provider: provider, keyID: signer)
         _ = try await h.relay.append(genesisHash: log.genesisHash(), request: request)
         _ = try publisher.relayStored(now: AstationRecoveryCoordinator.clock())
@@ -1989,5 +1996,223 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertTrue(requests.isEmpty)
         XCTAssertTrue(h.ownerRequests.isEmpty)
         XCTAssertEqual(h.keys.installs, 0)
+    }
+}
+
+extension AstationRecoveryCoordinatorTests {
+    private func senderHost(_ coordinator: AstationRecoveryCoordinator, harness h: RecoveryCoordinatorHarness) async throws {
+        _ = try await coordinator.setup()
+        try await append(["action": "add_host", "host": ["host_id": "host-a", "host_trust_gen": 1,
+            "host_key": ["alg": "ed25519", "pub": recoveryTestBase64(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)]]], harness: h)
+    }
+
+    func testHostSenderControlsCannotSignThroughTheOrdinaryProductionProvider() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        try await senderHost(coordinator, harness: h)
+        let before = h.ownerRequests.count
+        XCTAssertFalse(coordinator.hostSenderControlsAvailable)
+        do {
+            _ = try await coordinator.prepareHostSender(hostID: "host-a", operation: .revoke(interruptRunning: false), current: { true })
+            XCTFail("Production must wait for live verifier inventory and joint checks")
+        } catch { XCTAssertTrue(error is AstationDelegatedControlError) }
+        let relayLog = await h.relay.log
+        let log = try XCTUnwrap(relayLog)
+        let review = try RemoteHostSenderReview(stationOrigin: coordinator.relayURL, log: log, managerID: "manager-a",
+            hostID: "host-a", operation: .revoke(interruptRunning: false), now: AstationRecoveryCoordinator.clock())
+        let request = try review.signingRequest(managerID: "manager-a")
+        let key = try h.identity.remotePublicKeys().signing
+        let ordinary = AstationMembershipKeyProvider(identity: h.identity, keyID: "manager-a", publicKey: key)
+        XCTAssertThrowsError(try ordinary.sign(request: request))
+        XCTAssertThrowsError(try h.identity.signMembership(request, expectedPublicKey: key))
+        XCTAssertEqual(h.ownerRequests.count, before)
+    }
+
+    func testNativeHostSenderRevokeAndReadmitCommitTheReviewedSharedEntries() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var checks = 0
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, authorizeNewMembership: { _, _ in checks += 1 })
+        try await senderHost(coordinator, harness: h)
+        let confirmations = h.ownerRequests.count
+        let revoke = try await coordinator.prepareHostSender(hostID: "host-a", operation: .revoke(interruptRunning: true), current: { true })
+        XCTAssertEqual(checks, 1)
+        XCTAssertEqual(try coordinator.pendingHostSenderReview(), revoke)
+        do { _ = try await coordinator.exportedKit(); XCTFail("Another account writer must wait for this review") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .busy) }
+        try await coordinator.commitHostSender(revoke, current: { true })
+        XCTAssertEqual(checks, 4, "Check before review, before and after confirmation and at the real key callback")
+        XCTAssertNil(try coordinator.pendingHostSenderReview())
+        let revoked = try await coordinator.hostSenderMembership()
+        guard case .revoked = revoked.hostSenderState(hostId: "host-a") else { return XCTFail("revoke was not applied") }
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(revoke.bodyJSON.utf8)) as? [String: Any])
+        XCTAssertEqual(body["interrupt_running"] as? Bool, true)
+        XCTAssertEqual(h.ownerRequests.last, try revoke.signingRequest(managerID: "manager-a"))
+        let readmit = try await coordinator.prepareHostSender(hostID: "host-a", operation: .readmit, current: { true })
+        try await coordinator.commitHostSender(readmit, current: { true })
+        let admitted = try await coordinator.hostSenderMembership()
+        XCTAssertEqual(admitted.hostSenderState(hostId: "host-a"), .authorized(generation: admitted.head().seq))
+        XCTAssertEqual(h.ownerRequests.count, confirmations + 2)
+        XCTAssertTrue(h.ownerRequests.suffix(2).allSatisfy { $0.purpose == .hostSender && $0.freshConfirmation })
+    }
+
+    func testNativeHostSenderLostReplyReconcilesAfterRestartWithoutSigningOrAppendingAgain() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator(authorizeDelegatedControl: { _ in }, authorizeNewMembership: { _, _ in })
+        try await senderHost(coordinator!, harness: h)
+        let review = try await coordinator!.prepareHostSender(hostID: "host-a", operation: .revoke(interruptRunning: true), current: { true })
+        await h.relay.dropNextAppendReply()
+        do { try await coordinator!.commitHostSender(review, current: { true }); XCTFail("lost reply") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .unavailable) }
+        XCTAssertThrowsError(try coordinator!.cancelUnsignedHostSender(review), "A signed entry cannot be discarded")
+        let confirmations = h.ownerRequests.count
+        let appends = await h.relay.appends.count
+        coordinator = nil
+        let resumed = try h.coordinator(authorizeDelegatedControl: { _ in }, authorizeNewMembership: { _, _ in XCTFail("Already signed") })
+        XCTAssertEqual(try resumed.pendingHostSenderReview(), review)
+        try await resumed.commitHostSender(review, current: { true })
+        XCTAssertNil(try resumed.pendingHostSenderReview())
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        let after = await h.relay.appends.count
+        XCTAssertEqual(after, appends)
+    }
+
+    func testNativeHostSenderWriteThatCommitsThenThrowsResumesTheExactSignature() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var checks = 0
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator(authorizeDelegatedControl: { _ in }, authorizeNewMembership: { _, _ in
+            checks += 1
+            if checks == 4 { h.store.failAfterWrite = true }
+        })
+        try await senderHost(coordinator!, harness: h)
+        let review = try await coordinator!.prepareHostSender(hostID: "host-a", operation: .revoke(interruptRunning: false), current: { true })
+        let count = await h.relay.appends.count
+        do { try await coordinator!.commitHostSender(review, current: { true }); XCTFail("uncertain commit") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .storageUncertain) }
+        XCTAssertThrowsError(try coordinator!.pendingHostSenderReview())
+        let beforeRestart = await h.relay.appends.count
+        XCTAssertEqual(beforeRestart, count, "Never send after uncertain protected persistence")
+        let confirmations = h.ownerRequests.count
+        coordinator = nil
+        let resumed = try h.coordinator(authorizeDelegatedControl: { _ in }, authorizeNewMembership: { _, _ in XCTFail("Saved signature must be reused") })
+        try await resumed.commitHostSender(review, current: { true })
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        let after = await h.relay.appends
+        XCTAssertEqual(after.count, count + 1)
+        XCTAssertEqual(try signedObjectInfo(json: XCTUnwrap(after.last).entryJson).bodyJcs, review.bodyJSON)
+    }
+
+    func testNativeHostSenderVerifierDisconnectDuringOwnerConfirmationPreventsSignature() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var online = true
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, authorizeNewMembership: { _, _ in
+            guard online else { throw RemoteVerifierGateError.unconfirmedVerifiers }
+        })
+        try await senderHost(coordinator, harness: h)
+        let review = try await coordinator.prepareHostSender(hostID: "host-a", operation: .revoke(interruptRunning: false), current: { true })
+        let appends = await h.relay.appends.count
+        h.ownerConfirmation = { _ in online = false; return true }
+        do { try await coordinator.commitHostSender(review, current: { true }); XCTFail("Offline strict verifier") }
+        catch { XCTAssertEqual(error as? RemoteVerifierGateError, .unconfirmedVerifiers) }
+        let after = await h.relay.appends.count
+        XCTAssertEqual(after, appends)
+        XCTAssertEqual(try coordinator.pendingHostSenderReview(), review)
+        try coordinator.cancelUnsignedHostSender(review)
+        XCTAssertNil(try coordinator.pendingHostSenderReview())
+    }
+
+    func testNativeHostSenderDemotionDuringConfirmationNeverSignsOrReusesTheReview() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, authorizeNewMembership: { _, _ in })
+        try await senderHost(coordinator, harness: h)
+        let manager = try await addSecondManager(harness: h)
+        let review = try await coordinator.prepareHostSender(hostID: "host-a", operation: .revoke(interruptRunning: false), current: { true })
+        h.ownerConfirmation = { _ in
+            try await self.append(["action": "set_roles", "device_id": "manager-a", "roles": ["view"]],
+                harness: h, signer: "manager-b", identity: manager)
+            return true
+        }
+        do { try await coordinator.commitHostSender(review, current: { true }); XCTFail("Demoted manager") }
+        catch { }
+        let relayLog = await h.relay.log
+        let log = try XCTUnwrap(relayLog)
+        XCTAssertNotEqual(log.hostSenderState(hostId: "host-a"), .revoked(seq: log.head().seq))
+        XCTAssertFalse(log.entries().contains { (try? signedObjectInfo(json: $0).bodyJcs) == review.bodyJSON })
+        try coordinator.cancelUnsignedHostSender(review)
+    }
+
+    func testNativeHostSenderConcurrentNoninterruptingRevokeCannotSatisfyAnInterruptingIntent() async throws {
+        for interrupt in [false, true] {
+            let h = RecoveryCoordinatorHarness()
+            let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, authorizeNewMembership: { _, _ in })
+            try await senderHost(coordinator, harness: h)
+            let manager = try await addSecondManager(harness: h)
+            let review = try await coordinator.prepareHostSender(hostID: "host-a", operation: .revoke(interruptRunning: interrupt), current: { true })
+            let action = try JSONSerialization.jsonObject(with: Data(hostSenderRevokeAction(hostId: "host-a", interruptRunning: false,
+                signedAt: AstationRecoveryCoordinator.clock().wallMs).utf8)) as! [String: Any]
+            try await append(action, harness: h, signer: "manager-b", identity: manager, authorizeNewMembership: { _ in })
+            let confirmations = h.ownerRequests.count
+            do {
+                try await coordinator.commitHostSender(review, current: { true })
+                XCTAssertFalse(interrupt, "Do not silently downgrade interrupt_running")
+            } catch { XCTAssertTrue(interrupt); XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+            XCTAssertNil(try coordinator.pendingHostSenderReview())
+            XCTAssertEqual(h.ownerRequests.count, confirmations)
+            XCTAssertEqual((try checkpoint(h.store)["supersededHostSenderPublications"] as? [Data])?.count, 1)
+        }
+    }
+
+    func testNativeHostSenderRowsKeepRevokedRemovedHostsAndReadmitExplainsNewWorkOnly() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, authorizeNewMembership: { _, _ in })
+        try await senderHost(coordinator, harness: h)
+        let revoke = try await coordinator.prepareHostSender(hostID: "host-a", operation: .revoke(interruptRunning: false), current: { true })
+        XCTAssertTrue(HostSenderAccessWindowController.explanation(revoke).contains("not interrupted"))
+        try await coordinator.commitHostSender(revoke, current: { true })
+        try await append(["action": "remove_host", "host_id": "host-a"], harness: h)
+        let log = try await coordinator.hostSenderMembership()
+        XCTAssertEqual(try HostSenderAccessWindowController.senderRows(log: log), [
+            HostSenderAccessWindowController.Row(hostID: "host-a", projects: [], revoked: true, removed: true)])
+        let readmit = try await coordinator.prepareHostSender(hostID: "host-a", operation: .readmit, current: { true })
+        let notice = HostSenderAccessWindowController.explanation(readmit)
+        XCTAssertTrue(notice.contains("Only newly sent work"))
+        XCTAssertTrue(notice.contains("Cancelled tasks do not return"))
+        try coordinator.cancelUnsignedHostSender(readmit)
+    }
+
+    func testNativeHostSenderCASRaceRetainsTheLosingSignatureAndDoesNotReSign() async throws {
+        for interrupt in [false, true] {
+            let h = RecoveryCoordinatorHarness()
+            let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, authorizeNewMembership: { _, _ in })
+            try await senderHost(coordinator, harness: h)
+            let other = try await addSecondManager(harness: h)
+            let stored = await h.relay.log
+            let rival = try XCTUnwrap(stored).snapshot()
+            let publisher = RemoteMembershipPublication(log: rival, persist: { _ in })
+            _ = try publisher.prepare(actionJSON: hostSenderRevokeAction(hostId: "host-a", interruptRunning: false,
+                signedAt: AstationRecoveryCoordinator.clock().wallMs), signer: "manager-b", signedAt: AstationRecoveryCoordinator.clock().wallMs)
+            let rivalKeys = AstationMembershipKeyProvider(identity: other, keyID: "manager-b",
+                publicKey: try other.remotePublicKeys().signing, authorizeNewMembership: { _ in })
+            let entry = try publisher.sign(provider: rivalKeys, keyID: "manager-b")
+            _ = try rival.extend(entries: [entry.entryJson], now: AstationRecoveryCoordinator.clock())
+            let review = try await coordinator.prepareHostSender(hostID: "host-a", operation: .revoke(interruptRunning: interrupt), current: { true })
+            await h.relay.replaceAtNextAppend(rival)
+            let confirmations = h.ownerRequests.count
+            do {
+                try await coordinator.commitHostSender(review, current: { true })
+                XCTAssertFalse(interrupt, "Conflicting revoke lost interruption intent")
+            } catch {
+                XCTAssertTrue(interrupt, "An equivalent concurrent revoke is already done")
+                XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview)
+            }
+            XCTAssertEqual(h.ownerRequests.count, confirmations + 1)
+            XCTAssertNil(try coordinator.pendingHostSenderReview())
+            let evidence = try XCTUnwrap((try checkpoint(h.store)["supersededHostSenderPublications"] as? [Data])?.first)
+            // The actual signed publication is retained, not just the unsigned review.
+            let archived = try PropertyListSerialization.propertyList(from: evidence, format: nil) as? [String: Any]
+            XCTAssertNotNil(archived?["prepared"] as? String)
+            let appends = await h.relay.appends
+            XCTAssertEqual(try signedObjectInfo(json: XCTUnwrap(appends.last).entryJson).bodyJcs, review.bodyJSON)
+            let final = try await coordinator.hostSenderMembership()
+            XCTAssertEqual(final.head(), rival.head())
+        }
     }
 }

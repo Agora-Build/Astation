@@ -322,11 +322,18 @@ final class AtemE2EIdentity {
         return (try crypto.signingPublicKey(record.material), record.material.encryptionPublicKey)
     }
 
-    func signMembership(_ request: SignRequest, expectedPublicKey: Data) throws -> Data {
-        lock.lock(); defer { lock.unlock() }
+    func signMembership(_ request: SignRequest, expectedPublicKey: Data,
+        authorizeNewMembership: ((SignRequest) throws -> Void)? = nil) throws -> Data {
         guard let body = request.bodyJson,
-              request == (try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: request.keyId)),
-              let record = try read(create: false),
+              request == (try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: request.keyId)) else {
+            throw AtemIdentityError.identityChanged
+        }
+        if [.project, .hostSender, .hostEncKey].contains(request.purpose) {
+            guard let authorizeNewMembership else { throw AtemIdentityError.invalidState }
+            try authorizeNewMembership(request)
+        }
+        lock.lock(); defer { lock.unlock() }
+        guard let record = try read(create: false),
               try crypto.signingPublicKey(record.material) == expectedPublicKey else {
             throw AtemIdentityError.identityChanged
         }
