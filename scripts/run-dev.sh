@@ -93,7 +93,7 @@ fi
 
 printf 'Starting Astation Dev (menu bar app). Quit from its menu to stop.\n'
 launch_args=(-W -n)
-for variable in ASTATION_RELAY_URL ASTATION_SSO_URL ASTATION_BFF_URL ASTATION_NETWORK_DEBUG; do
+for variable in ASTATION_RELAY_URL ASTATION_SSO_URL ASTATION_BFF_URL ASTATION_NETWORK_DEBUG ASTATION_LOCAL_STATION_PROXY; do
     if [[ -n "${!variable:-}" ]]; then launch_args+=(--env "$variable=${!variable}"); fi
 done
 # LaunchServices attributes screen/audio permission to Astation rather than the terminal.

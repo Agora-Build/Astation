@@ -17,7 +17,7 @@ assert.match(
   "/health must preserve the public request scheme",
 );
 
-for (const path of ["ws", "health"]) {
+for (const path of ["ws", "ws/proxy", "health"]) {
   const location = config.match(
     new RegExp(`location\\s*=\\s*\\/${path}\\s*\\{([\\s\\S]*?)\\}`),
   );
@@ -28,6 +28,12 @@ for (const path of ["ws", "health"]) {
     `/${path} must move on to another relay replica when one refuses, fails or drains`,
   );
 }
+
+const nativeProxyLocation = config.match(/location\s*=\s*\/ws\/proxy\s*\{([\s\S]*?)\}/);
+assert.match(nativeProxyLocation[1], /proxy_pass\s+http:\/\/station_relay_upstream\/ws\/proxy;/);
+assert.match(nativeProxyLocation[1], /proxy_http_version\s+1\.1;/);
+assert.match(nativeProxyLocation[1], /proxy_set_header\s+Upgrade\s+\$http_upgrade;/);
+assert.doesNotMatch(nativeProxyLocation[1], /proxy_set_header\s+Authorization\s+""|try_files/);
 
 assert.match(
   config,

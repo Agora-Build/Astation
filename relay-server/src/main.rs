@@ -619,6 +619,7 @@ fn router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
         .route("/ws", get(relay::ws_handler))
+        .route("/ws/proxy", get(relay::proxy::handler))
         .route("/pair", get(relay::pair_page_handler))
         .route("/auth", get(routes::auth_page_handler))
         .layer(cors_layer())

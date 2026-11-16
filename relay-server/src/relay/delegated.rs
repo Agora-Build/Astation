@@ -61,6 +61,10 @@ impl RelayHub {
     }
 
     pub(super) async fn delegated_peer_current(&self, binding: &HostBinding) -> bool {
+        if binding.proxy.is_some() {
+            return self.local().contains(&binding.connection.conn)
+                && self.proxy_current(&binding.connection.conn).await;
+        }
         self.local().contains(&binding.connection.conn)
             && matches!(self.room(&binding.room).await, Ok(Some(room))
                 if room.atems.get(&binding.atem_id) == Some(&binding.connection))

@@ -720,7 +720,7 @@ pub(super) fn apply(
         return Err(Fault::Invalid);
     }
     if let Some(binding) = binding {
-        if root.routes.get(&binding.host) != Some(binding) || !binding.valid(log) {
+        if !root.current(binding) || !binding.valid(log) {
             return Err(Fault::Invalid);
         }
     }
