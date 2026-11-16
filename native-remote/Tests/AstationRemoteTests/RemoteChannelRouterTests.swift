@@ -26,7 +26,7 @@ private final class RoutedCore: RemoteChannelCore {
             features: [], accountId: "account-a", atemDeviceId: "host-a", hostTrustGen: 3,
             attachmentGen: "attachment-a", controllerSession: "controller-a", runtimeGen: "runtime-a",
             authorizationMsLeft: 60_000, serverTime: 0, head: LogHead(seq: 1, hash: "head"),
-            pendingRecovery: [], channelId: "channel-a", scopeJson: nil, json: "{}")
+            pendingRecovery: [], channelId: "channel-a", scopeJson: nil, verifier: nil, json: "{}")
     }
     func receive(_ frame: Data, now: UInt64) throws -> [ClientEvent] {
         frames.append(frame)

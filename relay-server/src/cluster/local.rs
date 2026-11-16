@@ -65,7 +65,7 @@ pub enum SocketRole {
 pub type CloseRequest = Option<(u16, String)>;
 
 struct LocalConn {
-    tx: mpsc::Sender<String>,
+    tx: mpsc::Sender<SocketFrame>,
     queued_bytes: Arc<AtomicUsize>,
     /// Frames the writer has taken off the queue (its progress).
     sent_frames: Arc<AtomicU64>,
@@ -88,10 +88,26 @@ struct Stall {
 
 /// The receiving half, owned by the socket's writer task.
 pub struct SocketOutbox {
-    pub frames: mpsc::Receiver<String>,
+    pub frames: mpsc::Receiver<SocketFrame>,
     pub close: watch::Receiver<CloseRequest>,
     pub queued_bytes: Arc<AtomicUsize>,
     sent_frames: Arc<AtomicU64>,
+}
+
+/// Scoped control responses retain the exact authorization checked at enqueue.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SocketFrame {
+    pub text: String,
+    pub delegated: Option<crate::remote_api::recovery::HostBinding>,
+}
+
+impl std::ops::Deref for SocketFrame {
+    type Target = str;
+    fn deref(&self) -> &str { &self.text }
+}
+
+impl PartialEq<String> for SocketFrame {
+    fn eq(&self, other: &String) -> bool { self.text == *other }
 }
 
 impl SocketOutbox {
@@ -163,6 +179,10 @@ impl LocalSockets {
     /// no longer) here, or its queue is full: the frame is dropped, and a
     /// queue full for `stall` closes the socket with 1013.
     pub fn send(&self, connection_id: &str, frame: String) -> bool {
+        self.enqueue(connection_id, SocketFrame { text: frame, delegated: None })
+    }
+
+    fn enqueue(&self, connection_id: &str, frame: SocketFrame) -> bool {
         let mut conns = self.lock();
         let Some(conn) = conns.get_mut(connection_id) else {
             return false;
@@ -216,6 +236,12 @@ impl LocalSockets {
     pub fn send_required(&self, connection_id: &str, frame: String) -> bool {
         if self.send(connection_id, frame) { return true; }
         self.close_with(connection_id, CLOSE_SLOW_CLIENT, "r9 queue unavailable");
+        false
+    }
+
+    pub(crate) fn send_delegated(&self, binding: &crate::remote_api::recovery::HostBinding, text: String) -> bool {
+        if self.enqueue(&binding.connection.conn, SocketFrame { text, delegated: Some(binding.clone()) }) { return true; }
+        self.close_with(&binding.connection.conn, CLOSE_SLOW_CLIENT, "r9 queue unavailable");
         false
     }
 

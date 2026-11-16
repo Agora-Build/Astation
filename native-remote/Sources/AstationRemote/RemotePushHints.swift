@@ -2,12 +2,17 @@ import AtemClient
 import Foundation
 
 public struct RemotePushNotice: Equatable, Sendable {
+    public enum Target: Equatable, Sendable {
+        case approval(ApprovalRef)
+        case alert(AlertRef)
+    }
     public enum State: Equatable, Sendable {
         /// A nil content uses generic OS text when the protected key is unavailable.
         case approval(HintContent?)
         case resolved(reason: String)
+        case outcomeUnknown(HintContent?)
     }
-    public let approval: ApprovalRef
+    public let target: Target
     public let state: State
 }
 
@@ -67,16 +72,20 @@ public final class RemotePushHints {
         saved = next
         switch hint.state() {
         case .open:
-            return RemotePushNotice(approval: hint.approval(), state: .approval(try? open?(hint)))
+            return RemotePushNotice(target: .approval(try hint.approval()), state: .approval(try? open?(hint)))
         case .resolved(let reason, _):
-            return RemotePushNotice(approval: hint.approval(), state: .resolved(reason: reason))
+            return RemotePushNotice(target: .approval(try hint.approval()), state: .resolved(reason: reason))
+        case .outcomeUnknown:
+            return RemotePushNotice(target: .alert(try hint.alert()), state: .outcomeUnknown(try? open?(hint)))
         }
     }
 
     /// A tap always verifies again against current membership, then reconnects
     /// for host state even when the original delivery was already displayed.
-    public func target(hintJSON: String, log: MembershipLog, now: UInt64) throws -> ApprovalRef {
-        try verified(hintJSON, log: log, now: now).approval()
+    public func target(hintJSON: String, log: MembershipLog, now: UInt64) throws -> RemotePushNotice.Target {
+        let hint = try verified(hintJSON, log: log, now: now)
+        if case .outcomeUnknown = hint.state() { return .alert(try hint.alert()) }
+        return .approval(try hint.approval())
     }
 
     private func verified(_ json: String, log: MembershipLog, now: UInt64) throws -> PushHint {
@@ -85,10 +94,12 @@ public final class RemotePushHints {
               member.status == .active, member.roles.contains("control") else { throw RemoteChannelError.notReady }
         let hint = try verifyPushHint(hintJson: json, log: log, nowMs: now, verifier: .client)
         try hint.checkSealed()
-        if case .open(let device, let kid, _) = hint.state() {
+        switch hint.state() {
+        case .open(let device, let kid, _), .outcomeUnknown(let device, let kid, _):
             guard device == saved.device, let key = member.encKey, try encKid(encKey: key) == kid else {
                 throw RemoteChannelError.invalidInput
             }
+        case .resolved: break
         }
         return hint
     }

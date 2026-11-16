@@ -7,10 +7,15 @@ use crate::cluster::redis::RedisConn;
 use crate::identity_store::{IdentityStore, PgIdentityStore};
 
 pub const USAGE: &str = "usage: station-relay-server admin forget-key <astation_id>\n\
+       station-relay-server admin delegated-recovery status|fence\n\
 \n\
 Deletes the Astation's registered relay key (DATABASE_URL, required) and\n\
 announces it on relay:broadcast (REDIS_URL, optional) so every relay\n\
-replica drops the cached key at once. Bindings are kept.";
+replica drops the cached key at once. Bindings are kept.\n\
+\n\
+delegated-recovery uses DATABASE_URL, PUBLIC_BASE_URL and\n\
+STATION_DELEGATED_RECOVERY_GENERATION. status only inspects; fence\n\
+durably stops delegated serving, signing and reporting. It never resumes them.";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ForgetOutcome {
@@ -48,6 +53,9 @@ pub async fn forget_key(
 
 /// `admin` arguments (after the word `admin`); returns the exit code.
 pub async fn main(args: &[String]) -> i32 {
+    if args.first().map(String::as_str) == Some("delegated-recovery") {
+        return delegated_recovery(&args[1..]).await;
+    }
     let astation_id = match args {
         [command, id] if command == "forget-key" && !id.is_empty() => id.clone(),
         _ => {
@@ -97,6 +105,65 @@ pub async fn main(args: &[String]) -> i32 {
         }
         Err(message) => {
             eprintln!("{message}");
+            1
+        }
+    }
+}
+
+async fn delegated_recovery(args: &[String]) -> i32 {
+    use crate::remote_api::recovery::delegated_recovery::{generation, inspect, Binding};
+    let fence = match args {
+        [command] if command == "status" => false,
+        [command] if command == "fence" => true,
+        _ => {
+            eprintln!("{USAGE}");
+            return 2;
+        }
+    };
+    let origin = std::env::var("PUBLIC_BASE_URL").unwrap_or_default();
+    let configured = std::env::var("STATION_DELEGATED_RECOVERY_GENERATION").unwrap_or_default();
+    let binding = match generation(&configured).and_then(|g| Binding::new(&origin, g)) {
+        Ok(binding) => binding,
+        Err(reason) => {
+            eprintln!("{reason}");
+            return 2;
+        }
+    };
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("DATABASE_URL is required");
+        return 1;
+    };
+    let pool = match sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+    {
+        Ok(pool) => pool,
+        Err(_) => {
+            eprintln!("could not connect to recovery storage");
+            return 1;
+        }
+    };
+    let result = if fence {
+        binding.initialize(&pool, true).await.map(Some)
+    } else {
+        inspect(&pool, &binding.origin).await
+    };
+    match result {
+        Ok(status) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "origin": binding.origin,
+                    "configured_generation": binding.generation,
+                    "recovery_ready": status.as_ref().is_some_and(|s| s.ready && s.generation == binding.generation),
+                    "status": status,
+                })
+            );
+            0
+        }
+        Err(_) => {
+            eprintln!("could not inspect or commit the delegated recovery fence");
             1
         }
     }
@@ -192,5 +259,8 @@ mod tests {
         assert_eq!(main(&[]).await, 2);
         assert_eq!(main(&["forget-key".to_string()]).await, 2);
         assert_eq!(main(&["drop-everything".to_string(), "x".to_string()]).await, 2);
+        assert_eq!(main(&["delegated-recovery".into()]).await, 2);
+        assert_eq!(main(&["delegated-recovery".into(), "resume".into()]).await, 2);
+        assert_eq!(main(&["delegated-recovery".into(), "fence".into(), "extra".into()]).await, 2);
     }
 }

@@ -51,6 +51,7 @@ final class AstationRecoveryCoordinator {
         var restoreKit: String?
         var restore: Data?
         var pendingDataKey: SavedKey?
+        var controlPublications: [String: Data]?
     }
 
     nonisolated static let bootID = RemoteSystemClock.bootIdentifier
@@ -67,6 +68,7 @@ final class AstationRecoveryCoordinator {
     private let allowNewDataKey: () -> Bool
     private let confirmOwner: (SignRequest) async -> Bool
     private let confirmServiceOwner: (RemoteServiceApproval, SignRequest) async -> Bool
+    private let authorizeDelegatedControl: ((MembershipLog) throws -> Void)?
     private let confirmReplacement: (String) async -> Bool
     private let saveKit: (String) async -> Bool
     private let dataKeys: AstationRecoveryDataKeys
@@ -79,6 +81,10 @@ final class AstationRecoveryCoordinator {
     private var backup: RemoteRecoveryBackup?
     private var restoreOperation: RemoteRecoveryRestore?
     private var membershipLog: MembershipLog?
+    private var controlPublication: RemoteControlPublication?
+    private var controlDeliveryContext: (portal: PortalIntegrationHTTP, current: () -> Bool)?
+    private var controlDeliveryTask: Task<Void, Never>?
+    var onControlDelivery: ((RemoteControlDelivery) -> Void)?
     /// Deliver only durable head changes, after the account operation releases its lock.
     var onMembershipCommit: ((LogHead) -> Void)?
     private var pendingMembershipHead: LogHead?
@@ -96,6 +102,7 @@ final class AstationRecoveryCoordinator {
             confirmOwner: { request in
                 await withCheckedContinuation { continuation in
                     let reason = request.purpose == .genesis ? "confirm this account's recovery setup"
+                        : request.purpose == .controlRecord ? "authorize the reviewed stop of delegated agent work"
                         : request.purpose != .keyBackup ? "approve this account's device or integration access"
                         : "confirm this account's encrypted key backup"
                     DeviceOwnerAuth.authenticate(reason: reason) {
@@ -124,6 +131,7 @@ final class AstationRecoveryCoordinator {
         allowNewDataKey: @escaping () -> Bool, confirmOwner: @escaping (SignRequest) async -> Bool,
         confirmReplacement: @escaping (String) async -> Bool, saveKit: @escaping (String) async -> Bool,
         confirmServiceOwner: ((RemoteServiceApproval, SignRequest) async -> Bool)? = nil,
+        authorizeDelegatedControl: ((MembershipLog) throws -> Void)? = nil,
         now: @escaping () -> HostClock = { AstationRecoveryCoordinator.clock() }) throws {
         self.accountID = accountID
         self.managerID = managerID
@@ -135,6 +143,7 @@ final class AstationRecoveryCoordinator {
         self.dataKeys = dataKeys
         self.confirmOwner = confirmOwner
         self.confirmServiceOwner = confirmServiceOwner ?? { _, request in await confirmOwner(request) }
+        self.authorizeDelegatedControl = authorizeDelegatedControl
         self.confirmReplacement = confirmReplacement
         self.saveKit = saveKit
         self.now = now
@@ -170,6 +179,7 @@ final class AstationRecoveryCoordinator {
     private func checkpointFromLifecycle() {
         do { try checkpointPendingWaits() }
         catch { uncertain = true; Log.error("[Recovery] Membership checkpoint failed; account operations are paused") }
+        retrySavedControlsIfNeeded()
     }
 
     func checkpointPendingWaits() throws {
@@ -1228,6 +1238,201 @@ final class AstationRecoveryCoordinator {
         try commitLog(log)
         guard result.stop == nil, log.frozen() == nil else { throw RemoteRecoveryError.requiresReview }
     }
+}
+
+extension AstationRecoveryCoordinator {
+    struct ServiceControlReview {
+        let integrationID: String
+        let integrationName: String
+        let issuer: String
+        let ownerAccount: String
+        let stationOrigin: String
+        let recordID: String
+        let body: ControlRecordBody
+        let request: SignRequest
+    }
+
+    // Production supplies no authorization until the real delegated joint checks pass.
+    var delegatedControlsAvailable: Bool { authorizeDelegatedControl != nil }
+
+    func resumeControlDelivery(portal: PortalIntegrationHTTP, current: @escaping () -> Bool) {
+        guard delegatedControlsAvailable else { return }
+        controlDeliveryContext = (portal, current)
+        retrySavedControlsIfNeeded()
+    }
+
+    private func retrySavedControlsIfNeeded() {
+        guard delegatedControlsAvailable, !busy, !uncertain, controlDeliveryTask == nil,
+              let context = controlDeliveryContext, context.current(),
+              let journal = try? controls(), (try? journal.pendingDeliveryIDs().isEmpty) == false else { return }
+        controlDeliveryTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.controlDeliveryTask = nil }
+            do {
+                let deliveries = try await self.retryPendingControls(portal: context.portal, current: context.current)
+                for delivery in deliveries { self.onControlDelivery?(delivery) }
+            } catch {
+                Log.warn("[Delegated] Saved control delivery will resume after account access is available")
+            }
+        }
+    }
+
+    private func requireDelegatedControl(_ log: MembershipLog) throws {
+        guard let authorizeDelegatedControl else { throw AstationDelegatedControlError.notVerified }
+        try authorizeDelegatedControl(log)
+    }
+
+    private func controls() throws -> RemoteControlPublication {
+        if let controlPublication { return controlPublication }
+        guard let kit = try currentKit() else { throw RemoteRecoveryError.notCommitted }
+        let persistControl: (Data) throws -> Void = { [unowned self] bytes in
+            try self.persist { $0.controlPublications = ($0.controlPublications ?? [:]).merging([self.relayURL: bytes]) { _, new in new } }
+        }
+        let value: RemoteControlPublication
+        if let data = saved.controlPublications?[relayURL] {
+            value = try RemoteControlPublication(checkpoint: data, accountID: accountID, genesisHash: kit.genesisHash,
+                stationOrigin: relayURL, persist: persistControl)
+        } else {
+            value = try RemoteControlPublication(accountID: accountID, genesisHash: kit.genesisHash,
+                stationOrigin: relayURL, persist: persistControl)
+        }
+        controlPublication = value
+        return value
+    }
+
+    static func controlService(record: PortalIntegrationRecord, log: MembershipLog) throws -> String? {
+        guard let fingerprint = record.r9Svc, log.frozen() == nil else { return nil }
+        let ids = try log.entries().compactMap { entry -> String? in
+            let body = try JSONSerialization.jsonObject(with: Data(signedObjectInfo(json: entry).bodyJcs.utf8)) as? [String: Any]
+            guard body?["action"] as? String == "add", let member = body?["member"] as? [String: Any],
+                  member["kind"] as? String == "service" else { return nil }
+            return member["device_id"] as? String
+        }
+        let matches = try Set(ids).compactMap { log.member(deviceId: $0) }.filter {
+            try $0.kind == "service" && RemoteServiceKeyFingerprint.compute($0.authKey) == fingerprint
+        }
+        return matches.count == 1 ? matches[0].deviceId : nil
+    }
+
+    func prepareServiceControl(_ record: PortalIntegrationRecord, portal: PortalIntegrationHTTP,
+        interruptOnly: Bool, interruptRunning: Bool, current: () -> Bool) async throws -> ServiceControlReview {
+        try begin(); defer { busy = false }
+        guard delegatedControlsAvailable else { throw AstationDelegatedControlError.notVerified }
+        guard current(), record.stationOrigin == relayURL, let kit = try currentKit(),
+              let transport = http as? RemoteControlTransport else { throw RemoteChannelError.staleLink }
+        let log = try await refreshedLog(genesis: kit.genesisHash)
+        try requireManager(log)
+        try requireDelegatedControl(log)
+        let records = try await portal.owned(stationOrigin: relayURL)
+        guard current(), let fresh = records.first(where: { $0.id == record.id }), fresh.role == "owner",
+              fresh.r9Svc == record.r9Svc, let service = try Self.controlService(record: fresh, log: log),
+              !interruptOnly || ["revoking", "revoked"].contains(fresh.state) else { throw AccountLoginError.changed }
+        let heads = try relayDecodeToHost(message: await transport.controlHeads(genesisHash: kit.genesisHash))
+        guard current(), case .heads(let feeds, let head) = heads, head == log.head(), feeds.count == 1,
+              feeds[0].origin == relayURL else { throw RemoteRecoveryError.requiresReview }
+        let principal = "service:" + service
+        let time = try await transport.reserveControlTime(genesisHash: kit.genesisHash, principal: principal,
+            managerID: managerID, expected: log.head())
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        let body = ControlRecordBody(accountId: accountID, genesisHash: kit.genesisHash, origin: relayURL,
+            feedId: feeds[0].feedId, principal: principal, principalKey: fresh.r9Svc, signer: "member:" + managerID,
+            action: interruptOnly ? "interrupt_running" : "revoke", interruptRunning: interruptOnly ? nil : interruptRunning,
+            revokeSeq: nil, recordId: UUID().uuidString.lowercased(), issuedAt: time, integrationId: fresh.id, by: "owner")
+        let mirror = interruptOnly ? nil : try RemoteControlPortalMirror(issuer: portal.configuration.issuer,
+            ownerAccount: portal.ownerAccount, stationOrigin: relayURL, integrationID: fresh.id, interruptRunning: interruptRunning)
+        let request = try controls().prepare(body: body, log: log, portalMirror: mirror)
+        return ServiceControlReview(integrationID: fresh.id, integrationName: fresh.name, issuer: portal.configuration.issuer,
+            ownerAccount: portal.ownerAccount, stationOrigin: relayURL, recordID: body.recordId, body: body, request: request)
+    }
+
+    /// Fresh confirmation happens only after the exact draft has been durably saved.
+    func commitServiceControl(_ review: ServiceControlReview, portal: PortalIntegrationHTTP,
+        current: () -> Bool) async throws -> RemoteControlDelivery {
+        try begin(); defer { busy = false }
+        guard delegatedControlsAvailable else { throw AstationDelegatedControlError.notVerified }
+        guard current(), review.issuer == portal.configuration.issuer, review.ownerAccount == portal.ownerAccount,
+              review.stationOrigin == relayURL, let kit = try currentKit() else { throw AccountLoginError.changed }
+        let journal = try controls()
+        if try journal.retainedDelivery(recordID: review.recordID) == nil {
+            guard try journal.signingRequest(recordID: review.recordID) == review.request else {
+                throw RemoteRecoveryError.requiresReview
+            }
+            let before = try await refreshedLog(genesis: kit.genesisHash)
+            try requireManager(before)
+            try requireDelegatedControl(before)
+            guard await confirmOwner(review.request), current(), !Task.isCancelled else { throw RemoteRecoveryError.confirmationRequired }
+            let confirmedAt = Self.clock().monoMs
+            let log = try await refreshedLog(genesis: kit.genesisHash)
+            try requireManager(log)
+            try requireDelegatedControl(log)
+            let provider = AstationMembershipKeyProvider(identity: identity, keyID: managerID,
+                publicKey: try identity.remotePublicKeys().signing, controlRecordsAllowed: true)
+            _ = try journal.sign(recordID: review.recordID, log: log, provider: provider,
+                confirmedAt: confirmedAt, now: { Self.clock().monoMs }, current: current)
+        }
+        return try await deliverControl(review.recordID, portal: portal, current: current)
+    }
+
+    func cancelUnsignedControl(_ review: ServiceControlReview) throws {
+        guard !busy, !uncertain else { throw RemoteRecoveryError.busy }
+        try controls().cancelUnsigned(recordID: review.recordID)
+    }
+
+    /// Existing signatures and Portal intents are retried; no owner approval is reused.
+    func retryPendingControls(portal: PortalIntegrationHTTP, current: () -> Bool) async throws -> [RemoteControlDelivery] {
+        try begin(); defer { busy = false }
+        guard delegatedControlsAvailable else { throw AstationDelegatedControlError.notVerified }
+        var results: [RemoteControlDelivery] = []
+        for id in try controls().pendingDeliveryIDs().prefix(8) {
+            guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+            results.append(try await deliverControl(id, portal: portal, current: current))
+        }
+        return results
+    }
+
+    private func deliverControl(_ id: String, portal: PortalIntegrationHTTP,
+        current: () -> Bool) async throws -> RemoteControlDelivery {
+        guard current(), !Task.isCancelled, let kit = try currentKit(), let transport = http as? RemoteControlTransport else {
+            throw RemoteChannelError.staleLink
+        }
+        let journal = try controls()
+        guard let delivery = try journal.retainedDelivery(recordID: id) else { throw RemoteRecoveryError.notCommitted }
+        if !delivery.stationStored {
+            do {
+                let log = try await refreshedLog(genesis: kit.genesisHash)
+                try requireDelegatedControl(log)
+                guard current(), !Task.isCancelled, let verified = try journal.delivery(recordID: id, log: log) else {
+                    throw RemoteChannelError.staleLink
+                }
+                _ = try await transport.publishControl(log: log, recordJSON: verified.recordJSON)
+                guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+                try journal.stationStored(verified)
+            } catch {
+                guard !uncertain, !journal.storageUncertain else { throw RemoteRecoveryError.storageUncertain }
+                guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+                Log.warn("[Delegated] Signed stop retained for Station retry or a fresh manager review")
+            }
+        }
+        // This independent leg remains necessary even if Station is down or the signer lost manage.
+        if let mirror = delivery.portalMirror, !delivery.portalMirrored {
+            do {
+                _ = try await portal.mirrorRevoke(mirror)
+                guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+                try journal.portalMirrored(delivery)
+            } catch {
+                guard !uncertain, !journal.storageUncertain else { throw RemoteRecoveryError.storageUncertain }
+                guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+                Log.warn("[Delegated] Native revoke retained for Portal retry")
+            }
+        }
+        guard let result = try journal.retainedDelivery(recordID: id) else { throw RemoteRecoveryError.notCommitted }
+        return result
+    }
+}
+
+enum AstationDelegatedControlError: LocalizedError {
+    case notVerified
+    var errorDescription: String? { "Delegated controls are waiting for the Station and native verification checks. Your existing access is unchanged." }
 }
 
 private extension Data {

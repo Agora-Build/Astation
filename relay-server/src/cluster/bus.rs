@@ -48,6 +48,8 @@ pub enum InboxMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum BroadcastMessage {
+    /// A durable append completed. Each replica re-reads its own authorized links.
+    DelegatedChanged { source_replica: String },
     /// An Astation key was registered, replaced or deleted: re-read it.
     KeyChanged { astation_id: String },
     /// A room's directory entry changed: drop any cached copy.

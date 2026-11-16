@@ -171,6 +171,7 @@ async fn independent_native_verifies_host_and_exchanges_encrypted_registry_witho
         .unwrap();
     let runtime = uuid::Uuid::new_v4().to_string();
     let welcome = Welcome {
+        verifier: None,
         id: uuid::Uuid::new_v4().to_string(),
         re: hello.id,
         account_id: log.account_id().into(),

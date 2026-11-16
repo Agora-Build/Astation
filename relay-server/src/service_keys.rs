@@ -157,6 +157,7 @@ impl ServiceKeyVault {
             key,
             public,
             id: KeyId::new(&context.service_id),
+            context: context.clone(),
         })
     }
 }
@@ -165,6 +166,31 @@ pub(crate) struct ServiceSigner {
     key: signature::EcdsaKeyPair,
     public: PublicKey,
     id: KeyId,
+    context: ServiceKeyContext,
+}
+
+impl ServiceSigner {
+    /// Control signing stays separate from the channel-only KeyProvider. The
+    /// caller cannot change the sealed key's principal, integration or Station.
+    pub(crate) fn sign_control(&self, body: &atem_client::control::ControlBody)
+        -> atem_client::Result<atem_client::SignedObject>
+    {
+        use atem_client::control::{control_signing_input, control_with_signature,
+            principal_key_of, ControlPrincipal, ControlSigner};
+        if body.genesis_hash.to_hex() != self.context.genesis
+            || body.feed.as_ref().is_none_or(|feed| feed.origin != self.context.station_origin)
+            || body.principal != ControlPrincipal::Service(self.context.service_id.clone())
+            || body.signer != ControlSigner::Principal
+            || body.about.integration_id.as_deref() != Some(self.context.integration_id.as_str())
+            || body.principal_key != Some(principal_key_of(&self.public)?)
+        {
+            return Err(atem_client::Error::BadKey);
+        }
+        let input = control_signing_input(body)?;
+        let signature = self.key.sign(&SystemRandom::new(), input.as_bytes())
+            .map_err(|_| atem_client::Error::BadSignature)?;
+        control_with_signature(body, &self.public, signature.as_ref())
+    }
 }
 
 impl KeyProvider for ServiceSigner {
@@ -304,6 +330,7 @@ mod tests {
             SignLabel::RecoveryCosign,
             SignLabel::BrowserGrant,
             SignLabel::ChannelHost,
+            SignLabel::HostWorkControl,
         ] {
             assert!(signer
                 .sign(&id, &SigningInput::new(label, &[3; 32]))
@@ -313,6 +340,41 @@ mod tests {
         assert!(signer
             .sign(&id, &SigningInput::new(SignLabel::ChannelClient, &[3; 31]))
             .is_err());
+    }
+    #[test]
+    fn control_signer_cannot_escape_the_sealed_service_context() {
+        use atem_client::control::{control_signing_input, principal_key_of,
+            ControlAbout, ControlAction, ControlBody, ControlFeed, ControlPrincipal, ControlSigner};
+        let vault = ServiceKeyVault::new(&[7; 32], "operator-v1").unwrap();
+        let context = context();
+        let signer = vault.open(&context, &vault.generate(&context).unwrap()).unwrap();
+        let body = ControlBody {
+            account_id: "account-a".into(),
+            genesis_hash: atem_client::Hash32::from_hex(&context.genesis).unwrap(),
+            feed: Some(ControlFeed { origin: context.station_origin.clone(), feed_id: uuid::Uuid::new_v4().to_string() }),
+            principal: ControlPrincipal::Service(context.service_id.clone()),
+            principal_key: Some(principal_key_of(&signer.public).unwrap()),
+            signer: ControlSigner::Principal,
+            action: ControlAction::Revoke { interrupt_running: false },
+            record_id: uuid::Uuid::new_v4().to_string(), issued_at: 100,
+            about: ControlAbout { integration_id: Some(context.integration_id.clone()), by: "owner".into() },
+        };
+        let object = signer.sign_control(&body).unwrap();
+        signer.public.verify(&control_signing_input(&body).unwrap(), object.sig()).unwrap();
+        for field in 0..7 {
+            let mut other = body.clone();
+            match field {
+                0 => other.genesis_hash = atem_client::Hash32([3; 32]),
+                1 => other.feed.as_mut().unwrap().origin = "https://other.example".into(),
+                2 => other.feed = None,
+                3 => other.principal = ControlPrincipal::Service("another-service".into()),
+                4 => other.signer = ControlSigner::Member("phone".into()),
+                5 => other.about.integration_id = Some("i-11234567890123456789012345".into()),
+                _ => other.principal_key = None,
+            }
+            assert!(signer.sign_control(&other).is_err(), "context field {field}");
+        }
+        assert!(signer.sign(&KeyId::new(&context.service_id), &control_signing_input(&body).unwrap()).is_err());
     }
     #[test]
     fn sealed_keys_cannot_move_between_owners_stations_integrations_or_roots() {

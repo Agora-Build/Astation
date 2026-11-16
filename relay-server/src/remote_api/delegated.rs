@@ -1,0 +1,785 @@
+//! Durable Station control state. Membership, feeds and ACK evidence share one
+//! recovery-root transaction, so another replica cannot publish a rejected record.
+use super::{HostBinding, Root};
+use atem_client::{
+    control::{
+        principal_key_of,
+        relay::{MAX_FEED_RECORDS, MAX_FETCH_ENTRIES},
+        verify_control, AckLedger, CallRefused, ControlAbout, ControlAck, ControlAction,
+        ControlBody, ControlCheck, ControlFeed, ControlPrincipal, ControlRecord, ControlSigner,
+        ControlSyncResult, FeedEntry, FeedHead, Heads, LinkAssociation, MembershipFetchResult,
+        RefusalCode, RefusedCall, RelayError, ToStation,
+    },
+    membership::{Action, Head, MemberKind, MemberStatus, Membership, RolesChange},
+    station_route::normalize_relay,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+
+#[cfg(test)]
+#[path = "delegated_tests.rs"]
+pub(crate) mod tests;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct Stored {
+    version: u8,
+    feed_id: String,
+    records: Vec<Value>,
+    ledger: Value,
+    signing_high_water: BTreeMap<String, u64>,
+    #[serde(default)]
+    delivery: BTreeMap<String, DeliveryRetry>,
+    #[serde(default)]
+    report_control_seq: usize,
+    #[serde(default)]
+    report_control_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeliveryRetry {
+    attempts: u32,
+    not_before: u64,
+}
+
+#[derive(Debug)]
+pub(crate) enum Fault {
+    Forbidden(RefusedCall),
+    Invalid,
+    Unavailable,
+}
+
+impl Fault {
+    pub(crate) fn refusal(&self) -> Option<Value> {
+        let Self::Forbidden(call) = self else {
+            return None;
+        };
+        CallRefused {
+            call: *call,
+            code: RefusalCode::Forbidden,
+        }
+        .to_json()
+        .ok()
+    }
+}
+
+impl Stored {
+    fn new(origin: &str, log: &Membership) -> Result<Self, Fault> {
+        let ledger = AckLedger::new(origin, log.account_id(), log.genesis_hash())
+            .map_err(|_| Fault::Unavailable)?;
+        Ok(Self {
+            version: 1,
+            feed_id: uuid::Uuid::new_v4().to_string(),
+            records: Vec::new(),
+            ledger: ledger.to_json(),
+            signing_high_water: BTreeMap::new(),
+            delivery: BTreeMap::new(),
+            report_control_seq: 0,
+            report_control_hash: None,
+        })
+    }
+
+    fn ledger(&self, origin: &str, log: &Membership) -> Result<AckLedger, Fault> {
+        let ledger = AckLedger::from_json(&self.ledger).map_err(|_| Fault::Unavailable)?;
+        if self.version != 1
+            || ledger.origin() != origin
+            || ledger.account_id() != log.account_id()
+            || ledger.genesis_hash() != log.genesis_hash()
+        {
+            return Err(Fault::Unavailable);
+        }
+        Ok(ledger)
+    }
+
+    fn heads(&self, origin: &str, log: &Membership, now: u64) -> Result<Value, Fault> {
+        self.ledger(origin, log)?;
+        Heads {
+            feeds: vec![FeedHead {
+                origin: origin.into(),
+                feed_id: self.feed_id.clone(),
+                head: self.records.len() as u64,
+                station_time: now,
+            }],
+            membership: log.head(),
+        }
+        .to_json()
+        .map_err(|_| Fault::Unavailable)
+    }
+
+    fn response(
+        &self,
+        origin: &str,
+        log: &Membership,
+        call: &ToStation,
+        now: u64,
+    ) -> Result<Option<Value>, Fault> {
+        self.ledger(origin, log)?;
+        match call {
+            ToStation::ControlSync(call) => {
+                if call.origin != origin
+                    || call.feed_id.as_ref().is_some_and(|id| id != &self.feed_id)
+                {
+                    return Err(Fault::Forbidden(RefusedCall::ControlSync));
+                }
+                let mut page = ControlSyncResult {
+                    request_id: call.request_id.clone(),
+                    origin: origin.into(),
+                    feed_id: self.feed_id.clone(),
+                    after: call.after,
+                    head: self.records.len() as u64,
+                    station_time: now,
+                    records: Vec::new(),
+                };
+                for (index, value) in self
+                    .records
+                    .iter()
+                    .enumerate()
+                    .skip(usize::try_from(call.after).unwrap_or(usize::MAX))
+                    .take(MAX_FEED_RECORDS)
+                {
+                    let record = ControlRecord::parse(
+                        &serde_json::to_vec(value).map_err(|_| Fault::Unavailable)?,
+                    )
+                    .map_err(|_| Fault::Unavailable)?;
+                    page.records.push(FeedEntry::new(index as u64 + 1, &record));
+                    if matches!(page.to_json(), Err(RelayError::TooLarge)) {
+                        page.records.pop();
+                        if page.records.is_empty() {
+                            return Err(Fault::Unavailable);
+                        }
+                        break;
+                    }
+                }
+                page.to_json().map(Some).map_err(|_| Fault::Unavailable)
+            }
+            ToStation::MembershipFetch(call) => {
+                let mut page = MembershipFetchResult {
+                    head: log.head(),
+                    entries: Vec::new(),
+                };
+                for entry in log
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.seq > call.after)
+                    .take(MAX_FETCH_ENTRIES)
+                {
+                    page.entries.push(entry.object().clone());
+                    if matches!(page.to_json(), Err(RelayError::TooLarge)) {
+                        page.entries.pop();
+                        if page.entries.is_empty() {
+                            return Err(Fault::Unavailable);
+                        }
+                        break;
+                    }
+                }
+                page.to_json().map(Some).map_err(|_| Fault::Unavailable)
+            }
+            ToStation::ControlAck(_) => Ok(None),
+        }
+    }
+
+    fn acknowledge(
+        &mut self,
+        origin: &str,
+        log: &Membership,
+        binding: &HostBinding,
+        ack: &ControlAck,
+        now: u64,
+    ) -> Result<(), Fault> {
+        let link = LinkAssociation {
+            account_id: log.account_id().into(),
+            genesis_hash: log.genesis_hash(),
+            host_id: binding.host.clone(),
+            host_trust_gen: log
+                .host(&binding.host)
+                .ok_or(Fault::Unavailable)?
+                .host_trust_gen,
+            connection_id: binding.connection.conn.clone(),
+        };
+        let next = self
+            .ledger(origin, log)?
+            .ack(&link, ack, now)
+            .map_err(|reason| {
+                if reason.reply().is_some() {
+                    Fault::Forbidden(RefusedCall::ControlAck)
+                } else {
+                    Fault::Invalid
+                }
+            })?;
+        self.ledger = next.next.to_json();
+        Ok(())
+    }
+
+    fn update_ledger(
+        &mut self,
+        origin: &str,
+        log: &Membership,
+        update: LedgerUpdate,
+        now: u64,
+    ) -> Result<Value, Fault> {
+        let ledger = self.ledger(origin, log)?;
+        let transition = match update {
+            LedgerUpdate::Tick => ledger.tick(now),
+            LedgerUpdate::Confirm(id) => {
+                self.delivery.remove(&id);
+                ledger.confirm(&id)
+            }
+            LedgerUpdate::Refuse(id) => {
+                self.delivery.remove(&id);
+                ledger.refuse(&id)
+            }
+            LedgerUpdate::Retry { id, retry_after_ms } => {
+                if ledger
+                    .pending_reports()
+                    .iter()
+                    .any(|intent| intent.report_id == id)
+                {
+                    let retry = self.delivery.entry(id).or_insert(DeliveryRetry {
+                        attempts: 0,
+                        not_before: now,
+                    });
+                    retry.attempts = retry.attempts.saturating_add(1);
+                    let delay = retry_after_ms
+                        .unwrap_or_else(|| 1000u64.saturating_mul(1 << retry.attempts.min(8)))
+                        .clamp(1000, 86_400_000);
+                    retry.not_before = now
+                        .saturating_add(delay)
+                        .min(atem_client::canonical::MAX_SAFE_INTEGER);
+                }
+                ledger.tick(now)
+            }
+        };
+        self.ledger = transition.next.to_json();
+        self.delivery.retain(|id, _| {
+            transition
+                .next
+                .pending_reports()
+                .iter()
+                .any(|intent| &intent.report_id == id)
+        });
+        Ok(serde_json::json!({
+            "ledger":self.ledger,
+            "reports": transition.next.pending_reports().iter()
+                .filter(|intent| self.delivery.get(&intent.report_id).is_none_or(|retry| retry.not_before <= now))
+                .map(|intent| intent.to_json()).collect::<Vec<_>>(),
+            "resign_alerts":transition.next.resign_alerts(),
+            "refused_reports":transition.next.refused_reports(),
+            "stopped_client_id":transition.next.stopped_client_id(),
+            "dropped_reports":transition.next.dropped_reports(),
+        }))
+    }
+
+    fn reporting_control(
+        &mut self,
+        origin: &str,
+        log: &Membership,
+        events: &[ReportControlEvent],
+        now: u64,
+    ) -> Result<Value, Fault> {
+        if events.len() < self.report_control_seq {
+            return Err(Fault::Unavailable);
+        }
+        let digest = |events: &[ReportControlEvent]| {
+            atem_client::Hash32::of(
+                &serde_json::to_vec(events).expect("serializable report control events"),
+            )
+            .to_hex()
+        };
+        if self
+            .report_control_hash
+            .as_ref()
+            .is_some_and(|prior| prior != &digest(&events[..self.report_control_seq]))
+        {
+            return Err(Fault::Unavailable);
+        }
+        let mut ledger = self.ledger(origin, log)?;
+        for event in &events[self.report_control_seq..] {
+            ledger = match event {
+                ReportControlEvent::Stop(client) => ledger.stop_reporting(client),
+                ReportControlEvent::Resume(client) => ledger.resume_reporting(client),
+            }
+            .map_err(|_| Fault::Unavailable)?
+            .next;
+        }
+        self.report_control_seq = events.len();
+        self.report_control_hash = Some(digest(events));
+        self.ledger = ledger.to_json();
+        self.update_ledger(origin, log, LedgerUpdate::Tick, now)
+    }
+
+    fn publish(
+        &mut self,
+        origin: &str,
+        log: &Membership,
+        record: &ControlRecord,
+        revoked_at: u64,
+        covered: &[String],
+        now: u64,
+    ) -> Result<bool, Fault> {
+        if log.frozen().is_some()
+            || !matches!(verify_control(record, log), ControlCheck::Valid(_))
+            || record
+                .feed()
+                .is_some_and(|feed| feed != (origin, self.feed_id.as_str()))
+        {
+            return Err(Fault::Invalid);
+        }
+        for value in &self.records {
+            let prior =
+                ControlRecord::parse(&serde_json::to_vec(value).map_err(|_| Fault::Unavailable)?)
+                    .map_err(|_| Fault::Unavailable)?;
+            if prior.record_id() == record.record_id() {
+                return if prior.object().jcs() == record.object().jcs() {
+                    Ok(false)
+                } else {
+                    Err(Fault::Invalid)
+                };
+            }
+        }
+        let next = self
+            .ledger(origin, log)?
+            .record(record, revoked_at, covered, now)
+            .map_err(|_| Fault::Invalid)?;
+        // Prove that the full signed record fits a page before making it visible.
+        ControlSyncResult {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            origin: origin.into(),
+            feed_id: self.feed_id.clone(),
+            after: self.records.len() as u64,
+            head: self.records.len() as u64 + 1,
+            station_time: now,
+            records: vec![FeedEntry::new(self.records.len() as u64 + 1, record)],
+        }
+        .to_json()
+        .map_err(|_| Fault::Invalid)?;
+        let principal = record.principal().name();
+        let watermark = self.signing_high_water.entry(principal).or_default();
+        *watermark = (*watermark).max(record.issued_at());
+        self.records.push(record.object().to_json());
+        self.ledger = next.next.to_json();
+        Ok(true)
+    }
+
+    fn reconcile_service(
+        &mut self,
+        origin: &str,
+        log: &Membership,
+        service: ServiceControl,
+        now: u64,
+    ) -> Result<Value, Fault> {
+        use atem_client::{KeyId, KeyProvider};
+        let ServiceControl {
+            context,
+            signer,
+            desired,
+        } = service;
+        if context.genesis != log.genesis_hash().to_hex() || context.station_origin != origin {
+            return Err(Fault::Invalid);
+        }
+        let member = log.member(&context.service_id).ok_or(Fault::Invalid)?;
+        if !matches!(member.member.kind, MemberKind::Service { .. }) {
+            return Err(Fault::Invalid);
+        }
+        let key = signer
+            .public_key(&KeyId::new(&context.service_id))
+            .map_err(|_| Fault::Invalid)?;
+        if key != member.member.auth_key {
+            return Err(Fault::Invalid);
+        }
+        let principal = ControlPrincipal::Service(context.service_id.clone());
+        let covered = covered_hosts(log, &principal);
+        let records = self
+            .records
+            .iter()
+            .map(|value| {
+                ControlRecord::parse(&serde_json::to_vec(value).map_err(|_| Fault::Unavailable)?)
+                    .map_err(|_| Fault::Unavailable)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let own: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record.principal() == &principal && record.signer() == &ControlSigner::Principal
+            })
+            .collect();
+        let revoked = records.iter().any(|record| {
+            record.principal() == &principal
+                && matches!(record.action(), ControlAction::Revoke { .. })
+        });
+        let own_revoked = own
+            .iter()
+            .any(|record| matches!(record.action(), ControlAction::Revoke { .. }));
+        let interrupted = own.iter().any(|record| {
+            matches!(
+                record.action(),
+                ControlAction::Revoke {
+                    interrupt_running: true
+                } | ControlAction::InterruptRunning { .. }
+            )
+        });
+        let covered_before = own
+            .iter()
+            .any(|record| record.action() == ControlAction::Cover);
+        let held = own
+            .iter()
+            .rev()
+            .find_map(|record| match record.action() {
+                ControlAction::Hold => Some(true),
+                ControlAction::Release => Some(false),
+                _ => None,
+            })
+            .unwrap_or(false);
+        let mut actions = Vec::new();
+        match desired {
+            ServiceDesired::Revoked { interrupt_running } => {
+                if !own_revoked {
+                    actions.push(ControlAction::Revoke { interrupt_running });
+                } else if interrupt_running && !interrupted {
+                    actions.push(ControlAction::InterruptRunning { revoke_seq: None });
+                }
+            }
+            _ if revoked || member.status == atem_client::membership::MemberStatus::Removed => {}
+            ServiceDesired::Active | ServiceDesired::Held => {
+                if !covered_before {
+                    actions.push(ControlAction::Cover);
+                }
+                if desired == ServiceDesired::Held && !held {
+                    actions.push(ControlAction::Hold);
+                }
+                if desired == ServiceDesired::Active && held {
+                    actions.push(ControlAction::Release);
+                }
+            }
+        }
+        let mut published = Vec::new();
+        for action in actions {
+            let name = principal.name();
+            let previous = self.signing_high_water.get(&name).copied().unwrap_or(0);
+            let issued_at = now.max(previous.checked_add(1).ok_or(Fault::Unavailable)?);
+            if issued_at > atem_client::canonical::MAX_SAFE_INTEGER {
+                return Err(Fault::Unavailable);
+            }
+            let object = signer
+                .sign_control(&ControlBody {
+                    account_id: log.account_id().into(),
+                    genesis_hash: log.genesis_hash(),
+                    feed: Some(ControlFeed {
+                        origin: origin.into(),
+                        feed_id: self.feed_id.clone(),
+                    }),
+                    principal: principal.clone(),
+                    principal_key: Some(principal_key_of(&key).map_err(|_| Fault::Invalid)?),
+                    signer: ControlSigner::Principal,
+                    action,
+                    record_id: uuid::Uuid::new_v4().to_string(),
+                    issued_at,
+                    about: ControlAbout {
+                        integration_id: Some(context.integration_id.clone()),
+                        by: "reconciled".into(),
+                    },
+                })
+                .map_err(|_| Fault::Invalid)?;
+            let record = ControlRecord::from_signed(object).map_err(|_| Fault::Invalid)?;
+            self.publish(origin, log, &record, now, &covered, now)?;
+            published.push(record.record_id().to_owned());
+        }
+        Ok(serde_json::json!({"published":published}))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ServiceDesired {
+    Active,
+    Held,
+    Revoked { interrupt_running: bool },
+}
+
+pub(crate) struct ServiceControl {
+    pub context: crate::service_keys::ServiceKeyContext,
+    pub signer: crate::service_keys::ServiceSigner,
+    pub desired: ServiceDesired,
+}
+
+pub(super) fn ensure(root: &mut Root, origin: &str, log: &Membership) -> Result<(), Fault> {
+    if normalize_relay(origin).as_deref() != Ok(origin) {
+        return Err(Fault::Unavailable);
+    }
+    if !root.delegated.contains_key(origin) {
+        root.delegated
+            .insert(origin.into(), Stored::new(origin, log)?);
+    }
+    root.delegated[origin].ledger(origin, log)?;
+    Ok(())
+}
+
+pub(super) fn heads(root: &Root, origin: &str, log: &Membership, now: u64) -> Result<Value, Fault> {
+    root.delegated
+        .get(origin)
+        .ok_or(Fault::Unavailable)?
+        .heads(origin, log, now)
+}
+
+pub(super) fn response(
+    root: &Root,
+    origin: &str,
+    log: &Membership,
+    call: &ToStation,
+    now: u64,
+) -> Result<Option<Value>, Fault> {
+    root.delegated
+        .get(origin)
+        .ok_or(Fault::Unavailable)?
+        .response(origin, log, call, now)
+}
+
+pub(super) fn acknowledge(
+    root: &mut Root,
+    origin: &str,
+    log: &Membership,
+    binding: &HostBinding,
+    ack: &ControlAck,
+    now: u64,
+) -> Result<(), Fault> {
+    root.delegated
+        .get_mut(origin)
+        .ok_or(Fault::Unavailable)?
+        .acknowledge(origin, log, binding, ack, now)
+}
+
+pub(super) fn publish(
+    root: &mut Root,
+    origin: &str,
+    log: &Membership,
+    record: &ControlRecord,
+    revoked_at: u64,
+    covered: &[String],
+    now: u64,
+) -> Result<bool, Fault> {
+    root.delegated
+        .get_mut(origin)
+        .ok_or(Fault::Unavailable)?
+        .publish(origin, log, record, revoked_at, covered, now)
+}
+
+pub(super) fn reserve(
+    root: &mut Root,
+    origin: &str,
+    log: &Membership,
+    principal: &str,
+    now: u64,
+) -> Result<u64, Fault> {
+    let feed = root.delegated.get_mut(origin).ok_or(Fault::Unavailable)?;
+    feed.ledger(origin, log)?;
+    if atem_client::control::ControlPrincipal::parse(principal).is_none() {
+        return Err(Fault::Invalid);
+    }
+    let previous = feed.signing_high_water.get(principal).copied().unwrap_or(0);
+    let next = now.max(previous.checked_add(1).ok_or(Fault::Unavailable)?);
+    if next > atem_client::canonical::MAX_SAFE_INTEGER {
+        return Err(Fault::Unavailable);
+    }
+    feed.signing_high_water.insert(principal.into(), next);
+    Ok(next)
+}
+
+pub(crate) enum Command {
+    Ensure,
+    Ack(ControlAck),
+    Publish {
+        record: ControlRecord,
+        revoked_at: u64,
+        covered: Vec<String>,
+    },
+    Reserve {
+        principal: String,
+    },
+    Ledger(LedgerUpdate),
+    ReportingControl(Vec<ReportControlEvent>),
+    ReconcileService(ServiceControl),
+    Owner(OwnerCommand),
+}
+
+pub(crate) enum OwnerCommand {
+    Heads,
+    Sync(atem_client::control::ControlSync),
+    Reserve {
+        principal: ControlPrincipal,
+        manager: String,
+        expected: Head,
+    },
+    Publish {
+        record: ControlRecord,
+        expected: Head,
+    },
+}
+
+fn manager(log: &Membership, id: &str) -> bool {
+    log.member(id)
+        .is_some_and(|member| member.status == MemberStatus::Active && member.member.is_manager())
+}
+
+fn covered_hosts(log: &Membership, principal: &ControlPrincipal) -> Vec<String> {
+    let mut hosts = std::collections::BTreeSet::new();
+    for entry in log.entries() {
+        match (&entry.action, principal) {
+            (Action::Add { member }, ControlPrincipal::Service(id)) if member.device_id == *id => {
+                if let MemberKind::Service { scope, .. } = &member.kind {
+                    hosts.extend(scope.hosts.iter().cloned());
+                }
+            }
+            (
+                Action::SetRoles {
+                    device_id,
+                    change: RolesChange::Service { scope, .. },
+                },
+                ControlPrincipal::Service(id),
+            ) if device_id == id => hosts.extend(scope.hosts.iter().cloned()),
+            (Action::AddHost { host }, ControlPrincipal::Host(_)) => {
+                hosts.insert(host.host_id.clone());
+            }
+            _ => {}
+        }
+    }
+    hosts.into_iter().collect()
+}
+
+fn owner(
+    root: &mut Root,
+    origin: &str,
+    log: &Membership,
+    command: OwnerCommand,
+    now: u64,
+) -> Result<Value, Fault> {
+    match command {
+        OwnerCommand::Heads => heads(root, origin, log, now),
+        OwnerCommand::Sync(call) => {
+            response(root, origin, log, &ToStation::ControlSync(call), now)?
+                .ok_or(Fault::Unavailable)
+        }
+        OwnerCommand::Reserve {
+            principal,
+            manager: id,
+            expected,
+        } => {
+            if expected != log.head() || !manager(log, &id)
+                || match &principal {
+                    ControlPrincipal::Service(id) => !log.member(id).is_some_and(|member|
+                        matches!(member.member.kind, MemberKind::Service { .. })),
+                    ControlPrincipal::Host(id) => !log.entries().iter().any(|entry|
+                        matches!(&entry.action, Action::AddHost { host } if host.host_id == *id)),
+                }
+            { return Err(Fault::Invalid); }
+            Ok(serde_json::json!({"issued_at":reserve(root, origin, log, &principal.name(), now)?}))
+        }
+        OwnerCommand::Publish { record, expected } => {
+            if expected != log.head()
+                || !matches!(record.signer(), ControlSigner::Member(id) if manager(log, id))
+                || !matches!(
+                    record.action(),
+                    ControlAction::Revoke { .. } | ControlAction::InterruptRunning { .. }
+                )
+            {
+                return Err(Fault::Invalid);
+            }
+            let covered = covered_hosts(log, record.principal());
+            let appended = publish(root, origin, log, &record, now, &covered, now)?;
+            Ok(serde_json::json!({"appended":appended,"record_id":record.record_id()}))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum ReportControlEvent {
+    Stop(String),
+    Resume(String),
+}
+
+pub(crate) enum LedgerUpdate {
+    Tick,
+    Confirm(String),
+    Refuse(String),
+    Retry {
+        id: String,
+        retry_after_ms: Option<u64>,
+    },
+}
+
+pub(super) fn apply(
+    root: &mut Root,
+    log: &Membership,
+    origin: &str,
+    binding: Option<&HostBinding>,
+    command: Command,
+    now: u64,
+) -> Result<Value, Fault> {
+    // Already-committed report intents may settle during a membership freeze;
+    // a freeze still forbids new records, reservations and host evidence.
+    if log.frozen().is_some()
+        && !matches!(&command, Command::Ledger(_) | Command::ReportingControl(_))
+    {
+        return Err(Fault::Invalid);
+    }
+    if let Some(binding) = binding {
+        if root.routes.get(&binding.host) != Some(binding) || !binding.valid(log) {
+            return Err(Fault::Invalid);
+        }
+    }
+    ensure(root, origin, log)?;
+    match command {
+        Command::Ensure => heads(root, origin, log, now),
+        Command::Ack(ack) => {
+            acknowledge(root, origin, log, binding.ok_or(Fault::Invalid)?, &ack, now)?;
+            Ok(serde_json::json!({}))
+        }
+        Command::Publish {
+            record,
+            revoked_at,
+            covered,
+        } => {
+            if binding.is_some() {
+                return Err(Fault::Invalid);
+            }
+            let appended = publish(root, origin, log, &record, revoked_at, &covered, now)?;
+            Ok(serde_json::json!({"appended":appended}))
+        }
+        Command::Reserve { principal } => {
+            if binding.is_some() {
+                return Err(Fault::Invalid);
+            }
+            Ok(serde_json::json!({"issued_at":reserve(root, origin, log, &principal, now)?}))
+        }
+        Command::Ledger(update) => {
+            if binding.is_some() {
+                return Err(Fault::Invalid);
+            }
+            root.delegated
+                .get_mut(origin)
+                .ok_or(Fault::Unavailable)?
+                .update_ledger(origin, log, update, now)
+        }
+        Command::ReportingControl(events) => {
+            if binding.is_some() {
+                return Err(Fault::Invalid);
+            }
+            root.delegated
+                .get_mut(origin)
+                .ok_or(Fault::Unavailable)?
+                .reporting_control(origin, log, &events, now)
+        }
+        Command::ReconcileService(service) => {
+            if binding.is_some() {
+                return Err(Fault::Invalid);
+            }
+            root.delegated
+                .get_mut(origin)
+                .ok_or(Fault::Unavailable)?
+                .reconcile_service(origin, log, service, now)
+        }
+        Command::Owner(command) => {
+            if binding.is_some() {
+                return Err(Fault::Invalid);
+            }
+            owner(root, origin, log, command, now)
+        }
+    }
+}

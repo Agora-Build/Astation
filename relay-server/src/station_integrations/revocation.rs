@@ -69,6 +69,11 @@ impl StationIntegrations {
                 if self.revoked_context(id).await.as_ref() != Ok(&context) {
                     return;
                 }
+                if self.app.recovery.delegated_enabled() {
+                    // Delegated completion comes from the committed ACK ledger,
+                    // even if the owner used R9 removal as the final backstop.
+                    return;
+                }
                 let _ = self
                     .portal
                     .report(IntegrationReport {

@@ -46,6 +46,7 @@ class AstationHubManager: ObservableObject {
     private let accountDefaults: UserDefaults
     private(set) var portalSettings: AccountServiceSettings?
     private(set) var portalAuth: AstationAccountAuth?
+    @MainActor private var integrationAuth: AstationAccountAuth?
     let portalAPI: PortalAPIClient
     @Published private(set) var signedInAccount: String?
     @Published private(set) var accountSignInRequired = true
@@ -300,36 +301,97 @@ class AstationHubManager: ObservableObject {
     @MainActor private var accountRecovery: AstationRecoveryCoordinator?
     @MainActor private var approvalPushHints: RemotePushHints?
     @MainActor private var approvalPushScope: String?
+    @MainActor private var outcomeReminders: RemoteOutcomeReminders?
+    @MainActor private var outcomeReminderScope: String?
+    var hostOutcomesDidChange: (@MainActor (String, RemoteHostWork) -> Void)?
+
+    @MainActor func takeOutcomeReminder(clientID: String, work: RemoteHostWork) -> Bool {
+        guard hostWorkClients[clientID] === work, work.canReviewOutcomes, work.alertsLoaded,
+              !work.loadingAlerts, let context = sessionContext(for: clientID),
+              let welcome = nativeSessionClients[clientID]?.welcome,
+              welcome.account_id == context.account, welcome.atem_device_id == context.device,
+              let trust = welcome.host_trust_gen else { return false }
+        do {
+            let log = try recoveryCoordinator().channelMembership(hostID: context.device)
+            guard log.accountId() == context.account, log.host(hostId: context.device)?.hostTrustGen == trust,
+                  let member = log.member(deviceId: AstationIdentity.shared.id), member.kind == "native",
+                  member.status == .active, member.roles.contains("control") else { return false }
+            let scope = log.accountId() + ":" + log.genesisHash()
+            if outcomeReminderScope != scope {
+                outcomeReminders = nil; outcomeReminderScope = nil
+                let store = try RemoteRecoveryStore(outcomeAccountID: log.accountId(), genesisHash: log.genesisHash(),
+                    deviceID: AstationIdentity.shared.id)
+                outcomeReminders = try RemoteOutcomeReminders(accountID: log.accountId(), genesisHash: log.genesisHash(),
+                    deviceID: AstationIdentity.shared.id, checkpoint: store.read(), persist: { try store.write($0) })
+                outcomeReminderScope = scope
+            }
+            return try outcomeReminders?.offer(host: RemoteWorkHost(account: context.account, device: context.device, trust: trust),
+                alerts: work.alerts, now: UInt64(max(0, Date().timeIntervalSince1970 * 1000))) == true
+        } catch {
+            Log.warn("[Outcomes] Protected reminder state is unavailable; authenticated outcome review remains available")
+            return false
+        }
+    }
 
     @MainActor func verifyApprovalPush(_ userInfo: [AnyHashable: Any], tapped: Bool) -> ApprovalPushHint? {
         do {
-            guard let json = userInfo["r9_hint"] as? String, json.utf8.count <= 16_384 else { return nil }
-            let parsed = try signedObjectInfo(json: json)
-            guard parsed.bodyType == "atem-push-hint",
-                  let body = try JSONSerialization.jsonObject(with: Data(parsed.bodyJcs.utf8)) as? [String: Any],
-                  body["account_id"] as? String == e2eDataAccount, let host = body["host_id"] as? String else { return nil }
-            let log = try recoveryCoordinator().channelMembership(hostID: host)
-            let scope = log.accountId() + ":" + log.genesisHash()
-            if approvalPushScope != scope {
-                approvalPushHints = nil; approvalPushScope = nil
-                let store = try RemoteRecoveryStore(pushAccountID: log.accountId(), genesisHash: log.genesisHash(), deviceID: AstationIdentity.shared.id)
-                approvalPushHints = try RemotePushHints(accountID: log.accountId(), genesisHash: log.genesisHash(),
-                    deviceID: AstationIdentity.shared.id, checkpoint: store.read(), persist: { try store.write($0) })
-                approvalPushScope = scope
-            }
-            guard let hints = approvalPushHints else { return nil }
-            let now = UInt64(max(0, Date().timeIntervalSince1970 * 1000))
+            guard let (json, log, hints, now) = try pushVerificationContext(userInfo) else { return nil }
             if tapped {
-                let target = try hints.target(hintJSON: json, log: log, now: now)
+                guard case .approval(let target) = try hints.target(hintJSON: json, log: log, now: now) else { return nil }
                 let hint = try verifyPushHint(hintJson: json, log: log, nowMs: now, verifier: .client)
                 if case .resolved = hint.state() { return ApprovalPushHint(verified: target, resolved: true) }
                 return ApprovalPushHint(verified: target, resolved: false)
             }
-            guard let notice = try hints.receive(hintJSON: json, log: log, now: now) else { return nil }
-            if case .resolved = notice.state { return ApprovalPushHint(verified: notice.approval, resolved: true) }
-            return ApprovalPushHint(verified: notice.approval, resolved: false)
+            guard case .approval = try hints.target(hintJSON: json, log: log, now: now),
+                  let notice = try hints.receive(hintJSON: json, log: log, now: now),
+                  case .approval(let approval) = notice.target else { return nil }
+            if case .resolved = notice.state { return ApprovalPushHint(verified: approval, resolved: true) }
+            return ApprovalPushHint(verified: approval, resolved: false)
         } catch {
             Log.warn("[Approvals] Sealed notification could not be verified; reconnect for current host state")
+            return nil
+        }
+    }
+
+    @MainActor private func pushVerificationContext(_ userInfo: [AnyHashable: Any]) throws -> (String, MembershipLog, RemotePushHints, UInt64)? {
+        guard let json = userInfo["r9_hint"] as? String, json.utf8.count <= 16_384 else { return nil }
+        let parsed = try signedObjectInfo(json: json)
+        guard parsed.bodyType == "atem-push-hint",
+              let body = try JSONSerialization.jsonObject(with: Data(parsed.bodyJcs.utf8)) as? [String: Any],
+              body["account_id"] as? String == e2eDataAccount, let host = body["host_id"] as? String else { return nil }
+        let log = try recoveryCoordinator().channelMembership(hostID: host)
+        let scope = log.accountId() + ":" + log.genesisHash()
+        if approvalPushScope != scope {
+            approvalPushHints = nil; approvalPushScope = nil
+            let store = try RemoteRecoveryStore(pushAccountID: log.accountId(), genesisHash: log.genesisHash(), deviceID: AstationIdentity.shared.id)
+            approvalPushHints = try RemotePushHints(accountID: log.accountId(), genesisHash: log.genesisHash(),
+                deviceID: AstationIdentity.shared.id, checkpoint: store.read(), persist: { try store.write($0) })
+            approvalPushScope = scope
+        }
+        guard let hints = approvalPushHints else { return nil }
+        return (json, log, hints, UInt64(max(0, Date().timeIntervalSince1970 * 1000)))
+    }
+
+    /// A hint requests authenticated catch-up. It never supplies a task card,
+    /// grants control, or authorizes the notification's proposed outcome.
+    @MainActor func handleOutcomePush(_ userInfo: [AnyHashable: Any], tapped: Bool) -> String? {
+        do {
+            guard let (json, log, hints, now) = try pushVerificationContext(userInfo),
+                  case .alert(let target) = try hints.target(hintJSON: json, log: log, now: now) else { return nil }
+            if !tapped {
+                guard let notice = try hints.receive(hintJSON: json, log: log, now: now),
+                      case .alert = notice.target else { return nil }
+            }
+            startIdentityRelay()
+            guard let id = connectedClients.first(where: {
+                guard let context = sessionContext(for: $0.id) else { return false }
+                return context.account == target.accountId && context.device == target.hostId
+            })?.id else { return nil }
+            requestAgentList(from: id)
+            hostWorkClient(for: id)?.refreshAlerts()
+            return id
+        } catch {
+            Log.warn("[Outcomes] Sealed hint could not be verified; reconnect for current host state")
             return nil
         }
     }
@@ -349,7 +411,32 @@ class AstationHubManager: ObservableObject {
             self.refreshChannelsAfterMembershipCommit(head)
         }
         accountRecovery = coordinator
+        if coordinator.delegatedControlsAvailable, let owner = signedInAccount, let settings = portalSettings {
+            let epoch = integrationAccountGeneration
+            let auth = try integrationAuthorization(settings: settings)
+            guard let configuration = auth.configuration else { throw AccountLoginError.configuration }
+            let portal = try PortalIntegrationHTTP(configuration: configuration, portalOrigin: settings.portalURL,
+                ownerAccount: owner, accessToken: {
+                    guard try await auth.current()?.session.subject == owner else { throw AccountLoginError.signInRequired }
+                    return try await auth.accessToken()
+                })
+            coordinator.resumeControlDelivery(portal: portal, current: { [weak self, weak coordinator] in
+                guard let self, let coordinator else { return false }
+                return self.accountRecovery === coordinator && self.integrationAccountGeneration == epoch
+                    && self.signedInAccount == owner && !self.accountSignInRequired && self.stationRelayUrl == targetRelay
+            })
+        }
         return coordinator
+    }
+
+    @MainActor func integrationAuthorization(settings: AccountServiceSettings) throws -> AstationAccountAuth {
+        let config = try AccountOIDCConfiguration(issuer: settings.issuer, clientID: settings.clientID,
+            resource: settings.portalURL, requiredScope: "integrations:read", additionalScopes: ["integrations:approve"])
+        if let integrationAuth, integrationAuth.configuration == config { return integrationAuth }
+        let auth = AstationAccountAuth(configuration: config,
+            storage: AccountKeychainStorage(service: "build.agora.astation.integrations-v1." + settings.storageContext))
+        integrationAuth = auth
+        return auth
     }
 
     @MainActor private func refreshChannelsAfterMembershipCommit(_ head: LogHead) {
@@ -1857,7 +1944,11 @@ class AstationHubManager: ObservableObject {
                   current.account == context.account, current.device == context.device else { return false }
             return self.r9Connections[clientID]?.sendHostWork(json) ?? false
         })
-        work.onChange = { [weak self] in self?.hostWorkRevision &+= 1 }
+        work.onChange = { [weak self, weak work] in
+            guard let self, let work else { return }
+            self.hostWorkRevision &+= 1
+            self.hostOutcomesDidChange?(clientID, work)
+        }
         work.onStarted = { [weak self] _ in self?.requestAgentList(from: clientID) }
         hostWorkClients[clientID] = work
         hostWorkAccounts[clientID] = owner
@@ -1865,9 +1956,19 @@ class AstationHubManager: ObservableObject {
         return work
     }
 
+    @MainActor func canReviewHostOutcomes(for clientID: String) -> Bool {
+        guard let client = nativeSessionClients[clientID] else { return false }
+        return client.hasRegistrySnapshot && client.canReviewApprovals && client.features.contains("host.alerts")
+    }
+
     @MainActor private func updateHostWork(clientID: String) {
-        guard let work = hostWorkClients[clientID] else { return }
         let session = nativeSessionClients[clientID]
+        guard let work = hostWorkClients[clientID] else {
+            // Catch up on owner alerts even when no Activity or launch sheet is open.
+            if session?.hasRegistrySnapshot == true, session?.canReviewApprovals == true,
+               session?.features.contains("host.alerts") == true { _ = hostWorkClient(for: clientID) }
+            return
+        }
         let welcome = session?.hasRegistrySnapshot == true ? session?.welcome : nil
         let host = welcome.flatMap { value in
             value.account_id.flatMap { account in value.atem_device_id.flatMap { device in
@@ -1949,6 +2050,10 @@ class AstationHubManager: ObservableObject {
             client.connectionChanged()
             if !connectedClients.contains(where: { $0.id == id }) {
                 nativeSessionClients.removeValue(forKey: id)
+                MainActor.assumeIsolated {
+                    hostWorkClients.removeValue(forKey: id)?.connected(host: nil, attachment: nil, features: [], control: false)
+                    hostWorkAccounts.removeValue(forKey: id)
+                }
                 agentsByClientId.removeValue(forKey: id)
                 sessionStatusByClientId.removeValue(forKey: id)
             }

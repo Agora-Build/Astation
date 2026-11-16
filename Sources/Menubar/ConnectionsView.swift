@@ -390,6 +390,7 @@ private struct AgentListPanel: View {
     let clientId: String?
     let onRemoteControl: (String, AtemAgentInfo?) -> Void
     @State private var showingLaunch = false
+    @State private var showingOutcomes = false
 
     private var agents: [AtemAgentInfo] {
         guard let id = clientId else { return [] }
@@ -445,6 +446,11 @@ private struct AgentListPanel: View {
                         .buttonStyle(.borderless)
                         .font(.caption)
                         .disabled(accessBlockReason != nil || sessionStatus?.phase != .ready)
+                        if hubManager.canReviewHostOutcomes(for: id) {
+                            Button("Outcomes") { showingOutcomes = true }
+                                .buttonStyle(.borderless).font(.caption)
+                                .disabled(accessBlockReason != nil || sessionStatus?.phase != .ready)
+                        }
                         Button {
                             onRemoteControl(id, nil)
                         } label: {
@@ -588,6 +594,11 @@ private struct AgentListPanel: View {
                     onRemoteControl(id, agent)
                 })
                 .id(id)
+            }
+        }
+        .sheet(isPresented: $showingOutcomes) {
+            if let id = clientId {
+                HostOutcomeView(hub: hubManager, clientID: id) { showingOutcomes = false }.id(id)
             }
         }
     }

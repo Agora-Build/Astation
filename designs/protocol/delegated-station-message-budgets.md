@@ -27,9 +27,12 @@ The existing encrypted member-channel WebSocket limit is **2 MiB**
 
 ## Current Station implementation
 
-The Station does not yet implement the delegated `membership_fetch` or
-`control_sync` handlers, so it has no 512 KiB response assumption to remove.
-Its existing push ACK serializer already measures the complete envelope
-against 262,144 bytes (`relay-server/src/remote_api/push_ack.rs`).
-The forthcoming delegated handlers must preserve the R9.9 bound. This note
-does not claim that their runtime enforcement or joint tests are complete.
+The gated #79 implementation uses Atem shared readers/builders at
+`c7b0054fe1208cad1bac98162d9d3ea99b5307cc` for complete control messages.
+Both control and membership pages stop at 64 entries or the complete byte
+limit, whichever comes first. A signed entry is never truncated.
+
+The shared fixtures run through the actual Rust and Swift bindings. Real
+WebSocket, Postgres and replica tests cover the Station handlers; this does
+not establish the remaining native proxy or real host/Portal joint flow.
+See [implementation status](delegated-station-implementation.md).

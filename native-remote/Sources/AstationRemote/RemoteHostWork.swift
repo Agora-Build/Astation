@@ -38,11 +38,44 @@ public struct RemoteLaunchRecord: Codable, Equatable, Identifiable, Sendable {
 }
 
 public struct RemoteWorkProgress: Codable, Equatable, Identifiable, Sendable {
+    public struct Resolution: Codable, Equatable, Sendable {
+        public let by: String
+        public let at: UInt64
+    }
     public let task_id: String
     public let receipt_id: String
     public let state: String
     public let detail: String
+    public let result: RemoteWorkResult?
+    public let resolved: Resolution?
     public var id: String { task_id }
+}
+
+public struct RemoteWorkResult: Codable, Equatable, Sendable {
+    public let kind: String
+    public let id: String
+    public let version: UInt64
+    public let digest: String
+    public let text: String
+}
+
+public struct RemoteOutcomeAlert: Decodable, Equatable, Identifiable, Sendable {
+    public let alert_id: String
+    public let seq: UInt64
+    public let kind: String
+    public let host_id: String
+    public let session_id: String
+    public let task_id: String
+    public let sender: String
+    public let reason: String
+    public let created_at: UInt64
+    public var id: String { alert_id }
+}
+
+public struct RemoteOutcomeReview: Equatable, Identifiable, Sendable {
+    public let alert: RemoteOutcomeAlert
+    public let id: UUID
+    fileprivate let generation: UUID
 }
 
 public struct RemoteMessageProgress: Decodable, Equatable, Identifiable, Sendable {
@@ -77,6 +110,10 @@ public final class RemoteHostWork {
     public private(set) var storageFailed = false
     public private(set) var needsReconnect = false
     public private(set) var trackingStatus: String?
+    public private(set) var alerts: [RemoteOutcomeAlert] = []
+    public private(set) var loadingAlerts = false
+    public private(set) var alertsLoaded = false
+    public private(set) var alertStatus: String?
     public var onChange: (() -> Void)?
     public var onStarted: ((RemoteLaunchStatus) -> Void)?
 
@@ -88,6 +125,12 @@ public final class RemoteHostWork {
     private var host: RemoteWorkHost?
     private var attachment: String?
     private var features: Set<String> = []
+    private var hasControl = false
+    private let resolutionEnabled: Bool
+    private var alertScan: [RemoteOutcomeAlert] = []
+    private var settledTasks: Set<String> = []
+    private var lastAlertQuery: UInt64 = 0
+    private var outcomeGeneration = UUID()
     private var pending: [String: Pending] = [:]
     private var lastQuery: UInt64 = 0
     private var trackedTasks: [RemoteWorkHost: Set<String>] = [:]
@@ -100,8 +143,10 @@ public final class RemoteHostWork {
     public init(load: () throws -> [RemoteLaunchRecord], save: @escaping ([RemoteLaunchRecord]) throws -> Void,
                 clock: @escaping () -> UInt64 = { UInt64(Date().timeIntervalSince1970 * 1000) },
                 makeID: @escaping () -> String = { UUID().uuidString.lowercased() },
+                resolutionEnabled: Bool = false,
                 send: @escaping (String) -> Bool) {
         self.save = save; self.send = send; self.clock = clock; self.makeID = makeID
+        self.resolutionEnabled = resolutionEnabled
         do {
             let records = try load()
             guard records.count <= 4096, Set(records.map(\.requestID)).count == records.count,
@@ -118,11 +163,15 @@ public final class RemoteHostWork {
 
     public func connected(host: RemoteWorkHost?, attachment: String?, features: Set<String>, control: Bool) {
         guard self.host != host || self.attachment != attachment || self.features != features
+                || hasControl != control
                 || available != (host != nil && attachment != nil && control && features.contains("host.launch")) else { return }
         self.host = host; self.attachment = attachment; self.features = features
+        hasControl = control
         available = host != nil && attachment != nil && control && features.contains("host.launch")
         pending = [:]; profiles = []; work = []; messages = []; loadingProfiles = false; lastQuery = 0; needsReconnect = false
         trackingStatus = nil
+        alerts = []; alertScan = []; settledTasks = []; loadingAlerts = false; alertsLoaded = false; alertStatus = nil; lastAlertQuery = 0
+        outcomeGeneration = UUID()
         if storageFailed { status = "Launch recovery data is unreadable. New launches are disabled." }
         else if available { status = "Choose a launch profile approved on this host." }
         else if host != nil { status = "Remote launch is unavailable. Enable hosting and approve a profile on Atem." }
@@ -130,11 +179,23 @@ public final class RemoteHostWork {
         onChange?()
         if available { refreshProfiles() }
         if host != nil { refresh() }
+        refreshAlerts()
     }
 
     public var currentLaunches: [RemoteLaunchRecord] { launches.filter { $0.host == host }.reversed() }
     public var canTrackMessages: Bool { canQueryReceipts && features.contains("host.messages") }
     public var canTrackTasks: Bool { canQueryReceipts && features.contains("host.work") }
+    public var canReviewOutcomes: Bool { canQueryReceipts && hasControl && features.contains("host.alerts") }
+    public var canResolveOutcomes: Bool { canReviewOutcomes && resolutionEnabled && features.contains("host.delegated") }
+    public func isCheckingOutcome(_ taskID: String) -> Bool { pending.values.contains { $0.identity == taskID && $0.op != "alert_list" } }
+    public func canResolve(_ review: RemoteOutcomeReview) -> Bool {
+        canResolveOutcomes && alertsLoaded && review.generation == outcomeGeneration && alerts.contains(review.alert)
+            && !isCheckingOutcome(review.alert.task_id)
+    }
+    public func reviewOutcome(_ alert: RemoteOutcomeAlert) -> RemoteOutcomeReview? {
+        guard canResolveOutcomes, alertsLoaded, alerts.contains(alert), !isCheckingOutcome(alert.task_id) else { return nil }
+        return RemoteOutcomeReview(alert: alert, id: UUID(), generation: outcomeGeneration)
+    }
     private var canQueryReceipts: Bool { host != nil && attachment != nil && !storageFailed && !needsReconnect }
 
     public func refreshProfiles() {
@@ -170,7 +231,7 @@ public final class RemoteHostWork {
         for id in trackedTasks[host] ?? [] where features.contains("host.work") {
             guard pending.count < 32 else { break }
             if let progress = work.first(where: { $0.task_id == id }),
-               ["completed", "failed", "cancelled", "expired", "outcome_unknown"].contains(progress.state) { continue }
+               ["completed", "failed", "cancelled", "expired"].contains(progress.state) { continue }
             if !pending.values.contains(where: { $0.identity == id }) {
                 _ = request("work_query", identity: id, fields: ["task_id": id])
             }
@@ -179,13 +240,48 @@ public final class RemoteHostWork {
             guard pending.count < 32 else { break }
             if let receipt = messages.first(where: { $0.message_id == id }), receipt.recipients.allSatisfy({ recipient in
                 guard let work = recipient.delivery.work else { return ["stored", "refused"].contains(recipient.delivery.state) }
-                return ["completed", "failed", "cancelled", "expired", "outcome_unknown"].contains(work.state)
+                return ["completed", "failed", "cancelled", "expired"].contains(work.state)
             }) { continue }
             if !pending.values.contains(where: { $0.identity == id }) {
                 _ = request("message_query", identity: id, fields: ["message_id": id])
             }
         }
         lastQuery = clock()
+    }
+
+    /// Only a completed scan can remove old cards. A failed later page is not
+    /// evidence that an outcome was resolved on the host.
+    public func refreshAlerts() {
+        guard canReviewOutcomes, !loadingAlerts else { return }
+        alertScan = []; loadingAlerts = true; alertsLoaded = false; alertStatus = nil; lastAlertQuery = clock()
+        if !request("alert_list") { loadingAlerts = false; alertStatus = "Could not check outcomes. Retry the host connection." }
+        onChange?()
+    }
+
+    /// The caller must show an explicit review. The SDK validates the complete
+    /// resolution and correlates the host's exact result; no operation is replayed.
+    @discardableResult
+    public func resolve(_ review: RemoteOutcomeReview, failed detail: String) -> Bool {
+        resolve(review, resolution: ["kind": "failed", "detail": detail])
+    }
+
+    @discardableResult
+    public func resolve(_ review: RemoteOutcomeReview, done snapshotJSON: String) -> Bool {
+        guard snapshotJSON.utf8.count <= 1_048_576,
+              let canonical = try? canonicalJson(json: snapshotJSON),
+              let snapshot = try? JSONSerialization.jsonObject(with: Data(canonical.utf8)) as? [String: Any] else {
+            alertStatus = "Paste a published memory or vault result snapshot."; onChange?(); return false
+        }
+        return resolve(review, resolution: ["kind": "done", "result": snapshot])
+    }
+
+    private func resolve(_ review: RemoteOutcomeReview, resolution: [String: Any]) -> Bool {
+        guard canResolve(review) else { return false }
+        let sent = request("work_resolve", identity: review.alert.task_id,
+            fields: ["task_id": review.alert.task_id, "resolution": resolution])
+        alertStatus = sent ? "Checking the host's resolution receipt."
+            : "Resolution was not confirmed. Check the result snapshot and connection, then refresh outcomes."
+        onChange?(); return sent
     }
 
     public func tick() {
@@ -195,6 +291,7 @@ public final class RemoteHostWork {
         for (id, exchange) in expired {
             pending.removeValue(forKey: id)
             if exchange.op == "host_profiles" { loadingProfiles = false }
+            if exchange.op == "alert_list" { loadingAlerts = false; alertScan = [] }
         }
         if !expired.isEmpty {
             needsReconnect = true
@@ -202,9 +299,13 @@ public final class RemoteHostWork {
             if expired.values.contains(where: { ["message_query", "work_query"].contains($0.op) }) {
                 trackingStatus = "Receipt response delayed. Reconnect to check again."
             }
+            if expired.values.contains(where: { ["alert_list", "work_resolve"].contains($0.op) }) {
+                alertStatus = "Outcome response delayed. Reconnect to check host state. A resolution is never replayed."
+            }
             onChange?()
         }
         if time >= lastQuery && time - lastQuery >= 5_000 { refresh() }
+        if time >= lastAlertQuery && time - lastAlertQuery >= 30_000 { refreshAlerts() }
     }
 
     /// Called only with an event already authenticated and correlated by atem-client.
@@ -218,6 +319,15 @@ public final class RemoteHostWork {
             pending.removeValue(forKey: re)
             if exchange.op == "host_profiles" { loadingProfiles = false }
             let code = data["code"] as? String ?? "unknown_error"
+            if exchange.op == "alert_list" {
+                loadingAlerts = false; alertScan = []
+                alertStatus = "Atem could not list outcomes: \(code). Refresh to start a new scan."
+            }
+            if exchange.op == "work_resolve" {
+                alertStatus = "Resolution was not confirmed: \(code). Refresh outcomes before deciding again."
+                alertsLoaded = false; outcomeGeneration = UUID()
+                lastAlertQuery = 0
+            }
             if ["message_query", "work_query"].contains(exchange.op) {
                 trackingStatus = "Atem refused the receipt lookup: \(code)."
             }
@@ -253,12 +363,41 @@ public final class RemoteHostWork {
                     : launch.state == .outcome_unknown ? "Launch outcome is unknown. Check the host before starting another agent."
                     : "Agent launch failed. Review the approved profile on the host."
                 if launch.state == .started && previous?.state != .started { onStarted?(launch) }
-            case "work" where exchange.op == "work_query":
+            case "work" where ["work_query", "work_resolve"].contains(exchange.op):
                 let progress = try Self.decode(RemoteWorkProgress.self, result["work"] as Any)
                 guard progress.task_id == exchange.identity else { return false }
                 if let index = work.firstIndex(where: { $0.task_id == progress.task_id }) { work[index] = progress }
                 else { work.append(progress) }
+                if ["awaiting_result", "completed", "failed", "cancelled", "expired"].contains(progress.state) {
+                    settledTasks.insert(progress.task_id)
+                    alerts.removeAll { $0.task_id == progress.task_id }
+                }
+                if exchange.op == "work_resolve" { alertStatus = "Resolution confirmed by Atem." }
                 trackingStatus = nil
+            case "alerts" where exchange.op == "alert_list":
+                let page = try Self.decode([RemoteOutcomeAlert].self, result["alerts"] as Any)
+                guard let more = result["more"] as? Bool, page.count <= 64, !more || !page.isEmpty,
+                      alertScan.count + page.count <= 256,
+                      !more || alertScan.count + page.count < 256 else { return false }
+                var previous = alertScan.last?.seq ?? 0
+                var ids = Set(alertScan.map(\.id)), tasks = Set(alertScan.map(\.task_id))
+                for alert in page {
+                    guard alert.host_id == host?.atem_device_id, alert.seq > previous,
+                          ids.insert(alert.id).inserted, tasks.insert(alert.task_id).inserted else { return false }
+                    previous = alert.seq
+                }
+                alertScan += page
+                pending.removeValue(forKey: re)
+                if more, let after = page.last?.id {
+                    if !request("alert_list", identity: after, fields: ["after": after]) {
+                        loadingAlerts = false; alertScan = []
+                        alertStatus = "Outcome scan was interrupted. Refresh to check again."
+                    }
+                } else {
+                    alerts = alertScan.filter { !settledTasks.contains($0.task_id) }
+                    alertScan = []; loadingAlerts = false; alertsLoaded = true
+                    alertStatus = nil
+                }
             case "message" where exchange.op == "message_query":
                 let message = try Self.decode(RemoteMessageProgress.self, result["message"] as Any)
                 guard message.message_id == exchange.identity else { return false }

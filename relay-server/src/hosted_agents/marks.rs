@@ -46,6 +46,9 @@ impl MarkCall {
             message_id: self.message_id.clone(),
             workflow_id: self.workflow_id.clone(),
             sender,
+            kind: Default::default(),
+            reply_to: None,
+            from_session: None,
             created_at: self.created_at,
             expires_at: self.expires_at,
             recipients: vec![Recipient {

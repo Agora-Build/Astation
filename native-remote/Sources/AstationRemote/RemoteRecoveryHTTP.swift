@@ -41,6 +41,12 @@ public protocol RemoteRecoveryTransport: Sendable {
     func hostAccept(genesisHash: String, hostID: String, initFrame: Data) async throws -> Data
 }
 
+public protocol RemoteControlTransport: Sendable {
+    func controlHeads(genesisHash: String) async throws -> String
+    func reserveControlTime(genesisHash: String, principal: String, managerID: String, expected: LogHead) async throws -> UInt64
+    @MainActor func publishControl(log: MembershipLog, recordJSON: String) async throws -> Bool
+}
+
 private final class RecoveryRedirectGuard: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
         newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
@@ -49,7 +55,7 @@ private final class RecoveryRedirectGuard: NSObject, URLSessionTaskDelegate, @un
 }
 
 /// TLS/account login limits storage access. Only the shared verifier grants cryptographic trust.
-public final class RemoteRecoveryHTTP: RemoteRecoveryTransport, RemoteDeviceEnrollmentTransport, @unchecked Sendable {
+public final class RemoteRecoveryHTTP: RemoteRecoveryTransport, RemoteDeviceEnrollmentTransport, RemoteControlTransport, @unchecked Sendable {
     private let baseURL: URL
     private let stationOrigin: String
     private let session: URLSession
@@ -88,6 +94,73 @@ public final class RemoteRecoveryHTTP: RemoteRecoveryTransport, RemoteDeviceEnro
         url.queryItems = [URLQueryItem(name: "after", value: String(after))]
         let (_, data) = try await perform(url: url.url!, method: "GET")
         return try Self.page(data)
+    }
+
+    /// Announcements are synchronization hints, never a trusted device-list head.
+    public func controlHeads(genesisHash: String) async throws -> String {
+        guard RemoteRecoveryKit.validHash(genesisHash) else { throw RemoteChannelError.invalidInput }
+        let (_, data) = try await perform(url: path(genesisHash, "control"), method: "GET")
+        let text = String(decoding: data, as: UTF8.self)
+        guard case .heads(let feeds, _) = try relayDecodeToHost(message: text),
+              feeds.count == 1, feeds[0].origin == stationOrigin else {
+            throw RemoteRecoveryTransportError.invalidResponse
+        }
+        return text
+    }
+
+    public func controlSync(genesisHash: String, callJSON: String) async throws -> String {
+        guard RemoteRecoveryKit.validHash(genesisHash),
+              case .controlSync(_, let origin, _, _) = try relayDecodeToStation(message: callJSON),
+              origin == stationOrigin else { throw RemoteChannelError.invalidInput }
+        let (_, data) = try await perform(url: path(genesisHash, "control/sync"), method: "POST", body: Data(callJSON.utf8))
+        let text = String(decoding: data, as: UTF8.self)
+        if case .controlSyncRefused = try relayDecodeToHost(message: text) {
+            throw RemoteRecoveryTransportError.accessDenied
+        }
+        guard try relayControlSyncAnswers(call: callJSON, result: text) == .answers else {
+            throw RemoteRecoveryTransportError.invalidResponse
+        }
+        return text
+    }
+
+    public func reserveControlTime(genesisHash: String, principal: String, managerID: String, expected: LogHead) async throws -> UInt64 {
+        guard RemoteRecoveryKit.validHash(genesisHash), RemoteRecoveryKit.validID(managerID),
+              expected.seq > 0, expected.seq <= 9_007_199_254_740_991, RemoteRecoveryKit.validHash(expected.hash),
+              ["service:", "host:"].contains(where: { principal.hasPrefix($0) && RemoteRecoveryKit.validID(String(principal.dropFirst($0.count))) }) else {
+            throw RemoteChannelError.invalidInput
+        }
+        let (_, data) = try await perform(url: path(genesisHash, "control/reservations"), method: "POST",
+            body: Self.encode(["principal": principal, "manager": managerID, "expected": ["seq": expected.seq, "hash": expected.hash]]))
+        let reply = try Self.dictionary(data)
+        guard Set(reply.keys) == ["issued_at"], let time = reply["issued_at"] as? NSNumber,
+              CFGetTypeID(time) != CFBooleanGetTypeID(), time.uint64Value > 0,
+              time.uint64Value <= 9_007_199_254_740_991, time.stringValue == String(time.uint64Value) else {
+            throw RemoteRecoveryTransportError.invalidResponse
+        }
+        return time.uint64Value
+    }
+
+    /// Only delivers an already-signed, independently verified manager record.
+    /// The native publisher owns confirmation and durable signing/delivery state.
+    @MainActor
+    public func publishControl(log: MembershipLog, recordJSON: String) async throws -> Bool {
+        let log = log.snapshot()
+        let body = try parseControlRecord(recordJson: recordJSON)
+        guard log.frozen() == nil, body.genesisHash == log.genesisHash(), body.accountId == log.accountId(),
+              body.origin == nil || body.origin == stationOrigin,
+              body.signer.hasPrefix("member:"), ["revoke", "interrupt_running"].contains(body.action),
+              case .valid = try verifyControlRecord(log: log, recordJson: recordJSON) else {
+            throw RemoteChannelError.invalidInput
+        }
+        let head = log.head()
+        let (_, data) = try await perform(url: path(log.genesisHash(), "control/records"), method: "POST",
+            body: Self.encode(["record": Self.object(recordJSON), "expected": ["seq": head.seq, "hash": head.hash]]))
+        let reply = try Self.dictionary(data)
+        guard Set(reply.keys) == ["record_id", "appended"], reply["record_id"] as? String == body.recordId,
+              let appended = reply["appended"] as? NSNumber, CFGetTypeID(appended) == CFBooleanGetTypeID() else {
+            throw RemoteRecoveryTransportError.invalidResponse
+        }
+        return appended.boolValue
     }
 
     public func append(genesisHash: String, request: AppendRequest) async throws -> RemoteRecoveryAppendReply {

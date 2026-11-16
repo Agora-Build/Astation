@@ -254,10 +254,13 @@ async fn postgres_background_poll_nudge_restart_and_closed_readiness() {
         portal.shared.reports.lock().await[0]["state"],
         "waiting_for_host"
     );
+    #[cfg(not(feature = "hosted-agent-api"))]
     assert_eq!(
         portal.shared.reports.lock().await[0]["reason"],
         "Hosted execution awaits end-to-end verification"
     );
+    #[cfg(feature = "hosted-agent-api")]
+    assert!(portal.shared.reports.lock().await[0].get("reason").is_none());
     let saved = runtime.policies.load(&runtime.binding).await.unwrap();
     assert!(!saved.denied);
     // An unsigned nudge asks for a fresh authenticated snapshot, not a cursor jump.
@@ -335,13 +338,13 @@ async fn postgres_background_poll_nudge_restart_and_closed_readiness() {
     db.cleanup().await;
 }
 
-async fn signed_action(runtime: &StationIntegrations, f: &Fixture, action: atem_client::membership::Action) {
+pub(super) async fn signed_action(runtime: &StationIntegrations, f: &Fixture, action: atem_client::membership::Action) {
     let log = runtime.recovery_log(&f.log.genesis_hash().to_hex(), OWNER).await.unwrap();
     let body = log.draft("phone", chrono::Utc::now().timestamp_millis() as u64, &action);
     append_body(runtime, f, body).await;
 }
 
-async fn append_body(runtime: &StationIntegrations, f: &Fixture, body: Value) {
+pub(super) async fn append_body(runtime: &StationIntegrations, f: &Fixture, body: Value) {
     use atem_client::{membership::Entry, signed::SignedObject};
     let log = runtime.recovery_log(&f.log.genesis_hash().to_hex(), OWNER).await.unwrap();
     let entry = Entry::parse_bytes(SignedObject::sign(&f.keys, &KeyId::new("manager"), body).unwrap()

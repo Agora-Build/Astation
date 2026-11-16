@@ -35,7 +35,7 @@ jobs:
           ref: ${{ inputs.head_sha || '' }}
 
       # Match the verified Apple SDK's SOURCE.json; mixed Rust runtimes fail to link.
-      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Select Xcode 26.2 (Foundation Models SDK)
         run: sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
@@ -202,6 +202,14 @@ jobs:
           cargo test --locked --features host-work-api hosted_agents
           cargo test --locked --features host-work-api hosted_agents::tests::postgres -- --ignored --test-threads=2
           cargo test --locked --features host-work-api station_integrations::tests::postgres_mark_tasks -- --ignored
+      - name: Test gated delegated control feeds and durable reporting
+        working-directory: relay-server
+        env:
+          RECOVERY_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:55433/postgres
+          TEST_REDIS_URL: redis://127.0.0.1:56379/
+        run: |
+          cargo test --locked --features delegated-host-work
+          cargo test --locked --features delegated-host-work delegated -- --ignored --test-threads=4
       - name: Run relay Redis (Valkey) suites
         working-directory: relay-server
         env:

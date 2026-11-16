@@ -121,6 +121,14 @@ def main():
         host_work_fixture = REPO / "native-remote/Tests/AstationRemoteTests/Fixtures/host-work-requests-v1.json"
         if host_work_fixture.read_bytes() != (payloads / pin["host_work_fixture"]["payload"]).read_bytes():
             raise ValueError("host-work fixture differs from the immutable packaged vector")
+        for name in pin["delegated_fixtures"]:
+            fixture_name = name.removeprefix(f"atem-client-0.1.0-{pin['revision'][:12]}-")
+            stored = REPO / "relay-server/src/remote_api/fixtures/delegated" / fixture_name
+            if stored.read_bytes() != (payloads / name).read_bytes():
+                raise ValueError("delegated Station fixture differs from the immutable packaged vector")
+        delegated = pin["delegated_station_fixture"]
+        if (REPO / delegated["path"]).read_bytes() != (payloads / delegated["payload"]).read_bytes():
+            raise ValueError("native delegated fixture differs from the immutable packaged vector")
         subprocess.run([str(executable), str(fixture), str(route_fixture)], check=True)
         if args.install:
             destination = REPO / "build/atem-client" / pin["revision"] / "AtemClient"

@@ -116,6 +116,10 @@ struct AgentActivityView: View {
                         }
                         Divider()
                         if let work {
+                            if work.canReviewOutcomes {
+                                AgentOutcomeListView(work: work, revision: hub.hostWorkRevision)
+                                Divider()
+                            }
                             AgentReceiptLookupView(work: work, revision: hub.hostWorkRevision,
                                 reconnect: { client.reconnectForHostWorkRecovery() })
                         } else {
@@ -253,6 +257,10 @@ private struct AgentReceiptLookupView: View {
                     Text("Task \(task.id)").font(.caption.monospaced())
                     Text(workLabel(task.state)).font(.callout)
                     Text(task.detail).font(.caption).foregroundStyle(.secondary)
+                    if let resolution = task.resolved {
+                        Text("Resolved by \(resolution.by) on \(Date(timeIntervalSince1970: Double(resolution.at) / 1000).formatted())")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
                 .textSelection(.enabled)
             }

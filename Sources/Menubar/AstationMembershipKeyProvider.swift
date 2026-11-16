@@ -1,17 +1,19 @@
 import AtemClient
 import Foundation
 
-/// Membership signatures use the existing Enclave key. The caller wraps this
+/// Account signatures use the existing Enclave key. The caller wraps this
 /// provider in RemoteConfirmedSigner after confirming its exact stored request.
 final class AstationMembershipKeyProvider: AppKeyProvider, @unchecked Sendable {
     let identity: AtemE2EIdentity
     let keyID: String
     let expectedPublicKey: Data
+    private let controlRecordsAllowed: Bool
 
-    init(identity: AtemE2EIdentity, keyID: String, publicKey: Data) {
+    init(identity: AtemE2EIdentity, keyID: String, publicKey: Data, controlRecordsAllowed: Bool = false) {
         self.identity = identity
         self.keyID = keyID
         expectedPublicKey = publicKey
+        self.controlRecordsAllowed = controlRecordsAllowed
     }
 
     func publicKey(keyId: String) throws -> PublicKeyData {
@@ -23,6 +25,10 @@ final class AstationMembershipKeyProvider: AppKeyProvider, @unchecked Sendable {
 
     func sign(request: SignRequest) throws -> Data {
         guard request.keyId == keyID else { throw AtemIdentityError.identityChanged }
+        if request.purpose == .controlRecord {
+            guard controlRecordsAllowed else { throw AtemIdentityError.invalidState }
+            return try identity.signControlRecord(request, expectedPublicKey: expectedPublicKey)
+        }
         return try identity.signMembership(request, expectedPublicKey: expectedPublicKey)
     }
 

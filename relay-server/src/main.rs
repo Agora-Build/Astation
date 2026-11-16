@@ -841,10 +841,26 @@ async fn serve() {
     relay.configure_push_tokens(push_tokens);
     relay.configure_push_delivery(push_delivery);
     relay.configure_recovery(recovery.clone());
+    if std::env::var("STATION_DELEGATED_HOST_WORK").as_deref() == Ok("true") {
+        let origin = std::env::var("PUBLIC_BASE_URL").unwrap_or_default();
+        let generation = std::env::var("STATION_DELEGATED_RECOVERY_GENERATION").ok()
+            .and_then(|raw| remote_api::recovery::delegated_recovery::generation(&raw).ok());
+        let Some(generation) = generation else {
+            tracing::error!("Delegated host work requires STATION_DELEGATED_RECOVERY_GENERATION, maintained outside database backups");
+            std::process::exit(1);
+        };
+        if let Err(reason) = recovery.configure_delegated(&origin, generation).await {
+            tracing::error!("Delegated host work cannot start: {}", reason);
+            std::process::exit(1);
+        }
+    }
 
     // Background tasks run for the life of the process; one that stops
     // outside a drain stops the relay (exit 1) so it is restarted.
     let mut background = cluster_tasks;
+    if recovery.delegated_enabled() {
+        background.push(("delegated Station heads", relay.spawn_delegated_heads()));
+    }
     background.extend(spawn_upkeep(
         &relay,
         &sessions,

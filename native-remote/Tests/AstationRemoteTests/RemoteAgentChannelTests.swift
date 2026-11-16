@@ -31,7 +31,7 @@ private final class FakeCore: RemoteChannelCore {
                     features: [], accountId: "account-a", atemDeviceId: "host-a", hostTrustGen: 3,
                     attachmentGen: "attachment-a", controllerSession: "controller-a", runtimeGen: "runtime-a",
                     authorizationMsLeft: authorization, serverTime: 0, head: LogHead(seq: 1, hash: "head"),
-                    pendingRecovery: [], channelId: "channel-a", scopeJson: nil, json: "{}")
+            pendingRecovery: [], channelId: "channel-a", scopeJson: nil, verifier: nil, json: "{}")
     }
     func receive(_ frame: Data, now: UInt64) throws -> [ClientEvent] {
         received += 1
