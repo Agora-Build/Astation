@@ -706,3 +706,102 @@ async fn postgres_delegated_proxy_and_relay_bindings_survive_replica_reload_and_
     drop(second);
     database.cleanup().await;
 }
+
+
+#[tokio::test]
+async fn unavailable_directory_never_selects_a_saved_relay_over_a_proxy() {
+    let mut t = Test::new().await;
+    let mut relay = connect_atem(&t.base, "phone", "host-a").await;
+    let _ = next_client_json(&mut t.native).await;
+    host_route_tests::prove(&mut relay, &t.fixture.keys, &t.fixture.host_key, &t.fixture.log, "host-a").await;
+    let _ = next_client_json(&mut relay).await;
+    let mut proxy = t.proxy(RouteKind::Proxy).await;
+    let _ = next_client_json(&mut proxy).await;
+    let _ = next_client_json(&mut proxy).await;
+    let mut unavailable = t.state.clone();
+    unavailable.relay = RelayHub::from_parts(HubParts {
+        directory: Arc::new(DirectoryReadFails { inner: InMemoryRoomDirectory::new() }),
+        ..HubParts::single_instance(InMemoryRoomDirectory::new(), Duration::from_secs(10))
+    });
+    let refused = crate::remote_api::recovery::host_target(
+        &unavailable, &t.fixture.log.genesis_hash().to_hex(), "alice", "host-a"
+    ).await.unwrap_err();
+    assert_eq!(refused.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(refused.1.0["error"]["code"], "recovery_storage_unavailable");
+    assert!(crate::remote_api::recovery::host_target(
+        &t.state, &t.fixture.log.genesis_hash().to_hex(), "alice", "host-a"
+    ).await.is_ok(), "A failed directory read does not retire either proved route");
+}
+
+struct DirectoryReadFails {
+    inner: InMemoryRoomDirectory,
+}
+
+#[async_trait::async_trait]
+impl RoomDirectory for DirectoryReadFails {
+    fn backend_name(&self) -> &'static str {
+        "directory-read-fails"
+    }
+    async fn create_room(&self, code: &str, hostname: &str, now: i64) -> Result<(), crate::cluster::StoreError> {
+        self.inner.create_room(code, hostname, now).await
+    }
+    async fn ensure_room(&self, code: &str, hostname: &str, now: i64) -> Result<bool, crate::cluster::StoreError> {
+        self.inner.ensure_room(code, hostname, now).await
+    }
+    async fn ensure_pairing_room(&self, code: &str, hostname: &str, now: i64) -> Result<bool, crate::cluster::StoreError> {
+        self.inner.ensure_pairing_room(code, hostname, now).await
+    }
+    async fn get(&self, code: &str) -> Result<Option<RoomInfo>, crate::cluster::StoreError> {
+        let _ = code;
+        Err(crate::cluster::StoreError::Unavailable("directory unavailable".into()))
+    }
+    async fn join_atem(&self, code: &str, atem_id: &str, conn: &ConnRef) -> Result<AtemJoin, crate::cluster::StoreError> {
+        self.inner.join_atem(code, atem_id, conn).await
+    }
+    async fn claim_owner(
+        &self,
+        code: &str,
+        conn: &ConnRef,
+        ip: &str,
+        now: i64,
+        caps: PendingCaps,
+    ) -> Result<crate::cluster::directory::OwnerClaim, crate::cluster::StoreError> {
+        self.inner.claim_owner(code, conn, ip, now, caps).await
+    }
+    async fn add_pending(
+        &self,
+        code: &str,
+        conn: &ConnRef,
+        ip: &str,
+        now: i64,
+        caps: PendingCaps,
+    ) -> Result<bool, crate::cluster::StoreError> {
+        self.inner.add_pending(code, conn, ip, now, caps).await
+    }
+    async fn promote(&self, code: &str, conn: &ConnRef, was_pending: bool) -> Result<Promotion, crate::cluster::StoreError> {
+        self.inner.promote(code, conn, was_pending).await
+    }
+    async fn leave_atem(
+        &self,
+        code: &str,
+        atem_id: &str,
+        connection_id: &str,
+    ) -> Result<crate::cluster::directory::AtemLeave, crate::cluster::StoreError> {
+        self.inner.leave_atem(code, atem_id, connection_id).await
+    }
+    async fn leave_astation(&self, code: &str, connection_id: &str) -> Result<bool, crate::cluster::StoreError> {
+        self.inner.leave_astation(code, connection_id).await
+    }
+    async fn delete_room(&self, code: &str) -> Result<Option<RoomInfo>, crate::cluster::StoreError> {
+        self.inner.delete_room(code).await
+    }
+    async fn touch(&self, _code: &str) -> Result<bool, crate::cluster::StoreError> {
+        self.inner.touch(_code).await
+    }
+    async fn exists(&self, codes: &[String]) -> Result<Vec<bool>, crate::cluster::StoreError> {
+        self.inner.exists(codes).await
+    }
+    async fn remove_expired(&self, now: i64) -> Result<Vec<String>, crate::cluster::StoreError> {
+        self.inner.remove_expired(now).await
+    }
+}

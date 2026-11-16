@@ -289,7 +289,8 @@ trust generation and proof are captured together. Replacing or retiring a proxy
 cannot remove or publish over the host's real relay route. The independent r9
 API prefers a live proved relay route and otherwise can use the current proxy;
 a stale stored carrier must not hide a live one. No route moves to a different
-Station implicitly.
+Station implicitly. A failed directory read returns unavailable rather than
+selecting a saved carrier whose current presence could not be checked.
 
 Station rechecks native ownership, key, pairing and account authorization when
 admitting traffic and again at the actual proxy writer boundary. Membership and
@@ -303,10 +304,13 @@ the captured authenticated local socket. That close-only path grants no further
 forwarding, and the local server refuses it once the socket generation changes.
 
 Each direction has a bounded queue (128 frames / 8 MiB). Encrypted envelopes
-retain their original bytes and existing 2 MiB bound; control messages retain
+retain their original bytes and existing 2 MiB bound, including the underlying
+WebSocket receive and fragment-aggregation limits; control messages retain
 the shared 256 KiB / 64-record limits. A transport failure closes the proxy's
-virtual channels and retries with backoff. Atem signs one challenge per local
-authentication generation: a subsequent Station challenge causes fresh local
+virtual channels and retries with backoff. A closing channel remains tracked
+until the local write succeeds, so queue rejection still retires it. The local
+socket tracks at most 128 native and proxy channel handles together. Atem signs
+one challenge per local authentication generation: a subsequent Station challenge causes fresh local
 authentication on the same TCP socket, with old channels closed **before** the
 new authentication request and a new client generation. Both loopback and LAN
 reuse their existing authentication credentials; this requires no new pairing
@@ -333,6 +337,9 @@ proof ordering, unchanged ciphertext, read correlation, refusal and bounded
 queues; real Station WSS native/key/session/account admission, proof-kind
 refusal, concurrent relay/proxy routing, queued-write fencing and stale parent
 retirement; and Postgres replica reload/replacement/revocation of both bindings.
+The production socket factory receives a greater-than-1-MiB frame from a real
+WebSocket in tests. Regressions also cover a close against a full local queue,
+channel-capacity release, the reauthentication timeout and directory failures.
 These are isolated tests, not a claim of a completed real native/Atem joint run.
 
 ## Gates and remaining work

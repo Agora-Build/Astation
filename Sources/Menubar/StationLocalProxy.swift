@@ -6,6 +6,12 @@ import Foundation
 /// reads control messages; signed and encrypted payloads retain their bytes.
 @MainActor
 final class StationLocalProxy {
+    nonisolated static func socket(request: URLRequest) -> URLSessionWebSocketTask {
+        let task = URLSession.shared.webSocketTask(with: request)
+        task.maximumMessageSize = RemoteChannelEnvelope.maximumBytes
+        return task
+    }
+
     static func request(station: String, room: String, host: String, session: String,
                         generation: String, token: String) -> URLRequest? {
         guard PortalIntegrationRecord.validOrigin(station), UUID(uuidString: generation) != nil,
@@ -144,7 +150,7 @@ final class StationLocalProxy {
                 channels.insert(handle)
             case "frame": guard channels.contains(handle), (try? RemoteChannelEnvelope.readHost(bytes)) != nil else { return }
             case "close": guard (try? RemoteChannelEnvelope.readHost(bytes)) != nil,
-                                channels.remove(handle) != nil else { return }
+                                channels.contains(handle) else { return }
             default: return
             }
             forwardLocal(bytes)
@@ -215,6 +221,11 @@ final class StationLocalProxy {
             Task { @MainActor in
                 guard let self, self.attempt == generation else { return }
                 if error != nil { self.failed(); return }
+                // Keep a closing channel until the write completes so queue
+                // rejection or a failed write still closes it during retirement.
+                if case .close(let handle, _) = try? RemoteChannelEnvelope.readHost(bytes) {
+                    self.channels.remove(handle)
+                }
                 self.localQueue.removeFirst(); self.localBytes -= bytes.count
                 self.localSending = false; self.flushLocal()
             }

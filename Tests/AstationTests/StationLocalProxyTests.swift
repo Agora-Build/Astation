@@ -143,6 +143,30 @@ final class StationLocalProxyTests: XCTestCase {
         XCTAssertEqual(f.local, [challenge, refusal], "An old completion cannot revive a retired queue")
     }
 
+    func testFullLocalQueueStillClosesChannelWhenItsCloseCannotBeForwarded() async throws {
+        let f = Fixture()
+        await f.ready()
+        f.proxy.receiveStation(Data(#"{"type":"channel","event":"open","channel":"station_1","transport":"relay"}"#.utf8))
+        await drain()
+        f.holdLocalWrites = true
+        let frame = Data(#"{"type":"channel","event":"frame","channel":"station_1","frame":{"ct":"opaque"}}"#.utf8)
+        for _ in 0..<128 { f.proxy.receiveStation(frame) }
+        XCTAssertEqual(f.proxy.phase, .ready)
+        let before = f.local.count
+        f.proxy.receiveStation(Data(#"{"type":"channel","event":"close","channel":"station_1","reason":"closed"}"#.utf8))
+        XCTAssertEqual(f.proxy.phase, .connecting)
+        XCTAssertTrue(f.socket.cancelled)
+        let closes = try f.local.dropFirst(before).map { try RemoteChannelEnvelope.readHost($0) }
+        XCTAssertEqual(closes.count, 1)
+        guard case .close(let handle, _) = closes.first else { return XCTFail("Expected cleanup close") }
+        XCTAssertEqual(handle, "station_1")
+        for done in f.localCompletions { done(nil) }
+        await drain()
+        f.proxy.close()
+        XCTAssertEqual(f.local.count, before + 1, "Retired completions cannot duplicate or revive the channel")
+        XCTAssertTrue(f.current, "The ordinary local socket remains usable")
+    }
+
     func testRetiringAccountOrStationStillClosesOnlyItsCapturedProxyChannels() async throws {
         let f = Fixture()
         await f.ready()

@@ -615,7 +615,7 @@ class AstationHubManager: ObservableObject {
         dispatchMigration: @escaping (@escaping () -> Void) -> Void = { DispatchQueue.main.async(execute: $0) },
         makeIdentityRelayTask: @escaping (URL) -> IdentityRelaySocket = { URLSession.shared.webSocketTask(with: $0) },
         makePairingRelayTask: @escaping (URL) -> IdentityRelaySocket = { URLSession.shared.webSocketTask(with: $0) },
-        makeStationProxyTask: @escaping (URLRequest) -> IdentityRelaySocket = { URLSession.shared.webSocketTask(with: $0) },
+        makeStationProxyTask: @escaping (URLRequest) -> IdentityRelaySocket = { StationLocalProxy.socket(request: $0) },
         enableLocalStationProxy: Bool = ProcessInfo.processInfo.environment["ASTATION_LOCAL_STATION_PROXY"] == "true",
         workspaceNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
         portalSettings: AccountServiceSettings? = try? AccountServiceSettings.load(),

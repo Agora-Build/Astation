@@ -1101,7 +1101,8 @@ pub(crate) async fn host_target(
             Ok(Some(room)) => if let Some(proxy) = &candidate.proxy {
                 room.verified && room.owner.as_ref() == Some(&proxy.native)
             } else { room.atems.get(&candidate.atem_id) == Some(&candidate.connection) },
-            _ => false,
+            Ok(None) => false,
+            Err(_) => return Err(unavailable()),
         };
         if current {
             room = candidate.room.clone();

@@ -7,6 +7,7 @@ import NIOHTTP1
 import NIOWebSocket
 
 class AstationWebSocketServer {
+    static let maximumChannelsPerClient = 128
     private var eventLoopGroup: EventLoopGroup!
     private var stateEventLoop: EventLoop?
     private var channel: Channel?
@@ -50,12 +51,16 @@ class AstationWebSocketServer {
         stateEventLoop = eventLoopGroup.next()
         
         let upgrader = NIOWebSocketServerUpgrader(
+            maxFrameSize: RemoteChannelEnvelope.maximumBytes,
+            automaticErrorHandling: true,
             shouldUpgrade: { channel, _ in
                 return channel.eventLoop.makeSucceededFuture(HTTPHeaders())
             },
             upgradePipelineHandler: { channel, _ in
                 let scope = DirectConnectionScope(peerAddress: channel.remoteAddress?.ipAddress)
-                return WebSocket.server(on: channel) { ws in
+                var configuration = WebSocket.Configuration()
+                configuration.maxAccumulatedFrameSize = RemoteChannelEnvelope.maximumBytes
+                return WebSocket.server(on: channel, config: configuration) { ws in
                     self.handleWebSocketConnection(ws, scope: scope)
                 }
             }
@@ -475,12 +480,19 @@ class AstationWebSocketServer {
                   let text = String(data: bytes, encoding: .utf8) else {
                 completion(RemoteChannelError.staleLink); return
             }
-            let promise = ws.eventLoop.makePromise(of: Void.self)
             if let fields = try? AtemSessionJSON.validatePacket(bytes), fields["type"]?.string == "channel",
                let handle = fields["channel"]?.string {
-                if fields["event"]?.string == "open" { self.channelHandles[clientID, default: []].insert(handle) }
+                if fields["event"]?.string == "open" {
+                    guard RemoteChannelRoute.isValidHandle(handle),
+                          self.channelHandles[clientID]?.contains(handle) == true
+                            || (self.channelHandles[clientID]?.count ?? 0) < Self.maximumChannelsPerClient else {
+                        completion(RemoteChannelError.notReady); return
+                    }
+                    self.channelHandles[clientID, default: []].insert(handle)
+                }
                 if fields["event"]?.string == "close" { self.channelHandles[clientID]?.remove(handle) }
             }
+            let promise = ws.eventLoop.makePromise(of: Void.self)
             promise.futureResult.whenComplete { result in
                 switch result { case .success: completion(nil); case .failure(let error): completion(error) }
             }
@@ -508,6 +520,8 @@ class AstationWebSocketServer {
         guard let ws = connectedClients.removeValue(forKey: clientID), !ws.isClosed,
               let identity = socketIdentities.removeValue(forKey: clientID) else { return }
         for handle in channelHandles.removeValue(forKey: clientID) ?? [] {
+            // linkGeneration is a local routing fence, not part of the wire
+            // envelope. The captured socket and channel handle identify the peer.
             if let route = try? RemoteChannelRoute(linkGeneration: UUID(), handle: handle) {
                 ws.send(String(decoding: RemoteChannelEnvelope.close(route: route), as: UTF8.self))
             }

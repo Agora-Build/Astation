@@ -131,6 +131,105 @@ final class DirectConnectionTests: XCTestCase {
         })
     }
 
+    func testProductionProxySocketReceivesMoreThanOneMiBFromRealWebSocket() async throws {
+        let fixture = try DirectServerFixture(host: "127.0.0.1")
+        defer { fixture.shutdown() }
+        let url = try XCTUnwrap(URL(string: "ws://127.0.0.1:\(fixture.port)/ws"))
+        let socket = StationLocalProxy.socket(request: URLRequest(url: url))
+        defer { socket.cancel(with: .goingAway, reason: nil) }
+        XCTAssertEqual(socket.maximumMessageSize, RemoteChannelEnvelope.maximumBytes)
+        socket.resume()
+        guard case .string(let challenge) = try await socket.receive(),
+              case .statusUpdate(_, let fields) = try AstationMessage.decodePacket(Data(challenge.utf8)) else {
+            return XCTFail("Expected local authentication challenge")
+        }
+        let auth = loopbackAuthMessage(fixture: fixture, atemId: "large-proxy-frame")(fields)
+        try await socket.send(.string(String(decoding: JSONEncoder().encode(auth), as: UTF8.self)))
+        guard case .string(let reply) = try await socket.receive(),
+              case .statusUpdate(let status, _) = try AstationMessage.decodePacket(Data(reply.utf8)),
+              status == "auth" || status == "authenticated" else {
+            return XCTFail("Expected authenticated socket")
+        }
+        let route = try RemoteChannelRoute(linkGeneration: UUID(), handle: "large_1")
+        let frame = try RemoteChannelEnvelope.frame(
+            Data((#"{"ct":""# + String(repeating: "a", count: 1_100_000) + #""}"#).utf8), route: route)
+        XCTAssertGreaterThan(frame.count, 1_048_576)
+        let sent = expectation(description: "Large encrypted envelope written")
+        fixture.server.sendChannel(frame, clientID: try XCTUnwrap(fields["clientId"])) { error in
+            XCTAssertNil(error); sent.fulfill()
+        }
+        guard case .string(let received) = try await socket.receive() else { return XCTFail("Expected text envelope") }
+        XCTAssertEqual(Data(received.utf8), frame)
+        await fulfillment(of: [sent], timeout: 3)
+    }
+
+    func testLocalChannelTrackingIsBoundedAndCloseReleasesCapacity() throws {
+        let fixture = try DirectServerFixture(host: "127.0.0.1")
+        defer { fixture.shutdown() }
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+        var clientID = ""
+        let auth = loopbackAuthMessage(fixture: fixture, atemId: "bounded-channels")
+        let (_, socket) = try connect(host: "127.0.0.1", fixture: fixture, group: group, authMessage: {
+            clientID = $0["clientId"] ?? ""; return auth($0)
+        }).wait()
+        defer { _ = socket.close() }
+        let opened = expectation(description: "Bounded channels opened")
+        opened.expectedFulfillmentCount = AstationWebSocketServer.maximumChannelsPerClient
+        for index in 0..<AstationWebSocketServer.maximumChannelsPerClient {
+            let route = try RemoteChannelRoute(linkGeneration: UUID(), handle: "bounded_\(index)")
+            fixture.server.sendChannel(RemoteChannelEnvelope.open(route: route, transport: .direct), clientID: clientID) {
+                XCTAssertNil($0); opened.fulfill()
+            }
+        }
+        wait(for: [opened], timeout: 3)
+        let overflow = try RemoteChannelRoute(linkGeneration: UUID(), handle: "overflow")
+        let refused = expectation(description: "Extra channel refused")
+        fixture.server.sendChannel(RemoteChannelEnvelope.open(route: overflow, transport: .direct), clientID: clientID) {
+            XCTAssertEqual($0 as? RemoteChannelError, .notReady); refused.fulfill()
+        }
+        wait(for: [refused], timeout: 3)
+        let released = expectation(description: "Close frees capacity on the same socket")
+        let closing = try RemoteChannelRoute(linkGeneration: UUID(), handle: "bounded_0")
+        fixture.server.sendChannel(RemoteChannelEnvelope.close(route: closing), clientID: clientID) { error in
+            XCTAssertNil(error)
+            fixture.server.sendChannel(RemoteChannelEnvelope.open(route: overflow, transport: .direct), clientID: clientID) {
+                XCTAssertNil($0); released.fulfill()
+            }
+        }
+        wait(for: [released], timeout: 3)
+        XCTAssertFalse(socket.isClosed)
+    }
+
+    func testUnansweredProxyReauthenticationTimesOutWithoutClosingOtherLocalSocket() throws {
+        let fixture = try DirectServerFixture(host: "127.0.0.1")
+        defer { fixture.shutdown() }
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+        var clientID = ""
+        let auth = loopbackAuthMessage(fixture: fixture, atemId: "timeout-host")
+        let (_, socket) = try connect(host: "127.0.0.1", fixture: fixture, group: group, authMessage: {
+            clientID = $0["clientId"] ?? ""; return auth($0)
+        }).wait()
+        let (_, other) = try connect(host: "127.0.0.1", fixture: fixture, group: group,
+            authMessage: loopbackAuthMessage(fixture: fixture, atemId: "unrelated-host")).wait()
+        defer { _ = other.close(); _ = socket.close() }
+        let closed = expectation(description: "Unanswered authentication expires")
+        try socket.eventLoop.submit {
+            socket.onText { _, _ in }
+            socket.onClose.whenComplete { _ in closed.fulfill() }
+        }.wait()
+        let challenge = Data(#"{"type":"relay","op":"host_challenge","v":1}"#.utf8)
+        fixture.server.sendStationProxy(challenge, clientID: clientID) { error in
+            XCTAssertNil(error)
+            fixture.server.sendStationProxy(challenge, clientID: clientID) {
+                XCTAssertEqual($0 as? RemoteChannelError, .staleLink)
+            }
+        }
+        wait(for: [closed], timeout: 12)
+        XCTAssertFalse(other.isClosed)
+    }
+
     private func assertProxyReauthentication(fixture: DirectServerFixture, host: String,
         auth: @escaping ([String: String]) -> AstationMessage) throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
