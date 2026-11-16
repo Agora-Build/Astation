@@ -174,10 +174,52 @@ mod tests {
     };
 
     #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_queued_frames_are_discarded_after_a_recovery_fence() {
+        const ORIGIN: &str = "https://station-dev.agora.build";
+        let database = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+        let store = RecoveryStore::postgres(database.pool.clone());
+        store.configure_delegated(ORIGIN, 1).await.unwrap();
+        let f = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
+        f.publish(&store).await;
+        let hub = RelayHub::new();
+        hub.configure_recovery(store.clone());
+        let mut outbox = hub.local().register("queued-before-recovery", "phone", SocketRole::Atem { atem_id: "host-a".into() });
+        let challenge = HostChallenge::new("phone");
+        let (binding, _) = store.admit_host(
+            &proof(&f.keys, &f.host_key, &f.log, &challenge, "host-a").to_string(),
+            challenge.nonce, "phone", "host-a", hub.me("queued-before-recovery"),
+        ).await.unwrap();
+        hub.track_host_route(binding.clone());
+        assert!(hub.publish_host_route(&binding, None).await.unwrap().is_ok());
+        assert!(hub.delegated_heads(&binding).await);
+        let first = outbox.frames.recv().await.unwrap();
+        outbox.sent(&first);
+        let mut written: Vec<Message> = Vec::new();
+        assert!(super::super::write_socket_frame(&mut written, first, Some(&hub)).await);
+        assert_eq!(written.len(), 1);
+        assert!(hub.delegated_heads(&binding).await);
+        let stale = outbox.frames.recv().await.unwrap();
+        outbox.sent(&stale);
+        let recovery = crate::remote_api::recovery::delegated_recovery::Binding::new(ORIGIN, 2).unwrap();
+        assert!(!recovery.initialize(&database.pool, false).await.unwrap().ready);
+        assert!(super::super::write_socket_frame(&mut written, stale, Some(&hub)).await);
+        assert_eq!(written.len(), 1, "the actual sink receives no pre-fence control frame");
+        assert!(!hub.delegated_heads(&binding).await);
+        assert!(store.admit_host(
+            &proof(&f.keys, &f.host_key, &f.log, &challenge, "host-a").to_string(),
+            challenge.nonce, "phone", "host-a", hub.me("after-recovery"),
+        ).await.is_err());
+        drop(hub);
+        drop(store);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn delegated_writer_rechecks_the_queued_association_and_preserves_completion_on_close() {
         let store = RecoveryStore::memory();
         store
-            .configure_delegated("https://station-dev.agora.build")
+            .configure_delegated("https://station-dev.agora.build", 1).await
             .unwrap();
         let f = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
         f.publish(&store).await;

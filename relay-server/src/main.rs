@@ -843,8 +843,14 @@ async fn serve() {
     relay.configure_recovery(recovery.clone());
     if std::env::var("STATION_DELEGATED_HOST_WORK").as_deref() == Ok("true") {
         let origin = std::env::var("PUBLIC_BASE_URL").unwrap_or_default();
-        if recovery.configure_delegated(&origin).is_err() {
-            tracing::error!("Delegated host work requires its opt-in build and normalized PUBLIC_BASE_URL");
+        let generation = std::env::var("STATION_DELEGATED_RECOVERY_GENERATION").ok()
+            .and_then(|raw| remote_api::recovery::delegated_recovery::generation(&raw).ok());
+        let Some(generation) = generation else {
+            tracing::error!("Delegated host work requires STATION_DELEGATED_RECOVERY_GENERATION, maintained outside database backups");
+            std::process::exit(1);
+        };
+        if let Err(reason) = recovery.configure_delegated(&origin, generation).await {
+            tracing::error!("Delegated host work cannot start: {}", reason);
             std::process::exit(1);
         }
     }

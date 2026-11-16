@@ -142,6 +142,7 @@ impl StationIntegrations {
             .map_err(|_| ())?;
         let key = self.report_control_binding();
         let mut tx = self.policies.0.begin().await.map_err(|_| ())?;
+        self.app.recovery.lock_delegated_recovery(&mut tx).await.map_err(|_| ())?;
         let initial = vec![ReportControlEvent::Resume(
             self.binding.report_client_id.clone(),
         )];
@@ -186,6 +187,9 @@ impl StationIntegrations {
             let Ok(mut tx) = self.policies.0.begin().await else {
                 return;
             };
+            if self.app.recovery.lock_delegated_recovery(&mut tx).await.is_err() {
+                return;
+            }
             let key = self.report_control_binding();
             let Ok((value, in_flight)) = sqlx::query_as::<_, (Value, Option<String>)>(
                 "SELECT events,in_flight FROM station_delegated_reporting WHERE binding=$1 FOR UPDATE")
@@ -198,11 +202,11 @@ impl StationIntegrations {
             let Ok(mut events) = serde_json::from_value::<Vec<ReportControlEvent>>(value) else {
                 return;
             };
-            let (status, Json(snapshot)) = self
+            let Ok((status, Json(snapshot))) = self
                 .app
                 .recovery
-                .delegated_operation(genesis, owner, Command::ReportingControl(events.clone()))
-                .await;
+                .delegated_operation_in(&mut tx, genesis, owner, Command::ReportingControl(events.clone()))
+                .await else { return };
             if status != StatusCode::OK {
                 return;
             }
@@ -211,12 +215,14 @@ impl StationIntegrations {
                     self.binding.report_client_id.clone(),
                 ))
             {
+                let _ = tx.commit().await;
                 return;
             }
             let Ok(ledger) = AckLedger::from_json(&snapshot["ledger"]) else {
                 return;
             };
             if ledger.stopped_client_id().is_some() {
+                let _ = tx.commit().await;
                 return;
             }
             let Some(intent) = ledger.pending_reports().into_iter().find(|intent| {
@@ -225,6 +231,7 @@ impl StationIntegrations {
                         .any(|value| value["report_id"] == intent.report_id)
                 })
             }) else {
+                let _ = tx.commit().await;
                 return;
             };
             let claim = uuid::Uuid::new_v4().to_string();
@@ -246,6 +253,9 @@ impl StationIntegrations {
             let Ok(mut tx) = self.policies.0.begin().await else {
                 return;
             };
+            if self.app.recovery.lock_delegated_recovery(&mut tx).await.is_err() {
+                return;
+            }
             let Ok(saved_claim) = sqlx::query_scalar::<_, Option<String>>(
                 "SELECT in_flight FROM station_delegated_reporting WHERE binding=$1 FOR UPDATE",
             )
@@ -290,11 +300,11 @@ impl StationIntegrations {
                     retry_after_ms: result.retry_after_ms,
                 },
             };
-            let (status, _) = self
+            let Ok((status, _)) = self
                 .app
                 .recovery
-                .delegated_operation(genesis, owner, Command::Ledger(update))
-                .await;
+                .delegated_operation_in(&mut tx, genesis, owner, Command::Ledger(update))
+                .await else { return };
             if status != StatusCode::OK {
                 return;
             }
@@ -357,6 +367,82 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_recovery_fences_http_and_preserves_reports_and_client_stops() {
+        use crate::remote_api::recovery::delegated_recovery::Binding;
+        let (database, mut runtime, _) = super::super::tests::fixture().await;
+        let mut portal = crate::integration_portal::tests::Fixture::new().await;
+        let local = Arc::get_mut(&mut runtime).unwrap();
+        local.binding = portal.binding.clone();
+        local.portal = portal.client();
+        local.app.recovery.configure_delegated("https://station-dev.agora.build", 1).await.unwrap();
+        runtime.initialize_report_control(None).await.unwrap();
+        let a = pending_report(&runtime.app.recovery).await.log.genesis_hash().to_hex();
+        let b = pending_report(&runtime.app.recovery).await.log.genesis_hash().to_hex();
+        portal.set_status(403);
+        runtime.deliver_delegated_reports(&a, "alice").await;
+        let old_reports = portal.shared.reports.lock().await.clone();
+        assert_eq!(old_reports.len(), 1);
+        let before: Vec<(String, Value)> = sqlx::query_as("SELECT genesis_hash,state FROM remote_recovery_roots ORDER BY genesis_hash")
+            .fetch_all(&database.pool).await.unwrap();
+        let report_state: (Value, Option<String>) = sqlx::query_as("SELECT events,in_flight FROM station_delegated_reporting")
+            .fetch_one(&database.pool).await.unwrap();
+        assert!(!Binding::new("https://station-dev.agora.build", 2).unwrap().initialize(&database.pool, false).await.unwrap().ready);
+        portal.set_status(200);
+        assert!(runtime.initialize_report_control(Some(&uuid::Uuid::new_v4().to_string())).await.is_err());
+        runtime.deliver_delegated_reports(&a, "alice").await;
+        runtime.deliver_delegated_reports(&b, "alice").await;
+        assert_eq!(*portal.shared.reports.lock().await, old_reports);
+        let after: Vec<(String, Value)> = sqlx::query_as("SELECT genesis_hash,state FROM remote_recovery_roots ORDER BY genesis_hash")
+            .fetch_all(&database.pool).await.unwrap();
+        assert_eq!(after, before, "no settlement, watermark change or synthetic report receipt");
+        let after_reports: (Value, Option<String>) = sqlx::query_as("SELECT events,in_flight FROM station_delegated_reporting")
+            .fetch_one(&database.pool).await.unwrap();
+        assert_eq!(after_reports, report_state, "recovery does not resume a stopped report client");
+        drop(runtime);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_recovery_waits_for_in_flight_http_and_atomic_settlement() {
+        use crate::remote_api::recovery::delegated_recovery::Binding;
+        let (database, mut runtime, _) = super::super::tests::fixture().await;
+        let mut portal = crate::integration_portal::tests::Fixture::new().await;
+        let local = Arc::get_mut(&mut runtime).unwrap();
+        local.binding = portal.binding.clone();
+        local.portal = portal.client();
+        local.app.recovery.configure_delegated("https://station-dev.agora.build", 1).await.unwrap();
+        runtime.initialize_report_control(None).await.unwrap();
+        let a = pending_report(&runtime.app.recovery).await.log.genesis_hash().to_hex();
+        let b = pending_report(&runtime.app.recovery).await.log.genesis_hash().to_hex();
+        let hold = Arc::new(tokio::sync::Semaphore::new(0));
+        *portal.shared.report_hold.lock().await = Some(hold.clone());
+        let delivery = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.deliver_delegated_reports(&a, "alice").await })
+        };
+        tokio::time::timeout(Duration::from_secs(3), portal.shared.report_started.notified()).await.unwrap();
+        let mut fence = {
+            let pool = database.pool.clone();
+            tokio::spawn(async move {
+                Binding::new("https://station-dev.agora.build", 2).unwrap().initialize(&pool, false).await.unwrap()
+            })
+        };
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut fence).await.is_err());
+        hold.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(3), delivery).await.unwrap().unwrap();
+        assert!(!fence.await.unwrap().ready);
+        runtime.deliver_delegated_reports(&b, "alice").await;
+        assert_eq!(portal.shared.reports.lock().await.len(), 1);
+        let marker: Option<String> = sqlx::query_scalar("SELECT in_flight FROM station_delegated_reporting")
+            .fetch_one(&database.pool).await.unwrap();
+        assert!(marker.is_none(), "the earlier request settles before the recovery fence commits");
+        drop(runtime);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
     async fn postgres_delegated_service_lifecycle_signs_once_and_retains_key_until_r9_removal() {
         use super::super::tests::{append_body, fixture, request, signed_action};
         use atem_client::{
@@ -368,7 +454,7 @@ mod tests {
         runtime
             .app
             .recovery
-            .configure_delegated(&runtime.binding.station_origin)
+            .configure_delegated(&runtime.binding.station_origin, 1).await
             .unwrap();
         let draft = runtime.prepare(ID, OWNER, request(&f)).await.unwrap();
         let fingerprint = draft["fingerprint"].as_str().unwrap();
@@ -468,7 +554,7 @@ mod tests {
         runtime
             .app
             .recovery
-            .configure_delegated(&runtime.binding.station_origin)
+            .configure_delegated(&runtime.binding.station_origin, 1).await
             .unwrap();
         let draft = runtime.prepare(ID, OWNER, request(&f)).await.unwrap();
         let fingerprint = draft["fingerprint"].as_str().unwrap();
@@ -518,7 +604,7 @@ mod tests {
         runtime
             .app
             .recovery
-            .configure_delegated(&runtime.binding.station_origin)
+            .configure_delegated(&runtime.binding.station_origin, 1).await
             .unwrap();
         let draft = runtime.prepare(ID, OWNER, request(&f)).await.unwrap();
         append_body(
@@ -600,7 +686,7 @@ mod tests {
         runtime
             .app
             .recovery
-            .configure_delegated(&runtime.binding.station_origin)
+            .configure_delegated(&runtime.binding.station_origin, 1).await
             .unwrap();
         let draft = runtime.prepare(ID, OWNER, request(&f)).await.unwrap();
         append_body(
@@ -695,7 +781,7 @@ mod tests {
         local
             .app
             .recovery
-            .configure_delegated("https://station-dev.agora.build")
+            .configure_delegated("https://station-dev.agora.build", 1).await
             .unwrap();
         runtime.initialize_report_control(None).await.unwrap();
         let f = pending_report(&runtime.app.recovery).await;
@@ -731,7 +817,7 @@ mod tests {
         local
             .app
             .recovery
-            .configure_delegated("https://station-dev.agora.build")
+            .configure_delegated("https://station-dev.agora.build", 1).await
             .unwrap();
         runtime.initialize_report_control(None).await.unwrap();
         let a = pending_report(&runtime.app.recovery)
@@ -800,7 +886,7 @@ mod tests {
         local
             .app
             .recovery
-            .configure_delegated("https://station-dev.agora.build")
+            .configure_delegated("https://station-dev.agora.build", 1).await
             .unwrap();
         runtime.initialize_report_control(None).await.unwrap();
         let a = pending_report(&runtime.app.recovery)
@@ -867,7 +953,7 @@ mod tests {
         local
             .app
             .recovery
-            .configure_delegated("https://station-dev.agora.build")
+            .configure_delegated("https://station-dev.agora.build", 1).await
             .unwrap();
         runtime.initialize_report_control(None).await.unwrap();
         let genesis = pending_report(&runtime.app.recovery)
@@ -885,8 +971,8 @@ mod tests {
             .execute(&database.pool)
             .await
             .unwrap();
-        // Settlement commits in the account, but losing the global clear must
-        // still block every account until an explicit operator resume.
+        // Ledger settlement and the global clear now commit together. Losing
+        // that commit retains the earlier marker until explicit operator resume.
         sqlx::query("CREATE FUNCTION fail_report_clear() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.in_flight IS NULL AND OLD.in_flight IS NOT NULL THEN RAISE EXCEPTION 'test clear failure'; END IF; RETURN NEW; END $$")
             .execute(&database.pool).await.unwrap();
         sqlx::query("CREATE CONSTRAINT TRIGGER fail_report_clear AFTER UPDATE ON station_delegated_reporting DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_report_clear()")

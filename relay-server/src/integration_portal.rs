@@ -358,6 +358,8 @@ pub(crate) mod tests {
         status: AtomicUsize,
         assertions: Mutex<Vec<String>>,
         pub reports: Mutex<Vec<Value>>,
+        pub report_hold: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+        pub report_started: tokio::sync::Notify,
         pub feed: Mutex<Option<Value>>,
         pub cursors: Mutex<Vec<u64>>,
     }
@@ -384,6 +386,8 @@ pub(crate) mod tests {
                 status: AtomicUsize::new(200),
                 assertions: Mutex::new(vec![]),
                 reports: Mutex::new(vec![]),
+                report_hold: Mutex::new(None),
+                report_started: tokio::sync::Notify::new(),
                 feed: Mutex::new(None),
                 cursors: Mutex::new(vec![]),
             });
@@ -475,6 +479,11 @@ pub(crate) mod tests {
     ) -> axum::response::Response {
         assert_eq!(headers["authorization"], "Bearer test-report-token");
         shared.reports.lock().await.push(body);
+        shared.report_started.notify_one();
+        let hold = shared.report_hold.lock().await.clone();
+        if let Some(hold) = hold {
+            hold.acquire().await.unwrap().forget();
+        }
         (
             StatusCode::from_u16(shared.status.load(Ordering::SeqCst) as u16).unwrap(),
             Json(json!({"state":"waiting_for_host"})),

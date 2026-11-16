@@ -40,6 +40,9 @@ pub(crate) mod delegated;
 #[path = "delegated_http.rs"]
 pub(crate) mod delegated_http;
 
+#[path = "delegated_recovery.rs"]
+pub(crate) mod delegated_recovery;
+
 fn error(status: StatusCode, code: &'static str) -> Reply {
     (status, Json(json!({"error":{"code":code}})))
 }
@@ -135,20 +138,36 @@ pub struct RecoveryStore {
     pool: Option<PgPool>,
     memory: Option<Mutex<HashMap<String, (String, Root)>>>,
     delegated_origin: OnceLock<String>,
+    delegated_recovery: OnceLock<delegated_recovery::Binding>,
     delegated_changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl RecoveryStore {
     pub(crate) fn pool(&self) -> Option<PgPool> { self.pool.clone() }
 
-    pub(crate) fn configure_delegated(&self, origin: &str) -> Result<(), ()> {
-        if !cfg!(feature = "delegated-host-work")
-            || atem_client::station_route::normalize_relay(origin).as_deref() != Ok(origin)
-        { return Err(()); }
-        if let Some(current) = self.delegated_origin.get() {
-            return if current == origin { Ok(()) } else { Err(()) };
+    pub(crate) async fn configure_delegated(&self, origin: &str, generation: i64) -> Result<(), &'static str> {
+        if !cfg!(feature = "delegated-host-work") {
+            return Err("delegated host work requires its opt-in build");
         }
-        self.delegated_origin.set(origin.into()).map_err(|_| ())
+        let binding = delegated_recovery::Binding::new(origin, generation)?;
+        // Retain even a failed attempt, so this store cannot silently become an
+        // unfenced ordinary host route if initialization fails or is cancelled.
+        if self.delegated_recovery.get_or_init(|| binding.clone()) != &binding {
+            return Err("delegated recovery binding cannot change in a running store");
+        }
+        if let Some(pool) = &self.pool {
+            let status = binding.initialize(pool, false).await
+                .map_err(|_| "cannot establish durable delegated recovery fence")?;
+            if !status.ready || status.generation != generation {
+                return Err("delegated recovery is fenced; complete snapshot recovery is required");
+            }
+        } else if self.memory.is_none() {
+            return Err("delegated host work requires durable recovery storage");
+        }
+        if self.delegated_origin.get_or_init(|| origin.into()) != origin {
+            return Err("delegated origin already configured");
+        }
+        Ok(())
     }
 
     pub(crate) fn delegated_enabled(&self) -> bool { self.delegated_origin.get().is_some() }
@@ -455,6 +474,7 @@ impl RecoveryStore {
         }
         let pool = self.pool.as_ref()?;
         let mut tx = pool.begin().await.ok()?;
+        self.lock_delegated_recovery(&mut tx).await.ok()?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(genesis)
             .execute(&mut *tx)
@@ -478,6 +498,7 @@ impl RecoveryStore {
             pool: None,
             memory: None,
             delegated_origin: OnceLock::new(),
+            delegated_recovery: OnceLock::new(),
             delegated_changes: tokio::sync::watch::channel(0).0,
         })
     }
@@ -486,6 +507,7 @@ impl RecoveryStore {
             pool: Some(pool),
             memory: None,
             delegated_origin: OnceLock::new(),
+            delegated_recovery: OnceLock::new(),
             delegated_changes: tokio::sync::watch::channel(0).0,
         })
     }
@@ -526,6 +548,7 @@ impl RecoveryStore {
             pool: None,
             memory: Some(Mutex::new(HashMap::new())),
             delegated_origin: OnceLock::new(),
+            delegated_recovery: OnceLock::new(),
             delegated_changes: tokio::sync::watch::channel(0).0,
         })
     }
@@ -602,14 +625,38 @@ impl RecoveryStore {
         operation: Operation,
     ) -> Result<Reply, sqlx::Error> {
         let mut tx = pool.begin().await?;
+        if matches!(&operation, Operation::Delegated { .. } | Operation::HostRoute { .. }) {
+            self.lock_delegated_recovery(&mut tx).await?;
+        }
+        let reply = self.database_apply(&mut tx, genesis, subject, hash, operation).await?;
+        tx.commit().await?;
+        Ok(reply)
+    }
+
+    /// Reporting holds the recovery fence in its existing transaction through
+    /// HTTP delivery and ledger settlement; no second connection/lock is nested.
+    pub(crate) async fn delegated_operation_in(&self, connection: &mut sqlx::PgConnection,
+        genesis: &str, subject: &str, command: delegated::Command) -> Result<Reply, sqlx::Error>
+    {
+        let Some(origin) = self.delegated_origin.get() else { return Ok(unavailable()) };
+        self.lock_delegated_recovery(connection).await?;
+        let Ok(hash) = Hash32::from_hex(genesis) else { return Ok(invalid()) };
+        self.database_apply(connection, genesis, Some(subject), hash, Operation::Delegated {
+            origin: origin.clone(), binding: None, command,
+        }).await
+    }
+
+    async fn database_apply(&self, connection: &mut sqlx::PgConnection, genesis: &str,
+        subject: Option<&str>, hash: Hash32, operation: Operation) -> Result<Reply, sqlx::Error>
+    {
         // Lock absent roots too. A hash collision only serializes unrelated roots.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(genesis)
-            .execute(&mut *tx)
+            .execute(&mut *connection)
             .await?;
         let saved: Option<(String, Value)> = sqlx::query_as(
             "SELECT account_subject, state FROM remote_recovery_roots WHERE genesis_hash = $1 FOR UPDATE")
-            .bind(genesis).fetch_optional(&mut *tx).await?;
+            .bind(genesis).fetch_optional(&mut *connection).await?;
         if saved.as_ref().is_some_and(|(owner, _)| subject.is_some_and(|subject| owner != subject)) {
             return Ok(error(StatusCode::NOT_FOUND, "recovery_record_not_found"));
         }
@@ -629,8 +676,7 @@ impl RecoveryStore {
         let value = serde_json::to_value(root).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
         sqlx::query("INSERT INTO remote_recovery_roots (genesis_hash, account_subject, state) VALUES ($1,$2,$3) \
             ON CONFLICT (genesis_hash) DO UPDATE SET state = EXCLUDED.state, updated_at = now()")
-            .bind(genesis).bind(owner).bind(value).execute(&mut *tx).await?;
-        tx.commit().await?;
+            .bind(genesis).bind(owner).bind(value).execute(&mut *connection).await?;
         Ok(reply)
     }
 }

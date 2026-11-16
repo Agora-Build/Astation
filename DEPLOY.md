@@ -709,6 +709,27 @@ the room code could register first (see "First-use squatting" in
 `DELETE /api/pair/:code` is refused with `409` for a code that has a registered
 key; use `admin forget-key`, not the API, to manage such rooms.
 
+Delegated host-work recovery is separate from relay-key reset. The feature
+remains disabled. An opt-in build additionally requires
+`STATION_DELEGATED_HOST_WORK=true`, normalized `PUBLIC_BASE_URL` and
+`STATION_DELEGATED_RECOVERY_GENERATION`, maintained outside database backups.
+The initial generation is `1`; increase it before every database restore or
+history-loss recovery, after draining/stopping all replicas. A mismatch closes
+a durable fence rather than serving old control state. Do not decrease the
+generation or restore it from the backup.
+
+```sh
+station-relay-server admin delegated-recovery status
+station-relay-server admin delegated-recovery fence
+```
+
+These use `DATABASE_URL`, `PUBLIC_BASE_URL` and the configured recovery
+generation. `status` only inspects. `fence` stops subsequent delegated serving,
+signing and reporting after admitted operations finish, and never reopens it.
+Snapshot reconstruction/reopening is not yet implemented. See
+[the recovery procedure](designs/protocol/delegated-station-restore.md) for the
+remaining obligations and the limits of the external generation guard.
+
 Rollback caveat: once `0003` has been applied, a relay image built before it
 fails at startup (`sqlx` migrate error `VersionMissing(3)`: the database has a
 migration the binary does not know). Roll back to an image that includes

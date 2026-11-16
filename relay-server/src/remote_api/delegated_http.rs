@@ -179,7 +179,7 @@ mod tests {
                 std::sync::Arc::new(super::super::tests::TestAccountVerifier),
             ));
         if enabled {
-            app.recovery.configure_delegated(ORIGIN).unwrap();
+            app.recovery.configure_delegated(ORIGIN, 1).await.unwrap();
         }
         let f = super::super::delegated::tests::fixture();
         f.publish(&app.recovery).await;
@@ -230,7 +230,7 @@ mod tests {
             http(&app, &genesis, "", Some("alice"), None).await.0,
             StatusCode::SERVICE_UNAVAILABLE
         );
-        app.recovery.configure_delegated(ORIGIN).unwrap();
+        app.recovery.configure_delegated(ORIGIN, 1).await.unwrap();
         assert_eq!(
             http(&app, &genesis, "", Some("mallory"), None).await.0,
             StatusCode::NOT_FOUND

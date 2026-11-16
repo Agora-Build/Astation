@@ -254,10 +254,13 @@ async fn postgres_background_poll_nudge_restart_and_closed_readiness() {
         portal.shared.reports.lock().await[0]["state"],
         "waiting_for_host"
     );
+    #[cfg(not(feature = "hosted-agent-api"))]
     assert_eq!(
         portal.shared.reports.lock().await[0]["reason"],
         "Hosted execution awaits end-to-end verification"
     );
+    #[cfg(feature = "hosted-agent-api")]
+    assert!(portal.shared.reports.lock().await[0].get("reason").is_none());
     let saved = runtime.policies.load(&runtime.binding).await.unwrap();
     assert!(!saved.denied);
     // An unsigned nudge asks for a fresh authenticated snapshot, not a cursor jump.

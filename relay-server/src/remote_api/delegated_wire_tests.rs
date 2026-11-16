@@ -6,7 +6,7 @@ const ORIGIN: &str = "https://station-dev.agora.build";
 #[tokio::test]
 async fn real_socket_announces_empty_feed_then_serves_correlated_calls_without_a_mac() {
     let store = RecoveryStore::memory();
-    store.configure_delegated(ORIGIN).unwrap();
+    store.configure_delegated(ORIGIN, 1).await.unwrap();
     let f = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
     f.publish(&store).await;
     let app = state(store);
@@ -54,7 +54,7 @@ async fn real_socket_announces_empty_feed_then_serves_correlated_calls_without_a
 #[tokio::test]
 async fn stale_feed_and_cross_account_ack_disclose_no_metadata_and_do_not_close_current_link() {
     let store = RecoveryStore::memory();
-    store.configure_delegated(ORIGIN).unwrap();
+    store.configure_delegated(ORIGIN, 1).await.unwrap();
     let f = Fixture::new(chrono::Utc::now().timestamp_millis() as u64);
     f.publish(&store).await;
     let (base, server) = spawn_relay(state(store)).await;

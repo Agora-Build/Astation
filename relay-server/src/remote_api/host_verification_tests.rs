@@ -73,7 +73,7 @@ impl Harness {
         let base = state(RecoveryStore::memory());
         if delegated {
             base.recovery
-                .configure_delegated("https://station-dev.agora.build")
+                .configure_delegated("https://station-dev.agora.build", 1).await
                 .unwrap();
         }
         fixture.publish(&base.recovery).await;
@@ -405,7 +405,7 @@ async fn postgres_completion(delegated: bool) {
         RecoveryStore::postgres(second_pool.clone()),
     ] {
         if delegated {
-            store.configure_delegated("https://station-dev.agora.build").unwrap();
+            store.configure_delegated("https://station-dev.agora.build", 1).await.unwrap();
         }
         let cluster = crate::start_redis_replica(
             &test_support::test_url(),

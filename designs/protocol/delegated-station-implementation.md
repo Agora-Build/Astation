@@ -34,6 +34,12 @@ delegated execution or new native membership/control signing.
   revoke cannot be undone by a later active Portal snapshot. A separate own-key
   revoke is still issued for Portal reporting. Keys remain until signed R9
   membership removal, rather than being deleted on Portal revocation alone.
+- Durable deployment-generation recovery fence, initial-history check and
+  operator status/fence commands. A restore's externally increased generation
+  blocks stale replicas, feed/ACK operations, signing and queued socket frames.
+  Reporting holds the fence through actual HTTP delivery and commits ledger
+  settlement together with its global delivery marker. This implements fencing,
+  not complete snapshot reconstruction or reopening after a restore.
 
 ## Native client HTTP carriage
 
@@ -166,7 +172,9 @@ for operator diagnostics rather than retried under a new ID.
 
 The `delegated-host-work` Cargo feature and exact
 `STATION_DELEGATED_HOST_WORK=true` runtime setting are both required, with a
-normalized `PUBLIC_BASE_URL`. Deployment configuration enables neither.
+normalized `PUBLIC_BASE_URL` and externally maintained
+`STATION_DELEGATED_RECOVERY_GENERATION`. Deployment configuration enables neither
+the build feature nor runtime gate.
 New native signing/device-list compatibility gates remain off.
 
 Still required before activation:
@@ -181,10 +189,13 @@ Still required before activation:
   are implemented but remain gated. Record-specific re-sign/application alerts
   remain required. Unknown-outcome listing, resolution review, protected reminder
   policy and push routing are implemented; their real joint checks remain open.
-- Restore/reset/incarnation tooling: a restored database must never reuse a
+- Complete restore/reset tooling: a restored database must never reuse a
   `feed_id`. A reset must reissue a complete latest-state snapshot, including
   native records needing a manager. The present storage UUID is restart-stable;
-  it is not a completed database-restore procedure. Retention/compaction must
+  it is not a completed database-restore procedure. The deployment-generation
+  fence and operator status/fence commands now keep uncertain history closed;
+  snapshot reconstruction, manager re-signs and reopening remain unfinished.
+  Retention/compaction must
   preserve required stops, high-water and at least 30 days of records. The
   implementation requirements and recovery sequence are recorded in
   [delegated-station-restore.md](delegated-station-restore.md).
@@ -238,6 +249,15 @@ failed stop/marker commits and explicit one-shot resumption. Outcome tests cover
 all four pages, failure/timeout recovery, stale confirmation and late scan/query
 races, explicit receipt confirmation, daily reminder reload and uncertain writes,
 and actual shared verification of signed alert targets and tampering.
+
+Recovery-fence validation: default relay 604 passed/145 ignored; combined
+`host-work-api,delegated-host-work` 611 passed/166 ignored; all isolated Postgres
+tests in that combined build 97 passed, including all 19 delegated Postgres
+tests. The default Postgres build passes 76 tests. The existing background-poll
+test now asserts its readiness reason for both hosted build-gate states.
+The actual operator binary passes isolated status/fence, generation increase,
+stale-generation refusal and invalid-configuration checks without creating a
+feed. These results do not establish complete snapshot recovery or VII.A.
 
 The working branch's exact commands/results are recorded in its PR. Real
 protected owner ceremonies and native local transport remain joint checks.

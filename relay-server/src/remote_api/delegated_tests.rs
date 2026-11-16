@@ -13,6 +13,10 @@ use atem_client::{
 use axum::http::StatusCode;
 use serde_json::json;
 
+#[cfg(feature = "delegated-host-work")]
+#[path = "delegated_restore_tests.rs"]
+mod recovery_fence;
+
 const ORIGIN: &str = "https://station-dev.agora.build";
 
 pub(crate) fn fixture() -> Fixture {
@@ -579,7 +583,7 @@ async fn ack_is_atomic_cursor_alone_counts_nothing_and_restart_replays_one_repor
 async fn a_replaced_association_cannot_read_or_commit_evidence() {
     let f = fixture();
     let store = RecoveryStore::memory();
-    store.configure_delegated(ORIGIN).unwrap();
+    store.configure_delegated(ORIGIN, 1).await.unwrap();
     f.publish(&store).await;
     let old = admit(&store, &f, "old").await;
     assert!(store.prepare_delegated(&old).await);
@@ -649,8 +653,9 @@ async fn postgres_replicas_create_one_feed_and_restart_preserves_records() {
         crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 8).await;
     let a = RecoveryStore::postgres(database.pool.clone());
     let b = RecoveryStore::postgres(database.reconnect(4).await);
-    a.configure_delegated(ORIGIN).unwrap();
-    b.configure_delegated(ORIGIN).unwrap();
+    let (one, two) = tokio::join!(a.configure_delegated(ORIGIN, 1), b.configure_delegated(ORIGIN, 1));
+    one.unwrap();
+    two.unwrap();
     let f = fixture();
     f.publish(&a).await;
     let binding = admit(&a, &f, "shared").await;
@@ -698,7 +703,7 @@ async fn postgres_replicas_create_one_feed_and_restart_preserves_records() {
     drop(a);
     drop(b);
     let restarted = RecoveryStore::postgres(database.reconnect(4).await);
-    restarted.configure_delegated(ORIGIN).unwrap();
+    restarted.configure_delegated(ORIGIN, 1).await.unwrap();
     let heads = restarted
         .with_delegated_response(&binding, None, read)
         .await
@@ -720,7 +725,7 @@ async fn postgres_failed_ack_commit_leaks_no_evidence_and_retry_settles_once() {
     let database =
         crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
     let store = RecoveryStore::postgres(database.pool.clone());
-    store.configure_delegated(ORIGIN).unwrap();
+    store.configure_delegated(ORIGIN, 1).await.unwrap();
     let f = fixture();
     f.publish(&store).await;
     let binding = admit(&store, &f, "proved").await;
@@ -828,7 +833,11 @@ async fn postgres_report_scan_is_bounded_and_selects_only_this_stations_feeds() 
     let database =
         crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
     let store = RecoveryStore::postgres(database.pool.clone());
-    store.configure_delegated(ORIGIN).unwrap();
+    store.configure_delegated(ORIGIN, 1).await.unwrap();
+    let other_station = RecoveryStore::postgres(database.reconnect(2).await);
+    other_station
+        .configure_delegated("https://another.example", 1).await
+        .unwrap();
     let mut expected = Vec::new();
     for index in 0..35 {
         let f = fixture();
@@ -857,10 +866,6 @@ async fn postgres_report_scan_is_bounded_and_selects_only_this_stations_feeds() 
     }
     let without_feed = fixture();
     without_feed.publish(&store).await;
-    let other_station = RecoveryStore::postgres(database.reconnect(2).await);
-    other_station
-        .configure_delegated("https://another.example")
-        .unwrap();
     let other_root = fixture();
     other_root.publish(&other_station).await;
     assert_eq!(
