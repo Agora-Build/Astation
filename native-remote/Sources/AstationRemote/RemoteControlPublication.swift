@@ -119,6 +119,32 @@ public final class RemoteControlPublication {
         }
     }
 
+    /// Includes completed deliveries: a storage receipt does not settle host application.
+    public func activity(log: MembershipLog,
+        status: [String: RemoteControlApplicationState] = [:]) throws -> [RemoteControlActivity] {
+        try available()
+        try check(log)
+        return try saved.operations.map { operation in
+            let body = try validate(operation)
+            let needsManager: Bool
+            if let record = operation.recordJSON {
+                switch try verifyControlRecord(log: log, recordJson: record) {
+                case .valid: needsManager = false
+                case .refused(let reason) where reason == "removed_manager": needsManager = true
+                default: throw RemoteControlPublicationError.requiresReview
+                }
+            } else { needsManager = false }
+            return RemoteControlActivity(body: body, signed: operation.recordJSON != nil,
+                stationStored: operation.stationStored,
+                portalPending: operation.portalMirror != nil && !operation.portalMirrored && operation.portalRefusal == nil,
+                managerReviewRequired: needsManager,
+                application: operation.recordJSON == nil ? nil : status[body.recordId])
+        }.sorted {
+            if $0.body.issuedAt != $1.body.issuedAt { return $0.body.issuedAt > $1.body.issuedAt }
+            return $0.body.recordId < $1.body.recordId
+        }
+    }
+
     public init(accountID: String, genesisHash: String, stationOrigin: String,
         persist: @escaping (Data) throws -> Void) throws {
         guard RemoteRecoveryKit.validID(accountID), RemoteRecoveryKit.validHash(genesisHash),

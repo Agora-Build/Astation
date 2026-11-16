@@ -42,6 +42,58 @@ final class RemoteRecoveryHTTPTests: XCTestCase {
         return (try RemoteRecoveryHTTP(relayURL: "https://" + host, configuration: config, accessToken: { "test-account-token" }), host)
     }
 
+    func testControlStatusBindsTheAccountHeadAndExactOrderedRecordIDs() async throws {
+        let ids = (0..<3).map { _ in UUID().uuidString.lowercased() }, hash = genesis
+        let (http, host) = try transport { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path, "/api/remote/v1/logs/\(hash)/control/status")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-account-token")
+            var data = request.httpBody ?? Data()
+            if data.isEmpty, let stream = request.httpBodyStream {
+                stream.open(); defer { stream.close() }
+                var buffer = [UInt8](repeating: 0, count: 4096)
+                while stream.hasBytesAvailable {
+                    let count = stream.read(&buffer, maxLength: buffer.count)
+                    guard count >= 0 else { throw try XCTUnwrap(stream.streamError) }
+                    if count == 0 { break }
+                    data.append(contentsOf: buffer.prefix(count))
+                }
+            }
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            XCTAssertEqual(body["record_ids"] as? [String], ids)
+            let rows = zip(ids, ["unknown", "awaiting_application", "effects_reported"]).map { ["record_id": $0, "state": $1] }
+            return (200, try JSONSerialization.data(withJSONObject: ["head": body["expected"]!, "records": rows]))
+        }
+        defer { RecoveryHTTPStub.remove(host: host) }
+        let result = try await http.controlStatus(genesisHash: genesis, recordIDs: ids, expected: LogHead(seq: 5, hash: genesis))
+        XCTAssertEqual(result, [ids[0]: .unknown, ids[1]: .awaitingApplication, ids[2]: .effectsReported])
+    }
+
+    func testMalformedControlStatusCannotConfirmApplication() async throws {
+        let id = UUID().uuidString.lowercased(), hash = genesis
+        let good = "{\"head\":{\"seq\":5,\"hash\":\"\(hash)\"},\"records\":[{\"record_id\":\"\(id)\",\"state\":\"effects_reported\"}]}"
+        for bad in [
+            good.replacingOccurrences(of: "\"seq\":5", with: "\"seq\":4"),
+            good.replacingOccurrences(of: hash, with: String(repeating: "cd", count: 32)),
+            good.replacingOccurrences(of: id, with: UUID().uuidString.lowercased()),
+            good.replacingOccurrences(of: "effects_reported", with: "applied"),
+            good.replacingOccurrences(of: "\"state\":", with: "\"state\":null,\"state\":"),
+            good.replacingOccurrences(of: "\"records\":[", with: "\"extra\":null,\"records\":["),
+            "{\"head\":{\"seq\":5,\"hash\":\"\(hash)\"},\"records\":[]}"
+        ] {
+            let (http, host) = try transport { _ in (200, Data(bad.utf8)) }
+            defer { RecoveryHTTPStub.remove(host: host) }
+            do { _ = try await http.controlStatus(genesisHash: hash, recordIDs: [id], expected: LogHead(seq: 5, hash: hash)); XCTFail("accepted malformed status") }
+            catch {}
+        }
+        let (http, host) = try transport { _ in XCTFail("invalid selector requested an account token/HTTP request"); return (200, Data()) }
+        defer { RecoveryHTTPStub.remove(host: host) }
+        for ids in [[], [id, id], ["not-a-record-id"], (0..<65).map { _ in UUID().uuidString.lowercased() }] {
+            do { _ = try await http.controlStatus(genesisHash: hash, recordIDs: ids, expected: LogHead(seq: 5, hash: hash)); XCTFail("accepted invalid selector") }
+            catch {}
+        }
+    }
+
     func testLogRequestHasBoundedSelectorAndAccountAuthentication() async throws {
         let genesis = self.genesis
         let (http, host) = try transport { request in

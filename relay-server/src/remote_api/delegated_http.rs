@@ -117,6 +117,31 @@ pub(crate) async fn reserve(
         .await
 }
 
+pub(crate) async fn status(
+    State(state): State<AppState>,
+    Path(genesis): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Reply {
+    let owner = match access(&state, &headers).await {
+        Ok(owner) => owner,
+        Err(reply) => return reply,
+    };
+    let value = match read(body).await {
+        Ok(value) => value,
+        Err(reply) => return reply,
+    };
+    if !fields(&value, &["record_ids", "expected"]) { return invalid(); }
+    let parsed = (|| {
+        Some((value.value()["record_ids"].as_array()?.iter()
+            .map(|value| value.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>()?,
+            Head::from_json(&value.value()["expected"])?))
+    })();
+    let Some((record_ids, expected)) = parsed else { return invalid(); };
+    state.recovery.delegated_operation(&genesis, &owner,
+        Command::Owner(OwnerCommand::Status { record_ids, expected })).await
+}
+
 pub(crate) async fn publish(
     State(state): State<AppState>,
     Path(genesis): Path<String>,
@@ -384,6 +409,34 @@ mod tests {
                 .0,
                 StatusCode::BAD_REQUEST
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_native_http_status_is_private_bounded_and_bound_to_current_head() {
+        let (app, f) = app(false).await;
+        let genesis = f.log.genesis_hash().to_hex();
+        let id = uuid::Uuid::new_v4().to_string();
+        let request = json!({"record_ids":[id],"expected":f.log.head().to_json()});
+        for (owner, expected) in [(None, StatusCode::UNAUTHORIZED), (Some("alice"), StatusCode::SERVICE_UNAVAILABLE)] {
+            assert_eq!(http(&app, &genesis, "/status", owner, Some(request.clone())).await.0, expected);
+        }
+        app.recovery.configure_delegated(ORIGIN, 1).await.unwrap();
+        let denied = http(&app, &genesis, "/status", Some("mallory"), Some(request.clone())).await;
+        assert_eq!(denied.0, StatusCode::NOT_FOUND);
+        assert!(!denied.1.to_string().contains(&id));
+        let (status, reply) = http(&app, &genesis, "/status", Some("alice"), Some(request.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reply, json!({"head":f.log.head().to_json(),"records":[{"record_id":id,"state":"unknown"}]}));
+        let mut old_head = request.clone(); old_head["expected"]["seq"] = json!(1);
+        let mut extra = request.clone(); extra["account"] = json!("other");
+        for bad in [old_head, extra,
+            json!({"record_ids":[],"expected":f.log.head().to_json()}),
+            json!({"record_ids":[id,id],"expected":f.log.head().to_json()}),
+            json!({"record_ids":["not-a-record"],"expected":f.log.head().to_json()}),
+            json!({"record_ids":(0..65).map(|_| uuid::Uuid::new_v4().to_string()).collect::<Vec<_>>(),"expected":f.log.head().to_json()})
+        ] {
+            assert_eq!(http(&app, &genesis, "/status", Some("alice"), Some(bad)).await.0, StatusCode::BAD_REQUEST);
         }
     }
 
