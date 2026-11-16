@@ -600,11 +600,13 @@ feed. These results do not establish complete snapshot recovery or VII.A.
 The working branch's exact commands/results are recorded in its PR. Real
 protected owner ceremonies and native local transport remain joint checks.
 
-The native fanout adapter passes the full shared Swift suite (286 executed,
+The native fanout adapter passes the full shared Swift suite (287 executed,
 one optional skip, zero failures) and all 102 recovery-coordinator tests. Added
 cases exercise two real HTTP transports with separate origin credentials and a
 wrong-record receipt, independent receipts, exact lost-reply/restart retry,
 primary outage, an absent or changed roster, a mislabeled transport, manager
 demotion at a destination, uncertain receipt writes and re-sign destination
-preservation. These are isolated adapter tests, not VII.A/VII.B evidence or
+preservation. A selected-Station application report cannot hide a removed-manager
+warning while another destination's host application is unconfirmed, even when
+that Station stored the record. These are isolated adapter tests, not VII.A/VII.B evidence or
 authoritative Station-inventory coverage.

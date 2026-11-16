@@ -110,6 +110,26 @@ private final class ControlPublicationFixture {
 
 final class RemoteControlPublicationTests: XCTestCase {
     @MainActor
+    func testPrimaryApplicationCannotHideManagerReviewForOtherStationsEvenAfterStorage() throws {
+        let f = try ControlPublicationFixture(), body = try f.hostBody(), second = "https://second.example"
+        _ = try f.journal.prepare(body: body, log: f.log, additionalStationOrigins: [second])
+        _ = try f.sign(body)
+        let delivery = try XCTUnwrap(f.journal.delivery(recordID: body.recordId, log: f.log))
+        try f.journal.stationStored(delivery)
+        try f.journal.stationStored(delivery, stationOrigin: second)
+        _ = try f.replaceManager()
+        try f.restore()
+        let row = try XCTUnwrap(f.journal.activity(log: f.log, status: [body.recordId: .effectsReported]).first)
+        XCTAssertTrue(row.managerReviewRequired)
+        XCTAssertTrue(row.requiresManagerReview, "primary application and secondary storage do not prove secondary application")
+        XCTAssertTrue(row.summary.contains("Fresh manager review needed"))
+        let single = RemoteControlActivity(body: row.body, signed: true, stationStored: true, portalPending: false,
+            managerReviewRequired: true, replacementRecordID: nil, application: .effectsReported, additionalStations: [:])
+        XCTAssertFalse(single.requiresManagerReview, "single-Station application evidence still settles that review")
+        XCTAssertTrue(single.summary.contains("Selected Station reports"))
+    }
+
+    @MainActor
     func testHostFanoutHTTPUsesSeparateOriginCredentialsAndRejectsAFalseReceipt() async throws {
         let f = try ControlPublicationFixture(), body = try f.hostBody()
         let second = "https://fanout-" + UUID().uuidString.lowercased() + ".example"

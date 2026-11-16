@@ -22,11 +22,17 @@ public struct RemoteControlActivity: Equatable, Sendable {
     public let application: RemoteControlApplicationState?
     public let additionalStations: [String: Bool]
 
+    /// Application evidence is selected-Station only. Additional storage receipts
+    /// cannot settle a removed signer's stop on those Stations' receiving hosts.
+    public var requiresManagerReview: Bool {
+        managerReviewRequired && (application != .effectsReported || !additionalStations.isEmpty)
+    }
+
     public var summary: String {
         if !signed { return "Saved review - confirmation required" }
-        if application == .effectsReported { return "Selected Station reports all covered effects in force" }
         if let replacementRecordID { return "Fresh manager copy saved: " + replacementRecordID }
-        if managerReviewRequired { return "Fresh manager review needed - the original signer no longer manages this account" }
+        if requiresManagerReview { return "Fresh manager review needed - the original signer no longer manages this account" }
+        if application == .effectsReported { return "Selected Station reports all covered effects in force" }
         switch application {
         case .unknown: return "Selected Station has no matching stored stop"
         case .awaitingApplication: return "Waiting for covered hosts to confirm application"

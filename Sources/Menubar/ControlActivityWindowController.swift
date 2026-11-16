@@ -111,7 +111,7 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
     private func display(_ activity: [RemoteControlActivity]) {
         let previous = selected?.body.recordId
         rows = activity
-        reviewRows = activity.filter { $0.managerReviewRequired && $0.application != .effectsReported }
+        reviewRows = activity.filter(\.requiresManagerReview)
         stops.removeAllItems()
         stops.addItems(withTitles: reviewRows.map { $0.body.principal + " - " + $0.body.recordId })
         if let index = reviewRows.firstIndex(where: { $0.body.recordId == previous }) { stops.selectItem(at: index) }
