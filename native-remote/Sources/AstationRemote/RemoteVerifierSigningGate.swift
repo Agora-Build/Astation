@@ -44,6 +44,7 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
         var connection: Connection?
         var confirmed: VerifierInventory?
         var highest: VerifierInventory?
+        var validBefore: UInt64?
     }
 
     private let lock = NSLock()
@@ -51,11 +52,13 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
     private let genesisHash: String
     private let head: LogHead
     private let hostGenerations: [String: UInt64]
+    private let now: () -> UInt64
     private var states: [RemoteVerifierID: State]
 
     /// A roster is valid for one exact signed head. Changing membership requires a fresh roster
     /// and fresh reports; an unsigned server response cannot silently remove an offline verifier.
-    public init(log: MembershipLog, verifiers: [RemoteVerifierID]) throws {
+    public init(log: MembershipLog, verifiers: [RemoteVerifierID],
+                now: @escaping () -> UInt64 = { DispatchTime.now().uptimeNanoseconds / 1_000_000 }) throws {
         var required = Set(log.members().filter { $0.status == .active }.map { RemoteVerifierID.member($0.deviceId) })
         var hosts: [String: UInt64] = [:]
         for entry in log.entries() {
@@ -80,6 +83,7 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
         genesisHash = log.genesisHash()
         head = log.head()
         hostGenerations = hosts
+        self.now = now
         states = Dictionary(uniqueKeysWithValues: verifiers.map { ($0, State()) })
     }
 
@@ -89,6 +93,7 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
         let connection = Connection(verifier: verifier, generation: UUID())
         state.connection = connection
         state.confirmed = nil
+        state.validBefore = nil
         states[verifier] = state
         return connection
     }
@@ -109,23 +114,34 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
 
     /// The authenticated channel owner must disconnect this evidence when the channel closes,
     /// expires or loses authority; merely retaining a WelcomeInfo is not a live connection.
-    public func observeHostWelcome(_ welcome: WelcomeInfo, on connection: Connection) throws {
+    /// Capture receivedAt when the verified welcome arrives, before any deferred delivery.
+    public func observeHostWelcome(_ welcome: WelcomeInfo, on connection: Connection,
+                                   receivedAt: UInt64? = nil) throws {
+        let current = now()
+        let received = receivedAt ?? current
+        let deadline = received.addingReportingOverflow(welcome.authorizationMsLeft)
         guard case .host(let id) = connection.verifier, welcome.atemDeviceId == id,
               welcome.accountId == accountID, welcome.head == head,
               welcome.revision == 9, (1...86_400_000).contains(welcome.authorizationMsLeft),
+              received <= current, !deadline.overflow, current < deadline.partialValue,
               hostGenerations[id] == welcome.hostTrustGen else {
             try observe(nil, on: connection)
             throw RemoteVerifierGateError.staleMembership
         }
-        try observe(welcome.verifier, on: connection)
+        try observe(welcome.verifier, on: connection, validBefore: deadline.partialValue)
     }
 
-    private func observe(_ inventory: VerifierInventory?, on connection: Connection) throws {
+    private func observe(_ inventory: VerifierInventory?, on connection: Connection,
+                         validBefore: UInt64? = nil) throws {
         lock.lock(); defer { lock.unlock() }
         guard var state = states[connection.verifier], state.connection == connection else {
             throw RemoteVerifierGateError.staleConnection
         }
         state.confirmed = nil
+        if let validBefore {
+            // A missing or refused inventory cannot renew this channel's deadline later.
+            state.validBefore = min(state.validBefore ?? validBefore, validBefore)
+        }
         defer { states[connection.verifier] = state }
         guard let inventory else { return }
         guard inventory.version > 0, (1...64).contains(inventory.actions.count),
@@ -167,8 +183,10 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
         }
         if action == "add", let member = body["member"] as? [String: Any], let id = member["device_id"] as? String,
            states[.member(id)] == nil { throw RemoteVerifierGateError.unconfirmedVerifiers }
+        let current = now()
         guard states.values.allSatisfy({ state in
             guard state.connection != nil, let inventory = state.confirmed else { return false }
+            if let deadline = state.validBefore, current >= deadline { return false }
             return inventory.version >= minimum && inventory.actions.contains(action)
         }) else { throw RemoteVerifierGateError.unconfirmedVerifiers }
     }
