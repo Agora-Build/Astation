@@ -72,6 +72,9 @@ final class AstationRecoveryCoordinator {
     private let confirmServiceOwner: (RemoteServiceApproval, SignRequest) async -> Bool
     private let authorizeDelegatedControl: ((MembershipLog) throws -> Void)?
     private let authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)?
+    /// The caller authenticates this account's Station roster and scopes each transport's token
+    /// to its exact origin. A cached presence list is not a complete roster.
+    private let additionalControlStations: ((MembershipLog) throws -> [String: RemoteControlStationTransport])?
     private let confirmReplacement: (String) async -> Bool
     private let saveKit: (String) async -> Bool
     private let dataKeys: AstationRecoveryDataKeys
@@ -139,6 +142,7 @@ final class AstationRecoveryCoordinator {
         confirmServiceOwner: ((RemoteServiceApproval, SignRequest) async -> Bool)? = nil,
         authorizeDelegatedControl: ((MembershipLog) throws -> Void)? = nil,
         authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)? = nil,
+        additionalControlStations: ((MembershipLog) throws -> [String: RemoteControlStationTransport])? = nil,
         now: @escaping () -> HostClock = { AstationRecoveryCoordinator.clock() }) throws {
         self.accountID = accountID
         self.managerID = managerID
@@ -152,6 +156,7 @@ final class AstationRecoveryCoordinator {
         self.confirmServiceOwner = confirmServiceOwner ?? { _, request in await confirmOwner(request) }
         self.authorizeDelegatedControl = authorizeDelegatedControl
         self.authorizeNewMembership = authorizeNewMembership
+        self.additionalControlStations = additionalControlStations
         self.confirmReplacement = confirmReplacement
         self.saveKit = saveKit
         self.now = now
@@ -994,7 +999,7 @@ final class AstationRecoveryCoordinator {
         publication = nil
     }
 
-    private func refreshedLog(genesis: String) async throws -> MembershipLog {
+    private func refreshedLog(genesis: String, transport: RemoteRecoveryTransport? = nil) async throws -> MembershipLog {
         guard !saved.entries.isEmpty else { throw RemoteRecoveryError.notCommitted }
         let log: MembershipLog
         if let previous = membershipLog, previous.entries() == saved.entries {
@@ -1006,7 +1011,7 @@ final class AstationRecoveryCoordinator {
         _ = try log.advance(now: now())
         try commitLog(log)
         for _ in 0..<128 {
-            let page = try await http.entries(genesisHash: genesis, after: log.head().seq)
+            let page = try await (transport ?? http).entries(genesisHash: genesis, after: log.head().seq)
             let result = try log.extend(entries: page.entries, now: now())
             try commitLog(log)
             guard result.stop == nil, log.frozen() == nil else { throw RemoteRecoveryError.requiresReview }
@@ -1397,6 +1402,7 @@ extension AstationRecoveryCoordinator {
         let stationOrigin: String
         let body: ControlRecordBody
         let request: SignRequest
+        var additionalStationOrigins: [String] = []
         var hostID: String { String(body.principal.dropFirst(5)) }
         var recordID: String { body.recordId }
     }
@@ -1503,7 +1509,8 @@ extension AstationRecoveryCoordinator {
         guard delegatedControlsAvailable else { throw AstationDelegatedControlError.notVerified }
         guard current(), !Task.isCancelled, let source = review.resignsRecordID, let kit = try currentKit(),
               let saved = try controls().savedResignReview(recordID: source), saved.body == review.body,
-              saved.request == review.request, review.body.signer == "member:" + managerID else {
+              saved.request == review.request, saved.additionalStationOrigins == review.additionalStationOrigins,
+              review.body.signer == "member:" + managerID else {
             throw RemoteRecoveryError.requiresReview
         }
         if !saved.signed {
@@ -1597,7 +1604,8 @@ extension AstationRecoveryCoordinator {
 
     func pendingHostInterrupts() throws -> [HostInterruptReview] {
         try controls().pendingReviews().filter { $0.body.principal.hasPrefix("host:") }.map {
-            HostInterruptReview(stationOrigin: relayURL, body: $0.body, request: $0.request)
+            HostInterruptReview(stationOrigin: relayURL, body: $0.body, request: $0.request,
+                additionalStationOrigins: try controls().stationOrigins(recordID: $0.body.recordId).filter { $0 != relayURL })
         }
     }
 
@@ -1626,8 +1634,9 @@ extension AstationRecoveryCoordinator {
             feedId: nil, principal: "host:" + hostID, principalKey: nil, signer: "member:" + managerID,
             action: "interrupt_running", interruptRunning: nil, revokeSeq: revokeSeq,
             recordId: UUID().uuidString.lowercased(), issuedAt: time, integrationId: nil, by: "owner")
-        let request = try controls().prepare(body: body, log: log)
-        return HostInterruptReview(stationOrigin: relayURL, body: body, request: request)
+        let origins = try controlStationTransports(log).keys.filter { $0 != relayURL }.sorted()
+        let request = try controls().prepare(body: body, log: log, additionalStationOrigins: origins)
+        return HostInterruptReview(stationOrigin: relayURL, body: body, request: request, additionalStationOrigins: origins)
     }
 
     func commitHostInterrupt(_ review: HostInterruptReview, current: () -> Bool) async throws -> RemoteControlDelivery {
@@ -1636,6 +1645,9 @@ extension AstationRecoveryCoordinator {
         guard current(), review.stationOrigin == relayURL, review.body.principal.hasPrefix("host:"),
               review.body.action == "interrupt_running", let kit = try currentKit() else { throw AccountLoginError.changed }
         let journal = try controls()
+        guard try journal.stationOrigins(recordID: review.recordID) == [relayURL] + review.additionalStationOrigins else {
+            throw RemoteRecoveryError.requiresReview
+        }
         let savedRequest = try journal.signingRequest(recordID: review.recordID)
         if let retained = try journal.retainedDelivery(recordID: review.recordID) {
             guard try parseControlRecord(recordJson: retained.recordJSON) == review.body else {
@@ -1762,16 +1774,30 @@ extension AstationRecoveryCoordinator {
         }
         let journal = try controls()
         guard let delivery = try journal.retainedDelivery(recordID: id) else { throw RemoteRecoveryError.notCommitted }
-        if try journal.stationDeliveryNeeded(recordID: id) {
+        let origins = try journal.stationOrigins(recordID: id)
+        for origin in origins where try journal.stationDeliveryNeeded(recordID: id, stationOrigin: origin) {
             do {
-                let log = try await refreshedLog(genesis: kit.genesisHash)
+                let target: RemoteControlTransport
+                let membershipTransport: RemoteRecoveryTransport
+                if origin == relayURL { target = transport; membershipTransport = http }
+                else {
+                    guard let anchor = membershipLog?.snapshot(),
+                          let value = try controlStationTransports(anchor)[origin] else { continue }
+                    target = value; membershipTransport = value
+                }
+                let log = try await refreshedLog(genesis: kit.genesisHash, transport: membershipTransport)
                 try requireDelegatedControl(log)
                 guard current(), !Task.isCancelled, let verified = try journal.delivery(recordID: id, log: log) else {
                     throw RemoteChannelError.staleLink
                 }
-                _ = try await transport.publishControl(log: log, recordJSON: verified.recordJSON)
+                if origin != relayURL {
+                    // Membership may have advanced while reading this Station. Recheck the
+                    // authenticated roster before sending, without substituting another target.
+                    guard try controlStationTransports(log)[origin] != nil else { continue }
+                }
+                _ = try await target.publishControl(log: log, recordJSON: verified.recordJSON)
                 guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
-                try journal.stationStored(verified)
+                try journal.stationStored(verified, stationOrigin: origin)
             } catch {
                 guard !uncertain, !journal.storageUncertain else { throw RemoteRecoveryError.storageUncertain }
                 guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
@@ -1795,6 +1821,17 @@ extension AstationRecoveryCoordinator {
         }
         guard let result = try journal.retainedDelivery(recordID: id) else { throw RemoteRecoveryError.notCommitted }
         return result
+    }
+
+    private func controlStationTransports(_ log: MembershipLog) throws -> [String: RemoteControlStationTransport] {
+        let targets = try additionalControlStations?(log) ?? [:]
+        guard targets.count <= 63, targets[relayURL] == nil,
+              targets.allSatisfy({ origin, transport in
+                  PortalIntegrationRecord.validOrigin(origin) && transport.controlStationOrigin == origin
+              }) else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        return targets
     }
 }
 

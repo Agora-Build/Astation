@@ -98,7 +98,10 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
     static func description(_ row: RemoteControlActivity) -> String {
         let action = row.body.action == "revoke" ? "Revoke" : "Interrupt"
         let portal = row.portalPending ? "\nPortal mirror is still pending." : ""
-        return "\(action) \(row.body.principal)\n\(row.summary)\nRecord: \(row.body.recordId)\nSigner: \(row.body.signer)\(portal)"
+        let stations = row.additionalStations.keys.sorted().map {
+            "\n\($0): " + (row.additionalStations[$0] == true ? "Stored - host application not checked" : "Delivery pending")
+        }.joined()
+        return "\(action) \(row.body.principal)\n\(row.summary)\nRecord: \(row.body.recordId)\nSigner: \(row.body.signer)\(portal)\(stations)"
     }
 
     private var selected: RemoteControlActivity? {
@@ -108,7 +111,7 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
     private func display(_ activity: [RemoteControlActivity]) {
         let previous = selected?.body.recordId
         rows = activity
-        reviewRows = activity.filter { $0.managerReviewRequired && $0.application != .effectsReported }
+        reviewRows = activity.filter(\.requiresManagerReview)
         stops.removeAllItems()
         stops.addItems(withTitles: reviewRows.map { $0.body.principal + " - " + $0.body.recordId })
         if let index = reviewRows.firstIndex(where: { $0.body.recordId == previous }) { stops.selectItem(at: index) }
@@ -137,8 +140,10 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
             intent = "Revoke \(body.principal). " + (body.interruptRunning == true
                 ? "Also request interruption of its running tasks." : "Running tasks are not interrupted.")
         } else { intent = "Request interruption of running tasks from \(body.principal)." }
+        let stations = [station] + review.additionalStationOrigins
         return intent + "\n\nThe original stop stays saved. This copy does not confirm that tasks stopped or that other Stations received it." +
-            "\nStation: \(station)\nOriginal record: \(review.resignsRecordID ?? "")\nNew record: \(body.recordId)\nSigner: \(body.signer)"
+            "\nStations to receive this copy:\n" + stations.joined(separator: "\n") +
+            "\nOriginal record: \(review.resignsRecordID ?? "")\nNew record: \(body.recordId)\nSigner: \(body.signer)"
     }
 
     @objc private func reviewStop() {

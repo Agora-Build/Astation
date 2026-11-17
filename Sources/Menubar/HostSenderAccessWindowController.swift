@@ -117,9 +117,10 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
     }
 
     static func interruptExplanation(_ review: AstationRecoveryCoordinator.HostInterruptReview) -> String {
-        "Request interruption of tasks sent by \(review.hostID) before revoke #\(review.body.revokeSeq ?? 0). " +
+        let stations = [review.stationOrigin] + review.additionalStationOrigins
+        return "Request interruption of tasks sent by \(review.hostID) before revoke #\(review.body.revokeSeq ?? 0). " +
         "New work accepted after a readmit is unaffected. Delivery through this Station does not confirm that tasks stopped " +
-        "or that other Stations received the request.\n\nStation: \(review.stationOrigin)\nRecord: \(review.recordID)"
+        "or that other Stations received the request.\n\nStations to receive this request:\n" + stations.joined(separator: "\n") + "\nRecord: \(review.recordID)"
     }
 
     @objc private func reload() {
@@ -230,9 +231,9 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
                 let log = try await coordinator.hostSenderMembership()
                 guard current(), !Task.isCancelled else { throw AccountLoginError.changed }
                 try populate(log: log, coordinator: coordinator)
-                status.stringValue = delivery.stationStored
-                    ? "Interruption stored at the selected Station. Host application is not confirmed."
-                    : "Interruption saved. Station delivery will retry; host application is not confirmed."
+                status.stringValue = delivery.allStationsStored
+                    ? "Interruption stored at every reviewed Station. Host application is not confirmed."
+                    : "Interruption saved. Delivery to some reviewed Stations is pending and will retry; host application is not confirmed."
             } catch {
                 if generation == epoch {
                     pendingInterrupt = try? coordinator.pendingHostInterrupts().first
