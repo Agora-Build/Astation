@@ -526,9 +526,33 @@ Still required before activation:
   preserve required stops, high-water and at least 30 days of records. The
   implementation requirements and recovery sequence are recorded in
   [delegated-station-restore.md](delegated-station-restore.md).
-- Account ownership/mailbox integration, the remaining Kotlin delegated
-  fixture runner, and all real Station/native/Atem/Portal joint checks listed
+- Account ownership/mailbox integration and all real Station/native/Atem/Portal joint checks listed
   in #79. Passing fake-host/isolated tests is not activation evidence.
+
+### Android delegated conformance
+
+The Android instrumentation job now exercises the pinned JNI SDK's Station
+readers/builders and ACK ledger. It runs the published 27 call goldens,
+124 invalid calls, both complete-message boundary cases and 12 correlation
+groups, plus all six ACK scenarios covering deadlines, crash/restart, replica
+serialization, per-effect accounting, Portal refusals, informational reasons
+and manager re-signing. The SDK installer compares the packaged vector bytes
+against Station's committed copies and installs an immutable test-assets cache;
+those assets are not included in the app's production APK.
+
+The runner rejects unknown fixture steps, preserves raw malformed wire strings
+and checks exact refusal codes and byte goldens. It reloads only committed ACK
+state, checks transition immutability and compares competing replica transitions
+before adopting one. Portal-side database assertions remain external; this
+runner does not model or claim their success. Full membership-action,
+host-envelope and push verification, complete inventory and the real joint
+checks remain separate requirements before a signing gate may open.
+
+Local Android 16 arm64 emulator validation: all 22 connected tests (including
+the nine delegated tests) and eight JVM unit tests pass without skips; Android
+lint passes. Eight SDK-integrity/tooling tests pass. APK inspection confirms
+all 11 verified delegated fixture files are in the instrumentation APK and none
+are in the application APK. These are local results; exact-head CI is separate.
 
 ## Host Mail Follow-up
 
