@@ -190,3 +190,29 @@ The Gradle project keeps test APKs installed after connected tests so cleanup
 does not erase a developer's saved sign-in. The tests remove only their own
 synthetic identity records and keys. Flutter's separate live-login harness has
 its own application lifecycle; use a disposable device for that acceptance run.
+
+### Delegated protocol device checks
+
+The same connected-test job runs `MobileDelegatedProtocolTest` against the
+published Android JNI library. It covers all 27 Station call goldens, 124 invalid
+messages, both 256 KiB boundary messages, the 12 stale-reply correlation groups,
+and the six ACK scenarios (deadline, durable restart/replicas, per-effect,
+Portal refusals, reasons and manager re-signing). Fixture inputs are the exact
+packaged bytes, verified against the SDK artifact and the Station's committed
+copies by `scripts/check-atem-client-android.py --install`. They are included
+only in the instrumentation APK, under `delegated/`.
+
+To run just these checks on a disposable unlocked emulator:
+
+```sh
+cd android
+./gradlew -Ptarget=lib/main.dart \
+  -Pandroid.testInstrumentationRunnerArguments.class=build.agora.astation_mobile.MobileDelegatedProtocolTest \
+  :app:connectedDebugAndroidTest
+```
+
+The tests need no account or private keys. They execute the actual shared
+readers, builders, correlation helper and ACK ledger, including serialization
+and restoration at the commit boundary. They do not establish live Portal
+database effects, authenticated transport, complete verifier inventory or the
+VII.A/VII.B joint checks, and they do not enable delegated signing/execution.

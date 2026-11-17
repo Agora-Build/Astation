@@ -91,7 +91,7 @@ jobs:
       - name: Enable Android emulator acceleration
         if: matrix.platform == 'Android'
         run: sudo chmod a+rw /dev/kvm
-      - name: Android OAuth callback routing
+      - name: Android device authentication and delegated protocol vectors
         if: matrix.platform == 'Android'
         uses: reactivecircus/android-emulator-runner@v2
         with:

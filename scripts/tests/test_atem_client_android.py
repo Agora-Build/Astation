@@ -1,6 +1,7 @@
 import importlib.util
 from pathlib import Path
 import struct
+import tempfile
 import unittest
 
 
@@ -40,6 +41,28 @@ class AndroidArtifactTests(unittest.TestCase):
             android.check_elf(elf(machine=62), "arm64-v8a")
         with self.assertRaisesRegex(ValueError, "program headers"):
             android.check_elf(elf()[:70], "arm64-v8a")
+
+    def test_delegated_assets_match_the_published_payload_before_installation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payloads = root / "payloads"
+            payloads.mkdir()
+            fixtures = root / "relay-server/src/remote_api/fixtures/delegated"
+            fixtures.mkdir(parents=True)
+            name = "atem-client-0.1.0-123456789abc-r9-vectors-station-calls.json"
+            pin = {"revision": "123456789abc", "delegated_fixtures": [name]}
+            content = b'{"calls":[]}'
+            (payloads / name).write_bytes(content)
+            fixture = fixtures / "r9-vectors-station-calls.json"
+            fixture.write_bytes(content)
+            assets = root / "assets"
+            android.prepare_delegated_assets(pin, payloads, assets, root)
+            self.assertEqual((assets / "delegated" / fixture.name).read_bytes(), content)
+            fixture.write_bytes(b'{"calls":["modified"]}')
+            refused = root / "refused-assets"
+            with self.assertRaisesRegex(ValueError, "immutable packaged vector"):
+                android.prepare_delegated_assets(pin, payloads, refused, root)
+            self.assertFalse((refused / "delegated" / fixture.name).exists())
 
 
 if __name__ == "__main__":

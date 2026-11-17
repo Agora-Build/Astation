@@ -48,6 +48,18 @@ def check_elf(data, abi):
         raise ValueError(f"missing loadable ELF segments for {abi}")
 
 
+def prepare_delegated_assets(pin, payloads, assets, repository):
+    delegated = assets / "delegated"
+    delegated.mkdir(parents=True)
+    for name in pin["delegated_fixtures"]:
+        fixture_name = name.removeprefix(f"atem-client-0.1.0-{pin['revision'][:12]}-")
+        stored = repository / "relay-server/src/remote_api/fixtures/delegated" / fixture_name
+        content = (payloads / name).read_bytes()
+        if stored.read_bytes() != content:
+            raise ValueError("delegated Station fixture differs from the immutable packaged vector")
+        (delegated / fixture_name).write_bytes(content)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", type=Path)
@@ -87,9 +99,12 @@ def main():
         fixture_name = next(name for name in pin["payload_sha256"] if name.endswith("-host-work-requests-v1.json"))
         if (payloads / fixture_name).read_bytes() != (REPO / "native-remote/Tests/AstationRemoteTests/Fixtures/host-work-requests-v1.json").read_bytes():
             raise ValueError("host-work fixture differs from the reviewed package")
+        assets = work / "test-assets"
+        prepare_delegated_assets(pin, payloads, assets, REPO)
         if args.install:
             destination = REPO / "build/atem-client" / pin["revision"] / "atem-client-android"
             consumer.install_package(root, destination)
+            consumer.install_package(assets, destination.parent / "test-assets")
             print(f"Installed verified Android SDK: {destination}")
         print(f"Verified Android SDK at {pin['revision']}: all three ABIs support 16 KiB pages")
 
