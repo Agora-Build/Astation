@@ -94,6 +94,7 @@ final class AstationRecoveryCoordinator {
     private var controlPublications: [String: RemoteControlPublication] = [:]
     private var controlDeliveryContext: (portal: PortalIntegrationHTTP, current: () -> Bool)?
     private var controlDeliveryTask: Task<Void, Never>?
+    private var lastControlDeliveryOrigin: String?
     private var controlActivityContext: (generation: UUID, current: () -> Bool,
         updated: (String, MembershipLog, [RemoteControlActivity]) -> Void)?
     private var controlActivityTask: Task<Void, Never>?
@@ -1767,18 +1768,26 @@ extension AstationRecoveryCoordinator {
 
     private func retrySavedControlsIfNeeded() {
         guard delegatedControlsAvailable, !busy, !uncertain, controlDeliveryTask == nil,
-              let context = controlDeliveryContext, context.current(),
-              let journal = try? controls(), (try? journal.pendingDeliveryIDs().isEmpty) == false else { return }
+              let context = controlDeliveryContext, context.current() else { return }
         controlDeliveryTask = Task { [weak self] in
             guard let self else { return }
             defer { self.controlDeliveryTask = nil }
             do {
-                let deliveries = try await self.retryPendingControls(portal: context.portal, current: context.current)
+                let origins = try self.pendingControlDeliveryOrigins()
+                guard let origin = origins.first(where: { $0 > (self.lastControlDeliveryOrigin ?? "") }) ?? origins.first else { return }
+                self.lastControlDeliveryOrigin = origin
+                let deliveries = try await self.retryPendingControls(portal: context.portal,
+                    stationOrigin: origin, current: context.current)
                 for delivery in deliveries { self.onControlDelivery?(delivery) }
             } catch {
                 Log.warn("[Delegated] Saved control delivery will resume after account access is available")
             }
         }
+    }
+
+    private func pendingControlDeliveryOrigins() throws -> [String] {
+        let origins = Set((saved.controlPublications ?? [:]).keys).union(controlPublications.keys)
+        return try origins.sorted().filter { try !controls(stationOrigin: $0).pendingDeliveryIDs().isEmpty }
     }
 
     private func requireDelegatedControl(_ log: MembershipLog) throws {
@@ -2030,47 +2039,44 @@ extension AstationRecoveryCoordinator {
     }
 
     /// Existing signatures and Portal intents are retried; no owner approval is reused.
-    func retryPendingControls(portal: PortalIntegrationHTTP, current: () -> Bool) async throws -> [RemoteControlDelivery] {
+    func retryPendingControls(portal: PortalIntegrationHTTP, stationOrigin: String? = nil,
+        current: () -> Bool) async throws -> [RemoteControlDelivery] {
         try begin(); defer { busy = false }
         guard delegatedControlsAvailable else { throw AstationDelegatedControlError.notVerified }
+        let origin = stationOrigin ?? relayURL
+        guard origin == relayURL || saved.controlPublications?[origin] != nil else {
+            throw RemoteChannelError.staleLink
+        }
         var results: [RemoteControlDelivery] = []
-        for id in try controls().pendingDeliveryIDs().prefix(8) {
+        for id in try controls(stationOrigin: origin).pendingDeliveryIDs().prefix(8) {
             guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
-            results.append(try await deliverControl(id, portal: portal, current: current))
+            results.append(try await deliverControl(id, portal: portal, stationOrigin: origin, current: current))
         }
         return results
     }
 
-    private func deliverControl(_ id: String, portal: PortalIntegrationHTTP?,
+    private func deliverControl(_ id: String, portal: PortalIntegrationHTTP?, stationOrigin: String? = nil,
         current: () -> Bool) async throws -> RemoteControlDelivery {
-        guard current(), !Task.isCancelled, let kit = try currentKit(), let transport = http as? RemoteControlTransport else {
+        guard current(), !Task.isCancelled, let kit = try currentKit() else {
             throw RemoteChannelError.staleLink
         }
-        let journal = try controls()
+        let journal = try controls(stationOrigin: stationOrigin)
         guard let delivery = try journal.retainedDelivery(recordID: id) else { throw RemoteRecoveryError.notCommitted }
         let origins = try journal.stationOrigins(recordID: id)
         for origin in origins where try journal.stationDeliveryNeeded(recordID: id, stationOrigin: origin) {
             do {
-                let target: RemoteControlTransport
-                let membershipTransport: RemoteRecoveryTransport
-                if origin == relayURL { target = transport; membershipTransport = http }
-                else {
-                    guard let anchor = membershipLog?.snapshot(),
-                          let value = try controlStationTransports(anchor)[origin] else { continue }
-                    target = value; membershipTransport = value
-                }
+                guard let anchor = membershipLog?.snapshot() else { throw RemoteChannelError.staleLink }
+                let membershipTransport = try controlDeliverySource(origin: origin, approvedOrigins: origins, log: anchor)
+                guard let target = membershipTransport as? RemoteControlTransport else { throw RemoteChannelError.staleLink }
                 let log = try await refreshedLog(genesis: kit.genesisHash, transport: membershipTransport)
                 try requireDelegatedControl(log)
                 guard current(), !Task.isCancelled, let verified = try journal.delivery(recordID: id, log: log) else {
                     throw RemoteChannelError.staleLink
                 }
-                if origin != relayURL {
-                    // Membership may have advanced while reading this Station. Recheck the
-                    // authenticated roster before sending, without substituting another target.
-                    guard try controlStationTransports(log)[origin] != nil else { continue }
-                }
+                _ = try controlDeliverySource(origin: origin, approvedOrigins: origins, log: log)
                 _ = try await target.publishControl(log: log, recordJSON: verified.recordJSON)
                 guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+                _ = try controlDeliverySource(origin: origin, approvedOrigins: origins, log: log)
                 try journal.stationStored(verified, stationOrigin: origin)
             } catch {
                 guard !uncertain, !journal.storageUncertain else { throw RemoteRecoveryError.storageUncertain }
@@ -2095,6 +2101,21 @@ extension AstationRecoveryCoordinator {
         }
         guard let result = try journal.retainedDelivery(recordID: id) else { throw RemoteRecoveryError.notCommitted }
         return result
+    }
+
+    /// A retained signature authorizes only its protected, previously reviewed
+    /// destinations. Selection changes never add a destination or sign again.
+    private func controlDeliverySource(origin: String, approvedOrigins: [String], log: MembershipLog) throws -> RemoteRecoveryTransport {
+        guard approvedOrigins.contains(origin), PortalIntegrationRecord.validOrigin(origin) else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        if origin == relayURL { return http }
+        let source: RemoteControlStationTransport
+        if let current = try controlStationTransports(log)[origin] { source = current }
+        else if let retainedControlTransport { source = try retainedControlTransport(origin) }
+        else { throw RemoteChannelError.staleLink }
+        guard source.controlStationOrigin == origin else { throw RemoteRecoveryError.requiresReview }
+        return source
     }
 
     private func controlStationTransports(_ log: MembershipLog) throws -> [String: RemoteControlStationTransport] {

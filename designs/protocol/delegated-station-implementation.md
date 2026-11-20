@@ -354,6 +354,30 @@ This is bounded discovery and local notification for the selected Station, not
 complete multi-Station/account-wide discovery or a new APNs payload. Its
 production activation remains tied to the delegated gate and VII.A.
 
+### Retrying retained stops
+
+The account lifecycle retry also visits protected control journals belonging to
+previously selected Stations. Each tick selects one pending journal in rotating
+origin order and retries at most eight signed records. An offline journal cannot
+prevent another journal's next turn. Unsigned reviews remain saved for explicit
+owner confirmation and never enter this delivery path.
+
+Delivery uses the original bytes and only the destinations retained by the
+confirmed review. Changing selection cannot redirect a service stop to another
+Station or add a new host-interrupt destination. An exact-origin transport uses
+the existing silent account authorization; its origin must match before reading
+membership or sending a record. Each destination refreshes the independently
+anchored membership and verifies the retained signature against current manager
+authority. A removed manager leaves a review obligation, never permission to
+sign again in the background. Missing credentials, a failed request, a retired
+account context or uncertain protected storage cannot settle a delivery.
+
+The Portal mirror remains an independent leg, including while the original
+Station is unavailable. Saved final Portal refusals and individual Station
+receipts remain durable across retries. A receipt is storage evidence only;
+host application remains separately reported. Integration windows accept a
+delivery update only for their own integration and Station origin.
+
 ### Monitoring retained Stations
 
 Background monitoring also rotates through the authenticated additional Station
