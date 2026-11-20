@@ -15,6 +15,23 @@ pub(super) async fn services(
         Ok(permit) => permit,
         Err(_) => return error(StatusCode::TOO_MANY_REQUESTS, "verifier_inventory_busy"),
     };
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        service_request(&runtime, genesis, headers, body),
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(_) => unavailable(),
+    }
+}
+
+async fn service_request(
+    runtime: &StationIntegrations,
+    genesis: String,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> Response {
     let external = match runtime.native(&headers).await {
         Ok(token) => token.identity.subject,
         Err(reply) => return reply,
@@ -75,14 +92,12 @@ pub(super) async fn services(
     let Some(registry) = runtime.app.recovery.verifier_replicas() else {
         return unavailable();
     };
-    match tokio::time::timeout(
-        Duration::from_secs(10),
-        registry.managed_services_for(&genesis, &owner, &runtime, &ids, &expected),
-    )
-    .await
+    match registry
+        .managed_services_for(&genesis, &owner, runtime, &ids, &expected)
+        .await
     {
-        Ok(Ok(Some(snapshot))) => Json(snapshot).into_response(),
-        Ok(Ok(None)) => error(StatusCode::NOT_FOUND, "recovery_record_not_found"),
+        Ok(Some(snapshot)) => Json(snapshot).into_response(),
+        Ok(None) => error(StatusCode::NOT_FOUND, "recovery_record_not_found"),
         _ => unavailable(),
     }
 }

@@ -1,10 +1,105 @@
 use super::super::tests::{append_body, fixture_with_issuer, request, ID, OWNER, PRINCIPAL};
 use super::*;
 use axum::{
-    body::{to_bytes, Body},
+    body::{to_bytes, Body, Bytes},
     http::Request,
 };
+use std::sync::Arc;
 use tower::ServiceExt;
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_managed_service_inventory_times_out_stalled_bodies_and_releases_its_permit() {
+    let issuer = crate::account_identity::tests::Fixture::new().await;
+    let (db, runtime, f) = fixture_with_issuer(&issuer.issuer).await;
+    let origin = runtime.binding.station_origin.clone();
+    let genesis = f.log.genesis_hash().to_hex();
+    runtime
+        .app
+        .recovery
+        .configure_delegated(&origin, 1)
+        .await
+        .unwrap();
+    runtime
+        .app
+        .recovery
+        .configure_verifier_replicas(r#"{"generation":1,"replica":"a","replicas":["a"]}"#)
+        .await
+        .unwrap();
+    let mut claims = issuer.claims();
+    claims["aud"] = json!(origin);
+    claims["scope"] = json!("astation.remote");
+    let token = issuer.token(issuer.header(), claims);
+    let router = Router::new()
+        .route(
+            "/agora-build/v1/logs/:genesis/verifiers/services",
+            post(services),
+        )
+        .with_state(IntegrationState(Some(runtime.clone())));
+    let valid = json!({"member_ids":["unmanaged"],"expected":f.log.head().to_json()}).to_string();
+    let request = |body| {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/agora-build/v1/logs/{genesis}/verifiers/services"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(body)
+            .unwrap()
+    };
+    let permits = runtime.requests.available_permits();
+    let reserved = runtime
+        .requests
+        .acquire_many((permits - 1) as u32)
+        .await
+        .unwrap();
+    for partial in [false, true] {
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let polled = reached.clone();
+        let mut first = true;
+        let stream = futures_util::stream::poll_fn(move |_| {
+            if partial && first {
+                first = false;
+                return std::task::Poll::Ready(Some(Ok::<_, std::io::Error>(Bytes::from_static(
+                    b"{",
+                ))));
+            }
+            polled.notify_one();
+            std::task::Poll::Pending
+        });
+        let pending = tokio::spawn(router.clone().oneshot(request(Body::from_stream(stream))));
+        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+            .await
+            .unwrap();
+        assert_eq!(runtime.requests.available_permits(), 0);
+        let busy = router
+            .clone()
+            .oneshot(request(Body::from(valid.clone())))
+            .await
+            .unwrap();
+        assert_eq!(busy.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Pause only after real authentication/SQL has reached the stalled read.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let response = pending.await.unwrap().unwrap();
+        tokio::time::resume();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(runtime.requests.available_permits(), 1);
+        let healthy = router
+            .clone()
+            .oneshot(request(Body::from(valid.clone())))
+            .await
+            .unwrap();
+        assert_eq!(
+            healthy.status(),
+            StatusCode::OK,
+            "the released slot must accept real requests"
+        );
+    }
+    drop(reserved);
+    assert_eq!(runtime.requests.available_permits(), permits);
+    drop(router);
+    drop(runtime);
+    db.cleanup().await;
+}
 
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
