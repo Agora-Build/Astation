@@ -139,6 +139,7 @@ public final class RemoteStationVerifierEvidence {
     private var generations: [String: UInt64] = [:]
 
     public init(gate: RemoteVerifierSigningGate, roster: RemoteStationVerifierRoster, log: MembershipLog) throws {
+        try gate.requireMembership(log)
         // Revalidate decoded checkpoints instead of trusting synthesized Codable initializers.
         _ = try RemoteStationVerifierRoster(origin: roster.origin, generation: roster.generation, replicas: roster.replicas)
         self.gate = gate; self.roster = roster

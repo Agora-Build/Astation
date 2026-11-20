@@ -137,6 +137,21 @@ private final class VerifierChannelHarness {
 
 final class RemoteVerifierSigningGateTests: XCTestCase {
     @MainActor
+    func testStationEvidenceMustUseTheGatesExactAccountGenesisAndHead() throws {
+        let fixture = try VerifierFixture(), other = try VerifierFixture()
+        let gate = try RemoteVerifierSigningGate(log: fixture.log, verifiers: fixture.roster)
+        let anchor = fixture.log.snapshot()
+        let roster = try RemoteStationVerifierRoster(origin: "https://station.example", generation: 1, replicas: ["a", "b"])
+        XCTAssertNoThrow(try gate.requireMembership(anchor))
+        XCTAssertThrowsError(try gate.requireMembership(other.log))
+        XCTAssertThrowsError(try RemoteStationVerifierEvidence(gate: gate, roster: roster, log: other.log))
+        try fixture.append(["action": "set_roles", "device_id": "manager", "roles": ["control", "manage", "view"]])
+        XCTAssertThrowsError(try gate.requireMembership(fixture.log))
+        XCTAssertThrowsError(try RemoteStationVerifierEvidence(gate: gate, roster: roster, log: fixture.log))
+        XCTAssertNoThrow(try gate.requireMembership(anchor))
+    }
+
+    @MainActor
     func testStationEvidenceExpiresWithoutTimersAndFreshPollsConsumeRequestDelay() throws {
         let f = try VerifierFixture(), roster = try RemoteStationVerifierRoster(origin: "https://station.example", generation: 1, replicas: ["a", "b"])
         var time: UInt64 = 100

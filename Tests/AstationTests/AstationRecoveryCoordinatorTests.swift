@@ -345,7 +345,9 @@ private final class RecoveryCoordinatorHarness {
     let store = RecoveryMemoryCheckpoint()
     let keys = RecoveryMemoryKeys()
     let relay = RecoveryMemoryRelay()
-    let identity = AtemE2EIdentity(storage: TestAtemStorage(), crypto: TestAtemCryptography())
+    let identityStorage = TestAtemStorage()
+    let identityCryptography = TestAtemCryptography()
+    lazy var identity = AtemE2EIdentity(storage: identityStorage, crypto: identityCryptography)
     var ownerRequests: [SignRequest] = []
     var savedKits: [String] = []
     var approve = true
@@ -379,6 +381,122 @@ private final class RecoveryCoordinatorHarness {
 
 @MainActor
 final class AstationRecoveryCoordinatorTests: XCTestCase {
+    private func localVerifierGate(_ h: RecoveryCoordinatorHarness, others: [RemoteVerifierID] = []) async throws
+        -> (MembershipLog, RemoteVerifierSigningGate, SignRequest) {
+        let stored = await h.relay.log
+        let log = try XCTUnwrap(stored).snapshot()
+        let gate = try RemoteVerifierSigningGate(log: log,
+            verifiers: [.member("manager-a"), .stationReplica("server")] + others)
+        let server = try gate.connect(.stationReplica("server"))
+        try gate.observeConsumer(verifierInventory(), on: server)
+        let body = try log.draftEntry(signer: "manager-a", signedAt: AstationRecoveryCoordinator.clock().wallMs,
+            actionJson: hostSenderRevokeAction(hostId: "host-a", interruptRunning: false,
+                signedAt: AstationRecoveryCoordinator.clock().wallMs))
+        let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: "manager-a")
+        return (log, gate, request)
+    }
+
+    func testLocalVerifierUsesTheLoadedCoreAndExactExistingNativeKeys() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        _ = try await coordinator.setup()
+        let (log, gate, request) = try await localVerifierGate(h)
+        XCTAssertThrowsError(try gate.authorize(request, log: log))
+        let evidence = try AstationLocalVerifierEvidence(gate: gate, log: log, memberID: "manager-a",
+            identity: h.identity, current: { true })
+        XCTAssertNoThrow(try gate.authorize(request, log: log))
+        try evidence.refresh(log: log)
+        XCTAssertNoThrow(try gate.authorize(request, log: log))
+        evidence.retire()
+        XCTAssertThrowsError(try gate.authorize(request, log: log))
+        XCTAssertThrowsError(try evidence.refresh(log: log))
+    }
+
+    func testLocalVerifierNeverConfirmsAnotherSDKAndDisposalDropsItsEvidence() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        _ = try await coordinator.setup()
+        let (log, gate, request) = try await localVerifierGate(h, others: [.other("sdk")])
+        var evidence: AstationLocalVerifierEvidence? = try AstationLocalVerifierEvidence(gate: gate, log: log,
+            memberID: "manager-a", identity: h.identity, current: { true })
+        XCTAssertNotNil(evidence)
+        XCTAssertThrowsError(try gate.authorize(request, log: log))
+        let sdk = try gate.connect(.other("sdk"))
+        try gate.observeConsumer(verifierInventory(), on: sdk)
+        XCTAssertNoThrow(try gate.authorize(request, log: log))
+        evidence = nil
+        XCTAssertThrowsError(try gate.authorize(request, log: log))
+    }
+
+    func testLocalVerifierMissingIdentityNeverCreatesReplacementKeys() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        _ = try await coordinator.setup()
+        let (log, gate, request) = try await localVerifierGate(h)
+        let storage = TestAtemStorage(), crypto = TestAtemCryptography()
+        let missing = AtemE2EIdentity(storage: storage, crypto: crypto)
+        XCTAssertThrowsError(try AstationLocalVerifierEvidence(gate: gate, log: log, memberID: "manager-a",
+            identity: missing, current: { true }))
+        XCTAssertNil(storage.data)
+        XCTAssertEqual(storage.writes, 0)
+        XCTAssertEqual(crypto.creates, 0)
+        XCTAssertThrowsError(try gate.authorize(request, log: log))
+    }
+
+    func testLocalVerifierLosingProtectedStorageClearsEvidenceWithoutWriting() async throws {
+        for missing in [false, true] {
+            let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+            _ = try await coordinator.setup()
+            let (log, gate, request) = try await localVerifierGate(h)
+            let evidence = try AstationLocalVerifierEvidence(gate: gate, log: log, memberID: "manager-a",
+                identity: h.identity, current: { true })
+            XCTAssertNoThrow(try gate.authorize(request, log: log))
+            let writes = h.identityStorage.writes, creates = h.identityCryptography.creates
+            if missing { h.identityStorage.data = nil } else { h.identityStorage.failRead = true }
+            XCTAssertThrowsError(try evidence.refresh(log: log))
+            XCTAssertThrowsError(try gate.authorize(request, log: log))
+            XCTAssertEqual(h.identityStorage.writes, writes)
+            XCTAssertEqual(h.identityCryptography.creates, creates)
+            if missing { XCTAssertNil(h.identityStorage.data) }
+        }
+    }
+
+    func testLocalVerifierWrongKeysOrAnObsoleteAccountNeverConfirms() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        _ = try await coordinator.setup()
+        let (log, gate, request) = try await localVerifierGate(h)
+        let other = AtemE2EIdentity(storage: TestAtemStorage(), crypto: TestAtemCryptography())
+        _ = try other.remotePublicKeys()
+        XCTAssertThrowsError(try AstationLocalVerifierEvidence(gate: gate, log: log, memberID: "manager-a",
+            identity: other, current: { true }))
+        XCTAssertThrowsError(try gate.authorize(request, log: log))
+        var active = true
+        let evidence = try AstationLocalVerifierEvidence(gate: gate, log: log, memberID: "manager-a",
+            identity: h.identity, current: { active })
+        XCTAssertNoThrow(try gate.authorize(request, log: log))
+        active = false
+        XCTAssertThrowsError(try evidence.refresh(log: log))
+        XCTAssertThrowsError(try gate.authorize(request, log: log))
+        active = true
+        XCTAssertThrowsError(try evidence.refresh(log: log), "Retired account evidence cannot revive")
+    }
+
+    func testLocalVerifierHeadMovementClearsTheOldGateAndCannotCrossAnchors() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        _ = try await coordinator.setup()
+        let (log, gate, request) = try await localVerifierGate(h)
+        let evidence = try AstationLocalVerifierEvidence(gate: gate, log: log, memberID: "manager-a",
+            identity: h.identity, current: { true })
+        _ = try await addSecondManager(harness: h)
+        let stored = await h.relay.log
+        let next = try XCTUnwrap(stored).snapshot()
+        XCTAssertThrowsError(try evidence.refresh(log: next))
+        XCTAssertThrowsError(try gate.authorize(request, log: log))
+        XCTAssertThrowsError(try evidence.refresh(log: log), "An older snapshot cannot revive retired evidence")
+        XCTAssertThrowsError(try AstationLocalVerifierEvidence(gate: gate, log: next, memberID: "manager-a",
+            identity: h.identity, current: { true }))
+        let roster = try RemoteStationVerifierRoster(origin: "https://configured.example", generation: 1, replicas: ["server"])
+        XCTAssertThrowsError(try RemoteStationVerifierEvidence(gate: gate, roster: roster, log: next))
+        XCTAssertThrowsError(try gate.authorize(request, log: log))
+    }
+
     func testVerifierRosterAcceptanceIsProtectedDurableAndGrantsNoLiveSigningEvidence() async throws {
         let h = RecoveryCoordinatorHarness()
         var confirmations = 0
