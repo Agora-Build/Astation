@@ -1,5 +1,4 @@
 name: Deploy Station
-run-name: Deploy Station to ${{ vars.STATION_URL }} at ${{ github.sha }}
 
 on:
   push:
@@ -134,3 +133,12 @@ jobs:
           STATION_REQUIRE_REDIS: ${{ vars.STATION_REQUIRE_REDIS }}
           STATION_EXPECTED_COMMIT: ${{ github.sha }}
         run: node .github/scripts/verify-station.mjs
+      - name: Record verified deployment destination
+        id: context
+        run: node .github/scripts/webapp-deployment.mjs --record "$RUNNER_TEMP/station-deployment-context.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.context.outputs.artifact }}
+          path: ${{ runner.temp }}/station-deployment-context.json
+          retention-days: 30
+          overwrite: true

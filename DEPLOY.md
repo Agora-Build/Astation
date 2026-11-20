@@ -131,8 +131,10 @@ finish:
 
 The deployment compares the complete `webapp/` Git tree with the last successful
 Deploy Station run on `main`, including its nginx configuration and Dockerfile.
-That run's title must bind the same exact `STATION_URL` and source commit;
-an older unbound title or a changed destination requires deployment.
+After its public checks pass, the deployment job records an artifact bound to
+its actual `STATION_URL` and source commit. A missing/expired artifact or a
+changed destination requires deployment. The comparison reads artifact metadata;
+it downloads no archive or executable from a prior run.
 Relay-only changes leave the existing frontend running. Comparing with the last
 successful rollout, rather than the preceding commit, keeps webapp changes from
 an unsuccessful rollout pending. Missing history, unavailable revisions or API

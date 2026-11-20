@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { webappDeployment, webappTree } from './webapp-deployment.mjs';
+import { deploymentContextName, webappDeployment, webappTree } from './webapp-deployment.mjs';
 
 const directory = mkdtempSync(join(tmpdir(), 'station-webapp-deploy-'));
 const git = (...args) => execFileSync('git', args, { cwd: directory, encoding: 'utf8' }).trim();
@@ -31,12 +31,16 @@ function options(sha = relayOnly) {
     event: 'push', sha, repository: 'Agora-Build/Astation', token: 'test-token', origin: 'https://station.example',
     tree: value => webappTree(value, { cwd: directory }),
     fetchImpl: async (url, settings) => {
-      assert.match(url, /\/actions\/workflows\/deploy-station.yml\/runs\?branch=main&status=success&per_page=1$/);
       assert.equal(settings.headers.Authorization, 'Bearer test-token');
       assert.equal(settings.redirect, 'error');
+      if (url.endsWith('/actions/runs/123/artifacts?per_page=100')) {
+        return { ok: true, json: async () => ({ artifacts: [
+          { name: deploymentContextName('https://station.example', deployed), expired: false },
+        ] }) };
+      }
+      assert.match(url, /\/actions\/workflows\/deploy-station.yml\/runs\?branch=main&status=success&per_page=1$/);
       return { ok: true, json: async () => ({ workflow_runs: [
-        { conclusion: 'success', head_branch: 'main', head_sha: deployed,
-          display_title: `Deploy Station to https://station.example at ${deployed}` },
+        { id: 123, conclusion: 'success', head_branch: 'main', head_sha: deployed },
       ] }) };
     },
   };
@@ -59,13 +63,18 @@ test('manual deployment always deploys without relying on history', async () => 
   })).deploy, true);
 });
 
-test('a changed destination or an older unbound baseline requires webapp deployment', async () => {
+test('a changed destination or missing, expired or wrong-revision context requires webapp deployment', async () => {
   assert.equal((await webappDeployment({ ...options(), origin: 'https://production.example' })).deploy, true);
-  assert.equal((await webappDeployment({
-    ...options(), fetchImpl: async () => ({ ok: true, json: async () => ({ workflow_runs: [
-      { conclusion: 'success', head_branch: 'main', head_sha: deployed },
-    ] }) }),
-  })).deploy, true);
+  for (const artifacts of [[],
+    [{ name: deploymentContextName('https://station.example', deployed), expired: true }],
+    [{ name: deploymentContextName('https://station.example', relayOnly), expired: false }],
+  ]) {
+    const original = options().fetchImpl;
+    assert.equal((await webappDeployment({
+      ...options(), fetchImpl: (url, settings) => url.includes('/artifacts?')
+        ? { ok: true, json: async () => ({ artifacts }) } : original(url, settings),
+    })).deploy, true);
+  }
 });
 
 test('missing or uncertain deployment history never suppresses the webapp', async () => {
@@ -107,4 +116,17 @@ test('the real manual entrypoint writes the force-deploy output without account 
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   assert.equal(readFileSync(output, 'utf8'), 'deploy=true\n');
+});
+
+test('the real recording entrypoint binds the actual deployment job destination and revision', () => {
+  const output = join(directory, 'context-output'), context = join(directory, 'context.json');
+  const origin = 'https://another-station.example';
+  execFileSync(process.execPath, [fileURLToPath(new URL('./webapp-deployment.mjs', import.meta.url)), '--record', context], {
+    env: { STATION_URL: origin, GITHUB_SHA: relayOnly, GITHUB_OUTPUT: output },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  assert.deepEqual(JSON.parse(readFileSync(context, 'utf8')), { version: 1, origin, sha: relayOnly });
+  assert.equal(readFileSync(output, 'utf8'), `artifact=${deploymentContextName(origin, relayOnly)}\n`);
+  assert.notEqual(deploymentContextName(origin, relayOnly), deploymentContextName(origin, deployed));
+  assert.notEqual(deploymentContextName(origin, relayOnly), deploymentContextName('https://station.example', relayOnly));
 });
