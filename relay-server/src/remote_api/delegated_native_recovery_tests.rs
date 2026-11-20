@@ -310,11 +310,16 @@ async fn postgres_delegated_native_unsigned_history_cannot_be_rewritten_by_later
         next["recovery_ready"], false,
         "a later actual signature still grants no readiness"
     );
-    assert_eq!(
-        state(&database.pool).await["station_delegated_native_recovery"][0]["archive"]
-            ["unsigned_reviews"],
-        input["unsigned_reviews"]
-    );
+    let saved = state(&database.pool).await;
+    let archives: Vec<_> = saved["station_delegated_native_recovery"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| &row["archive"])
+        .collect();
+    assert_eq!(archives.len(), 2);
+    assert!(archives.contains(&&input));
+    assert!(archives.contains(&&signed_archive));
     drop(store);
     database.cleanup().await;
 }
