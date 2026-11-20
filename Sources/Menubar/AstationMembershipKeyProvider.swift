@@ -20,7 +20,7 @@ final class AstationMembershipKeyProvider: AppKeyProvider, @unchecked Sendable {
     }
 
     func publicKey(keyId: String) throws -> PublicKeyData {
-        guard keyId == keyID, try identity.remotePublicKeys().signing == expectedPublicKey else {
+        guard keyId == keyID, try identity.remotePublicKeys(create: false).signing == expectedPublicKey else {
             throw AtemIdentityError.identityChanged
         }
         return PublicKeyData(alg: .p256, raw: expectedPublicKey)

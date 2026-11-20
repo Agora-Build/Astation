@@ -107,6 +107,15 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
         return connection
     }
 
+    /// An evidence adapter must bind its authenticated source to this exact
+    /// anchor before confirming a non-host consumer through observeConsumer.
+    public func requireMembership(_ log: MembershipLog) throws {
+        guard log.accountId() == accountID, log.genesisHash() == genesisHash,
+              log.head() == head, log.frozen() == nil else {
+            throw RemoteVerifierGateError.staleMembership
+        }
+    }
+
     public func disconnect(_ connection: Connection) {
         lock.lock(); defer { lock.unlock() }
         guard states[connection.verifier]?.connection == connection else { return }

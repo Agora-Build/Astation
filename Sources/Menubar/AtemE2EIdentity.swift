@@ -315,9 +315,9 @@ final class AtemE2EIdentity {
         )
     }
 
-    func remotePublicKeys() throws -> (signing: Data, encryption: Data) {
+    func remotePublicKeys(create: Bool = true) throws -> (signing: Data, encryption: Data) {
         lock.lock(); defer { lock.unlock() }
-        guard let record = try read() else { throw AtemIdentityError.invalidStoredIdentity }
+        guard let record = try read(create: create) else { throw AtemIdentityError.invalidStoredIdentity }
         try crypto.validate(record.material)
         return (try crypto.signingPublicKey(record.material), record.material.encryptionPublicKey)
     }
@@ -329,9 +329,9 @@ final class AtemE2EIdentity {
             throw AtemIdentityError.identityChanged
         }
         if [.project, .hostSender, .hostEncKey].contains(request.purpose) {
-            guard let authorizeNewMembership else { throw AtemIdentityError.invalidState }
-            try authorizeNewMembership(request)
+            guard authorizeNewMembership != nil else { throw AtemIdentityError.invalidState }
         }
+        try authorizeNewMembership?(request)
         lock.lock(); defer { lock.unlock() }
         guard let record = try read(create: false),
               try crypto.signingPublicKey(record.material) == expectedPublicKey else {

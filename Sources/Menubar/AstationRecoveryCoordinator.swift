@@ -754,19 +754,30 @@ final class AstationRecoveryCoordinator {
             if let retry = try publication.outstanding() { append = retry }
             else {
                 let review = try RemoteServiceReview(approval: approval)
+                let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: approval.bodyJSON, keyID: managerID)
+                let authorizeInventory: ((SignRequest, MembershipLog) throws -> Void)?
                 if !review.requiredHostFeatures.isEmpty {
                     guard let authorizeNewOperations else { throw StationIntegrationError.hostUpgradeRequired }
                     try authorizeNewOperations(committed)
-                }
-                let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: approval.bodyJSON, keyID: managerID)
+                    guard let authorizeNewMembership else { throw RemoteVerifierGateError.unconfirmedVerifiers }
+                    try authorizeNewMembership(request, committed)
+                    authorizeInventory = authorizeNewMembership
+                } else { authorizeInventory = nil }
                 guard await confirmServiceOwner(approval, request), current() else { throw RemoteRecoveryError.confirmationRequired }
                 let latest = try await refreshedLog(genesis: approval.genesisHash)
                 try requireManager(latest)
                 guard current(), latest.head() == publication.head else { throw RemoteRecoveryError.requiresReview }
                 // A disconnect or host replacement during owner authentication cancels unsigned consent.
                 if !review.requiredHostFeatures.isEmpty { try authorizeNewOperations?(latest) }
+                try authorizeInventory?(request, latest)
+                let snapshot = latest.snapshot()
+                let signer = AstationMembershipKeyProvider(identity: identity, keyID: managerID,
+                    publicKey: try identity.remotePublicKeys(create: false).signing,
+                    authorizeNewMembership: authorizeInventory.map { authorize in
+                        { request in try authorize(request, snapshot) }
+                    })
                 let stamp = now().monoMs
-                append = try approval.sign(publication: publication, provider: provider(), managerID: managerID,
+                append = try approval.sign(publication: publication, provider: signer, managerID: managerID,
                     validationClock: now(), confirmedAt: stamp, now: { Self.clock().monoMs }, current: current)
             }
             guard current() else { throw RemoteChannelError.staleLink }

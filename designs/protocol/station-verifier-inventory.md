@@ -159,6 +159,27 @@ evidence for every required participant before any new signing can be enabled.
 
 ## Remaining integration
 
+### Local native evidence source
+
+`AstationLocalVerifierEvidence` reads the loaded SDK's `verifierInventory()`
+directly. It checks the existing protected signing and encryption public keys
+against this active native member in the exact anchored account/genesis/head.
+Missing or locked identity storage fails without creating or replacing keys.
+Only this member can be confirmed; another native member, hosted service or SDK
+consumer still needs its own authenticated evidence.
+
+The caller must refresh this source synchronously at the signing boundary and
+on identity/membership lifecycle changes. A failed check, changed account/head,
+retirement or disposal clears its gate connection. A failed source cannot be
+revived by replaying an older snapshot; reconstruct it only after establishing
+the current anchor and identity. Both the local and Station adapters check their
+log against the gate's exact anchor before confirming a consumer.
+
+This source is implemented and tested, but the production participant provider
+and new-action signer remain unset pending the complete sources/shared helper.
+It sends no network report, signs no capability claim and establishes no evidence
+for another process. No ordinary signing or verification ceremony is changed.
+
 The production native constructor still supplies no all-participant provider.
 Authenticated reports for other native/SDK members, complete Station discovery
 and the shared `required_version` helper remain required. A Station replica

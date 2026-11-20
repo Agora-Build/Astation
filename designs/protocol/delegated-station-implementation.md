@@ -145,6 +145,17 @@ entry/scope rule in a production signer. The Rust/bindings helper and vectors
 were requested in [Atem #120](https://github.com/Agora-Build/Atem/issues/120#issuecomment-7030456149).
 Roster discovery and authenticated non-host report carriage remain Astation work.
 
+The native service-approval path also keeps new launch/message/notify signatures
+closed while that all-verifier authorizer is absent. Existing host feature
+checks remain necessary but do not establish complete account compatibility.
+For these operations the exact enrollment request is checked before owner
+confirmation, after refreshing membership following confirmation, and again in
+the protected key provider. The provider applies a supplied authorizer to an
+enrollment request as well as the five new membership actions. This reuses the
+existing product consent review; it does not adopt a second production minimum-
+version classifier. Saved signatures still resume delivery without a new
+signature or owner prompt, and existing view/prompt grants remain unchanged.
+
 The next increment adds explicit durable Station-replica rosters, finite
 process reports, fenced account-private HTTP and a native reader/evidence
 adapter: [Station verifier inventory](station-verifier-inventory.md).
