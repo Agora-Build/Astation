@@ -327,15 +327,15 @@ the window or changing account/Station retires the read and clears the view.
 Normal constructors keep server polling gated off. Account-wide discovery across
 Stations and multi-Station aggregation remain open.
 
-The native coordinator can now run this selected-Station discovery without an
-Activity window. An authenticated, registered account starts one bounded page
+The native coordinator can run this discovery without an
+Activity window. An authenticated account starts one bounded page
 and status refresh, then the existing account lifecycle timer retries every
 30 seconds. The same account writer serializes imports with foreground changes;
 busy or uncertain storage postpones the scan. The cursor advances only after a
 successful correlated page and current status refresh. Completed scans restart
 at zero so later manager removals are detected. A source error retains the
 cursor and journal; it never emits an empty/resolved alert set. Account, Station,
-registration, sleep, generation, membership and manager checks retire stale
+sleep, generation, membership and manager checks retire stale
 replies. The background path never signs, confirms, or requests login.
 
 Verified retained stops can trigger an in-app reminder for a fresh manager
@@ -353,6 +353,44 @@ it carries no approval or signing action. Context changes clear the banner.
 This is bounded discovery and local notification for the selected Station, not
 complete multi-Station/account-wide discovery or a new APNs payload. Its
 production activation remains tied to the delegated gate and VII.A.
+
+### Monitoring retained Stations
+
+Background monitoring also rotates through the authenticated additional Station
+roster and origins already retained in the account's protected control journals
+or accepted server-list reviews. Only reviews for the current genesis count.
+This discovers no new URL from presence, a notification, or a server's claim.
+The union is bounded to 64 origins; exhausting the bound requires review and
+never silently discards a retained destination. Complete discovery of unseen
+owned/shared/built-in Stations still requires the native Portal directory
+contract requested in Portal #40.
+
+One origin gets one bounded feed page and status refresh per lifecycle tick.
+Each origin keeps its own cursor and protected journal. Even identical feed IDs
+on two origins cannot share a cursor. An unavailable primary does not prevent
+the next origin's turn. Completed scans restart from zero, while failed scans
+retain their prior cursor and journal and produce no empty/resolved notice.
+Missing directory entries or unavailable credentials cannot erase saved stops.
+
+Each source refreshes the independently anchored log through its own transport,
+checks current manager authority and rechecks that the destination remains
+authorized after awaits and before importing records or displaying status.
+Per-origin existing login sessions refresh silently, with one in-process refresh
+owner for each origin. Portal/another Station's token is never substituted.
+The selected Station's WebSocket or registration need not be live to read a
+retained Station over its separately authorized HTTP transport.
+Background monitoring opens no browser, signs nothing and asks for no owner
+confirmation. Sign-out clears the cached Station authorizations too.
+
+A reminder identifies its source Station. Clicking it opens that origin's
+Activity instead of the currently selected origin's journal. A zero-count scan
+for another origin cannot dismiss the current banner. Reviewing a secondary
+Station is read-only until the owner selects that Station; monitoring never
+changes the selected relay or routes a signature through another origin.
+
+The existing delegated authorization gate remains required. This adds retained-
+origin monitoring and production token carriage, not a complete account
+directory, signing activation, new APNs payload, or VII.A evidence.
 
 ### Fresh manager review of retained stops
 

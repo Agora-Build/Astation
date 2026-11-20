@@ -4,6 +4,7 @@ import AstationRemote
 @MainActor
 final class ControlActivityWindowController: NSWindowController, NSWindowDelegate {
     private let hub: AstationHubManager
+    private let stationOrigin: String?
     private let text = NSTextView()
     private let status = NSTextField(wrappingLabelWithString: "")
     private let refresh = NSButton(title: "Refresh", target: nil, action: nil)
@@ -18,8 +19,9 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
     private var generation = UUID()
     private var task: Task<Void, Never>?
 
-    init(hub: AstationHubManager) {
+    init(hub: AstationHubManager, stationOrigin: String? = nil) {
         self.hub = hub
+        self.stationOrigin = stationOrigin
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 500),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.title = "Control Activity"
@@ -27,7 +29,7 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
         super.init(window: window)
         window.delegate = self
         let intro = NSTextField(wrappingLabelWithString:
-            "Saved stops for the selected Station. Refresh also finds stops whose signer lost manager access. Station reports do not confirm delivery elsewhere or guarantee that a running task stopped. Signing a fresh copy requires owner confirmation.")
+            "Saved stops for " + (stationOrigin ?? "the selected Station") + ". Refresh also finds stops whose signer lost manager access. Station reports do not confirm delivery elsewhere or guarantee that a running task stopped. Select this Station before signing a fresh copy with owner confirmation.")
         text.isEditable = false; text.isSelectable = true
         text.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         text.textContainerInset = NSSize(width: 8, height: 8)
@@ -122,7 +124,8 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
     @objc private func selectionChanged() { render() }
 
     private func render() {
-        let ready = task == nil && current?() == true && coordinator?.delegatedControlsAvailable == true
+        let ready = task == nil && current?() == true && coordinator?.delegatedControlsAvailable == true &&
+            (stationOrigin == nil || stationOrigin == coordinator?.relayURL)
         let replacement = selected?.replacementRecordID.flatMap { id in rows.first { $0.body.recordId == id } }
         review.title = replacement?.signed == true ? "Retry Saved Copy" : "Review with Current Manager..."
         review.isEnabled = ready && selected != nil
@@ -147,7 +150,8 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
     }
 
     @objc private func reviewStop() {
-        guard task == nil, let row = selected, let coordinator, let current, current() else { return }
+        guard task == nil, let row = selected, let coordinator, let current, current(),
+              stationOrigin == nil || stationOrigin == coordinator.relayURL else { return }
         task = Task { [weak self] in
             guard let self else { return }
             defer { task = nil; render() }
@@ -179,7 +183,8 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
     }
 
     @objc private func cancelReview() {
-        guard task == nil, let row = selected, let coordinator, current?() == true else { return }
+        guard task == nil, let row = selected, let coordinator, current?() == true,
+              stationOrigin == nil || stationOrigin == coordinator.relayURL else { return }
         do {
             try coordinator.cancelUnsignedControlResign(recordID: row.body.recordId)
             display(try coordinator.localControlActivity())
@@ -190,46 +195,48 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
     @objc private func reload() {
         guard task == nil else { return }
         generation = UUID()
-        let epoch = generation, origin = hub.stationRelayUrl
+        let epoch = generation, selectedOrigin = hub.stationRelayUrl
+        let origin = stationOrigin ?? selectedOrigin
         text.string = ""; status.stringValue = "Loading saved control activity..."; refresh.isEnabled = false
         coordinator = nil; current = nil
         task = Task { [weak self] in
             guard let self else { return }
             defer { task = nil; render() }
             do {
-                try await hub.prepareAccountSecurityAccess()
+                if origin == selectedOrigin { try await hub.prepareAccountSecurityAccess() }
                 guard generation == epoch, window?.isVisible == true,
                       let owner = hub.signedInAccount, let issuer = hub.portalSettings?.issuer else { return }
                 let accountEpoch = hub.integrationAccountGeneration
                 let current: () -> Bool = { [weak self] in
                     guard let self else { return false }
-                    return generation == epoch && window?.isVisible == true && hub.stationRelayUrl == origin &&
+                    return generation == epoch && window?.isVisible == true && hub.stationRelayUrl == selectedOrigin &&
                         hub.integrationAccountGeneration == accountEpoch && hub.signedInAccount == owner &&
                         hub.portalSettings?.issuer == issuer && !hub.accountSignInRequired
                 }
                 guard current(), !Task.isCancelled else { return }
                 let coordinator = try hub.recoveryCoordinator()
-                _ = try await coordinator.hostSenderMembership()
+                if origin == selectedOrigin { _ = try await coordinator.hostSenderMembership() }
                 guard current(), !Task.isCancelled else { return }
                 self.coordinator = coordinator; self.current = current
-                let local = try coordinator.localControlActivity()
+                let local = try coordinator.localControlActivity(stationOrigin: origin)
                 display(local)
                 guard coordinator.delegatedControlsAvailable else {
                     status.stringValue = "Station: " + origin + "\nHost application has not been checked."
                     return
                 }
                 do {
-                    discovery = try await coordinator.discoverControlActivity(previous: discovery, current: current)
+                    discovery = try await coordinator.discoverControlActivity(previous: discovery, stationOrigin: origin, current: current)
                     guard current(), !Task.isCancelled else { return }
-                    let activity = try await coordinator.refreshControlActivity(current: current)
+                    let activity = try await coordinator.refreshControlActivity(stationOrigin: origin, current: current)
                     guard current(), !Task.isCancelled else { return }
                     display(activity)
-                    status.stringValue = "Station: " + origin + "\nSelected Station reports refreshed." +
-                        (discovery?.more == true ? " Refresh continues the search for other saved stops." : "")
+                    status.stringValue = "Station: " + origin + "\nThis Station's reports refreshed." +
+                        (discovery?.more == true ? " Refresh continues the search for other saved stops." : "") +
+                        (origin != selectedOrigin ? " Select this Station to review and sign a fresh copy." : "")
                 } catch {
                     guard current(), !Task.isCancelled else { return }
                     status.stringValue = "Saved records shown. Station reports unavailable; retry Refresh."
-                    if let activity = try? coordinator.localControlActivity() { display(activity) }
+                    if let activity = try? coordinator.localControlActivity(stationOrigin: origin) { display(activity) }
                 }
             } catch {
                 guard generation == epoch, window?.isVisible == true, !Task.isCancelled else { return }

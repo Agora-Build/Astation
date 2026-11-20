@@ -43,6 +43,7 @@ class AstationHubManager: ObservableObject {
     let sessionStore: SsoSessionStore
     let tokenProvider: SsoTokenProvider
     private(set) var accountAuth: AstationAccountAuth
+    @MainActor private var stationAuthorizations: [String: AstationAccountAuth] = [:]
     private let accountDefaults: UserDefaults
     private(set) var portalSettings: AccountServiceSettings?
     private(set) var portalAuth: AstationAccountAuth?
@@ -94,9 +95,30 @@ class AstationHubManager: ObservableObject {
         let reconnect = identityRelayActive
         pauseIdentityRelay()
         accountGeneration = UUID(); accountRecovery = nil
-        accountAuth = try Self.stationAccountAuth(settings: settings, origin: origin)
+        accountAuth = try stationAuthorization(origin: origin)
         stationAccountSignInRequired = true
         if reconnect { startIdentityRelay() }
+    }
+
+    /// Reuse one refresh owner per origin, including when a retained Station
+    /// becomes selected again. A token is never reused for a different origin.
+    @MainActor private func stationAuthorization(origin: String) throws -> AstationAccountAuth {
+        guard let settings = portalSettings, PortalIntegrationRecord.validOrigin(origin) else {
+            throw AccountLoginError.configuration
+        }
+        let expected = try AccountOIDCConfiguration(issuer: settings.issuer, clientID: settings.clientID,
+            resource: origin, requiredScope: "astation.remote")
+        if let current = accountAuth.configuration, current.issuer == settings.issuer,
+           current.clientID == settings.clientID {
+            stationAuthorizations[current.resource] = accountAuth
+        }
+        if let existing = stationAuthorizations[origin], existing.configuration == expected { return existing }
+        guard stationAuthorizations.count < 64 || stationAuthorizations[origin] != nil else {
+            throw AccountLoginError.configuration
+        }
+        let created = try Self.stationAccountAuth(settings: settings, origin: origin)
+        stationAuthorizations[origin] = created
+        return created
     }
 
     @MainActor func prepareAccountSecurityAccess(registrationTimeout: TimeInterval = 15, allowSignIn: Bool = true) async throws {
@@ -320,28 +342,19 @@ class AstationHubManager: ObservableObject {
     var controlReviewNotificationsEnabled: (@MainActor () -> Bool)?
 
     @MainActor private func refreshBackgroundControlReviews() {
-        guard !systemIsSleeping, identityRelayVerified, let owner = signedInAccount,
-              !accountSignInRequired, !stationAccountSignInRequired,
-              stationRegistration?.account == accountGeneration,
-              stationRegistration?.socket == identityRelaySocketGeneration,
-              stationRegistration?.origin == stationRelayUrl else { return }
+        guard !systemIsSleeping, let owner = signedInAccount, !accountSignInRequired else { return }
         do {
             let coordinator = try recoveryCoordinator()
             guard coordinator.delegatedControlsAvailable else { return }
             let epoch = accountGeneration, origin = stationRelayUrl, account = e2eDataAccount
-            let registration = stationRegistrationGeneration
             let current: () -> Bool = { [weak self, weak coordinator] in
                 guard let self, let coordinator else { return false }
                 return self.accountRecovery === coordinator && self.accountGeneration == epoch &&
-                    self.stationRegistrationGeneration == registration &&
                     self.stationRelayUrl == origin && self.e2eDataAccount == account &&
                     self.signedInAccount == owner && !self.accountSignInRequired &&
-                    !self.stationAccountSignInRequired && !self.systemIsSleeping && self.identityRelayVerified &&
-                    self.stationRegistration?.account == epoch &&
-                    self.stationRegistration?.socket == self.identityRelaySocketGeneration &&
-                    self.stationRegistration?.origin == origin
+                    !self.systemIsSleeping
             }
-            coordinator.resumeControlActivity(generation: registration, current: current) { [weak self] log, activity in
+            coordinator.resumeControlActivity(generation: epoch, current: current) { [weak self] sourceOrigin, log, activity in
                 guard let self, current(), log.accountId() == account else { return }
                 let count = RemoteControlReminders.reviewIDs(activity).count
                 do {
@@ -357,10 +370,10 @@ class AstationHubManager: ObservableObject {
                     }
                     let notify: Bool
                     if self.controlReviewNotificationsEnabled?() == true {
-                        notify = try self.controlReminders?.offer(stationOrigin: origin, activity: activity,
+                        notify = try self.controlReminders?.offer(stationOrigin: sourceOrigin, activity: activity,
                             now: UInt64(max(0, Date().timeIntervalSince1970 * 1000))) == true
                     } else { notify = false }
-                    self.controlReviewsDidChange?(ControlReviewNotice(stationOrigin: origin, count: count,
+                    self.controlReviewsDidChange?(ControlReviewNotice(stationOrigin: sourceOrigin, count: count,
                         shouldNotify: notify, current: current))
                 } catch {
                     Log.warn("[Delegated] Protected control reminders are unavailable; Control Activity remains available")
@@ -470,7 +483,18 @@ class AstationHubManager: ObservableObject {
         let coordinator = try AstationRecoveryCoordinator(accountID: account, managerID: AstationIdentity.shared.id,
             identity: atemE2EIdentity, relayURL: targetRelay,
             accessToken: { [accountAuth] in try await accountAuth.accessToken(relayURL: targetRelay) },
-            allowNewDataKey: { [weak self] in self?.e2eDataAccount == account && self?.relayEncryptionState?.mode == "off" })
+            allowNewDataKey: { [weak self] in self?.e2eDataAccount == account && self?.relayEncryptionState?.mode == "off" },
+            retainedControlTransport: { [weak self] origin in
+                guard let self, self.e2eDataAccount == account, let owner = self.signedInAccount,
+                      !self.accountSignInRequired else { throw AccountLoginError.changed }
+                let authorization = try self.stationAuthorization(origin: origin)
+                return try RemoteRecoveryHTTP(relayURL: origin, accessToken: {
+                    guard try await authorization.current()?.session.subject == owner else {
+                        throw AccountLoginError.signInRequired
+                    }
+                    return try await authorization.accessToken(relayURL: origin)
+                })
+            })
         coordinator.onMembershipCommit = { [weak self, weak coordinator] head in
             guard let self, let coordinator, self.accountRecovery === coordinator,
                   self.e2eDataAccount == account, self.stationRelayUrl == targetRelay else { return }
@@ -987,6 +1011,8 @@ class AstationHubManager: ObservableObject {
         pairingSession?.contextChanged()
         let epoch = accountGeneration
         let oldPortal = portalAuth, oldRelay = accountAuth
+        var retainedAuthorizations = Array(stationAuthorizations.values)
+        if !retainedAuthorizations.contains(where: { $0 === oldRelay }) { retainedAuthorizations.append(oldRelay) }
         projectLoadTask?.cancel()
         signedInAccount = nil; agoraConnection = nil
         accountSignInRequired = true
@@ -996,8 +1022,10 @@ class AstationHubManager: ObservableObject {
         try projectCache?.clear()
         try await oldPortal?.clearSession()
         guard epoch == accountGeneration else { throw AccountLoginError.changed }
-        try await oldRelay.clearSession()
-        guard epoch == accountGeneration else { throw AccountLoginError.changed }
+        for authorization in retainedAuthorizations {
+            try await authorization.clearSession()
+            guard epoch == accountGeneration else { throw AccountLoginError.changed }
+        }
         accountSessionChanged()
     }
 
@@ -1008,10 +1036,11 @@ class AstationHubManager: ObservableObject {
         settings.save(defaults: accountDefaults)
         // Environment overrides remain authoritative; show the effective values in the form.
         portalSettings = try AccountServiceSettings.load(defaults: accountDefaults)
+        stationAuthorizations = [:]
         portalAuth = Self.makePortalAuth(settings: portalSettings)
         projectCache = portalSettings.map(PortalProjectCache.init(settings:))
-        guard let effective = portalSettings else { throw AccountLoginError.configuration }
-        accountAuth = try Self.stationAccountAuth(settings: effective, origin: stationRelayUrl)
+        guard portalSettings != nil else { throw AccountLoginError.configuration }
+        accountAuth = try stationAuthorization(origin: stationRelayUrl)
         accountSessionChanged()
     }
 
@@ -1024,8 +1053,7 @@ class AstationHubManager: ObservableObject {
         stationRoutes?.invalidate()
         pauseIdentityRelay(retainForRouting: true)
         configuredStationOrigin = stationRelayUrl
-        if let settings = portalSettings,
-           let auth = try? Self.stationAccountAuth(settings: settings, origin: stationRelayUrl) { accountAuth = auth }
+        if let auth = try? stationAuthorization(origin: stationRelayUrl) { accountAuth = auth }
         relayAccountDevices = []; relayMergeRequests = []; relayAccountStatusMessage = nil
         relayEncryptionState = nil; relayEncryptionStatusMessage = nil
         relayIdentityKeyRepairRecord = RelayIdentityKeyRepairRecord.load(
