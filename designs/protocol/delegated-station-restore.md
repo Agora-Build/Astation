@@ -147,6 +147,50 @@ history, manager re-sign orchestration, snapshot publication and reopening
 remain required. Prepared plans have no automatic deletion or cancellation;
 authenticated account deletion follows the separate account lifecycle.
 
+## Retaining later native stops
+
+A manager's protected native journal may have signed a revoke or interrupt
+after the restored backup. An operator can retain those original signed objects
+as additional obligations on the exact prepared plan:
+
+```sh
+station-relay-server admin delegated-recovery retain-stops <genesis_hash> stops.json
+```
+
+The regular input file is strict JSON with exactly `plan_id`, `source_hash`
+(both from `prepare`) and `records` (1-64 original signed control objects).
+The file is at most 256 KiB. The command requires the same closed generation,
+ownership, membership and retained source as preparation; it never creates a
+missing plan. Every record must name this account/genesis and a native signer.
+Only revoke and interrupt records are accepted; a feed-bound service stop must
+name this Station origin. The original feed ID, body and signature are retained.
+A service's cover/hold/release or service-key signature is not a substitute for
+authoritative service-state reconciliation.
+
+Migration `0018` keeps these objects separately from the immutable checkpoint
+and live feed. The entire batch commits or none does. Concurrent imports
+serialize with preparation; identical retries are idempotent, while a record ID
+with different contents conflicts with both the checkpoint and imported history.
+Each origin/account history allows at most 4,096 distinct imported records and
+16 MiB of persisted JSONB. A later recovery generation includes all earlier
+imported stops; it cannot hide them by preparing another plan. Identical copies
+are deduplicated, and conflicting contents under one ID refuse recovery review.
+Malformed, oversized or inconsistent retained evidence refuses the report rather
+than omitting a stop. Imported evidence has no pruning/cancellation command.
+
+Both `prepare` and successful imports report every recovered record's metadata,
+its shared-verifier verdict and review requirement, plus a deterministic
+`evidence_hash`. They expose no signed bodies/signatures or private key material.
+An unknown, removed or invalid signer remains `authority_review`; importing its
+object never establishes that the stop is in force. The report's
+`observed_issued_at_lower_bounds` covers only currently valid imported records.
+Those observed times do not establish the greatest time ever signed or reserved;
+they cannot clear an unknown clock anchor or permit signing. Import changes no
+live watermark, cursor, ACK, effect, reporting stop, signature or recovery fence.
+The `snapshot_complete` and `recovery_ready` fields remain false. Authoritative
+later service history, complete clocks, fresh manager signatures, snapshot
+publication and reopening are still required.
+
 ## Complete recovery sequence
 
 1. Drain and stop every replica before restoring. Keep delegated serving,
