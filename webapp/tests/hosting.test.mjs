@@ -15,6 +15,11 @@ test("webapp serves Stoa and Agent without obsolete routes or a running relay", 
         await new Promise(resolve => setTimeout(resolve, 250));
     }
     assert.ok(ready, "webapp did not become ready");
+    const build = await fetch(new URL('/.well-known/astation-webapp-build.json', origin));
+    assert.equal(build.status, 200);
+    assert.equal(build.headers.get('cache-control'), 'no-store');
+    const metadata = await build.json();
+    assert.deepEqual(metadata, { version: 1, source_tree: process.env.WEBAPP_TEST_SOURCE_TREE ?? '' });
     await Promise.all([verifyAgentChat({ origin, log() {} }), verifyStoa({ origin, log() {} })]);
 
     const redirect = await fetch(new URL("/agent?preview=1", origin), { redirect: "manual" });

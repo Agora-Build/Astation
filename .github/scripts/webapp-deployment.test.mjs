@@ -1,167 +1,133 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:http';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { deploymentContextName, webappDeployment, webappTree } from './webapp-deployment.mjs';
+import { webappDeployment, webappTree } from './webapp-deployment.mjs';
 
 const directory = mkdtempSync(join(tmpdir(), 'station-webapp-deploy-'));
 const git = (...args) => execFileSync('git', args, { cwd: directory, encoding: 'utf8' }).trim();
 const commit = message => {
   git('add', '.');
-  git('-c', 'user.name=Deployment Test', '-c', 'user.email=deployment@example.test', 'commit', '-qm', message);
+  git('-c', 'user.name=Deployment Test', '-c', 'user.email=deployment@example.test', '-c', 'commit.gpgsign=false', 'commit', '-qm', message);
   return git('rev-parse', 'HEAD');
 };
 git('init', '-q');
 mkdirSync(join(directory, 'webapp'));
 writeFileSync(join(directory, 'webapp', 'nginx.conf'), 'original proxy');
-const deployed = commit('Deployed webapp');
+const deployed = commit('Original frontend');
 writeFileSync(join(directory, 'relay.rs'), 'relay update');
 const relayOnly = commit('Only the relay changed');
 writeFileSync(join(directory, 'webapp', 'nginx.conf'), 'new proxy');
-const webappChanged = commit('Proxy changed in an unsuccessful rollout');
-writeFileSync(join(directory, 'relay.rs'), 'another relay update');
-const nextPush = commit('Relay changed after the unsuccessful rollout');
+const changed = commit('Frontend changed');
 writeFileSync(join(directory, 'webapp', 'nginx.conf'), 'original proxy');
-const rollback = commit('Revert frontend source after an unsuccessful rollout');
+const rollback = commit('Revert frontend after a partial rollout');
 test.after(() => rmSync(directory, { recursive: true, force: true }));
+const tree = sha => webappTree(sha, { cwd: directory });
+const response = (source = tree(deployed)) => new Response(JSON.stringify({ version: 1, source_tree: source }), {
+  headers: { 'Cache-Control': 'no-store' },
+});
+const options = (sha = relayOnly) => ({
+  event: 'push', sha, origin: 'https://station.example', tree,
+  fetchImpl: async () => response(),
+});
 
-function options(sha = relayOnly) {
-  return {
-    event: 'push', sha, repository: 'Agora-Build/Astation', token: 'test-token', origin: 'https://station.example',
-    runNumber: '9', attempt: '1',
-    tree: value => webappTree(value, { cwd: directory }),
-    fetchImpl: async (url, settings) => {
-      assert.equal(settings.headers.Authorization, 'Bearer test-token');
+test('the running frontend is checked through actual HTTP with cache bypass and bounded metadata', async () => {
+  let requests = 0;
+  const server = createServer((request, result) => {
+    requests++;
+    assert.match(request.url, /^\/\.well-known\/astation-webapp-build\.json\?probe=[a-f0-9-]+$/);
+    assert.equal(request.headers['cache-control'], 'no-cache');
+    assert.equal(request.headers.authorization, undefined);
+    result.writeHead(200, { 'Cache-Control': 'no-store', 'Content-Type': 'application/json' });
+    result.end(JSON.stringify({ version: 1, source_tree: tree(deployed) }));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const local = `http://127.0.0.1:${server.address().port}`;
+    const result = await webappDeployment({ ...options(), fetchImpl: (url, settings) => {
+      assert.equal(url.origin, 'https://station.example');
       assert.equal(settings.redirect, 'error');
-      if (url.endsWith('/actions/runs/123/artifacts?per_page=100')) {
-        return { ok: true, json: async () => ({ artifacts: [
-          { name: deploymentContextName('https://station.example', deployed), expired: false },
-        ] }) };
-      }
-      assert.match(url, /\/actions\/workflows\/deploy-station.yml\/runs\?branch=main&per_page=100$/);
-      return { ok: true, json: async () => ({ workflow_runs: [
-        { id: 123, run_number: 8, status: 'completed', conclusion: 'success', head_branch: 'main', head_sha: deployed },
-      ] }) };
-    },
-  };
-}
+      return fetch(new URL(url.pathname + url.search, local), settings);
+    } });
+    assert.equal(result.deploy, false);
+    assert.equal(requests, 1);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
 
-test('a relay-only change keeps the unchanged webapp running', async () => {
+test('relay-only changes keep the frontend; source changes and rollback after a partial rollout deploy', async () => {
   assert.equal((await webappDeployment(options())).deploy, false);
+  assert.equal((await webappDeployment(options(changed))).deploy, true);
+  assert.equal(tree(deployed), tree(rollback));
+  assert.equal((await webappDeployment({ ...options(rollback), fetchImpl: async () => response(tree(changed)) })).deploy, true);
 });
 
-test('webapp changes deploy, including after an unsuccessful intermediate rollout', async () => {
-  assert.equal((await webappDeployment(options(webappChanged))).deploy, true);
-  assert.equal((await webappDeployment(options(nextPush))).deploy, true);
-  assert.equal(webappTree(webappChanged, { cwd: directory }), webappTree(nextPush, { cwd: directory }));
+test('each probe targets the selected origin with a fresh nonce and no redirect or token', async () => {
+  const probes = [];
+  for (const origin of ['https://station.example', 'https://custom.example:8443']) {
+    assert.equal((await webappDeployment({ ...options(), origin, fetchImpl: async (url, settings) => {
+      assert.equal(url.origin, origin);
+      assert.equal(settings.redirect, 'error');
+      assert.equal(Object.hasOwn(settings.headers, 'Authorization'), false);
+      probes.push(url.searchParams.get('probe'));
+      return response();
+    } })).deploy, false);
+  }
+  assert.equal(new Set(probes).size, 2);
 });
 
-test('manual deployment always deploys without relying on history', async () => {
-  assert.equal((await webappDeployment({
-    ...options(), event: 'workflow_dispatch',
-    fetchImpl: () => assert.fail('Manual deployment must not query history'),
+test('manual repair always deploys without relying on frontend state', async () => {
+  assert.equal((await webappDeployment({ ...options(), event: 'workflow_dispatch',
+    fetchImpl: () => assert.fail('Manual deployment must not probe'),
   })).deploy, true);
 });
 
-test('a partial or canceled newer rollout cannot hide a required rollback', async () => {
-  assert.equal(webappTree(deployed, { cwd: directory }), webappTree(rollback, { cwd: directory }));
-  for (const conclusion of ['failure', 'cancelled', null]) {
-    assert.equal((await webappDeployment({
-      ...options(rollback), fetchImpl: async () => ({ ok: true, json: async () => ({ workflow_runs: [
-        { id: 124, run_number: 8, status: conclusion ? 'completed' : 'in_progress', conclusion, head_branch: 'main', head_sha: webappChanged },
-        { id: 123, run_number: 7, status: 'completed', conclusion: 'success', head_branch: 'main', head_sha: deployed },
-      ] }) }),
-      tree: () => assert.fail('An uncertain newer attempt cannot use an older baseline'),
-    })).deploy, true);
-  }
-  assert.equal((await webappDeployment({
-    ...options(), attempt: '2', fetchImpl: () => assert.fail('A retry always redeploys'),
-  })).deploy, true);
-});
-
-test('current and future queued runs cannot become their own deployment baseline', async () => {
-  const original = options().fetchImpl;
-  assert.equal((await webappDeployment({
-    ...options(), fetchImpl: async (url, settings) => {
-      const result = await original(url, settings);
-      if (url.includes('/artifacts?')) return result;
-      const body = await result.json();
-      body.workflow_runs.unshift(
-        { id: 125, run_number: 10, status: 'queued', head_branch: 'main', head_sha: nextPush },
-        { id: 124, run_number: 9, status: 'in_progress', head_branch: 'main', head_sha: relayOnly });
-      return { ok: true, json: async () => body };
-    },
-  })).deploy, false);
-});
-
-test('a changed destination or missing, expired or wrong-revision context requires webapp deployment', async () => {
-  assert.equal((await webappDeployment({ ...options(), origin: 'https://production.example' })).deploy, true);
-  for (const artifacts of [[],
-    [{ name: deploymentContextName('https://station.example', deployed), expired: true }],
-    [{ name: deploymentContextName('https://station.example', relayOnly), expired: false }],
-  ]) {
-    const original = options().fetchImpl;
-    assert.equal((await webappDeployment({
-      ...options(), fetchImpl: (url, settings) => url.includes('/artifacts?')
-        ? { ok: true, json: async () => ({ artifacts }) } : original(url, settings),
-    })).deploy, true);
-  }
-});
-
-test('missing or uncertain deployment history never suppresses the webapp', async () => {
+test('missing, cached, malformed, oversized or unavailable live metadata never suppresses an update', async () => {
+  const valid = JSON.stringify({ version: 1, source_tree: tree(deployed) });
   for (const fetchImpl of [
-    async () => { throw new Error('Private upstream diagnostic'); },
-    async () => ({ ok: false, status: 403 }),
-    async () => ({ ok: true, json: async () => ({ workflow_runs: [] }) }),
-    async () => ({ ok: true, json: async () => ({ workflow_runs: [
-      { conclusion: 'failure', head_branch: 'main', head_sha: deployed },
-    ] }) }),
-    async () => ({ ok: true, json: async () => ({ workflow_runs: [
-      { conclusion: 'success', head_branch: 'other', head_sha: deployed },
-    ] }) }),
-    async () => ({ ok: true, json: async () => ({ workflow_runs: [
-      { conclusion: 'success', head_branch: 'main', head_sha: 'not-a-revision' },
-    ] }) }),
+    async () => { throw new Error('Upstream diagnostic'); },
+    async () => new Response('', { status: 404 }),
+    async () => new Response('', { status: 503 }),
+    async () => new Response(valid),
+    async () => new Response(valid, { headers: { 'Cache-Control': 'no-store', Age: '1' } }),
+    async () => new Response(valid, { headers: { 'Cache-Control': 'no-store', 'CF-Cache-Status': 'HIT' } }),
+    async () => new Response(' '.repeat(4097), { headers: { 'Cache-Control': 'no-store' } }),
+    async () => new Response('not json', { headers: { 'Cache-Control': 'no-store' } }),
+    async () => response(''),
+    async () => new Response(JSON.stringify({ version: 2, source_tree: tree(deployed) }), { headers: { 'Cache-Control': 'no-store' } }),
+    async () => new Response(JSON.stringify({ version: 1, source_tree: tree(deployed), extra: true }), { headers: { 'Cache-Control': 'no-store' } }),
   ]) {
     assert.deepEqual(await webappDeployment({ ...options(), fetchImpl }), {
-      deploy: true, reason: 'No confirmed deployment comparison',
+      deploy: true, reason: 'No confirmed live frontend comparison',
     });
   }
-  assert.equal((await webappDeployment({ ...options(), tree: () => { throw new Error('Missing old commit'); } })).deploy, true);
-  assert.equal((await webappDeployment({ ...options(), tree: () => '' })).deploy, true);
 });
 
-test('unconfirmed workflow context cannot skip an update or send the token elsewhere', async () => {
-  for (const change of [{ token: '' }, { sha: 'invalid' }, { repository: '../another' }, { origin: '' }, { event: 'other' },
-    { runNumber: '0' }, { attempt: 'bad' }]) {
-    assert.equal((await webappDeployment({
-      ...options(), ...change, fetchImpl: () => assert.fail('Invalid context must not request history'),
+test('invalid deployment context cannot probe another origin or invoke an arbitrary git command', async () => {
+  for (const change of [{ sha: '--help' }, { origin: 'http://station.example' },
+    { origin: 'https://user:secret@station.example' }, { origin: 'https://station.example/path' },
+    { origin: 'https://station.example?query' }, { origin: 'https://station.example#fragment' }, { event: 'other' }]) {
+    assert.equal((await webappDeployment({ ...options(), ...change,
+      fetchImpl: () => assert.fail('Invalid context must not probe'),
     })).deploy, true);
   }
-  assert.throws(() => webappTree('--help', { cwd: directory }), /Invalid deployment revision/);
+  assert.throws(() => tree('--help'), /Invalid deployment revision/);
 });
 
-test('the real manual entrypoint writes the force-deploy output without account credentials', () => {
+test('unavailable desired source forces deployment', async () => {
+  for (const unavailable of [() => '', () => { throw new Error('Missing git object'); }]) {
+    assert.equal((await webappDeployment({ ...options(), tree: unavailable })).deploy, true);
+  }
+});
+
+test('the real manual entrypoint forces deployment without account credentials', () => {
   const output = join(directory, 'workflow-output');
   execFileSync(process.execPath, [fileURLToPath(new URL('./webapp-deployment.mjs', import.meta.url))], {
     env: { GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_OUTPUT: output },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   assert.equal(readFileSync(output, 'utf8'), 'deploy=true\n');
-});
-
-test('the real recording entrypoint binds the actual deployment job destination and revision', () => {
-  const output = join(directory, 'context-output'), context = join(directory, 'context.json');
-  const origin = 'https://another-station.example';
-  execFileSync(process.execPath, [fileURLToPath(new URL('./webapp-deployment.mjs', import.meta.url)), '--record', context], {
-    env: { STATION_URL: origin, GITHUB_SHA: relayOnly, GITHUB_OUTPUT: output },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  assert.deepEqual(JSON.parse(readFileSync(context, 'utf8')), { version: 1, origin, sha: relayOnly });
-  assert.equal(readFileSync(output, 'utf8'), `artifact=${deploymentContextName(origin, relayOnly)}\n`);
-  assert.notEqual(deploymentContextName(origin, relayOnly), deploymentContextName(origin, deployed));
-  assert.notEqual(deploymentContextName(origin, relayOnly), deploymentContextName('https://station.example', relayOnly));
 });

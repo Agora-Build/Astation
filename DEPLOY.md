@@ -121,7 +121,7 @@ finish:
 1. each relay in `RELAY_DEPLOY_HOOKS` order (relay-a, then relay-b), waiting
    after each until `${STATION_URL}/health` is healthy (polled
    every 5 s, up to 36 times);
-2. the webapp, when its source differs from the last successful deployment;
+2. the webapp, when the running frontend's source differs or cannot be confirmed;
 3. the final check: public HTTPS, a healthy `/health` (Postgres knowledge
    store; Redis `ok` and at least `STATION_MIN_REPLICAS` live replicas when
    those checks are switched on, see below), the expected relay build commit,
@@ -129,27 +129,25 @@ finish:
    and an identity WebSocket
    connection to the selected origin's `/ws` endpoint.
 
-The deployment compares the complete `webapp/` Git tree with the last successful
-Deploy Station attempt on `main`, including its nginx configuration and Dockerfile.
-That attempt must have completed successfully; a newer failed/canceled attempt
-may already have changed the frontend and cannot be skipped past. A workflow
-retry also redeploys normally.
-After its public checks pass, the deployment job records an artifact bound to
-its actual `STATION_URL` and source commit. A missing/expired artifact or a
-changed destination requires deployment. The comparison reads artifact metadata;
-it downloads no archive or executable from a prior run.
-Relay-only changes leave the existing frontend running. Comparing with the last
-successful rollout, rather than the preceding commit, keeps webapp changes from
-an unsuccessful rollout pending. Missing history, unavailable revisions or API
-errors cause a normal webapp deployment. Both images are still published, and
-relay deployment and final public checks always run.
+The frontend image publishes its build-time `webapp/` Git tree at
+`/.well-known/astation-webapp-build.json`, with `Cache-Control: no-store`.
+Before automatic deployment, the workflow probes that path on the selected
+HTTPS origin with a unique query and cache bypass. It keeps the running
+frontend only when the bounded, uncached metadata matches the desired source.
+This checks the actual frontend after a partial rollout, rollback or older run's
+retry; it needs no deployment-history record or account credentials.
+
+Missing/invalid metadata, a redirect, cached response, outage or unknown source
+causes normal deployment. Both images are still published, and relay deployment
+and final public checks always run. The fingerprint describes source only;
+it supplies no verifier inventory, signing authority or compatibility evidence.
 
 Run the workflow manually on `main` from GitHub Actions to force a webapp
 deployment, including after changing its platform configuration or refreshing
-the nginx base image. The current
-frontend uses fixed host port `3010`; avoiding unnecessary replacements reduces
-public-route interruptions, but a webapp update still needs a separate frontend
-availability solution before claiming uninterrupted deployments.
+the nginx base image. The current frontend uses fixed host port `3010`;
+avoiding unnecessary replacements reduces public-route interruptions, but a
+webapp update still needs a separate frontend availability solution before
+claiming uninterrupted deployments.
 
 Release tags continue to publish versioned and `:latest` images and the macOS
 installer. They do not deploy production; Coolify tracks `:main` so publishing

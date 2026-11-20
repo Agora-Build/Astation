@@ -55,6 +55,7 @@ jobs:
             suffix="-hosted"
           fi
           echo "suffix=$suffix" >> "$GITHUB_OUTPUT"
+          echo "webapp_tree=$(git rev-parse HEAD:webapp)" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
@@ -63,6 +64,7 @@ jobs:
           build-args: |
             ASTATION_BUILD_COMMIT=${{ github.sha }}
             ASTATION_HOSTED_AGENT_API=${{ env.STATION_HOSTED_AGENT_API }}
+            ASTATION_WEBAPP_SOURCE_TREE=${{ steps.meta.outputs.webapp_tree }}
           tags: |
             ghcr.io/${{ steps.meta.outputs.owner }}/${{ matrix.image }}:main${{ steps.meta.outputs.suffix }}
             ghcr.io/${{ steps.meta.outputs.owner }}/${{ matrix.image }}:sha-${{ github.sha }}${{ steps.meta.outputs.suffix }}
@@ -78,15 +80,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      actions: read
     # Each relay hook can take ~20 min (Coolify wait up to 15 min + health
     # wait up to 3 min), plus ~30 min for the webapp and the final check:
     # 90 fits 3 relays. Raise it before adding a fourth.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -94,8 +93,6 @@ jobs:
         run: node .github/scripts/verify-station.mjs --check-deployment
       - name: Check whether the webapp needs redeployment
         id: webapp
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: node .github/scripts/webapp-deployment.mjs
       # Relays deploy one at a time, in RELAY_DEPLOY_HOOKS order (one deploy
       # hook URL per line, any webhook-capable platform). For each: trigger,
@@ -133,12 +130,3 @@ jobs:
           STATION_REQUIRE_REDIS: ${{ vars.STATION_REQUIRE_REDIS }}
           STATION_EXPECTED_COMMIT: ${{ github.sha }}
         run: node .github/scripts/verify-station.mjs
-      - name: Record verified deployment destination
-        id: context
-        run: node .github/scripts/webapp-deployment.mjs --record "$RUNNER_TEMP/station-deployment-context.json"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.context.outputs.artifact }}
-          path: ${{ runner.temp }}/station-deployment-context.json
-          retention-days: 30
-          overwrite: true
