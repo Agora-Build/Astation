@@ -134,7 +134,10 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
     /// including token refresh and response delay. Replays cannot extend it.
     public func observeConsumer(_ inventory: VerifierInventory?, on connection: Connection,
                                 receivedAt: UInt64, authorizationMilliseconds: UInt64) throws {
-        guard case .stationReplica = connection.verifier else { throw RemoteVerifierGateError.invalidInventory }
+        switch connection.verifier {
+        case .stationReplica, .member: break
+        default: throw RemoteVerifierGateError.invalidInventory
+        }
         let deadline = receivedAt.addingReportingOverflow(authorizationMilliseconds)
         let current = now()
         guard receivedAt <= current, (1...30_000).contains(authorizationMilliseconds),
