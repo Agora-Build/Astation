@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 
 const revision = value => typeof value === 'string' && /^[0-9a-f]{40}$/.test(value);
 const target = value => typeof value === 'string' && value.trim().length > 0 && value.length <= 2048;
+const counter = value => /^[1-9][0-9]*$/.test(String(value)) && Number.isSafeInteger(Number(value));
 
 export function deploymentContextName(origin, sha) {
   if (!target(origin) || !revision(sha)) throw new Error('Invalid deployment context');
@@ -23,20 +24,23 @@ export async function webappDeployment({
   sha = process.env.GITHUB_SHA,
   repository = process.env.GITHUB_REPOSITORY,
   origin = process.env.STATION_URL,
+  runNumber = process.env.GITHUB_RUN_NUMBER,
+  attempt = process.env.GITHUB_RUN_ATTEMPT,
   token = process.env.GITHUB_TOKEN,
   fetchImpl = fetch,
   tree = webappTree,
 } = {}) {
   if (event === 'workflow_dispatch') return { deploy: true, reason: 'Manual deployment' };
+  if (counter(attempt) && Number(attempt) > 1) return { deploy: true, reason: 'Deployment retry' };
   if (event !== 'push' || !revision(sha) ||
       !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository ?? '') || !token ||
-      !target(origin)) {
+      !target(origin) || !counter(runNumber) || !counter(attempt)) {
     return { deploy: true, reason: 'No confirmed deployment comparison' };
   }
   try {
-    // Compare with the last successful rollout, not the preceding commit:
-    // a failed rollout may have left an earlier webapp running.
-    const url = `https://api.github.com/repos/${repository}/actions/workflows/deploy-station.yml/runs?branch=main&status=success&per_page=1`;
+    // A newer failed/canceled attempt may already have replaced the frontend,
+    // even if the desired source now equals an older successful deployment.
+    const url = `https://api.github.com/repos/${repository}/actions/workflows/deploy-station.yml/runs?branch=main&per_page=100`;
     const settings = () => ({
       headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' },
       redirect: 'error', signal: AbortSignal.timeout(15_000),
@@ -44,8 +48,12 @@ export async function webappDeployment({
     const response = await fetchImpl(url, settings());
     if (!response.ok) throw new Error('Deployment history unavailable');
     const runs = (await response.json()).workflow_runs;
-    const previous = Array.isArray(runs) ? runs[0] : undefined;
-    if (!previous || previous.conclusion !== 'success' || previous.head_branch !== 'main' ||
+    if (!Array.isArray(runs) || runs.some(run => !run || !Number.isSafeInteger(run.run_number) || run.run_number <= 0)) {
+      throw new Error('Deployment order unavailable');
+    }
+    const previous = runs.filter(run => run.run_number < Number(runNumber))
+      .sort((a, b) => b.run_number - a.run_number)[0];
+    if (!previous || previous.status !== 'completed' || previous.conclusion !== 'success' || previous.head_branch !== 'main' ||
         !revision(previous.head_sha) || !Number.isSafeInteger(previous.id) || previous.id <= 0) {
       throw new Error('No successful deployment');
     }

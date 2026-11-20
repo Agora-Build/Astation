@@ -24,11 +24,14 @@ writeFileSync(join(directory, 'webapp', 'nginx.conf'), 'new proxy');
 const webappChanged = commit('Proxy changed in an unsuccessful rollout');
 writeFileSync(join(directory, 'relay.rs'), 'another relay update');
 const nextPush = commit('Relay changed after the unsuccessful rollout');
+writeFileSync(join(directory, 'webapp', 'nginx.conf'), 'original proxy');
+const rollback = commit('Revert frontend source after an unsuccessful rollout');
 test.after(() => rmSync(directory, { recursive: true, force: true }));
 
 function options(sha = relayOnly) {
   return {
     event: 'push', sha, repository: 'Agora-Build/Astation', token: 'test-token', origin: 'https://station.example',
+    runNumber: '9', attempt: '1',
     tree: value => webappTree(value, { cwd: directory }),
     fetchImpl: async (url, settings) => {
       assert.equal(settings.headers.Authorization, 'Bearer test-token');
@@ -38,9 +41,9 @@ function options(sha = relayOnly) {
           { name: deploymentContextName('https://station.example', deployed), expired: false },
         ] }) };
       }
-      assert.match(url, /\/actions\/workflows\/deploy-station.yml\/runs\?branch=main&status=success&per_page=1$/);
+      assert.match(url, /\/actions\/workflows\/deploy-station.yml\/runs\?branch=main&per_page=100$/);
       return { ok: true, json: async () => ({ workflow_runs: [
-        { id: 123, conclusion: 'success', head_branch: 'main', head_sha: deployed },
+        { id: 123, run_number: 8, status: 'completed', conclusion: 'success', head_branch: 'main', head_sha: deployed },
       ] }) };
     },
   };
@@ -61,6 +64,37 @@ test('manual deployment always deploys without relying on history', async () => 
     ...options(), event: 'workflow_dispatch',
     fetchImpl: () => assert.fail('Manual deployment must not query history'),
   })).deploy, true);
+});
+
+test('a partial or canceled newer rollout cannot hide a required rollback', async () => {
+  assert.equal(webappTree(deployed, { cwd: directory }), webappTree(rollback, { cwd: directory }));
+  for (const conclusion of ['failure', 'cancelled', null]) {
+    assert.equal((await webappDeployment({
+      ...options(rollback), fetchImpl: async () => ({ ok: true, json: async () => ({ workflow_runs: [
+        { id: 124, run_number: 8, status: conclusion ? 'completed' : 'in_progress', conclusion, head_branch: 'main', head_sha: webappChanged },
+        { id: 123, run_number: 7, status: 'completed', conclusion: 'success', head_branch: 'main', head_sha: deployed },
+      ] }) }),
+      tree: () => assert.fail('An uncertain newer attempt cannot use an older baseline'),
+    })).deploy, true);
+  }
+  assert.equal((await webappDeployment({
+    ...options(), attempt: '2', fetchImpl: () => assert.fail('A retry always redeploys'),
+  })).deploy, true);
+});
+
+test('current and future queued runs cannot become their own deployment baseline', async () => {
+  const original = options().fetchImpl;
+  assert.equal((await webappDeployment({
+    ...options(), fetchImpl: async (url, settings) => {
+      const result = await original(url, settings);
+      if (url.includes('/artifacts?')) return result;
+      const body = await result.json();
+      body.workflow_runs.unshift(
+        { id: 125, run_number: 10, status: 'queued', head_branch: 'main', head_sha: nextPush },
+        { id: 124, run_number: 9, status: 'in_progress', head_branch: 'main', head_sha: relayOnly });
+      return { ok: true, json: async () => body };
+    },
+  })).deploy, false);
 });
 
 test('a changed destination or missing, expired or wrong-revision context requires webapp deployment', async () => {
@@ -101,7 +135,8 @@ test('missing or uncertain deployment history never suppresses the webapp', asyn
 });
 
 test('unconfirmed workflow context cannot skip an update or send the token elsewhere', async () => {
-  for (const change of [{ token: '' }, { sha: 'invalid' }, { repository: '../another' }, { origin: '' }, { event: 'other' }]) {
+  for (const change of [{ token: '' }, { sha: 'invalid' }, { repository: '../another' }, { origin: '' }, { event: 'other' },
+    { runNumber: '0' }, { attempt: 'bad' }]) {
     assert.equal((await webappDeployment({
       ...options(), ...change, fetchImpl: () => assert.fail('Invalid context must not request history'),
     })).deploy, true);

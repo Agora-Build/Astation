@@ -130,7 +130,10 @@ finish:
    connection to the selected origin's `/ws` endpoint.
 
 The deployment compares the complete `webapp/` Git tree with the last successful
-Deploy Station run on `main`, including its nginx configuration and Dockerfile.
+Deploy Station attempt on `main`, including its nginx configuration and Dockerfile.
+That attempt must have completed successfully; a newer failed/canceled attempt
+may already have changed the frontend and cannot be skipped past. A workflow
+retry also redeploys normally.
 After its public checks pass, the deployment job records an artifact bound to
 its actual `STATION_URL` and source commit. A missing/expired artifact or a
 changed destination requires deployment. The comparison reads artifact metadata;
