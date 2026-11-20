@@ -55,6 +55,7 @@ jobs:
             suffix="-hosted"
           fi
           echo "suffix=$suffix" >> "$GITHUB_OUTPUT"
+          echo "webapp_tree=$(git rev-parse HEAD:webapp)" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
@@ -63,6 +64,7 @@ jobs:
           build-args: |
             ASTATION_BUILD_COMMIT=${{ github.sha }}
             ASTATION_HOSTED_AGENT_API=${{ env.STATION_HOSTED_AGENT_API }}
+            ASTATION_WEBAPP_SOURCE_TREE=${{ steps.meta.outputs.webapp_tree }}
           tags: |
             ghcr.io/${{ steps.meta.outputs.owner }}/${{ matrix.image }}:main${{ steps.meta.outputs.suffix }}
             ghcr.io/${{ steps.meta.outputs.owner }}/${{ matrix.image }}:sha-${{ github.sha }}${{ steps.meta.outputs.suffix }}
@@ -76,6 +78,8 @@ jobs:
     name: Deploy and verify Station
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     # Each relay hook can take ~20 min (Coolify wait up to 15 min + health
     # wait up to 3 min), plus ~30 min for the webapp and the final check:
     # 90 fits 3 relays. Raise it before adding a fourth.
@@ -87,6 +91,9 @@ jobs:
           node-version: '22'
       - name: Validate deployment configuration
         run: node .github/scripts/verify-station.mjs --check-deployment
+      - name: Check whether the webapp needs redeployment
+        id: webapp
+        run: node .github/scripts/webapp-deployment.mjs
       # Relays deploy one at a time, in RELAY_DEPLOY_HOOKS order (one deploy
       # hook URL per line, any webhook-capable platform). For each: trigger,
       # wait for the Coolify deployment when COOLIFY_API_TOKEN is set, then
@@ -112,6 +119,7 @@ jobs:
           done <<< "${RELAY_DEPLOY_HOOKS:-}"
           node .github/scripts/deploy-relays.mjs
       - name: Deploy webapp and wait for Coolify
+        if: steps.webapp.outputs.deploy == 'true'
         env:
           COOLIFY_WEBHOOK_URL: ${{ secrets.COOLIFY_WEBAPP_WEBHOOK_URL }}
           COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}

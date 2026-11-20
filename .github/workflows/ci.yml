@@ -121,12 +121,12 @@ jobs:
 
       - name: Verify Stoa and Agent webapps
         run: |
-          docker build --tag station-webapp:ci webapp
+          docker build --build-arg ASTATION_WEBAPP_SOURCE_TREE="$(git rev-parse HEAD:webapp)" --tag station-webapp:ci webapp
           trap 'docker rm -f webapp-check >/dev/null 2>&1' EXIT
           docker run --detach --name webapp-check \
             --env STATION_RELAY_UPSTREAM=127.0.0.1:9 \
             --publish 127.0.0.1:53001:80 station-webapp:ci
-          WEBAPP_TEST_ORIGIN=http://127.0.0.1:53001 node --test webapp/tests/hosting.test.mjs
+          WEBAPP_TEST_ORIGIN=http://127.0.0.1:53001 WEBAPP_TEST_SOURCE_TREE="$(git rev-parse HEAD:webapp)" node --test webapp/tests/hosting.test.mjs
 
       - name: Test AI review tooling
         run: node --test .github/scripts/*.test.mjs
