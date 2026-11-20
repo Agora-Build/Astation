@@ -6,6 +6,15 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sqlx::{PgConnection, PgPool};
 
+#[path = "delegated_recovery_plan.rs"]
+pub(crate) mod plan;
+
+fn canonical_genesis(genesis: &str) -> bool {
+    Hash32::from_hex(genesis).is_ok()
+        && genesis.len() == 64
+        && genesis.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Binding {
     pub origin: String,
@@ -130,12 +139,7 @@ pub(crate) async fn inspect_root(
     binding: &Binding,
     genesis: &str,
 ) -> Result<Value, sqlx::Error> {
-    if Hash32::from_hex(genesis).is_err()
-        || genesis.len() != 64
-        || genesis
-            .bytes()
-            .any(|b| !b.is_ascii_digit() && !(b'a'..=b'f').contains(&b))
-    {
+    if !canonical_genesis(genesis) {
         return Err(sqlx::Error::Protocol("invalid genesis hash".into()));
     }
     let mut tx = pool.begin().await?;

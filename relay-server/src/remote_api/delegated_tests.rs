@@ -17,6 +17,10 @@ use serde_json::json;
 #[path = "delegated_restore_tests.rs"]
 mod recovery_fence;
 
+#[cfg(feature = "delegated-host-work")]
+#[path = "delegated_recovery_plan_tests.rs"]
+mod recovery_plan;
+
 const ORIGIN: &str = "https://station-dev.agora.build";
 
 pub(crate) fn fixture() -> Fixture {
@@ -103,6 +107,38 @@ fn delegated_recovery_inspection_never_ticks_reports_or_exposes_record_bodies() 
         .is_err());
     feed.records[0]["signature"] = json!("tampered");
     assert!(feed.recovery_inspection(ORIGIN, &f.log).is_err());
+}
+
+#[test]
+fn delegated_recovery_review_preserves_host_interrupts_and_never_trusts_unknown_authority() {
+    let mut f = fixture();
+    let action = atem_client::membership::host_sender_revoke("host-a", false, f.created).unwrap();
+    let entry = sign_entry(&f.keys, &KeyId::new("manager"), f.log.draft("phone", f.created, &action)).unwrap();
+    let next = f.log.evaluate_objects(&[entry.object().clone()], &HostNow {
+        wall_ms: f.created, mono_ms: 0, boot_id: "test".into(),
+    });
+    assert_eq!(next.appended, 1);
+    f.log = next.next;
+    let mut feed = Stored::new(ORIGIN, &f.log).unwrap();
+    let record = ControlRecord::from_signed(build_control(&f.keys, &KeyId::new("manager"), &ControlBody {
+        account_id: f.log.account_id().into(), genesis_hash: f.log.genesis_hash(), feed: None,
+        principal: ControlPrincipal::Host("host-a".into()), principal_key: None,
+        signer: ControlSigner::Member("phone".into()),
+        action: ControlAction::InterruptRunning { revoke_seq: Some(f.log.head().seq) },
+        record_id: uuid::Uuid::new_v4().to_string(), issued_at: f.created + 1,
+        about: ControlAbout { integration_id: None, by: "owner".into() },
+    }).unwrap()).unwrap();
+    feed.publish(ORIGIN, &f.log, &record, f.created, &["host-a".into()], f.created).unwrap();
+    let before = serde_json::to_value(&feed).unwrap();
+    let review = feed.recovery_review(ORIGIN, &f.log).unwrap();
+    assert_eq!(review["records"][0]["requirement"], "retain_host_record");
+    assert_eq!(review["records"][0]["interrupt_running"], true);
+    assert_eq!(review["records"][0]["revoke_seq"], f.log.head().seq);
+    assert_eq!(serde_json::to_value(&feed).unwrap(), before);
+    feed.records[0]["body"]["signer"] = json!("member:unknown-manager");
+    let unknown = feed.recovery_review(ORIGIN, &f.log).unwrap();
+    assert_eq!(unknown["records"][0]["requirement"], "authority_review");
+    assert_eq!(unknown["records"][0]["verification"], "pending:signer_unknown");
 }
 
 fn root(f: &Fixture) -> Root {
