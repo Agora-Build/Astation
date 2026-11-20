@@ -329,9 +329,9 @@ final class AtemE2EIdentity {
             throw AtemIdentityError.identityChanged
         }
         if [.project, .hostSender, .hostEncKey].contains(request.purpose) {
-            guard let authorizeNewMembership else { throw AtemIdentityError.invalidState }
-            try authorizeNewMembership(request)
+            guard authorizeNewMembership != nil else { throw AtemIdentityError.invalidState }
         }
+        try authorizeNewMembership?(request)
         lock.lock(); defer { lock.unlock() }
         guard let record = try read(create: false),
               try crypto.signingPublicKey(record.material) == expectedPublicKey else {

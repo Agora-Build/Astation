@@ -293,6 +293,7 @@ private func recoveryTestJSON(_ object: Any) throws -> String {
 
 private actor ServiceApprovalPortal: AccountOIDCHTTP {
     var state = "awaiting_approval"
+    var scopes = ["agent.prompt", "agent.view"]
     var fingerprint: String?
     var posts = 0
     var loseReply = false
@@ -306,6 +307,7 @@ private actor ServiceApprovalPortal: AccountOIDCHTTP {
         if let fingerprint { self.fingerprint = fingerprint }
     }
     func setState(_ value: String) { state = value }
+    func setScopes(_ value: [String]) { scopes = value }
     func dropNextReply() { loseReply = true }
     func keepEarlierInterruptChoice() { convergeInterrupt = false }
     func refuseRevoke(_ code: String, status: Int = 409) { revokeError = (code, status) }
@@ -334,7 +336,7 @@ private actor ServiceApprovalPortal: AccountOIDCHTTP {
             if loseReply { loseReply = false; throw AccountLoginError.unavailable }
         }
         var record: [String: Any] = ["id": "i-01234567890123456789012345", "name": "Test bot", "stationOrigin": "https://configured.example",
-            "state": state, "scopes": ["agent.prompt", "agent.view"], "expiresAt": ISO8601DateFormatter().string(from: Date().addingTimeInterval(expired ? -3600 : 3600)), "role": "owner"]
+            "state": state, "scopes": scopes, "expiresAt": ISO8601DateFormatter().string(from: Date().addingTimeInterval(expired ? -3600 : 3600)), "role": "owner"]
         if let fingerprint { record["r9Svc"] = fingerprint }
         if ["revoking", "revoked"].contains(state) { record["interruptRunning"] = interruptRunning }
         return (try JSONSerialization.data(withJSONObject: request.httpMethod == "POST" ? record : ["stale": false, "integrations": [record]]), 200)
@@ -1254,7 +1256,9 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
     }
 
     func testHostWorkApprovalCannotSignWithoutHostAuthorizationOrAfterHostDisconnectsDuringConfirmation() async throws {
-        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+        let h = RecoveryCoordinatorHarness()
+        let coordinator = try h.coordinator(authorizeNewMembership: { _, _ in })
+        let transport = ServiceApprovalPortal()
         _ = try await coordinator.setup()
         let approval = try await service(coordinator, operations: ["launch", "view"])
         try await coordinator.prepareService(approval)
@@ -1280,6 +1284,86 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(appends, before)
         XCTAssertEqual(posts, 0)
         XCTAssertEqual(try coordinator.pendingServiceApproval(), approval)
+    }
+
+    func testNewServiceOperationsCannotUseHostFeaturesAsCompleteVerifierEvidence() async throws {
+        for operations in [["launch", "view"], ["message", "view"], ["message", "notify", "prompt", "view"]] {
+            let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(), transport = ServiceApprovalPortal()
+            _ = try await coordinator.setup()
+            let approval = try await service(coordinator, operations: operations)
+            try await coordinator.prepareService(approval)
+            let appends = await h.relay.appends.count, confirmations = h.ownerRequests.count
+            do {
+                try await coordinator.approveService(approval, portal: portal(transport),
+                    authorizeNewOperations: { _ in }, current: { true })
+                XCTFail("Host features cannot confirm every strict verifier")
+            } catch { XCTAssertEqual(error as? RemoteVerifierGateError, .unconfirmedVerifiers) }
+            XCTAssertEqual(h.ownerRequests.count, confirmations)
+            let after = await h.relay.appends.count, posts = await transport.count()
+            XCTAssertEqual(after, appends)
+            XCTAssertEqual(posts, 0)
+        }
+    }
+
+    func testNewServiceOperationsRecheckInventoryAfterConfirmationAndAtTheKeyBoundary() async throws {
+        for failAt in [2, 3] {
+            let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+            var checks = 0
+            let coordinator = try h.coordinator(authorizeNewMembership: { request, log in
+                XCTAssertEqual(request.purpose, .enroll)
+                XCTAssertEqual(log.accountId(), "account-a")
+                checks += 1
+                if checks == failAt { throw RemoteVerifierGateError.unconfirmedVerifiers }
+            })
+            _ = try await coordinator.setup()
+            let approval = try await service(coordinator, operations: ["launch", "view"])
+            try await coordinator.prepareService(approval)
+            let appends = await h.relay.appends.count, confirmations = h.ownerRequests.count
+            do {
+                try await coordinator.approveService(approval, portal: portal(transport),
+                    authorizeNewOperations: { _ in }, current: { true })
+                XCTFail("Expired inventory cannot authorize a service signature")
+            } catch {
+                if failAt == 2 { XCTAssertEqual(error as? RemoteVerifierGateError, .unconfirmedVerifiers) }
+                else { XCTAssertTrue(error is AtemError, "UniFFI wraps a rejected key-provider callback: \(error)") }
+            }
+            XCTAssertEqual(checks, failAt)
+            XCTAssertEqual(h.ownerRequests.count, confirmations + 1)
+            let after = await h.relay.appends.count, posts = await transport.count()
+            XCTAssertEqual(after, appends)
+            XCTAssertEqual(posts, 0)
+            XCTAssertEqual(try coordinator.pendingServiceApproval(), approval)
+        }
+    }
+
+    func testAlreadySignedServiceOperationsRecoverWithoutNewInventoryOrOwnerConfirmation() async throws {
+        let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        var checks = 0
+        var coordinator: AstationRecoveryCoordinator? = try h.coordinator(authorizeNewMembership: { _, _ in checks += 1 })
+        _ = try await coordinator!.setup()
+        let approval = try await service(coordinator!, operations: ["launch", "view"])
+        await transport.setScopes(["agent.launch", "agent.view"])
+        try await coordinator!.prepareService(approval)
+        await h.relay.dropNextAppendReply()
+        do {
+            try await coordinator!.approveService(approval, portal: portal(transport),
+                authorizeNewOperations: { _ in }, current: { true })
+            XCTFail("The durable append reply should be lost")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .unavailable) }
+        XCTAssertEqual(checks, 3, "Check before/after owner confirmation and at the private key")
+        let confirmations = h.ownerRequests.count
+        let before = await h.relay.appends
+        let signed = try XCTUnwrap(before.last).entryJson
+        coordinator = nil
+        let recovered = try h.coordinator(authorizeNewMembership: { _, _ in
+            XCTFail("A saved signature is delivery recovery, never new signing")
+            throw RemoteVerifierGateError.unconfirmedVerifiers
+        })
+        try await recovered.approveService(approval, portal: portal(transport), current: { true })
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        let after = await h.relay.appends
+        XCTAssertEqual(after.last?.entryJson, signed)
+        XCTAssertNil(try recovered.pendingServiceApproval())
     }
 
     func testServiceConfirmationUsesTheExactReviewedApprovalAndCannotBeBypassed() async throws {

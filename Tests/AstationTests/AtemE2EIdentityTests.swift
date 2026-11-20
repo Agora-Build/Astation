@@ -85,6 +85,16 @@ func atemStatementFields(_ signed: AtemSignedWire) -> [Data] {
 }
 
 final class AtemE2EIdentityTests: XCTestCase {
+    func testMembershipKeyProviderNeverCreatesAMissingIdentityDuringPublicKeyValidation() throws {
+        let storage = TestAtemStorage(), crypto = TestAtemCryptography()
+        let identity = AtemE2EIdentity(storage: storage, crypto: crypto)
+        let provider = AstationMembershipKeyProvider(identity: identity, keyID: "manager", publicKey: Data())
+        XCTAssertThrowsError(try provider.publicKey(keyId: "manager"))
+        XCTAssertNil(storage.data)
+        XCTAssertEqual(storage.writes, 0)
+        XCTAssertEqual(crypto.creates, 0)
+    }
+
     private func rethrowStorageError(_ error: Error) throws -> Never {
         if let identityError = error as? AtemIdentityError,
            case .keychain(errSecMissingEntitlement) = identityError,
