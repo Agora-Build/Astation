@@ -2,6 +2,7 @@ import AppKit
 import AtemClient
 @testable import AstationRemote
 import CryptoKit
+import Security
 import Vision
 import XCTest
 @testable import Menubar
@@ -438,6 +439,40 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(storage.writes, 0)
         XCTAssertEqual(crypto.creates, 0)
         XCTAssertThrowsError(try gate.authorize(request, log: log))
+    }
+
+    func testLocalVerifierWithRealProtectedKeysStopsWhenItsOwnTestIdentityIsRemoved() async throws {
+        guard SecureEnclave.isAvailable else { throw XCTSkip("Secure Enclave unavailable") }
+        let name = "atem-local-verifier-test-" + UUID().uuidString
+        let storage = AtemIdentityKeychainStorage(astationId: name)
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "build.agora.astation.atem-e2e-v1", kSecAttrAccount as String: name,
+            kSecUseDataProtectionKeychain as String: true]
+        defer { SecItemDelete(query as CFDictionary) }
+        let h = RecoveryCoordinatorHarness()
+        h.identity = AtemE2EIdentity(storage: storage)
+        let coordinator = try h.coordinator()
+        do { _ = try await coordinator.setup() }
+        catch {
+            let ns = error as NSError
+            let optional = ProcessInfo.processInfo.environment["ASTATION_REQUIRE_KEYCHAIN_TESTS"] != "1"
+            if optional, case AtemIdentityError.keychain(let status) = error,
+               [errSecMissingEntitlement, errSecInteractionNotAllowed].contains(status) {
+                throw XCTSkip("Provisioned signing and an unlocked Mac are required")
+            }
+            if optional, ns.domain == NSOSStatusErrorDomain, ns.code == Int(errSecInteractionNotAllowed) {
+                throw XCTSkip("Unlock this Mac to test protected verifier keys")
+            }
+            throw error
+        }
+        let (log, gate, request) = try await localVerifierGate(h)
+        let evidence = try AstationLocalVerifierEvidence(gate: gate, log: log, memberID: "manager-a",
+            identity: h.identity, current: { true })
+        XCTAssertNoThrow(try gate.authorize(request, log: log))
+        XCTAssertEqual(SecItemDelete(query as CFDictionary), errSecSuccess)
+        XCTAssertThrowsError(try evidence.refresh(log: log))
+        XCTAssertThrowsError(try gate.authorize(request, log: log))
+        XCTAssertNil(try storage.read(), "Inventory checks must never recreate removed protected keys")
     }
 
     func testLocalVerifierLosingProtectedStorageClearsEvidenceWithoutWriting() async throws {
