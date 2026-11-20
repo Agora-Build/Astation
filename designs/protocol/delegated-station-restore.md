@@ -259,6 +259,50 @@ can exceed a single batch and is never silently truncated. Never submit
 `unsigned_reviews` as signed records or infer that their intent was applied.
 The archive itself is not a `retain-stops` input file or a recovery approval.
 
+### Importing the complete native export
+
+The preferred handoff accepts the original export directly, without manually
+extracting records or splitting at a wire-page boundary:
+
+```sh
+station-relay-server admin delegated-recovery retain-native <genesis_hash> <plan_id> native-evidence.json
+```
+
+The plan ID must identify the exact existing `prepare` checkpoint. The command
+rechecks the closed generation, retained source, ownership and membership under
+the same transaction locks as preparation. It accepts only a bounded regular
+file (8 MiB) with the exact native version-1 export shape. The shared strict
+readers validate every original signed record and unsigned control body;
+account, genesis and original Station must match. The archive must preserve
+exactly one destination list per record or unsigned review, beginning with its
+original Station. Only feed-independent host interruptions can name additional
+destinations (at most 64 total). Duplicate IDs, substituted routes, extra fields,
+duplicate JSON keys and claims of complete history or clocks are refused.
+
+One transaction retains the complete archive, its deterministic canonical hash
+and all original signed stops. It accepts up to the native journal's 256 entries,
+including exports larger than the 64-record wire limit. Unsigned reviews and
+destinations are retained separately from verified stops: they establish no
+effect, delivery, signing timestamp or authority. They are explicit owner-review
+obligations for later reconstruction, not objects to sign automatically. Original
+signatures, unsigned bodies and routes remain in storage; public operator output
+contains only review metadata, destinations and commitments.
+
+Identical retries and concurrent replicas retain one archive for a plan. A later
+recovery generation includes earlier archives; changing the current source
+cannot discard known unsigned intent or its destinations. Conflicting bodies
+under one record ID, including a conflict between an unsigned review and any
+known signed checkpoint/import, refuse the entire transaction. A failed commit
+retains neither an archive nor a signed prefix. Inspection refuses corrupt,
+foreign or excessive history rather than returning a partial review. Retained
+archives are bounded to 128 rows, 16 MiB of persisted JSONB and 4,096 distinct
+review IDs per Station/account history, alongside existing signed-history limits.
+
+The combined preparation `evidence_hash` commits to this archive history as well
+as checkpoints and signed imports. All completeness/readiness fields stay false;
+the new command does not publish a snapshot, sign, clear a reporting stop, advance
+a clock or open a fence.
+
 This is a snapshot of one local journal, not proof that every manager, Station
 or later event has been found. `complete_history`, `signing_clock_complete`
 and `snapshot_complete` remain false. A locked, changed or uncertain protected
