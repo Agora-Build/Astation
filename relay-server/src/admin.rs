@@ -8,7 +8,7 @@ use crate::identity_store::{IdentityStore, PgIdentityStore};
 
 pub const USAGE: &str = "usage: station-relay-server admin forget-key <astation_id>\n\
        station-relay-server admin delegated-recovery status|fence\n\
-       station-relay-server admin delegated-recovery inspect <genesis_hash>\n\
+       station-relay-server admin delegated-recovery inspect|prepare <genesis_hash>\n\
 \n\
 Deletes the Astation's registered relay key (DATABASE_URL, required) and\n\
 announces it on relay:broadcast (REDIS_URL, optional) so every relay\n\
@@ -16,7 +16,8 @@ replica drops the cached key at once. Bindings are kept.\n\
 \n\
 delegated-recovery uses DATABASE_URL, PUBLIC_BASE_URL and\n\
 STATION_DELEGATED_RECOVERY_GENERATION. status and inspect only read; fence\n\
-durably stops delegated serving, signing and reporting. It never resumes them.";
+durably stops delegated serving, signing and reporting. prepare retains the old\n\
+evidence and reserves a replacement feed behind a closed fence. It never resumes them.";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ForgetOutcome {
@@ -117,10 +118,10 @@ async fn delegated_recovery(args: &[String]) -> i32 {
         [command] if command == "status" => (false, None),
         [command] if command == "fence" => (true, None),
         [command, genesis]
-            if command == "inspect" && genesis.len() == 64
+            if matches!(command.as_str(), "inspect" | "prepare") && genesis.len() == 64
                 && genesis.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
         {
-            (false, Some(genesis))
+            (false, Some((command.as_str(), genesis)))
         }
         _ => {
             eprintln!("{USAGE}");
@@ -151,14 +152,19 @@ async fn delegated_recovery(args: &[String]) -> i32 {
             return 1;
         }
     };
-    if let Some(genesis) = root {
-        return match inspect_root(&pool, &binding, genesis).await {
+    if let Some((command, genesis)) = root {
+        let report = if command == "prepare" {
+            crate::remote_api::recovery::delegated_recovery::plan::prepare(&pool, &binding, genesis).await
+        } else {
+            inspect_root(&pool, &binding, genesis).await
+        };
+        return match report {
             Ok(report) => {
                 println!("{report}");
                 0
             }
             Err(_) => {
-                eprintln!("could not inspect the retained delegated recovery state");
+                eprintln!("could not {command} the retained delegated recovery state");
                 1
             }
         };
@@ -281,9 +287,11 @@ mod tests {
         assert_eq!(main(&["delegated-recovery".into()]).await, 2);
         assert_eq!(main(&["delegated-recovery".into(), "resume".into()]).await, 2);
         assert_eq!(main(&["delegated-recovery".into(), "fence".into(), "extra".into()]).await, 2);
-        for genesis in ["", "not-a-hash", &"A".repeat(64), &"g".repeat(64), &"0".repeat(63)] {
-            assert_eq!(main(&["delegated-recovery".into(), "inspect".into(), genesis.into()]).await, 2);
+        for command in ["inspect", "prepare"] {
+            for genesis in ["", "not-a-hash", &"A".repeat(64), &"g".repeat(64), &"0".repeat(63)] {
+                assert_eq!(main(&["delegated-recovery".into(), command.into(), genesis.into()]).await, 2);
+            }
+            assert_eq!(main(&["delegated-recovery".into(), command.into()]).await, 2);
         }
-        assert_eq!(main(&["delegated-recovery".into(), "inspect".into()]).await, 2);
     }
 }

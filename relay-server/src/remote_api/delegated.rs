@@ -64,6 +64,72 @@ impl Fault {
 }
 
 impl Stored {
+    /// Every old record remains an obligation until recovery reconciles it.
+    /// In particular, a still-valid native service signature cannot be edited
+    /// to name the replacement feed; it needs a fresh owner-confirmed review.
+    pub(super) fn recovery_review(
+        &self,
+        origin: &str,
+        log: &Membership,
+    ) -> Result<Value, Fault> {
+        let inspection = self.recovery_inspection(origin, log)?;
+        if self.signing_high_water.iter().any(|(principal, value)| {
+            ControlPrincipal::parse(principal).is_none()
+                || *value > atem_client::canonical::MAX_SAFE_INTEGER
+        }) {
+            return Err(Fault::Unavailable);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut records = Vec::new();
+        for value in &self.records {
+            let record = ControlRecord::parse(
+                &serde_json::to_vec(value).map_err(|_| Fault::Unavailable)?,
+            ).map_err(|_| Fault::Unavailable)?;
+            if record.account_id() != log.account_id()
+                || record.genesis_hash() != log.genesis_hash()
+                || record.feed().is_some_and(|feed| feed != (origin, self.feed_id.as_str()))
+                || !seen.insert(record.record_id().to_owned())
+                || self.signing_high_water.get(&record.principal().name())
+                    .is_none_or(|watermark| *watermark < record.issued_at())
+            {
+                return Err(Fault::Unavailable);
+            }
+            let check = verify_control(&record, log);
+            let (verification, requirement) = match (&check, record.signer(), record.feed()) {
+                (ControlCheck::Valid(_), ControlSigner::Member(_), None) =>
+                    ("valid".to_owned(), "retain_host_record"),
+                (ControlCheck::Valid(_), ControlSigner::Member(_), Some(_)) =>
+                    ("valid".to_owned(), "fresh_manager_signature"),
+                (ControlCheck::Valid(_), ControlSigner::Principal, _) =>
+                    ("valid".to_owned(), "service_state_reconciliation"),
+                (ControlCheck::Pending(reason), _, _) =>
+                    (format!("pending:{}", reason.code()), "authority_review"),
+                (ControlCheck::Refused(reason), _, _) =>
+                    (reason.code().to_owned(), "authority_review"),
+            };
+            records.push(serde_json::json!({
+                "record_id": record.record_id(),
+                "principal": record.principal().name(),
+                "signer": record.signer().name(record.principal()),
+                "action": record.action().name(),
+                "interrupt_running": matches!(record.action(), ControlAction::Revoke { interrupt_running: true } | ControlAction::InterruptRunning { .. }),
+                "revoke_seq": match record.action() {
+                    ControlAction::InterruptRunning { revoke_seq } => revoke_seq,
+                    _ => None,
+                },
+                "issued_at": record.issued_at(),
+                "verification": verification,
+                "requirement": requirement,
+            }));
+        }
+        Ok(serde_json::json!({
+            "retained_feed_id": self.feed_id,
+            "records": records,
+            "retained_signing_watermarks": self.signing_high_water,
+            "inspection": inspection,
+        }))
+    }
+
     /// Read-only operator diagnostics. These counts describe retained history,
     /// not a complete post-restore snapshot or permission to reopen the fence.
     pub(super) fn recovery_inspection(

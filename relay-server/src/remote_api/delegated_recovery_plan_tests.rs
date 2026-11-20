@@ -1,0 +1,394 @@
+use super::super::super::delegated_recovery::{inspect, plan::prepare, Binding};
+use super::*;
+use crate::test_database::TestDatabase;
+
+async fn saved(pool: &sqlx::PgPool, genesis: &str) -> Value {
+    sqlx::query_scalar("SELECT state FROM remote_recovery_roots WHERE genesis_hash=$1")
+        .bind(genesis)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn plans(pool: &sqlx::PgPool) -> Vec<Value> {
+    sqlx::query_scalar(
+        "SELECT to_jsonb(p) FROM station_delegated_recovery_plans p ORDER BY generation",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+async fn retained(
+    database: &TestDatabase,
+) -> (std::sync::Arc<RecoveryStore>, Fixture, String, Binding) {
+    let store = RecoveryStore::postgres(database.pool.clone());
+    store.configure_delegated(ORIGIN, 1).await.unwrap();
+    let f = fixture();
+    f.publish(&store).await;
+    let genesis = f.log.genesis_hash().to_hex();
+    assert_eq!(
+        store
+            .delegated_operation(&genesis, "alice", Command::Ensure)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let mut root: Root = serde_json::from_value(saved(&database.pool, &genesis).await).unwrap();
+    let feed = root.delegated.get_mut(ORIGIN).unwrap();
+    let held = record(
+        &f,
+        feed,
+        &uuid::Uuid::new_v4().to_string(),
+        ControlAction::Hold,
+    );
+    feed.publish(
+        ORIGIN,
+        &f.log,
+        &held,
+        f.created,
+        &["host-a".into()],
+        f.created,
+    )
+    .unwrap();
+    let service = record(
+        &f,
+        feed,
+        &uuid::Uuid::new_v4().to_string(),
+        ControlAction::Revoke {
+            interrupt_running: true,
+        },
+    );
+    let mut body = service.body().clone();
+    body.signer = ControlSigner::Member("phone".into());
+    let native =
+        ControlRecord::from_signed(build_control(&f.keys, &KeyId::new("manager"), &body).unwrap())
+            .unwrap();
+    feed.publish(
+        ORIGIN,
+        &f.log,
+        &native,
+        f.created,
+        &["host-a".into()],
+        f.created,
+    )
+    .unwrap();
+    feed.ledger = feed
+        .ledger(ORIGIN, &f.log)
+        .unwrap()
+        .stop_reporting("old-report-client")
+        .unwrap()
+        .next
+        .to_json();
+    // A reservation with no record is still an outstanding clock obligation.
+    feed.signing_high_water
+        .insert("service:reserved-only".into(), f.created + 123);
+    sqlx::query("UPDATE remote_recovery_roots SET state=$2 WHERE genesis_hash=$1")
+        .bind(&genesis)
+        .bind(serde_json::to_value(root).unwrap())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    (store, f, genesis, Binding::new(ORIGIN, 1).unwrap())
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_preparation_survives_replica_races_and_restart_without_serving(
+) {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;
+    let (store, f, genesis, binding) = retained(&database).await;
+    assert!(
+        prepare(&database.pool, &binding, &genesis).await.is_err(),
+        "an open deployment cannot prepare"
+    );
+    assert!(plans(&database.pool).await.is_empty());
+    binding.initialize(&database.pool, true).await.unwrap();
+    let before = saved(&database.pool, &genesis).await;
+    let second = database.reconnect(2).await;
+    let (first, other) = tokio::join!(
+        prepare(&database.pool, &binding, &genesis),
+        prepare(&second, &binding, &genesis)
+    );
+    let first = first.unwrap();
+    assert_eq!(
+        other.unwrap(),
+        first,
+        "concurrent replicas retain one exact plan"
+    );
+    assert_eq!(plans(&database.pool).await.len(), 1);
+    assert_eq!(saved(&database.pool, &genesis).await, before);
+    assert_eq!(first["membership_head"], f.log.head().to_json());
+    assert_eq!(first["snapshot_complete"], false);
+    assert_eq!(first["recovery_ready"], false);
+    assert_eq!(first["retained_history_only"], true);
+    assert_ne!(
+        first["candidate_feed_id"],
+        before["delegated"][ORIGIN]["feed_id"]
+    );
+    assert_eq!(
+        first["review"]["records"][0]["requirement"],
+        "service_state_reconciliation"
+    );
+    assert_eq!(
+        first["review"]["records"][1]["requirement"],
+        "fresh_manager_signature"
+    );
+    assert_eq!(first["review"]["records"][1]["interrupt_running"], true);
+    assert_eq!(
+        first["review"]["retained_signing_watermarks"]["service:reserved-only"],
+        f.created + 123
+    );
+    assert_eq!(first["review"]["inspection"]["reporting_stopped"], true);
+    let saved_plans = plans(&database.pool).await;
+    assert_eq!(
+        saved_plans[0]["retained"]["feed"],
+        before["delegated"][ORIGIN]
+    );
+    for secret in [
+        "\"sig\"",
+        "\"signature\"",
+        "old-report-client",
+        "\"ledger\"",
+        "\"membership\"",
+    ] {
+        assert!(!first.to_string().contains(secret), "{secret}");
+    }
+    second.close().await;
+    let restart = database.reconnect(2).await;
+    assert_eq!(prepare(&restart, &binding, &genesis).await.unwrap(), first);
+    let fresh_store = RecoveryStore::postgres(restart.clone());
+    assert!(fresh_store.configure_delegated(ORIGIN, 1).await.is_err());
+    assert!(!inspect(&restart, ORIGIN).await.unwrap().unwrap().ready);
+    assert_ne!(
+        store
+            .delegated_operation(&genesis, "alice", Command::Ensure)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    drop(fresh_store);
+    restart.close().await;
+    drop(store);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_preparation_commit_failure_retains_fence_and_all_source_evidence(
+) {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (store, _, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    let before = saved(&database.pool, &genesis).await;
+    sqlx::query("CREATE FUNCTION fail_plan_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test plan commit failure'; END $$")
+        .execute(&database.pool).await.unwrap();
+    sqlx::query("CREATE CONSTRAINT TRIGGER fail_plan_commit AFTER INSERT ON station_delegated_recovery_plans DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_plan_commit()")
+        .execute(&database.pool).await.unwrap();
+    assert!(prepare(&database.pool, &binding, &genesis).await.is_err());
+    assert!(
+        plans(&database.pool).await.is_empty(),
+        "an uncommitted UUID is never returned or retained"
+    );
+    assert_eq!(saved(&database.pool, &genesis).await, before);
+    assert!(
+        !inspect(&database.pool, ORIGIN)
+            .await
+            .unwrap()
+            .unwrap()
+            .ready
+    );
+    sqlx::query("DROP TRIGGER fail_plan_commit ON station_delegated_recovery_plans")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert!(prepare(&database.pool, &binding, &genesis).await.is_ok());
+    assert_eq!(saved(&database.pool, &genesis).await, before);
+    drop(store);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_preparation_never_overwrites_changed_history_or_an_old_generation(
+) {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (store, f, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    let first = prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let before_plans = plans(&database.pool).await;
+    let source = saved(&database.pool, &genesis).await;
+    // Unrelated encrypted backup data does not substitute for control history
+    // and must not make an otherwise identical preparation unusable.
+    let mut changed = source.clone();
+    changed["blobs"] = json!({"1":{"bytes":"opaque-test-backup", "uploaded_at":f.created}});
+    sqlx::query("UPDATE remote_recovery_roots SET state=$2 WHERE genesis_hash=$1")
+        .bind(&genesis)
+        .bind(&changed)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        prepare(&database.pool, &binding, &genesis).await.unwrap(),
+        first
+    );
+    changed["delegated"][ORIGIN]["signing_high_water"]["service:reserved-only"] =
+        json!(f.created + 124);
+    sqlx::query("UPDATE remote_recovery_roots SET state=$2 WHERE genesis_hash=$1")
+        .bind(&genesis)
+        .bind(&changed)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert!(prepare(&database.pool, &binding, &genesis).await.is_err());
+    assert_eq!(plans(&database.pool).await, before_plans);
+    let newer = Binding::new(ORIGIN, 2).unwrap();
+    newer.initialize(&database.pool, false).await.unwrap();
+    assert!(prepare(&database.pool, &binding, &genesis).await.is_err());
+    let next = prepare(&database.pool, &newer, &genesis).await.unwrap();
+    assert_ne!(next["plan_id"], first["plan_id"]);
+    assert_ne!(next["candidate_feed_id"], first["candidate_feed_id"]);
+    let after = plans(&database.pool).await;
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0], before_plans[0]);
+    assert_eq!(saved(&database.pool, &genesis).await, changed);
+    assert!(
+        !inspect(&database.pool, ORIGIN)
+            .await
+            .unwrap()
+            .unwrap()
+            .ready
+    );
+    drop(store);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_preparation_refuses_missing_foreign_and_corrupt_sources() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (store, _, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    for bad in ["invalid".into(), "A".repeat(64), "0".repeat(64)] {
+        assert!(prepare(&database.pool, &binding, &bad).await.is_err());
+    }
+    let other = Binding::new("https://other.example", 1).unwrap();
+    assert!(prepare(&database.pool, &other, &genesis).await.is_err());
+    assert!(inspect(&database.pool, &other.origin)
+        .await
+        .unwrap()
+        .is_none());
+    let source = saved(&database.pool, &genesis).await;
+    let mut cases = vec![json!({})];
+    let mut missing = source.clone();
+    missing["delegated"] = json!({});
+    cases.push(missing);
+    let mut missing_clock = source.clone();
+    missing_clock["delegated"][ORIGIN]["signing_high_water"] = json!({});
+    cases.push(missing_clock);
+    let mut foreign = source.clone();
+    foreign["delegated"][ORIGIN]["records"][0]["body"]["feed"]["origin"] =
+        json!("https://other.example");
+    cases.push(foreign);
+    let mut duplicate = source.clone();
+    let duplicate_record = duplicate["delegated"][ORIGIN]["records"][0].clone();
+    duplicate["delegated"][ORIGIN]["records"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate_record);
+    cases.push(duplicate);
+    for changed in cases {
+        sqlx::query("UPDATE remote_recovery_roots SET state=$2 WHERE genesis_hash=$1")
+            .bind(&genesis)
+            .bind(changed)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert!(prepare(&database.pool, &binding, &genesis).await.is_err());
+        assert!(plans(&database.pool).await.is_empty());
+    }
+    assert!(
+        !inspect(&database.pool, ORIGIN)
+            .await
+            .unwrap()
+            .unwrap()
+            .ready
+    );
+    drop(store);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_preparation_refuses_changed_owner_and_corrupt_checkpoints() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (store, _, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    let first = prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let checkpoint = plans(&database.pool).await.remove(0);
+    let before = saved(&database.pool, &genesis).await;
+    sqlx::query(
+        "UPDATE remote_recovery_roots SET account_subject='another-owner' WHERE genesis_hash=$1",
+    )
+    .bind(&genesis)
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    assert!(prepare(&database.pool, &binding, &genesis).await.is_err());
+    assert_eq!(plans(&database.pool).await, vec![checkpoint.clone()]);
+    sqlx::query("UPDATE remote_recovery_roots SET account_subject=$2 WHERE genesis_hash=$1")
+        .bind(&genesis)
+        .bind(checkpoint["retained"]["account_subject"].as_str().unwrap())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    for (column, value) in [
+        ("plan_id", "not-a-uuid"),
+        (
+            "candidate_feed_id",
+            first["review"]["retained_feed_id"].as_str().unwrap(),
+        ),
+        ("source_hash", "changed"),
+    ] {
+        sqlx::query(&format!(
+            "UPDATE station_delegated_recovery_plans SET {column}=$1"
+        ))
+        .bind(value)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert!(
+            prepare(&database.pool, &binding, &genesis).await.is_err(),
+            "{column}"
+        );
+        sqlx::query(&format!(
+            "UPDATE station_delegated_recovery_plans SET {column}=$1"
+        ))
+        .bind(checkpoint[column].as_str().unwrap())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query("UPDATE station_delegated_recovery_plans SET retained=jsonb_set(retained,'{padding}',to_jsonb(repeat('x',16777216)))")
+        .execute(&database.pool).await.unwrap();
+    assert!(prepare(&database.pool, &binding, &genesis).await.is_err());
+    sqlx::query("UPDATE station_delegated_recovery_plans SET retained=$1")
+        .bind(&checkpoint["retained"])
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        prepare(&database.pool, &binding, &genesis).await.unwrap(),
+        first
+    );
+    assert_eq!(saved(&database.pool, &genesis).await, before);
+    assert!(
+        !inspect(&database.pool, ORIGIN)
+            .await
+            .unwrap()
+            .unwrap()
+            .ready
+    );
+    drop(store);
+    database.cleanup().await;
+}

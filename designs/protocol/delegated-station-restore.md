@@ -1,8 +1,9 @@
 # Delegated Station database recovery
 
 Implementation requirements for Astation #79. The deployment-generation fence,
-operator inspection and fencing, and checks at operation/write boundaries are
-implemented in draft #82. Complete snapshot recovery and reopening are not yet
+operator inspection/fencing and operation/write-boundary checks are implemented.
+Durable preparation now retains a recovery checkpoint and replacement feed
+identity behind the closed fence. Complete snapshot recovery and reopening are not yet
 implemented or approved as joint-test evidence. Delegated activation remains
 disabled. Ordinary process or replica restarts keep the existing feed identity;
 restoring a backup or losing history requires a new identity.
@@ -99,6 +100,53 @@ There is deliberately no reopen command yet. Removing the row, replaying a
 configuration or retrying startup does not establish a complete snapshot.
 The rest of the recovery sequence below is still required before reopening.
 
+## Durable recovery preparation
+
+After draining the fleet, increasing the external generation and committing its
+closed fence, the operator can prepare each retained account's recovery:
+
+```sh
+station-relay-server admin delegated-recovery prepare <genesis_hash>
+```
+
+Migration `0017` retains the exact old membership, account storage binding and
+selected origin's complete feed, including signatures, signing reservations,
+ACK ledger, report IDs, retry state and reporting stop. It reserves a replacement
+feed UUID in the same transaction. The old feed and root remain unchanged. This
+is a recovery checkpoint, not a live replacement feed or an export of private
+keys. The prepared UUID is never advertised in heads or accepted by live sync.
+
+Preparation requires an existing closed fence at exactly the configured
+generation, an owned retained root, an unfrozen shared-verified membership and
+a structurally consistent feed. Missing clocks, duplicate record IDs or another
+account/origin/feed are refused. It never initializes a missing root, feed or
+fence. Concurrent operators/replicas and retry after restart return the same
+durable plan and replacement UUID. A commit failure returns no successful plan.
+Changes to the retained membership, ownership or feed require review; retry
+never overwrites the earlier plan. A later external recovery generation gets
+its own plan while retaining the old one. Backup blobs, routes and push state
+do not establish control history and are excluded from this checkpoint.
+
+The JSON output includes record IDs, principals, actions, the explicit
+interruption choice, signer, shared-verifier verdicts and retained per-principal
+clock anchors. Treat it as account-private operator information. It omits
+signed bodies, signatures, membership contents, storage subjects, report
+payloads, key material and backup blobs. Valid feed-bound native stops are
+marked `fresh_manager_signature`: even a current manager's old signature cannot
+be edited to name a new feed. Valid feed-independent host stops are retained;
+other unverifiable authority remains a review obligation. Service records need
+service-state reconciliation rather than copying their old feed signatures.
+Every retained record remains listed; this command performs no compaction.
+
+Every preparation reports `retained_history_only: true`,
+`snapshot_complete: false` and `recovery_ready: false`. The operator's ability to
+prepare is not evidence that all later stops or high-water anchors survived.
+Preparation signs nothing, obtains no owner confirmation, changes no reporting
+stop, settles no ACK and leaves serving/signing/reporting fenced. Complete later
+history, manager re-sign orchestration, snapshot publication and reopening
+remain required. Prepared plans have no automatic deletion or cancellation;
+authenticated account deletion follows the separate account lifecycle.
+
 ## Complete recovery sequence
 
 1. Drain and stop every replica before restoring. Keep delegated serving,
@@ -114,7 +162,8 @@ The rest of the recovery sequence below is still required before reopening.
    to infer an active state. Fresh Portal state alone cannot settle a missing
    native record. A recovery with no trustworthy later history stays fenced
    until the required owner confirmations establish a complete snapshot.
-4. Stage a fresh UUID for each Station/account/genesis feed. Retain the old
+4. Stage a fresh UUID for each Station/account/genesis feed. `prepare` implements
+   this durable checkpoint for a retained source. Retain the old
    signed records and evidence separately. A service record signed for the old
    feed cannot be edited or copied into the new feed as a valid new record.
 5. Build the complete latest-state snapshot: coverage and each principal's

@@ -1,0 +1,170 @@
+//! Durable preparation only. No prepared UUID, retained snapshot or operator
+//! command establishes missing later history or authorizes reopening a fence.
+use super::super::{Root, MAX_STATE};
+use super::{Binding, Status};
+use atem_client::{canonical::jcs, membership::Membership, Hash32};
+use ring::digest::{digest, SHA256};
+use serde_json::{json, Value};
+use sqlx::PgPool;
+
+#[derive(sqlx::FromRow)]
+struct Prepared {
+    plan_id: String,
+    candidate_feed_id: String,
+    source_hash: String,
+    retained: Value,
+}
+
+fn invalid() -> sqlx::Error {
+    sqlx::Error::Protocol("delegated recovery preparation requires review".into())
+}
+
+fn canonical_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value)
+        .is_ok_and(|id| id.get_version_num() == 4 && id.to_string() == value)
+}
+
+fn source_hash(value: &Value) -> Result<String, sqlx::Error> {
+    let bytes = jcs(value).map_err(|_| invalid())?;
+    if bytes.len() > MAX_STATE {
+        return Err(invalid());
+    }
+    Ok(digest(&SHA256, bytes.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// Preserve the exact retained source and reserve one replacement identity.
+/// All replicas serialize through the closed deployment fence and root lock.
+pub(crate) async fn prepare(
+    pool: &PgPool,
+    binding: &Binding,
+    genesis: &str,
+) -> Result<Value, sqlx::Error> {
+    if !super::canonical_genesis(genesis) {
+        return Err(invalid());
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '5s'")
+        .execute(&mut *tx)
+        .await?;
+    let status: Option<Status> = sqlx::query_as(
+        "SELECT generation,ready,reason FROM station_delegated_recovery WHERE origin=$1 FOR UPDATE",
+    )
+    .bind(&binding.origin)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if !status.is_some_and(|status| status.generation == binding.generation && !status.ready) {
+        return Err(invalid());
+    }
+    let (subject, value): (Option<String>, Option<Value>) = sqlx::query_as(
+        "SELECT account_subject,CASE WHEN octet_length(state::text) <= $2 THEN state END \
+         FROM remote_recovery_roots WHERE genesis_hash=$1 FOR UPDATE",
+    )
+    .bind(genesis)
+    .bind(MAX_STATE as i64)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(invalid)?;
+    let subject = subject
+        .filter(|subject| !subject.is_empty())
+        .ok_or_else(invalid)?;
+    let root: Root = serde_json::from_value(value.ok_or_else(invalid)?).map_err(|_| invalid())?;
+    let hash = Hash32::from_hex(genesis).map_err(|_| invalid())?;
+    let log =
+        Membership::from_stored(&root.account, &hash, &root.membership).map_err(|_| invalid())?;
+    if log.frozen().is_some() {
+        return Err(invalid());
+    }
+    let feed = root.delegated.get(&binding.origin).ok_or_else(invalid)?;
+    let review = feed
+        .recovery_review(&binding.origin, &log)
+        .map_err(|_| invalid())?;
+    // Exclude mutable routes, pushes and backup blobs. They neither establish
+    // control history nor invalidate a prepared source on an ordinary reconnect.
+    let retained = json!({
+        "account_subject": subject,
+        "account_id": root.account,
+        "membership": root.membership,
+        "feed": feed,
+    });
+    let source_hash = source_hash(&retained)?;
+    // JSONB's text representation can be larger than canonical JSON. Check
+    // the actual persisted size so a successful first call is readable again.
+    let fits: bool = sqlx::query_scalar("SELECT octet_length($1::jsonb::text) <= $2")
+        .bind(&retained)
+        .bind(MAX_STATE as i64)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !fits {
+        return Err(invalid());
+    }
+    let prepared: Option<Prepared> = sqlx::query_as(
+        "SELECT plan_id,candidate_feed_id,source_hash, \
+         CASE WHEN octet_length(retained::text) <= $4 THEN retained END AS retained \
+         FROM station_delegated_recovery_plans \
+         WHERE origin=$1 AND generation=$2 AND genesis_hash=$3",
+    )
+    .bind(&binding.origin)
+    .bind(binding.generation)
+    .bind(genesis)
+    .bind(MAX_STATE as i64)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let prepared = if let Some(prepared) = prepared {
+        if prepared.source_hash != source_hash
+            || prepared.retained != retained
+            || !canonical_uuid(&prepared.plan_id)
+            || !canonical_uuid(&prepared.candidate_feed_id)
+            || prepared.candidate_feed_id == review["retained_feed_id"]
+        {
+            // Never replace an earlier plan or silently drop its obligations.
+            return Err(invalid());
+        }
+        prepared
+    } else {
+        let prepared = Prepared {
+            plan_id: uuid::Uuid::new_v4().to_string(),
+            candidate_feed_id: uuid::Uuid::new_v4().to_string(),
+            source_hash,
+            retained,
+        };
+        if prepared.candidate_feed_id == review["retained_feed_id"] {
+            return Err(invalid());
+        }
+        sqlx::query(
+            "INSERT INTO station_delegated_recovery_plans \
+             (origin,generation,genesis_hash,plan_id,candidate_feed_id,source_hash,retained) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        )
+        .bind(&binding.origin)
+        .bind(binding.generation)
+        .bind(genesis)
+        .bind(&prepared.plan_id)
+        .bind(&prepared.candidate_feed_id)
+        .bind(&prepared.source_hash)
+        .bind(&prepared.retained)
+        .execute(&mut *tx)
+        .await?;
+        prepared
+    };
+    let report = json!({
+        "version": 1,
+        "origin": binding.origin,
+        "generation": binding.generation,
+        "genesis_hash": genesis,
+        "plan_id": prepared.plan_id,
+        "candidate_feed_id": prepared.candidate_feed_id,
+        "source_hash": prepared.source_hash,
+        "membership_head": log.head().to_json(),
+        "retained_history_only": true,
+        "snapshot_complete": false,
+        "recovery_ready": false,
+        "review": review,
+        "unresolved": ["later_control_history", "signing_clock_anchors", "complete_snapshot", "fresh_manager_confirmations"],
+    });
+    tx.commit().await?;
+    Ok(report)
+}
