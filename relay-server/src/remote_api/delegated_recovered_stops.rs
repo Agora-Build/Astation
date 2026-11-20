@@ -98,6 +98,19 @@ pub(crate) async fn retain(
     if plan_id != prepared.plan_id || source_hash != prepared.source_hash {
         return Err(invalid());
     }
+    retain_records(&mut tx, &prepared, &log, binding, incoming).await?;
+    super::review_evidence(&mut tx, &prepared, &log, binding, &mut report).await?;
+    tx.commit().await?;
+    Ok(report)
+}
+
+pub(super) async fn retain_records(
+    connection: &mut PgConnection,
+    prepared: &super::Prepared,
+    log: &Membership,
+    binding: &Binding,
+    incoming: Vec<ControlRecord>,
+) -> Result<(), sqlx::Error> {
     let mut retained = BTreeMap::new();
     for value in prepared.retained["feed"]["records"]
         .as_array()
@@ -107,14 +120,14 @@ pub(crate) async fn retain(
             .map_err(|_| invalid())?;
         retained.insert(record.record_id().to_owned(), value.clone());
     }
-    let mut recovered = load(&mut tx, binding, genesis).await?;
+    let mut recovered = load(connection, binding, &log.genesis_hash().to_hex()).await?;
     for (id, value) in &recovered {
         if retained.get(id).is_some_and(|prior| prior != value) {
             return Err(invalid());
         }
     }
     for record in incoming {
-        review(&record, &log, &binding.origin)?;
+        review(&record, log, &binding.origin)?;
         let value = record.object().to_json();
         let id = record.record_id();
         if recovered
@@ -131,11 +144,9 @@ pub(crate) async fn retain(
         // source may omit it, so retain the accepted import independently.
         recovered.insert(id.to_owned(), value.clone());
         sqlx::query("INSERT INTO station_delegated_recovered_stops(plan_id,record_id,record) VALUES ($1,$2,$3)")
-            .bind(&plan_id).bind(id).bind(value).execute(&mut *tx).await?;
+            .bind(&prepared.plan_id).bind(id).bind(value).execute(&mut *connection).await?;
     }
-    super::review_evidence(&mut tx, &prepared, &log, binding, &mut report).await?;
-    tx.commit().await?;
-    Ok(report)
+    Ok(())
 }
 
 pub(super) async fn load(

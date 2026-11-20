@@ -59,7 +59,7 @@ pub(super) async fn inspection(
     prepared: &Prepared,
     log: &Membership,
     binding: &Binding,
-) -> Result<Value, sqlx::Error> {
+) -> Result<(Value, BTreeMap<String, Value>), sqlx::Error> {
     // The caller holds the deployment fence and account root through commit;
     // every prepare/import uses these same locks, including other replicas.
     let (count, bytes): (i64, i64) = sqlx::query_as(
@@ -189,12 +189,13 @@ pub(super) async fn inspection(
             stops::review(&record, log, &binding.origin)?,
         )?;
     }
-    Ok(json!({
+    let report = json!({
         "checkpoints": summaries,
         "records": records.values().map(|(_, review)| review).collect::<Vec<_>>(),
         "observed_signing_lower_bounds": lower_bounds,
         "evidence_hash": source_hash(&json!({"checkpoints": commitments, "imports": imports}))?,
         "complete_history": false,
         "signing_clock_complete": false,
-    }))
+    });
+    Ok((report, records.into_iter().map(|(id, (record, _))| (id, record)).collect()))
 }

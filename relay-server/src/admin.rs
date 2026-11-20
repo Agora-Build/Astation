@@ -10,6 +10,7 @@ pub const USAGE: &str = "usage: station-relay-server admin forget-key <astation_
        station-relay-server admin delegated-recovery status|fence\n\
        station-relay-server admin delegated-recovery inspect|prepare <genesis_hash>\n\
        station-relay-server admin delegated-recovery retain-stops <genesis_hash> <file>\n\
+       station-relay-server admin delegated-recovery retain-native <genesis_hash> <plan_id> <file>\n\
 \n\
 Deletes the Astation's registered relay key (DATABASE_URL, required) and\n\
 announces it on relay:broadcast (REDIS_URL, optional) so every relay\n\
@@ -19,7 +20,8 @@ delegated-recovery uses DATABASE_URL, PUBLIC_BASE_URL and\n\
 STATION_DELEGATED_RECOVERY_GENERATION. status and inspect only read; fence\n\
 durably stops delegated serving, signing and reporting. prepare retains the old\n\
 evidence and reserves a replacement feed behind a closed fence. retain-stops adds\n\
-native stop evidence to that exact preparation. Neither command resumes them.";
+native stop evidence to that exact preparation. retain-native imports a complete\n\
+native export, keeping unsigned intent and destinations separate. None resumes them.";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ForgetOutcome {
@@ -145,20 +147,27 @@ async fn read_opened_stop_evidence(input: tokio::fs::File, limit: usize) -> std:
 
 async fn delegated_recovery(args: &[String]) -> i32 {
     use crate::remote_api::recovery::delegated_recovery::{generation, inspect, inspect_root, Binding};
-    let (fence, root, file) = match args {
-        [command] if command == "status" => (false, None, None),
-        [command] if command == "fence" => (true, None, None),
+    let (fence, root, file, native_plan) = match args {
+        [command] if command == "status" => (false, None, None, None),
+        [command] if command == "fence" => (true, None, None, None),
         [command, genesis]
             if matches!(command.as_str(), "inspect" | "prepare") && genesis.len() == 64
                 && genesis.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
         {
-            (false, Some((command.as_str(), genesis)), None)
+            (false, Some((command.as_str(), genesis)), None, None)
         }
         [command, genesis, file]
             if command == "retain-stops" && genesis.len() == 64
                 && genesis.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
         {
-            (false, Some((command.as_str(), genesis)), Some(file))
+            (false, Some((command.as_str(), genesis)), Some(file), None)
+        }
+        [command, genesis, plan, file]
+            if command == "retain-native" && genesis.len() == 64
+                && genesis.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && uuid::Uuid::parse_str(plan).is_ok_and(|id| id.get_version_num() == 4 && id.to_string() == *plan) =>
+        {
+            (false, Some((command.as_str(), genesis)), Some(file), Some(plan))
         }
         _ => {
             eprintln!("{USAGE}");
@@ -191,15 +200,20 @@ async fn delegated_recovery(args: &[String]) -> i32 {
     };
     if let Some((command, genesis)) = root {
         let report = if let Some(file) = file {
-            use crate::remote_api::recovery::delegated_recovery::plan::stops;
-            let bytes = match read_stop_evidence(std::path::Path::new(file), stops::input_limit()).await {
+            use crate::remote_api::recovery::delegated_recovery::plan::{native, stops};
+            let limit = if native_plan.is_some() { native::INPUT_LIMIT } else { stops::input_limit() };
+            let bytes = match read_stop_evidence(std::path::Path::new(file), limit).await {
                 Ok(bytes) => bytes,
                 Err(_) => {
-                    eprintln!("could not read bounded regular recovery stop evidence");
+                    eprintln!("could not read bounded regular recovery evidence");
                     return 1;
                 }
             };
-            stops::retain(&pool, &binding, genesis, &bytes).await
+            if let Some(plan) = native_plan {
+                native::retain(&pool, &binding, genesis, plan, &bytes).await
+            } else {
+                stops::retain(&pool, &binding, genesis, &bytes).await
+            }
         } else if command == "prepare" {
             crate::remote_api::recovery::delegated_recovery::plan::prepare(&pool, &binding, genesis).await
         } else {
@@ -388,6 +402,10 @@ mod tests {
                 assert_eq!(main(&["delegated-recovery".into(), command.into(), genesis.into()]).await, 2);
             }
             assert_eq!(main(&["delegated-recovery".into(), command.into()]).await, 2);
+        }
+        for plan in ["", "not-a-plan", "00000000-0000-0000-0000-000000000000"] {
+            assert_eq!(main(&["delegated-recovery".into(), "retain-native".into(),
+                "0".repeat(64), plan.into(), "evidence.json".into()]).await, 2);
         }
     }
 }

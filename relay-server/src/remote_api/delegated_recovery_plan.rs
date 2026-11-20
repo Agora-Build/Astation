@@ -11,6 +11,8 @@ use sqlx::{PgConnection, PgPool};
 pub(crate) mod stops;
 #[path = "delegated_recovery_history.rs"]
 mod history;
+#[path = "delegated_native_recovery.rs"]
+pub(crate) mod native;
 
 #[derive(sqlx::FromRow)]
 pub(super) struct Prepared {
@@ -63,12 +65,15 @@ async fn review_evidence(
     report: &mut Value,
 ) -> Result<(), sqlx::Error> {
     report["recovered_stops"] = stops::inspection(connection, prepared, log, binding).await?;
-    report["known_history"] = history::inspection(connection, prepared, log, binding).await?;
+    let (history, signed) = history::inspection(connection, prepared, log, binding).await?;
+    report["known_history"] = history;
+    report["native_archives"] = native::inspection(connection, prepared, log, binding, &signed).await?;
     report["evidence_hash"] = source_hash(&json!({
         "plan_id": prepared.plan_id,
         "source_hash": prepared.source_hash,
         "known_history": report["known_history"]["evidence_hash"],
         "recovered_stops": report["recovered_stops"]["evidence_hash"],
+        "native_archives": report["native_archives"]["evidence_hash"],
     }))?.into();
     Ok(())
 }
