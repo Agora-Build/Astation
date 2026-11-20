@@ -504,6 +504,7 @@ final class IntegrationApprovalViewController: NSViewController {
         coordinator?.onControlDelivery = { [weak self] result in
             guard let self, epoch == self.generation, self.contextCurrent?() == true, !self.controlWorking,
                   self.records.indices.contains(self.picker.indexOfSelectedItem),
+                  result.stationOrigin == self.records[self.picker.indexOfSelectedItem].stationOrigin,
                   let body = try? parseControlRecord(recordJson: result.recordJSON),
                   body.integrationId == self.records[self.picker.indexOfSelectedItem].id else { return }
             self.status.stringValue = Self.controlStatus(result)

@@ -69,7 +69,8 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
     var signIns = 0
     var authorize: (() async throws -> AccountLoginSession)?
 
-    init(stationSubject: String = "test-owner", origin: String = "https://station-tests.example", tokenStatus: Int = 400) throws {
+    init(stationSubject: String = "test-owner", origin: String = "https://station-tests.example", tokenStatus: Int = 400,
+        makeStationAccountAuth: ((AccountServiceSettings, String) throws -> AstationAccountAuth)? = nil) throws {
         self.origin = origin
         defaults = UserDefaults(suiteName: suite)!
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -108,7 +109,8 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
                 let socket = StationTestSocket(); self?.urls.append(url); self?.sockets.append(socket); return socket
             }, makePairingRelayTask: { [unowned self] url in
                 self.pairingURLs.append(url); return self.pairingSocket
-            }, portalSettings: settings, portalAuth: portal, stationAuth: station, portalAPI: PortalAPIClient(http: http),
+            }, portalSettings: settings, portalAuth: portal, stationAuth: station,
+            makeStationAccountAuth: makeStationAccountAuth, portalAPI: PortalAPIClient(http: http),
             projectCache: PortalProjectCache(storage: StationTestCache()), accountDefaults: defaults)
         hub._testRelayUrlOverride = origin
     }
@@ -139,6 +141,52 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
         let hub = AstationHubManager(skipProjectLoad: true, accountDefaults: fixture.defaults)
         XCTAssertEqual(hub.accountAuth.configuration?.resource, hub.stationRelayUrl)
         XCTAssertEqual(hub.accountAuth.configuration?.requiredScope, "astation.remote")
+    }
+
+    func testReturningToARetainedStationReusesItsRefreshOwnerWithoutSharingAudiences() async throws {
+        let fixture = try StationAccountFixture(); defer { fixture.cleanup() }
+        let first = fixture.hub.accountAuth
+        fixture.hub._testRelayUrlOverride = "https://another-station.example"
+        try fixture.hub.configureIntegrationRelayAuth()
+        let second = fixture.hub.accountAuth
+        XCTAssertFalse(first === second)
+        XCTAssertEqual(second.configuration?.resource, "https://another-station.example")
+        fixture.hub._testRelayUrlOverride = fixture.origin
+        try fixture.hub.configureIntegrationRelayAuth()
+        XCTAssertTrue(fixture.hub.accountAuth === first, "two refresh owners must not rotate the same saved session")
+        let token = try await fixture.hub.accountAuth.accessToken(relayURL: fixture.origin)
+        XCTAssertEqual(token, "test-station-token")
+        do { _ = try await first.accessToken(relayURL: "https://another-station.example"); XCTFail("wrong audience") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .configuration) }
+        XCTAssertEqual(fixture.signIns, 0)
+        XCTAssertEqual(fixture.portalSignIns, 0)
+    }
+
+    func testSignOutReleasesAFullAuthorizationCacheWithoutRetainingOldSessions() async throws {
+        var sessions: [StationTestSession] = []
+        let fixture = try StationAccountFixture(makeStationAccountAuth: { settings, origin in
+            let config = try AccountOIDCConfiguration(issuer: settings.issuer, clientID: settings.clientID,
+                resource: origin, requiredScope: "astation.remote")
+            let storage = StationTestSession(configuration: config, token: "test-retained-token")
+            sessions.append(storage)
+            return AstationAccountAuth(configuration: config, storage: storage, http: StationTestHTTP())
+        })
+        defer { fixture.cleanup() }
+        for index in 1...63 {
+            fixture.hub._testRelayUrlOverride = "https://station-\(index).example"
+            try fixture.hub.configureIntegrationRelayAuth()
+        }
+        XCTAssertEqual(sessions.count, 63)
+        fixture.hub._testRelayUrlOverride = "https://after-signout.example"
+        XCTAssertThrowsError(try fixture.hub.configureIntegrationRelayAuth())
+        try await fixture.hub.signOutAccount()
+        XCTAssertTrue(try sessions.allSatisfy { try $0.read() == nil })
+        XCTAssertNil(try fixture.stationStorage.read())
+        try fixture.hub.configureIntegrationRelayAuth()
+        XCTAssertEqual(fixture.hub.accountAuth.configuration?.resource, "https://after-signout.example")
+        XCTAssertNil(fixture.hub.signedInAccount)
+        XCTAssertEqual(fixture.signIns, 0)
+        XCTAssertEqual(fixture.portalSignIns, 0)
     }
 
     func testAgoraBuildLoginPairsWithoutLegacySessionOrSharingAccountTokens() async throws {

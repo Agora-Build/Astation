@@ -577,7 +577,8 @@ final class RemoteVerifierSigningGateTests: XCTestCase {
         let (missing, _) = try f.confirmedGate()
         XCTAssertThrowsError(try missing.authorize(request, log: f.log), "The prospective service verifier must also be enumerated")
         let roster = f.roster + [.member("service")]
-        let gate = try RemoteVerifierSigningGate(log: f.log, verifiers: roster)
+        var time: UInt64 = 100
+        let gate = try RemoteVerifierSigningGate(log: f.log, verifiers: roster, now: { time })
         let newActions: Set<String> = ["host_enc_key", "host_sender_readmit", "host_sender_revoke", "project_remove", "project_set"]
         let v1 = VerifierInventory(version: 1, actions: verifierInventory().actions.filter { !newActions.contains($0) })
         var service: RemoteVerifierSigningGate.Connection?
@@ -587,9 +588,157 @@ final class RemoteVerifierSigningGateTests: XCTestCase {
             else { try gate.observeConsumer(v1, on: connection) }
             if id == .member("service") { service = connection }
         }
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log), "Generic member evidence cannot confirm a prospective enrollment")
+        let serviceLink = try XCTUnwrap(service)
+        try gate.observeProspectiveMember(v1, request: request, on: serviceLink, receivedAt: 100, authorizationMilliseconds: 1000)
         XCTAssertNoThrow(try gate.authorize(request, log: f.log))
         XCTAssertThrowsError(try gate.authorize(f.review().signingRequest(managerID: "manager"), log: f.log), "The new actions need v2")
-        try gate.observeConsumer(nil, on: XCTUnwrap(service))
+        try gate.observeConsumer(nil, on: serviceLink)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        try gate.observeConsumer(v1, on: serviceLink)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log), "A generic report cannot revive the exact-request binding")
+        try gate.observeProspectiveMember(v1, request: request, on: serviceLink, receivedAt: 100, authorizationMilliseconds: 1000)
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        var invalid = request; invalid.keyId = "another-manager"
+        XCTAssertThrowsError(try gate.observeProspectiveMember(v1, request: invalid, on: serviceLink,
+            receivedAt: 100, authorizationMilliseconds: 1000))
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log), "Invalid observations retire the old exact-request evidence")
+        try gate.observeProspectiveMember(v1, request: request, on: serviceLink, receivedAt: 100, authorizationMilliseconds: 1000)
+        gate.disconnect(serviceLink)
+        let replacement = try gate.connect(.member("service"))
+        try gate.observeConsumer(v1, on: replacement)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        try gate.observeProspectiveMember(v1, request: request, on: replacement, receivedAt: 100, authorizationMilliseconds: 1000)
+        XCTAssertThrowsError(try gate.observeProspectiveMember(v1, request: request, on: serviceLink,
+            receivedAt: 100, authorizationMilliseconds: 1000))
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log), "Retired connections cannot invalidate newer exact-request evidence")
+        time = 1100
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+    }
+
+    @MainActor
+    func testManagedServiceEvidenceRequiresEveryReplicaTheExistingKeyAndFiniteLifetime() throws {
+        let f = try VerifierFixture(), key = P256.Signing.PrivateKey().publicKey.x963Representation
+        let service = "svc-i-01234567890123456789012345"
+        try f.append(["action": "add", "member": ["device_id": service, "kind": "service", "roles": ["service"],
+            "auth_key": ["alg": "p256", "pub": RemoteRecoveryKit.base64URL(key)],
+            "scope": ["hosts": ["host"], "ops": ["view"]], "expires_at": f.clock.wallMs + 3_600_000]])
+        let roster = try RemoteStationVerifierRoster(origin: "https://station.example", generation: 1, replicas: ["a", "b"])
+        var time: UInt64 = 100
+        let required = f.roster.filter { if case .stationReplica = $0 { return false }; return true }
+            + roster.replicas.map(roster.verifierID) + [.member(service)]
+        let gate = try RemoteVerifierSigningGate(log: f.log, verifiers: required, now: { time })
+        for id in f.roster {
+            if case .stationReplica = id { continue }
+            let connection = try gate.connect(id)
+            if case .host = id { try gate.observeHostWelcome(f.welcome(), on: connection) }
+            else { try gate.observeConsumer(verifierInventory(), on: connection) }
+        }
+        let source = try RemoteManagedServiceVerifierEvidence(gate: gate, roster: roster, log: f.log, memberIDs: [service])
+        let request = try f.review().signingRequest(managerID: "manager")
+        func snapshot(key supplied: Data? = key, missingReplica: Bool = false, lifetime: UInt64 = 500) throws -> RemoteManagedServiceVerifierSnapshot {
+            let inventory = verifierInventory()
+            let replicas: [[String: Any]] = [
+                ["id": "a", "connection_generation": 1, "verifier": ["version": inventory.version, "actions": inventory.actions], "authorization_ms_left": lifetime],
+                missingReplica ? ["id": "b"] : ["id": "b", "connection_generation": 1,
+                    "verifier": ["version": inventory.version, "actions": inventory.actions], "authorization_ms_left": lifetime]]
+            var row: [String: Any] = ["id": service]
+            if let supplied { row["auth_key"] = ["alg": "p256", "pub": RemoteRecoveryKit.base64URL(supplied)] }
+            return try RemoteManagedServiceVerifierSnapshot.decode(JSONSerialization.data(withJSONObject: ["origin": roster.origin,
+                "roster_generation": roster.generation, "account_id": f.log.accountId(), "genesis_hash": f.log.genesisHash(),
+                "head": ["seq": f.log.head().seq, "hash": f.log.head().hash], "replicas": replicas, "services": [row]]),
+                origin: roster.origin, genesis: f.log.genesisHash(), memberIDs: [service], startedAt: 100)
+        }
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        try source.receive(snapshot(), for: source.begin())
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        for missing in [try snapshot(key: nil), try snapshot(key: P256.Signing.PrivateKey().publicKey.x963Representation),
+                        try snapshot(missingReplica: true)] {
+            try source.receive(missing, for: source.begin())
+            XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        }
+        try source.receive(snapshot(), for: source.begin())
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        let old = try source.begin(), newer = try source.begin()
+        try source.receive(snapshot(), for: newer)
+        source.failed(old)
+        XCTAssertThrowsError(try source.receive(snapshot(key: nil), for: old))
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log), "Retired polls cannot invalidate a newer report")
+        let failed = try source.begin()
+        source.failed(failed)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        try source.receive(snapshot(), for: source.begin())
+        time = 600
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log), "The shortest finite service/replica lifetime expired")
+        XCTAssertThrowsError(try source.receive(snapshot(), for: source.begin()), "Replaying old bytes cannot extend their lifetime")
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        source.retire()
+        XCTAssertThrowsError(try source.begin())
+    }
+
+    @MainActor
+    func testManagedServiceSourcesCannotRepresentNativeMembersOrAnotherGateAnchor() throws {
+        let f = try VerifierFixture()
+        let roster = try RemoteStationVerifierRoster(origin: "https://station.example", generation: 1, replicas: ["a", "b"])
+        let (gate, _) = try f.confirmedGate()
+        XCTAssertThrowsError(try RemoteManagedServiceVerifierEvidence(gate: gate, roster: roster, log: f.log, memberIDs: ["manager"]))
+        try f.append(["action": "host_sender_revoke", "host_id": "host", "interrupt_running": false])
+        XCTAssertThrowsError(try RemoteManagedServiceVerifierEvidence(gate: gate, roster: roster, log: f.log, memberIDs: ["unknown"]))
+    }
+
+    @MainActor
+    func testProspectiveManagedServiceEvidenceBindsTheExactUnsignedEnrollmentBeforeAnySignature() throws {
+        let f = try VerifierFixture(), raw = P256.Signing.PrivateKey().publicKey.x963Representation
+        let id = "svc-i-01234567890123456789012345"
+        let member: [String: Any] = ["device_id": id, "kind": "service", "roles": ["service"],
+            "auth_key": ["alg": "p256", "pub": RemoteRecoveryKit.base64URL(raw)],
+            "scope": ["hosts": ["host"], "ops": ["launch", "view"]], "expires_at": f.clock.wallMs + 3_600_000]
+        let body = try f.log.draftEntry(signer: "manager", signedAt: f.clock.wallMs,
+            actionJson: String(decoding: JSONSerialization.data(withJSONObject: ["action": "add", "member": member]), as: UTF8.self))
+        let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: "manager")
+        let roster = try RemoteStationVerifierRoster(origin: "https://station.example", generation: 1, replicas: ["a", "b"])
+        let required = f.roster.filter { if case .stationReplica = $0 { return false }; return true }
+            + roster.replicas.map(roster.verifierID) + [.member(id)]
+        let gate = try RemoteVerifierSigningGate(log: f.log, verifiers: required, now: { 100 })
+        for verifier in f.roster {
+            if case .stationReplica = verifier { continue }
+            let connection = try gate.connect(verifier)
+            if case .host = verifier { try gate.observeHostWelcome(f.welcome(), on: connection) }
+            else { try gate.observeConsumer(verifierInventory(), on: connection) }
+        }
+        XCTAssertThrowsError(try RemoteManagedServiceVerifierEvidence(gate: gate, roster: roster, log: f.log, memberIDs: [id]))
+        let source = try RemoteManagedServiceVerifierEvidence(gate: gate, roster: roster, log: f.log, memberIDs: [id], prospectiveRequest: request)
+        let inventory = verifierInventory()
+        let snapshot = try RemoteManagedServiceVerifierSnapshot.decode(JSONSerialization.data(withJSONObject: [
+            "origin": roster.origin, "roster_generation": 1, "account_id": f.log.accountId(), "genesis_hash": f.log.genesisHash(),
+            "head": ["seq": f.log.head().seq, "hash": f.log.head().hash], "services": [["id": id, "auth_key": member["auth_key"]!]],
+            "replicas": roster.replicas.map { ["id": $0, "connection_generation": 1,
+                "verifier": ["version": inventory.version, "actions": inventory.actions], "authorization_ms_left": 1000] }]),
+            origin: roster.origin, genesis: f.log.genesisHash(), memberIDs: [id], startedAt: 100)
+        let signs = f.keys.signs
+        try source.receive(snapshot, for: source.begin())
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        for change in ["key", "scope", "expiry", "signed_at"] {
+            var changedMember = member
+            var signedAt = f.clock.wallMs
+            switch change {
+            case "key": changedMember["auth_key"] = ["alg": "p256", "pub": RemoteRecoveryKit.base64URL(P256.Signing.PrivateKey().publicKey.x963Representation)]
+            case "scope": changedMember["scope"] = ["hosts": ["host"], "ops": ["launch", "message", "view"]]
+            case "expiry": changedMember["expires_at"] = f.clock.wallMs + 7_200_000
+            default: signedAt += 1
+            }
+            let changedBody = try f.log.draftEntry(signer: "manager", signedAt: signedAt,
+                actionJson: String(decoding: JSONSerialization.data(withJSONObject: ["action": "add", "member": changedMember]), as: UTF8.self))
+            let changed = try RemoteConfirmedSigner.membershipRequest(bodyJSON: changedBody, keyID: "manager")
+            XCTAssertNotEqual(changed, request)
+            XCTAssertThrowsError(try gate.authorize(changed, log: f.log), "Evidence for request A cannot authorize B with a different \(change)")
+            XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        }
+        XCTAssertEqual(f.keys.signs, signs, "Inventory never signs the enrollment")
+        XCTAssertNil(f.log.member(deviceId: id))
+        var wrong = request; wrong.bodyJson = body.replacingOccurrences(of: "\"account\"", with: "\"another-account\"")
+        XCTAssertThrowsError(try RemoteManagedServiceVerifierEvidence(gate: gate, roster: roster, log: f.log, memberIDs: [id], prospectiveRequest: wrong))
+        source.retire()
         XCTAssertThrowsError(try gate.authorize(request, log: f.log))
     }
 }

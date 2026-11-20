@@ -32,9 +32,9 @@ public struct RemoteControlActivity: Equatable, Sendable {
         if !signed { return "Saved review - confirmation required" }
         if let replacementRecordID { return "Fresh manager copy saved: " + replacementRecordID }
         if requiresManagerReview { return "Fresh manager review needed - the original signer no longer manages this account" }
-        if application == .effectsReported { return "Selected Station reports all covered effects in force" }
+        if application == .effectsReported { return "This Station reports all covered effects in force" }
         switch application {
-        case .unknown: return "Selected Station has no matching stored stop"
+        case .unknown: return "This Station has no matching stored stop"
         case .awaitingApplication: return "Waiting for covered hosts to confirm application"
         default: return stationStored ? "Stored at Station - host application not checked" : "Saved - Station delivery pending"
         }

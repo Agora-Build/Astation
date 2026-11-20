@@ -1,5 +1,47 @@
 # Station verifier inventory
 
+## Station-managed service evidence
+
+`POST /agora-build/v1/logs/{genesis}/verifiers/services` uses the existing
+native `astation.remote` bearer authorization for this exact Station. The body
+contains exactly `member_ids` (1-64 sorted, distinct IDs) and `expected` (the
+independently anchored device-list head). The request is limited to 16 KiB and
+the operation to ten seconds. Responses are account-private and `no-store`.
+
+The reply has the existing replica snapshot fields plus `services`, in the
+exact requested ID order. Each row is `{id}` when unconfirmed, or
+`{id, auth_key}` for a Station-managed P-256 key. In one repeatable-read
+transaction, Station holds the recovery/fleet fences and membership row,
+checks its exact issuer/origin/owner/provisioning/genesis binding, opens only
+the existing sealed key, checks its approved fingerprint, and compares any
+existing active service member's key. A removed/native member, foreign or
+unmanaged ID supplies no service evidence. Missing or corrupt keys never
+trigger generation, replacement, signing or provisioning. Cross-account roots
+return the same metadata-free 404 as other account storage.
+
+A pending enrollment may report its already durable provisioning key before
+membership append. The native adapter accepts this only for the exact shared-
+decoded unsigned enrollment request, reconstructed against the current manager
+and device-list head, including the proposed public key. An arbitrary absent
+member is refused. This report does not sign, append or authorize enrollment.
+
+The gate retains the complete prospective signing request with this evidence,
+not only the member ID or public key. A different key, scope, expiry, signing
+time or other request field needs fresh matching evidence. Generic member
+reports cannot authorize a new enrollment. Missing/invalid reports, reconnect
+and retirement clear the binding; its finite lease still expires at signing.
+
+The native source checks the protected accepted Station roster, exact account,
+genesis and head, and every reported key. All accepted replicas must have live
+evidence. Service capabilities are their common action set and lowest version;
+the shortest replica lease bounds the service evidence from request start,
+including token acquisition and response delay. Failed polls, key mismatch,
+missing replicas, expiry and explicit retirement clear evidence. Delayed retired
+polls cannot replace newer evidence; replayed response bytes cannot extend a
+lease. Production signing still needs the complete participant owner and shared
+minimum-version helper. Native/third-party SDK members require their own
+authenticated source; a Station cannot use this endpoint to confirm them.
+
 Part of Astation #79 and the agreed R9.2 all-verifier signing gate. This is
 Station-private HTTP carriage for deployment evidence, not an R9 wire change.
 It does not activate delegated work or supply the complete native participant

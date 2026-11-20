@@ -261,7 +261,9 @@ impl ReplicaRegistry {
 
     #[cfg(test)]
     pub async fn snapshot(&self) -> Result<Value, sqlx::Error> {
-        self.snapshot_inner(None).await?.ok_or_else(unavailable)
+        self.snapshot_inner(None, None)
+            .await?
+            .ok_or_else(unavailable)
     }
 
     pub async fn snapshot_for(
@@ -269,12 +271,38 @@ impl ReplicaRegistry {
         genesis: &str,
         owner: &str,
     ) -> Result<Option<Value>, sqlx::Error> {
-        self.snapshot_inner(Some((genesis, owner))).await
+        self.snapshot_inner(Some((genesis, owner)), None).await
+    }
+
+    pub async fn managed_services_for(
+        &self,
+        genesis: &str,
+        owner: &str,
+        runtime: &crate::station_integrations::StationIntegrations,
+        ids: &[String],
+        expected: &atem_client::membership::Head,
+    ) -> Result<Option<Value>, sqlx::Error> {
+        if ids.is_empty()
+            || ids.len() > 64
+            || !ids.windows(2).all(|pair| pair[0] < pair[1])
+            || ids.iter().any(|id| {
+                id.is_empty() || id.len() > 128 || !id.bytes().all(|b| b.is_ascii_graphic())
+            })
+        {
+            return Err(unavailable());
+        }
+        self.snapshot_inner(Some((genesis, owner)), Some((runtime, ids, expected)))
+            .await
     }
 
     async fn snapshot_inner(
         &self,
         account: Option<(&str, &str)>,
+        services: Option<(
+            &crate::station_integrations::StationIntegrations,
+            &[String],
+            &atem_client::membership::Head,
+        )>,
     ) -> Result<Option<Value>, sqlx::Error> {
         if Instant::now() >= *self.valid_before.lock().await {
             return Err(unavailable());
@@ -290,7 +318,7 @@ impl ReplicaRegistry {
         self.lock_live(&mut tx).await?;
         let log = if let Some((genesis, owner)) = account {
             let saved: Option<Option<Value>> = sqlx::query_scalar(
-                "SELECT CASE WHEN octet_length(state::text)<=$3 THEN state END FROM remote_recovery_roots WHERE genesis_hash=$1 AND account_subject=$2")
+                "SELECT CASE WHEN octet_length(state::text)<=$3 THEN state END FROM remote_recovery_roots WHERE genesis_hash=$1 AND account_subject=$2 FOR SHARE")
                 .bind(genesis).bind(owner).bind(MAX_STATE as i64).fetch_optional(&mut *tx).await?;
             let Some(saved) = saved else {
                 return Ok(None);
@@ -361,6 +389,25 @@ impl ReplicaRegistry {
             }
             members.push(member);
         }
+        let service_members = if let Some((runtime, ids, expected)) = services {
+            let log = log.as_ref().ok_or_else(unavailable)?;
+            if log.head() != *expected {
+                return Err(unavailable());
+            }
+            Some(
+                runtime
+                    .managed_verifier_members(
+                        &mut tx,
+                        &self.origin,
+                        account.ok_or_else(unavailable)?.1,
+                        log,
+                        ids,
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
         tx.commit().await?;
         if Instant::now() >= *self.valid_before.lock().await {
             return Err(unavailable());
@@ -371,6 +418,9 @@ impl ReplicaRegistry {
             result["account_id"] = json!(log.account_id());
             result["genesis_hash"] = json!(log.genesis_hash().to_hex());
             result["head"] = log.head().to_json();
+        }
+        if let Some(services) = service_members {
+            result["services"] = json!(services);
         }
         Ok(Some(result))
     }

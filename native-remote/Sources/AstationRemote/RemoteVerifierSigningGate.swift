@@ -54,6 +54,7 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
         var confirmed: VerifierInventory?
         var highest: VerifierInventory?
         var validBefore: UInt64?
+        var prospectiveRequest: SignRequest?
     }
 
     private let lock = NSLock()
@@ -103,6 +104,7 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
         state.connection = connection
         state.confirmed = nil
         state.validBefore = nil
+        state.prospectiveRequest = nil
         states[verifier] = state
         return connection
     }
@@ -121,6 +123,8 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
         guard states[connection.verifier]?.connection == connection else { return }
         states[connection.verifier]?.connection = nil
         states[connection.verifier]?.confirmed = nil
+        states[connection.verifier]?.validBefore = nil
+        states[connection.verifier]?.prospectiveRequest = nil
     }
 
     /// Only call after authenticating this consumer and its connection. A host's report must
@@ -134,7 +138,41 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
     /// including token refresh and response delay. Replays cannot extend it.
     public func observeConsumer(_ inventory: VerifierInventory?, on connection: Connection,
                                 receivedAt: UInt64, authorizationMilliseconds: UInt64) throws {
-        guard case .stationReplica = connection.verifier else { throw RemoteVerifierGateError.invalidInventory }
+        try observeHTTPConsumer(inventory, on: connection, receivedAt: receivedAt,
+            authorizationMilliseconds: authorizationMilliseconds)
+    }
+
+    /// A trusted evidence adapter must authenticate the proposed member's key before
+    /// confirming it. Its finite evidence authorizes only this exact enrollment request.
+    public func observeProspectiveMember(_ inventory: VerifierInventory?, request: SignRequest,
+                                         on connection: Connection, receivedAt: UInt64,
+                                         authorizationMilliseconds: UInt64) throws {
+        do {
+            guard case .member(let id) = connection.verifier, let json = request.bodyJson,
+                  request == (try RemoteConfirmedSigner.membershipRequest(bodyJSON: json, keyID: request.keyId)),
+                  let body = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],
+                  body["action"] as? String == "add", body["account_id"] as? String == accountID,
+                  body["signer"] as? String == request.keyId,
+                  body["prev_hash"] as? String == head.hash, head.seq < UInt64.max,
+                  (body["seq"] as? NSNumber)?.uint64Value == head.seq + 1,
+                  let member = body["member"] as? [String: Any], member["device_id"] as? String == id else {
+                throw RemoteVerifierGateError.staleMembership
+            }
+            try observeHTTPConsumer(inventory, on: connection, receivedAt: receivedAt,
+                authorizationMilliseconds: authorizationMilliseconds, prospectiveRequest: request)
+        } catch {
+            try observe(nil, on: connection)
+            throw error
+        }
+    }
+
+    private func observeHTTPConsumer(_ inventory: VerifierInventory?, on connection: Connection,
+                                     receivedAt: UInt64, authorizationMilliseconds: UInt64,
+                                     prospectiveRequest: SignRequest? = nil) throws {
+        switch connection.verifier {
+        case .stationReplica, .member: break
+        default: throw RemoteVerifierGateError.invalidInventory
+        }
         let deadline = receivedAt.addingReportingOverflow(authorizationMilliseconds)
         let current = now()
         guard receivedAt <= current, (1...30_000).contains(authorizationMilliseconds),
@@ -142,7 +180,8 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
             try observe(nil, on: connection, validBefore: deadline.overflow ? current : deadline.partialValue)
             throw RemoteVerifierGateError.staleConnection
         }
-        try observe(inventory, on: connection, validBefore: deadline.partialValue)
+        try observe(inventory, on: connection, validBefore: deadline.partialValue,
+            prospectiveRequest: prospectiveRequest)
     }
 
     /// The authenticated channel owner must disconnect this evidence when the channel closes,
@@ -170,12 +209,13 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
     }
 
     private func observe(_ inventory: VerifierInventory?, on connection: Connection,
-                         validBefore: UInt64? = nil) throws {
+                         validBefore: UInt64? = nil, prospectiveRequest: SignRequest? = nil) throws {
         lock.lock(); defer { lock.unlock() }
         guard var state = states[connection.verifier], state.connection == connection else {
             throw RemoteVerifierGateError.staleConnection
         }
         state.confirmed = nil
+        state.prospectiveRequest = nil
         if let validBefore {
             // A missing or refused inventory cannot renew this channel's deadline later.
             state.validBefore = min(state.validBefore ?? validBefore, validBefore)
@@ -197,6 +237,7 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
         }
         state.highest = inventory
         state.confirmed = inventory
+        state.prospectiveRequest = prospectiveRequest
     }
 
     /// Recheck at the actual signing boundary, after the owner's confirmation, using the fresh log.
@@ -219,8 +260,12 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
               (body["seq"] as? NSNumber)?.uint64Value == head.seq + 1 else {
             throw RemoteVerifierGateError.staleMembership
         }
-        if action == "add", let member = body["member"] as? [String: Any], let id = member["device_id"] as? String,
-           states[.member(id)] == nil { throw RemoteVerifierGateError.unconfirmedVerifiers }
+        if action == "add" {
+            guard let member = body["member"] as? [String: Any], let id = member["device_id"] as? String,
+                  states[.member(id)]?.prospectiveRequest == request else {
+                throw RemoteVerifierGateError.unconfirmedVerifiers
+            }
+        }
         let current = now()
         guard states.values.allSatisfy({ state in
             guard state.connection != nil, let inventory = state.confirmed else { return false }

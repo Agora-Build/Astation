@@ -63,7 +63,7 @@ private final class RecoveryRedirectGuard: NSObject, URLSessionTaskDelegate, @un
 }
 
 /// TLS/account login limits storage access. Only the shared verifier grants cryptographic trust.
-public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteStationVerifierTransport, @unchecked Sendable {
+public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteStationVerifierTransport, RemoteManagedServiceVerifierTransport, @unchecked Sendable {
     private let baseURL: URL
     private let stationOrigin: String
     public var controlStationOrigin: String { stationOrigin }
@@ -102,6 +102,23 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
         let startedAt = RemoteVerifierSigningGate.evidenceTimeMilliseconds()
         let (_, data) = try await perform(url: path(genesisHash, "verifiers"), method: "GET")
         return try RemoteStationVerifierSnapshot.decode(data, origin: stationOrigin, genesis: genesisHash, startedAt: startedAt)
+    }
+
+    public func managedServiceVerifiers(genesisHash: String, memberIDs: [String], expected: LogHead) async throws -> RemoteManagedServiceVerifierSnapshot {
+        guard RemoteRecoveryKit.validHash(genesisHash), RemoteManagedServiceVerifierSnapshot.validIDs(memberIDs),
+              expected.seq > 0, expected.seq <= 9_007_199_254_740_991, RemoteRecoveryKit.validHash(expected.hash) else {
+            throw RemoteChannelError.invalidInput
+        }
+        let started = RemoteVerifierSigningGate.evidenceTimeMilliseconds()
+        let url = URL(string: stationOrigin)!.appendingPathComponent("agora-build/v1/logs")
+            .appendingPathComponent(genesisHash).appendingPathComponent("verifiers/services")
+        let body = try JSONSerialization.data(withJSONObject: ["member_ids": memberIDs,
+            "expected": ["seq": expected.seq, "hash": expected.hash]])
+        let (_, bytes) = try await perform(url: url, method: "POST", body: body)
+        let result = try RemoteManagedServiceVerifierSnapshot.decode(bytes, origin: stationOrigin,
+            genesis: genesisHash, memberIDs: memberIDs, startedAt: started)
+        guard result.station.head == expected else { throw RemoteRecoveryTransportError.invalidResponse }
+        return result
     }
 
     public func entries(genesisHash: String, after: UInt64) async throws -> RemoteRecoveryLogPage {

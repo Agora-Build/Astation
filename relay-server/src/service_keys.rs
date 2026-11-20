@@ -268,11 +268,22 @@ pub(crate) async fn load_approved(
     context: &ServiceKeyContext,
     expected_fingerprint: &str,
 ) -> Result<ServiceSigner, ()> {
+    let mut connection = pool.acquire().await.map_err(|_| ())?;
+    load_approved_in(&mut connection, vault, context, expected_fingerprint).await
+}
+
+/// Inventory reads share the membership/fleet transaction and never generate keys.
+pub(crate) async fn load_approved_in(
+    connection: &mut sqlx::PgConnection,
+    vault: &ServiceKeyVault,
+    context: &ServiceKeyContext,
+    expected_fingerprint: &str,
+) -> Result<ServiceSigner, ()> {
     let binding = String::from_utf8(context.aad()?).map_err(|_| ())?;
     let encoded: String =
         sqlx::query_scalar("SELECT sealed FROM station_service_keys WHERE context = $1")
             .bind(binding)
-            .fetch_one(pool)
+            .fetch_one(connection)
             .await
             .map_err(|_| ())?;
     let sealed: SealedServiceKey = serde_json::from_str(&encoded).map_err(|_| ())?;
