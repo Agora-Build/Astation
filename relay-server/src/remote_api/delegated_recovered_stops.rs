@@ -47,7 +47,7 @@ fn parse(bytes: &[u8]) -> Result<(String, String, Vec<ControlRecord>), sqlx::Err
     Ok((plan.to_owned(), source.to_owned(), records))
 }
 
-fn review(record: &ControlRecord, log: &Membership, origin: &str) -> Result<Value, sqlx::Error> {
+pub(super) fn review(record: &ControlRecord, log: &Membership, origin: &str) -> Result<Value, sqlx::Error> {
     if record.account_id() != log.account_id()
         || record.genesis_hash() != log.genesis_hash()
         || !matches!(record.signer(), ControlSigner::Member(_))
@@ -133,12 +133,12 @@ pub(crate) async fn retain(
         sqlx::query("INSERT INTO station_delegated_recovered_stops(plan_id,record_id,record) VALUES ($1,$2,$3)")
             .bind(&plan_id).bind(id).bind(value).execute(&mut *tx).await?;
     }
-    report["recovered_stops"] = inspection(&mut tx, &prepared, &log, binding).await?;
+    super::review_evidence(&mut tx, &prepared, &log, binding, &mut report).await?;
     tx.commit().await?;
     Ok(report)
 }
 
-async fn load(
+pub(super) async fn load(
     connection: &mut PgConnection,
     binding: &Binding,
     genesis: &str,

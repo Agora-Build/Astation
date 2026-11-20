@@ -175,6 +175,176 @@ async fn postgres_delegated_recovery_preparation_survives_replica_races_and_rest
 
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_preserves_prior_checkpoint_stops_and_reserved_clocks() {
+    use atem_client::membership::{Member, Role};
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (store, mut f, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    let original = saved(&database.pool, &genesis).await;
+    let first = prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let original_plans = plans(&database.pool).await;
+
+    // The next restored source predates both stops and a reservation that
+    // never produced a record. The earlier checkpoint still knows them.
+    let mut older_source = original.clone();
+    let mut empty = Stored::new(ORIGIN, &f.log).unwrap();
+    empty.feed_id = original["delegated"][ORIGIN]["feed_id"].as_str().unwrap().into();
+    older_source["delegated"][ORIGIN] = serde_json::to_value(empty).unwrap();
+    let replacement_key = KeyId::new("replacement-manager");
+    let replacement_enc = KeyId::new("replacement-encryption");
+    f.keys.insert_p256(replacement_key.clone(), &[6; 32]).unwrap();
+    f.keys.insert_x25519(replacement_enc.clone(), &[7; 32]);
+    let add = Action::Add { member: Member {
+        device_id: "replacement-manager".into(),
+        auth_key: f.keys.public_key(&replacement_key).unwrap(),
+        kind: MemberKind::Native {
+            enc_key: f.keys.public_key(&replacement_enc).unwrap(),
+            roles: [Role::View, Role::Control, Role::Manage].into(),
+        },
+    }};
+    let entry = sign_entry(&f.keys, &KeyId::new("manager"), f.log.draft("phone", f.created, &add)).unwrap();
+    let added = f.log.evaluate_objects(&[entry.object().clone()], &HostNow {
+        wall_ms: f.created, mono_ms: 0, boot_id: "test".into(),
+    });
+    assert_eq!(added.appended, 1, "{:?}", added.stop);
+    let demotion = Action::SetRoles {
+        device_id: "phone".into(),
+        change: RolesChange::Native([Role::View].into()),
+    };
+    let entry = sign_entry(&f.keys, &KeyId::new("manager"), added.next.draft("phone", f.created, &demotion)).unwrap();
+    let next = added.next.evaluate_objects(&[entry.object().clone()], &HostNow {
+        wall_ms: f.created, mono_ms: 0, boot_id: "test".into(),
+    });
+    assert_eq!(next.appended, 1);
+    older_source["membership"] = next.next.to_stored();
+    sqlx::query("UPDATE remote_recovery_roots SET state=$1 WHERE genesis_hash=$2")
+        .bind(&older_source).bind(&genesis).execute(&database.pool).await.unwrap();
+    let later = Binding::new(ORIGIN, 2).unwrap();
+    later.initialize(&database.pool, true).await.unwrap();
+    let restart = database.reconnect(2).await;
+    let second = prepare(&restart, &later, &genesis).await.unwrap();
+    let history = &second["known_history"];
+    let records = history["records"].as_array().expect("known obligations");
+    assert_eq!(records.len(), 2);
+    for record in original["delegated"][ORIGIN]["records"].as_array().unwrap() {
+        assert!(records.iter().any(|review| review["record_id"] == record["body"]["record_id"]));
+    }
+    let native = records.iter().find(|record| record["signer"] == "member:phone").unwrap();
+    assert_eq!(native["verification"], "removed_manager");
+    assert_eq!(native["requirement"], "authority_review");
+    assert_eq!(history["observed_signing_lower_bounds"]["service:reserved-only"], f.created + 123);
+    assert_eq!(history["checkpoints"].as_array().unwrap().len(), 2);
+    assert!(history["checkpoints"].as_array().unwrap().iter().any(|checkpoint| {
+        checkpoint["plan_id"] == first["plan_id"] && checkpoint["inspection"]["reporting_stopped"] == true
+    }));
+    assert_eq!(prepare(&restart, &later, &genesis).await.unwrap(), second);
+    assert_eq!(saved(&restart, &genesis).await, older_source);
+    assert_eq!(plans(&restart).await[0], original_plans[0]);
+    assert_eq!(second["snapshot_complete"], false);
+    assert_eq!(second["recovery_ready"], false);
+    for private in ["\"sig\"", "\"membership\"", "\"ledger\"", "old-report-client", "\"account_subject\""] {
+        assert!(!second.to_string().contains(private), "{private}");
+    }
+    restart.close().await;
+    drop(store);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_refuses_corrupt_or_foreign_earlier_checkpoints_atomically() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (store, _, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let original = plans(&database.pool).await.remove(0);
+    let root = saved(&database.pool, &genesis).await;
+    let later = Binding::new(ORIGIN, 2).unwrap();
+    later.initialize(&database.pool, true).await.unwrap();
+    for wrong in ["account_subject", "account_id", "source_hash", "candidate_feed_id"] {
+        let mut checkpoint = original.clone();
+        if wrong.starts_with("account_") {
+            checkpoint["retained"][wrong] = json!("foreign");
+            let canonical = atem_client::canonical::jcs(&checkpoint["retained"]).unwrap();
+            checkpoint["source_hash"] = ring::digest::digest(&ring::digest::SHA256, canonical.as_bytes())
+                .as_ref().iter().map(|byte| format!("{byte:02x}")).collect::<String>().into();
+        } else {
+            checkpoint[wrong] = json!("corrupt");
+        }
+        sqlx::query("UPDATE station_delegated_recovery_plans SET retained=$1,source_hash=$2,candidate_feed_id=$3 WHERE generation=1")
+            .bind(&checkpoint["retained"]).bind(checkpoint["source_hash"].as_str().unwrap())
+            .bind(checkpoint["candidate_feed_id"].as_str().unwrap()).execute(&database.pool).await.unwrap();
+        let corrupt = plans(&database.pool).await;
+        assert!(prepare(&database.pool, &later, &genesis).await.is_err(), "{wrong}");
+        assert_eq!(plans(&database.pool).await, corrupt, "a failed reconciliation must not retain a partial plan");
+        assert_eq!(saved(&database.pool, &genesis).await, root);
+    }
+    sqlx::query("UPDATE station_delegated_recovery_plans SET retained=$1,source_hash=$2,candidate_feed_id=$3 WHERE generation=1")
+        .bind(&original["retained"]).bind(original["source_hash"].as_str().unwrap())
+        .bind(original["candidate_feed_id"].as_str().unwrap()).execute(&database.pool).await.unwrap();
+    assert!(prepare(&database.pool, &later, &genesis).await.is_ok());
+    assert!(!inspect(&database.pool, ORIGIN).await.unwrap().unwrap().ready);
+    drop(store);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_refuses_excess_checkpoint_history_without_truncation() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (store, _, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let original = plans(&database.pool).await.remove(0);
+    for generation in 2..=129 {
+        sqlx::query("INSERT INTO station_delegated_recovery_plans(origin,generation,genesis_hash,plan_id,candidate_feed_id,source_hash,retained) VALUES ($1,$2,$3,$4,$5,$6,$7)")
+            .bind(ORIGIN).bind(generation as i64).bind(&genesis)
+            .bind(uuid::Uuid::new_v4().to_string()).bind(uuid::Uuid::new_v4().to_string())
+            .bind(original["source_hash"].as_str().unwrap()).bind(&original["retained"])
+            .execute(&database.pool).await.unwrap();
+    }
+    let later = Binding::new(ORIGIN, 130).unwrap();
+    later.initialize(&database.pool, true).await.unwrap();
+    let before = plans(&database.pool).await;
+    let root = saved(&database.pool, &genesis).await;
+    assert!(prepare(&database.pool, &later, &genesis).await.is_err());
+    assert_eq!(plans(&database.pool).await, before);
+    assert_eq!(saved(&database.pool, &genesis).await, root);
+    assert!(!inspect(&database.pool, ORIGIN).await.unwrap().unwrap().ready);
+    drop(store);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_never_reuses_an_earlier_sources_feed_id() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (store, f, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let mut root = saved(&database.pool, &genesis).await;
+    let old_id = root["delegated"][ORIGIN]["feed_id"].as_str().unwrap().to_owned();
+    root["delegated"][ORIGIN] = serde_json::to_value(Stored::new(ORIGIN, &f.log).unwrap()).unwrap();
+    sqlx::query("UPDATE remote_recovery_roots SET state=$1 WHERE genesis_hash=$2")
+        .bind(&root).bind(&genesis).execute(&database.pool).await.unwrap();
+    let later = Binding::new(ORIGIN, 2).unwrap();
+    later.initialize(&database.pool, true).await.unwrap();
+    prepare(&database.pool, &later, &genesis).await.unwrap();
+    // It differs from this plan's source and every earlier candidate, so the
+    // old per-plan/SQL uniqueness checks cannot detect this history reuse.
+    sqlx::query("UPDATE station_delegated_recovery_plans SET candidate_feed_id=$1 WHERE generation=2")
+        .bind(old_id).execute(&database.pool).await.unwrap();
+    let before = plans(&database.pool).await;
+    assert!(prepare(&database.pool, &later, &genesis).await.is_err());
+    assert_eq!(plans(&database.pool).await, before);
+    assert_eq!(saved(&database.pool, &genesis).await, root);
+    assert!(!inspect(&database.pool, ORIGIN).await.unwrap().unwrap().ready);
+    drop(store);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
 async fn postgres_delegated_recovery_preparation_commit_failure_retains_fence_and_all_source_evidence(
 ) {
     let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
