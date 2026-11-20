@@ -110,8 +110,9 @@ async fn postgres_delegated_recovered_stops_refuse_conflicts_with_an_earlier_che
     let before = state(&database.pool).await;
     let old = ControlRecord::parse(&serde_json::to_vec(&before["root"]["delegated"][ORIGIN]["records"][1]).unwrap()).unwrap();
     let mut older_source = before["root"].clone();
-    older_source["delegated"][ORIGIN]["records"] = json!([]);
-    older_source["delegated"][ORIGIN]["signing_high_water"] = json!({});
+    let mut empty = Stored::new(ORIGIN, &f.log).unwrap();
+    empty.feed_id = before["root"]["delegated"][ORIGIN]["feed_id"].as_str().unwrap().into();
+    older_source["delegated"][ORIGIN] = serde_json::to_value(empty).unwrap();
     sqlx::query("UPDATE remote_recovery_roots SET state=$1")
         .bind(&older_source).execute(&database.pool).await.unwrap();
     let later = Binding::new(ORIGIN, 2).unwrap();

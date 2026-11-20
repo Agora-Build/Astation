@@ -187,8 +187,9 @@ async fn postgres_delegated_recovery_preserves_prior_checkpoint_stops_and_reserv
     // The next restored source predates both stops and a reservation that
     // never produced a record. The earlier checkpoint still knows them.
     let mut older_source = original.clone();
-    older_source["delegated"][ORIGIN]["records"] = json!([]);
-    older_source["delegated"][ORIGIN]["signing_high_water"] = json!({});
+    let mut empty = Stored::new(ORIGIN, &f.log).unwrap();
+    empty.feed_id = original["delegated"][ORIGIN]["feed_id"].as_str().unwrap().into();
+    older_source["delegated"][ORIGIN] = serde_json::to_value(empty).unwrap();
     let replacement_key = KeyId::new("replacement-manager");
     let replacement_enc = KeyId::new("replacement-encryption");
     f.keys.insert_p256(replacement_key.clone(), &[6; 32]).unwrap();
@@ -306,6 +307,34 @@ async fn postgres_delegated_recovery_refuses_excess_checkpoint_history_without_t
     later.initialize(&database.pool, true).await.unwrap();
     let before = plans(&database.pool).await;
     let root = saved(&database.pool, &genesis).await;
+    assert!(prepare(&database.pool, &later, &genesis).await.is_err());
+    assert_eq!(plans(&database.pool).await, before);
+    assert_eq!(saved(&database.pool, &genesis).await, root);
+    assert!(!inspect(&database.pool, ORIGIN).await.unwrap().unwrap().ready);
+    drop(store);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_never_reuses_an_earlier_sources_feed_id() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (store, f, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let mut root = saved(&database.pool, &genesis).await;
+    let old_id = root["delegated"][ORIGIN]["feed_id"].as_str().unwrap().to_owned();
+    root["delegated"][ORIGIN] = serde_json::to_value(Stored::new(ORIGIN, &f.log).unwrap()).unwrap();
+    sqlx::query("UPDATE remote_recovery_roots SET state=$1 WHERE genesis_hash=$2")
+        .bind(&root).bind(&genesis).execute(&database.pool).await.unwrap();
+    let later = Binding::new(ORIGIN, 2).unwrap();
+    later.initialize(&database.pool, true).await.unwrap();
+    prepare(&database.pool, &later, &genesis).await.unwrap();
+    // It differs from this plan's source and every earlier candidate, so the
+    // old per-plan/SQL uniqueness checks cannot detect this history reuse.
+    sqlx::query("UPDATE station_delegated_recovery_plans SET candidate_feed_id=$1 WHERE generation=2")
+        .bind(old_id).execute(&database.pool).await.unwrap();
+    let before = plans(&database.pool).await;
     assert!(prepare(&database.pool, &later, &genesis).await.is_err());
     assert_eq!(plans(&database.pool).await, before);
     assert_eq!(saved(&database.pool, &genesis).await, root);
