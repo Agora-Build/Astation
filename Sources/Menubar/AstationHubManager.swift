@@ -413,6 +413,14 @@ class AstationHubManager: ObservableObject {
                   self.e2eDataAccount == account, self.stationRelayUrl == targetRelay else { return }
             self.refreshChannelsAfterMembershipCommit(head)
         }
+        coordinator.onControlCommit = { [weak self, weak coordinator] in
+            guard let self, let coordinator, self.accountRecovery === coordinator,
+                  self.e2eDataAccount == account, self.stationRelayUrl == targetRelay else { return }
+            for link in Array(self.r9Connections.values) + Array(self.policyR9Connections.values)
+                where link.context.account == account {
+                link.refreshControlRecords()
+            }
+        }
         accountRecovery = coordinator
         if coordinator.delegatedControlsAvailable, let owner = signedInAccount, let settings = portalSettings {
             let epoch = integrationAccountGeneration
@@ -2253,6 +2261,11 @@ class AstationHubManager: ObservableObject {
                     self?.receiveHostPolicy(event, confirmed: confirmed, clientID: context.route.clientId, generation: generation)
                 }, hostWorkEvent: { [weak self] json in
                     self?.hostWorkClients[context.route.clientId]?.receive(json) ?? false
+                }, signedHostControls: { [weak self] log in
+                    guard let self, self.sessionContext(for: context.route.clientId) == context,
+                          let coordinator = self.accountRecovery, coordinator.accountID == context.account,
+                          coordinator.relayURL == self.stationRelayUrl else { throw RemoteChannelError.staleLink }
+                    return try coordinator.signedHostControls(for: log)
                 }, generation: generation)
             r9Connections[context.route.clientId] = link
             nativeSessionClients[context.route.clientId]?.channelAuthorizationStarted(context: context)
@@ -2342,6 +2355,11 @@ class AstationHubManager: ObservableObject {
                     self?.hostPolicyWelcomed(clientID: id, generation: generation)
                 }, policyEvent: { [weak self] event, confirmed in
                     self?.receiveHostPolicy(event, confirmed: confirmed, clientID: id, generation: generation)
+                }, signedHostControls: { [weak self] log in
+                    guard let self, self.transportPolicyContext(for: id, includeBinding: false) == policyContext,
+                          let coordinator = self.accountRecovery, coordinator.accountID == context.account,
+                          coordinator.relayURL == self.stationRelayUrl else { throw RemoteChannelError.staleLink }
+                    return try coordinator.signedHostControls(for: log)
                 }, generation: generation)
             policyR9Connections[id] = link
             try link.start(identity: ClientIdentity(kind: .native, deviceId: AstationIdentity.shared.id,

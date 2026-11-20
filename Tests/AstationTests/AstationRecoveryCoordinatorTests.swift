@@ -2695,6 +2695,32 @@ extension AstationRecoveryCoordinatorTests {
         XCTAssertTrue(try coordinator.pendingHostInterrupts().isEmpty)
     }
 
+    func testDurableHostStopIsAvailableForNativeCarriageAfterStationStorageAndRestart() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(authorizeDelegatedControl: { _ in })
+        _ = try await revokedSender(coordinator, harness: h)
+        var committed: [[String]] = []
+        coordinator.onControlCommit = {
+            do {
+                let log = try coordinator.channelMembership(hostID: "host-a")
+                committed.append(try coordinator.signedHostControls(for: log))
+            } catch { XCTFail("Commit callback must run after the account operation: \(error)") }
+        }
+        defer { coordinator.onControlCommit = nil }
+        let review = try await coordinator.prepareHostInterrupt(hostID: "host-a", current: { true })
+        let delivery = try await coordinator.commitHostInterrupt(review, current: { true })
+        XCTAssertTrue(delivery.stationStored)
+        XCTAssertEqual(committed.last, [delivery.recordJSON])
+        let log = try coordinator.channelMembership(hostID: "host-a")
+        XCTAssertEqual(try coordinator.signedHostControls(for: log), [delivery.recordJSON])
+        let restored = try h.coordinator(authorizeDelegatedControl: { _ in })
+        XCTAssertEqual(try restored.signedHostControls(for: log), [delivery.recordJSON])
+        let disabled = try h.coordinator()
+        XCTAssertEqual(try disabled.signedHostControls(for: log), [])
+        _ = try await addSecondManager(harness: h)
+        _ = try await restored.hostSenderMembership()
+        XCTAssertThrowsError(try restored.signedHostControls(for: log), "An old channel head cannot reuse the source")
+    }
+
     func testHostFanoutLostReplyRetriesOnlyPendingStationWithOneOwnerConfirmation() async throws {
         let h = RecoveryCoordinatorHarness(), second = RecoveryMemoryRelay(stationOrigin: "https://second.example"), origin = "https://second.example"
         var coordinator: AstationRecoveryCoordinator? = try h.coordinator(authorizeDelegatedControl: { _ in },
