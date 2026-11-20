@@ -95,6 +95,7 @@ final class AstationRecoveryCoordinator {
     private var controlDeliveryContext: (portal: PortalIntegrationHTTP, current: () -> Bool)?
     private var controlDeliveryTask: Task<Void, Never>?
     private var lastControlDeliveryOrigin: String?
+    private var lastControlDeliveryRecord: [String: String] = [:]
     private var controlActivityContext: (generation: UUID, current: () -> Bool,
         updated: (String, MembershipLog, [RemoteControlActivity]) -> Void)?
     private var controlActivityTask: Task<Void, Never>?
@@ -2048,8 +2049,13 @@ extension AstationRecoveryCoordinator {
             throw RemoteChannelError.staleLink
         }
         var results: [RemoteControlDelivery] = []
-        for id in try controls(stationOrigin: origin).pendingDeliveryIDs().prefix(8) {
+        let pending = try controls(stationOrigin: origin).pendingDeliveryIDs()
+        let start = lastControlDeliveryRecord[origin].flatMap { pending.firstIndex(of: $0) }.map { $0 + 1 } ?? 0
+        // Unavailable records must not keep later signed stops outside every batch.
+        let batch = (Array(pending.dropFirst(start)) + Array(pending.prefix(start))).prefix(8)
+        for id in batch {
             guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+            lastControlDeliveryRecord[origin] = id
             results.append(try await deliverControl(id, portal: portal, stationOrigin: origin, current: current))
         }
         return results

@@ -2604,6 +2604,39 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(records, [secondPending.recordJSON])
     }
 
+    func testSavedStopBatchesRotatePastEightUnavailableRecords() async throws {
+        let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        var first: AstationRecoveryCoordinator? = try h.coordinator(authorizeDelegatedControl: { _ in })
+        let record = try await activeService(first!, transport: transport), client = try portal(transport)
+        var pending: [RemoteControlDelivery] = []
+        for _ in 0..<9 {
+            let review = try await first!.prepareServiceControl(record, portal: client, interruptOnly: false,
+                interruptRunning: false, current: { true })
+            await h.relay.dropControlReply()
+            pending.append(try await first!.commitServiceControl(review, portal: client, current: { true }))
+        }
+        XCTAssertTrue(pending.allSatisfy { !$0.stationStored })
+        let confirmations = h.ownerRequests.count
+        first = nil
+        let resumed = try h.coordinator(authorizeDelegatedControl: { _ in })
+        await h.relay.setEntriesUnavailable(true)
+        let unavailable = try await resumed.retryPendingControls(portal: client, current: { true })
+        XCTAssertEqual(unavailable.map(\.recordID), Array(pending.prefix(8)).map(\.recordID))
+        XCTAssertTrue(unavailable.allSatisfy { !$0.stationStored })
+        await h.relay.setEntriesUnavailable(false)
+        let retried = try await resumed.retryPendingControls(portal: client, current: { true })
+        XCTAssertEqual(retried.count, 8)
+        XCTAssertEqual(retried.first?.recordID, pending.last?.recordID,
+            "the ninth stop must get its turn even when the first eight remain pending")
+        XCTAssertTrue(retried.allSatisfy(\.stationStored))
+        let remaining = try await resumed.retryPendingControls(portal: client, current: { true })
+        XCTAssertEqual(remaining.map(\.recordID), [pending[7].recordID])
+        XCTAssertTrue(remaining.allSatisfy(\.stationStored))
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        let stored = await h.relay.controls()
+        XCTAssertEqual(stored, pending.map(\.recordJSON), "retries never change or duplicate the original signatures")
+    }
+
     func testRetainedHostStopRetriesOnlyItsPreviouslyReviewedFanout() async throws {
         let h = RecoveryCoordinatorHarness(), origin = "https://second.example"
         let second = RecoveryMemoryRelay(stationOrigin: origin), transport = ServiceApprovalPortal()

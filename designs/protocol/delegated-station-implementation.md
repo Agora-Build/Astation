@@ -358,7 +358,8 @@ production activation remains tied to the delegated gate and VII.A.
 
 The account lifecycle retry also visits protected control journals belonging to
 previously selected Stations. Each tick selects one pending journal in rotating
-origin order and retries at most eight signed records. An offline journal cannot
+origin order and retries at most eight signed records, rotating past the previous
+batch even when its records remain unavailable. An offline journal cannot
 prevent another journal's next turn. Unsigned reviews remain saved for explicit
 owner confirmation and never enter this delivery path.
 
