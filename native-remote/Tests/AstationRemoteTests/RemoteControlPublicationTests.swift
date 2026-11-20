@@ -280,7 +280,7 @@ final class RemoteControlPublicationTests: XCTestCase {
         let single = RemoteControlActivity(body: row.body, signed: true, stationStored: true, portalPending: false,
             managerReviewRequired: true, replacementRecordID: nil, application: .effectsReported, additionalStations: [:])
         XCTAssertFalse(single.requiresManagerReview, "single-Station application evidence still settles that review")
-        XCTAssertTrue(single.summary.contains("Selected Station reports"))
+        XCTAssertTrue(single.summary.contains("This Station reports"))
     }
 
     @MainActor

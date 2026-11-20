@@ -69,7 +69,10 @@ private final class RecoveryMemoryKeys: AstationRecoveryDataKeys {
 
 private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteStationVerifierTransport {
     nonisolated let controlStationOrigin: String
-    init(stationOrigin: String = "https://configured.example") { controlStationOrigin = stationOrigin }
+    init(stationOrigin: String = "https://configured.example", controlFeedID: String = UUID().uuidString.lowercased()) {
+        controlStationOrigin = stationOrigin
+        self.controlFeedID = controlFeedID
+    }
     var log: MembershipLog?
     var account = "account-a"
     var appends: [AppendRequest] = []
@@ -87,7 +90,7 @@ private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEn
     let hostKey = Curve25519.Signing.PrivateKey()
     var deviceMailboxes: [String: RemoteDeviceEnrollmentMailbox] = [:]
     var loseDeviceResponseReply = false
-    let controlFeedID = UUID().uuidString.lowercased()
+    let controlFeedID: String
     var controlRecords: [String] = []
     var controlAttempts = 0
     var loseControlReply = false
@@ -362,6 +365,7 @@ private final class RecoveryCoordinatorHarness {
         authorizeDelegatedControl: ((MembershipLog) throws -> Void)? = nil,
         authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)? = nil,
         additionalControlStations: ((MembershipLog) throws -> [String: RemoteControlStationTransport])? = nil,
+        retainedControlTransport: ((String) throws -> RemoteControlStationTransport)? = nil,
         confirmVerifierRoster: ((AstationRecoveryCoordinator.VerifierRosterReview) async -> Bool)? = nil,
         verifierTime: @escaping () -> UInt64 = { RemoteVerifierSigningGate.evidenceTimeMilliseconds() }) throws -> AstationRecoveryCoordinator {
         try AstationRecoveryCoordinator(accountID: "account-a", managerID: "manager-a", identity: identity,
@@ -378,6 +382,7 @@ private final class RecoveryCoordinatorHarness {
                 return save
             }, confirmServiceOwner: serviceOwnerConfirmation, authorizeDelegatedControl: authorizeDelegatedControl,
             authorizeNewMembership: authorizeNewMembership, additionalControlStations: additionalControlStations,
+            retainedControlTransport: retainedControlTransport,
             confirmVerifierRoster: confirmVerifierRoster, verifierTime: verifierTime)
     }
 }
@@ -2852,7 +2857,7 @@ extension AstationRecoveryCoordinatorTests {
         let confirmations = h.ownerRequests.count
         let deliveries = await h.relay.controlCallCount()
         let found = expectation(description: "background review discovered")
-        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { log, activity in
+        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { _, log, activity in
             XCTAssertEqual(log.accountId(), coordinator.accountID)
             XCTAssertEqual(activity.map { $0.body.recordId }, records.compactMap { try? parseControlRecord(recordJson: $0).recordId })
             XCTAssertEqual(activity.filter(\.requiresManagerReview).count, 1)
@@ -2870,7 +2875,7 @@ extension AstationRecoveryCoordinatorTests {
         _ = try await stopsByRemovedManager(coordinator, harness: h, count: 65)
         let first = expectation(description: "first bounded page"), second = expectation(description: "second bounded page")
         var scans = 0
-        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { _, activity in
+        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { _, _, activity in
             scans += 1
             if scans == 1 { XCTAssertEqual(activity.count, 64); first.fulfill() }
             else { XCTAssertEqual(activity.count, 65); second.fulfill() }
@@ -2883,7 +2888,7 @@ extension AstationRecoveryCoordinatorTests {
         XCTAssertEqual(reads, [0, 64])
         let resumed = try h.coordinator(authorizeDelegatedControl: { _ in })
         let restarted = expectation(description: "restart retains all imported records")
-        resumed.resumeControlActivity(generation: UUID(), current: { true }) { _, activity in
+        resumed.resumeControlActivity(generation: UUID(), current: { true }) { _, _, activity in
             XCTAssertEqual(activity.count, 65)
             XCTAssertEqual(Set(activity.map { $0.body.recordId }).count, 65)
             restarted.fulfill()
@@ -2899,7 +2904,7 @@ extension AstationRecoveryCoordinatorTests {
         let unexpected = expectation(description: "retired account must not notify")
         unexpected.isInverted = true
         var current = true
-        coordinator.resumeControlActivity(generation: UUID(), current: { current }) { _, _ in unexpected.fulfill() }
+        coordinator.resumeControlActivity(generation: UUID(), current: { current }) { _, _, _ in unexpected.fulfill() }
         for _ in 0..<1_000 {
             if await h.relay.controlSyncWaiter != nil { break }
             await Task.yield()
@@ -2918,7 +2923,7 @@ extension AstationRecoveryCoordinatorTests {
         _ = try await coordinator.setup()
         let unexpected = expectation(description: "default gate must not notify")
         unexpected.isInverted = true
-        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { _, _ in unexpected.fulfill() }
+        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { _, _, _ in unexpected.fulfill() }
         coordinator.refreshControlActivityInBackground()
         await fulfillment(of: [unexpected], timeout: 0.1)
         let reads = await h.relay.syncReads
@@ -2933,14 +2938,14 @@ extension AstationRecoveryCoordinatorTests {
         let old = expectation(description: "previous registration must not notify")
         old.isInverted = true
         let new = expectation(description: "replacement registration catches up")
-        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { _, _ in old.fulfill() }
+        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { _, _, _ in old.fulfill() }
         for _ in 0..<1_000 {
             if await h.relay.controlSyncWaiter != nil { break }
             await Task.yield()
         }
         let waiting = await h.relay.controlSyncWaiter != nil
         XCTAssertTrue(waiting)
-        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { _, activity in
+        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { _, _, activity in
             XCTAssertEqual(activity.filter(\.requiresManagerReview).count, 1)
             new.fulfill()
         }
@@ -2960,7 +2965,7 @@ extension AstationRecoveryCoordinatorTests {
         let failed = expectation(description: "invalid source is not an empty resolved scan")
         failed.isInverted = true
         let recovered = expectation(description: "later bounded retry recovers")
-        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { _, activity in
+        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { _, _, activity in
             if !repaired { failed.fulfill() }
             else { XCTAssertEqual(activity.filter(\.requiresManagerReview).count, 1); recovered.fulfill() }
         }
@@ -2973,6 +2978,212 @@ extension AstationRecoveryCoordinatorTests {
         coordinator.stopControlActivity()
         let reads = await h.relay.syncReads
         XCTAssertEqual(reads, [0, 0])
+    }
+
+    func testControlDiscoveryKeepsOtherStationEvidenceSeparateAndRetainsItAfterRestart() async throws {
+        let h = RecoveryCoordinatorHarness(), origin = "https://second.example"
+        let second = RecoveryMemoryRelay(stationOrigin: origin)
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, additionalControlStations: { _ in [origin: second] })
+        let records = try await stopsByRemovedManager(coordinator, harness: h)
+        let sharedLog = await h.relay.log
+        await second.replaceLog(try XCTUnwrap(sharedLog))
+        await second.replaceControlRecords(records)
+        let confirmations = h.ownerRequests.count
+        _ = try await coordinator.discoverControlActivity(previous: nil, stationOrigin: origin, current: { true })
+        let activity = try await coordinator.refreshControlActivity(stationOrigin: origin, current: { true })
+        XCTAssertEqual(activity.filter(\.requiresManagerReview).count, 1)
+        XCTAssertTrue(try coordinator.localControlActivity().isEmpty)
+        XCTAssertEqual(try coordinator.localControlActivity(stationOrigin: origin).map(\.body.recordId), activity.map(\.body.recordId))
+        let restarted = try h.coordinator(authorizeDelegatedControl: { _ in })
+        XCTAssertTrue(try restarted.localControlActivity().isEmpty)
+        XCTAssertEqual(try restarted.localControlActivity(stationOrigin: origin).map(\.body.recordId), activity.map(\.body.recordId),
+            "losing a directory source cannot erase a retained Station's evidence")
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        let attempts = await second.controlCallCount()
+        XCTAssertEqual(attempts, 0, "discovery must not publish or sign")
+    }
+
+    func testBackgroundControlDiscoveryRotatesPastAnUnavailablePrimary() async throws {
+        let h = RecoveryCoordinatorHarness(), origin = "https://second.example"
+        let second = RecoveryMemoryRelay(stationOrigin: origin)
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, additionalControlStations: { _ in [origin: second] })
+        let records = try await stopsByRemovedManager(coordinator, harness: h)
+        let sharedLog = await h.relay.log
+        await second.replaceLog(try XCTUnwrap(sharedLog))
+        await second.replaceControlRecords(records)
+        await h.relay.setEntriesUnavailable(true)
+        let failed = expectation(description: "primary outage produces no resolved notice")
+        failed.isInverted = true
+        let found = expectation(description: "secondary remains observable")
+        var secondaryTick = false
+        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { source, _, activity in
+            if !secondaryTick { failed.fulfill(); return }
+            XCTAssertEqual(source, origin)
+            XCTAssertEqual(activity.filter(\.requiresManagerReview).count, 1)
+            found.fulfill()
+        }
+        await fulfillment(of: [failed], timeout: 0.1)
+        secondaryTick = true
+        coordinator.refreshControlActivityInBackground()
+        await fulfillment(of: [found], timeout: 5)
+        coordinator.stopControlActivity()
+        XCTAssertTrue(try coordinator.localControlActivity().isEmpty)
+        XCTAssertEqual(try coordinator.localControlActivity(stationOrigin: origin).count, 1)
+    }
+
+    func testBackgroundControlDiscoveryMaintainsIndependentBoundedPagesForEveryOrigin() async throws {
+        let h = RecoveryCoordinatorHarness(), origin = "https://second.example"
+        let second = RecoveryMemoryRelay(stationOrigin: origin)
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, additionalControlStations: { _ in [origin: second] })
+        let records = try await stopsByRemovedManager(coordinator, harness: h, count: 65)
+        let sharedLog = await h.relay.log
+        await second.replaceLog(try XCTUnwrap(sharedLog))
+        await second.replaceControlRecords(records)
+        let pages = (0..<4).map { expectation(description: "rotating page \($0)") }
+        var scans = 0
+        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { source, _, activity in
+            guard scans < pages.count else { XCTFail("unbounded scan"); return }
+            XCTAssertEqual(source, scans.isMultiple(of: 2) ? coordinator.relayURL : origin)
+            XCTAssertEqual(activity.count, scans < 2 ? 64 : 65)
+            pages[scans].fulfill(); scans += 1
+        }
+        for index in pages.indices {
+            await fulfillment(of: [pages[index]], timeout: 5)
+            if index < pages.count - 1 { coordinator.refreshControlActivityInBackground() }
+        }
+        coordinator.stopControlActivity()
+        let firstReads = await h.relay.syncReads, secondReads = await second.syncReads
+        XCTAssertEqual(firstReads, [0, 64])
+        XCTAssertEqual(secondReads, [0, 64])
+    }
+
+    func testControlDiscoveryRetiresADestinationRemovedDuringItsFeedRead() async throws {
+        let h = RecoveryCoordinatorHarness(), origin = "https://second.example"
+        let second = RecoveryMemoryRelay(stationOrigin: origin)
+        var destinations: [String: RemoteControlStationTransport] = [origin: second]
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, additionalControlStations: { _ in destinations })
+        let records = try await stopsByRemovedManager(coordinator, harness: h)
+        let sharedLog = await h.relay.log
+        await second.replaceLog(try XCTUnwrap(sharedLog))
+        await second.replaceControlRecords(records)
+        await second.holdNextControlSync()
+        let scan = Task { try await coordinator.discoverControlActivity(previous: nil, stationOrigin: origin, current: { true }) }
+        for _ in 0..<1_000 {
+            if await second.controlSyncWaiter != nil { break }
+            await Task.yield()
+        }
+        let waiting = await second.controlSyncWaiter != nil
+        XCTAssertTrue(waiting)
+        destinations = [:]
+        await second.releaseControlSync()
+        do { _ = try await scan.value; XCTFail("removed source must not import a delayed page") }
+        catch { XCTAssertEqual(error as? RemoteChannelError, .staleLink) }
+        XCTAssertTrue(try coordinator.localControlActivity(stationOrigin: origin).isEmpty)
+        destinations = [origin: second]
+        _ = try await coordinator.discoverControlActivity(previous: nil, stationOrigin: origin, current: { true })
+        XCTAssertEqual(try coordinator.localControlActivity(stationOrigin: origin).count, 1)
+        destinations = [:]
+        do { _ = try await coordinator.refreshControlActivity(stationOrigin: origin, current: { true }); XCTFail("absent source") }
+        catch { XCTAssertEqual(error as? RemoteChannelError, .staleLink) }
+        XCTAssertEqual(try coordinator.localControlActivity(stationOrigin: origin).count, 1)
+    }
+
+    func testControlDiscoveryRejectsAMislabeledDestinationBeforeReadingIt() async throws {
+        let h = RecoveryCoordinatorHarness(), origin = "https://second.example", wrong = RecoveryMemoryRelay()
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, additionalControlStations: { _ in [origin: wrong] })
+        _ = try await stopsByRemovedManager(coordinator, harness: h)
+        do { _ = try await coordinator.discoverControlActivity(previous: nil, stationOrigin: origin, current: { true }); XCTFail("misdirected token source") }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        let reads = await wrong.syncReads
+        XCTAssertTrue(reads.isEmpty)
+        XCTAssertTrue(try coordinator.localControlActivity(stationOrigin: origin).isEmpty)
+    }
+
+    func testControlDiscoveryCannotReuseAnotherOriginsCursorEvenWithTheSameFeedID() async throws {
+        let h = RecoveryCoordinatorHarness(), origin = "https://second.example"
+        let feed = await h.relay.controlFeedID
+        let second = RecoveryMemoryRelay(stationOrigin: origin, controlFeedID: feed)
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, additionalControlStations: { _ in [origin: second] })
+        let records = try await stopsByRemovedManager(coordinator, harness: h, count: 65)
+        let sharedLog = await h.relay.log
+        await second.replaceLog(try XCTUnwrap(sharedLog))
+        await second.replaceControlRecords([records[0]])
+        let first = try await coordinator.discoverControlActivity(previous: nil, current: { true })
+        XCTAssertTrue(first.more)
+        XCTAssertEqual(first.after, 64)
+        _ = try await coordinator.discoverControlActivity(previous: first, stationOrigin: origin, current: { true })
+        let reads = await second.syncReads
+        XCTAssertEqual(reads, [0])
+        XCTAssertEqual(try coordinator.localControlActivity(stationOrigin: origin).count, 1)
+    }
+
+    func testControlStatusRetiresARemovedDestinationWithoutClearingItsJournal() async throws {
+        let h = RecoveryCoordinatorHarness(), origin = "https://second.example"
+        let second = RecoveryMemoryRelay(stationOrigin: origin)
+        var destinations: [String: RemoteControlStationTransport] = [origin: second]
+        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, additionalControlStations: { _ in destinations })
+        let records = try await stopsByRemovedManager(coordinator, harness: h)
+        let sharedLog = await h.relay.log
+        await second.replaceLog(try XCTUnwrap(sharedLog))
+        await second.replaceControlRecords(records)
+        _ = try await coordinator.discoverControlActivity(previous: nil, stationOrigin: origin, current: { true })
+        await second.holdNextControlStatus()
+        let scan = Task { try await coordinator.refreshControlActivity(stationOrigin: origin, current: { true }) }
+        for _ in 0..<1_000 {
+            if await second.controlStatusWaiter != nil { break }
+            await Task.yield()
+        }
+        let waiting = await second.controlStatusWaiter != nil
+        XCTAssertTrue(waiting)
+        destinations = [:]
+        await second.releaseControlStatus()
+        do { _ = try await scan.value; XCTFail("removed source must not resolve an alert") }
+        catch { XCTAssertEqual(error as? RemoteChannelError, .staleLink) }
+        let activity = try coordinator.localControlActivity(stationOrigin: origin)
+        XCTAssertEqual(activity.filter(\.requiresManagerReview).count, 1)
+        XCTAssertNil(activity.first?.application)
+    }
+
+    func testBackgroundDiscoveryUsesProtectedRetainedOriginsWithoutACompleteDirectoryOrPrimaryAccess() async throws {
+        let h = RecoveryCoordinatorHarness(), origin = "https://second.example"
+        let second = RecoveryMemoryRelay(stationOrigin: origin)
+        let first = try h.coordinator(authorizeDelegatedControl: { _ in }, additionalControlStations: { _ in [origin: second] })
+        let records = try await stopsByRemovedManager(first, harness: h)
+        let sharedLog = await h.relay.log
+        await second.replaceLog(try XCTUnwrap(sharedLog))
+        await second.replaceControlRecords(records)
+        _ = try await first.discoverControlActivity(previous: nil, stationOrigin: origin, current: { true })
+        first.stopControlActivity()
+        await h.relay.setEntriesUnavailable(true)
+        var requests: [String] = []
+        let resumed = try h.coordinator(authorizeDelegatedControl: { _ in }, retainedControlTransport: { requested in
+            requests.append(requested)
+            XCTAssertEqual(requested, origin)
+            return second
+        })
+        // An arbitrary URL cannot cause token acquisition or a network request.
+        do {
+            _ = try await resumed.discoverControlActivity(previous: nil, stationOrigin: "https://unreviewed.example", current: { true })
+            XCTFail("unretained destination")
+        } catch { XCTAssertEqual(error as? RemoteChannelError, .staleLink) }
+        XCTAssertTrue(requests.isEmpty)
+        let unavailable = expectation(description: "unavailable primary produces no notice")
+        unavailable.isInverted = true
+        let found = expectation(description: "retained secondary is polled after restart")
+        var secondaryTick = false
+        resumed.resumeControlActivity(generation: UUID(), current: { true }) { source, _, activity in
+            guard secondaryTick else { unavailable.fulfill(); return }
+            XCTAssertEqual(source, origin)
+            XCTAssertEqual(activity.filter(\.requiresManagerReview).count, 1)
+            found.fulfill()
+        }
+        await fulfillment(of: [unavailable], timeout: 0.1)
+        secondaryTick = true
+        resumed.refreshControlActivityInBackground()
+        await fulfillment(of: [found], timeout: 5)
+        resumed.stopControlActivity()
+        XCTAssertFalse(requests.isEmpty)
+        XCTAssertEqual(try resumed.localControlActivity(stationOrigin: origin).count, 1)
     }
 
     func testFreshManagerReviewDiscoversAnotherManagersStopAndRetriesExactCopyAfterRestart() async throws {

@@ -35,6 +35,7 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
     private var outcomeWindowController: NSWindowController?
     private var controlBanner: NSPanel?
     private var controlBannerGeneration = UUID()
+    private var controlBannerOrigin: String?
     private var controlActivityWindow: ControlActivityWindowController?
     var supportsPush: Bool { pushPlatform != nil }
 
@@ -72,6 +73,7 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
 
     @objc private func clearControlBanner() {
         controlBannerGeneration = UUID()
+        controlBannerOrigin = nil
         controlBanner?.orderOut(nil)
     }
 
@@ -226,11 +228,15 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
     }
 
     @MainActor func controlReviewsChanged(_ notice: AstationHubManager.ControlReviewNotice, hub: AstationHubManager) {
-        guard notice.current() else { clearControlBanner(); return }
-        if notice.count == 0 { clearControlBanner(); return }
+        guard notice.current() else { return }
+        if notice.count == 0 {
+            if controlBannerOrigin == notice.stationOrigin { clearControlBanner() }
+            return
+        }
         guard inAppEnabled, notice.shouldNotify else { return }
         let generation = UUID()
         controlBannerGeneration = generation
+        controlBannerOrigin = notice.stationOrigin
         let panel = controlBanner ?? NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: false)
         panel.level = .floating; panel.isOpaque = false; panel.backgroundColor = .clear
@@ -239,7 +245,8 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
         panel.contentView = NSHostingView(rootView: ControlReviewBannerView(count: notice.count, review: { [weak self, weak hub] in
             guard let self, let hub, notice.current() else { return }
             clearControlBanner()
-            if controlActivityWindow == nil { controlActivityWindow = ControlActivityWindowController(hub: hub) }
+            controlActivityWindow?.close()
+            controlActivityWindow = ControlActivityWindowController(hub: hub, stationOrigin: notice.stationOrigin)
             controlActivityWindow?.showWindow(nil)
             NSApp.activate(ignoringOtherApps: true)
         }, dismiss: { [weak self] in self?.clearControlBanner() }))

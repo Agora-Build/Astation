@@ -141,6 +141,25 @@ private final class StationTestSocket: IdentityRelaySocket, @unchecked Sendable 
         XCTAssertEqual(hub.accountAuth.configuration?.requiredScope, "astation.remote")
     }
 
+    func testReturningToARetainedStationReusesItsRefreshOwnerWithoutSharingAudiences() async throws {
+        let fixture = try StationAccountFixture(); defer { fixture.cleanup() }
+        let first = fixture.hub.accountAuth
+        fixture.hub._testRelayUrlOverride = "https://another-station.example"
+        try fixture.hub.configureIntegrationRelayAuth()
+        let second = fixture.hub.accountAuth
+        XCTAssertFalse(first === second)
+        XCTAssertEqual(second.configuration?.resource, "https://another-station.example")
+        fixture.hub._testRelayUrlOverride = fixture.origin
+        try fixture.hub.configureIntegrationRelayAuth()
+        XCTAssertTrue(fixture.hub.accountAuth === first, "two refresh owners must not rotate the same saved session")
+        let token = try await fixture.hub.accountAuth.accessToken(relayURL: fixture.origin)
+        XCTAssertEqual(token, "test-station-token")
+        do { _ = try await first.accessToken(relayURL: "https://another-station.example"); XCTFail("wrong audience") }
+        catch { XCTAssertEqual(error as? AccountLoginError, .configuration) }
+        XCTAssertEqual(fixture.signIns, 0)
+        XCTAssertEqual(fixture.portalSignIns, 0)
+    }
+
     func testAgoraBuildLoginPairsWithoutLegacySessionOrSharingAccountTokens() async throws {
         let fixture = try StationAccountFixture(); defer { fixture.hub.cancelRemotePairing(); fixture.cleanup() }
         let socket = try await connected(fixture)

@@ -78,6 +78,7 @@ final class AstationRecoveryCoordinator {
     /// The caller authenticates this account's Station roster and scopes each transport's token
     /// to its exact origin. A cached presence list is not a complete roster.
     private let additionalControlStations: ((MembershipLog) throws -> [String: RemoteControlStationTransport])?
+    private let retainedControlTransport: ((String) throws -> RemoteControlStationTransport)?
     private let confirmReplacement: (String) async -> Bool
     private let saveKit: (String) async -> Bool
     private let dataKeys: AstationRecoveryDataKeys
@@ -90,13 +91,14 @@ final class AstationRecoveryCoordinator {
     private var backup: RemoteRecoveryBackup?
     private var restoreOperation: RemoteRecoveryRestore?
     private var membershipLog: MembershipLog?
-    private var controlPublication: RemoteControlPublication?
+    private var controlPublications: [String: RemoteControlPublication] = [:]
     private var controlDeliveryContext: (portal: PortalIntegrationHTTP, current: () -> Bool)?
     private var controlDeliveryTask: Task<Void, Never>?
     private var controlActivityContext: (generation: UUID, current: () -> Bool,
-        updated: (MembershipLog, [RemoteControlActivity]) -> Void)?
+        updated: (String, MembershipLog, [RemoteControlActivity]) -> Void)?
     private var controlActivityTask: Task<Void, Never>?
-    private var controlActivityPage: ControlDiscoveryPage?
+    private var controlActivityPages: [String: ControlDiscoveryPage] = [:]
+    private var lastControlActivityOrigin: String?
     var onControlDelivery: ((RemoteControlDelivery) -> Void)?
     /// Deliver only durable head changes, after the account operation releases its lock.
     var onMembershipCommit: ((LogHead) -> Void)?
@@ -110,7 +112,8 @@ final class AstationRecoveryCoordinator {
     private var verifierRosterReview: VerifierRosterReview?
 
     convenience init(accountID: String, managerID: String, identity: AtemE2EIdentity, relayURL: String,
-        accessToken: @escaping @Sendable () async throws -> String, allowNewDataKey: @escaping () -> Bool) throws {
+        accessToken: @escaping @Sendable () async throws -> String, allowNewDataKey: @escaping () -> Bool,
+        retainedControlTransport: ((String) throws -> RemoteControlStationTransport)? = nil) throws {
         try self.init(accountID: accountID, managerID: managerID, identity: identity, relayURL: relayURL,
             store: RemoteRecoveryStore(accountID: accountID),
             transport: RemoteRecoveryHTTP(relayURL: relayURL, accessToken: accessToken),
@@ -142,7 +145,7 @@ final class AstationRecoveryCoordinator {
                         continuation.resume(returning: $0)
                     }
                 }
-            }, confirmVerifierRoster: { _ in
+            }, retainedControlTransport: retainedControlTransport, confirmVerifierRoster: { _ in
                 await withCheckedContinuation { continuation in
                     DeviceOwnerAuth.authenticate(reason: "confirm the reviewed Station server list") {
                         continuation.resume(returning: $0)
@@ -159,6 +162,7 @@ final class AstationRecoveryCoordinator {
         authorizeDelegatedControl: ((MembershipLog) throws -> Void)? = nil,
         authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)? = nil,
         additionalControlStations: ((MembershipLog) throws -> [String: RemoteControlStationTransport])? = nil,
+        retainedControlTransport: ((String) throws -> RemoteControlStationTransport)? = nil,
         confirmVerifierRoster: ((VerifierRosterReview) async -> Bool)? = nil,
         verifierTime: @escaping () -> UInt64 = { RemoteVerifierSigningGate.evidenceTimeMilliseconds() },
         now: @escaping () -> HostClock = { AstationRecoveryCoordinator.clock() }) throws {
@@ -175,6 +179,7 @@ final class AstationRecoveryCoordinator {
         self.authorizeDelegatedControl = authorizeDelegatedControl
         self.authorizeNewMembership = authorizeNewMembership
         self.additionalControlStations = additionalControlStations
+        self.retainedControlTransport = retainedControlTransport
         self.confirmVerifierRoster = confirmVerifierRoster
         self.verifierTime = verifierTime
         self.confirmReplacement = confirmReplacement
@@ -1553,12 +1558,13 @@ extension AstationRecoveryCoordinator {
     // Production supplies no authorization until the real delegated joint checks pass.
     var delegatedControlsAvailable: Bool { authorizeDelegatedControl != nil }
 
-    func localControlActivity() throws -> [RemoteControlActivity] {
+    func localControlActivity(stationOrigin: String? = nil) throws -> [RemoteControlActivity] {
         guard !busy, !uncertain, let log = membershipLog else { throw RemoteRecoveryError.busy }
-        return try controls().activity(log: log)
+        return try controls(stationOrigin: stationOrigin).activity(log: log)
     }
 
     struct ControlDiscoveryPage {
+        let stationOrigin: String
         let feedID: String
         let after: UInt64
         let more: Bool
@@ -1566,22 +1572,24 @@ extension AstationRecoveryCoordinator {
     }
 
     func resumeControlActivity(generation: UUID, current: @escaping () -> Bool,
-        updated: @escaping (MembershipLog, [RemoteControlActivity]) -> Void) {
+        updated: @escaping (String, MembershipLog, [RemoteControlActivity]) -> Void) {
         guard delegatedControlsAvailable, controlActivityContext?.generation != generation else { return }
         controlActivityTask?.cancel()
-        controlActivityPage = nil
+        controlActivityPages = [:]
+        lastControlActivityOrigin = nil
         controlActivityContext = (generation, current, updated)
         refreshControlActivityInBackground()
     }
 
     func stopControlActivity() {
         controlActivityContext = nil
-        controlActivityPage = nil
+        controlActivityPages = [:]
+        lastControlActivityOrigin = nil
         controlActivityTask?.cancel()
     }
 
-    /// One bounded feed page per tick. The same account writer serializes this
-    /// read/import with foreground changes; no background operation signs.
+    /// One bounded feed page per tick, rotating origins even after a failure.
+    /// An unavailable Station never blocks another one or resolves its alerts.
     func refreshControlActivityInBackground() {
         guard delegatedControlsAvailable, !busy, !uncertain, controlActivityTask == nil,
               let context = controlActivityContext, context.current() else { return }
@@ -1592,14 +1600,19 @@ extension AstationRecoveryCoordinator {
             guard let self else { return }
             defer { self.controlActivityTask = nil }
             do {
-                let page = try await self.discoverControlActivity(previous: self.controlActivityPage, current: current)
+                guard let log = self.membershipLog else { return }
+                let origins = try self.controlActivityOrigins(log)
+                let origin = origins.first(where: { $0 > (self.lastControlActivityOrigin ?? "") }) ?? origins[0]
+                self.lastControlActivityOrigin = origin
+                let page = try await self.discoverControlActivity(previous: self.controlActivityPages[origin],
+                    stationOrigin: origin, current: current)
                 guard current(), !Task.isCancelled else { return }
-                let activity = try await self.refreshControlActivity(current: current)
+                let activity = try await self.refreshControlActivity(stationOrigin: origin, current: current)
                 guard current(), !Task.isCancelled, !self.uncertain, let log = self.membershipLog else { return }
                 try self.requireManager(log)
                 try self.requireDelegatedControl(log)
-                self.controlActivityPage = page
-                context.updated(log, activity)
+                self.controlActivityPages[origin] = page
+                context.updated(origin, log, activity)
             } catch {
                 // Keep the previous cursor and durable journal for the next tick.
                 // An unavailable source is never an empty, resolved alert set.
@@ -1608,32 +1621,44 @@ extension AstationRecoveryCoordinator {
     }
 
     /// One bounded page per refresh. A list change restarts discovery at zero.
-    func discoverControlActivity(previous: ControlDiscoveryPage?, current: () -> Bool) async throws -> ControlDiscoveryPage {
+    func discoverControlActivity(previous: ControlDiscoveryPage?, stationOrigin: String? = nil,
+        current: () -> Bool) async throws -> ControlDiscoveryPage {
         try begin(); defer { busy = false }
         guard delegatedControlsAvailable else { throw AstationDelegatedControlError.notVerified }
-        guard current(), !Task.isCancelled, let kit = try currentKit(), let transport = http as? RemoteControlFeedTransport else {
+        guard current(), !Task.isCancelled, let kit = try currentKit(), let anchor = membershipLog else {
             throw RemoteChannelError.staleLink
         }
-        let log = try await refreshedLog(genesis: kit.genesisHash)
+        let origin = stationOrigin ?? relayURL
+        let source = try controlActivitySource(origin: origin, log: anchor)
+        guard let transport = source as? RemoteControlFeedTransport else { throw RemoteChannelError.staleLink }
+        let log = try await refreshedLog(genesis: kit.genesisHash, transport: source)
+        try requireControlActivitySource(origin: origin, log: log)
         try requireManager(log)
         try requireDelegatedControl(log)
         let heads = try relayDecodeToHost(message: await transport.controlHeads(genesisHash: kit.genesisHash))
         guard current(), !Task.isCancelled, case .heads(let feeds, let head) = heads,
-              head == log.head(), feeds.count == 1, feeds[0].origin == relayURL else {
+              head == log.head(), feeds.count == 1, feeds[0].origin == origin else {
             throw RemoteRecoveryError.requiresReview
         }
+        try requireControlActivitySource(origin: origin, log: log)
         let feed = feeds[0]
-        let after = previous.flatMap { $0.more && $0.feedID == feed.feedId && $0.membershipHead == log.head() ? $0.after : nil } ?? 0
-        let call = try relayControlSync(requestId: UUID().uuidString.lowercased(), origin: relayURL, feedId: feed.feedId, after: after)
+        let after = previous.flatMap {
+            $0.more && $0.stationOrigin == origin && $0.feedID == feed.feedId && $0.membershipHead == log.head() ? $0.after : nil
+        } ?? 0
+        let call = try relayControlSync(requestId: UUID().uuidString.lowercased(), origin: origin, feedId: feed.feedId, after: after)
         let result = try await transport.controlSync(genesisHash: kit.genesisHash, callJSON: call)
         guard current(), !Task.isCancelled, try relayControlSyncAnswers(call: call, result: result) == .answers,
               case .controlSyncResult(_, _, let feedID, _, let feedHead, _, let records) = try relayDecodeToHost(message: result),
               records.count <= 64, feedHead >= max(after, feed.head), !records.isEmpty || feedHead == after else {
             throw RemoteRecoveryTransportError.invalidResponse
         }
-        let latest = try await refreshedLog(genesis: kit.genesisHash)
+        try requireControlActivitySource(origin: origin, log: log)
+        let latest = try await refreshedLog(genesis: kit.genesisHash, transport: source)
         guard current(), !Task.isCancelled, latest.head() == log.head() else { throw RemoteChannelError.staleLink }
-        let journal = try controls()
+        try requireManager(latest)
+        try requireDelegatedControl(latest)
+        try requireControlActivitySource(origin: origin, log: latest)
+        let journal = try controls(stationOrigin: origin)
         for row in records {
             // Feed entries can be future or malformed record types; they grant no authority.
             guard let body = try? parseControlRecord(recordJson: row.recordJson), body.signer.hasPrefix("member:"),
@@ -1643,7 +1668,8 @@ extension AstationRecoveryCoordinator {
             catch RemoteControlPublicationError.invalidRecord { continue }
         }
         let cursor = records.last?.feedSeq ?? after
-        return ControlDiscoveryPage(feedID: feedID, after: cursor, more: cursor < feedHead, membershipHead: latest.head())
+        return ControlDiscoveryPage(stationOrigin: origin, feedID: feedID, after: cursor,
+            more: cursor < feedHead, membershipHead: latest.head())
     }
 
     func prepareControlResign(recordID: String, current: () -> Bool) async throws -> RemoteControlReview {
@@ -1701,25 +1727,36 @@ extension AstationRecoveryCoordinator {
         try controls().cancelUnsigned(recordID: review.body.recordId)
     }
 
-    func refreshControlActivity(current: () -> Bool) async throws -> [RemoteControlActivity] {
+    func refreshControlActivity(stationOrigin: String? = nil, current: () -> Bool) async throws -> [RemoteControlActivity] {
         try begin(); defer { busy = false }
-        guard delegatedControlsAvailable, current(), let kit = try currentKit(),
-              let transport = http as? RemoteControlStatusTransport else { throw AstationDelegatedControlError.notVerified }
-        let log = try await refreshedLog(genesis: kit.genesisHash)
+        guard delegatedControlsAvailable, current(), let kit = try currentKit(), let anchor = membershipLog else {
+            throw AstationDelegatedControlError.notVerified
+        }
+        let origin = stationOrigin ?? relayURL
+        let source = try controlActivitySource(origin: origin, log: anchor)
+        guard let transport = source as? RemoteControlStatusTransport else { throw RemoteChannelError.staleLink }
+        let log = try await refreshedLog(genesis: kit.genesisHash, transport: source)
         guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
-        let activity = try controls().activity(log: log)
+        try requireManager(log)
+        try requireDelegatedControl(log)
+        try requireControlActivitySource(origin: origin, log: log)
+        let activity = try controls(stationOrigin: origin).activity(log: log)
         let ids = activity.filter(\.signed).map { $0.body.recordId }
         var reports: [String: RemoteControlApplicationState] = [:]
         for offset in stride(from: 0, to: ids.count, by: 64) {
             let page = try await transport.controlStatus(genesisHash: kit.genesisHash,
                 recordIDs: Array(ids[offset..<min(offset + 64, ids.count)]), expected: log.head())
             guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+            try requireControlActivitySource(origin: origin, log: log)
             reports.merge(page) { _, new in new }
         }
         // Reject a changed list even if a delayed status response looked complete.
-        let latest = try await refreshedLog(genesis: kit.genesisHash)
+        let latest = try await refreshedLog(genesis: kit.genesisHash, transport: source)
         guard current(), !Task.isCancelled, latest.head() == log.head() else { throw RemoteChannelError.staleLink }
-        return try controls().activity(log: latest, status: reports)
+        try requireManager(latest)
+        try requireDelegatedControl(latest)
+        try requireControlActivitySource(origin: origin, log: latest)
+        return try controls(stationOrigin: origin).activity(log: latest, status: reports)
     }
 
     func resumeControlDelivery(portal: PortalIntegrationHTTP, current: @escaping () -> Bool) {
@@ -1749,23 +1786,68 @@ extension AstationRecoveryCoordinator {
         try authorizeDelegatedControl(log)
     }
 
-    private func controls() throws -> RemoteControlPublication {
-        if let controlPublication { return controlPublication }
+    private func controls(stationOrigin: String? = nil) throws -> RemoteControlPublication {
+        let origin = stationOrigin ?? relayURL
+        guard PortalIntegrationRecord.validOrigin(origin) else { throw RemoteRecoveryError.requiresReview }
+        if let value = controlPublications[origin] { return value }
+        let retained = Set((saved.controlPublications ?? [:]).keys).union(controlPublications.keys)
+        guard retained.contains(origin) || retained.count < 64 else { throw RemoteControlPublicationError.full }
         guard let kit = try currentKit() else { throw RemoteRecoveryError.notCommitted }
         let persistControl: (Data) throws -> Void = { [unowned self] bytes in
-            try self.persist { $0.controlPublications = ($0.controlPublications ?? [:]).merging([self.relayURL: bytes]) { _, new in new } }
+            try self.persist { $0.controlPublications = ($0.controlPublications ?? [:]).merging([origin: bytes]) { _, new in new } }
             self.pendingControlCommit = true
         }
         let value: RemoteControlPublication
-        if let data = saved.controlPublications?[relayURL] {
+        if let data = saved.controlPublications?[origin] {
             value = try RemoteControlPublication(checkpoint: data, accountID: accountID, genesisHash: kit.genesisHash,
-                stationOrigin: relayURL, persist: persistControl)
+                stationOrigin: origin, persist: persistControl)
         } else {
             value = try RemoteControlPublication(accountID: accountID, genesisHash: kit.genesisHash,
-                stationOrigin: relayURL, persist: persistControl)
+                stationOrigin: origin, persist: persistControl)
         }
-        controlPublication = value
+        controlPublications[origin] = value
         return value
+    }
+
+    private func controlActivitySource(origin: String, log: MembershipLog) throws -> RemoteRecoveryTransport {
+        guard PortalIntegrationRecord.validOrigin(origin) else { throw RemoteRecoveryError.requiresReview }
+        if origin == relayURL { return http }
+        let value: RemoteControlStationTransport
+        if let supplied = try controlStationTransports(log)[origin] { value = supplied }
+        else {
+            guard let retainedControlTransport, retainedControlOrigins(log).contains(origin) else {
+                throw RemoteChannelError.staleLink
+            }
+            value = try retainedControlTransport(origin)
+        }
+        guard PortalIntegrationRecord.validOrigin(origin), value.controlStationOrigin == origin else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        return value
+    }
+
+    private func retainedControlOrigins(_ log: MembershipLog) -> Set<String> {
+        Set((saved.controlPublications ?? [:]).keys).union((saved.verifierRosters ?? [:]).compactMap {
+            $0.value.genesis == log.genesisHash() ? $0.key : nil
+        })
+    }
+
+    private func controlActivityOrigins(_ log: MembershipLog) throws -> [String] {
+        var origins = Set(try controlStationTransports(log).keys)
+        origins.insert(relayURL)
+        if retainedControlTransport != nil { origins.formUnion(retainedControlOrigins(log)) }
+        guard origins.count <= 64, origins.allSatisfy(PortalIntegrationRecord.validOrigin) else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        return origins.sorted()
+    }
+
+    private func requireControlActivitySource(origin: String, log: MembershipLog) throws {
+        if origin == relayURL { return }
+        guard try controlStationTransports(log)[origin] != nil ||
+                (retainedControlTransport != nil && retainedControlOrigins(log).contains(origin)) else {
+            throw RemoteChannelError.staleLink
+        }
     }
 
     /// Native delivery uses the same durable signatures, independently of Station storage receipts.
