@@ -60,6 +60,7 @@ Using the deployment's database, origin and generation configuration:
 ```sh
 station-relay-server admin delegated-recovery status
 station-relay-server admin delegated-recovery fence
+station-relay-server admin delegated-recovery inspect <genesis_hash>
 ```
 
 `status` only reads the row and prints the configured generation, durable state
@@ -71,6 +72,28 @@ inspection/fence, `1` for a storage/fencing failure, and `2` for invalid argumen
 or configuration. A successful status command is not activation evidence.
 A failed fence write does not prove that other replicas stopped. Keep the fleet
 drained and fix storage; never restart it with an older generation.
+
+`inspect` reads one account root and the configured origin's fence in a single
+read-only, repeatable-read Postgres transaction. It works while the fence is
+closed and never advances the saved membership clock, ticks the ACK ledger,
+initializes a missing feed or changes a signing reservation. The root is bounded
+to 16 MiB and each query has a five-second statement timeout. A malformed root,
+membership, ledger or record produces an error rather than a partial report.
+
+The JSON report includes the saved membership head, feed ID/head, record verdict
+counts from the shared verifier, watermark count/highest time, outstanding native
+effect count, immediately ready/refused/dropped report counts, reporting stop
+state and retained delivery retries. `ready_reports` is not the full unsettled
+backlog: the shared ledger offers no reports while reporting is stopped and only
+the next eligible report per principal otherwise. The command does not expose
+signed bodies, recovery blobs, keys or report payloads. An absent root or an
+absent feed for this origin is reported as null; it is not created or borrowed
+from another Station.
+
+Every report says `retained_history_only: true`. It can inventory what survived
+the restore, but cannot establish missing later stops or unknown clock anchors.
+`recovery_ready` describes only the existing deployment fence. Neither a report
+nor a normal ready fence certifies snapshot completeness or authorizes reopening.
 
 There is deliberately no reopen command yet. Removing the row, replaying a
 configuration or retrying startup does not establish a complete snapshot.

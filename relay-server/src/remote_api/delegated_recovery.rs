@@ -1,7 +1,9 @@
 //! Operational rollback fence. The configured generation must live outside the
 //! restored backup; neither a feed UUID nor wall-clock time proves later history.
-use super::RecoveryStore;
+use super::{RecoveryStore, Root, MAX_STATE};
+use atem_client::{membership::Membership, Hash32};
 use serde::Serialize;
+use serde_json::{json, Value};
 use sqlx::{PgConnection, PgPool};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +121,81 @@ pub(crate) async fn inspect(pool: &PgPool, origin: &str) -> Result<Option<Status
         .bind(origin)
         .fetch_optional(pool)
         .await
+}
+
+/// Inspect one retained account root and its fence in the same database snapshot,
+/// including while serving is fenced. Never advance membership or mutate history.
+pub(crate) async fn inspect_root(
+    pool: &PgPool,
+    binding: &Binding,
+    genesis: &str,
+) -> Result<Value, sqlx::Error> {
+    if Hash32::from_hex(genesis).is_err()
+        || genesis.len() != 64
+        || genesis
+            .bytes()
+            .any(|b| !b.is_ascii_digit() && !(b'a'..=b'f').contains(&b))
+    {
+        return Err(sqlx::Error::Protocol("invalid genesis hash".into()));
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout = '5s'")
+        .execute(&mut *tx)
+        .await?;
+    let status: Option<Status> = sqlx::query_as(
+        "SELECT generation,ready,reason FROM station_delegated_recovery WHERE origin=$1",
+    )
+    .bind(&binding.origin)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let stored: Option<(Option<Value>,)> = sqlx::query_as(
+        "SELECT CASE WHEN octet_length(state::text) <= $2 THEN state END FROM remote_recovery_roots WHERE genesis_hash=$1")
+        .bind(genesis).bind(MAX_STATE as i64).fetch_optional(&mut *tx).await?;
+    let root = match stored {
+        None => Value::Null,
+        Some((Some(value),)) => root_inspection(value, binding, genesis)?,
+        Some((None,)) => {
+            return Err(sqlx::Error::Protocol(
+                "recovery root exceeds inspection bound".into(),
+            ))
+        }
+    };
+    tx.commit().await?;
+    Ok(json!({
+        "version": 1,
+        "origin": binding.origin,
+        "genesis_hash": genesis,
+        "configured_generation": binding.generation,
+        "recovery_ready": status.as_ref().is_some_and(|s| s.ready && s.generation == binding.generation),
+        "retained_history_only": true,
+        "status": status,
+        "root": root,
+    }))
+}
+
+fn root_inspection(value: Value, binding: &Binding, genesis: &str) -> Result<Value, sqlx::Error> {
+    let invalid = || sqlx::Error::Protocol("retained recovery state could not be inspected".into());
+    let root: Root = serde_json::from_value(value).map_err(|_| invalid())?;
+    let hash = Hash32::from_hex(genesis).map_err(|_| invalid())?;
+    let log =
+        Membership::from_stored(&root.account, &hash, &root.membership).map_err(|_| invalid())?;
+    let feed = root
+        .delegated
+        .get(&binding.origin)
+        .map(|feed| {
+            feed.recovery_inspection(&binding.origin, &log)
+                .map_err(|_| invalid())
+        })
+        .transpose()?;
+    Ok(json!({
+        "account_id": root.account,
+        "membership_head": log.head().to_json(),
+        "membership_frozen": log.frozen().is_some(),
+        "feed": feed,
+    }))
 }
 
 impl RecoveryStore {
