@@ -121,7 +121,7 @@ finish:
 1. each relay in `RELAY_DEPLOY_HOOKS` order (relay-a, then relay-b), waiting
    after each until `${STATION_URL}/health` is healthy (polled
    every 5 s, up to 36 times);
-2. the webapp;
+2. the webapp, when its source differs from the last successful deployment;
 3. the final check: public HTTPS, a healthy `/health` (Postgres knowledge
    store; Redis `ok` and at least `STATION_MIN_REPLICAS` live replicas when
    those checks are switched on, see below), the expected relay build commit,
@@ -129,7 +129,22 @@ finish:
    and an identity WebSocket
    connection to the selected origin's `/ws` endpoint.
 
-The workflow can also be run manually on `main` from GitHub Actions.
+The deployment compares the complete `webapp/` Git tree with the last successful
+Deploy Station run on `main`, including its nginx configuration and Dockerfile.
+That run's title must bind the same exact `STATION_URL` and source commit;
+an older unbound title or a changed destination requires deployment.
+Relay-only changes leave the existing frontend running. Comparing with the last
+successful rollout, rather than the preceding commit, keeps webapp changes from
+an unsuccessful rollout pending. Missing history, unavailable revisions or API
+errors cause a normal webapp deployment. Both images are still published, and
+relay deployment and final public checks always run.
+
+Run the workflow manually on `main` from GitHub Actions to force a webapp
+deployment, including after changing its platform configuration or refreshing
+the nginx base image. The current
+frontend uses fixed host port `3010`; avoiding unnecessary replacements reduces
+public-route interruptions, but a webapp update still needs a separate frontend
+availability solution before claiming uninterrupted deployments.
 
 Release tags continue to publish versioned and `:latest` images and the macOS
 installer. They do not deploy production; Coolify tracks `:main` so publishing

@@ -1,4 +1,5 @@
 name: Deploy Station
+run-name: Deploy Station to ${{ vars.STATION_URL }} at ${{ github.sha }}
 
 on:
   push:
@@ -76,17 +77,27 @@ jobs:
     name: Deploy and verify Station
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     # Each relay hook can take ~20 min (Coolify wait up to 15 min + health
     # wait up to 3 min), plus ~30 min for the webapp and the final check:
     # 90 fits 3 relays. Raise it before adding a fourth.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - name: Validate deployment configuration
         run: node .github/scripts/verify-station.mjs --check-deployment
+      - name: Check whether the webapp needs redeployment
+        id: webapp
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node .github/scripts/webapp-deployment.mjs
       # Relays deploy one at a time, in RELAY_DEPLOY_HOOKS order (one deploy
       # hook URL per line, any webhook-capable platform). For each: trigger,
       # wait for the Coolify deployment when COOLIFY_API_TOKEN is set, then
@@ -112,6 +123,7 @@ jobs:
           done <<< "${RELAY_DEPLOY_HOOKS:-}"
           node .github/scripts/deploy-relays.mjs
       - name: Deploy webapp and wait for Coolify
+        if: steps.webapp.outputs.deploy == 'true'
         env:
           COOLIFY_WEBHOOK_URL: ${{ secrets.COOLIFY_WEBAPP_WEBHOOK_URL }}
           COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
