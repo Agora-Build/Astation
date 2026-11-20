@@ -723,6 +723,7 @@ station-relay-server admin delegated-recovery status
 station-relay-server admin delegated-recovery fence
 station-relay-server admin delegated-recovery inspect <genesis_hash>
 station-relay-server admin delegated-recovery prepare <genesis_hash>
+station-relay-server admin delegated-recovery retain-stops <genesis_hash> stops.json
 ```
 
 These use `DATABASE_URL`, `PUBLIC_BASE_URL` and the configured recovery
@@ -733,7 +734,11 @@ feed, reservations and ledger with one replacement feed UUID. Retry and replica
 races reuse the same plan; a changed source requires review. It does not publish
 the replacement, sign records, prove complete later history or resume reporting.
 Its output includes account-private record metadata; keep it with the recovery
-case. Snapshot reconstruction/reopening is not yet implemented. See
+case. Snapshot reconstruction/reopening is not yet implemented.
+`retain-stops` imports bounded original native stop objects into that exact
+closed-fence plan. Retry cannot change an ID's contents; imported stops remain
+review obligations, including in later recovery generations. It never sets
+effects, signs, clears an unknown clock anchor or reopens the fence. See
 [the recovery procedure](designs/protocol/delegated-station-restore.md) for the
 remaining obligations and the limits of the external generation guard.
 

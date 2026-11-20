@@ -21,6 +21,10 @@ mod recovery_fence;
 #[path = "delegated_recovery_plan_tests.rs"]
 mod recovery_plan;
 
+#[cfg(feature = "delegated-host-work")]
+#[path = "delegated_recovered_stops_tests.rs"]
+mod recovered_stops;
+
 const ORIGIN: &str = "https://station-dev.agora.build";
 
 pub(crate) fn fixture() -> Fixture {

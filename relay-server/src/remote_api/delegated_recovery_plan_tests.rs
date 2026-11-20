@@ -19,7 +19,7 @@ async fn plans(pool: &sqlx::PgPool) -> Vec<Value> {
     .unwrap()
 }
 
-async fn retained(
+pub(super) async fn retained(
     database: &TestDatabase,
 ) -> (std::sync::Arc<RecoveryStore>, Fixture, String, Binding) {
     let store = RecoveryStore::postgres(database.pool.clone());

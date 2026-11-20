@@ -1565,6 +1565,22 @@ extension AstationRecoveryCoordinator {
         return try controls(stationOrigin: stationOrigin).activity(log: log)
     }
 
+    func exportControlRecoveryEvidence(stationOrigin: String? = nil, current: () -> Bool) throws -> String {
+        guard !busy, !uncertain, current() else { throw RemoteRecoveryError.requiresReview }
+        guard let checkpoint = try store.read(), checkpoint.count <= 8_388_608 else {
+            throw RemoteRecoveryError.notCommitted
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard try encoder.encode(PropertyListDecoder().decode(Saved.self, from: checkpoint)) == encoder.encode(saved) else {
+            uncertain = true
+            throw RemoteRecoveryError.storageUncertain
+        }
+        // Reading retained public evidence needs neither network access nor new
+        // signing authority. Removed managers' originals must remain exportable.
+        return try controls(stationOrigin: stationOrigin).recoveryEvidenceJSON()
+    }
+
     struct ControlDiscoveryPage {
         let stationOrigin: String
         let feedID: String

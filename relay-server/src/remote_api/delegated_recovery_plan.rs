@@ -5,17 +5,20 @@ use super::{Binding, Status};
 use atem_client::{canonical::jcs, membership::Membership, Hash32};
 use ring::digest::{digest, SHA256};
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
+
+#[path = "delegated_recovered_stops.rs"]
+pub(crate) mod stops;
 
 #[derive(sqlx::FromRow)]
-struct Prepared {
+pub(super) struct Prepared {
     plan_id: String,
     candidate_feed_id: String,
     source_hash: String,
     retained: Value,
 }
 
-fn invalid() -> sqlx::Error {
+pub(super) fn invalid() -> sqlx::Error {
     sqlx::Error::Protocol("delegated recovery preparation requires review".into())
 }
 
@@ -43,18 +46,31 @@ pub(crate) async fn prepare(
     binding: &Binding,
     genesis: &str,
 ) -> Result<Value, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let (prepared, log, mut report) = checkpoint(&mut tx, binding, genesis, true).await?;
+    report["recovered_stops"] = stops::inspection(&mut tx, &prepared, &log, binding).await?;
+    tx.commit().await?;
+    Ok(report)
+}
+
+/// The fence and source stay locked until the caller commits all new evidence.
+async fn checkpoint(
+    connection: &mut PgConnection,
+    binding: &Binding,
+    genesis: &str,
+    create: bool,
+) -> Result<(Prepared, Membership, Value), sqlx::Error> {
     if !super::canonical_genesis(genesis) {
         return Err(invalid());
     }
-    let mut tx = pool.begin().await?;
     sqlx::query("SET LOCAL statement_timeout = '5s'")
-        .execute(&mut *tx)
+        .execute(&mut *connection)
         .await?;
     let status: Option<Status> = sqlx::query_as(
         "SELECT generation,ready,reason FROM station_delegated_recovery WHERE origin=$1 FOR UPDATE",
     )
     .bind(&binding.origin)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *connection)
     .await?;
     if !status.is_some_and(|status| status.generation == binding.generation && !status.ready) {
         return Err(invalid());
@@ -65,7 +81,7 @@ pub(crate) async fn prepare(
     )
     .bind(genesis)
     .bind(MAX_STATE as i64)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *connection)
     .await?
     .ok_or_else(invalid)?;
     let subject = subject
@@ -96,7 +112,7 @@ pub(crate) async fn prepare(
     let fits: bool = sqlx::query_scalar("SELECT octet_length($1::jsonb::text) <= $2")
         .bind(&retained)
         .bind(MAX_STATE as i64)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *connection)
         .await?;
     if !fits {
         return Err(invalid());
@@ -111,7 +127,7 @@ pub(crate) async fn prepare(
     .bind(binding.generation)
     .bind(genesis)
     .bind(MAX_STATE as i64)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *connection)
     .await?;
     let prepared = if let Some(prepared) = prepared {
         if prepared.source_hash != source_hash
@@ -125,6 +141,9 @@ pub(crate) async fn prepare(
         }
         prepared
     } else {
+        if !create {
+            return Err(invalid());
+        }
         let prepared = Prepared {
             plan_id: uuid::Uuid::new_v4().to_string(),
             candidate_feed_id: uuid::Uuid::new_v4().to_string(),
@@ -146,7 +165,7 @@ pub(crate) async fn prepare(
         .bind(&prepared.candidate_feed_id)
         .bind(&prepared.source_hash)
         .bind(&prepared.retained)
-        .execute(&mut *tx)
+        .execute(&mut *connection)
         .await?;
         prepared
     };
@@ -165,6 +184,5 @@ pub(crate) async fn prepare(
         "review": review,
         "unresolved": ["later_control_history", "signing_clock_anchors", "complete_snapshot", "fresh_manager_confirmations"],
     });
-    tx.commit().await?;
-    Ok(report)
+    Ok((prepared, log, report))
 }

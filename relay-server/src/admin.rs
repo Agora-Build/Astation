@@ -9,6 +9,7 @@ use crate::identity_store::{IdentityStore, PgIdentityStore};
 pub const USAGE: &str = "usage: station-relay-server admin forget-key <astation_id>\n\
        station-relay-server admin delegated-recovery status|fence\n\
        station-relay-server admin delegated-recovery inspect|prepare <genesis_hash>\n\
+       station-relay-server admin delegated-recovery retain-stops <genesis_hash> <file>\n\
 \n\
 Deletes the Astation's registered relay key (DATABASE_URL, required) and\n\
 announces it on relay:broadcast (REDIS_URL, optional) so every relay\n\
@@ -17,7 +18,8 @@ replica drops the cached key at once. Bindings are kept.\n\
 delegated-recovery uses DATABASE_URL, PUBLIC_BASE_URL and\n\
 STATION_DELEGATED_RECOVERY_GENERATION. status and inspect only read; fence\n\
 durably stops delegated serving, signing and reporting. prepare retains the old\n\
-evidence and reserves a replacement feed behind a closed fence. It never resumes them.";
+evidence and reserves a replacement feed behind a closed fence. retain-stops adds\n\
+native stop evidence to that exact preparation. Neither command resumes them.";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ForgetOutcome {
@@ -112,16 +114,51 @@ pub async fn main(args: &[String]) -> i32 {
     }
 }
 
+async fn read_stop_evidence(path: &std::path::Path, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    // A path can become a FIFO before open; do not wait for a writer before
+    // checking the actual opened descriptor's file type.
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    read_opened_stop_evidence(options.open(path).await?, limit).await
+}
+
+async fn read_opened_stop_evidence(input: tokio::fs::File, limit: usize) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    if !input.metadata().await?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "stop evidence must be a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    input.take((limit + 1) as u64).read_to_end(&mut bytes).await?;
+    if bytes.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stop evidence exceeds input limit",
+        ));
+    }
+    Ok(bytes)
+}
+
 async fn delegated_recovery(args: &[String]) -> i32 {
     use crate::remote_api::recovery::delegated_recovery::{generation, inspect, inspect_root, Binding};
-    let (fence, root) = match args {
-        [command] if command == "status" => (false, None),
-        [command] if command == "fence" => (true, None),
+    let (fence, root, file) = match args {
+        [command] if command == "status" => (false, None, None),
+        [command] if command == "fence" => (true, None, None),
         [command, genesis]
             if matches!(command.as_str(), "inspect" | "prepare") && genesis.len() == 64
                 && genesis.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
         {
-            (false, Some((command.as_str(), genesis)))
+            (false, Some((command.as_str(), genesis)), None)
+        }
+        [command, genesis, file]
+            if command == "retain-stops" && genesis.len() == 64
+                && genesis.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
+        {
+            (false, Some((command.as_str(), genesis)), Some(file))
         }
         _ => {
             eprintln!("{USAGE}");
@@ -153,7 +190,17 @@ async fn delegated_recovery(args: &[String]) -> i32 {
         }
     };
     if let Some((command, genesis)) = root {
-        let report = if command == "prepare" {
+        let report = if let Some(file) = file {
+            use crate::remote_api::recovery::delegated_recovery::plan::stops;
+            let bytes = match read_stop_evidence(std::path::Path::new(file), stops::input_limit()).await {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    eprintln!("could not read bounded regular recovery stop evidence");
+                    return 1;
+                }
+            };
+            stops::retain(&pool, &binding, genesis, &bytes).await
+        } else if command == "prepare" {
             crate::remote_api::recovery::delegated_recovery::plan::prepare(&pool, &binding, genesis).await
         } else {
             inspect_root(&pool, &binding, genesis).await
@@ -200,6 +247,55 @@ mod tests {
     use crate::cluster::bus::LoopbackBus;
     use crate::cluster::local::LocalSockets;
     use crate::identity_store::InMemoryIdentityStore;
+
+    #[tokio::test]
+    async fn stop_evidence_reads_only_bounded_regular_files() {
+        let directory = std::env::temp_dir()
+            .join(format!("station-stop-input-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("stops.json");
+        std::fs::write(&path, b"test").unwrap();
+        assert_eq!(read_stop_evidence(&path, 4).await.unwrap(), b"test");
+        assert!(read_stop_evidence(&path, 3).await.is_err());
+        assert!(read_stop_evidence(&directory, 4).await.is_err());
+        assert!(read_stop_evidence(&directory.join("missing"), 4).await.is_err());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_evidence_refuses_fifos_without_waiting_and_checks_opened_descriptor() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = std::env::temp_dir()
+            .join(format!("station-stop-fifo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("stops.json");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&path).status().unwrap().success());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2), read_stop_evidence(&path, 4),
+        ).await;
+        if result.is_err() {
+            // Release a regressed blocking open so test-runtime cleanup can finish.
+            let _writer = std::fs::OpenOptions::new()
+                .write(true).custom_flags(libc::O_NONBLOCK).open(&path);
+            panic!("opening a FIFO waited for a writer");
+        }
+        assert!(result.unwrap().is_err());
+        let fifo = tokio::fs::OpenOptions::new()
+            .read(true).custom_flags(libc::O_NONBLOCK).open(&path).await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"test").unwrap();
+        assert!(read_opened_stop_evidence(fifo, 4).await.is_err(),
+            "a regular replacement path cannot disguise the opened FIFO");
+        let regular = tokio::fs::File::open(&path).await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&path).status().unwrap().success());
+        assert_eq!(read_opened_stop_evidence(regular, 4).await.unwrap(), b"test",
+            "a replacement FIFO cannot change the already-opened regular descriptor");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[tokio::test]
     async fn forget_key_deletes_and_announces() {

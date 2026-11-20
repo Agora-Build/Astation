@@ -147,7 +147,95 @@ history, manager re-sign orchestration, snapshot publication and reopening
 remain required. Prepared plans have no automatic deletion or cancellation;
 authenticated account deletion follows the separate account lifecycle.
 
+## Retaining later native stops
+
+A manager's protected native journal may have signed a revoke or interrupt
+after the restored backup. An operator can retain those original signed objects
+as additional obligations on the exact prepared plan:
+
+```sh
+station-relay-server admin delegated-recovery retain-stops <genesis_hash> stops.json
+```
+
+The regular input file is strict JSON with exactly `plan_id`, `source_hash`
+(both from `prepare`) and `records` (1-64 original signed control objects).
+The file is at most 256 KiB. Its opened descriptor must be a regular file;
+on Unix the open is nonblocking so a replacement FIFO cannot stall the command.
+The command requires the same closed generation,
+ownership, membership and retained source as preparation; it never creates a
+missing plan. Every record must name this account/genesis and a native signer.
+Only revoke and interrupt records are accepted; a feed-bound service stop must
+name this Station origin. The original feed ID, body and signature are retained.
+A service's cover/hold/release or service-key signature is not a substitute for
+authoritative service-state reconciliation.
+
+Migration `0018` keeps these objects separately from the immutable checkpoint
+and live feed. The entire batch commits or none does. Concurrent imports
+serialize with preparation; identical retries are idempotent, while a record ID
+with different contents conflicts with both the checkpoint and imported history.
+Each origin/account history allows at most 4,096 distinct imported records and
+16 MiB of persisted JSONB. A later recovery generation includes all earlier
+imported stops; it cannot hide them by preparing another plan. Identical copies
+are deduplicated, and conflicting contents under one ID refuse recovery review.
+An import equal to a checkpoint record is still retained independently so that
+a later restored source cannot erase that accepted obligation.
+Malformed, oversized or inconsistent retained evidence refuses the report rather
+than omitting a stop. Imported evidence has no pruning/cancellation command.
+
+Both `prepare` and successful imports report every recovered record's metadata,
+its shared-verifier verdict and review requirement, plus a deterministic
+`evidence_hash`. They expose no signed bodies/signatures or private key material.
+An unknown, removed or invalid signer remains `authority_review`; importing its
+object never establishes that the stop is in force. The
+`fresh_manager_signature` and `retain_host_record` labels identify necessary
+future obligations, not sufficient authority, current effects or readiness.
+Missing later authority and history still require reconciliation for both.
+The report's
+`observed_issued_at_lower_bounds` covers only currently valid imported records.
+Those observed times do not establish the greatest time ever signed or reserved;
+they cannot clear an unknown clock anchor or permit signing. Import changes no
+live watermark, cursor, ACK, effect, reporting stop, signature or recovery fence.
+The `snapshot_complete` and `recovery_ready` fields remain false. Authoritative
+later service history, complete clocks, fresh manager signatures, snapshot
+publication and reopening are still required.
+
 ## Complete recovery sequence
+
+### Native evidence export
+
+In Astation, open Control Activity for the source Station and choose
+**Export Recovery Evidence**. The export reads the protected local journal;
+it needs no network request, signing key operation or new owner confirmation,
+and remains available while delegated signing is disabled. Changing account or
+Station access, or closing the review window, cancels an outstanding save.
+An expired network token does not authorize any remote call or prevent this
+local read for the remembered account; explicit sign-out disables export.
+The destination file is atomically saved with mode `0600`.
+
+The JSON archive identifies its account, genesis and original Station. `records`
+contains every retained original signed object, including completed deliveries,
+removed-manager stops and superseded originals. `unsigned_reviews` is separate:
+these drafts are unresolved intent, not signed stops. `destinations` preserves
+each record's original Station routes, including host-interrupt fanout. No
+private key, Recovery Kit, encryption secret, Portal credential or mirror
+credential is exported. The archive does contain public account/control metadata
+and signatures; share it only with the recovery operator.
+
+For `retain-stops`, the operator must match the archive's genesis and Station to
+the exact `prepare` report, then package `records` into batches with that report's
+`plan_id` and `source_hash`. Each batch must fit 64 records and 256 KiB; an export
+can exceed a single batch and is never silently truncated. Never submit
+`unsigned_reviews` as signed records or infer that their intent was applied.
+The archive itself is not a `retain-stops` input file or a recovery approval.
+
+This is a snapshot of one local journal, not proof that every manager, Station
+or later event has been found. `complete_history`, `signing_clock_complete`
+and `snapshot_complete` remain false. A locked, changed or uncertain protected
+checkpoint refuses export; no older fallback, signing, retry, receipt change or
+reopening is performed. Complete history and clock reconciliation, fresh
+manager confirmation and publication remain separate obligations.
+
+### Operator Steps
 
 1. Drain and stop every replica before restoring. Keep delegated serving,
    signing and reporting closed while recovery is incomplete. A rolling restore
