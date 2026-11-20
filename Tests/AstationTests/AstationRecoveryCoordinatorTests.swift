@@ -2695,6 +2695,50 @@ extension AstationRecoveryCoordinatorTests {
         XCTAssertTrue(try coordinator.pendingHostInterrupts().isEmpty)
     }
 
+    func testDurableHostStopIsAvailableForNativeCarriageAfterStationStorageAndRestart() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(authorizeDelegatedControl: { _ in })
+        _ = try await revokedSender(coordinator, harness: h)
+        var committed: [[String]] = []
+        coordinator.onControlCommit = {
+            do {
+                let log = try coordinator.channelMembership(hostID: "host-a")
+                committed.append(try coordinator.signedHostControls(for: log))
+            } catch { XCTFail("Commit callback must run after the account operation: \(error)") }
+        }
+        defer { coordinator.onControlCommit = nil }
+        let review = try await coordinator.prepareHostInterrupt(hostID: "host-a", current: { true })
+        let delivery = try await coordinator.commitHostInterrupt(review, current: { true })
+        XCTAssertTrue(delivery.stationStored)
+        XCTAssertEqual(committed.last, [delivery.recordJSON])
+        let log = try coordinator.channelMembership(hostID: "host-a")
+        XCTAssertEqual(try coordinator.signedHostControls(for: log), [delivery.recordJSON])
+        let restored = try h.coordinator(authorizeDelegatedControl: { _ in })
+        XCTAssertEqual(try restored.signedHostControls(for: log), [delivery.recordJSON])
+        let disabled = try h.coordinator()
+        XCTAssertEqual(try disabled.signedHostControls(for: log), [])
+        _ = try await addSecondManager(harness: h)
+        _ = try await restored.hostSenderMembership()
+        XCTAssertThrowsError(try restored.signedHostControls(for: log), "An old channel head cannot reuse the source")
+    }
+
+    func testNativeControlSourceRetainsButDoesNotCarryARemovedManagersSignature() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(authorizeDelegatedControl: { _ in })
+        _ = try await revokedSender(coordinator, harness: h)
+        let manager = try await addSecondManager(harness: h)
+        let review = try await coordinator.prepareHostInterrupt(hostID: "host-a", current: { true })
+        let delivery = try await coordinator.commitHostInterrupt(review, current: { true })
+        try await append(["action": "set_roles", "device_id": "manager-a", "roles": ["control", "view"]],
+            harness: h, signer: "manager-b", identity: manager)
+        let currentLog = await h.relay.log
+        let head = try XCTUnwrap(currentLog).head()
+        try await coordinator.refreshChannelMembership(hostID: "host-a", requiredHead: head)
+        let log = try coordinator.channelMembership(hostID: "host-a")
+        XCTAssertEqual(try coordinator.signedHostControls(for: log), [])
+        let activity = try XCTUnwrap(coordinator.localControlActivity().first { $0.body.recordId == delivery.recordID })
+        XCTAssertTrue(activity.managerReviewRequired)
+        XCTAssertTrue(activity.signed)
+    }
+
     func testHostFanoutLostReplyRetriesOnlyPendingStationWithOneOwnerConfirmation() async throws {
         let h = RecoveryCoordinatorHarness(), second = RecoveryMemoryRelay(stationOrigin: "https://second.example"), origin = "https://second.example"
         var coordinator: AstationRecoveryCoordinator? = try h.coordinator(authorizeDelegatedControl: { _ in },
@@ -2910,10 +2954,12 @@ extension AstationRecoveryCoordinatorTests {
         var coordinator: AstationRecoveryCoordinator? = try h.coordinator(authorizeDelegatedControl: { _ in })
         _ = try await revokedSender(coordinator!, harness: h)
         let review = try await coordinator!.prepareHostInterrupt(hostID: "host-a", current: { true })
+        let carriageLog = try coordinator!.channelMembership(hostID: "host-a")
         h.store.failOnControlSignature = true
         let confirmations = h.ownerRequests.count
         do { _ = try await coordinator!.commitHostInterrupt(review, current: { true }); XCTFail("uncertain write") }
         catch { XCTAssertEqual(error as? RemoteRecoveryError, .storageUncertain) }
+        XCTAssertThrowsError(try coordinator!.signedHostControls(for: carriageLog), "An uncertain signature must not escape over a native channel")
         let records = await h.relay.controls()
         XCTAssertTrue(records.isEmpty)
         coordinator = nil

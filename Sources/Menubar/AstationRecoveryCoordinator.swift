@@ -93,9 +93,11 @@ final class AstationRecoveryCoordinator {
     var onControlDelivery: ((RemoteControlDelivery) -> Void)?
     /// Deliver only durable head changes, after the account operation releases its lock.
     var onMembershipCommit: ((LogHead) -> Void)?
+    var onControlCommit: (() -> Void)?
     private var pendingMembershipHead: LogHead?
+    private var pendingControlCommit = false
     private var busy = false {
-        didSet { notifyMembershipCommit() }
+        didSet { notifyMembershipCommit(); notifyControlCommit() }
     }
     private var uncertain = false
 
@@ -221,6 +223,12 @@ final class AstationRecoveryCoordinator {
         guard !busy, let head = pendingMembershipHead else { return }
         pendingMembershipHead = nil
         onMembershipCommit?(head)
+    }
+
+    private func notifyControlCommit() {
+        guard !busy, !uncertain, pendingControlCommit else { return }
+        pendingControlCommit = false
+        onControlCommit?()
     }
 
     private func persist(_ change: (inout Saved) -> Void) throws {
@@ -1580,6 +1588,7 @@ extension AstationRecoveryCoordinator {
         guard let kit = try currentKit() else { throw RemoteRecoveryError.notCommitted }
         let persistControl: (Data) throws -> Void = { [unowned self] bytes in
             try self.persist { $0.controlPublications = ($0.controlPublications ?? [:]).merging([self.relayURL: bytes]) { _, new in new } }
+            self.pendingControlCommit = true
         }
         let value: RemoteControlPublication
         if let data = saved.controlPublications?[relayURL] {
@@ -1591,6 +1600,23 @@ extension AstationRecoveryCoordinator {
         }
         controlPublication = value
         return value
+    }
+
+    /// Native delivery uses the same durable signatures, independently of Station storage receipts.
+    func signedHostControls(for log: MembershipLog) throws -> [String] {
+        guard delegatedControlsAvailable else { return [] }
+        guard !uncertain else { throw RemoteRecoveryError.storageUncertain }
+        guard let kit = try currentKit(), log.frozen() == nil, log.accountId() == accountID,
+              log.genesisHash() == kit.genesisHash, log.head() == membershipLog?.head() else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        let journal = try controls()
+        return try journal.recordIDs.compactMap { id in
+            guard let delivery = try journal.retainedDelivery(recordID: id),
+                  try parseControlRecord(recordJson: delivery.recordJSON).principal.hasPrefix("host:"),
+                  case .valid = try verifyControlRecord(log: log, recordJson: delivery.recordJSON) else { return nil }
+            return delivery.recordJSON
+        }
     }
 
     static func latestHostSenderRevocation(log: MembershipLog, hostID: String) throws -> UInt64? {

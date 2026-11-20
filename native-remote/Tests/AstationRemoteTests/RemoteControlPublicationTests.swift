@@ -110,6 +110,160 @@ private final class ControlPublicationFixture {
 
 final class RemoteControlPublicationTests: XCTestCase {
     @MainActor
+    func testNativeCarriageSynchronizesMembershipAndKeepsExactStoredRecordIndependent() throws {
+        let f = try ControlPublicationFixture(), body = try f.hostBody()
+        _ = try f.prepare(body)
+        let record = try f.sign(body)
+        try f.journal.stationStored(XCTUnwrap(f.journal.retainedDelivery(recordID: body.recordId)))
+        let older = f.log.entries()[f.log.entries().count - 2]
+        let oldHead = LogHead(seq: f.log.head().seq - 1, hash: try XCTUnwrap(signedObjectInfo(json: older).entryHash))
+        var sent: [RemoteAgentOperation] = [], time: UInt64 = 100
+        let carriage = RemoteControlCarriage(log: f.log, hostID: "host", records: { [record] }, send: {
+            sent.append($0); return "membership-request"
+        }, failed: { XCTFail("Valid carriage failed") }, now: { time })
+        carriage.welcomed(controlWelcome(f.log, head: oldHead), automaticTimer: false)
+        XCTAssertEqual(sent, [.membership(Array(f.log.entriesAfter(seq: oldHead.seq)))])
+        _ = carriage.receiveVerified(.membershipHead(re: "membership-request", head: f.log.head(), pendingRecovery: []))
+        XCTAssertEqual(sent.count, 2)
+        guard case .message(let wire) = sent[1] else { return XCTFail("Missing control call") }
+        XCTAssertTrue(wire.contains(record), "Carriage must preserve the saved signed object")
+        let reply = try controlReply(wire)
+        XCTAssertTrue(carriage.receiveVerified(reply))
+        time = 100_000
+        carriage.refresh()
+        XCTAssertEqual(sent.count, 2)
+        XCTAssertTrue(try f.journal.pendingDeliveryIDs().isEmpty)
+        XCTAssertTrue(try XCTUnwrap(f.journal.retainedDelivery(recordID: body.recordId)).stationStored)
+    }
+
+    @MainActor
+    func testNativeCarriageBatchesRetriesPendingAndReplaysExactStopsAfterReconnect() throws {
+        let f = try ControlPublicationFixture(), body = try f.hostBody()
+        let records = try (0..<67).map { _ in
+            try buildControlRecord(provider: f.keys, keyId: "manager", body: ControlRecordBody(
+                accountId: body.accountId, genesisHash: body.genesisHash, origin: nil, feedId: nil,
+                principal: body.principal, principalKey: nil, signer: body.signer, action: body.action,
+                interruptRunning: nil, revokeSeq: body.revokeSeq, recordId: UUID().uuidString.lowercased(),
+                issuedAt: body.issuedAt, integrationId: nil, by: body.by))
+        }
+        var sent: [String] = [], time: UInt64 = 100
+        func make() -> RemoteControlCarriage {
+            RemoteControlCarriage(log: f.log, hostID: "host", records: { records }, send: {
+                guard case .message(let json) = $0 else { throw RemoteChannelError.invalidInput }
+                sent.append(json); return ""
+            }, failed: { XCTFail("Valid carriage failed") }, now: { time })
+        }
+        let carriage = make()
+        carriage.welcomed(controlWelcome(f.log), automaticTimer: false)
+        let first = try XCTUnwrap(sent.first)
+        XCTAssertLessThanOrEqual(first.utf8.count, 262_144)
+        XCTAssertEqual(try controlCallRecords(first).count, 64)
+        carriage.refresh()
+        XCTAssertEqual(sent.count, 1, "Only one call may be outstanding")
+        _ = carriage.receiveVerified(try controlReply(first, pendingFirst: true))
+        time = 5_099; carriage.refresh(); XCTAssertEqual(sent.count, 1)
+        time = 5_100; carriage.refresh(); XCTAssertEqual(sent.count, 2)
+        XCTAssertEqual(try controlCallRecords(sent[1]).count, 4, "Pending plus the next unsent records remain owed")
+        _ = carriage.receiveVerified(try controlReply(sent[1]))
+        time = 10_100; carriage.refresh(); XCTAssertEqual(sent.count, 2)
+        carriage.disconnect()
+        _ = carriage.receiveVerified(try controlReply(first))
+        let replacement = make()
+        replacement.welcomed(controlWelcome(f.log), automaticTimer: false)
+        XCTAssertEqual(try controlCallRecords(sent[2]), try controlCallRecords(first))
+    }
+
+    @MainActor
+    func testNativeCarriageRefusesServiceRecordsAndIgnoresUnsupportedOrForeignWelcome() throws {
+        let f = try ControlPublicationFixture(), hostBody = try f.hostBody()
+        let host = try buildControlRecord(provider: f.keys, keyId: "manager", body: hostBody)
+        let service = try buildControlRecord(provider: f.keys, keyId: "manager", body: f.body())
+        var failures = 0, sends = 0
+        let carriage = RemoteControlCarriage(log: f.log, hostID: "host", records: { [host, service] },
+            send: { _ in sends += 1; return "" }, failed: { failures += 1 })
+        carriage.welcomed(controlWelcome(f.log, features: []), automaticTimer: false)
+        carriage.welcomed(controlWelcome(f.log, account: "another-account"), automaticTimer: false)
+        XCTAssertEqual(sends, 0); XCTAssertEqual(failures, 0)
+        carriage.welcomed(controlWelcome(f.log), automaticTimer: false)
+        XCTAssertEqual(sends, 0, "A mixed call is refused whole before sending")
+        XCTAssertEqual(failures, 1)
+    }
+
+    @MainActor
+    func testNativeCarriageTimesOutWithoutMarkingTheStationStored() throws {
+        let f = try ControlPublicationFixture(), body = try f.hostBody()
+        _ = try f.prepare(body)
+        let record = try f.sign(body)
+        var time: UInt64 = 100, failures = 0, sends = 0
+        let carriage = RemoteControlCarriage(log: f.log, hostID: "host", records: { [record] },
+            send: { _ in sends += 1; return "" }, failed: { failures += 1 }, now: { time })
+        carriage.welcomed(controlWelcome(f.log), automaticTimer: false)
+        time = 30_099; carriage.refresh(); XCTAssertEqual(failures, 0)
+        time = 30_100; carriage.refresh(); XCTAssertEqual(failures, 1)
+        time = 90_000; carriage.refresh(); XCTAssertEqual(sends, 1)
+        XCTAssertFalse(try XCTUnwrap(f.journal.retainedDelivery(recordID: body.recordId)).stationStored)
+        XCTAssertEqual(try f.journal.pendingDeliveryIDs(), [body.recordId])
+    }
+
+    @MainActor
+    func testNativeCarriageWriteFailureAndBusyRetryNeverResignOrAcceptAnUnrelatedError() throws {
+        let f = try ControlPublicationFixture(), body = try f.hostBody()
+        _ = try f.prepare(body)
+        let record = try f.sign(body), signs = f.keys.signs
+        var failures = 0, time: UInt64 = 100, sent: [String] = []
+        let lost = RemoteControlCarriage(log: f.log, hostID: "host", records: { [record] },
+            send: { _ in throw RemoteChannelError.staleLink }, failed: { failures += 1 })
+        lost.welcomed(controlWelcome(f.log), automaticTimer: false)
+        XCTAssertEqual(failures, 1)
+        let replacement = RemoteControlCarriage(log: f.log, hostID: "host", records: { [record] }, send: {
+            guard case .message(let json) = $0 else { throw RemoteChannelError.invalidInput }
+            sent.append(json); return ""
+        }, failed: { XCTFail("Retry failed") }, now: { time })
+        replacement.welcomed(controlWelcome(f.log), automaticTimer: false)
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(sent[0].utf8)) as? [String: Any])
+        let data = try XCTUnwrap(root["data"] as? [String: Any]), id = try XCTUnwrap(data["id"] as? String)
+        XCTAssertFalse(replacement.receiveVerified(.error(code: "busy", re: UUID().uuidString.lowercased(), detail: nil, json: "")))
+        XCTAssertTrue(replacement.receiveVerified(.error(code: "busy", re: id, detail: nil, json: "")))
+        time = 5_100; replacement.refresh()
+        XCTAssertEqual(sent.count, 2)
+        XCTAssertNotEqual(sent[0], sent[1], "A retry has a fresh request id")
+        XCTAssertTrue(sent.allSatisfy { $0.contains(record) })
+        XCTAssertEqual(f.keys.signs, signs)
+        XCTAssertFalse(try XCTUnwrap(f.journal.retainedDelivery(recordID: body.recordId)).stationStored)
+    }
+
+    private func controlWelcome(_ log: MembershipLog, head: LogHead? = nil, account: String? = nil,
+        features: [String] = ["host.senders"]) -> WelcomeInfo {
+        WelcomeInfo(principal: "member:manager", clientKind: "native", permissions: ["control", "manage", "view"],
+            revision: 9, features: features, accountId: account ?? log.accountId(), atemDeviceId: "host", hostTrustGen: 1,
+            attachmentGen: "attachment", controllerSession: "controller", runtimeGen: "runtime",
+            authorizationMsLeft: 60_000, serverTime: 1_792_400_000_000, head: head ?? log.head(),
+            pendingRecovery: [], channelId: "channel", scopeJson: nil, verifier: nil, json: "")
+    }
+
+    private func controlCallRecords(_ call: String) throws -> [String] {
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(call.utf8)) as? [String: Any])
+        let data = try XCTUnwrap(root["data"] as? [String: Any])
+        return try XCTUnwrap(data["records"] as? [[String: Any]]).map {
+            try parseControlRecord(recordJson: String(decoding: JSONSerialization.data(withJSONObject: $0), as: UTF8.self)).recordId
+        }
+    }
+
+    private func controlReply(_ call: String, pendingFirst: Bool = false) throws -> ClientEvent {
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(call.utf8)) as? [String: Any])
+        let data = try XCTUnwrap(root["data"] as? [String: Any])
+        let re = try XCTUnwrap(data["id"] as? String)
+        let results = try controlCallRecords(call).enumerated().map { offset, id -> [String: Any] in
+            let outcome = pendingFirst && offset == 0 ? "pending" : "applied"
+            return ["record_id": id, "result": outcome, "effects": [["effect": "interrupt_running", "result": outcome]]]
+        }
+        let reply: [String: Any] = ["type": "session", "data": ["v": 1, "op": "control_records_result",
+            "id": UUID().uuidString.lowercased(), "re": re, "results": results]]
+        return .family(family: "session", op: "control_records_result",
+            json: String(decoding: try JSONSerialization.data(withJSONObject: reply), as: UTF8.self))
+    }
+
+    @MainActor
     func testPrimaryApplicationCannotHideManagerReviewForOtherStationsEvenAfterStorage() throws {
         let f = try ControlPublicationFixture(), body = try f.hostBody(), second = "https://second.example"
         _ = try f.journal.prepare(body: body, log: f.log, additionalStationOrigins: [second])

@@ -13,6 +13,7 @@ final class AstationR9Connection {
     private var router: RemoteChannelRouter!
     private var queue: RemoteSocketQueue!
     private var channel: RemoteAgentChannel?
+    private var controlCarriage: RemoteControlCarriage?
     private(set) var membershipHead: LogHead?
     private var membershipLog: MembershipLog?
     private var preparation: Task<Void, Never>?
@@ -28,6 +29,7 @@ final class AstationR9Connection {
     private let policyEvent: (ClientEvent, Bool) -> Void
     private let hostWorkEvent: (String) -> Bool
     private let verifierGate: RemoteVerifierSigningGate?
+    private let signedHostControls: ((MembershipLog) throws -> [String])?
 
     deinit { preparation?.cancel() }
 
@@ -42,6 +44,7 @@ final class AstationR9Connection {
          policyWelcomed: @escaping () -> Void = {}, policyEvent: @escaping (ClientEvent, Bool) -> Void = { _, _ in },
          hostWorkEvent: @escaping (String) -> Bool = { _ in false },
          verifierGate: RemoteVerifierSigningGate? = nil,
+         signedHostControls: ((MembershipLog) throws -> [String])? = nil,
          generation: UUID = UUID()) {
         self.context = context
         self.generation = generation
@@ -56,6 +59,7 @@ final class AstationR9Connection {
         self.policyEvent = policyEvent
         self.hostWorkEvent = hostWorkEvent
         self.verifierGate = verifierGate
+        self.signedHostControls = signedHostControls
         queue = RemoteSocketQueue(write: write, failed: { [weak self] _ in
             self?.finish("The r9 connection was interrupted. Reconnect to query pending requests.")
         })
@@ -124,10 +128,16 @@ final class AstationR9Connection {
         catch { return false }
     }
 
+    func refreshControlRecords() {
+        guard !closed, current() else { return }
+        controlCarriage?.refresh()
+    }
+
     func disconnect(sendClose: Bool = true) {
         guard !closed else { return }
         closed = true
         preparation?.cancel(); preparation = nil
+        controlCarriage?.disconnect(); controlCarriage = nil
         hostPolicyBinding = nil
         if !sendClose { queue.drain() }
         else if current(), let channel { queue.finish(with: RemoteChannelEnvelope.close(route: channel.route)) }
@@ -159,7 +169,19 @@ final class AstationR9Connection {
             welcome.authorization_ms_left = info.authorizationMsLeft; welcome.server_time = info.serverTime
             welcomed(welcome)
             policyWelcomed()
+            if !closed, current(), let signedHostControls {
+                let carriage = RemoteControlCarriage(log: membershipLog, hostID: context.device,
+                    records: { try signedHostControls(membershipLog) }, send: { [weak self] operation in
+                        guard let self, !closed, current(), let channel else { throw RemoteChannelError.staleLink }
+                        return try channel.perform(operation)
+                    }, failed: { [weak self] in
+                        self?.finish("A signed host stop could not be delivered. Reconnect to retry its saved record.")
+                    })
+                controlCarriage = carriage
+                carriage.welcomed(info)
+            }
         case .update(let update):
+            if controlCarriage?.receiveVerified(update) == true { return }
             switch update {
             case .hostPolicy(_, _, _, _, _, _, let observed, let json),
                  .hostPolicyChanged(_, _, _, let observed, let json):

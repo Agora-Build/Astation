@@ -192,6 +192,31 @@ verification. A version number does not substitute for the reported actions.
 
 ### Later host interruption
 
+The native connection also carries retained, already-signed host interrupts over
+its authenticated r9 channel. The coordinator supplies only durable signatures
+that still verify against that connection's exact account/genesis/head; unsigned
+reviews, service records, uncertain storage and superseded-manager signatures
+cannot enter this path. The ordinary application supplies this journal source,
+but it returns no records while delegated controls are disabled.
+
+`RemoteControlCarriage` sends missing membership first through the shared SDK's
+typed `sendMembership` method, in pages bounded to 64 entries and 256 KiB. It waits
+for the authenticated head before sending host records. Its `control_records`
+message preserves the saved signed objects and goes through the shared
+`sendJson` reader, feature checks and request/result correlation. Each message is
+bounded to 64 records and 256 KiB, with at most one outstanding call and 256
+retained records. A missing answer closes the channel after 30 seconds.
+
+A pending result or request error retains the exact signature for a later call
+under a new request ID. Applied/duplicate/refused results settle only this
+connection's delivery attempt; reconnect starts again from the durable journal.
+No channel result creates a Station receipt, ACK-ledger evidence or Portal
+report. Even a record already stored at every Station is still eligible for the
+native channel. The coordinator notifies live connections only after its durable
+account operation releases its lock; new records do not wait for another window
+or reconnect. Account/Station changes and retired channels retain the existing
+connection fences. Actual native/Atem carriage remains part of VII.A.
+
 Host Sending Access also provides a separate Interrupt review after a sender has
 been revoked. It selects the latest historical `host_sender_revoke` from the
 anchored device list, including after Readmit or removal of the host key. The
@@ -546,7 +571,9 @@ Still required before activation:
 - Authoritative replica/non-host verifier inventory carriage, wiring all live
   inventory invalidations, and complete multi-Station Interrupt routing. The
   protected per-Station fanout/retry adapter is implemented, but production roster
-  discovery, native-channel carriage and adding newly discovered routes remain.
+  discovery and adding newly discovered routes remain. Native-channel carriage
+  from the durable signed journal is implemented with separate channel-only
+  results; its real-host checks remain part of VII.A.
   Native host-sender
   Revoke/Readmit reviews, their UI and the inventory authorization adapter are
   implemented but remain gated, as are the selected-Station host Interrupt flow
