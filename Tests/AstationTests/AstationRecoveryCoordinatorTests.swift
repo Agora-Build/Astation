@@ -16,7 +16,11 @@ private final class RecoveryMemoryCheckpoint: AstationRecoveryCheckpointStorage 
     var failOnControlSignature = false
     var failOnVerifierRoster = false
     var writes = 0
-    func read() throws -> Data? { bytes }
+    var readFailure = false
+    func read() throws -> Data? {
+        if readFailure { throw RemoteRecoveryStoreError.keychain(errSecInteractionNotAllowed) }
+        return bytes
+    }
     func write(_ data: Data) throws {
         writes += 1
         bytes = data
@@ -2449,6 +2453,45 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         }
         resumed.resumeControlDelivery(portal: client, current: { true })
         await fulfillment(of: [finished], timeout: 2)
+    }
+
+    func testRecoveryEvidenceExportsRetainedOriginWithoutNetworkGateOrOwnerPrompt() async throws {
+        let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        var first: AstationRecoveryCoordinator? = try h.coordinator(authorizeDelegatedControl: { _ in })
+        let record = try await activeService(first!, transport: transport), client = try portal(transport)
+        let review = try await first!.prepareServiceControl(record, portal: client, interruptOnly: false,
+            interruptRunning: true, current: { true })
+        await h.relay.dropControlReply(disableEntries: true)
+        let pending = try await first!.commitServiceControl(review, portal: client, current: { true })
+        first = nil
+        let selected = RecoveryMemoryRelay(stationOrigin: "https://new.example")
+        let resumed = try h.coordinator(relayURL: "https://new.example", transport: selected)
+        XCTAssertFalse(resumed.delegatedControlsAvailable)
+        let confirmations = h.ownerRequests.count, before = h.store.bytes, writes = h.store.writes
+        let exported = try resumed.exportControlRecoveryEvidence(stationOrigin: pending.stationOrigin, current: { true })
+        let value = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(exported.utf8)) as? [String: Any])
+        XCTAssertEqual(value["station_origin"] as? String, pending.stationOrigin)
+        XCTAssertTrue(exported.contains(pending.recordJSON))
+        XCTAssertEqual((value["records"] as? [Any])?.count, 1)
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        XCTAssertEqual(h.store.bytes, before)
+        XCTAssertEqual(h.store.writes, writes)
+        let newRecords = await selected.controls()
+        XCTAssertTrue(newRecords.isEmpty)
+        XCTAssertThrowsError(try resumed.exportControlRecoveryEvidence(stationOrigin: pending.stationOrigin, current: { false }))
+        h.store.readFailure = true
+        XCTAssertThrowsError(try resumed.exportControlRecoveryEvidence(stationOrigin: pending.stationOrigin, current: { true }))
+        h.store.readFailure = false
+        XCTAssertEqual(try resumed.exportControlRecoveryEvidence(stationOrigin: pending.stationOrigin, current: { true }), exported)
+        var changed = try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(h.store.bytes), format: nil) as? [String: Any])
+        changed["managerID"] = "other-manager"
+        h.store.bytes = try PropertyListSerialization.data(fromPropertyList: changed, format: .binary, options: 0)
+        XCTAssertThrowsError(try resumed.exportControlRecoveryEvidence(stationOrigin: pending.stationOrigin, current: { true }))
+        h.store.bytes = before
+        XCTAssertThrowsError(try resumed.exportControlRecoveryEvidence(stationOrigin: pending.stationOrigin, current: { true }),
+            "A detected external change fences the instance even if its older bytes return")
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        XCTAssertEqual(h.store.writes, writes)
     }
 
     func testSavedServiceStopRetriesItsOriginalStationAfterSelectionAndProcessChange() async throws {

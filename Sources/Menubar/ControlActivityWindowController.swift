@@ -1,5 +1,6 @@
 import AppKit
 import AstationRemote
+import UniformTypeIdentifiers
 
 @MainActor
 final class ControlActivityWindowController: NSWindowController, NSWindowDelegate {
@@ -8,6 +9,8 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
     private let text = NSTextView()
     private let status = NSTextField(wrappingLabelWithString: "")
     private let refresh = NSButton(title: "Refresh", target: nil, action: nil)
+    private let export = NSButton(title: "Export Recovery Evidence...", target: nil, action: nil)
+    private var exportPanel: NSSavePanel?
     private let stops = NSPopUpButton()
     private let review = NSButton(title: "Review with Current Manager...", target: nil, action: nil)
     private let cancel = NSButton(title: "Cancel Unsigned Copy", target: nil, action: nil)
@@ -38,7 +41,7 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
         text.isVerticallyResizable = true; text.isHorizontallyResizable = false
         text.autoresizingMask = .width
         text.textContainer?.widthTracksTextView = true
-        let footer = NSStackView(views: [status, refresh]); footer.spacing = 12
+        let footer = NSStackView(views: [status, export, refresh]); footer.spacing = 12
         let actions = NSStackView(views: [review, cancel]); actions.spacing = 8
         let stack = NSStackView(views: [intro, scroll, stops, actions, footer])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 14
@@ -57,6 +60,7 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
         ])
         status.setContentHuggingPriority(.defaultLow, for: .horizontal)
         refresh.target = self; refresh.action = #selector(reload)
+        export.target = self; export.action = #selector(exportEvidence)
         stops.target = self; stops.action = #selector(selectionChanged)
         stops.setAccessibilityLabel("Stop requiring a fresh manager review")
         review.target = self; review.action = #selector(reviewStop)
@@ -94,6 +98,7 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
     }
 
     private func clearContext() {
+        exportPanel?.cancel(nil); exportPanel = nil
         coordinator = nil; current = nil; discovery = nil; rows = []; reviewRows = []; stops.removeAllItems(); render()
     }
 
@@ -124,14 +129,51 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
     @objc private func selectionChanged() { render() }
 
     private func render() {
-        let ready = task == nil && current?() == true && coordinator?.delegatedControlsAvailable == true &&
+        let ready = task == nil && exportPanel == nil && current?() == true && coordinator?.delegatedControlsAvailable == true &&
             (stationOrigin == nil || stationOrigin == coordinator?.relayURL)
         let replacement = selected?.replacementRecordID.flatMap { id in rows.first { $0.body.recordId == id } }
         review.title = replacement?.signed == true ? "Retry Saved Copy" : "Review with Current Manager..."
         review.isEnabled = ready && selected != nil
         cancel.isEnabled = ready && replacement?.signed == false
         stops.isEnabled = ready && !reviewRows.isEmpty
-        refresh.isEnabled = task == nil
+        refresh.isEnabled = task == nil && exportPanel == nil
+        export.isEnabled = task == nil && exportPanel == nil && hub.signedInAccount != nil &&
+            hub.portalSettings?.issuer != nil && !hub.accountSignInRequired
+    }
+
+    @objc private func exportEvidence() {
+        guard task == nil, exportPanel == nil, let window, let owner = hub.signedInAccount,
+              let issuer = hub.portalSettings?.issuer, !hub.accountSignInRequired else { return }
+        let epoch = generation, accountEpoch = hub.integrationAccountGeneration, selectedOrigin = hub.stationRelayUrl
+        let current: () -> Bool = { [weak self] in
+            guard let self else { return false }
+            return generation == epoch && window.isVisible && hub.stationRelayUrl == selectedOrigin &&
+                hub.integrationAccountGeneration == accountEpoch && hub.signedInAccount == owner &&
+                hub.portalSettings?.issuer == issuer && !hub.accountSignInRequired
+        }
+        do {
+            // A failed remote refresh must not hide the protected local journal.
+            let coordinator = try hub.recoveryCoordinator()
+            let evidence = try coordinator.exportControlRecoveryEvidence(stationOrigin: stationOrigin, current: current)
+            let panel = NSSavePanel()
+            exportPanel = panel
+            panel.nameFieldStringValue = "Astation Control Recovery.json"
+            panel.allowedContentTypes = [.json]
+            panel.message = "Save original signed stops and unsigned reviews for Station recovery. This file contains account and control metadata, not private keys. It does not confirm a complete history or resume access."
+            panel.beginSheetModal(for: window) { [weak self] result in
+                guard let self, self.exportPanel === panel else { return }
+                self.exportPanel = nil
+                defer { self.render() }
+                guard result == .OK, let url = panel.url, current() else { return }
+                do {
+                    try RecoveryKit.save(evidence, to: url)
+                    self.status.stringValue = "Recovery evidence saved. Complete history, clocks and manager review are still required."
+                } catch {
+                    self.status.stringValue = "Could not save recovery evidence: " + error.localizedDescription
+                }
+            }
+            render()
+        } catch { status.stringValue = "Could not export recovery evidence: " + error.localizedDescription }
     }
 
     static func explanation(_ review: RemoteControlReview, station: String) -> String {
@@ -203,7 +245,7 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
             guard let self else { return }
             defer { task = nil; render() }
             do {
-                if origin == selectedOrigin { try await hub.prepareAccountSecurityAccess() }
+                if origin == selectedOrigin { try await hub.prepareAccountSecurityAccess(allowSignIn: false) }
                 guard generation == epoch, window?.isVisible == true,
                       let owner = hub.signedInAccount, let issuer = hub.portalSettings?.issuer else { return }
                 let accountEpoch = hub.integrationAccountGeneration

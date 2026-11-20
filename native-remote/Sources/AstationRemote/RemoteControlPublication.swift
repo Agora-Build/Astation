@@ -405,6 +405,33 @@ public final class RemoteControlPublication {
             portalRefusal: operation.portalRefusal, additionalStations: operation.additionalStations ?? [:])
     }
 
+    /// Export original public evidence, including superseded and completed stops.
+    /// This is not a complete history, signing-clock anchor or recovery approval.
+    public func recoveryEvidenceJSON() throws -> String {
+        try available()
+        var records: [String] = [], unsigned: [String] = []
+        var destinations: [String: [String]] = [:]
+        for operation in saved.operations {
+            let body = try validate(operation)
+            destinations[body.recordId] = [saved.stationOrigin] + (operation.additionalStations ?? [:]).keys.sorted()
+            if let record = operation.recordJSON { records.append(record) }
+            else { unsigned.append(operation.bodyJSON) }
+        }
+        let metadata: [String: Any] = [
+            "type": "astation-native-control-recovery-evidence", "version": 1,
+            "account_id": saved.accountID, "genesis_hash": saved.genesisHash,
+            "station_origin": saved.stationOrigin, "destinations": destinations,
+            "retained_history_only": true, "complete_history": false,
+            "signing_clock_complete": false, "snapshot_complete": false,
+        ]
+        let header = String(decoding: try JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys]), as: UTF8.self)
+        // Keep the saved signed bytes; do not rebuild bodies or signatures.
+        let output = String(header.dropLast()) + ",\"records\":[" + records.joined(separator: ",") +
+            "],\"unsigned_reviews\":[" + unsigned.joined(separator: ",") + "]}"
+        guard output.utf8.count <= 8_388_608 else { throw RemoteControlPublicationError.full }
+        return output
+    }
+
     public func cancelUnsigned(recordID: String) throws {
         try available()
         let index = try index(recordID)

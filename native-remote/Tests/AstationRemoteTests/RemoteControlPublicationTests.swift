@@ -110,6 +110,91 @@ private final class ControlPublicationFixture {
 
 final class RemoteControlPublicationTests: XCTestCase {
     @MainActor
+    func testRecoveryExportPreservesSignedStopsAndSeparatesUnsignedIntentWithoutSigningOrWriting() throws {
+        let f = try ControlPublicationFixture(), signed = try f.body()
+        _ = try f.prepare(signed)
+        let record = try f.sign(signed)
+        let delivery = try XCTUnwrap(f.journal.retainedDelivery(recordID: signed.recordId))
+        try f.journal.stationStored(delivery)
+        try f.journal.portalMirrored(delivery)
+        let unsigned = try f.body(action: "interrupt_running", interrupt: nil)
+        _ = try f.prepare(unsigned)
+        let bytes = f.stored, signs = f.keys.signs
+        let exported = try f.journal.recoveryEvidenceJSON()
+        let value = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(exported.utf8)) as? [String: Any])
+        let records = try XCTUnwrap(value["records"] as? [[String: Any]])
+        XCTAssertEqual(records.count, 1)
+        XCTAssertTrue(exported.contains(record), "The original signed bytes must not be rebuilt")
+        XCTAssertEqual(try parseControlRecord(recordJson: String(decoding: JSONSerialization.data(withJSONObject: records[0]), as: UTF8.self)), signed)
+        let reviews = try XCTUnwrap(value["unsigned_reviews"] as? [[String: Any]])
+        XCTAssertEqual(reviews.count, 1)
+        XCTAssertEqual(reviews[0]["record_id"] as? String, unsigned.recordId)
+        XCTAssertEqual(value["account_id"] as? String, f.log.accountId())
+        XCTAssertEqual(value["genesis_hash"] as? String, f.log.genesisHash())
+        XCTAssertEqual(value["station_origin"] as? String, f.origin)
+        for key in ["complete_history", "signing_clock_complete", "snapshot_complete"] {
+            XCTAssertEqual(value[key] as? Bool, false)
+        }
+        XCTAssertEqual(value["retained_history_only"] as? Bool, true)
+        XCTAssertNil(value["portalMirror"])
+        XCTAssertNil(value["signerPublicKey"])
+        XCTAssertEqual(f.stored, bytes)
+        XCTAssertEqual(f.keys.signs, signs)
+        try f.restore()
+        XCTAssertEqual(try f.journal.recoveryEvidenceJSON(), exported)
+    }
+
+    @MainActor
+    func testRecoveryExportKeepsRemovedManagersSupersededStopAndReplacement() throws {
+        let f = try ControlPublicationFixture(), body = try f.body(interrupt: true)
+        _ = try f.prepare(body)
+        let original = try f.sign(body)
+        let next = try f.replaceManager()
+        let review = try f.journal.prepareResign(recordID: body.recordId, managerID: "other-manager",
+            issuedAt: body.issuedAt + 1, feedID: UUID().uuidString.lowercased(), log: f.log)
+        let replacement = try f.journal.sign(recordID: review.body.recordId, log: f.log, provider: next,
+            confirmedAt: 100, now: { 100 }, current: { true })
+        let before = f.stored, signs = f.keys.signs + next.signs
+        let exported = try f.journal.recoveryEvidenceJSON()
+        XCTAssertTrue(exported.contains(original))
+        XCTAssertTrue(exported.contains(replacement))
+        XCTAssertEqual(f.stored, before)
+        XCTAssertEqual(f.keys.signs + next.signs, signs)
+        try f.restore()
+        XCTAssertEqual(try f.journal.recoveryEvidenceJSON(), exported)
+    }
+
+    @MainActor
+    func testRecoveryExportKeepsEveryRecordBeyondWirePageLimitAndHostDestinations() throws {
+        let f = try ControlPublicationFixture(), host = try f.hostBody()
+        _ = try f.journal.prepare(body: host, log: f.log, additionalStationOrigins: ["https://other.example"])
+        let hostRecord = try f.sign(host)
+        for _ in 0..<64 {
+            let body = try f.body()
+            _ = try f.prepare(body)
+            _ = try f.sign(body)
+        }
+        let exported = try f.journal.recoveryEvidenceJSON()
+        let value = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(exported.utf8)) as? [String: Any])
+        XCTAssertEqual((value["records"] as? [Any])?.count, 65, "Export must not silently truncate at a wire-page bound")
+        let destinations = try XCTUnwrap(value["destinations"] as? [String: [String]])
+        XCTAssertEqual(destinations[host.recordId], [f.origin, "https://other.example"])
+        XCTAssertTrue(exported.contains(hostRecord))
+    }
+
+    @MainActor
+    func testRecoveryExportRefusesUncertainStorageRatherThanPublishingOlderEvidence() throws {
+        let f = try ControlPublicationFixture(), body = try f.body()
+        _ = try f.prepare(body)
+        f.failAfterWrite = true
+        XCTAssertThrowsError(try f.sign(body))
+        XCTAssertTrue(f.journal.storageUncertain)
+        XCTAssertThrowsError(try f.journal.recoveryEvidenceJSON()) { error in
+            XCTAssertEqual(error as? RemoteControlPublicationError, .storageUncertain)
+        }
+    }
+
+    @MainActor
     func testNativeCarriageSynchronizesMembershipAndKeepsExactStoredRecordIndependent() throws {
         let f = try ControlPublicationFixture(), body = try f.hostBody()
         _ = try f.prepare(body)

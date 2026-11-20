@@ -201,6 +201,40 @@ publication and reopening are still required.
 
 ## Complete recovery sequence
 
+### Native evidence export
+
+In Astation, open Control Activity for the source Station and choose
+**Export Recovery Evidence**. The export reads the protected local journal;
+it needs no network request, signing key operation or new owner confirmation,
+and remains available while delegated signing is disabled. Changing account or
+Station access, or closing the review window, cancels an outstanding save.
+The destination file is atomically saved with mode `0600`.
+
+The JSON archive identifies its account, genesis and original Station. `records`
+contains every retained original signed object, including completed deliveries,
+removed-manager stops and superseded originals. `unsigned_reviews` is separate:
+these drafts are unresolved intent, not signed stops. `destinations` preserves
+each record's original Station routes, including host-interrupt fanout. No
+private key, Recovery Kit, encryption secret, Portal credential or mirror
+credential is exported. The archive does contain public account/control metadata
+and signatures; share it only with the recovery operator.
+
+For `retain-stops`, the operator must match the archive's genesis and Station to
+the exact `prepare` report, then package `records` into batches with that report's
+`plan_id` and `source_hash`. Each batch must fit 64 records and 256 KiB; an export
+can exceed a single batch and is never silently truncated. Never submit
+`unsigned_reviews` as signed records or infer that their intent was applied.
+The archive itself is not a `retain-stops` input file or a recovery approval.
+
+This is a snapshot of one local journal, not proof that every manager, Station
+or later event has been found. `complete_history`, `signing_clock_complete`
+and `snapshot_complete` remain false. A locked, changed or uncertain protected
+checkpoint refuses export; no older fallback, signing, retry, receipt change or
+reopening is performed. Complete history and clock reconciliation, fresh
+manager confirmation and publication remain separate obligations.
+
+### Operator Steps
+
 1. Drain and stop every replica before restoring. Keep delegated serving,
    signing and reporting closed while recovery is incomplete. A rolling restore
    that leaves old sockets or writers alive is unsupported.
