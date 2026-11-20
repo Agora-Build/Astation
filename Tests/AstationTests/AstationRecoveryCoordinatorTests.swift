@@ -1,6 +1,6 @@
 import AppKit
 import AtemClient
-import AstationRemote
+@testable import AstationRemote
 import CryptoKit
 import Vision
 import XCTest
@@ -13,11 +13,18 @@ private final class RecoveryMemoryCheckpoint: AstationRecoveryCheckpointStorage 
     var failAtEntryCount: Int?
     var failOnRemoval = false
     var failOnControlSignature = false
+    var failOnVerifierRoster = false
     var writes = 0
     func read() throws -> Data? { bytes }
     func write(_ data: Data) throws {
         writes += 1
         bytes = data
+        if failOnVerifierRoster,
+           let saved = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+           (saved["verifierRosters"] as? [String: Any])?.isEmpty == false {
+            failOnVerifierRoster = false
+            throw RemoteRecoveryError.storageUncertain
+        }
         if failOnControlSignature,
            let saved = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
            let controls = saved["controlPublications"] as? [String: Data],
@@ -59,7 +66,7 @@ private final class RecoveryMemoryKeys: AstationRecoveryDataKeys {
     func installRecovered(_ values: [AccountDataKey], dataAccount: String) throws { keys = values; installs += 1 }
 }
 
-private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport {
+private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteStationVerifierTransport {
     nonisolated let controlStationOrigin: String
     init(stationOrigin: String = "https://configured.example") { controlStationOrigin = stationOrigin }
     var log: MembershipLog?
@@ -92,6 +99,20 @@ private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEn
     var holdControlSync = false
     var controlSyncWaiter: CheckedContinuation<Void, Never>?
     var wrongSyncCorrelation = false
+    var verifierGeneration: UInt64 = 1
+    var verifierReplicas = ["a", "b"]
+
+    func setVerifierRoster(generation: UInt64, replicas: [String]) { verifierGeneration = generation; verifierReplicas = replicas }
+    func stationVerifiers(genesisHash: String) throws -> RemoteStationVerifierSnapshot {
+        let log = try XCTUnwrap(log)
+        XCTAssertEqual(genesisHash, log.genesisHash())
+        let data = try JSONSerialization.data(withJSONObject: ["origin": controlStationOrigin,
+            "roster_generation": verifierGeneration, "account_id": account, "genesis_hash": genesisHash,
+            "head": ["seq": log.head().seq, "hash": log.head().hash],
+            "replicas": verifierReplicas.map { ["id": $0] }])
+        return try RemoteStationVerifierSnapshot.decode(data, origin: controlStationOrigin, genesis: genesisHash,
+            startedAt: RemoteVerifierSigningGate.evidenceTimeMilliseconds())
+    }
 
     func holdNextControlSync() { holdControlSync = true }
     func releaseControlSync() { holdControlSync = false; controlSyncWaiter?.resume(); controlSyncWaiter = nil }
@@ -335,7 +356,9 @@ private final class RecoveryCoordinatorHarness {
     func coordinator(relayURL: String = "https://configured.example", transport: RemoteRecoveryTransport? = nil,
         authorizeDelegatedControl: ((MembershipLog) throws -> Void)? = nil,
         authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)? = nil,
-        additionalControlStations: ((MembershipLog) throws -> [String: RemoteControlStationTransport])? = nil) throws -> AstationRecoveryCoordinator {
+        additionalControlStations: ((MembershipLog) throws -> [String: RemoteControlStationTransport])? = nil,
+        confirmVerifierRoster: ((AstationRecoveryCoordinator.VerifierRosterReview) async -> Bool)? = nil,
+        verifierTime: @escaping () -> UInt64 = { RemoteVerifierSigningGate.evidenceTimeMilliseconds() }) throws -> AstationRecoveryCoordinator {
         try AstationRecoveryCoordinator(accountID: "account-a", managerID: "manager-a", identity: identity,
             relayURL: relayURL, store: store, transport: transport ?? relay, dataKeys: keys,
             allowNewDataKey: { true }, confirmOwner: { [unowned self] request in
@@ -349,12 +372,156 @@ private final class RecoveryCoordinatorHarness {
                 savedKits.append(kit)
                 return save
             }, confirmServiceOwner: serviceOwnerConfirmation, authorizeDelegatedControl: authorizeDelegatedControl,
-            authorizeNewMembership: authorizeNewMembership, additionalControlStations: additionalControlStations)
+            authorizeNewMembership: authorizeNewMembership, additionalControlStations: additionalControlStations,
+            confirmVerifierRoster: confirmVerifierRoster, verifierTime: verifierTime)
     }
 }
 
 @MainActor
 final class AstationRecoveryCoordinatorTests: XCTestCase {
+    func testVerifierRosterAcceptanceIsProtectedDurableAndGrantsNoLiveSigningEvidence() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var confirmations = 0
+        let coordinator = try h.coordinator(confirmVerifierRoster: { _ in confirmations += 1; return true })
+        _ = try await coordinator.setup()
+        let before = h.ownerRequests.count
+        let review = try await coordinator.prepareStationVerifierRoster(current: { true })
+        XCTAssertNil(try coordinator.acceptedStationVerifierRoster())
+        XCTAssertEqual(review.candidate.replicas, ["a", "b"])
+        XCTAssertTrue(HostSenderAccessWindowController.serverReviewText(review).contains("https://configured.example"))
+        try await coordinator.acceptStationVerifierRoster(review, current: { true })
+        XCTAssertEqual(confirmations, 1)
+        XCTAssertEqual(try coordinator.acceptedStationVerifierRoster(), review.candidate)
+        XCTAssertEqual(h.ownerRequests.count, before, "Roster acceptance must not repurpose a membership signing request")
+        XCTAssertFalse(coordinator.hostSenderControlsAvailable)
+        let restarted = try h.coordinator()
+        XCTAssertEqual(try restarted.acceptedStationVerifierRoster(), review.candidate)
+        XCTAssertFalse(restarted.hostSenderControlsAvailable)
+    }
+
+    func testVerifierRosterDenyAndAccountChangeNeverSaveAcceptance() async throws {
+        for fault in ["deny", "account"] {
+            let h = RecoveryCoordinatorHarness()
+            var active = true
+            let coordinator = try h.coordinator(confirmVerifierRoster: { _ in
+                if fault == "account" { active = false }
+                return fault != "deny"
+            })
+            _ = try await coordinator.setup()
+            let review = try await coordinator.prepareStationVerifierRoster(current: { active })
+            do { try await coordinator.acceptStationVerifierRoster(review, current: { active }); XCTFail("accepted \(fault)") }
+            catch { }
+            XCTAssertNil(try coordinator.acceptedStationVerifierRoster())
+        }
+    }
+
+    func testVerifierRosterChangedDuringConfirmationRequiresANewExactReview() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let coordinator = try h.coordinator(confirmVerifierRoster: { _ in
+            await h.relay.setVerifierRoster(generation: 2, replicas: ["a"])
+            return true
+        })
+        _ = try await coordinator.setup()
+        let review = try await coordinator.prepareStationVerifierRoster(current: { true })
+        do { try await coordinator.acceptStationVerifierRoster(review, current: { true }); XCTFail("saved a different roster") }
+        catch { }
+        XCTAssertNil(try coordinator.acceptedStationVerifierRoster())
+    }
+
+    func testVerifierRosterRemovalIsExplicitAndRollbackNeverReplacesAcceptedState() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let coordinator = try h.coordinator(confirmVerifierRoster: { _ in true })
+        _ = try await coordinator.setup()
+        let first = try await coordinator.prepareStationVerifierRoster(current: { true })
+        try await coordinator.acceptStationVerifierRoster(first, current: { true })
+        await h.relay.setVerifierRoster(generation: 2, replicas: ["a"])
+        let changed = try await coordinator.prepareStationVerifierRoster(current: { true })
+        XCTAssertEqual(changed.removed, ["b"])
+        XCTAssertTrue(HostSenderAccessWindowController.serverReviewText(changed).contains("Servers removed from the current list:\nb"))
+        XCTAssertEqual(try coordinator.acceptedStationVerifierRoster(), first.candidate)
+        try await coordinator.acceptStationVerifierRoster(changed, current: { true })
+        await h.relay.setVerifierRoster(generation: 1, replicas: ["a", "b"])
+        do { _ = try await coordinator.prepareStationVerifierRoster(current: { true }); XCTFail("accepted a rolled back manifest") }
+        catch { }
+        XCTAssertEqual(try coordinator.acceptedStationVerifierRoster(), changed.candidate)
+    }
+
+    func testVerifierRosterUncertainWriteFencesTheInstanceAndReloadsOnlyTheConfirmedList() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let coordinator = try h.coordinator(confirmVerifierRoster: { _ in true })
+        _ = try await coordinator.setup()
+        let review = try await coordinator.prepareStationVerifierRoster(current: { true })
+        h.store.failOnVerifierRoster = true
+        do { try await coordinator.acceptStationVerifierRoster(review, current: { true }); XCTFail("uncertain write succeeded") }
+        catch { }
+        XCTAssertThrowsError(try coordinator.acceptedStationVerifierRoster())
+        let reloaded = try h.coordinator()
+        XCTAssertEqual(try reloaded.acceptedStationVerifierRoster(), review.candidate)
+        XCTAssertFalse(reloaded.hostSenderControlsAvailable)
+    }
+
+    func testVerifierRosterManagerDemotionAndHeadMovementDuringConfirmationNeverSave() async throws {
+        for demote in [false, true] {
+            let h = RecoveryCoordinatorHarness()
+            var manager: AtemE2EIdentity?
+            let coordinator = try h.coordinator(confirmVerifierRoster: { _ in
+                do {
+                    try await self.append(["action": "set_roles", "device_id": "manager-a",
+                        "roles": demote ? ["view"] : ["control", "manage", "view"]],
+                        harness: h, signer: "manager-b", identity: manager)
+                } catch { XCTFail("membership update failed: \(error)") }
+                return true
+            })
+            _ = try await coordinator.setup()
+            manager = try await addSecondManager(harness: h)
+            let review = try await coordinator.prepareStationVerifierRoster(current: { true })
+            do { try await coordinator.acceptStationVerifierRoster(review, current: { true }); XCTFail("saved an obsolete membership review") }
+            catch { }
+            let stored = await h.relay.log
+            let log = try XCTUnwrap(stored)
+            XCTAssertGreaterThan(log.head().seq, review.head.seq)
+            XCTAssertNil(try coordinator.acceptedStationVerifierRoster())
+        }
+    }
+
+    func testVerifierRosterReplacedOrConsumedReviewNeverReusesOwnerConfirmation() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var confirmations = 0
+        let coordinator = try h.coordinator(confirmVerifierRoster: { _ in confirmations += 1; return true })
+        _ = try await coordinator.setup()
+        let obsolete = try await coordinator.prepareStationVerifierRoster(current: { true })
+        let current = try await coordinator.prepareStationVerifierRoster(current: { true })
+        do { try await coordinator.acceptStationVerifierRoster(obsolete, current: { true }); XCTFail("accepted a replaced review") }
+        catch { }
+        XCTAssertEqual(confirmations, 0)
+        try await coordinator.acceptStationVerifierRoster(current, current: { true })
+        XCTAssertEqual(confirmations, 1)
+        do { try await coordinator.acceptStationVerifierRoster(current, current: { true }); XCTFail("replayed a consumed review") }
+        catch { }
+        XCTAssertEqual(confirmations, 1)
+        XCTAssertEqual(try coordinator.acceptedStationVerifierRoster(), current.candidate)
+    }
+
+    func testVerifierRosterExpiresBeforeOrDuringOwnerConfirmation() async throws {
+        for duringConfirmation in [false, true] {
+            let h = RecoveryCoordinatorHarness()
+            var time: UInt64 = 100
+            var confirmations = 0
+            let coordinator = try h.coordinator(confirmVerifierRoster: { _ in
+                confirmations += 1
+                time += 300_000
+                return true
+            }, verifierTime: { time })
+            _ = try await coordinator.setup()
+            let review = try await coordinator.prepareStationVerifierRoster(current: { true })
+            if !duringConfirmation { time = review.validBefore }
+            do { try await coordinator.acceptStationVerifierRoster(review, current: { true }); XCTFail("accepted an expired review") }
+            catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+            XCTAssertEqual(confirmations, duringConfirmation ? 1 : 0)
+            XCTAssertNil(try coordinator.acceptedStationVerifierRoster())
+        }
+    }
+
     func testNativeEnrollmentQRCodePreservesTheCompleteTrustAnchorWhenDecoded() async throws {
         let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
         _ = try await coordinator.setup()

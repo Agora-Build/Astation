@@ -134,12 +134,35 @@ at the protected signing boundary even if no close callback or timer ran. A
 fresh authenticated poll can renew evidence, but reusing an old snapshot cannot
 move its original deadline. No live report survives constructing a new provider.
 
+### Protected server-list review
+
+The native Host Sending Access window offers **Review Station Servers...** even
+while new-action signing is disabled. A current manager reviews the exact
+origin, roster revision and complete slot list. Removed slots are listed
+separately, with an explicit warning that they will no longer be checked.
+The list is not accepted merely by opening the window or fetching a response.
+
+Saving requires fresh Touch ID or Mac password confirmation. The coordinator
+checks the anchored account/genesis/head and the manager's local public keys
+before and after confirmation, fetches the same manifest again and writes the
+reviewed roster to the existing protected account checkpoint. A changed head,
+account, manager, selected Station or manifest requires another review. Reviews
+expire after five minutes; the final refresh and commit must complete within
+30 seconds of confirmation. A replaced or already consumed review cannot be
+replayed. Roster revision rollback and changed contents at the same revision
+are refused. An uncertain checkpoint write fences the coordinator until reload.
+
+At most 64 accepted Station rosters are retained. Acceptance persists the
+reviewed roster and genesis, not a live capability report, signature or reusable
+owner confirmation. Restart must still collect fresh independently authenticated
+evidence for every required participant before any new signing can be enabled.
+
 ## Remaining integration
 
 The production native constructor still supplies no all-participant provider.
-Protected manager roster acceptance, authenticated reports for other native/SDK
-members, complete Station discovery and the shared `required_version` helper
-remain required. A Station replica report proves only that replica's own core;
+Authenticated reports for other native/SDK members, complete Station discovery
+and the shared `required_version` helper remain required. A Station replica
+report proves only that replica's own core;
 it cannot confirm a host, member or unrelated SDK. OAuth login alone cannot prove
 that a reporter owns a signed-list member key. Shared host welcomes and local
 protected-key evidence retain their separate authority boundaries.
