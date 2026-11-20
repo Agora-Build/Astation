@@ -43,6 +43,9 @@ pub(crate) mod delegated_http;
 #[path = "delegated_recovery.rs"]
 pub(crate) mod delegated_recovery;
 
+#[path = "verifier_replicas.rs"]
+pub(crate) mod verifier_replicas;
+
 fn error(status: StatusCode, code: &'static str) -> Reply {
     (status, Json(json!({"error":{"code":code}})))
 }
@@ -164,6 +167,7 @@ pub struct RecoveryStore {
     memory: Option<Mutex<HashMap<String, (String, Root)>>>,
     delegated_origin: OnceLock<String>,
     delegated_recovery: OnceLock<delegated_recovery::Binding>,
+    verifier_replicas: OnceLock<verifier_replicas::ReplicaRegistry>,
     delegated_changes: tokio::sync::watch::Sender<u64>,
 }
 
@@ -196,6 +200,22 @@ impl RecoveryStore {
     }
 
     pub(crate) fn delegated_enabled(&self) -> bool { self.delegated_origin.get().is_some() }
+
+    pub(crate) async fn configure_verifier_replicas(&self, raw: &str) -> Result<(), &'static str> {
+        let configuration = verifier_replicas::Configuration::parse(raw)?;
+        if !self.delegated_enabled() || self.verifier_replicas.get().is_some() {
+            return Err("verifier reports require an initialized delegated deployment and configure only once");
+        }
+        let pool = self.pool.clone().ok_or("verifier reports require durable storage")?;
+        let binding = self.delegated_recovery.get().cloned().ok_or("recovery generation is not configured")?;
+        let registry = verifier_replicas::ReplicaRegistry::register(pool, binding, configuration).await
+            .map_err(|_| "cannot acquire the verifier replica slot; drain its previous process first")?;
+        self.verifier_replicas.set(registry).map_err(|_| "verifier reports already configured")
+    }
+
+    pub(crate) fn verifier_replicas(&self) -> Option<&verifier_replicas::ReplicaRegistry> {
+        self.verifier_replicas.get()
+    }
 
     pub(crate) async fn delegated_operation(&self, genesis: &str, owner: &str, command: delegated::Command) -> Reply {
         let Some(origin) = self.delegated_origin.get() else { return unavailable() };
@@ -542,6 +562,7 @@ impl RecoveryStore {
             memory: None,
             delegated_origin: OnceLock::new(),
             delegated_recovery: OnceLock::new(),
+            verifier_replicas: OnceLock::new(),
             delegated_changes: tokio::sync::watch::channel(0).0,
         })
     }
@@ -551,6 +572,7 @@ impl RecoveryStore {
             memory: None,
             delegated_origin: OnceLock::new(),
             delegated_recovery: OnceLock::new(),
+            verifier_replicas: OnceLock::new(),
             delegated_changes: tokio::sync::watch::channel(0).0,
         })
     }
@@ -592,6 +614,7 @@ impl RecoveryStore {
             memory: Some(Mutex::new(HashMap::new())),
             delegated_origin: OnceLock::new(),
             delegated_recovery: OnceLock::new(),
+            verifier_replicas: OnceLock::new(),
             delegated_changes: tokio::sync::watch::channel(0).0,
         })
     }
@@ -668,7 +691,8 @@ impl RecoveryStore {
         operation: Operation,
     ) -> Result<Reply, sqlx::Error> {
         let mut tx = pool.begin().await?;
-        if matches!(&operation, Operation::Delegated { .. } | Operation::HostRoute { .. }) {
+        if self.verifier_replicas.get().is_some()
+            || matches!(&operation, Operation::Delegated { .. } | Operation::HostRoute { .. }) {
             self.lock_delegated_recovery(&mut tx).await?;
         }
         let reply = self.database_apply(&mut tx, genesis, subject, hash, operation).await?;

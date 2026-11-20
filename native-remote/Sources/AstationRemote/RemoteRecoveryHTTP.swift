@@ -63,7 +63,7 @@ private final class RecoveryRedirectGuard: NSObject, URLSessionTaskDelegate, @un
 }
 
 /// TLS/account login limits storage access. Only the shared verifier grants cryptographic trust.
-public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, @unchecked Sendable {
+public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteStationVerifierTransport, @unchecked Sendable {
     private let baseURL: URL
     private let stationOrigin: String
     public var controlStationOrigin: String { stationOrigin }
@@ -96,6 +96,13 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
     }
 
     deinit { session.invalidateAndCancel() }
+
+    public func stationVerifiers(genesisHash: String) async throws -> RemoteStationVerifierSnapshot {
+        guard RemoteRecoveryKit.validHash(genesisHash) else { throw RemoteChannelError.invalidInput }
+        let startedAt = RemoteVerifierSigningGate.evidenceTimeMilliseconds()
+        let (_, data) = try await perform(url: path(genesisHash, "verifiers"), method: "GET")
+        return try RemoteStationVerifierSnapshot.decode(data, origin: stationOrigin, genesis: genesisHash, startedAt: startedAt)
+    }
 
     public func entries(genesisHash: String, after: UInt64) async throws -> RemoteRecoveryLogPage {
         guard RemoteRecoveryKit.validHash(genesisHash), after <= 9_007_199_254_740_991 else { throw RemoteChannelError.invalidInput }

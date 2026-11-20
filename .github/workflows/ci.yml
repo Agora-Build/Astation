@@ -210,6 +210,7 @@ jobs:
         run: |
           cargo test --locked --features delegated-host-work
           cargo test --locked --features delegated-host-work delegated -- --ignored --test-threads=4
+          cargo test --locked --features delegated-host-work verifier_replicas -- --ignored --test-threads=4
       - name: Run relay Redis (Valkey) suites
         working-directory: relay-server
         env:

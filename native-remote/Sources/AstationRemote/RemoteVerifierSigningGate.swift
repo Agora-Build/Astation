@@ -121,6 +121,21 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
         try observe(inventory, on: connection)
     }
 
+    /// An authenticated HTTP report consumes its lifetime from request start,
+    /// including token refresh and response delay. Replays cannot extend it.
+    public func observeConsumer(_ inventory: VerifierInventory?, on connection: Connection,
+                                receivedAt: UInt64, authorizationMilliseconds: UInt64) throws {
+        guard case .stationReplica = connection.verifier else { throw RemoteVerifierGateError.invalidInventory }
+        let deadline = receivedAt.addingReportingOverflow(authorizationMilliseconds)
+        let current = now()
+        guard receivedAt <= current, (1...30_000).contains(authorizationMilliseconds),
+              !deadline.overflow, current < deadline.partialValue else {
+            try observe(nil, on: connection, validBefore: deadline.overflow ? current : deadline.partialValue)
+            throw RemoteVerifierGateError.staleConnection
+        }
+        try observe(inventory, on: connection, validBefore: deadline.partialValue)
+    }
+
     /// The authenticated channel owner must disconnect this evidence when the channel closes,
     /// expires or loses authority; merely retaining a WelcomeInfo is not a live connection.
     /// Capture receivedAt using evidenceTimeMilliseconds when the verified welcome arrives,

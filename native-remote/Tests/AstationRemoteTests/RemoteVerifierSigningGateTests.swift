@@ -137,6 +137,94 @@ private final class VerifierChannelHarness {
 
 final class RemoteVerifierSigningGateTests: XCTestCase {
     @MainActor
+    func testStationEvidenceExpiresWithoutTimersAndFreshPollsConsumeRequestDelay() throws {
+        let f = try VerifierFixture(), roster = try RemoteStationVerifierRoster(origin: "https://station.example", generation: 1, replicas: ["a", "b"])
+        var time: UInt64 = 100
+        let gate = try stationGate(f, roster: roster, now: { time })
+        let evidence = try RemoteStationVerifierEvidence(gate: gate, roster: roster, log: f.log)
+        let request = try f.review().signingRequest(managerID: "manager")
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        try evidence.receive(stationSnapshot(f, started: 100), for: evidence.begin())
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        time = 399
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        time = 400
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        try evidence.receive(stationSnapshot(f, started: 350), for: evidence.begin())
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        time = 650
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        XCTAssertThrowsError(try evidence.receive(stationSnapshot(f, started: 100), for: evidence.begin()))
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+    }
+
+    @MainActor
+    func testStationPollRetirementAndFailureCannotRestoreOrInvalidateANewerReply() throws {
+        let f = try VerifierFixture(), roster = try RemoteStationVerifierRoster(origin: "https://station.example", generation: 1, replicas: ["a", "b"])
+        let gate = try stationGate(f, roster: roster), evidence = try RemoteStationVerifierEvidence(gate: gate, roster: roster, log: f.log)
+        let request = try f.review().signingRequest(managerID: "manager"), old = evidence.begin(), current = evidence.begin()
+        try evidence.receive(stationSnapshot(f), for: current)
+        XCTAssertThrowsError(try evidence.receive(stationSnapshot(f), for: old))
+        evidence.failed(old)
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        let pending = evidence.begin()
+        evidence.failed(pending)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        XCTAssertThrowsError(try evidence.receive(stationSnapshot(f), for: pending))
+        try evidence.receive(stationSnapshot(f), for: evidence.begin())
+        evidence.disconnect()
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+    }
+
+    @MainActor
+    func testStationRosterChangesDowngradeAndStaleProcessGenerationInvalidateEveryReplica() throws {
+        for fault in ["missing", "removed", "roster", "head", "account", "downgrade", "generation"] {
+            let f = try VerifierFixture(), roster = try RemoteStationVerifierRoster(origin: "https://station.example", generation: 1, replicas: ["a", "b"])
+            let gate = try stationGate(f, roster: roster), evidence = try RemoteStationVerifierEvidence(gate: gate, roster: roster, log: f.log)
+            let request = try f.review().signingRequest(managerID: "manager")
+            try evidence.receive(stationSnapshot(f), for: evidence.begin())
+            XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+            let changed = try stationSnapshot(f, fault: fault)
+            if fault == "missing" { try evidence.receive(changed, for: evidence.begin()) }
+            else { XCTAssertThrowsError(try evidence.receive(changed, for: evidence.begin()), fault) }
+            XCTAssertThrowsError(try gate.authorize(request, log: f.log), fault)
+        }
+    }
+
+    @MainActor
+    private func stationGate(_ f: VerifierFixture, roster: RemoteStationVerifierRoster,
+                             now: @escaping () -> UInt64 = { 100 }) throws -> RemoteVerifierSigningGate {
+        let others: [RemoteVerifierID] = [.host("host"), .member("manager"), .other("sdk")]
+        let gate = try RemoteVerifierSigningGate(log: f.log, verifiers: others + roster.replicas.map(roster.verifierID), now: now)
+        for id in others {
+            let connection = try gate.connect(id)
+            if case .host = id { try gate.observeHostWelcome(f.welcome(), on: connection) }
+            else { try gate.observeConsumer(verifierInventory(), on: connection) }
+        }
+        return gate
+    }
+
+    @MainActor
+    private func stationSnapshot(_ f: VerifierFixture, started: UInt64 = 100, fault: String = "") throws -> RemoteStationVerifierSnapshot {
+        let inventory = verifierInventory()
+        var rows: [[String: Any]] = ["a", "b"].map { ["id": $0, "connection_generation": 2,
+            "verifier": ["version": inventory.version, "actions": inventory.actions], "authorization_ms_left": 300] }
+        switch fault {
+        case "missing": rows[1] = ["id": "b", "connection_generation": 2]
+        case "removed": rows.removeLast()
+        case "downgrade": rows[1]["verifier"] = ["version": 1, "actions": ["add"]]
+        case "generation": rows[1]["connection_generation"] = 1
+        default: break
+        }
+        let origin = "https://station.example"
+        let object: [String: Any] = ["origin": origin, "roster_generation": fault == "roster" ? 2 : 1,
+            "account_id": fault == "account" ? "other" : f.log.accountId(), "genesis_hash": f.log.genesisHash(),
+            "head": ["seq": fault == "head" ? f.log.head().seq + 1 : f.log.head().seq, "hash": f.log.head().hash], "replicas": rows]
+        return try RemoteStationVerifierSnapshot.decode(JSONSerialization.data(withJSONObject: object), origin: origin,
+            genesis: f.log.genesisHash(), startedAt: started)
+    }
+
+    @MainActor
     func testChannelRecordsEvidenceBeforeReadyAndRetiresItOnEveryClosePath() async throws {
         for reason in ["disconnect", "link", "fence", "read failure", "expiry"] {
             let f = try VerifierFixture(), request = try f.review().signingRequest(managerID: "manager")
