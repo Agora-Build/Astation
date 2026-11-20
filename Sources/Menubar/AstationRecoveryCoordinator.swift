@@ -54,6 +54,7 @@ final class AstationRecoveryCoordinator {
         var controlPublications: [String: Data]?
         var hostSenderReview: Data?
         var supersededHostSenderPublications: [Data]?
+        var verifierRosters: [String: AcceptedVerifierRoster]?
     }
 
     nonisolated static let bootID = RemoteSystemClock.bootIdentifier
@@ -72,6 +73,8 @@ final class AstationRecoveryCoordinator {
     private let confirmServiceOwner: (RemoteServiceApproval, SignRequest) async -> Bool
     private let authorizeDelegatedControl: ((MembershipLog) throws -> Void)?
     private let authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)?
+    private let confirmVerifierRoster: ((VerifierRosterReview) async -> Bool)?
+    private let verifierTime: () -> UInt64
     /// The caller authenticates this account's Station roster and scopes each transport's token
     /// to its exact origin. A cached presence list is not a complete roster.
     private let additionalControlStations: ((MembershipLog) throws -> [String: RemoteControlStationTransport])?
@@ -104,6 +107,7 @@ final class AstationRecoveryCoordinator {
         didSet { notifyMembershipCommit(); notifyControlCommit() }
     }
     private var uncertain = false
+    private var verifierRosterReview: VerifierRosterReview?
 
     convenience init(accountID: String, managerID: String, identity: AtemE2EIdentity, relayURL: String,
         accessToken: @escaping @Sendable () async throws -> String, allowNewDataKey: @escaping () -> Bool) throws {
@@ -138,6 +142,12 @@ final class AstationRecoveryCoordinator {
                         continuation.resume(returning: $0)
                     }
                 }
+            }, confirmVerifierRoster: { _ in
+                await withCheckedContinuation { continuation in
+                    DeviceOwnerAuth.authenticate(reason: "confirm the reviewed Station server list") {
+                        continuation.resume(returning: $0)
+                    }
+                }
             })
     }
 
@@ -149,6 +159,8 @@ final class AstationRecoveryCoordinator {
         authorizeDelegatedControl: ((MembershipLog) throws -> Void)? = nil,
         authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)? = nil,
         additionalControlStations: ((MembershipLog) throws -> [String: RemoteControlStationTransport])? = nil,
+        confirmVerifierRoster: ((VerifierRosterReview) async -> Bool)? = nil,
+        verifierTime: @escaping () -> UInt64 = { RemoteVerifierSigningGate.evidenceTimeMilliseconds() },
         now: @escaping () -> HostClock = { AstationRecoveryCoordinator.clock() }) throws {
         self.accountID = accountID
         self.managerID = managerID
@@ -163,6 +175,8 @@ final class AstationRecoveryCoordinator {
         self.authorizeDelegatedControl = authorizeDelegatedControl
         self.authorizeNewMembership = authorizeNewMembership
         self.additionalControlStations = additionalControlStations
+        self.confirmVerifierRoster = confirmVerifierRoster
+        self.verifierTime = verifierTime
         self.confirmReplacement = confirmReplacement
         self.saveKit = saveKit
         self.now = now
@@ -1271,6 +1285,97 @@ final class AstationRecoveryCoordinator {
 }
 
 extension AstationRecoveryCoordinator {
+    private struct AcceptedVerifierRoster: Codable {
+        let genesis: String
+        let roster: RemoteStationVerifierRoster
+    }
+
+    struct VerifierRosterReview: Equatable {
+        let id: UUID
+        let account: String
+        let genesis: String
+        let head: LogHead
+        let previous: RemoteStationVerifierRoster?
+        let candidate: RemoteStationVerifierRoster
+        let validBefore: UInt64
+
+        var removed: [String] { (previous?.replicas ?? []).filter { !candidate.replicas.contains($0) } }
+    }
+
+    var verifierRosterReviewAvailable: Bool { confirmVerifierRoster != nil && http is RemoteStationVerifierTransport }
+
+    func acceptedStationVerifierRoster() throws -> RemoteStationVerifierRoster? {
+        guard !uncertain else { throw RemoteRecoveryError.storageUncertain }
+        guard let genesis = try currentKit()?.genesisHash,
+              let accepted = saved.verifierRosters?[relayURL], accepted.genesis == genesis else { return nil }
+        guard accepted.roster.origin == relayURL else { throw RemoteRecoveryError.invalidCheckpoint }
+        return accepted.roster
+    }
+
+    func prepareStationVerifierRoster(current: () -> Bool) async throws -> VerifierRosterReview {
+        try begin(); defer { busy = false }
+        guard verifierRosterReviewAvailable, let transport = http as? RemoteStationVerifierTransport,
+              current(), !Task.isCancelled, let kit = try currentKit() else { throw RemoteChannelError.staleLink }
+        let log = try await refreshedLog(genesis: kit.genesisHash)
+        try requireManager(log)
+        let snapshot = try await transport.stationVerifiers(genesisHash: kit.genesisHash)
+        guard current(), !Task.isCancelled, log.frozen() == nil,
+              snapshot.accountID == accountID, snapshot.genesisHash == kit.genesisHash,
+              snapshot.head == log.head(), snapshot.roster.origin == relayURL else { throw RemoteRecoveryError.requiresReview }
+        let previous = try acceptedStationVerifierRoster()
+        guard previous != nil || (saved.verifierRosters?.count ?? 0) < 64 else { throw RemoteRecoveryError.requiresReview }
+        if let previous {
+            guard snapshot.roster.generation >= previous.generation,
+                  snapshot.roster.generation != previous.generation || snapshot.roster == previous else {
+                throw RemoteRecoveryError.requiresReview
+            }
+        }
+        let deadline = verifierTime().addingReportingOverflow(300_000)
+        guard !deadline.overflow else { throw RemoteRecoveryError.requiresReview }
+        let review = VerifierRosterReview(id: UUID(), account: accountID, genesis: kit.genesisHash, head: log.head(),
+            previous: previous, candidate: snapshot.roster,
+            validBefore: deadline.partialValue)
+        verifierRosterReview = review
+        return review
+    }
+
+    func acceptStationVerifierRoster(_ review: VerifierRosterReview, current: () -> Bool) async throws {
+        try begin(); defer { busy = false }
+        guard let confirmVerifierRoster, let transport = http as? RemoteStationVerifierTransport else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        func check(_ log: MembershipLog) throws {
+            guard current(), !Task.isCancelled, verifierRosterReview == review,
+                  review.account == accountID, review.candidate.origin == relayURL,
+                  review.genesis == log.genesisHash(), review.head == log.head(), log.frozen() == nil,
+                  review.previous == (try acceptedStationVerifierRoster()),
+                  verifierTime() < review.validBefore else {
+                throw RemoteRecoveryError.requiresReview
+            }
+            try requireManager(log)
+        }
+        let before = try await refreshedLog(genesis: review.genesis)
+        try check(before)
+        guard await confirmVerifierRoster(review) else { throw RemoteRecoveryError.confirmationRequired }
+        let confirmedAt = verifierTime()
+        let log = try await refreshedLog(genesis: review.genesis)
+        try check(log)
+        let snapshot = try await transport.stationVerifiers(genesisHash: review.genesis)
+        try check(log)
+        let finishedAt = verifierTime()
+        guard snapshot.roster == review.candidate, snapshot.accountID == accountID,
+              snapshot.genesisHash == review.genesis, snapshot.head == review.head,
+              finishedAt >= confirmedAt, finishedAt - confirmedAt < 30_000 else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        try persist { value in
+            var rosters = value.verifierRosters ?? [:]
+            rosters[relayURL] = AcceptedVerifierRoster(genesis: review.genesis, roster: review.candidate)
+            value.verifierRosters = rosters
+        }
+        verifierRosterReview = nil
+    }
+
     var hostSenderControlsAvailable: Bool { authorizeNewMembership != nil && delegatedControlsAvailable }
 
     func pendingHostSenderReview() throws -> RemoteHostSenderReview? {

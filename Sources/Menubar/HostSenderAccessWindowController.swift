@@ -17,6 +17,7 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
     private let details = NSTextField(wrappingLabelWithString: "")
     private let status = NSTextField(wrappingLabelWithString: "")
     private let refresh = NSButton(title: "Refresh", target: nil, action: nil)
+    private let servers = NSButton(title: "Review Station Servers...", target: nil, action: nil)
     private let revoke = NSButton(title: "Revoke...", target: nil, action: nil)
     private let readmit = NSButton(title: "Readmit...", target: nil, action: nil)
     private let interrupt = NSButton(title: "Interrupt...", target: nil, action: nil)
@@ -32,7 +33,7 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
 
     init(hub: AstationHubManager) {
         self.hub = hub
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 420),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 470),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Host Sending Access"
         window.isReleasedWhenClosed = false
@@ -44,7 +45,7 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
         actions.spacing = 8
         let savedActions = NSStackView(views: [resume, cancel])
         savedActions.spacing = 8
-        let stack = NSStackView(views: [intro, hosts, details, actions, savedActions, status])
+        let stack = NSStackView(views: [intro, hosts, details, actions, savedActions, servers, status])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 16
         guard let content = window.contentView else { return }
         content.addSubview(stack)
@@ -61,7 +62,7 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
         status.textColor = .secondaryLabelColor
         hosts.target = self; hosts.action = #selector(selectedHost)
         hosts.setAccessibilityLabel("Host sender")
-        for (button, action) in [(refresh, #selector(reload)), (revoke, #selector(revokeHost)),
+        for (button, action) in [(refresh, #selector(reload)), (servers, #selector(reviewServers)), (revoke, #selector(revokeHost)),
             (readmit, #selector(readmitHost)), (interrupt, #selector(interruptHost)),
             (resume, #selector(resumeChange)), (cancel, #selector(cancelChange))] {
             button.bezelStyle = .rounded; button.target = self; button.action = action
@@ -176,6 +177,46 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
         resume.isEnabled = ready && hasSavedChange; cancel.isEnabled = ready && hasSavedChange
         hosts.isEnabled = task == nil && !hasSavedChange
         refresh.isEnabled = task == nil
+        servers.isEnabled = task == nil && current?() == true && coordinator?.verifierRosterReviewAvailable == true
+    }
+
+    static func serverReviewText(_ review: AstationRecoveryCoordinator.VerifierRosterReview) -> String {
+        var text = "Station: \(review.candidate.origin)\nServer list revision: \(review.candidate.generation)\n\nServers to check:\n"
+        text += review.candidate.replicas.joined(separator: "\n")
+        if !review.removed.isEmpty { text += "\n\nServers removed from the current list:\n" + review.removed.joined(separator: "\n") }
+        return text
+    }
+
+    @objc private func reviewServers() {
+        guard task == nil, let coordinator, let current, current(), NSApp.isActive else { return }
+        let epoch = generation
+        task = Task { [weak self] in
+            guard let self else { return }
+            defer { task = nil; render() }
+            do {
+                let review = try await coordinator.prepareStationVerifierRoster(current: current)
+                guard current(), NSApp.isActive, !Task.isCancelled else { throw AccountLoginError.changed }
+                let alert = NSAlert()
+                alert.messageText = "Review this Station's servers"
+                alert.informativeText = "All listed servers must confirm support before new permissions can be signed. Saving this list does not enable permissions or verify the servers."
+                if !review.removed.isEmpty {
+                    alert.alertStyle = .warning
+                    alert.informativeText += " Removed servers will no longer be checked. Confirm they no longer serve this Station."
+                }
+                let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 470, height: 200))
+                text.isEditable = false; text.isSelectable = true
+                text.font = .systemFont(ofSize: 12); text.string = Self.serverReviewText(review)
+                let scroll = NSScrollView(frame: text.frame)
+                scroll.hasVerticalScroller = true; scroll.documentView = text
+                alert.accessoryView = scroll
+                alert.addButton(withTitle: "Confirm Server List..."); alert.addButton(withTitle: "Cancel")
+                guard alert.runModal() == .alertFirstButtonReturn, current(), NSApp.isActive, !Task.isCancelled else { return }
+                try await coordinator.acceptStationVerifierRoster(review, current: current)
+                guard current(), generation == epoch else { return }
+                status.stringValue = "Station server list saved. Live support checks are still required."
+            } catch { if generation == epoch { status.stringValue = error.localizedDescription } }
+        }
+        render()
     }
 
     @objc private func revokeHost() { change(readmitting: false) }
