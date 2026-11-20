@@ -156,6 +156,33 @@ welcome cannot extend its first deadline, even after a missing report. A new
 authenticated connection needs fresh evidence. This does not discover the roster
 or replace the channel owner's invalidation duties.
 
+The first finite deadline is also retained when the initial welcome arrives too
+late to be accepted. Same-connection replay cannot revive that authorization.
+The default evidence clock is `ContinuousClock`, so system sleep consumes the
+authorization lifetime. Deferred callbacks must capture their receipt timestamp
+with the gate's clock rather than mixing clock origins. These expiry protections
+are merged in #91, main `fbd9c90`, after all six required checks passed.
+
+The native r9 connection and shared channel/router now accept an optional gate
+from the authoritative roster owner. Opening a channel retires the previous
+connection's report before the handshake. Only the shared core's verified welcome
+can supply new host evidence, synchronously before the ready callback. Closure,
+link loss, handshake/read/write failure, authorization expiry and disposal retire
+it. A fence or changed host membership head invalidates evidence before observers
+receive the event; an unchanged head leaves it usable. Late callbacks or closure
+from a retired channel cannot alter its replacement's evidence. A missing or
+unsupported inventory keeps signing off while the ordinary channel remains usable.
+
+This lifecycle plumbing does not enumerate the account, authenticate a Station
+replica/non-host report or supply the production gate. The normal native factory
+still passes no gate. Its roster provider and the remaining account-wide source
+invalidations are required before new-action signing can be enabled. Tests drive
+the adapter with controlled channel events and a real shared-verifier membership
+log. The native adapter regression uses the actual shared-core init and a refused
+accept to verify gate forwarding and failure cleanup. All 298 shared Swift tests
+(one optional skip) and 11 native-channel tests pass, without failures. These tests
+do not constitute a real host handshake or joint-check pass.
+
 All five actions require version 2 and the requested action in every live report.
 The adapter also implements the proposed version-1 rule for service scopes with
 launch/message/notify, including the prospective service's verifier on add. This
@@ -618,6 +645,33 @@ agreed implementation obligation, not deployed mailbox evidence.
 The required D3 ceremony wire change in Atem #176 remains held until the matching
 native implementation and partial-commit joint tests are ready. It is a separate
 coordinated change, with no compatibility fallback and no signing activation.
+
+### Remaining November 19 readings
+
+[Astation's latest contract response](https://github.com/Agora-Build/Atem/issues/120#issuecomment-7028723996)
+reviews Atem main `e8551409ad2072120ab4218f60dfc58ae5082bcc` (#189). The
+independent shared-vector checker passes 669 cases. The admission, result,
+completion and launch readings are agreed subject to the explicit durable
+staging, authorization, no-disclosure and dispatch fences in that response.
+This is contract review, without adopting that SDK or claiming VII.B.
+
+Two follow-ups remain explicit. Owner-channel query, resolution and interruption
+must support host-selector UUIDv5 tasks with recorded host-sender provenance;
+CLI-only resolution does not meet the mobile requirement. The proposed
+final-head-only project narrowing is not agreed: removing/narrowing permission
+and restoring it before catch-up currently lets old queued work survive, unlike
+the prior per-entry rule. Keep the prior requirement until the owner decides.
+Routine host encryption-key rotation also needs a separate reviewed operation;
+get is not rotation, and unsupported in-place re-verification is not a substitute.
+
+The isolated VII.A artifact is already built: `bin/atem.3cc0cc9`, SHA-256
+`47002a5871d9378e67df2254412042b5361d357fe4c009212e8e0c58b2db1c47`.
+The owner's decision to wait before switching the shared host still applies.
+The response specifies disposable service-principal cases, native-manager cases,
+scripted-profile coverage and the separate real Codex and local/LAN checks.
+Astation must publish exact readiness/builds and a run sheet before requesting
+that joint slot. No runtime, pairing or credential-agent change is authorized
+by these agreements.
 
 Next, build the Station host-mail mailbox (reuse enrollment mailbox
 storage only where the authority/retention semantics actually fit), native

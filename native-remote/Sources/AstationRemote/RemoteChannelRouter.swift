@@ -13,11 +13,12 @@ public final class RemoteChannelRouter {
     }
 
     public func open(hostID: String, identity: ClientIdentity, log: MembershipLog, needBefore: UInt64? = nil,
+        verifierGate: RemoteVerifierSigningGate? = nil,
         sign: @escaping (SignRequest) async throws -> Data,
         observe: @escaping (RemoteAgentChannel.Event) -> Void) throws -> RemoteAgentChannel {
         try open(make: { route, send, close, events in
             try RemoteAgentChannel(route: route, hostID: hostID, identity: identity, log: log,
-                needBefore: needBefore, sign: sign, send: send, close: close, observe: events)
+                needBefore: needBefore, verifierGate: verifierGate, sign: sign, send: send, close: close, observe: events)
         }, observe: observe)
     }
 

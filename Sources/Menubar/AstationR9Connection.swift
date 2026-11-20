@@ -27,6 +27,7 @@ final class AstationR9Connection {
     private let policyWelcomed: () -> Void
     private let policyEvent: (ClientEvent, Bool) -> Void
     private let hostWorkEvent: (String) -> Bool
+    private let verifierGate: RemoteVerifierSigningGate?
 
     deinit { preparation?.cancel() }
 
@@ -40,6 +41,7 @@ final class AstationR9Connection {
          handshakeStarted: @escaping () -> Void = {},
          policyWelcomed: @escaping () -> Void = {}, policyEvent: @escaping (ClientEvent, Bool) -> Void = { _, _ in },
          hostWorkEvent: @escaping (String) -> Bool = { _ in false },
+         verifierGate: RemoteVerifierSigningGate? = nil,
          generation: UUID = UUID()) {
         self.context = context
         self.generation = generation
@@ -53,6 +55,7 @@ final class AstationR9Connection {
         self.policyWelcomed = policyWelcomed
         self.policyEvent = policyEvent
         self.hostWorkEvent = hostWorkEvent
+        self.verifierGate = verifierGate
         queue = RemoteSocketQueue(write: write, failed: { [weak self] _ in
             self?.finish("The r9 connection was interrupted. Reconnect to query pending requests.")
         })
@@ -80,6 +83,7 @@ final class AstationR9Connection {
                 guard !closed, current() else { return }
                 Log.info("[R9] Opening encrypted channel to \(context.device) with membership seq \(log.head().seq)")
                 channel = try router.open(hostID: context.device, identity: identity, log: log,
+                    verifierGate: verifierGate,
                     sign: { [weak self] request in
                         try await signer.sign(request, isCurrent: { self?.current() == true && self?.closed == false })
                     }, observe: { [weak self] event in self?.observe(event) })

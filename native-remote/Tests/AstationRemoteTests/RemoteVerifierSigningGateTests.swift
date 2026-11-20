@@ -78,7 +78,173 @@ private final class VerifierFixture {
     }
 }
 
+@MainActor
+private final class VerifierChannelCore: RemoteChannelCore {
+    var acceptDeadline: UInt64? = 5_000
+    var isClosed = false
+    var events: [ClientEvent] = []
+    var receiveError: Error?
+    var startError: Error?
+    let welcomeInfo: WelcomeInfo
+
+    init(_ welcome: WelcomeInfo) { welcomeInfo = welcome }
+    func start(now: UInt64) throws -> Data {
+        if let startError { throw startError }
+        return Data()
+    }
+    func accept(_ frame: Data, now: UInt64) throws -> SignRequest {
+        SignRequest(keyId: "manager", purpose: .channel, freshConfirmation: false,
+            label: "atem-ch1-client", input: Data(), bodyJson: nil)
+    }
+    func finish(_ signature: Data, now: UInt64) throws -> Data { Data() }
+    func welcome(_ frame: Data, now: UInt64) throws -> WelcomeInfo { welcomeInfo }
+    func receive(_ frame: Data, now: UInt64) throws -> [ClientEvent] {
+        if let receiveError { throw receiveError }
+        return events
+    }
+    func perform(_ operation: RemoteAgentOperation, now: UInt64) throws -> Outgoing {
+        Outgoing(id: "unused", frame: Data())
+    }
+    func disconnect() { isClosed = true }
+}
+
+@MainActor
+private final class VerifierChannelHarness {
+    let route = try! RemoteChannelRoute(linkGeneration: UUID(), handle: "verified_host")
+    let core: VerifierChannelCore
+    let channel: RemoteAgentChannel
+
+    init(gate: RemoteVerifierSigningGate, welcome: WelcomeInfo, now: @escaping () -> UInt64 = { 100 },
+        ready: @escaping () -> Void = {}, update: @escaping (ClientEvent) -> Void = { _ in }) {
+        core = VerifierChannelCore(welcome)
+        channel = RemoteAgentChannel(route: route, core: core, clock: now, automaticTimer: false,
+            verifierEvidence: RemoteHostVerifierEvidence(gate: gate, hostID: "host"),
+            sign: { _ in Data() }, send: { _, _ in }, close: { _ in }, observe: { event in
+                if case .ready = event { ready() }
+                if case .update(let event) = event { update(event) }
+            })
+    }
+
+    func welcome() async throws {
+        if channel.phase == .new { try channel.start() }
+        channel.receive(Data(), from: route)
+        for _ in 0..<20 where channel.phase == .signing { await Task.yield() }
+        XCTAssertEqual(channel.phase, .awaitingWelcome)
+        channel.receive(Data(), from: route)
+        XCTAssertEqual(channel.phase, .ready)
+    }
+}
+
 final class RemoteVerifierSigningGateTests: XCTestCase {
+    @MainActor
+    func testChannelRecordsEvidenceBeforeReadyAndRetiresItOnEveryClosePath() async throws {
+        for reason in ["disconnect", "link", "fence", "read failure", "expiry"] {
+            let f = try VerifierFixture(), request = try f.review().signingRequest(managerID: "manager")
+            var time: UInt64 = 100
+            let (gate, _) = try f.confirmedGate(now: { time })
+            var ready = false
+            let h = VerifierChannelHarness(gate: gate, welcome: f.welcome(), now: { time }, ready: {
+                ready = true
+                do { try gate.authorize(request, log: f.log) }
+                catch { XCTFail("Evidence was not recorded before ready: \(error)") }
+            }, update: { event in
+                if case .fenced = event {
+                    do { try gate.authorize(request, log: f.log); XCTFail("Fence callback retained signing evidence") }
+                    catch { }
+                }
+            })
+            try h.channel.start()
+            XCTAssertThrowsError(try gate.authorize(request, log: f.log), reason)
+            try await h.welcome()
+            XCTAssertTrue(ready, reason)
+            switch reason {
+            case "disconnect": h.channel.disconnect()
+            case "link": h.channel.linkLost(generation: h.route.linkGeneration)
+            case "fence":
+                h.core.events = [.fenced(code: "unauthorized", detail: nil, json: "{}")]
+                h.channel.receive(Data(), from: h.route)
+            case "read failure":
+                h.core.receiveError = RemoteChannelError.invalidInput
+                h.channel.receive(Data(), from: h.route)
+            default:
+                time = 1_100
+                h.channel.checkDeadline()
+            }
+            XCTAssertEqual(h.channel.phase, .closed, reason)
+            XCTAssertThrowsError(try gate.authorize(request, log: f.log), reason)
+        }
+    }
+
+    @MainActor
+    func testChangedHostHeadInvalidatesEvidenceBeforeItsCallback() async throws {
+        let f = try VerifierFixture(), request = try f.review().signingRequest(managerID: "manager")
+        let (gate, _) = try f.confirmedGate()
+        var changed = false
+        let h = VerifierChannelHarness(gate: gate, welcome: f.welcome(), update: { event in
+            if case .membershipHead(_, let head, _) = event, head != f.log.head() {
+                changed = true
+                do { try gate.authorize(request, log: f.log); XCTFail("Changed-head callback retained signing evidence") }
+                catch { }
+            }
+        })
+        try await h.welcome()
+        h.core.events = [.membershipHead(re: nil, head: f.log.head(), pendingRecovery: [])]
+        h.channel.receive(Data(), from: h.route)
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        h.core.events = [.membershipHead(re: nil,
+            head: LogHead(seq: f.log.head().seq + 1, hash: String(repeating: "a", count: 64)), pendingRecovery: [])]
+        h.channel.receive(Data(), from: h.route)
+        XCTAssertTrue(changed)
+        XCTAssertEqual(h.channel.phase, .ready)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+    }
+
+    @MainActor
+    func testRetiredChannelCannotConfirmOrInvalidateTheReplacement() async throws {
+        let f = try VerifierFixture(), request = try f.review().signingRequest(managerID: "manager")
+        let (gate, _) = try f.confirmedGate()
+        let old = VerifierChannelHarness(gate: gate, welcome: f.welcome())
+        try old.channel.start()
+        let fresh = VerifierChannelHarness(gate: gate, welcome: f.welcome())
+        try await fresh.welcome()
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        try await old.welcome()
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        old.channel.linkLost(generation: old.route.linkGeneration)
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        fresh.channel.disconnect()
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+    }
+
+    @MainActor
+    func testUnconfirmedHostKeepsOrdinaryChannelUsableButCannotAuthorizeSigning() async throws {
+        for inventory in [nil, VerifierInventory(version: 2, actions: ["host_sender_revoke", "host_sender_revoke"])] {
+            let f = try VerifierFixture(), request = try f.review().signingRequest(managerID: "manager")
+            let (gate, _) = try f.confirmedGate()
+            let h = VerifierChannelHarness(gate: gate, welcome: f.welcome(inventory: inventory))
+            try await h.welcome()
+            XCTAssertNoThrow(try h.channel.perform(.list))
+            XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+            h.channel.disconnect()
+        }
+    }
+
+    @MainActor
+    func testChannelDisposalAndFailedHandshakeNeverLeaveEvidenceUsable() async throws {
+        let f = try VerifierFixture(), request = try f.review().signingRequest(managerID: "manager")
+        let (gate, _) = try f.confirmedGate()
+        var h: VerifierChannelHarness? = VerifierChannelHarness(gate: gate, welcome: f.welcome())
+        try await h!.welcome()
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        h = nil
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        let failed = VerifierChannelHarness(gate: gate, welcome: f.welcome())
+        failed.core.startError = RemoteChannelError.invalidInput
+        XCTAssertThrowsError(try failed.channel.start())
+        XCTAssertEqual(failed.channel.phase, .closed)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+    }
+
     @MainActor
     func testEnumeratedAccountRequiresEveryHostMemberReplicaAndOtherSDK() throws {
         let f = try VerifierFixture(), request = try f.review().signingRequest(managerID: "manager")
