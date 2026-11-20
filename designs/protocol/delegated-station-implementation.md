@@ -145,6 +145,12 @@ entry/scope rule in a production signer. The Rust/bindings helper and vectors
 were requested in [Atem #120](https://github.com/Agora-Build/Atem/issues/120#issuecomment-7030456149).
 Roster discovery and authenticated non-host report carriage remain Astation work.
 
+The next increment adds explicit durable Station-replica rosters, finite
+process reports, fenced account-private HTTP and a native reader/evidence
+adapter: [Station verifier inventory](station-verifier-inventory.md).
+The production participant provider remains unset. This does not establish
+authenticated reports for other native/SDK members or authorize signing.
+
 Each consumer starts unconfirmed. Reports are scoped to fresh connection tokens;
 reconnect, missing inventory, offline status, malformed inventory, lower versions
 and narrower action sets invalidate confirmation. Delayed reports/disconnects

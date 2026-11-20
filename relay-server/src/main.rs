@@ -854,6 +854,17 @@ async fn serve() {
             tracing::error!("Delegated host work cannot start: {}", reason);
             std::process::exit(1);
         }
+        if let Ok(configuration) = std::env::var("STATION_VERIFIER_CONFIGURATION") {
+            if !remote_api::recovery::verifier_replicas::Configuration::parse(&configuration)
+                .is_ok_and(|manifest| manifest.replicas.len() == expected_replicas) {
+                tracing::error!("Station verifier roster must list exactly RELAY_REPLICAS_EXPECTED slots");
+                std::process::exit(1);
+            }
+            if let Err(reason) = recovery.configure_verifier_replicas(&configuration).await {
+                tracing::error!("Station verifier reporting cannot start: {}", reason);
+                std::process::exit(1);
+            }
+        }
     }
 
     // Background tasks run for the life of the process; one that stops
@@ -861,6 +872,9 @@ async fn serve() {
     let mut background = cluster_tasks;
     if recovery.delegated_enabled() {
         background.push(("delegated Station heads", relay.spawn_delegated_heads()));
+    }
+    if let Some(registry) = recovery.verifier_replicas() {
+        background.push(("Station verifier inventory", registry.spawn_refresh()));
     }
     background.extend(spawn_upkeep(
         &relay,
@@ -897,6 +911,7 @@ async fn serve() {
     };
 
     let shutdown_hub = state.relay.clone();
+    let verifier_registry = state.recovery.verifier_replicas().cloned();
     let app = router(state);
 
     tracing::info!("Rate limiting configured:");
@@ -933,6 +948,11 @@ async fn serve() {
     serve_with_drain(listener, app, shutdown_hub, signal, relay::DRAIN_GRACE)
         .await
         .expect("Server error");
+    if let Some(registry) = verifier_registry {
+        if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), registry.withdraw()).await, Ok(Ok(()))) {
+            tracing::warn!("Station verifier withdrawal failed; its report will expire");
+        }
+    }
     tracing::info!("Relay stopped");
 }
 

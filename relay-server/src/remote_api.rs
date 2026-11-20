@@ -28,6 +28,7 @@ pub fn routes() -> Router<AppState> {
         .route("/logs/:genesis/control/reservations", axum::routing::post(recovery::delegated_http::reserve))
         .route("/logs/:genesis/control/records", axum::routing::post(recovery::delegated_http::publish))
         .route("/logs/:genesis/control/status", axum::routing::post(recovery::delegated_http::status))
+        .route("/logs/:genesis/verifiers", get(recovery::delegated_http::verifiers))
         .route("/logs/:genesis/backups/:version", get(recovery::backup).put(recovery::upload))
         .route("/logs/:genesis/probes/:host", axum::routing::post(recovery_probe::probe))
         .route("/logs/:genesis/device-enrollments/:id", get(recovery::device_enrollment::get)

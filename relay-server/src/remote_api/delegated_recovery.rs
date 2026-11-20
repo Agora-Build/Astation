@@ -209,7 +209,11 @@ impl RecoveryStore {
                     "delegated recovery initialization has not completed".into(),
                 ));
             }
-            binding.lock(connection).await
+            binding.lock(connection).await?;
+            if let Some(registry) = self.verifier_replicas() {
+                registry.lock_live(connection).await?;
+            }
+            Ok(())
         } else if self.delegated_enabled() {
             Err(sqlx::Error::Protocol(
                 "delegated recovery generation is not configured".into(),

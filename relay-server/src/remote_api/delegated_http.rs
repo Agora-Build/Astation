@@ -37,6 +37,23 @@ fn fields(value: &StrictValue, keys: &[&str]) -> bool {
     })
 }
 
+pub(crate) async fn verifiers(
+    State(state): State<AppState>, Path(genesis): Path<String>, headers: HeaderMap,
+) -> Reply {
+    let owner = match access(&state, &headers).await { Ok(owner) => owner, Err(reply) => return reply };
+    if genesis.len() != 64 || !genesis.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return invalid();
+    }
+    let Some(registry) = state.recovery.verifier_replicas() else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "verifier_inventory_unavailable");
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(10), registry.snapshot_for(&genesis, &owner)).await {
+        Ok(Ok(Some(snapshot))) => (StatusCode::OK, axum::Json(snapshot)),
+        Ok(Ok(None)) => error(StatusCode::NOT_FOUND, "recovery_record_not_found"),
+        _ => error(StatusCode::SERVICE_UNAVAILABLE, "verifier_inventory_unavailable"),
+    }
+}
+
 pub(crate) async fn heads(
     State(state): State<AppState>,
     Path(genesis): Path<String>,
