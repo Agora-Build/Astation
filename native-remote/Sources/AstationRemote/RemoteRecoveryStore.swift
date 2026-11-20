@@ -90,6 +90,10 @@ public final class RemoteRecoveryStore {
         try self.init(notificationAccountID: outcomeAccountID, genesisHash: genesisHash, deviceID: deviceID, purpose: "outcome-reminders")
     }
 
+    public convenience init(controlReminderAccountID: String, genesisHash: String, deviceID: String) throws {
+        try self.init(notificationAccountID: controlReminderAccountID, genesisHash: genesisHash, deviceID: deviceID, purpose: "control-reminders")
+    }
+
     private convenience init(notificationAccountID pushAccountID: String, genesisHash: String, deviceID: String, purpose: String) throws {
         guard RemoteRecoveryKit.validID(pushAccountID), RemoteRecoveryKit.validID(deviceID),
               genesisHash.utf8.count == 64, genesisHash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {

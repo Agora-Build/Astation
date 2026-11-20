@@ -240,6 +240,11 @@ class AstationApp: NSObject, NSApplicationDelegate {
             guard let hubManager else { return }
             notifications?.outcomesChanged(sourceID: source, work: work, hub: hubManager)
         }
+        hubManager.controlReviewsDidChange = { [weak notifications, weak hubManager] notice in
+            guard let hubManager else { return }
+            notifications?.controlReviewsChanged(notice, hub: hubManager)
+        }
+        hubManager.controlReviewNotificationsEnabled = { [weak notifications] in notifications?.inAppEnabled == true }
         statusBarController.approvalNotificationSettings = { [weak notifications] in notifications?.showPreferences() }
         statusBarController.approvalPendingCount = { [weak notifications] in notifications?.inbox.pendingCount ?? 0 }
         notifications.start()

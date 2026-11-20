@@ -307,6 +307,69 @@ class AstationHubManager: ObservableObject {
     @MainActor private var outcomeReminders: RemoteOutcomeReminders?
     @MainActor private var outcomeReminderScope: String?
     var hostOutcomesDidChange: (@MainActor (String, RemoteHostWork) -> Void)?
+    @MainActor private var controlReminders: RemoteControlReminders?
+    @MainActor private var controlReminderScope: String?
+    private var controlReviewTimer: Timer?
+    struct ControlReviewNotice {
+        let stationOrigin: String
+        let count: Int
+        let shouldNotify: Bool
+        let current: () -> Bool
+    }
+    var controlReviewsDidChange: (@MainActor (ControlReviewNotice) -> Void)?
+    var controlReviewNotificationsEnabled: (@MainActor () -> Bool)?
+
+    @MainActor private func refreshBackgroundControlReviews() {
+        guard !systemIsSleeping, identityRelayVerified, let owner = signedInAccount,
+              !accountSignInRequired, !stationAccountSignInRequired,
+              stationRegistration?.account == accountGeneration,
+              stationRegistration?.socket == identityRelaySocketGeneration,
+              stationRegistration?.origin == stationRelayUrl else { return }
+        do {
+            let coordinator = try recoveryCoordinator()
+            guard coordinator.delegatedControlsAvailable else { return }
+            let epoch = accountGeneration, origin = stationRelayUrl, account = e2eDataAccount
+            let registration = stationRegistrationGeneration
+            let current: () -> Bool = { [weak self, weak coordinator] in
+                guard let self, let coordinator else { return false }
+                return self.accountRecovery === coordinator && self.accountGeneration == epoch &&
+                    self.stationRegistrationGeneration == registration &&
+                    self.stationRelayUrl == origin && self.e2eDataAccount == account &&
+                    self.signedInAccount == owner && !self.accountSignInRequired &&
+                    !self.stationAccountSignInRequired && !self.systemIsSleeping && self.identityRelayVerified &&
+                    self.stationRegistration?.account == epoch &&
+                    self.stationRegistration?.socket == self.identityRelaySocketGeneration &&
+                    self.stationRegistration?.origin == origin
+            }
+            coordinator.resumeControlActivity(generation: registration, current: current) { [weak self] log, activity in
+                guard let self, current(), log.accountId() == account else { return }
+                let count = RemoteControlReminders.reviewIDs(activity).count
+                do {
+                    let scope = account + ":" + log.genesisHash()
+                    if self.controlReminderScope != scope {
+                        self.controlReminders = nil; self.controlReminderScope = nil
+                        let store = try RemoteRecoveryStore(controlReminderAccountID: account,
+                            genesisHash: log.genesisHash(), deviceID: AstationIdentity.shared.id)
+                        self.controlReminders = try RemoteControlReminders(accountID: account,
+                            genesisHash: log.genesisHash(), deviceID: AstationIdentity.shared.id,
+                            checkpoint: store.read(), persist: { try store.write($0) })
+                        self.controlReminderScope = scope
+                    }
+                    let notify: Bool
+                    if self.controlReviewNotificationsEnabled?() == true {
+                        notify = try self.controlReminders?.offer(stationOrigin: origin, activity: activity,
+                            now: UInt64(max(0, Date().timeIntervalSince1970 * 1000))) == true
+                    } else { notify = false }
+                    self.controlReviewsDidChange?(ControlReviewNotice(stationOrigin: origin, count: count,
+                        shouldNotify: notify, current: current))
+                } catch {
+                    Log.warn("[Delegated] Protected control reminders are unavailable; Control Activity remains available")
+                }
+            }
+        } catch {
+            // Background monitoring must not launch login or owner confirmation.
+        }
+    }
 
     @MainActor func takeOutcomeReminder(clientID: String, work: RemoteHostWork) -> Bool {
         guard hostWorkClients[clientID] === work, work.canReviewOutcomes, work.alertsLoaded,
@@ -693,6 +756,9 @@ class AstationHubManager: ObservableObject {
             name: NSWorkspace.willSleepNotification, object: nil)
         workspaceNotifications.addObserver(self, selector: #selector(systemDidWake),
             name: NSWorkspace.didWakeNotification, object: nil)
+        controlReviewTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshBackgroundControlReviews() }
+        }
         self.relayIdentityKeyManager.onChange = { [weak self] state in
             self?.finishRelayIdentityKeyLoad(state)
         }
@@ -717,6 +783,7 @@ class AstationHubManager: ObservableObject {
         sessionTimer?.invalidate()
         transportPolicyTimer?.invalidate()
         sessionExpiryTimer?.invalidate()
+        controlReviewTimer?.invalidate()
         identityRelayPathMonitor?.cancel()
         identityRelayTask?.cancel(with: .goingAway, reason: nil)
         if let core = coreHandle {
