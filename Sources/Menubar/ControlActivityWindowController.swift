@@ -138,21 +138,22 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
         stops.isEnabled = ready && !reviewRows.isEmpty
         refresh.isEnabled = task == nil && exportPanel == nil
         export.isEnabled = task == nil && exportPanel == nil && hub.signedInAccount != nil &&
-            hub.portalSettings?.issuer != nil && !hub.accountSignInRequired
+            hub.portalSettings?.issuer != nil
     }
 
     @objc private func exportEvidence() {
         guard task == nil, exportPanel == nil, let window, let owner = hub.signedInAccount,
-              let issuer = hub.portalSettings?.issuer, !hub.accountSignInRequired else { return }
+              let issuer = hub.portalSettings?.issuer else { return }
         let epoch = generation, accountEpoch = hub.integrationAccountGeneration, selectedOrigin = hub.stationRelayUrl
         let current: () -> Bool = { [weak self] in
             guard let self else { return false }
             return generation == epoch && window.isVisible && hub.stationRelayUrl == selectedOrigin &&
                 hub.integrationAccountGeneration == accountEpoch && hub.signedInAccount == owner &&
-                hub.portalSettings?.issuer == issuer && !hub.accountSignInRequired
+                hub.portalSettings?.issuer == issuer
         }
         do {
-            // A failed remote refresh must not hide the protected local journal.
+            // A failed remote refresh or expired token cannot hide this account's
+            // protected local evidence. Explicit sign-out clears the account.
             let coordinator = try hub.recoveryCoordinator()
             let evidence = try coordinator.exportControlRecoveryEvidence(stationOrigin: stationOrigin, current: current)
             let panel = NSSavePanel()

@@ -208,6 +208,8 @@ In Astation, open Control Activity for the source Station and choose
 it needs no network request, signing key operation or new owner confirmation,
 and remains available while delegated signing is disabled. Changing account or
 Station access, or closing the review window, cancels an outstanding save.
+An expired network token does not authorize any remote call or prevent this
+local read for the remembered account; explicit sign-out disables export.
 The destination file is atomically saved with mode `0600`.
 
 The JSON archive identifies its account, genesis and original Station. `records`
