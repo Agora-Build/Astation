@@ -82,6 +82,53 @@ private final class NativeChannelFixture {
 
 final class AstationR9NativeChannelTests: XCTestCase {
     @MainActor
+    func testNativeConnectionInvalidatesPreviousVerifierEvidenceBeforeAccept() async throws {
+        let f = try NativeChannelFixture()
+        let gate = try RemoteVerifierSigningGate(log: f.log,
+            verifiers: [.host("host-a"), .member("manager-a"), .stationReplica("test-replica")], now: { 100 })
+        let welcome = WelcomeInfo(principal: "member:manager-a", clientKind: "native", permissions: ["view", "control"],
+            revision: 9, features: [], accountId: "account-a", atemDeviceId: "host-a", hostTrustGen: 3,
+            attachmentGen: "attachment", controllerSession: "controller", runtimeGen: "runtime",
+            authorizationMsLeft: 1_000, serverTime: 1_792_400_000_000, head: f.log.head(),
+            pendingRecovery: [], channelId: "channel", scopeJson: nil, verifier: verifierInventory(), json: "")
+        for verifier in [RemoteVerifierID.host("host-a"), .member("manager-a"), .stationReplica("test-replica")] {
+            let token = try gate.connect(verifier)
+            if case .host = verifier { try gate.observeHostWelcome(welcome, on: token) }
+            else { try gate.observeConsumer(verifierInventory(), on: token) }
+        }
+        let review = try RemoteHostSenderReview(stationOrigin: "https://station.example", log: f.log,
+            managerID: "manager-a", hostID: "host-a", operation: .revoke(interruptRunning: false),
+            now: HostClock(wallMs: 1_792_400_000_000, monoMs: 100, bootId: "test-boot"))
+        let request = try review.signingRequest(managerID: "manager-a")
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+
+        let started = expectation(description: "Real shared-core init sent")
+        let failed = expectation(description: "Malformed accept closes native channel")
+        var route: RemoteChannelRoute?
+        let signer = try AstationChannelSigner(identity: f.identity, keyID: "manager-a",
+            active: { true }, confirm: { true })
+        let context = AtemSessionContext(route: RemoteTerminalConnection(clientId: "local-host", connectionId: "connection-a"),
+            account: "account-a", device: "host-a", pairingSession: "pairing-a")
+        let connection = AstationR9Connection(context: context, current: { true }, write: { bytes, completion in
+            if case .frame(let handle, _) = try? RemoteChannelEnvelope.readHost(bytes) {
+                route = try? RemoteChannelRoute(linkGeneration: f.generation, handle: handle)
+                started.fulfill()
+            }
+            completion(nil)
+        }, welcomed: { _ in XCTFail("Malformed accept cannot welcome") }, receive: { _ in },
+            failed: { _, _ in failed.fulfill() }, refreshMembership: { _ in },
+            verifierGate: gate, generation: f.generation)
+        try connection.start(identity: ClientIdentity(kind: .native, deviceId: "manager-a", keyId: "manager-a", grantJson: nil),
+            log: f.log, signer: signer)
+        await fulfillment(of: [started], timeout: 3)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log), "Native router must retire the old report before accept")
+        connection.receive(try RemoteChannelEnvelope.frame(Data("{}".utf8), route: XCTUnwrap(route)))
+        await fulfillment(of: [failed], timeout: 3)
+        XCTAssertTrue(connection.isClosed)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+    }
+
+    @MainActor
     func testRelayOnlyAndSessionsOpenOneHandshakeAfterOwnerConfirmation() async throws {
         let manager = AstationIdentity.shared.id
         let membership = try NativeChannelFixture(account: manager, manager: manager, device: "selected-host")

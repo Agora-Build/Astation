@@ -62,6 +62,7 @@ public final class RemoteAgentChannel {
     public private(set) var phase = Phase.new
     public var hostPolicyReady: Bool { phase == .ready && core.hostPolicyReady }
     private let core: RemoteChannelCore
+    private let verifierEvidence: RemoteHostVerifierEvidence?
     private let clock: () -> UInt64
     private let sign: (SignRequest) async throws -> Data
     private let send: (RemoteChannelRoute, Data) throws -> Void
@@ -75,24 +76,29 @@ public final class RemoteAgentChannel {
     public convenience init(
         route: RemoteChannelRoute, hostID: String, identity: ClientIdentity, log: MembershipLog,
         needBefore: UInt64? = nil,
-        clock: @escaping () -> UInt64 = { DispatchTime.now().uptimeNanoseconds / 1_000_000 },
+        verifierGate: RemoteVerifierSigningGate? = nil,
+        clock: @escaping () -> UInt64 = { RemoteVerifierSigningGate.evidenceTimeMilliseconds() },
         sign: @escaping (SignRequest) async throws -> Data,
         send: @escaping (RemoteChannelRoute, Data) throws -> Void,
         close: @escaping (RemoteChannelRoute) -> Void,
         observe: @escaping (Event) -> Void
     ) throws {
         let core = try SharedRemoteChannelCore(hostID: hostID, identity: identity, log: log, needBefore: needBefore)
-        self.init(route: route, core: core, clock: clock, sign: sign, send: send, close: close, observe: observe)
+        self.init(route: route, core: core, clock: clock,
+            verifierEvidence: verifierGate.map { RemoteHostVerifierEvidence(gate: $0, hostID: hostID) },
+            sign: sign, send: send, close: close, observe: observe)
     }
 
     init(
         route: RemoteChannelRoute, core: RemoteChannelCore, clock: @escaping () -> UInt64,
-        automaticTimer: Bool = true, sign: @escaping (SignRequest) async throws -> Data,
+        automaticTimer: Bool = true, verifierEvidence: RemoteHostVerifierEvidence? = nil,
+        sign: @escaping (SignRequest) async throws -> Data,
         send: @escaping (RemoteChannelRoute, Data) throws -> Void,
         close: @escaping (RemoteChannelRoute) -> Void, observe: @escaping (Event) -> Void
     ) {
         self.route = route
         self.core = core
+        self.verifierEvidence = verifierEvidence
         self.clock = clock
         self.automaticTimer = automaticTimer
         self.sign = sign
@@ -106,6 +112,7 @@ public final class RemoteAgentChannel {
     public func start() throws {
         guard phase == .new else { throw RemoteChannelError.alreadyStarted }
         do {
+            try verifierEvidence?.start()
             let frame = try core.start(now: clock())
             deadline = core.acceptDeadline
             transition(.awaitingAccept)
@@ -151,6 +158,7 @@ public final class RemoteAgentChannel {
                 let welcome = try core.welcome(frame, now: clock())
                 guard welcome.authorizationMsLeft > 0 else { throw RemoteChannelError.deadlineExceeded }
                 deadline = try addingDeadline(welcome.authorizationMsLeft)
+                verifierEvidence?.welcome(welcome)
                 transition(.ready)
                 if phase == .ready { observe(.ready(welcome)) }
             case .ready:
@@ -159,8 +167,12 @@ public final class RemoteAgentChannel {
                     switch event {
                     case .outgoing(let outgoing): try transmit(outgoing)
                     case .fenced:
+                        verifierEvidence?.disconnect()
                         observe(.update(event))
                         finish(nil)
+                    case .membershipHead(_, let head, _):
+                        verifierEvidence?.membershipHead(head)
+                        observe(.update(event))
                     default: observe(.update(event))
                     }
                 }
@@ -215,6 +227,7 @@ public final class RemoteAgentChannel {
     private func finish(_ error: Error?) {
         guard phase != .closed else { return }
         phase = .closed
+        verifierEvidence?.disconnect()
         timer?.cancel(); timer = nil
         signer?.cancel(); signer = nil
         core.disconnect()
