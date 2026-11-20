@@ -33,6 +33,9 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
     private var outcomeBannerSource: String?
     private var outcomeBannerGeneration = UUID()
     private var outcomeWindowController: NSWindowController?
+    private var controlBanner: NSPanel?
+    private var controlBannerGeneration = UUID()
+    private var controlActivityWindow: ControlActivityWindowController?
     var supportsPush: Bool { pushPlatform != nil }
 
     init(defaults: UserDefaults = .standard, platform: ApprovalPushPlatform? = ApprovalNotifications.platform,
@@ -55,6 +58,21 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
         reconciliation = ApprovalPushReconciliation(saved: defaults.data(forKey: "agentApprovalNotificationResolutions"))
         super.init()
         inbox.onNew = { [weak self] entry in self?.showInAppAlert(entry) }
+        for name in [Notification.Name.accountLoginChanged, .serverInfoChanged, .relayIdentityKeyChanged] {
+            NotificationCenter.default.addObserver(self, selector: #selector(clearControlBanner), name: name, object: nil)
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(clearControlBanner),
+            name: NSWorkspace.willSleepNotification, object: nil)
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
+    @objc private func clearControlBanner() {
+        controlBannerGeneration = UUID()
+        controlBanner?.orderOut(nil)
     }
 
     static var platform: ApprovalPushPlatform? {
@@ -108,7 +126,7 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
     func setInAppEnabled(_ enabled: Bool) {
         inAppEnabled = enabled
         defaults.set(enabled, forKey: inAppKey)
-        if !enabled { banner?.orderOut(nil); outcomeBanner?.orderOut(nil) }
+        if !enabled { banner?.orderOut(nil); outcomeBanner?.orderOut(nil); clearControlBanner() }
     }
 
     func setPushEnabled(_ enabled: Bool) {
@@ -205,6 +223,34 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
         outcomeWindowController?.showWindow(nil)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @MainActor func controlReviewsChanged(_ notice: AstationHubManager.ControlReviewNotice, hub: AstationHubManager) {
+        guard notice.current() else { clearControlBanner(); return }
+        if notice.count == 0 { clearControlBanner(); return }
+        guard inAppEnabled, notice.shouldNotify else { return }
+        let generation = UUID()
+        controlBannerGeneration = generation
+        let panel = controlBanner ?? NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered, defer: false)
+        panel.level = .floating; panel.isOpaque = false; panel.backgroundColor = .clear
+        panel.hasShadow = true; panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.contentView = NSHostingView(rootView: ControlReviewBannerView(count: notice.count, review: { [weak self, weak hub] in
+            guard let self, let hub, notice.current() else { return }
+            clearControlBanner()
+            if controlActivityWindow == nil { controlActivityWindow = ControlActivityWindowController(hub: hub) }
+            controlActivityWindow?.showWindow(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }, dismiss: { [weak self] in self?.clearControlBanner() }))
+        if let frame = NSScreen.main?.visibleFrame {
+            panel.setFrame(NSRect(x: frame.maxX - 424, y: frame.maxY - 440, width: 408, height: 172), display: true)
+        }
+        controlBanner = panel
+        panel.orderFrontRegardless()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            if self?.controlBannerGeneration == generation { self?.clearControlBanner() }
+        }
     }
 
     func received(userInfo: [String: Any]) {
@@ -304,6 +350,25 @@ final class ApprovalNotifications: NSObject, ObservableObject, UNUserNotificatio
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
             if self?.bannerKey == key { self?.banner?.orderOut(nil) }
         }
+    }
+}
+
+private struct ControlReviewBannerView: View {
+    let count: Int
+    let review: () -> Void
+    let dismiss: () -> Void
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Saved stops need manager review", systemImage: "exclamationmark.shield.fill").font(.headline)
+                Spacer()
+                Button(action: dismiss) { Image(systemName: "xmark") }.buttonStyle(.plain).help("Dismiss alert")
+            }
+            Text("\(count) saved stop\(count == 1 ? "" : "s") may need a fresh manager signature.")
+            Text("Review current access before confirming a new copy.").font(.caption)
+            HStack { Spacer(); Button("Review Control Activity", action: review).buttonStyle(.borderedProminent) }
+        }.padding(16).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
     }
 }
 

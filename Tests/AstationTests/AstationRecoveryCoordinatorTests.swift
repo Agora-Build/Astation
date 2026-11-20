@@ -95,7 +95,7 @@ private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEn
 
     func holdNextControlSync() { holdControlSync = true }
     func releaseControlSync() { holdControlSync = false; controlSyncWaiter?.resume(); controlSyncWaiter = nil }
-    func corruptControlSync() { wrongSyncCorrelation = true }
+    func corruptControlSync(_ value: Bool = true) { wrongSyncCorrelation = value }
     func replaceControlRecords(_ records: [String]) { controlRecords = records }
     func controlSync(genesisHash: String, callJSON: String) async throws -> String {
         guard case .controlSync(let id, let origin, let feed, let after) = try relayDecodeToStation(message: callJSON) else {
@@ -2440,6 +2440,135 @@ extension AstationRecoveryCoordinatorTests {
         }
         try await append(["action": "set_roles", "device_id": "manager-b", "roles": ["control", "view"]], harness: h)
         return records
+    }
+
+    func testBackgroundControlDiscoveryRunsWithoutAWindowAndNeverSigns() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(authorizeDelegatedControl: { _ in })
+        let records = try await stopsByRemovedManager(coordinator, harness: h)
+        let confirmations = h.ownerRequests.count
+        let deliveries = await h.relay.controlCallCount()
+        let found = expectation(description: "background review discovered")
+        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { log, activity in
+            XCTAssertEqual(log.accountId(), coordinator.accountID)
+            XCTAssertEqual(activity.map { $0.body.recordId }, records.compactMap { try? parseControlRecord(recordJson: $0).recordId })
+            XCTAssertEqual(activity.filter(\.requiresManagerReview).count, 1)
+            found.fulfill()
+        }
+        await fulfillment(of: [found], timeout: 5)
+        coordinator.stopControlActivity()
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+        let attempts = await h.relay.controlCallCount()
+        XCTAssertEqual(attempts, deliveries)
+    }
+
+    func testBackgroundControlDiscoveryContinuesPagesAndDeduplicatesAfterRestart() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(authorizeDelegatedControl: { _ in })
+        _ = try await stopsByRemovedManager(coordinator, harness: h, count: 65)
+        let first = expectation(description: "first bounded page"), second = expectation(description: "second bounded page")
+        var scans = 0
+        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { _, activity in
+            scans += 1
+            if scans == 1 { XCTAssertEqual(activity.count, 64); first.fulfill() }
+            else { XCTAssertEqual(activity.count, 65); second.fulfill() }
+        }
+        await fulfillment(of: [first], timeout: 5)
+        coordinator.refreshControlActivityInBackground()
+        await fulfillment(of: [second], timeout: 5)
+        coordinator.stopControlActivity()
+        let reads = await h.relay.syncReads
+        XCTAssertEqual(reads, [0, 64])
+        let resumed = try h.coordinator(authorizeDelegatedControl: { _ in })
+        let restarted = expectation(description: "restart retains all imported records")
+        resumed.resumeControlActivity(generation: UUID(), current: { true }) { _, activity in
+            XCTAssertEqual(activity.count, 65)
+            XCTAssertEqual(Set(activity.map { $0.body.recordId }).count, 65)
+            restarted.fulfill()
+        }
+        await fulfillment(of: [restarted], timeout: 5)
+        resumed.stopControlActivity()
+    }
+
+    func testBackgroundControlDiscoveryDiscardsRetiredAccountReplies() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(authorizeDelegatedControl: { _ in })
+        _ = try await stopsByRemovedManager(coordinator, harness: h)
+        await h.relay.holdNextControlSync()
+        let unexpected = expectation(description: "retired account must not notify")
+        unexpected.isInverted = true
+        var current = true
+        coordinator.resumeControlActivity(generation: UUID(), current: { current }) { _, _ in unexpected.fulfill() }
+        for _ in 0..<1_000 {
+            if await h.relay.controlSyncWaiter != nil { break }
+            await Task.yield()
+        }
+        let waiting = await h.relay.controlSyncWaiter != nil
+        XCTAssertTrue(waiting)
+        current = false
+        coordinator.stopControlActivity()
+        await h.relay.releaseControlSync()
+        await fulfillment(of: [unexpected], timeout: 0.1)
+        XCTAssertTrue(try coordinator.localControlActivity().isEmpty)
+    }
+
+    func testBackgroundControlDiscoveryCannotBypassTheDefaultActivationGate() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator()
+        _ = try await coordinator.setup()
+        let unexpected = expectation(description: "default gate must not notify")
+        unexpected.isInverted = true
+        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { _, _ in unexpected.fulfill() }
+        coordinator.refreshControlActivityInBackground()
+        await fulfillment(of: [unexpected], timeout: 0.1)
+        let reads = await h.relay.syncReads
+        XCTAssertTrue(reads.isEmpty)
+        coordinator.stopControlActivity()
+    }
+
+    func testBackgroundControlDiscoveryRetiresThePriorRegistrationBeforeStartingItsReplacement() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(authorizeDelegatedControl: { _ in })
+        _ = try await stopsByRemovedManager(coordinator, harness: h)
+        await h.relay.holdNextControlSync()
+        let old = expectation(description: "previous registration must not notify")
+        old.isInverted = true
+        let new = expectation(description: "replacement registration catches up")
+        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { _, _ in old.fulfill() }
+        for _ in 0..<1_000 {
+            if await h.relay.controlSyncWaiter != nil { break }
+            await Task.yield()
+        }
+        let waiting = await h.relay.controlSyncWaiter != nil
+        XCTAssertTrue(waiting)
+        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { _, activity in
+            XCTAssertEqual(activity.filter(\.requiresManagerReview).count, 1)
+            new.fulfill()
+        }
+        await h.relay.releaseControlSync()
+        await fulfillment(of: [old], timeout: 0.1)
+        XCTAssertTrue(try coordinator.localControlActivity().isEmpty)
+        coordinator.refreshControlActivityInBackground()
+        await fulfillment(of: [new], timeout: 5)
+        coordinator.stopControlActivity()
+    }
+
+    func testBackgroundControlDiscoveryDoesNotPublishAnEmptyScanOnFailureAndRetries() async throws {
+        let h = RecoveryCoordinatorHarness(), coordinator = try h.coordinator(authorizeDelegatedControl: { _ in })
+        _ = try await stopsByRemovedManager(coordinator, harness: h)
+        await h.relay.corruptControlSync()
+        var repaired = false
+        let failed = expectation(description: "invalid source is not an empty resolved scan")
+        failed.isInverted = true
+        let recovered = expectation(description: "later bounded retry recovers")
+        coordinator.resumeControlActivity(generation: UUID(), current: { true }) { _, activity in
+            if !repaired { failed.fulfill() }
+            else { XCTAssertEqual(activity.filter(\.requiresManagerReview).count, 1); recovered.fulfill() }
+        }
+        await fulfillment(of: [failed], timeout: 0.1)
+        XCTAssertTrue(try coordinator.localControlActivity().isEmpty)
+        repaired = true
+        await h.relay.corruptControlSync(false)
+        coordinator.refreshControlActivityInBackground()
+        await fulfillment(of: [recovered], timeout: 5)
+        coordinator.stopControlActivity()
+        let reads = await h.relay.syncReads
+        XCTAssertEqual(reads, [0, 0])
     }
 
     func testFreshManagerReviewDiscoversAnotherManagersStopAndRetriesExactCopyAfterRestart() async throws {

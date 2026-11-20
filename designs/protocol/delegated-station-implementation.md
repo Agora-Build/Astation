@@ -138,6 +138,13 @@ external inventory's completeness or authenticity itself. Omitting/removing an
 obsolete verifier is not automatic discovery and requires an explicit manager
 decision. The production application does not yet supply this authority.
 
+R9.2 also holds production signing-gate adoption until the shared
+`required_version` helper is available. It is absent from reviewed Atem main
+`e855140`; the native injection-only model is not permission to duplicate that
+entry/scope rule in a production signer. The Rust/bindings helper and vectors
+were requested in [Atem #120](https://github.com/Agora-Build/Atem/issues/120#issuecomment-7030456149).
+Roster discovery and authenticated non-host report carriage remain Astation work.
+
 Each consumer starts unconfirmed. Reports are scoped to fresh connection tokens;
 reconnect, missing inventory, offline status, malformed inventory, lower versions
 and narrower action sets invalidate confirmation. Delayed reports/disconnects
@@ -300,8 +307,35 @@ head for every batch, and rechecks the head and account/Station generation after
 the last response. Responses are not cached across window refreshes or restart;
 errors retain local records without displaying old application claims. Closing
 the window or changing account/Station retires the read and clears the view.
-Normal constructors keep server polling gated off. Proactive notifications,
-account-wide discovery across Stations and multi-Station aggregation remain open.
+Normal constructors keep server polling gated off. Account-wide discovery across
+Stations and multi-Station aggregation remain open.
+
+The native coordinator can now run this selected-Station discovery without an
+Activity window. An authenticated, registered account starts one bounded page
+and status refresh, then the existing account lifecycle timer retries every
+30 seconds. The same account writer serializes imports with foreground changes;
+busy or uncertain storage postpones the scan. The cursor advances only after a
+successful correlated page and current status refresh. Completed scans restart
+at zero so later manager removals are detected. A source error retains the
+cursor and journal; it never emits an empty/resolved alert set. Account, Station,
+registration, sleep, generation, membership and manager checks retire stale
+replies. The background path never signs, confirms, or requests login.
+
+Verified retained stops can trigger an in-app reminder for a fresh manager
+review, and another reminder after a day while unresolved. The protected reminder
+book is scoped to account/genesis/device and separately keyed by Station. It
+commits only record IDs and notification times before presentation, with no task,
+principal, tool, signer or response content. A failed or uncertain write produces
+no notification until protected reload. Disabling in-app notifications does not
+consume a reminder. A signed valid replacement suppresses the original's request
+for another signature; an unsigned or removed-manager replacement does not.
+Selected-Station application evidence cannot suppress another destination's
+review obligation. The banner opens Control Activity for a new verified review;
+it carries no approval or signing action. Context changes clear the banner.
+
+This is bounded discovery and local notification for the selected Station, not
+complete multi-Station/account-wide discovery or a new APNs payload. Its
+production activation remains tied to the delegated gate and VII.A.
 
 ### Fresh manager review of retained stops
 
@@ -580,7 +614,8 @@ Still required before activation:
   and the service Revoke/Interrupt journal.
   Selected-Station activity, bounded discovery of other managers' removed-signer
   stops and fresh protected re-sign reviews are implemented and gated off.
-  Account-wide alert discovery and proactive notifications remain required.
+  Background discovery and protected in-app reminders now cover the selected
+  Station. Complete account-wide alert discovery remains required.
   Unknown-outcome listing, resolution review, protected reminder
   policy and push routing are implemented; their real joint checks remain open.
 - Complete restore/reset tooling: a restored database must never reuse a

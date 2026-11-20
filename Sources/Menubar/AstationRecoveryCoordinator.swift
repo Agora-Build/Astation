@@ -90,6 +90,10 @@ final class AstationRecoveryCoordinator {
     private var controlPublication: RemoteControlPublication?
     private var controlDeliveryContext: (portal: PortalIntegrationHTTP, current: () -> Bool)?
     private var controlDeliveryTask: Task<Void, Never>?
+    private var controlActivityContext: (generation: UUID, current: () -> Bool,
+        updated: (MembershipLog, [RemoteControlActivity]) -> Void)?
+    private var controlActivityTask: Task<Void, Never>?
+    private var controlActivityPage: ControlDiscoveryPage?
     var onControlDelivery: ((RemoteControlDelivery) -> Void)?
     /// Deliver only durable head changes, after the account operation releases its lock.
     var onMembershipCommit: ((LogHead) -> Void)?
@@ -175,7 +179,10 @@ final class AstationRecoveryCoordinator {
             try commitLog(log)
         } else if saved.membership != nil { throw RemoteRecoveryError.invalidCheckpoint }
         checkpointTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.checkpointFromLifecycle() }
+            MainActor.assumeIsolated {
+                self?.checkpointFromLifecycle()
+                self?.refreshControlActivityInBackground()
+            }
         }
         for (center, name) in [(NotificationCenter.default, NSApplication.didResignActiveNotification),
                                (NSWorkspace.shared.notificationCenter, NSWorkspace.willSleepNotification)] {
@@ -188,6 +195,7 @@ final class AstationRecoveryCoordinator {
 
     deinit {
         checkpointTimer?.invalidate()
+        controlActivityTask?.cancel()
         for (center, observer) in lifecycleObservers { center.removeObserver(observer) }
     }
 
@@ -1439,6 +1447,48 @@ extension AstationRecoveryCoordinator {
         let after: UInt64
         let more: Bool
         let membershipHead: LogHead
+    }
+
+    func resumeControlActivity(generation: UUID, current: @escaping () -> Bool,
+        updated: @escaping (MembershipLog, [RemoteControlActivity]) -> Void) {
+        guard delegatedControlsAvailable, controlActivityContext?.generation != generation else { return }
+        controlActivityTask?.cancel()
+        controlActivityPage = nil
+        controlActivityContext = (generation, current, updated)
+        refreshControlActivityInBackground()
+    }
+
+    func stopControlActivity() {
+        controlActivityContext = nil
+        controlActivityPage = nil
+        controlActivityTask?.cancel()
+    }
+
+    /// One bounded feed page per tick. The same account writer serializes this
+    /// read/import with foreground changes; no background operation signs.
+    func refreshControlActivityInBackground() {
+        guard delegatedControlsAvailable, !busy, !uncertain, controlActivityTask == nil,
+              let context = controlActivityContext, context.current() else { return }
+        let current: () -> Bool = { [weak self] in
+            self?.controlActivityContext?.generation == context.generation && context.current()
+        }
+        controlActivityTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.controlActivityTask = nil }
+            do {
+                let page = try await self.discoverControlActivity(previous: self.controlActivityPage, current: current)
+                guard current(), !Task.isCancelled else { return }
+                let activity = try await self.refreshControlActivity(current: current)
+                guard current(), !Task.isCancelled, !self.uncertain, let log = self.membershipLog else { return }
+                try self.requireManager(log)
+                try self.requireDelegatedControl(log)
+                self.controlActivityPage = page
+                context.updated(log, activity)
+            } catch {
+                // Keep the previous cursor and durable journal for the next tick.
+                // An unavailable source is never an empty, resolved alert set.
+            }
+        }
     }
 
     /// One bounded page per refresh. A list change restarts discovery at zero.
