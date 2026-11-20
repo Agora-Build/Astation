@@ -41,6 +41,9 @@ zeroize = "1"
 # reconnect, pub/sub, Lua scripts. Valkey-compatible.
 redis = { version = "0.27", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "keep-alive"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 atem-client = { git = "https://github.com/Agora-Build/Atem.git", rev = "d59f98f46816d16bbbf06d39f783fafe2602966d", features = ["software-keys"] }
 tokio = { version = "1", features = ["test-util"] }

@@ -56,6 +56,52 @@ async fn state(pool: &sqlx::PgPool) -> Value {
 
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovered_checkpoint_duplicate_survives_changed_source_generation() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (store, _, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    let plan = prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let before = state(&database.pool).await;
+    let record = before["root"]["delegated"][ORIGIN]["records"][1].clone();
+    let bytes = input(&plan, vec![record.clone(), record.clone()]);
+    let first = retain(&database.pool, &binding, &genesis, &bytes)
+        .await
+        .unwrap();
+    assert_eq!(first["recovered_stops"]["records"].as_array().unwrap().len(), 1);
+    assert_eq!(state(&database.pool).await["stops"].as_array().unwrap().len(), 1);
+    assert_eq!(retain(&database.pool, &binding, &genesis, &bytes).await.unwrap(), first);
+    for key in ["root", "plans", "fences"] {
+        assert_eq!(state(&database.pool).await[key], before[key], "{key}");
+    }
+
+    // A later restored source can lack this stop. Its accepted import must
+    // remain an obligation independently of the older immutable checkpoint.
+    let mut changed_source = before["root"].clone();
+    changed_source["delegated"][ORIGIN]["records"].as_array_mut().unwrap().pop();
+    sqlx::query("UPDATE remote_recovery_roots SET state=$1")
+        .bind(&changed_source)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let next_binding = Binding::new(ORIGIN, 2).unwrap();
+    next_binding.initialize(&database.pool, true).await.unwrap();
+    let restart = database.reconnect(2).await;
+    let next = prepare(&restart, &next_binding, &genesis).await.unwrap();
+    assert_ne!(next["source_hash"], first["source_hash"]);
+    assert_eq!(next["recovered_stops"], first["recovered_stops"]);
+    assert_eq!(next["snapshot_complete"], false);
+    assert_eq!(next["recovery_ready"], false);
+    let after = state(&restart).await;
+    assert_eq!(after["stops"][0]["record"], record);
+    assert_eq!(after["root"], changed_source);
+    assert_eq!(after["plans"][0], before["plans"][0]);
+    restart.close().await;
+    drop(store);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
 async fn postgres_delegated_recovered_stops_preserve_later_native_intent_across_replicas_and_restart(
 ) {
     let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;

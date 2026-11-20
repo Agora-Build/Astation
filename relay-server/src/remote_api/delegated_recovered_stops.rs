@@ -63,6 +63,8 @@ fn review(record: &ControlRecord, log: &Membership, origin: &str) -> Result<Valu
     }
     // Unknown/removed authority is retained as an unresolved obligation, never
     // promoted to a currently effective stop or a clock-completeness claim.
+    // A valid native signature identifies a future recovery obligation only;
+    // it does not settle missing authority/history or make recovery ready.
     let (verification, requirement) = match verify_control(record, log) {
         ControlCheck::Valid(_) => (
             "valid".to_owned(),
@@ -115,12 +117,18 @@ pub(crate) async fn retain(
         review(&record, &log, &binding.origin)?;
         let value = record.object().to_json();
         let id = record.record_id();
-        if let Some(prior) = recovered.get(id).or_else(|| retained.get(id)) {
-            if prior != &value {
-                return Err(invalid());
-            }
+        if recovered
+            .get(id)
+            .or_else(|| retained.get(id))
+            .is_some_and(|prior| prior != &value)
+        {
+            return Err(invalid());
+        }
+        if recovered.contains_key(id) {
             continue;
         }
+        // Checkpoint equality is not an imported obligation: a later restored
+        // source may omit it, so retain the accepted import independently.
         recovered.insert(id.to_owned(), value.clone());
         sqlx::query("INSERT INTO station_delegated_recovered_stops(plan_id,record_id,record) VALUES ($1,$2,$3)")
             .bind(&plan_id).bind(id).bind(value).execute(&mut *tx).await?;
@@ -209,6 +217,30 @@ pub(super) async fn inspection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovered_stop_import_refuses_duplicate_keys_on_otherwise_accepted_input() {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "fixtures/delegated/r9-vectors-host-work-control.json"
+        )).unwrap();
+        let payload = json!({
+            "plan_id": "plan", "source_hash": "hash",
+            "records": [vectors["records"][0]["record"].clone()],
+        });
+        let accepted = payload.to_string();
+        assert!(parse(accepted.as_bytes()).is_ok());
+        for (key, prior) in [("plan_id", "wrong"), ("signer", "member:other")] {
+            let duplicate = accepted.replacen(
+                &format!("\"{key}\":"),
+                &format!("\"{key}\":\"{prior}\",\"{key}\":"),
+                1,
+            );
+            assert_ne!(duplicate, accepted);
+            assert_eq!(serde_json::from_str::<Value>(&duplicate).unwrap(), payload);
+            assert!(parse(duplicate.as_bytes()).is_err());
+        }
+    }
+
     #[test]
     fn recovered_stop_import_is_strict_and_bounded_before_storage() {
         for bytes in [

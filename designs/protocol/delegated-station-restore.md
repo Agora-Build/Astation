@@ -159,7 +159,9 @@ station-relay-server admin delegated-recovery retain-stops <genesis_hash> stops.
 
 The regular input file is strict JSON with exactly `plan_id`, `source_hash`
 (both from `prepare`) and `records` (1-64 original signed control objects).
-The file is at most 256 KiB. The command requires the same closed generation,
+The file is at most 256 KiB. Its opened descriptor must be a regular file;
+on Unix the open is nonblocking so a replacement FIFO cannot stall the command.
+The command requires the same closed generation,
 ownership, membership and retained source as preparation; it never creates a
 missing plan. Every record must name this account/genesis and a native signer.
 Only revoke and interrupt records are accepted; a feed-bound service stop must
@@ -175,6 +177,8 @@ Each origin/account history allows at most 4,096 distinct imported records and
 16 MiB of persisted JSONB. A later recovery generation includes all earlier
 imported stops; it cannot hide them by preparing another plan. Identical copies
 are deduplicated, and conflicting contents under one ID refuse recovery review.
+An import equal to a checkpoint record is still retained independently so that
+a later restored source cannot erase that accepted obligation.
 Malformed, oversized or inconsistent retained evidence refuses the report rather
 than omitting a stop. Imported evidence has no pruning/cancellation command.
 
@@ -182,7 +186,11 @@ Both `prepare` and successful imports report every recovered record's metadata,
 its shared-verifier verdict and review requirement, plus a deterministic
 `evidence_hash`. They expose no signed bodies/signatures or private key material.
 An unknown, removed or invalid signer remains `authority_review`; importing its
-object never establishes that the stop is in force. The report's
+object never establishes that the stop is in force. The
+`fresh_manager_signature` and `retain_host_record` labels identify necessary
+future obligations, not sufficient authority, current effects or readiness.
+Missing later authority and history still require reconciliation for both.
+The report's
 `observed_issued_at_lower_bounds` covers only currently valid imported records.
 Those observed times do not establish the greatest time ever signed or reserved;
 they cannot clear an unknown clock anchor or permit signing. Import changes no
