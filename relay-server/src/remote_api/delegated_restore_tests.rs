@@ -1,4 +1,4 @@
-use super::super::super::delegated_recovery::{inspect, Binding};
+use super::super::super::delegated_recovery::{inspect, inspect_root, Binding};
 use super::*;
 use crate::test_database::TestDatabase;
 
@@ -8,6 +8,134 @@ async fn saved(pool: &sqlx::PgPool, genesis: &str) -> Value {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_inspection_reads_fenced_history_without_changing_it() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 3).await;
+    let store = RecoveryStore::postgres(database.pool.clone());
+    store.configure_delegated(ORIGIN, 1).await.unwrap();
+    let f = fixture();
+    f.publish(&store).await;
+    let genesis = f.log.genesis_hash().to_hex();
+    let binding = Binding::new(ORIGIN, 1).unwrap();
+    let before_feed = inspect_root(&database.pool, &binding, &genesis)
+        .await
+        .unwrap();
+    assert!(before_feed["root"]["feed"].is_null());
+    assert_eq!(
+        store
+            .delegated_operation(&genesis, "alice", Command::Ensure)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let root: Root = serde_json::from_value(saved(&database.pool, &genesis).await).unwrap();
+    let held = record(
+        &f,
+        &root.delegated[ORIGIN],
+        &uuid::Uuid::new_v4().to_string(),
+        ControlAction::Hold,
+    );
+    assert_eq!(
+        store
+            .delegated_operation(
+                &genesis,
+                "alice",
+                Command::Publish {
+                    record: held,
+                    revoked_at: f.created,
+                    covered: vec!["host-a".into()],
+                }
+            )
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        store
+            .delegated_operation(
+                &genesis,
+                "alice",
+                Command::Reserve {
+                    principal: "service:svc-test".into(),
+                }
+            )
+            .await
+            .0,
+        StatusCode::OK
+    );
+    binding.initialize(&database.pool, true).await.unwrap();
+    let before = saved(&database.pool, &genesis).await;
+    let report = inspect_root(&database.pool, &binding, &genesis)
+        .await
+        .unwrap();
+    assert_eq!(report["retained_history_only"], true);
+    assert_eq!(report["recovery_ready"], false);
+    assert_eq!(report["status"]["reason"], "operator_fenced");
+    assert_eq!(report["root"]["membership_head"], f.log.head().to_json());
+    assert_eq!(report["root"]["feed"]["head"], 1);
+    assert!(
+        report["root"]["feed"]["signing_watermarks"]["highest_issued_at"]
+            .as_u64()
+            .unwrap()
+            > f.created
+    );
+    assert_eq!(saved(&database.pool, &genesis).await, before);
+    assert!(
+        !inspect(&database.pool, ORIGIN)
+            .await
+            .unwrap()
+            .unwrap()
+            .ready
+    );
+    let other = Binding::new("https://other.example", 1).unwrap();
+    let unrelated = inspect_root(&database.pool, &other, &genesis)
+        .await
+        .unwrap();
+    assert!(unrelated["root"]["feed"].is_null());
+    assert!(unrelated["status"].is_null());
+    assert!(inspect(&database.pool, &other.origin)
+        .await
+        .unwrap()
+        .is_none());
+    sqlx::query("UPDATE remote_recovery_roots SET state=jsonb_set(state,'{inspection_padding}',to_jsonb(repeat('x',16777216))) WHERE genesis_hash=$1")
+        .bind(&genesis).execute(&database.pool).await.unwrap();
+    assert!(inspect_root(&database.pool, &binding, &genesis)
+        .await
+        .is_err());
+    sqlx::query("UPDATE remote_recovery_roots SET state='{}'::jsonb WHERE genesis_hash=$1")
+        .bind(&genesis)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert!(inspect_root(&database.pool, &binding, &genesis)
+        .await
+        .is_err());
+    drop(store);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_inspection_does_not_initialize_absent_history() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 2).await;
+    let binding = Binding::new(ORIGIN, 2).unwrap();
+    let report = inspect_root(&database.pool, &binding, &"0".repeat(64))
+        .await
+        .unwrap();
+    assert!(report["root"].is_null());
+    assert_eq!(report["genesis_hash"], "0".repeat(64));
+    assert!(report["status"].is_null());
+    assert_eq!(report["recovery_ready"], false);
+    assert!(inspect(&database.pool, ORIGIN).await.unwrap().is_none());
+    for invalid in ["0".repeat(63), "A".repeat(64), "g".repeat(64)] {
+        assert!(inspect_root(&database.pool, &binding, &invalid)
+            .await
+            .is_err());
+    }
+    database.cleanup().await;
 }
 
 #[tokio::test]

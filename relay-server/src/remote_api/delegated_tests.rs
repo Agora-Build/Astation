@@ -50,6 +50,61 @@ pub(crate) fn fixture() -> Fixture {
     f
 }
 
+#[test]
+fn delegated_recovery_inspection_never_ticks_reports_or_exposes_record_bodies() {
+    let f = fixture();
+    let mut feed = Stored::new(ORIGIN, &f.log).unwrap();
+    let held = record(
+        &f,
+        &feed,
+        &uuid::Uuid::new_v4().to_string(),
+        ControlAction::Hold,
+    );
+    feed.publish(
+        ORIGIN,
+        &f.log,
+        &held,
+        f.created,
+        &["host-a".into()],
+        f.created,
+    )
+    .unwrap();
+    let ledger = feed
+        .ledger(ORIGIN, &f.log)
+        .unwrap()
+        .stop_reporting("report-client")
+        .unwrap()
+        .next;
+    feed.ledger = ledger.to_json();
+    let before = serde_json::to_value(&feed).unwrap();
+    let report = feed.recovery_inspection(ORIGIN, &f.log).unwrap();
+    assert_eq!(report["head"], 1);
+    assert_eq!(report["record_verification"]["valid"], 1);
+    assert_eq!(report["signing_watermarks"]["principals"], 1);
+    assert_eq!(report["signing_watermarks"]["highest_issued_at"], f.created);
+    assert_eq!(report["reporting_stopped"], true);
+    assert_eq!(report["ready_reports"], 0);
+    assert_eq!(serde_json::to_value(&feed).unwrap(), before);
+    for private in [
+        "svc-test",
+        "host-a",
+        "signature",
+        "report-client",
+        "records",
+        "ledger",
+    ] {
+        assert!(
+            !report.to_string().contains(&format!("\"{private}\"")),
+            "{private}"
+        );
+    }
+    assert!(feed
+        .recovery_inspection("https://other.example", &f.log)
+        .is_err());
+    feed.records[0]["signature"] = json!("tampered");
+    assert!(feed.recovery_inspection(ORIGIN, &f.log).is_err());
+}
+
 fn root(f: &Fixture) -> Root {
     Root {
         account: f.log.account_id().into(),

@@ -64,6 +64,52 @@ impl Fault {
 }
 
 impl Stored {
+    /// Read-only operator diagnostics. These counts describe retained history,
+    /// not a complete post-restore snapshot or permission to reopen the fence.
+    pub(super) fn recovery_inspection(
+        &self,
+        origin: &str,
+        log: &Membership,
+    ) -> Result<Value, Fault> {
+        let ledger = self.ledger(origin, log)?;
+        if uuid::Uuid::parse_str(&self.feed_id)
+            .ok()
+            .filter(|id| id.get_version_num() == 4 && id.to_string() == self.feed_id)
+            .is_none()
+        {
+            return Err(Fault::Unavailable);
+        }
+        let mut verification = BTreeMap::<String, usize>::new();
+        for value in &self.records {
+            let record = ControlRecord::parse(
+                &serde_json::to_vec(value).map_err(|_| Fault::Unavailable)?,
+            )
+            .map_err(|_| Fault::Unavailable)?;
+            let result = match verify_control(&record, log) {
+                ControlCheck::Valid(_) => "valid".to_owned(),
+                ControlCheck::Pending(reason) => format!("pending:{}", reason.code()),
+                ControlCheck::Refused(reason) => reason.code().to_owned(),
+            };
+            *verification.entry(result).or_default() += 1;
+        }
+        Ok(serde_json::json!({
+            "feed_id": self.feed_id,
+            "head": self.records.len(),
+            "record_verification": verification,
+            "signing_watermarks": {
+                "principals": self.signing_high_water.len(),
+                "highest_issued_at": self.signing_high_water.values().max(),
+            },
+            "native_records_awaiting_effects": ledger.resign_alerts().len(),
+            "ready_reports": ledger.pending_reports().len(),
+            "refused_reports": ledger.refused_reports().len(),
+            "dropped_reports": ledger.dropped_reports().len(),
+            "reporting_stopped": ledger.reporting_stopped(),
+            "delivery_retries": self.delivery.len(),
+            "report_control_seq": self.report_control_seq,
+        }))
+    }
+
     fn new(origin: &str, log: &Membership) -> Result<Self, Fault> {
         let ledger = AckLedger::new(origin, log.account_id(), log.genesis_hash())
             .map_err(|_| Fault::Unavailable)?;
