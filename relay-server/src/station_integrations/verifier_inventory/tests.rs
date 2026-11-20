@@ -8,6 +8,105 @@ use tower::ServiceExt;
 
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
+async fn postgres_managed_service_inventory_hides_foreign_provisioning_like_unknown_ids() {
+    let issuer = crate::account_identity::tests::Fixture::new().await;
+    let (db, runtime, f) = fixture_with_issuer(&issuer.issuer).await;
+    let origin = runtime.binding.station_origin.clone();
+    let genesis = f.log.genesis_hash().to_hex();
+    runtime
+        .app
+        .recovery
+        .configure_delegated(&origin, 1)
+        .await
+        .unwrap();
+    runtime.prepare(ID, OWNER, request(&f)).await.unwrap();
+    runtime
+        .app
+        .recovery
+        .configure_verifier_replicas(r#"{"generation":1,"replica":"a","replicas":["a"]}"#)
+        .await
+        .unwrap();
+    let context: String =
+        sqlx::query_scalar("SELECT context FROM station_integration_provisioning")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let sealed: String = sqlx::query_scalar("SELECT sealed FROM station_service_keys")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let original: Value = serde_json::from_str(&context).unwrap();
+    let mut foreign = original.clone();
+    foreign["owner"] = json!("ab99999999999999999999999999");
+    sqlx::query("INSERT INTO account_identities(issuer,subject,principal) VALUES($1,$2,'foreign-principal')")
+        .bind(&issuer.issuer).bind(foreign["owner"].as_str().unwrap())
+        .execute(&db.pool).await.unwrap();
+    let mut another_genesis = original.clone();
+    another_genesis["genesis"] = json!("f".repeat(64));
+    let mut another_issuer = original.clone();
+    another_issuer["issuer"] = json!("https://another-auth.example");
+    let mut claims = issuer.claims();
+    claims["aud"] = json!(origin);
+    claims["scope"] = json!("astation.remote");
+    let token = issuer.token(issuer.header(), claims);
+    let router = Router::new()
+        .route(
+            "/agora-build/v1/logs/:genesis/verifiers/services",
+            post(services),
+        )
+        .with_state(IntegrationState(Some(runtime.clone())));
+    let id = format!("svc-{ID}");
+    let unknown = "svc-i-99999999999999999999999999";
+    for changed in [
+        foreign.to_string(),
+        another_genesis.to_string(),
+        another_issuer.to_string(),
+        "corrupt".into(),
+    ] {
+        sqlx::query("UPDATE station_integration_provisioning SET context=$1")
+            .bind(changed)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        for requested in [&id, unknown] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/agora-build/v1/logs/{genesis}/verifiers/services"))
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::from(
+                            json!({"member_ids":[requested],"expected":f.log.head().to_json()})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 262_144).await.unwrap())
+                    .unwrap();
+            assert_eq!(
+                body["services"],
+                json!([{"id":requested}]),
+                "foreign and absent records disclose no evidence"
+            );
+        }
+        let unchanged: String = sqlx::query_scalar("SELECT sealed FROM station_service_keys")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(unchanged, sealed);
+    }
+    drop(router);
+    drop(runtime);
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
 async fn postgres_managed_service_inventory_opens_only_existing_account_bound_keys() {
     let issuer = crate::account_identity::tests::Fixture::new().await;
     let (db, runtime, f) = fixture_with_issuer(&issuer.issuer).await;

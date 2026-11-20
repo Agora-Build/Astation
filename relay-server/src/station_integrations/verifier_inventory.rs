@@ -128,8 +128,10 @@ impl StationIntegrations {
                 rows.push(json!({"id":id}));
                 continue;
             };
-            let context: ServiceKeyContext =
-                serde_json::from_str(&context).map_err(|_| invalid())?;
+            let Ok(context) = serde_json::from_str::<ServiceKeyContext>(&context) else {
+                rows.push(json!({"id":id}));
+                continue;
+            };
             let principal: Option<String> = sqlx::query_scalar(
                 "SELECT principal FROM account_identities WHERE issuer=$1 AND subject=$2",
             )
@@ -144,7 +146,8 @@ impl StationIntegrations {
                 || context.genesis != log.genesis_hash().to_hex()
                 || principal.as_deref() != Some(owner)
             {
-                return Err(invalid());
+                rows.push(json!({"id":id}));
+                continue;
             }
             // A missing, locked, corrupt or replaced key supplies no evidence.
             // Neither provisioning nor policy state can create a replacement here.

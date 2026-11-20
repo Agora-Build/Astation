@@ -577,7 +577,8 @@ final class RemoteVerifierSigningGateTests: XCTestCase {
         let (missing, _) = try f.confirmedGate()
         XCTAssertThrowsError(try missing.authorize(request, log: f.log), "The prospective service verifier must also be enumerated")
         let roster = f.roster + [.member("service")]
-        let gate = try RemoteVerifierSigningGate(log: f.log, verifiers: roster)
+        var time: UInt64 = 100
+        let gate = try RemoteVerifierSigningGate(log: f.log, verifiers: roster, now: { time })
         let newActions: Set<String> = ["host_enc_key", "host_sender_readmit", "host_sender_revoke", "project_remove", "project_set"]
         let v1 = VerifierInventory(version: 1, actions: verifierInventory().actions.filter { !newActions.contains($0) })
         var service: RemoteVerifierSigningGate.Connection?
@@ -587,9 +588,31 @@ final class RemoteVerifierSigningGateTests: XCTestCase {
             else { try gate.observeConsumer(v1, on: connection) }
             if id == .member("service") { service = connection }
         }
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log), "Generic member evidence cannot confirm a prospective enrollment")
+        let serviceLink = try XCTUnwrap(service)
+        try gate.observeProspectiveMember(v1, request: request, on: serviceLink, receivedAt: 100, authorizationMilliseconds: 1000)
         XCTAssertNoThrow(try gate.authorize(request, log: f.log))
         XCTAssertThrowsError(try gate.authorize(f.review().signingRequest(managerID: "manager"), log: f.log), "The new actions need v2")
-        try gate.observeConsumer(nil, on: XCTUnwrap(service))
+        try gate.observeConsumer(nil, on: serviceLink)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        try gate.observeConsumer(v1, on: serviceLink)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log), "A generic report cannot revive the exact-request binding")
+        try gate.observeProspectiveMember(v1, request: request, on: serviceLink, receivedAt: 100, authorizationMilliseconds: 1000)
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        var invalid = request; invalid.keyId = "another-manager"
+        XCTAssertThrowsError(try gate.observeProspectiveMember(v1, request: invalid, on: serviceLink,
+            receivedAt: 100, authorizationMilliseconds: 1000))
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log), "Invalid observations retire the old exact-request evidence")
+        try gate.observeProspectiveMember(v1, request: request, on: serviceLink, receivedAt: 100, authorizationMilliseconds: 1000)
+        gate.disconnect(serviceLink)
+        let replacement = try gate.connect(.member("service"))
+        try gate.observeConsumer(v1, on: replacement)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        try gate.observeProspectiveMember(v1, request: request, on: replacement, receivedAt: 100, authorizationMilliseconds: 1000)
+        XCTAssertThrowsError(try gate.observeProspectiveMember(v1, request: request, on: serviceLink,
+            receivedAt: 100, authorizationMilliseconds: 1000))
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log), "Retired connections cannot invalidate newer exact-request evidence")
+        time = 1100
         XCTAssertThrowsError(try gate.authorize(request, log: f.log))
     }
 
@@ -695,6 +718,22 @@ final class RemoteVerifierSigningGateTests: XCTestCase {
         let signs = f.keys.signs
         try source.receive(snapshot, for: source.begin())
         XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        for change in ["key", "scope", "expiry", "signed_at"] {
+            var changedMember = member
+            var signedAt = f.clock.wallMs
+            switch change {
+            case "key": changedMember["auth_key"] = ["alg": "p256", "pub": RemoteRecoveryKit.base64URL(P256.Signing.PrivateKey().publicKey.x963Representation)]
+            case "scope": changedMember["scope"] = ["hosts": ["host"], "ops": ["launch", "message", "view"]]
+            case "expiry": changedMember["expires_at"] = f.clock.wallMs + 7_200_000
+            default: signedAt += 1
+            }
+            let changedBody = try f.log.draftEntry(signer: "manager", signedAt: signedAt,
+                actionJson: String(decoding: JSONSerialization.data(withJSONObject: ["action": "add", "member": changedMember]), as: UTF8.self))
+            let changed = try RemoteConfirmedSigner.membershipRequest(bodyJSON: changedBody, keyID: "manager")
+            XCTAssertNotEqual(changed, request)
+            XCTAssertThrowsError(try gate.authorize(changed, log: f.log), "Evidence for request A cannot authorize B with a different \(change)")
+            XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        }
         XCTAssertEqual(f.keys.signs, signs, "Inventory never signs the enrollment")
         XCTAssertNil(f.log.member(deviceId: id))
         var wrong = request; wrong.bodyJson = body.replacingOccurrences(of: "\"account\"", with: "\"another-account\"")

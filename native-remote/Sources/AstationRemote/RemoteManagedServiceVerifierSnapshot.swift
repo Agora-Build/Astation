@@ -60,6 +60,7 @@ public final class RemoteManagedServiceVerifierEvidence {
     private let log: MembershipLog
     private let members: [String]
     private let keys: [String: PublicKeyData]
+    private let prospective: (id: String, request: SignRequest)?
     private var poll: (id: Poll, station: RemoteStationVerifierEvidence.Poll)?
     private var connections: [RemoteVerifierSigningGate.Connection] = []
     private var retired = false
@@ -68,6 +69,7 @@ public final class RemoteManagedServiceVerifierEvidence {
                 prospectiveRequest: SignRequest? = nil) throws {
         try gate.requireMembership(log)
         var keys: [String: PublicKeyData] = [:]
+        var prospective: (id: String, request: SignRequest)?
         if let request = prospectiveRequest {
             guard let body = request.bodyJson,
                   request == (try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: request.keyId)),
@@ -82,6 +84,7 @@ public final class RemoteManagedServiceVerifierEvidence {
                     actionJson: String(decoding: JSONSerialization.data(withJSONObject: ["action": "add", "member": member]), as: UTF8.self)) == body,
                   memberIDs.contains(id) else { throw RemoteVerifierGateError.staleMembership }
             keys[id] = try RemoteManagedServiceVerifierSnapshot.serviceKey(key)
+            prospective = (id, request)
         }
         guard RemoteManagedServiceVerifierSnapshot.validIDs(memberIDs), memberIDs.allSatisfy({ id in
             if keys[id] != nil { return true }
@@ -91,6 +94,7 @@ public final class RemoteManagedServiceVerifierEvidence {
         }) else { throw RemoteVerifierGateError.invalidRoster }
         self.gate = gate; self.roster = roster; self.log = log.snapshot(); members = memberIDs
         self.keys = keys
+        self.prospective = prospective
         station = try RemoteStationVerifierEvidence(gate: gate, roster: roster, log: log)
     }
 
@@ -124,8 +128,14 @@ public final class RemoteManagedServiceVerifierEvidence {
             for id in members {
                 guard let key = snapshot.services[id], keys[id] == key else { continue }
                 let connection = try gate.connect(.member(id)); connections.append(connection)
-                try gate.observeConsumer(VerifierInventory(version: version, actions: actions), on: connection,
-                    receivedAt: snapshot.station.requestStartedAt, authorizationMilliseconds: lifetime)
+                let inventory = VerifierInventory(version: version, actions: actions)
+                if let prospective, prospective.id == id {
+                    try gate.observeProspectiveMember(inventory, request: prospective.request, on: connection,
+                        receivedAt: snapshot.station.requestStartedAt, authorizationMilliseconds: lifetime)
+                } else {
+                    try gate.observeConsumer(inventory, on: connection,
+                        receivedAt: snapshot.station.requestStartedAt, authorizationMilliseconds: lifetime)
+                }
             }
         } catch {
             station.disconnect(); disconnectMembers()

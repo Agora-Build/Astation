@@ -25,6 +25,12 @@ decoded unsigned enrollment request, reconstructed against the current manager
 and device-list head, including the proposed public key. An arbitrary absent
 member is refused. This report does not sign, append or authorize enrollment.
 
+The gate retains the complete prospective signing request with this evidence,
+not only the member ID or public key. A different key, scope, expiry, signing
+time or other request field needs fresh matching evidence. Generic member
+reports cannot authorize a new enrollment. Missing/invalid reports, reconnect
+and retirement clear the binding; its finite lease still expires at signing.
+
 The native source checks the protected accepted Station roster, exact account,
 genesis and head, and every reported key. All accepted replicas must have live
 evidence. Service capabilities are their common action set and lowest version;
