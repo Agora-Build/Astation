@@ -192,6 +192,29 @@ final class RemoteVerifierSigningGateTests: XCTestCase {
     }
 
     @MainActor
+    func testInitiallyExpiredWelcomeCannotBeRevivedOnTheSameConnection() throws {
+        let f = try VerifierFixture(), request = try f.review().signingRequest(managerID: "manager")
+        var time: UInt64 = 100
+        let (gate, _) = try f.confirmedGate(now: { time })
+        let expired = try gate.connect(.host("host"))
+        time = 1_100
+        XCTAssertThrowsError(try gate.observeHostWelcome(f.welcome(), on: expired, receivedAt: 100))
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        time = 1_101
+        try gate.observeHostWelcome(f.welcome(), on: expired)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        try gate.observeHostWelcome(f.welcome(inventory: nil), on: expired)
+        try gate.observeHostWelcome(f.welcome(), on: expired)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+
+        let fresh = try gate.connect(.host("host"))
+        try gate.observeHostWelcome(f.welcome(), on: fresh)
+        XCTAssertThrowsError(try gate.observeHostWelcome(f.welcome(), on: expired, receivedAt: 100))
+        gate.disconnect(expired)
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+    }
+
+    @MainActor
     func testFutureTimestampAndDeadlineOverflowCannotConfirmAHost() throws {
         let f = try VerifierFixture(), request = try f.review().signingRequest(managerID: "manager")
         var time: UInt64 = 100
