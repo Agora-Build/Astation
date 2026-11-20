@@ -43,6 +43,7 @@ class AstationHubManager: ObservableObject {
     let sessionStore: SsoSessionStore
     let tokenProvider: SsoTokenProvider
     private(set) var accountAuth: AstationAccountAuth
+    private let makeStationAccountAuth: (AccountServiceSettings, String) throws -> AstationAccountAuth
     @MainActor private var stationAuthorizations: [String: AstationAccountAuth] = [:]
     private let accountDefaults: UserDefaults
     private(set) var portalSettings: AccountServiceSettings?
@@ -116,7 +117,7 @@ class AstationHubManager: ObservableObject {
         guard stationAuthorizations.count < 64 || stationAuthorizations[origin] != nil else {
             throw AccountLoginError.configuration
         }
-        let created = try Self.stationAccountAuth(settings: settings, origin: origin)
+        let created = try makeStationAccountAuth(settings, origin)
         stationAuthorizations[origin] = created
         return created
     }
@@ -716,6 +717,7 @@ class AstationHubManager: ObservableObject {
         portalSettings: AccountServiceSettings? = try? AccountServiceSettings.load(),
         portalAuth: AstationAccountAuth? = nil,
         stationAuth: AstationAccountAuth? = nil,
+        makeStationAccountAuth: ((AccountServiceSettings, String) throws -> AstationAccountAuth)? = nil,
         portalAPI: PortalAPIClient = PortalAPIClient(),
         projectCache: PortalProjectCache? = nil,
         accountDefaults: UserDefaults = .standard,
@@ -729,7 +731,9 @@ class AstationHubManager: ObservableObject {
         self.accountDefaults = accountDefaults
         let station = SettingsWindowController.currentAstationRelayUrl
         self.configuredStationOrigin = station
-        self.accountAuth = stationAuth ?? portalSettings.flatMap { try? Self.stationAccountAuth(settings: $0, origin: station) }
+        let makeStationAccountAuth = makeStationAccountAuth ?? { try Self.stationAccountAuth(settings: $0, origin: $1) }
+        self.makeStationAccountAuth = makeStationAccountAuth
+        self.accountAuth = stationAuth ?? portalSettings.flatMap { try? makeStationAccountAuth($0, station) }
             ?? AstationAccountAuth(defaults: accountDefaults)
         self.portalSettings = portalSettings
         self.portalAuth = portalAuth ?? Self.makePortalAuth(settings: portalSettings)
@@ -1026,6 +1030,7 @@ class AstationHubManager: ObservableObject {
             try await authorization.clearSession()
             guard epoch == accountGeneration else { throw AccountLoginError.changed }
         }
+        stationAuthorizations = [:]
         accountSessionChanged()
     }
 
