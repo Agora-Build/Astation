@@ -56,8 +56,9 @@ private final class VerifierFixture {
             operation: operation, now: clock)
     }
 
-    func confirmedGate() throws -> (RemoteVerifierSigningGate, [RemoteVerifierID: RemoteVerifierSigningGate.Connection]) {
-        let gate = try RemoteVerifierSigningGate(log: log, verifiers: roster)
+    func confirmedGate(now: @escaping () -> UInt64 = { 100 }) throws
+        -> (RemoteVerifierSigningGate, [RemoteVerifierID: RemoteVerifierSigningGate.Connection]) {
+        let gate = try RemoteVerifierSigningGate(log: log, verifiers: roster, now: now)
         var connections: [RemoteVerifierID: RemoteVerifierSigningGate.Connection] = [:]
         for id in roster {
             let connection = try gate.connect(id)
@@ -114,6 +115,117 @@ final class RemoteVerifierSigningGateTests: XCTestCase {
         // A process restart has no live evidence, even if the same roster is loaded.
         let restarted = try RemoteVerifierSigningGate(log: f.log, verifiers: f.roster)
         XCTAssertThrowsError(try restarted.authorize(request, log: f.log))
+    }
+
+    @MainActor
+    func testHostAuthorizationExpiresAtSigningEvenBeforeTheCloseCallback() throws {
+        let f = try VerifierFixture(), request = try f.review().signingRequest(managerID: "manager")
+        var time: UInt64 = 100
+        let (gate, _) = try f.confirmedGate(now: { time })
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        time = 1_099
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        // No timer, disconnect callback or fresh report is needed to stop signing.
+        time = 1_100
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+    }
+
+    @MainActor
+    func testReobservedWelcomeCannotRenewButFreshConnectionCan() throws {
+        let f = try VerifierFixture(), request = try f.review().signingRequest(managerID: "manager")
+        var time: UInt64 = 100
+        let (gate, links) = try f.confirmedGate(now: { time })
+        let old = try XCTUnwrap(links[.host("host")])
+        time = 900
+        try gate.observeHostWelcome(f.welcome(), on: old)
+        time = 1_100
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        try gate.observeHostWelcome(f.welcome(), on: old)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        try gate.observeHostWelcome(f.welcome(inventory: nil), on: old)
+        try gate.observeHostWelcome(f.welcome(), on: old)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+
+        let fresh = try gate.connect(.host("host"))
+        try gate.observeHostWelcome(f.welcome(), on: fresh)
+        XCTAssertThrowsError(try gate.observeHostWelcome(f.welcome(), on: old, receivedAt: 100))
+        gate.disconnect(old)
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        time = 2_100
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+    }
+
+    @MainActor
+    func testDelayedWelcomeKeepsItsOriginalAuthorizationDeadline() throws {
+        let f = try VerifierFixture(), request = try f.review().signingRequest(managerID: "manager")
+        var time: UInt64 = 100
+        let (gate, links) = try f.confirmedGate(now: { time })
+        let connection = try gate.connect(.host("host"))
+        time = 900
+        try gate.observeHostWelcome(f.welcome(), on: connection, receivedAt: 100)
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        time = 1_100
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+
+        let delayed = try gate.connect(.host("host"))
+        XCTAssertThrowsError(try gate.observeHostWelcome(f.welcome(), on: delayed, receivedAt: 100))
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        gate.disconnect(try XCTUnwrap(links[.host("host")]))
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+    }
+
+    @MainActor
+    func testInitiallyMissingOrInvalidInventoryCannotShiftTheFirstDeadline() throws {
+        let f = try VerifierFixture(), request = try f.review().signingRequest(managerID: "manager")
+        var time: UInt64 = 100
+        let (gate, _) = try f.confirmedGate(now: { time })
+        for inventory in [nil, VerifierInventory(version: 0, actions: [])] {
+            time = 100
+            let connection = try gate.connect(.host("host"))
+            if inventory == nil { try gate.observeHostWelcome(f.welcome(inventory: nil), on: connection) }
+            else { XCTAssertThrowsError(try gate.observeHostWelcome(f.welcome(inventory: inventory), on: connection)) }
+            XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+            time = 1_100
+            try gate.observeHostWelcome(f.welcome(), on: connection)
+            XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        }
+    }
+
+    @MainActor
+    func testInitiallyExpiredWelcomeCannotBeRevivedOnTheSameConnection() throws {
+        let f = try VerifierFixture(), request = try f.review().signingRequest(managerID: "manager")
+        var time: UInt64 = 100
+        let (gate, _) = try f.confirmedGate(now: { time })
+        let expired = try gate.connect(.host("host"))
+        time = 1_100
+        XCTAssertThrowsError(try gate.observeHostWelcome(f.welcome(), on: expired, receivedAt: 100))
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        time = 1_101
+        try gate.observeHostWelcome(f.welcome(), on: expired)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        try gate.observeHostWelcome(f.welcome(inventory: nil), on: expired)
+        try gate.observeHostWelcome(f.welcome(), on: expired)
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+
+        let fresh = try gate.connect(.host("host"))
+        try gate.observeHostWelcome(f.welcome(), on: fresh)
+        XCTAssertThrowsError(try gate.observeHostWelcome(f.welcome(), on: expired, receivedAt: 100))
+        gate.disconnect(expired)
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+    }
+
+    @MainActor
+    func testFutureTimestampAndDeadlineOverflowCannotConfirmAHost() throws {
+        let f = try VerifierFixture(), request = try f.review().signingRequest(managerID: "manager")
+        var time: UInt64 = 100
+        let (gate, links) = try f.confirmedGate(now: { time })
+        let connection = try XCTUnwrap(links[.host("host")])
+        XCTAssertThrowsError(try gate.observeHostWelcome(f.welcome(), on: connection, receivedAt: 101))
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        let fresh = try gate.connect(.host("host"))
+        time = UInt64.max - 500
+        XCTAssertThrowsError(try gate.observeHostWelcome(f.welcome(), on: fresh, receivedAt: time))
+        XCTAssertThrowsError(try gate.authorize(request, log: f.log))
     }
 
     @MainActor

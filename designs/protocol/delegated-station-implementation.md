@@ -148,6 +148,14 @@ authorization expiry or identity change. Non-host reports require their own
 authenticated source. Nothing is confirmed from presence, release version, cached
 inventories or a host feature flag, and no confirmation survives a process restart.
 
+The gate also checks each host welcome's monotonic authorization deadline at the
+signing boundary, independently of timers or channel-close callbacks. A deferred
+welcome must carry its original receipt time; a future time, an expired welcome
+or deadline overflow cannot confirm the host. Reobserving that connection's
+welcome cannot extend its first deadline, even after a missing report. A new
+authenticated connection needs fresh evidence. This does not discover the roster
+or replace the channel owner's invalidation duties.
+
 All five actions require version 2 and the requested action in every live report.
 The adapter also implements the proposed version-1 rule for service scopes with
 launch/message/notify, including the prospective service's verifier on add. This
@@ -500,8 +508,14 @@ Still required before activation:
   the trust-generation-only change during host reauthentication is corrected in
   Atem #175 at `d7a066e8505822db86dbb6e713b34cd164beedc7`, source-reviewed with
   no blocking finding in [Atem #120](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6925943051).
-  Exact-head CI, the owner's merge decision and the final test artifact remain
-  before-joint-test dependencies. Source tests are not real joint-test evidence.
+  The final source sign-off extends to #175 head `7664045`, now merged; the
+  explicit item-15 agreement includes same-socket reauthentication,
+  trust-generation-only changes and host-channel-key changes on both carriers.
+  See [the latest agreement](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6938206284).
+  Astation approved building a separate hook-enabled test artifact, preserving
+  the running shared runtime, agents, pairing and credential agent. The exact
+  artifact/hash, isolated configuration and coordinated joint slot are still
+  required. Source tests are not real joint-test evidence.
 - Authoritative replica/non-host verifier inventory carriage, wiring all live
   inventory invalidations, and complete multi-Station Interrupt routing. The
   protected per-Station fanout/retry adapter is implemented, but production roster
@@ -552,7 +566,9 @@ Local Android 16 arm64 emulator validation: all 22 connected tests (including
 the nine delegated tests) and eight JVM unit tests pass without skips; Android
 lint passes. Eight SDK-integrity/tooling tests pass. APK inspection confirms
 all 11 verified delegated fixture files are in the instrumentation APK and none
-are in the application APK. These are local results; exact-head CI is separate.
+are in the application APK. All six required checks passed at `f199a18`; #90 is
+squash-merged as `ccef00f` with an identical tree. These tests do not establish
+real joint behavior or Portal database effects.
 
 ## Host Mail Follow-up
 
@@ -578,6 +594,30 @@ lifetimes get `expired`; deterministic result ID validation follows strict
 plaintext parsing and precedes outbox correlation regardless of sender standing.
 This is source/contract sign-off without SDK adoption. The reference mailbox,
 mailbox-call vectors, Station storage and real VII.B remain follow-ups.
+
+The reference model in [Atem #178](https://github.com/Agora-Build/Atem/pull/178)
+is source-signed-off at `5f7c951`; all eight readings are agreed, as recorded in
+[the original reply](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6930157163).
+The later [#177/#179 receiving-client readings and item-15 extension](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6938206284)
+are also agreed. Reset cursor/dones/pending-position changes commit before
+fetch. Deferred admission or result storage never causes a premature done;
+rewind is permitted, furthest-read state is retained, and deferred results do
+not hold the admission gate. Retained results use their exact fetched bytes and
+the sender's own result reader. Bounded storage follows the documented clock
+and expiry qualifications.
+
+Station's mailbox implementation must serialize pages and heads delivered to
+each verified host association across replicas: within one mailbox history, an
+older queued head cannot follow a newer answered page. Replica notifications
+only trigger a fresh authoritative store read, and history/association must be
+checked at the write boundary. A genuine reset fences obsolete jobs and links;
+it must not be concealed with a maximum of old and new heads. Delayed heads,
+replica switching and reset races require real storage/socket tests. This is an
+agreed implementation obligation, not deployed mailbox evidence.
+
+The required D3 ceremony wire change in Atem #176 remains held until the matching
+native implementation and partial-commit joint tests are ready. It is a separate
+coordinated change, with no compatibility fallback and no signing activation.
 
 Next, build the Station host-mail mailbox (reuse enrollment mailbox
 storage only where the authority/retention semantics actually fit), native
