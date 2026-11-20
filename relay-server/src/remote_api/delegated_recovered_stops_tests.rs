@@ -102,6 +102,46 @@ async fn postgres_delegated_recovered_checkpoint_duplicate_survives_changed_sour
 
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovered_stops_refuse_conflicts_with_an_earlier_checkpoint() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (store, f, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let before = state(&database.pool).await;
+    let old = ControlRecord::parse(&serde_json::to_vec(&before["root"]["delegated"][ORIGIN]["records"][1]).unwrap()).unwrap();
+    let mut older_source = before["root"].clone();
+    older_source["delegated"][ORIGIN]["records"] = json!([]);
+    older_source["delegated"][ORIGIN]["signing_high_water"] = json!({});
+    sqlx::query("UPDATE remote_recovery_roots SET state=$1")
+        .bind(&older_source).execute(&database.pool).await.unwrap();
+    let later = Binding::new(ORIGIN, 2).unwrap();
+    later.initialize(&database.pool, true).await.unwrap();
+    let plan = prepare(&database.pool, &later, &genesis).await.unwrap();
+    let retained_source: Root = serde_json::from_value(older_source).unwrap();
+    let genuine = later_stop(&f, &retained_source.delegated[ORIGIN], 100);
+    let mut conflict = old.body().clone();
+    conflict.issued_at += 200;
+    let conflicting = build_control(&f.keys, &KeyId::new("manager"), &conflict).unwrap().to_json();
+    let unchanged = state(&database.pool).await;
+    assert!(retain(&database.pool, &later, &genesis,
+        &input(&plan, vec![genuine.object().to_json(), conflicting])).await.is_err());
+    assert_eq!(state(&database.pool).await, unchanged, "the entire batch must roll back");
+    let accepted = retain(&database.pool, &later, &genesis,
+        &input(&plan, vec![genuine.object().to_json()])).await.unwrap();
+    assert_ne!(accepted["evidence_hash"], plan["evidence_hash"]);
+    assert_eq!(accepted["plan_id"], plan["plan_id"]);
+    assert_eq!(accepted["source_hash"], plan["source_hash"]);
+    assert_eq!(accepted["known_history"]["records"].as_array().unwrap().len(), 3);
+    assert_eq!(accepted["known_history"]["observed_signing_lower_bounds"]["service:svc-test"], f.created + 100);
+    assert_eq!(accepted["known_history"]["complete_history"], false);
+    assert_eq!(accepted["known_history"]["signing_clock_complete"], false);
+    assert_eq!(accepted["snapshot_complete"], false);
+    drop(store);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
 async fn postgres_delegated_recovered_stops_preserve_later_native_intent_across_replicas_and_restart(
 ) {
     let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;

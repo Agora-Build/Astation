@@ -199,6 +199,37 @@ The `snapshot_complete` and `recovery_ready` fields remain false. Authoritative
 later service history, complete clocks, fresh manager signatures, snapshot
 publication and reopening are still required.
 
+### Reconciling retained checkpoints
+
+Every preparation/import also reconciles all known earlier checkpoints for this
+exact Station, account and genesis. `known_history.records` deduplicates identical
+objects across checkpoints and imports; the same record ID with different
+contents refuses the entire transaction. A later restored root cannot omit an
+earlier known hold, revoke or interrupt from the recovery review. Every signature
+is classified against current membership, so a former manager's original stays
+an authority-review obligation. No former signature is promoted to current
+authority.
+
+`known_history.checkpoints` identifies each original immutable checkpoint and
+summarizes its retained ACK/reporting state. Old ledgers, report IDs, delivery
+retries and reporting stops remain separate; reconciliation never merges or
+settles them. `observed_signing_lower_bounds` includes every retained reservation,
+including reservations with no published record, and valid imported signatures.
+These are lower bounds, not proof that later clocks/history survived.
+
+The combined `evidence_hash` binds the exact prepared plan/source, all known
+checkpoint commitments and imported evidence. It changes when later evidence is
+retained; it authorizes no signature or reopening. Reconciliation is bounded to
+128 checkpoints, 16 MiB of retained checkpoint JSONB and 4,096 distinct combined
+record IDs, in addition to the import limits. Exceeding a bound or finding a
+corrupt/foreign checkpoint refuses recovery without truncation or a partial
+plan/import. Known historical feed IDs cannot become the new candidate ID.
+
+Both `complete_history` and `signing_clock_complete` remain false. This is the
+inventory required before snapshot construction; it cannot establish missing
+history or replace authoritative service reconciliation and fresh manager
+confirmation.
+
 ## Complete recovery sequence
 
 ### Native evidence export

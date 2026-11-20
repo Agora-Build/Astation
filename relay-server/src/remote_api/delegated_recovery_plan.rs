@@ -9,6 +9,8 @@ use sqlx::{PgConnection, PgPool};
 
 #[path = "delegated_recovered_stops.rs"]
 pub(crate) mod stops;
+#[path = "delegated_recovery_history.rs"]
+mod history;
 
 #[derive(sqlx::FromRow)]
 pub(super) struct Prepared {
@@ -48,9 +50,27 @@ pub(crate) async fn prepare(
 ) -> Result<Value, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let (prepared, log, mut report) = checkpoint(&mut tx, binding, genesis, true).await?;
-    report["recovered_stops"] = stops::inspection(&mut tx, &prepared, &log, binding).await?;
+    review_evidence(&mut tx, &prepared, &log, binding, &mut report).await?;
     tx.commit().await?;
     Ok(report)
+}
+
+async fn review_evidence(
+    connection: &mut PgConnection,
+    prepared: &Prepared,
+    log: &Membership,
+    binding: &Binding,
+    report: &mut Value,
+) -> Result<(), sqlx::Error> {
+    report["recovered_stops"] = stops::inspection(connection, prepared, log, binding).await?;
+    report["known_history"] = history::inspection(connection, prepared, log, binding).await?;
+    report["evidence_hash"] = source_hash(&json!({
+        "plan_id": prepared.plan_id,
+        "source_hash": prepared.source_hash,
+        "known_history": report["known_history"]["evidence_hash"],
+        "recovered_stops": report["recovered_stops"]["evidence_hash"],
+    }))?.into();
+    Ok(())
 }
 
 /// The fence and source stay locked until the caller commits all new evidence.
