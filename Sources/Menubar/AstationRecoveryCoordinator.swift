@@ -52,6 +52,7 @@ final class AstationRecoveryCoordinator {
         var restore: Data?
         var pendingDataKey: SavedKey?
         var controlPublications: [String: Data]?
+        var controlRecoveryPublications: [String: Data]?
         var hostSenderReview: Data?
         var supersededHostSenderPublications: [Data]?
         var verifierRosters: [String: AcceptedVerifierRoster]?
@@ -72,6 +73,7 @@ final class AstationRecoveryCoordinator {
     private let confirmOwner: (SignRequest) async -> Bool
     private let confirmServiceOwner: (RemoteServiceApproval, SignRequest) async -> Bool
     private let authorizeDelegatedControl: ((MembershipLog) throws -> Void)?
+    private let controlRecoveryAuthority: RemoteControlRecoveryAuthorizing?
     private let authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)?
     private let confirmVerifierRoster: ((VerifierRosterReview) async -> Bool)?
     private let verifierTime: () -> UInt64
@@ -92,6 +94,7 @@ final class AstationRecoveryCoordinator {
     private var restoreOperation: RemoteRecoveryRestore?
     private var membershipLog: MembershipLog?
     private var controlPublications: [String: RemoteControlPublication] = [:]
+    private var controlRecoveryPublications: [String: RemoteControlRecoveryPublication] = [:]
     private var controlDeliveryContext: (portal: PortalIntegrationHTTP, current: () -> Bool)?
     private var controlDeliveryTask: Task<Void, Never>?
     private var lastControlDeliveryOrigin: String?
@@ -162,6 +165,7 @@ final class AstationRecoveryCoordinator {
         confirmReplacement: @escaping (String) async -> Bool, saveKit: @escaping (String) async -> Bool,
         confirmServiceOwner: ((RemoteServiceApproval, SignRequest) async -> Bool)? = nil,
         authorizeDelegatedControl: ((MembershipLog) throws -> Void)? = nil,
+        controlRecoveryAuthority: RemoteControlRecoveryAuthorizing? = nil,
         authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)? = nil,
         additionalControlStations: ((MembershipLog) throws -> [String: RemoteControlStationTransport])? = nil,
         retainedControlTransport: ((String) throws -> RemoteControlStationTransport)? = nil,
@@ -179,6 +183,7 @@ final class AstationRecoveryCoordinator {
         self.confirmOwner = confirmOwner
         self.confirmServiceOwner = confirmServiceOwner ?? { _, request in await confirmOwner(request) }
         self.authorizeDelegatedControl = authorizeDelegatedControl
+        self.controlRecoveryAuthority = controlRecoveryAuthority
         self.authorizeNewMembership = authorizeNewMembership
         self.additionalControlStations = additionalControlStations
         self.retainedControlTransport = retainedControlTransport
@@ -1567,6 +1572,13 @@ extension AstationRecoveryCoordinator {
 
     func exportControlRecoveryEvidence(stationOrigin: String? = nil, current: () -> Bool) throws -> String {
         guard !busy, !uncertain, current() else { throw RemoteRecoveryError.requiresReview }
+        try requireDurableRecoveryCheckpoint()
+        // Reading retained public evidence needs neither network access nor new
+        // signing authority. Removed managers' originals must remain exportable.
+        return try controls(stationOrigin: stationOrigin).recoveryEvidenceJSON()
+    }
+
+    private func requireDurableRecoveryCheckpoint() throws {
         guard let checkpoint = try store.read(), checkpoint.count <= 8_388_608 else {
             throw RemoteRecoveryError.notCommitted
         }
@@ -1576,9 +1588,110 @@ extension AstationRecoveryCoordinator {
             uncertain = true
             throw RemoteRecoveryError.storageUncertain
         }
-        // Reading retained public evidence needs neither network access nor new
-        // signing authority. Removed managers' originals must remain exportable.
-        return try controls(stationOrigin: stationOrigin).recoveryEvidenceJSON()
+    }
+
+    var controlRecoveryAvailable: Bool { delegatedControlsAvailable && controlRecoveryAuthority != nil }
+
+    func prepareControlRecoveryCopy(recordID: String, context: RemoteControlRecoveryContext,
+        current: () -> Bool) async throws -> RemoteControlRecoveryReview {
+        try begin(); defer { busy = false }
+        guard controlRecoveryAvailable, let authority = controlRecoveryAuthority else {
+            throw AstationDelegatedControlError.notVerified
+        }
+        guard current(), !Task.isCancelled, context.stationOrigin == relayURL, context.accountID == accountID,
+              let kit = try currentKit(), kit.genesisHash == context.genesisHash else {
+            throw RemoteChannelError.staleLink
+        }
+        let log = try await refreshedLog(genesis: kit.genesisHash)
+        try requireManager(log)
+        try requireDelegatedControl(log)
+        guard current(), !Task.isCancelled, log.head() == context.membershipHead,
+              let original = try controls().retainedDelivery(recordID: recordID) else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        let recovery = try recoveryControls(origin: context.stationOrigin)
+        if let prior = try recovery.reviews().first(where: { $0.context == context && $0.originalRecordID == recordID }) {
+            guard prior.body.signer == "member:" + managerID, prior.originalRecordJSON == original.recordJSON else {
+                throw RemoteRecoveryError.requiresReview
+            }
+            try authority.authorize(prior, log: log)
+            guard current(), !Task.isCancelled, log.head() == context.membershipHead else { throw RemoteChannelError.staleLink }
+            return prior
+        }
+        let time = try await authority.reserve(originalRecordJSON: original.recordJSON, context: context,
+            managerID: managerID, log: log)
+        let latest = try await refreshedLog(genesis: kit.genesisHash)
+        try requireManager(latest)
+        try requireDelegatedControl(latest)
+        guard current(), !Task.isCancelled, latest.head() == context.membershipHead else { throw RemoteChannelError.staleLink }
+        return try recovery.prepare(originalRecordJSON: original.recordJSON, context: context, managerID: managerID,
+            issuedAt: time, log: latest, authority: authority)
+    }
+
+    /// Owner confirmation signs only the protected recovery draft. No live feed,
+    /// ordinary delivery, Portal mirror or recovery fence is changed here.
+    func signControlRecoveryCopy(_ review: RemoteControlRecoveryReview, current: () -> Bool) async throws -> String {
+        try begin(); defer { busy = false }
+        guard controlRecoveryAvailable, let authority = controlRecoveryAuthority else {
+            throw AstationDelegatedControlError.notVerified
+        }
+        guard current(), !Task.isCancelled, review.context.stationOrigin == relayURL,
+              review.body.signer == "member:" + managerID, let kit = try currentKit(),
+              kit.genesisHash == review.context.genesisHash else { throw RemoteChannelError.staleLink }
+        let recovery = try recoveryControls(origin: relayURL)
+        guard let retained = try recovery.reviews().first(where: { $0.body.recordId == review.body.recordId }),
+              retained.context == review.context, retained.body == review.body, retained.request == review.request,
+              retained.originalRecordJSON == review.originalRecordJSON else { throw RemoteRecoveryError.requiresReview }
+        let before = try await refreshedLog(genesis: kit.genesisHash)
+        try requireManager(before)
+        try requireDelegatedControl(before)
+        guard current(), !Task.isCancelled, before.head() == retained.context.membershipHead else {
+            throw RemoteChannelError.staleLink
+        }
+        try authority.authorize(retained, log: before)
+        var confirmedAt: UInt64 = 0
+        if !retained.signed {
+            guard current(), !Task.isCancelled, await confirmOwner(retained.request), current(), !Task.isCancelled else {
+                throw RemoteRecoveryError.confirmationRequired
+            }
+            confirmedAt = Self.clock().monoMs
+        }
+        let latest = try await refreshedLog(genesis: kit.genesisHash)
+        try requireManager(latest)
+        try requireDelegatedControl(latest)
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        try authority.authorize(retained, log: latest)
+        let provider = AstationMembershipKeyProvider(identity: identity, keyID: managerID,
+            publicKey: try identity.remotePublicKeys().signing, controlRecordsAllowed: true)
+        _ = try recovery.sign(recordID: retained.body.recordId, log: latest, provider: provider, authority: authority,
+            confirmedAt: confirmedAt, now: { Self.clock().monoMs }, current: current)
+        return try recovery.export(context: retained.context, recordIDs: [retained.body.recordId])
+    }
+
+    func exportControlRecoveryCopies(context: RemoteControlRecoveryContext, recordIDs: [String], current: () -> Bool) throws -> String {
+        guard !busy, !uncertain, current(), context.accountID == accountID else { throw RemoteRecoveryError.requiresReview }
+        try requireDurableRecoveryCheckpoint()
+        return try recoveryControls(origin: context.stationOrigin).export(context: context, recordIDs: recordIDs)
+    }
+
+    private func recoveryControls(origin: String) throws -> RemoteControlRecoveryPublication {
+        guard PortalIntegrationRecord.validOrigin(origin), let kit = try currentKit() else { throw RemoteRecoveryError.requiresReview }
+        if let value = controlRecoveryPublications[origin] { return value }
+        let retained = Set((saved.controlRecoveryPublications ?? [:]).keys).union(controlRecoveryPublications.keys)
+        guard retained.contains(origin) || retained.count < 64 else { throw RemoteControlPublicationError.full }
+        let save: (Data) throws -> Void = { [unowned self] bytes in
+            try self.persist { $0.controlRecoveryPublications = ($0.controlRecoveryPublications ?? [:]).merging([origin: bytes]) { _, new in new } }
+        }
+        let value: RemoteControlRecoveryPublication
+        if let data = saved.controlRecoveryPublications?[origin] {
+            value = try RemoteControlRecoveryPublication(checkpoint: data, accountID: accountID,
+                genesisHash: kit.genesisHash, stationOrigin: origin, persist: save)
+        } else {
+            value = try RemoteControlRecoveryPublication(accountID: accountID, genesisHash: kit.genesisHash,
+                stationOrigin: origin, persist: save)
+        }
+        controlRecoveryPublications[origin] = value
+        return value
     }
 
     struct ControlDiscoveryPage {

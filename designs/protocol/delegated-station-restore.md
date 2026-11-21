@@ -360,6 +360,50 @@ and commitments, not signatures or keys. `snapshot_complete`,
 reconstruction, not snapshot publication, a completed native recovery ceremony
 or permission to reopen the Station.
 
+### Protected native recovery copies
+
+`RemoteControlRecoveryPublication` now keeps recovery copies in a separate,
+bounded protected journal. `AstationRecoveryCoordinator` persists it alongside
+the account checkpoint, independently of ordinary control deliveries. A recovery
+copy can use the same current manager or a replacement manager for an original
+whose signer lost manage. The shared builders/readers verify every original,
+draft and signature. Service copies name the exact prepared candidate feed;
+host interruptions keep their original revoke sequence and no feed binding.
+All other intent and audit fields remain identical. Originals, their delivery
+destinations and independently approved Portal mirrors stay intact.
+
+Preparation is scoped to the exact account/genesis, Station, external generation,
+plan, source/evidence commitments, replacement feed and membership head. A saved
+draft is not authorization. The trusted `RemoteControlRecoveryAuthorizing`
+adapter must establish complete current history/clocks and durably reserve its
+timestamp before preparation, then validate that reservation and review again
+before and after owner confirmation and at signing. The journal also refuses
+times at or below any recovery draft/copy it already retained for that principal;
+these local observations still cannot establish a complete clock.
+
+There is **no production adapter** or user-facing recovery-signing action yet.
+The coordinator defaults this provider to nil and refuses preparation/signing
+before a prompt or key operation, including when ordinary delegated control has
+an authorization provider. A caller-supplied plan, observed lower bound, restored
+database, wall clock or owner click cannot substitute for the missing authority.
+The complete history/clock reconciliation and authenticated adapter remain to
+be built before enabling the native recovery workflow.
+
+With an authenticated adapter and fresh owner approval, the exact signature is
+saved before it can be exported. An uncertain protected save fences the process;
+restart reads the committed draft or exact signature without silently choosing
+an older checkpoint. Membership or account changes invalidate the pending review.
+Retrying an already signed copy never signs it again, including with P-256.
+Earlier review copies and their clock obligations remain saved across new plans.
+
+Export uses the existing `retain-resigned` JSON shape, limited to 64 signed copies
+and 256 KiB, preserving preparation order for increasing per-principal times.
+Mixed contexts, duplicate/missing IDs, unsigned copies and oversized batches are
+refused rather than partially exported. Recovery copies never enter the original
+native-evidence archive or normal Station delivery queue. Exporting already-signed
+evidence reads the protected checkpoint and needs no new network/signing authority.
+This component does not publish a replacement snapshot or reopen recovery.
+
 ### Operator Steps
 
 1. Drain and stop every replica before restoring. Keep delegated serving,

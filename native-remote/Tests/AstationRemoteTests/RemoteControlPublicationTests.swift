@@ -4,7 +4,7 @@ import Foundation
 import XCTest
 @testable import AstationRemote
 
-private final class ControlPublicationKeys: AppKeyProvider, @unchecked Sendable {
+final class ControlPublicationKeys: AppKeyProvider, @unchecked Sendable {
     let key = Curve25519.Signing.PrivateKey()
     var signs = 0
     var beforeSign: (() throws -> Void)?
@@ -19,7 +19,7 @@ private final class ControlPublicationKeys: AppKeyProvider, @unchecked Sendable 
 }
 
 @MainActor
-private final class ControlPublicationFixture {
+final class ControlPublicationFixture {
     let keys = ControlPublicationKeys()
     let origin = "https://station.example"
     let integration = "i-01234567890123456789012345"
