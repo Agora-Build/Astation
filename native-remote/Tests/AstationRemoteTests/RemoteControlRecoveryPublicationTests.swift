@@ -357,4 +357,80 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
         root["accountID"] = "another-account"
         XCTAssertThrowsError(try f.restore(PropertyListSerialization.data(fromPropertyList: root, format: .binary, options: 0)))
     }
+
+    @MainActor
+    func testCheckpointLimitsRefuseValidExcessReviewsWithoutLosingRetainedSignature() throws {
+        let f = try ControlRecoveryFixture(), first = try f.prepare()
+        let signature = try f.sign(first)
+        for index in 1..<256 {
+            let context = try ControlRecoveryFixture.context(f.source)
+            let authority = ControlRecoveryAuthority(context: context, original: f.original,
+                reservedTime: first.body.issuedAt + UInt64(index))
+            _ = try f.journal.prepare(originalRecordJSON: f.original, context: context, managerID: "manager",
+                issuedAt: authority.reservedTime, log: f.source.log, authority: authority)
+        }
+        let checkpoint = try XCTUnwrap(f.bytes), writes = f.writes, signs = f.source.keys.signs
+        try f.restore(checkpoint)
+        XCTAssertEqual(try f.journal.reviews().count, 256)
+        let context = try ControlRecoveryFixture.context(f.source)
+        let authority = ControlRecoveryAuthority(context: context, original: f.original,
+            reservedTime: first.body.issuedAt + 256)
+        XCTAssertThrowsError(try f.journal.prepare(originalRecordJSON: f.original, context: context, managerID: "manager",
+            issuedAt: authority.reservedTime, log: f.source.log, authority: authority)) {
+            XCTAssertEqual($0 as? RemoteControlPublicationError, .full)
+        }
+        XCTAssertEqual(f.bytes, checkpoint)
+        XCTAssertEqual(f.writes, writes)
+        XCTAssertEqual(f.source.keys.signs, signs)
+
+        // The 257th entry is valid and unique; only the whole-journal limit should refuse its reload.
+        var extra: Data?
+        let standalone = try RemoteControlRecoveryPublication(accountID: f.source.log.accountId(),
+            genesisHash: f.source.log.genesisHash(), stationOrigin: f.source.origin, persist: { extra = $0 })
+        let extraAuthority = ControlRecoveryAuthority(context: context, original: f.original,
+            reservedTime: authority.reservedTime + 1)
+        _ = try standalone.prepare(originalRecordJSON: f.original, context: context, managerID: "manager",
+            issuedAt: extraAuthority.reservedTime, log: f.source.log, authority: extraAuthority)
+        let extraRoot = try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(extra), format: nil) as? [String: Any])
+        let root = try XCTUnwrap(PropertyListSerialization.propertyList(from: checkpoint, format: nil) as? [String: Any])
+        let operations = try XCTUnwrap(root["operations"] as? [[String: Any]])
+        let extraOperations = try XCTUnwrap(extraRoot["operations"] as? [[String: Any]])
+        XCTAssertEqual(extraOperations.count, 1)
+        var withinCount = root
+        withinCount["operations"] = [operations[0]] + operations.dropFirst(2) + extraOperations
+        let withinCountBytes = try PropertyListSerialization.data(fromPropertyList: withinCount, format: .binary, options: 0)
+        try f.restore(withinCountBytes)
+        XCTAssertEqual(try f.journal.reviews().count, 256)
+        XCTAssertTrue(try f.journal.export(context: f.context, recordIDs: [first.body.recordId]).contains(signature))
+        var excessive = root
+        excessive["operations"] = operations + extraOperations
+        let excessiveBytes = try PropertyListSerialization.data(fromPropertyList: excessive, format: .binary, options: 0)
+        XCTAssertLessThanOrEqual(excessiveBytes.count, 2_097_152)
+
+        var smallPadding = root
+        smallPadding["padding"] = Data(repeating: 0, count: 16)
+        let smallPaddingBytes = try PropertyListSerialization.data(fromPropertyList: smallPadding, format: .binary, options: 0)
+        XCTAssertLessThanOrEqual(smallPaddingBytes.count, 2_097_152)
+        try f.restore(smallPaddingBytes)
+        XCTAssertEqual(try f.journal.reviews().count, 256)
+        var oversized = root
+        oversized["padding"] = Data(repeating: 0, count: 2_097_152)
+        let oversizedBytes = try PropertyListSerialization.data(fromPropertyList: oversized, format: .binary, options: 0)
+        XCTAssertGreaterThan(oversizedBytes.count, 2_097_152)
+        var oldVersion = root, futureVersion = root
+        oldVersion["version"] = 0
+        futureVersion["version"] = 2
+        let versionBytes = try [oldVersion, futureVersion].map {
+            try PropertyListSerialization.data(fromPropertyList: $0, format: .binary, options: 0)
+        }
+        for bytes in [excessiveBytes, oversizedBytes] + versionBytes {
+            XCTAssertThrowsError(try f.restore(bytes)) {
+                XCTAssertEqual($0 as? RemoteControlPublicationError, .invalidCheckpoint)
+            }
+        }
+        try f.restore(checkpoint)
+        XCTAssertTrue(try f.journal.export(context: f.context, recordIDs: [first.body.recordId]).contains(signature))
+        XCTAssertEqual(f.writes, writes)
+        XCTAssertEqual(f.source.keys.signs, signs)
+    }
 }

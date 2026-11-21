@@ -406,6 +406,7 @@ private final class RecoveryCoordinatorHarness {
     var serviceOwnerConfirmation: ((RemoteServiceApproval, SignRequest) async -> Bool)?
 
     func coordinator(relayURL: String = "https://configured.example", transport: RemoteRecoveryTransport? = nil,
+        checkpointStore: AstationRecoveryCheckpointStorage? = nil,
         authorizeDelegatedControl: ((MembershipLog) throws -> Void)? = nil,
         controlRecoveryAuthority: RemoteControlRecoveryAuthorizing? = nil,
         authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)? = nil,
@@ -414,7 +415,7 @@ private final class RecoveryCoordinatorHarness {
         confirmVerifierRoster: ((AstationRecoveryCoordinator.VerifierRosterReview) async -> Bool)? = nil,
         verifierTime: @escaping () -> UInt64 = { RemoteVerifierSigningGate.evidenceTimeMilliseconds() }) throws -> AstationRecoveryCoordinator {
         try AstationRecoveryCoordinator(accountID: "account-a", managerID: "manager-a", identity: identity,
-            relayURL: relayURL, store: store, transport: transport ?? relay, dataKeys: keys,
+            relayURL: relayURL, store: checkpointStore ?? store, transport: transport ?? relay, dataKeys: keys,
             allowNewDataKey: { true }, confirmOwner: { [unowned self] request in
                 ownerRequests.append(request)
                 if let ownerConfirmation {
@@ -2394,9 +2395,11 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(h.ownerRequests.count, before)
     }
 
-    private func recoveryCopySource(_ h: RecoveryCoordinatorHarness, authority: RecoveryCopyAuthority) async throws
+    private func recoveryCopySource(_ h: RecoveryCoordinatorHarness, authority: RecoveryCopyAuthority,
+        checkpointStore: AstationRecoveryCheckpointStorage? = nil) async throws
         -> (AstationRecoveryCoordinator, RemoteControlRecoveryContext, String) {
-        let coordinator = try h.coordinator(authorizeDelegatedControl: { _ in }, controlRecoveryAuthority: authority)
+        let coordinator = try h.coordinator(checkpointStore: checkpointStore,
+            authorizeDelegatedControl: { _ in }, controlRecoveryAuthority: authority)
         let portalTransport = ServiceApprovalPortal()
         let record = try await activeService(coordinator, transport: portalTransport)
         let client = try portal(portalTransport)
@@ -2411,6 +2414,84 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             candidateFeedID: UUID().uuidString.lowercased(), membershipHead: log.head())
         authority.context = context; authority.original = result.recordJSON
         return (coordinator, context, review.recordID)
+    }
+
+    func testRealProtectedRecoveryCopySurvivesStoreAndEnclaveIdentityReload() async throws {
+        // Authority/owner answers are synthetic; storage and P-256 signing use the real protected implementations.
+        let optional = ProcessInfo.processInfo.environment["ASTATION_REQUIRE_KEYCHAIN_TESTS"] != "1"
+        guard SecureEnclave.isAvailable else {
+            if optional { throw XCTSkip("Secure Enclave unavailable") }
+            throw AtemIdentityError.secureEnclaveUnavailable
+        }
+        let name = "atem-recovery-copy-test-" + UUID().uuidString
+        let identityStorage = AtemIdentityKeychainStorage(astationId: name)
+        let queries: [[String: Any]] = [
+            [kSecClass as String: kSecClassGenericPassword,
+             kSecAttrService as String: "build.agora.astation.atem-e2e-v1", kSecAttrAccount as String: name,
+             kSecUseDataProtectionKeychain as String: true],
+            [kSecClass as String: kSecClassGenericPassword,
+             kSecAttrService as String: "build.agora.astation.recovery-v2", kSecAttrAccount as String: "account:" + name,
+             kSecUseDataProtectionKeychain as String: true]
+        ]
+        defer {
+            for query in queries {
+                let status = SecItemDelete(query as CFDictionary)
+                if !optional {
+                    XCTAssertTrue(status == errSecSuccess || status == errSecItemNotFound,
+                        "Required protected test cleanup failed: \(status)")
+                }
+            }
+        }
+        let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+        h.identity = AtemE2EIdentity(storage: identityStorage)
+        var store: RemoteRecoveryStore?
+        var coordinator: AstationRecoveryCoordinator?
+        let context: RemoteControlRecoveryContext, original: String
+        do {
+            store = try RemoteRecoveryStore(accountID: name)
+            (coordinator, context, original) = try await recoveryCopySource(h, authority: authority, checkpointStore: store)
+        } catch {
+            let status: OSStatus?
+            switch error {
+            case AtemIdentityError.keychain(let code), RemoteRecoveryStoreError.keychain(let code): status = code
+            default:
+                let ns = error as NSError
+                status = ns.domain == NSOSStatusErrorDomain ? OSStatus(ns.code) : nil
+            }
+            if optional, let status, [errSecMissingEntitlement, errSecInteractionNotAllowed].contains(status) {
+                throw XCTSkip("Provisioned signing and an unlocked Mac are required")
+            }
+            throw error
+        }
+        let review = try await coordinator!.prepareControlRecoveryCopy(recordID: original, context: context, current: { true })
+        let prompts = h.ownerRequests.count
+        let exported = try await coordinator!.signControlRecoveryCopy(review, current: { true })
+        XCTAssertEqual(h.ownerRequests.count, prompts + 1)
+        XCTAssertEqual(authority.reservations, 1)
+        let data = try XCTUnwrap(store?.read())
+        let fields = try XCTUnwrap(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
+        XCTAssertEqual(fields["version"] as? Int, 4)
+        XCTAssertFalse(try XCTUnwrap(fields["controlRecoveryPublications"] as? [String: Data]).isEmpty)
+        let retainedLog = await h.relay.log
+        let log = try XCTUnwrap(retainedLog)
+        XCTAssertEqual(log.member(deviceId: "manager-a")?.authKey.alg, .p256)
+
+        coordinator = nil
+        store = nil
+        h.identity = AtemE2EIdentity(storage: identityStorage)
+        store = try RemoteRecoveryStore(accountID: name)
+        XCTAssertEqual(try store?.read(), data, "A newly opened protected store must retain the complete signed checkpoint")
+        coordinator = try h.coordinator(checkpointStore: store)
+        XCTAssertFalse(coordinator!.controlRecoveryAvailable)
+        XCTAssertEqual(try coordinator!.exportControlRecoveryCopies(context: context,
+            recordIDs: [review.body.recordId], current: { true }), exported)
+        coordinator = nil
+        coordinator = try h.coordinator(checkpointStore: store,
+            authorizeDelegatedControl: { _ in }, controlRecoveryAuthority: authority)
+        let retried = try await coordinator!.signControlRecoveryCopy(review, current: { true })
+        XCTAssertEqual(retried, exported)
+        XCTAssertEqual(h.ownerRequests.count, prompts + 1, "Reloading saved signatures must not confirm or sign again")
+        XCTAssertEqual(authority.reservations, 1)
     }
 
     func testRecoveryCopiesUseProtectedCheckpointAndOwnerConfirmationWithoutOrdinaryDelivery() async throws {
