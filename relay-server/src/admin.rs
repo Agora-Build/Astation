@@ -11,6 +11,7 @@ pub const USAGE: &str = "usage: station-relay-server admin forget-key <astation_
        station-relay-server admin delegated-recovery inspect|prepare <genesis_hash>\n\
        station-relay-server admin delegated-recovery retain-stops <genesis_hash> <file>\n\
        station-relay-server admin delegated-recovery retain-native <genesis_hash> <plan_id> <file>\n\
+       station-relay-server admin delegated-recovery retain-resigned <genesis_hash> <plan_id> <file>\n\
 \n\
 Deletes the Astation's registered relay key (DATABASE_URL, required) and\n\
 announces it on relay:broadcast (REDIS_URL, optional) so every relay\n\
@@ -21,7 +22,8 @@ STATION_DELEGATED_RECOVERY_GENERATION. status and inspect only read; fence\n\
 durably stops delegated serving, signing and reporting. prepare retains the old\n\
 evidence and reserves a replacement feed behind a closed fence. retain-stops adds\n\
 native stop evidence to that exact preparation. retain-native imports a complete\n\
-native export, keeping unsigned intent and destinations separate. None resumes them.";
+native export, keeping unsigned intent and destinations separate. retain-resigned\n\
+retains fresh manager copies for the replacement feed. None resumes them.";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ForgetOutcome {
@@ -163,7 +165,7 @@ async fn delegated_recovery(args: &[String]) -> i32 {
             (false, Some((command.as_str(), genesis)), Some(file), None)
         }
         [command, genesis, plan, file]
-            if command == "retain-native" && genesis.len() == 64
+            if matches!(command.as_str(), "retain-native" | "retain-resigned") && genesis.len() == 64
                 && genesis.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                 && uuid::Uuid::parse_str(plan).is_ok_and(|id| id.get_version_num() == 4 && id.to_string() == *plan) =>
         {
@@ -200,8 +202,12 @@ async fn delegated_recovery(args: &[String]) -> i32 {
     };
     if let Some((command, genesis)) = root {
         let report = if let Some(file) = file {
-            use crate::remote_api::recovery::delegated_recovery::plan::{native, stops};
-            let limit = if native_plan.is_some() { native::INPUT_LIMIT } else { stops::input_limit() };
+            use crate::remote_api::recovery::delegated_recovery::plan::{native, signatures, stops};
+            let limit = match command {
+                "retain-native" => native::INPUT_LIMIT,
+                "retain-resigned" => signatures::INPUT_LIMIT,
+                _ => stops::input_limit(),
+            };
             let bytes = match read_stop_evidence(std::path::Path::new(file), limit).await {
                 Ok(bytes) => bytes,
                 Err(_) => {
@@ -209,7 +215,9 @@ async fn delegated_recovery(args: &[String]) -> i32 {
                     return 1;
                 }
             };
-            if let Some(plan) = native_plan {
+            if command == "retain-resigned" {
+                signatures::retain(&pool, &binding, genesis, native_plan.expect("validated plan"), &bytes).await
+            } else if let Some(plan) = native_plan {
                 native::retain(&pool, &binding, genesis, plan, &bytes).await
             } else {
                 stops::retain(&pool, &binding, genesis, &bytes).await
@@ -404,8 +412,10 @@ mod tests {
             assert_eq!(main(&["delegated-recovery".into(), command.into()]).await, 2);
         }
         for plan in ["", "not-a-plan", "00000000-0000-0000-0000-000000000000"] {
-            assert_eq!(main(&["delegated-recovery".into(), "retain-native".into(),
-                "0".repeat(64), plan.into(), "evidence.json".into()]).await, 2);
+            for command in ["retain-native", "retain-resigned"] {
+                assert_eq!(main(&["delegated-recovery".into(), command.into(),
+                    "0".repeat(64), plan.into(), "evidence.json".into()]).await, 2);
+            }
         }
     }
 }
