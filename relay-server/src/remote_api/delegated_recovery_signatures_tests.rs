@@ -72,6 +72,15 @@ async fn submit(
     .await
 }
 
+fn obligation<'a>(report: &'a Value, original_id: &str) -> &'a Value {
+    report["recovery_signatures"]["known_native_obligations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["original"]["record_id"] == original_id)
+        .expect("the original stop must remain visible")
+}
+
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
 async fn postgres_delegated_recovery_signatures_survive_replica_retry_without_publishing_or_opening(
@@ -82,6 +91,11 @@ async fn postgres_delegated_recovery_signatures_survive_replica_retry_without_pu
     let plan = prepare(&database.pool, &binding, &genesis).await.unwrap();
     let before = saved(&database.pool).await;
     let source = original(&before);
+    assert_eq!(
+        obligation(&plan, source.record_id())["requirement"],
+        "fresh_manager_signature"
+    );
+    assert!(obligation(&plan, source.record_id())["copy_record_id"].is_null());
     let copy = fresh(&f, &plan, &source, 1000);
     let input = input(&plan, &source, copy.clone());
     let second = database.reconnect(2).await;
@@ -100,6 +114,10 @@ async fn postgres_delegated_recovery_signatures_survive_replica_retry_without_pu
     assert_eq!(signatures["records"].as_array().unwrap().len(), 1);
     assert_eq!(signatures["records"][0]["current_review"], true);
     assert_eq!(signatures["records"][0]["verification"], "valid");
+    let matched = obligation(&first, source.record_id());
+    assert_eq!(matched["requirement"], "signed_copy_retained");
+    assert_eq!(matched["copy_record_id"], copy["body"]["record_id"]);
+    assert_eq!(matched["original"]["interrupt_running"], true);
     assert_eq!(
         signatures["observed_signing_lower_bounds"]["service:svc-test"],
         f.created + 1000
@@ -305,6 +323,7 @@ async fn postgres_delegated_recovery_signatures_keep_prior_clocks_and_require_re
     .unwrap();
     let mut later = source.body().clone();
     later.record_id = uuid::Uuid::new_v4().to_string();
+    let later_id = later.record_id.clone();
     later.issued_at += 100;
     let later = build_control(&f.keys, &KeyId::new("manager"), &later)
         .unwrap()
@@ -324,6 +343,15 @@ async fn postgres_delegated_recovery_signatures_keep_prior_clocks_and_require_re
         updated["recovery_signatures"]["records"][0]["current_review"],
         false
     );
+    assert_eq!(
+        obligation(&updated, source.record_id())["requirement"],
+        "fresh_manager_signature"
+    );
+    assert!(obligation(&updated, source.record_id())["copy_record_id"].is_null());
+    assert_eq!(
+        obligation(&updated, &later_id)["requirement"],
+        "fresh_manager_signature"
+    );
     let before_failed = saved(&database.pool).await;
     let stale = input(&plan, &source, fresh(&f, &plan, &source, 1001));
     assert!(submit(&database.pool, &binding, &genesis, &plan, &stale)
@@ -340,6 +368,16 @@ async fn postgres_delegated_recovery_signatures_keep_prior_clocks_and_require_re
     let current = submit(&database.pool, &binding, &genesis, &updated, &next)
         .await
         .unwrap();
+    assert_eq!(
+        obligation(&current, source.record_id())["requirement"],
+        "signed_copy_retained"
+    );
+    assert_eq!(
+        obligation(&current, &later_id)["requirement"],
+        "fresh_manager_signature",
+        "a copy of another stop for the same principal cannot replace this obligation"
+    );
+    assert!(obligation(&current, &later_id)["copy_record_id"].is_null());
     assert_eq!(
         current["recovery_signatures"]["records"]
             .as_array()
@@ -364,6 +402,10 @@ async fn postgres_delegated_recovery_signatures_keep_prior_clocks_and_require_re
         .unwrap()
         .iter()
         .all(|row| row["current_review"] == false));
+    assert_eq!(
+        obligation(&later_plan, source.record_id())["requirement"],
+        "fresh_manager_signature"
+    );
     let late_copy = fresh(&f, &later_plan, &source, 1002);
     let final_report = submit(
         &database.pool,
@@ -486,6 +528,15 @@ async fn postgres_delegated_recovery_signatures_refuse_partial_batches_and_keep_
             .unwrap();
     let updated = stops::retain(&database.pool, &binding, &genesis, &serde_json::to_vec(&json!({
         "plan_id":plan["plan_id"],"source_hash":plan["source_hash"],"records":[host.object().to_json()]})).unwrap()).await.unwrap();
+    assert_eq!(
+        obligation(&updated, host.record_id())["requirement"],
+        "retain_host_record"
+    );
+    assert!(obligation(&updated, host.record_id())["copy_record_id"].is_null());
+    assert_eq!(
+        obligation(&updated, host.record_id())["original"]["revoke_seq"],
+        f.log.head().seq
+    );
     let before = saved(&database.pool).await;
     let mut batch = input(&updated, &source, fresh(&f, &updated, &source, 1000));
     let mut invalid_host = host.body().clone();
@@ -508,6 +559,10 @@ async fn postgres_delegated_recovery_signatures_refuse_partial_batches_and_keep_
     let accepted = submit(&database.pool, &binding, &genesis, &updated, &batch)
         .await
         .unwrap();
+    assert_eq!(
+        obligation(&accepted, host.record_id())["requirement"],
+        "signed_copy_retained"
+    );
     assert_eq!(
         accepted["recovery_signatures"]["records"]
             .as_array()
@@ -624,6 +679,11 @@ async fn postgres_delegated_recovery_signatures_recheck_current_manager_without_
         "removed_manager"
     );
     assert_eq!(
+        obligation(&next_plan, source.record_id())["requirement"],
+        "authority_review"
+    );
+    assert!(obligation(&next_plan, source.record_id())["copy_record_id"].is_null());
+    assert_eq!(
         next_plan["recovery_signatures"]["observed_signing_lower_bounds"]["service:svc-test"],
         f.created + 1000
     );
@@ -656,6 +716,15 @@ async fn postgres_delegated_recovery_signatures_recheck_current_manager_without_
     )
     .await
     .unwrap();
+    assert_eq!(
+        obligation(&result, source.record_id())["requirement"],
+        "signed_copy_retained"
+    );
+    assert_eq!(
+        obligation(&result, source.record_id())["original"]["verification"],
+        "removed_manager",
+        "a fresh manager copy cannot rewrite the original authority verdict"
+    );
     assert_eq!(
         result["recovery_signatures"]["records"]
             .as_array()

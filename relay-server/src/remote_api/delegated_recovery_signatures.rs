@@ -283,6 +283,7 @@ pub(super) async fn inspection(
     let (rows, lower_bounds) = load(connection, prepared, log, binding, &signed, report).await?;
     let mut commitments = Vec::new();
     let mut summaries = Vec::new();
+    let mut current_copies = BTreeMap::new();
     for row in rows {
         let record = ControlRecord::parse(&serde_json::to_vec(&row.record).map_err(|_| invalid())?)
             .map_err(|_| invalid())?;
@@ -291,15 +292,45 @@ pub(super) async fn inspection(
             ControlCheck::Pending(reason) => format!("pending:{}", reason.code()),
             ControlCheck::Refused(reason) => reason.code().to_owned(),
         };
+        let current_review =
+            row.plan_id == prepared.plan_id && report["evidence_hash"] == row.evidence_hash;
+        if current_review
+            && verification == "valid"
+            && current_copies
+                .insert(row.original_record_id.clone(), row.record_id.clone())
+                .is_some()
+        {
+            return Err(invalid());
+        }
         summaries.push(json!({"original_record_id":row.original_record_id,"record_id":row.record_id,
             "principal":record.principal().name(),"issued_at":record.issued_at(),"verification":verification,
-            "current_review":row.plan_id == prepared.plan_id && report["evidence_hash"] == row.evidence_hash,
+            "current_review":current_review,
             "source_evidence_hash":row.evidence_hash,"plan_id":row.plan_id}));
         commitments.push(json!({"plan_id":row.plan_id,"record_id":row.record_id,
             "original_record_id":row.original_record_id,"evidence_hash":row.evidence_hash,"record":row.record}));
     }
+    let mut obligations = Vec::new();
+    for value in signed.values() {
+        let record = ControlRecord::parse(&serde_json::to_vec(value).map_err(|_| invalid())?)
+            .map_err(|_| invalid())?;
+        if !matches!(record.signer(), ControlSigner::Member(_)) {
+            continue;
+        }
+        let original = super::stops::review(&record, log, &binding.origin)?;
+        let copy = current_copies.get(record.record_id());
+        let requirement = if copy.is_some() {
+            "signed_copy_retained"
+        } else {
+            original["requirement"].as_str().ok_or_else(invalid)?
+        };
+        // Preserve each original independently. A newer stop for its principal,
+        // an old-review copy or unsigned intent cannot discharge this mapping.
+        obligations
+            .push(json!({"original":original,"copy_record_id":copy,"requirement":requirement}));
+    }
     Ok(
         json!({"records":summaries,"evidence_hash":source_hash(&json!(commitments))?,
+        "known_native_obligations":obligations,
         "observed_signing_lower_bounds":lower_bounds,"signing_clock_complete":false,
         "snapshot_complete":false,"recovery_ready":false}),
     )

@@ -426,6 +426,25 @@ and commitments, not signatures or keys. `snapshot_complete`,
 reconstruction, not snapshot publication, a completed native recovery ceremony
 or permission to reopen the Station.
 
+The same locked inspection assembles `recovery_signatures.known_native_obligations`
+from every retained original signed native stop. Each item preserves the original
+review and identifies a matching current copy by record ID, or explicitly says
+`fresh_manager_signature`, `authority_review` or `retain_host_record`. A copy is
+`signed_copy_retained` only when it matches that exact original, the current plan
+and source evidence, and passes the shared verifier under current membership.
+Another stop for the same principal cannot replace it. Changing evidence or the
+recovery generation makes earlier copies require review again; removing a manager
+preserves their original verdict and all earlier copies and clock obligations.
+An unchanged valid host interruption can instead retain its original signature
+and exact revoke sequence. Unsigned owner intent remains separately listed in
+`native_archives`; it never becomes an original signed stop through this mapping.
+
+This mapping avoids manual matching while assembling the known native portion
+of a future snapshot. It exposes no signed bodies and changes no stored state.
+Even a copy for every known original does not establish missing history, complete
+clocks, service state or a complete snapshot. All existing completeness/readiness
+fields remain false, and no signing, publication or reopening is authorized.
+
 ### Protected native recovery copies
 
 `RemoteControlRecoveryPublication` now keeps recovery copies in a separate,
