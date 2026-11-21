@@ -102,6 +102,22 @@ async fn postgres_delegated_native_archive_retains_all_pages_intents_and_destina
         "unsigned_owner_intent"
     );
     assert_eq!(summary["destinations"], input["destinations"]);
+    let obligations = first["recovery_signatures"]["known_native_obligations"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        obligations.len(),
+        66,
+        "65 imported native stops and the retained original"
+    );
+    assert!(
+        obligations.iter().all(|row| {
+            row["original"]["record_id"] != pending.record_id
+                && row["requirement"] == "fresh_manager_signature"
+                && row["copy_record_id"].is_null()
+        }),
+        "unsigned intent and Station-signed state cannot become native signed stops"
+    );
     assert_eq!(
         first["native_archives"]["unsigned_intent_is_authority"],
         false
