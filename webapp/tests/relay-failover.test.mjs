@@ -49,7 +49,20 @@ test('an unresponsive old relay address fails over before the client handshake d
     const sockets = new Set();
     const upgrades = [];
     let healthCalls = 0;
-    const backend = createServer((req, res) => {
+    let apiCalls = 0;
+    const apiBody = '{"request_id":"isolated-request","text":"fixture only"}';
+    const backend = createServer(async (req, res) => {
+      if (req.url === '/api/agent/v1/failover-probe') {
+        apiCalls++;
+        assert.equal(req.method, 'POST');
+        assert.equal(req.headers.authorization, 'Bearer isolated-failover-test');
+        const chunks = [];
+        for await (const chunk of req) chunks.push(chunk);
+        assert.equal(Buffer.concat(chunks).toString(), apiBody);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"stored":true}');
+        return;
+      }
       assert.equal(req.url, '/health');
       healthCalls++;
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -114,6 +127,15 @@ test('an unresponsive old relay address fails over before the client handshake d
     assert.deepEqual(await health.json(), { status: 'ok' });
     assert.equal(healthCalls, 1);
     assert.ok(performance.now() - started >= 2_500, 'the request must actually encounter the blackholed peer');
+    // Connecting to an obsolete peer must not consume the API client's deadline
+    // or turn one POST into more than one backend acceptance.
+    const result = await fetch(new URL('/api/agent/v1/failover-probe', origin), {
+      method: 'POST', headers: { Authorization: 'Bearer isolated-failover-test', 'Content-Type': 'application/json' },
+      body: apiBody, signal: AbortSignal.timeout(8_000),
+    });
+    assert.equal(result.status, 200);
+    assert.deepEqual(await result.json(), { stored: true });
+    assert.equal(apiCalls, 1);
     for (const path of ['/ws?proof=isolated', '//ws?proof=isolated', '/ws/proxy?proof=isolated']) {
       const { socket, head } = await upgrade(origin, path);
       try {
