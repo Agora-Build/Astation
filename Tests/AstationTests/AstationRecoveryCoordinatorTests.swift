@@ -2418,7 +2418,11 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
 
     func testRealProtectedRecoveryCopySurvivesStoreAndEnclaveIdentityReload() async throws {
         // Authority/owner answers are synthetic; storage and P-256 signing use the real protected implementations.
-        guard SecureEnclave.isAvailable else { throw XCTSkip("Secure Enclave unavailable") }
+        let optional = ProcessInfo.processInfo.environment["ASTATION_REQUIRE_KEYCHAIN_TESTS"] != "1"
+        guard SecureEnclave.isAvailable else {
+            if optional { throw XCTSkip("Secure Enclave unavailable") }
+            throw AtemIdentityError.secureEnclaveUnavailable
+        }
         let name = "atem-recovery-copy-test-" + UUID().uuidString
         let identityStorage = AtemIdentityKeychainStorage(astationId: name)
         let queries: [[String: Any]] = [
@@ -2439,7 +2443,6 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             store = try RemoteRecoveryStore(accountID: name)
             (coordinator, context, original) = try await recoveryCopySource(h, authority: authority, checkpointStore: store)
         } catch {
-            let optional = ProcessInfo.processInfo.environment["ASTATION_REQUIRE_KEYCHAIN_TESTS"] != "1"
             let status: OSStatus?
             switch error {
             case AtemIdentityError.keychain(let code), RemoteRecoveryStoreError.keychain(let code): status = code

@@ -394,14 +394,36 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
         let extraRoot = try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(extra), format: nil) as? [String: Any])
         let root = try XCTUnwrap(PropertyListSerialization.propertyList(from: checkpoint, format: nil) as? [String: Any])
         let operations = try XCTUnwrap(root["operations"] as? [[String: Any]])
+        let extraOperations = try XCTUnwrap(extraRoot["operations"] as? [[String: Any]])
+        XCTAssertEqual(extraOperations.count, 1)
+        var withinCount = root
+        withinCount["operations"] = [operations[0]] + operations.dropFirst(2) + extraOperations
+        let withinCountBytes = try PropertyListSerialization.data(fromPropertyList: withinCount, format: .binary, options: 0)
+        try f.restore(withinCountBytes)
+        XCTAssertEqual(try f.journal.reviews().count, 256)
+        XCTAssertTrue(try f.journal.export(context: f.context, recordIDs: [first.body.recordId]).contains(signature))
         var excessive = root
-        excessive["operations"] = operations + (try XCTUnwrap(extraRoot["operations"] as? [[String: Any]]))
-        var wrongVersion = root
-        wrongVersion["version"] = 2
+        excessive["operations"] = operations + extraOperations
+        let excessiveBytes = try PropertyListSerialization.data(fromPropertyList: excessive, format: .binary, options: 0)
+        XCTAssertLessThanOrEqual(excessiveBytes.count, 2_097_152)
+
+        var smallPadding = root
+        smallPadding["padding"] = Data(repeating: 0, count: 16)
+        let smallPaddingBytes = try PropertyListSerialization.data(fromPropertyList: smallPadding, format: .binary, options: 0)
+        XCTAssertLessThanOrEqual(smallPaddingBytes.count, 2_097_152)
+        try f.restore(smallPaddingBytes)
+        XCTAssertEqual(try f.journal.reviews().count, 256)
         var oversized = root
         oversized["padding"] = Data(repeating: 0, count: 2_097_152)
-        for invalid in [excessive, wrongVersion, oversized] {
-            let bytes = try PropertyListSerialization.data(fromPropertyList: invalid, format: .binary, options: 0)
+        let oversizedBytes = try PropertyListSerialization.data(fromPropertyList: oversized, format: .binary, options: 0)
+        XCTAssertGreaterThan(oversizedBytes.count, 2_097_152)
+        var oldVersion = root, futureVersion = root
+        oldVersion["version"] = 0
+        futureVersion["version"] = 2
+        let versionBytes = try [oldVersion, futureVersion].map {
+            try PropertyListSerialization.data(fromPropertyList: $0, format: .binary, options: 0)
+        }
+        for bytes in [excessiveBytes, oversizedBytes] + versionBytes {
             XCTAssertThrowsError(try f.restore(bytes)) {
                 XCTAssertEqual($0 as? RemoteControlPublicationError, .invalidCheckpoint)
             }
