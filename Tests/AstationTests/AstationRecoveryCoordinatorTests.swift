@@ -2433,7 +2433,15 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
              kSecAttrService as String: "build.agora.astation.recovery-v2", kSecAttrAccount as String: "account:" + name,
              kSecUseDataProtectionKeychain as String: true]
         ]
-        defer { for query in queries { SecItemDelete(query as CFDictionary) } }
+        defer {
+            for query in queries {
+                let status = SecItemDelete(query as CFDictionary)
+                if !optional {
+                    XCTAssertTrue(status == errSecSuccess || status == errSecItemNotFound,
+                        "Required protected test cleanup failed: \(status)")
+                }
+            }
+        }
         let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
         h.identity = AtemE2EIdentity(storage: identityStorage)
         var store: RemoteRecoveryStore?
