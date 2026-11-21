@@ -2778,6 +2778,208 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         controller.showWindow(nil)
     }
 
+    func testRecoveryWindowPreparesFirstCopyThenConfirmsSeparatelyWithoutChangingOriginalDelivery() async throws {
+        _ = NSApplication.shared
+        let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+        let (coordinator, context, original) = try await recoveryCopySource(h, authority: authority)
+        await h.relay.setRecoveryReview(.init(context: context, reconstructionHash: String(repeating: "c", count: 64)))
+        let prompts = h.ownerRequests.count, beforeControls = await h.relay.controls()
+        var shown: [RemoteControlRecoveryReview] = []
+        let controller = ControlRecoveryWindowController(stationOrigin: context.stationOrigin, loadAccess: {
+            .init(coordinator: coordinator, current: { true }, canSign: { true })
+        }, confirm: { shown.append($0); return true })
+        showRecovery(controller)
+        defer { controller.close() }
+        let prepare = try recoveryButton("Prepare Copy...", window: controller.window)
+        XCTAssertFalse(prepare.isEnabled, "a Station plan must be loaded first")
+        let load = try recoveryButton("Load Station Review", window: controller.window)
+        try clickRecovery(load)
+        try await waitForRecoveryUI { prepare.isEnabled }
+        try clickRecovery(prepare)
+        let sign = try recoveryButton("Confirm Copy...", window: controller.window)
+        try await waitForRecoveryUI { sign.isEnabled }
+        let draft = try XCTUnwrap(coordinator.localControlRecoveryReviews(current: { true }).first)
+        XCTAssertEqual(draft.originalRecordID, original)
+        XCTAssertEqual(draft.context, context)
+        XCTAssertFalse(draft.signed)
+        XCTAssertEqual(authority.reservations, 1)
+        XCTAssertEqual(h.ownerRequests.count, prompts, "preparation cannot confirm or sign")
+        XCTAssertFalse(try recoveryButton("Save Signed Copy...", window: controller.window).isEnabled)
+        try clickRecovery(prepare)
+        try await waitForRecoveryUI { prepare.isEnabled }
+        XCTAssertEqual(try coordinator.localControlRecoveryReviews(current: { true }), [draft])
+        XCTAssertEqual(authority.reservations, 1, "exact preparation retry retains its reservation and draft")
+        try clickRecovery(sign)
+        try await waitForRecoveryUI { (try? self.recoveryButton("Save Signed Copy...", window: controller.window).isEnabled) == true }
+        XCTAssertEqual(shown, [draft])
+        XCTAssertEqual(h.ownerRequests.count, prompts + 1)
+        let controls = await h.relay.controls()
+        XCTAssertEqual(controls, beforeControls)
+        XCTAssertEqual(try coordinator.localControlRecoveryOriginals(stationOrigin: context.stationOrigin,
+            current: { true }).map { $0.body.recordId }, [original])
+    }
+
+    func testRecoveryWindowCannotPrepareWithReadOnlyMetadataAndNoAuthority() async throws {
+        _ = NSApplication.shared
+        let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+        let (_, context, original) = try await recoveryCopySource(h, authority: authority)
+        await h.relay.setRecoveryReview(.init(context: context, reconstructionHash: String(repeating: "c", count: 64)))
+        let coordinator = try h.coordinator(), prompts = h.ownerRequests.count, checkpoint = h.store.bytes
+        let controller = ControlRecoveryWindowController(stationOrigin: context.stationOrigin, loadAccess: {
+            .init(coordinator: coordinator, current: { true }, canSign: { true })
+        })
+        showRecovery(controller)
+        defer { controller.close() }
+        XCTAssertEqual(try coordinator.localControlRecoveryOriginals(stationOrigin: context.stationOrigin,
+            current: { true }).map { $0.body.recordId }, [original])
+        let load = try recoveryButton("Load Station Review", window: controller.window)
+        try clickRecovery(load)
+        try await waitForRecoveryUI { load.isEnabled }
+        let prepare = try recoveryButton("Prepare Copy...", window: controller.window)
+        XCTAssertFalse(prepare.isEnabled)
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(prepare.action), to: prepare.target, from: prepare))
+        XCTAssertEqual(h.store.bytes, checkpoint)
+        XCTAssertEqual(h.ownerRequests.count, prompts)
+        XCTAssertEqual(authority.reservations, 0)
+        XCTAssertTrue(try coordinator.localControlRecoveryReviews(current: { true }).isEmpty)
+    }
+
+    func testRecoveryWindowRetiresPreparationAfterClosingOrAccountChangeDuringReservation() async throws {
+        _ = NSApplication.shared
+        for closeWindow in [false, true] {
+            let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+            let (coordinator, context, _) = try await recoveryCopySource(h, authority: authority)
+            await h.relay.setRecoveryReview(.init(context: context, reconstructionHash: String(repeating: "c", count: 64)))
+            let prompts = h.ownerRequests.count
+            var live = true, answer: CheckedContinuation<Void, Never>?
+            authority.afterReserve = { await withCheckedContinuation { answer = $0 } }
+            let controller = ControlRecoveryWindowController(stationOrigin: context.stationOrigin, loadAccess: {
+                .init(coordinator: coordinator, current: { live }, canSign: { true })
+            })
+            showRecovery(controller)
+            defer { controller.close() }
+            try clickRecovery(recoveryButton("Load Station Review", window: controller.window))
+            let prepare = try recoveryButton("Prepare Copy...", window: controller.window)
+            try await waitForRecoveryUI { prepare.isEnabled }
+            try clickRecovery(prepare)
+            try await waitForRecoveryUI { answer != nil }
+            if closeWindow { controller.close() }
+            else {
+                live = false
+                NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
+            }
+            answer?.resume()
+            try await waitForRecoveryUI { (try? self.recoveryButton("Refresh", window: controller.window).isEnabled) == true }
+            XCTAssertEqual(authority.reservations, 1, "the spent reservation must not create a draft in retired context")
+            XCTAssertTrue(try coordinator.localControlRecoveryReviews(current: { true }).isEmpty)
+            XCTAssertEqual(h.ownerRequests.count, prompts)
+            XCTAssertFalse(try recoveryButton("Confirm Copy...", window: controller.window).isEnabled)
+        }
+    }
+
+    func testRecoveryPreparationRechecksProtectedStoreBeforeReservationAndDraftPersistence() async throws {
+        for beforeReservation in [false, true] {
+            let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+            let (coordinator, context, original) = try await recoveryCopySource(h, authority: authority)
+            let prompts = h.ownerRequests.count, checkpoint = h.store.bytes
+            if beforeReservation { h.store.bytes = nil }
+            else { authority.afterReserve = { h.store.bytes = nil } }
+            do {
+                _ = try await coordinator.prepareControlRecoveryCopy(recordID: original, context: context, current: { true })
+                XCTFail("an unreadable protected journal must not prepare a recovery copy")
+            } catch {}
+            XCTAssertNil(h.store.bytes, "network membership refresh must not recreate the lost protected journal")
+            h.store.bytes = checkpoint
+            XCTAssertEqual(authority.reservations, beforeReservation ? 0 : 1)
+            XCTAssertEqual(h.ownerRequests.count, prompts)
+            let restarted = try h.coordinator()
+            XCTAssertTrue(try restarted.localControlRecoveryReviews(current: { true }).isEmpty)
+            XCTAssertEqual(try restarted.localControlRecoveryOriginals(stationOrigin: context.stationOrigin,
+                current: { true }).map { $0.body.recordId }, [original])
+        }
+    }
+
+    func testRecoveryConfirmationNeverRecreatesAProtectedDraftLostBeforeOrDuringOwnerPrompt() async throws {
+        for beforeConfirmation in [false, true] {
+            let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+            let (coordinator, context, original) = try await recoveryCopySource(h, authority: authority)
+            let draft = try await coordinator.prepareControlRecoveryCopy(recordID: original, context: context, current: { true })
+            let checkpoint = h.store.bytes, prompts = h.ownerRequests.count, signingCalls = h.identityCryptography.signingCalls
+            if beforeConfirmation { h.store.bytes = nil }
+            else { h.ownerConfirmation = { _ in h.store.bytes = nil; return true } }
+            do {
+                _ = try await coordinator.signControlRecoveryCopy(draft, current: { true })
+                XCTFail("a lost durable draft must never be signed from memory")
+            } catch {}
+            XCTAssertEqual(h.ownerRequests.count, prompts + (beforeConfirmation ? 0 : 1))
+            XCTAssertEqual(h.identityCryptography.signingCalls, signingCalls)
+            XCTAssertNil(h.store.bytes, "membership refresh must not overwrite the missing checkpoint")
+            h.store.bytes = checkpoint
+            let restarted = try h.coordinator()
+            XCTAssertFalse(try XCTUnwrap(restarted.localControlRecoveryReviews(current: { true }).first).signed)
+        }
+    }
+
+    func testRecoveryPreparationAndConfirmationNeverOverwriteCheckpointLostDuringMembershipFetch() async throws {
+        for signing in [false, true] {
+            let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+            let (coordinator, context, original) = try await recoveryCopySource(h, authority: authority)
+            let draft = signing ? try await coordinator.prepareControlRecoveryCopy(recordID: original,
+                context: context, current: { true }) : nil
+            let checkpoint = h.store.bytes, prompts = h.ownerRequests.count, signingCalls = h.identityCryptography.signingCalls
+            let reservations = authority.reservations
+            await h.relay.whenEntriesReply { await MainActor.run { h.store.bytes = nil } }
+            do {
+                if let draft { _ = try await coordinator.signControlRecoveryCopy(draft, current: { true }) }
+                else { _ = try await coordinator.prepareControlRecoveryCopy(recordID: original, context: context, current: { true }) }
+                XCTFail("a network response must never recreate the lost protected journal")
+            } catch {}
+            XCTAssertNil(h.store.bytes)
+            XCTAssertEqual(h.ownerRequests.count, prompts)
+            XCTAssertEqual(h.identityCryptography.signingCalls, signingCalls)
+            XCTAssertEqual(authority.reservations, reservations)
+            h.store.bytes = checkpoint
+            let restarted = try h.coordinator()
+            XCTAssertTrue(try restarted.localControlRecoveryReviews(current: { true }).allSatisfy { !$0.signed })
+        }
+    }
+
+    func testRecoveryWindowRetainsOfflineCopyExportWhenMembershipIsFrozen() async throws {
+        _ = NSApplication.shared
+        let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+        let (coordinator, context, original) = try await recoveryCopySource(h, authority: authority)
+        let draft = try await coordinator.prepareControlRecoveryCopy(recordID: original, context: context, current: { true })
+        _ = try await coordinator.signControlRecoveryCopy(draft, current: { true })
+        let expected = try coordinator.exportControlRecoveryCopies(context: context,
+            recordIDs: [draft.body.recordId], current: { true })
+        let storedChain = await h.relay.log
+        let chain = try XCTUnwrap(storedChain)
+        let genesis = try MembershipLog.verify(accountId: "account-a", genesisHash: context.genesisHash,
+            entries: [XCTUnwrap(chain.entries().first)], now: AstationRecoveryCoordinator.clock())
+        let body = try genesis.draftEntry(signer: "manager-a", signedAt: AstationRecoveryCoordinator.clock().wallMs,
+            actionJson: recoveryTestJSON(["action": "add_host", "host": ["host_id": "fork-host", "host_trust_gen": 1,
+                "host_key": ["alg": "ed25519", "pub": recoveryTestBase64(Curve25519.Signing.PrivateKey().publicKey.rawRepresentation)]]]))
+        let provider = AstationMembershipKeyProvider(identity: h.identity, keyID: "manager-a", publicKey: try h.identity.remotePublicKeys().signing)
+        let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: "manager-a")
+        let entry = try recoveryTestJSON(["body": JSONSerialization.jsonObject(with: Data(body.utf8)),
+            "sig": recoveryTestBase64(provider.sign(request: request))])
+        await h.relay.injectNextEntries([entry])
+        do { _ = try await coordinator.exportedKit(); XCTFail("a conflicting chain must freeze membership") } catch {}
+        XCTAssertThrowsError(try coordinator.localControlRecoveryOriginals(stationOrigin: context.stationOrigin, current: { true }))
+        let panel = RecoveryCopySavePanel(), destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        panel.destination = destination
+        defer { try? FileManager.default.removeItem(at: destination) }
+        let controller = ControlRecoveryWindowController(stationOrigin: context.stationOrigin, loadAccess: {
+            .init(coordinator: coordinator, current: { true }, canSign: { false })
+        }, makeSavePanel: { panel })
+        showRecovery(controller)
+        defer { controller.close() }
+        try clickRecovery(recoveryButton("Save Signed Copy...", window: controller.window))
+        try XCTUnwrap(panel.reply)(.OK)
+        XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), expected)
+        XCTAssertFalse(try recoveryButton("Prepare Copy...", window: controller.window).isEnabled)
+    }
+
     func testRecoveryCopyWindowConfirmsExactDraftAndExportsOfflineWithoutResigning() async throws {
         _ = NSApplication.shared
         let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()

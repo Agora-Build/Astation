@@ -15,6 +15,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
     private let confirm: ((RemoteControlRecoveryReview) async -> Bool)?
     private let makeSavePanel: @MainActor () -> NSSavePanel
     private let choices = NSPopUpButton()
+    private let originalChoices = NSPopUpButton()
     private let details = NSTextView()
     private let status = NSTextField(wrappingLabelWithString: "")
     private let stationStatus = NSTextField(wrappingLabelWithString: "Station review has not been loaded. Saved copies remain available offline.")
@@ -22,8 +23,10 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
     private let sign = NSButton(title: "Confirm Copy...", target: nil, action: nil)
     private let export = NSButton(title: "Save Signed Copy...", target: nil, action: nil)
     private let loadReview = NSButton(title: "Load Station Review", target: nil, action: nil)
+    private let prepare = NSButton(title: "Prepare Copy...", target: nil, action: nil)
     private var access: Access?
     private var rows: [RemoteControlRecoveryReview] = []
+    private var originals: [RemoteControlActivity] = []
     private var preparation: RemoteControlRecoveryPreparation?
     private var generation = UUID()
     private var task: Task<Void, Never>?
@@ -48,10 +51,10 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         makeSavePanel: @escaping @MainActor () -> NSSavePanel = { NSSavePanel() }) {
         self.stationOrigin = stationOrigin; self.loadAccess = loadAccess
         self.confirm = confirm; self.makeSavePanel = makeSavePanel
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 580),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 720),
             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.title = "Recovery Copies"; window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 620, height: 440)
+        window.minSize = NSSize(width: 620, height: 680)
         super.init(window: window)
         window.delegate = self
         let intro = NSTextField(wrappingLabelWithString:
@@ -62,9 +65,14 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         details.isVerticallyResizable = true; details.isHorizontallyResizable = false
         details.autoresizingMask = .width; details.textContainer?.widthTracksTextView = true
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.documentView = details
-        let actions = NSStackView(views: [sign, export, loadReview, refresh]); actions.spacing = 12
-        let stack = NSStackView(views: [intro, stationStatus, choices, scroll, status, actions])
-        stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 14
+        let reviewActions = NSStackView(views: [loadReview, refresh]); reviewActions.spacing = 12
+        let originalActions = NSStackView(views: [originalChoices, prepare]); originalActions.spacing = 12
+        originalChoices.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let actions = NSStackView(views: [sign, export]); actions.spacing = 12
+        let stack = NSStackView(views: [intro, stationStatus, reviewActions,
+            NSTextField(labelWithString: "Original signed stop"), originalActions,
+            NSTextField(labelWithString: "Saved recovery copy"), choices, scroll, status, actions])
+        stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10
         if let content = window.contentView {
             content.addSubview(stack); stack.translatesAutoresizingMaskIntoConstraints = false
             NSLayoutConstraint.activate([
@@ -74,6 +82,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
                 stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
                 intro.widthAnchor.constraint(equalTo: stack.widthAnchor),
                 stationStatus.widthAnchor.constraint(equalTo: stack.widthAnchor),
+                originalActions.widthAnchor.constraint(equalTo: stack.widthAnchor),
                 choices.widthAnchor.constraint(equalTo: stack.widthAnchor),
                 scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
                 scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 160),
@@ -82,10 +91,13 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         }
         choices.setAccessibilityLabel("Saved recovery copy")
         choices.target = self; choices.action = #selector(selectionChanged)
+        originalChoices.setAccessibilityLabel("Original signed stop")
+        originalChoices.target = self; originalChoices.action = #selector(selectionChanged)
         refresh.target = self; refresh.action = #selector(reload)
         sign.target = self; sign.action = #selector(confirmCopy)
         export.target = self; export.action = #selector(saveCopy)
         loadReview.target = self; loadReview.action = #selector(loadStationReview)
+        prepare.target = self; prepare.action = #selector(prepareCopy)
         for name in [Notification.Name.accountLoginChanged, .serverInfoChanged, .relayIdentityKeyChanged] {
             NotificationCenter.default.addObserver(self, selector: #selector(contextChanged), name: name, object: nil)
         }
@@ -105,6 +117,10 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         rows.indices.contains(choices.indexOfSelectedItem) ? rows[choices.indexOfSelectedItem] : nil
     }
 
+    private var selectedOriginal: RemoteControlActivity? {
+        originals.indices.contains(originalChoices.indexOfSelectedItem) ? originals[originalChoices.indexOfSelectedItem] : nil
+    }
+
     private func isCurrent(_ access: Access, epoch: UUID) -> Bool {
         generation == epoch && window?.isVisible == true && access.current() && !Task.isCancelled
     }
@@ -115,7 +131,8 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         generation = UUID(); task?.cancel()
         panel?.cancel(nil); panel = nil
         if let alert { window?.endSheet(alert.window, returnCode: .abort) }
-        alert = nil; access = nil; rows = []; preparation = nil; choices.removeAllItems(); details.string = ""
+        alert = nil; access = nil; rows = []; originals = []; preparation = nil
+        choices.removeAllItems(); originalChoices.removeAllItems(); details.string = ""
         stationStatus.stringValue = "Station review has not been loaded. Saved copies remain available offline."
         render()
     }
@@ -127,22 +144,44 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
 
     @objc private func reload() {
         guard task == nil, panel == nil else { return }
-        generation = UUID(); access = nil; rows = []; preparation = nil; choices.removeAllItems(); details.string = ""
+        generation = UUID(); access = nil; rows = []; originals = []; preparation = nil
+        choices.removeAllItems(); originalChoices.removeAllItems(); details.string = ""
         stationStatus.stringValue = "Station review has not been loaded. Saved copies remain available offline."
         do {
             let value = try loadAccess(), epoch = generation
             guard isCurrent(value, epoch: epoch) else { throw RemoteRecoveryError.requiresReview }
-            rows = try value.coordinator.localControlRecoveryReviews(stationOrigin: stationOrigin,
+            let copies = try value.coordinator.localControlRecoveryReviews(stationOrigin: stationOrigin,
                 current: { self.isCurrent(value, epoch: epoch) })
             access = value
-            choices.addItems(withTitles: rows.map {
-                ($0.signed ? "Signed - " : "Needs confirmation - ") + $0.body.principal + " - " + $0.body.recordId
-            })
+            setCopies(copies)
             status.stringValue = rows.isEmpty
-                ? "No saved recovery copies. Copies appear after an authenticated recovery review is prepared."
+                ? "No saved recovery copies. Load the Station review, then prepare a copy of an original stop. Preparation requires verified recovery authority."
                 : "Saved copies shown. History, clocks, publication and reopening are separate recovery steps."
+            do {
+                originals = try value.coordinator.localControlRecoveryOriginals(stationOrigin: stationOrigin,
+                    current: { self.isCurrent(value, epoch: epoch) })
+                originalChoices.addItems(withTitles: originals.map {
+                    $0.body.principal + " - " + $0.body.recordId
+                })
+            } catch {
+                // A currently unreviewable original must not hide an independently
+                // retained signed copy. Export still rechecks the protected store.
+                status.stringValue = "Could not review originals for new preparation: " + error.localizedDescription +
+                    " Saved recovery copies remain listed."
+            }
         } catch { status.stringValue = "Could not read protected recovery copies: " + error.localizedDescription }
         render()
+    }
+
+    private func setCopies(_ copies: [RemoteControlRecoveryReview], selecting recordID: String? = nil) {
+        rows = copies
+        choices.removeAllItems()
+        choices.addItems(withTitles: rows.map {
+            ($0.signed ? "Signed - " : "Needs confirmation - ") + $0.body.principal + " - " + $0.body.recordId
+        })
+        if let recordID, let index = rows.firstIndex(where: { $0.body.recordId == recordID }) {
+            choices.selectItem(at: index)
+        }
     }
 
     static func explanation(_ review: RemoteControlRecoveryReview) -> String {
@@ -199,15 +238,53 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
             "\nSource: \(context.sourceHash)\nEvidence: \(context.evidenceHash)\nReconstruction: \(preparation.reconstructionHash)"
     }
 
+    static func explanation(_ original: RemoteControlActivity) -> String {
+        let body = original.body
+        return "Original signed stop: \(body.recordId)\nPrincipal: \(body.principal)\nAction: \(body.action)" +
+            "\nInterrupt running: \(body.action == "interrupt_running" || body.interruptRunning == true ? "yes" : "no")" +
+            (body.revokeSeq.map { "\nHost revoke sequence: \($0)" } ?? "") +
+            "\nOriginal signer: \(body.signer)\nOriginal timestamp: \(body.issuedAt)" +
+            "\n\nPreparation reserves a timestamp and saves an unsigned draft only when recovery authority is verified. Review and confirm the draft separately."
+    }
+
+    @objc private func prepareCopy() {
+        guard prepare.isEnabled, let access, let preparation, let original = selectedOriginal else { return }
+        let epoch = generation
+        task = Task { [weak self] in
+            guard let self else { return }
+            defer { task = nil; render() }
+            let current = { self.isCurrent(access, epoch: epoch) && access.canSign() && self.preparation == preparation }
+            do {
+                let review = try await access.coordinator.prepareControlRecoveryCopy(recordID: original.body.recordId,
+                    context: preparation.context, current: current)
+                guard current() else { return }
+                setCopies(try access.coordinator.localControlRecoveryReviews(stationOrigin: stationOrigin, current: current),
+                    selecting: review.body.recordId)
+                status.stringValue = review.signed
+                    ? "The exact signed copy was already saved. Export it without another signature."
+                    : "Unsigned copy saved. Review its intent and Station plan, then choose Confirm Copy."
+            } catch {
+                guard isCurrent(access, epoch: epoch) else { return }
+                self.preparation = nil
+                stationStatus.stringValue = "Load the Station review again before preparing another copy."
+                status.stringValue = "Could not prepare recovery copy: " + error.localizedDescription
+            }
+        }
+        render()
+    }
+
     private func render() {
         let available = task == nil && panel == nil && access?.current() == true
         choices.isEnabled = available && !rows.isEmpty
+        originalChoices.isEnabled = available && !originals.isEmpty
         refresh.isEnabled = task == nil && panel == nil
         sign.isEnabled = available && selected?.signed == false && access?.canSign() == true &&
             access?.coordinator.controlRecoveryAvailable == true
         export.isEnabled = available && selected?.signed == true
         loadReview.isEnabled = available && access?.canSign() == true
-        details.string = [selected.map(Self.explanation), preparation.map {
+        prepare.isEnabled = available && selectedOriginal != nil && preparation != nil &&
+            access?.canSign() == true && access?.coordinator.controlRecoveryAvailable == true
+        details.string = [selected.map(Self.explanation), selectedOriginal.map(Self.explanation), preparation.map {
             "Current Station Review\n\n" + Self.explanation($0)
         }].compactMap { $0 }.joined(separator: "\n\n")
     }
@@ -237,12 +314,8 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
                 _ = try await access.coordinator.signControlRecoveryCopy(review,
                     current: { self.isCurrent(access, epoch: epoch) && access.canSign() })
                 guard isCurrent(access, epoch: epoch) else { return }
-                rows = try access.coordinator.localControlRecoveryReviews(stationOrigin: stationOrigin,
-                    current: { self.isCurrent(access, epoch: epoch) })
-                for (index, row) in rows.enumerated() {
-                    choices.item(at: index)?.title = (row.signed ? "Signed - " : "Needs confirmation - ") +
-                        row.body.principal + " - " + row.body.recordId
-                }
+                setCopies(try access.coordinator.localControlRecoveryReviews(stationOrigin: stationOrigin,
+                    current: { self.isCurrent(access, epoch: epoch) }), selecting: review.body.recordId)
                 status.stringValue = "Signed copy saved. Use Save Signed Copy to hand it to the recovery operator. Access stays fenced."
             } catch {
                 guard isCurrent(access, epoch: epoch) else { return }
