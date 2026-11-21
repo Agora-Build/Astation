@@ -128,6 +128,9 @@ jobs:
             --publish 127.0.0.1:53001:80 station-webapp:ci
           WEBAPP_TEST_ORIGIN=http://127.0.0.1:53001 WEBAPP_TEST_SOURCE_TREE="$(git rev-parse HEAD:webapp)" node --test webapp/tests/hosting.test.mjs
 
+      - name: Verify relay failover before client handshake deadlines
+        run: WEBAPP_FAILOVER_IMAGE=station-webapp:ci node --test webapp/tests/relay-failover.test.mjs
+
       - name: Test AI review tooling
         run: node --test .github/scripts/*.test.mjs
 
