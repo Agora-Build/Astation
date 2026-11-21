@@ -63,7 +63,7 @@ private final class RecoveryRedirectGuard: NSObject, URLSessionTaskDelegate, @un
 }
 
 /// TLS/account login limits storage access. Only the shared verifier grants cryptographic trust.
-public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteStationVerifierTransport, RemoteManagedServiceVerifierTransport, @unchecked Sendable {
+public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteControlRecoveryReviewTransport, RemoteStationVerifierTransport, RemoteManagedServiceVerifierTransport, @unchecked Sendable {
     private let baseURL: URL
     private let stationOrigin: String
     public var controlStationOrigin: String { stationOrigin }
@@ -139,6 +139,16 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
             throw RemoteRecoveryTransportError.invalidResponse
         }
         return text
+    }
+
+    public func controlRecoveryReview(accountID: String, genesisHash: String,
+        expected: LogHead) async throws -> RemoteControlRecoveryPreparation {
+        guard RemoteRecoveryKit.validID(accountID), RemoteRecoveryKit.validHash(genesisHash),
+              expected.seq > 0, expected.seq <= 9_007_199_254_740_991,
+              RemoteRecoveryKit.validHash(expected.hash) else { throw RemoteChannelError.invalidInput }
+        let (_, data) = try await perform(url: path(genesisHash, "control/recovery"), method: "GET")
+        return try RemoteControlRecoveryPreparation.decode(data, accountID: accountID, genesisHash: genesisHash,
+            stationOrigin: stationOrigin, expected: expected)
     }
 
     public func controlSync(genesisHash: String, callJSON: String) async throws -> String {

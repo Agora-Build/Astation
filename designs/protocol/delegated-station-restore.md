@@ -100,6 +100,50 @@ There is deliberately no reopen command yet. Removing the row, replaying a
 configuration or retrying startup does not establish a complete snapshot.
 The rest of the recovery sequence below is still required before reopening.
 
+### Authenticated acquisition of an existing preparation
+
+After the operator has fenced and prepared the retained account, a drained
+Station can start in explicit review mode with
+`STATION_DELEGATED_RECOVERY_REVIEW=true`, `STATION_DELEGATED_HOST_WORK` disabled,
+and the exact external `PUBLIC_BASE_URL` and
+`STATION_DELEGATED_RECOVERY_GENERATION`. This requires the opt-in delegated
+build, durable Postgres storage and an already closed fence at that generation.
+It never initializes a missing fence, increases a generation, creates a plan or
+enables delegated serving/signing/reporting. Invalid configuration refuses
+startup. Ordinary deployments retain their existing configuration and behavior.
+This mode is for a drained recovery deployment, not an availability workaround.
+
+`GET /api/remote/v1/logs/<genesis>/control/recovery` uses the existing native
+Station bearer and recovery account-ownership checks. Under the same fence/root
+locks used by preparation/import, it reads the existing exact checkpoint and
+reconciles all retained evidence. It returns at most 8 KiB of version-1 metadata:
+account, genesis, normalized origin, generation, plan/candidate-feed IDs,
+source/evidence/reconstruction hashes and the membership head. The generation is
+a canonical positive decimal **string**, preserving the deployment integer
+without JSON numeric conversion. No bodies, signatures, subjects, keys or
+backups are included. Missing/foreign roots return the same metadata-free404;
+missing/stale plans, open/stale fences, corrupt evidence, storage failures and
+the ten-second operation deadline return503 with no partial review. Every
+response is `no-store`.
+
+The reply explicitly retains `retained_history_only: true` and false
+`complete_history`, `signing_clock_complete`, `snapshot_complete` and
+`recovery_ready`. This is an authenticated view of current retained evidence,
+not a completeness attestation or signing reservation. Imports can change its
+evidence/reconstruction hashes; changed ownership, membership, source or
+deployment generation retires the earlier review. A fetch does not create any
+durable recovery state, tick clocks/ACKs or reopen a fence.
+
+In Recovery Copies, **Load Station Review** explicitly fetches this metadata
+from the selected Station. The native reader rejects another account, origin,
+genesis or membership head, noncanonical IDs/numbers, unknown/duplicate/null
+fields, oversize replies and any assertion of completion/readiness. The
+coordinator checks its protected checkpoint before and after the fetch and
+discards replies after account/Station/window changes. Opening the window and
+exporting saved signatures remain local operations. Loading a plan installs no
+authority and enables no confirmation button; complete authoritative collection,
+reservation, preparation and publication still require the provider below.
+
 ## Durable recovery preparation
 
 After draining the fleet, increasing the external generation and committing its

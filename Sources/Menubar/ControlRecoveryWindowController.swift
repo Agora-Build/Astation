@@ -17,11 +17,14 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
     private let choices = NSPopUpButton()
     private let details = NSTextView()
     private let status = NSTextField(wrappingLabelWithString: "")
+    private let stationStatus = NSTextField(wrappingLabelWithString: "Station review has not been loaded. Saved copies remain available offline.")
     private let refresh = NSButton(title: "Refresh", target: nil, action: nil)
     private let sign = NSButton(title: "Confirm Copy...", target: nil, action: nil)
     private let export = NSButton(title: "Save Signed Copy...", target: nil, action: nil)
+    private let loadReview = NSButton(title: "Load Station Review", target: nil, action: nil)
     private var access: Access?
     private var rows: [RemoteControlRecoveryReview] = []
+    private var preparation: RemoteControlRecoveryPreparation?
     private var generation = UUID()
     private var task: Task<Void, Never>?
     private var panel: NSSavePanel?
@@ -59,8 +62,8 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         details.isVerticallyResizable = true; details.isHorizontallyResizable = false
         details.autoresizingMask = .width; details.textContainer?.widthTracksTextView = true
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.documentView = details
-        let actions = NSStackView(views: [sign, export, refresh]); actions.spacing = 12
-        let stack = NSStackView(views: [intro, choices, scroll, status, actions])
+        let actions = NSStackView(views: [sign, export, loadReview, refresh]); actions.spacing = 12
+        let stack = NSStackView(views: [intro, stationStatus, choices, scroll, status, actions])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 14
         if let content = window.contentView {
             content.addSubview(stack); stack.translatesAutoresizingMaskIntoConstraints = false
@@ -70,6 +73,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
                 stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
                 stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
                 intro.widthAnchor.constraint(equalTo: stack.widthAnchor),
+                stationStatus.widthAnchor.constraint(equalTo: stack.widthAnchor),
                 choices.widthAnchor.constraint(equalTo: stack.widthAnchor),
                 scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
                 scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 160),
@@ -81,6 +85,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         refresh.target = self; refresh.action = #selector(reload)
         sign.target = self; sign.action = #selector(confirmCopy)
         export.target = self; export.action = #selector(saveCopy)
+        loadReview.target = self; loadReview.action = #selector(loadStationReview)
         for name in [Notification.Name.accountLoginChanged, .serverInfoChanged, .relayIdentityKeyChanged] {
             NotificationCenter.default.addObserver(self, selector: #selector(contextChanged), name: name, object: nil)
         }
@@ -110,7 +115,8 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         generation = UUID(); task?.cancel()
         panel?.cancel(nil); panel = nil
         if let alert { window?.endSheet(alert.window, returnCode: .abort) }
-        alert = nil; access = nil; rows = []; choices.removeAllItems(); details.string = ""
+        alert = nil; access = nil; rows = []; preparation = nil; choices.removeAllItems(); details.string = ""
+        stationStatus.stringValue = "Station review has not been loaded. Saved copies remain available offline."
         render()
     }
 
@@ -121,7 +127,8 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
 
     @objc private func reload() {
         guard task == nil, panel == nil else { return }
-        generation = UUID(); access = nil; rows = []; choices.removeAllItems(); details.string = ""
+        generation = UUID(); access = nil; rows = []; preparation = nil; choices.removeAllItems(); details.string = ""
+        stationStatus.stringValue = "Station review has not been loaded. Saved copies remain available offline."
         do {
             let value = try loadAccess(), epoch = generation
             guard isCurrent(value, epoch: epoch) else { throw RemoteRecoveryError.requiresReview }
@@ -160,6 +167,38 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
 
     @objc private func selectionChanged() { render() }
 
+    @objc private func loadStationReview() {
+        guard loadReview.isEnabled, let access else { return }
+        let epoch = generation
+        preparation = nil
+        stationStatus.stringValue = "Loading the selected Station's prepared recovery review..."
+        task = Task { [weak self] in
+            guard let self else { return }
+            defer { task = nil; render() }
+            do {
+                let value = try await access.coordinator.loadControlRecoveryPreparation(stationOrigin: stationOrigin,
+                    current: { self.isCurrent(access, epoch: epoch) && access.canSign() })
+                guard isCurrent(access, epoch: epoch), access.canSign() else { return }
+                preparation = value
+                stationStatus.stringValue = "Station review loaded for recovery generation \(value.context.generation). Access remains fenced."
+                status.stringValue = "Complete history, signing clocks and service authority still need verification before signing or reopening."
+            } catch {
+                guard isCurrent(access, epoch: epoch) else { return }
+                stationStatus.stringValue = "Could not load the Station review: " + error.localizedDescription
+            }
+        }
+        render()
+    }
+
+    static func explanation(_ preparation: RemoteControlRecoveryPreparation) -> String {
+        let context = preparation.context
+        return "The Station retained this recovery plan. It does not prove complete history or signing clocks and does not authorize a signature or restored access." +
+            "\n\nStation: \(context.stationOrigin)\nAccount: \(context.accountID)\nGenesis: \(context.genesisHash)" +
+            "\nGeneration: \(context.generation)\nPlan: \(context.planID)\nReplacement feed: \(context.candidateFeedID)" +
+            "\nMembership: \(context.membershipHead.seq) / \(context.membershipHead.hash)" +
+            "\nSource: \(context.sourceHash)\nEvidence: \(context.evidenceHash)\nReconstruction: \(preparation.reconstructionHash)"
+    }
+
     private func render() {
         let available = task == nil && panel == nil && access?.current() == true
         choices.isEnabled = available && !rows.isEmpty
@@ -167,7 +206,10 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         sign.isEnabled = available && selected?.signed == false && access?.canSign() == true &&
             access?.coordinator.controlRecoveryAvailable == true
         export.isEnabled = available && selected?.signed == true
-        details.string = selected.map(Self.explanation) ?? ""
+        loadReview.isEnabled = available && access?.canSign() == true
+        details.string = [selected.map(Self.explanation), preparation.map {
+            "Current Station Review\n\n" + Self.explanation($0)
+        }].compactMap { $0 }.joined(separator: "\n\n")
     }
 
     @objc private func confirmCopy() {

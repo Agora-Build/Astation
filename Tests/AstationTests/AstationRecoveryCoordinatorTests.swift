@@ -71,7 +71,7 @@ private final class RecoveryMemoryKeys: AstationRecoveryDataKeys {
     func installRecovered(_ values: [AccountDataKey], dataAccount: String) throws { keys = values; installs += 1 }
 }
 
-private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteStationVerifierTransport {
+private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteControlRecoveryReviewTransport, RemoteStationVerifierTransport {
     nonisolated let controlStationOrigin: String
     init(stationOrigin: String = "https://configured.example", controlFeedID: String = UUID().uuidString.lowercased()) {
         controlStationOrigin = stationOrigin
@@ -110,6 +110,22 @@ private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEn
     var wrongSyncCorrelation = false
     var verifierGeneration: UInt64 = 1
     var verifierReplicas = ["a", "b"]
+    var preparedRecovery: RemoteControlRecoveryPreparation?
+    var recoveryReviewWaiter: CheckedContinuation<Void, Never>?
+    var holdRecoveryReview = false
+
+    func setRecoveryReview(_ value: RemoteControlRecoveryPreparation) { preparedRecovery = value }
+    func holdNextRecoveryReview() { holdRecoveryReview = true }
+    func releaseRecoveryReview() { holdRecoveryReview = false; recoveryReviewWaiter?.resume(); recoveryReviewWaiter = nil }
+    func recoveryReviewIsWaiting() -> Bool { recoveryReviewWaiter != nil }
+    func controlRecoveryReview(accountID: String, genesisHash: String, expected: LogHead) async throws -> RemoteControlRecoveryPreparation {
+        XCTAssertEqual(accountID, account)
+        XCTAssertEqual(genesisHash, log?.genesisHash())
+        XCTAssertEqual(expected, log?.head())
+        if holdRecoveryReview { await withCheckedContinuation { recoveryReviewWaiter = $0 } }
+        guard let preparedRecovery else { throw RemoteRecoveryTransportError.unavailable }
+        return preparedRecovery
+    }
 
     func setVerifierRoster(generation: UInt64, replicas: [String]) { verifierGeneration = generation; verifierReplicas = replicas }
     func stationVerifiers(genesisHash: String) throws -> RemoteStationVerifierSnapshot {
@@ -2414,6 +2430,100 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             candidateFeedID: UUID().uuidString.lowercased(), membershipHead: log.head())
         authority.context = context; authority.original = result.recordJSON
         return (coordinator, context, review.recordID)
+    }
+
+    private func preparedRecoverySource(_ h: RecoveryCoordinatorHarness) async throws
+        -> (AstationRecoveryCoordinator, RemoteControlRecoveryPreparation) {
+        let coordinator = try h.coordinator()
+        _ = try await coordinator.setup()
+        let retained = await h.relay.log
+        let log = try XCTUnwrap(retained)
+        let context = try RemoteControlRecoveryContext(accountID: log.accountId(), genesisHash: log.genesisHash(),
+            stationOrigin: "https://configured.example", generation: 2, planID: UUID().uuidString.lowercased(),
+            sourceHash: String(repeating: "a", count: 64), evidenceHash: String(repeating: "b", count: 64),
+            candidateFeedID: UUID().uuidString.lowercased(), membershipHead: log.head())
+        let preparation = RemoteControlRecoveryPreparation(context: context, reconstructionHash: String(repeating: "c", count: 64))
+        await h.relay.setRecoveryReview(preparation)
+        return (coordinator, preparation)
+    }
+
+    func testPreparedRecoveryAcquisitionNeverInstallsAuthorityOrChangesProtectedState() async throws {
+        let h = RecoveryCoordinatorHarness(), (coordinator, preparation) = try await preparedRecoverySource(h)
+        let writes = h.store.writes, checkpoint = h.store.bytes, prompts = h.ownerRequests.count
+        let value = try await coordinator.loadControlRecoveryPreparation(stationOrigin: preparation.context.stationOrigin, current: { true })
+        XCTAssertEqual(value, preparation)
+        XCTAssertFalse(coordinator.controlRecoveryAvailable)
+        XCTAssertFalse(coordinator.delegatedControlsAvailable)
+        XCTAssertEqual(h.store.writes, writes)
+        XCTAssertEqual(h.store.bytes, checkpoint)
+        XCTAssertEqual(h.ownerRequests.count, prompts)
+        let copies = try coordinator.localControlRecoveryReviews(current: { true })
+        XCTAssertTrue(copies.isEmpty)
+    }
+
+    func testPreparedRecoveryAcquisitionRefusesDelayedAccountAndProtectedCheckpointChanges() async throws {
+        for changeProtectedState in [false, true] {
+            let h = RecoveryCoordinatorHarness(), (coordinator, preparation) = try await preparedRecoverySource(h)
+            let checkpoint = h.store.bytes, writes = h.store.writes
+            var current = true
+            await h.relay.holdNextRecoveryReview()
+            let load = Task { try await coordinator.loadControlRecoveryPreparation(stationOrigin: preparation.context.stationOrigin, current: { current }) }
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            while !(await h.relay.recoveryReviewIsWaiting()), ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            let waiting = await h.relay.recoveryReviewIsWaiting()
+            XCTAssertTrue(waiting)
+            if changeProtectedState { h.store.readFailure = true } else { current = false }
+            await h.relay.releaseRecoveryReview()
+            do { _ = try await load.value; XCTFail("a retired review was accepted") } catch {}
+            XCTAssertEqual(h.store.bytes, checkpoint)
+            XCTAssertEqual(h.store.writes, writes)
+            XCTAssertFalse(coordinator.controlRecoveryAvailable)
+        }
+    }
+
+    func testPreparedRecoveryWindowLoadsExactPlanWithSigningDisabled() async throws {
+        _ = NSApplication.shared
+        let h = RecoveryCoordinatorHarness(), (coordinator, preparation) = try await preparedRecoverySource(h)
+        let prompts = h.ownerRequests.count, writes = h.store.writes
+        let controller = ControlRecoveryWindowController(stationOrigin: preparation.context.stationOrigin, loadAccess: {
+            .init(coordinator: coordinator, current: { true }, canSign: { true })
+        })
+        showRecovery(controller)
+        defer { controller.close() }
+        let load = try recoveryButton("Load Station Review", window: controller.window)
+        try clickRecovery(load)
+        try await waitForRecoveryUI { load.isEnabled }
+        XCTAssertFalse(try recoveryButton("Confirm Copy...", window: controller.window).isEnabled)
+        func containsPlan(_ view: NSView) -> Bool {
+            if let text = view as? NSTextView, text.string.contains(preparation.context.planID) { return true }
+            return view.subviews.contains(where: containsPlan)
+        }
+        XCTAssertTrue(try XCTUnwrap(controller.window?.contentView).subviews.contains(where: containsPlan))
+        XCTAssertEqual(h.store.writes, writes)
+        XCTAssertEqual(h.ownerRequests.count, prompts)
+        XCTAssertFalse(coordinator.controlRecoveryAvailable)
+    }
+
+    func testPreparedRecoveryWindowDiscardsAReplyAfterClosing() async throws {
+        _ = NSApplication.shared
+        let h = RecoveryCoordinatorHarness(), (coordinator, preparation) = try await preparedRecoverySource(h)
+        let writes = h.store.writes
+        let controller = ControlRecoveryWindowController(stationOrigin: preparation.context.stationOrigin, loadAccess: {
+            .init(coordinator: coordinator, current: { true }, canSign: { true })
+        })
+        await h.relay.holdNextRecoveryReview()
+        showRecovery(controller)
+        try clickRecovery(try recoveryButton("Load Station Review", window: controller.window))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await h.relay.recoveryReviewIsWaiting()), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        let refresh = try recoveryButton("Refresh", window: controller.window)
+        controller.close()
+        await h.relay.releaseRecoveryReview()
+        try await waitForRecoveryUI { refresh.isEnabled }
+        XCTAssertFalse(try recoveryButton("Confirm Copy...", window: controller.window).isEnabled)
+        XCTAssertEqual(h.store.writes, writes)
     }
 
     func testRealProtectedRecoveryCopySurvivesStoreAndEnclaveIdentityReload() async throws {

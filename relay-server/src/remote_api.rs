@@ -24,6 +24,7 @@ pub fn routes() -> Router<AppState> {
         .route("/channels", get(channels::connect))
         .route("/logs/:genesis/entries", get(recovery::entries).post(recovery::append))
         .route("/logs/:genesis/control", get(recovery::delegated_http::heads))
+        .route("/logs/:genesis/control/recovery", get(recovery::delegated_http::recovery_review))
         .route("/logs/:genesis/control/sync", axum::routing::post(recovery::delegated_http::sync))
         .route("/logs/:genesis/control/reservations", axum::routing::post(recovery::delegated_http::reserve))
         .route("/logs/:genesis/control/records", axum::routing::post(recovery::delegated_http::publish))
@@ -150,7 +151,8 @@ mod tests {
     async fn recovery_routes_require_login_before_reading_records() {
         let root = "a".repeat(64);
         for (method, suffix) in [(Method::GET, "entries"), (Method::POST, "entries"),
-            (Method::GET, "backups/1"), (Method::PUT, "backups/1"), (Method::POST, "probes/host-a")] {
+            (Method::GET, "backups/1"), (Method::PUT, "backups/1"), (Method::POST, "probes/host-a"),
+            (Method::GET, "control/recovery")] {
             let response = app().oneshot(Request::builder().method(method)
                 .uri(format!("/api/remote/v1/logs/{root}/{suffix}"))
                 .body(Body::from("{}" )).unwrap()).await.unwrap();
