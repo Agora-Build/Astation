@@ -59,6 +59,44 @@ pub(crate) async fn prepare(
     Ok(report)
 }
 
+/// Account-private acquisition of an existing review. It never prepares a plan,
+/// reserves a clock, advances a ledger or makes retained history authoritative.
+pub(crate) async fn review_for_owner(
+    pool: &PgPool,
+    binding: &Binding,
+    genesis: &str,
+    owner: &str,
+) -> Result<Value, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let (prepared, log, mut report) =
+        checkpoint_for_owner(&mut tx, binding, genesis, false, Some(owner)).await?;
+    review_evidence(&mut tx, &prepared, &log, binding, &mut report).await?;
+    let summary = json!({
+        "version": 1,
+        "account_id": log.account_id(),
+        "genesis_hash": genesis,
+        "origin": binding.origin,
+        // Deployment generations are i64; preserve values beyond JSON's safe integers.
+        "generation": binding.generation.to_string(),
+        "plan_id": prepared.plan_id,
+        "candidate_feed_id": prepared.candidate_feed_id,
+        "source_hash": prepared.source_hash,
+        "evidence_hash": report["evidence_hash"],
+        "reconstruction_hash": report["reconstruction_hash"],
+        "membership_head": log.head().to_json(),
+        "retained_history_only": true,
+        "complete_history": false,
+        "signing_clock_complete": false,
+        "snapshot_complete": false,
+        "recovery_ready": false,
+    });
+    if serde_json::to_vec(&summary).map_err(|_| invalid())?.len() > 8192 {
+        return Err(invalid());
+    }
+    tx.commit().await?;
+    Ok(summary)
+}
+
 async fn review_evidence(
     connection: &mut PgConnection,
     prepared: &Prepared,
@@ -103,6 +141,16 @@ async fn checkpoint(
     genesis: &str,
     create: bool,
 ) -> Result<(Prepared, Membership, Value), sqlx::Error> {
+    checkpoint_for_owner(connection, binding, genesis, create, None).await
+}
+
+async fn checkpoint_for_owner(
+    connection: &mut PgConnection,
+    binding: &Binding,
+    genesis: &str,
+    create: bool,
+    owner: Option<&str>,
+) -> Result<(Prepared, Membership, Value), sqlx::Error> {
     if !super::canonical_genesis(genesis) {
         return Err(invalid());
     }
@@ -126,7 +174,10 @@ async fn checkpoint(
     .bind(MAX_STATE as i64)
     .fetch_optional(&mut *connection)
     .await?
-    .ok_or_else(invalid)?;
+    .ok_or(sqlx::Error::RowNotFound)?;
+    if owner.is_some_and(|owner| subject.as_deref() != Some(owner)) {
+        return Err(sqlx::Error::RowNotFound);
+    }
     let subject = subject
         .filter(|subject| !subject.is_empty())
         .ok_or_else(invalid)?;

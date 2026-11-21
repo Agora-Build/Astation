@@ -69,6 +69,21 @@ pub(crate) async fn heads(
         .await
 }
 
+pub(crate) async fn recovery_review(
+    State(state): State<AppState>,
+    Path(genesis): Path<String>,
+    headers: HeaderMap,
+) -> Reply {
+    let owner = match subject(&state, &headers).await {
+        Ok(owner) => owner,
+        Err(reply) => return reply,
+    };
+    if genesis.len() != 64 || !genesis.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return invalid();
+    }
+    state.recovery.control_recovery_review(&genesis, &owner).await
+}
+
 pub(crate) async fn sync(
     State(state): State<AppState>,
     Path(genesis): Path<String>,

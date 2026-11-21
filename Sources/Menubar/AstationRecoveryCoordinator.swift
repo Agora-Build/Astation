@@ -1596,6 +1596,27 @@ extension AstationRecoveryCoordinator {
 
     var controlRecoveryAvailable: Bool { delegatedControlsAvailable && controlRecoveryAuthority != nil }
 
+    func loadControlRecoveryPreparation(stationOrigin: String, current: () -> Bool) async throws -> RemoteControlRecoveryPreparation {
+        try begin(); defer { busy = false }
+        guard current(), !Task.isCancelled, let kit = try currentKit(), let log = membershipLog,
+              log.frozen() == nil else { throw RemoteRecoveryError.requiresReview }
+        try requireDurableRecoveryCheckpoint()
+        let head = log.head()
+        let source = try controlActivitySource(origin: stationOrigin, log: log)
+        guard let transport = source as? RemoteControlRecoveryReviewTransport else {
+            throw RemoteRecoveryTransportError.unavailable
+        }
+        let result = try await transport.controlRecoveryReview(accountID: accountID, genesisHash: kit.genesisHash, expected: head)
+        guard current(), !Task.isCancelled, membershipLog?.frozen() == nil, membershipLog?.head() == head,
+              result.context.accountID == accountID, result.context.genesisHash == kit.genesisHash,
+              result.context.stationOrigin == stationOrigin, result.context.membershipHead == head else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        try requireDurableRecoveryCheckpoint()
+        // This read deliberately does not install an authority, prepare a draft or persist a clock.
+        return result
+    }
+
     func localControlRecoveryReviews(stationOrigin: String? = nil, current: () -> Bool) throws -> [RemoteControlRecoveryReview] {
         guard !busy, !uncertain, current() else { throw RemoteRecoveryError.requiresReview }
         try requireDurableRecoveryCheckpoint()

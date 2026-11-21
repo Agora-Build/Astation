@@ -22,6 +22,10 @@ mod recovery_fence;
 mod recovery_plan;
 
 #[cfg(feature = "delegated-host-work")]
+#[path = "delegated_recovery_review_tests.rs"]
+mod recovery_review;
+
+#[cfg(feature = "delegated-host-work")]
 #[path = "delegated_recovered_stops_tests.rs"]
 mod recovered_stops;
 

@@ -842,6 +842,24 @@ async fn serve() {
     relay.configure_push_tokens(push_tokens);
     relay.configure_push_delivery(push_delivery);
     relay.configure_recovery(recovery.clone());
+    let recovery_review_only = std::env::var("STATION_DELEGATED_RECOVERY_REVIEW").as_deref() == Ok("true");
+    if recovery_review_only {
+        if std::env::var("STATION_DELEGATED_HOST_WORK").as_deref() == Ok("true") {
+            tracing::error!("Recovery review mode requires STATION_DELEGATED_HOST_WORK disabled");
+            std::process::exit(1);
+        }
+        let origin = std::env::var("PUBLIC_BASE_URL").unwrap_or_default();
+        let generation = std::env::var("STATION_DELEGATED_RECOVERY_GENERATION").ok()
+            .and_then(|raw| remote_api::recovery::delegated_recovery::generation(&raw).ok());
+        let Some(generation) = generation else {
+            tracing::error!("Recovery review requires STATION_DELEGATED_RECOVERY_GENERATION");
+            std::process::exit(1);
+        };
+        if let Err(reason) = recovery.configure_recovery_review(&origin, generation).await {
+            tracing::error!("Recovery review cannot start: {}", reason);
+            std::process::exit(1);
+        }
+    }
     if std::env::var("STATION_DELEGATED_HOST_WORK").as_deref() == Ok("true") {
         let origin = std::env::var("PUBLIC_BASE_URL").unwrap_or_default();
         let generation = std::env::var("STATION_DELEGATED_RECOVERY_GENERATION").ok()

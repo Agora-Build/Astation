@@ -167,6 +167,7 @@ pub struct RecoveryStore {
     memory: Option<Mutex<HashMap<String, (String, Root)>>>,
     delegated_origin: OnceLock<String>,
     delegated_recovery: OnceLock<delegated_recovery::Binding>,
+    recovery_review_only: OnceLock<()>,
     verifier_replicas: OnceLock<verifier_replicas::ReplicaRegistry>,
     delegated_changes: tokio::sync::watch::Sender<u64>,
 }
@@ -175,6 +176,9 @@ impl RecoveryStore {
     pub(crate) fn pool(&self) -> Option<PgPool> { self.pool.clone() }
 
     pub(crate) async fn configure_delegated(&self, origin: &str, generation: i64) -> Result<(), &'static str> {
+        if self.recovery_review_only.get().is_some() {
+            return Err("recovery review mode cannot enable delegated work");
+        }
         if !cfg!(feature = "delegated-host-work") {
             return Err("delegated host work requires its opt-in build");
         }
@@ -200,6 +204,36 @@ impl RecoveryStore {
     }
 
     pub(crate) fn delegated_enabled(&self) -> bool { self.delegated_origin.get().is_some() }
+
+    pub(crate) async fn configure_recovery_review(&self, origin: &str, generation: i64) -> Result<(), &'static str> {
+        if !cfg!(feature = "delegated-host-work") || self.delegated_enabled() {
+            return Err("recovery review requires its opt-in build and disabled delegated work");
+        }
+        let binding = delegated_recovery::Binding::new(origin, generation)?;
+        let pool = self.pool.as_ref().ok_or("recovery review requires durable storage")?;
+        self.recovery_review_only.get_or_init(|| ());
+        if self.delegated_recovery.get_or_init(|| binding.clone()) != &binding {
+            return Err("recovery review binding cannot change in a running store");
+        }
+        let status = delegated_recovery::inspect(pool, origin).await
+            .map_err(|_| "cannot inspect the recovery fence")?;
+        if !status.is_some_and(|status| !status.ready && status.generation == generation) {
+            return Err("recovery review requires an existing closed fence at the exact generation");
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn control_recovery_review(&self, genesis: &str, owner: &str) -> Reply {
+        let (Some(pool), Some(binding)) = (&self.pool, self.delegated_recovery.get()) else {
+            return unavailable();
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(10),
+            delegated_recovery::plan::review_for_owner(pool, binding, genesis, owner)).await {
+            Ok(Ok(review)) => (StatusCode::OK, Json(review)),
+            Ok(Err(sqlx::Error::RowNotFound)) => error(StatusCode::NOT_FOUND, "recovery_record_not_found"),
+            _ => error(StatusCode::SERVICE_UNAVAILABLE, "recovery_review_unavailable"),
+        }
+    }
 
     pub(crate) async fn configure_verifier_replicas(&self, raw: &str) -> Result<(), &'static str> {
         let configuration = verifier_replicas::Configuration::parse(raw)?;
@@ -562,6 +596,7 @@ impl RecoveryStore {
             memory: None,
             delegated_origin: OnceLock::new(),
             delegated_recovery: OnceLock::new(),
+            recovery_review_only: OnceLock::new(),
             verifier_replicas: OnceLock::new(),
             delegated_changes: tokio::sync::watch::channel(0).0,
         })
@@ -572,6 +607,7 @@ impl RecoveryStore {
             memory: None,
             delegated_origin: OnceLock::new(),
             delegated_recovery: OnceLock::new(),
+            recovery_review_only: OnceLock::new(),
             verifier_replicas: OnceLock::new(),
             delegated_changes: tokio::sync::watch::channel(0).0,
         })
@@ -614,6 +650,7 @@ impl RecoveryStore {
             memory: Some(Mutex::new(HashMap::new())),
             delegated_origin: OnceLock::new(),
             delegated_recovery: OnceLock::new(),
+            recovery_review_only: OnceLock::new(),
             verifier_replicas: OnceLock::new(),
             delegated_changes: tokio::sync::watch::channel(0).0,
         })
