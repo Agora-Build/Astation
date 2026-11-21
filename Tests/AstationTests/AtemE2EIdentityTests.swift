@@ -28,6 +28,7 @@ final class TestAtemCryptography: AtemIdentityCryptography {
     let encryption: Curve25519.KeyAgreement.PrivateKey
     var failSign = false
     var creates = 0
+    var signingCalls = 0
 
     init(signing: P256.Signing.PrivateKey = P256.Signing.PrivateKey(),
          encryption: Curve25519.KeyAgreement.PrivateKey = Curve25519.KeyAgreement.PrivateKey()) {
@@ -54,6 +55,7 @@ final class TestAtemCryptography: AtemIdentityCryptography {
     }
 
     func sign(_ message: Data, material: AtemIdentityMaterial) throws -> Data {
+        signingCalls += 1
         if failSign { throw AtemIdentityError.keychain(errSecAuthFailed) }
         return try AtemE2ECrypto.normalizedP256Signature(P256.Signing.PrivateKey(rawRepresentation: material.signingKey).signature(for: message).rawRepresentation)
     }

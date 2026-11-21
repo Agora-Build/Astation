@@ -1058,6 +1058,7 @@ final class AstationRecoveryCoordinator {
 
     private func refreshedLog(genesis: String, transport: RemoteRecoveryTransport? = nil) async throws -> MembershipLog {
         guard !saved.entries.isEmpty else { throw RemoteRecoveryError.notCommitted }
+        try requireDurableRecoveryCheckpoint()
         let log: MembershipLog
         if let previous = membershipLog, previous.entries() == saved.entries {
             log = previous.snapshot()
@@ -1069,6 +1070,7 @@ final class AstationRecoveryCoordinator {
         try commitLog(log)
         for _ in 0..<128 {
             let page = try await (transport ?? http).entries(genesisHash: genesis, after: log.head().seq)
+            try requireDurableRecoveryCheckpoint()
             let result = try log.extend(entries: page.entries, now: now())
             try commitLog(log)
             guard result.stop == nil, log.frozen() == nil else { throw RemoteRecoveryError.requiresReview }
@@ -1596,6 +1598,13 @@ extension AstationRecoveryCoordinator {
 
     var controlRecoveryAvailable: Bool { delegatedControlsAvailable && controlRecoveryAuthority != nil }
 
+    func localControlRecoveryOriginals(stationOrigin: String, current: () -> Bool) throws -> [RemoteControlActivity] {
+        guard !busy, !uncertain, current(), let log = membershipLog else { throw RemoteRecoveryError.requiresReview }
+        try requireDurableRecoveryCheckpoint()
+        guard saved.controlPublications?[stationOrigin] != nil else { return [] }
+        return try controls(stationOrigin: stationOrigin).activity(log: log).filter(\.signed)
+    }
+
     func loadControlRecoveryPreparation(stationOrigin: String, current: () -> Bool) async throws -> RemoteControlRecoveryPreparation {
         try begin(); defer { busy = false }
         guard current(), !Task.isCancelled, let kit = try currentKit(), let log = membershipLog,
@@ -1633,6 +1642,7 @@ extension AstationRecoveryCoordinator {
               let kit = try currentKit(), kit.genesisHash == context.genesisHash else {
             throw RemoteChannelError.staleLink
         }
+        try requireDurableRecoveryCheckpoint()
         let log = try await refreshedLog(genesis: kit.genesisHash)
         try requireManager(log)
         try requireDelegatedControl(log)
@@ -1640,6 +1650,7 @@ extension AstationRecoveryCoordinator {
               let original = try controls().retainedDelivery(recordID: recordID) else {
             throw RemoteRecoveryError.requiresReview
         }
+        try requireDurableRecoveryCheckpoint()
         let recovery = try recoveryControls(origin: context.stationOrigin)
         if let prior = try recovery.reviews().first(where: { $0.context == context && $0.originalRecordID == recordID }) {
             guard prior.body.signer == "member:" + managerID, prior.originalRecordJSON == original.recordJSON else {
@@ -1651,10 +1662,13 @@ extension AstationRecoveryCoordinator {
         }
         let time = try await authority.reserve(originalRecordJSON: original.recordJSON, context: context,
             managerID: managerID, log: log)
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        try requireDurableRecoveryCheckpoint()
         let latest = try await refreshedLog(genesis: kit.genesisHash)
         try requireManager(latest)
         try requireDelegatedControl(latest)
         guard current(), !Task.isCancelled, latest.head() == context.membershipHead else { throw RemoteChannelError.staleLink }
+        try requireDurableRecoveryCheckpoint()
         return try recovery.prepare(originalRecordJSON: original.recordJSON, context: context, managerID: managerID,
             issuedAt: time, log: latest, authority: authority)
     }
@@ -1669,6 +1683,7 @@ extension AstationRecoveryCoordinator {
         guard current(), !Task.isCancelled, review.context.stationOrigin == relayURL,
               review.body.signer == "member:" + managerID, let kit = try currentKit(),
               kit.genesisHash == review.context.genesisHash else { throw RemoteChannelError.staleLink }
+        try requireDurableRecoveryCheckpoint()
         let recovery = try recoveryControls(origin: relayURL)
         guard let retained = try recovery.reviews().first(where: { $0.body.recordId == review.body.recordId }),
               retained.context == review.context, retained.body == review.body, retained.request == review.request,
@@ -1679,6 +1694,7 @@ extension AstationRecoveryCoordinator {
         guard current(), !Task.isCancelled, before.head() == retained.context.membershipHead else {
             throw RemoteChannelError.staleLink
         }
+        try requireDurableRecoveryCheckpoint()
         try authority.authorize(retained, log: before)
         var confirmedAt: UInt64 = 0
         if !retained.signed {
@@ -1687,11 +1703,13 @@ extension AstationRecoveryCoordinator {
             }
             confirmedAt = Self.clock().monoMs
         }
+        try requireDurableRecoveryCheckpoint()
         let latest = try await refreshedLog(genesis: kit.genesisHash)
         try requireManager(latest)
         try requireDelegatedControl(latest)
         guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
         try authority.authorize(retained, log: latest)
+        try requireDurableRecoveryCheckpoint()
         let provider = AstationMembershipKeyProvider(identity: identity, keyID: managerID,
             publicKey: try identity.remotePublicKeys().signing, controlRecordsAllowed: true)
         _ = try recovery.sign(recordID: retained.body.recordId, log: latest, provider: provider, authority: authority,

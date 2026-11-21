@@ -144,6 +144,28 @@ exporting saved signatures remain local operations. Loading a plan installs no
 authority and enables no confirmation button; complete authoritative collection,
 reservation, preparation and publication still require the provider below.
 
+The screen also lists original signed stops retained in the selected Station's
+protected local journal. These are local evidence, not a complete Station history;
+unsigned intent is never offered as an original signature. After loading a plan,
+**Prepare Copy** invokes the existing trusted recovery-authority adapter for that
+exact original and context. It requires both the delegated gate and recovery
+provider, rechecks the protected checkpoint before reservation and draft storage,
+and revalidates current account, Station and membership across async work.
+Membership refresh rechecks protected state before writing and after each network
+page, so a reply cannot recreate a missing or changed journal from memory.
+Signing also rechecks it before and after owner confirmation and at the key boundary.
+An account/Station change or closed window retires pending preparation. A spent
+reservation does not authorize a late draft. No additional production provider
+is installed by this UI.
+
+Successful preparation saves an unsigned draft and selects it for review; it
+does not sign or show an owner prompt. **Confirm Copy** is the separate existing
+protected confirmation/signing step. Exact preparation retries reuse the saved
+draft and reservation, and exact signed retries reuse their signature. Original
+delivery/Portal receipts and feed state remain separate. Saved-copy export stays
+available offline even if current membership no longer permits reviewing an
+original for a new preparation; protected checkpoint failures still refuse it.
+
 ## Durable recovery preparation
 
 After draining the fleet, increasing the external generation and committing its
