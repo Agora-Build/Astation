@@ -396,6 +396,12 @@ an older checkpoint. Saving the first recovery draft raises the account checkpoi
 to version 4. Older readers refuse it instead of rewriting away recovery copies;
 later operations cannot lower the checkpoint version. Membership or account
 changes invalidate the pending review.
+This version fence prevents older supported readers from erasing a new journal;
+it is not a claim of rollback resistance against replacing the entire protected
+checkpoint with an earlier legacy value. Legacy checkpoints must remain readable,
+and neither a missing journal nor its local lower bounds establish complete clocks.
+The independent trusted recovery authority remains mandatory before any new
+signature, including after a legacy checkpoint is loaded.
 Retrying an already signed copy never signs it again, including with P-256.
 Earlier review copies and their clock obligations remain saved across new plans.
 
@@ -405,6 +411,9 @@ Mixed contexts, duplicate/missing IDs, unsigned copies and oversized batches are
 refused rather than partially exported. Recovery copies never enter the original
 native-evidence archive or normal Station delivery queue. Exporting already-signed
 evidence reads the protected checkpoint and needs no new network/signing authority.
+Exports load only an already retained origin journal. Unknown-origin failures do
+not create journals or consume capacity. Retained other-Station copies remain
+exportable without changing the selected Station or obtaining network authority.
 This component does not publish a replacement snapshot or reopen recovery.
 
 ### Operator Steps

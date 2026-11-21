@@ -2504,6 +2504,51 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(log.member(deviceId: "service-test")?.status, .removed)
     }
 
+    func testRecoveryCopyUnknownOriginExportsNeverConsumeRetainedJournalCapacity() async throws {
+        let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+        let (coordinator, context, original) = try await recoveryCopySource(h, authority: authority)
+        let checkpoint = h.store.bytes, writes = h.store.writes, prompts = h.ownerRequests.count
+        for index in 0..<80 {
+            let unknown = try RemoteControlRecoveryContext(accountID: context.accountID, genesisHash: context.genesisHash,
+                stationOrigin: "https://unknown-\(index).example", generation: context.generation,
+                planID: context.planID, sourceHash: context.sourceHash, evidenceHash: context.evidenceHash,
+                candidateFeedID: context.candidateFeedID, membershipHead: context.membershipHead)
+            XCTAssertThrowsError(try coordinator.exportControlRecoveryCopies(context: unknown,
+                recordIDs: [original], current: { true }))
+        }
+        XCTAssertEqual(h.store.bytes, checkpoint)
+        XCTAssertEqual(h.store.writes, writes)
+        XCTAssertEqual(h.ownerRequests.count, prompts)
+        XCTAssertEqual(authority.reservations, 0)
+        let review = try await coordinator.prepareControlRecoveryCopy(recordID: original, context: context, current: { true })
+        let copy = try await coordinator.signControlRecoveryCopy(review, current: { true })
+        XCTAssertEqual(try coordinator.exportControlRecoveryCopies(context: context,
+            recordIDs: [review.body.recordId], current: { true }), copy)
+        let elsewhere = try h.coordinator(relayURL: "https://other-selected.example")
+        XCTAssertEqual(try elsewhere.exportControlRecoveryCopies(context: context,
+            recordIDs: [review.body.recordId], current: { true }), copy,
+            "retained evidence does not require selecting or contacting its original Station")
+    }
+
+    func testLegacyCheckpointWithoutRecoveryJournalNeverEstablishesSigningAuthority() async throws {
+        let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+        let (coordinator, context, original) = try await recoveryCopySource(h, authority: authority)
+        _ = try await coordinator.prepareControlRecoveryCopy(recordID: original, context: context, current: { true })
+        var checkpoint = try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(h.store.bytes), format: nil) as? [String: Any])
+        checkpoint["version"] = 3
+        checkpoint.removeValue(forKey: "controlRecoveryPublications")
+        h.store.bytes = try PropertyListSerialization.data(fromPropertyList: checkpoint, format: .binary, options: 0)
+        let legacy = try h.coordinator(authorizeDelegatedControl: { _ in })
+        let prompts = h.ownerRequests.count, reservations = authority.reservations
+        XCTAssertFalse(legacy.controlRecoveryAvailable)
+        do {
+            _ = try await legacy.prepareControlRecoveryCopy(recordID: original, context: context, current: { true })
+            XCTFail("a legacy/empty journal is not complete signing-clock evidence")
+        } catch { XCTAssertTrue(error is AstationDelegatedControlError) }
+        XCTAssertEqual(h.ownerRequests.count, prompts)
+        XCTAssertEqual(authority.reservations, reservations)
+    }
+
     func testNativeStopAndPortalMirrorRetryTheirExactSavedIntentAfterBothRepliesAreLost() async throws {
         let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
         var coordinator: AstationRecoveryCoordinator? = try h.coordinator(authorizeDelegatedControl: { _ in })

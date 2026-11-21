@@ -38,6 +38,7 @@ public struct RemoteControlRecoveryContext: Codable, Equatable, Sendable {
 
     fileprivate static func validUUID(_ value: String) -> Bool {
         guard let id = UUID(uuidString: value) else { return false }
+        // A canonical UUID places its version nibble at offset 14.
         return id.uuidString.lowercased() == value && value[value.index(value.startIndex, offsetBy: 14)] == "4"
     }
 }
@@ -54,6 +55,8 @@ public struct RemoteControlRecoveryReview: Equatable, Sendable {
 /// A trusted adapter must establish the current closed plan, exact original,
 /// complete history/clocks and a durable reservation for this exact body. These
 /// checks are required again at signing; a saved draft is never authorization.
+/// Cached context and a local journal alone cannot establish current authority
+/// or complete clocks, including after loading a legacy/empty checkpoint.
 /// There is deliberately no default or production implementation yet.
 @MainActor
 public protocol RemoteControlRecoveryAuthorizing {
@@ -155,10 +158,11 @@ public final class RemoteControlRecoveryPublication {
         try check(context, log: log)
         let old = try original(originalRecordJSON, log: log)
         if let operation = saved.operations.first(where: {
-            $0.context == context && (try? parseControlRecord(recordJson: $0.originalRecordJSON).recordId) == old.recordId
+            $0.context.planID == context.planID && $0.context.evidenceHash == context.evidenceHash &&
+                (try? parseControlRecord(recordJson: $0.originalRecordJSON).recordId) == old.recordId
         }) {
             let review = try validate(operation)
-            guard review.body.signer == "member:" + managerID,
+            guard operation.context == context, review.body.signer == "member:" + managerID,
                   try canonicalJson(json: originalRecordJSON) == canonicalJson(json: operation.originalRecordJSON) else {
                 throw RemoteControlPublicationError.requiresReview
             }

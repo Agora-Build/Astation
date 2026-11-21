@@ -1675,7 +1675,17 @@ extension AstationRecoveryCoordinator {
     func exportControlRecoveryCopies(context: RemoteControlRecoveryContext, recordIDs: [String], current: () -> Bool) throws -> String {
         guard !busy, !uncertain, current(), context.accountID == accountID else { throw RemoteRecoveryError.requiresReview }
         try requireDurableRecoveryCheckpoint()
-        return try recoveryControls(origin: context.stationOrigin).export(context: context, recordIDs: recordIDs)
+        guard let recovery = try retainedRecoveryControls(origin: context.stationOrigin) else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        return try recovery.export(context: context, recordIDs: recordIDs)
+    }
+
+    private func retainedRecoveryControls(origin: String) throws -> RemoteControlRecoveryPublication? {
+        guard PortalIntegrationRecord.validOrigin(origin) else { throw RemoteRecoveryError.requiresReview }
+        // Evidence reads must not consume origin slots by creating empty journals.
+        guard saved.controlRecoveryPublications?[origin] != nil else { return nil }
+        return try recoveryControls(origin: origin)
     }
 
     private func recoveryControls(origin: String) throws -> RemoteControlRecoveryPublication {

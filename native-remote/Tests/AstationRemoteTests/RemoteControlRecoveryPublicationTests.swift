@@ -124,6 +124,27 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
     }
 
     @MainActor
+    func testChangedMembershipCannotPersistDuplicateReviewThatWouldPreventRestart() throws {
+        let f = try ControlRecoveryFixture(), first = try f.prepare()
+        let signature = try f.sign(first), checkpoint = f.bytes, writes = f.writes
+        let keys = try f.source.replaceManager()
+        let changed = try RemoteControlRecoveryContext(accountID: f.context.accountID, genesisHash: f.context.genesisHash,
+            stationOrigin: f.context.stationOrigin, generation: f.context.generation, planID: f.context.planID,
+            sourceHash: f.context.sourceHash, evidenceHash: f.context.evidenceHash,
+            candidateFeedID: f.context.candidateFeedID, membershipHead: f.source.log.head())
+        let authority = ControlRecoveryAuthority(context: changed, original: f.original,
+            reservedTime: first.body.issuedAt + 1)
+        XCTAssertThrowsError(try f.journal.prepare(originalRecordJSON: f.original, context: changed,
+            managerID: "other-manager", issuedAt: authority.reservedTime, log: f.source.log, authority: authority))
+        XCTAssertEqual(f.bytes, checkpoint)
+        XCTAssertEqual(f.writes, writes)
+        XCTAssertEqual(keys.signs, 0)
+        try f.restore()
+        XCTAssertEqual(try f.journal.reviews().count, 1)
+        XCTAssertTrue(try f.journal.export(context: f.context, recordIDs: [first.body.recordId]).contains(signature))
+    }
+
+    @MainActor
     func testExportKeepsIncreasingPreparationOrderAndRefusesMoreThanOneWirePage() throws {
         let f = try ControlRecoveryFixture()
         var ids: [String] = []
