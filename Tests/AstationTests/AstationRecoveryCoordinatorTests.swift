@@ -380,6 +380,17 @@ private final class RecoveryCopyAuthority: RemoteControlRecoveryAuthorizing {
 }
 
 @MainActor
+private final class RecoveryCopySavePanel: NSSavePanel {
+    var destination: URL?
+    var reply: ((NSApplication.ModalResponse) -> Void)?
+    var cancellations = 0
+    override var url: URL? { destination }
+    override func beginSheetModal(for window: NSWindow,
+        completionHandler handler: @escaping (NSApplication.ModalResponse) -> Void) { reply = handler }
+    override func cancel(_ sender: Any?) { cancellations += 1; reply?(.cancel) }
+}
+
+@MainActor
 private final class RecoveryCoordinatorHarness {
     let store = RecoveryMemoryCheckpoint()
     let keys = RecoveryMemoryKeys()
@@ -2515,6 +2526,8 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                 candidateFeedID: context.candidateFeedID, membershipHead: context.membershipHead)
             XCTAssertThrowsError(try coordinator.exportControlRecoveryCopies(context: unknown,
                 recordIDs: [original], current: { true }))
+            XCTAssertTrue(try coordinator.localControlRecoveryReviews(stationOrigin: unknown.stationOrigin,
+                current: { true }).isEmpty)
         }
         XCTAssertEqual(h.store.bytes, checkpoint)
         XCTAssertEqual(h.store.writes, writes)
@@ -2547,6 +2560,191 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         } catch { XCTAssertTrue(error is AstationDelegatedControlError) }
         XCTAssertEqual(h.ownerRequests.count, prompts)
         XCTAssertEqual(authority.reservations, reservations)
+    }
+
+    private func recoveryButton(_ title: String, window: NSWindow?) throws -> NSButton {
+        func search(_ view: NSView) -> NSButton? {
+            if let button = view as? NSButton, button.title == title { return button }
+            return view.subviews.compactMap(search).first
+        }
+        return try XCTUnwrap(window?.contentView.flatMap(search))
+    }
+
+    private func waitForRecoveryUI(_ predicate: () -> Bool) async throws {
+        let clock = ContinuousClock(), deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !predicate(), clock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        XCTAssertTrue(predicate(), "recovery UI operation did not complete")
+    }
+
+    private func clickRecovery(_ button: NSButton) throws {
+        XCTAssertTrue(button.isEnabled)
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(button.action), to: button.target, from: button))
+    }
+
+    private func showRecovery(_ controller: ControlRecoveryWindowController) {
+        // Headless AppKit animations can occupy all interactive worker threads.
+        controller.window?.animationBehavior = .none
+        controller.showWindow(nil)
+    }
+
+    func testRecoveryCopyWindowConfirmsExactDraftAndExportsOfflineWithoutResigning() async throws {
+        _ = NSApplication.shared
+        let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+        let (coordinator, context, original) = try await recoveryCopySource(h, authority: authority)
+        let review = try await coordinator.prepareControlRecoveryCopy(recordID: original, context: context, current: { true })
+        let prompts = h.ownerRequests.count, beforeControls = await h.relay.controls()
+        var shown: [RemoteControlRecoveryReview] = []
+        let controller = ControlRecoveryWindowController(stationOrigin: context.stationOrigin, loadAccess: {
+            .init(coordinator: coordinator, current: { true }, canSign: { true })
+        }, confirm: { shown.append($0); return true })
+        showRecovery(controller)
+        defer { controller.close() }
+        let sign = try recoveryButton("Confirm Copy...", window: controller.window)
+        XCTAssertFalse(try recoveryButton("Save Signed Copy...", window: controller.window).isEnabled)
+        try clickRecovery(sign)
+        try await waitForRecoveryUI { (try? self.recoveryButton("Save Signed Copy...", window: controller.window).isEnabled) == true }
+        XCTAssertEqual(shown, [review])
+        XCTAssertEqual(h.ownerRequests.count, prompts + 1)
+        XCTAssertEqual(h.ownerRequests.last, review.request)
+        XCTAssertFalse(sign.isEnabled)
+        let afterControls = await h.relay.controls()
+        XCTAssertEqual(afterControls, beforeControls)
+        let expected = try coordinator.exportControlRecoveryCopies(context: context,
+            recordIDs: [review.body.recordId], current: { true })
+        let offline = try h.coordinator(), panel = RecoveryCopySavePanel()
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")
+        panel.destination = destination
+        defer { try? FileManager.default.removeItem(at: destination) }
+        let saved = ControlRecoveryWindowController(stationOrigin: context.stationOrigin, loadAccess: {
+            .init(coordinator: offline, current: { true }, canSign: { false })
+        }, makeSavePanel: { panel })
+        showRecovery(saved)
+        defer { saved.close() }
+        XCTAssertFalse(try recoveryButton("Confirm Copy...", window: saved.window).isEnabled)
+        try clickRecovery(recoveryButton("Save Signed Copy...", window: saved.window))
+        try XCTUnwrap(panel.reply)(.OK)
+        XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), expected)
+        let attributes = try FileManager.default.attributesOfItem(atPath: destination.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+        XCTAssertEqual(h.ownerRequests.count, prompts + 1, "offline export never prompts or signs")
+        XCTAssertEqual(authority.reservations, 1)
+    }
+
+    func testRecoveryCopyWindowCancelsReviewOnAccountChangeBeforeOwnerPrompt() async throws {
+        _ = NSApplication.shared
+        let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+        let (coordinator, context, original) = try await recoveryCopySource(h, authority: authority)
+        _ = try await coordinator.prepareControlRecoveryCopy(recordID: original, context: context, current: { true })
+        let prompts = h.ownerRequests.count
+        var live = true
+        let entered = expectation(description: "recovery review shown")
+        var answer: CheckedContinuation<Bool, Never>?
+        let controller = ControlRecoveryWindowController(stationOrigin: context.stationOrigin, loadAccess: {
+            .init(coordinator: coordinator, current: { live }, canSign: { true })
+        }, confirm: { _ in
+            await withCheckedContinuation { answer = $0; entered.fulfill() }
+        })
+        showRecovery(controller)
+        defer { controller.close() }
+        try clickRecovery(recoveryButton("Confirm Copy...", window: controller.window))
+        await fulfillment(of: [entered], timeout: 5)
+        live = false
+        NotificationCenter.default.post(name: .accountLoginChanged, object: nil)
+        answer?.resume(returning: true)
+        try await waitForRecoveryUI { (try? self.recoveryButton("Refresh", window: controller.window).isEnabled) == true }
+        XCTAssertEqual(h.ownerRequests.count, prompts)
+        XCTAssertFalse(try recoveryButton("Save Signed Copy...", window: controller.window).isEnabled)
+        XCTAssertFalse(try XCTUnwrap(coordinator.localControlRecoveryReviews(current: { true }).first).signed)
+    }
+
+    func testRecoveryCopyWindowDefaultGateAndRejectedReviewNeverPrompt() async throws {
+        _ = NSApplication.shared
+        let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+        let (coordinator, context, original) = try await recoveryCopySource(h, authority: authority)
+        _ = try await coordinator.prepareControlRecoveryCopy(recordID: original, context: context, current: { true })
+        let prompts = h.ownerRequests.count, offline = try h.coordinator()
+        let disabled = ControlRecoveryWindowController(stationOrigin: context.stationOrigin, loadAccess: {
+            .init(coordinator: offline, current: { true }, canSign: { true })
+        })
+        showRecovery(disabled)
+        defer { disabled.close() }
+        XCTAssertFalse(try recoveryButton("Confirm Copy...", window: disabled.window).isEnabled)
+        var reviews = 0
+        let denied = ControlRecoveryWindowController(stationOrigin: context.stationOrigin, loadAccess: {
+            .init(coordinator: coordinator, current: { true }, canSign: { true })
+        }, confirm: { _ in reviews += 1; return false })
+        showRecovery(denied)
+        defer { denied.close() }
+        let sign = try recoveryButton("Confirm Copy...", window: denied.window)
+        try clickRecovery(sign)
+        try await waitForRecoveryUI { reviews == 1 && sign.isEnabled }
+        XCTAssertEqual(h.ownerRequests.count, prompts)
+        XCTAssertFalse(try recoveryButton("Save Signed Copy...", window: denied.window).isEnabled)
+    }
+
+    func testRecoveryCopyWindowClosesSavePanelAndIgnoresLateReply() async throws {
+        _ = NSApplication.shared
+        let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+        let (coordinator, context, original) = try await recoveryCopySource(h, authority: authority)
+        let review = try await coordinator.prepareControlRecoveryCopy(recordID: original, context: context, current: { true })
+        _ = try await coordinator.signControlRecoveryCopy(review, current: { true })
+        let panel = RecoveryCopySavePanel(), destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        panel.destination = destination
+        defer { try? FileManager.default.removeItem(at: destination) }
+        let controller = ControlRecoveryWindowController(stationOrigin: context.stationOrigin, loadAccess: {
+            .init(coordinator: coordinator, current: { true }, canSign: { false })
+        }, makeSavePanel: { panel })
+        showRecovery(controller)
+        try clickRecovery(recoveryButton("Save Signed Copy...", window: controller.window))
+        let reply = try XCTUnwrap(panel.reply)
+        controller.close()
+        XCTAssertEqual(panel.cancellations, 1)
+        reply(.OK)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
+    func testRecoveryCopyWindowDismissesRealReviewSheetWhenClosed() async throws {
+        _ = NSApplication.shared
+        let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+        let (coordinator, context, original) = try await recoveryCopySource(h, authority: authority)
+        _ = try await coordinator.prepareControlRecoveryCopy(recordID: original, context: context, current: { true })
+        let prompts = h.ownerRequests.count
+        let controller = ControlRecoveryWindowController(stationOrigin: context.stationOrigin, loadAccess: {
+            .init(coordinator: coordinator, current: { true }, canSign: { true })
+        })
+        showRecovery(controller)
+        defer { controller.close() }
+        try clickRecovery(recoveryButton("Confirm Copy...", window: controller.window))
+        try await waitForRecoveryUI { controller.window?.attachedSheet != nil }
+        let sheet = try XCTUnwrap(controller.window?.attachedSheet)
+        controller.close()
+        try await waitForRecoveryUI { !sheet.isVisible }
+        showRecovery(controller)
+        try await waitForRecoveryUI { (try? self.recoveryButton("Refresh", window: controller.window).isEnabled) == true }
+        try clickRecovery(recoveryButton("Refresh", window: controller.window))
+        XCTAssertEqual(h.ownerRequests.count, prompts)
+        XCTAssertFalse(try XCTUnwrap(coordinator.localControlRecoveryReviews(current: { true }).first).signed)
+    }
+
+    func testRecoveryCopyWindowRechecksDurableCheckpointBeforeSaving() async throws {
+        _ = NSApplication.shared
+        let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+        let (coordinator, context, original) = try await recoveryCopySource(h, authority: authority)
+        let review = try await coordinator.prepareControlRecoveryCopy(recordID: original, context: context, current: { true })
+        _ = try await coordinator.signControlRecoveryCopy(review, current: { true })
+        let panel = RecoveryCopySavePanel(), destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        panel.destination = destination
+        defer { try? FileManager.default.removeItem(at: destination) }
+        let controller = ControlRecoveryWindowController(stationOrigin: context.stationOrigin, loadAccess: {
+            .init(coordinator: coordinator, current: { true }, canSign: { false })
+        }, makeSavePanel: { panel })
+        showRecovery(controller)
+        defer { controller.close() }
+        try clickRecovery(recoveryButton("Save Signed Copy...", window: controller.window))
+        h.store.bytes = nil
+        try XCTUnwrap(panel.reply)(.OK)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertThrowsError(try coordinator.localControlRecoveryReviews(current: { true }))
     }
 
     func testNativeStopAndPortalMirrorRetryTheirExactSavedIntentAfterBothRepliesAreLost() async throws {
