@@ -1,0 +1,239 @@
+import AppKit
+import AstationRemote
+import UniformTypeIdentifiers
+
+@MainActor
+final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegate {
+    struct Access {
+        let coordinator: AstationRecoveryCoordinator
+        let current: () -> Bool
+        let canSign: () -> Bool
+    }
+
+    private let stationOrigin: String
+    private let loadAccess: () throws -> Access
+    private let confirm: ((RemoteControlRecoveryReview) async -> Bool)?
+    private let makeSavePanel: @MainActor () -> NSSavePanel
+    private let choices = NSPopUpButton()
+    private let details = NSTextView()
+    private let status = NSTextField(wrappingLabelWithString: "")
+    private let refresh = NSButton(title: "Refresh", target: nil, action: nil)
+    private let sign = NSButton(title: "Confirm Copy...", target: nil, action: nil)
+    private let export = NSButton(title: "Save Signed Copy...", target: nil, action: nil)
+    private var access: Access?
+    private var rows: [RemoteControlRecoveryReview] = []
+    private var generation = UUID()
+    private var task: Task<Void, Never>?
+    private var panel: NSSavePanel?
+    private var alert: NSAlert?
+
+    convenience init(hub: AstationHubManager, stationOrigin: String) {
+        self.init(stationOrigin: stationOrigin, loadAccess: {
+            guard let owner = hub.signedInAccount, let issuer = hub.portalSettings?.issuer else {
+                throw RemoteRecoveryError.requiresReview
+            }
+            let accountGeneration = hub.integrationAccountGeneration, selected = hub.stationRelayUrl
+            return Access(coordinator: try hub.recoveryCoordinator(), current: {
+                hub.signedInAccount == owner && hub.portalSettings?.issuer == issuer &&
+                    hub.integrationAccountGeneration == accountGeneration && hub.stationRelayUrl == selected
+            }, canSign: { !hub.accountSignInRequired && hub.stationRelayUrl == stationOrigin })
+        })
+    }
+
+    init(stationOrigin: String, loadAccess: @escaping () throws -> Access,
+        confirm: ((RemoteControlRecoveryReview) async -> Bool)? = nil,
+        makeSavePanel: @escaping @MainActor () -> NSSavePanel = { NSSavePanel() }) {
+        self.stationOrigin = stationOrigin; self.loadAccess = loadAccess
+        self.confirm = confirm; self.makeSavePanel = makeSavePanel
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 580),
+            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        window.title = "Recovery Copies"; window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 620, height: 440)
+        super.init(window: window)
+        window.delegate = self
+        let intro = NSTextField(wrappingLabelWithString:
+            "Review saved recovery copies for " + stationOrigin + ". Originals stay saved. Confirming a copy does not publish a new feed or resume access.")
+        details.isEditable = false; details.isSelectable = true
+        details.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        details.textContainerInset = NSSize(width: 8, height: 8)
+        details.isVerticallyResizable = true; details.isHorizontallyResizable = false
+        details.autoresizingMask = .width; details.textContainer?.widthTracksTextView = true
+        let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.documentView = details
+        let actions = NSStackView(views: [sign, export, refresh]); actions.spacing = 12
+        let stack = NSStackView(views: [intro, choices, scroll, status, actions])
+        stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 14
+        if let content = window.contentView {
+            content.addSubview(stack); stack.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+                stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+                stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
+                stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
+                intro.widthAnchor.constraint(equalTo: stack.widthAnchor),
+                choices.widthAnchor.constraint(equalTo: stack.widthAnchor),
+                scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
+                scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 160),
+                status.widthAnchor.constraint(equalTo: stack.widthAnchor)
+            ])
+        }
+        choices.setAccessibilityLabel("Saved recovery copy")
+        choices.target = self; choices.action = #selector(selectionChanged)
+        refresh.target = self; refresh.action = #selector(reload)
+        sign.target = self; sign.action = #selector(confirmCopy)
+        export.target = self; export.action = #selector(saveCopy)
+        for name in [Notification.Name.accountLoginChanged, .serverInfoChanged, .relayIdentityKeyChanged] {
+            NotificationCenter.default.addObserver(self, selector: #selector(contextChanged), name: name, object: nil)
+        }
+        render()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    deinit { task?.cancel(); NotificationCenter.default.removeObserver(self) }
+
+    override func showWindow(_ sender: Any?) {
+        super.showWindow(sender)
+        window?.center(); window?.makeKeyAndOrderFront(sender)
+        reload()
+    }
+
+    private var selected: RemoteControlRecoveryReview? {
+        rows.indices.contains(choices.indexOfSelectedItem) ? rows[choices.indexOfSelectedItem] : nil
+    }
+
+    private func isCurrent(_ access: Access, epoch: UUID) -> Bool {
+        generation == epoch && window?.isVisible == true && access.current() && !Task.isCancelled
+    }
+
+    func windowWillClose(_ notification: Notification) { invalidate() }
+
+    private func invalidate() {
+        generation = UUID(); task?.cancel()
+        panel?.cancel(nil); panel = nil
+        if let alert { window?.endSheet(alert.window, returnCode: .abort) }
+        alert = nil; access = nil; rows = []; choices.removeAllItems(); details.string = ""
+        render()
+    }
+
+    @objc private func contextChanged() {
+        invalidate()
+        status.stringValue = "Account or Station access changed. Refresh to review current copies."
+    }
+
+    @objc private func reload() {
+        guard task == nil, panel == nil else { return }
+        generation = UUID(); access = nil; rows = []; choices.removeAllItems(); details.string = ""
+        do {
+            let value = try loadAccess(), epoch = generation
+            guard isCurrent(value, epoch: epoch) else { throw RemoteRecoveryError.requiresReview }
+            rows = try value.coordinator.localControlRecoveryReviews(stationOrigin: stationOrigin,
+                current: { self.isCurrent(value, epoch: epoch) })
+            access = value
+            choices.addItems(withTitles: rows.map {
+                ($0.signed ? "Signed - " : "Needs confirmation - ") + $0.body.principal + " - " + $0.body.recordId
+            })
+            status.stringValue = rows.isEmpty
+                ? "No saved recovery copies. Copies appear after an authenticated recovery review is prepared."
+                : "Saved copies shown. History, clocks, publication and reopening are separate recovery steps."
+        } catch { status.stringValue = "Could not read protected recovery copies: " + error.localizedDescription }
+        render()
+    }
+
+    static func explanation(_ review: RemoteControlRecoveryReview) -> String {
+        let body = review.body, context = review.context
+        let intent: String
+        if body.principal.hasPrefix("host:") {
+            intent = "Request interruption of tasks sent by \(body.principal) before revoke #\(body.revokeSeq ?? 0). New work after readmit is unaffected."
+        } else if body.action == "revoke" {
+            intent = "Revoke \(body.principal). " + (body.interruptRunning == true
+                ? "Also request interruption of its running tasks." : "Running tasks are not interrupted.")
+        } else { intent = "Request interruption of running tasks from \(body.principal)." }
+        return intent + "\n\n" + (review.signed ? "Signed copy saved." : "Fresh owner confirmation is required.") +
+            " Originals stay saved. This copy does not confirm delivery, stop completion or restored access." +
+            "\n\nStation: \(context.stationOrigin)\nAccount: \(context.accountID)\nGenesis: \(context.genesisHash)\nGeneration: \(context.generation)" +
+            "\nPlan: \(context.planID)\nReplacement feed: \(context.candidateFeedID)" +
+            "\nMembership: \(context.membershipHead.seq) / \(context.membershipHead.hash)" +
+            "\nOriginal record: \(review.originalRecordID)\nNew record: \(body.recordId)\nSigner: \(body.signer)" +
+            (body.principalKey.map { "\nPrincipal key: " + $0 } ?? "") +
+            "\nReserved timestamp: \(body.issuedAt)" +
+            "\nSource: \(context.sourceHash)\nEvidence: \(context.evidenceHash)"
+    }
+
+    @objc private func selectionChanged() { render() }
+
+    private func render() {
+        let available = task == nil && panel == nil && access?.current() == true
+        choices.isEnabled = available && !rows.isEmpty
+        refresh.isEnabled = task == nil && panel == nil
+        sign.isEnabled = available && selected?.signed == false && access?.canSign() == true &&
+            access?.coordinator.controlRecoveryAvailable == true
+        export.isEnabled = available && selected?.signed == true
+        details.string = selected.map(Self.explanation) ?? ""
+    }
+
+    @objc private func confirmCopy() {
+        guard sign.isEnabled, let access, let review = selected else { return }
+        let epoch = generation
+        task = Task { [weak self] in
+            guard let self else { return }
+            defer { task = nil; render() }
+            do {
+                guard isCurrent(access, epoch: epoch), access.canSign() else { return }
+                let approved: Bool
+                if let confirm { approved = await confirm(review) }
+                else {
+                    guard let window else { return }
+                    let alert = NSAlert(); self.alert = alert
+                    alert.messageText = "Confirm this recovery copy?"
+                    alert.informativeText = Self.explanation(review)
+                    alert.addButton(withTitle: "Continue to Confirmation"); alert.addButton(withTitle: "Cancel")
+                    approved = await withCheckedContinuation { continuation in
+                        alert.beginSheetModal(for: window) { continuation.resume(returning: $0 == .alertFirstButtonReturn) }
+                    }
+                    self.alert = nil
+                }
+                guard approved, isCurrent(access, epoch: epoch), access.canSign() else { return }
+                _ = try await access.coordinator.signControlRecoveryCopy(review,
+                    current: { self.isCurrent(access, epoch: epoch) && access.canSign() })
+                guard isCurrent(access, epoch: epoch) else { return }
+                rows = try access.coordinator.localControlRecoveryReviews(stationOrigin: stationOrigin,
+                    current: { self.isCurrent(access, epoch: epoch) })
+                for (index, row) in rows.enumerated() {
+                    choices.item(at: index)?.title = (row.signed ? "Signed - " : "Needs confirmation - ") +
+                        row.body.principal + " - " + row.body.recordId
+                }
+                status.stringValue = "Signed copy saved. Use Save Signed Copy to hand it to the recovery operator. Access stays fenced."
+            } catch {
+                guard isCurrent(access, epoch: epoch) else { return }
+                status.stringValue = "Could not confirm recovery copy: " + error.localizedDescription
+            }
+        }
+        render()
+    }
+
+    @objc private func saveCopy() {
+        guard export.isEnabled, let access, let review = selected, let window else { return }
+        let epoch = generation
+        do {
+            let json = try access.coordinator.exportControlRecoveryCopies(context: review.context,
+                recordIDs: [review.body.recordId], current: { self.isCurrent(access, epoch: epoch) })
+            let panel = makeSavePanel(); self.panel = panel
+            panel.nameFieldStringValue = "Astation Recovery Copy.json"; panel.allowedContentTypes = [.json]
+            panel.message = "Save this exact signed copy for the Station recovery operator. It contains account and control metadata, not private keys. Saving does not publish it or resume access."
+            panel.beginSheetModal(for: window) { [weak self] response in
+                guard let self, self.panel === panel else { return }
+                self.panel = nil
+                defer { self.render() }
+                guard response == .OK, let url = panel.url, self.isCurrent(access, epoch: epoch) else { return }
+                do {
+                    guard try access.coordinator.exportControlRecoveryCopies(context: review.context,
+                        recordIDs: [review.body.recordId], current: { self.isCurrent(access, epoch: epoch) }) == json else {
+                        throw RemoteRecoveryError.requiresReview
+                    }
+                    try RecoveryKit.save(json, to: url)
+                    self.status.stringValue = "Signed copy saved to file. Publication and reopening are still required."
+                } catch { self.status.stringValue = "Could not save signed copy: " + error.localizedDescription }
+            }
+            render()
+        } catch { status.stringValue = "Could not export signed copy: " + error.localizedDescription }
+    }
+}

@@ -381,13 +381,32 @@ before and after owner confirmation and at signing. The journal also refuses
 times at or below any recovery draft/copy it already retained for that principal;
 these local observations still cannot establish a complete clock.
 
-There is **no production adapter** or user-facing recovery-signing action yet.
+There is **no production adapter** yet.
 The coordinator defaults this provider to nil and refuses preparation/signing
 before a prompt or key operation, including when ordinary delegated control has
 an authorization provider. A caller-supplied plan, observed lower bound, restored
 database, wall clock or owner click cannot substitute for the missing authority.
 The complete history/clock reconciliation and authenticated adapter remain to
 be built before enabling the native recovery workflow.
+
+Control Activity's **Review Recovery Copies** opens a separate protected local
+review. It lists only drafts already prepared through that trusted adapter and
+signed copies retained on this Mac; it never accepts a caller-supplied plan as
+authorization. Each review shows the original stop and interruption choice,
+original/new record IDs, manager, Station, generation, candidate feed, exact
+membership head and source/evidence commitments. **Confirm Copy** first reviews
+that exact intent, then uses the coordinator's fresh owner confirmation and
+authority rechecks. The button remains disabled without the production adapter,
+current sign-in and selected source Station. Confirmation does not submit the
+record to a live feed or clear the recovery fence.
+
+**Save Signed Copy** exports the existing `retain-resigned` JSON for the selected
+saved signature without network access or a new signing prompt. Before writing
+the file it rereads the protected checkpoint and requires the exact same export;
+changed or unreadable storage refuses the save. Files are atomic and mode `0600`.
+Account/Station changes or closing the window invalidate pending confirmation
+and save callbacks. A delayed callback cannot sign or write an earlier account's
+copy. The original evidence-export action stays separate.
 
 With an authenticated adapter and fresh owner approval, the exact signature is
 saved before it can be exported. An uncertain protected save fences the process;

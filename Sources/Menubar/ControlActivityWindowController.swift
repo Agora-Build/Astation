@@ -10,6 +10,8 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
     private let status = NSTextField(wrappingLabelWithString: "")
     private let refresh = NSButton(title: "Refresh", target: nil, action: nil)
     private let export = NSButton(title: "Export Recovery Evidence...", target: nil, action: nil)
+    private let recovery = NSButton(title: "Review Recovery Copies...", target: nil, action: nil)
+    private var recoveryWindow: ControlRecoveryWindowController?
     private var exportPanel: NSSavePanel?
     private let stops = NSPopUpButton()
     private let review = NSButton(title: "Review with Current Manager...", target: nil, action: nil)
@@ -41,9 +43,10 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
         text.isVerticallyResizable = true; text.isHorizontallyResizable = false
         text.autoresizingMask = .width
         text.textContainer?.widthTracksTextView = true
-        let footer = NSStackView(views: [status, export, refresh]); footer.spacing = 12
+        let footer = NSStackView(views: [status, refresh]); footer.spacing = 12
         let actions = NSStackView(views: [review, cancel]); actions.spacing = 8
-        let stack = NSStackView(views: [intro, scroll, stops, actions, footer])
+        let recoveryActions = NSStackView(views: [export, recovery]); recoveryActions.spacing = 8
+        let stack = NSStackView(views: [intro, scroll, stops, actions, recoveryActions, footer])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 14
         guard let content = window.contentView else { return }
         content.addSubview(stack); stack.translatesAutoresizingMaskIntoConstraints = false
@@ -61,6 +64,7 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
         status.setContentHuggingPriority(.defaultLow, for: .horizontal)
         refresh.target = self; refresh.action = #selector(reload)
         export.target = self; export.action = #selector(exportEvidence)
+        recovery.target = self; recovery.action = #selector(showRecoveryCopies)
         stops.target = self; stops.action = #selector(selectionChanged)
         stops.setAccessibilityLabel("Stop requiring a fresh manager review")
         review.target = self; review.action = #selector(reviewStop)
@@ -98,6 +102,7 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
     }
 
     private func clearContext() {
+        recoveryWindow?.close(); recoveryWindow = nil
         exportPanel?.cancel(nil); exportPanel = nil
         coordinator = nil; current = nil; discovery = nil; rows = []; reviewRows = []; stops.removeAllItems(); render()
     }
@@ -139,6 +144,15 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
         refresh.isEnabled = task == nil && exportPanel == nil
         export.isEnabled = task == nil && exportPanel == nil && hub.signedInAccount != nil &&
             hub.portalSettings?.issuer != nil
+        recovery.isEnabled = export.isEnabled
+    }
+
+    @objc private func showRecoveryCopies() {
+        guard recovery.isEnabled else { return }
+        if recoveryWindow == nil {
+            recoveryWindow = ControlRecoveryWindowController(hub: hub, stationOrigin: stationOrigin ?? hub.stationRelayUrl)
+        }
+        recoveryWindow?.showWindow(nil)
     }
 
     @objc private func exportEvidence() {
