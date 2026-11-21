@@ -1599,7 +1599,7 @@ extension AstationRecoveryCoordinator {
     func localControlRecoveryReviews(stationOrigin: String? = nil, current: () -> Bool) throws -> [RemoteControlRecoveryReview] {
         guard !busy, !uncertain, current() else { throw RemoteRecoveryError.requiresReview }
         try requireDurableRecoveryCheckpoint()
-        return try recoveryControls(origin: stationOrigin ?? relayURL).reviews()
+        return try retainedRecoveryControls(origin: stationOrigin ?? relayURL)?.reviews() ?? []
     }
 
     func prepareControlRecoveryCopy(recordID: String, context: RemoteControlRecoveryContext,

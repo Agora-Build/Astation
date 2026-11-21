@@ -2526,6 +2526,8 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                 candidateFeedID: context.candidateFeedID, membershipHead: context.membershipHead)
             XCTAssertThrowsError(try coordinator.exportControlRecoveryCopies(context: unknown,
                 recordIDs: [original], current: { true }))
+            XCTAssertTrue(try coordinator.localControlRecoveryReviews(stationOrigin: unknown.stationOrigin,
+                current: { true }).isEmpty)
         }
         XCTAssertEqual(h.store.bytes, checkpoint)
         XCTAssertEqual(h.store.writes, writes)
