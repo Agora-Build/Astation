@@ -194,7 +194,8 @@ final class AstationRecoveryCoordinator {
         self.now = now
         if let data = try store.read() {
             saved = try PropertyListDecoder().decode(Saved.self, from: data)
-            guard [2, 3].contains(saved.version), saved.accountID == accountID, saved.managerID == managerID else {
+            guard [2, 3, 4].contains(saved.version), saved.accountID == accountID, saved.managerID == managerID,
+                  saved.version >= 4 || (saved.controlRecoveryPublications ?? [:]).isEmpty else {
                 throw RemoteRecoveryError.invalidCheckpoint
             }
         } else { saved = Saved(accountID: accountID, managerID: managerID) }
@@ -269,6 +270,9 @@ final class AstationRecoveryCoordinator {
         guard !uncertain else { throw RemoteRecoveryError.storageUncertain }
         var next = saved
         change(&next)
+        // Older readers must refuse rather than rewrite away recovery signatures.
+        next.version = max(saved.version, next.version)
+        if !(next.controlRecoveryPublications ?? [:]).isEmpty { next.version = max(next.version, 4) }
         do {
             let encoder = PropertyListEncoder()
             encoder.outputFormat = .binary

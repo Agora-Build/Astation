@@ -392,7 +392,10 @@ be built before enabling the native recovery workflow.
 With an authenticated adapter and fresh owner approval, the exact signature is
 saved before it can be exported. An uncertain protected save fences the process;
 restart reads the committed draft or exact signature without silently choosing
-an older checkpoint. Membership or account changes invalidate the pending review.
+an older checkpoint. Saving the first recovery draft raises the account checkpoint
+to version 4. Older readers refuse it instead of rewriting away recovery copies;
+later operations cannot lower the checkpoint version. Membership or account
+changes invalidate the pending review.
 Retrying an already signed copy never signs it again, including with P-256.
 Earlier review copies and their clock obligations remain saved across new plans.
 

@@ -2411,6 +2411,13 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(authority.reservations, 1)
         XCTAssertEqual(h.ownerRequests.count, prompts, "preparing a draft is not owner confirmation")
         let copy = try await coordinator.signControlRecoveryCopy(review, current: { true })
+        let savedCheckpoint = try XCTUnwrap(h.store.bytes)
+        var savedFields = try XCTUnwrap(PropertyListSerialization.propertyList(from: savedCheckpoint, format: nil) as? [String: Any])
+        XCTAssertEqual(savedFields["version"] as? Int, 4)
+        savedFields["version"] = 3
+        h.store.bytes = try PropertyListSerialization.data(fromPropertyList: savedFields, format: .binary, options: 0)
+        XCTAssertThrowsError(try h.coordinator(), "a downgraded checkpoint must not hide retained recovery clocks")
+        h.store.bytes = savedCheckpoint
         XCTAssertEqual(h.ownerRequests.count, prompts + 1)
         XCTAssertEqual(h.ownerRequests.last, review.request)
         XCTAssertEqual(try coordinator.exportControlRecoveryEvidence(current: { true }), beforeExport)
@@ -2479,6 +2486,22 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(h.ownerRequests.count, prompts)
         let state = try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(h.store.bytes), format: nil) as? [String: Any])
         XCTAssertNil(state["controlRecoveryPublications"])
+    }
+
+    func testServiceRemovalNeverLowersRecoveryCheckpointVersion() async throws {
+        let h = RecoveryCoordinatorHarness(), transport = ServiceApprovalPortal()
+        let initial = try h.coordinator()
+        let record = try await revokedService(initial, transport: transport)
+        var saved = try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(h.store.bytes), format: nil) as? [String: Any])
+        saved["version"] = 4
+        h.store.bytes = try PropertyListSerialization.data(fromPropertyList: saved, format: .binary, options: 0)
+        let coordinator = try h.coordinator()
+        try await coordinator.removeRevokedService(record, ownerAccount: "ab01234567890123456789012345",
+            portal: portal(transport), current: { true })
+        saved = try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(h.store.bytes), format: nil) as? [String: Any])
+        XCTAssertEqual(saved["version"] as? Int, 4)
+        let log = try await coordinator.serviceMembership()
+        XCTAssertEqual(log.member(deviceId: "service-test")?.status, .removed)
     }
 
     func testNativeStopAndPortalMirrorRetryTheirExactSavedIntentAfterBothRepliesAreLost() async throws {
