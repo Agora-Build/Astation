@@ -310,6 +310,56 @@ checkpoint refuses export; no older fallback, signing, retry, receipt change or
 reopening is performed. Complete history and clock reconciliation, fresh
 manager confirmation and publication remain separate obligations.
 
+### Retaining fresh manager copies
+
+The operator can retain already-signed fresh manager copies against an exact
+prepared source review:
+
+```sh
+station-relay-server admin delegated-recovery retain-resigned <genesis_hash> <plan_id> replacements.json
+```
+
+The bounded regular file (256 KiB) has exactly `evidence_hash`, taken from the
+current preparation, and `replacements`, a nonempty array of at most 64 objects
+with exactly `original_record_id` and `record`. Each original must be a retained
+signed native revoke or interruption. Unsigned intent and service-signed state
+cannot be substituted. The current shared verifier must accept each new native
+manager signature. The replacement preserves the exact principal, key, action,
+interruption choice, host revoke sequence and audit fields. Only its signer,
+record ID, timestamp and service feed ID change. A service copy must name the
+prepared replacement feed; a host interruption remains feed-independent.
+The operator associates the source commitment; the control signature authenticates
+the exact stop body only. It is not an attestation of complete recovery history.
+
+New IDs must not collide with retained originals, unsigned reviews or earlier
+copies. Each new signature's time must exceed every observed retained reservation
+and earlier accepted copy for its principal; exact retries reuse their signature.
+These are necessary lower-bound checks, never proof that all clock anchors are
+known. This command performs no signing or timestamp reservation and cannot
+authorize a native application to sign while its recovery clock is unknown.
+Native recovery review, complete clock reconciliation and its protected signing
+path remain required.
+
+Migration `0020` retains copies separately from originals and the live feed.
+The deployment fence, exact generation, owned root and immutable source stay
+locked through the whole batch and commit. Any mismatch, failed signature,
+conflicting ID, excess history or failed commit refuses the whole batch. Retry
+and concurrent replicas retain one exact copy for a source/evidence review.
+All generations' copies and signing lower bounds remain retained; current
+membership reclassifies a removed manager without erasing their old signature
+or clock obligation. Corrupt signatures are refused under the original plan's
+verified membership, including after a restart.
+
+The source `evidence_hash` remains the commitment to checkpoints/imports. A new
+`reconstruction_hash` additionally commits to the retained manager copies.
+Later source evidence marks earlier copies as belonging to an earlier review;
+they never silently satisfy the changed review. A new review retains a new copy
+with a fresh ID and higher timestamp. Outputs contain only metadata, verification
+and commitments, not signatures or keys. `snapshot_complete`,
+`signing_clock_complete` and `recovery_ready` remain false. This is retention for
+reconstruction, not snapshot publication, a completed native recovery ceremony
+or permission to reopen the Station.
+
 ### Operator Steps
 
 1. Drain and stop every replica before restoring. Keep delegated serving,

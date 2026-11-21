@@ -13,6 +13,8 @@ pub(crate) mod stops;
 mod history;
 #[path = "delegated_native_recovery.rs"]
 pub(crate) mod native;
+#[path = "delegated_recovery_signatures.rs"]
+pub(crate) mod signatures;
 
 #[derive(sqlx::FromRow)]
 pub(super) struct Prepared {
@@ -58,6 +60,22 @@ pub(crate) async fn prepare(
 }
 
 async fn review_evidence(
+    connection: &mut PgConnection,
+    prepared: &Prepared,
+    log: &Membership,
+    binding: &Binding,
+    report: &mut Value,
+) -> Result<(), sqlx::Error> {
+    review_source_evidence(connection, prepared, log, binding, report).await?;
+    report["recovery_signatures"] = signatures::inspection(connection, prepared, log, binding, report).await?;
+    report["reconstruction_hash"] = source_hash(&json!({
+        "source_evidence_hash": report["evidence_hash"],
+        "signature_evidence_hash": report["recovery_signatures"]["evidence_hash"],
+    }))?.into();
+    Ok(())
+}
+
+async fn review_source_evidence(
     connection: &mut PgConnection,
     prepared: &Prepared,
     log: &Membership,

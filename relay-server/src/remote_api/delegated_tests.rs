@@ -29,6 +29,10 @@ mod recovered_stops;
 #[path = "delegated_native_recovery_tests.rs"]
 mod native_recovery;
 
+#[cfg(feature = "delegated-host-work")]
+#[path = "delegated_recovery_signatures_tests.rs"]
+mod recovery_signatures;
+
 const ORIGIN: &str = "https://station-dev.agora.build";
 
 pub(crate) fn fixture() -> Fixture {
