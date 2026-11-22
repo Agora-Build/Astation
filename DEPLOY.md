@@ -87,17 +87,24 @@ A public health request identifies only the replica that answers; it cannot
 prove that every replica has updated. Coolify deployment completion remains
 the per-application rollout check.
 
-nginx disables passive peer quarantine (`max_fails=0`) because Docker can
-immediately reuse a failed container's IP for a healthy replacement. Shared
-failure state must not keep refusing that replacement for the default ten
-seconds. TCP connection attempts remain bounded at three seconds and can try
-another peer. A persistently unresponsive address that remains in DNS can add
-that connection latency to each request until the platform removes or replaces
-it; passive quarantine no longer suppresses those attempts. This does not
-enable replay of an accepted POST: the maintained
-real-nginx tests cover lost replies, busy responses, unresponsive addresses,
-immediate peer recovery, and an unsafe-retry negative control. Established
-WebSockets keep their existing timeouts.
+nginx resolves the configured relay alias through a variable `proxy_pass`.
+Its DNS cache lasts one second and lookup has a one-second deadline. Each
+request keeps its own resolved address list while it tries peers; a background
+DNS update cannot retire that request's remaining peers. A shared dynamically
+resolved upstream can instead return `no live upstreams` when its generation
+changes during a stalled TCP attempt, even with passive quarantine disabled.
+Request-local peers also prevent a failure on an old Docker IP from quarantining
+a healthy replacement at that address for subsequent requests.
+
+TCP attempts remain bounded at three seconds. A persistently unresponsive
+address that remains in DNS can add that latency to each request until the
+platform removes or replaces it. This does not enable replay of an accepted
+POST: normal nginx retry rules still apply, and `non_idempotent` is never enabled.
+The maintained real-nginx tests cover a DNS change during stalled connections,
+immediate peer recovery, lost replies, busy responses, and unsafe/shared-upstream
+negative controls. Established WebSockets keep their existing timeouts. The
+explicit `/ws` and `/ws/proxy` targets preserve query parameters and normalize
+legacy `//ws` without changing the selected Station or authorization headers.
 
 `RELAY_DEPLOY_HOOKS` is required: if it is empty or unset the run fails
 before calling anything. One relay is one line.
@@ -238,8 +245,8 @@ Runtime configuration:
   been removed. Existing identity/data rows are retained.
 - Webapp: `STATION_RELAY_UPSTREAM=station-relay-server:3000`. All containers
   must use the `coolify` Docker network. nginx re-resolves the alias through
-  Docker DNS every 10 s and spreads requests across every address it returns,
-  so replaced and added relay containers are picked up.
+  Docker DNS with a one-second cache and keeps the resolved peer list local to
+  each request, so replacement cannot invalidate a retry already in progress.
 - Cloudflare: publish `station.agora.build` on the existing Volumetric tunnel
   with origin `http://10.0.0.1:3010` and a proxied CNAME to that tunnel's
   `<tunnel-id>.cfargotunnel.com`. TLS terminates at Cloudflare; the tunnel

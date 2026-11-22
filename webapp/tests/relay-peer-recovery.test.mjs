@@ -5,6 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { withSharedPeers } from './relay-test-config.mjs';
 
 const image = process.env.WEBAPP_FAILOVER_IMAGE;
 const docker = (...args) => execFileSync('docker', args, { encoding: 'utf8', timeout: 120_000 });
@@ -38,7 +39,9 @@ test('a recovered relay address is usable immediately after all peers refused co
     const frontends = [];
     for (const [mode, config] of [
       ['production', source],
-      ['quarantined-negative-control', source.replace('max_fails=0', 'max_fails=1')],
+      ['quarantined-negative-control', withSharedPeers(source,
+        `    server ${alias}:3000 resolve max_fails=1;`,
+        '    zone recovery_fixture 64k;\n    resolver 127.0.0.11 valid=1s ipv6=off;')],
     ]) {
       const configPath = join(directory, mode + '.conf');
       writeFileSync(configPath, config);

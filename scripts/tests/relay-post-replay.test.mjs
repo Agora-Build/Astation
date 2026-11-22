@@ -7,6 +7,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { withSharedPeers } from '../../webapp/tests/relay-test-config.mjs';
 
 const image = process.env.WEBAPP_FAILOVER_IMAGE;
 const docker = (...args) => execFileSync('docker', args, { encoding: 'utf8', timeout: 120_000 });
@@ -51,10 +52,9 @@ test('accepted POSTs are not replayed when a relay loses its reply or returns bu
       await once(backend, 'listening');
     }
     const source = readFileSync(new URL('../../webapp/nginx.conf', import.meta.url), 'utf8');
-    const peers = 'upstream station_relay_upstream {\n' + backends.map(backend =>
-      `    server host.docker.internal:${backend.address().port} max_fails=0;`).join('\n') + '\n}';
-    const production = source.replace(/^upstream station_relay_upstream \{[\s\S]*?^\}/m, peers);
-    assert.notEqual(production, source, 'the fixture must replace upstream discovery');
+    const peers = backends.map(backend =>
+      `    server host.docker.internal:${backend.address().port} max_fails=0;`).join('\n');
+    const production = withSharedPeers(source, peers);
 
     async function start(config, mode) {
       const configPath = join(directory, mode + '.conf');
