@@ -91,7 +91,10 @@ nginx disables passive peer quarantine (`max_fails=0`) because Docker can
 immediately reuse a failed container's IP for a healthy replacement. Shared
 failure state must not keep refusing that replacement for the default ten
 seconds. TCP connection attempts remain bounded at three seconds and can try
-another peer. This does not enable replay of an accepted POST: the maintained
+another peer. A persistently unresponsive address that remains in DNS can add
+that connection latency to each request until the platform removes or replaces
+it; passive quarantine no longer suppresses those attempts. This does not
+enable replay of an accepted POST: the maintained
 real-nginx tests cover lost replies, busy responses, unresponsive addresses,
 immediate peer recovery, and an unsafe-retry negative control. Established
 WebSockets keep their existing timeouts.

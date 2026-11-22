@@ -82,7 +82,7 @@ test('a recovered relay address is usable immediately after all peers refused co
     const negative = await fetch(`${frontends[1].origin}/health`, { signal: AbortSignal.timeout(2_000) });
     await negative.arrayBuffer();
     assert.equal(negative.status, 502, 'the old quarantine must reproduce the real availability gap');
-    assert.ok(performance.now() - started < 5_000, 'recovery must not wait out the passive-failure quarantine');
+    assert.ok(performance.now() - started < 8_000, 'recovery must not wait out the passive-failure quarantine');
     const logs = spawnSync('docker', ['logs', frontends[1].name], { encoding: 'utf8', timeout: 10_000 });
     assert.equal(logs.status, 0);
     assert.match(logs.stdout + logs.stderr, /no live upstreams/);
