@@ -1726,6 +1726,45 @@ extension AstationRecoveryCoordinator {
         return try recovery.export(context: context, recordIDs: recordIDs)
     }
 
+    /// Send only an already durable signature. A lost reply retries the same
+    /// bytes, without reserving another clock or asking the owner to sign again.
+    func retainControlRecoveryCopy(_ review: RemoteControlRecoveryReview, current: () -> Bool) async throws -> RemoteControlRecoveryRetention {
+        try begin(); defer { busy = false }
+        guard current(), !Task.isCancelled, review.signed, review.context.stationOrigin == relayURL,
+              review.context.accountID == accountID, let log = membershipLog, log.frozen() == nil,
+              log.head() == review.context.membershipHead, log.genesisHash() == review.context.genesisHash else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        try requireDurableRecoveryCheckpoint()
+        guard let recovery = try retainedRecoveryControls(origin: review.context.stationOrigin),
+              try recovery.reviews().contains(review) else { throw RemoteRecoveryError.requiresReview }
+        let json = try recovery.export(context: review.context, recordIDs: [review.body.recordId])
+        let source = try controlActivitySource(origin: review.context.stationOrigin, log: log)
+        guard let reviews = source as? RemoteControlRecoveryReviewTransport,
+              let retention = source as? RemoteControlRecoveryRetentionTransport else {
+            throw RemoteRecoveryTransportError.unavailable
+        }
+        let preparation = try await reviews.controlRecoveryReview(accountID: accountID,
+            genesisHash: review.context.genesisHash, expected: review.context.membershipHead)
+        guard current(), !Task.isCancelled, preparation.context == review.context,
+              membershipLog?.head() == review.context.membershipHead, membershipLog?.frozen() == nil else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        try requireDurableRecoveryCheckpoint()
+        guard try recovery.export(context: review.context, recordIDs: [review.body.recordId]) == json else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        let receipt = try await retention.retainControlRecoveryCopies(context: review.context, copiesJSON: json)
+        guard current(), !Task.isCancelled, membershipLog?.head() == review.context.membershipHead,
+              membershipLog?.frozen() == nil, receipt.recordIDs == [review.body.recordId] else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        try requireDurableRecoveryCheckpoint()
+        // Keep the protected original and copy. This receipt is neither a live
+        // feed ACK nor evidence that the replacement snapshot may be opened.
+        return receipt
+    }
+
     private func retainedRecoveryControls(origin: String) throws -> RemoteControlRecoveryPublication? {
         guard PortalIntegrationRecord.validOrigin(origin) else { throw RemoteRecoveryError.requiresReview }
         // Evidence reads must not consume origin slots by creating empty journals.

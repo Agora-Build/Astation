@@ -63,7 +63,7 @@ private final class RecoveryRedirectGuard: NSObject, URLSessionTaskDelegate, @un
 }
 
 /// TLS/account login limits storage access. Only the shared verifier grants cryptographic trust.
-public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteControlRecoveryReviewTransport, RemoteStationVerifierTransport, RemoteManagedServiceVerifierTransport, @unchecked Sendable {
+public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteControlRecoveryReviewTransport, RemoteControlRecoveryRetentionTransport, RemoteStationVerifierTransport, RemoteManagedServiceVerifierTransport, @unchecked Sendable {
     private let baseURL: URL
     private let stationOrigin: String
     public var controlStationOrigin: String { stationOrigin }
@@ -139,6 +139,15 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
             throw RemoteRecoveryTransportError.invalidResponse
         }
         return text
+    }
+
+    public func retainControlRecoveryCopies(context: RemoteControlRecoveryContext,
+        copiesJSON: String) async throws -> RemoteControlRecoveryRetention {
+        guard context.stationOrigin == stationOrigin else { throw RemoteChannelError.invalidInput }
+        let ids = try RemoteControlRecoveryRetention.requestIDs(context: context, json: copiesJSON)
+        let (_, data) = try await perform(url: path(context.genesisHash, "control/recovery/\(context.planID)/signatures"),
+            method: "POST", body: Data(copiesJSON.utf8))
+        return try RemoteControlRecoveryRetention.decode(data, context: context, recordIDs: ids)
     }
 
     public func controlRecoveryReview(accountID: String, genesisHash: String,

@@ -235,6 +235,18 @@ impl RecoveryStore {
         }
     }
 
+    pub(crate) async fn retain_control_recovery_copies(&self, genesis: &str, plan: &str, owner: &str, bytes: &[u8]) -> Reply {
+        let (Some(pool), Some(binding)) = (&self.pool, self.delegated_recovery.get()) else {
+            return unavailable();
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(10),
+            delegated_recovery::plan::signatures::retain_for_owner(pool, binding, genesis, plan, bytes, owner)).await {
+            Ok(Ok(receipt)) => (StatusCode::OK, Json(receipt)),
+            Ok(Err(sqlx::Error::RowNotFound)) => error(StatusCode::NOT_FOUND, "recovery_record_not_found"),
+            _ => error(StatusCode::SERVICE_UNAVAILABLE, "recovery_review_unavailable"),
+        }
+    }
+
     pub(crate) async fn configure_verifier_replicas(&self, raw: &str) -> Result<(), &'static str> {
         let configuration = verifier_replicas::Configuration::parse(raw)?;
         if !self.delegated_enabled() || self.verifier_replicas.get().is_some() {

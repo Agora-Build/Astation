@@ -25,7 +25,7 @@ public struct RemoteControlRecoveryContext: Codable, Equatable, Sendable {
         try validate()
     }
 
-    fileprivate func validate() throws {
+    func validate() throws {
         guard RemoteRecoveryKit.validID(accountID), RemoteRecoveryKit.validHash(genesisHash),
               PortalIntegrationRecord.validOrigin(stationOrigin), (1...UInt64(Int64.max)).contains(generation),
               Self.validUUID(planID), Self.validUUID(candidateFeedID),
@@ -36,7 +36,7 @@ public struct RemoteControlRecoveryContext: Codable, Equatable, Sendable {
         }
     }
 
-    fileprivate static func validUUID(_ value: String) -> Bool {
+    static func validUUID(_ value: String) -> Bool {
         guard let id = UUID(uuidString: value) else { return false }
         // A canonical UUID places its version nibble at offset 14.
         return id.uuidString.lowercased() == value && value[value.index(value.startIndex, offsetBy: 14)] == "4"

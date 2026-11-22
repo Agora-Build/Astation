@@ -84,6 +84,24 @@ pub(crate) async fn recovery_review(
     state.recovery.control_recovery_review(&genesis, &owner).await
 }
 
+pub(crate) async fn retain_recovery_copies(
+    State(state): State<AppState>,
+    Path((genesis, plan)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Reply {
+    let owner = match subject(&state, &headers).await {
+        Ok(owner) => owner, Err(reply) => return reply,
+    };
+    if !super::delegated_recovery::canonical_genesis(&genesis)
+        || !uuid::Uuid::parse_str(&plan).is_ok_and(|id| id.get_version_num() == 4 && id.to_string() == plan) {
+        return invalid();
+    }
+    let value = match read(body).await { Ok(value) => value, Err(reply) => return reply };
+    state.recovery.retain_control_recovery_copies(&genesis, &plan, &owner,
+        value.value().to_string().as_bytes()).await
+}
+
 pub(crate) async fn sync(
     State(state): State<AppState>,
     Path(genesis): Path<String>,

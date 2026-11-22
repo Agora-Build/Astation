@@ -22,6 +22,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
     private let refresh = NSButton(title: "Refresh", target: nil, action: nil)
     private let sign = NSButton(title: "Confirm Copy...", target: nil, action: nil)
     private let export = NSButton(title: "Save Signed Copy...", target: nil, action: nil)
+    private let sendCopy = NSButton(title: "Send to Station", target: nil, action: nil)
     private let loadReview = NSButton(title: "Load Station Review", target: nil, action: nil)
     private let prepare = NSButton(title: "Prepare Copy...", target: nil, action: nil)
     private var access: Access?
@@ -68,7 +69,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         let reviewActions = NSStackView(views: [loadReview, refresh]); reviewActions.spacing = 12
         let originalActions = NSStackView(views: [originalChoices, prepare]); originalActions.spacing = 12
         originalChoices.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let actions = NSStackView(views: [sign, export]); actions.spacing = 12
+        let actions = NSStackView(views: [sign, export, sendCopy]); actions.spacing = 12
         let stack = NSStackView(views: [intro, stationStatus, reviewActions,
             NSTextField(labelWithString: "Original signed stop"), originalActions,
             NSTextField(labelWithString: "Saved recovery copy"), choices, scroll, status, actions])
@@ -96,6 +97,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         refresh.target = self; refresh.action = #selector(reload)
         sign.target = self; sign.action = #selector(confirmCopy)
         export.target = self; export.action = #selector(saveCopy)
+        sendCopy.target = self; sendCopy.action = #selector(retainCopy)
         loadReview.target = self; loadReview.action = #selector(loadStationReview)
         prepare.target = self; prepare.action = #selector(prepareCopy)
         for name in [Notification.Name.accountLoginChanged, .serverInfoChanged, .relayIdentityKeyChanged] {
@@ -281,6 +283,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         sign.isEnabled = available && selected?.signed == false && access?.canSign() == true &&
             access?.coordinator.controlRecoveryAvailable == true
         export.isEnabled = available && selected?.signed == true
+        sendCopy.isEnabled = available && selected?.signed == true && access?.canSign() == true
         loadReview.isEnabled = available && access?.canSign() == true
         prepare.isEnabled = available && selectedOriginal != nil && preparation != nil &&
             access?.canSign() == true && access?.coordinator.controlRecoveryAvailable == true
@@ -350,5 +353,25 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
             }
             render()
         } catch { status.stringValue = "Could not export signed copy: " + error.localizedDescription }
+    }
+
+    @objc private func retainCopy() {
+        guard sendCopy.isEnabled, let access, let review = selected else { return }
+        let epoch = generation
+        task = Task { [weak self] in
+            guard let self else { return }
+            defer { task = nil; render() }
+            do {
+                _ = try await access.coordinator.retainControlRecoveryCopy(review,
+                    current: { self.isCurrent(access, epoch: epoch) && access.canSign() })
+                guard isCurrent(access, epoch: epoch) else { return }
+                status.stringValue = "Station retained the signed copy. Your original and saved copy stay protected. Access remains fenced."
+            } catch {
+                guard isCurrent(access, epoch: epoch) else { return }
+                status.stringValue = "Could not confirm Station storage: " + error.localizedDescription +
+                    " Retry sends the same saved signature."
+            }
+        }
+        render()
     }
 }
