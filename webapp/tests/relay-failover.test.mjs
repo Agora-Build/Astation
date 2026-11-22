@@ -7,6 +7,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { withSharedPeers } from './relay-test-config.mjs';
 
 const image = process.env.WEBAPP_FAILOVER_IMAGE;
 const docker = (...args) => execFileSync('docker', args, { encoding: 'utf8', timeout: 120_000 });
@@ -92,11 +93,9 @@ test('an unresponsive old relay address fails over before the client handshake d
     await once(backend, 'listening');
     // Only replace peer discovery to deterministically put a blackholed address
     // first. All production proxy locations and timeouts run unmodified.
-    const config = readFileSync(new URL('../nginx.conf', import.meta.url), 'utf8').replace(
-      /^upstream station_relay_upstream \{[\s\S]*?^\}/m,
-      'upstream station_relay_upstream {\n' +
+    const config = withSharedPeers(readFileSync(new URL('../nginx.conf', import.meta.url), 'utf8'),
       '    server 127.0.0.2:9 max_fails=0;\n' +
-      `    server host.docker.internal:${backend.address().port} backup;\n}`,
+      `    server host.docker.internal:${backend.address().port} backup;`,
     );
     const configPath = join(directory, 'default.conf');
     writeFileSync(configPath, config);

@@ -8,7 +8,7 @@ const healthLocation = config.match(/location\s*=\s*\/health\s*\{([\s\S]*?)\}/);
 assert.ok(healthLocation, "nginx must proxy the exact /health path");
 assert.match(
   healthLocation[1],
-  /proxy_pass\s+http:\/\/station_relay_upstream;/,
+  /proxy_pass\s+http:\/\/\$station_relay;/,
   "/health must use the relay upstream",
 );
 assert.match(
@@ -30,7 +30,7 @@ for (const path of ["ws", "ws/proxy", "health"]) {
 }
 
 const nativeProxyLocation = config.match(/location\s*=\s*\/ws\/proxy\s*\{([\s\S]*?)\}/);
-assert.match(nativeProxyLocation[1], /proxy_pass\s+http:\/\/station_relay_upstream\/ws\/proxy;/);
+assert.match(nativeProxyLocation[1], /proxy_pass\s+http:\/\/\$station_relay\/ws\/proxy\$is_args\$args;/);
 assert.match(nativeProxyLocation[1], /proxy_http_version\s+1\.1;/);
 assert.match(nativeProxyLocation[1], /proxy_set_header\s+Upgrade\s+\$http_upgrade;/);
 assert.doesNotMatch(nativeProxyLocation[1], /proxy_set_header\s+Authorization\s+""|try_files/);
@@ -42,9 +42,16 @@ assert.match(
 );
 assert.match(
   config,
-  /server\s+\$\{STATION_RELAY_UPSTREAM\}\s+resolve\s+max_fails=0;/,
-  "nginx must balance across every address of the relay alias",
+  /set\s+\$station_relay\s+\$\{STATION_RELAY_UPSTREAM\};/,
+  "nginx must resolve the relay alias for each request's own peer list",
 );
+assert.doesNotMatch(config, /upstream\s+station_relay_upstream|\szone\s/,
+  "a live DNS refresh must not invalidate a shared peer generation during retry");
+assert.match(config, /resolver_timeout\s+1s;/,
+  "DNS lookup must fit inside the client connection budget");
+const wsLocation = config.match(/location\s*=\s*\/ws\s*\{([\s\S]*?)\}/);
+assert.match(wsLocation[1], /proxy_pass\s+http:\/\/\$station_relay\/ws\$is_args\$args;/,
+  "normalized WebSocket paths must retain their query parameters");
 
 console.log("nginx proxy tests passed");
 
