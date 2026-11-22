@@ -142,8 +142,20 @@ private final class AccountNoRedirect: NSObject, URLSessionTaskDelegate, @unchec
 
 public final class AccountURLSessionHTTP: AccountOIDCHTTP, @unchecked Sendable {
     private let session: URLSession
-    public init() {
-        let config = URLSessionConfiguration.ephemeral
+    private let maximumResponseBytes: Int
+
+    public convenience init() {
+        self.init(maximumResponseBytes: 65_536)
+    }
+
+    public convenience init(maximumResponseBytes: Int) {
+        self.init(configuration: .ephemeral, maximumResponseBytes: maximumResponseBytes)
+    }
+
+    init(configuration: URLSessionConfiguration, maximumResponseBytes: Int = 65_536) {
+        precondition((1...262_144).contains(maximumResponseBytes))
+        self.maximumResponseBytes = maximumResponseBytes
+        let config = configuration
         config.httpShouldSetCookies = false; config.httpCookieStorage = nil; config.urlCache = nil
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForRequest = 10; config.timeoutIntervalForResource = 20
@@ -152,10 +164,10 @@ public final class AccountURLSessionHTTP: AccountOIDCHTTP, @unchecked Sendable {
     public func send(_ request: URLRequest) async throws -> (Data, Int) {
         do {
             let (bytes, response) = try await session.bytes(for: request)
-            guard let response = response as? HTTPURLResponse, response.expectedContentLength <= 65536 else { throw AccountLoginError.invalidResponse }
+            guard let response = response as? HTTPURLResponse, response.expectedContentLength <= maximumResponseBytes else { throw AccountLoginError.invalidResponse }
             var data = Data()
             for try await byte in bytes {
-                guard data.count < 65536 else { throw AccountLoginError.invalidResponse }
+                guard data.count < maximumResponseBytes else { throw AccountLoginError.invalidResponse }
                 data.append(byte)
             }
             return (data, response.statusCode)

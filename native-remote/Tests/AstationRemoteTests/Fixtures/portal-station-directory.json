@@ -1,0 +1,63 @@
+{
+  "stations": [
+    {
+      "id": "st01KB4K8W3Z5Q7R2T9X1C6D4FGH",
+      "origin": "https://station-dev.agora.build",
+      "name": "Agora Station",
+      "builtIn": true,
+      "access": "any_account",
+      "role": "built_in",
+      "status": "active",
+      "removedAt": null,
+      "membership": null,
+      "membershipEndedAt": null,
+      "integrationsEnabled": true,
+      "createdAt": "2026-10-31T18:20:41.512Z"
+    },
+    {
+      "id": "st01KB4MR0E2S8V3N6P5J7A1BDXZ",
+      "origin": "https://station.example.net",
+      "name": null,
+      "builtIn": false,
+      "access": "members",
+      "role": "owner",
+      "status": "active",
+      "removedAt": null,
+      "membership": null,
+      "membershipEndedAt": null,
+      "integrationsEnabled": true,
+      "createdAt": "2026-11-01T08:00:00.000Z"
+    },
+    {
+      "id": "st01KB4NS6F4T9W2Y8Z1B3C5DGJ7",
+      "origin": "https://shared.example.org",
+      "name": null,
+      "builtIn": false,
+      "access": "members",
+      "role": "member",
+      "status": "active",
+      "removedAt": null,
+      "membership": "ended",
+      "membershipEndedAt": "2026-11-20T09:15:00.000Z",
+      "integrationsEnabled": false,
+      "createdAt": "2026-11-02T08:00:00.000Z"
+    },
+    {
+      "id": "st01KB4P1H7V3X9C5M2R8T6Z4YQ0",
+      "origin": "https://old.example.net",
+      "name": null,
+      "builtIn": false,
+      "access": "members",
+      "role": "owner",
+      "status": "removed",
+      "removedAt": "2026-11-21T14:30:12.044Z",
+      "membership": null,
+      "membershipEndedAt": null,
+      "integrationsEnabled": false,
+      "createdAt": "2026-11-03T08:00:00.000Z"
+    }
+  ],
+  "nextCursor": null,
+  "stale": false,
+  "complete": true
+}

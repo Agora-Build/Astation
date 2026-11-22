@@ -41,6 +41,52 @@ delegated execution or new native membership/control signing.
   settlement together with its global delivery marker. This implements fencing,
   not complete snapshot reconstruction or reopening after a restore.
 
+## Native Portal Station discovery
+
+The shared native transport implements the directory agreed in
+[Portal #40](https://github.com/Agora-Build/Portal/issues/40#issuecomment-7082465418),
+against merged Portal #42 (`d81bda5`). It uses a Portal-audience native bearer
+with `integrations:read` at `GET /api/v1/stations`, without a browser cookie or
+an unversioned fallback. Read-only credentials can list Stations; consent and
+revoke writes still require `integrations:approve` before token acquisition.
+
+The strict page reader retains built-in, owned, shared, removed and ended
+entries. It rejects ambiguous JSON, unknown fields, inconsistent access/state
+fields, invalid origins and oversized pages. Traversal follows opaque cursors,
+up to 100 rows per page, 41 pages and 4,096 rows locally. A failed page, repeated
+identity, cursor cycle or exceeded bound yields no successful prefix. A stale
+or explicitly incomplete response remains incomplete. Cancellation retires a
+pending traversal rather than publishing its partial result.
+
+This directory is discovery metadata. Its mutable keyset traversal is not an
+atomic security inventory, an R9 grant or proof that every verifier is present.
+Neither a lost-access row nor an omission removes a previously reviewed route
+or verifier obligation. It does not authorize a new control destination.
+Production directory retention, explicit route review and participant lifecycle
+wiring remain required; the additional-route provider remains unset.
+
+## November 22 shared-contract responses
+
+- [Astation #101](https://github.com/Agora-Build/Astation/issues/101#issuecomment-7082464613):
+  typed loaded-core verifier reports agreed for implementation. The consuming
+  signing gate requires the exact current head, expected signer/slot and a
+  continuously measured lease that includes token/challenge delays and sleep.
+  Report carriage and production adoption are not implemented by discovery.
+- [Astation #114](https://github.com/Agora-Build/Astation/issues/114#issuecomment-7082464868):
+  service signing ceilings and native-stop retention readings agreed; complete
+  author-journal collection through publication still needs a durable exact-plan
+  barrier or reconciled continuation. Hashing the received imports alone cannot
+  prove that a later signed stop has arrived. Recovery remains fenced.
+- [Atem #120](https://github.com/Agora-Build/Atem/issues/120#issuecomment-7082465179):
+  result/status signing while sender-revoked, immutable first-resolved task IDs
+  and typed `required_version` shape confirmed. Requested a new immutable SDK
+  covering #190 and #191-#195, plus owner `reply_query` for selector tasks as a
+  separate follow-up. No SDK pin is changed by this increment.
+- [Portal #41](https://github.com/Agora-Build/Portal/issues/41#issuecomment-7082465658):
+  binding grammar confirmed. A changes cursor alone does not version binding
+  rows, which can change without a feed event. Exact binding content/versions
+  must join locked recovery evidence; D27 release/invalidation is still pending.
+
 ## Native client HTTP carriage
 
 All endpoints are under `/api/remote/v1/logs/{genesis}/control`, require the
