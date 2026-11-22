@@ -77,20 +77,42 @@ export async function waitForHealth({
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   log = console.log,
   attempts = 36,
+  stableForMs = 0,
+  allowMixedBuilds = false,
+  now = () => performance.now(),
 }) {
+  if (!Number.isFinite(stableForMs) || stableForMs < 0) throw new Error('stableForMs must be non-negative');
   let last = 'no response';
+  let healthySince = null;
+  let buildObserved = false;
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
       const { ok, status, health } = await fetchHealth(origin, fetchImpl);
       const problems = ok
-        ? healthProblems(health, { minReplicas, requireRedis, expectedCommit })
+        ? healthProblems(health, { minReplicas, requireRedis,
+          expectedCommit: allowMixedBuilds ? null : expectedCommit })
         : [`/health returned HTTP ${status}`];
       if (problems.length === 0) {
-        log(`Relay healthy: redis ${health.redis ?? 'n/a'}, ${health.replicas ?? 'n/a'} live replica(s), build ${health.build_commit ?? 'unknown'}`);
-        return health;
+        buildObserved ||= !expectedCommit || health.build_commit === expectedCommit;
+        if (buildObserved) {
+          healthySince ??= now();
+          const elapsed = now() - healthySince;
+          if (elapsed >= stableForMs) {
+            log(`Relay healthy: redis ${health.redis ?? 'n/a'}, ${health.replicas ?? 'n/a'} live replica(s), build ${health.build_commit ?? 'unknown'}; stable for ${Math.floor(elapsed / 1_000)}s`);
+            return health;
+          }
+          last = `healthy for ${Math.floor(elapsed / 1_000)}s, waiting for ${stableForMs / 1_000}s`;
+        } else {
+          last = `relay build ${expectedCommit} has not been observed`;
+        }
+      } else {
+        last = problems.join('; ');
+        healthySince = null;
+        buildObserved = false;
       }
-      last = problems.join('; ');
     } catch (error) {
+      healthySince = null;
+      buildObserved = false;
       last = error.message;
       // Node's fetch message omits DNS, connection and TLS failure codes.
       const code = error.cause?.code;

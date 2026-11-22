@@ -92,7 +92,11 @@ export async function deployRelays({
         await trigger(hook, { fetchImpl });
       }
       safeLog('waiting for relay health');
-      await wait({ ...health, fetchImpl, sleep, log: safeLog });
+      // Observe the new build, then let DNS and removed-container connections
+      // settle before retiring another replica. Mixed builds are intentional
+      // during a rolling update; any health failure restarts the whole window.
+      await wait({ ...health, stableForMs: 30_000, allowMixedBuilds: true,
+        fetchImpl, sleep, log: safeLog });
     } catch (error) {
       const rest = total - index - 1;
       const skipped = rest ? `; ${rest} later relay hook(s) not triggered` : '';

@@ -108,6 +108,7 @@ jobs:
           COOLIFY_API_TOKEN: ${{ secrets.COOLIFY_API_TOKEN }}
           STATION_MIN_REPLICAS: ${{ vars.STATION_MIN_REPLICAS }}
           STATION_REQUIRE_REDIS: ${{ vars.STATION_REQUIRE_REDIS }}
+          STATION_EXPECTED_COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
           # Mask each hook on its own (trimmed, as the script reads it).

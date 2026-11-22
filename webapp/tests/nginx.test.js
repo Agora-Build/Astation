@@ -37,12 +37,12 @@ assert.doesNotMatch(nativeProxyLocation[1], /proxy_set_header\s+Authorization\s+
 
 assert.match(
   config,
-  /resolver\s+127\.0\.0\.11\s+valid=10s/,
-  "nginx must re-resolve the relay alias every 10 s",
+  /resolver\s+127\.0\.0\.11\s+valid=1s/,
+  "nginx must promptly refresh replaced relay addresses",
 );
 assert.match(
   config,
-  /server\s+\$\{STATION_RELAY_UPSTREAM\}\s+resolve;/,
+  /server\s+\$\{STATION_RELAY_UPSTREAM\}\s+resolve\s+max_fails=0;/,
   "nginx must balance across every address of the relay alias",
 );
 
