@@ -13,6 +13,10 @@ import { withSharedPeers } from './relay-test-config.mjs';
 const image = process.env.WEBAPP_FAILOVER_IMAGE;
 const docker = (...args) => execFileSync('docker', args, { encoding: 'utf8', timeout: 120_000 });
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const postRoutes = [
+  '/api/agent/v1/dns-change-probe', '/api/skills/batch', '/api/memory/batch',
+  '/api/dns-change-probe', '/agora-build/dns-change-probe', '/auth/dns-change-probe', '/pair/dns-change-probe',
+];
 
 function call(origin, path, body) {
   return new Promise((resolve, reject) => {
@@ -120,26 +124,44 @@ test('DNS replacement during a stalled connection preserves every request remain
     assert.ok(initialQueries > 0, 'the shared negative control must have its initial two-address generation');
     const ids = [], productionIDs = [];
     function burst(origin, recordIDs) {
-      return Promise.all(Array.from({ length: 6 }, (_, i) => {
-        const id = randomUUID(); ids.push(id); recordIDs?.push(id);
-        return Promise.all([call(origin, '/health'), call(origin, `/ws?probe=${i}`),
-          call(origin, '/api/agent/v1/dns-change-probe', id)]);
+      return Promise.all(Array.from({ length: 6 }, () => {
+        const probe = randomUUID();
+        const calls = [call(origin, `/health?probe=${probe}`).then(status => ({ status, expected: 200,
+          path: `/health?probe=${probe}` })), ...['/ws', '/ws/proxy'].map(route =>
+          call(origin, `${route}?probe=${probe}`).then(status => ({ status, expected: 101,
+            path: `${route}?probe=${probe}` }))), ...postRoutes.map(route => {
+          const id = randomUUID(); ids.push(id); recordIDs?.push(id);
+          const path = `${route}?probe=${id}`;
+          return call(origin, path, id).then(status => ({ status, expected: 200, path }));
+        })];
+        return Promise.all(calls);
       })).then(rows => rows.flat());
     }
-    const started = performance.now();
     const production = burst(origins[0], productionIDs), negative = burst(origins[1]);
-    await sleep(400);
+    // Observe dropped SYNs from both proxies before changing DNS, rather than
+    // assuming a fixed delay put their requests in the old connection attempt.
+    const deadline = performance.now() + 2_000;
+    let blocked = [];
+    do {
+      await sleep(20);
+      blocked = containers.map(name => {
+        const rules = docker('exec', name, 'iptables', '-L', 'OUTPUT', '-v', '-n', '-x');
+        return Number(rules.match(/^\s*(\d+)\s+\d+\s+DROP\s+tcp/m)?.[1] || 0);
+      });
+    } while (blocked.some(count => count === 0) && performance.now() < deadline);
+    assert.ok(blocked.every(count => count > 0), 'both proxies must attempt the blackholed peer before DNS changes');
     replaced = true;
     const [good, bad] = await Promise.all([production, negative]);
     assert.ok(replacementQueries > 0, 'DNS must change while the old connection is waiting');
-    assert.ok(performance.now() - started >= 2_500, 'the fixture must encounter the blackholed address');
-    assert.deepEqual(good, Array.from({ length: 6 }, () => [200, 101, 200]).flat());
-    assert.ok(bad.some(status => status === 502 || status === 504),
-      `the shared-generation negative control must fail: ${bad}`);
+    for (const result of good) assert.equal(result.status, result.expected, result.path);
+    const failed = bad.filter(({ status }) => status === 502 || status === 504);
+    assert.ok(failed.length > 0, `the shared-generation negative control must fail: ${JSON.stringify(bad)}`);
     for (const id of productionIDs) assert.equal(accepted.get(id), 1, 'each production POST must reach one peer');
     for (const id of ids) assert.ok((accepted.get(id) || 0) <= 1, 'no accepted POST may be replayed');
     for (const origin of origins) assert.equal(await call(origin, '/health'), 200, 'the new generation is healthy');
     const logs = spawnSync('docker', ['logs', containers[1]], { encoding: 'utf8', timeout: 10_000 });
     assert.equal(logs.status, 0);
-    assert.match(logs.stdout + logs.stderr, /no live upstreams/);
+    const noPeers = (logs.stdout + logs.stderr).split('\n').filter(line => line.includes('no live upstreams'));
+    assert.ok(failed.some(({ path }) => noPeers.some(line => line.includes(path + ' HTTP/'))),
+      'a failed request must have a matching generation-guard no-live-upstreams error');
   });
