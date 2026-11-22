@@ -67,7 +67,7 @@ public enum PortalIntegrationRevokeResult: Equatable, Sendable {
     case finalRefusal(RemoteControlPortalRefusal)
 }
 
-/// Native Portal consent transport. It cannot enroll a service or mark it Ready.
+/// Native Portal discovery and consent transport. It cannot enroll a service or mark it Ready.
 /// Use a separately scoped AccountTokenProvider; project login need not expand.
 public struct PortalIntegrationHTTP: Sendable {
     public let configuration: AccountOIDCConfiguration
@@ -81,7 +81,7 @@ public struct PortalIntegrationHTTP: Sendable {
         guard PortalIntegrationRecord.validAccountID(ownerAccount),
               let parts = URLComponents(string: portalOrigin), parts.url != nil, parts.path.isEmpty,
               configuration.resource == portalOrigin,
-              configuration.apiScopes.contains("integrations:read"), configuration.apiScopes.contains("integrations:approve")
+              configuration.apiScopes.contains("integrations:read")
         else { throw AccountLoginError.configuration }
         _ = try AccountOIDCConfiguration.endpoint(portalOrigin)
         self.configuration = configuration
@@ -105,6 +105,39 @@ public struct PortalIntegrationHTTP: Sendable {
         return try result.integrations.filter {
             $0.role == "owner" && $0.stationOrigin == stationOrigin
         }.map { try $0.validate(); return $0 }
+    }
+
+    public func stations(cursor: String? = nil, limit: Int = 100) async throws -> PortalStationDirectoryPage {
+        guard (1...100).contains(limit), cursor == nil || PortalStationDirectoryPage.validCursor(cursor!) else {
+            throw AccountLoginError.configuration
+        }
+        var query = URLComponents()
+        query.queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        if let cursor { query.queryItems!.append(URLQueryItem(name: "cursor", value: cursor)) }
+        let (bytes, code) = try await send(path: "/api/v1/stations?" + query.percentEncodedQuery!, jsonBody: nil)
+        try checkStatus(code)
+        return try PortalStationDirectoryPage.decode(bytes, limit: limit)
+    }
+
+    /// Finish the traversal before exposing new discovery metadata. Never return
+    /// a successful prefix after a missing, repeated or conflicting page.
+    public func stationDirectory() async throws -> PortalStationDirectorySnapshot {
+        var cursor: String?, cursors = Set<String>(), ids = Set<String>()
+        var stations: [PortalStationDirectoryEntry] = []
+        for _ in 0..<41 {
+            try Task.checkCancellation()
+            let page = try await self.stations(cursor: cursor)
+            try Task.checkCancellation()
+            guard page.stations.allSatisfy({ ids.insert($0.id).inserted }),
+                  stations.count + page.stations.count <= 4_096 else { throw AccountLoginError.invalidResponse }
+            stations.append(contentsOf: page.stations)
+            if page.stale || page.nextCursor == nil {
+                return PortalStationDirectorySnapshot(stations: stations, stale: page.stale, complete: page.complete)
+            }
+            guard let next = page.nextCursor, cursors.insert(next).inserted else { throw AccountLoginError.invalidResponse }
+            cursor = next
+        }
+        throw AccountLoginError.invalidResponse
     }
 
     /// The protected control journal retains this exact intent until this reply is committed.
@@ -175,8 +208,13 @@ public struct PortalIntegrationHTTP: Sendable {
     }
 
     private func send(path: String, jsonBody: Data?) async throws -> (Data, Int) {
+        guard jsonBody == nil || configuration.apiScopes.contains("integrations:approve") else {
+            throw AccountLoginError.configuration
+        }
+        try Task.checkCancellation()
         var request = URLRequest(url: URL(string: portalOrigin + path)!)
         request.setValue("Bearer \(try await accessToken())", forHTTPHeaderField: "Authorization")
+        try Task.checkCancellation()
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if let jsonBody {
             request.httpMethod = "POST"

@@ -240,6 +240,17 @@ other unverifiable authority remains a review obligation. Service records need
 service-state reconciliation rather than copying their old feed signatures.
 Every retained record remains listed; this command performs no compaction.
 
+The `fresh_manager_signature` classification above describes the current
+conservative preparation output, not a shared requirement to replace every
+native service stop. The November 22
+[#114 reading](https://github.com/Agora-Build/Astation/issues/114#issuecomment-7082464868)
+allows an unchanged original stop signed by a current native manager across a
+feed reset. Removed managers still require a fresh current-manager copy.
+Publication must adopt that distinction with shared verifier/ACK regression
+coverage; the current command cannot yet assemble or publish a replacement.
+Newly signed service-key snapshot records must name the candidate feed, and
+unknown historical service-key signing ceilings remain fenced.
+
 Every preparation reports `retained_history_only: true`,
 `snapshot_complete: false` and `recovery_ready: false`. The operator's ability to
 prepare is not evidence that all later stops or high-water anchors survived.
