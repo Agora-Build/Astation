@@ -44,7 +44,7 @@ need:
   start without `REDIS_URL`).
 - **One DNS name for all of them**: nginx reaches the relays through
   `STATION_RELAY_UPSTREAM` (`<name>:3000`) and re-resolves `<name>` every
-  10 s, spreading requests over every address it returns. The name must
+  1 s, spreading requests over every address it returns. The name must
   resolve to every relay (a shared Docker network alias, a headless service,
   round-robin DNS). A relay the name doesn't resolve to still counts in
   `/health`'s `"replicas"` (presence is in Valkey) but never gets traffic.
@@ -64,26 +64,37 @@ one at a time (`.github/scripts/deploy-relays.mjs`). For each hook:
    Coolify deployment has finished. Without the
    token the hook gets a plain `POST` (the shape most platforms' deploy hooks
    accept) and the workflow does not wait for the platform;
-2. wait until `/health` is healthy (as `verify-station.mjs --wait-health`,
-   honoring `STATION_REQUIRE_REDIS` and `STATION_MIN_REPLICAS`) before
-   triggering the next hook, so the other relays keep serving while one
-   restarts.
+2. observe the requested `STATION_EXPECTED_COMMIT` through public `/health`,
+   then require 30 seconds of healthy samples, honoring
+   `STATION_REQUIRE_REDIS` and `STATION_MIN_REPLICAS`, before triggering the
+   next hook. Old and new builds can coexist in this window. Any bad status,
+   missing replica or fetch failure resets both the window and the requirement
+   to observe the new build. Samples are five seconds apart; this is a rollout
+   settling check, not proof of uninterrupted availability between samples.
 
 Any failure stops the run: later hooks are not triggered and keep serving the
 previous image. Hook URLs are masked in the logs and the script never prints
 them; it refers to them as "relay hook 1/N".
 
 Without the Coolify token the workflow can't see the platform's deploy, so
-the health wait right after a trigger can pass against the old, still-healthy
-container while the new one is still starting. On other platforms rely on the
+the platform can still be replacing containers after the hook returns. On other platforms rely on the
 platform's own rolling deploy and health check (it keeps the old container
 until the new one passes `/health`), or use a hook that returns only once the
 deploy is done. `/health` reports the running commit, and the final workflow
-check requires the commit built by this run. Intermediate health waits do not
-require it because old and new replicas coexist during a rolling deploy.
+check requires the commit built by this run. Intermediate waits require that
+build to be observed, while allowing healthy old replicas alongside it.
 A public health request identifies only the replica that answers; it cannot
 prove that every replica has updated. Coolify deployment completion remains
 the per-application rollout check.
+
+nginx disables passive peer quarantine (`max_fails=0`) because Docker can
+immediately reuse a failed container's IP for a healthy replacement. Shared
+failure state must not keep refusing that replacement for the default ten
+seconds. TCP connection attempts remain bounded at three seconds and can try
+another peer. This does not enable replay of an accepted POST: the maintained
+real-nginx tests cover lost replies, busy responses, unresponsive addresses,
+immediate peer recovery, and an unsafe-retry negative control. Established
+WebSockets keep their existing timeouts.
 
 `RELAY_DEPLOY_HOOKS` is required: if it is empty or unset the run fails
 before calling anything. One relay is one line.

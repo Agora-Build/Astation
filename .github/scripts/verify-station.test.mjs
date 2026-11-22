@@ -128,6 +128,57 @@ test('waitForHealth gives up', async () => {
   );
 });
 
+test('rolling health observes the new build before a continuous mixed-build settle window', async () => {
+  const expectedCommit = 'a'.repeat(40), oldCommit = 'b'.repeat(40);
+  const samples = [oldCommit, oldCommit, expectedCommit, oldCommit, expectedCommit, oldCommit];
+  let clock = 0, calls = 0;
+  const result = await waitForHealth({
+    origin: 'https://station.test', minReplicas: 2, requireRedis: true,
+    expectedCommit, stableForMs: 15_000, allowMixedBuilds: true,
+    now: () => clock, sleep: async ms => { clock += ms; }, log() {},
+    fetchImpl: async () => {
+      calls++;
+      return new Response(JSON.stringify({ ...healthy, build_commit: samples.shift() }));
+    },
+  });
+  assert.equal(calls, 6, 'old replicas alone cannot start the settle window');
+  assert.equal(clock, 25_000);
+  assert.equal(result.build_commit, oldCommit, 'a surviving old build remains healthy during rolling replacement');
+});
+
+test('a rollout failure resets both the health window and the observed replacement', async () => {
+  for (const failure of ['http', 'fetch', 'replicas']) {
+    const expectedCommit = 'a'.repeat(40), oldCommit = 'b'.repeat(40);
+    let clock = 0, calls = 0;
+    await waitForHealth({
+      origin: 'https://station.test', minReplicas: 2, requireRedis: true,
+      expectedCommit, stableForMs: 10_000, allowMixedBuilds: true,
+      now: () => clock, sleep: async ms => { clock += ms; }, log() {},
+      fetchImpl: async () => {
+        calls++;
+        if (calls === 2) {
+          if (failure === 'http') return new Response('', { status: 502 });
+          if (failure === 'fetch') throw new Error('connection lost');
+          return new Response(JSON.stringify({ ...healthy, replicas: 1 }));
+        }
+        return new Response(JSON.stringify({ ...healthy,
+          build_commit: calls === 1 || calls >= 5 ? expectedCommit : oldCommit }));
+      },
+    });
+    assert.equal(calls, 7, failure);
+    assert.equal(clock, 30_000, failure);
+  }
+});
+
+test('a rolling update cannot pass by serving only the preceding build', async () => {
+  await assert.rejects(waitForHealth({
+    origin: 'https://station.test', expectedCommit: 'a'.repeat(40),
+    stableForMs: 30_000, allowMixedBuilds: true, attempts: 3,
+    sleep: async () => {}, log() {},
+    fetchImpl: async () => new Response(JSON.stringify({ ...healthy, build_commit: 'b'.repeat(40) })),
+  }), /has not been observed/);
+});
+
 test('health fetch failures retain the DNS error code', async () => {
   const logs = [];
   await assert.rejects(waitForHealth({

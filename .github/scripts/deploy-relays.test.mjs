@@ -35,7 +35,9 @@ function recorder() {
         log(`Coolify deployment for ${webhookURL} queued`);
       },
       trigger: async hook => events.push(['trigger', hook]),
-      wait: async ({ origin, log }) => {
+      wait: async ({ origin, log, stableForMs, allowMixedBuilds }) => {
+        assert.equal(stableForMs, 30_000);
+        assert.equal(allowMixedBuilds, true);
         events.push(['health', origin]);
         log('Relay healthy');
       },
