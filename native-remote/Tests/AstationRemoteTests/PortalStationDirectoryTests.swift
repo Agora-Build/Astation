@@ -40,11 +40,12 @@ final class PortalStationDirectoryTests: XCTestCase {
         return try JSONSerialization.data(withJSONObject: value)
     }
 
-    private func client(_ http: DirectoryHTTP, readOnly: Bool = false) throws -> PortalIntegrationHTTP {
+    private func client(_ http: AccountOIDCHTTP, readOnly: Bool = false,
+        portalOrigin: String = "https://portal.example") throws -> PortalIntegrationHTTP {
         let configuration = try AccountOIDCConfiguration(issuer: "https://auth.example", clientID: "astation",
-            resource: "https://portal.example", requiredScope: "integrations:read",
+            resource: portalOrigin, requiredScope: "integrations:read",
             additionalScopes: readOnly ? [] : ["integrations:approve"])
-        return try PortalIntegrationHTTP(configuration: configuration, portalOrigin: "https://portal.example",
+        return try PortalIntegrationHTTP(configuration: configuration, portalOrigin: portalOrigin,
             ownerAccount: "ab00000000000000000000000000", http: http, accessToken: { "native-test-access" })
     }
 
@@ -227,6 +228,59 @@ final class PortalStationDirectoryTests: XCTestCase {
         catch { XCTAssertTrue(error is CancellationError) }
         let sent = await http.sent()
         XCTAssertEqual(sent.count, 1)
+    }
+
+    func testURLSessionReadsLargeDirectoryPagesWithoutRelaxingAccountResponses() async throws {
+        var value = try object()
+        let first = try XCTUnwrap((value["stations"] as? [[String: Any]])?.first)
+        value["stations"] = (0..<100).map { index in
+            var row = first
+            row["id"] = "station-\(index)"
+            row["name"] = String(repeating: "n", count: 320)
+            row["origin"] = "https://" + Array(repeating: String(repeating: "a", count: 50), count: 3)
+                .joined(separator: ".") + ".example"
+            return row
+        }
+        let bytes = try JSONSerialization.data(withJSONObject: value)
+        XCTAssertGreaterThan(bytes.count, 65_536)
+        let host = "directory-" + UUID().uuidString.lowercased() + ".example"
+        RecoveryHTTPStub.install(host: host) { request in
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer native-test-access")
+            XCTAssertNil(request.value(forHTTPHeaderField: "Cookie"))
+            return (200, bytes)
+        }
+        defer { RecoveryHTTPStub.remove(host: host) }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RecoveryHTTPStub.self]
+        let http = AccountURLSessionHTTP(configuration: configuration, maximumResponseBytes: 262_144)
+        let directory = try await client(http, readOnly: true, portalOrigin: "https://" + host).stationDirectory()
+        XCTAssertEqual(directory.stations.count, 100)
+        XCTAssertTrue(directory.complete)
+        let accountHTTP = AccountURLSessionHTTP(configuration: configuration)
+        do {
+            _ = try await client(accountHTTP, readOnly: true, portalOrigin: "https://" + host).stationDirectory()
+            XCTFail("account response bound was relaxed")
+        } catch { XCTAssertEqual(error as? AccountLoginError, .invalidResponse) }
+    }
+
+    func testURLSessionBoundsUnknownLengthDirectoryBodiesWhileStreaming() async throws {
+        for size in [262_144, 262_145] {
+            let host = "directory-" + UUID().uuidString.lowercased() + ".example"
+            RecoveryHTTPStub.install(host: host) { _ in (200, Data(repeating: 32, count: size)) }
+            defer { RecoveryHTTPStub.remove(host: host) }
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [RecoveryHTTPStub.self]
+            let http = AccountURLSessionHTTP(configuration: configuration, maximumResponseBytes: 262_144)
+            do {
+                let (data, status) = try await http.send(URLRequest(url: URL(string: "https://" + host)!))
+                XCTAssertEqual(size, 262_144, "oversized chunked body accepted")
+                XCTAssertEqual(data.count, size)
+                XCTAssertEqual(status, 200)
+            } catch {
+                XCTAssertEqual(size, 262_145)
+                XCTAssertEqual(error as? AccountLoginError, .invalidResponse)
+            }
+        }
     }
 
     func testCancellationStopsBeforeFetchingAnotherDirectoryPage() async throws {

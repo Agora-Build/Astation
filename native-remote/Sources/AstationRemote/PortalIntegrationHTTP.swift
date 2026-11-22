@@ -77,7 +77,8 @@ public struct PortalIntegrationHTTP: Sendable {
     private let accessToken: @Sendable () async throws -> String
 
     public init(configuration: AccountOIDCConfiguration, portalOrigin: String, ownerAccount: String,
-        http: AccountOIDCHTTP = AccountURLSessionHTTP(), accessToken: @escaping @Sendable () async throws -> String) throws {
+        http: AccountOIDCHTTP = AccountURLSessionHTTP(maximumResponseBytes: 262_144),
+        accessToken: @escaping @Sendable () async throws -> String) throws {
         guard PortalIntegrationRecord.validAccountID(ownerAccount),
               let parts = URLComponents(string: portalOrigin), parts.url != nil, parts.path.isEmpty,
               configuration.resource == portalOrigin,
