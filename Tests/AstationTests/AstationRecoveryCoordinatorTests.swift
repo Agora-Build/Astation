@@ -71,7 +71,7 @@ private final class RecoveryMemoryKeys: AstationRecoveryDataKeys {
     func installRecovered(_ values: [AccountDataKey], dataAccount: String) throws { keys = values; installs += 1 }
 }
 
-private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteControlRecoveryReviewTransport, RemoteStationVerifierTransport {
+private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteControlRecoveryReviewTransport, RemoteControlRecoveryRetentionTransport, RemoteStationVerifierTransport {
     nonisolated let controlStationOrigin: String
     init(stationOrigin: String = "https://configured.example", controlFeedID: String = UUID().uuidString.lowercased()) {
         controlStationOrigin = stationOrigin
@@ -113,6 +113,24 @@ private actor RecoveryMemoryRelay: RemoteControlStationTransport, RemoteDeviceEn
     var preparedRecovery: RemoteControlRecoveryPreparation?
     var recoveryReviewWaiter: CheckedContinuation<Void, Never>?
     var holdRecoveryReview = false
+    var recoveryCopies: [String] = []
+    var loseRecoveryCopyReply = false
+    var holdRecoveryCopy = false
+    var recoveryCopyWaiter: CheckedContinuation<Void, Never>?
+
+    func sentRecoveryCopies() -> [String] { recoveryCopies }
+    func loseNextRecoveryCopyReply() { loseRecoveryCopyReply = true }
+    func holdNextRecoveryCopy() { holdRecoveryCopy = true }
+    func recoveryCopyIsWaiting() -> Bool { recoveryCopyWaiter != nil }
+    func releaseRecoveryCopy() { holdRecoveryCopy = false; recoveryCopyWaiter?.resume(); recoveryCopyWaiter = nil }
+    func retainControlRecoveryCopies(context: RemoteControlRecoveryContext, copiesJSON: String) async throws -> RemoteControlRecoveryRetention {
+        XCTAssertEqual(context, preparedRecovery?.context)
+        let ids = try RemoteControlRecoveryRetention.requestIDs(context: context, json: copiesJSON)
+        recoveryCopies.append(copiesJSON)
+        if holdRecoveryCopy { await withCheckedContinuation { recoveryCopyWaiter = $0 } }
+        if loseRecoveryCopyReply { loseRecoveryCopyReply = false; throw RemoteRecoveryTransportError.unavailable }
+        return RemoteControlRecoveryRetention(recordIDs: ids, reconstructionHash: String(repeating: "e", count: 64))
+    }
 
     func setRecoveryReview(_ value: RemoteControlRecoveryPreparation) { preparedRecovery = value }
     func holdNextRecoveryReview() { holdRecoveryReview = true }
@@ -2635,6 +2653,97 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(try offline.exportControlRecoveryCopies(context: context,
             recordIDs: [review.body.recordId], current: { true }), copy)
         XCTAssertEqual(try offline.exportControlRecoveryEvidence(current: { true }), beforeExport)
+    }
+
+    private func signedRecoverySource(_ h: RecoveryCoordinatorHarness) async throws -> (AstationRecoveryCoordinator, RemoteControlRecoveryReview) {
+        let authority = RecoveryCopyAuthority()
+        let (coordinator, context, original) = try await recoveryCopySource(h, authority: authority)
+        let draft = try await coordinator.prepareControlRecoveryCopy(recordID: original, context: context, current: { true })
+        _ = try await coordinator.signControlRecoveryCopy(draft, current: { true })
+        let signed = try XCTUnwrap(coordinator.localControlRecoveryReviews(current: { true }).first)
+        await h.relay.setRecoveryReview(RemoteControlRecoveryPreparation(context: context, reconstructionHash: String(repeating: "c", count: 64)))
+        return (try h.coordinator(), signed)
+    }
+
+    func testRecoveryCopyRetentionRetriesExactSignatureAfterLostReplyAndRestartWithoutNewAuthority() async throws {
+        let h = RecoveryCoordinatorHarness()
+        var (coordinator, signed) = try await signedRecoverySource(h)
+        let checkpoint = h.store.bytes, writes = h.store.writes, prompts = h.ownerRequests.count
+        let controls = await h.relay.controls()
+        XCTAssertFalse(coordinator.controlRecoveryAvailable)
+        await h.relay.loseNextRecoveryCopyReply()
+        do { _ = try await coordinator.retainControlRecoveryCopy(signed, current: { true }); XCTFail() } catch {}
+        XCTAssertEqual(h.store.writes, writes)
+        coordinator = try h.coordinator()
+        let reloadedWrites = h.store.writes
+        let receipt = try await coordinator.retainControlRecoveryCopy(signed, current: { true })
+        XCTAssertEqual(receipt.recordIDs, [signed.body.recordId])
+        let copies = await h.relay.sentRecoveryCopies()
+        XCTAssertEqual(copies.count, 2)
+        XCTAssertEqual(copies[0], copies[1])
+        XCTAssertEqual(h.store.bytes, checkpoint)
+        XCTAssertEqual(h.store.writes, reloadedWrites)
+        XCTAssertEqual(h.ownerRequests.count, prompts)
+        let after = await h.relay.controls()
+        XCTAssertEqual(after, controls)
+    }
+
+    func testRecoveryCopyRetentionRejectsChangedContextOrProtectedStoreBeforeSending() async throws {
+        for missingStore in [false, true] {
+            let h = RecoveryCoordinatorHarness(), (coordinator, signed) = try await signedRecoverySource(h)
+            let writes = h.store.writes
+            var current = true
+            await h.relay.holdNextRecoveryReview()
+            let operation = Task { try await coordinator.retainControlRecoveryCopy(signed, current: { current }) }
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            while !(await h.relay.recoveryReviewIsWaiting()), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+            let waiting = await h.relay.recoveryReviewIsWaiting()
+            XCTAssertTrue(waiting)
+            if missingStore { h.store.bytes = nil } else { current = false }
+            await h.relay.releaseRecoveryReview()
+            do { _ = try await operation.value; XCTFail() } catch {}
+            let copies = await h.relay.sentRecoveryCopies()
+            XCTAssertTrue(copies.isEmpty)
+            XCTAssertEqual(h.store.writes, writes)
+            if missingStore { XCTAssertNil(h.store.bytes) }
+        }
+    }
+
+    func testRecoveryCopyRetentionDiscardsALateReceiptAndKeepsTheProtectedSignature() async throws {
+        let h = RecoveryCoordinatorHarness(), (coordinator, signed) = try await signedRecoverySource(h)
+        let checkpoint = h.store.bytes, writes = h.store.writes
+        var current = true
+        await h.relay.holdNextRecoveryCopy()
+        let operation = Task { try await coordinator.retainControlRecoveryCopy(signed, current: { current }) }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await h.relay.recoveryCopyIsWaiting()), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
+        let waiting = await h.relay.recoveryCopyIsWaiting()
+        XCTAssertTrue(waiting)
+        current = false
+        await h.relay.releaseRecoveryCopy()
+        do { _ = try await operation.value; XCTFail() } catch {}
+        XCTAssertEqual(h.store.bytes, checkpoint)
+        XCTAssertEqual(h.store.writes, writes)
+        XCTAssertEqual(try coordinator.localControlRecoveryReviews(current: { true }), [signed])
+    }
+
+    func testRecoveryCopyWindowSendsSavedSignatureWithSigningDisabled() async throws {
+        _ = NSApplication.shared
+        let h = RecoveryCoordinatorHarness(), (coordinator, signed) = try await signedRecoverySource(h)
+        let prompts = h.ownerRequests.count
+        let controller = ControlRecoveryWindowController(stationOrigin: signed.context.stationOrigin, loadAccess: {
+            .init(coordinator: coordinator, current: { true }, canSign: { true })
+        })
+        showRecovery(controller); defer { controller.close() }
+        XCTAssertFalse(try recoveryButton("Confirm Copy...", window: controller.window).isEnabled)
+        let send = try recoveryButton("Send to Station", window: controller.window)
+        XCTAssertTrue(send.isEnabled)
+        try clickRecovery(send)
+        try await waitForRecoveryUI { send.isEnabled }
+        let copies = await h.relay.sentRecoveryCopies()
+        XCTAssertEqual(copies.count, 1)
+        XCTAssertEqual(h.ownerRequests.count, prompts)
+        XCTAssertFalse(coordinator.controlRecoveryAvailable)
     }
 
     func testRecoveryCopyDefaultGateDenialAndChangedAccountPreventSigning() async throws {

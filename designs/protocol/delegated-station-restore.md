@@ -166,6 +166,42 @@ delivery/Portal receipts and feed state remain separate. Saved-copy export stays
 available offline even if current membership no longer permits reviewing an
 original for a new preparation; protected checkpoint failures still refuse it.
 
+### Native storage of signed recovery copies
+
+**Send to Station** sends an already signed, protected copy using the existing
+native Station bearer. It needs no new owner confirmation, clock reservation or
+signing authority. The coordinator checks the exact protected copy and current
+membership, fetches the existing plan, and requires its complete context to match
+before sending. Account/Station/window changes, cancellation, or a changed/missing
+protected checkpoint retire the operation and any late receipt. Originals and
+signed copies stay saved; a lost reply retries the exact stored signature after
+restart. No ordinary control-feed receipt is created or cleared.
+
+`POST /api/remote/v1/logs/<genesis>/control/recovery/<plan>/signatures` accepts the
+existing `retain-resigned` input: `evidence_hash` and at most 64 replacements,
+each naming its exact `original_record_id` and signed `record`. Authentication
+precedes body reading; strict decoding and the 256 KiB bound apply. The shared
+retention transaction checks account ownership under the root/fence locks, the
+current closed generation, plan, exact source evidence, original intent and
+current manager signature. It reuses the operator path's clock lower bounds,
+atomic batch and exact retry rules. Cross-account and missing roots produce the
+same metadata-free 404. A stale review or failed commit returns no successful
+receipt. Only the signed-copy table changes.
+
+After commit, the bounded version-1 receipt names account, genesis, origin,
+canonical decimal generation string, plan, evidence hash, exact ordered record
+IDs and reconstruction hash. `retained_only` is true and `recovery_ready` is
+false. The native strict reader checks every binding, the submitted IDs and
+those flags. Storage success establishes neither complete history/clocks nor
+stop effects, snapshot publication or reopening. These still require the
+production authority and joint checks.
+
+The explicit recovery-review startup mode also permits this signed-copy
+retention endpoint; its GET remains read-only. The mode still requires the
+opt-in delegated build, durable store and already closed exact-generation
+fence. It does not permit unsigned preparation, new signing, live feed writes,
+reporting or reopening. Ordinary deployments remain disabled for this path.
+
 ## Durable recovery preparation
 
 After draining the fleet, increasing the external generation and committing its

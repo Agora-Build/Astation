@@ -1,7 +1,7 @@
 //! Retain fresh manager copies for a recovery snapshot. These signatures never
 //! supply missing history, clock completeness, publication or reopening authority.
 use super::super::Binding;
-use super::{checkpoint, history, invalid, source_hash, Prepared};
+use super::{history, invalid, source_hash, Prepared};
 use atem_client::{
     canonical::StrictValue,
     control::{
@@ -201,9 +201,32 @@ pub(crate) async fn retain(
     plan_id: &str,
     bytes: &[u8],
 ) -> Result<Value, sqlx::Error> {
+    retain_checked(pool, binding, genesis, plan_id, bytes, None).await
+}
+
+pub(crate) async fn retain_for_owner(
+    pool: &PgPool,
+    binding: &Binding,
+    genesis: &str,
+    plan_id: &str,
+    bytes: &[u8],
+    owner: &str,
+) -> Result<Value, sqlx::Error> {
+    retain_checked(pool, binding, genesis, plan_id, bytes, Some(owner)).await
+}
+
+async fn retain_checked(
+    pool: &PgPool,
+    binding: &Binding,
+    genesis: &str,
+    plan_id: &str,
+    bytes: &[u8],
+    owner: Option<&str>,
+) -> Result<Value, sqlx::Error> {
     let input = parse(bytes)?;
+    let record_ids: Vec<_> = input.replacements.iter().map(|(_, record)| record.record_id().to_owned()).collect();
     let mut tx = pool.begin().await?;
-    let (prepared, log, mut report) = checkpoint(&mut tx, binding, genesis, false).await?;
+    let (prepared, log, mut report) = super::checkpoint_for_owner(&mut tx, binding, genesis, false, owner).await?;
     super::review_source_evidence(&mut tx, &prepared, &log, binding, &mut report).await?;
     if prepared.plan_id != plan_id || report["evidence_hash"] != input.evidence_hash {
         return Err(invalid());
@@ -268,6 +291,12 @@ pub(crate) async fn retain(
         .await?;
     }
     super::review_evidence(&mut tx, &prepared, &log, binding, &mut report).await?;
+    if owner.is_some() {
+        report = json!({"version":1,"account_id":log.account_id(),"genesis_hash":genesis,
+            "origin":binding.origin,"generation":binding.generation.to_string(),"plan_id":plan_id,
+            "evidence_hash":input.evidence_hash,"record_ids":record_ids,
+            "reconstruction_hash":report["reconstruction_hash"],"retained_only":true,"recovery_ready":false});
+    }
     tx.commit().await?;
     Ok(report)
 }
