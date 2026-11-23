@@ -137,6 +137,37 @@ private final class VerifierChannelHarness {
 
 final class RemoteVerifierSigningGateTests: XCTestCase {
     @MainActor
+    func testLegacyNativeRolesWaiveOnlyTheVerifierUpgradeRequirement() throws {
+        let f = try VerifierFixture()
+        let body = try f.log.draftEntry(signer: "manager", signedAt: f.clock.wallMs,
+            actionJson: "{\"action\":\"set_roles\",\"device_id\":\"manager\",\"roles\":[\"control\",\"manage\",\"view\"]}")
+        let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: "manager")
+        XCTAssertNil(try membershipRequiredVersion(bodyJson: body))
+        let gate = try RemoteVerifierSigningGate(log: f.log, verifiers: f.roster)
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        XCTAssertTrue(request.freshConfirmation)
+        XCTAssertThrowsError(try gate.authorize(f.review().signingRequest(managerID: "manager"), log: f.log))
+    }
+
+    @MainActor
+    func testActualSigningGateRejectsEveryPublishedMalformedMembershipBody() throws {
+        let f = try VerifierFixture()
+        let (gate, _) = try f.confirmedGate()
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "r9-vectors-required-verifier",
+            withExtension: "json", subdirectory: "Fixtures"))
+        let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        let cases = try XCTUnwrap(fixture["cases"] as? [[String: Any]])
+        let rejected = cases.filter { $0["reject"] as? Bool == true }
+        XCTAssertFalse(rejected.isEmpty)
+        for vector in rejected {
+            let body = try XCTUnwrap(vector["body_json"] as? String)
+            let request = SignRequest(keyId: "manager", purpose: .roles, freshConfirmation: true,
+                label: "atem-membership-entry-v1", input: Data(), bodyJson: body)
+            XCTAssertThrowsError(try gate.authorize(request, log: f.log), "\(vector["label"] ?? "malformed")")
+        }
+    }
+
+    @MainActor
     func testStationEvidenceMustUseTheGatesExactAccountGenesisAndHead() throws {
         let fixture = try VerifierFixture(), other = try VerifierFixture()
         let gate = try RemoteVerifierSigningGate(log: fixture.log, verifiers: fixture.roster)
