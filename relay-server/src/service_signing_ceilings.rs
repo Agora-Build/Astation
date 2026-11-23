@@ -103,16 +103,20 @@ impl SigningCeilings {
         genesis: &str,
         service: &str,
         key: &str,
-        first: u64,
-        last: u64,
+        previously_signed: u64,
+        range: std::ops::RangeInclusive<u64>,
     ) -> Result<(), ()> {
-        if first == 0 || first > last || last > atem_client::canonical::MAX_SAFE_INTEGER {
+        let (first, last) = range.into_inner();
+        if first <= previously_signed
+            || first > last
+            || last > atem_client::canonical::MAX_SAFE_INTEGER
+        {
             return Err(());
         }
         // An uncertain commit burns the range. Only a successful reply permits signing.
         let result = sqlx::query("UPDATE station_service_signing_ceilings SET highest_ms=$6
-            WHERE account_id=$1 AND genesis_hash=$2 AND service_id=$3 AND key_hash=$4 AND highest_ms<$5")
-            .bind(account).bind(genesis).bind(service).bind(key).bind(first as i64).bind(last as i64)
+            WHERE account_id=$1 AND genesis_hash=$2 AND service_id=$3 AND key_hash=$4 AND highest_ms<$5 AND highest_ms >= $7")
+            .bind(account).bind(genesis).bind(service).bind(key).bind(first as i64).bind(last as i64).bind(previously_signed as i64)
             .execute(&self.0).await.map_err(|_| ())?;
         if result.rows_affected() != 1 {
             return Err(());
@@ -152,12 +156,28 @@ impl SigningCeilings {
                 }
             }
         }
+        let mut observed = std::collections::BTreeMap::<&str, u64>::new();
+        for record in plan["known_history"]["records"].as_array().ok_or(())? {
+            let principal = record["principal"].as_str().ok_or(())?;
+            if record["signer"] == principal && record["verification"] == "valid" {
+                if let Some(service) = principal.strip_prefix("service:") {
+                    let floor = observed.entry(service).or_default();
+                    *floor = (*floor).max(record["issued_at"].as_u64().ok_or(())?);
+                }
+            }
+        }
+        let signed: std::collections::BTreeMap<_, _> = reservations
+            .iter()
+            .filter(|r| r.highest_ms > 0)
+            .map(|r| (r.service_id.as_str(), r.highest_ms as u64))
+            .collect();
+        observed.retain(|service, time| signed.get(service).is_none_or(|ceiling| ceiling < time));
         // Preserve even registrations absent from restored membership. The
         // publisher must reread these observations under the recovery fence.
         Ok(
             serde_json::json!({"plan_id": plan["plan_id"], "source_hash": plan["source_hash"],
             "reconstruction_hash": plan["reconstruction_hash"], "reservations": reservations,
-            "unregistered_membership_keys": missing}),
+            "unregistered_membership_keys": missing, "uncovered_service_signatures": observed}),
         )
     }
 

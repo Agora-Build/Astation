@@ -790,6 +790,8 @@ Install [the signing-store schema](relay-server/signing-store/schema.sql) as its
 Use an ordinary logged table, durable storage, fsync and a writable primary.
 Station checks the cluster identifier on every new signing-store connection and
 uses synchronous commits. Replicas retry ordinary outages against the configured store.
+Upgrade every service signer before allowing delegated work. An older binary
+can produce signatures without making the corresponding reservation.
 
 Give the runtime role CONNECT on that database, USAGE on the schema, SELECT on the
 table, INSERT on `account_id, genesis_hash, service_id, key_hash`, and UPDATE on
@@ -803,6 +805,8 @@ reserves a batch of elapsed milliseconds before it produces the first signature.
 A failed or uncertain publication can consume a range. A retry waits for later elapsed
 time if needed. The store contains account, genesis, service and public-key identifiers
 and the maximum reserved timestamp. An unknown legacy key cannot start at zero.
+If the external row falls behind a retained service signature, reconciliation
+refuses the next batch and recovery reports the discrepancy.
 
 Restore the Station database under the deployment fence and keep the signing store
 at its latest durable state. The configured operator `prepare` command reads all

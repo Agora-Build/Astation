@@ -510,7 +510,7 @@ impl Stored {
         key: &atem_client::keys::PublicKey,
         desired: ServiceDesired,
         now: u64,
-    ) -> Result<Vec<ControlBody>, Fault> {
+    ) -> Result<(Vec<ControlBody>, u64), Fault> {
         if context.genesis != log.genesis_hash().to_hex() || context.station_origin != origin {
             return Err(Fault::Invalid);
         }
@@ -536,6 +536,7 @@ impl Stored {
                 record.principal() == &principal && record.signer() == &ControlSigner::Principal
             })
             .collect();
+        let previously_signed = own.iter().map(|r| r.issued_at()).max().unwrap_or(0);
         let revoked = records.iter().any(|record| {
             record.principal() == &principal
                 && matches!(record.action(), ControlAction::Revoke { .. })
@@ -587,7 +588,7 @@ impl Stored {
         }
         let mut bodies = Vec::new();
         if actions.is_empty() {
-            return Ok(bodies);
+            return Ok((bodies, previously_signed));
         }
         let previous = self.signing_high_water.get(&principal.name()).copied().unwrap_or(0);
         // Reserve successive elapsed milliseconds ending at the observed wall time.
@@ -616,7 +617,7 @@ impl Stored {
                 },
             });
         }
-        Ok(bodies)
+        Ok((bodies, previously_signed))
     }
 }
 
@@ -660,7 +661,7 @@ impl super::RecoveryStore {
         let key = signer
             .public_key(&KeyId::new(&context.service_id))
             .map_err(|_| ())?;
-        let bodies = feed
+        let (bodies, previously_signed) = feed
             .plan_service(origin, &log, context, &key, desired, clock.wall_ms)
             .map_err(|_| ())?;
         if bodies.is_empty() {
@@ -668,7 +669,7 @@ impl super::RecoveryStore {
         }
         let covered = covered_hosts(&log, &bodies[0].principal);
         let store = self.signing_ceilings.get().ok_or(())?;
-        for record in signer.sign_control_batch(store, &bodies).await? {
+        for record in signer.sign_control_batch(store, &bodies, previously_signed).await? {
             feed.publish(
                 origin,
                 &log,

@@ -75,7 +75,7 @@ async fn postgres_delegated_external_reservation_survives_failed_commit_and_prim
     let burned = replica.reservations(account, &genesis).await.unwrap()[0].highest_ms as u64;
     assert!(burned > 0);
     assert!(replica
-        .reserve(account, &genesis, service, key, burned, burned + 1)
+        .reserve(account, &genesis, service, key, 0, burned..=burned + 1)
         .await
         .is_err());
     sqlx::query("DROP TRIGGER fail_publish ON remote_recovery_roots")
@@ -107,8 +107,8 @@ async fn postgres_delegated_external_reservation_survives_failed_commit_and_prim
     let future = chrono::Utc::now().timestamp_millis() as u64 + 60_000;
     let first = recovery.signing_ceilings.get().unwrap();
     let (a, b) = tokio::join!(
-        first.reserve(account, &genesis, service, key, last + 1, future),
-        replica.reserve(account, &genesis, service, key, last + 1, future)
+        first.reserve(account, &genesis, service, key, last, last + 1..=future),
+        replica.reserve(account, &genesis, service, key, last, last + 1..=future)
     );
     assert_ne!(a.is_ok(), b.is_ok());
     assert!(runtime.reconcile_delegated_service(ID).await.is_err());
@@ -134,8 +134,8 @@ async fn postgres_delegated_external_reservation_survives_failed_commit_and_prim
             &genesis,
             service,
             "legacy-key",
-            future + 1,
-            future + 1
+            last,
+            future + 1..=future + 1
         )
         .await
         .is_err());
@@ -146,7 +146,14 @@ async fn postgres_delegated_external_reservation_survives_failed_commit_and_prim
         .await
         .unwrap();
     assert!(replica
-        .reserve(account, &genesis, service, "orphan", future + 1, future + 1)
+        .reserve(
+            account,
+            &genesis,
+            service,
+            "orphan",
+            last,
+            future + 1..=future + 1
+        )
         .await
         .is_err());
     // Install the same schema at the primary alias: rejecting this read must
@@ -178,7 +185,14 @@ async fn postgres_delegated_external_reservation_survives_failed_commit_and_prim
         review["service_clock_evidence_hash"]
     );
     assert!(replica
-        .reserve(account, &genesis, service, key, future + 1, future + 1)
+        .reserve(
+            account,
+            &genesis,
+            service,
+            key,
+            last,
+            future + 1..=future + 1
+        )
         .await
         .is_err());
     sqlx::query("DROP TABLE station_service_signing_ceilings")
@@ -186,13 +200,88 @@ async fn postgres_delegated_external_reservation_survives_failed_commit_and_prim
         .await
         .unwrap();
     assert!(replica
-        .reserve(account, &genesis, service, key, future + 1, future + 1)
+        .reserve(
+            account,
+            &genesis,
+            service,
+            key,
+            last,
+            future + 1..=future + 1
+        )
         .await
         .is_err());
     assert!(
         plan::prepare_with_ceilings(&primary.pool, &fence, &genesis, Some(&replica))
             .await
             .is_err()
+    );
+    drop(runtime);
+    primary.cleanup().await;
+    external.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires two independent local PostgreSQL clusters"]
+async fn postgres_delegated_regressed_signing_store_cannot_hide_retained_service_signatures() {
+    let external = TestDatabase::new("SIGNING_TEST_DATABASE_URL", 2).await;
+    sqlx::raw_sql(include_str!("../../signing-store/schema.sql"))
+        .execute(&external.pool)
+        .await
+        .unwrap();
+    let (primary, runtime, fixture) =
+        fixture_with_ceiling_cluster("https://auth.example", Some(&external.pool)).await;
+    let genesis = fixture.log.genesis_hash().to_hex();
+    let origin = &runtime.binding.station_origin;
+    let recovery = &runtime.app.recovery;
+    recovery.configure_delegated(origin, 1).await.unwrap();
+    let draft = runtime.prepare(ID, OWNER, request(&fixture)).await.unwrap();
+    append_body(
+        &runtime,
+        &fixture,
+        serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap(),
+    )
+    .await;
+    policy(
+        &runtime,
+        "paused",
+        draft["fingerprint"].as_str().unwrap(),
+        None,
+    )
+    .await;
+    runtime.reconcile_delegated_service(ID).await.unwrap();
+    let records = feed(&runtime, &genesis).await;
+    let last = records[1]["body"]["issued_at"].as_u64().unwrap();
+    // The independent store was itself restored to the moment of registration.
+    sqlx::raw_sql("CREATE TEMP TABLE old_rows AS SELECT account_id,genesis_hash,service_id,key_hash FROM station_service_signing_ceilings;
+        TRUNCATE station_service_signing_ceilings;
+        INSERT INTO station_service_signing_ceilings(account_id,genesis_hash,service_id,key_hash) SELECT * FROM old_rows;")
+        .execute(&external.pool).await.unwrap();
+    policy(
+        &runtime,
+        "ready",
+        draft["fingerprint"].as_str().unwrap(),
+        None,
+    )
+    .await;
+    assert!(runtime.reconcile_delegated_service(ID).await.is_err());
+    assert_eq!(feed(&runtime, &genesis).await, records);
+    let fence = Binding::new(origin, 2).unwrap();
+    fence.initialize(&primary.pool, true).await.unwrap();
+    let review = plan::prepare_with_ceilings(
+        &primary.pool,
+        &fence,
+        &genesis,
+        recovery.signing_ceilings.get(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        review["service_clock_evidence"]["uncovered_service_signatures"][format!("svc-{ID}")],
+        last
+    );
+    assert_eq!(
+        review["service_clock_evidence"]["reservations"][0]["highest_ms"],
+        0
     );
     drop(runtime);
     primary.cleanup().await;

@@ -174,6 +174,7 @@ impl ServiceSigner {
         &self,
         store: &crate::service_signing_ceilings::SigningCeilings,
         bodies: &[atem_client::control::ControlBody],
+        previously_signed: u64,
     ) -> Result<Vec<atem_client::control::ControlRecord>, ()> {
         use atem_client::control::{principal_key_of, ControlRecord};
         let first = bodies.first().ok_or(())?;
@@ -194,8 +195,8 @@ impl ServiceSigner {
                 &self.context.genesis,
                 &self.context.service_id,
                 &key,
-                first.issued_at,
-                last.issued_at,
+                previously_signed,
+                first.issued_at..=last.issued_at,
             )
             .await?;
         bodies
