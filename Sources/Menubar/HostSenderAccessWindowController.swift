@@ -340,6 +340,7 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
             do {
                 let review = try await prepare()
                 guard current(), NSApp.isActive, !Task.isCancelled else { throw AccountLoginError.changed }
+                try coordinator.requireControlChange(review.request)
                 pendingInterrupt = review
                 let alert = NSAlert()
                 alert.messageText = "Interrupt earlier host work?"

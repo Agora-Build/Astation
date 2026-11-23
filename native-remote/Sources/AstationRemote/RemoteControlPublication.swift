@@ -102,6 +102,7 @@ public final class RemoteControlPublication {
     }
 
     private var saved: Checkpoint
+    private let draftJournal: @MainActor (MembershipLog, String) throws -> RemoteControlSigningJournal
     private let persist: (Data) throws -> Void
     private var operating = false
     public private(set) var storageUncertain = false
@@ -201,6 +202,7 @@ public final class RemoteControlPublication {
     }
 
     public init(accountID: String, genesisHash: String, stationOrigin: String,
+        draftJournal: @escaping @MainActor (MembershipLog, String) throws -> RemoteControlSigningJournal = RemoteControlSigningJournal.init(log:memberID:),
         persist: @escaping (Data) throws -> Void) throws {
         guard RemoteRecoveryKit.validID(accountID), RemoteRecoveryKit.validHash(genesisHash),
               PortalIntegrationRecord.validOrigin(stationOrigin) else {
@@ -208,13 +210,16 @@ public final class RemoteControlPublication {
         }
         saved = Checkpoint(version: 2, accountID: accountID, genesisHash: genesisHash,
             stationOrigin: stationOrigin, operations: [])
+        self.draftJournal = draftJournal
         self.persist = persist
     }
 
     public init(checkpoint: Data, accountID: String, genesisHash: String, stationOrigin: String,
+        draftJournal: @escaping @MainActor (MembershipLog, String) throws -> RemoteControlSigningJournal = RemoteControlSigningJournal.init(log:memberID:),
         persist: @escaping (Data) throws -> Void) throws {
         guard checkpoint.count <= 2_097_152 else { throw RemoteControlPublicationError.invalidCheckpoint }
         saved = try PropertyListDecoder().decode(Checkpoint.self, from: checkpoint)
+        self.draftJournal = draftJournal
         self.persist = persist
         guard [1, 2].contains(saved.version), saved.accountID == accountID, saved.genesisHash == genesisHash,
               saved.stationOrigin == stationOrigin, saved.operations.count <= 256,
@@ -350,7 +355,9 @@ public final class RemoteControlPublication {
             return request
         }
         guard saved.operations.count < 256 else { throw RemoteControlPublicationError.full }
-        try transaction { $0.operations.append(operation) }
+        try draftJournal(log, manager).withPermittedStopChange(origin: body.origin) {
+            try transaction { $0.operations.append(operation) }
+        }
         return request
     }
 
@@ -383,6 +390,7 @@ public final class RemoteControlPublication {
         let signer = try RemoteConfirmedSigner(provider: provider, request: request, confirmedAt: confirmedAt, now: now)
         guard current() else { signer.invalidate(); throw RemoteChannelError.staleLink }
         let journal = try authorJournal(log, manager)
+        try journal.requireStopChange(origin: body.origin)
         if operation.attempted != true {
             try commit { $0.operations[index].attempted = true }
         }
@@ -426,7 +434,7 @@ public final class RemoteControlPublication {
         }
         for op in saved.operations {
             try inventory.retain(body: Self.body(op.bodyJSON), json: op.bodyJSON, key: Self.signerKey(op),
-                record: op.recordJSON, possiblySigned: op.attempted != false)
+                record: op.recordJSON, possiblySigned: op.attempted != false, unsignedDraft: op.recordJSON == nil)
         }
     }
 
@@ -478,11 +486,14 @@ public final class RemoteControlPublication {
         let index = try index(recordID)
         let operation = saved.operations[index]
         let body = try validate(operation)
+        let journal = try authorJournal(String(body.signer.dropFirst(7)))
         guard operation.recordJSON == nil, operation.attempted == false,
-              try retainedSignature(operation, journal: authorJournal(String(body.signer.dropFirst(7)))) == nil else {
+              try retainedSignature(operation, journal: journal) == nil else {
             throw RemoteControlPublicationError.requiresReview
         }
-        _ = try transaction { $0.operations.remove(at: index) }
+        try journal.withPermittedStopChange(origin: body.origin) {
+            _ = try transaction { $0.operations.remove(at: index) }
+        }
     }
 
     public func stationStored(_ delivery: RemoteControlDelivery, stationOrigin: String? = nil) throws {

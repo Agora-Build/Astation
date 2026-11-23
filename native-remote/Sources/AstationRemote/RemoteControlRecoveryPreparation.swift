@@ -11,6 +11,9 @@ public protocol RemoteControlRecoveryReviewTransport: Sendable {
 public struct RemoteControlRecoveryPreparation: Equatable, Sendable {
     public let context: RemoteControlRecoveryContext
     public let reconstructionHash: String
+    // Plain decoded/exported JSON cannot release a protected signing hold.
+    var stationReceipt: RemoteRecoveryHTTP.ReviewReceipt?
+    var receivedFromStation: Bool { stationReceipt?.context == context }
 
     public static func decode(_ bytes: Data, accountID: String, genesisHash: String,
         stationOrigin: String, expected: LogHead) throws -> Self {

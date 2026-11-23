@@ -199,14 +199,21 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
         return try RemoteControlRecoveryRetention.decode(data, context: context, recordIDs: ids)
     }
 
+    struct ReviewReceipt: Equatable, Sendable {
+        let context: RemoteControlRecoveryContext
+        fileprivate init(_ context: RemoteControlRecoveryContext) { self.context = context }
+    }
+
     public func controlRecoveryReview(accountID: String, genesisHash: String,
         expected: LogHead) async throws -> RemoteControlRecoveryPreparation {
         guard RemoteRecoveryKit.validID(accountID), RemoteRecoveryKit.validHash(genesisHash),
               expected.seq > 0, expected.seq <= 9_007_199_254_740_991,
               RemoteRecoveryKit.validHash(expected.hash) else { throw RemoteChannelError.invalidInput }
         let (_, data) = try await perform(url: path(genesisHash, "control/recovery"), method: "GET")
-        return try RemoteControlRecoveryPreparation.decode(data, accountID: accountID, genesisHash: genesisHash,
+        var review = try RemoteControlRecoveryPreparation.decode(data, accountID: accountID, genesisHash: genesisHash,
             stationOrigin: stationOrigin, expected: expected)
+        review.stationReceipt = ReviewReceipt(review.context)
+        return review
     }
 
     public func controlSync(genesisHash: String, callJSON: String) async throws -> String {

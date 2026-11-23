@@ -25,6 +25,11 @@ public struct RemoteControlRecoveryContext: Codable, Equatable, Sendable {
         try validate()
     }
 
+    var signerReportRecovery: SignerReportRecovery {
+        SignerReportRecovery(generation: String(generation), planId: planID, candidateFeedId: candidateFeedID,
+            sourceHash: sourceHash, evidenceHash: evidenceHash)
+    }
+
     func validate() throws {
         guard RemoteRecoveryKit.validID(accountID), RemoteRecoveryKit.validHash(genesisHash),
               PortalIntegrationRecord.validOrigin(stationOrigin), (1...UInt64(Int64.max)).contains(generation),
@@ -40,6 +45,15 @@ public struct RemoteControlRecoveryContext: Codable, Equatable, Sendable {
         guard let id = UUID(uuidString: value) else { return false }
         // A canonical UUID places its version nibble at offset 14.
         return id.uuidString.lowercased() == value && value[value.index(value.startIndex, offsetBy: 14)] == "4"
+    }
+}
+
+public struct RemoteControlRecoveryHold: LocalizedError {
+    public let context: RemoteControlRecoveryContext
+
+    public var errorDescription: String? {
+        "Stop changes are paused for recovery plan " + context.planID + " (generation " +
+            String(context.generation) + ") at " + context.stationOrigin + "."
     }
 }
 
@@ -102,11 +116,13 @@ public final class RemoteControlRecoveryPublication {
     }
 
     private var saved: Checkpoint
+    private let draftJournal: @MainActor (MembershipLog, String) throws -> RemoteControlSigningJournal
     private let persist: (Data) throws -> Void
     private var operating = false
     public private(set) var storageUncertain = false
 
     public init(accountID: String, genesisHash: String, stationOrigin: String,
+        draftJournal: @escaping @MainActor (MembershipLog, String) throws -> RemoteControlSigningJournal = RemoteControlSigningJournal.init(log:memberID:),
         persist: @escaping (Data) throws -> Void) throws {
         guard RemoteRecoveryKit.validID(accountID), RemoteRecoveryKit.validHash(genesisHash),
               PortalIntegrationRecord.validOrigin(stationOrigin) else {
@@ -114,13 +130,16 @@ public final class RemoteControlRecoveryPublication {
         }
         saved = Checkpoint(version: 2, accountID: accountID, genesisHash: genesisHash,
             stationOrigin: stationOrigin, operations: [])
+        self.draftJournal = draftJournal
         self.persist = persist
     }
 
     public init(checkpoint: Data, accountID: String, genesisHash: String, stationOrigin: String,
+        draftJournal: @escaping @MainActor (MembershipLog, String) throws -> RemoteControlSigningJournal = RemoteControlSigningJournal.init(log:memberID:),
         persist: @escaping (Data) throws -> Void) throws {
         guard checkpoint.count <= 2_097_152 else { throw RemoteControlPublicationError.invalidCheckpoint }
         saved = try PropertyListDecoder().decode(Checkpoint.self, from: checkpoint)
+        self.draftJournal = draftJournal
         self.persist = persist
         guard [1, 2].contains(saved.version), saved.accountID == accountID, saved.genesisHash == genesisHash,
               saved.stationOrigin == stationOrigin, saved.operations.count <= 256,
@@ -202,7 +221,9 @@ public final class RemoteControlRecoveryPublication {
             (try? parseControlRecord(recordJson: $0.originalRecordJSON).recordId) == body.recordId ||
             (try? Self.body($0.bodyJSON).recordId) == old.recordId
         }), saved.operations.count < 256 else { throw RemoteControlPublicationError.full }
-        try commit { $0.operations.append(operation) }
+        try draftJournal(log, managerID).withPermittedStopChange(origin: body.origin) {
+            try commit { $0.operations.append(operation) }
+        }
         return review
     }
 
@@ -242,6 +263,7 @@ public final class RemoteControlRecoveryPublication {
             confirmedAt: confirmedAt, now: now)
         guard current() else { throw RemoteChannelError.staleLink }
         let journal = try authorJournal(log, manager)
+        try journal.requireStopChange(origin: review.body.origin)
         if operation.attempted != true {
             try commit { $0.operations[index].attempted = true }
         }
@@ -269,7 +291,7 @@ public final class RemoteControlRecoveryPublication {
             try inventory.retain(body: original, json: signedObjectInfo(json: op.originalRecordJSON).bodyJcs,
                 key: op.originalKey.key(), record: op.originalRecordJSON, possiblySigned: true)
             try inventory.retain(body: Self.body(op.bodyJSON), json: op.bodyJSON, key: op.signingKey.key(),
-                record: op.recordJSON, possiblySigned: op.attempted != false)
+                record: op.recordJSON, possiblySigned: op.attempted != false, unsignedDraft: op.recordJSON == nil)
         }
     }
 

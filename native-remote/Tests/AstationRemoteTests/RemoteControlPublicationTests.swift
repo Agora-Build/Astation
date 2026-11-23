@@ -49,7 +49,7 @@ final class ControlPublicationFixture {
         try append(["action": "add", "member": ["device_id": "service", "kind": "service", "roles": ["service"],
             "auth_key": publicKey, "scope": ["hosts": ["host"], "ops": ["view"]], "expires_at": clock.wallMs + 3_600_000]])
         journal = try RemoteControlPublication(accountID: log.accountId(), genesisHash: log.genesisHash(), stationOrigin: origin,
-            persist: { [unowned self] in try persist($0) })
+            draftJournal: { [unowned self] in try self.authorJournal($0, $1) }, persist: { [unowned self] in try persist($0) })
     }
 
     func readAuthorJournal(_ member: String) throws -> RemoteControlSigningJournal {
@@ -88,7 +88,7 @@ final class ControlPublicationFixture {
     }
     func restore(_ data: Data? = nil) throws {
         journal = try RemoteControlPublication(checkpoint: XCTUnwrap(data ?? stored), accountID: log.accountId(),
-            genesisHash: log.genesisHash(), stationOrigin: origin, persist: { [unowned self] in try persist($0) })
+            genesisHash: log.genesisHash(), stationOrigin: origin, draftJournal: { [unowned self] in try self.authorJournal($0, $1) }, persist: { [unowned self] in try persist($0) })
     }
     func body(action: String = "revoke", interrupt: Bool? = false) throws -> ControlRecordBody {
         ControlRecordBody(accountId: log.accountId(), genesisHash: log.genesisHash(), origin: origin, feedId: feed,
@@ -124,7 +124,7 @@ final class RemoteControlPublicationTests: XCTestCase {
         let f = try ControlPublicationFixture(), host = try f.hostBody()
         let other = "https://second.example"
         let box = try RemoteControlPublication(accountID: f.log.accountId(), genesisHash: f.log.genesisHash(),
-            stationOrigin: other, persist: { _ in })
+            stationOrigin: other, draftJournal: f.authorJournal, persist: { _ in })
         let hostDraft = try box.prepare(body: host, log: f.log)
         let own = try f.body(), signed = try f.prepare(own)
         let record = try f.sign(own)
@@ -149,7 +149,7 @@ final class RemoteControlPublicationTests: XCTestCase {
         _ = try f.prepare(local)
         let other = "https://second.example"
         let box = try RemoteControlPublication(accountID: f.log.accountId(), genesisHash: f.log.genesisHash(),
-            stationOrigin: other, persist: { _ in })
+            stationOrigin: other, draftJournal: f.authorJournal, persist: { _ in })
         var conflicting = local
         conflicting.origin = other
         _ = try box.prepare(body: conflicting, log: f.log)
@@ -164,7 +164,7 @@ final class RemoteControlPublicationTests: XCTestCase {
         let f = try ControlPublicationFixture(), host = try f.hostBody()
         _ = try f.prepare(host)
         let box = try RemoteControlPublication(accountID: f.log.accountId(), genesisHash: f.log.genesisHash(),
-            stationOrigin: "https://second.example", persist: { _ in })
+            stationOrigin: "https://second.example", draftJournal: f.authorJournal, persist: { _ in })
         var conflict = host
         conflict.issuedAt += 1
         _ = try box.prepare(body: conflict, log: f.log)

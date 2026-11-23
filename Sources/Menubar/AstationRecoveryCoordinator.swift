@@ -1740,7 +1740,10 @@ extension AstationRecoveryCoordinator {
             throw RemoteRecoveryError.requiresReview
         }
         try requireDurableRecoveryCheckpoint()
-        // This read deliberately does not install an authority, prepare a draft or persist a clock.
+        if !(saved.controlJournalIDs ?? [:]).isEmpty {
+            try readControlJournal(member: managerID).reconcileSupersedingPlan(result)
+        }
+        // Reading a plan never installs recovery signing or publication authority.
         return result
     }
 
@@ -1816,6 +1819,7 @@ extension AstationRecoveryCoordinator {
         try authority.authorize(retained, log: before)
         var confirmedAt: UInt64 = 0
         if !retained.signed {
+            try requireControlChange(retained.request)
             guard current(), !Task.isCancelled, await confirmOwner(retained.request), current(), !Task.isCancelled else {
                 throw RemoteRecoveryError.confirmationRequired
             }
@@ -1904,10 +1908,12 @@ extension AstationRecoveryCoordinator {
         let value: RemoteControlRecoveryPublication
         if let data = saved.controlRecoveryPublications?[origin] {
             value = try RemoteControlRecoveryPublication(checkpoint: data, accountID: accountID,
-                genesisHash: kit.genesisHash, stationOrigin: origin, persist: save)
+                genesisHash: kit.genesisHash, stationOrigin: origin,
+                draftJournal: { [unowned self] _, member in try self.readControlJournal(member: member) }, persist: save)
         } else {
             value = try RemoteControlRecoveryPublication(accountID: accountID, genesisHash: kit.genesisHash,
-                stationOrigin: origin, persist: save)
+                stationOrigin: origin,
+                draftJournal: { [unowned self] _, member in try self.readControlJournal(member: member) }, persist: save)
         }
         controlRecoveryPublications[origin] = value
         return value
@@ -2161,10 +2167,12 @@ extension AstationRecoveryCoordinator {
         let value: RemoteControlPublication
         if let data = saved.controlPublications?[origin] {
             value = try RemoteControlPublication(checkpoint: data, accountID: accountID, genesisHash: kit.genesisHash,
-                stationOrigin: origin, persist: persistControl)
+                stationOrigin: origin,
+                draftJournal: { [unowned self] _, member in try self.readControlJournal(member: member) }, persist: persistControl)
         } else {
             value = try RemoteControlPublication(accountID: accountID, genesisHash: kit.genesisHash,
-                stationOrigin: origin, persist: persistControl)
+                stationOrigin: origin,
+                draftJournal: { [unowned self] _, member in try self.readControlJournal(member: member) }, persist: persistControl)
         }
         controlPublications[origin] = value
         return value
@@ -2336,6 +2344,14 @@ extension AstationRecoveryCoordinator {
         return journal
     }
 
+    func requireControlChange(_ request: SignRequest) throws {
+        guard request.keyId == managerID, let json = request.bodyJson,
+              request == (try RemoteConfirmedSigner.controlRequest(bodyJSON: json, keyID: managerID)) else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        try readControlJournal(member: managerID).requireStopChange(bodyJSON: json)
+    }
+
     private func signControl(recordID: String, request: SignRequest, genesis: String, current: () -> Bool) async throws {
         let before = try await refreshedLog(genesis: genesis)
         try requireManager(before)
@@ -2344,6 +2360,7 @@ extension AstationRecoveryCoordinator {
             throw RemoteRecoveryError.requiresReview
         }
         guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        try requireControlChange(request)
         guard await confirmOwner(request), current(), !Task.isCancelled else { throw RemoteRecoveryError.confirmationRequired }
         let confirmedAt = Self.clock().monoMs
         let log = try await refreshedLog(genesis: genesis)

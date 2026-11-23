@@ -476,6 +476,7 @@ final class IntegrationApprovalViewController: NSViewController {
                     interruptRunning: interrupt.state == .on, current: current)
                 review = value
                 guard current() else { throw RemoteChannelError.staleLink }
+                try coordinator.requireControlChange(value.request)
                 let confirm = NSAlert()
                 confirm.messageText = interruptOnly ? "Confirm interruption" : "Confirm revocation"
                 confirm.informativeText = "\(value.integrationName)\nPrincipal: \(value.body.principal)\nStation: \(value.stationOrigin)\n"

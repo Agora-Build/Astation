@@ -8,6 +8,7 @@ public struct RemoteControlAuthorInventory {
         let bodyJSON: String
         let signedRecord: String?
         let possiblySigned: Bool
+        let hasUnsignedDraft: Bool
     }
 
     let origin: String
@@ -42,9 +43,25 @@ public struct RemoteControlAuthorInventory {
         }
     }
 
+    // An outbox can retain an unsigned draft even when another retained source
+    // proves the same body was signed. The SDK commits both sets independently.
+    var reportRecordBodies: [String] {
+        rows.keys.sorted().compactMap { id in
+            guard let row = rows[id], row.possiblySigned || row.signedRecord != nil else { return nil }
+            return row.bodyJSON
+        }
+    }
+
+    var reportDraftBodies: [String] {
+        rows.keys.sorted().compactMap { id in
+            guard let row = rows[id], row.hasUnsignedDraft else { return nil }
+            return row.bodyJSON
+        }
+    }
+
     // Each source validates its own saved key, canonical body and signature.
     mutating func retain(body: ControlRecordBody, json: String, key sourceKey: PublicKeyData,
-                         record: String?, possiblySigned: Bool) throws {
+                         record: String?, possiblySigned: Bool, unsignedDraft: Bool = false) throws {
         guard body.accountId == account, body.genesisHash == genesis else {
             throw RemoteControlPublicationError.invalidCheckpoint
         }
@@ -69,6 +86,7 @@ public struct RemoteControlAuthorInventory {
             throw RemoteControlPublicationError.requiresReview
         }
         rows[body.recordId] = Row(bodyJSON: json, signedRecord: prior?.signedRecord ?? record,
-            possiblySigned: possiblySigned || prior?.possiblySigned == true)
+            possiblySigned: possiblySigned || prior?.possiblySigned == true,
+            hasUnsignedDraft: unsignedDraft || prior?.hasUnsignedDraft == true)
     }
 }
