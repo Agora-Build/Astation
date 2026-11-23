@@ -305,7 +305,15 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
     @objc private func interruptHost() {
         guard rows.indices.contains(hosts.indexOfSelectedItem), let coordinator, let current else { return }
         let hostID = rows[hosts.indexOfSelectedItem].hostID
-        runInterrupt { try await coordinator.prepareHostInterrupt(hostID: hostID, current: current) }
+        let active = { current() && NSApp.isActive && !Task.isCancelled }
+        runInterrupt { [hub] in
+            try await coordinator.prepareHostInterrupt(hostID: hostID, directory: {
+                try await hub.controlPortal().stationDirectory()
+            }, chooseStations: { review in
+                guard active() else { throw AccountLoginError.changed }
+                return try InterruptStationPicker.choose(review)
+            }, current: active)
+        }
     }
 
     private func change(readmitting: Bool) {
@@ -344,7 +352,12 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
                 pendingInterrupt = review
                 let alert = NSAlert()
                 alert.messageText = "Interrupt earlier host work?"
-                alert.informativeText = Self.interruptExplanation(review)
+                let explanation = Self.interruptExplanation(review)
+                if review.additionalStationOrigins.count > 3 {
+                    alert.accessoryView = processEditor(explanation, editable: false).0
+                } else {
+                    alert.informativeText = explanation
+                }
                 alert.addButton(withTitle: "Confirm..."); alert.addButton(withTitle: "Later")
                 guard alert.runModal() == .alertFirstButtonReturn, current(), NSApp.isActive else { return }
                 status.stringValue = "Confirm with Touch ID or your Mac password..."
@@ -411,5 +424,68 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
             status.stringValue = "Unsigned change cancelled."
         } catch { status.stringValue = "A signed or uncertain change must be reconciled before it can be removed." }
         render()
+    }
+}
+
+@MainActor
+private final class InterruptStationPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+    let review: AstationRecoveryCoordinator.InterruptStations
+    let origins: [String]
+    init(_ review: AstationRecoveryCoordinator.InterruptStations) {
+        self.review = review
+        origins = review.candidates.union(review.unavailable).sorted()
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { origins.count }
+    func tableView(_ tableView: NSTableView, objectValueFor tableColumn: NSTableColumn?, row: Int) -> Any? {
+        title(row)
+    }
+
+    private func title(_ row: Int) -> String {
+        let origin = origins[row]
+        if review.unavailable.contains(origin) { return origin + " (unavailable in Portal)" }
+        if review.previous.contains(origin) { return origin + " (previously confirmed)" }
+        return origin
+    }
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+        review.candidates.contains(origins[row])
+    }
+
+    static func choose(_ review: AstationRecoveryCoordinator.InterruptStations) throws -> Set<String> {
+        if review.candidates.isEmpty && review.unavailable.isEmpty && review.directoryComplete { return [] }
+        let alert = NSAlert()
+        alert.messageText = "Choose Stations for this interruption"
+        alert.informativeText = "The request will go to " + review.primary + "."
+        if !review.directoryComplete {
+            alert.informativeText += "\n\nThe Portal directory is unavailable or incomplete. Only known destinations are available."
+        }
+        let picker = InterruptStationPicker(review)
+        let table = NSTableView(frame: NSRect(x: 0, y: 0, width: 490, height: 165))
+        if !picker.origins.isEmpty {
+            alert.informativeText += "\n\nSelect any additional Stations for this request. Command-click to select more than one."
+            let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 490, height: 165))
+            scroll.hasVerticalScroller = true
+            scroll.hasHorizontalScroller = true
+            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("origin"))
+            column.isEditable = false
+            column.width = max(scroll.bounds.width - 20, picker.origins.indices.map {
+                (picker.title($0) as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: NSFont.systemFontSize)]).width + 16
+            }.max() ?? 0)
+            table.addTableColumn(column)
+            table.headerView = nil
+            table.allowsMultipleSelection = true
+            table.allowsEmptySelection = true
+            table.setAccessibilityLabel("Additional Stations")
+            table.delegate = picker
+            table.dataSource = picker
+            scroll.documentView = table
+            table.reloadData()
+            table.deselectAll(nil)
+            alert.accessoryView = scroll
+        }
+        alert.addButton(withTitle: "Review Request")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { throw CancellationError() }
+        return Set(table.selectedRowIndexes.map { picker.origins[$0] })
     }
 }

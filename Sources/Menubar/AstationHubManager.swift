@@ -510,15 +510,9 @@ class AstationHubManager: ObservableObject {
             }
         }
         accountRecovery = coordinator
-        if coordinator.delegatedControlsAvailable, let owner = signedInAccount, let settings = portalSettings {
+        if coordinator.delegatedControlsAvailable, let owner = signedInAccount, portalSettings != nil {
             let epoch = integrationAccountGeneration
-            let auth = try integrationAuthorization(settings: settings)
-            guard let configuration = auth.configuration else { throw AccountLoginError.configuration }
-            let portal = try PortalIntegrationHTTP(configuration: configuration, portalOrigin: settings.portalURL,
-                ownerAccount: owner, accessToken: {
-                    guard try await auth.current()?.session.subject == owner else { throw AccountLoginError.signInRequired }
-                    return try await auth.accessToken()
-                })
+            let portal = try controlPortal()
             coordinator.resumeControlDelivery(portal: portal, current: { [weak self, weak coordinator] in
                 guard let self, let coordinator else { return false }
                 return self.accountRecovery === coordinator && self.integrationAccountGeneration == epoch
@@ -526,6 +520,19 @@ class AstationHubManager: ObservableObject {
             })
         }
         return coordinator
+    }
+
+    @MainActor func controlPortal() throws -> PortalIntegrationHTTP {
+        guard let settings = portalSettings, let owner = signedInAccount, !accountSignInRequired else {
+            throw AccountLoginError.signInRequired
+        }
+        let auth = try integrationAuthorization(settings: settings)
+        guard let configuration = auth.configuration else { throw AccountLoginError.configuration }
+        return try PortalIntegrationHTTP(configuration: configuration, portalOrigin: settings.portalURL,
+            ownerAccount: owner, accessToken: {
+                guard try await auth.current()?.session.subject == owner else { throw AccountLoginError.changed }
+                return try await auth.accessToken()
+            })
     }
 
     @MainActor func integrationAuthorization(settings: AccountServiceSettings) throws -> AstationAccountAuth {

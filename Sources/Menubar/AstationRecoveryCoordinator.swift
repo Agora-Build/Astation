@@ -2336,7 +2336,38 @@ extension AstationRecoveryCoordinator {
         }
     }
 
-    func prepareHostInterrupt(hostID: String, current: () -> Bool) async throws -> HostInterruptReview {
+    struct InterruptStations {
+        let primary: String
+        let previous: Set<String>
+        let candidates: Set<String>
+        let unavailable: Set<String>
+        let directoryComplete: Bool
+    }
+
+    private func interruptStationChoices(hostID: String, configured: Set<String>,
+        directory: (() async throws -> PortalStationDirectorySnapshot)?) async throws -> InterruptStations {
+        var previous = Set<String>()
+        for origin in (saved.controlPublications ?? [:]).keys {
+            previous.formUnion(try controls(stationOrigin: origin).previouslyReviewedStations(hostID: hostID))
+        }
+        previous.remove(relayURL)
+        let snapshot = try? await directory?()
+        var candidates = configured.union(previous)
+        var unavailable = Set<String>()
+        let complete = snapshot?.complete == true && snapshot?.stale == false
+        if complete, let snapshot {
+            for (origin, rows) in Dictionary(grouping: snapshot.stations, by: \.origin) where origin != relayURL {
+                if rows.allSatisfy(\.availableForIntegrations) { candidates.insert(origin) }
+                else { unavailable.insert(origin) }
+            }
+        }
+        return InterruptStations(primary: relayURL, previous: previous, candidates: candidates,
+            unavailable: unavailable, directoryComplete: complete)
+    }
+
+    func prepareHostInterrupt(hostID: String, directory: (() async throws -> PortalStationDirectorySnapshot)? = nil,
+        chooseStations: ((InterruptStations) throws -> Set<String>)? = nil,
+        current: () -> Bool) async throws -> HostInterruptReview {
         try begin(); defer { busy = false }
         guard delegatedControlsAvailable else { throw AstationDelegatedControlError.notVerified }
         guard current(), let kit = try currentKit(), let transport = http as? RemoteControlTransport else {
@@ -2349,6 +2380,16 @@ extension AstationRecoveryCoordinator {
         guard let revokeSeq = try Self.latestHostSenderRevocation(log: log, hostID: hostID) else {
             throw RemoteRecoveryError.requiresReview
         }
+        let configured = Set(try controlStationTransports(log).keys)
+        let origins: Set<String>
+        if let chooseStations {
+            let choices = try await interruptStationChoices(hostID: hostID, configured: configured, directory: directory)
+            guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+            origins = try chooseStations(choices)
+            guard current(), !Task.isCancelled, origins.count <= 63, origins.isSubset(of: choices.candidates) else {
+                throw RemoteRecoveryError.requiresReview
+            }
+        } else { origins = configured }
         let heads = try relayDecodeToHost(message: await transport.controlHeads(genesisHash: kit.genesisHash))
         guard current(), case .heads(let feeds, let head) = heads, head == log.head(), feeds.count == 1,
               feeds[0].origin == relayURL else { throw RemoteRecoveryError.requiresReview }
@@ -2361,9 +2402,9 @@ extension AstationRecoveryCoordinator {
             feedId: nil, principal: "host:" + hostID, principalKey: nil, signer: "member:" + managerID,
             action: "interrupt_running", interruptRunning: nil, revokeSeq: revokeSeq,
             recordId: UUID().uuidString.lowercased(), issuedAt: time, integrationId: nil, by: "owner")
-        let origins = try controlStationTransports(log).keys.filter { $0 != relayURL }.sorted()
-        let request = try controls().prepare(body: body, log: log, additionalStationOrigins: origins)
-        return HostInterruptReview(stationOrigin: relayURL, body: body, request: request, additionalStationOrigins: origins)
+        let destinations = origins.sorted()
+        let request = try controls().prepare(body: body, log: log, additionalStationOrigins: destinations)
+        return HostInterruptReview(stationOrigin: relayURL, body: body, request: request, additionalStationOrigins: destinations)
     }
 
     func commitHostInterrupt(_ review: HostInterruptReview, current: () -> Bool) async throws -> RemoteControlDelivery {
