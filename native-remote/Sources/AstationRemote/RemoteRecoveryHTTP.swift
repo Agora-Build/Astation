@@ -62,6 +62,19 @@ private final class RecoveryRedirectGuard: NSObject, URLSessionTaskDelegate, @un
     }
 }
 
+/// An SDK-decoded challenge received from the selected Station for this exact plan.
+public struct RemoteStationSignerChallenge: Sendable {
+    public let context: RemoteControlRecoveryContext
+    public let json: String
+    public let challenge: SignerReportChallenge
+
+    fileprivate init(context: RemoteControlRecoveryContext, json: String, challenge: SignerReportChallenge) {
+        self.context = context
+        self.json = json
+        self.challenge = challenge
+    }
+}
+
 /// TLS/account login limits storage access. Only the shared verifier grants cryptographic trust.
 public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteControlRecoveryReviewTransport, RemoteControlRecoveryRetentionTransport, RemoteStationVerifierTransport, RemoteManagedServiceVerifierTransport, RemoteVerifierReportTransport, @unchecked Sendable {
     private let baseURL: URL
@@ -207,6 +220,31 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
         let (_, data) = try await perform(url: path(genesisHash, "control/recovery"), method: "GET")
         return try RemoteControlRecoveryPreparation.decode(data, accountID: accountID, genesisHash: genesisHash,
             stationOrigin: stationOrigin, expected: expected)
+    }
+
+    public func signerChallenge(for context: RemoteControlRecoveryContext, memberID: String, slot: String,
+        nowMs: @Sendable () -> UInt64) async throws -> RemoteStationSignerChallenge {
+        try context.validate()
+        guard stationOrigin == context.stationOrigin, RemoteRecoveryKit.validID(memberID),
+              RemoteRecoveryKit.validID(slot) else { throw RemoteChannelError.invalidInput }
+        let signer = "member:" + memberID
+        let recovery = ["generation": String(context.generation), "plan_id": context.planID,
+            "candidate_feed_id": context.candidateFeedID, "source_hash": context.sourceHash, "evidence_hash": context.evidenceHash]
+        let bytes = try JSONSerialization.data(withJSONObject: ["signer": signer, "slot": slot, "recovery": recovery,
+            "expected": ["seq": context.membershipHead.seq, "hash": context.membershipHead.hash]] as [String: Any])
+        let (_, data) = try await perform(url: path(context.genesisHash, "control/recovery/signer-challenges"),
+            method: "POST", body: bytes)
+        guard data.count <= 4096, let json = String(data: data, encoding: .utf8) else {
+            throw RemoteRecoveryTransportError.invalidResponse
+        }
+        let challenge = try parseSignerReportChallenge(challengeJson: json)
+        let now = nowMs()
+        guard challenge.signer == signer, challenge.slot == slot, challenge.origin == stationOrigin,
+              challenge.issuedAt <= now, now < challenge.expiresAt,
+              challenge.recovery == SignerReportRecovery(generation: String(context.generation), planId: context.planID,
+                candidateFeedId: context.candidateFeedID, sourceHash: context.sourceHash, evidenceHash: context.evidenceHash)
+        else { throw RemoteRecoveryTransportError.invalidResponse }
+        return RemoteStationSignerChallenge(context: context, json: json, challenge: challenge)
     }
 
     public func controlSync(genesisHash: String, callJSON: String) async throws -> String {

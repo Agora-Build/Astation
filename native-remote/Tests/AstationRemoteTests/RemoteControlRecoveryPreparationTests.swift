@@ -55,6 +55,40 @@ final class RemoteControlRecoveryPreparationTests: XCTestCase {
         XCTAssertThrowsError(try decode(Data(repeating: 32, count: 8_193)))
     }
 
+    func testStationSignerChallengeChecksMemberSlotLeaseAndFullRecoveryContext() async throws {
+        let context = try decode(JSONSerialization.data(withJSONObject: value())).context
+        let host = try XCTUnwrap(URL(string: context.stationOrigin)?.host)
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RecoveryHTTPStub.self]
+        let http = try RemoteRecoveryHTTP(relayURL: context.stationOrigin, configuration: config,
+            accessToken: { "test-native-token" })
+        defer { RecoveryHTTPStub.remove(host: host) }
+        let target = SignerReportRecovery(generation: String(context.generation), planId: context.planID,
+            candidateFeedId: context.candidateFeedID, sourceHash: context.sourceHash, evidenceHash: context.evidenceHash)
+        for change in ["valid", "other-slot", "other-member", "other-plan", "expired"] {
+            var recovery = target
+            if change == "other-plan" { recovery.planId = UUID().uuidString.lowercased() }
+            let response = try signerReportChallenge(signer: change == "other-member" ? "member:other" : "member:mac",
+                slot: change == "other-slot" ? "other" : "astation-macos", origin: context.stationOrigin,
+                connection: 5, issuedAt: 1000, expiresAt: 31_000, recovery: recovery)
+            RecoveryHTTPStub.install(host: host) { request in
+                XCTAssertEqual(request.httpMethod, "POST")
+                XCTAssertEqual(request.url?.path, "/api/remote/v1/logs/" + context.genesisHash + "/control/recovery/signer-challenges")
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-native-token")
+                return (200, Data(response.utf8))
+            }
+            do {
+                let result = try await http.signerChallenge(for: context, memberID: "mac", slot: "astation-macos",
+                    nowMs: { change == "expired" ? 31_000 : 1001 })
+                XCTAssertEqual(change, "valid")
+                XCTAssertEqual(result.context, context)
+                XCTAssertEqual(result.json, response)
+            } catch {
+                XCTAssertNotEqual(change, "valid", String(describing: error))
+            }
+        }
+    }
+
     func testHTTPUsesTheSelectedStationAndNativeBearerWithoutAnySigningCall() async throws {
         let host = "recovery-" + UUID().uuidString.lowercased() + ".example", anchorHash = anchorHash
         let bytes = try JSONSerialization.data(withJSONObject: value(origin: "https://" + host))

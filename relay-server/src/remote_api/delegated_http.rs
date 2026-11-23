@@ -84,6 +84,19 @@ pub(crate) async fn recovery_review(
     state.recovery.control_recovery_review(&genesis, &owner).await
 }
 
+pub(crate) async fn signer_challenge(
+    State(state): State<AppState>, Path(genesis): Path<String>, headers: HeaderMap, body: Body,
+) -> Reply {
+    let owner = match subject(&state, &headers).await { Ok(owner) => owner, Err(reply) => return reply };
+    if !super::delegated_recovery::canonical_genesis(&genesis) { return invalid() }
+    let bytes = match axum::body::to_bytes(body, 4096).await { Ok(bytes) => bytes, Err(_) => return invalid() };
+    let Ok(value) = StrictValue::parse(&bytes, 4096) else { return invalid() };
+    let Some(request) = super::delegated_recovery::plan::signer_challenges::Request::parse(value.value()) else {
+        return invalid();
+    };
+    state.recovery.mint_signer_challenge(&genesis, &owner, request).await
+}
+
 pub(crate) async fn retain_recovery_copies(
     State(state): State<AppState>,
     Path((genesis, plan)): Path<(String, String)>,

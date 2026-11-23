@@ -16,6 +16,9 @@ pub(crate) mod native;
 #[path = "delegated_recovery_signatures.rs"]
 pub(crate) mod signatures;
 
+#[path = "delegated_signer_challenges.rs"]
+pub(crate) mod signer_challenges;
+
 #[derive(sqlx::FromRow)]
 pub(super) struct Prepared {
     plan_id: String,

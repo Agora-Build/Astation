@@ -84,6 +84,25 @@ records bind the candidate feed and exceed its mark. Removed-manager copies
 require a fresh manager; an invalid/forged retained record never induces a
 signature. ACK and settlement evidence is new for the replacement feed.
 
+## Requesting a signer challenge
+
+A native account client with a current Station review calls
+`POST /api/remote/v1/logs/{genesis}/control/recovery/signer-challenges`.
+Its native bearer identifies the owner of the recovery root. The body contains
+`signer` (a native `member:<device_id>`), `slot`, the exact `expected` membership
+head and the five SDK `recovery` fields from the review. The Station checks
+them against the stored plan and signed membership under the closed recovery
+fence. The named device must be active and must have held the manager role.
+
+The response is the SDK signer challenge. A retry for the same member, slot,
+plan, evidence and head returns the same unexpired challenge across replicas.
+The Station allocates a new connection number and random nonce on renewal.
+It retains at most 128 unexpired slots per plan. Its 30-second lease starts
+at the database clock. The Apple client checks the response against the
+selected HTTPS origin, target, every recovery field and the current time
+before passing it to the approval flow. Issuance grants no signing authority.
+Owner confirmation, report submission and snapshot publication are separate.
+
 ## Implemented fence and operator commands
 
 An opt-in delegated deployment must set

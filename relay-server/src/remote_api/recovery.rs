@@ -240,6 +240,19 @@ impl RecoveryStore {
         }
     }
 
+    pub(crate) async fn mint_signer_challenge(&self, genesis: &str, owner: &str, request: delegated_recovery::plan::signer_challenges::Request) -> Reply {
+        use delegated_recovery::plan::signer_challenges::MintError;
+        let (Some(pool), Some(binding)) = (&self.pool, self.delegated_recovery.get()) else { return unavailable() };
+        match tokio::time::timeout(std::time::Duration::from_secs(10),
+            delegated_recovery::plan::signer_challenges::mint(pool, binding, genesis, owner, request)).await {
+            Ok(Ok(challenge)) => (StatusCode::OK, Json(challenge)),
+            Ok(Err(MintError::ContextChanged)) => error(StatusCode::CONFLICT, "recovery_plan_changed"),
+            Ok(Err(MintError::Limit)) => error(StatusCode::TOO_MANY_REQUESTS, "signer_challenge_limit"),
+            Ok(Err(MintError::Storage(sqlx::Error::RowNotFound))) => error(StatusCode::NOT_FOUND, "recovery_record_not_found"),
+            _ => error(StatusCode::SERVICE_UNAVAILABLE, "recovery_review_unavailable"),
+        }
+    }
+
     pub(crate) async fn retain_control_recovery_copies(&self, genesis: &str, plan: &str, owner: &str, bytes: &[u8]) -> Reply {
         let (Some(pool), Some(binding)) = (&self.pool, self.delegated_recovery.get()) else {
             return unavailable();
