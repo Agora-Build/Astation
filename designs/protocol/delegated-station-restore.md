@@ -149,6 +149,11 @@ grant, including members who have since been removed or demoted. Pending and
 cancelled recovery additions confer no authority. For this plan it rechecks the
 saved challenge, signature and exported records at the recorded acceptance time.
 A journal created after the first grant shows `missing_early_range: true`.
+Each reviewed report includes the slot and base64url process ID from the verified
+SDK report. The Mac uses its unique matching slot from the protected process
+list for this Station and membership head. With no current, unambiguous match
+it can still submit journal evidence under its platform slot. The slot alone
+never matches a process or establishes complete participant coverage.
 An empty reports list identifies a known author with no accepted report in this
 plan. `known_authors.prior_plans` lists the authors and reports from each earlier
 retained membership head. An old report describes only its original plan.
