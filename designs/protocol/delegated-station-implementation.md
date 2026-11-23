@@ -133,6 +133,35 @@ Package adoption does not implement Station report carriage, complete process
 enumeration, author barriers, production recovery publication or VII.A.
 Shared-host WAIT, #176 hold and disabled delegated activation remain.
 
+## Exact Portal recovery source
+
+The Station has an explicit report-credential consumer for
+`GET /api/v1/stations/changes?checkpoint=1`. It requires the checkpoint key,
+an empty changes list and one bounded, duplicate-free response. A legacy
+cursor-zero reply, partial/page-shaped snapshot or invalid response is refused.
+The configured report binding travels with the stored source. Built-in
+`station.agora.build` and `station-dev.agora.build` snapshots require account
+completeness and bindings; custom snapshots must contain neither, even as null.
+An incomplete account view never means an absent account is enabled. A legacy
+null revocation time stays unknown.
+
+The collector retains this exact source with the policy's existing durable
+compare-and-swap revision. Equal feed cursors do not suppress binding changes:
+the binding content/version and a fresh local revision are retained together.
+Lower/conflicting binding versions and disappearing known bindings/integrations
+are refused, retaining the prior source for recovery. A later ordinary feed
+response or denial invalidates the source's current-revision marker without
+erasing its retained evidence. Delayed replica writes cannot overwrite either.
+Collecting this source never replaces live integrations/cursor, refreshes their
+authorization age, or clears an execution denial.
+
+This read-only collection entry point is not wired into the background worker
+or production recovery provider yet. Binding-to-room ownership enforcement,
+account lifecycle closures, history/clock completeness and locked plan-source
+comparison remain required. No provider, signing, publication or reopening is
+enabled by a successful collection. D27 pending releases/admin actions are not
+inferred. The normal hosted policy polling path remains in use.
+
 ## Native client HTTP carriage
 
 All endpoints are under `/api/remote/v1/logs/{genesis}/control`, require the

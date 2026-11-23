@@ -146,10 +146,10 @@ impl PortalReportClient {
         })
     }
 
-    async fn response<T: DeserializeOwned>(
+    async fn response_bytes(
         mut response: reqwest::Response,
         bound: usize,
-    ) -> Result<T, PortalError> {
+    ) -> Result<Vec<u8>, PortalError> {
         let status = response.status().as_u16();
         match status {
             200 | 409 => {}
@@ -182,6 +182,11 @@ impl PortalReportClient {
                 },
             );
         }
+        Ok(bytes)
+    }
+
+    async fn response<T: DeserializeOwned>(response: reqwest::Response, bound: usize) -> Result<T, PortalError> {
+        let bytes = Self::response_bytes(response, bound).await?;
         serde_json::from_slice(&bytes).map_err(|_| PortalError::Contract)
     }
 
@@ -257,6 +262,36 @@ impl PortalReportClient {
             *self.token.lock().await = None;
         }
         result
+    }
+
+    /// Explicit exact-snapshot read; a legacy cursor-zero answer is never a substitute.
+    pub(crate) async fn checkpoint(&self) -> Result<crate::integration_checkpoint::PortalCheckpoint, PortalError> {
+        let token = self.access_token().await?;
+        let response = self.http.get(format!("{}/api/v1/stations/changes", self.binding.portal_origin))
+            .query(&[("checkpoint", "1")]).bearer_auth(token).send().await
+            .map_err(|_| PortalError::Unavailable)?;
+        let result = Self::response_bytes(response, crate::integration_checkpoint::MAX_CHECKPOINT_BYTES).await;
+        if matches!(result, Err(PortalError::Denied)) { *self.token.lock().await = None; }
+        crate::integration_checkpoint::PortalCheckpoint::parse(&result?, &self.binding)
+            .map_err(|_| PortalError::Contract)
+    }
+
+    /// The recovery collector can retain this source atomically. Production
+    /// enforcement/publication must separately bind it to the complete plan.
+    pub(crate) async fn collect_checkpoint(&self, store: &PolicyStore) -> Result<(), PortalError> {
+        let old = store.load(&self.binding).await.map_err(|_| PortalError::Unavailable)?;
+        match self.checkpoint().await {
+            Ok(snapshot) => {
+                let next = old.apply_checkpoint(snapshot, chrono::Utc::now().timestamp())
+                    .map_err(|_| PortalError::Contract)?;
+                store.commit(&old, &next).await.map_err(|_| PortalError::Conflict)
+            }
+            Err(error @ PortalError::Denied) => {
+                store.deny(&self.binding).await.map_err(|_| PortalError::Unavailable)?;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn report(&self, report: IntegrationReport<'_>) -> Result<(), PortalError> {
@@ -457,7 +492,8 @@ pub(crate) mod tests {
     ) -> axum::response::Response {
         assert_eq!(headers["authorization"], "Bearer test-report-token");
         shared.feeds.fetch_add(1, Ordering::SeqCst);
-        shared.cursors.lock().await.push(query["cursor"]);
+        if let Some(cursor) = query.get("cursor") { shared.cursors.lock().await.push(*cursor); }
+        else { assert_eq!(query.get("checkpoint"), Some(&1)); }
         let code = shared.status.load(Ordering::SeqCst) as u16;
         (
             StatusCode::from_u16(code).unwrap(),

@@ -7,6 +7,7 @@ mod cluster;
 mod encryption;
 mod identity_store;
 mod integration_auth;
+mod integration_checkpoint;
 mod integration_feed;
 mod integration_portal;
 mod station_integrations;
