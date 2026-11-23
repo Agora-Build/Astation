@@ -546,7 +546,8 @@ impl StationIntegrations {
                 .map_err(|_| unavailable())?
         } else {
             let sealed =
-                service_keys::load_or_create_pending(&self.policies.0, &self.vault, &context)
+                service_keys::load_or_create_pending(&self.policies.0, &self.vault, &context,
+                    self.app.recovery.signing_ceilings.get().map(|store| (store, log.account_id())))
                     .await
                     .map_err(|_| unavailable())?;
             PublicKey::new(

@@ -21,9 +21,23 @@ pub(crate) async fn fixture_with_issuer(
     Arc<StationIntegrations>,
     Fixture,
 ) {
+    fixture_with_ceiling_cluster(issuer, None).await
+}
+
+pub(crate) async fn fixture_with_ceiling_cluster(
+    issuer: &str,
+    external: Option<&sqlx::PgPool>,
+) -> (crate::test_database::TestDatabase, Arc<StationIntegrations>, Fixture) {
     let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 8).await;
     let mut app = crate::tests::test_state();
     app.recovery = RecoveryStore::postgres(db.pool.clone());
+    use crate::service_signing_ceilings::SigningCeilings;
+    let ceilings = if let Some(external) = external {
+        SigningCeilings::connect(&db.pool, (*external.connect_options()).clone()).await.unwrap()
+    } else {
+        SigningCeilings::fixture(db.reconnect(2).await).await
+    };
+    assert!(app.recovery.signing_ceilings.set(ceilings).is_ok());
     app.accounts = Arc::new(crate::account_store::PgAccountStore::new(db.pool.clone()));
     sqlx::query("INSERT INTO account_identities (issuer,subject,principal) VALUES ($1,$2,$3)")
         .bind(issuer)

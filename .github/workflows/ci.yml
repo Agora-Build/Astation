@@ -161,6 +161,17 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      signing-postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 55434:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -209,6 +220,7 @@ jobs:
         working-directory: relay-server
         env:
           RECOVERY_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:55433/postgres
+          SIGNING_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:55434/postgres
           TEST_REDIS_URL: redis://127.0.0.1:56379/
         run: |
           cargo test --locked --features delegated-host-work

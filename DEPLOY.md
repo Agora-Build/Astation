@@ -781,6 +781,43 @@ effects, signs, clears an unknown clock anchor or reopens the fence. See
 [the recovery procedure](designs/protocol/delegated-station-restore.md) for the
 remaining obligations and the limits of the external generation guard.
 
+### Shared service signing store
+
+Every Station replica that provisions service keys or signs delegated control records
+uses the same secret `STATION_SIGNING_CEILING_DATABASE_URL`. Point it at a dedicated
+PostgreSQL cluster with a persistent volume and independent backup and recovery.
+Install [the signing-store schema](relay-server/signing-store/schema.sql) as its owner.
+Use an ordinary logged table, durable storage, fsync and a writable primary.
+Station checks the cluster identifier on every new signing-store connection and
+uses synchronous commits. Replicas retry ordinary outages against the configured store.
+Upgrade every service signer before allowing delegated work. An older binary
+can produce signatures without making the corresponding reservation.
+
+Give the runtime role CONNECT on that database, USAGE on the schema, SELECT on the
+table, INSERT on `account_id, genesis_hash, service_id, key_hash`, and UPDATE on
+`highest_ms` alone. Keep ownership, schema creation, DELETE, TRUNCATE and any
+replication privileges with the operator. The Station primary and signing database
+roles each need EXECUTE on `pg_catalog.pg_control_system()` in their respective
+databases. Restrict network access to the replicas and operators.
+
+A new key registers before its provisioning transaction commits. The signer durably
+reserves a batch of elapsed milliseconds before it produces the first signature.
+A failed or uncertain publication can consume a range. A retry waits for later elapsed
+time if needed. The store contains account, genesis, service and public-key identifiers
+and the maximum reserved timestamp. An unknown legacy key cannot start at zero.
+If the external row falls behind a retained service signature, reconciliation
+refuses the next batch and recovery reports the discrepancy.
+
+Restore the Station database under the deployment fence and keep the signing store
+at its latest durable state. The configured operator `prepare` command reads all
+registrations for the protocol account and genesis, flags missing membership keys,
+and binds the observation to the recovery plan. Snapshot publication still requires
+fresh checks and participant evidence. If signing history is lost, a failover may
+have discarded commits, or all replicas cannot establish the same store, drain signing
+and keep the fence closed. An old signing-store backup cannot establish continuity.
+Restore proven complete history or have the owner re-enroll the affected integration
+as a new service principal through Portal.
+
 Rollback caveat: once `0003` has been applied, a relay image built before it
 fails at startup (`sqlx` migrate error `VersionMissing(3)`: the database has a
 migration the binary does not know). Roll back to an image that includes

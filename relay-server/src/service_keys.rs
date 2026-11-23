@@ -170,9 +170,47 @@ pub(crate) struct ServiceSigner {
 }
 
 impl ServiceSigner {
+    pub(crate) async fn sign_control_batch(
+        &self,
+        store: &crate::service_signing_ceilings::SigningCeilings,
+        bodies: &[atem_client::control::ControlBody],
+        previously_signed: u64,
+    ) -> Result<Vec<atem_client::control::ControlRecord>, ()> {
+        use atem_client::control::{principal_key_of, ControlRecord};
+        let first = bodies.first().ok_or(())?;
+        let last = bodies.last().ok_or(())?;
+        if bodies
+            .iter()
+            .any(|body| body.account_id != first.account_id)
+            || !bodies
+                .windows(2)
+                .all(|pair| pair[0].issued_at.checked_add(1) == Some(pair[1].issued_at))
+        {
+            return Err(());
+        }
+        let key = principal_key_of(&self.public).map_err(|_| ())?.to_hex();
+        store
+            .reserve(
+                &first.account_id,
+                &self.context.genesis,
+                &self.context.service_id,
+                &key,
+                previously_signed,
+                first.issued_at..=last.issued_at,
+            )
+            .await?;
+        bodies
+            .iter()
+            .map(|body| {
+                let object = self.sign_control(body).map_err(|_| ())?;
+                ControlRecord::from_signed(object).map_err(|_| ())
+            })
+            .collect()
+    }
+
     /// Control signing stays separate from the channel-only KeyProvider. The
     /// caller cannot change the sealed key's principal, integration or Station.
-    pub(crate) fn sign_control(&self, body: &atem_client::control::ControlBody)
+    fn sign_control(&self, body: &atem_client::control::ControlBody)
         -> atem_client::Result<atem_client::SignedObject>
     {
         use atem_client::control::{control_signing_input, control_with_signature,
@@ -238,26 +276,43 @@ pub(crate) async fn load_or_create_pending(
     pool: &sqlx::PgPool,
     vault: &ServiceKeyVault,
     context: &ServiceKeyContext,
+    ceiling: Option<(&crate::service_signing_ceilings::SigningCeilings, &str)>,
 ) -> Result<SealedServiceKey, ()> {
+    let mut tx = pool.begin().await.map_err(|_| ())?;
     let binding = String::from_utf8(context.aad()?).map_err(|_| ())?;
     let candidate = vault.generate(context)?;
     let encoded = serde_json::to_string(&candidate).map_err(|_| ())?;
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO station_service_keys (context, sealed) VALUES ($1, $2) ON CONFLICT DO NOTHING",
     )
     .bind(&binding)
     .bind(encoded)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|_| ())?;
+    if inserted.rows_affected() == 1 {
+        if let Some((store, account_id)) = ceiling {
+            let signer = vault.open(context, &candidate)?;
+            let key = atem_client::control::principal_key_of(&signer.public).map_err(|_| ())?;
+            store
+                .register_new_key(
+                    account_id,
+                    &context.genesis,
+                    &context.service_id,
+                    &key.to_hex(),
+                )
+                .await?;
+        }
+    }
     let stored: String =
         sqlx::query_scalar("SELECT sealed FROM station_service_keys WHERE context = $1")
             .bind(binding)
-            .fetch_one(pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|_| ())?;
     let sealed = serde_json::from_str(&stored).map_err(|_| ())?;
     let _ = vault.open(context, &sealed)?;
+    tx.commit().await.map_err(|_| ())?;
     Ok(sealed)
 }
 
@@ -427,8 +482,8 @@ mod tests {
         let vault = ServiceKeyVault::new(&[7; 32], "operator-v1").unwrap();
         let context = context();
         let (one, two) = tokio::join!(
-            load_or_create_pending(&database.pool, &vault, &context),
-            load_or_create_pending(&database.pool, &vault, &context)
+            load_or_create_pending(&database.pool, &vault, &context, None),
+            load_or_create_pending(&database.pool, &vault, &context, None)
         );
         let one = one.unwrap();
         assert_eq!(one.public_key, two.unwrap().public_key);
@@ -446,10 +501,10 @@ mod tests {
             .await
             .is_err());
         let wrong_key = ServiceKeyVault::new(&[8; 32], "operator-v1").unwrap();
-        assert!(load_or_create_pending(&pool, &wrong_key, &context)
+        assert!(load_or_create_pending(&pool, &wrong_key, &context, None)
             .await
             .is_err());
-        let retained = load_or_create_pending(&pool, &vault, &context)
+        let retained = load_or_create_pending(&pool, &vault, &context, None)
             .await
             .unwrap();
         assert_eq!(one.public_key, retained.public_key);
@@ -469,7 +524,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        assert!(load_or_create_pending(&pool, &vault, &context)
+        assert!(load_or_create_pending(&pool, &vault, &context, None)
             .await
             .is_err());
         pool.close().await;

@@ -237,7 +237,13 @@ async fn delegated_recovery(args: &[String]) -> i32 {
             crate::remote_api::recovery::delegated_recovery::plan::outcome::abandon(&pool, &binding, genesis,
                 native_plan.expect("validated plan")).await
         } else if command == "prepare" {
-            crate::remote_api::recovery::delegated_recovery::plan::prepare(&pool, &binding, genesis).await
+            let Ok(ceilings) = crate::service_signing_ceilings::SigningCeilings::from_env(&pool).await else {
+                eprintln!("invalid signing store configuration");
+                return 1;
+            };
+            crate::remote_api::recovery::delegated_recovery::plan::prepare_with_ceilings(
+                &pool, &binding, genesis, ceilings.as_ref(),
+            ).await
         } else {
             inspect_root(&pool, &binding, genesis).await
         };
