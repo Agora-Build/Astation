@@ -318,6 +318,7 @@ public final class RemoteControlSigningJournal {
                   preview.member == saved.member, preview.key == key, preview.signedRecords == evidence.signedRecords,
                   preview.reportDraftBodies == drafts else { throw RemoteControlPublicationError.requiresReview }
         }
+        var heldRevision: UInt64?
         if let prior = saved.barriers?[origin] {
             // Never replace a different plan using a caller-supplied generation,
             // or mistake a restored outbox for the disappearance of a frozen draft.
@@ -336,6 +337,9 @@ public final class RemoteControlSigningJournal {
                 guard prior.context.planID == context.planID, prior.context.generation == context.generation,
                       prior.context.candidateFeedID == context.candidateFeedID, prior.context.sourceHash == context.sourceHash,
                       prior.records == records, prior.drafts == drafts else { throw RemoteControlPublicationError.requiresReview }
+                // The held revision identifies the frozen record and draft sets.
+                // Renewing the challenge advances storage without moving that cut.
+                heldRevision = prior.revision
                 if prior.context == context, prior.slot == slot, prior.challengeJSON == challengeJSON {
                     return try prior.request(log: log, id: id, since: saved.since, member: saved.member, nowMs: nowMs).signRequest()
                 }
@@ -346,7 +350,7 @@ public final class RemoteControlSigningJournal {
             throw RemoteControlPublicationError.full
         }
         let revision = saved.revision + 1
-        let barrier = Barrier(context: context, revision: revision, records: records, drafts: drafts,
+        let barrier = Barrier(context: context, revision: heldRevision ?? revision, records: records, drafts: drafts,
             signedRecords: evidence.signedRecords, challengeJSON: challengeJSON, slot: slot)
         // Reject malformed, expired or unauthorized requests before acquiring a hold.
         let request = try barrier.request(log: log, id: id, since: saved.since, member: saved.member, nowMs: nowMs)

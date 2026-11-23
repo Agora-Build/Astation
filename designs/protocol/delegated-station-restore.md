@@ -132,8 +132,14 @@ The account client posts `{"report": <signed report>, "records": [<signed record
 to `POST /api/remote/v1/logs/{genesis}/control/recovery/signer-reports`.
 Under the closed fence and locked owner root, Station verifies the SDK report
 and exports against the saved challenge, exact head, plan, current evidence
-and database time. A committed report contributes its SHA-256 submission
-hash to the review's evidence commitment. Each request is bounded to 256 KiB
+and database time. The first observation of a journal, or a change to its signed summary for the
+same member, slot and process, commits the exact submission hash to the review.
+After all authors have contributed, each can confirm that common evidence hash.
+The Mac keeps the held journal revision while renewing a challenge over the same
+frozen inventory. It durably advances its local checkpoint before returning the
+new request and before exposing its signature. An identical journal confirmation
+changes the reconstruction hash while leaving the evidence hash available to
+the other authors. New evidence requires fresh confirmations. Each request is bounded to 256 KiB
 and the Station retains up to 256 submissions per plan.
 
 A successful response contains `plan_id`, `retained_only: true` and
@@ -184,7 +190,9 @@ and membership head. A change requires a fresh export. The output names historic
 managers without a current roster, reviewed processes without a report in this
 plan, and reported processes absent from the supplied list. A match requires
 the same member, slot and SDK process ID. Early journal gaps and ambiguous
-process identities remain visible even when a tuple matches. This command reads
+process identities remain visible even when a tuple matches. The comparison
+also lists which reviewed tuples' latest reports sign the current evidence hash
+and which still need confirmation. A retried receipt retains its original scope. This command reads
 one Mac's export and cannot attest its provenance, establish complete history,
 release a signing hold or reopen a feed.
 

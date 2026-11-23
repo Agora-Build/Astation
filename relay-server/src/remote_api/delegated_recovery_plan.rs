@@ -148,10 +148,14 @@ async fn review_evidence(
 ) -> Result<(), sqlx::Error> {
     let signed = review_source_evidence(connection, prepared, log, binding, report, operator_review).await?;
     report["recovery_signatures"] = signatures::inspection(connection, prepared, log, binding, report, &signed).await?;
-    report["reconstruction_hash"] = source_hash(&json!({
+    let mut reconstruction = json!({
         "source_evidence_hash": report["evidence_hash"],
         "signature_evidence_hash": report["recovery_signatures"]["evidence_hash"],
-    }))?.into();
+    });
+    if let Some(confirmations) = report.get("author_confirmation_hash") {
+        reconstruction["author_confirmation_hash"] = confirmations.clone();
+    }
+    report["reconstruction_hash"] = source_hash(&reconstruction)?.into();
     Ok(())
 }
 
@@ -177,6 +181,9 @@ async fn review_source_evidence(
         "recovered_stops": report["recovered_stops"]["evidence_hash"],
         "native_archives": report["native_archives"]["evidence_hash"],
     });
+    if !history.confirmation_hashes.is_empty() {
+        report["author_confirmation_hash"] = source_hash(&json!(history.confirmation_hashes))?.into();
+    }
     let hashes = history.current_report_hashes;
     if !hashes.is_empty() { sources["signer_reports"] = json!(hashes); }
     report["evidence_hash"] = source_hash(&sources)?.into();

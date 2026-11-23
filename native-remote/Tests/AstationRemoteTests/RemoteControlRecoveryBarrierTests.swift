@@ -65,6 +65,39 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
         XCTAssertThrowsError(try box.prepare(body: host, log: f.log), "", assertHeld)
     }
 
+    func testFreshConfirmationOfTheSameHeldInventorySurvivesRestart() throws {
+        let f = try ControlPublicationFixture(), first = try context(f), now = f.clock.wallMs
+        let next = try RemoteControlRecoveryContext(accountID: first.accountID, genesisHash: first.genesisHash,
+            stationOrigin: first.stationOrigin, generation: first.generation, planID: first.planID,
+            sourceHash: first.sourceHash, evidenceHash: String(repeating: "c", count: 64),
+            candidateFeedID: first.candidateFeedID, membershipHead: first.membershipHead)
+        let stop = try f.body()
+        _ = try f.prepare(stop)
+        let record = try f.sign(stop)
+
+        func confirm(_ context: RemoteControlRecoveryContext) throws -> VerifiedSignerReport {
+            let journal = try f.readAuthorJournal("manager"), ch = try challenge(context, now: now)
+            let request = try journal.holdForReport(context: context, challengeJSON: ch, log: f.log,
+                slot: "astation-macos", nowMs: now, outboxes: [f.journal], recoveryCopies: [])
+            let result = try journal.finishReport(context: context, reviewed: request, log: f.log,
+                nowMs: { now }, current: { true }, sign: f.keys.sign)
+            XCTAssertEqual(result.records, [record])
+            return try verifySignerReport(log: f.log, reportJson: result.report, expectedChallengeJson: ch,
+                exportedRecordsJson: result.records, nowMs: now)
+        }
+
+        let firstReport = try confirm(first)
+        let storedRevision = try f.readAuthorJournal("manager").revision
+        let secondReport = try confirm(next)
+        XCTAssertEqual(secondReport.journal, firstReport.journal)
+        XCTAssertNotEqual(secondReport.recovery.evidenceHash, firstReport.recovery.evidenceHash)
+        let reopened = try f.readAuthorJournal("manager")
+        XCTAssertGreaterThan(reopened.revision, storedRevision)
+        XCTAssertThrowsError(try reopened.requireStopChange(origin: next.stationOrigin))
+        let retry = try XCTUnwrap(reopened.exposedSubmission(for: next, log: f.log))
+        XCTAssertEqual(retry.context, next)
+    }
+
     func testUncertainBarrierCommitNeverReturnsARequestAndReopenSeesWhatBecameDurable() throws {
         for stored in [false, true] {
             let f = try ControlPublicationFixture(), c = try context(f), ch = try challenge(c, now: f.clock.wallMs)
