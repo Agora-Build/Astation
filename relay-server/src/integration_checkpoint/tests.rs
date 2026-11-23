@@ -190,8 +190,8 @@ fn equal_feed_cursor_does_not_hide_binding_changes_or_allow_version_rollback() {
         .is_err());
     let polled = next
         .apply(
-            next.cursor,
-            serde_json::from_value(json!({"changes":[],"cursor":next.cursor})).unwrap(),
+            0,
+            serde_json::from_value(json!({"changes":[],"cursor":0,"integrations":[]})).unwrap(),
             103,
         )
         .unwrap();
@@ -217,6 +217,37 @@ fn equal_feed_cursor_does_not_hide_binding_changes_or_allow_version_rollback() {
     assert!(emptied
         .apply_checkpoint(parse(&swapped, &config).unwrap(), 107)
         .is_err());
+}
+
+#[test]
+fn collecting_a_source_never_refreshes_or_replaces_live_execution_policy() {
+    let config = binding(true);
+    let raw = source(true);
+    let mut live_row = raw["checkpoint"]["integrations"][0].clone();
+    live_row["state"] = json!("paused");
+    let live = PolicyCheckpoint::empty(config.clone())
+        .unwrap()
+        .apply(
+            0,
+            serde_json::from_value(json!({"changes":[],"cursor":0,"integrations":[live_row]}))
+                .unwrap(),
+            100,
+        )
+        .unwrap();
+    let collected = live
+        .apply_checkpoint(parse(&raw, &config).unwrap(), 221)
+        .unwrap();
+    assert_eq!(collected.cursor, live.cursor);
+    assert_eq!(collected.integrations, live.integrations);
+    assert_eq!(collected.denied, live.denied);
+    assert_eq!(collected.received_at, live.received_at);
+    assert!(collected.current(ID, OWNER, 221).is_err());
+    assert_eq!(
+        collected.portal_snapshot.as_ref().unwrap().integrations[ID]
+            .policy
+            .state,
+        "ready"
+    );
 }
 
 #[tokio::test]
@@ -296,7 +327,10 @@ async fn postgres_delegated_portal_http_collection_preserves_source_on_errors_an
     *fixture.shared.feed.lock().await = Some(source(false));
     client.collect_checkpoint(&store).await.unwrap();
     let first = store.load(&fixture.binding).await.unwrap();
-    assert_eq!(first.cursor, 12);
+    assert_eq!(first.cursor, 0);
+    assert_eq!(first.portal_snapshot.as_ref().unwrap().cursor, 12);
+    assert!(first.denied);
+    assert_eq!(first.received_at, 0);
     assert!(first.portal_snapshot.is_some());
     fixture.set_status(503);
     assert_eq!(
@@ -330,6 +364,6 @@ async fn postgres_delegated_portal_http_collection_preserves_source_on_errors_an
     fixture.set_status(200);
     *fixture.shared.feed.lock().await = Some(source(false));
     client.collect_checkpoint(&store).await.unwrap();
-    assert!(!store.load(&fixture.binding).await.unwrap().denied);
+    assert!(store.load(&fixture.binding).await.unwrap().denied);
     database.cleanup().await;
 }

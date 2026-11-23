@@ -152,6 +152,8 @@ Lower/conflicting binding versions and disappearing known bindings/integrations
 are refused, retaining the prior source for recovery. A later ordinary feed
 response or denial invalidates the source's current-revision marker without
 erasing its retained evidence. Delayed replica writes cannot overwrite either.
+Collecting this source never replaces live integrations/cursor, refreshes their
+authorization age, or clears an execution denial.
 
 This read-only collection entry point is not wired into the background worker
 or production recovery provider yet. Binding-to-room ownership enforcement,

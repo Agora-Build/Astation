@@ -263,6 +263,9 @@ impl PolicyCheckpoint {
             snapshot.integrations.get(id).is_none_or(|next| next.policy.owner_account != row.policy.owner_account))) {
             return Err(());
         }
+        if self.portal_snapshot.as_ref().is_some_and(|old| snapshot.cursor < old.cursor) {
+            return Err(());
+        }
         if let Some(previous) = self.portal_snapshot.as_ref().and_then(|source| source.bindings.as_ref()) {
             let current = snapshot.bindings.as_ref().ok_or(())?.iter()
                 .map(|row| ((&row.account_id, &row.genesis_hash), row)).collect::<BTreeMap<_, _>>();
@@ -274,11 +277,8 @@ impl PolicyCheckpoint {
             }
         }
         let mut next = self.clone();
-        next.cursor = snapshot.cursor;
         next.revision = self.revision.checked_add(1).ok_or(())?;
-        next.received_at = now;
-        next.denied = false;
-        next.integrations = snapshot.integrations.iter().map(|(id, row)| (id.clone(), row.policy.clone())).collect();
+        // Collection cannot replace live policy, refresh its lease or clear a denial.
         next.portal_snapshot = Some(snapshot);
         next.portal_snapshot_revision = Some(next.revision);
         Ok(next)
@@ -353,10 +353,7 @@ impl PolicyStore {
                 if let Some(snapshot) = &checkpoint.portal_snapshot {
                     snapshot.validate_for(binding)?;
                     if let Some(revision) = checkpoint.portal_snapshot_revision {
-                        let policies = snapshot.integrations.iter()
-                            .map(|(id, row)| (id.clone(), row.policy.clone())).collect::<BTreeMap<_, _>>();
-                        if revision != checkpoint.revision || snapshot.cursor != checkpoint.cursor
-                            || policies != checkpoint.integrations { return Err(()); }
+                        if revision != checkpoint.revision { return Err(()); }
                     }
                 } else if checkpoint.portal_snapshot_revision.is_some() { return Err(()); }
                 Ok(checkpoint)
