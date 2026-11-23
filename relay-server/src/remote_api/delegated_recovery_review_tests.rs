@@ -455,7 +455,7 @@ async fn postgres_signer_report_is_verified_once_and_receipted_across_replicas()
         let (status, challenge) = post_recovery(&a, &format!("{base}/signer-challenges"), Some("alice"), mint(slot)).await;
         assert_eq!(status, StatusCode::OK);
         let challenge = SignerReportChallenge::parse(challenge.to_string().as_bytes()).unwrap();
-        let journal = JournalView {id:[1;16], since:1, revision:2, records:vec![original["body"].to_string()], drafts:vec![]};
+        let journal = JournalView {id:[1;16], since:2, revision:2, records:vec![original["body"].to_string()], drafts:vec![]};
         let body = signer_report_body(&f.log, &challenge, signer, slot, ORIGIN, &journal, challenge.issued_at()).unwrap();
         let report = sign_signer_report(&f.keys, &KeyId::new("manager"), &body).unwrap();
         inputs.push(json!({"report":report.to_json(),"records":[original]}));
@@ -497,5 +497,15 @@ async fn postgres_signer_report_is_verified_once_and_receipted_across_replicas()
     assert_eq!(count, 1);
     assert_eq!(saved(&database.pool, &genesis).await, before);
     assert!(!inspect(&database.pool, ORIGIN).await.unwrap().unwrap().ready);
+    let review = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let author = &review["known_authors"]["members"]["member:phone"];
+    assert_eq!(author["member_status"], "manager");
+    assert_eq!(author["reports"][0]["missing_early_range"], true);
+    assert_eq!(author["reports"][0]["journal"]["records"], 1);
+    assert_eq!(author["reports"][0]["submission_hash"], one.1["submission_hash"]);
+    assert_eq!(review["known_authors"]["complete_history"], false);
+    // A corrupted retained report cannot appear in a subsequent operator review.
+    sqlx::query("UPDATE station_delegated_signer_reports SET accepted_at=0").execute(&database.pool).await.unwrap();
+    assert!(plan::prepare(&database.pool, &binding, &genesis).await.is_err());
     database.cleanup().await;
 }

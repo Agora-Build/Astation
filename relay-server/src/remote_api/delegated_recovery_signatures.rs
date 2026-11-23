@@ -290,7 +290,7 @@ async fn retain_checked(
         .execute(&mut *tx)
         .await?;
     }
-    super::review_evidence(&mut tx, &prepared, &log, binding, &mut report).await?;
+    super::review_evidence(&mut tx, &prepared, &log, binding, &mut report, owner.is_none()).await?;
     if owner.is_some() {
         report = json!({"version":1,"account_id":log.account_id(),"genesis_hash":genesis,
             "origin":binding.origin,"generation":binding.generation.to_string(),"plan_id":plan_id,

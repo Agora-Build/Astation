@@ -223,6 +223,13 @@ async fn postgres_delegated_recovery_preserves_prior_checkpoint_stops_and_reserv
     later.initialize(&database.pool, true).await.unwrap();
     let restart = database.reconnect(2).await;
     let second = prepare(&restart, &later, &genesis).await.unwrap();
+    let authors = &second["known_authors"]["members"];
+    assert_eq!(authors["member:phone"]["first_manage_seq"], 1);
+    assert_eq!(authors["member:phone"]["member_status"], "demoted");
+    assert_eq!(authors["member:replacement-manager"]["member_status"], "manager");
+    assert_eq!(authors["member:replacement-manager"]["first_manage_seq"], added.next.head().seq);
+    assert_eq!(authors["member:phone"]["reports"], json!([]));
+    assert_eq!(second["known_authors"]["complete_history"], false);
     let history = &second["known_history"];
     let records = history["records"].as_array().expect("known obligations");
     assert_eq!(records.len(), 2);

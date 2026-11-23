@@ -18,6 +18,8 @@ pub(crate) mod signatures;
 
 #[path = "delegated_signer_challenges.rs"]
 pub(crate) mod signer_challenges;
+#[path = "delegated_author_history.rs"]
+mod author_history;
 #[path = "delegated_signer_reports.rs"]
 pub(crate) mod signer_reports;
 
@@ -59,7 +61,7 @@ pub(crate) async fn prepare(
 ) -> Result<Value, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let (prepared, log, mut report) = checkpoint(&mut tx, binding, genesis, true).await?;
-    review_evidence(&mut tx, &prepared, &log, binding, &mut report).await?;
+    review_evidence(&mut tx, &prepared, &log, binding, &mut report, true).await?;
     tx.commit().await?;
     Ok(report)
 }
@@ -75,7 +77,7 @@ pub(crate) async fn review_for_owner(
     let mut tx = pool.begin().await?;
     let (prepared, log, mut report) =
         checkpoint_for_owner(&mut tx, binding, genesis, false, Some(owner)).await?;
-    review_evidence(&mut tx, &prepared, &log, binding, &mut report).await?;
+    review_evidence(&mut tx, &prepared, &log, binding, &mut report, false).await?;
     let summary = json!({
         "version": 1,
         "account_id": log.account_id(),
@@ -108,7 +110,11 @@ async fn review_evidence(
     log: &Membership,
     binding: &Binding,
     report: &mut Value,
+    operator_review: bool,
 ) -> Result<(), sqlx::Error> {
+    if operator_review {
+        report["known_authors"] = signer_reports::inspect(connection, prepared, log, binding).await?;
+    }
     review_source_evidence(connection, prepared, log, binding, report).await?;
     report["recovery_signatures"] = signatures::inspection(connection, prepared, log, binding, report).await?;
     report["reconstruction_hash"] = source_hash(&json!({

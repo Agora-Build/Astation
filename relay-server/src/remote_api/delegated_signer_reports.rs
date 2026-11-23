@@ -136,3 +136,69 @@ pub(crate) async fn submit(
     tx.commit().await?;
     Ok(receipt)
 }
+
+/// Reverify accepted bytes under the retained list and the original acceptance
+/// time. Only the operator's preparation command requests this bounded walk.
+pub(super) async fn inspect(
+    db: &mut PgConnection,
+    plan: &super::Prepared,
+    log: &atem_client::membership::Membership,
+    binding: &Binding,
+) -> Result<Value, sqlx::Error> {
+    use futures_util::TryStreamExt;
+    let mut authors = super::author_history::inventory(log);
+    let mut rows = sqlx::query_as::<_, (i64, Value, Value, String, i64)>(
+        "SELECT connection,challenge,submission,submission_hash,accepted_at
+         FROM station_delegated_signer_reports WHERE plan_id=$1 ORDER BY connection LIMIT 257",
+    )
+    .bind(&plan.plan_id)
+    .fetch(db);
+    let mut count = 0;
+    while let Some((connection, raw, input, hash, accepted)) = rows.try_next().await? {
+        count += 1;
+        if count > MAX_REPORTS || source_hash(&input)? != hash {
+            return Err(invalid());
+        }
+        let challenge =
+            SignerReportChallenge::parse(raw.to_string().as_bytes()).map_err(|_| invalid())?;
+        let recovery = challenge.recovery();
+        let when = u64::try_from(accepted).map_err(|_| invalid())?;
+        if challenge.connection() != u64::try_from(connection).map_err(|_| invalid())?
+            || recovery.generation() != binding.generation as u64
+            || recovery.plan_id() != plan.plan_id
+            || recovery.source_hash().to_hex() != plan.source_hash
+            || recovery.candidate_feed_id() != plan.candidate_feed_id
+            || challenge.origin() != binding.origin
+            || when < challenge.issued_at()
+            || when >= challenge.expires_at()
+        {
+            return Err(invalid());
+        }
+        let exported: Vec<_> = input["records"]
+            .as_array()
+            .ok_or_else(invalid)?
+            .iter()
+            .map(Value::to_string)
+            .collect();
+        let verified = verify_signer_report(
+            log,
+            input["report"].to_string().as_bytes(),
+            &challenge,
+            &exported,
+            when,
+        )
+        .map_err(|_| invalid())?;
+        if !verified.at_head {
+            return Err(invalid());
+        }
+        let author = authors.get_mut(&verified.signer).ok_or_else(invalid)?;
+        let first = author["first_manage_seq"].as_u64().ok_or_else(invalid)?;
+        let summary = json!({"connection":connection, "slot":verified.slot, "journal":verified.journal.to_json(),
+            "missing_early_range":verified.journal.since > first, "submission_hash":hash});
+        author["reports"]
+            .as_array_mut()
+            .ok_or_else(invalid)?
+            .push(summary);
+    }
+    Ok(json!({"members":authors,"complete_history":false}))
+}

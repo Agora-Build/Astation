@@ -143,6 +143,16 @@ submission needs a current challenge. A conflicting reuse of a connection is
 refused. Retention leaves the signing hold and recovery fence in place.
 Historical coverage and snapshot publication require separate evidence.
 
+The operator's preparation output includes `known_authors.members`. It walks the
+signed membership history to find each native member's earliest effective manager
+grant, including members who have since been removed or demoted. Pending and
+cancelled recovery additions confer no authority. For this plan it rechecks the
+saved challenge, signature and exported records at the recorded acceptance time.
+A journal created after the first grant shows `missing_early_range: true`.
+An empty reports list identifies a known author with no accepted report in this
+plan. This view uses only the available membership and current plan; independent
+historical sources and complete participant coverage are still required.
+
 ## Implemented fence and operator commands
 
 An opt-in delegated deployment must set
