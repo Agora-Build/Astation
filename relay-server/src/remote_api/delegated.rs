@@ -502,19 +502,15 @@ impl Stored {
         Ok(true)
     }
 
-    fn reconcile_service(
-        &mut self,
+    fn plan_service(
+        &self,
         origin: &str,
         log: &Membership,
-        service: ServiceControl,
+        context: &crate::service_keys::ServiceKeyContext,
+        key: &atem_client::keys::PublicKey,
+        desired: ServiceDesired,
         now: u64,
-    ) -> Result<Value, Fault> {
-        use atem_client::{KeyId, KeyProvider};
-        let ServiceControl {
-            context,
-            signer,
-            desired,
-        } = service;
+    ) -> Result<Vec<ControlBody>, Fault> {
         if context.genesis != log.genesis_hash().to_hex() || context.station_origin != origin {
             return Err(Fault::Invalid);
         }
@@ -522,14 +518,10 @@ impl Stored {
         if !matches!(member.member.kind, MemberKind::Service { .. }) {
             return Err(Fault::Invalid);
         }
-        let key = signer
-            .public_key(&KeyId::new(&context.service_id))
-            .map_err(|_| Fault::Invalid)?;
-        if key != member.member.auth_key {
+        if key != &member.member.auth_key {
             return Err(Fault::Invalid);
         }
         let principal = ControlPrincipal::Service(context.service_id.clone());
-        let covered = covered_hosts(log, &principal);
         let records = self
             .records
             .iter()
@@ -593,9 +585,9 @@ impl Stored {
                 }
             }
         }
-        let mut published = Vec::new();
+        let mut bodies = Vec::new();
         if actions.is_empty() {
-            return Ok(serde_json::json!({"published": published}));
+            return Ok(bodies);
         }
         let previous = self.signing_high_water.get(&principal.name()).copied().unwrap_or(0);
         // Reserve successive elapsed milliseconds ending at the observed wall time.
@@ -605,31 +597,26 @@ impl Stored {
             return Err(Fault::Unavailable);
         }
         for (action, issued_at) in actions.into_iter().zip(first..=now) {
-            let object = signer
-                .sign_control(&ControlBody {
-                    account_id: log.account_id().into(),
-                    genesis_hash: log.genesis_hash(),
-                    feed: Some(ControlFeed {
-                        origin: origin.into(),
-                        feed_id: self.feed_id.clone(),
-                    }),
-                    principal: principal.clone(),
-                    principal_key: Some(principal_key_of(&key).map_err(|_| Fault::Invalid)?),
-                    signer: ControlSigner::Principal,
-                    action,
-                    record_id: uuid::Uuid::new_v4().to_string(),
-                    issued_at,
-                    about: ControlAbout {
-                        integration_id: Some(context.integration_id.clone()),
-                        by: "reconciled".into(),
-                    },
-                })
-                .map_err(|_| Fault::Invalid)?;
-            let record = ControlRecord::from_signed(object).map_err(|_| Fault::Invalid)?;
-            self.publish(origin, log, &record, now, &covered, now)?;
-            published.push(record.record_id().to_owned());
+            bodies.push(ControlBody {
+                account_id: log.account_id().into(),
+                genesis_hash: log.genesis_hash(),
+                feed: Some(ControlFeed {
+                    origin: origin.into(),
+                    feed_id: self.feed_id.clone(),
+                }),
+                principal: principal.clone(),
+                principal_key: Some(principal_key_of(key).map_err(|_| Fault::Invalid)?),
+                signer: ControlSigner::Principal,
+                action,
+                record_id: uuid::Uuid::new_v4().to_string(),
+                issued_at,
+                about: ControlAbout {
+                    integration_id: Some(context.integration_id.clone()),
+                    by: "reconciled".into(),
+                },
+            });
         }
-        Ok(serde_json::json!({"published":published}))
+        Ok(bodies)
     }
 }
 
@@ -640,10 +627,64 @@ pub(crate) enum ServiceDesired {
     Revoked { interrupt_running: bool },
 }
 
-pub(crate) struct ServiceControl {
-    pub context: crate::service_keys::ServiceKeyContext,
-    pub signer: crate::service_keys::ServiceSigner,
-    pub desired: ServiceDesired,
+impl super::RecoveryStore {
+    pub(crate) async fn reconcile_service_in(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        owner: &str,
+        context: &crate::service_keys::ServiceKeyContext,
+        signer: &crate::service_keys::ServiceSigner,
+        desired: ServiceDesired,
+    ) -> Result<bool, ()> {
+        use atem_client::{KeyId, KeyProvider};
+        let origin = self.delegated_origin.get().ok_or(())?;
+        self.lock_delegated_recovery(tx).await.map_err(|_| ())?;
+        let (subject, state) = Self::locked_root(tx, &context.genesis)
+            .await
+            .map_err(|_| ())?
+            .ok_or(())?;
+        if subject != owner {
+            return Err(());
+        }
+        let mut root: Root = serde_json::from_value(state).map_err(|_| ())?;
+        let genesis = atem_client::Hash32::from_hex(&context.genesis).map_err(|_| ())?;
+        let mut log =
+            Membership::from_stored(&root.account, &genesis, &root.membership).map_err(|_| ())?;
+        let clock = super::now();
+        log.advance(&clock);
+        if log.frozen().is_some() {
+            return Err(());
+        }
+        ensure(&mut root, origin, &log).map_err(|_| ())?;
+        let feed = root.delegated.get_mut(origin).ok_or(())?;
+        let key = signer
+            .public_key(&KeyId::new(&context.service_id))
+            .map_err(|_| ())?;
+        let bodies = feed
+            .plan_service(origin, &log, context, &key, desired, clock.wall_ms)
+            .map_err(|_| ())?;
+        if bodies.is_empty() {
+            return Ok(false);
+        }
+        let covered = covered_hosts(&log, &bodies[0].principal);
+        let store = self.signing_ceilings.get().ok_or(())?;
+        for record in signer.sign_control_batch(store, &bodies).await? {
+            feed.publish(
+                origin,
+                &log,
+                &record,
+                clock.wall_ms,
+                &covered,
+                clock.wall_ms,
+            )
+            .map_err(|_| ())?;
+        }
+        super::finish_root(&mut root, &log, clock.wall_ms).map_err(|_| ())?;
+        Self::save_root(tx, &context.genesis, owner, root)
+            .await
+            .map_err(|_| ())?;
+        Ok(true)
+    }
 }
 
 pub(super) fn ensure(root: &mut Root, origin: &str, log: &Membership) -> Result<(), Fault> {
@@ -741,7 +782,6 @@ pub(crate) enum Command {
     },
     Ledger(LedgerUpdate),
     ReportingControl(Vec<ReportControlEvent>),
-    ReconcileService(ServiceControl),
     Owner(OwnerCommand),
 }
 
@@ -922,15 +962,6 @@ pub(super) fn apply(
                 .get_mut(origin)
                 .ok_or(Fault::Unavailable)?
                 .reporting_control(origin, log, &events, now)
-        }
-        Command::ReconcileService(service) => {
-            if binding.is_some() {
-                return Err(Fault::Invalid);
-            }
-            root.delegated
-                .get_mut(origin)
-                .ok_or(Fault::Unavailable)?
-                .reconcile_service(origin, log, service, now)
         }
         Command::Owner(command) => {
             if binding.is_some() {

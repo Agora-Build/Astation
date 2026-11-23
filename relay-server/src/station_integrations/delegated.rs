@@ -1,6 +1,6 @@
 use super::*;
 use crate::remote_api::recovery::delegated::{
-    Command, LedgerUpdate, ReportControlEvent, ServiceControl, ServiceDesired,
+    Command, LedgerUpdate, ReportControlEvent, ServiceDesired,
 };
 use atem_client::control::{AckLedger, ReportAnswer};
 
@@ -61,31 +61,22 @@ impl StationIntegrations {
             // never manufacture a release, stop, or cover from expiry alone.
             _ => return Ok(()),
         };
-        let signer = crate::service_keys::load_approved(
-            &self.policies.0,
+        let signer = crate::service_keys::load_approved_in(
+            &mut tx,
             &self.vault,
             &context,
             policy.r9_svc.as_deref().ok_or(())?,
         )
         .await?;
-        let genesis = context.genesis.clone();
-        let (status, _) = self
-            .app
-            .recovery
-            .delegated_operation(
-                &genesis,
-                &principal,
-                Command::ReconcileService(ServiceControl {
-                    context,
-                    signer,
-                    desired,
-                }),
-            )
-            .await;
-        if status != StatusCode::OK {
-            return Err(());
+        let recovery = &self.app.recovery;
+        let published = recovery
+            .reconcile_service_in(&mut tx, &principal, &context, &signer, desired)
+            .await?;
+        tx.commit().await.map_err(|_| ())?;
+        if published {
+            recovery.notify_delegated_change();
         }
-        tx.commit().await.map_err(|_| ())
+        Ok(())
     }
 
     pub(super) async fn run_delegated_reports(self: Arc<Self>) {
@@ -330,12 +321,16 @@ impl StationIntegrations {
 }
 
 #[cfg(all(test, feature = "delegated-host-work"))]
+#[path = "signing_ceiling_tests.rs"]
+mod signing_ceiling_tests;
+
+#[cfg(all(test, feature = "delegated-host-work"))]
 mod tests {
     use super::super::tests::{ID, OWNER};
     use super::*;
     use crate::remote_api::recovery::delegated::tests::pending_report;
 
-    async fn policy(
+    pub(super) async fn policy(
         runtime: &StationIntegrations,
         state: &str,
         fingerprint: &str,
@@ -352,7 +347,7 @@ mod tests {
         runtime.policies.commit(&previous, &next).await.unwrap();
     }
 
-    async fn feed(runtime: &StationIntegrations, genesis: &str) -> Vec<Value> {
+    pub(super) async fn feed(runtime: &StationIntegrations, genesis: &str) -> Vec<Value> {
         let state: Value =
             sqlx::query_scalar("SELECT state FROM remote_recovery_roots WHERE genesis_hash=$1")
                 .bind(genesis)

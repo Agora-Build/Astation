@@ -22,6 +22,7 @@ mod rtc_session;
 mod session_store;
 mod station_ai;
 mod service_keys;
+mod service_signing_ceilings;
 mod voice_session;
 #[cfg(test)]
 mod voice_routes;
@@ -782,6 +783,20 @@ async fn serve() {
         }
     };
 
+    if std::env::var_os("STATION_SIGNING_CEILING_DATABASE_URL").is_some() {
+        let configured = match recovery.pool() {
+            Some(primary) => service_signing_ceilings::SigningCeilings::from_env(&primary).await,
+            None => Err(()),
+        };
+        match configured {
+            Ok(Some(store)) => { let _ = recovery.signing_ceilings.set(store); }
+            _ => {
+                tracing::error!("Invalid service signing store configuration");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // The relay decides Pending vs legacy Astation connections and verifies
     // registered keys from an in-memory cache, so it is loaded once here,
     // before the relay's shared state is set up.
@@ -869,6 +884,16 @@ async fn serve() {
             tracing::error!("Delegated host work requires STATION_DELEGATED_RECOVERY_GENERATION, maintained outside database backups");
             std::process::exit(1);
         };
+        if std::env::var_os("STATION_REPORT_CLIENT_ID").is_some() {
+            let Some(store) = recovery.signing_ceilings.get() else {
+                tracing::error!("Delegated service signing requires STATION_SIGNING_CEILING_DATABASE_URL");
+                std::process::exit(1);
+            };
+            if store.check_access().await.is_err() {
+                tracing::error!("Delegated service signing cannot access its reservation store");
+                std::process::exit(1);
+            }
+        }
         if let Err(reason) = recovery.configure_delegated(&origin, generation).await {
             tracing::error!("Delegated host work cannot start: {}", reason);
             std::process::exit(1);

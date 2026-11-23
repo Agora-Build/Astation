@@ -60,14 +60,29 @@ fn source_hash(value: &Value) -> Result<String, sqlx::Error> {
 
 /// Preserve the exact retained source and reserve one replacement identity.
 /// All replicas serialize through the closed deployment fence and root lock.
+#[cfg(test)]
 pub(crate) async fn prepare(
     pool: &PgPool,
     binding: &Binding,
     genesis: &str,
 ) -> Result<Value, sqlx::Error> {
+    prepare_with_ceilings(pool, binding, genesis, None).await
+}
+
+pub(crate) async fn prepare_with_ceilings(
+    pool: &PgPool,
+    binding: &Binding,
+    genesis: &str,
+    ceilings: Option<&crate::service_signing_ceilings::SigningCeilings>,
+) -> Result<Value, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let (prepared, log, mut report) = checkpoint(&mut tx, binding, genesis, true).await?;
     review_evidence(&mut tx, &prepared, &log, binding, &mut report, true).await?;
+    if let Some(ceilings) = ceilings {
+        let evidence = ceilings.recovery_evidence(&log, &report).await.map_err(|_| invalid())?;
+        report["service_clock_evidence_hash"] = source_hash(&evidence)?.into();
+        report["service_clock_evidence"] = evidence;
+    }
     tx.commit().await?;
     Ok(report)
 }

@@ -174,6 +174,7 @@ pub struct RecoveryStore {
     delegated_recovery: OnceLock<delegated_recovery::Binding>,
     recovery_review_only: OnceLock<()>,
     verifier_replicas: OnceLock<verifier_replicas::ReplicaRegistry>,
+    pub(crate) signing_ceilings: OnceLock<crate::service_signing_ceilings::SigningCeilings>,
     delegated_changes: tokio::sync::watch::Sender<u64>,
 }
 
@@ -330,6 +331,10 @@ impl RecoveryStore {
         }
         sqlx::query_as("SELECT genesis_hash,account_subject FROM remote_recovery_roots WHERE genesis_hash>$1 AND state->'delegated' ? $2 ORDER BY genesis_hash LIMIT 32")
             .bind(after).bind(origin).fetch_all(self.pool.as_ref()?).await.ok()
+    }
+
+    pub(crate) fn notify_delegated_change(&self) {
+        self.delegated_changes.send_modify(|version| *version = version.wrapping_add(1));
     }
 
     pub(crate) fn delegated_changes(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -656,6 +661,7 @@ impl RecoveryStore {
             delegated_recovery: OnceLock::new(),
             recovery_review_only: OnceLock::new(),
             verifier_replicas: OnceLock::new(),
+            signing_ceilings: OnceLock::new(),
             delegated_changes: tokio::sync::watch::channel(0).0,
         })
     }
@@ -667,6 +673,7 @@ impl RecoveryStore {
             delegated_recovery: OnceLock::new(),
             recovery_review_only: OnceLock::new(),
             verifier_replicas: OnceLock::new(),
+            signing_ceilings: OnceLock::new(),
             delegated_changes: tokio::sync::watch::channel(0).0,
         })
     }
@@ -710,6 +717,7 @@ impl RecoveryStore {
             delegated_recovery: OnceLock::new(),
             recovery_review_only: OnceLock::new(),
             verifier_replicas: OnceLock::new(),
+            signing_ceilings: OnceLock::new(),
             delegated_changes: tokio::sync::watch::channel(0).0,
         })
     }
@@ -732,8 +740,7 @@ impl RecoveryStore {
     async fn perform_scoped(&self, genesis: &str, subject: Option<&str>, operation: Operation) -> Reply {
         let changed = matches!(&operation, Operation::Append { .. }
             | Operation::Delegated { command: delegated::Command::Publish { .. }
-                | delegated::Command::Owner(delegated::OwnerCommand::Publish { .. })
-                | delegated::Command::ReconcileService(_), .. });
+                | delegated::Command::Owner(delegated::OwnerCommand::Publish { .. }), .. });
         let hash = match Hash32::from_hex(genesis) {
             Ok(h) => h,
             Err(_) => return invalid(),
@@ -772,7 +779,7 @@ impl RecoveryStore {
             unavailable()
         };
         if changed && reply.0 == StatusCode::OK {
-            self.delegated_changes.send_modify(|version| *version = version.wrapping_add(1));
+            self.notify_delegated_change();
         }
         reply
     }
@@ -814,14 +821,7 @@ impl RecoveryStore {
     async fn database_apply(&self, connection: &mut sqlx::PgConnection, genesis: &str,
         subject: Option<&str>, hash: Hash32, operation: Operation) -> Result<Reply, sqlx::Error>
     {
-        // Lock absent roots too. A hash collision only serializes unrelated roots.
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(genesis)
-            .execute(&mut *connection)
-            .await?;
-        let saved: Option<(String, Value)> = sqlx::query_as(
-            "SELECT account_subject, state FROM remote_recovery_roots WHERE genesis_hash = $1 FOR UPDATE")
-            .bind(genesis).fetch_optional(&mut *connection).await?;
+        let saved = Self::locked_root(connection, genesis).await?;
         if saved.as_ref().is_some_and(|(owner, _)| subject.is_some_and(|subject| owner != subject)) {
             return Ok(error(StatusCode::NOT_FOUND, "recovery_record_not_found"));
         }
@@ -838,11 +838,36 @@ impl RecoveryStore {
             Ok(r) => r,
             Err(reply) => return Ok(reply),
         };
+        Self::save_root(connection, genesis, &owner, root).await?;
+        Ok(reply)
+    }
+
+    async fn locked_root(
+        connection: &mut sqlx::PgConnection,
+        genesis: &str,
+    ) -> Result<Option<(String, Value)>, sqlx::Error> {
+        // Lock absent roots too. A hash collision only serializes unrelated roots.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(genesis)
+            .execute(&mut *connection)
+            .await?;
+        let saved: Option<(String, Value)> = sqlx::query_as(
+            "SELECT account_subject, state FROM remote_recovery_roots WHERE genesis_hash = $1 FOR UPDATE")
+            .bind(genesis).fetch_optional(&mut *connection).await?;
+        Ok(saved)
+    }
+
+    async fn save_root(
+        connection: &mut sqlx::PgConnection,
+        genesis: &str,
+        owner: &str,
+        root: Root,
+    ) -> Result<(), sqlx::Error> {
         let value = serde_json::to_value(root).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
         sqlx::query("INSERT INTO remote_recovery_roots (genesis_hash, account_subject, state) VALUES ($1,$2,$3) \
             ON CONFLICT (genesis_hash) DO UPDATE SET state = EXCLUDED.state, updated_at = now()")
             .bind(genesis).bind(owner).bind(value).execute(&mut *connection).await?;
-        Ok(reply)
+        Ok(())
     }
 }
 
@@ -1112,14 +1137,19 @@ fn apply(
             )
         }
     };
-    root.routes.retain(|_, binding| binding.valid(&log));
-    root.proxies.retain(|_, binding| binding.valid(&log));
-    retain(&mut root, &log, clock.wall_ms);
+    finish_root(&mut root, &log, clock.wall_ms)?;
+    Ok((root, reply))
+}
+
+fn finish_root(root: &mut Root, log: &Membership, wall_ms: u64) -> Result<(), Reply> {
+    root.routes.retain(|_, binding| binding.valid(log));
+    root.proxies.retain(|_, binding| binding.valid(log));
+    retain(root, log, wall_ms);
     root.membership = log.to_stored();
     if serde_json::to_vec(&root).map_err(|_| unavailable())?.len() > MAX_STATE {
         return Err(unavailable());
     }
-    Ok((root, reply))
+    Ok(())
 }
 
 fn retain(root: &mut Root, log: &Membership, now: u64) {
