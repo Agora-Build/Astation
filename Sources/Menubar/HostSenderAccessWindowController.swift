@@ -18,12 +18,14 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
     private let status = NSTextField(wrappingLabelWithString: "")
     private let refresh = NSButton(title: "Refresh", target: nil, action: nil)
     private let servers = NSButton(title: "Review Station Servers...", target: nil, action: nil)
+    private let processes = NSButton(title: "Review Member Processes...", target: nil, action: nil)
     private let revoke = NSButton(title: "Revoke...", target: nil, action: nil)
     private let readmit = NSButton(title: "Readmit...", target: nil, action: nil)
     private let interrupt = NSButton(title: "Interrupt...", target: nil, action: nil)
     private let resume = NSButton(title: "Continue Saved Change...", target: nil, action: nil)
     private let cancel = NSButton(title: "Cancel Unsigned Change", target: nil, action: nil)
     private var rows: [Row] = []
+    private var verifierMembers: [String] = []
     private var task: Task<Void, Never>?
     private var generation = UUID()
     private var coordinator: AstationRecoveryCoordinator?
@@ -45,7 +47,8 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
         actions.spacing = 8
         let savedActions = NSStackView(views: [resume, cancel])
         savedActions.spacing = 8
-        let stack = NSStackView(views: [intro, hosts, details, actions, savedActions, servers, status])
+        let stack = NSStackView(views: [intro, hosts, details, actions, savedActions,
+            NSStackView(views: [servers, processes]), status])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 16
         guard let content = window.contentView else { return }
         content.addSubview(stack)
@@ -62,7 +65,8 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
         status.textColor = .secondaryLabelColor
         hosts.target = self; hosts.action = #selector(selectedHost)
         hosts.setAccessibilityLabel("Host sender")
-        for (button, action) in [(refresh, #selector(reload)), (servers, #selector(reviewServers)), (revoke, #selector(revokeHost)),
+        for (button, action) in [(refresh, #selector(reload)), (servers, #selector(reviewServers)),
+            (processes, #selector(reviewProcesses)), (revoke, #selector(revokeHost)),
             (readmit, #selector(readmitHost)), (interrupt, #selector(interruptHost)),
             (resume, #selector(resumeChange)), (cancel, #selector(cancelChange))] {
             button.bezelStyle = .rounded; button.target = self; button.action = action
@@ -155,6 +159,8 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
     }
 
     private func populate(log: MembershipLog, coordinator: AstationRecoveryCoordinator) throws {
+        verifierMembers = log.members().filter { $0.status == .active && ["native", "service"].contains($0.kind) }
+            .map(\.deviceId).sorted()
         let previous = rows.indices.contains(hosts.indexOfSelectedItem) ? rows[hosts.indexOfSelectedItem].hostID : nil
         pending = try coordinator.pendingHostSenderReview()
         pendingInterrupt = try coordinator.pendingHostInterrupts().first
@@ -178,6 +184,7 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
         hosts.isEnabled = task == nil && !hasSavedChange
         refresh.isEnabled = task == nil
         servers.isEnabled = task == nil && current?() == true && coordinator?.verifierRosterReviewAvailable == true
+        processes.isEnabled = task == nil && current?() == true && coordinator?.processReviewAvailable == true && !verifierMembers.isEmpty
     }
 
     static func serverReviewText(_ review: AstationRecoveryCoordinator.VerifierRosterReview) -> String {
@@ -214,6 +221,79 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
                 try await coordinator.acceptStationVerifierRoster(review, current: current)
                 guard current(), generation == epoch else { return }
                 status.stringValue = "Station server list saved. Live support checks are still required."
+            } catch { if generation == epoch { status.stringValue = error.localizedDescription } }
+        }
+        render()
+    }
+
+    private func processEditor(_ text: String, editable: Bool) -> (NSScrollView, NSTextView) {
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 490, height: 160))
+        let view = NSTextView(frame: scroll.bounds)
+        view.isRichText = false; view.isEditable = editable
+        view.isAutomaticDashSubstitutionEnabled = false
+        view.isAutomaticTextReplacementEnabled = false
+        view.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        view.string = text
+        scroll.hasVerticalScroller = true; scroll.documentView = view
+        return (scroll, view)
+    }
+
+    @objc private func reviewProcesses() {
+        guard task == nil, let coordinator, let current, current(), NSApp.isActive else { return }
+        let pick = NSAlert()
+        pick.messageText = "Choose a verifier member"
+        pick.informativeText = "Review the processes using this device or integration's signing key."
+        let members = NSPopUpButton()
+        members.addItems(withTitles: verifierMembers)
+        members.selectItem(withTitle: coordinator.managerID)
+        pick.accessoryView = members
+        pick.addButton(withTitle: "Continue"); pick.addButton(withTitle: "Cancel")
+        guard pick.runModal() == .alertFirstButtonReturn, let member = members.titleOfSelectedItem, current() else { return }
+        let epoch = generation
+        let active = { current() && NSApp.isActive && !Task.isCancelled }
+        task = Task { [weak self] in
+            guard let self else { return }
+            defer { task = nil; render() }
+            do {
+                let review = try await coordinator.prepareProcessReview(member: member, current: active)
+                guard active() else { throw AccountLoginError.changed }
+                let edit = NSAlert()
+                edit.messageText = "Processes for " + member
+                edit.informativeText = "Include every SDK process using this key, even offline ones. Enter its configured slot name and SDK process ID on each line, separated by a space."
+                if member == coordinator.managerID {
+                    edit.informativeText += "\n\nThis Mac's SDK process ID is " + verifierReportProcess()
+                }
+                let (scroll, text) = processEditor(review.previous?.lines.joined(separator: "\n") ?? "", editable: true)
+                edit.accessoryView = scroll
+                edit.window.initialFirstResponder = text
+                edit.addButton(withTitle: "Review List"); edit.addButton(withTitle: "Cancel")
+                var lines: [String]
+                while true {
+                    guard edit.runModal() == .alertFirstButtonReturn, active() else { return }
+                    do {
+                        lines = try AstationProcessRoster.rows(member: member, text: text.string).map { $0.slot + " " + $0.process }
+                        break
+                    } catch {
+                        edit.messageText = "Check the process list"
+                        edit.informativeText = "Enter one unique slot and its 22-character SDK process ID on each line. Include at least one process."
+                    }
+                }
+                let selected = Set(lines)
+                let removed = (review.previous?.lines ?? []).filter { !selected.contains($0) }
+                let confirm = NSAlert()
+                confirm.messageText = "Confirm processes for " + member
+                confirm.informativeText = "Station: " + review.origin + "\nDevice list revision: " + String(review.head.seq) +
+                    "\nConfirm that this list includes every SDK process using this key. Each still needs a fresh signed report."
+                var summary = lines.joined(separator: "\n")
+                if !removed.isEmpty {
+                    confirm.alertStyle = .warning
+                    summary += "\n\nRemoved from the previous review:\n" + removed.joined(separator: "\n")
+                }
+                confirm.accessoryView = processEditor(summary, editable: false).0
+                confirm.addButton(withTitle: "Confirm with Mac..."); confirm.addButton(withTitle: "Cancel")
+                guard confirm.runModal() == .alertFirstButtonReturn, active() else { return }
+                try await coordinator.acceptProcessReview(review, lines: lines, current: active)
+                if current() { status.stringValue = "Process list saved for " + member + "." }
             } catch { if generation == epoch { status.stringValue = error.localizedDescription } }
         }
         render()

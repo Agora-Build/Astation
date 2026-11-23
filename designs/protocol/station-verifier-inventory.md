@@ -368,3 +368,26 @@ native endpoints, or add a protected roster editor. An external SDK service
 still needs its separately authorized carrier; its report cannot be inferred
 from a native process or a Station-managed service. No report secret or private
 key is uploaded, and no new signing/execution gate is enabled by these routes.
+
+### Manager review of a member's verifier processes
+
+In the Mac app, open **Manage Host Senders** and choose **Review Member
+Processes**. Select an active native or service member from the signed device
+list. Enter every SDK process that uses its key, including offline processes.
+Each row contains the configured slot name and the process's SDK identifier.
+The editor shows this Mac's identifier when reviewing its member. For a remote
+process, the operator supplies the identifier obtained from that process.
+
+The final review shows the Station, member, device-list revision, proposed
+rows and removed entries. A manager confirms with Touch ID or their Mac
+password. The coordinator rereads the signed list, checks the existing
+manager keys and saves the exact rows in the protected account checkpoint.
+Changing the selected Station or device-list head invalidates the review.
+On a later head the previous rows are available for editing, including offline
+slots. A successful save cannot clear the conflict journal or supply live
+evidence. Older app versions refuse a checkpoint containing process rosters.
+
+The review covers one member at one Station. The production provider must
+establish coverage for every active member, host and Station replica, and
+obtain independent evidence from every required process. Third-party service
+carriage, production polling and VII.A are still open.
