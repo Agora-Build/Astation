@@ -51,6 +51,7 @@ final class AstationRecoveryCoordinator {
         var restoreKit: String?
         var restore: Data?
         var pendingDataKey: SavedKey?
+        var controlJournalIDs: [String: Data]?
         var controlPublications: [String: Data]?
         var controlRecoveryPublications: [String: Data]?
         var hostSenderReview: Data?
@@ -74,6 +75,7 @@ final class AstationRecoveryCoordinator {
     private let confirmOwner: (SignRequest) async -> Bool
     private let confirmServiceOwner: (RemoteServiceApproval, SignRequest) async -> Bool
     private let authorizeDelegatedControl: ((MembershipLog) throws -> Void)?
+    private let controlSigningJournal: @MainActor (MembershipLog, String) throws -> RemoteControlSigningJournal
     private let controlRecoveryAuthority: RemoteControlRecoveryAuthorizing?
     private let authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)?
     private let confirmVerifierRoster: ((VerifierRosterReview) async -> Bool)?
@@ -175,6 +177,7 @@ final class AstationRecoveryCoordinator {
         confirmServiceOwner: ((RemoteServiceApproval, SignRequest) async -> Bool)? = nil,
         authorizeDelegatedControl: ((MembershipLog) throws -> Void)? = nil,
         controlRecoveryAuthority: RemoteControlRecoveryAuthorizing? = nil,
+        controlSigningJournal: @escaping @MainActor (MembershipLog, String) throws -> RemoteControlSigningJournal = RemoteControlSigningJournal.init(log:memberID:),
         authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)? = nil,
         additionalControlStations: ((MembershipLog) throws -> [String: RemoteControlStationTransport])? = nil,
         retainedControlTransport: ((String) throws -> RemoteControlStationTransport)? = nil,
@@ -194,6 +197,7 @@ final class AstationRecoveryCoordinator {
         self.confirmServiceOwner = confirmServiceOwner ?? { _, request in await confirmOwner(request) }
         self.authorizeDelegatedControl = authorizeDelegatedControl
         self.controlRecoveryAuthority = controlRecoveryAuthority
+        self.controlSigningJournal = controlSigningJournal
         self.authorizeNewMembership = authorizeNewMembership
         self.additionalControlStations = additionalControlStations
         self.retainedControlTransport = retainedControlTransport
@@ -205,7 +209,9 @@ final class AstationRecoveryCoordinator {
         self.now = now
         if let data = try store.read() {
             saved = try PropertyListDecoder().decode(Saved.self, from: data)
-            guard [2, 3, 4, 5].contains(saved.version), saved.accountID == accountID, saved.managerID == managerID,
+            guard [2, 3, 4, 5, 6].contains(saved.version), saved.accountID == accountID, saved.managerID == managerID,
+                  (saved.controlJournalIDs ?? [:]).allSatisfy({ RemoteRecoveryKit.validHash($0.key) && $0.value.count == 16 }),
+                  saved.version >= 6 || saved.controlJournalIDs == nil,
                   saved.version >= 5 || (saved.processRosters ?? [:]).isEmpty,
                   saved.version >= 4 || (saved.controlRecoveryPublications ?? [:]).isEmpty else {
                 throw RemoteRecoveryError.invalidCheckpoint
@@ -1803,7 +1809,7 @@ extension AstationRecoveryCoordinator {
         try requireDurableRecoveryCheckpoint()
         let provider = AstationMembershipKeyProvider(identity: identity, keyID: managerID,
             publicKey: try identity.remotePublicKeys().signing, controlRecordsAllowed: true)
-        _ = try recovery.sign(recordID: retained.body.recordId, log: latest, provider: provider, authority: authority,
+        _ = try recovery.sign(recordID: retained.body.recordId, log: latest, provider: provider, authorJournal: pinnedControlJournal, authority: authority,
             confirmedAt: confirmedAt, now: { Self.clock().monoMs }, current: current)
         return try recovery.export(context: retained.context, recordIDs: [retained.body.recordId])
     }
@@ -1869,7 +1875,10 @@ extension AstationRecoveryCoordinator {
         let retained = Set((saved.controlRecoveryPublications ?? [:]).keys).union(controlRecoveryPublications.keys)
         guard retained.contains(origin) || retained.count < 64 else { throw RemoteControlPublicationError.full }
         let save: (Data) throws -> Void = { [unowned self] bytes in
-            try self.persist { $0.controlRecoveryPublications = ($0.controlRecoveryPublications ?? [:]).merging([origin: bytes]) { _, new in new } }
+            try self.persist {
+                $0.version = 6
+                $0.controlRecoveryPublications = ($0.controlRecoveryPublications ?? [:]).merging([origin: bytes]) { _, new in new }
+            }
         }
         let value: RemoteControlRecoveryPublication
         if let data = saved.controlRecoveryPublications?[origin] {
@@ -2122,7 +2131,10 @@ extension AstationRecoveryCoordinator {
         guard retained.contains(origin) || retained.count < 64 else { throw RemoteControlPublicationError.full }
         guard let kit = try currentKit() else { throw RemoteRecoveryError.notCommitted }
         let persistControl: (Data) throws -> Void = { [unowned self] bytes in
-            try self.persist { $0.controlPublications = ($0.controlPublications ?? [:]).merging([origin: bytes]) { _, new in new } }
+            try self.persist {
+                $0.version = 6
+                $0.controlPublications = ($0.controlPublications ?? [:]).merging([origin: bytes]) { _, new in new }
+            }
             self.pendingControlCommit = true
         }
         let value: RemoteControlPublication
@@ -2271,6 +2283,26 @@ extension AstationRecoveryCoordinator {
         try controls().cancelUnsigned(recordID: review.recordID)
     }
 
+    private func pinnedControlJournal(log: MembershipLog, member: String) throws -> RemoteControlSigningJournal {
+        try requireDurableRecoveryCheckpoint()
+        guard member == managerID, log.accountId() == accountID else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        let journal = try controlSigningJournal(log, member)
+        let scope = journal.storageScope
+        if let id = saved.controlJournalIDs?[scope] {
+            guard journal.id == id else { throw RemoteRecoveryError.storageUncertain }
+        } else {
+            guard journal.revision == 0 else { throw RemoteRecoveryError.requiresReview }
+            try journal.establish()
+            try persist {
+                $0.version = 6
+                $0.controlJournalIDs = ($0.controlJournalIDs ?? [:]).merging([scope: journal.id]) { _, new in new }
+            }
+        }
+        return journal
+    }
+
     private func signControl(recordID: String, request: SignRequest, genesis: String, current: () -> Bool) async throws {
         let before = try await refreshedLog(genesis: genesis)
         try requireManager(before)
@@ -2286,7 +2318,7 @@ extension AstationRecoveryCoordinator {
         try requireDelegatedControl(log)
         let provider = AstationMembershipKeyProvider(identity: identity, keyID: managerID,
             publicKey: try identity.remotePublicKeys().signing, controlRecordsAllowed: true)
-        _ = try controls().sign(recordID: recordID, log: log, provider: provider,
+        _ = try controls().sign(recordID: recordID, log: log, provider: provider, authorJournal: pinnedControlJournal,
             confirmedAt: confirmedAt, now: { Self.clock().monoMs }, current: current)
     }
 

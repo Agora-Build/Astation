@@ -83,12 +83,32 @@ private final class ControlRecoveryFixture {
     }
     func sign(_ review: RemoteControlRecoveryReview, provider: AppKeyProvider? = nil,
         current: () -> Bool = { true }, confirmedAt: UInt64 = 100, now: @escaping @Sendable () -> UInt64 = { 100 }) throws -> String {
-        try journal.sign(recordID: review.body.recordId, log: source.log, provider: provider ?? source.keys,
+        try journal.sign(recordID: review.body.recordId, log: source.log, provider: provider ?? source.keys, authorJournal: source.authorJournal,
             authority: authority, confirmedAt: confirmedAt, now: now, current: current)
     }
 }
 
 final class RemoteControlRecoveryPublicationTests: XCTestCase {
+    @MainActor
+    func testOriginalAndRecoveryCopyShareAnAuthorJournalAcrossOutboxFailure() throws {
+        let f = try ControlRecoveryFixture(), review = try f.prepare()
+        let before = try f.source.authorJournal(f.source.log, "manager")
+        let signs = f.source.keys.signs
+        XCTAssertEqual(before.revision, 2)
+        f.failBeforeWrite = true
+        XCTAssertThrowsError(try f.sign(review))
+        XCTAssertEqual(f.source.keys.signs, signs + 1)
+        let after = try f.source.authorJournal(f.source.log, "manager")
+        XCTAssertEqual(after.id, before.id)
+        XCTAssertEqual(after.revision, 4)
+        f.failBeforeWrite = false
+        try f.restore()
+        XCTAssertThrowsError(try f.journal.export(context: review.context, recordIDs: [review.body.recordId]))
+        _ = try f.sign(review)
+        XCTAssertEqual(f.source.keys.signs, signs + 1)
+        XCTAssertNoThrow(try f.journal.export(context: review.context, recordIDs: [review.body.recordId]))
+    }
+
     @MainActor
     func testRemovedManagerOriginalNeedsFreshCurrentManagerAndKeepsItsExactIntent() throws {
         let f = try ControlRecoveryFixture(), keys = try f.source.replaceManager()
@@ -96,7 +116,7 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
         let authority = ControlRecoveryAuthority(context: context, original: f.original, reservedTime: f.authority.reservedTime)
         let review = try f.journal.prepare(originalRecordJSON: f.original, context: context,
             managerID: "other-manager", issuedAt: authority.reservedTime, log: f.source.log, authority: authority)
-        let record = try f.journal.sign(recordID: review.body.recordId, log: f.source.log, provider: keys,
+        let record = try f.journal.sign(recordID: review.body.recordId, log: f.source.log, provider: keys, authorJournal: f.source.authorJournal,
             authority: authority, confirmedAt: 100, now: { 100 }, current: { true })
         XCTAssertEqual(review.body.signer, "member:other-manager")
         XCTAssertEqual(review.body.interruptRunning, true)
@@ -115,7 +135,7 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
         let authority = ControlRecoveryAuthority(context: later, original: f.original, reservedTime: first.body.issuedAt + 1)
         let second = try f.journal.prepare(originalRecordJSON: f.original, context: later,
             managerID: "manager", issuedAt: authority.reservedTime, log: f.source.log, authority: authority)
-        _ = try f.journal.sign(recordID: second.body.recordId, log: f.source.log, provider: f.source.keys,
+        _ = try f.journal.sign(recordID: second.body.recordId, log: f.source.log, provider: f.source.keys, authorJournal: f.source.authorJournal,
             authority: authority, confirmedAt: 100, now: { 100 }, current: { true })
         try f.restore()
         XCTAssertEqual(try f.journal.reviews().count, 2)
@@ -156,7 +176,7 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
                 reservedTime: f.authority.reservedTime + UInt64(index))
             let review = try f.journal.prepare(originalRecordJSON: original, context: f.context,
                 managerID: "manager", issuedAt: authority.reservedTime, log: f.source.log, authority: authority)
-            _ = try f.journal.sign(recordID: review.body.recordId, log: f.source.log, provider: f.source.keys,
+            _ = try f.journal.sign(recordID: review.body.recordId, log: f.source.log, provider: f.source.keys, authorJournal: f.source.authorJournal,
                 authority: authority, confirmedAt: 100, now: { 100 }, current: { true })
             ids.append(review.body.recordId)
         }
@@ -218,7 +238,7 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
         let review = try f.prepare(), bytes = f.bytes
         f.authority.complete = false
         XCTAssertThrowsError(try f.sign(review))
-        XCTAssertThrowsError(try f.journal.sign(recordID: review.body.recordId, log: f.source.log, provider: f.source.keys,
+        XCTAssertThrowsError(try f.journal.sign(recordID: review.body.recordId, log: f.source.log, provider: f.source.keys, authorJournal: f.source.authorJournal,
             authority: nil, confirmedAt: 100, now: { 100 }, current: { true }))
         XCTAssertEqual(f.bytes, bytes)
         XCTAssertEqual(f.source.keys.signs, signs)

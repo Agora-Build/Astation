@@ -80,6 +80,14 @@ public final class RemoteRecoveryStore {
         try self.init(name: name, directory: directory, backend: KeychainCheckpointBackend(account: name), lockName: accountID)
     }
 
+    convenience init(controlJournalScope scope: String, keyScope: String) throws {
+        let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true).appendingPathComponent("Astation/Account Trust", isDirectory: true)
+        let name = "control-author:" + scope
+        try self.init(name: name, directory: directory, backend: KeychainCheckpointBackend(account: name),
+            lockName: "control-author-key:" + keyScope)
+    }
+
     /// Notification dedup has its own lock; it cannot contend with or own the
     /// account's enrollment/recovery operation. Only sealed hints are stored.
     public convenience init(pushAccountID: String, genesisHash: String, deviceID: String) throws {
