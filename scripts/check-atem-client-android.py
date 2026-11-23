@@ -69,16 +69,11 @@ def main():
     apple_pin = json.loads((REPO / "Config/atem-client-apple.json").read_text())
     if pin["revision"] != apple_pin["revision"]:
         raise ValueError("Android and Apple SDK revisions must agree")
-    data = args.archive.read_bytes() if args.archive else subprocess.check_output([
-        "gh", "api", f"repos/{pin['repository']}/actions/artifacts/{pin['artifact_id']}/zip"])
-    consumer.check_hash(data, pin["archive_sha256"], "GitHub artifact")
     with tempfile.TemporaryDirectory(prefix="astation-android-consumer-") as temporary:
         work = Path(temporary)
         payloads = work / "payloads"
         payloads.mkdir()
-        consumer.extract_zip(data, payloads)
-        for name, digest in pin["payload_sha256"].items():
-            consumer.check_hash((payloads / name).read_bytes(), digest, name)
+        consumer.release_payloads(pin, payloads, args.archive)
         source = json.loads((payloads / pin["source"]).read_text())
         if (source.get("commit") != pin["revision"] or source.get("tree_dirty") is not False
                 or source.get("artifact") != "android" or source.get("features") !=

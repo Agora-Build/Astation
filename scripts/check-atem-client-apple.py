@@ -67,27 +67,37 @@ def extract_zip(data, destination):
                 target.write_bytes(archive.read(entry))
 
 
+def release_payloads(pin, destination, archive=None):
+    """Verify each consumed asset against the reviewed release pin, including offline bundles."""
+    if pin["release"] != f"atem-client-sdk-{pin['revision'][:12]}":
+        raise ValueError("release does not match the pinned revision")
+    if archive:
+        extract_zip(archive.read_bytes(), destination)
+    else:
+        command = ["gh", "release", "download", pin["release"], "--repo", pin["repository"],
+                   "--dir", str(destination)]
+        for name in pin["payload_sha256"]:
+            command.extend(["--pattern", name])
+        subprocess.run(command, check=True)
+    for name, digest in pin["payload_sha256"].items():
+        if Path(name).name != name:
+            raise ValueError("invalid release asset name")
+        check_hash((destination / name).read_bytes(), digest, name)
+    for name, digest in pin.get("source_fixtures", {}).items():
+        check_hash((REPO / name).read_bytes(), digest, name)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--archive", type=Path, help="existing GitHub artifact ZIP; otherwise download with gh")
+    parser.add_argument("--archive", type=Path, help="offline ZIP of the pinned release assets; otherwise download with gh")
     parser.add_argument("--install", action="store_true", help="install the verified SwiftPM dependency under build/atem-client")
     args = parser.parse_args()
     pin = json.loads((REPO / "Config/atem-client-apple.json").read_text())
-    if args.archive:
-        data = args.archive.read_bytes()
-    else:
-        data = subprocess.check_output([
-            "gh", "api",
-            f"repos/{pin['repository']}/actions/artifacts/{pin['artifact_id']}/zip",
-        ])
-    check_hash(data, pin["archive_sha256"], "GitHub artifact")
     with tempfile.TemporaryDirectory(prefix="astation-client-consumer-") as temporary:
         work = Path(temporary)
         payloads = work / "payloads"
         payloads.mkdir()
-        extract_zip(data, payloads)
-        for name, digest in pin["payload_sha256"].items():
-            check_hash((payloads / name).read_bytes(), digest, name)
+        release_payloads(pin, payloads, args.archive)
         source = json.loads((payloads / pin["source"]).read_text())
         if (source.get("commit") != pin["revision"] or source.get("tree_dirty") is not False
                 or source.get("features") != "default (uniffi)"

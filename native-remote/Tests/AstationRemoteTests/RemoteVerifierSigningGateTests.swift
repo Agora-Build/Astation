@@ -137,6 +137,42 @@ private final class VerifierChannelHarness {
 
 final class RemoteVerifierSigningGateTests: XCTestCase {
     @MainActor
+    func testLegacyNativeRolesWaiveOnlyTheVerifierUpgradeRequirement() throws {
+        let f = try VerifierFixture()
+        let body = try f.log.draftEntry(signer: "manager", signedAt: f.clock.wallMs,
+            actionJson: "{\"action\":\"set_roles\",\"device_id\":\"manager\",\"roles\":[\"control\",\"manage\",\"view\"]}")
+        let request = try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: "manager")
+        XCTAssertNil(try membershipRequiredVersion(bodyJson: body))
+        let gate = try RemoteVerifierSigningGate(log: f.log, verifiers: f.roster)
+        XCTAssertNoThrow(try gate.authorize(request, log: f.log))
+        XCTAssertTrue(request.freshConfirmation)
+        XCTAssertThrowsError(try gate.authorize(f.review().signingRequest(managerID: "manager"), log: f.log))
+    }
+
+    @MainActor
+    func testActualSigningGateRejectsDuplicateAndUnknownActionsBeforeWaivingUpgrade() throws {
+        let f = try VerifierFixture()
+        let (gate, _) = try f.confirmedGate()
+        let body = try f.log.draftEntry(signer: "manager", signedAt: f.clock.wallMs,
+            actionJson: "{\"action\":\"set_roles\",\"device_id\":\"manager\",\"roles\":[\"control\",\"manage\",\"view\"]}")
+        let valid = try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: "manager")
+        XCTAssertNoThrow(try gate.authorize(valid, log: f.log))
+        let canonical = try XCTUnwrap(valid.bodyJson)
+        let malformed = [
+            String(canonical.dropLast()) + ",\"action\":\"set_roles\"}",
+            String(canonical.dropLast()) + ",\"\\u0061ction\":\"set_roles\"}",
+            canonical.replacingOccurrences(of: "\"action\":\"set_roles\"", with: "\"action\":\"future_action\"")
+        ]
+        for body in malformed {
+            XCTAssertNotEqual(body, canonical)
+            XCTAssertThrowsError(try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: "manager"))
+            let request = SignRequest(keyId: valid.keyId, purpose: valid.purpose,
+                freshConfirmation: valid.freshConfirmation, label: valid.label, input: valid.input, bodyJson: body)
+            XCTAssertThrowsError(try gate.authorize(request, log: f.log))
+        }
+    }
+
+    @MainActor
     func testStationEvidenceMustUseTheGatesExactAccountGenesisAndHead() throws {
         let fixture = try VerifierFixture(), other = try VerifierFixture()
         let gate = try RemoteVerifierSigningGate(log: fixture.log, verifiers: fixture.roster)

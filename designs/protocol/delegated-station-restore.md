@@ -27,6 +27,55 @@ verified complete snapshot. The generation is an operational rollback fence;
 it grants no signing or host authority. The UUID alone supplies no such
 protection.
 
+## Agreed author barrier (not yet implemented)
+
+The [November 23 review](https://github.com/Agora-Build/Astation/issues/114#issuecomment-7089435073)
+agrees Atem's exact-plan durable barrier B1-B6 and typed signer-report proposal.
+This closes the contract question about a stop signed after an author's report
+but before snapshot publication. It does not implement the barrier or establish
+that existing saved journals are complete.
+
+One journal lock must cover every process using the member's key. Before any
+stop signature, append the exact body durably as possibly signed, then save the
+signature. The report and barrier commit together, bound to the account,
+genesis, exact Station origin, external recovery generation, plan, candidate
+feed, membership head, journal identity/range/revision and source/evidence
+commitments. No report can escape before that commit. The report's exposure
+must itself be durable before export/return/transmission.
+
+While held, the barrier refuses the plan's new drafts and signatures before
+any prompt and at the key boundary: service stops at that origin, plus
+originless host-principal interrupts. Any active barrier for this account and
+genesis holds host interrupts; completing one origin's recovery cannot release
+another's barrier. Other-origin service stops are outside this plan.
+
+A possibly-signed body without its saved signature remains an unresolved
+obligation. Missing exported signatures cannot be reclassified as drafts or
+erased to make report hashes match. Unknown/old processes, missing journal
+ranges, a changed journal identity and possible protected-store rollback remain
+unresolved too. Owner approval and a signed report do not repair these gaps.
+
+Only authenticated durable evidence from the exact origin that the plan
+published, or can never publish, releases its barrier. A higher caller-supplied
+generation, timeout, report-lease expiry, sleep, restart or cancelled prompt
+cannot release it. A failed/uncertain release write retains the hold. Replacing
+a report for the same plan is atomic; a different plan requires proof the old
+one cannot publish. Changed evidence/head invalidates the prepared collection.
+
+The owner review must explain the temporary stop-signing restriction and the
+available device-list/channel emergency actions. The fenced Station must not
+serve usable delegated heads. All recovery publication gates stay closed until
+these adapter obligations and independent history/clock completeness are met.
+
+The adopted SDK's `check_control_snapshot_consistency` is deliberately weaker:
+it checks consistency only with supplied retained records/marks/covered set.
+A retained, still-valid Station-own or current-manager revoke/interrupt may be
+carried with the exact original body and signature, including its old feed,
+without a mark. Covers, holds and releases are signed anew. New service-key
+records bind the candidate feed and exceed its mark. Removed-manager copies
+require a fresh manager; an invalid/forged retained record never induces a
+signature. ACK and settlement evidence is new for the replacement feed.
+
 ## Implemented fence and operator commands
 
 An opt-in delegated deployment must set

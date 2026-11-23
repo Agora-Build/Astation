@@ -1,7 +1,8 @@
 # Delegated Station implementation (#79)
 
 This is implementation status against the agreed Atem Step 4 contract, pinned
-to `c7b0054fe1208cad1bac98162d9d3ea99b5307cc` (#166's merged tree).
+to `de7ec29882f23508a430436cba34f73f88c15ed1` (published SDK
+`atem-client-sdk-de7ec29882f2`, including #190-#199).
 The feature is **not ready for activation**. This change does not enable
 delegated execution or new native membership/control signing.
 
@@ -86,6 +87,51 @@ wiring remain required; the additional-route provider remains unset.
   binding grammar confirmed. A changes cursor alone does not version binding
   rows, which can change without a feed event. Exact binding content/versions
   must join locked recovery evidence; D27 release/invalidation is still pending.
+
+## November 23 SDK adoption and review resolutions
+
+Atem's responses crossed the November 22 status update. Its immutable
+`de7ec29882f2` SDK is now the Apple, Android and Station source pin. The release's
+combined manifest was verified before selecting the individual asset hashes;
+the consumers download published release assets, validate every consumed hash
+and source record, and retain an offline bundle option with the same checks.
+They no longer depend on expiring Actions artifacts. Native/Android test
+fixtures remain byte-bound to the published vectors; the supplemental signed
+membership fixture is pinned to the same source commit.
+
+The native gate now invokes the shared `membershipRequiredVersion`, removing
+the provisional local action/scope classifier. Its `nil` result waives only
+this upgrade check, never another authorization or signing boundary. The
+production participant provider remains absent and new signing remains off.
+
+The review answers are posted on
+[#101](https://github.com/Agora-Build/Astation/issues/101#issuecomment-7089434853),
+[#114](https://github.com/Agora-Build/Astation/issues/114#issuecomment-7089435073)
+and [Atem #120](https://github.com/Agora-Build/Atem/issues/120#issuecomment-7089435308):
+
+- The verifier challenge has a 4,096-byte bound; a mismatched configured origin
+  is `origin_mismatch`; the client's log has frozen, not host-held, state.
+  No extra reporter-wall-clock future-`issued_at` bound is requested. Native
+  authorization requires its own exact single-use challenge and ContinuousClock
+  deadline, captured before token work, with sleep/delay consuming at most 30 s.
+- The exact-plan durable author barrier and typed signer report are agreed
+  for implementation. The journal/locking/publication adapter remains
+  Astation-owned and unimplemented; the signer-report helper is a newly
+  approved Atem build, not part of this SDK.
+- Valid retained Station-own stops may be carried unchanged, as may a current
+  manager's. Covers/holds/releases are new signatures. The shared snapshot
+  checker reports consistency only, never complete history or clocks.
+- Routine key rotation uses the separate `host_enc_key_new` op, one persistent
+  pending key, refusal rather than re-sealing on immediate retirement, and an
+  advisory with explicit confirmation before shortening a previous window.
+  Crash replay cannot extend the previous key's 24-hour lifetime. Rotation's
+  host/shared implementation and native UI remain separate work.
+
+All previously requested Atem inputs are supplied and these review questions
+are answered. They must not be reported as unanswered external blockers.
+Package adoption does not implement Station report carriage, complete process
+enumeration, author barriers, production recovery publication or VII.A.
+Shared-host WAIT, #176 hold and disabled delegated activation remain.
 
 ## Native client HTTP carriage
 
@@ -184,12 +230,11 @@ external inventory's completeness or authenticity itself. Omitting/removing an
 obsolete verifier is not automatic discovery and requires an explicit manager
 decision. The production application does not yet supply this authority.
 
-R9.2 also holds production signing-gate adoption until the shared
-`required_version` helper is available. It is absent from reviewed Atem main
-`e855140`; the native injection-only model is not permission to duplicate that
-entry/scope rule in a production signer. The Rust/bindings helper and vectors
-were requested in [Atem #120](https://github.com/Agora-Build/Atem/issues/120#issuecomment-7030456149).
-Roster discovery and authenticated non-host report carriage remain Astation work.
+The shared `required_version` helper is published and adopted through
+`membershipRequiredVersion`; native code no longer duplicates its action/scope
+classification. The actual loaded production core is pinned with that helper.
+Complete roster discovery, authenticated non-host report carriage and lifecycle
+invalidation remain Astation work before a production authorizer can be supplied.
 
 The native service-approval path also keeps new launch/message/notify signatures
 closed while that all-verifier authorizer is absent. Existing host feature
@@ -668,9 +713,9 @@ the opt-in flag through LaunchServices. For an already provisioned bundle, use
 `open --env ASTATION_LOCAL_STATION_PROXY=true "/path/to/Astation Local.app"`
 after quitting that app. The Station still needs its separate build/runtime
 gates and healthy recovery generation; this native flag changes none of them.
-Station consumes shared proof verification at Atem `d59f98f46816d16bbbf06d39f783fafe2602966d`.
-The Apple SDK remains at its existing reviewed pin: native forwards the proof
-opaquely and already has the shared control readers/correlation helper. This
+Station and Apple consume the reviewed shared core at
+`de7ec29882f23508a430436cba34f73f88c15ed1`; native forwards the proof opaquely
+and uses the shared control readers/correlation helper. This
 does not satisfy the separate all-verifier signing compatibility gate.
 
 Coverage includes real loopback/LAN authentication and reauthentication, native
