@@ -46,6 +46,9 @@ pub(crate) mod delegated_recovery;
 #[path = "verifier_replicas.rs"]
 pub(crate) mod verifier_replicas;
 
+#[path = "verifier_reports.rs"]
+pub(super) mod verifier_reports;
+
 fn error(status: StatusCode, code: &'static str) -> Reply {
     (status, Json(json!({"error":{"code":code}})))
 }
@@ -77,6 +80,8 @@ struct Root {
     proxies: BTreeMap<String, HostBinding>,
     #[serde(default)]
     enrollments: BTreeMap<String, device_enrollment::Record>,
+    #[serde(default)]
+    verifier_reports: BTreeMap<String, verifier_reports::Record>,
     #[serde(default)]
     delegated: BTreeMap<String, delegated::Stored>,
 }
@@ -740,8 +745,11 @@ impl RecoveryStore {
         operation: Operation,
     ) -> Result<Reply, sqlx::Error> {
         let mut tx = pool.begin().await?;
+        if matches!(&operation, Operation::VerifierReport { .. }) {
+            sqlx::query("SET LOCAL statement_timeout='5s'").execute(&mut *tx).await?;
+        }
         if self.verifier_replicas.get().is_some()
-            || matches!(&operation, Operation::Delegated { .. } | Operation::HostRoute { .. }) {
+            || matches!(&operation, Operation::Delegated { .. } | Operation::HostRoute { .. } | Operation::VerifierReport { .. }) {
             self.lock_delegated_recovery(&mut tx).await?;
         }
         let reply = self.database_apply(&mut tx, genesis, subject, hash, operation).await?;
@@ -821,6 +829,7 @@ pub(super) enum Operation {
     },
     Collect,
     DeviceEnrollment(device_enrollment::Command),
+    VerifierReport { origin: String, command: verifier_reports::Command },
     Push(super::push_ingress::Ingress),
     Delegated { origin: String, binding: Option<HostBinding>, command: delegated::Command },
 }
@@ -863,6 +872,7 @@ fn apply(
                 routes: Default::default(),
                 proxies: Default::default(),
                 enrollments: Default::default(),
+                verifier_reports: Default::default(),
                 delegated: Default::default(),
             }
         }
@@ -883,6 +893,8 @@ fn apply(
             }
         }
         Operation::DeviceEnrollment(command) => device_enrollment::apply(&mut root.enrollments, command, clock.wall_ms)?,
+        Operation::VerifierReport { origin, command } =>
+            verifier_reports::apply(&mut root.verifier_reports, &log, &origin, command, clock.wall_ms)?,
         Operation::HostRoute { text, nonce, room, atem_id, connection, proxy } => {
             let kind = if proxy.is_some() { RouteKind::Proxy } else { RouteKind::Relay };
             let route = verify_host_route_message_as(kind, &log, text.as_bytes(), &nonce, &room, &atem_id)
@@ -902,6 +914,7 @@ fn apply(
         Operation::Collect => {
             root.push.collect(clock.wall_ms);
             device_enrollment::collect(&mut root.enrollments, clock.wall_ms);
+            verifier_reports::collect(&mut root.verifier_reports, clock.wall_ms);
             (StatusCode::OK, Json(json!({})))
         }
         Operation::Push(ingress) => {

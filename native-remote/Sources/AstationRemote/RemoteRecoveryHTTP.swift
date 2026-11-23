@@ -63,7 +63,7 @@ private final class RecoveryRedirectGuard: NSObject, URLSessionTaskDelegate, @un
 }
 
 /// TLS/account login limits storage access. Only the shared verifier grants cryptographic trust.
-public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteControlRecoveryReviewTransport, RemoteControlRecoveryRetentionTransport, RemoteStationVerifierTransport, RemoteManagedServiceVerifierTransport, @unchecked Sendable {
+public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDeviceEnrollmentTransport, RemoteControlFeedTransport, RemoteControlStatusTransport, RemoteControlRecoveryReviewTransport, RemoteControlRecoveryRetentionTransport, RemoteStationVerifierTransport, RemoteManagedServiceVerifierTransport, RemoteVerifierReportTransport, @unchecked Sendable {
     private let baseURL: URL
     private let stationOrigin: String
     public var controlStationOrigin: String { stationOrigin }
@@ -96,6 +96,55 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
     }
 
     deinit { session.invalidateAndCancel() }
+
+    public func submitVerifierChallenge(genesisHash: String, challengeJSON: String, expected: LogHead) async throws -> RemoteVerifierReportMailbox {
+        try validateVerifierChallenge(genesisHash: genesisHash, challengeJSON: challengeJSON, expected: expected)
+        let (_, data) = try await perform(url: path(genesisHash, "verifier-reports"), method: "POST",
+            body: Self.encode(["challenge": Self.object(challengeJSON), "expected": ["seq": expected.seq, "hash": expected.hash]]))
+        return try RemoteVerifierReportMailbox.decode(data, challengeJSON: challengeJSON, expected: expected)
+    }
+
+    public func verifierReports(genesisHash: String, challengeJSON: String, expected: LogHead) async throws -> RemoteVerifierReportMailbox {
+        let challenge = try validateVerifierChallenge(genesisHash: genesisHash, challengeJSON: challengeJSON, expected: expected)
+        let (_, data) = try await perform(url: path(genesisHash, "verifier-reports").appendingPathComponent(challenge.nonce), method: "GET")
+        return try RemoteVerifierReportMailbox.decode(data, challengeJSON: challengeJSON, expected: expected)
+    }
+
+    public func publishVerifierReport(genesisHash: String, challengeJSON: String, expected: LogHead, reportJSON: String) async throws -> RemoteVerifierReportMailbox {
+        let challenge = try validateVerifierChallenge(genesisHash: genesisHash, challengeJSON: challengeJSON, expected: expected)
+        guard reportJSON.utf8.count <= 16_384 else { throw RemoteChannelError.invalidInput }
+        let (_, data) = try await perform(url: path(genesisHash, "verifier-reports").appendingPathComponent(challenge.nonce), method: "POST",
+            body: Self.encode(["report": Self.object(reportJSON)]))
+        return try RemoteVerifierReportMailbox.decode(data, challengeJSON: challengeJSON, expected: expected)
+    }
+
+    public func verifierChallenges(genesisHash: String, signer: String, slot: String, expected: LogHead) async throws -> [String] {
+        let validation = try verifierReportChallenge(signer: signer, slot: slot, origin: stationOrigin,
+            connection: 1, issuedAt: 1, expiresAt: 2)
+        try validateVerifierChallenge(genesisHash: genesisHash, challengeJSON: validation, expected: expected)
+        let (_, data) = try await perform(url: path(genesisHash, "verifier-requests"), method: "POST",
+            body: Self.encode(["signer": signer, "slot": slot, "expected": ["seq": expected.seq, "hash": expected.hash]]))
+        let object = try Self.dictionary(data)
+        guard Set(object.keys) == ["challenges"], let values = object["challenges"] as? [[String: Any]], values.count <= 16 else {
+            throw RemoteRecoveryTransportError.invalidResponse
+        }
+        var nonces = Set<String>()
+        return try values.map { value in
+            let json = try Self.json(value), challenge = try parseVerifierReportChallenge(challengeJson: json)
+            guard challenge.signer == signer, challenge.slot == slot, challenge.origin == stationOrigin,
+                  nonces.insert(challenge.nonce).inserted else { throw RemoteRecoveryTransportError.invalidResponse }
+            return json
+        }
+    }
+
+    @discardableResult
+    private func validateVerifierChallenge(genesisHash: String, challengeJSON: String, expected: LogHead) throws -> VerifierReportChallenge {
+        guard RemoteRecoveryKit.validHash(genesisHash), (1...9_007_199_254_740_991).contains(expected.seq),
+              RemoteRecoveryKit.validHash(expected.hash) else { throw RemoteChannelError.invalidInput }
+        let challenge = try parseVerifierReportChallenge(challengeJson: challengeJSON)
+        guard challenge.origin == stationOrigin else { throw RemoteChannelError.invalidInput }
+        return challenge
+    }
 
     public func stationVerifiers(genesisHash: String) async throws -> RemoteStationVerifierSnapshot {
         guard RemoteRecoveryKit.validHash(genesisHash) else { throw RemoteChannelError.invalidInput }

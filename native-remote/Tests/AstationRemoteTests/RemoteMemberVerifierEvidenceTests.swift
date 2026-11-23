@@ -131,9 +131,167 @@ private final class MemberReportFixture {
     func confirmAll() throws {
         for index in slots.indices { let next = try begin(index); try receive(report(next), next) }
     }
+
+    func carriedReport(_ challengeJSON: String, process: UInt8? = nil) throws -> String {
+        let request = try VerifierReportRequest(log: log, challengeJson: challengeJSON,
+            signer: "member:manager", slot: slots[0].slot, origin: origin, keyId: "manager", nowMs: wall)
+        let report = try request.finish(signature: key.signature(for: request.signRequest().input))
+        guard let process else { return report }
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(report.utf8)) as? [String: Any])
+        var body = try XCTUnwrap(object["body"] as? [String: Any])
+        body["process"] = RemoteRecoveryKit.base64URL(Data(repeating: process, count: 16))
+        return try VerifierReportTestSupport.signed(body, sign: { try key.signature(for: $0) })
+    }
+
+    func mailbox(_ challengeJSON: String, reports: [String]) throws -> RemoteVerifierReportMailbox {
+        let data = try JSONSerialization.data(withJSONObject: ["challenge": JSONSerialization.jsonObject(with: Data(challengeJSON.utf8)),
+            "expected": ["seq": log.head().seq, "hash": log.head().hash],
+            "reports": reports.map { try JSONSerialization.jsonObject(with: Data($0.utf8)) }])
+        return try RemoteVerifierReportMailbox.decode(data, challengeJSON: challengeJSON, expected: log.head())
+    }
+}
+
+private final class MemberReportTransport: RemoteVerifierReportTransport, @unchecked Sendable {
+    var handler: @MainActor (Bool, String) throws -> RemoteVerifierReportMailbox
+    init(_ handler: @escaping @MainActor (Bool, String) throws -> RemoteVerifierReportMailbox) { self.handler = handler }
+    func submitVerifierChallenge(genesisHash: String, challengeJSON: String, expected: LogHead) async throws -> RemoteVerifierReportMailbox {
+        try await handler(true, challengeJSON)
+    }
+    func verifierReports(genesisHash: String, challengeJSON: String, expected: LogHead) async throws -> RemoteVerifierReportMailbox {
+        try await handler(false, challengeJSON)
+    }
+    func verifierChallenges(genesisHash: String, signer: String, slot: String, expected: LogHead) async throws -> [String] {
+        throw RemoteRecoveryTransportError.unavailable
+    }
+    func publishVerifierReport(genesisHash: String, challengeJSON: String, expected: LogHead, reportJSON: String) async throws -> RemoteVerifierReportMailbox {
+        throw RemoteRecoveryTransportError.unavailable
+    }
 }
 
 final class RemoteMemberVerifierEvidenceTests: XCTestCase {
+    @MainActor
+    private func assertPoll(_ poller: RemoteMemberVerifierPoller, _ slot: RemoteMemberVerifierSlot,
+                            expected: Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
+        let actual = try await poller.poll(slot)
+        XCTAssertEqual(actual, expected, file: file, line: line)
+    }
+
+    @MainActor
+    func testPollerReusesChallengeThenRenewsBeforeTokenWorkAndWithdrawsOnFailure() async throws {
+        let f = try MemberReportFixture(slotNames: ["phone"])
+        var calls = 0, creates = 0, lastChallenge: String?
+        var unavailable = false
+        let transport = MemberReportTransport { creating, challenge in
+            XCTAssertThrowsError(try f.authorize(), "A new round withdraws evidence before transport")
+            calls += 1
+            if creating { creates += 1; XCTAssertNotEqual(challenge, lastChallenge) }
+            else { XCTAssertEqual(challenge, lastChallenge) }
+            lastChallenge = challenge
+            if unavailable { throw RemoteRecoveryTransportError.unavailable }
+            return try f.mailbox(challenge, reports: calls == 1 ? [] : [f.carriedReport(challenge)])
+        }
+        let poller = RemoteMemberVerifierPoller(evidence: f.evidence, transport: transport,
+            membership: { f.log }, wall: { f.wall }, now: { f.time })
+        try await assertPoll(poller, f.slots[0], expected: false)
+        try await assertPoll(poller, f.slots[0], expected: true)
+        XCTAssertNoThrow(try f.authorize())
+        // Stop asserting withdrawal for repeated reads: the original proof stays
+        // live until failure, expiry or the next consumer-minted challenge.
+        transport.handler = { creating, challenge in
+            if creating { creates += 1; XCTAssertNotEqual(challenge, lastChallenge); XCTAssertThrowsError(try f.authorize()) }
+            else { XCTAssertEqual(challenge, lastChallenge) }
+            lastChallenge = challenge
+            if unavailable { throw RemoteRecoveryTransportError.unavailable }
+            return try f.mailbox(challenge, reports: [f.carriedReport(challenge)])
+        }
+        try await assertPoll(poller, f.slots[0], expected: true)
+        XCTAssertNoThrow(try f.authorize())
+        XCTAssertEqual(creates, 1)
+        f.time += 10_000; f.wall += 10_000
+        try await assertPoll(poller, f.slots[0], expected: true)
+        XCTAssertEqual(creates, 2)
+        unavailable = true
+        do { _ = try await poller.poll(f.slots[0]); XCTFail("accepted failed carrier") } catch {}
+        XCTAssertThrowsError(try f.authorize())
+        unavailable = false
+        try await assertPoll(poller, f.slots[0], expected: true)
+        XCTAssertEqual(creates, 3)
+    }
+
+    @MainActor
+    func testPollerDetectsASecondAuthenticatedProcessOnALaterMailboxRead() async throws {
+        let f = try MemberReportFixture(slotNames: ["phone"])
+        var conflicting = false
+        let transport = MemberReportTransport { _, challenge in
+            let original = try f.carriedReport(challenge)
+            return try f.mailbox(challenge, reports: conflicting ? [original, f.carriedReport(challenge, process: 3)] : [original])
+        }
+        let poller = RemoteMemberVerifierPoller(evidence: f.evidence, transport: transport,
+            membership: { f.log }, wall: { f.wall }, now: { f.time })
+        try await assertPoll(poller, f.slots[0], expected: true)
+        XCTAssertNoThrow(try f.authorize())
+        conflicting = true
+        do { _ = try await poller.poll(f.slots[0]); XCTFail("accepted conflicting process") } catch {}
+        XCTAssertTrue(f.journal.retained(f.slots[0]).conflicted)
+        XCTAssertThrowsError(try f.authorize())
+        conflicting = false
+        do { _ = try await poller.poll(f.slots[0]); XCTFail("lost durable conflict") } catch {}
+    }
+
+    @MainActor
+    func testPollerAuthenticatesEntireBatchAndFencesChangedContextAfterAwait() async throws {
+        for changedContext in [false, true] {
+            let f = try MemberReportFixture(slotNames: ["phone"])
+            let transport = MemberReportTransport { _, challenge in
+                let report = try f.carriedReport(challenge)
+                if changedContext {
+                    f.current = false
+                    return try f.mailbox(challenge, reports: [report])
+                }
+                let bad = report.replacingOccurrences(of: "\"sig\":\"", with: "\"sig\":\"bad")
+                return try f.mailbox(challenge, reports: [report, bad])
+            }
+            let poller = RemoteMemberVerifierPoller(evidence: f.evidence, transport: transport,
+                membership: { f.log }, wall: { f.wall }, now: { f.time })
+            do { _ = try await poller.poll(f.slots[0]); XCTFail("accepted stale/invalid batch") } catch {}
+            XCTAssertThrowsError(try f.authorize())
+            XCTAssertNil(f.journal.retained(f.slots[0]).highest, "No first report leaks from an invalid batch")
+            poller.retire()
+            do { _ = try await poller.poll(f.slots[0]); XCTFail("accepted retired poll") } catch {}
+        }
+    }
+
+    @MainActor
+    func testPollerCountsTransportDelayAndRetiresWhenTrustedMembershipBecomesUnavailable() async throws {
+        let delayed = try MemberReportFixture(slotNames: ["phone"])
+        let carrier = MemberReportTransport { _, challenge in
+            let reply = try delayed.mailbox(challenge, reports: [delayed.carriedReport(challenge)])
+            delayed.time += 30_000
+            return reply
+        }
+        let slow = RemoteMemberVerifierPoller(evidence: delayed.evidence, transport: carrier,
+            membership: { delayed.log }, wall: { delayed.wall }, now: { delayed.time })
+        do { _ = try await slow.poll(delayed.slots[0]); XCTFail("accepted delayed report") } catch {}
+        XCTAssertThrowsError(try delayed.authorize())
+
+        let f = try MemberReportFixture(slotNames: ["phone"])
+        var calls = 0, available = true
+        let transport = MemberReportTransport { _, challenge in
+            calls += 1
+            return try f.mailbox(challenge, reports: [f.carriedReport(challenge)])
+        }
+        let poller = RemoteMemberVerifierPoller(evidence: f.evidence, transport: transport, membership: {
+            guard available else { throw RemoteRecoveryStoreError.changed }; return f.log
+        }, wall: { f.wall }, now: { f.time })
+        try await assertPoll(poller, f.slots[0], expected: true)
+        available = false
+        do { _ = try await poller.poll(f.slots[0]); XCTFail("accepted missing trust context") } catch {}
+        XCTAssertEqual(calls, 1)
+        XCTAssertThrowsError(try f.authorize())
+        available = true
+        do { _ = try await poller.poll(f.slots[0]); XCTFail("revived retired owner") } catch {}
+    }
+
     @MainActor
     func testAnotherConsumersDurableHigherInventoryInvalidatesOlderLiveEvidenceAtSigningRefresh() throws {
         let f = try MemberReportFixture(slotNames: ["phone"])
