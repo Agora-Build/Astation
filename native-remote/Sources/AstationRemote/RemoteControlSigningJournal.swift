@@ -150,6 +150,23 @@ public final class RemoteControlSigningJournal {
         expected = bytes
     }
 
+    enum SigningEvidence {
+        case untouched
+        case attempted
+        case signed(String)
+    }
+
+    func evidence(bodyJSON: String, publicKey: PublicKeyData) throws -> SigningEvidence {
+        guard !operating else { throw RemoteControlPublicationError.busy }
+        try checkStorage()
+        let body = try checkedBody(bodyJSON)
+        guard key == publicKey else { throw RemoteControlPublicationError.requiresReview }
+        guard let entry = saved.entries[body.recordId] else { return .untouched }
+        guard entry.body == bodyJSON else { throw RemoteControlPublicationError.requiresReview }
+        if let record = entry.record { return .signed(record) }
+        return .attempted
+    }
+
     func sign(bodyJSON: String, publicKey: PublicKeyData, makeRecord: () throws -> String) throws -> String {
         guard !operating else { throw RemoteControlPublicationError.busy }
         operating = true

@@ -1678,7 +1678,7 @@ extension AstationRecoveryCoordinator {
         try requireDurableRecoveryCheckpoint()
         // Reading retained public evidence needs neither network access nor new
         // signing authority. Removed managers' originals must remain exportable.
-        return try controls(stationOrigin: stationOrigin).recoveryEvidenceJSON()
+        return try controls(stationOrigin: stationOrigin).recoveryEvidenceJSON(authorJournal: readControlJournal)
     }
 
     private func requireDurableRecoveryCheckpoint() throws {
@@ -2053,7 +2053,7 @@ extension AstationRecoveryCoordinator {
         guard !busy, !uncertain, let review = try controls().savedResignReview(recordID: recordID), !review.signed else {
             throw RemoteRecoveryError.requiresReview
         }
-        try controls().cancelUnsigned(recordID: review.body.recordId)
+        try controls().cancelUnsigned(recordID: review.body.recordId, authorJournal: readControlJournal)
     }
 
     func refreshControlActivity(stationOrigin: String? = nil, current: () -> Bool) async throws -> [RemoteControlActivity] {
@@ -2280,7 +2280,19 @@ extension AstationRecoveryCoordinator {
     func cancelUnsignedHostInterrupt(_ review: HostInterruptReview) throws {
         guard !busy, !uncertain, review.stationOrigin == relayURL,
               try controls().signingRequest(recordID: review.recordID) == review.request else { throw RemoteRecoveryError.requiresReview }
-        try controls().cancelUnsigned(recordID: review.recordID)
+        try controls().cancelUnsigned(recordID: review.recordID, authorJournal: readControlJournal)
+    }
+
+    /// Looking up a draft never creates a protected journal or a pin. A rolled-back
+    /// outbox can predate its pin while the independent journal still retains the signature.
+    private func readControlJournal(member: String) throws -> RemoteControlSigningJournal {
+        try requireDurableRecoveryCheckpoint()
+        guard member == managerID, let log = membershipLog else { throw RemoteRecoveryError.requiresReview }
+        let journal = try controlSigningJournal(log, member)
+        if let pinned = saved.controlJournalIDs?[journal.storageScope], pinned != journal.id {
+            throw RemoteRecoveryError.storageUncertain
+        }
+        return journal
     }
 
     private func pinnedControlJournal(log: MembershipLog, member: String) throws -> RemoteControlSigningJournal {
@@ -2386,7 +2398,7 @@ extension AstationRecoveryCoordinator {
 
     func cancelUnsignedControl(_ review: ServiceControlReview) throws {
         guard !busy, !uncertain else { throw RemoteRecoveryError.busy }
-        try controls().cancelUnsigned(recordID: review.recordID)
+        try controls().cancelUnsigned(recordID: review.recordID, authorJournal: readControlJournal)
     }
 
     /// Existing signatures and Portal intents are retried; no owner approval is reused.

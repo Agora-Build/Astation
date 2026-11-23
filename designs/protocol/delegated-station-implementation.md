@@ -122,10 +122,11 @@ and [Atem #120](https://github.com/Agora-Build/Atem/issues/120#issuecomment-7089
   journal shared across Station origins. The physical member key has one
   process lock. The account checkpoint pins the journal ID. Each signing
   attempt saves the exact body before key use and the signed record before
-  outbox delivery. A restart can recover that signature. An attempted or
-  legacy unsigned stop requires review before recovery export and cannot be
-  cancelled as an untouched draft. An unresolved signature or a missing
-  journal leaves recovery incomplete.
+  outbox delivery. If the outbox still shows a draft, offline evidence
+  export checks the independent journal and can recover the exact signed
+  record. Cancellation checks the same journal. An attempted or legacy
+  stop whose signature is missing requires review. A missing pinned journal
+  leaves recovery incomplete.
 - Report-time draft inventory, the durable plan barrier, journal range
   coverage and Station verification of complete history still precede
   recovery publication.

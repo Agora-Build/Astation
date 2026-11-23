@@ -52,6 +52,10 @@ final class ControlPublicationFixture {
             persist: { [unowned self] in try persist($0) })
     }
 
+    func readAuthorJournal(_ member: String) throws -> RemoteControlSigningJournal {
+        try authorJournal(log, member)
+    }
+
     func append(_ action: [String: Any], signer: String = "manager", signingKeys: ControlPublicationKeys? = nil) throws {
         let body = try log.draftEntry(signer: signer, signedAt: clock.wallMs,
             actionJson: String(decoding: JSONSerialization.data(withJSONObject: action), as: UTF8.self))
@@ -126,7 +130,7 @@ final class RemoteControlPublicationTests: XCTestCase {
         let unsigned = try f.body(action: "interrupt_running", interrupt: nil)
         _ = try f.prepare(unsigned)
         let bytes = f.stored, signs = f.keys.signs
-        let exported = try f.journal.recoveryEvidenceJSON()
+        let exported = try f.journal.recoveryEvidenceJSON(authorJournal: f.readAuthorJournal)
         let value = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(exported.utf8)) as? [String: Any])
         let records = try XCTUnwrap(value["records"] as? [[String: Any]])
         XCTAssertEqual(records.count, 1)
@@ -147,7 +151,7 @@ final class RemoteControlPublicationTests: XCTestCase {
         XCTAssertEqual(f.stored, bytes)
         XCTAssertEqual(f.keys.signs, signs)
         try f.restore()
-        XCTAssertEqual(try f.journal.recoveryEvidenceJSON(), exported)
+        XCTAssertEqual(try f.journal.recoveryEvidenceJSON(authorJournal: f.readAuthorJournal), exported)
     }
 
     @MainActor
@@ -161,13 +165,13 @@ final class RemoteControlPublicationTests: XCTestCase {
         let replacement = try f.journal.sign(recordID: review.body.recordId, log: f.log, provider: next, authorJournal: f.authorJournal,
             confirmedAt: 100, now: { 100 }, current: { true })
         let before = f.stored, signs = f.keys.signs + next.signs
-        let exported = try f.journal.recoveryEvidenceJSON()
+        let exported = try f.journal.recoveryEvidenceJSON(authorJournal: f.readAuthorJournal)
         XCTAssertTrue(exported.contains(original))
         XCTAssertTrue(exported.contains(replacement))
         XCTAssertEqual(f.stored, before)
         XCTAssertEqual(f.keys.signs + next.signs, signs)
         try f.restore()
-        XCTAssertEqual(try f.journal.recoveryEvidenceJSON(), exported)
+        XCTAssertEqual(try f.journal.recoveryEvidenceJSON(authorJournal: f.readAuthorJournal), exported)
     }
 
     @MainActor
@@ -180,7 +184,7 @@ final class RemoteControlPublicationTests: XCTestCase {
             _ = try f.prepare(body)
             _ = try f.sign(body)
         }
-        let exported = try f.journal.recoveryEvidenceJSON()
+        let exported = try f.journal.recoveryEvidenceJSON(authorJournal: f.readAuthorJournal)
         let value = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(exported.utf8)) as? [String: Any])
         XCTAssertEqual((value["records"] as? [Any])?.count, 65, "Export must not silently truncate at a wire-page bound")
         let destinations = try XCTUnwrap(value["destinations"] as? [String: [String]])
@@ -195,7 +199,7 @@ final class RemoteControlPublicationTests: XCTestCase {
         f.keys.beforeSign = { f.failAfterWrite = true }
         XCTAssertThrowsError(try f.sign(body))
         XCTAssertTrue(f.journal.storageUncertain)
-        XCTAssertThrowsError(try f.journal.recoveryEvidenceJSON()) { error in
+        XCTAssertThrowsError(try f.journal.recoveryEvidenceJSON(authorJournal: f.readAuthorJournal)) { error in
             XCTAssertEqual(error as? RemoteControlPublicationError, .storageUncertain)
         }
     }
@@ -583,7 +587,7 @@ final class RemoteControlPublicationTests: XCTestCase {
         XCTAssertThrowsError(try f.journal.sign(recordID: review.body.recordId, log: f.log, provider: keys, authorJournal: f.authorJournal,
             confirmedAt: 100, now: { 100 }, current: { true }))
         XCTAssertEqual(keys.signs, 0)
-        try f.journal.cancelUnsigned(recordID: review.body.recordId)
+        try f.journal.cancelUnsigned(recordID: review.body.recordId, authorJournal: f.readAuthorJournal)
         XCTAssertNil(try f.journal.savedResignReview(recordID: body.recordId))
         XCTAssertEqual(f.journal.recordIDs, [body.recordId])
     }
@@ -815,8 +819,8 @@ final class RemoteControlPublicationTests: XCTestCase {
                 authorJournal: factory, confirmedAt: 100, now: { 100 }, current: { true }))
             XCTAssertEqual(f.keys.signs, 0)
             try f.restore()
-            XCTAssertThrowsError(try f.journal.cancelUnsigned(recordID: body.recordId))
-            XCTAssertThrowsError(try f.journal.recoveryEvidenceJSON())
+            XCTAssertThrowsError(try f.journal.cancelUnsigned(recordID: body.recordId, authorJournal: f.readAuthorJournal))
+            XCTAssertThrowsError(try f.journal.recoveryEvidenceJSON(authorJournal: f.readAuthorJournal))
             XCTAssertNil(try f.journal.retainedDelivery(recordID: body.recordId))
         }
         let saved = try XCTUnwrap(f.authorBytes["manager"])
@@ -838,15 +842,56 @@ final class RemoteControlPublicationTests: XCTestCase {
         XCTAssertThrowsError(try f.sign(body))
         XCTAssertEqual(f.keys.signs, 1)
         try f.restore()
-        XCTAssertThrowsError(try f.journal.cancelUnsigned(recordID: body.recordId))
-        XCTAssertThrowsError(try f.journal.recoveryEvidenceJSON())
+        XCTAssertThrowsError(try f.journal.cancelUnsigned(recordID: body.recordId, authorJournal: f.readAuthorJournal))
+        let export = try f.journal.recoveryEvidenceJSON(authorJournal: f.readAuthorJournal)
+        XCTAssertTrue(export.contains(body.recordId))
+        XCTAssertNil(try f.journal.retainedDelivery(recordID: body.recordId))
         f.writeFailure = false
         let before = f.authorBytes
         let record = try f.sign(body)
         XCTAssertEqual(f.keys.signs, 1)
         XCTAssertEqual(f.authorBytes, before)
         XCTAssertEqual(try f.journal.retainedDelivery(recordID: body.recordId)?.recordJSON, record)
-        XCTAssertNoThrow(try f.journal.recoveryEvidenceJSON())
+        XCTAssertNoThrow(try f.journal.recoveryEvidenceJSON(authorJournal: f.readAuthorJournal))
+    }
+
+    @MainActor
+    func testRestoredDraftConsultsIndependentAuthorHistoryBeforeCancelOrRecoveryExport() throws {
+        for signatureSaved in [false, true] {
+            let f = try ControlPublicationFixture(), body = try f.body()
+            _ = try f.prepare(body)
+            let beforeAttempt = try XCTUnwrap(f.stored)
+            let factory: @MainActor (MembershipLog, String) throws -> RemoteControlSigningJournal = { log, member in
+                try RemoteControlSigningJournal(log: log, memberID: member, read: { f.authorBytes[member] },
+                    persist: { bytes in
+                        if f.keys.signs > 0 {
+                            if signatureSaved { f.authorBytes[member] = bytes }
+                            throw RemoteControlPublicationError.storageUncertain
+                        }
+                        f.authorBytes[member] = bytes
+                    })
+            }
+            XCTAssertThrowsError(try f.journal.sign(recordID: body.recordId, log: f.log, provider: f.keys,
+                authorJournal: factory, confirmedAt: 100, now: { 100 }, current: { true }))
+            try f.restore(beforeAttempt)
+            let journalBytes = f.authorBytes
+            XCTAssertThrowsError(try f.journal.cancelUnsigned(recordID: body.recordId, authorJournal: f.readAuthorJournal))
+            if signatureSaved {
+                let archive = try f.journal.recoveryEvidenceJSON(authorJournal: f.readAuthorJournal)
+                let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(archive.utf8)) as? [String: Any])
+                XCTAssertEqual((object["unsigned_reviews"] as? [Any])?.count, 0)
+                let records = try XCTUnwrap(object["records"] as? [[String: Any]])
+                XCTAssertEqual(records.count, 1)
+                let record = String(decoding: try JSONSerialization.data(withJSONObject: records[0]), as: UTF8.self)
+                guard case .valid = try verifyControlRecord(log: f.log, recordJson: record) else { return XCTFail() }
+                XCTAssertEqual(try parseControlRecord(recordJson: record), body)
+            } else {
+                XCTAssertThrowsError(try f.journal.recoveryEvidenceJSON(authorJournal: f.readAuthorJournal))
+            }
+            XCTAssertNil(try f.journal.retainedDelivery(recordID: body.recordId))
+            XCTAssertEqual(f.keys.signs, 1)
+            XCTAssertEqual(f.authorBytes, journalBytes)
+        }
     }
 
     @MainActor
@@ -859,10 +904,10 @@ final class RemoteControlPublicationTests: XCTestCase {
         fields["operations"] = ops
         fields["version"] = 1
         try f.restore(PropertyListSerialization.data(fromPropertyList: fields, format: .binary, options: 0))
-        XCTAssertThrowsError(try f.journal.cancelUnsigned(recordID: body.recordId))
-        XCTAssertThrowsError(try f.journal.recoveryEvidenceJSON())
+        XCTAssertThrowsError(try f.journal.cancelUnsigned(recordID: body.recordId, authorJournal: f.readAuthorJournal))
+        XCTAssertThrowsError(try f.journal.recoveryEvidenceJSON(authorJournal: f.readAuthorJournal))
         _ = try f.sign(body)
-        XCTAssertNoThrow(try f.journal.recoveryEvidenceJSON())
+        XCTAssertNoThrow(try f.journal.recoveryEvidenceJSON(authorJournal: f.readAuthorJournal))
     }
 
     @MainActor

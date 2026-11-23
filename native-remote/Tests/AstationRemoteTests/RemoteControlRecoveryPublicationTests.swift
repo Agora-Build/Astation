@@ -199,7 +199,7 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
     func testSameManagerRecoveryKeepsOriginalDeliveriesAndExportsExactSignedCopyAfterRestart() throws {
         let f = try ControlRecoveryFixture()
         let originalJournal = f.source.stored
-        let originalExport = try f.source.journal.recoveryEvidenceJSON()
+        let originalExport = try f.source.journal.recoveryEvidenceJSON(authorJournal: f.source.readAuthorJournal)
         let deliveryIDs = try f.source.journal.pendingDeliveryIDs()
         let review = try f.prepare()
         XCTAssertFalse(review.signed)
@@ -222,7 +222,7 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
         XCTAssertEqual(f.source.keys.signs, signs)
         XCTAssertEqual(f.writes, writes)
         XCTAssertEqual(f.source.stored, originalJournal)
-        XCTAssertEqual(try f.source.journal.recoveryEvidenceJSON(), originalExport)
+        XCTAssertEqual(try f.source.journal.recoveryEvidenceJSON(authorJournal: f.source.readAuthorJournal), originalExport)
         XCTAssertEqual(try f.source.journal.pendingDeliveryIDs(), deliveryIDs)
     }
 

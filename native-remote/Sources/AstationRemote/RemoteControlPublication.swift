@@ -421,18 +421,23 @@ public final class RemoteControlPublication {
 
     /// Export original public evidence, including superseded and completed stops.
     /// This is not a complete history, signing-clock anchor or recovery approval.
-    public func recoveryEvidenceJSON() throws -> String {
+    public func recoveryEvidenceJSON(authorJournal: (String) throws -> RemoteControlSigningJournal) throws -> String {
         try available()
         var records: [String] = [], unsigned: [String] = []
         var destinations: [String: [String]] = [:]
+        var journals: [String: RemoteControlSigningJournal] = [:]
         for operation in saved.operations {
             let body = try validate(operation)
             destinations[body.recordId] = [saved.stationOrigin] + (operation.additionalStations ?? [:]).keys.sorted()
-            if let record = operation.recordJSON { records.append(record) }
-            else {
-                guard operation.attempted == false else { throw RemoteControlPublicationError.requiresReview }
-                unsigned.append(operation.bodyJSON)
+            if let record = operation.recordJSON {
+                records.append(record)
+                continue
             }
+            let member = String(body.signer.dropFirst(7))
+            let journal = try journals[member] ?? authorJournal(member)
+            journals[member] = journal
+            if let record = try retainedSignature(operation, journal: journal) { records.append(record) }
+            else { unsigned.append(operation.bodyJSON) }
         }
         let metadata: [String: Any] = [
             "type": "astation-native-control-recovery-evidence", "version": 1,
@@ -449,10 +454,23 @@ public final class RemoteControlPublication {
         return output
     }
 
-    public func cancelUnsigned(recordID: String) throws {
+    private func retainedSignature(_ operation: Operation, journal: RemoteControlSigningJournal) throws -> String? {
+        switch try journal.evidence(bodyJSON: operation.bodyJSON, publicKey: Self.signerKey(operation)) {
+        case .signed(let record): return record
+        case .untouched where operation.attempted == false: return nil
+        default: throw RemoteControlPublicationError.requiresReview
+        }
+    }
+
+    public func cancelUnsigned(recordID: String, authorJournal: (String) throws -> RemoteControlSigningJournal) throws {
         try available()
         let index = try index(recordID)
-        guard saved.operations[index].recordJSON == nil, saved.operations[index].attempted == false else { throw RemoteControlPublicationError.requiresReview }
+        let operation = saved.operations[index]
+        let body = try validate(operation)
+        guard operation.recordJSON == nil, operation.attempted == false,
+              try retainedSignature(operation, journal: authorJournal(String(body.signer.dropFirst(7)))) == nil else {
+            throw RemoteControlPublicationError.requiresReview
+        }
         _ = try transaction { $0.operations.remove(at: index) }
     }
 
