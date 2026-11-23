@@ -79,7 +79,7 @@ pub(crate) async fn mint(
     if request.expected != log.head() || !eligible(&log, &request.signer) {
         return Err(MintError::ContextChanged);
     }
-    review_source_evidence(&mut tx, &prepared, &log, binding, &mut evidence).await?;
+    review_source_evidence(&mut tx, &prepared, &log, binding, &mut evidence, false).await?;
     let recovery = RecoveryPlan::from_json(&json!({
         "generation": binding.generation.to_string(), "plan_id": prepared.plan_id,
         "candidate_feed_id": prepared.candidate_feed_id, "source_hash": prepared.source_hash,

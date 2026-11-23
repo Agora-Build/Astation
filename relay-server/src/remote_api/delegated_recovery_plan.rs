@@ -6,6 +6,7 @@ use atem_client::{canonical::jcs, membership::Membership, Hash32};
 use ring::digest::{digest, SHA256};
 use serde_json::{json, Value};
 use sqlx::{PgConnection, PgPool};
+use std::collections::BTreeMap;
 
 #[path = "delegated_recovered_stops.rs"]
 pub(crate) mod stops;
@@ -115,11 +116,8 @@ async fn review_evidence(
     report: &mut Value,
     operator_review: bool,
 ) -> Result<(), sqlx::Error> {
-    if operator_review {
-        report["known_authors"] = signer_reports::inspect(connection, prepared, log, binding).await?;
-    }
-    review_source_evidence(connection, prepared, log, binding, report).await?;
-    report["recovery_signatures"] = signatures::inspection(connection, prepared, log, binding, report).await?;
+    let signed = review_source_evidence(connection, prepared, log, binding, report, operator_review).await?;
+    report["recovery_signatures"] = signatures::inspection(connection, prepared, log, binding, report, &signed).await?;
     report["reconstruction_hash"] = source_hash(&json!({
         "source_evidence_hash": report["evidence_hash"],
         "signature_evidence_hash": report["recovery_signatures"]["evidence_hash"],
@@ -133,11 +131,15 @@ async fn review_source_evidence(
     log: &Membership,
     binding: &Binding,
     report: &mut Value,
-) -> Result<(), sqlx::Error> {
+    operator_review: bool,
+) -> Result<BTreeMap<String, Value>, sqlx::Error> {
     report["recovered_stops"] = stops::inspection(connection, prepared, log, binding).await?;
-    let (history, signed) = history::inspection(connection, prepared, log, binding).await?;
-    report["known_history"] = history;
-    report["native_archives"] = native::inspection(connection, prepared, log, binding, &signed).await?;
+    let history = history::inspection(connection, prepared, log, binding, operator_review).await?;
+    report["known_history"] = history.review;
+    if operator_review {
+        report["known_authors"] = history.authors;
+    }
+    report["native_archives"] = native::inspection(connection, prepared, log, binding, &history.signed).await?;
     let mut sources = json!({
         "plan_id": prepared.plan_id,
         "source_hash": prepared.source_hash,
@@ -145,10 +147,10 @@ async fn review_source_evidence(
         "recovered_stops": report["recovered_stops"]["evidence_hash"],
         "native_archives": report["native_archives"]["evidence_hash"],
     });
-    let hashes = signer_reports::commitments(connection, &prepared.plan_id).await?;
+    let hashes = history.current_report_hashes;
     if !hashes.is_empty() { sources["signer_reports"] = json!(hashes); }
     report["evidence_hash"] = source_hash(&sources)?.into();
-    Ok(())
+    Ok(history.signed)
 }
 
 /// The fence and source stay locked until the caller commits all new evidence.

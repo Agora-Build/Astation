@@ -150,8 +150,18 @@ cancelled recovery additions confer no authority. For this plan it rechecks the
 saved challenge, signature and exported records at the recorded acceptance time.
 A journal created after the first grant shows `missing_early_range: true`.
 An empty reports list identifies a known author with no accepted report in this
-plan. This view uses only the available membership and current plan; independent
-historical sources and complete participant coverage are still required.
+plan. `known_authors.prior_plans` lists the authors and reports from each earlier
+retained membership head. An old report describes only its original plan.
+
+Recovery rechecks each retained report with the membership and challenge from
+the plan that accepted it. A signed revoke or interrupt exported only in that
+report appears among the replacement plan's obligations, including after
+abandonment. Identical records from different sources appear once. Conflicting
+contents under one record ID refuse reconciliation. The recorded signing time
+remains a lower bound even if the manager later loses authority. Current
+membership determines whether the stop needs a new signature or authority
+review. Independent evidence of complete history and participant coverage is
+still required before publication.
 
 ## Ending a prepared plan
 
