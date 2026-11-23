@@ -2720,6 +2720,10 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         store = try RemoteRecoveryStore(accountID: name)
         XCTAssertEqual(try store?.read(), data, "A newly opened protected store must retain the complete signed checkpoint")
         coordinator = try h.coordinator(checkpointStore: store)
+        let local = try coordinator!.localControlAuthorInventory(stationOrigin: context.stationOrigin, current: { true })
+        XCTAssertEqual(local.signedRecords.count, 2)
+        XCTAssertTrue(local.unsignedDraftBodies.isEmpty)
+        XCTAssertTrue(local.missingSignatureBodies.isEmpty)
         XCTAssertFalse(coordinator!.controlRecoveryAvailable)
         XCTAssertEqual(try coordinator!.exportControlRecoveryCopies(context: context,
             recordIDs: [review.body.recordId], current: { true }), exported)
@@ -2730,6 +2734,37 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(retried, exported)
         XCTAssertEqual(h.ownerRequests.count, prompts + 1, "Reloading saved signatures must not confirm or sign again")
         XCTAssertEqual(authority.reservations, 1)
+    }
+
+    func testLocalAuthorInventoryReadsAllRetainedOriginsOfflineWithoutChangingIntent() async throws {
+        let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+        let (coordinator, context, original) = try await recoveryCopySource(h, authority: authority)
+        let draft = try await coordinator.prepareControlRecoveryCopy(recordID: original, context: context, current: { true })
+        let other = "https://another.example"
+        let offline = try h.coordinator(relayURL: other)
+        let saved = h.store.bytes, author = h.authorBytes, prompts = h.ownerRequests.count
+        XCTAssertFalse(offline.controlRecoveryAvailable)
+        let view = try offline.localControlAuthorInventory(stationOrigin: context.stationOrigin, current: { true })
+        XCTAssertEqual(view.signedRecords, [try XCTUnwrap(authority.original)])
+        XCTAssertEqual(view.unsignedDraftBodies, [try XCTUnwrap(draft.request.bodyJson)])
+        XCTAssertTrue(view.missingSignatureBodies.isEmpty)
+        let unrelated = try offline.localControlAuthorInventory(stationOrigin: other, current: { true })
+        XCTAssertTrue(unrelated.signedRecords.isEmpty)
+        XCTAssertTrue(unrelated.unsignedDraftBodies.isEmpty)
+        XCTAssertEqual(h.store.bytes, saved)
+        XCTAssertEqual(h.authorBytes, author)
+        XCTAssertEqual(h.ownerRequests.count, prompts)
+
+        var root = try checkpoint(h.store)
+        var outboxes = try XCTUnwrap(root["controlPublications"] as? [String: Data])
+        outboxes[other] = Data([0xff])
+        root["controlPublications"] = outboxes
+        h.store.bytes = try PropertyListSerialization.data(fromPropertyList: root, format: .binary, options: 0)
+        let damaged = try h.coordinator()
+        XCTAssertThrowsError(try damaged.localControlAuthorInventory(stationOrigin: context.stationOrigin, current: { true }),
+            "An unreadable origin may contain an originless host interrupt")
+        XCTAssertThrowsError(try offline.localControlAuthorInventory(stationOrigin: context.stationOrigin, current: { true }),
+            "An older coordinator cannot return cached evidence after a protected checkpoint changes")
     }
 
     func testMissingOrReplacedAuthorJournalBlocksRecoveryCopyWithNoKeyUse() async throws {

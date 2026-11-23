@@ -150,6 +150,23 @@ public final class RemoteControlSigningJournal {
         expected = bytes
     }
 
+    public func inventory(stationOrigin: String, outboxes: [RemoteControlPublication],
+                          recoveryCopies: [RemoteControlRecoveryPublication]) throws -> RemoteControlAuthorInventory {
+        guard !operating else { throw RemoteControlPublicationError.busy }
+        guard PortalIntegrationRecord.validOrigin(stationOrigin) else { throw RemoteControlPublicationError.invalidRecord }
+        try checkStorage()
+        var result = RemoteControlAuthorInventory(origin: stationOrigin, account: saved.account,
+            genesis: saved.genesis, member: saved.member, key: key)
+        for entry in saved.entries.values {
+            try result.retain(body: checkedBody(entry.body), json: entry.body, key: key,
+                record: entry.record, possiblySigned: true)
+        }
+        for box in outboxes { try box.collectAuthorEvidence(into: &result) }
+        for copies in recoveryCopies { try copies.collectAuthorEvidence(into: &result) }
+        try checkStorage()
+        return result
+    }
+
     enum SigningEvidence {
         case untouched
         case attempted

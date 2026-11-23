@@ -18,6 +18,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
     private let originalChoices = NSPopUpButton()
     private let details = NSTextView()
     private let status = NSTextField(wrappingLabelWithString: "")
+    private let authorStatus = NSTextField(wrappingLabelWithString: "")
     private let stationStatus = NSTextField(wrappingLabelWithString: "Station review has not been loaded. Saved copies remain available offline.")
     private let refresh = NSButton(title: "Refresh", target: nil, action: nil)
     private let sign = NSButton(title: "Confirm Copy...", target: nil, action: nil)
@@ -70,7 +71,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         let originalActions = NSStackView(views: [originalChoices, prepare]); originalActions.spacing = 12
         originalChoices.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let actions = NSStackView(views: [sign, export, sendCopy]); actions.spacing = 12
-        let stack = NSStackView(views: [intro, stationStatus, reviewActions,
+        let stack = NSStackView(views: [intro, stationStatus, reviewActions, authorStatus,
             NSTextField(labelWithString: "Original signed stop"), originalActions,
             NSTextField(labelWithString: "Saved recovery copy"), choices, scroll, status, actions])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10
@@ -83,6 +84,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
                 stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
                 intro.widthAnchor.constraint(equalTo: stack.widthAnchor),
                 stationStatus.widthAnchor.constraint(equalTo: stack.widthAnchor),
+                authorStatus.widthAnchor.constraint(equalTo: stack.widthAnchor),
                 originalActions.widthAnchor.constraint(equalTo: stack.widthAnchor),
                 choices.widthAnchor.constraint(equalTo: stack.widthAnchor),
                 scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
@@ -135,6 +137,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         if let alert { window?.endSheet(alert.window, returnCode: .abort) }
         alert = nil; access = nil; rows = []; originals = []; preparation = nil
         choices.removeAllItems(); originalChoices.removeAllItems(); details.string = ""
+        authorStatus.stringValue = ""
         stationStatus.stringValue = "Station review has not been loaded. Saved copies remain available offline."
         render()
     }
@@ -148,6 +151,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         guard task == nil, panel == nil else { return }
         generation = UUID(); access = nil; rows = []; originals = []; preparation = nil
         choices.removeAllItems(); originalChoices.removeAllItems(); details.string = ""
+        authorStatus.stringValue = ""
         stationStatus.stringValue = "Station review has not been loaded. Saved copies remain available offline."
         do {
             let value = try loadAccess(), epoch = generation
@@ -155,6 +159,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
             let copies = try value.coordinator.localControlRecoveryReviews(stationOrigin: stationOrigin,
                 current: { self.isCurrent(value, epoch: epoch) })
             access = value
+            refreshAuthorInventory(value, epoch: epoch)
             setCopies(copies)
             status.stringValue = rows.isEmpty
                 ? "No saved recovery copies. Load the Station review, then prepare a copy of an original stop. Preparation requires verified recovery authority."
@@ -173,6 +178,21 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
             }
         } catch { status.stringValue = "Could not read protected recovery copies: " + error.localizedDescription }
         render()
+    }
+
+    private func refreshAuthorInventory(_ access: Access, epoch: UUID) {
+        guard isCurrent(access, epoch: epoch) else { return }
+        do {
+            let inventory = try access.coordinator.localControlAuthorInventory(stationOrigin: stationOrigin,
+                current: { self.isCurrent(access, epoch: epoch) })
+            guard isCurrent(access, epoch: epoch) else { return }
+            authorStatus.stringValue = "Stops retained on this Mac at last review: " +
+                "\(inventory.signedRecords.count) signed, \(inventory.unsignedDraftBodies.count) unsigned, " +
+                "\(inventory.missingSignatureBodies.count) with an unresolved signature."
+        } catch {
+            guard isCurrent(access, epoch: epoch) else { return }
+            authorStatus.stringValue = "This Mac's stop inventory is unavailable. Refresh to try again."
+        }
     }
 
     private func setCopies(_ copies: [RemoteControlRecoveryReview], selecting recordID: String? = nil) {
@@ -254,7 +274,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         let epoch = generation
         task = Task { [weak self] in
             guard let self else { return }
-            defer { task = nil; render() }
+            defer { task = nil; refreshAuthorInventory(access, epoch: epoch); render() }
             let current = { self.isCurrent(access, epoch: epoch) && access.canSign() && self.preparation == preparation }
             do {
                 let review = try await access.coordinator.prepareControlRecoveryCopy(recordID: original.body.recordId,
@@ -297,7 +317,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         let epoch = generation
         task = Task { [weak self] in
             guard let self else { return }
-            defer { task = nil; render() }
+            defer { task = nil; refreshAuthorInventory(access, epoch: epoch); render() }
             do {
                 guard isCurrent(access, epoch: epoch), access.canSign() else { return }
                 let approved: Bool

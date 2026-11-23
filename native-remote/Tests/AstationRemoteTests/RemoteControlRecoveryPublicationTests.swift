@@ -90,12 +90,50 @@ private final class ControlRecoveryFixture {
 
 final class RemoteControlRecoveryPublicationTests: XCTestCase {
     @MainActor
+    func testInventoryRetainsRecoveryOriginalAndDistinguishesUntouchedAndInterruptedCopies() throws {
+        let f = try ControlRecoveryFixture(), review = try f.prepare()
+        let request = try XCTUnwrap(review.request.bodyJson)
+        func inventory() throws -> RemoteControlAuthorInventory {
+            try f.source.authorJournal(f.source.log, "manager").inventory(stationOrigin: f.source.origin,
+                outboxes: [], recoveryCopies: [f.journal])
+        }
+        XCTAssertEqual(try inventory().signedRecords, [f.original])
+        XCTAssertEqual(try inventory().unsignedDraftBodies, [request])
+        let draft = try XCTUnwrap(f.bytes)
+        var stored = try XCTUnwrap(PropertyListSerialization.propertyList(from: draft, format: nil) as? [String: Any])
+        var operations = try XCTUnwrap(stored["operations"] as? [[String: Any]])
+        operations[0].removeValue(forKey: "attempted")
+        stored["version"] = 1
+        stored["operations"] = operations
+        try f.restore(PropertyListSerialization.data(fromPropertyList: stored, format: .binary, options: 0))
+        XCTAssertTrue(try inventory().unsignedDraftBodies.isEmpty)
+        XCTAssertEqual(try inventory().missingSignatureBodies, [request])
+
+        try f.restore(draft)
+        f.source.keys.beforeSign = { throw RemoteChannelError.staleLink }
+        XCTAssertThrowsError(try f.sign(review))
+        let attempted = try XCTUnwrap(f.bytes)
+        XCTAssertNotEqual(attempted, draft)
+        try f.restore(draft)
+        XCTAssertEqual(try inventory().missingSignatureBodies, [request], "The independent journal survives an older outbox")
+        XCTAssertTrue(try inventory().unsignedDraftBodies.isEmpty)
+        f.source.keys.beforeSign = nil
+        let signed = try f.sign(review)
+        try f.restore(draft)
+        let recovered = try inventory()
+        XCTAssertEqual(Set(recovered.signedRecords), Set([f.original, signed]))
+        XCTAssertTrue(recovered.unsignedDraftBodies.isEmpty)
+        XCTAssertTrue(recovered.missingSignatureBodies.isEmpty)
+        XCTAssertFalse(try XCTUnwrap(f.journal.reviews().first).signed, "The inventory cannot authorize delivery")
+    }
+
+    @MainActor
     func testOriginalAndRecoveryCopyShareAnAuthorJournalAcrossOutboxFailure() throws {
         let f = try ControlRecoveryFixture(), review = try f.prepare()
         let before = try f.source.authorJournal(f.source.log, "manager")
         let signs = f.source.keys.signs
         XCTAssertEqual(before.revision, 2)
-        f.failBeforeWrite = true
+        f.source.keys.beforeSign = { f.failBeforeWrite = true }
         XCTAssertThrowsError(try f.sign(review))
         XCTAssertEqual(f.source.keys.signs, signs + 1)
         let after = try f.source.authorJournal(f.source.log, "manager")
@@ -270,9 +308,11 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
         XCTAssertThrowsError(try f.sign(review, current: { false }))
         XCTAssertThrowsError(try f.sign(review, now: { 30_100 }))
         XCTAssertEqual(f.source.keys.signs, signs)
+        XCTAssertEqual(f.bytes, bytes)
         f.source.keys.beforeSign = { f.authority.complete = false }
         XCTAssertThrowsError(try f.sign(review))
-        XCTAssertEqual(f.bytes, bytes)
+        XCTAssertNotEqual(f.bytes, bytes, "A key attempt is retained even when signing authority changes")
+        XCTAssertThrowsError(try f.journal.export(context: review.context, recordIDs: [review.body.recordId]))
         XCTAssertEqual(f.source.keys.signs, signs + 1)
         XCTAssertFalse(try XCTUnwrap(f.journal.reviews().first).signed)
     }
@@ -293,7 +333,9 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
             if duringSignature { f.source.keys.beforeSign = { _ = try f.source.replaceManager() } }
             else { f.authority.beforeAuthorize = { _ = try f.source.replaceManager() } }
             XCTAssertThrowsError(try f.sign(review))
-            XCTAssertEqual(f.bytes, bytes)
+            if duringSignature { XCTAssertNotEqual(f.bytes, bytes) }
+            else { XCTAssertEqual(f.bytes, bytes) }
+            XCTAssertThrowsError(try f.journal.export(context: review.context, recordIDs: [review.body.recordId]))
         }
     }
 
@@ -328,7 +370,8 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
     func testFailedProtectedSaveFencesAndRestartRecoversCommittedExactSignature() throws {
         for afterWrite in [false, true] {
             let f = try ControlRecoveryFixture(), review = try f.prepare(), draft = f.bytes
-            f.failBeforeWrite = !afterWrite; f.failAfterWrite = afterWrite
+            if afterWrite { f.source.keys.beforeSign = { f.failAfterWrite = true } }
+            else { f.failBeforeWrite = true }
             XCTAssertThrowsError(try f.sign(review))
             XCTAssertTrue(f.journal.storageUncertain)
             XCTAssertThrowsError(try f.journal.reviews())
@@ -439,7 +482,7 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
         XCTAssertGreaterThan(oversizedBytes.count, 2_097_152)
         var oldVersion = root, futureVersion = root
         oldVersion["version"] = 0
-        futureVersion["version"] = 2
+        futureVersion["version"] = 3
         let versionBytes = try [oldVersion, futureVersion].map {
             try PropertyListSerialization.data(fromPropertyList: $0, format: .binary, options: 0)
         }

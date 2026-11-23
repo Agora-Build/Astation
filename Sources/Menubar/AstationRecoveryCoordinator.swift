@@ -1695,6 +1695,27 @@ extension AstationRecoveryCoordinator {
 
     var controlRecoveryAvailable: Bool { delegatedControlsAvailable && controlRecoveryAuthority != nil }
 
+    /// The account store owns all outboxes under its process lock. A host
+    /// interrupt saved at another Station is still part of this origin's review.
+    func localControlAuthorInventory(stationOrigin: String, current: () -> Bool) throws -> RemoteControlAuthorInventory {
+        guard !busy, !uncertain else { throw RemoteRecoveryError.busy }
+        busy = true
+        defer { busy = false }
+        guard current(), !Task.isCancelled, PortalIntegrationRecord.validOrigin(stationOrigin),
+              let log = membershipLog, log.frozen() == nil else { throw RemoteRecoveryError.requiresReview }
+        let journal = try readControlJournal(member: managerID)
+        let origins = (saved.controlPublications ?? [:]).keys.sorted()
+        let recoveryOrigins = (saved.controlRecoveryPublications ?? [:]).keys.sorted()
+        guard origins.count <= 64, recoveryOrigins.count <= 64 else { throw RemoteControlPublicationError.full }
+        let inventory = try journal.inventory(stationOrigin: stationOrigin,
+            outboxes: origins.map { try controls(stationOrigin: $0) },
+            recoveryCopies: recoveryOrigins.map { try recoveryControls(origin: $0) })
+        try requireDurableRecoveryCheckpoint()
+        guard current(), !Task.isCancelled, membershipLog?.head() == log.head(),
+              membershipLog?.frozen() == nil else { throw RemoteRecoveryError.requiresReview }
+        return inventory
+    }
+
     func localControlRecoveryOriginals(stationOrigin: String, current: () -> Bool) throws -> [RemoteControlActivity] {
         guard !busy, !uncertain, current(), let log = membershipLog else { throw RemoteRecoveryError.requiresReview }
         try requireDurableRecoveryCheckpoint()
