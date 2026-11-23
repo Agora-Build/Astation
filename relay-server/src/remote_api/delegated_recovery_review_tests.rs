@@ -538,6 +538,11 @@ async fn postgres_delegated_history_retains_signer_exports_after_abandonment() {
     let exported = build_control(&f.keys, &KeyId::new("manager"), &body)
         .unwrap()
         .to_json();
+    let mut wrong_target = body.clone();
+    wrong_target.record_id = uuid::Uuid::new_v4().to_string();
+    wrong_target.issued_at += 1000;
+    wrong_target.principal_key = Some(atem_client::Hash32::of(b"unknown-service-key"));
+    let unresolved = build_control(&f.keys, &KeyId::new("manager"), &wrong_target).unwrap().to_json();
     let store = RecoveryStore::postgres(database.reconnect(2).await);
     store.configure_recovery_review(ORIGIN, 1).await.unwrap();
     let app = make_app(store);
@@ -602,7 +607,7 @@ async fn postgres_delegated_history_retains_signer_exports_after_abandonment() {
             &app,
             &path,
             Some("alice"),
-            submission(&[retained_stop, &exported])
+            submission(&[retained_stop, &exported, &unresolved])
         )
         .await
         .0,
@@ -640,8 +645,8 @@ async fn postgres_delegated_history_retains_signer_exports_after_abandonment() {
     let history = &later["known_history"];
     assert_eq!(
         history["records"].as_array().unwrap().len(),
-        3,
-        "one report-only stop and two feed records"
+        4,
+        "two report-only records and two feed records"
     );
     assert_eq!(
         history["observed_signing_lower_bounds"][body.principal.name()],
@@ -662,7 +667,7 @@ async fn postgres_delegated_history_retains_signer_exports_after_abandonment() {
     let previous = &later["known_authors"]["prior_plans"][0];
     assert_eq!(previous["plan_id"], first["plan_id"]);
     assert_eq!(previous["members"][signer]["member_status"], "manager");
-    assert_eq!(previous["members"][signer]["reports"][0]["journal"]["records"], 2);
+    assert_eq!(previous["members"][signer]["reports"][0]["journal"]["records"], 3);
     assert_eq!(later["known_authors"]["members"][signer]["member_status"], "demoted");
     assert_eq!(later["recovery_ready"], false);
     assert_eq!(

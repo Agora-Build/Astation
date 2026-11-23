@@ -4,7 +4,7 @@ use super::super::super::{delegated::Stored, MAX_STATE};
 use super::super::Binding;
 use super::{canonical_uuid, invalid, signer_reports, source_hash, stops, Prepared};
 use atem_client::{
-    control::{verify_control, ControlCheck, ControlRecord},
+    control::{verify_control, ControlCheck, ControlRecord, RefusalReason},
     membership::Membership,
 };
 use serde::Deserialize;
@@ -176,10 +176,14 @@ pub(super) async fn inspection(
         let mut hashes = Vec::new();
         signer_reports::visit(connection, &checkpoint, &old_log, &binding.origin, generation, |verified, hash| {
             for record in verified.records {
-                // The SDK authenticated these bytes against the historical member key.
-                // Keep the observed clock even if the signer subsequently lost manage.
-                let lower = lower_bounds.entry(record.principal().name()).or_default();
-                *lower = (*lower).max(record.issued_at());
+                // Signing a journal export does not establish authority for its target.
+                // Keep the original verified clock across later membership changes.
+                if matches!(verify_control(&record, &old_log),
+                    ControlCheck::Valid(_) | ControlCheck::Refused(RefusalReason::RemovedManager))
+                {
+                    let lower = lower_bounds.entry(record.principal().name()).or_default();
+                    *lower = (*lower).max(record.issued_at());
+                }
                 add_record(&mut records, record.object().to_json(), stops::review(&record, log, &binding.origin)?)?;
             }
             if let Some(authors) = &mut authors {
