@@ -617,7 +617,7 @@ async fn postgres_delegated_history_retains_signer_exports_after_abandonment() {
         .unwrap()
         .iter()
         .any(|r| r["original"]["record_id"] == body.record_id
-            && r["requirement"] == "fresh_manager_signature"));
+            && r["requirement"] == "retain_service_stop"));
     plan::outcome::abandon(
         &database.pool,
         &binding,
@@ -653,7 +653,7 @@ async fn postgres_delegated_history_retains_signer_exports_after_abandonment() {
     assert!(obligations
         .iter()
         .any(|r| r["original"]["record_id"] == body.record_id
-            && r["requirement"] == "authority_review"
+            && r["requirement"] == "fresh_manager_signature"
             && r["original"]["verification"] == "removed_manager"));
     assert_eq!(
         later["known_authors"]["members"][signer]["reports"],

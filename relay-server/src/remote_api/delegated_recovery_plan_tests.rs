@@ -132,7 +132,7 @@ async fn postgres_delegated_recovery_preparation_survives_replica_races_and_rest
     );
     assert_eq!(
         first["review"]["records"][1]["requirement"],
-        "fresh_manager_signature"
+        "retain_service_stop"
     );
     assert_eq!(first["review"]["records"][1]["interrupt_running"], true);
     assert_eq!(
@@ -243,7 +243,7 @@ async fn postgres_delegated_recovery_preserves_prior_checkpoint_stops_and_reserv
     }
     let native = records.iter().find(|record| record["signer"] == "member:phone").unwrap();
     assert_eq!(native["verification"], "removed_manager");
-    assert_eq!(native["requirement"], "authority_review");
+    assert_eq!(native["requirement"], "fresh_manager_signature");
     assert_eq!(history["observed_signing_lower_bounds"]["service:reserved-only"], f.created + 123);
     assert_eq!(history["checkpoints"].as_array().unwrap().len(), 2);
     assert!(history["checkpoints"].as_array().unwrap().iter().any(|checkpoint| {

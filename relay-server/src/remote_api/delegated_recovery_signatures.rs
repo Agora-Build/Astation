@@ -5,7 +5,7 @@ use super::{invalid, source_hash, Prepared};
 use atem_client::{
     canonical::StrictValue,
     control::{
-        verify_control, ControlAction, ControlCheck, ControlFeed, ControlRecord, ControlSigner,
+        verify_control, ControlAction, ControlCheck, ControlFeed, ControlRecord, ControlSigner, RefusalReason,
     },
     membership::Membership,
     Hash32,
@@ -71,8 +71,10 @@ fn check_copy(
     record: &ControlRecord,
     origin: &str,
     candidate: &str,
+    verifying_head: &Membership,
 ) -> Result<(), sqlx::Error> {
-    if !matches!(original.signer(), ControlSigner::Member(_))
+    if !matches!(verify_control(original, verifying_head), ControlCheck::Valid(_) | ControlCheck::Refused(RefusalReason::RemovedManager))
+        || !matches!(original.signer(), ControlSigner::Member(_))
         || !matches!(record.signer(), ControlSigner::Member(_))
         || !matches!(
             original.action(),
@@ -148,10 +150,10 @@ async fn load(
             .map_err(|_| invalid())?;
         let record = ControlRecord::parse(&serde_json::to_vec(&row.record).map_err(|_| invalid())?)
             .map_err(|_| invalid())?;
-        check_copy(&original, &record, &binding.origin, &row.candidate_feed_id)?;
         let accepted_log =
             Membership::from_stored(log.account_id(), &log.genesis_hash(), &row.membership)
                 .map_err(|_| invalid())?;
+        check_copy(&original, &record, &binding.origin, &row.candidate_feed_id, &accepted_log)?;
         if prepared.retained["account_subject"] != row.subject
             || !super::canonical_uuid(&row.plan_id)
             || !super::canonical_uuid(&row.candidate_feed_id)
@@ -249,6 +251,7 @@ async fn retain_checked(
             &record,
             &binding.origin,
             &prepared.candidate_feed_id,
+            &log,
         )?;
         if !matches!(verify_control(&record, &log), ControlCheck::Valid(_))
             || signed.contains_key(record.record_id())

@@ -159,8 +159,8 @@ report appears among the replacement plan's obligations, including after
 abandonment. Identical records from different sources appear once. Conflicting
 contents under one record ID refuse reconciliation. The recorded signing time
 remains a lower bound even if the manager later loses authority. Current
-membership determines whether the stop needs a new signature or authority
-review. Independent evidence of complete history and participant coverage is
+membership determines whether to carry the stop unchanged, obtain a fresh
+signature or review its authority. Independent evidence of complete history and participant coverage is
 still required before publication.
 
 ## Ending a prepared plan
@@ -390,23 +390,13 @@ The JSON output includes record IDs, principals, actions, the explicit
 interruption choice, signer, shared-verifier verdicts and retained per-principal
 clock anchors. Treat it as account-private operator information. It omits
 signed bodies, signatures, membership contents, storage subjects, report
-payloads, key material and backup blobs. Valid feed-bound native stops are
-marked `fresh_manager_signature`: even a current manager's old signature cannot
-be edited to name a new feed. Valid feed-independent host stops are retained;
-other unverifiable authority remains a review obligation. Service records need
-service-state reconciliation rather than copying their old feed signatures.
-Every retained record remains listed; this command performs no compaction.
-
-The `fresh_manager_signature` classification above describes the current
-conservative preparation output, not a shared requirement to replace every
-native service stop. The November 22
-[#114 reading](https://github.com/Agora-Build/Astation/issues/114#issuecomment-7082464868)
-allows an unchanged original stop signed by a current native manager across a
-feed reset. Removed managers still require a fresh current-manager copy.
-Publication must adopt that distinction with shared verifier/ACK regression
-coverage; the current command cannot yet assemble or publish a replacement.
-Newly signed service-key snapshot records must name the candidate feed, and
-unknown historical service-key signing ceilings remain fenced.
+payloads, key material and backup blobs. Valid revokes and interrupts can be carried unchanged. Feed-bound stops are
+marked `retain_service_stop`, including those signed by the service itself.
+Feed-independent host stops are marked `retain_host_record`. An authenticated
+former manager's stop requires a fresh manager signature. Unknown or invalid
+authority remains under review. Service covers, holds and releases require
+authoritative state reconciliation, a new signature for the candidate feed and
+a complete signing ceiling. Preparation keeps the original records for review.
 
 Every preparation reports `retained_history_only: true`,
 `snapshot_complete: false` and `recovery_ready: false`. The operator's ability to
@@ -455,11 +445,10 @@ than omitting a stop. Imported evidence has no pruning/cancellation command.
 Both `prepare` and successful imports report every recovered record's metadata,
 its shared-verifier verdict and review requirement, plus a deterministic
 `evidence_hash`. They expose no signed bodies/signatures or private key material.
-An unknown, removed or invalid signer remains `authority_review`; importing its
-object never establishes that the stop is in force. The
-`fresh_manager_signature` and `retain_host_record` labels identify necessary
-future obligations, not sufficient authority, current effects or readiness.
-Missing later authority and history still require reconciliation for both.
+The SDK identifies a genuine stop from a former manager as `removed_manager`.
+Its recovery requirement is `fresh_manager_signature`. Other invalid or unknown
+authority stays under `authority_review`. Recovery refuses a signed replacement
+if it cannot authenticate the original at the head where the copy was retained.
 The report's
 `observed_issued_at_lower_bounds` covers only currently valid imported records.
 Those observed times do not establish the greatest time ever signed or reserved;
@@ -633,7 +622,8 @@ or permission to reopen the Station.
 The same locked inspection assembles `recovery_signatures.known_native_obligations`
 from every retained original signed native stop. Each item preserves the original
 review and identifies a matching current copy by record ID, or explicitly says
-`fresh_manager_signature`, `authority_review` or `retain_host_record`. A copy is
+`retain_service_stop`, `retain_host_record`, `fresh_manager_signature` or
+`authority_review`. A copy is
 `signed_copy_retained` only when it matches that exact original, the current plan
 and source evidence, and passes the shared verifier under current membership.
 Another stop for the same principal cannot replace it. Changing evidence or the

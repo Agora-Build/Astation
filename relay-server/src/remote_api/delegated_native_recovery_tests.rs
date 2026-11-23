@@ -113,7 +113,7 @@ async fn postgres_delegated_native_archive_retains_all_pages_intents_and_destina
     assert!(
         obligations.iter().all(|row| {
             row["original"]["record_id"] != pending.record_id
-                && row["requirement"] == "fresh_manager_signature"
+                && row["requirement"] == "retain_service_stop"
                 && row["copy_record_id"].is_null()
         }),
         "unsigned intent and Station-signed state cannot become native signed stops"

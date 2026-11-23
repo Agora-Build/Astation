@@ -93,7 +93,7 @@ async fn postgres_delegated_recovery_signatures_survive_replica_retry_without_pu
     let source = original(&before);
     assert_eq!(
         obligation(&plan, source.record_id())["requirement"],
-        "fresh_manager_signature"
+        "retain_service_stop"
     );
     assert!(obligation(&plan, source.record_id())["copy_record_id"].is_null());
     let copy = fresh(&f, &plan, &source, 1000);
@@ -303,6 +303,28 @@ async fn postgres_delegated_recovery_signatures_refuse_changed_intent_authority_
 
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_refuses_copy_of_unauthenticated_original() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 3).await;
+    let (_, f, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    let plan = prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let source = original(&saved(&database.pool).await);
+    let mut unsigned_change = source.object().to_json();
+    unsigned_change["body"]["record_id"] = json!(uuid::Uuid::new_v4().to_string());
+    let changed = ControlRecord::parse(unsigned_change.to_string().as_bytes()).unwrap();
+    let review = stops::retain(&database.pool, &binding, &genesis, &serde_json::to_vec(
+        &json!({"plan_id":plan["plan_id"],"source_hash":plan["source_hash"],"records":[unsigned_change]})).unwrap()
+    ).await.unwrap();
+    assert_eq!(obligation(&review, changed.record_id())["requirement"], "authority_review");
+    let prior = saved(&database.pool).await;
+    let copy = fresh(&f, &review, &changed, 1000);
+    assert!(submit(&database.pool, &binding, &genesis, &review, &input(&review, &changed, copy)).await.is_err());
+    assert_eq!(saved(&database.pool).await, prior);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
 async fn postgres_delegated_recovery_signatures_keep_prior_clocks_and_require_review_after_new_evidence(
 ) {
     let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 3).await;
@@ -345,12 +367,12 @@ async fn postgres_delegated_recovery_signatures_keep_prior_clocks_and_require_re
     );
     assert_eq!(
         obligation(&updated, source.record_id())["requirement"],
-        "fresh_manager_signature"
+        "retain_service_stop"
     );
     assert!(obligation(&updated, source.record_id())["copy_record_id"].is_null());
     assert_eq!(
         obligation(&updated, &later_id)["requirement"],
-        "fresh_manager_signature"
+        "retain_service_stop"
     );
     let before_failed = saved(&database.pool).await;
     let stale = input(&plan, &source, fresh(&f, &plan, &source, 1001));
@@ -374,7 +396,7 @@ async fn postgres_delegated_recovery_signatures_keep_prior_clocks_and_require_re
     );
     assert_eq!(
         obligation(&current, &later_id)["requirement"],
-        "fresh_manager_signature",
+        "retain_service_stop",
         "a copy of another stop for the same principal cannot replace this obligation"
     );
     assert!(obligation(&current, &later_id)["copy_record_id"].is_null());
@@ -404,7 +426,7 @@ async fn postgres_delegated_recovery_signatures_keep_prior_clocks_and_require_re
         .all(|row| row["current_review"] == false));
     assert_eq!(
         obligation(&later_plan, source.record_id())["requirement"],
-        "fresh_manager_signature"
+        "retain_service_stop"
     );
     let late_copy = fresh(&f, &later_plan, &source, 1002);
     let final_report = submit(
@@ -680,7 +702,7 @@ async fn postgres_delegated_recovery_signatures_recheck_current_manager_without_
     );
     assert_eq!(
         obligation(&next_plan, source.record_id())["requirement"],
-        "authority_review"
+        "fresh_manager_signature"
     );
     assert!(obligation(&next_plan, source.record_id())["copy_record_id"].is_null());
     assert_eq!(
