@@ -48,8 +48,8 @@ commit. A file import, another origin or an unknown outcome keeps the hold.
 
 Recovery Copies can request a Station challenge and submit a signed report
 when the delegated signing gate permits it. A retry can deliver a previously
-exposed signature. Same-generation publication and abandonment receipts,
-historical author coverage and joint verification remain open.
+exposed signature. The Mac can check for an authenticated abandonment receipt. Publication receipts,
+complete historical author coverage and joint verification remain open.
 
 Recovery Copies can review this Mac's retained evidence offline. The coordinator
 holds the account checkpoint and the member key's journal lock while reading
@@ -152,6 +152,27 @@ A journal created after the first grant shows `missing_early_range: true`.
 An empty reports list identifies a known author with no accepted report in this
 plan. This view uses only the available membership and current plan; independent
 historical sources and complete participant coverage are still required.
+
+## Ending a prepared plan
+
+To permanently abandon a candidate, a Station operator runs
+`station-relay-server admin delegated-recovery abandon <genesis_hash> <plan_id>`
+with the exact closed deployment generation and origin. The transaction takes the
+deployment and account locks, checks the current subject against the retained owner,
+and marks the plan abandoned. The original plan, records, historical commitments
+and reserved generation stay in storage. All preparation and new evidence writes
+for that candidate stop. Recovery can prepare another candidate in a later
+external generation. The deployment fence stays closed.
+
+**Check Signing Hold** in Recovery Copies reads
+`GET /api/remote/v1/logs/{genesis}/control/recovery/{plan}/outcome` from the
+selected Station with the native owner's bearer. Only an `abandoned` receipt
+matching the account, genesis, origin, generation, plan, candidate and source
+can end this hold. Missing, pending and unrecognized outcomes keep it held.
+The Mac retains the frozen signatures and end marker in one protected write.
+A late challenge cannot reinstall that plan. Holds at other origins still apply.
+Publication requires the future atomic reconstruction path before Station can
+issue a published outcome.
 
 ## Implemented fence and operator commands
 

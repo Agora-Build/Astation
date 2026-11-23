@@ -9,7 +9,7 @@ use sqlx::{PgConnection, PgPool};
 #[path = "delegated_recovery_plan.rs"]
 pub(crate) mod plan;
 
-pub(super) fn canonical_genesis(genesis: &str) -> bool {
+pub(crate) fn canonical_genesis(genesis: &str) -> bool {
     Hash32::from_hex(genesis).is_ok()
         && genesis.len() == 64
         && genesis.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))

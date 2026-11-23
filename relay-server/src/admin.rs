@@ -8,6 +8,7 @@ use crate::identity_store::{IdentityStore, PgIdentityStore};
 
 pub const USAGE: &str = "usage: station-relay-server admin forget-key <astation_id>\n\
        station-relay-server admin delegated-recovery status|fence\n\
+       station-relay-server admin delegated-recovery abandon <genesis_hash> <plan_id>\n\
        station-relay-server admin delegated-recovery inspect|prepare <genesis_hash>\n\
        station-relay-server admin delegated-recovery retain-stops <genesis_hash> <file>\n\
        station-relay-server admin delegated-recovery retain-native <genesis_hash> <plan_id> <file>\n\
@@ -158,6 +159,12 @@ async fn delegated_recovery(args: &[String]) -> i32 {
         {
             (false, Some((command.as_str(), genesis)), None, None)
         }
+        [command, genesis, plan] if command == "abandon"
+            && crate::remote_api::recovery::delegated_recovery::canonical_genesis(genesis)
+            && uuid::Uuid::parse_str(plan).is_ok_and(|id| id.get_version_num() == 4 && id.to_string() == *plan) =>
+        {
+            (false, Some((command.as_str(), genesis)), None, Some(plan))
+        }
         [command, genesis, file]
             if command == "retain-stops" && genesis.len() == 64
                 && genesis.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
@@ -222,6 +229,9 @@ async fn delegated_recovery(args: &[String]) -> i32 {
             } else {
                 stops::retain(&pool, &binding, genesis, &bytes).await
             }
+        } else if command == "abandon" {
+            crate::remote_api::recovery::delegated_recovery::plan::outcome::abandon(&pool, &binding, genesis,
+                native_plan.expect("validated plan")).await
         } else if command == "prepare" {
             crate::remote_api::recovery::delegated_recovery::plan::prepare(&pool, &binding, genesis).await
         } else {

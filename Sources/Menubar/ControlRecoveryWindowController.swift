@@ -25,6 +25,8 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
     private let export = NSButton(title: "Save Signed Copy...", target: nil, action: nil)
     private let sendCopy = NSButton(title: "Send to Station", target: nil, action: nil)
     private let loadReview = NSButton(title: "Load Station Review", target: nil, action: nil)
+    private let checkHold = NSButton(title: "Check Signing Hold", target: nil, action: nil)
+    private var heldPlan: RemoteControlRecoveryContext?
     private let report = NSButton(title: "Review Signing Report...", target: nil, action: nil)
     private let retryReport = NSButton(title: "Retry Report Delivery", target: nil, action: nil)
     private let prepare = NSButton(title: "Prepare Copy...", target: nil, action: nil)
@@ -69,11 +71,12 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         details.isVerticallyResizable = true; details.isHorizontallyResizable = false
         details.autoresizingMask = .width; details.textContainer?.widthTracksTextView = true
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.documentView = details
-        let reviewActions = NSStackView(views: [loadReview, refresh, report, retryReport]); reviewActions.spacing = 12
+        let reviewActions = NSStackView(views: [loadReview, refresh]); reviewActions.spacing = 12
+        let authorActions = NSStackView(views: [report, retryReport, checkHold]); authorActions.spacing = 12
         let originalActions = NSStackView(views: [originalChoices, prepare]); originalActions.spacing = 12
         originalChoices.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let actions = NSStackView(views: [sign, export, sendCopy]); actions.spacing = 12
-        let stack = NSStackView(views: [intro, stationStatus, reviewActions, authorStatus,
+        let stack = NSStackView(views: [intro, stationStatus, reviewActions, authorStatus, authorActions,
             NSTextField(labelWithString: "Original signed stop"), originalActions,
             NSTextField(labelWithString: "Saved recovery copy"), choices, scroll, status, actions])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10
@@ -103,6 +106,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         export.target = self; export.action = #selector(saveCopy)
         sendCopy.target = self; sendCopy.action = #selector(retainCopy)
         loadReview.target = self; loadReview.action = #selector(loadStationReview)
+        checkHold.target = self; checkHold.action = #selector(checkSigningHold)
         report.target = self; report.action = #selector(reviewReport)
         retryReport.target = self; retryReport.action = #selector(retrySignedReport)
         prepare.target = self; prepare.action = #selector(prepareCopy)
@@ -139,7 +143,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         generation = UUID(); task?.cancel()
         panel?.cancel(nil); panel = nil
         if let alert { window?.endSheet(alert.window, returnCode: .abort) }
-        alert = nil; access = nil; rows = []; originals = []; preparation = nil
+        alert = nil; heldPlan = nil; access = nil; rows = []; originals = []; preparation = nil
         choices.removeAllItems(); originalChoices.removeAllItems(); details.string = ""
         authorStatus.stringValue = ""
         stationStatus.stringValue = "Station review has not been loaded. Saved copies remain available offline."
@@ -153,7 +157,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
 
     @objc private func reload() {
         guard task == nil, panel == nil else { return }
-        generation = UUID(); access = nil; rows = []; originals = []; preparation = nil
+        generation = UUID(); heldPlan = nil; access = nil; rows = []; originals = []; preparation = nil
         choices.removeAllItems(); originalChoices.removeAllItems(); details.string = ""
         authorStatus.stringValue = ""
         stationStatus.stringValue = "Station review has not been loaded. Saved copies remain available offline."
@@ -190,11 +194,13 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
             let inventory = try access.coordinator.localControlAuthorInventory(stationOrigin: stationOrigin,
                 current: { self.isCurrent(access, epoch: epoch) })
             guard isCurrent(access, epoch: epoch) else { return }
+            heldPlan = inventory.heldPlan
             authorStatus.stringValue = "Stops retained on this Mac at last review: " +
                 "\(inventory.signedRecords.count) signed, \(inventory.unsignedDraftBodies.count) unsigned, " +
-                "\(inventory.missingSignatureBodies.count) with an unresolved signature."
+                "\(inventory.missingSignatureBodies.count) with an unresolved signature." + (heldPlan == nil ? "" : " Stop signing is on hold.")
         } catch {
             guard isCurrent(access, epoch: epoch) else { return }
+            heldPlan = nil
             authorStatus.stringValue = "This Mac's stop inventory is unavailable. Refresh to try again."
         }
     }
@@ -271,6 +277,27 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
             (body.revokeSeq.map { "\nHost revoke sequence: \($0)" } ?? "") +
             "\nOriginal signer: \(body.signer)\nOriginal timestamp: \(body.issuedAt)" +
             "\n\nPreparation reserves a timestamp and saves an unsigned draft only when recovery authority is verified. Review and confirm the draft separately."
+    }
+
+    @objc private func checkSigningHold() {
+        guard checkHold.isEnabled, let access, let heldPlan else { return }
+        let epoch = generation
+        task = Task { [weak self] in
+            guard let self else { return }
+            defer { task = nil; refreshAuthorInventory(access, epoch: epoch); render() }
+            let current = { self.isCurrent(access, epoch: epoch) && access.canSign() }
+            do {
+                let ended = try await access.coordinator.checkSigningHold(heldPlan, current: current)
+                guard current() else { return }
+                if ended { preparation = nil }
+                status.stringValue = ended ? "Station abandoned this plan. Its signing hold has ended."
+                    : "Station still has this plan pending. Its signing hold continues."
+            } catch {
+                guard current() else { return }
+                status.stringValue = "Could not verify the plan's end. " + error.localizedDescription
+            }
+        }
+        render()
     }
 
     @objc private func reviewReport() {
@@ -372,6 +399,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         export.isEnabled = available && selected?.signed == true
         sendCopy.isEnabled = available && selected?.signed == true && access?.canSign() == true
         loadReview.isEnabled = available && access?.canSign() == true
+        checkHold.isEnabled = available && heldPlan != nil && access?.canSign() == true
         report.isEnabled = available && preparation != nil && access?.canSign() == true &&
             access?.coordinator.delegatedControlsAvailable == true
         retryReport.isEnabled = available && preparation != nil && access?.canSign() == true

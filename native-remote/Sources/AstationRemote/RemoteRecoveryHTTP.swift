@@ -63,6 +63,12 @@ private final class RecoveryRedirectGuard: NSObject, URLSessionTaskDelegate, @un
     }
 }
 
+/// Only an authenticated GET to this plan's Station can construct this proof.
+public struct RemoteStationAbandonment: Sendable {
+    let context: RemoteControlRecoveryContext
+    fileprivate init(context: RemoteControlRecoveryContext) { self.context = context }
+}
+
 /// An SDK-decoded challenge received from the selected Station for this exact plan.
 public struct RemoteStationSignerChallenge: Sendable {
     public let context: RemoteControlRecoveryContext
@@ -228,6 +234,24 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
             stationOrigin: stationOrigin, expected: expected)
         review.stationReceipt = ReviewReceipt(review.context)
         return review
+    }
+
+    public func abandonment(of held: RemoteControlRecoveryContext) async throws -> RemoteStationAbandonment? {
+        try held.validate()
+        guard held.stationOrigin == stationOrigin else { throw RemoteChannelError.invalidInput }
+        let (_, data) = try await perform(url: path(held.genesisHash, "control/recovery/" + held.planID + "/outcome"), method: "GET")
+        guard data.count <= 4096 else { throw RemoteRecoveryTransportError.invalidResponse }
+        let body = try Self.dictionary(data)
+        guard Set(body.keys) == ["account_id", "genesis_hash", "origin", "generation", "plan_id", "candidate_feed_id", "source_hash", "outcome"],
+              body["account_id"] as? String == held.accountID, body["genesis_hash"] as? String == held.genesisHash,
+              body["origin"] as? String == stationOrigin, body["generation"] as? String == String(held.generation),
+              body["plan_id"] as? String == held.planID, body["candidate_feed_id"] as? String == held.candidateFeedID,
+              body["source_hash"] as? String == held.sourceHash else { throw RemoteRecoveryTransportError.invalidResponse }
+        switch body["outcome"] as? String {
+        case "abandoned": return RemoteStationAbandonment(context: held)
+        case "pending": return nil
+        default: throw RemoteRecoveryTransportError.invalidResponse
+        }
     }
 
     public func signerChallenge(for context: RemoteControlRecoveryContext, memberID: String, slot: String,

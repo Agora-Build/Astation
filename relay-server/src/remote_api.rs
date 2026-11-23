@@ -24,6 +24,7 @@ pub fn routes() -> Router<AppState> {
         .route("/channels", get(channels::connect))
         .route("/logs/:genesis/entries", get(recovery::entries).post(recovery::append))
         .route("/logs/:genesis/control", get(recovery::delegated_http::heads))
+        .route("/logs/:genesis/control/recovery/:plan/outcome", axum::routing::get(recovery::delegated_http::plan_outcome))
         .route("/logs/:genesis/control/recovery/signer-reports", axum::routing::post(recovery::delegated_http::signer_report))
         .route("/logs/:genesis/control/recovery/signer-challenges", axum::routing::post(recovery::delegated_http::signer_challenge))
         .route("/logs/:genesis/control/recovery", get(recovery::delegated_http::recovery_review))

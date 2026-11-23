@@ -18,6 +18,8 @@ pub(crate) mod signatures;
 
 #[path = "delegated_signer_challenges.rs"]
 pub(crate) mod signer_challenges;
+#[path = "delegated_plan_outcome.rs"]
+pub(crate) mod outcome;
 #[path = "delegated_author_history.rs"]
 mod author_history;
 #[path = "delegated_signer_reports.rs"]
@@ -25,6 +27,7 @@ pub(crate) mod signer_reports;
 
 #[derive(sqlx::FromRow)]
 pub(super) struct Prepared {
+    abandoned: bool,
     plan_id: String,
     candidate_feed_id: String,
     source_hash: String,
@@ -226,7 +229,7 @@ async fn checkpoint_for_owner(
         return Err(invalid());
     }
     let prepared: Option<Prepared> = sqlx::query_as(
-        "SELECT plan_id,candidate_feed_id,source_hash, \
+        "SELECT abandoned,plan_id,candidate_feed_id,source_hash, \
          CASE WHEN octet_length(retained::text) <= $4 THEN retained END AS retained \
          FROM station_delegated_recovery_plans \
          WHERE origin=$1 AND generation=$2 AND genesis_hash=$3",
@@ -238,7 +241,7 @@ async fn checkpoint_for_owner(
     .fetch_optional(&mut *connection)
     .await?;
     let prepared = if let Some(prepared) = prepared {
-        if prepared.source_hash != source_hash
+        if prepared.abandoned || prepared.source_hash != source_hash
             || prepared.retained != retained
             || !canonical_uuid(&prepared.plan_id)
             || !canonical_uuid(&prepared.candidate_feed_id)
@@ -253,6 +256,7 @@ async fn checkpoint_for_owner(
             return Err(invalid());
         }
         let prepared = Prepared {
+            abandoned: false,
             plan_id: uuid::Uuid::new_v4().to_string(),
             candidate_feed_id: uuid::Uuid::new_v4().to_string(),
             source_hash,

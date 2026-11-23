@@ -27,6 +27,8 @@ public struct RemoteControlAuthorInventory {
         self.key = key
     }
 
+    public internal(set) var heldPlan: RemoteControlRecoveryContext?
+
     public var signedRecords: [String] {
         rows.keys.sorted().compactMap { rows[$0]?.signedRecord }
     }

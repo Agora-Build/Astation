@@ -178,6 +178,57 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
         try hold(successor)
     }
 
+    func testOnlyExactAbandonmentReleasesTheHoldAndPreventsItsReinstallation() async throws {
+        let f = try ControlPublicationFixture(), c = try context(f), other = try context(f, origin: "https://another.example")
+        let host = try XCTUnwrap(URL(string: c.stationOrigin)?.host)
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RecoveryHTTPStub.self]
+        let station = try RemoteRecoveryHTTP(relayURL: c.stationOrigin, configuration: config, accessToken: { "native-test" })
+        defer { RecoveryHTTPStub.remove(host: host) }
+        func hold(_ ctx: RemoteControlRecoveryContext) throws {
+            _ = try f.readAuthorJournal("manager").holdForReport(context: ctx, challengeJSON: challenge(ctx, now: f.clock.wallMs),
+                log: f.log, slot: "astation-macos", nowMs: f.clock.wallMs, outboxes: [f.journal], recoveryCopies: [])
+        }
+        try hold(c); try hold(other)
+        let current = try f.readAuthorJournal("manager")
+        let payload: [String: String] = ["account_id": c.accountID, "genesis_hash": c.genesisHash, "origin": c.stationOrigin,
+            "generation": String(c.generation), "plan_id": c.planID, "candidate_feed_id": c.candidateFeedID,
+            "source_hash": c.sourceHash, "outcome": "abandoned"]
+        for field in payload.keys.sorted() + ["extra", "pending", "valid"] {
+            var body = payload
+            if field == "pending" { body["outcome"] = "pending" }
+            else if field != "valid" { body[field] = "wrong" }
+            let data = try JSONSerialization.data(withJSONObject: body)
+            RecoveryHTTPStub.install(host: host) { request in
+                XCTAssertEqual(request.httpMethod, "GET")
+                XCTAssertEqual(request.url?.path, "/api/remote/v1/logs/" + c.genesisHash + "/control/recovery/" + c.planID + "/outcome")
+                return (200, data)
+            }
+            if field == "valid" {
+                let end = try await station.abandonment(of: c)
+                let proof = try XCTUnwrap(end)
+                let fail = try RemoteControlSigningJournal(log: f.log, memberID: "manager",
+                    read: { f.authorBytes["manager"] }, persist: { _ in throw RemoteControlPublicationError.storageUncertain })
+                XCTAssertThrowsError(try fail.reconcileAbandonment(proof))
+                XCTAssertThrowsError(try current.requireStopChange(origin: c.stationOrigin))
+                try current.reconcileAbandonment(proof)
+            } else if field == "pending" {
+                let end = try await station.abandonment(of: c)
+                XCTAssertNil(end)
+            } else {
+                do { _ = try await station.abandonment(of: c); XCTFail(field) }
+                catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .invalidResponse, field) }
+            }
+        }
+        let reopened = try f.readAuthorJournal("manager")
+        XCTAssertNoThrow(try reopened.requireStopChange(origin: c.stationOrigin))
+        XCTAssertThrowsError(try reopened.requireStopChange(origin: other.stationOrigin))
+        XCTAssertThrowsError(try reopened.requireStopChange(origin: nil))
+        XCTAssertThrowsError(try hold(c))
+        XCTAssertThrowsError(try hold(context(f)))
+        try hold(context(f, generation: c.generation + 1))
+    }
+
     func testMismatchedExpiredAndCompetingPlansCannotInstallOrReplaceAHold() throws {
         let f = try ControlPublicationFixture(), c = try context(f), other = try context(f, generation: 3)
         let journal = try f.readAuthorJournal("manager"), ch = try challenge(c, now: f.clock.wallMs)
