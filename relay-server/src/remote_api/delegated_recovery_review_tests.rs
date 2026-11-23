@@ -666,6 +666,10 @@ async fn postgres_delegated_history_retains_signer_exports_after_abandonment() {
         later["known_authors"]["members"][signer]["reports"],
         json!([])
     );
+    let gaps = later["known_authors"]["journal_gaps"].as_array().unwrap();
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0]["signer"], signer);
+    assert_eq!(gaps[0]["reasons"], json!(["missing_current_report"]));
     let previous = &later["known_authors"]["prior_plans"][0];
     assert_eq!(previous["plan_id"], first["plan_id"]);
     assert_eq!(previous["members"][signer]["member_status"], "manager");
