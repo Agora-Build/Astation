@@ -166,6 +166,7 @@ fn root(f: &Fixture) -> Root {
         routes: Default::default(),
         proxies: Default::default(),
         enrollments: Default::default(),
+        verifier_reports: Default::default(),
         delegated: Default::default(),
     }
 }

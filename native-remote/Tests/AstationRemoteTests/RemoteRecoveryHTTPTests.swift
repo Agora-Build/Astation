@@ -42,6 +42,67 @@ final class RemoteRecoveryHTTPTests: XCTestCase {
         return (try RemoteRecoveryHTTP(relayURL: "https://" + host, configuration: config, accessToken: { "test-account-token" }), host)
     }
 
+    private static func requestBody(_ request: URLRequest) throws -> [String: Any] {
+        var data = request.httpBody ?? Data()
+        if data.isEmpty, let stream = request.httpBodyStream {
+            stream.open(); defer { stream.close() }
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while stream.hasBytesAvailable {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                guard count >= 0 else { throw try XCTUnwrap(stream.streamError) }
+                if count == 0 { break }
+                data.append(contentsOf: buffer.prefix(count))
+            }
+        }
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    func testVerifierChallengeUsesExistingExactOriginAccountAuthorizationAndStrictCorrelation() async throws {
+        let hash = genesis, expected = LogHead(seq: 3, hash: genesis)
+        let (http, host) = try transport { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.url?.path, "/api/remote/v1/logs/\(hash)/verifier-reports")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-account-token")
+            let body = try Self.requestBody(request)
+            XCTAssertEqual(Set(body.keys), ["challenge", "expected"])
+            let challenge = try XCTUnwrap(body["challenge"] as? [String: Any])
+            XCTAssertEqual(challenge["origin"] as? String, "https://" + request.url!.host!)
+            return (200, try JSONSerialization.data(withJSONObject: ["challenge": challenge,
+                "expected": body["expected"]!, "reports": []]))
+        }
+        defer { RecoveryHTTPStub.remove(host: host) }
+        let challenge = try verifierReportChallenge(signer: "member:phone", slot: "ios", origin: "https://" + host,
+            connection: 1, issuedAt: 1, expiresAt: 30_001)
+        let result = try await http.submitVerifierChallenge(genesisHash: hash, challengeJSON: challenge, expected: expected)
+        XCTAssertEqual(result.challengeJSON, challenge)
+        XCTAssertTrue(result.reports.isEmpty)
+        let foreign = try verifierReportChallenge(signer: "member:phone", slot: "ios", origin: "https://other.example",
+            connection: 1, issuedAt: 1, expiresAt: 30_001)
+        do { _ = try await http.submitVerifierChallenge(genesisHash: hash, challengeJSON: foreign, expected: expected); XCTFail("sent a foreign-origin challenge") }
+        catch { XCTAssertEqual(error as? RemoteChannelError, .invalidInput) }
+    }
+
+    func testVerifierMailboxRejectsChangedChallengeHeadUnknownFieldsDuplicatesAndResponseLimits() throws {
+        let challenge = try verifierReportChallenge(signer: "member:phone", slot: "ios", origin: "https://station.example",
+            connection: 1, issuedAt: 1, expiresAt: 30_001)
+        let good = "{\"challenge\":\(challenge),\"expected\":{\"seq\":3,\"hash\":\"\(genesis)\"},\"reports\":[]}"
+        let expected = LogHead(seq: 3, hash: genesis)
+        XCTAssertNoThrow(try RemoteVerifierReportMailbox.decode(Data(good.utf8), challengeJSON: challenge, expected: expected))
+        for bad in [
+            good.replacingOccurrences(of: "\"seq\":3", with: "\"seq\":2"),
+            good.replacingOccurrences(of: "\"connection\":1", with: "\"connection\":2"),
+            good.replacingOccurrences(of: "\"reports\":[]", with: "\"reports\":[{},{},{},{},{}]"),
+            good.replacingOccurrences(of: "\"reports\":[]", with: "\"reports\":null"),
+            good.replacingOccurrences(of: "\"reports\":[]", with: "\"reports\":[],\"reports\":[]"),
+            good.replacingOccurrences(of: "\"reports\":[]", with: "\"reports\":[],\"extra\":false"),
+            "{\"challenge\":null,\"expected\":{\"seq\":3,\"hash\":\"\(genesis)\"},\"reports\":[]}",
+            "{\"challenge\":\"invalid\",\"expected\":{\"seq\":3,\"hash\":\"\(genesis)\"},\"reports\":[]}",
+            String(repeating: " ", count: 262_145)
+        ] {
+            XCTAssertThrowsError(try RemoteVerifierReportMailbox.decode(Data(bad.utf8), challengeJSON: challenge, expected: expected))
+        }
+    }
+
     func testControlStatusBindsTheAccountHeadAndExactOrderedRecordIDs() async throws {
         let ids = (0..<3).map { _ in UUID().uuidString.lowercased() }, hash = genesis
         let (http, host) = try transport { request in

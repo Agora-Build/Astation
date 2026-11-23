@@ -225,7 +225,7 @@ for another process. No ordinary signing or verification ceremony is changed.
 The production native constructor still supplies no all-participant provider.
 The shared `required_version` classifier and verifier-report primitives are
 adopted from `atem-client-sdk-de7ec29882f2` on Apple, Android and Station.
-Complete protected participant enumeration and Station carriage remain required.
+Complete protected participant enumeration and production polling remain required.
 A Station replica
 report proves only that replica's own core;
 it cannot confirm a host, member or unrelated SDK. OAuth login alone cannot prove
@@ -296,9 +296,75 @@ the caller's current-context fence binds the active login and selected Station.
 An Agora.Build OAuth subject scopes identity storage but is not the protocol
 account ID. Reporting never equates those two identifiers.
 
-These adapters and their crash/lifecycle tests are implemented. They do not
-install the production participant provider, supply a protected process-roster
-review UI, start report polling, or add Station HTTP carriage. Those remain
-explicit #79 work, along with the separate durable author barrier and recovery
-assembly/publication/reopening. Delegated activation stays off until the whole
-provider and VII.A are verified; existing hosted execution is unchanged.
+These adapters and their crash/lifecycle tests are implemented. The production
+participant provider, protected process-roster review and polling lifecycle
+remain explicit #79 work, along with the separate durable author barrier and
+recovery assembly/publication/reopening. Delegated activation stays off until
+the whole provider and VII.A are verified; existing hosted execution is unchanged.
+
+### Account-private challenge carriage
+
+The following endpoints reuse this exact Station's existing native account
+bearer and recovery-root ownership. They require the separate delegated
+build/runtime opt-in. A bearer allows carriage only; it does not sign a report
+or establish membership, process identity, freshness or compatibility.
+
+| Method | Suffix under `/api/remote/v1/logs/{genesis}` | Body |
+| --- | --- | --- |
+| POST | `/verifier-reports` | `{challenge, expected}` |
+| GET | `/verifier-reports/{nonce}` | none |
+| POST | `/verifier-reports/{nonce}` | `{report}` |
+| DELETE | `/verifier-reports/{nonce}` | none |
+| POST | `/verifier-requests` | `{signer, slot, expected}` |
+
+`challenge` is the unchanged shared-library challenge object; `expected` is the
+consumer's independently anchored device-list head. `{nonce}` is its canonical
+32-byte base64url nonce. The mailbox reply is exactly
+`{challenge, expected, reports:[<signed report objects>]}`. Inbox replies are
+exactly `{challenges:[<challenge objects>]}` for the requested signer/slot/head.
+Closing returns `{closed:true}`. Roots owned by another account return the same
+metadata-free 404 as an unknown root. Every response is `no-store`.
+
+Station uses the shared challenge reader and report verifier, checks the exact
+configured origin, active signer, unexpired challenge and current expected head,
+and rejects frozen membership. It verifies each report before retaining it.
+The client repeats authentication against its own pinned membership. Station
+may carry an authenticated ancestor report so its process conflict is not lost;
+the native consumer continues to refuse ancestors as live signing evidence.
+
+The mailbox retains up to four distinct authenticated processes per challenge.
+Each process's report body is immutable. Retrying the same signed body, including
+a different valid signature over it, returns the retained report without
+extending expiry. Distinct processes are returned together, never overwritten
+by the latest response. A changed body for the same process is refused. Excess
+reports or pending challenges return 429 and cannot confirm a verifier.
+
+All root updates use the existing transactional recovery store, account lock
+and configured recovery/replica fences. A failed or uncertain write acknowledges
+no new report. Replica and restart reads retain committed bytes, not live trust.
+The operation has a ten-second deadline and five-second SQL statement bound.
+Request bodies are limited to 16,640 bytes; shared challenges to 4,096 bytes and
+reports to 16 KiB. At most 128 challenge slots exist per account root, including
+expiry/closure tombstones retained for a further 30 seconds. At most sixteen
+unexpired challenges target one signer/slot, bounding inbox replies. HTTP
+responses remain within the native 256 KiB bound. Re-creation cannot change an
+existing nonce's challenge, head or expiry or reopen a closed challenge.
+
+`RemoteRecoveryHTTP` implements these native carrier calls, refuses redirects
+and foreign-origin challenges before acquiring a token, and strictly checks
+the reply's challenge/head/shape/limits. `RemoteMemberVerifierPoller.poll` is a
+scheduling primitive for an explicitly reviewed slot. It mints a challenge
+before token acquisition, checks later mailbox reads for additional process
+responses, and starts a new round after ten seconds. A repeated signed body
+cannot consume or renew evidence. It authenticates the entire batch before
+exposing any new proof, rechecks the trusted context after each await, and
+withdraws evidence on a current poll failure. Overlapping requests for one slot
+are refused. Retirement invalidates in-flight responses and the evidence owner.
+The complete native provider must schedule these calls and retire the owner on
+account, identity, selection, recovery, roster and membership lifecycle changes.
+
+This slice does not schedule production jobs, grant service tokens access to
+native endpoints, or add a protected roster editor. An external SDK service
+still needs its separately authorized carrier; its report cannot be inferred
+from a native process or a Station-managed service. No report secret or private
+key is uploaded, and no new signing/execution gate is enabled by these routes.
