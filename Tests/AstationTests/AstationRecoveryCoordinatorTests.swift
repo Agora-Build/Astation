@@ -737,6 +737,45 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertThrowsError(try coordinator.reviewedProcessSlots(member: "manager-a", log: log))
     }
 
+    func testRecoveryProcessExportKeepsAnOfflineAndReplacedProcessAcrossRestartAndSavePanel() async throws {
+        _ = NSApplication.shared
+        let h = RecoveryCoordinatorHarness(), (_, plan) = try await preparedRecoverySource(h)
+        let writer = try h.coordinator(confirmProcessRoster: { true })
+        let local = verifierReportProcess(), other = "AQEBAQEBAQEBAQEBAQEBAQ", member = "manager-a"
+        for lines in [["desktop " + local, "offline " + other], ["desktop " + other]] {
+            let review = try await writer.prepareProcessReview(member: member, current: { true })
+            try await writer.acceptProcessReview(review, lines: lines, current: { true })
+        }
+        let restarted = try h.coordinator()
+        let panel = RecoveryCopySavePanel(), url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        panel.destination = url
+        defer { try? FileManager.default.removeItem(at: url) }
+        let controller = ControlRecoveryWindowController(stationOrigin: plan.context.stationOrigin, loadAccess: {
+            .init(coordinator: restarted, current: { true }, canSign: { true })
+        }, makeSavePanel: { panel })
+        showRecovery(controller)
+        defer { controller.close() }
+        let save = try recoveryButton("Save Reviewed Processes...", window: controller.window)
+        XCTAssertFalse(save.isEnabled)
+        try clickRecovery(recoveryButton("Load Station Review", window: controller.window))
+        try await waitForRecoveryUI { save.isEnabled }
+        try clickRecovery(save)
+        try XCTUnwrap(panel.reply)(.OK)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        let rows = try XCTUnwrap(object["slots"] as? [[String: Any]])
+        XCTAssertEqual(rows.compactMap { $0["slot"] as? String }, ["desktop", "desktop", "offline"])
+        XCTAssertEqual(rows.compactMap { $0["process"] as? String }, [other, local, other])
+        XCTAssertEqual(rows.compactMap { $0["selected"] as? Bool }, [true, false, false])
+        XCTAssertEqual(object["evidence_hash"] as? String, plan.context.evidenceHash)
+        XCTAssertEqual(object["reconstruction_hash"] as? String, plan.reconstructionHash)
+        XCTAssertFalse(restarted.controlRecoveryAvailable)
+        XCTAssertThrowsError(try restarted.exportAuthorRoster(plan, current: { false }))
+        let foreign = try h.coordinator(relayURL: "https://another.example")
+        XCTAssertThrowsError(try foreign.exportAuthorRoster(plan, current: { true }))
+        h.store.readFailure = true
+        XCTAssertThrowsError(try restarted.exportAuthorRoster(plan, current: { true }))
+    }
+
     func testProcessReviewRefusesDeniedStaleOrSupersededConfirmation() async throws {
         for fault in ["denied", "head", "selection", "expiry", "superseded"] {
             let h = RecoveryCoordinatorHarness()

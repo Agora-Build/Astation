@@ -23,6 +23,8 @@ pub(crate) mod signer_challenges;
 pub(crate) mod outcome;
 #[path = "delegated_author_history.rs"]
 mod author_history;
+#[path = "delegated_author_roster.rs"]
+pub(crate) mod author_roster;
 #[path = "delegated_signer_reports.rs"]
 pub(crate) mod signer_reports;
 

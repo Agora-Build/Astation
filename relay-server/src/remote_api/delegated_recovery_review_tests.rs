@@ -510,8 +510,55 @@ async fn postgres_signer_report_is_verified_once_and_receipted_across_replicas()
     assert_eq!(author["reports"][0]["journal"]["records"], 1);
     assert_eq!(author["reports"][0]["submission_hash"], one.1["submission_hash"]);
     assert_eq!(review["known_authors"]["complete_history"], false);
+    // Use the same prepared-plan fields the Mac exporter reads, plus one offline
+    // slot that the Station has never had a connection or a report for.
+    let mut roster = http(&b, &genesis, Some("alice")).await.1;
+    for flag in ["retained_history_only", "complete_history", "signing_clock_complete", "snapshot_complete", "recovery_ready"] {
+        roster.as_object_mut().unwrap().remove(flag);
+    }
+    let slot = json!({"member":"phone","slot":"astation-macos","process":author["reports"][0]["process"],
+        "review_head":f.log.head().to_json(),"selected":true});
+    let offline = json!({"member":"phone","slot":"offline","process":"AQEBAQEBAQEBAQEBAQEBAQ",
+        "review_head":f.log.head().to_json(),"selected":false});
+    roster["slots"] = json!([slot, offline]);
+    let comparison = |value: Value| {
+        let bytes = value.to_string().into_bytes();
+        let pool = database.pool.clone();
+        let binding = binding.clone();
+        let genesis = genesis.clone();
+        let id = review["plan_id"].as_str().unwrap().to_owned();
+        async move { plan::author_roster::compare(&pool, &binding, &genesis, &id, &bytes).await }
+    };
+    let result = comparison(roster.clone()).await.unwrap();
+    assert_eq!(result["matching_current_reports"][0]["slot"], "astation-macos");
+    assert_eq!(result["reviewed_without_current_report"][0]["slot"], "offline");
+    assert_eq!(result["reports_missing_early_range"][0]["submission_hash"], one.1["submission_hash"]);
+    assert_eq!(result["reported_outside_review"], json!([]));
+    assert_eq!(result["recovery_ready"], false);
+    let mut replaced = roster.clone();
+    replaced["slots"][0]["process"] = offline["process"].clone();
+    let mismatch = comparison(replaced).await.unwrap();
+    assert_eq!(mismatch["matching_current_reports"], json!([]));
+    assert_eq!(mismatch["reported_outside_review"][0]["slot"], "astation-macos");
+    let mut empty = roster.clone();
+    empty["slots"] = json!([]);
+    assert_eq!(comparison(empty).await.unwrap()["missing_current_roster"], json!(["phone"]));
+    for field in ["account_id","genesis_hash","origin","generation","plan_id","candidate_feed_id",
+        "source_hash","evidence_hash","reconstruction_hash","membership_head","version","unknown"] {
+        let mut changed = roster.clone();
+        changed[field] = json!("changed");
+        assert!(comparison(changed).await.is_err(), "{field}");
+    }
+    let mut fork = roster.clone();
+    fork["slots"][1]["review_head"]["hash"] = json!("0".repeat(64));
+    assert!(comparison(fork).await.is_err());
+    let mut duplicate = roster.clone();
+    duplicate["slots"] = json!([slot, slot]);
+    assert!(comparison(duplicate).await.is_err());
+    assert_eq!(plan::prepare(&database.pool, &binding, &genesis).await.unwrap(), review);
     // A corrupted retained report cannot appear in a subsequent operator review.
     sqlx::query("UPDATE station_delegated_signer_reports SET accepted_at=0").execute(&database.pool).await.unwrap();
+    assert!(comparison(roster).await.is_err());
     assert!(plan::prepare(&database.pool, &binding, &genesis).await.is_err());
     database.cleanup().await;
 }

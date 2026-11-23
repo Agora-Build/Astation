@@ -26,6 +26,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
     private let export = NSButton(title: "Save Signed Copy...", target: nil, action: nil)
     private let sendCopy = NSButton(title: "Send to Station", target: nil, action: nil)
     private let loadReview = NSButton(title: "Load Station Review", target: nil, action: nil)
+    private let exportRoster = NSButton(title: "Save Reviewed Processes...", target: nil, action: nil)
     private let checkHold = NSButton(title: "Check Signing Hold", target: nil, action: nil)
     private var heldPlan: RemoteControlRecoveryContext?
     private let report = NSButton(title: "Review Signing Report...", target: nil, action: nil)
@@ -72,7 +73,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         details.isVerticallyResizable = true; details.isHorizontallyResizable = false
         details.autoresizingMask = .width; details.textContainer?.widthTracksTextView = true
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.documentView = details
-        let reviewActions = NSStackView(views: [loadReview, refresh]); reviewActions.spacing = 12
+        let reviewActions = NSStackView(views: [loadReview, exportRoster, refresh]); reviewActions.spacing = 12
         let authorActions = NSStackView(views: [report, retryReport, checkHold]); authorActions.spacing = 12
         let originalActions = NSStackView(views: [originalChoices, prepare]); originalActions.spacing = 12
         originalChoices.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -107,6 +108,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         export.target = self; export.action = #selector(saveCopy)
         sendCopy.target = self; sendCopy.action = #selector(retainCopy)
         loadReview.target = self; loadReview.action = #selector(loadStationReview)
+        exportRoster.target = self; exportRoster.action = #selector(saveRoster)
         checkHold.target = self; checkHold.action = #selector(checkSigningHold)
         report.target = self; report.action = #selector(reviewReport)
         retryReport.target = self; retryReport.action = #selector(retrySignedReport)
@@ -404,6 +406,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         export.isEnabled = available && selected?.signed == true
         sendCopy.isEnabled = available && selected?.signed == true && access?.canSign() == true
         loadReview.isEnabled = available && access?.canSign() == true
+        exportRoster.isEnabled = available && preparation != nil && access?.canSign() == true
         checkHold.isEnabled = available && heldPlan != nil && access?.canSign() == true
         report.isEnabled = available && preparation != nil && access?.canSign() == true &&
             access?.coordinator.delegatedControlsAvailable == true
@@ -453,30 +456,48 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
     }
 
     @objc private func saveCopy() {
-        guard export.isEnabled, let access, let review = selected, let window else { return }
+        guard export.isEnabled, let access, let review = selected else { return }
+        saveEvidence(access, filename: "Astation Recovery Copy.json",
+            message: "Save this exact signed copy for the Station recovery operator. It contains account and control metadata, not private keys. Saving does not publish it or resume access.",
+            success: "Signed copy saved to file. Publication and reopening are still required.") { current in
+            try access.coordinator.exportControlRecoveryCopies(context: review.context,
+                recordIDs: [review.body.recordId], current: current)
+        }
+    }
+
+    @objc private func saveRoster() {
+        guard exportRoster.isEnabled, let access, let preparation else { return }
+        saveEvidence(access, filename: "Astation Reviewed Processes.json",
+            message: "Share these reviewed process IDs with the Station recovery operator to identify missing reports.",
+            success: "Reviewed process list saved for comparison at this Station.") { current in
+            try access.coordinator.exportAuthorRoster(preparation, current: current)
+        }
+    }
+
+    private func saveEvidence(_ access: Access, filename: String, message: String, success: String,
+        read: @escaping (() -> Bool) throws -> String) {
+        guard let window else { return }
         let epoch = generation
         do {
-            let json = try access.coordinator.exportControlRecoveryCopies(context: review.context,
-                recordIDs: [review.body.recordId], current: { self.isCurrent(access, epoch: epoch) })
+            let json = try read { self.isCurrent(access, epoch: epoch) }
             let panel = makeSavePanel(); self.panel = panel
-            panel.nameFieldStringValue = "Astation Recovery Copy.json"; panel.allowedContentTypes = [.json]
-            panel.message = "Save this exact signed copy for the Station recovery operator. It contains account and control metadata, not private keys. Saving does not publish it or resume access."
+            panel.nameFieldStringValue = filename; panel.allowedContentTypes = [.json]
+            panel.message = message
             panel.beginSheetModal(for: window) { [weak self] response in
                 guard let self, self.panel === panel else { return }
                 self.panel = nil
                 defer { self.render() }
                 guard response == .OK, let url = panel.url, self.isCurrent(access, epoch: epoch) else { return }
                 do {
-                    guard try access.coordinator.exportControlRecoveryCopies(context: review.context,
-                        recordIDs: [review.body.recordId], current: { self.isCurrent(access, epoch: epoch) }) == json else {
+                    guard try read({ self.isCurrent(access, epoch: epoch) }) == json else {
                         throw RemoteRecoveryError.requiresReview
                     }
                     try RecoveryKit.save(json, to: url)
-                    self.status.stringValue = "Signed copy saved to file. Publication and reopening are still required."
-                } catch { self.status.stringValue = "Could not save signed copy: " + error.localizedDescription }
+                    self.status.stringValue = success
+                } catch { self.status.stringValue = "Could not save file: " + error.localizedDescription }
             }
             render()
-        } catch { status.stringValue = "Could not export signed copy: " + error.localizedDescription }
+        } catch { status.stringValue = "Could not export file: " + error.localizedDescription }
     }
 
     @objc private func retainCopy() {

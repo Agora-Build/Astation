@@ -166,6 +166,28 @@ cannot account for the missing old one. An empty list describes only the
 journals observed at this Station. Participant coverage still requires the
 independent roster.
 
+In **Recovery Copies**, load the Station review and choose **Save Reviewed
+Processes**. Give the file to the recovery operator for comparison:
+
+```sh
+station-relay-server admin delegated-recovery compare-authors <genesis_hash> <plan_id> <file>
+```
+
+The Mac reads its protected native process lists for the selected Station,
+including offline slots and previously reviewed processes displaced by a list
+edit. Each row includes its reviewed membership head. Existing lists migrate
+on their next protected edit. Processes discarded by older versions still
+require independent investigation.
+
+Station compares the file against the locked plan, source, evidence, reconstruction
+and membership head. A change requires a fresh export. The output names historical
+managers without a current roster, reviewed processes without a report in this
+plan, and reported processes absent from the supplied list. A match requires
+the same member, slot and SDK process ID. Early journal gaps and ambiguous
+process identities remain visible even when a tuple matches. This command reads
+one Mac's export and cannot attest its provenance, establish complete history,
+release a signing hold or reopen a feed.
+
 Recovery rechecks each retained report with the membership and challenge from
 the plan that accepted it. A signed revoke or interrupt exported only in that
 report appears among the replacement plan's obligations, including after
