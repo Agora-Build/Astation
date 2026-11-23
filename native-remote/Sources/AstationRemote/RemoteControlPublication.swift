@@ -419,6 +419,17 @@ public final class RemoteControlPublication {
             portalRefusal: operation.portalRefusal, additionalStations: operation.additionalStations ?? [:])
     }
 
+    func collectAuthorEvidence(into inventory: inout RemoteControlAuthorInventory) throws {
+        try available()
+        guard saved.accountID == inventory.account, saved.genesisHash == inventory.genesis else {
+            throw RemoteControlPublicationError.invalidCheckpoint
+        }
+        for op in saved.operations {
+            try inventory.retain(body: Self.body(op.bodyJSON), json: op.bodyJSON, key: Self.signerKey(op),
+                record: op.recordJSON, possiblySigned: op.attempted != false)
+        }
+    }
+
     /// Export original public evidence, including superseded and completed stops.
     /// This is not a complete history, signing-clock anchor or recovery approval.
     public func recoveryEvidenceJSON(authorJournal: (String) throws -> RemoteControlSigningJournal) throws -> String {

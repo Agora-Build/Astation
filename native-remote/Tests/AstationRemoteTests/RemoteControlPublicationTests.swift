@@ -120,6 +120,63 @@ final class ControlPublicationFixture {
 
 final class RemoteControlPublicationTests: XCTestCase {
     @MainActor
+    func testLocalInventoryIncludesHostInterruptsFromEveryOriginAndOnlyThisStationsServiceStops() throws {
+        let f = try ControlPublicationFixture(), host = try f.hostBody()
+        let other = "https://second.example"
+        let box = try RemoteControlPublication(accountID: f.log.accountId(), genesisHash: f.log.genesisHash(),
+            stationOrigin: other, persist: { _ in })
+        let hostDraft = try box.prepare(body: host, log: f.log)
+        let own = try f.body(), signed = try f.prepare(own)
+        let record = try f.sign(own)
+        var foreign = try f.body(action: "interrupt_running", interrupt: nil)
+        foreign.origin = other
+        let foreignDraft = try box.prepare(body: foreign, log: f.log)
+        let journal = try f.authorJournal(f.log, "manager"), bytes = f.authorBytes
+        let local = try journal.inventory(stationOrigin: f.origin, outboxes: [f.journal, box], recoveryCopies: [])
+        XCTAssertEqual(local.signedRecords, [record])
+        XCTAssertEqual(local.unsignedDraftBodies, [try XCTUnwrap(hostDraft.bodyJson)])
+        XCTAssertTrue(local.missingSignatureBodies.isEmpty)
+        let elsewhere = try journal.inventory(stationOrigin: other, outboxes: [box, f.journal], recoveryCopies: [])
+        XCTAssertEqual(Set(elsewhere.unsignedDraftBodies), Set([try XCTUnwrap(hostDraft.bodyJson), try XCTUnwrap(foreignDraft.bodyJson)]))
+        XCTAssertTrue(elsewhere.signedRecords.isEmpty)
+        XCTAssertFalse(elsewhere.unsignedDraftBodies.contains(try XCTUnwrap(signed.bodyJson)))
+        XCTAssertEqual(bytes, f.authorBytes)
+    }
+
+    @MainActor
+    func testOriginFilteringCannotHideAnotherServiceBodyWithTheSameRecordID() throws {
+        let f = try ControlPublicationFixture(), local = try f.body(action: "interrupt_running", interrupt: nil)
+        _ = try f.prepare(local)
+        let other = "https://second.example"
+        let box = try RemoteControlPublication(accountID: f.log.accountId(), genesisHash: f.log.genesisHash(),
+            stationOrigin: other, persist: { _ in })
+        var conflicting = local
+        conflicting.origin = other
+        _ = try box.prepare(body: conflicting, log: f.log)
+        let journal = try f.authorJournal(f.log, "manager")
+        for boxes in [[f.journal!, box], [box, f.journal!]] {
+            XCTAssertThrowsError(try journal.inventory(stationOrigin: f.origin, outboxes: boxes, recoveryCopies: []))
+        }
+    }
+
+    @MainActor
+    func testLocalInventoryRejectsConflictingHostBodiesAcrossOutboxes() throws {
+        let f = try ControlPublicationFixture(), host = try f.hostBody()
+        _ = try f.prepare(host)
+        let box = try RemoteControlPublication(accountID: f.log.accountId(), genesisHash: f.log.genesisHash(),
+            stationOrigin: "https://second.example", persist: { _ in })
+        var conflict = host
+        conflict.issuedAt += 1
+        _ = try box.prepare(body: conflict, log: f.log)
+        let journal = try f.authorJournal(f.log, "manager")
+        for boxes in [[f.journal!, box], [box, f.journal!]] {
+            XCTAssertThrowsError(try journal.inventory(stationOrigin: f.origin, outboxes: boxes, recoveryCopies: [])) {
+                XCTAssertEqual($0 as? RemoteControlPublicationError, .requiresReview)
+            }
+        }
+    }
+
+    @MainActor
     func testRecoveryExportPreservesSignedStopsAndSeparatesUnsignedIntentWithoutSigningOrWriting() throws {
         let f = try ControlPublicationFixture(), signed = try f.body()
         _ = try f.prepare(signed)

@@ -35,6 +35,14 @@ This closes the contract question about a stop signed after an author's report
 but before snapshot publication. It does not implement the barrier or establish
 that existing saved journals are complete.
 
+Recovery Copies can review this Mac's retained evidence offline. The coordinator
+holds the account checkpoint and the member key's journal lock while reading
+ordinary and recovery outboxes across saved Station origins. Service stops belong
+to their named Station. Host interrupts apply at every origin. Matching bodies
+with the same ID count once. A retained signature resolves an older outbox
+draft. An attempted or legacy draft without a known signature stays unresolved.
+The review neither establishes historical coverage nor commits a report barrier.
+
 One journal lock must cover every process using the member's key. Before any
 stop signature, append the exact body durably as possibly signed, then save the
 signature. The report and barrier commit together, bound to the account,
