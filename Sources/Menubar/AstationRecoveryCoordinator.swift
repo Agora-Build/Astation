@@ -1778,8 +1778,9 @@ extension AstationRecoveryCoordinator {
             nowMs: { Self.clock().wallMs })
         guard current(), !Task.isCancelled, membershipLog?.head() == context.membershipHead else { throw RemoteChannelError.staleLink }
         try requireDelegatedControl(log)
-        let journal = try pinnedControlJournal(log: log, member: managerID)
-        let review = try journal.reviewReport(issued, log: log, preview: preview, nowMs: now().wallMs,
+        // The protected hold spans authentication; release the process lock while the owner responds.
+        let review = try pinnedControlJournal(log: log, member: managerID).reviewReport(issued,
+            log: log, preview: preview, nowMs: now().wallMs,
             outboxes: (saved.controlPublications ?? [:]).keys.map { try controls(stationOrigin: $0) },
             recoveryCopies: (saved.controlRecoveryPublications ?? [:]).keys.map { try recoveryControls(origin: $0) })
         guard await confirmOwner(review.request), current(), !Task.isCancelled else { throw RemoteRecoveryError.confirmationRequired }
@@ -1789,7 +1790,8 @@ extension AstationRecoveryCoordinator {
               let key = latest.member(deviceId: managerID)?.authKey, key.alg == .p256 else { throw RemoteChannelError.staleLink }
         try requireDelegatedControl(latest)
         try requireDurableRecoveryCheckpoint()
-        let submission = try journal.finishReport(review, log: latest, nowMs: { now().wallMs },
+        let submission = try pinnedControlJournal(log: latest, member: managerID).finishReport(review,
+            log: latest, nowMs: { now().wallMs },
             current: { current() && !Task.isCancelled },
             sign: { keyRequest in
                 let time = Self.clock()

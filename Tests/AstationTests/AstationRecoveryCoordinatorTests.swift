@@ -2617,6 +2617,19 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         defer { RecoveryReportHTTPStub.lock.withLock { RecoveryReportHTTPStub.response = nil } }
         let coordinator = try h.coordinator(transport: http, authorizeDelegatedControl: { _ in })
         let preview = try coordinator.localControlAuthorInventory(stationOrigin: context.stationOrigin, current: { true })
+        weak var openJournal: RemoteControlSigningJournal?
+        h.protectedJournal = { log, id in
+            XCTAssertNil(openJournal, "A second operation must be able to acquire the key lock")
+            let journal = try RemoteControlSigningJournal(log: log, memberID: id,
+                read: { h.authorBytes[id] }, persist: { h.authorBytes[id] = $0 })
+            openJournal = journal
+            return journal
+        }
+        h.ownerConfirmation = { _ in
+            XCTAssertNil(openJournal, "Only the durable hold should survive while waiting for the owner")
+            return h.approve
+        }
+        defer { h.protectedJournal = nil; h.ownerConfirmation = nil }
         h.approve = false
         do { try await coordinator.submitSignerReport(context, preview: preview, current: { true }); XCTFail() }
         catch { XCTAssertEqual(error as? RemoteRecoveryError, .confirmationRequired) }
