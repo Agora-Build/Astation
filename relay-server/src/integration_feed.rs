@@ -28,7 +28,26 @@ impl FeedBinding {
         }
         Ok(())
     }
-    fn storage_key(&self) -> Result<String, ()> {
+    pub(crate) fn from_reporting_env() -> Result<Option<Self>, ()> {
+        let get = |key| std::env::var(key).map_err(|_| ());
+        if std::env::var_os("STATION_REPORT_CLIENT_ID").is_none() {
+            return Ok(None);
+        }
+        let public_origin = std::env::var("PUBLIC_BASE_URL").ok();
+        let station_origin = crate::account_identity::configured_integration_origin(
+            public_origin.as_deref(), &get("ACCOUNT_OIDC_AUDIENCE")?,
+        )?;
+        let binding = Self {
+            issuer: get("ACCOUNT_OIDC_ISSUER")?,
+            portal_origin: get("STATION_PORTAL_ORIGIN")?,
+            station_origin,
+            report_client_id: get("STATION_REPORT_CLIENT_ID")?,
+        };
+        binding.validate()?;
+        Ok(Some(binding))
+    }
+
+    pub(crate) fn storage_key(&self) -> Result<String, ()> {
         self.validate()?;
         serde_json::to_string(self).map_err(|_| ())
     }
@@ -396,7 +415,7 @@ impl PolicyStore {
         checkpoint.denied = true;
         checkpoint.portal_snapshot_revision = None;
         checkpoint.revision = checkpoint.revision.checked_add(1).ok_or(())?;
-        sqlx::query("UPDATE station_integration_policy SET checkpoint=$1 WHERE binding=$2")
+        sqlx::query("UPDATE station_integration_policy SET checkpoint=$1,recovery_generation=NULL,recovery_revision=NULL WHERE binding=$2")
             .bind(serde_json::to_string(&checkpoint).map_err(|_| ())?)
             .bind(key)
             .execute(&mut *tx)
@@ -412,6 +431,13 @@ impl PolicyStore {
         previous: &PolicyCheckpoint,
         next: &PolicyCheckpoint,
     ) -> Result<(), ()> {
+        self.commit_for_recovery(previous, next, None).await
+    }
+
+    pub(crate) async fn commit_for_recovery(
+        &self, previous: &PolicyCheckpoint, next: &PolicyCheckpoint,
+        recovery: Option<&crate::remote_api::recovery::delegated_recovery::Binding>,
+    ) -> Result<(), ()> {
         if next.binding != previous.binding
             || next.revision != previous.revision.checked_add(1).ok_or(())?
         {
@@ -421,11 +447,19 @@ impl PolicyStore {
         let old = serde_json::to_string(previous).map_err(|_| ())?;
         let new = serde_json::to_string(next).map_err(|_| ())?;
         let mut tx = self.0.begin().await.map_err(|_| ())?;
+        if let Some(fence) = recovery {
+            if fence.origin != next.binding.station_origin || next.portal_snapshot_revision != Some(next.revision) {
+                return Err(());
+            }
+            fence.lock_mode(&mut tx, false).await.map_err(|_| ())?;
+        }
         sqlx::query("INSERT INTO station_integration_policy(binding,checkpoint) VALUES ($1,$2) ON CONFLICT DO NOTHING")
             .bind(&key).bind(serde_json::to_string(&PolicyCheckpoint::empty(previous.binding.clone())?).map_err(|_| ())?)
             .execute(&mut *tx).await.map_err(|_| ())?;
-        let result = sqlx::query("UPDATE station_integration_policy SET checkpoint=$1 WHERE binding=$2 AND checkpoint=$3")
-            .bind(new).bind(key).bind(old).execute(&mut *tx).await.map_err(|_| ())?;
+        let result = sqlx::query("UPDATE station_integration_policy SET checkpoint=$1,
+            recovery_generation=$4,recovery_revision=CASE WHEN $4::bigint IS NULL THEN NULL ELSE ($1::jsonb->>'revision')::numeric END
+            WHERE binding=$2 AND checkpoint=$3")
+            .bind(new).bind(key).bind(old).bind(recovery.map(|f| f.generation)).execute(&mut *tx).await.map_err(|_| ())?;
         if result.rows_affected() != 1 {
             return Err(());
         }

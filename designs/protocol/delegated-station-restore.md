@@ -749,6 +749,24 @@ not create journals or consume capacity. Retained other-Station copies remain
 exportable without changing the selected Station or obtaining network authority.
 This component does not publish a replacement snapshot or reopen recovery.
 
+### Portal service observations during recovery
+
+A Station in recovery review mode fetches the existing authenticated Portal checkpoint
+after observing its configured closed generation. At commit it takes a shared lock
+on the same fence and compares the policy revision. A late response from a previous
+generation cannot stamp a restored checkpoint. Ordinary policy updates and denials
+invalidate the observation, including writes made by a replica running the earlier
+schema. An operator restores under a new external generation.
+
+With its report-client configuration present, `admin delegated-recovery prepare`
+projects the checkpoint onto the retained R9 membership. An observed row matches
+the configured issuer's account owner, integration ID and signed service key.
+The projection carries the lifecycle state, interruption choice, expiry and any
+known revocation time. Missing or mismatched rows stay unresolved. The recovery
+plan commits to this observation separately from its native signer reports.
+A missing checkpoint is reported as pending. Publication still needs to reconcile
+services absent from the restored membership and recheck current authority.
+
 ### Operator Steps
 
 1. Drain and stop every replica before restoring. Keep delegated serving,

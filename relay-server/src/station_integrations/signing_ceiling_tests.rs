@@ -115,7 +115,7 @@ async fn postgres_delegated_external_reservation_survives_failed_commit_and_prim
     assert!(feed(&runtime, &genesis).await.is_empty());
     let fence = Binding::new(origin, 2).unwrap();
     fence.initialize(&primary.pool, true).await.unwrap();
-    let review = plan::prepare_with_ceilings(&primary.pool, &fence, &genesis, Some(&replica))
+    let review = plan::prepare_with_sources(&primary.pool, &fence, &genesis, Some(&replica), None)
         .await
         .unwrap();
     assert_eq!(
@@ -173,7 +173,7 @@ async fn postgres_delegated_external_reservation_survives_failed_commit_and_prim
         .execute(&external.pool)
         .await
         .unwrap();
-    let missing = plan::prepare_with_ceilings(&primary.pool, &fence, &genesis, Some(&replica))
+    let missing = plan::prepare_with_sources(&primary.pool, &fence, &genesis, Some(&replica), None)
         .await
         .unwrap();
     assert_eq!(
@@ -211,7 +211,7 @@ async fn postgres_delegated_external_reservation_survives_failed_commit_and_prim
         .await
         .is_err());
     assert!(
-        plan::prepare_with_ceilings(&primary.pool, &fence, &genesis, Some(&replica))
+        plan::prepare_with_sources(&primary.pool, &fence, &genesis, Some(&replica), None)
             .await
             .is_err()
     );
@@ -267,11 +267,12 @@ async fn postgres_delegated_regressed_signing_store_cannot_hide_retained_service
     assert_eq!(feed(&runtime, &genesis).await, records);
     let fence = Binding::new(origin, 2).unwrap();
     fence.initialize(&primary.pool, true).await.unwrap();
-    let review = plan::prepare_with_ceilings(
+    let review = plan::prepare_with_sources(
         &primary.pool,
         &fence,
         &genesis,
         recovery.signing_ceilings.get(),
+        None,
     )
     .await
     .unwrap();

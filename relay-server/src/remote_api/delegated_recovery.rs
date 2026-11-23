@@ -112,14 +112,18 @@ impl Binding {
     /// Hold the shared row lock through actual socket writes/signing/HTTP
     /// delivery. A concurrent fence waits, and no later operation can pass it.
     pub async fn lock(&self, connection: &mut PgConnection) -> Result<(), sqlx::Error> {
+        self.lock_mode(connection, true).await
+    }
+
+    pub(crate) async fn lock_mode(&self, connection: &mut PgConnection, ready: bool) -> Result<(), sqlx::Error> {
         let status: Option<Status> = sqlx::query_as(
             "SELECT generation,ready,reason FROM station_delegated_recovery WHERE origin=$1 FOR SHARE")
             .bind(&self.origin).fetch_optional(connection).await?;
-        if status.is_some_and(|s| s.ready && s.generation == self.generation) {
+        if status.is_some_and(|s| s.ready == ready && s.generation == self.generation) {
             Ok(())
         } else {
             Err(sqlx::Error::Protocol(
-                "delegated recovery fence is closed".into(),
+                "delegated recovery fence or generation changed".into(),
             ))
         }
     }

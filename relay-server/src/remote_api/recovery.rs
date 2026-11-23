@@ -211,6 +211,10 @@ impl RecoveryStore {
 
     pub(crate) fn delegated_enabled(&self) -> bool { self.delegated_origin.get().is_some() }
 
+    pub(crate) fn closed_review_binding(&self) -> Option<&delegated_recovery::Binding> {
+        self.recovery_review_only.get().and(self.delegated_recovery.get())
+    }
+
     pub(crate) fn collects_portal_checkpoint(&self, origin: &str) -> bool {
         (self.delegated_enabled() || self.recovery_review_only.get().is_some())
             && self.delegated_recovery.get().is_some_and(|binding| binding.origin == origin)

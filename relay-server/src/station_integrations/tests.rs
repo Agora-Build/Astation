@@ -403,6 +403,9 @@ async fn postgres_recovery_review_worker_retains_same_cursor_binding_changes_and
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.unwrap();
+        let stamp: (i64, String) = sqlx::query_as("SELECT recovery_generation,recovery_revision::text FROM station_integration_policy WHERE binding=$1")
+            .bind(runtime.binding.storage_key().unwrap()).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(stamp, (2, replica.load(&runtime.binding).await.unwrap().revision.to_string()));
         assert!(!replica.claim_checkpoint_poll(&runtime.binding).await.unwrap());
         worker.abort();
         let _ = worker.await;
@@ -527,4 +530,65 @@ fn operator_keys_refuse_world_readable_symlink_empty_and_oversized_files() {
     std::fs::write(&file, []).unwrap();
     assert!(protected_file(file.to_str().unwrap(), 32).is_err());
     std::fs::remove_dir_all(folder).unwrap();
+}
+
+#[cfg(feature = "delegated-host-work")]
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_requires_a_portal_observation_in_this_closed_generation() {
+    use crate::integration_checkpoint::PortalCheckpoint;
+    use crate::remote_api::recovery::delegated::Command;
+    use crate::remote_api::recovery::delegated_recovery::{plan, Binding};
+    let (db, runtime, fixture) = fixture().await;
+    let genesis = fixture.log.genesis_hash().to_hex();
+    let origin = &runtime.binding.station_origin;
+    runtime.app.recovery.configure_delegated(origin, 1).await.unwrap();
+    let draft = runtime.prepare(ID, OWNER, request(&fixture)).await.unwrap();
+    append_body(&runtime, &fixture, serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap()).await;
+    assert_eq!(runtime.app.recovery.delegated_operation(&genesis, PRINCIPAL, Command::Ensure).await.0, StatusCode::OK);
+    let source = json!({"changes":[],"cursor":0,"checkpoint":{"at":"2026-11-23T10:00:00.000Z","integrations":[{
+        "id":ID,"ownerAccount":OWNER,"state":"revoked","scopes":["agent.view"],"r9Svc":draft["fingerprint"],
+        "interruptRunning":true,"revokedAt":null,"expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10
+    }]}});
+    let snapshot = PortalCheckpoint::parse(&serde_json::to_vec(&source).unwrap(), &runtime.binding).unwrap();
+    let old = runtime.policies.load(&runtime.binding).await.unwrap();
+    let unbound = old.apply_checkpoint(snapshot.clone(), old.received_at).unwrap();
+    runtime.policies.commit(&old,&unbound).await.unwrap();
+    let fence = Binding::new(origin, 2).unwrap();
+    fence.initialize(&db.pool, true).await.unwrap();
+    let review = |fence| plan::prepare_with_sources(&db.pool, fence, &genesis, None, Some(&runtime.binding));
+    let before = review(&fence).await.unwrap();
+    assert_eq!(before["portal_service_evidence"]["status"], "awaiting_checkpoint");
+    let bound = unbound.apply_checkpoint(snapshot.clone(), old.received_at).unwrap();
+    runtime.policies.commit_for_recovery(&unbound, &bound, Some(&fence)).await.unwrap();
+    let observed = review(&fence).await.unwrap();
+    let evidence = &observed["portal_service_evidence"];
+    assert_eq!(evidence["generation"], "2");
+    assert_eq!(evidence["services"][0]["service_id"], format!("svc-{ID}"));
+    let action = &evidence["services"][0]["observation"];
+    assert_eq!(action["state"], "revoked");
+    assert_eq!(action["interrupt_running"], true);
+    assert!(action["revoked_at"].is_null());
+    assert_ne!(before["portal_service_evidence_hash"],observed["portal_service_evidence_hash"]);
+    assert_eq!(observed["recovery_ready"],false);
+
+    let mut wrong_key = snapshot.clone();
+    wrong_key.integrations.get_mut(ID).unwrap().policy.r9_svc = Some("e".repeat(64));
+    let wrong = bound.apply_checkpoint(wrong_key, old.received_at).unwrap();
+    runtime.policies.commit_for_recovery(&bound, &wrong, Some(&fence)).await.unwrap();
+    let unresolved = review(&fence).await.unwrap();
+    assert_eq!(unresolved["portal_service_evidence"]["services"][0]["observation"], json!({"status":"unresolved"}));
+
+    let late = wrong.apply_checkpoint(snapshot, old.received_at).unwrap();
+    let newer = Binding::new(origin, 3).unwrap();
+    newer.initialize(&db.pool,true).await.unwrap();
+    assert!(runtime.policies.commit_for_recovery(&wrong,&late,Some(&fence)).await.is_err());
+    assert_eq!(review(&newer).await.unwrap()["portal_service_evidence"]["status"],"awaiting_checkpoint");
+    runtime.policies.commit_for_recovery(&wrong,&late,Some(&newer)).await.unwrap();
+    // Simulate the policy update of an older replica unaware of the stamp columns.
+    sqlx::query("UPDATE station_integration_policy SET checkpoint=jsonb_set(checkpoint::jsonb,'{revision}',to_jsonb(1000))::text")
+        .execute(&db.pool).await.unwrap();
+    assert_eq!(review(&newer).await.unwrap()["portal_service_evidence"]["status"],"awaiting_checkpoint");
+    drop(runtime);
+    db.cleanup().await;
 }
