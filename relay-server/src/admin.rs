@@ -241,8 +241,12 @@ async fn delegated_recovery(args: &[String]) -> i32 {
                 eprintln!("invalid signing store configuration");
                 return 1;
             };
-            crate::remote_api::recovery::delegated_recovery::plan::prepare_with_ceilings(
-                &pool, &binding, genesis, ceilings.as_ref(),
+            let Ok(portal) = crate::integration_feed::FeedBinding::from_reporting_env() else {
+                eprintln!("invalid Portal reporting configuration");
+                return 1;
+            };
+            crate::remote_api::recovery::delegated_recovery::plan::prepare_with_sources(
+                &pool, &binding, genesis, ceilings.as_ref(), portal.as_ref(),
             ).await
         } else {
             inspect_root(&pool, &binding, genesis).await

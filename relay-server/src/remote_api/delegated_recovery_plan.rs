@@ -8,6 +8,9 @@ use serde_json::{json, Value};
 use sqlx::{PgConnection, PgPool};
 use std::collections::BTreeMap;
 
+#[path = "delegated_portal_services.rs"]
+mod portal_services;
+
 #[path = "delegated_recovered_stops.rs"]
 pub(crate) mod stops;
 #[path = "delegated_recovery_history.rs"]
@@ -66,14 +69,15 @@ pub(crate) async fn prepare(
     binding: &Binding,
     genesis: &str,
 ) -> Result<Value, sqlx::Error> {
-    prepare_with_ceilings(pool, binding, genesis, None).await
+    prepare_with_sources(pool, binding, genesis, None, None).await
 }
 
-pub(crate) async fn prepare_with_ceilings(
+pub(crate) async fn prepare_with_sources(
     pool: &PgPool,
     binding: &Binding,
     genesis: &str,
     ceilings: Option<&crate::service_signing_ceilings::SigningCeilings>,
+    portal: Option<&crate::integration_feed::FeedBinding>,
 ) -> Result<Value, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let (prepared, log, mut report) = checkpoint(&mut tx, binding, genesis, true).await?;
@@ -82,6 +86,15 @@ pub(crate) async fn prepare_with_ceilings(
         let evidence = ceilings.recovery_evidence(&log, &report).await.map_err(|_| invalid())?;
         report["service_clock_evidence_hash"] = source_hash(&evidence)?.into();
         report["service_clock_evidence"] = evidence;
+    }
+    if let Some(portal) = portal {
+        let subject = prepared.retained["account_subject"].as_str().ok_or_else(invalid)?;
+        let source = portal_services::observe(&mut tx, binding, portal, subject, &log).await?;
+        report["portal_service_evidence_hash"] = source_hash(&json!({
+            "plan_id": prepared.plan_id, "reconstruction_hash": report["reconstruction_hash"],
+            "source": source,
+        }))?.into();
+        report["portal_service_evidence"] = source;
     }
     tx.commit().await?;
     Ok(report)

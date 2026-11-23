@@ -113,21 +113,7 @@ impl StationIntegrations {
 
     pub(crate) fn from_env(app: AppState) -> Result<Option<Arc<Self>>, ()> {
         let get = |key| std::env::var(key).map_err(|_| ());
-        if std::env::var_os("STATION_REPORT_CLIENT_ID").is_none() {
-            return Ok(None);
-        }
-        let public_origin = std::env::var("PUBLIC_BASE_URL").ok();
-        let station_origin = crate::account_identity::configured_integration_origin(
-            public_origin.as_deref(),
-            &get("ACCOUNT_OIDC_AUDIENCE")?,
-        )?;
-        let binding = FeedBinding {
-            issuer: get("ACCOUNT_OIDC_ISSUER")?,
-            portal_origin: get("STATION_PORTAL_ORIGIN")?,
-            station_origin,
-            report_client_id: get("STATION_REPORT_CLIENT_ID")?,
-        };
-        binding.validate()?;
+        let Some(binding) = FeedBinding::from_reporting_env()? else { return Ok(None) };
         let wrapping = protected_file(&get("STATION_SERVICE_WRAPPING_KEY_FILE")?, 32)?;
         let key: &[u8; 32] = wrapping.as_slice().try_into().map_err(|_| ())?;
         let vault = ServiceKeyVault::new(key, &get("STATION_SERVICE_WRAPPING_KEY_ID")?)?;
@@ -205,7 +191,7 @@ impl StationIntegrations {
         match self.policies.claim_checkpoint_poll(&self.binding).await {
             Ok(false) => {}
             Ok(true) => {
-                if let Err(error) = self.portal.collect_checkpoint(&self.policies).await {
+                if let Err(error) = self.portal.collect_checkpoint(&self.policies, self.app.recovery.closed_review_binding()).await {
                     tracing::warn!(?error, "could not retain Portal recovery checkpoint");
                 }
             }

@@ -325,7 +325,7 @@ async fn postgres_delegated_portal_http_collection_preserves_source_on_errors_an
     let mut fixture = crate::integration_portal::tests::Fixture::new().await;
     let client = fixture.client();
     *fixture.shared.feed.lock().await = Some(source(false));
-    client.collect_checkpoint(&store).await.unwrap();
+    client.collect_checkpoint(&store, None).await.unwrap();
     let first = store.load(&fixture.binding).await.unwrap();
     assert_eq!(first.cursor, 0);
     assert_eq!(first.portal_snapshot.as_ref().unwrap().cursor, 12);
@@ -334,20 +334,20 @@ async fn postgres_delegated_portal_http_collection_preserves_source_on_errors_an
     assert!(first.portal_snapshot.is_some());
     fixture.set_status(503);
     assert_eq!(
-        client.collect_checkpoint(&store).await,
+        client.collect_checkpoint(&store, None).await,
         Err(crate::integration_portal::PortalError::Unavailable)
     );
     assert_eq!(store.load(&fixture.binding).await.unwrap(), first);
     fixture.set_status(200);
     *fixture.shared.feed.lock().await = Some(json!({"changes":[], "cursor":0, "integrations":[]}));
     assert_eq!(
-        client.collect_checkpoint(&store).await,
+        client.collect_checkpoint(&store, None).await,
         Err(crate::integration_portal::PortalError::Contract)
     );
     assert_eq!(store.load(&fixture.binding).await.unwrap(), first);
     fixture.set_status(401);
     assert_eq!(
-        client.collect_checkpoint(&store).await,
+        client.collect_checkpoint(&store, None).await,
         Err(crate::integration_portal::PortalError::Denied)
     );
     let denied = store.load(&fixture.binding).await.unwrap();
@@ -363,7 +363,7 @@ async fn postgres_delegated_portal_http_collection_preserves_source_on_errors_an
     assert!(store.commit(&first, &stale).await.is_err());
     fixture.set_status(200);
     *fixture.shared.feed.lock().await = Some(source(false));
-    client.collect_checkpoint(&store).await.unwrap();
+    client.collect_checkpoint(&store, None).await.unwrap();
     assert!(store.load(&fixture.binding).await.unwrap().denied);
     database.cleanup().await;
 }

@@ -278,13 +278,20 @@ impl PortalReportClient {
 
     /// The recovery collector can retain this source atomically. Production
     /// enforcement/publication must separately bind it to the complete plan.
-    pub(crate) async fn collect_checkpoint(&self, store: &PolicyStore) -> Result<(), PortalError> {
+    pub(crate) async fn collect_checkpoint(&self, store: &PolicyStore,
+        recovery: Option<&crate::remote_api::recovery::delegated_recovery::Binding>,
+    ) -> Result<(), PortalError> {
+        if let Some(fence) = recovery {
+            if fence.origin != self.binding.station_origin { return Err(PortalError::Contract); }
+            let mut connection = store.0.acquire().await.map_err(|_| PortalError::Unavailable)?;
+            fence.lock_mode(&mut connection, false).await.map_err(|_| PortalError::Conflict)?;
+        }
         let old = store.load(&self.binding).await.map_err(|_| PortalError::Unavailable)?;
         match self.checkpoint().await {
             Ok(snapshot) => {
                 let next = old.apply_checkpoint(snapshot, chrono::Utc::now().timestamp())
                     .map_err(|_| PortalError::Contract)?;
-                store.commit(&old, &next).await.map_err(|_| PortalError::Conflict)
+                store.commit_for_recovery(&old, &next, recovery).await.map_err(|_| PortalError::Conflict)
             }
             Err(error @ PortalError::Denied) => {
                 store.deny(&self.binding).await.map_err(|_| PortalError::Unavailable)?;
