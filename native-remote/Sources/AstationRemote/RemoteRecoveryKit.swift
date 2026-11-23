@@ -136,7 +136,7 @@ public struct RemoteRecoveryKit: Equatable, Sendable {
         }
     }
 
-    static func validHash(_ value: String) -> Bool {
+    public static func validHash(_ value: String) -> Bool {
         value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
     }
 

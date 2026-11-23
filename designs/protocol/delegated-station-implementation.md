@@ -117,9 +117,19 @@ and [Atem #120](https://github.com/Agora-Build/Atem/issues/120#issuecomment-7089
 - Apple, Android and Station now consume Atem #207 at `1952ec8ad03f`.
   Its immutable signer-report request binds the confirmed signature to the
   reviewed recovery plan and journal contents. Its verifier checks the signed
-  report against the challenge and exported records. Astation still owns the
-  protected author journal, the signing barrier and verification of complete
-  history before publication.
+  report against the challenge and exported records.
+- On Mac, ordinary stops, manager re-signs and recovery copies use a protected
+  journal shared across Station origins. The physical member key has one
+  process lock. The account checkpoint pins the journal ID. Each signing
+  attempt saves the exact body before key use and the signed record before
+  outbox delivery. If the outbox still shows a draft, offline evidence
+  export checks the independent journal and can recover the exact signed
+  record. Cancellation checks the same journal. An attempted or legacy
+  stop whose signature is missing requires review. A missing pinned journal
+  leaves recovery incomplete.
+- Report-time draft inventory, the durable plan barrier, journal range
+  coverage and Station verification of complete history still precede
+  recovery publication.
 - Valid retained Station-own stops may be carried unchanged, as may a current
   manager's. Covers/holds/releases are new signatures. The shared snapshot
   checker reports consistency only, never complete history or clocks.

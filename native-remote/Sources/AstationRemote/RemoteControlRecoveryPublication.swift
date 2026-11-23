@@ -212,6 +212,7 @@ public final class RemoteControlRecoveryPublication {
     /// Exact signed retries need no new signature. Changed membership/context must
     /// be reviewed again; a failed save fences this process even if it wrote first.
     public func sign(recordID: String, log: MembershipLog, provider: AppKeyProvider,
+        authorJournal: @MainActor (MembershipLog, String) throws -> RemoteControlSigningJournal = RemoteControlSigningJournal.init(log:memberID:),
         authority: RemoteControlRecoveryAuthorizing?, confirmedAt: UInt64,
         now: @escaping @Sendable () -> UInt64, current: () -> Bool) throws -> String {
         try available()
@@ -239,7 +240,12 @@ public final class RemoteControlRecoveryPublication {
             let signer = try RemoteConfirmedSigner(provider: provider, request: review.request,
                 confirmedAt: confirmedAt, now: now)
             guard current() else { throw RemoteChannelError.staleLink }
-            let record = try buildControlRecord(provider: signer, keyId: manager, body: review.body)
+            let journal = try authorJournal(log, manager)
+            let record = try journal.sign(bodyJSON: operation.bodyJSON, publicKey: operation.signingKey.key()) {
+                guard current() else { throw RemoteChannelError.staleLink }
+                try authorize(review, log: log, authority: authority)
+                return try buildControlRecord(provider: signer, keyId: manager, body: review.body)
+            }
             guard current() else { throw RemoteChannelError.staleLink }
             try authorize(review, log: log, authority: authority)
             guard case .valid = try verifyControlRecord(log: log, recordJson: record) else {

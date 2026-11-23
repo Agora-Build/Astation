@@ -84,6 +84,8 @@ public final class RemoteControlPublication {
         let signerPublicKey: Data
         let resignsRecordID: String?
         let observed: Bool?
+        // Older outboxes cannot distinguish an untouched draft from a lost signature.
+        var attempted: Bool?
         var recordJSON: String?
         var stationStored = false
         let portalMirror: RemoteControlPortalMirror?
@@ -92,7 +94,7 @@ public final class RemoteControlPublication {
         var additionalStations: [String: Bool]?
     }
     private struct Checkpoint: Codable {
-        let version: Int
+        var version: Int
         let accountID: String
         let genesisHash: String
         let stationOrigin: String
@@ -204,7 +206,7 @@ public final class RemoteControlPublication {
               PortalIntegrationRecord.validOrigin(stationOrigin) else {
             throw RemoteControlPublicationError.invalidCheckpoint
         }
-        saved = Checkpoint(version: 1, accountID: accountID, genesisHash: genesisHash,
+        saved = Checkpoint(version: 2, accountID: accountID, genesisHash: genesisHash,
             stationOrigin: stationOrigin, operations: [])
         self.persist = persist
     }
@@ -214,7 +216,7 @@ public final class RemoteControlPublication {
         guard checkpoint.count <= 2_097_152 else { throw RemoteControlPublicationError.invalidCheckpoint }
         saved = try PropertyListDecoder().decode(Checkpoint.self, from: checkpoint)
         self.persist = persist
-        guard saved.version == 1, saved.accountID == accountID, saved.genesisHash == genesisHash,
+        guard [1, 2].contains(saved.version), saved.accountID == accountID, saved.genesisHash == genesisHash,
               saved.stationOrigin == stationOrigin, saved.operations.count <= 256,
               RemoteRecoveryKit.validID(accountID), RemoteRecoveryKit.validHash(genesisHash),
               PortalIntegrationRecord.validOrigin(stationOrigin) else {
@@ -222,6 +224,9 @@ public final class RemoteControlPublication {
         }
         var ids = Set<String>()
         for operation in saved.operations {
+            guard saved.version >= 2 || operation.attempted == nil else {
+                throw RemoteControlPublicationError.invalidCheckpoint
+            }
             let body = try validate(operation)
             guard ids.insert(body.recordId).inserted else { throw RemoteControlPublicationError.invalidCheckpoint }
         }
@@ -327,7 +332,7 @@ public final class RemoteControlPublication {
         let head = log.head()
         let operation = Operation(bodyJSON: bodyJSON, headSeq: head.seq, headHash: head.hash,
             signerAlgorithm: key.alg == .p256 ? "p256" : "ed25519", signerPublicKey: key.raw,
-            resignsRecordID: resignsRecordID, observed: nil, portalMirror: portalMirror,
+            resignsRecordID: resignsRecordID, observed: nil, attempted: false, portalMirror: portalMirror,
             additionalStations: additionalStationOrigins.isEmpty ? nil : Dictionary(uniqueKeysWithValues: additionalStationOrigins.map { ($0, false) }))
         _ = try validate(operation)
         if let source = resignsRecordID {
@@ -351,6 +356,7 @@ public final class RemoteControlPublication {
 
     /// A retry returns the stored signature, including for nondeterministic P-256 keys.
     public func sign(recordID: String, log: MembershipLog, provider: AppKeyProvider,
+        authorJournal: @MainActor (MembershipLog, String) throws -> RemoteControlSigningJournal = RemoteControlSigningJournal.init(log:memberID:),
         confirmedAt: UInt64, now: @escaping @Sendable () -> UInt64, current: () -> Bool) throws -> String {
         try available()
         try check(log)
@@ -365,23 +371,31 @@ public final class RemoteControlPublication {
             throw RemoteControlPublicationError.requiresReview
         }
         try checkResignSource(operation, log: log)
-        return try transaction { next in
-            let body = try validate(operation)
-            let manager = String(body.signer.dropFirst(7))
-            let request = try RemoteConfirmedSigner.controlRequest(bodyJSON: operation.bodyJSON, keyID: manager)
-            guard let member = log.member(deviceId: manager), member.authKey == (try Self.signerKey(operation)),
-                  try provider.publicKey(keyId: manager) == member.authKey else {
-                throw RemoteControlPublicationError.requiresReview
-            }
-            let signer = try RemoteConfirmedSigner(provider: provider, request: request, confirmedAt: confirmedAt, now: now)
-            guard current() else { signer.invalidate(); throw RemoteChannelError.staleLink }
-            let record = try buildControlRecord(provider: signer, keyId: manager, body: body)
-            try verify(record, log: log)
+        operating = true
+        defer { operating = false }
+        let body = try validate(operation)
+        let manager = String(body.signer.dropFirst(7))
+        let request = try RemoteConfirmedSigner.controlRequest(bodyJSON: operation.bodyJSON, keyID: manager)
+        guard let member = log.member(deviceId: manager), member.authKey == (try Self.signerKey(operation)),
+              try provider.publicKey(keyId: manager) == member.authKey else {
+            throw RemoteControlPublicationError.requiresReview
+        }
+        let signer = try RemoteConfirmedSigner(provider: provider, request: request, confirmedAt: confirmedAt, now: now)
+        guard current() else { signer.invalidate(); throw RemoteChannelError.staleLink }
+        let journal = try authorJournal(log, manager)
+        if operation.attempted != true {
+            try commit { $0.operations[index].attempted = true }
+        }
+        let record = try journal.sign(bodyJSON: operation.bodyJSON, publicKey: member.authKey) {
             guard current(), log.head() == LogHead(seq: operation.headSeq, hash: operation.headHash),
                   log.frozen() == nil else { throw RemoteChannelError.staleLink }
-            next.operations[index].recordJSON = record
-            return record
+            return try buildControlRecord(provider: signer, keyId: manager, body: body)
         }
+        try verify(record, log: log)
+        guard current(), log.head() == LogHead(seq: operation.headSeq, hash: operation.headHash),
+              log.frozen() == nil else { throw RemoteChannelError.staleLink }
+        try commit { $0.operations[index].recordJSON = record }
+        return record
     }
 
     /// Revalidate on every delivery against the independently refreshed device list.
@@ -407,14 +421,22 @@ public final class RemoteControlPublication {
 
     /// Export original public evidence, including superseded and completed stops.
     /// This is not a complete history, signing-clock anchor or recovery approval.
-    public func recoveryEvidenceJSON() throws -> String {
+    public func recoveryEvidenceJSON(authorJournal: (String) throws -> RemoteControlSigningJournal) throws -> String {
         try available()
         var records: [String] = [], unsigned: [String] = []
         var destinations: [String: [String]] = [:]
+        var journals: [String: RemoteControlSigningJournal] = [:]
         for operation in saved.operations {
             let body = try validate(operation)
             destinations[body.recordId] = [saved.stationOrigin] + (operation.additionalStations ?? [:]).keys.sorted()
-            if let record = operation.recordJSON { records.append(record) }
+            if let record = operation.recordJSON {
+                records.append(record)
+                continue
+            }
+            let member = String(body.signer.dropFirst(7))
+            let journal = try journals[member] ?? authorJournal(member)
+            journals[member] = journal
+            if let record = try retainedSignature(operation, journal: journal) { records.append(record) }
             else { unsigned.append(operation.bodyJSON) }
         }
         let metadata: [String: Any] = [
@@ -432,11 +454,24 @@ public final class RemoteControlPublication {
         return output
     }
 
-    public func cancelUnsigned(recordID: String) throws {
+    private func retainedSignature(_ operation: Operation, journal: RemoteControlSigningJournal) throws -> String? {
+        switch try journal.evidence(bodyJSON: operation.bodyJSON, publicKey: Self.signerKey(operation)) {
+        case .signed(let record): return record
+        case .untouched where operation.attempted == false: return nil
+        default: throw RemoteControlPublicationError.requiresReview
+        }
+    }
+
+    public func cancelUnsigned(recordID: String, authorJournal: (String) throws -> RemoteControlSigningJournal) throws {
         try available()
         let index = try index(recordID)
-        guard saved.operations[index].recordJSON == nil else { throw RemoteControlPublicationError.requiresReview }
-        try transaction { $0.operations.remove(at: index) }
+        let operation = saved.operations[index]
+        let body = try validate(operation)
+        guard operation.recordJSON == nil, operation.attempted == false,
+              try retainedSignature(operation, journal: authorJournal(String(body.signer.dropFirst(7)))) == nil else {
+            throw RemoteControlPublicationError.requiresReview
+        }
+        _ = try transaction { $0.operations.remove(at: index) }
     }
 
     public func stationStored(_ delivery: RemoteControlDelivery, stationOrigin: String? = nil) throws {
@@ -590,7 +625,12 @@ public final class RemoteControlPublication {
         try available()
         operating = true
         defer { operating = false }
+        return try commit(update)
+    }
+
+    private func commit<T>(_ update: (inout Checkpoint) throws -> T) throws -> T {
         var next = saved
+        next.version = 2
         let result = try update(&next)
         let encoder = PropertyListEncoder()
         encoder.outputFormat = .binary

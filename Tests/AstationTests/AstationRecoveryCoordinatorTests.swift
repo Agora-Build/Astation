@@ -436,6 +436,8 @@ private final class RecoveryCoordinatorHarness {
     let store = RecoveryMemoryCheckpoint()
     let keys = RecoveryMemoryKeys()
     let relay = RecoveryMemoryRelay()
+    var authorBytes: [String: Data] = [:]
+    var protectedJournal: ((MembershipLog, String) throws -> RemoteControlSigningJournal)?
     let identityStorage = TestAtemStorage()
     let identityCryptography = TestAtemCryptography()
     lazy var identity = AtemE2EIdentity(storage: identityStorage, crypto: identityCryptography)
@@ -469,7 +471,11 @@ private final class RecoveryCoordinatorHarness {
                 savedKits.append(kit)
                 return save
             }, confirmServiceOwner: serviceOwnerConfirmation, authorizeDelegatedControl: authorizeDelegatedControl,
-            controlRecoveryAuthority: controlRecoveryAuthority,
+            controlRecoveryAuthority: controlRecoveryAuthority, controlSigningJournal: { [unowned self] log, member in
+                if let protectedJournal { return try protectedJournal(log, member) }
+                return try RemoteControlSigningJournal(log: log, memberID: member, read: { self.authorBytes[member] },
+                    persist: { self.authorBytes[member] = $0 })
+            },
             authorizeNewMembership: authorizeNewMembership, additionalControlStations: additionalControlStations,
             retainedControlTransport: retainedControlTransport,
             confirmVerifierRoster: confirmVerifierRoster, confirmProcessRoster: confirmProcessRoster, verifierTime: verifierTime)
@@ -2641,7 +2647,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         }
         let name = "atem-recovery-copy-test-" + UUID().uuidString
         let identityStorage = AtemIdentityKeychainStorage(astationId: name)
-        let queries: [[String: Any]] = [
+        var queries: [[String: Any]] = [
             [kSecClass as String: kSecClassGenericPassword,
              kSecAttrService as String: "build.agora.astation.atem-e2e-v1", kSecAttrAccount as String: name,
              kSecUseDataProtectionKeychain as String: true],
@@ -2659,6 +2665,22 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             }
         }
         let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+        var journalScope: String?
+        h.protectedJournal = { log, member in
+            let journal = try RemoteControlSigningJournal(log: log, memberID: member)
+            if journalScope == nil {
+                journalScope = journal.storageScope
+                queries.append([kSecClass as String: kSecClassGenericPassword,
+                    kSecAttrService as String: "build.agora.astation.recovery-v2",
+                    kSecAttrAccount as String: "control-author:" + journal.storageScope,
+                    kSecUseDataProtectionKeychain as String: true])
+            }
+            XCTAssertEqual(journal.storageScope, journalScope)
+            XCTAssertThrowsError(try RemoteControlSigningJournal(log: log, memberID: member)) { error in
+                guard case RemoteRecoveryStoreError.locked = error else { return XCTFail("Expected key lock, got " + String(describing: error)) }
+            }
+            return journal
+        }
         h.identity = AtemE2EIdentity(storage: identityStorage)
         var store: RemoteRecoveryStore?
         var coordinator: AstationRecoveryCoordinator?
@@ -2686,7 +2708,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(authority.reservations, 1)
         let data = try XCTUnwrap(store?.read())
         let fields = try XCTUnwrap(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any])
-        XCTAssertEqual(fields["version"] as? Int, 4)
+        XCTAssertEqual(fields["version"] as? Int, 6)
         XCTAssertFalse(try XCTUnwrap(fields["controlRecoveryPublications"] as? [String: Data]).isEmpty)
         let retainedLog = await h.relay.log
         let log = try XCTUnwrap(retainedLog)
@@ -2710,6 +2732,33 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(authority.reservations, 1)
     }
 
+    func testMissingOrReplacedAuthorJournalBlocksRecoveryCopyWithNoKeyUse() async throws {
+        let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
+        let (coordinator, context, original) = try await recoveryCopySource(h, authority: authority)
+        let review = try await coordinator.prepareControlRecoveryCopy(recordID: original, context: context, current: { true })
+        let retained = try XCTUnwrap(h.authorBytes["manager-a"])
+        let signs = h.identityCryptography.signingCalls
+        let log = await h.relay.log
+        h.authorBytes.removeAll()
+        for missing in [true, false] {
+            if !missing {
+                let replacement = try RemoteControlSigningJournal(log: XCTUnwrap(log), memberID: "manager-a",
+                    read: { h.authorBytes["manager-a"] }, persist: { h.authorBytes["manager-a"] = $0 })
+                try replacement.establish()
+            }
+            let reopened = try h.coordinator(authorizeDelegatedControl: { _ in }, controlRecoveryAuthority: authority)
+            do {
+                _ = try await reopened.signControlRecoveryCopy(review, current: { true })
+                XCTFail("A fresh journal must not replace an established signing history")
+            } catch { XCTAssertEqual(error as? RemoteRecoveryError, .storageUncertain) }
+            XCTAssertEqual(h.identityCryptography.signingCalls, signs)
+        }
+        h.authorBytes["manager-a"] = retained
+        let reopened = try h.coordinator(authorizeDelegatedControl: { _ in }, controlRecoveryAuthority: authority)
+        _ = try await reopened.signControlRecoveryCopy(review, current: { true })
+        XCTAssertEqual(h.identityCryptography.signingCalls, signs + 1)
+    }
+
     func testRecoveryCopiesUseProtectedCheckpointAndOwnerConfirmationWithoutOrdinaryDelivery() async throws {
         let h = RecoveryCoordinatorHarness(), authority = RecoveryCopyAuthority()
         var (coordinator, context, original) = try await recoveryCopySource(h, authority: authority)
@@ -2721,7 +2770,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         let copy = try await coordinator.signControlRecoveryCopy(review, current: { true })
         let savedCheckpoint = try XCTUnwrap(h.store.bytes)
         var savedFields = try XCTUnwrap(PropertyListSerialization.propertyList(from: savedCheckpoint, format: nil) as? [String: Any])
-        XCTAssertEqual(savedFields["version"] as? Int, 4)
+        XCTAssertEqual(savedFields["version"] as? Int, 6)
         savedFields["version"] = 3
         h.store.bytes = try PropertyListSerialization.data(fromPropertyList: savedFields, format: .binary, options: 0)
         XCTAssertThrowsError(try h.coordinator(), "a downgraded checkpoint must not hide retained recovery clocks")
@@ -2938,6 +2987,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         var checkpoint = try XCTUnwrap(PropertyListSerialization.propertyList(from: XCTUnwrap(h.store.bytes), format: nil) as? [String: Any])
         checkpoint["version"] = 3
         checkpoint.removeValue(forKey: "controlRecoveryPublications")
+        checkpoint.removeValue(forKey: "controlJournalIDs")
         h.store.bytes = try PropertyListSerialization.data(fromPropertyList: checkpoint, format: .binary, options: 0)
         let legacy = try h.coordinator(authorizeDelegatedControl: { _ in })
         let prompts = h.ownerRequests.count, reservations = authority.reservations
