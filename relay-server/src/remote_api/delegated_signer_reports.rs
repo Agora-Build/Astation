@@ -1,6 +1,8 @@
 //! Retained author evidence under the closed plan. A receipt never releases the author's hold.
 use super::{checkpoint_for_owner, invalid, review_source_evidence, source_hash, Binding};
-use atem_client::member_report::{verify_signer_report, SignerReportChallenge};
+use atem_client::member_report::{
+    verify_signer_report, SignerReportChallenge, VerifiedSignerReport,
+};
 use serde_json::{json, Value};
 use sqlx::{PgConnection, PgPool};
 
@@ -18,21 +20,6 @@ impl From<sqlx::Error> for SubmitError {
 }
 
 const MAX_REPORTS: usize = 256;
-
-// Only accepted evidence changes the review. Preserve the commitment for plans
-// prepared by earlier versions until their first report actually arrives.
-pub(super) async fn commitments(
-    db: &mut PgConnection,
-    plan_id: &str,
-) -> Result<Vec<String>, sqlx::Error> {
-    let hashes: Vec<String> = sqlx::query_scalar(
-        "SELECT submission_hash FROM station_delegated_signer_reports WHERE plan_id=$1 ORDER BY connection LIMIT 257"
-    ).bind(plan_id).fetch_all(db).await?;
-    if hashes.len() > MAX_REPORTS {
-        return Err(invalid());
-    }
-    Ok(hashes)
-}
 
 pub(crate) async fn submit(
     pool: &PgPool,
@@ -87,7 +74,8 @@ pub(crate) async fn submit(
     .ok_or(SubmitError::Changed)?;
     let challenge = SignerReportChallenge::parse(challenge_json.to_string().as_bytes())
         .map_err(|_| invalid())?;
-    review_source_evidence(&mut tx, &plan, &log, binding, &mut evidence).await?;
+    let mut known =
+        review_source_evidence(&mut tx, &plan, &log, binding, &mut evidence, false).await?;
     let recovery = challenge.recovery();
     if challenge.connection() != connection as u64
         || challenge.origin() != binding.origin
@@ -129,6 +117,24 @@ pub(crate) async fn submit(
     if !verified.at_head {
         return Err(SubmitError::Changed);
     }
+    let old_count = known.len();
+    for record in verified.records {
+        let value = record.object().to_json();
+        if let Some(previous) = known.insert(record.record_id().to_owned(), value.clone()) {
+            if previous != value {
+                return Err(SubmitError::Invalid);
+            }
+        }
+    }
+    if known.len() > super::history::MAX_RECORDS {
+        return Err(SubmitError::Limit);
+    }
+    if known.len() > old_count {
+        // A new source can also collide with an archived draft or retained recovery copy.
+        // Check those before committing a receipt that would make the next review unusable.
+        super::native::inspection(&mut tx, &plan, &log, binding, &known).await?;
+        super::signatures::inspection(&mut tx, &plan, &log, binding, &evidence, &known).await?;
+    }
     sqlx::query("INSERT INTO station_delegated_signer_reports(plan_id,connection,challenge,submission,submission_hash,accepted_at)
         VALUES ($1,$2,$3,$4,$5,$6)")
         .bind(&plan.plan_id).bind(connection).bind(&challenge_json).bind(input).bind(&hash).bind(now)
@@ -138,15 +144,16 @@ pub(crate) async fn submit(
 }
 
 /// Reverify accepted bytes under the retained list and the original acceptance
-/// time. Only the operator's preparation command requests this bounded walk.
-pub(super) async fn inspect(
+/// time. Stream each verified export into the same reconciliation as feed records.
+pub(super) async fn visit(
     db: &mut PgConnection,
     plan: &super::Prepared,
     log: &atem_client::membership::Membership,
-    binding: &Binding,
-) -> Result<Value, sqlx::Error> {
+    origin: &str,
+    generation: i64,
+    mut accept: impl FnMut(VerifiedSignerReport, String) -> Result<(), sqlx::Error>,
+) -> Result<(), sqlx::Error> {
     use futures_util::TryStreamExt;
-    let mut authors = super::author_history::inventory(log);
     let mut rows = sqlx::query_as::<_, (i64, Value, Value, String, i64)>(
         "SELECT connection,challenge,submission,submission_hash,accepted_at
          FROM station_delegated_signer_reports WHERE plan_id=$1 ORDER BY connection LIMIT 257",
@@ -156,7 +163,10 @@ pub(super) async fn inspect(
     let mut count = 0;
     while let Some((connection, raw, input, hash, accepted)) = rows.try_next().await? {
         count += 1;
-        if count > MAX_REPORTS || source_hash(&input)? != hash {
+        if count > MAX_REPORTS
+            || input.as_object().is_none_or(|object| object.len() != 2)
+            || source_hash(&input)? != hash
+        {
             return Err(invalid());
         }
         let challenge =
@@ -164,11 +174,11 @@ pub(super) async fn inspect(
         let recovery = challenge.recovery();
         let when = u64::try_from(accepted).map_err(|_| invalid())?;
         if challenge.connection() != u64::try_from(connection).map_err(|_| invalid())?
-            || recovery.generation() != binding.generation as u64
+            || recovery.generation() != generation as u64
             || recovery.plan_id() != plan.plan_id
             || recovery.source_hash().to_hex() != plan.source_hash
             || recovery.candidate_feed_id() != plan.candidate_feed_id
-            || challenge.origin() != binding.origin
+            || challenge.origin() != origin
             || when < challenge.issued_at()
             || when >= challenge.expires_at()
         {
@@ -191,14 +201,7 @@ pub(super) async fn inspect(
         if !verified.at_head {
             return Err(invalid());
         }
-        let author = authors.get_mut(&verified.signer).ok_or_else(invalid)?;
-        let first = author["first_manage_seq"].as_u64().ok_or_else(invalid)?;
-        let summary = json!({"connection":connection, "slot":verified.slot, "journal":verified.journal.to_json(),
-            "missing_early_range":verified.journal.since > first, "submission_hash":hash});
-        author["reports"]
-            .as_array_mut()
-            .ok_or_else(invalid)?
-            .push(summary);
+        accept(verified, hash)?;
     }
-    Ok(json!({"members":authors,"complete_history":false}))
+    Ok(())
 }

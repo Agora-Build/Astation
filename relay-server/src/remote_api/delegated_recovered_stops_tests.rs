@@ -169,7 +169,7 @@ async fn postgres_delegated_recovered_stops_preserve_later_native_intent_across_
     assert_eq!(rows.len(), 2);
     assert!(rows
         .iter()
-        .all(|row| row["requirement"] == "fresh_manager_signature"
+        .all(|row| row["requirement"] == "retain_service_stop"
             && row["interrupt_running"] == true));
     assert_eq!(
         final_report["recovered_stops"]["observed_issued_at_lower_bounds"]["service:svc-test"],

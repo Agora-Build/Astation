@@ -8,7 +8,7 @@ use atem_client::{
         verify_control, AckLedger, CallRefused, ControlAbout, ControlAck, ControlAction,
         ControlBody, ControlCheck, ControlFeed, ControlPrincipal, ControlRecord, ControlSigner,
         ControlSyncResult, FeedEntry, FeedHead, Heads, LinkAssociation, MembershipFetchResult,
-        RefusalCode, RefusedCall, RelayError, ToStation,
+        RefusalCode, RefusalReason, RefusedCall, RelayError, ToStation,
     },
     membership::{Action, Head, MemberKind, MemberStatus, Membership, RolesChange},
     station_route::normalize_relay,
@@ -63,10 +63,39 @@ impl Fault {
     }
 }
 
+pub(super) fn recovery_record_review(record: &ControlRecord, log: &Membership) -> Value {
+    let (verification, requirement) = match verify_control(record, log) {
+        ControlCheck::Valid(_) => {
+            let requirement = match (record.action(), record.feed()) {
+                (ControlAction::Revoke { .. } | ControlAction::InterruptRunning { .. }, None) => "retain_host_record",
+                (ControlAction::Revoke { .. } | ControlAction::InterruptRunning { .. }, Some(_)) => "retain_service_stop",
+                _ => "service_state_reconciliation",
+            };
+            ("valid".to_owned(), requirement)
+        }
+        ControlCheck::Refused(RefusalReason::RemovedManager) =>
+            ("removed_manager".to_owned(), "fresh_manager_signature"),
+        ControlCheck::Pending(reason) => (format!("pending:{}", reason.code()), "authority_review"),
+        ControlCheck::Refused(reason) => (reason.code().to_owned(), "authority_review"),
+    };
+    serde_json::json!({
+        "record_id": record.record_id(),
+        "principal": record.principal().name(),
+        "signer": record.signer().name(record.principal()),
+        "action": record.action().name(),
+        "interrupt_running": matches!(record.action(), ControlAction::Revoke { interrupt_running: true } | ControlAction::InterruptRunning { .. }),
+        "revoke_seq": match record.action() {
+            ControlAction::InterruptRunning { revoke_seq } => revoke_seq,
+            _ => None,
+        },
+        "issued_at": record.issued_at(),
+        "verification": verification,
+        "requirement": requirement,
+    })
+}
+
 impl Stored {
-    /// Every old record remains an obligation until recovery reconciles it.
-    /// In particular, a still-valid native service signature cannot be edited
-    /// to name the replacement feed; it needs a fresh owner-confirmed review.
+    /// Classify each retained record at the head that recovery is reviewing.
     pub(super) fn recovery_review(
         &self,
         origin: &str,
@@ -94,33 +123,7 @@ impl Stored {
             {
                 return Err(Fault::Unavailable);
             }
-            let check = verify_control(&record, log);
-            let (verification, requirement) = match (&check, record.signer(), record.feed()) {
-                (ControlCheck::Valid(_), ControlSigner::Member(_), None) =>
-                    ("valid".to_owned(), "retain_host_record"),
-                (ControlCheck::Valid(_), ControlSigner::Member(_), Some(_)) =>
-                    ("valid".to_owned(), "fresh_manager_signature"),
-                (ControlCheck::Valid(_), ControlSigner::Principal, _) =>
-                    ("valid".to_owned(), "service_state_reconciliation"),
-                (ControlCheck::Pending(reason), _, _) =>
-                    (format!("pending:{}", reason.code()), "authority_review"),
-                (ControlCheck::Refused(reason), _, _) =>
-                    (reason.code().to_owned(), "authority_review"),
-            };
-            records.push(serde_json::json!({
-                "record_id": record.record_id(),
-                "principal": record.principal().name(),
-                "signer": record.signer().name(record.principal()),
-                "action": record.action().name(),
-                "interrupt_running": matches!(record.action(), ControlAction::Revoke { interrupt_running: true } | ControlAction::InterruptRunning { .. }),
-                "revoke_seq": match record.action() {
-                    ControlAction::InterruptRunning { revoke_seq } => revoke_seq,
-                    _ => None,
-                },
-                "issued_at": record.issued_at(),
-                "verification": verification,
-                "requirement": requirement,
-            }));
+            records.push(recovery_record_review(&record, log));
         }
         Ok(serde_json::json!({
             "retained_feed_id": self.feed_id,

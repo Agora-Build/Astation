@@ -61,29 +61,7 @@ pub(super) fn review(record: &ControlRecord, log: &Membership, origin: &str) -> 
     {
         return Err(invalid());
     }
-    // Unknown/removed authority is retained as an unresolved obligation, never
-    // promoted to a currently effective stop or a clock-completeness claim.
-    // A valid native signature identifies a future recovery obligation only;
-    // it does not settle missing authority/history or make recovery ready.
-    let (verification, requirement) = match verify_control(record, log) {
-        ControlCheck::Valid(_) => (
-            "valid".to_owned(),
-            if record.feed().is_some() {
-                "fresh_manager_signature"
-            } else {
-                "retain_host_record"
-            },
-        ),
-        ControlCheck::Pending(reason) => (format!("pending:{}", reason.code()), "authority_review"),
-        ControlCheck::Refused(reason) => (reason.code().to_owned(), "authority_review"),
-    };
-    Ok(json!({
-        "record_id": record.record_id(), "principal": record.principal().name(),
-        "signer": record.signer().name(record.principal()), "action": record.action().name(),
-        "interrupt_running": matches!(record.action(), ControlAction::Revoke { interrupt_running: true } | ControlAction::InterruptRunning { .. }),
-        "revoke_seq": match record.action() { ControlAction::InterruptRunning { revoke_seq } => revoke_seq, _ => None },
-        "issued_at": record.issued_at(), "verification": verification, "requirement": requirement,
-    }))
+    Ok(super::super::super::delegated::recovery_record_review(record, log))
 }
 
 pub(crate) async fn retain(

@@ -1,11 +1,11 @@
 //! Retain fresh manager copies for a recovery snapshot. These signatures never
 //! supply missing history, clock completeness, publication or reopening authority.
 use super::super::Binding;
-use super::{history, invalid, source_hash, Prepared};
+use super::{invalid, source_hash, Prepared};
 use atem_client::{
     canonical::StrictValue,
     control::{
-        verify_control, ControlAction, ControlCheck, ControlFeed, ControlRecord, ControlSigner,
+        verify_control, ControlAction, ControlCheck, ControlFeed, ControlRecord, ControlSigner, RefusalReason,
     },
     membership::Membership,
     Hash32,
@@ -71,8 +71,10 @@ fn check_copy(
     record: &ControlRecord,
     origin: &str,
     candidate: &str,
+    verifying_head: &Membership,
 ) -> Result<(), sqlx::Error> {
-    if !matches!(original.signer(), ControlSigner::Member(_))
+    if !matches!(verify_control(original, verifying_head), ControlCheck::Valid(_) | ControlCheck::Refused(RefusalReason::RemovedManager))
+        || !matches!(original.signer(), ControlSigner::Member(_))
         || !matches!(record.signer(), ControlSigner::Member(_))
         || !matches!(
             original.action(),
@@ -148,10 +150,10 @@ async fn load(
             .map_err(|_| invalid())?;
         let record = ControlRecord::parse(&serde_json::to_vec(&row.record).map_err(|_| invalid())?)
             .map_err(|_| invalid())?;
-        check_copy(&original, &record, &binding.origin, &row.candidate_feed_id)?;
         let accepted_log =
             Membership::from_stored(log.account_id(), &log.genesis_hash(), &row.membership)
                 .map_err(|_| invalid())?;
+        check_copy(&original, &record, &binding.origin, &row.candidate_feed_id, &accepted_log)?;
         if prepared.retained["account_subject"] != row.subject
             || !super::canonical_uuid(&row.plan_id)
             || !super::canonical_uuid(&row.candidate_feed_id)
@@ -227,11 +229,10 @@ async fn retain_checked(
     let record_ids: Vec<_> = input.replacements.iter().map(|(_, record)| record.record_id().to_owned()).collect();
     let mut tx = pool.begin().await?;
     let (prepared, log, mut report) = super::checkpoint_for_owner(&mut tx, binding, genesis, false, owner).await?;
-    super::review_source_evidence(&mut tx, &prepared, &log, binding, &mut report).await?;
+    let signed = super::review_source_evidence(&mut tx, &prepared, &log, binding, &mut report, false).await?;
     if prepared.plan_id != plan_id || report["evidence_hash"] != input.evidence_hash {
         return Err(invalid());
     }
-    let (_, signed) = history::inspection(&mut tx, &prepared, &log, binding).await?;
     let (rows, mut lower_bounds) =
         load(&mut tx, &prepared, &log, binding, &signed, &report).await?;
     for (principal, value) in report["known_history"]["observed_signing_lower_bounds"]
@@ -250,6 +251,7 @@ async fn retain_checked(
             &record,
             &binding.origin,
             &prepared.candidate_feed_id,
+            &log,
         )?;
         if !matches!(verify_control(&record, &log), ControlCheck::Valid(_))
             || signed.contains_key(record.record_id())
@@ -307,9 +309,9 @@ pub(super) async fn inspection(
     log: &Membership,
     binding: &Binding,
     report: &Value,
+    signed: &BTreeMap<String, Value>,
 ) -> Result<Value, sqlx::Error> {
-    let (_, signed) = history::inspection(connection, prepared, log, binding).await?;
-    let (rows, lower_bounds) = load(connection, prepared, log, binding, &signed, report).await?;
+    let (rows, lower_bounds) = load(connection, prepared, log, binding, signed, report).await?;
     let mut commitments = Vec::new();
     let mut summaries = Vec::new();
     let mut current_copies = BTreeMap::new();

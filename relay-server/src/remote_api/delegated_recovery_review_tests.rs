@@ -516,6 +516,177 @@ async fn postgres_signer_report_is_verified_once_and_receipted_across_replicas()
 
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_history_retains_signer_exports_after_abandonment() {
+    use atem_client::member_report::{
+        sign_signer_report, signer_report_body, JournalView, SignerReportChallenge,
+    };
+
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;
+    let (_, mut f, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    let first = plan::prepare(&database.pool, &binding, &genesis)
+        .await
+        .unwrap();
+    let mut root = saved(&database.pool, &genesis).await;
+    let retained_stop = &root["delegated"][ORIGIN]["records"][1];
+    let mut body = ControlRecord::parse(retained_stop.to_string().as_bytes())
+        .unwrap()
+        .body()
+        .clone();
+    body.record_id = uuid::Uuid::new_v4().to_string();
+    body.issued_at += 1000;
+    let exported = build_control(&f.keys, &KeyId::new("manager"), &body)
+        .unwrap()
+        .to_json();
+    let mut wrong_target = body.clone();
+    wrong_target.record_id = uuid::Uuid::new_v4().to_string();
+    wrong_target.issued_at += 1000;
+    wrong_target.principal_key = Some(atem_client::Hash32::of(b"unknown-service-key"));
+    let unresolved = build_control(&f.keys, &KeyId::new("manager"), &wrong_target).unwrap().to_json();
+    let store = RecoveryStore::postgres(database.reconnect(2).await);
+    store.configure_recovery_review(ORIGIN, 1).await.unwrap();
+    let app = make_app(store);
+    let base = format!("/api/remote/v1/logs/{genesis}/control/recovery");
+    let signer = "member:phone";
+    let slot = "astation-macos";
+    let mint = json!({"signer":signer,"slot":slot,"expected":f.log.head().to_json(),
+        "recovery":{"generation":"1","plan_id":first["plan_id"],"candidate_feed_id":first["candidate_feed_id"],
+            "source_hash":first["source_hash"],"evidence_hash":first["evidence_hash"]}});
+    let (status, challenge) = post_recovery(
+        &app,
+        &format!("{base}/signer-challenges"),
+        Some("alice"),
+        mint.to_string().into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let challenge = SignerReportChallenge::parse(challenge.to_string().as_bytes()).unwrap();
+    let submission = |stops: &[&Value]| {
+        let journal = JournalView {
+            id: [1; 16],
+            since: 1,
+            revision: 2,
+            records: stops.iter().map(|r| r["body"].to_string()).collect(),
+            drafts: vec![],
+        };
+        let report = signer_report_body(
+            &f.log,
+            &challenge,
+            signer,
+            slot,
+            ORIGIN,
+            &journal,
+            challenge.issued_at(),
+        )
+        .unwrap();
+        let signed = sign_signer_report(&f.keys, &KeyId::new("manager"), &report).unwrap();
+        json!({"report":signed.to_json(),"records":stops})
+            .to_string()
+            .into_bytes()
+    };
+    let mut conflicting_body = body.clone();
+    conflicting_body.record_id = retained_stop["body"]["record_id"].as_str().unwrap().into();
+    let conflict = build_control(&f.keys, &KeyId::new("manager"), &conflicting_body)
+        .unwrap()
+        .to_json();
+    let path = format!("{base}/signer-reports");
+    assert_eq!(
+        post_recovery(&app, &path, Some("alice"), submission(&[&conflict]))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        plan::prepare(&database.pool, &binding, &genesis)
+            .await
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        post_recovery(
+            &app,
+            &path,
+            Some("alice"),
+            submission(&[retained_stop, &exported, &unresolved])
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+
+    let current = plan::prepare(&database.pool, &binding, &genesis)
+        .await
+        .unwrap();
+    assert!(current["recovery_signatures"]["known_native_obligations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["original"]["record_id"] == body.record_id
+            && r["requirement"] == "retain_service_stop"));
+    plan::outcome::abandon(
+        &database.pool,
+        &binding,
+        &genesis,
+        first["plan_id"].as_str().unwrap(),
+    )
+    .await
+    .unwrap();
+    root["membership"] = super::recovery_plan::demote_manager(&mut f).to_stored();
+    sqlx::query("UPDATE remote_recovery_roots SET state=$2 WHERE genesis_hash=$1")
+        .bind(&genesis)
+        .bind(&root)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let next = Binding::new(ORIGIN, 2).unwrap();
+    next.initialize(&database.pool, true).await.unwrap();
+    let replica = database.reconnect(2).await;
+    let later = plan::prepare(&replica, &next, &genesis).await.unwrap();
+    let history = &later["known_history"];
+    assert_eq!(
+        history["records"].as_array().unwrap().len(),
+        4,
+        "two report-only records and two feed records"
+    );
+    assert_eq!(
+        history["observed_signing_lower_bounds"][body.principal.name()],
+        body.issued_at
+    );
+    let obligations = later["recovery_signatures"]["known_native_obligations"]
+        .as_array()
+        .unwrap();
+    assert!(obligations
+        .iter()
+        .any(|r| r["original"]["record_id"] == body.record_id
+            && r["requirement"] == "fresh_manager_signature"
+            && r["original"]["verification"] == "removed_manager"));
+    assert_eq!(
+        later["known_authors"]["members"][signer]["reports"],
+        json!([])
+    );
+    let previous = &later["known_authors"]["prior_plans"][0];
+    assert_eq!(previous["plan_id"], first["plan_id"]);
+    assert_eq!(previous["members"][signer]["member_status"], "manager");
+    assert_eq!(previous["members"][signer]["reports"][0]["journal"]["records"], 3);
+    assert_eq!(later["known_authors"]["members"][signer]["member_status"], "demoted");
+    assert_eq!(later["recovery_ready"], false);
+    assert_eq!(
+        later,
+        plan::prepare(&database.pool, &next, &genesis)
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE station_delegated_signer_reports SET accepted_at=0")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert!(plan::prepare(&replica, &next, &genesis).await.is_err());
+    assert_eq!(saved(&replica, &genesis).await, root);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
 async fn postgres_plan_abandonment_is_terminal_private_atomic_and_independent_of_live_state() {
     let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
     let (_, f, genesis, binding) = retained(&database).await;

@@ -132,7 +132,7 @@ async fn postgres_delegated_recovery_preparation_survives_replica_races_and_rest
     );
     assert_eq!(
         first["review"]["records"][1]["requirement"],
-        "fresh_manager_signature"
+        "retain_service_stop"
     );
     assert_eq!(first["review"]["records"][1]["interrupt_running"], true);
     assert_eq!(
@@ -173,23 +173,8 @@ async fn postgres_delegated_recovery_preparation_survives_replica_races_and_rest
     database.cleanup().await;
 }
 
-#[tokio::test]
-#[ignore = "requires isolated Postgres"]
-async fn postgres_delegated_recovery_preserves_prior_checkpoint_stops_and_reserved_clocks() {
+pub(super) fn demote_manager(f: &mut Fixture) -> Membership {
     use atem_client::membership::{Member, Role};
-    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
-    let (store, mut f, genesis, binding) = retained(&database).await;
-    binding.initialize(&database.pool, true).await.unwrap();
-    let original = saved(&database.pool, &genesis).await;
-    let first = prepare(&database.pool, &binding, &genesis).await.unwrap();
-    let original_plans = plans(&database.pool).await;
-
-    // The next restored source predates both stops and a reservation that
-    // never produced a record. The earlier checkpoint still knows them.
-    let mut older_source = original.clone();
-    let mut empty = Stored::new(ORIGIN, &f.log).unwrap();
-    empty.feed_id = original["delegated"][ORIGIN]["feed_id"].as_str().unwrap().into();
-    older_source["delegated"][ORIGIN] = serde_json::to_value(empty).unwrap();
     let replacement_key = KeyId::new("replacement-manager");
     let replacement_enc = KeyId::new("replacement-encryption");
     f.keys.insert_p256(replacement_key.clone(), &[6; 32]).unwrap();
@@ -216,7 +201,27 @@ async fn postgres_delegated_recovery_preserves_prior_checkpoint_stops_and_reserv
         wall_ms: f.created, mono_ms: 0, boot_id: "test".into(),
     });
     assert_eq!(next.appended, 1);
-    older_source["membership"] = next.next.to_stored();
+    next.next
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_preserves_prior_checkpoint_stops_and_reserved_clocks() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (store, mut f, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    let original = saved(&database.pool, &genesis).await;
+    let first = prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let original_plans = plans(&database.pool).await;
+
+    // The next restored source predates both stops and a reservation that
+    // never produced a record. The earlier checkpoint still knows them.
+    let mut older_source = original.clone();
+    let mut empty = Stored::new(ORIGIN, &f.log).unwrap();
+    empty.feed_id = original["delegated"][ORIGIN]["feed_id"].as_str().unwrap().into();
+    older_source["delegated"][ORIGIN] = serde_json::to_value(empty).unwrap();
+    let replacement_seq = f.log.head().seq + 1;
+    older_source["membership"] = demote_manager(&mut f).to_stored();
     sqlx::query("UPDATE remote_recovery_roots SET state=$1 WHERE genesis_hash=$2")
         .bind(&older_source).bind(&genesis).execute(&database.pool).await.unwrap();
     let later = Binding::new(ORIGIN, 2).unwrap();
@@ -227,7 +232,7 @@ async fn postgres_delegated_recovery_preserves_prior_checkpoint_stops_and_reserv
     assert_eq!(authors["member:phone"]["first_manage_seq"], 1);
     assert_eq!(authors["member:phone"]["member_status"], "demoted");
     assert_eq!(authors["member:replacement-manager"]["member_status"], "manager");
-    assert_eq!(authors["member:replacement-manager"]["first_manage_seq"], added.next.head().seq);
+    assert_eq!(authors["member:replacement-manager"]["first_manage_seq"], replacement_seq);
     assert_eq!(authors["member:phone"]["reports"], json!([]));
     assert_eq!(second["known_authors"]["complete_history"], false);
     let history = &second["known_history"];
@@ -238,7 +243,7 @@ async fn postgres_delegated_recovery_preserves_prior_checkpoint_stops_and_reserv
     }
     let native = records.iter().find(|record| record["signer"] == "member:phone").unwrap();
     assert_eq!(native["verification"], "removed_manager");
-    assert_eq!(native["requirement"], "authority_review");
+    assert_eq!(native["requirement"], "fresh_manager_signature");
     assert_eq!(history["observed_signing_lower_bounds"]["service:reserved-only"], f.created + 123);
     assert_eq!(history["checkpoints"].as_array().unwrap().len(), 2);
     assert!(history["checkpoints"].as_array().unwrap().iter().any(|checkpoint| {
