@@ -224,7 +224,7 @@ for another process. No ordinary signing or verification ceremony is changed.
 
 The production native constructor still supplies no all-participant provider.
 The shared `required_version` classifier and verifier-report primitives are
-adopted from `atem-client-sdk-de7ec29882f2` on Apple, Android and Station.
+available in the current Apple, Android and Station pin `atem-client-sdk-1952ec8ad03f`.
 Complete protected participant enumeration and production polling remain required.
 A Station replica
 report proves only that replica's own core;
