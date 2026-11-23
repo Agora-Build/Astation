@@ -210,7 +210,10 @@ final class AstationRecoveryCoordinator {
         self.now = now
         if let data = try store.read() {
             saved = try PropertyListDecoder().decode(Saved.self, from: data)
-            guard [2, 3, 4, 5, 6].contains(saved.version), saved.accountID == accountID, saved.managerID == managerID,
+            guard (2...7).contains(saved.version), saved.accountID == accountID, saved.managerID == managerID,
+                  saved.version >= 7 || !(saved.processRosters ?? [:]).values.contains(where: {
+                      $0.values.contains { $0.earlier != nil }
+                  }),
                   (saved.controlJournalIDs ?? [:]).allSatisfy({ RemoteRecoveryKit.validHash($0.key) && $0.value.count == 16 }),
                   saved.version >= 6 || saved.controlJournalIDs == nil,
                   saved.version >= 5 || (saved.processRosters ?? [:]).isEmpty,
@@ -1403,16 +1406,20 @@ extension AstationRecoveryCoordinator {
         guard current(), !Task.isCancelled else { throw RemoteRecoveryError.requiresReview }
         try check(try await refreshedLog(genesis: review.genesis))
         var rosters = saved.processRosters ?? [:]
-        rosters[relayURL, default: [:]][review.member] = AstationProcessRoster(origin: relayURL, member: review.member,
+        var candidate = AstationProcessRoster(origin: relayURL, member: review.member,
             genesis: review.genesis, sequence: review.head.seq, headHash: review.head.hash, lines: lines)
-        let total = rosters.values.reduce(0) { $0 + $1.values.reduce(0) { $0 + $1.lines.count } }
-        guard rosters.count <= 64, total <= 4096 else { throw RemoteVerifierGateError.invalidRoster }
+        if let previous = review.previous { candidate.retainDisplacedSlots(from: previous) }
+        rosters[relayURL, default: [:]][review.member] = candidate
+        let lists = rosters.values.flatMap(\.values)
+        guard rosters.count <= 64, lists.reduce(0, { $0 + $1.lines.count }) <= 4096,
+              lists.reduce(0, { $0 + ($1.earlier?.count ?? 0) }) <= 4096 else { throw RemoteVerifierGateError.invalidRoster }
         guard await confirmProcessRoster() else { throw RemoteRecoveryError.confirmationRequired }
         let confirmedAt = verifierTime()
         try check(try await refreshedLog(genesis: review.genesis))
         let finished = verifierTime()
         guard finished >= confirmedAt, finished - confirmedAt < 30_000 else { throw RemoteRecoveryError.requiresReview }
-        try persist { $0.processRosters = rosters }
+        try requireDurableRecoveryCheckpoint()
+        try persist { $0.version = 7; $0.processRosters = rosters }
         do { try requireDurableRecoveryCheckpoint() }
         catch { uncertain = true; throw error }
     }
@@ -1787,6 +1794,53 @@ extension AstationRecoveryCoordinator {
         let process = verifierReportProcess()
         let matches = try reviewedProcessSlots(member: managerID, log: log).filter { $0.process == process }
         return matches.count == 1 ? matches[0].slot : "astation-macos"
+    }
+
+    /// Operator comparison input. Each review head must belong to this Mac's anchored list.
+    func exportAuthorRoster(_ plan: RemoteControlRecoveryPreparation, current: () -> Bool) throws -> String {
+        let context = plan.context
+        guard current(), !busy, !uncertain, !Task.isCancelled, let log = membershipLog,
+              log.frozen() == nil, log.accountId() == context.accountID, context.accountID == accountID,
+              context.stationOrigin == relayURL, context.genesisHash == log.genesisHash(),
+              context.membershipHead == log.head() else { throw RemoteRecoveryError.requiresReview }
+        try requireDurableRecoveryCheckpoint()
+        let entries = log.entries()
+        var checkedHeads = [UInt64: String]()
+        var rows = [[String: Any]]()
+        func append(_ slot: RemoteMemberVerifierSlot, seq: UInt64, hash: String, selected: Bool) throws {
+            guard seq > 0, seq <= UInt64(entries.count), rows.count < 8192 else { throw RemoteRecoveryError.invalidCheckpoint }
+            if checkedHeads[seq] == nil { checkedHeads[seq] = try signedObjectInfo(json: entries[Int(seq - 1)]).entryHash }
+            guard checkedHeads[seq] == hash else { throw RemoteRecoveryError.invalidCheckpoint }
+            rows.append(["member": slot.memberID, "slot": slot.slot, "process": slot.process,
+                         "review_head": ["seq": seq, "hash": hash], "selected": selected])
+        }
+        let rosters = saved.processRosters?[relayURL] ?? [:]
+        for member in rosters.keys.sorted() {
+            guard let roster = rosters[member], member == roster.member, roster.origin == relayURL,
+                  roster.genesis == context.genesisHash, let target = log.member(deviceId: member) else {
+                throw RemoteRecoveryError.invalidCheckpoint
+            }
+            guard target.kind == "native" else { continue }
+            for slot in try roster.slots() {
+                try append(slot, seq: roster.sequence, hash: roster.headHash, selected: true)
+            }
+            for old in roster.earlier ?? [] {
+                let slots = try AstationProcessRoster.rows(member: member, text: old.line)
+                guard slots.count == 1, let slot = slots.first, old.line == slot.slot + " " + slot.process else {
+                    throw RemoteRecoveryError.invalidCheckpoint
+                }
+                try append(slot, seq: old.sequence, hash: old.headHash, selected: false)
+            }
+        }
+        let value: [String: Any] = ["version": 1, "account_id": accountID, "genesis_hash": context.genesisHash,
+            "origin": relayURL, "generation": String(context.generation), "plan_id": context.planID,
+            "candidate_feed_id": context.candidateFeedID, "source_hash": context.sourceHash,
+            "evidence_hash": context.evidenceHash, "reconstruction_hash": plan.reconstructionHash,
+            "membership_head": ["seq": context.membershipHead.seq, "hash": context.membershipHead.hash],
+            "slots": rows]
+        let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
+        guard data.count <= 4 * 1024 * 1024 else { throw RemoteVerifierGateError.invalidRoster }
+        return String(decoding: data, as: UTF8.self)
     }
 
     func submitSignerReport(_ context: RemoteControlRecoveryContext, slot: String, preview: RemoteControlAuthorInventory,

@@ -10,6 +10,7 @@ pub const USAGE: &str = "usage: station-relay-server admin forget-key <astation_
        station-relay-server admin delegated-recovery status|fence\n\
        station-relay-server admin delegated-recovery abandon <genesis_hash> <plan_id>\n\
        station-relay-server admin delegated-recovery inspect|prepare <genesis_hash>\n\
+       station-relay-server admin delegated-recovery compare-authors <genesis_hash> <plan_id> <file>\n\
        station-relay-server admin delegated-recovery retain-stops <genesis_hash> <file>\n\
        station-relay-server admin delegated-recovery retain-native <genesis_hash> <plan_id> <file>\n\
        station-relay-server admin delegated-recovery retain-resigned <genesis_hash> <plan_id> <file>\n\
@@ -172,7 +173,7 @@ async fn delegated_recovery(args: &[String]) -> i32 {
             (false, Some((command.as_str(), genesis)), Some(file), None)
         }
         [command, genesis, plan, file]
-            if matches!(command.as_str(), "retain-native" | "retain-resigned") && genesis.len() == 64
+            if matches!(command.as_str(), "retain-native" | "retain-resigned" | "compare-authors") && genesis.len() == 64
                 && genesis.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                 && uuid::Uuid::parse_str(plan).is_ok_and(|id| id.get_version_num() == 4 && id.to_string() == *plan) =>
         {
@@ -209,8 +210,9 @@ async fn delegated_recovery(args: &[String]) -> i32 {
     };
     if let Some((command, genesis)) = root {
         let report = if let Some(file) = file {
-            use crate::remote_api::recovery::delegated_recovery::plan::{native, signatures, stops};
+            use crate::remote_api::recovery::delegated_recovery::plan::{author_roster, native, signatures, stops};
             let limit = match command {
+                "compare-authors" => author_roster::INPUT_LIMIT,
                 "retain-native" => native::INPUT_LIMIT,
                 "retain-resigned" => signatures::INPUT_LIMIT,
                 _ => stops::input_limit(),
@@ -222,7 +224,9 @@ async fn delegated_recovery(args: &[String]) -> i32 {
                     return 1;
                 }
             };
-            if command == "retain-resigned" {
+            if command == "compare-authors" {
+                author_roster::compare(&pool, &binding, genesis, native_plan.expect("validated plan"), &bytes).await
+            } else if command == "retain-resigned" {
                 signatures::retain(&pool, &binding, genesis, native_plan.expect("validated plan"), &bytes).await
             } else if let Some(plan) = native_plan {
                 native::retain(&pool, &binding, genesis, plan, &bytes).await
@@ -422,7 +426,7 @@ mod tests {
             assert_eq!(main(&["delegated-recovery".into(), command.into()]).await, 2);
         }
         for plan in ["", "not-a-plan", "00000000-0000-0000-0000-000000000000"] {
-            for command in ["retain-native", "retain-resigned"] {
+            for command in ["retain-native", "retain-resigned", "compare-authors"] {
                 assert_eq!(main(&["delegated-recovery".into(), command.into(),
                     "0".repeat(64), plan.into(), "evidence.json".into()]).await, 2);
             }
