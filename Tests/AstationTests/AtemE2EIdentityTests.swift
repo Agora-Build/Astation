@@ -29,6 +29,9 @@ final class TestAtemCryptography: AtemIdentityCryptography {
     var failSign = false
     var creates = 0
     var signingCalls = 0
+    var noninteractiveSigningCalls = 0
+    var refuseNoninteractive = false
+    var afterNoninteractiveSign: (() -> Void)?
 
     init(signing: P256.Signing.PrivateKey = P256.Signing.PrivateKey(),
          encryption: Curve25519.KeyAgreement.PrivateKey = Curve25519.KeyAgreement.PrivateKey()) {
@@ -47,6 +50,20 @@ final class TestAtemCryptography: AtemIdentityCryptography {
 
     func signingPublicKey(_ material: AtemIdentityMaterial) throws -> Data {
         try P256.Signing.PrivateKey(rawRepresentation: material.signingKey).publicKey.x963Representation
+    }
+
+    func signingPublicKeyWithoutInteraction(_ material: AtemIdentityMaterial) throws -> Data {
+        if refuseNoninteractive { throw AtemIdentityError.keychain(errSecInteractionNotAllowed) }
+        return try signingPublicKey(material)
+    }
+
+    func signWithoutInteraction(_ message: Data, material: AtemIdentityMaterial) throws -> Data {
+        noninteractiveSigningCalls += 1
+        if refuseNoninteractive { throw AtemIdentityError.keychain(errSecInteractionNotAllowed) }
+        let signature = try AtemE2ECrypto.normalizedP256Signature(
+            P256.Signing.PrivateKey(rawRepresentation: material.signingKey).signature(for: message).rawRepresentation)
+        afterNoninteractiveSign?()
+        return signature
     }
 
     func validate(_ material: AtemIdentityMaterial) throws {

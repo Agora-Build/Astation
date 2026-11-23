@@ -222,13 +222,7 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
         }
         defer { states[connection.verifier] = state }
         guard let inventory else { return }
-        guard inventory.version > 0, (1...64).contains(inventory.actions.count),
-              inventory.actions == inventory.actions.sorted(), Set(inventory.actions).count == inventory.actions.count,
-              inventory.actions.allSatisfy({ action in
-                  let bytes = Array(action.utf8)
-                  return (1...32).contains(bytes.count) && (97...122).contains(bytes[0]) &&
-                      bytes.allSatisfy { (97...122).contains($0) || (48...57).contains($0) || $0 == 95 }
-              }) else { throw RemoteVerifierGateError.invalidInventory }
+        try Self.validateInventory(inventory)
         if let highest = state.highest {
             guard inventory.version >= highest.version, Set(highest.actions).isSubset(of: Set(inventory.actions)),
                   inventory.version != highest.version || inventory == highest else {
@@ -238,6 +232,16 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
         state.highest = inventory
         state.confirmed = inventory
         state.prospectiveRequest = prospectiveRequest
+    }
+
+    static func validateInventory(_ inventory: VerifierInventory) throws {
+        guard inventory.version > 0, (1...64).contains(inventory.actions.count),
+              inventory.actions == inventory.actions.sorted(), Set(inventory.actions).count == inventory.actions.count,
+              inventory.actions.allSatisfy({ action in
+                  let bytes = Array(action.utf8)
+                  return (1...32).contains(bytes.count) && (97...122).contains(bytes[0]) &&
+                      bytes.allSatisfy { (97...122).contains($0) || (48...57).contains($0) || $0 == 95 }
+              }) else { throw RemoteVerifierGateError.invalidInventory }
     }
 
     /// Recheck at the actual signing boundary, after the owner's confirmation, using the fresh log.

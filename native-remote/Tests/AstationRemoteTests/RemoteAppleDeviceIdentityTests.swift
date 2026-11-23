@@ -7,6 +7,10 @@ import XCTest
 final class SoftwareDeviceCryptography: RemoteAppleIdentityCryptography {
     var creations = 0
     var signatures = 0
+    var noninteractiveSignatures = 0
+    var noninteractiveLoads = 0
+    var refuseInteraction = false
+    var onNoninteractiveSignature: (() -> Void)?
     func create() throws -> RemoteAppleIdentityMaterial {
         creations += 1
         let signing = P256.Signing.PrivateKey()
@@ -24,6 +28,17 @@ final class SoftwareDeviceCryptography: RemoteAppleIdentityCryptography {
     }
     func sign(_ input: Data, material: RemoteAppleIdentityMaterial) throws -> Data {
         signatures += 1
+        return try P256.Signing.PrivateKey(rawRepresentation: material.signingHandle).signature(for: input).rawRepresentation
+    }
+    func validateWithoutInteraction(_ material: RemoteAppleIdentityMaterial) throws -> (auth: Data, encryption: Data) {
+        noninteractiveLoads += 1
+        if refuseInteraction { throw RemoteDeviceIdentityError.secureHardwareUnavailable }
+        return try validate(material)
+    }
+    func signWithoutInteraction(_ input: Data, material: RemoteAppleIdentityMaterial) throws -> Data {
+        noninteractiveSignatures += 1
+        if refuseInteraction { throw RemoteDeviceIdentityError.secureHardwareUnavailable }
+        onNoninteractiveSignature?()
         return try P256.Signing.PrivateKey(rawRepresentation: material.signingHandle).signature(for: input).rawRepresentation
     }
     func sharedSecret(_ peer: Data, material: RemoteAppleIdentityMaterial) throws -> Data {
@@ -51,7 +66,7 @@ final class DeviceIdentityFixture {
     var confirmations = 0
     var time: UInt64 = 100
 
-    func load(issuer: String = "https://auth.dev.agora.build", account: String = "account-device") throws -> RemoteAppleDeviceIdentity {
+    func load(issuer: String = "https://auth.dev.agora.build", account: String = "account-device", existingOnly: Bool = false) throws -> RemoteAppleDeviceIdentity {
         try RemoteAppleDeviceIdentity(issuer: issuer, accountID: account, crypto: crypto,
             read: { [unowned self] in
                 if locked { throw RemoteDeviceIdentityError.storageUncertain }
@@ -61,7 +76,7 @@ final class DeviceIdentityFixture {
                 if failBeforeWrite { throw RemoteDeviceIdentityError.storageUncertain }
                 stored = bytes
                 if failAfterWrite { throw RemoteDeviceIdentityError.storageUncertain }
-            })
+            }, existingOnly: existingOnly)
     }
 
     func signer(_ identity: RemoteAppleDeviceIdentity) -> RemoteRoutineChannelSigner {
@@ -78,6 +93,71 @@ final class DeviceIdentityFixture {
 }
 
 final class RemoteAppleDeviceIdentityTests: XCTestCase {
+    @MainActor
+    func testReportingLoadNeverCreatesKeysOrFallsBackToInteractiveValidation() throws {
+        let f = DeviceIdentityFixture()
+        XCTAssertThrowsError(try f.load(existingOnly: true))
+        XCTAssertEqual(f.crypto.creations, 0); XCTAssertEqual(f.writes, 0)
+        let first = try f.load()
+        let saved = f.stored
+        XCTAssertEqual(try f.load(existingOnly: true).publicIdentity, first.publicIdentity)
+        XCTAssertEqual(f.crypto.noninteractiveLoads, 1)
+        f.crypto.refuseInteraction = true
+        XCTAssertThrowsError(try f.load(existingOnly: true))
+        XCTAssertEqual(f.stored, saved)
+        XCTAssertEqual(f.crypto.creations, 1); XCTAssertEqual(f.writes, 1)
+        f.stored = Data("corrupt".utf8)
+        XCTAssertThrowsError(try f.load(existingOnly: true))
+        XCTAssertEqual(f.crypto.creations, 1); XCTAssertEqual(f.writes, 1)
+    }
+
+    @MainActor
+    func testReadOnlyVerifierReportUsesTheActualSDKAndOnlyTheNoninteractiveKeyPath() throws {
+        let f = DeviceIdentityFixture(), identity = try f.load()
+        let publicID = identity.publicIdentity
+        let material = try XCTUnwrap(f.stored)
+        let log = try VerifierReportTestSupport.log(account: "protocol-account", member: publicID.deviceID,
+            auth: publicID.authKey, encryption: publicID.encryptionKey, sign: { input in
+                // The genesis is a separate owner operation; reporting must not use this path.
+                let record = try PropertyListSerialization.propertyList(from: material, format: nil) as! [String: Any]
+                let crypto = record["material"] as! [String: Any]
+                return try RemoteP256Signature.normalize(P256.Signing.PrivateKey(rawRepresentation: crypto["signingHandle"] as! Data).signature(for: input).rawRepresentation)
+            })
+        let anchor = try RemoteVerifierReportAnchor(log: log)
+        let challenge = try verifierReportChallenge(signer: "member:" + publicID.deviceID, slot: "astation-ios",
+            origin: "https://station.example", connection: 1, issuedAt: VerifierReportTestSupport.wall,
+            expiresAt: VerifierReportTestSupport.wall + 30_000)
+        let report = try identity.verifierReport(log: log, anchor: anchor, challengeJSON: challenge, slot: "astation-ios",
+            origin: "https://station.example", wallMs: VerifierReportTestSupport.wall, current: { true })
+        let verified = try verifyVerifierReport(log: log, reportJson: report, expectedChallengeJson: challenge,
+            nowMs: VerifierReportTestSupport.wall)
+        XCTAssertEqual(verified.process, verifierReportProcess())
+        XCTAssertEqual(verified.inventory, verifierInventory())
+        XCTAssertTrue(verified.atHead)
+        XCTAssertEqual(f.crypto.noninteractiveSignatures, 1)
+        XCTAssertEqual(f.crypto.signatures, 0); XCTAssertEqual(f.confirmations, 0)
+        XCTAssertEqual(f.stored, material); XCTAssertEqual(f.writes, 1); XCTAssertEqual(f.crypto.creations, 1)
+
+        XCTAssertThrowsError(try identity.verifierReport(log: log, anchor: anchor, challengeJSON: challenge, slot: "other",
+            origin: "https://station.example", wallMs: VerifierReportTestSupport.wall, current: { true }))
+        XCTAssertThrowsError(try identity.verifierReport(log: log, anchor: anchor, challengeJSON: challenge, slot: "astation-ios",
+            origin: "https://other.example", wallMs: VerifierReportTestSupport.wall, current: { true }))
+        XCTAssertThrowsError(try identity.verifierReport(log: log, anchor: anchor, challengeJSON: challenge, slot: "astation-ios",
+            origin: "https://station.example", wallMs: VerifierReportTestSupport.wall, current: { false }))
+        XCTAssertEqual(f.crypto.noninteractiveSignatures, 1)
+        f.crypto.refuseInteraction = true
+        XCTAssertThrowsError(try identity.verifierReport(log: log, anchor: anchor, challengeJSON: challenge, slot: "astation-ios",
+            origin: "https://station.example", wallMs: VerifierReportTestSupport.wall, current: { true }))
+        XCTAssertEqual(f.crypto.noninteractiveSignatures, 2)
+        XCTAssertEqual(f.crypto.signatures, 0); XCTAssertEqual(f.confirmations, 0)
+        f.crypto.refuseInteraction = false
+        f.crypto.onNoninteractiveSignature = { f.stored = nil }
+        XCTAssertThrowsError(try identity.verifierReport(log: log, anchor: anchor, challengeJSON: challenge, slot: "astation-ios",
+            origin: "https://station.example", wallMs: VerifierReportTestSupport.wall, current: { true }))
+        XCTAssertTrue(identity.storageUncertain)
+        XCTAssertEqual(f.crypto.creations, 1)
+    }
+
     func testHPKEMatchesTheSamePublishedBaseVectorUsedOnAndroid() throws {
         let url = try XCTUnwrap(Bundle.module.url(forResource: "hpke-base-x25519", withExtension: "json", subdirectory: "Fixtures"))
         let vector = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
