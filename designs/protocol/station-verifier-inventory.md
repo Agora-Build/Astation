@@ -38,8 +38,8 @@ the shortest replica lease bounds the service evidence from request start,
 including token acquisition and response delay. Failed polls, key mismatch,
 missing replicas, expiry and explicit retirement clear evidence. Delayed retired
 polls cannot replace newer evidence; replayed response bytes cannot extend a
-lease. Production signing still needs the complete participant owner and shared
-minimum-version helper. Native/third-party SDK members require their own
+lease. Production signing still needs the complete participant owner.
+Native/third-party SDK members require their own
 authenticated source; a Station cannot use this endpoint to confirm them.
 
 Part of Astation #79 and the agreed R9.2 all-verifier signing gate. This is
@@ -218,13 +218,15 @@ the current anchor and identity. Both the local and Station adapters check their
 log against the gate's exact anchor before confirming a consumer.
 
 This source is implemented and tested, but the production participant provider
-and new-action signer remain unset pending the complete sources/shared helper.
+and new-action signer remain unset pending complete production sources.
 It sends no network report, signs no capability claim and establishes no evidence
 for another process. No ordinary signing or verification ceremony is changed.
 
 The production native constructor still supplies no all-participant provider.
-Authenticated reports for other native/SDK members, complete Station discovery
-and the shared `required_version` helper remain required. A Station replica
+The shared `required_version` classifier and verifier-report primitives are
+adopted from `atem-client-sdk-de7ec29882f2` on Apple, Android and Station.
+Complete protected participant enumeration and Station carriage remain required.
+A Station replica
 report proves only that replica's own core;
 it cannot confirm a host, member or unrelated SDK. OAuth login alone cannot prove
 that a reporter owns a signed-list member key. Shared host welcomes and local
@@ -234,3 +236,69 @@ This implementation can be reviewed/tested independently of those remaining
 requirements. It is not VII.A evidence and leaves all new signing/delegated
 execution/proxy opt-ins off. The current provisioned app and shared test host
 are preserved.
+
+### Native and external SDK process proofs
+
+`RemoteMemberVerifierEvidence` uses the actual shared report builder/verifier,
+not an app protocol parser or a release-derived inventory. It consumes an
+explicitly reviewed list of `(member, slot, process)` tuples. The process is the
+loaded SDK's `verifierReportProcess()` value; a key alone does not identify every
+process using that key. A process replacement needs a protected roster review.
+Missing or expired slots stay required, and this collector cannot discover or
+silently remove them. Hosts and Station replicas retain their separate sources.
+
+Call `begin` before token acquisition or passing a challenge to any carrier.
+The shared helper mints a fresh nonce for the exact member/service, configured
+slot, normalized Station origin and increasing connection generation. The
+consumer retains that expectation and a local ContinuousClock deadline, at most
+30 seconds including token work, network delay, verification, persistence and
+sleep. A service's signed membership expiry also caps that deadline.
+
+`receive` verifies the signed bytes against the independently anchored current
+membership and the stored expectation. The report must be at the exact current
+head and name the reviewed process. Wrong signer/slot/signature input cannot
+consume another slot's expectation. A matching report is single-use; replay
+cannot renew evidence. A second authenticated process for the same challenge
+conflicts even after the first response was consumed. A conflict keeps the
+member unconfirmed; it does not select the latest process.
+
+All reviewed slots for one member must be confirmed. The gate receives only
+their common actions, lowest version and earliest deadline. Call `refresh` with
+the fresh membership and wall time synchronously at the protected signing
+boundary. The gate itself also enforces the monotonic deadline without needing
+timer delivery. An account/key/head/roster/recovery/association change retires
+the collector through its current-context fence. Old failures and retired
+responses cannot overwrite a newer request.
+
+`RemoteMemberVerifierJournal` retains per-member/slot inventory high-water marks
+and conflicts across consumer restarts. Its production backend uses the existing
+no-interaction protected Keychain store and exclusive cross-process file lock.
+The initial protected roster review may explicitly create an empty journal;
+ordinary reload refuses a missing journal. The complete account/genesis/origin
+binding, duplicate-free bounded checkpoint and monotonic inventory rules are
+checked on load/update. Save and read-back complete before any proof is exposed
+to the gate. An uncertain write retires the collector. Stored history never
+restores a live report, challenge, deadline or owner confirmation. There is no
+automatic conflict-clear or history-pruning operation.
+
+Apple's `RemoteAppleDeviceIdentity.loadExisting` and Android's
+`MobileDeviceIdentity.open(existingOnly = true)` load existing protected keys
+without creating an identity. Their typed `verifierReport` methods and the Mac's
+`AtemE2EIdentity.verifierReport` let the shared SDK construct the complete signing
+body and bind it to the current member's keys. Apple explicitly disables
+LocalAuthentication interaction for key validation and signing; Android uses
+its existing unlocked-device Keystore path without opening a biometric flow.
+No routine-channel owner confirmation is reused or requested. Missing, locked,
+foreign or changed keys/storage produce no report and never trigger replacement.
+The reporters also require a protocol account/genesis anchor captured from
+independently trusted native membership. They check it before and after signing;
+the caller's current-context fence binds the active login and selected Station.
+An Agora.Build OAuth subject scopes identity storage but is not the protocol
+account ID. Reporting never equates those two identifiers.
+
+These adapters and their crash/lifecycle tests are implemented. They do not
+install the production participant provider, supply a protected process-roster
+review UI, start report polling, or add Station HTTP carriage. Those remain
+explicit #79 work, along with the separate durable author barrier and recovery
+assembly/publication/reopening. Delegated activation stays off until the whole
+provider and VII.A are verified; existing hosted execution is unchanged.

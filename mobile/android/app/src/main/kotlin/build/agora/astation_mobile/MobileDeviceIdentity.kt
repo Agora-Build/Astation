@@ -31,10 +31,26 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 import org.json.JSONObject
 import uniffi.atem_client_ffi.SignRequest
+import uniffi.atem_client_ffi.KeyAlg
+import uniffi.atem_client_ffi.MemberStatusKind
+import uniffi.atem_client_ffi.MembershipLog
+import uniffi.atem_client_ffi.VerifierReportRequest
 import uniffi.atem_client_ffi.canonicalJson
 import uniffi.atem_client_ffi.hashFields
 
 internal class MobileDeviceIdentityFailure(val reason: String) : Exception("Protected device identity: $reason")
+
+/** Capture from independently anchored native membership, never a remote challenge. */
+internal class MobileVerifierReportAnchor(log: MembershipLog) {
+    private val account = log.accountId()
+    private val genesis = log.genesisHash()
+    init { check(log) }
+    fun check(log: MembershipLog) {
+        if (log.frozen() != null || log.accountId() != account || log.genesisHash() != genesis) {
+            throw MobileDeviceIdentityFailure("context_changed")
+        }
+    }
+}
 
 /** Immutable native identity. A saved key or an account login is never membership. */
 internal class MobileDeviceIdentity private constructor(
@@ -58,7 +74,7 @@ internal class MobileDeviceIdentity private constructor(
     val encryptionPublicKey: ByteArray get() = encryptionPublic.copyOf()
 
     companion object {
-        fun open(context: Context, issuer: String, accountId: String): MobileDeviceIdentity {
+        fun open(context: Context, issuer: String, accountId: String, existingOnly: Boolean = false): MobileDeviceIdentity {
             val origin = URI(issuer)
             if (origin.scheme != "https" || origin.host.isNullOrEmpty() || origin.rawPath != "" || origin.rawQuery != null ||
                 origin.rawFragment != null || origin.rawUserInfo != null || origin.toASCIIString() != issuer ||
@@ -71,7 +87,7 @@ internal class MobileDeviceIdentity private constructor(
                 val lock = descriptor.channel.tryLock() ?: throw MobileDeviceIdentityFailure("busy")
                 val identity = MobileDeviceIdentity(context.applicationContext, issuer, accountId, scope,
                     AtomicFile(File(directory, "$scope.bin")), descriptor, lock)
-                try { identity.initialize(); return identity }
+                try { identity.initialize(existingOnly); return identity }
                 catch (error: Exception) { identity.close(); throw error }
             } catch (error: Exception) { descriptor.close(); throw error }
         }
@@ -84,10 +100,11 @@ internal class MobileDeviceIdentity private constructor(
     private fun wrappingKey(): SecretKey = keyStore.getKey(wrappingAlias, null) as? SecretKey
         ?: throw MobileDeviceIdentityFailure("missing_key")
 
-    private fun initialize() {
+    private fun initialize(existingOnly: Boolean) {
         requireUnlocked()
         if (file.baseFile.exists() || File(file.baseFile.path + ".bak").exists()) saved = file.openRead().use { it.readBytesBounded() }
         else {
+            if (existingOnly) throw MobileDeviceIdentityFailure("missing_identity")
             // A missing record beside existing aliases can be an interrupted or lost save. Never replace those keys.
             if (keyStore.containsAlias(authAlias) || keyStore.containsAlias(wrappingAlias)) throw MobileDeviceIdentityFailure("incomplete_setup")
             val authSpec = KeyGenParameterSpec.Builder(authAlias, KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY)
@@ -166,6 +183,30 @@ internal class MobileDeviceIdentity private constructor(
         checkStorage()
         MobileDeviceChannelSigner.validate(request, deviceId)
         return sign(request.input)
+    }
+
+    /** The SDK supplies the body, inventory and process. Keystore never opens UI;
+     * unavailable/locked keys fail without creating keys or asking for consent. */
+    @Synchronized
+    fun verifierReport(log: MembershipLog, anchor: MobileVerifierReportAnchor, challengeJSON: String, slot: String, station: String,
+        wallMs: ULong, current: () -> Boolean): String {
+        fun check() {
+            checkStorage()
+            anchor.check(log)
+            val member = log.member(deviceId)
+            if (!current() || member == null ||
+                member.status != MemberStatusKind.ACTIVE || member.kind != "native" ||
+                member.authKey.alg != KeyAlg.P256 || !member.authKey.raw.contentEquals(authPublic) ||
+                member.encKey?.alg != KeyAlg.X25519 || member.encKey?.raw?.contentEquals(encryptionPublic) != true) {
+                throw MobileDeviceIdentityFailure("context_changed")
+            }
+        }
+        check()
+        return VerifierReportRequest(log, challengeJSON, "member:$deviceId", slot, station, deviceId, wallMs).use { request ->
+            val signature = sign(request.signRequest().input)
+            check()
+            request.finish(signature)
+        }
     }
 
     private fun sign(input: ByteArray): ByteArray {

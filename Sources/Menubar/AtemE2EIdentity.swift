@@ -89,13 +89,23 @@ struct AtemIdentityMaterial: Codable {
 protocol AtemIdentityCryptography {
     func create() throws -> AtemIdentityMaterial
     func signingPublicKey(_ material: AtemIdentityMaterial) throws -> Data
+    func signingPublicKeyWithoutInteraction(_ material: AtemIdentityMaterial) throws -> Data
     func validate(_ material: AtemIdentityMaterial) throws
     func sign(_ message: Data, material: AtemIdentityMaterial) throws -> Data
+    func signWithoutInteraction(_ message: Data, material: AtemIdentityMaterial) throws -> Data
     func openStorageKey(_ sealed: AtemHPKESealedKey, info: Data, material: AtemIdentityMaterial) throws -> Data
     func openProjectReport(_ report: AtemProjectReportWire, info: Data, material: AtemIdentityMaterial) throws -> Data
 }
 
 extension AtemIdentityCryptography {
+    func signingPublicKeyWithoutInteraction(_ material: AtemIdentityMaterial) throws -> Data {
+        throw AtemIdentityError.invalidState
+    }
+
+    func signWithoutInteraction(_ message: Data, material: AtemIdentityMaterial) throws -> Data {
+        throw AtemIdentityError.invalidState
+    }
+
     func openProjectReport(_ report: AtemProjectReportWire, info: Data, material: AtemIdentityMaterial) throws -> Data {
         throw AtemIdentityError.invalidState
     }
@@ -124,6 +134,13 @@ struct AtemSecureEnclaveCryptography: AtemIdentityCryptography {
 
     func signingPublicKey(_ material: AtemIdentityMaterial) throws -> Data {
         try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: material.signingKey).publicKey.x963Representation
+    }
+
+    func signingPublicKeyWithoutInteraction(_ material: AtemIdentityMaterial) throws -> Data {
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        return try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: material.signingKey,
+            authenticationContext: context).publicKey.x963Representation
     }
 
     func validate(_ material: AtemIdentityMaterial) throws {
@@ -157,6 +174,14 @@ struct AtemSecureEnclaveCryptography: AtemIdentityCryptography {
 
     func sign(_ message: Data, material: AtemIdentityMaterial) throws -> Data {
         let key = try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: material.signingKey)
+        return try AtemE2ECrypto.normalizedP256Signature(key.signature(for: message).rawRepresentation)
+    }
+
+    func signWithoutInteraction(_ message: Data, material: AtemIdentityMaterial) throws -> Data {
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        let key = try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: material.signingKey,
+            authenticationContext: context)
         return try AtemE2ECrypto.normalizedP256Signature(key.signature(for: message).rawRepresentation)
     }
 
@@ -255,7 +280,7 @@ final class AtemE2EIdentity {
         self.crypto = crypto
     }
 
-    private func read(create: Bool = true) throws -> Stored? {
+    private func read(create: Bool = true, noninteractive: Bool = false) throws -> Stored? {
         if let data = try storage.read() {
             let record: Stored
             do {
@@ -271,7 +296,7 @@ final class AtemE2EIdentity {
                 throw AtemIdentityError.invalidStoredIdentity
             }
             if !record.storageKeys.isEmpty {
-                let signingPublicKey = try crypto.signingPublicKey(record.material)
+                let signingPublicKey = try noninteractive ? crypto.signingPublicKeyWithoutInteraction(record.material) : crypto.signingPublicKey(record.material)
                 for (binding, keys) in record.storageKeys {
                     guard try binding == AtemDeviceStorageKeys.binding(deviceId: keys.deviceId, devicePub: keys.devicePub) else {
                         throw AtemIdentityError.invalidStoredIdentity
@@ -283,7 +308,7 @@ final class AtemE2EIdentity {
                 throw AtemIdentityError.invalidStoredIdentity
             }
             if !record.migrations.isEmpty {
-                let publicKey = try crypto.signingPublicKey(record.material)
+                let publicKey = try noninteractive ? crypto.signingPublicKeyWithoutInteraction(record.material) : crypto.signingPublicKey(record.material)
                 for (account, migration) in record.migrations {
                     guard let state = record.accounts[account] else { throw AtemIdentityError.invalidStoredIdentity }
                     try migration.validate(account: account, state: state, signingPublicKey: publicKey)
@@ -359,6 +384,27 @@ final class AtemE2EIdentity {
             throw AtemIdentityError.identityChanged
         }
         return try crypto.sign(request.input, material: record.material)
+    }
+
+    /// This API builds the report in the SDK; it never accepts arbitrary signing bytes.
+    func verifierReport(log: MembershipLog, anchor: RemoteVerifierReportAnchor, memberID: String, challengeJSON: String, slot: String,
+                        origin: String, wallMs: UInt64, current: () -> Bool) throws -> String {
+        lock.lock(); defer { lock.unlock() }
+        try anchor.require(log)
+        let saved = try storage.read()
+        guard current(), log.frozen() == nil,
+              let member = log.member(deviceId: memberID), member.status == .active, member.kind == "native",
+              let record = try read(create: false, noninteractive: true),
+              member.authKey == PublicKeyData(alg: .p256, raw: try crypto.signingPublicKeyWithoutInteraction(record.material)),
+              member.encKey == PublicKeyData(alg: .x25519, raw: record.material.encryptionPublicKey) else {
+            throw AtemIdentityError.identityChanged
+        }
+        let request = try VerifierReportRequest(log: log, challengeJson: challengeJSON, signer: "member:" + memberID,
+            slot: slot, origin: origin, keyId: memberID, nowMs: wallMs)
+        let signature = try crypto.signWithoutInteraction(request.signRequest().input, material: record.material)
+        try anchor.require(log)
+        guard current(), try storage.read() == saved else { throw AtemIdentityError.identityChanged }
+        return try request.finish(signature: signature)
     }
 
     func recoveryKit(astationId: String, relayURL: String) throws -> String {

@@ -8,6 +8,7 @@ import XCTest
 @MainActor
 private final class NativeChannelFixture {
     let crypto = TestAtemCryptography()
+    let storage = TestAtemStorage()
     let host = Curve25519.Signing.PrivateKey()
     let identity: AtemE2EIdentity
     let log: MembershipLog
@@ -32,7 +33,7 @@ private final class NativeChannelFixture {
     }
 
     init(account: String = "account-a", manager: String = "manager-a", device: String = "host-a") throws {
-        identity = AtemE2EIdentity(storage: TestAtemStorage(), crypto: crypto)
+        identity = AtemE2EIdentity(storage: storage, crypto: crypto)
         let keys = try identity.remotePublicKeys()
         let body: [String: Any] = ["type": "atem-membership-entry", "v": 1, "account_id": account, "seq": 1,
             "prev_hash": String(repeating: "0", count: 64), "action": "genesis", "signer": manager, "signed_at": 1_792_400_000_000,
@@ -81,6 +82,59 @@ private final class NativeChannelFixture {
 }
 
 final class AstationR9NativeChannelTests: XCTestCase {
+    @MainActor
+    func testMacVerifierReportUsesOnlyExistingKeysWithoutInteractionAndTheLoadedSDKInventory() throws {
+        let f = try NativeChannelFixture()
+        let saved = f.storage.data, writes = f.storage.writes
+        let wall: UInt64 = 1_792_400_000_000
+        let anchor = try RemoteVerifierReportAnchor(log: f.log)
+        let challenge = try verifierReportChallenge(signer: "member:manager-a", slot: "astation-macos",
+            origin: "https://station.example", connection: 1, issuedAt: wall, expiresAt: wall + 30_000)
+        func report(origin: String = "https://station.example", current: Bool = true) throws -> String {
+            try f.identity.verifierReport(log: f.log, anchor: anchor, memberID: "manager-a", challengeJSON: challenge,
+                slot: "astation-macos", origin: origin, wallMs: wall, current: { current })
+        }
+        let proof = try report()
+        let verified = try verifyVerifierReport(log: f.log, reportJson: proof, expectedChallengeJson: challenge, nowMs: wall)
+        XCTAssertEqual(verified.inventory, verifierInventory()); XCTAssertEqual(verified.process, verifierReportProcess())
+        XCTAssertTrue(verified.atHead)
+        XCTAssertEqual(f.crypto.noninteractiveSigningCalls, 1); XCTAssertEqual(f.crypto.signingCalls, 0)
+        XCTAssertEqual(f.storage.writes, writes); XCTAssertEqual(f.storage.data, saved); XCTAssertEqual(f.crypto.creates, 1)
+        XCTAssertThrowsError(try report(origin: "https://other.example"))
+        XCTAssertThrowsError(try report(current: false))
+        XCTAssertEqual(f.crypto.noninteractiveSigningCalls, 1)
+        f.crypto.refuseNoninteractive = true
+        XCTAssertThrowsError(try report())
+        XCTAssertEqual(f.crypto.signingCalls, 0)
+        f.crypto.refuseNoninteractive = false
+        f.crypto.afterNoninteractiveSign = { f.storage.data = nil }
+        XCTAssertThrowsError(try report(), "A changed protected record cannot export the signature")
+        XCTAssertEqual(f.crypto.creates, 1)
+    }
+
+    @MainActor
+    func testMacReportCannotCreateOrReplaceMissingLockedOrForeignIdentity() throws {
+        let f = try NativeChannelFixture(), storage = TestAtemStorage(), crypto = TestAtemCryptography()
+        let identity = AtemE2EIdentity(storage: storage, crypto: crypto)
+        let wall: UInt64 = 1_792_400_000_000
+        let anchor = try RemoteVerifierReportAnchor(log: f.log)
+        let challenge = try verifierReportChallenge(signer: "member:manager-a", slot: "astation-macos",
+            origin: "https://station.example", connection: 1, issuedAt: wall, expiresAt: wall + 30_000)
+        func report() throws -> String {
+            try identity.verifierReport(log: f.log, anchor: anchor, memberID: "manager-a", challengeJSON: challenge,
+                slot: "astation-macos", origin: "https://station.example", wallMs: wall, current: { true })
+        }
+        XCTAssertThrowsError(try report())
+        XCTAssertEqual(crypto.creates, 0); XCTAssertEqual(storage.writes, 0)
+        _ = try identity.remotePublicKeys()
+        let saved = storage.data
+        XCTAssertThrowsError(try report(), "Another device's key cannot report for this member")
+        storage.failRead = true
+        XCTAssertThrowsError(try report())
+        XCTAssertEqual(storage.data, saved); XCTAssertEqual(crypto.creates, 1)
+        XCTAssertEqual(crypto.noninteractiveSigningCalls, 0); XCTAssertEqual(crypto.signingCalls, 0)
+    }
+
     @MainActor
     func testNativeConnectionInvalidatesPreviousVerifierEvidenceBeforeAccept() async throws {
         let f = try NativeChannelFixture()

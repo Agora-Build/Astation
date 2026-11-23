@@ -1,6 +1,7 @@
 import AtemClient
 import CryptoKit
 import Foundation
+import LocalAuthentication
 import Security
 
 public enum RemoteDeviceIdentityError: Error, Equatable {
@@ -26,7 +27,9 @@ struct RemoteAppleIdentityMaterial: Codable {
 protocol RemoteAppleIdentityCryptography {
     func create() throws -> RemoteAppleIdentityMaterial
     func validate(_ material: RemoteAppleIdentityMaterial) throws -> (auth: Data, encryption: Data)
+    func validateWithoutInteraction(_ material: RemoteAppleIdentityMaterial) throws -> (auth: Data, encryption: Data)
     func sign(_ input: Data, material: RemoteAppleIdentityMaterial) throws -> Data
+    func signWithoutInteraction(_ input: Data, material: RemoteAppleIdentityMaterial) throws -> Data
     func sharedSecret(_ peer: Data, material: RemoteAppleIdentityMaterial) throws -> Data
     func open(enc: Data, ct: Data, info: Data, aad: Data, material: RemoteAppleIdentityMaterial) throws -> Data
 }
@@ -60,6 +63,21 @@ private struct EnclaveDeviceCryptography: RemoteAppleIdentityCryptography {
         try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: material.signingHandle).signature(for: input).rawRepresentation
     }
 
+    func validateWithoutInteraction(_ material: RemoteAppleIdentityMaterial) throws -> (auth: Data, encryption: Data) {
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        let auth = try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: material.signingHandle,
+            authenticationContext: context).publicKey.x963Representation
+        return (auth, try encryptionKey(material, context: context).publicKey.rawRepresentation)
+    }
+
+    func signWithoutInteraction(_ input: Data, material: RemoteAppleIdentityMaterial) throws -> Data {
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        return try SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: material.signingHandle,
+            authenticationContext: context).signature(for: input).rawRepresentation
+    }
+
     func sharedSecret(_ peer: Data, material: RemoteAppleIdentityMaterial) throws -> Data {
         let key = try encryptionKey(material)
         let secret = try key.sharedSecretFromKeyAgreement(with: Curve25519.KeyAgreement.PublicKey(rawRepresentation: peer))
@@ -72,8 +90,9 @@ private struct EnclaveDeviceCryptography: RemoteAppleIdentityCryptography {
         return try recipient.open(ct, authenticating: aad)
     }
 
-    private func encryptionKey(_ material: RemoteAppleIdentityMaterial) throws -> Curve25519.KeyAgreement.PrivateKey {
-        let wrapping = try SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: material.wrappingHandle)
+    private func encryptionKey(_ material: RemoteAppleIdentityMaterial, context: LAContext? = nil) throws -> Curve25519.KeyAgreement.PrivateKey {
+        let wrapping = try SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: material.wrappingHandle,
+            authenticationContext: context)
         let peer = try P256.KeyAgreement.PublicKey(x963Representation: material.wrappingPublicKey)
         let key = wrappingKey(try wrapping.sharedSecretFromKeyAgreement(with: peer))
         let raw = try AES.GCM.open(AES.GCM.SealedBox(combined: material.sealedEncryptionKey), using: key)
@@ -119,8 +138,17 @@ public final class RemoteAppleDeviceIdentity {
             read: { try store.read() }, write: { try store.write($0) })
     }
 
+    /// Reporting must not create an identity or present Keychain/biometric UI.
+    public static func loadExisting(issuer: String, accountID: String) throws -> RemoteAppleDeviceIdentity {
+        let scope = try Self.scope(issuer: issuer, accountID: accountID)
+        let store = try RemoteRecoveryStore(accountID: scope, operation: "device-identity")
+        return try RemoteAppleDeviceIdentity(issuer: issuer, accountID: accountID,
+            crypto: EnclaveDeviceCryptography(scope: scope), read: { try store.read() },
+            write: { _ in throw RemoteDeviceIdentityError.invalidIdentity }, existingOnly: true)
+    }
+
     init(issuer: String, accountID: String, crypto: RemoteAppleIdentityCryptography,
-        read: @escaping () throws -> Data?, write: (Data) throws -> Void) throws {
+        read: @escaping () throws -> Data?, write: (Data) throws -> Void, existingOnly: Bool = false) throws {
         _ = try Self.scope(issuer: issuer, accountID: accountID)
         let record: Stored
         let bytes: Data
@@ -129,6 +157,7 @@ public final class RemoteAppleDeviceIdentity {
             record = try PropertyListDecoder().decode(Stored.self, from: previous)
             bytes = previous
         } else {
+            guard !existingOnly else { throw RemoteDeviceIdentityError.invalidIdentity }
             let generated = try crypto.create()
             let publicKeys = try crypto.validate(generated)
             record = Stored(version: 1, issuer: issuer, accountID: accountID, deviceID: "astation-" + UUID().uuidString,
@@ -143,7 +172,7 @@ public final class RemoteAppleDeviceIdentity {
               RemoteRecoveryKit.validID(record.deviceID), record.deviceID != "recovery" else {
             throw RemoteDeviceIdentityError.invalidIdentity
         }
-        let keys = try crypto.validate(record.material)
+        let keys = try existingOnly ? crypto.validateWithoutInteraction(record.material) : crypto.validate(record.material)
         guard keys.auth == record.authPublicKey else { throw RemoteDeviceIdentityError.invalidIdentity }
         let auth = PublicKeyData(alg: .p256, raw: keys.auth)
         let encryption = PublicKeyData(alg: .x25519, raw: keys.encryption)
@@ -168,6 +197,28 @@ public final class RemoteAppleDeviceIdentity {
                 try checkStorage()
                 return try RemoteP256Signature.normalize(crypto.sign(request.input, material: material))
             })
+    }
+
+    /// A typed, read-only report built by the loaded SDK. No routine channel
+    /// confirmation, owner prompt, key creation or caller-supplied signing bytes.
+    public func verifierReport(log: MembershipLog, anchor: RemoteVerifierReportAnchor, challengeJSON: String, slot: String, origin: String,
+                               wallMs: UInt64, current: () -> Bool) throws -> String {
+        func check() throws {
+            try anchor.require(log)
+            guard current(),
+                  let member = log.member(deviceId: publicIdentity.deviceID), member.kind == "native",
+                  member.status == .active, member.authKey == publicIdentity.authKey,
+                  member.encKey == publicIdentity.encryptionKey else { throw RemoteVerifierGateError.staleMembership }
+            try checkStorage()
+        }
+        try check()
+        let request = try VerifierReportRequest(log: log, challengeJson: challengeJSON,
+            signer: "member:" + publicIdentity.deviceID, slot: slot, origin: origin,
+            keyId: publicIdentity.deviceID, nowMs: wallMs)
+        let signing = request.signRequest()
+        let signature = try crypto.signWithoutInteraction(signing.input, material: material)
+        try check()
+        return try request.finish(signature: RemoteP256Signature.normalize(signature))
     }
 
     /// A fresh, separate confirmation proves these exact applicant keys. Routine
