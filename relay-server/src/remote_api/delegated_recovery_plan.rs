@@ -18,6 +18,8 @@ pub(crate) mod signatures;
 
 #[path = "delegated_signer_challenges.rs"]
 pub(crate) mod signer_challenges;
+#[path = "delegated_signer_reports.rs"]
+pub(crate) mod signer_reports;
 
 #[derive(sqlx::FromRow)]
 pub(super) struct Prepared {
@@ -127,13 +129,16 @@ async fn review_source_evidence(
     let (history, signed) = history::inspection(connection, prepared, log, binding).await?;
     report["known_history"] = history;
     report["native_archives"] = native::inspection(connection, prepared, log, binding, &signed).await?;
-    report["evidence_hash"] = source_hash(&json!({
+    let mut sources = json!({
         "plan_id": prepared.plan_id,
         "source_hash": prepared.source_hash,
         "known_history": report["known_history"]["evidence_hash"],
         "recovered_stops": report["recovered_stops"]["evidence_hash"],
         "native_archives": report["native_archives"]["evidence_hash"],
-    }))?.into();
+    });
+    let hashes = signer_reports::commitments(connection, &prepared.plan_id).await?;
+    if !hashes.is_empty() { sources["signer_reports"] = json!(hashes); }
+    report["evidence_hash"] = source_hash(&sources)?.into();
     Ok(())
 }
 

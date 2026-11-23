@@ -46,10 +46,10 @@ review reconciles a different plan in a higher generation for that origin. The
 Mac retains the original signatures and the successor generation in the same
 commit. A file import, another origin or an unknown outcome keeps the hold.
 
-Station signer-challenge delivery, the native report confirmation and submission
-flow, exact publication and abandonment receipts, historical author coverage and
-joint verification remain open. The production app cannot initiate a hold or
-issue a signer report yet.
+Recovery Copies can request a Station challenge and submit a signed report
+when the delegated signing gate permits it. A retry can deliver a previously
+exposed signature. Same-generation publication and abandonment receipts,
+historical author coverage and joint verification remain open.
 
 Recovery Copies can review this Mac's retained evidence offline. The coordinator
 holds the account checkpoint and the member key's journal lock while reading
@@ -118,6 +118,30 @@ at the database clock. The Apple client checks the response against the
 selected HTTPS origin, target, every recovery field and the current time
 before passing it to the approval flow. Issuance grants no signing authority.
 Owner confirmation, report submission and snapshot publication are separate.
+
+## Submitting an author report
+
+Recovery Copies shows the selected Station, plan, generation, signed record
+count and draft count. The owner consents to the signing hold before the Mac
+takes it. The journal checks the reviewed inventory again under the key lock.
+Fresh owner authentication approves use of the member key for that SDK request.
+If authentication is cancelled after consent, the hold continues. A delivery
+retry reads only the already exposed report and records from protected storage.
+
+The account client posts `{"report": <signed report>, "records": [<signed records>]}`
+to `POST /api/remote/v1/logs/{genesis}/control/recovery/signer-reports`.
+Under the closed fence and locked owner root, Station verifies the SDK report
+and exports against the saved challenge, exact head, plan, current evidence
+and database time. A committed report contributes its SHA-256 submission
+hash to the review's evidence commitment. Each request is bounded to 256 KiB
+and the Station retains up to 256 submissions per plan.
+
+A successful response contains `plan_id`, `retained_only: true` and
+`submission_hash` (lowercase hex SHA-256 of the canonical request). Exact
+retries recover this receipt across replicas and after challenge expiry. A new
+submission needs a current challenge. A conflicting reuse of a connection is
+refused. Retention leaves the signing hold and recovery fence in place.
+Historical coverage and snapshot publication require separate evidence.
 
 ## Implemented fence and operator commands
 

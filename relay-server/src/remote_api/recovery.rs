@@ -253,6 +253,19 @@ impl RecoveryStore {
         }
     }
 
+    pub(crate) async fn submit_signer_report(&self, genesis: &str, owner: &str, input: &Value) -> Reply {
+        use delegated_recovery::plan::signer_reports::{submit, SubmitError};
+        let (Some(pool), Some(binding)) = (&self.pool, self.delegated_recovery.get()) else { return unavailable() };
+        match tokio::time::timeout(std::time::Duration::from_secs(10), submit(pool, binding, genesis, owner, input)).await {
+            Ok(Ok(receipt)) => (StatusCode::OK, Json(receipt)),
+            Ok(Err(SubmitError::Invalid)) => invalid(),
+            Ok(Err(SubmitError::Changed)) => error(StatusCode::CONFLICT, "recovery_plan_changed"),
+            Ok(Err(SubmitError::Limit)) => error(StatusCode::TOO_MANY_REQUESTS, "signer_report_limit"),
+            Ok(Err(SubmitError::Storage(sqlx::Error::RowNotFound))) => error(StatusCode::NOT_FOUND, "recovery_record_not_found"),
+            _ => error(StatusCode::SERVICE_UNAVAILABLE, "recovery_review_unavailable"),
+        }
+    }
+
     pub(crate) async fn retain_control_recovery_copies(&self, genesis: &str, plan: &str, owner: &str, bytes: &[u8]) -> Reply {
         let (Some(pool), Some(binding)) = (&self.pool, self.delegated_recovery.get()) else {
             return unavailable();

@@ -25,6 +25,8 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
     private let export = NSButton(title: "Save Signed Copy...", target: nil, action: nil)
     private let sendCopy = NSButton(title: "Send to Station", target: nil, action: nil)
     private let loadReview = NSButton(title: "Load Station Review", target: nil, action: nil)
+    private let report = NSButton(title: "Review Signing Report...", target: nil, action: nil)
+    private let retryReport = NSButton(title: "Retry Report Delivery", target: nil, action: nil)
     private let prepare = NSButton(title: "Prepare Copy...", target: nil, action: nil)
     private var access: Access?
     private var rows: [RemoteControlRecoveryReview] = []
@@ -67,7 +69,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         details.isVerticallyResizable = true; details.isHorizontallyResizable = false
         details.autoresizingMask = .width; details.textContainer?.widthTracksTextView = true
         let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.documentView = details
-        let reviewActions = NSStackView(views: [loadReview, refresh]); reviewActions.spacing = 12
+        let reviewActions = NSStackView(views: [loadReview, refresh, report, retryReport]); reviewActions.spacing = 12
         let originalActions = NSStackView(views: [originalChoices, prepare]); originalActions.spacing = 12
         originalChoices.setContentHuggingPriority(.defaultLow, for: .horizontal)
         let actions = NSStackView(views: [sign, export, sendCopy]); actions.spacing = 12
@@ -101,6 +103,8 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         export.target = self; export.action = #selector(saveCopy)
         sendCopy.target = self; sendCopy.action = #selector(retainCopy)
         loadReview.target = self; loadReview.action = #selector(loadStationReview)
+        report.target = self; report.action = #selector(reviewReport)
+        retryReport.target = self; retryReport.action = #selector(retrySignedReport)
         prepare.target = self; prepare.action = #selector(prepareCopy)
         for name in [Notification.Name.accountLoginChanged, .serverInfoChanged, .relayIdentityKeyChanged] {
             NotificationCenter.default.addObserver(self, selector: #selector(contextChanged), name: name, object: nil)
@@ -269,6 +273,69 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
             "\n\nPreparation reserves a timestamp and saves an unsigned draft only when recovery authority is verified. Review and confirm the draft separately."
     }
 
+    @objc private func reviewReport() {
+        guard report.isEnabled, let access, let context = preparation?.context, let window else { return }
+        let epoch = generation
+        task = Task { [weak self] in
+            guard let self else { return }
+            defer { task = nil; refreshAuthorInventory(access, epoch: epoch); render() }
+            let current = { self.isCurrent(access, epoch: epoch) && access.canSign() }
+            do {
+                let preview = try access.coordinator.localControlAuthorInventory(stationOrigin: stationOrigin, current: current)
+                guard preview.missingSignatureBodies.isEmpty else {
+                    status.stringValue = "Resolve the missing signatures on this Mac before sending its report."
+                    return
+                }
+                let sheet = NSAlert(); alert = sheet
+                sheet.messageText = "Hold stop signing and report to Station?"
+                sheet.informativeText = """
+                    \(stationOrigin)
+                    Recovery plan \(context.planID) (generation \(context.generation))
+                    This Mac will report \(preview.signedRecords.count) signed stops and commit to \(preview.reportDraftCount) draft bodies.
+
+                    Continuing places a durable hold before Touch ID or password confirmation. During the hold this Mac cannot sign service stops for this Station or host interrupts at any Station. Closing this window or cancelling authentication keeps the hold.
+
+                    You can still remove a service from the device list, revoke a host sender, or interrupt work through its live channel.
+                    """
+                sheet.addButton(withTitle: "Hold and Continue"); sheet.addButton(withTitle: "Cancel")
+                sheet.buttons[0].keyEquivalent = ""
+                sheet.buttons[1].keyEquivalent = "\r"
+                let consent = await withCheckedContinuation { continuation in
+                    sheet.beginSheetModal(for: window) { continuation.resume(returning: $0 == .alertFirstButtonReturn) }
+                }
+                alert = nil
+                guard consent, current() else { return }
+                try await access.coordinator.submitSignerReport(context, preview: preview, current: current)
+                guard current() else { return }
+                status.stringValue = "Station retained this Mac's signed report. The signing hold remains in place."
+            } catch {
+                guard current() else { return }
+                status.stringValue = error.localizedDescription + " A saved signing hold stays in effect. Retry delivery to check for a receipt."
+            }
+        }
+        render()
+    }
+
+    @objc private func retrySignedReport() {
+        guard retryReport.isEnabled, let access, let context = preparation?.context else { return }
+        let epoch = generation
+        task = Task { [weak self] in
+            guard let self else { return }
+            defer { task = nil; render() }
+            let current = { self.isCurrent(access, epoch: epoch) && access.canSign() }
+            do {
+                let retained = try await access.coordinator.retrySignerReport(context, current: current)
+                guard current() else { return }
+                status.stringValue = retained ? "Station confirmed receipt of the saved report. The signing hold remains in place."
+                    : "No current receipt. Load the latest Station review before approving a new report."
+            } catch {
+                guard current() else { return }
+                status.stringValue = "Could not confirm report delivery. " + error.localizedDescription
+            }
+        }
+        render()
+    }
+
     @objc private func prepareCopy() {
         guard prepare.isEnabled, let access, let preparation, let original = selectedOriginal else { return }
         let epoch = generation
@@ -305,6 +372,9 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
         export.isEnabled = available && selected?.signed == true
         sendCopy.isEnabled = available && selected?.signed == true && access?.canSign() == true
         loadReview.isEnabled = available && access?.canSign() == true
+        report.isEnabled = available && preparation != nil && access?.canSign() == true &&
+            access?.coordinator.delegatedControlsAvailable == true
+        retryReport.isEnabled = available && preparation != nil && access?.canSign() == true
         prepare.isEnabled = available && selectedOriginal != nil && preparation != nil &&
             access?.canSign() == true && access?.coordinator.controlRecoveryAvailable == true
         details.string = [selected.map(Self.explanation), selectedOriginal.map(Self.explanation), preparation.map {

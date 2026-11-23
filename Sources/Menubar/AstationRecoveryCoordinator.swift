@@ -131,6 +131,7 @@ final class AstationRecoveryCoordinator {
             confirmOwner: { request in
                 await withCheckedContinuation { continuation in
                     let reason = request.purpose == .genesis ? "confirm this account's recovery setup"
+                        : request.purpose == .signerReport ? "sign this Mac's recovery report for the reviewed Station plan"
                         : request.purpose == .controlRecord ? "authorize the reviewed stop of delegated agent work"
                         : request.purpose == .hostSender ? "confirm the reviewed host sending change"
                         : request.purpose == .project ? "confirm the reviewed project permissions"
@@ -1747,6 +1748,62 @@ extension AstationRecoveryCoordinator {
         return result
     }
 
+    /// A transport retry sends the existing signed evidence without a second owner prompt.
+    func retrySignerReport(_ context: RemoteControlRecoveryContext, current: () -> Bool) async throws -> Bool {
+        try begin(); defer { busy = false }
+        guard current(), !Task.isCancelled, context.stationOrigin == relayURL, context.accountID == accountID,
+              let station = http as? RemoteRecoveryHTTP, let log = membershipLog, log.frozen() == nil,
+              log.genesisHash() == context.genesisHash, log.head() == context.membershipHead else {
+            throw RemoteRecoveryError.requiresReview
+        }
+        try requireDurableRecoveryCheckpoint()
+        guard let submission = try readControlJournal(member: managerID).exposedSubmission(for: context, log: log) else {
+            return false
+        }
+        let retained = try await station.retainSignerReport(submission)
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        return retained
+    }
+
+    func submitSignerReport(_ context: RemoteControlRecoveryContext, preview: RemoteControlAuthorInventory,
+        current: () -> Bool) async throws {
+        try begin(); defer { busy = false }
+        guard current(), !Task.isCancelled, context.stationOrigin == relayURL, context.accountID == accountID,
+              try currentKit()?.genesisHash == context.genesisHash,
+              let station = http as? RemoteRecoveryHTTP else { throw RemoteRecoveryError.requiresReview }
+        let log = try await refreshedLog(genesis: context.genesisHash)
+        try requireDelegatedControl(log)
+        guard current(), !Task.isCancelled, log.head() == context.membershipHead else { throw RemoteChannelError.staleLink }
+        let issued = try await station.signerChallenge(for: context, memberID: managerID, slot: "astation-macos",
+            nowMs: { Self.clock().wallMs })
+        guard current(), !Task.isCancelled, membershipLog?.head() == context.membershipHead else { throw RemoteChannelError.staleLink }
+        try requireDelegatedControl(log)
+        let journal = try pinnedControlJournal(log: log, member: managerID)
+        let review = try journal.reviewReport(issued, log: log, preview: preview, nowMs: now().wallMs,
+            outboxes: (saved.controlPublications ?? [:]).keys.map { try controls(stationOrigin: $0) },
+            recoveryCopies: (saved.controlRecoveryPublications ?? [:]).keys.map { try recoveryControls(origin: $0) })
+        guard await confirmOwner(review.request), current(), !Task.isCancelled else { throw RemoteRecoveryError.confirmationRequired }
+        let confirmedAt = Self.clock().monoMs
+        let latest = try await refreshedLog(genesis: context.genesisHash)
+        guard current(), !Task.isCancelled, latest.head() == context.membershipHead,
+              let key = latest.member(deviceId: managerID)?.authKey, key.alg == .p256 else { throw RemoteChannelError.staleLink }
+        try requireDelegatedControl(latest)
+        try requireDurableRecoveryCheckpoint()
+        let submission = try journal.finishReport(review, log: latest, nowMs: { now().wallMs },
+            current: { current() && !Task.isCancelled },
+            sign: { keyRequest in
+                let time = Self.clock()
+                guard time.monoMs >= confirmedAt, time.monoMs - confirmedAt < 30_000,
+                      time.wallMs >= issued.challenge.issuedAt, time.wallMs < issued.challenge.expiresAt else {
+                    throw RemoteRecoveryError.confirmationRequired
+                }
+                return try identity.signRecoveryReport(keyRequest, expectedPublicKey: key.raw)
+            })
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+        guard try await station.retainSignerReport(submission) else { throw RemoteRecoveryError.requiresReview }
+        guard current(), !Task.isCancelled else { throw RemoteChannelError.staleLink }
+    }
+
     func localControlRecoveryReviews(stationOrigin: String? = nil, current: () -> Bool) throws -> [RemoteControlRecoveryReview] {
         guard !busy, !uncertain, current() else { throw RemoteRecoveryError.requiresReview }
         try requireDurableRecoveryCheckpoint()
@@ -2342,6 +2399,11 @@ extension AstationRecoveryCoordinator {
             }
         }
         return journal
+    }
+
+    func requireServiceStopChange(origin: String) throws {
+        guard origin == relayURL, !busy, !uncertain else { throw RemoteRecoveryError.requiresReview }
+        try readControlJournal(member: managerID).requireStopChange(origin: origin)
     }
 
     func requireControlChange(_ request: SignRequest) throws {

@@ -7,6 +7,36 @@ import Vision
 import XCTest
 @testable import Menubar
 
+private final class RecoveryReportHTTPStub: URLProtocol {
+    static let lock = NSLock()
+    static var response: ((URLRequest, Data) throws -> Data)?
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        do {
+            var bytes = request.httpBody ?? Data()
+            if bytes.isEmpty, let stream = request.httpBodyStream {
+                stream.open(); defer { stream.close() }
+                var buffer = [UInt8](repeating: 0, count: 4096)
+                while true {
+                    let count = stream.read(&buffer, maxLength: buffer.count)
+                    guard count >= 0 else { throw URLError(.cannotDecodeContentData) }
+                    if count == 0 { break }
+                    bytes.append(contentsOf: buffer.prefix(count))
+                }
+            }
+            let reply = try Self.lock.withLock { try XCTUnwrap(Self.response)(request, bytes) }
+            let http = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: reply)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch { client?.urlProtocol(self, didFailWithError: error) }
+    }
+
+    override func stopLoading() {}
+}
+
 @MainActor
 private final class RecoveryMemoryCheckpoint: AstationRecoveryCheckpointStorage {
     var bytes: Data?
@@ -2542,6 +2572,72 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             candidateFeedID: UUID().uuidString.lowercased(), membershipHead: log.head())
         authority.context = context; authority.original = result.recordJSON
         return (coordinator, context, review.recordID)
+    }
+
+    func testNativeSignerReportRequiresConsentAndRecoversExactReceiptAfterRestart() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let (_, context, _) = try await recoveryCopySource(h, authority: RecoveryCopyAuthority())
+        let savedLog = await h.relay.log
+        let log = try XCTUnwrap(savedLog)
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RecoveryReportHTTPStub.self]
+        let http = try RemoteRecoveryHTTP(relayURL: context.stationOrigin, configuration: config, accessToken: { "native-test" })
+        let wall = AstationRecoveryCoordinator.clock().wallMs
+        let challenge = try signerReportChallenge(signer: "member:manager-a", slot: "astation-macos", origin: context.stationOrigin,
+            connection: 1, issuedAt: wall, expiresAt: wall + 30_000, recovery: context.signerReportRecovery)
+        var deliveries: [Data] = []
+        RecoveryReportHTTPStub.lock.withLock {
+            RecoveryReportHTTPStub.response = { request, data in
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer native-test")
+                switch request.url?.lastPathComponent {
+                case "entries":
+                    return try JSONSerialization.data(withJSONObject: ["head": ["seq": log.head().seq, "hash": log.head().hash] as [String: Any],
+                        "entries": [], "more": false] as [String: Any])
+                case "signer-challenges":
+                    return Data(challenge.utf8)
+                case "signer-reports":
+                    deliveries.append(data)
+                    let input = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+                    func json(_ value: Any) throws -> String {
+                        String(decoding: try JSONSerialization.data(withJSONObject: value), as: UTF8.self)
+                    }
+                    let records = try XCTUnwrap(input["records"] as? [Any]).map(json)
+                    let checked = try verifySignerReport(log: log, reportJson: json(XCTUnwrap(input["report"])),
+                        expectedChallengeJson: challenge, exportedRecordsJson: records, nowMs: wall)
+                    XCTAssertTrue(checked.atHead)
+                    XCTAssertEqual(checked.journal.records, 1)
+                    if deliveries.count == 1 { throw URLError(.networkConnectionLost) }
+                    let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                    return try JSONSerialization.data(withJSONObject: ["plan_id": context.planID,
+                        "retained_only": true, "submission_hash": deliveries.count == 2 ? "wrong" : hash] as [String: Any])
+                default: XCTFail("unexpected Station path"); throw URLError(.badURL)
+                }
+            }
+        }
+        defer { RecoveryReportHTTPStub.lock.withLock { RecoveryReportHTTPStub.response = nil } }
+        let coordinator = try h.coordinator(transport: http, authorizeDelegatedControl: { _ in })
+        let preview = try coordinator.localControlAuthorInventory(stationOrigin: context.stationOrigin, current: { true })
+        h.approve = false
+        do { try await coordinator.submitSignerReport(context, preview: preview, current: { true }); XCTFail() }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .confirmationRequired) }
+        XCTAssertEqual(h.ownerRequests.last?.purpose, .signerReport)
+        XCTAssertThrowsError(try coordinator.requireServiceStopChange(origin: context.stationOrigin)) {
+            XCTAssertTrue($0 is RemoteControlRecoveryHold)
+        }
+        XCTAssertTrue(deliveries.isEmpty)
+        h.approve = true
+        do { try await coordinator.submitSignerReport(context, preview: preview, current: { true }); XCTFail() }
+        catch { XCTAssertEqual((error as? URLError)?.code, .networkConnectionLost) }
+        let count = h.ownerRequests.count
+        let reopened = try h.coordinator(transport: http)
+        do { _ = try await reopened.retrySignerReport(context, current: { true }); XCTFail() }
+        catch { XCTAssertEqual(error as? RemoteRecoveryTransportError, .invalidResponse) }
+        let ok = try await reopened.retrySignerReport(context, current: { true })
+        XCTAssertTrue(ok)
+        XCTAssertEqual(deliveries.count, 3)
+        XCTAssertEqual(Set(deliveries).count, 1)
+        XCTAssertEqual(h.ownerRequests.count, count)
+        XCTAssertThrowsError(try reopened.requireServiceStopChange(origin: context.stationOrigin))
     }
 
     private func preparedRecoverySource(_ h: RecoveryCoordinatorHarness) async throws

@@ -428,3 +428,74 @@ async fn postgres_signer_challenge_is_private_committed_and_reused_by_other_repl
     assert_eq!(counts, (2, 1));
     database.cleanup().await;
 }
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_signer_report_is_verified_once_and_receipted_across_replicas() {
+    use atem_client::member_report::{sign_signer_report, signer_report_body, JournalView, SignerReportChallenge};
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;
+    let (_, f, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    let plan = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let a = RecoveryStore::postgres(database.reconnect(2).await);
+    let b = RecoveryStore::postgres(database.reconnect(2).await);
+    a.configure_recovery_review(ORIGIN, 1).await.unwrap();
+    b.configure_recovery_review(ORIGIN, 1).await.unwrap();
+    let (a, b) = (make_app(a), make_app(b));
+    let base = format!("/api/remote/v1/logs/{genesis}/control/recovery");
+    let path = format!("{base}/signer-reports");
+    let signer = "member:phone";
+    let mint = |slot: &str| json!({"signer":signer,"slot":slot,"expected":f.log.head().to_json(),
+        "recovery":{"generation":"1","plan_id":plan["plan_id"],"candidate_feed_id":plan["candidate_feed_id"],
+            "source_hash":plan["source_hash"],"evidence_hash":plan["evidence_hash"]}}).to_string().into_bytes();
+    let before = saved(&database.pool, &genesis).await;
+    let original = &before["delegated"][ORIGIN]["records"][1];
+    let mut inputs = Vec::new();
+    for slot in ["astation-macos", "other"] {
+        let (status, challenge) = post_recovery(&a, &format!("{base}/signer-challenges"), Some("alice"), mint(slot)).await;
+        assert_eq!(status, StatusCode::OK);
+        let challenge = SignerReportChallenge::parse(challenge.to_string().as_bytes()).unwrap();
+        let journal = JournalView {id:[1;16], since:1, revision:2, records:vec![original["body"].to_string()], drafts:vec![]};
+        let body = signer_report_body(&f.log, &challenge, signer, slot, ORIGIN, &journal, challenge.issued_at()).unwrap();
+        let report = sign_signer_report(&f.keys, &KeyId::new("manager"), &body).unwrap();
+        inputs.push(json!({"report":report.to_json(),"records":[original]}));
+    }
+    let input = &inputs[0];
+    let bytes = input.to_string().into_bytes();
+    assert_eq!(post_recovery(&a, &path, None, bytes.clone()).await.0, StatusCode::UNAUTHORIZED);
+    let missing = path.replace(&genesis, &"0".repeat(64));
+    assert_eq!(post_recovery(&a, &path, Some("bob"), bytes.clone()).await,
+        post_recovery(&a, &missing, Some("alice"), bytes.clone()).await);
+    for field in ["signature", "records", "extra"] {
+        let mut bad = input.clone();
+        match field {
+            "signature" => bad["report"]["sig"] = json!("forged"),
+            "records" => bad["records"] = json!([{}]),
+            _ => bad["extra"] = json!(true),
+        }
+        assert_eq!(post_recovery(&a, &path, Some("alice"), bad.to_string().into_bytes()).await.0, StatusCode::BAD_REQUEST);
+    }
+    sqlx::raw_sql("CREATE FUNCTION reject_report() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'commit fault'; END $$;
+        CREATE CONSTRAINT TRIGGER reject_report AFTER INSERT ON station_delegated_signer_reports
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_report();")
+        .execute(&database.pool).await.unwrap();
+    assert_eq!(post_recovery(&a, &path, Some("alice"), bytes.clone()).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(http(&b, &genesis, Some("alice")).await.1["evidence_hash"], plan["evidence_hash"]);
+    sqlx::query("DROP TRIGGER reject_report ON station_delegated_signer_reports").execute(&database.pool).await.unwrap();
+    let (one, two) = tokio::join!(post_recovery(&a, &path, Some("alice"), bytes.clone()),
+        post_recovery(&b, &path, Some("alice"), bytes.clone()));
+    assert_eq!(one.0, StatusCode::OK, "{}", one.1);
+    assert_eq!(one, two);
+    assert_eq!(one.1["retained_only"], true);
+    assert_eq!(one.1["plan_id"], plan["plan_id"]);
+    assert_eq!(one.1["submission_hash"].as_str().unwrap().len(), 64);
+    assert_eq!(post_recovery(&b, &path, Some("alice"), inputs[1].to_string().into_bytes()).await.0, StatusCode::CONFLICT);
+    assert_ne!(http(&b, &genesis, Some("alice")).await.1["evidence_hash"], plan["evidence_hash"]);
+    sqlx::query("DELETE FROM station_delegated_signer_challenges").execute(&database.pool).await.unwrap();
+    assert_eq!(post_recovery(&a, &path, Some("alice"), bytes).await, one);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM station_delegated_signer_reports").fetch_one(&database.pool).await.unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(saved(&database.pool, &genesis).await, before);
+    assert!(!inspect(&database.pool, ORIGIN).await.unwrap().unwrap().ready);
+    database.cleanup().await;
+}
