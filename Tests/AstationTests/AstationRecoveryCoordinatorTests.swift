@@ -15,6 +15,7 @@ private final class RecoveryMemoryCheckpoint: AstationRecoveryCheckpointStorage 
     var failOnRemoval = false
     var failOnControlSignature = false
     var failOnVerifierRoster = false
+    var failOnProcessRoster = false
     var writes = 0
     var readFailure = false
     func read() throws -> Data? {
@@ -24,6 +25,12 @@ private final class RecoveryMemoryCheckpoint: AstationRecoveryCheckpointStorage 
     func write(_ data: Data) throws {
         writes += 1
         bytes = data
+        if failOnProcessRoster,
+           let saved = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+           saved["processRosters"] != nil {
+            failOnProcessRoster = false
+            throw RemoteRecoveryError.storageUncertain
+        }
         if failOnVerifierRoster,
            let saved = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
            (saved["verifierRosters"] as? [String: Any])?.isEmpty == false {
@@ -447,6 +454,7 @@ private final class RecoveryCoordinatorHarness {
         additionalControlStations: ((MembershipLog) throws -> [String: RemoteControlStationTransport])? = nil,
         retainedControlTransport: ((String) throws -> RemoteControlStationTransport)? = nil,
         confirmVerifierRoster: ((AstationRecoveryCoordinator.VerifierRosterReview) async -> Bool)? = nil,
+        confirmProcessRoster: (() async -> Bool)? = nil,
         verifierTime: @escaping () -> UInt64 = { RemoteVerifierSigningGate.evidenceTimeMilliseconds() }) throws -> AstationRecoveryCoordinator {
         try AstationRecoveryCoordinator(accountID: "account-a", managerID: "manager-a", identity: identity,
             relayURL: relayURL, store: checkpointStore ?? store, transport: transport ?? relay, dataKeys: keys,
@@ -464,7 +472,7 @@ private final class RecoveryCoordinatorHarness {
             controlRecoveryAuthority: controlRecoveryAuthority,
             authorizeNewMembership: authorizeNewMembership, additionalControlStations: additionalControlStations,
             retainedControlTransport: retainedControlTransport,
-            confirmVerifierRoster: confirmVerifierRoster, verifierTime: verifierTime)
+            confirmVerifierRoster: confirmVerifierRoster, confirmProcessRoster: confirmProcessRoster, verifierTime: verifierTime)
     }
 }
 
@@ -654,6 +662,86 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             catch { }
             XCTAssertNil(try coordinator.acceptedStationVerifierRoster())
         }
+    }
+
+    func testProcessReviewPersistsAllSlotsAndHeadChangesRequireReviewAgain() async throws {
+        let h = RecoveryCoordinatorHarness(), process = verifierReportProcess()
+        let member = "manager-a", active = { true }
+        let coordinator = try h.coordinator(confirmProcessRoster: { true })
+        _ = try await coordinator.setup()
+        let review = try await coordinator.prepareProcessReview(member: member, current: active)
+        let lines = ["desktop " + process, "offline AQEBAQEBAQEBAQEBAQEBAQ"]
+        try await coordinator.acceptProcessReview(review, lines: lines, current: active)
+        let restarted = try h.coordinator(confirmProcessRoster: { true })
+        let log = try await restarted.hostSenderMembership()
+        XCTAssertEqual(try restarted.reviewedProcessSlots(member: member, log: log).map(\.slot), ["desktop", "offline"])
+        XCTAssertFalse(restarted.hostSenderControlsAvailable)
+        do { try await coordinator.acceptProcessReview(review, lines: lines, current: active); XCTFail("replayed review") } catch {}
+        let foreign = try h.coordinator(relayURL: "https://another.example")
+        XCTAssertThrowsError(try foreign.reviewedProcessSlots(member: member, log: log))
+        _ = try await addSecondManager(harness: h)
+        let changed = try await restarted.hostSenderMembership()
+        XCTAssertThrowsError(try restarted.reviewedProcessSlots(member: member, log: changed))
+        XCTAssertThrowsError(try restarted.reviewedProcessSlots(member: member, log: log))
+        let next = try await restarted.prepareProcessReview(member: member, current: active)
+        XCTAssertEqual(next.previous?.lines, lines, "Keep offline slots visible while re-reviewing the newer head")
+        try await restarted.acceptProcessReview(next, lines: [lines[0]], current: active)
+        XCTAssertEqual(try restarted.reviewedProcessSlots(member: member, log: changed).count, 1)
+    }
+
+    func testProcessReviewRefusesInvalidRowsBeforeConfirmation() async throws {
+        let h = RecoveryCoordinatorHarness(), process = verifierReportProcess()
+        let coordinator = try h.coordinator(confirmProcessRoster: { XCTFail("confirmed an invalid candidate"); return true })
+        _ = try await coordinator.setup()
+        for lines in [[], ["a " + process, "a " + process], ["invalid/slot " + process], ["a malformed"], ["b " + process, "a " + process]] {
+            let review = try await coordinator.prepareProcessReview(member: "manager-a", current: { true })
+            do { try await coordinator.acceptProcessReview(review, lines: lines, current: { true }); XCTFail("accepted invalid candidate") } catch {}
+        }
+        let log = try await coordinator.hostSenderMembership()
+        XCTAssertThrowsError(try coordinator.reviewedProcessSlots(member: "manager-a", log: log))
+    }
+
+    func testProcessReviewRefusesDeniedStaleOrSupersededConfirmation() async throws {
+        for fault in ["denied", "head", "selection", "expiry", "superseded"] {
+            let h = RecoveryCoordinatorHarness()
+            var active = true, time: UInt64 = 5, confirmations = 0
+            let coordinator = try h.coordinator(confirmProcessRoster: {
+                confirmations += 1
+                if fault == "head" {
+                    do { _ = try await self.addSecondManager(harness: h) } catch { XCTFail("membership fixture failed") }
+                }
+                if fault == "selection" { active = false }
+                return fault != "denied"
+            }, verifierTime: { time })
+            _ = try await coordinator.setup()
+            let review = try await coordinator.prepareProcessReview(member: "manager-a", current: { active })
+            if fault == "superseded" { _ = try await coordinator.prepareProcessReview(member: "manager-a", current: { active }) }
+            if fault == "expiry" { time += 300_000 }
+            do {
+                try await coordinator.acceptProcessReview(review, lines: ["mac " + verifierReportProcess()], current: { active })
+                XCTFail("accepted " + fault)
+            } catch {}
+            XCTAssertEqual(confirmations, ["expiry", "superseded"].contains(fault) ? 0 : 1)
+            let log = try await coordinator.hostSenderMembership()
+            XCTAssertThrowsError(try coordinator.reviewedProcessSlots(member: "manager-a", log: log))
+        }
+    }
+
+    func testUncertainProcessListWriteRequiresReloadAndFreshEvidence() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let coordinator = try h.coordinator(confirmProcessRoster: { true })
+        _ = try await coordinator.setup()
+        let review = try await coordinator.prepareProcessReview(member: "manager-a", current: { true })
+        h.store.failOnProcessRoster = true
+        do {
+            try await coordinator.acceptProcessReview(review, lines: ["mac " + verifierReportProcess()], current: { true })
+            XCTFail("acknowledged uncertain write")
+        } catch {}
+        let restarted = try h.coordinator()
+        let log = try await restarted.hostSenderMembership()
+        XCTAssertThrowsError(try coordinator.reviewedProcessSlots(member: "manager-a", log: log))
+        XCTAssertEqual(try restarted.reviewedProcessSlots(member: "manager-a", log: log).first?.process, verifierReportProcess())
+        XCTAssertFalse(restarted.hostSenderControlsAvailable)
     }
 
     func testVerifierRosterChangedDuringConfirmationRequiresANewExactReview() async throws {

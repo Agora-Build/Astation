@@ -56,6 +56,7 @@ final class AstationRecoveryCoordinator {
         var hostSenderReview: Data?
         var supersededHostSenderPublications: [Data]?
         var verifierRosters: [String: AcceptedVerifierRoster]?
+        var processRosters: [String: [String: AstationProcessRoster]]?
     }
 
     nonisolated static let bootID = RemoteSystemClock.bootIdentifier
@@ -76,6 +77,8 @@ final class AstationRecoveryCoordinator {
     private let controlRecoveryAuthority: RemoteControlRecoveryAuthorizing?
     private let authorizeNewMembership: ((SignRequest, MembershipLog) throws -> Void)?
     private let confirmVerifierRoster: ((VerifierRosterReview) async -> Bool)?
+    private let confirmProcessRoster: (() async -> Bool)?
+    private var processReview: ProcessReview?
     private let verifierTime: () -> UInt64
     /// The caller authenticates this account's Station roster and scopes each transport's token
     /// to its exact origin. A cached presence list is not a complete roster.
@@ -156,6 +159,12 @@ final class AstationRecoveryCoordinator {
                         continuation.resume(returning: $0)
                     }
                 }
+            }, confirmProcessRoster: {
+                await withCheckedContinuation { continuation in
+                    DeviceOwnerAuth.authenticate(reason: "confirm the reviewed verifier processes") {
+                        continuation.resume(returning: $0)
+                    }
+                }
             })
     }
 
@@ -170,6 +179,7 @@ final class AstationRecoveryCoordinator {
         additionalControlStations: ((MembershipLog) throws -> [String: RemoteControlStationTransport])? = nil,
         retainedControlTransport: ((String) throws -> RemoteControlStationTransport)? = nil,
         confirmVerifierRoster: ((VerifierRosterReview) async -> Bool)? = nil,
+        confirmProcessRoster: (() async -> Bool)? = nil,
         verifierTime: @escaping () -> UInt64 = { RemoteVerifierSigningGate.evidenceTimeMilliseconds() },
         now: @escaping () -> HostClock = { AstationRecoveryCoordinator.clock() }) throws {
         self.accountID = accountID
@@ -188,13 +198,15 @@ final class AstationRecoveryCoordinator {
         self.additionalControlStations = additionalControlStations
         self.retainedControlTransport = retainedControlTransport
         self.confirmVerifierRoster = confirmVerifierRoster
+        self.confirmProcessRoster = confirmProcessRoster
         self.verifierTime = verifierTime
         self.confirmReplacement = confirmReplacement
         self.saveKit = saveKit
         self.now = now
         if let data = try store.read() {
             saved = try PropertyListDecoder().decode(Saved.self, from: data)
-            guard [2, 3, 4].contains(saved.version), saved.accountID == accountID, saved.managerID == managerID,
+            guard [2, 3, 4, 5].contains(saved.version), saved.accountID == accountID, saved.managerID == managerID,
+                  saved.version >= 5 || (saved.processRosters ?? [:]).isEmpty,
                   saved.version >= 4 || (saved.controlRecoveryPublications ?? [:]).isEmpty else {
                 throw RemoteRecoveryError.invalidCheckpoint
             }
@@ -273,6 +285,7 @@ final class AstationRecoveryCoordinator {
         // Older readers must refuse rather than rewrite away recovery signatures.
         next.version = max(saved.version, next.version)
         if !(next.controlRecoveryPublications ?? [:]).isEmpty { next.version = max(next.version, 4) }
+        if !(next.processRosters ?? [:]).isEmpty { next.version = max(next.version, 5) }
         do {
             let encoder = PropertyListEncoder()
             encoder.outputFormat = .binary
@@ -1122,8 +1135,8 @@ final class AstationRecoveryCoordinator {
             host: host.hostId, trust: host.hostTrustGen)
     }
 
-    private func requireManager(_ log: MembershipLog) throws {
-        let keys = try identity.remotePublicKeys()
+    private func requireManager(_ log: MembershipLog, createKeys: Bool = true) throws {
+        let keys = try identity.remotePublicKeys(create: createKeys)
         guard let manager = log.member(deviceId: managerID) else { throw RemoteRecoveryError.requiresReview }
         guard manager.status != .pending else { throw RemoteRecoveryError.enrollmentPending }
         guard manager.status == .active, manager.roles.contains("manage"),
@@ -1317,6 +1330,84 @@ extension AstationRecoveryCoordinator {
     private struct AcceptedVerifierRoster: Codable {
         let genesis: String
         let roster: RemoteStationVerifierRoster
+    }
+
+    struct ProcessReview: Equatable {
+        let id: UUID
+        let member: String
+        let origin: String
+        let genesis: String
+        let head: LogHead
+        let previous: AstationProcessRoster?
+        let started: UInt64
+    }
+
+    var processReviewAvailable: Bool { confirmProcessRoster != nil }
+
+    func reviewedProcessSlots(member: String, log: MembershipLog) throws -> [RemoteMemberVerifierSlot] {
+        guard !uncertain, let roster = saved.processRosters?[relayURL]?[member], roster.member == member,
+              roster.origin == relayURL, log.accountId() == accountID, log.frozen() == nil,
+              roster.genesis == log.genesisHash(), roster.sequence == log.head().seq, roster.headHash == log.head().hash,
+              log.head() == membershipLog?.head(), let target = log.member(deviceId: member), target.status == .active,
+              target.kind == "native" || (target.kind == "service" && (target.expiresAt ?? 0) > now().wallMs)
+        else { throw RemoteRecoveryError.requiresReview }
+        try requireDurableRecoveryCheckpoint()
+        return try roster.slots()
+    }
+
+    func prepareProcessReview(member: String, current: () -> Bool) async throws -> ProcessReview {
+        try begin(); defer { busy = false }
+        processReview = nil
+        guard processReviewAvailable, current(), !Task.isCancelled, PortalIntegrationRecord.validOrigin(relayURL),
+              let kit = try currentKit() else { throw RemoteRecoveryError.requiresReview }
+        let log = try await refreshedLog(genesis: kit.genesisHash)
+        try requireManager(log, createKeys: false)
+        guard current(), !Task.isCancelled, log.frozen() == nil,
+              let target = log.member(deviceId: member), target.status == .active,
+              ["native", "service"].contains(target.kind) else { throw RemoteRecoveryError.requiresReview }
+        let previous = saved.processRosters?[relayURL]?[member]
+        if let previous {
+            guard previous.member == member, previous.genesis == kit.genesisHash, previous.origin == relayURL,
+                  previous.sequence <= UInt64(log.entries().count), previous.sequence > 0,
+                  try signedObjectInfo(json: log.entries()[Int(previous.sequence - 1)]).entryHash == previous.headHash,
+                  !previous.lines.isEmpty else { throw RemoteRecoveryError.invalidCheckpoint }
+            _ = try previous.slots()
+        }
+        let review = ProcessReview(id: UUID(), member: member, origin: relayURL, genesis: kit.genesisHash,
+            head: log.head(), previous: previous, started: verifierTime())
+        processReview = review
+        return review
+    }
+
+    func acceptProcessReview(_ review: ProcessReview, lines: [String], current: () -> Bool) async throws {
+        try begin(); defer { busy = false }
+        guard let confirmProcessRoster, processReview == review else { throw RemoteRecoveryError.requiresReview }
+        processReview = nil
+        let slots = try AstationProcessRoster.rows(member: review.member, text: lines.joined(separator: "\n"))
+        guard lines == slots.map({ $0.slot + " " + $0.process }) else { throw RemoteVerifierGateError.invalidRoster }
+        func check(_ log: MembershipLog) throws {
+            let tick = verifierTime()
+            guard current(), !Task.isCancelled, review.origin == relayURL, log.frozen() == nil,
+                  log.genesisHash() == review.genesis, log.head() == review.head, review.started <= tick,
+                  tick - review.started < 300_000, saved.processRosters?[relayURL]?[review.member] == review.previous
+            else { throw RemoteRecoveryError.requiresReview }
+            try requireManager(log, createKeys: false)
+        }
+        guard current(), !Task.isCancelled else { throw RemoteRecoveryError.requiresReview }
+        try check(try await refreshedLog(genesis: review.genesis))
+        var rosters = saved.processRosters ?? [:]
+        rosters[relayURL, default: [:]][review.member] = AstationProcessRoster(origin: relayURL, member: review.member,
+            genesis: review.genesis, sequence: review.head.seq, headHash: review.head.hash, lines: lines)
+        let total = rosters.values.reduce(0) { $0 + $1.values.reduce(0) { $0 + $1.lines.count } }
+        guard rosters.count <= 64, total <= 4096 else { throw RemoteVerifierGateError.invalidRoster }
+        guard await confirmProcessRoster() else { throw RemoteRecoveryError.confirmationRequired }
+        let confirmedAt = verifierTime()
+        try check(try await refreshedLog(genesis: review.genesis))
+        let finished = verifierTime()
+        guard finished >= confirmedAt, finished - confirmedAt < 30_000 else { throw RemoteRecoveryError.requiresReview }
+        try persist { $0.processRosters = rosters }
+        do { try requireDurableRecoveryCheckpoint() }
+        catch { uncertain = true; throw error }
     }
 
     struct VerifierRosterReview: Equatable {
