@@ -84,6 +84,15 @@ pub(crate) async fn recovery_review(
     state.recovery.control_recovery_review(&genesis, &owner).await
 }
 
+pub(crate) async fn plan_outcome(
+    State(state): State<AppState>, Path((genesis, plan)): Path<(String, String)>, headers: HeaderMap,
+) -> Reply {
+    let owner = match subject(&state, &headers).await { Ok(owner) => owner, Err(reply) => return reply };
+    if !super::delegated_recovery::canonical_genesis(&genesis) ||
+        !uuid::Uuid::parse_str(&plan).is_ok_and(|v| v.get_version_num() == 4 && v.to_string() == plan) { return invalid(); }
+    state.recovery.recovery_plan_outcome(&genesis, &plan, &owner).await
+}
+
 pub(crate) async fn signer_challenge(
     State(state): State<AppState>, Path(genesis): Path<String>, headers: HeaderMap, body: Body,
 ) -> Reply {

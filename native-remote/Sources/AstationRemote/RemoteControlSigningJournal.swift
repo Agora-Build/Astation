@@ -21,6 +21,8 @@ public final class RemoteControlSigningJournal {
         let slot: String
         var exposedReport: String?
         var supersededBy: RemoteControlRecoveryContext?
+        var abandoned: Bool?
+        var isHeld: Bool { supersededBy == nil && abandoned != true }
 
         func request(log: MembershipLog, id: Data, since: UInt64, member: String, nowMs: UInt64) throws -> SignerReportRequest {
             try SignerReportRequest(log: log, challengeJson: challengeJSON, signer: "member:" + member,
@@ -141,7 +143,7 @@ public final class RemoteControlSigningJournal {
         }
         if let successor = barrier.supersededBy {
             try successor.validate()
-            guard successor.accountID == context.accountID, successor.genesisHash == context.genesisHash,
+            guard barrier.abandoned != true, successor.accountID == context.accountID, successor.genesisHash == context.genesisHash,
                   successor.stationOrigin == origin, successor.generation > context.generation,
                   successor.planID != context.planID else { throw RemoteControlPublicationError.invalidCheckpoint }
         }
@@ -228,7 +230,8 @@ public final class RemoteControlSigningJournal {
             }
             // A held draft cannot have been cancelled. An ended plan no longer
             // attests that its unsigned drafts are outstanding.
-            if barrier.supersededBy == nil {
+            if barrier.isHeld {
+                if barrier.context.stationOrigin == stationOrigin { result.heldPlan = barrier.context }
                 for json in barrier.drafts {
                     try result.retain(body: checkedBody(json), json: json, key: key, record: nil,
                         possiblySigned: false, unsignedDraft: true)
@@ -277,7 +280,7 @@ public final class RemoteControlSigningJournal {
     /// qualify. Recheck the signature and frozen records at their original challenge.
     public func exposedSubmission(for context: RemoteControlRecoveryContext, log: MembershipLog) throws -> Submission? {
         try checkStorage()
-        guard let barrier = saved.barriers?[context.stationOrigin], barrier.supersededBy == nil,
+        guard let barrier = saved.barriers?[context.stationOrigin], barrier.isHeld,
               let report = barrier.exposedReport, barrier.context.planID == context.planID,
               barrier.context.generation == context.generation, barrier.context.candidateFeedID == context.candidateFeedID,
               barrier.context.sourceHash == context.sourceHash, barrier.context.accountID == context.accountID,
@@ -318,7 +321,11 @@ public final class RemoteControlSigningJournal {
         if let prior = saved.barriers?[origin] {
             // Never replace a different plan using a caller-supplied generation,
             // or mistake a restored outbox for the disappearance of a frozen draft.
-            if let successor = prior.supersededBy {
+            if prior.abandoned == true {
+                guard context.generation > prior.context.generation, context.planID != prior.context.planID else {
+                    throw RemoteControlPublicationError.requiresReview
+                }
+            } else if let successor = prior.supersededBy {
                 guard context.generation >= successor.generation,
                       context.generation != successor.generation ||
                         (context.planID == successor.planID && context.candidateFeedID == successor.candidateFeedID &&
@@ -368,7 +375,7 @@ public final class RemoteControlSigningJournal {
         operating = true
         defer { operating = false }
         try checkStorage()
-        guard current(), let barrier = saved.barriers?[context.stationOrigin], barrier.context == context, barrier.supersededBy == nil,
+        guard current(), let barrier = saved.barriers?[context.stationOrigin], barrier.context == context, barrier.isHeld,
               context.accountID == log.accountId(), context.genesisHash == log.genesisHash(),
               context.membershipHead == log.head(), log.member(deviceId: saved.member)?.authKey == key else {
             throw RemoteControlPublicationError.requiresReview
@@ -406,9 +413,25 @@ public final class RemoteControlSigningJournal {
         guard !operating else { throw RemoteControlPublicationError.busy }
         try checkStorage()
         let successor = review.context, origin = successor.stationOrigin
-        guard var barrier = saved.barriers?[origin], barrier.supersededBy == nil else { return }
+        guard var barrier = saved.barriers?[origin], barrier.isHeld else { return }
         guard review.receivedFromStation, successor.accountID == saved.account, successor.genesisHash == saved.genesis,
               successor.generation > barrier.context.generation, successor.planID != barrier.context.planID else { return }
+        barrier.supersededBy = successor
+        try endBarrier(barrier)
+    }
+
+    public func reconcileAbandonment(_ proof: RemoteStationAbandonment) throws {
+        guard !operating else { throw RemoteControlPublicationError.busy }
+        try checkStorage()
+        let held = proof.context
+        guard var barrier = saved.barriers?[held.stationOrigin], barrier.context == held, barrier.isHeld else {
+            throw RemoteControlPublicationError.requiresReview
+        }
+        barrier.abandoned = true
+        try endBarrier(barrier)
+    }
+
+    private func endBarrier(_ barrier: Barrier) throws {
         operating = true
         defer { operating = false }
         var next = saved
@@ -425,8 +448,7 @@ public final class RemoteControlSigningJournal {
         guard next.entries.count <= 4096, next.revision <= 9_007_199_254_740_991 - increments else {
             throw RemoteControlPublicationError.full
         }
-        barrier.supersededBy = successor
-        next.barriers?[origin] = barrier
+        next.barriers?[barrier.context.stationOrigin] = barrier
         next.revision += increments
         try write(next)
     }
@@ -453,10 +475,10 @@ public final class RemoteControlSigningJournal {
     private func requirePermitted(origin: String?) throws {
         guard let barriers = saved.barriers else { return }
         if let origin {
-            if let barrier = barriers[origin], barrier.supersededBy == nil {
+            if let barrier = barriers[origin], barrier.isHeld {
                 throw RemoteControlRecoveryHold(context: barrier.context)
             }
-        } else if let station = barriers.keys.sorted().first(where: { barriers[$0]?.supersededBy == nil }),
+        } else if let station = barriers.keys.sorted().first(where: { barriers[$0]?.isHeld == true }),
                   let barrier = barriers[station] {
             throw RemoteControlRecoveryHold(context: barrier.context)
         }

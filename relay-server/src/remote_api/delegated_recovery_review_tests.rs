@@ -21,8 +21,12 @@ fn make_app(store: Arc<RecoveryStore>) -> crate::AppState {
 }
 
 async fn http(app: &crate::AppState, genesis: &str, owner: Option<&str>) -> (StatusCode, Value) {
+    get_recovery(app, &format!("/api/remote/v1/logs/{genesis}/control/recovery"), owner).await
+}
+
+async fn get_recovery(app: &crate::AppState, path: &str, owner: Option<&str>) -> (StatusCode, Value) {
     let mut request = Request::builder()
-        .uri(format!("/api/remote/v1/logs/{genesis}/control/recovery"))
+        .uri(path)
         .extension(axum::extract::ConnectInfo(
             "127.0.0.1:40001".parse::<std::net::SocketAddr>().unwrap(),
         ));
@@ -507,5 +511,58 @@ async fn postgres_signer_report_is_verified_once_and_receipted_across_replicas()
     // A corrupted retained report cannot appear in a subsequent operator review.
     sqlx::query("UPDATE station_delegated_signer_reports SET accepted_at=0").execute(&database.pool).await.unwrap();
     assert!(plan::prepare(&database.pool, &binding, &genesis).await.is_err());
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_plan_abandonment_is_terminal_private_atomic_and_independent_of_live_state() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (_, f, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    let plan = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let id = plan["plan_id"].as_str().unwrap();
+    let replica = database.reconnect(2).await;
+    let store = RecoveryStore::postgres(replica.clone());
+    store.configure_recovery_review(ORIGIN, 1).await.unwrap();
+    let app = make_app(store);
+    let path = format!("/api/remote/v1/logs/{genesis}/control/recovery/{id}/outcome");
+    let before = saved(&database.pool, &genesis).await;
+    let pending = get_recovery(&app, &path, Some("alice")).await;
+    assert_eq!(pending.0, StatusCode::OK);
+    assert_eq!(pending.1["outcome"], "pending");
+    assert_eq!(get_recovery(&app, &path, None).await.0, StatusCode::UNAUTHORIZED);
+    let missing = get_recovery(&app, &path.replace(id, &uuid::Uuid::new_v4().to_string()), Some("alice")).await;
+    assert_eq!(missing.0, StatusCode::NOT_FOUND);
+    assert_eq!(get_recovery(&app, &path, Some("bob")).await, missing);
+    sqlx::raw_sql("CREATE FUNCTION reject_end() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'commit fault'; END $$;
+        CREATE CONSTRAINT TRIGGER reject_end AFTER UPDATE ON station_delegated_recovery_plans
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_end();")
+        .execute(&database.pool).await.unwrap();
+    assert!(plan::outcome::abandon(&database.pool, &binding, &genesis, id).await.is_err());
+    assert_eq!(get_recovery(&app, &path, Some("alice")).await, pending);
+    assert!(plan::prepare(&replica, &binding, &genesis).await.is_ok());
+    sqlx::query("DROP TRIGGER reject_end ON station_delegated_recovery_plans").execute(&database.pool).await.unwrap();
+    let (a, b) = tokio::join!(plan::outcome::abandon(&database.pool, &binding, &genesis, id),
+        plan::outcome::abandon(&replica, &binding, &genesis, id));
+    let receipt = a.unwrap();
+    assert_eq!(b.unwrap(), receipt);
+    assert_eq!(receipt["outcome"], "abandoned");
+    assert_eq!(receipt["generation"], "1");
+    assert_eq!(receipt["account_id"], f.log.account_id());
+    assert_eq!(receipt["candidate_feed_id"], plan["candidate_feed_id"]);
+    assert_eq!(receipt["source_hash"], plan["source_hash"]);
+    assert_eq!(receipt.as_object().unwrap().len(), 8);
+    assert_eq!(get_recovery(&app, &path, Some("alice")).await, (StatusCode::OK, receipt));
+    assert!(plan::prepare(&replica, &binding, &genesis).await.is_err());
+    assert_eq!(http(&app, &genesis, Some("alice")).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(saved(&database.pool, &genesis).await, before);
+    assert!(!inspect(&database.pool, ORIGIN).await.unwrap().unwrap().ready);
+    let next = Binding::new(ORIGIN, 2).unwrap();
+    next.initialize(&database.pool, true).await.unwrap();
+    let new_plan = plan::prepare(&replica, &next, &genesis).await.unwrap();
+    assert_ne!(new_plan["plan_id"], id);
+    assert!(plan::outcome::abandon(&database.pool, &next, &genesis, id).await.is_err());
+    assert_eq!(get_recovery(&app, &path, Some("alice")).await.0, StatusCode::NOT_FOUND);
     database.cleanup().await;
 }

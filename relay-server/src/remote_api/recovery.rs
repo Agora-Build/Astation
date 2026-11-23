@@ -228,6 +228,16 @@ impl RecoveryStore {
         Ok(())
     }
 
+    pub(crate) async fn recovery_plan_outcome(&self, genesis: &str, plan: &str, owner: &str) -> Reply {
+        let (Some(pool), Some(binding)) = (&self.pool, self.delegated_recovery.get()) else { return unavailable() };
+        match tokio::time::timeout(std::time::Duration::from_secs(10),
+            delegated_recovery::plan::outcome::for_owner(pool, binding, genesis, plan, owner)).await {
+            Ok(Ok(outcome)) => (StatusCode::OK, Json(outcome)),
+            Ok(Err(sqlx::Error::RowNotFound)) => error(StatusCode::NOT_FOUND, "recovery_record_not_found"),
+            _ => error(StatusCode::SERVICE_UNAVAILABLE, "recovery_review_unavailable"),
+        }
+    }
+
     pub(crate) async fn control_recovery_review(&self, genesis: &str, owner: &str) -> Reply {
         let (Some(pool), Some(binding)) = (&self.pool, self.delegated_recovery.get()) else {
             return unavailable();
