@@ -210,6 +210,11 @@ impl RecoveryStore {
 
     pub(crate) fn delegated_enabled(&self) -> bool { self.delegated_origin.get().is_some() }
 
+    pub(crate) fn collects_portal_checkpoint(&self, origin: &str) -> bool {
+        (self.delegated_enabled() || self.recovery_review_only.get().is_some())
+            && self.delegated_recovery.get().is_some_and(|binding| binding.origin == origin)
+    }
+
     pub(crate) async fn configure_recovery_review(&self, origin: &str, generation: i64) -> Result<(), &'static str> {
         if !cfg!(feature = "delegated-host-work") || self.delegated_enabled() {
             return Err("recovery review requires its opt-in build and disabled delegated work");

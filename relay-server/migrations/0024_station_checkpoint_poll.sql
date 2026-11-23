@@ -1,0 +1,1 @@
+ALTER TABLE station_integration_feed_poll ADD COLUMN checkpoint_not_before TIMESTAMPTZ;

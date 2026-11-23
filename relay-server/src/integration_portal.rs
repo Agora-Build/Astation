@@ -396,6 +396,7 @@ pub(crate) mod tests {
         pub report_hold: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
         pub report_started: tokio::sync::Notify,
         pub feed: Mutex<Option<Value>>,
+        pub checkpoint: Mutex<Option<Value>>,
         pub cursors: Mutex<Vec<u64>>,
     }
     impl Drop for Fixture {
@@ -424,6 +425,7 @@ pub(crate) mod tests {
                 report_hold: Mutex::new(None),
                 report_started: tokio::sync::Notify::new(),
                 feed: Mutex::new(None),
+                checkpoint: Mutex::new(None),
                 cursors: Mutex::new(vec![]),
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -492,17 +494,18 @@ pub(crate) mod tests {
     ) -> axum::response::Response {
         assert_eq!(headers["authorization"], "Bearer test-report-token");
         shared.feeds.fetch_add(1, Ordering::SeqCst);
-        if let Some(cursor) = query.get("cursor") { shared.cursors.lock().await.push(*cursor); }
-        else { assert_eq!(query.get("checkpoint"), Some(&1)); }
+        let checkpoint = if let Some(cursor) = query.get("cursor") {
+            shared.cursors.lock().await.push(*cursor);
+            None
+        } else {
+            assert_eq!(query.get("checkpoint"), Some(&1));
+            shared.checkpoint.lock().await.clone()
+        };
         let code = shared.status.load(Ordering::SeqCst) as u16;
         (
             StatusCode::from_u16(code).unwrap(),
             Json(
-                shared
-                    .feed
-                    .lock()
-                    .await
-                    .clone()
+                checkpoint.or(shared.feed.lock().await.clone())
                     .unwrap_or_else(|| json!({"changes":[],"cursor":0,"integrations":[]})),
             ),
         )

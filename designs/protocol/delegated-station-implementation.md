@@ -176,8 +176,14 @@ erasing its retained evidence. Delayed replica writes cannot overwrite either.
 Collecting this source never replaces live integrations/cursor, refreshes their
 authorization age, or clears an execution denial.
 
-This read-only collection entry point is not wired into the background worker
-or production recovery provider yet. Binding-to-room ownership enforcement,
+The Station integration worker polls the exact checkpoint after catching up
+with the ordinary feed for its configured delegated or recovery-review origin.
+All replicas share one checkpoint attempt per minute, including on restart or
+an unsigned nudge. Each attempt reads the checkpoint even if the feed cursor
+stayed fixed. A full ordinary page is processed before another checkpoint
+attempt. Legacy Station deployments continue their ordinary feed polling.
+The checkpoint's polling interval sets no ownership freshness guarantee.
+Binding-to-room ownership enforcement,
 account lifecycle closures, history/clock completeness and locked plan-source
 comparison remain required. No provider, signing, publication or reopening is
 enabled by a successful collection. D27 pending releases/admin actions are not

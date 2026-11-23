@@ -180,6 +180,9 @@ impl StationIntegrations {
             // Even a full page or an unsigned nudge cannot exceed 120 polls/min.
             let result = self.portal.poll(&self.policies, reconcile).await;
             if result.is_ok() {
+                if matches!(result, Ok(false)) && self.app.recovery.collects_portal_checkpoint(&self.binding.station_origin) {
+                    self.collect_portal_checkpoint_if_due().await;
+                }
                 if self.app.recovery.delegated_enabled() {
                     self.reconcile_delegated_services().await;
                 }
@@ -195,6 +198,18 @@ impl StationIntegrations {
             if !immediate {
                 tokio::select! { _ = self.nudge.notified() => {}, _ = tokio::time::sleep(Duration::from_secs(59)) => {} }
             }
+        }
+    }
+
+    async fn collect_portal_checkpoint_if_due(&self) {
+        match self.policies.claim_checkpoint_poll(&self.binding).await {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(error) = self.portal.collect_checkpoint(&self.policies).await {
+                    tracing::warn!(?error, "could not retain Portal recovery checkpoint");
+                }
+            }
+            Err(()) => tracing::warn!("could not claim Portal recovery checkpoint poll"),
         }
     }
 

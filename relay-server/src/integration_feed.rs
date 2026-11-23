@@ -325,6 +325,20 @@ impl PolicyStore {
             .bind(binding.storage_key()?).execute(&self.0).await.map_err(|_| ())?;
         Ok(result.rows_affected() == 1)
     }
+
+    /// The ordinary feed gets up to 60 claims/minute. All replicas share one
+    /// additional checkpoint read/minute within Portal's 120 reads/minute.
+    pub(crate) async fn claim_checkpoint_poll(&self, binding: &FeedBinding) -> Result<bool, ()> {
+        let result = sqlx::query(
+            "UPDATE station_integration_feed_poll SET checkpoint_not_before=clock_timestamp()+interval '1 minute' \
+             WHERE binding=$1 AND (checkpoint_not_before IS NULL OR checkpoint_not_before<=clock_timestamp())",
+        )
+        .bind(binding.storage_key()?)
+        .execute(&self.0)
+        .await
+        .map_err(|_| ())?;
+        Ok(result.rows_affected() == 1)
+    }
     pub async fn load(&self, binding: &FeedBinding) -> Result<PolicyCheckpoint, ()> {
         let key = binding.storage_key()?;
         let saved: Option<String> = sqlx::query_scalar(
