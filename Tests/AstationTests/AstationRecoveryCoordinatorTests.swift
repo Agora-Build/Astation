@@ -1363,7 +1363,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             log: log, managerID: "manager-a", now: time)
     }
 
-    private func portal(_ http: ServiceApprovalPortal) throws -> PortalIntegrationHTTP {
+    private func portal(_ http: AccountOIDCHTTP) throws -> PortalIntegrationHTTP {
         let config = try AccountOIDCConfiguration(issuer: "https://auth.example", clientID: "astation", resource: "https://portal.example",
             requiredScope: "integrations:read", additionalScopes: ["integrations:approve"])
         return try PortalIntegrationHTTP(configuration: config, portalOrigin: "https://portal.example",
@@ -5009,6 +5009,97 @@ extension AstationRecoveryCoordinatorTests {
         let firstCalls = await h.relay.controlCallCount(), secondCalls = await second.controlCallCount()
         XCTAssertEqual(firstCalls, 1, "a receipt at the primary must prevent another HTTP publication")
         XCTAssertEqual(secondCalls, 2, "only the missing receipt is retried")
+    }
+
+    func testPortalDirectoryInterruptRequiresASelectionAndRetainsOnlySignedDestinations() async throws {
+        struct Directory: AccountOIDCHTTP {
+            let data: Data
+            func send(_ request: URLRequest) async throws -> (Data, Int) {
+                XCTAssertEqual(request.url?.absoluteString, "https://portal.example/api/v1/stations?limit=100")
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-only-token")
+                return (data, 200)
+            }
+        }
+        let h = RecoveryCoordinatorHarness(), origin = "https://second.example", other = "https://third.example"
+        let second = RecoveryMemoryRelay(stationOrigin: origin)
+        var requests: [String] = []
+        func restart() throws -> AstationRecoveryCoordinator {
+            try h.coordinator(authorizeDelegatedControl: { _ in }, retainedControlTransport: { requested in
+                requests.append(requested)
+                guard requested == origin else { throw RemoteChannelError.staleLink }
+                return second
+            })
+        }
+        func directory(_ rows: [(String, Bool)], stale: Bool = false, complete: Bool = true) throws -> PortalIntegrationHTTP {
+            let date = "2026-11-21T14:30:12.044Z"
+            let stations: [[String: Any]] = rows.enumerated().map { index, row in
+                ["id": "station-\(index)", "origin": row.0, "name": NSNull(), "builtIn": false, "access": "members",
+                 "role": "owner", "status": row.1 ? "active" : "removed", "removedAt": row.1 ? NSNull() as Any : date,
+                 "membership": NSNull(), "membershipEndedAt": NSNull(), "integrationsEnabled": row.1, "createdAt": date]
+            }
+            return try portal(Directory(data: JSONSerialization.data(withJSONObject:
+                ["stations": stations, "nextCursor": NSNull(), "stale": stale, "complete": complete])))
+        }
+
+        var coordinator = try restart()
+        _ = try await revokedSender(coordinator, harness: h)
+        await second.replaceLog(try await coordinator.hostSenderMembership())
+        let fresh = try directory([(origin, true), (other, true), ("https://removed.example", false)])
+        do {
+            _ = try await coordinator.prepareHostInterrupt(hostID: "host-a", directory: fresh.stationDirectory,
+                chooseStations: { _ in ["https://removed.example"] }, current: { true })
+            XCTFail("an unavailable destination was accepted")
+        } catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        var current = true
+        do {
+            _ = try await coordinator.prepareHostInterrupt(hostID: "host-a", directory: {
+                let snapshot = try await fresh.stationDirectory()
+                current = false
+                return snapshot
+            }, chooseStations: { _ in XCTFail("account changed during discovery"); return [] }, current: { current })
+            XCTFail("stale account prepared a review")
+        } catch { XCTAssertEqual(error as? RemoteChannelError, .staleLink) }
+        XCTAssertTrue(try coordinator.pendingHostInterrupts().isEmpty)
+        let review = try await coordinator.prepareHostInterrupt(hostID: "host-a", directory: fresh.stationDirectory,
+            chooseStations: { choice in
+                XCTAssertTrue(choice.directoryComplete)
+                XCTAssertEqual(choice.candidates, [origin, other])
+                XCTAssertTrue(choice.previous.isEmpty)
+                XCTAssertEqual(choice.unavailable, ["https://removed.example"])
+                return [origin]
+            }, current: { true })
+        XCTAssertTrue(requests.isEmpty, "discovery and draft preparation must never contact the listed Stations")
+        XCTAssertEqual(review.additionalStationOrigins, [origin])
+        await second.dropControlReply()
+        let first = try await coordinator.commitHostInterrupt(review, current: { true })
+        XCTAssertEqual(first.additionalStations, [origin: false])
+        let confirmations = h.ownerRequests.count
+        coordinator = try restart()
+        let pending = try XCTUnwrap(coordinator.pendingHostInterrupts().first)
+        let retry = try await coordinator.commitHostInterrupt(pending, current: { true })
+        XCTAssertEqual(retry.recordJSON, first.recordJSON)
+        XCTAssertEqual(retry.additionalStations, [origin: true])
+        XCTAssertEqual(Set(requests), [origin])
+        XCTAssertEqual(h.ownerRequests.count, confirmations)
+
+        let omitted = try directory([])
+        let removed = try directory([(origin, false)])
+        let stale = try directory([(other, true)], stale: true, complete: false)
+        let incomplete = try directory([(other, true)], complete: false)
+        let outages: [(() async throws -> PortalStationDirectorySnapshot, Bool)] = [
+            (omitted.stationDirectory, true), (removed.stationDirectory, true), (stale.stationDirectory, false),
+            (incomplete.stationDirectory, false), ({ throw AccountLoginError.unavailable }, false)]
+        for (read, complete) in outages {
+            let next = try await coordinator.prepareHostInterrupt(hostID: "host-a", directory: read,
+                chooseStations: { choice in
+                    XCTAssertEqual(choice.directoryComplete, complete)
+                    XCTAssertEqual(choice.candidates, [origin])
+                    XCTAssertEqual(choice.previous, [origin])
+                    return []
+                }, current: { true })
+            XCTAssertTrue(next.additionalStationOrigins.isEmpty)
+            try coordinator.cancelUnsignedHostInterrupt(next)
+        }
     }
 
     func testHostFanoutRejectsAMislabeledTransportBeforeConfirmation() async throws {

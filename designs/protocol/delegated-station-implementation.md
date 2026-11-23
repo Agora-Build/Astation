@@ -63,8 +63,17 @@ This directory is discovery metadata. Its mutable keyset traversal is not an
 atomic security inventory, an R9 grant or proof that every verifier is present.
 Neither a lost-access row nor an omission removes a previously reviewed route
 or verifier obligation. It does not authorize a new control destination.
-Production directory retention, explicit route review and participant lifecycle
-wiring remain required; the additional-route provider remains unset.
+The Mac reads the directory when a manager prepares a host interruption. The
+picker shows the selected Station and lets the manager add individual
+destinations. New candidates require a complete, fresh listing. The picker also
+remembers destinations the manager previously confirmed for this host across
+Station selection changes. Removed or ended entries stay visible. An
+unavailable entry can only be chosen again if already known through an
+independent source. A directory failure still allows review of known routes.
+The protected draft freezes the choices before owner confirmation. Each
+delivery and retry uses that destination's own Station bearer. Discovery and
+selection do not contact candidate Stations. Account-wide participant
+enumeration and signing activation are separate work.
 
 ## November 22 shared-contract responses
 
@@ -392,11 +401,10 @@ retry path, without a Portal revocation request. An unsigned review may be
 cancelled; a signed intent remains retained.
 
 The protected journal and coordinator can deliver a host interrupt to the selected
-Station and up to 63 additional authenticated account Stations. The caller must
-provide an independently established account roster and a separate transport with
-an access token scoped to each exact origin. This adapter does not authenticate or
-establish the completeness of that roster. The normal application supplies no
-roster yet; authoritative discovery and production wiring remain unfinished.
+Station and up to 63 additional reviewed Stations. Each additional Station uses
+a separate transport with a bearer scoped to its exact origin. The Mac offers
+Portal directory discovery during interrupt preparation. A manager selects
+the destinations for each new record.
 
 The exact sorted destination set is retained before confirmation and displayed
 with the revoke sequence and record ID. A changed review cannot redirect or narrow
@@ -518,9 +526,8 @@ roster and origins already retained in the account's protected control journals
 or accepted server-list reviews. Only reviews for the current genesis count.
 This discovers no new URL from presence, a notification, or a server's claim.
 The union is bounded to 64 origins; exhausting the bound requires review and
-never silently discards a retained destination. Complete discovery of unseen
-owned/shared/built-in Stations still requires the native Portal directory
-contract requested in Portal #40.
+never silently discards a retained destination. The interrupt picker uses the Portal directory for new
+destinations. Background monitoring continues to use its retained origins.
 
 One origin gets one bounded feed page and status refresh per lifecycle tick.
 Each origin keeps its own cursor and protected journal. Even identical feed IDs
@@ -816,8 +823,8 @@ Still required before activation:
   required. Source tests are not real joint-test evidence.
 - Authoritative replica/non-host verifier inventory carriage, wiring all live
   inventory invalidations, and complete multi-Station Interrupt routing. The
-  protected per-Station fanout/retry adapter is implemented, but production roster
-  discovery and adding newly discovered routes remain. Native-channel carriage
+  protected per-Station fanout/retry adapter and native route review are implemented.
+  Complete account participant verification is still required. Native-channel carriage
   from the durable signed journal is implemented with separate channel-only
   results; its real-host checks remain part of VII.A.
   Native host-sender
