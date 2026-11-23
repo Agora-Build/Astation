@@ -591,13 +591,17 @@ impl Stored {
             }
         }
         let mut published = Vec::new();
-        for action in actions {
-            let name = principal.name();
-            let previous = self.signing_high_water.get(&name).copied().unwrap_or(0);
-            let issued_at = now.max(previous.checked_add(1).ok_or(Fault::Unavailable)?);
-            if issued_at > atem_client::canonical::MAX_SAFE_INTEGER {
-                return Err(Fault::Unavailable);
-            }
+        if actions.is_empty() {
+            return Ok(serde_json::json!({"published": published}));
+        }
+        let previous = self.signing_high_water.get(&principal.name()).copied().unwrap_or(0);
+        // Reserve successive elapsed milliseconds ending at the observed wall time.
+        // The whole cover/hold pair must fit before either signature is produced.
+        let first = now.checked_sub(actions.len() as u64 - 1).ok_or(Fault::Unavailable)?;
+        if first <= previous || now > atem_client::canonical::MAX_SAFE_INTEGER {
+            return Err(Fault::Unavailable);
+        }
+        for (action, issued_at) in actions.into_iter().zip(first..=now) {
             let object = signer
                 .sign_control(&ControlBody {
                     account_id: log.account_id().into(),

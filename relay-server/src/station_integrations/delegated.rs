@@ -547,6 +547,34 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires isolated Postgres"]
+    async fn postgres_delegated_clock_rollback_keeps_cover_and_hold_unpublished() {
+        use super::super::tests::{append_body, fixture, request};
+        let (database, runtime, f) = fixture().await;
+        let genesis = f.log.genesis_hash().to_hex();
+        let origin = &runtime.binding.station_origin;
+        runtime.app.recovery.configure_delegated(origin, 1).await.unwrap();
+        let draft = runtime.prepare(ID, OWNER, request(&f)).await.unwrap();
+        append_body(&runtime, &f, serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap()).await;
+        policy(&runtime, "paused", draft["fingerprint"].as_str().unwrap(), None).await;
+        let owner = runtime.owner_principal(OWNER).await.unwrap();
+        assert_eq!(runtime.app.recovery.delegated_operation(&genesis, &owner, Command::Ensure).await.0, StatusCode::OK);
+
+        // A restored wall clock behind a durable reservation cannot sign either action.
+        let future = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        let before: Value = sqlx::query_scalar("UPDATE remote_recovery_roots SET state=jsonb_set(state,             ARRAY['delegated',$2,'signing_high_water',$3],to_jsonb($4::bigint)) WHERE genesis_hash=$1 RETURNING state")
+            .bind(&genesis).bind(origin).bind(format!("service:svc-{ID}")).bind(future)
+            .fetch_one(&database.pool).await.unwrap();
+        assert!(runtime.reconcile_delegated_service(ID).await.is_err());
+        let after: Value = sqlx::query_scalar("SELECT state FROM remote_recovery_roots WHERE genesis_hash=$1")
+            .bind(&genesis).fetch_one(&database.pool).await.unwrap();
+        assert_eq!(before, after);
+        assert!(feed(&runtime, &genesis).await.is_empty());
+        drop(runtime);
+        database.cleanup().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Postgres"]
     async fn postgres_delegated_service_refuses_stale_policy_wrong_key_and_failed_publication() {
         use super::super::tests::{append_body, fixture, request};
         let (database, runtime, f) = fixture().await;
