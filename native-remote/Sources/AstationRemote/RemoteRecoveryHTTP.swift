@@ -1,4 +1,5 @@
 import AtemClient
+import CryptoKit
 import Foundation
 
 public enum RemoteRecoveryTransportError: LocalizedError {
@@ -252,6 +253,35 @@ public final class RemoteRecoveryHTTP: RemoteControlStationTransport, RemoteDevi
                 candidateFeedId: context.candidateFeedID, sourceHash: context.sourceHash, evidenceHash: context.evidenceHash)
         else { throw RemoteRecoveryTransportError.invalidResponse }
         return RemoteStationSignerChallenge(context: context, json: json, challenge: challenge)
+    }
+
+    static func submissionBytes(report: String, records: [String]) throws -> Data {
+        guard records.reduce(report.utf8.count, { $0 + $1.utf8.count }) <= 262_144 else {
+            throw RemoteControlPublicationError.full
+        }
+        let bytes = try Self.encode(["report": Self.object(report), "records": records.map { try Self.object($0) }])
+        guard bytes.count <= 262_144 else { throw RemoteControlPublicationError.full }
+        return bytes
+    }
+
+    /// True only for a receipt for these exact bytes. A retired challenge may be renewed
+    /// after a reviewed retry. A storage or network failure leaves the outcome unknown.
+    public func retainSignerReport(_ submission: RemoteControlSigningJournal.Submission) async throws -> Bool {
+        let context = submission.context
+        try context.validate()
+        guard context.stationOrigin == stationOrigin else { throw RemoteChannelError.invalidInput }
+        let bytes = try Self.submissionBytes(report: submission.report, records: submission.records)
+        let hash = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let (status, reply) = try await perform(url: path(context.genesisHash, "control/recovery/signer-reports"),
+            method: "POST", body: bytes, allowConflict: true)
+        let body = try Self.dictionary(reply)
+        if status == 409, let error = body["error"] as? [String: Any],
+           error["code"] as? String == "recovery_plan_changed" { return false }
+        guard status == 200, Set(body.keys) == ["plan_id", "retained_only", "submission_hash"],
+              body["plan_id"] as? String == context.planID, body["submission_hash"] as? String == hash,
+              let retained = body["retained_only"] as? NSNumber, CFGetTypeID(retained) == CFBooleanGetTypeID(),
+              retained.boolValue else { throw RemoteRecoveryTransportError.invalidResponse }
+        return true
     }
 
     public func controlSync(genesisHash: String, callJSON: String) async throws -> String {

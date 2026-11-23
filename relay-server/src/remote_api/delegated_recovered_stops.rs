@@ -99,7 +99,7 @@ pub(crate) async fn retain(
         return Err(invalid());
     }
     retain_records(&mut tx, &prepared, &log, binding, incoming).await?;
-    super::review_evidence(&mut tx, &prepared, &log, binding, &mut report).await?;
+    super::review_evidence(&mut tx, &prepared, &log, binding, &mut report, true).await?;
     tx.commit().await?;
     Ok(report)
 }

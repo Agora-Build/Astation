@@ -241,12 +241,63 @@ public final class RemoteControlSigningJournal {
         return result
     }
 
+    /// The application can only obtain this request through a Station-issued challenge.
+    public struct ReportReview {
+        public let request: SignRequest
+        fileprivate let context: RemoteControlRecoveryContext
+    }
+
+    public struct ReportKeyRequest {
+        public let request: SignRequest
+        fileprivate init(_ request: SignRequest) { self.request = request }
+    }
+
+    public struct Submission: Sendable {
+        public let context: RemoteControlRecoveryContext
+        let report: String
+        let records: [String]
+    }
+
+    public func reviewReport(_ issued: RemoteStationSignerChallenge, log: MembershipLog,
+        preview: RemoteControlAuthorInventory, nowMs: UInt64, outboxes: [RemoteControlPublication],
+        recoveryCopies: [RemoteControlRecoveryPublication]) throws -> ReportReview {
+        let request = try holdForReport(context: issued.context, challengeJSON: issued.json, log: log,
+            slot: issued.challenge.slot, nowMs: nowMs, outboxes: outboxes, recoveryCopies: recoveryCopies, preview: preview)
+        return ReportReview(request: request, context: issued.context)
+    }
+
+    public func finishReport(_ review: ReportReview, log: MembershipLog, nowMs: () -> UInt64,
+        current: () -> Bool, sign: (ReportKeyRequest) throws -> Data) throws -> Submission {
+        let result = try finishReport(context: review.context, reviewed: review.request, log: log,
+            nowMs: nowMs, current: current, sign: { try sign(ReportKeyRequest($0)) })
+        return Submission(context: review.context, report: result.report, records: result.records)
+    }
+
+    /// A lost HTTP reply may be recovered after lease expiry. Only already exposed bytes
+    /// qualify. Recheck the signature and frozen records at their original challenge.
+    public func exposedSubmission(for context: RemoteControlRecoveryContext, log: MembershipLog) throws -> Submission? {
+        try checkStorage()
+        guard let barrier = saved.barriers?[context.stationOrigin], barrier.supersededBy == nil,
+              let report = barrier.exposedReport, barrier.context.planID == context.planID,
+              barrier.context.generation == context.generation, barrier.context.candidateFeedID == context.candidateFeedID,
+              barrier.context.sourceHash == context.sourceHash, barrier.context.accountID == context.accountID,
+              barrier.context.genesisHash == context.genesisHash, log.accountId() == context.accountID,
+              log.genesisHash() == context.genesisHash, context.membershipHead == log.head(),
+              barrier.context.membershipHead == log.head() else { return nil }
+        let challenge = try parseSignerReportChallenge(challengeJson: barrier.challengeJSON)
+        let checked = try verifySignerReport(log: log, reportJson: report, expectedChallengeJson: barrier.challengeJSON,
+            exportedRecordsJson: barrier.signedRecords, nowMs: challenge.issuedAt)
+        guard checked.atHead, checked.journal.revision == barrier.revision, checked.journal.id == RemoteRecoveryKit.base64URL(id),
+              checked.journal.since == saved.since else { throw RemoteControlPublicationError.invalidCheckpoint }
+        return Submission(context: barrier.context, report: report, records: barrier.signedRecords)
+    }
+
     /// Called under the member-key lock with every outbox from the locked account.
     /// Only the trusted collector may supply the Station's authenticated review and challenge.
     /// The hold is durable before the SDK signing request leaves the journal.
     func holdForReport(context: RemoteControlRecoveryContext, challengeJSON: String, log: MembershipLog,
                        slot: String, nowMs: UInt64, outboxes: [RemoteControlPublication],
-                       recoveryCopies: [RemoteControlRecoveryPublication]) throws -> SignRequest {
+                       recoveryCopies: [RemoteControlRecoveryPublication], preview: RemoteControlAuthorInventory? = nil) throws -> SignRequest {
         try context.validate()
         let origin = context.stationOrigin
         guard !operating, context.accountID == saved.account, context.genesisHash == saved.genesis,
@@ -259,6 +310,11 @@ public final class RemoteControlSigningJournal {
         let evidence = try inventory(stationOrigin: origin, outboxes: outboxes, recoveryCopies: recoveryCopies)
         guard evidence.missingSignatureBodies.isEmpty else { throw RemoteControlPublicationError.requiresReview }
         let records = evidence.reportRecordBodies, drafts = evidence.reportDraftBodies
+        if let preview {
+            guard preview.origin == origin, preview.account == saved.account, preview.genesis == saved.genesis,
+                  preview.member == saved.member, preview.key == key, preview.signedRecords == evidence.signedRecords,
+                  preview.reportDraftBodies == drafts else { throw RemoteControlPublicationError.requiresReview }
+        }
         if let prior = saved.barriers?[origin] {
             // Never replace a different plan using a caller-supplied generation,
             // or mistake a restored outbox for the disappearance of a frozen draft.
@@ -286,7 +342,12 @@ public final class RemoteControlSigningJournal {
         let barrier = Barrier(context: context, revision: revision, records: records, drafts: drafts,
             signedRecords: evidence.signedRecords, challengeJSON: challengeJSON, slot: slot)
         // Reject malformed, expired or unauthorized requests before acquiring a hold.
-        _ = try barrier.request(log: log, id: id, since: saved.since, member: saved.member, nowMs: nowMs)
+        let request = try barrier.request(log: log, id: id, since: saved.since, member: saved.member, nowMs: nowMs)
+        // Both supported algorithms produce 64-byte signatures. Size the canonical
+        // HTTP body before committing a hold that this Station could never accept.
+        let signature = RemoteRecoveryKit.base64URL(Data(repeating: 0, count: 64))
+        let report = #"{"body":\#(request.bodyJson()),"sig":"\#(signature)"}"#
+        _ = try RemoteRecoveryHTTP.submissionBytes(report: report, records: barrier.signedRecords)
         operating = true
         defer { operating = false }
         var next = saved
@@ -383,7 +444,7 @@ public final class RemoteControlSigningJournal {
         try requireStopChange(origin: checkedBody(bodyJSON).origin)
     }
 
-    func requireStopChange(origin: String?) throws {
+    public func requireStopChange(origin: String?) throws {
         guard !operating else { throw RemoteControlPublicationError.busy }
         try checkStorage()
         try requirePermitted(origin: origin)

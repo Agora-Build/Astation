@@ -59,6 +59,8 @@ public struct RemoteControlAuthorInventory {
         }
     }
 
+    public var reportDraftCount: Int { reportDraftBodies.count }
+
     // Each source validates its own saved key, canonical body and signature.
     mutating func retain(body: ControlRecordBody, json: String, key sourceKey: PublicKeyData,
                          record: String?, possiblySigned: Bool, unsignedDraft: Bool = false) throws {

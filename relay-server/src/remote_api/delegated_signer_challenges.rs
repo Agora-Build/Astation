@@ -3,7 +3,7 @@
 use super::{checkpoint_for_owner, invalid, review_source_evidence, Binding};
 use atem_client::{
     member_report::{RecoveryPlan, SignerReportChallenge},
-    membership::{Action, Head, MemberKind, MemberStatus, Membership, Role, RolesChange},
+    membership::{Head, MemberKind, MemberStatus, Membership},
 };
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -63,18 +63,7 @@ fn eligible(log: &Membership, signer: &str) -> bool {
     }) {
         return false;
     }
-    // An active recovery_add subject necessarily took effect; device ids
-    // cannot be reused. Demotion does not erase earlier signing authority.
-    log.entries().iter().any(|entry| match &entry.action {
-        Action::Genesis { member, .. }
-        | Action::Add { member }
-        | Action::RecoveryAdd { member } => member.device_id == id && member.is_manager(),
-        Action::SetRoles {
-            device_id,
-            change: RolesChange::Native(roles),
-        } => device_id == id && roles.contains(&Role::Manage),
-        _ => false,
-    })
+    super::author_history::first_manage(log).contains_key(id)
 }
 
 pub(crate) async fn mint(

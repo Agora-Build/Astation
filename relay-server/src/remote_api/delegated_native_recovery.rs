@@ -150,7 +150,7 @@ pub(crate) async fn retain(
     sqlx::query("INSERT INTO station_delegated_native_recovery(plan_id,evidence_hash,archive) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING")
         .bind(plan_id).bind(hash).bind(&archive.value).execute(&mut *tx).await?;
     stops::retain_records(&mut tx, &prepared, &log, binding, archive.signed).await?;
-    super::review_evidence(&mut tx, &prepared, &log, binding, &mut report).await?;
+    super::review_evidence(&mut tx, &prepared, &log, binding, &mut report, true).await?;
     tx.commit().await?;
     Ok(report)
 }

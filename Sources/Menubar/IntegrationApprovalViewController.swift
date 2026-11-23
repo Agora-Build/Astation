@@ -454,6 +454,8 @@ final class IntegrationApprovalViewController: NSViewController {
         guard records.indices.contains(picker.indexOfSelectedItem), let coordinator, let portal,
               coordinator.delegatedControlsAvailable, contextCurrent?() == true else { return }
         let record = records[picker.indexOfSelectedItem]
+        do { try coordinator.requireServiceStopChange(origin: record.stationOrigin) }
+        catch { fail(error, epoch: generation); return }
         let choice = NSAlert()
         choice.messageText = interruptOnly ? "Interrupt this integration's running tasks?" : "Revoke this integration?"
         choice.informativeText = "\(record.name)\nStation: \(record.stationOrigin)\n\n"

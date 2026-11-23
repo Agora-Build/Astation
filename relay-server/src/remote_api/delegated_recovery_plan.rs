@@ -18,6 +18,10 @@ pub(crate) mod signatures;
 
 #[path = "delegated_signer_challenges.rs"]
 pub(crate) mod signer_challenges;
+#[path = "delegated_author_history.rs"]
+mod author_history;
+#[path = "delegated_signer_reports.rs"]
+pub(crate) mod signer_reports;
 
 #[derive(sqlx::FromRow)]
 pub(super) struct Prepared {
@@ -57,7 +61,7 @@ pub(crate) async fn prepare(
 ) -> Result<Value, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let (prepared, log, mut report) = checkpoint(&mut tx, binding, genesis, true).await?;
-    review_evidence(&mut tx, &prepared, &log, binding, &mut report).await?;
+    review_evidence(&mut tx, &prepared, &log, binding, &mut report, true).await?;
     tx.commit().await?;
     Ok(report)
 }
@@ -73,7 +77,7 @@ pub(crate) async fn review_for_owner(
     let mut tx = pool.begin().await?;
     let (prepared, log, mut report) =
         checkpoint_for_owner(&mut tx, binding, genesis, false, Some(owner)).await?;
-    review_evidence(&mut tx, &prepared, &log, binding, &mut report).await?;
+    review_evidence(&mut tx, &prepared, &log, binding, &mut report, false).await?;
     let summary = json!({
         "version": 1,
         "account_id": log.account_id(),
@@ -106,7 +110,11 @@ async fn review_evidence(
     log: &Membership,
     binding: &Binding,
     report: &mut Value,
+    operator_review: bool,
 ) -> Result<(), sqlx::Error> {
+    if operator_review {
+        report["known_authors"] = signer_reports::inspect(connection, prepared, log, binding).await?;
+    }
     review_source_evidence(connection, prepared, log, binding, report).await?;
     report["recovery_signatures"] = signatures::inspection(connection, prepared, log, binding, report).await?;
     report["reconstruction_hash"] = source_hash(&json!({
@@ -127,13 +135,16 @@ async fn review_source_evidence(
     let (history, signed) = history::inspection(connection, prepared, log, binding).await?;
     report["known_history"] = history;
     report["native_archives"] = native::inspection(connection, prepared, log, binding, &signed).await?;
-    report["evidence_hash"] = source_hash(&json!({
+    let mut sources = json!({
         "plan_id": prepared.plan_id,
         "source_hash": prepared.source_hash,
         "known_history": report["known_history"]["evidence_hash"],
         "recovered_stops": report["recovered_stops"]["evidence_hash"],
         "native_archives": report["native_archives"]["evidence_hash"],
-    }))?.into();
+    });
+    let hashes = signer_reports::commitments(connection, &prepared.plan_id).await?;
+    if !hashes.is_empty() { sources["signer_reports"] = json!(hashes); }
+    report["evidence_hash"] = source_hash(&sources)?.into();
     Ok(())
 }
 

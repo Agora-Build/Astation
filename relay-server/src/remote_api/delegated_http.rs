@@ -97,6 +97,15 @@ pub(crate) async fn signer_challenge(
     state.recovery.mint_signer_challenge(&genesis, &owner, request).await
 }
 
+pub(crate) async fn signer_report(
+    State(state): State<AppState>, Path(genesis): Path<String>, headers: HeaderMap, body: Body,
+) -> Reply {
+    let owner = match subject(&state, &headers).await { Ok(owner) => owner, Err(reply) => return reply };
+    if !super::delegated_recovery::canonical_genesis(&genesis) { return invalid() }
+    let value = match read(body).await { Ok(value) => value, Err(reply) => return reply };
+    state.recovery.submit_signer_report(&genesis, &owner, value.value()).await
+}
+
 pub(crate) async fn retain_recovery_copies(
     State(state): State<AppState>,
     Path((genesis, plan)): Path<(String, String)>,

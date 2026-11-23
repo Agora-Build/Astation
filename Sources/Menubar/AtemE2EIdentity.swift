@@ -376,6 +376,16 @@ final class AtemE2EIdentity {
         return try crypto.sign(request.input, material: record.material)
     }
 
+    /// The protected journal issues this immutable review for a Station challenge.
+    func signRecoveryReport(_ reviewed: RemoteControlSigningJournal.ReportKeyRequest, expectedPublicKey: Data) throws -> Data {
+        let request = reviewed.request
+        lock.lock(); defer { lock.unlock() }
+        guard request.purpose == .signerReport, request.freshConfirmation, request.label == "atem-signer-report-v1",
+              let record = try read(create: false),
+              try crypto.signingPublicKey(record.material) == expectedPublicKey else { throw AtemIdentityError.identityChanged }
+        return try crypto.sign(request.input, material: record.material)
+    }
+
     func signChannel(_ request: SignRequest, keyID: String, expectedPublicKey: Data) throws -> Data {
         try RemoteRoutineChannelSigner.validate(request, keyID: keyID)
         lock.lock(); defer { lock.unlock() }
