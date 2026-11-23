@@ -56,7 +56,7 @@ pub(crate) struct IntegrationPolicy {
 }
 
 impl IntegrationPolicy {
-    fn validate(&self) -> Result<(), ()> {
+    pub(crate) fn validate(&self) -> Result<(), ()> {
         if self.owner_account.len() != 28
             || !self.owner_account.starts_with("ab")
             || !self.owner_account.as_bytes()[2..]
@@ -143,6 +143,10 @@ pub(crate) struct PolicyCheckpoint {
     pub received_at: i64,
     pub denied: bool,
     pub integrations: BTreeMap<String, IntegrationPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portal_snapshot: Option<crate::integration_checkpoint::PortalCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portal_snapshot_revision: Option<u64>,
 }
 
 impl PolicyCheckpoint {
@@ -155,6 +159,8 @@ impl PolicyCheckpoint {
             received_at: 0,
             denied: true,
             integrations: BTreeMap::new(),
+            portal_snapshot: None,
+            portal_snapshot_revision: None,
         })
     }
 
@@ -173,6 +179,8 @@ impl PolicyCheckpoint {
             return Err(());
         }
         let mut next = self.clone();
+        // An ordinary feed response cannot refresh the independently changing bindings.
+        next.portal_snapshot_revision = None;
         if let Some(snapshot) = page.integrations {
             next.integrations.clear();
             for row in snapshot {
@@ -232,6 +240,47 @@ impl PolicyCheckpoint {
         next.revision = next.revision.checked_add(1).ok_or(())?;
         next.received_at = now;
         next.denied = false;
+        Ok(next)
+    }
+
+    /// Retain the exact source with a new CAS revision even when its cursor is unchanged.
+    /// This is collection, not complete recovery evidence or permission to reopen.
+    pub(crate) fn apply_checkpoint(
+        &self,
+        snapshot: crate::integration_checkpoint::PortalCheckpoint,
+        now: i64,
+    ) -> Result<Self, ()> {
+        snapshot.validate_for(&self.binding)?;
+        if now < 0 || (snapshot.cursor < self.cursor && !self.denied) {
+            return Err(());
+        }
+        for (id, row) in &snapshot.integrations {
+            if self.integrations.get(id).is_some_and(|old| old.owner_account != row.policy.owner_account) {
+                return Err(());
+            }
+        }
+        if self.portal_snapshot.as_ref().is_some_and(|old| old.integrations.iter().any(|(id, row)|
+            snapshot.integrations.get(id).is_none_or(|next| next.policy.owner_account != row.policy.owner_account))) {
+            return Err(());
+        }
+        if let Some(previous) = self.portal_snapshot.as_ref().and_then(|source| source.bindings.as_ref()) {
+            let current = snapshot.bindings.as_ref().ok_or(())?.iter()
+                .map(|row| ((&row.account_id, &row.genesis_hash), row)).collect::<BTreeMap<_, _>>();
+            for old in previous {
+                let row = *current.get(&(&old.account_id, &old.genesis_hash)).ok_or(())?;
+                if row.version < old.version || (row.version == old.version && row != old) {
+                    return Err(());
+                }
+            }
+        }
+        let mut next = self.clone();
+        next.cursor = snapshot.cursor;
+        next.revision = self.revision.checked_add(1).ok_or(())?;
+        next.received_at = now;
+        next.denied = false;
+        next.integrations = snapshot.integrations.iter().map(|(id, row)| (id.clone(), row.policy.clone())).collect();
+        next.portal_snapshot = Some(snapshot);
+        next.portal_snapshot_revision = Some(next.revision);
         Ok(next)
     }
 
@@ -301,6 +350,15 @@ impl PolicyStore {
                     }
                     policy.validate()?;
                 }
+                if let Some(snapshot) = &checkpoint.portal_snapshot {
+                    snapshot.validate_for(binding)?;
+                    if let Some(revision) = checkpoint.portal_snapshot_revision {
+                        let policies = snapshot.integrations.iter()
+                            .map(|(id, row)| (id.clone(), row.policy.clone())).collect::<BTreeMap<_, _>>();
+                        if revision != checkpoint.revision || snapshot.cursor != checkpoint.cursor
+                            || policies != checkpoint.integrations { return Err(()); }
+                    }
+                } else if checkpoint.portal_snapshot_revision.is_some() { return Err(()); }
                 Ok(checkpoint)
             }
         }
@@ -325,6 +383,7 @@ impl PolicyStore {
             return Err(());
         }
         checkpoint.denied = true;
+        checkpoint.portal_snapshot_revision = None;
         checkpoint.revision = checkpoint.revision.checked_add(1).ok_or(())?;
         sqlx::query("UPDATE station_integration_policy SET checkpoint=$1 WHERE binding=$2")
             .bind(serde_json::to_string(&checkpoint).map_err(|_| ())?)
