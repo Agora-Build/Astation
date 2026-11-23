@@ -15,6 +15,30 @@ spec.loader.exec_module(artifacts)
 
 
 class ArtifactIntegrityTests(unittest.TestCase):
+    def test_offline_release_bundle_verifies_every_consumed_asset(self):
+        content = b"pinned package"
+        pin = {"release": "atem-client-sdk-123456789abc", "revision": "123456789abc",
+               "payload_sha256": {"package.zip": hashlib.sha256(content).hexdigest()}}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "release.zip"
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr("package.zip", content)
+            verified = root / "verified"
+            verified.mkdir()
+            artifacts.release_payloads(pin, verified, archive)
+            self.assertEqual((verified / "package.zip").read_bytes(), content)
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr("package.zip", b"replaced package")
+            with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                artifacts.release_payloads(pin, root / "rejected", archive)
+
+    def test_release_tag_must_name_the_pinned_revision(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "release does not match"):
+                artifacts.release_payloads({"release": "atem-client-sdk-other", "revision": "123456789abc"},
+                                           Path(temporary))
+
     def test_install_is_repeatable_and_refuses_a_modified_dependency(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

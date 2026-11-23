@@ -245,14 +245,12 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
     public func authorize(_ request: SignRequest, log: MembershipLog) throws {
         guard let json = request.bodyJson,
               request == (try RemoteConfirmedSigner.membershipRequest(bodyJSON: json, keyID: request.keyId)),
-              let body = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],
-              let action = body["action"] as? String else { throw RemoteVerifierGateError.unsupportedEntry }
-        let minimum: UInt32
-        if ["project_set", "project_remove", "host_sender_revoke", "host_sender_readmit", "host_enc_key"].contains(action) {
-            minimum = 2
-        } else if ["add", "set_roles"].contains(action), Self.hasNewScopeOps(body) {
-            minimum = 1
-        } else { return }
+              let body = try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any] else {
+            throw RemoteVerifierGateError.unsupportedEntry
+        }
+        guard let requirement = try membershipRequiredVersion(bodyJson: json) else { return }
+        let action = requirement.action
+        let minimum = requirement.minimumVersion
         lock.lock(); defer { lock.unlock() }
         guard log.accountId() == accountID, log.genesisHash() == genesisHash, log.head() == head, log.frozen() == nil,
               body["account_id"] as? String == accountID,
@@ -274,9 +272,4 @@ public final class RemoteVerifierSigningGate: @unchecked Sendable {
         }) else { throw RemoteVerifierGateError.unconfirmedVerifiers }
     }
 
-    private static func hasNewScopeOps(_ body: [String: Any]) -> Bool {
-        let member = body["member"] as? [String: Any]
-        let scope = (member?["scope"] ?? body["scope"]) as? [String: Any]
-        return (scope?["ops"] as? [String] ?? []).contains { ["launch", "message", "notify"].contains($0) }
-    }
 }

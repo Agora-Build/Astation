@@ -39,6 +39,7 @@ class MobileDelegatedProtocolTest {
         is AtemException.Publish -> code
         is AtemException.Push -> code
         is AtemException.Stored -> code
+        is AtemException.Report -> code
         is AtemException.BadWelcome -> "bad_welcome"
         is AtemException.Request -> "request"
         is AtemException.State -> "state"
@@ -52,6 +53,47 @@ class MobileDelegatedProtocolTest {
         if (item.has("wire")) return item.getString("wire")
         val fill = item.getJSONObject("wire_fill")
         return fill.getString("prefix") + fill.getString("fill").repeat(fill.getInt("count")) + fill.getString("suffix")
+    }
+
+    @Test fun publishedMembershipRequirementsUseTheActualClassifier() {
+        val cases = fixture("r9-vectors-required-verifier").getJSONArray("cases").objects()
+        assertEquals(56, cases.size)
+        for (item in cases) vector(item.getString("label")) {
+            val body = item.getString("body_json")
+            if (item.optBoolean("reject")) {
+                val error = assertThrows(AtemException.Membership::class.java) { membershipRequiredVersion(body) }
+                assertEquals("membership_invalid", error.code)
+                assertEquals(item.getString("reason"), error.detail)
+            } else {
+                val actual = membershipRequiredVersion(body)
+                if (item.isNull("requirement")) assertNull(actual)
+                else {
+                    val expected = item.getJSONObject("requirement")
+                    assertEquals(expected.getString("action"), actual?.action)
+                    assertEquals(expected.getInt("minimum_version").toUInt(), actual?.minimumVersion)
+                }
+            }
+        }
+    }
+
+    @Test fun publishedVerifierChallengesAreStrictAndBounded() {
+        val cases = fixture("r9-vectors-verifier-report").getJSONArray("challenges").objects()
+        assertEquals(38, cases.size)
+        for (item in cases) vector(item.getString("label")) {
+            val text = item.getString("text")
+            if (!item.has("fields")) refuses(item.getString("code")) { parseVerifierReportChallenge(text) }
+            else {
+                val expected = item.getJSONObject("fields")
+                val actual = parseVerifierReportChallenge(text)
+                assertEquals(expected.getString("signer"), actual.signer)
+                assertEquals(expected.getString("slot"), actual.slot)
+                assertEquals(expected.getString("origin"), actual.origin)
+                assertEquals(expected.getString("nonce"), actual.nonce)
+                assertEquals(expected.number("connection"), actual.connection)
+                assertEquals(expected.number("issued_at"), actual.issuedAt)
+                assertEquals(expected.number("expires_at"), actual.expiresAt)
+            }
+        }
     }
 
     @Test fun publishedCallsRoundTripThroughActualAndroidReadersAndBuilders() {
@@ -158,6 +200,7 @@ class MobileDelegatedProtocolTest {
     @Test fun ackPortalRefusalsAndReportingStop() = acknowledgments("portal-refusals")
     @Test fun ackReasonsAreInformationOnly() = acknowledgments("reasons")
     @Test fun ackFreshManagerResign() = acknowledgments("resign")
+    @Test fun ackReplacementFeedStartsWithFreshApplicationCounts() = acknowledgments("replacement-feed")
 
     private fun acknowledgments(suffix: String) {
         val fixture = fixture("r9-control-ack-$suffix")
@@ -231,6 +274,7 @@ class MobileDelegatedProtocolTest {
                         assertEquals(committed, ledger.toJson())
                     }
                     step.has("expect_report") -> jsonEqual(step.getJSONArray("expect_report"), JSONArray(ledger.pendingReports().map(::intent)))
+                    step.has("expect_counts") -> jsonEqual(step.getJSONArray("expect_counts"), JSONObject(ledger.toJson()).getJSONArray("done"))
                     step.has("confirm") -> {
                         val id = step.getString("confirm")
                         sendable(id)
