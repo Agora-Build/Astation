@@ -48,8 +48,11 @@ async fn saved(pool: &sqlx::PgPool, genesis: &str) -> Value {
 }
 
 async fn retain_http(app: &crate::AppState, genesis: &str, plan: &str, owner: Option<&str>, bytes: Vec<u8>) -> (StatusCode, Value) {
-    let mut request = Request::builder().method("POST")
-        .uri(format!("/api/remote/v1/logs/{genesis}/control/recovery/{plan}/signatures"))
+    post_recovery(app, &format!("/api/remote/v1/logs/{genesis}/control/recovery/{plan}/signatures"), owner, bytes).await
+}
+
+async fn post_recovery(app: &crate::AppState, path: &str, owner: Option<&str>, bytes: Vec<u8>) -> (StatusCode, Value) {
+    let mut request = Request::builder().method("POST").uri(path)
         .extension(axum::extract::ConnectInfo("127.0.0.1:40001".parse::<std::net::SocketAddr>().unwrap()));
     if let Some(owner) = owner { request = request.header("authorization", format!("Bearer {owner}")); }
     let response = crate::router(app.clone()).oneshot(request.body(Body::from(bytes)).unwrap()).await.unwrap();
@@ -350,5 +353,78 @@ async fn postgres_delegated_recovery_review_updates_evidence_and_preserves_large
     assert_ne!(review["evidence_hash"], before["evidence_hash"]);
     assert_eq!(review["evidence_hash"], after["evidence_hash"]);
     assert_eq!(review["reconstruction_hash"], after["reconstruction_hash"]);
+    database.cleanup().await;
+}
+
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_signer_challenge_is_private_committed_and_reused_by_other_replicas() {
+    use atem_client::member_report::SignerReportChallenge;
+
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;
+    let (_, f, genesis, binding) = retained(&database).await;
+    binding.initialize(&database.pool, true).await.unwrap();
+    let plan = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let endpoint = |root: &str| format!("/api/remote/v1/logs/{root}/control/recovery/signer-challenges");
+    let path = endpoint(&genesis);
+    let request = json!({"signer":"member:phone","slot":"astation-macos","expected":f.log.head().to_json(),
+        "recovery":{"generation":"1","plan_id":plan["plan_id"],"candidate_feed_id":plan["candidate_feed_id"],
+            "source_hash":plan["source_hash"],"evidence_hash":plan["evidence_hash"]}});
+    let bytes = serde_json::to_vec(&request).unwrap();
+    let before = saved(&database.pool, &genesis).await;
+    let a = RecoveryStore::postgres(database.reconnect(2).await);
+    let b = RecoveryStore::postgres(database.reconnect(2).await);
+    a.configure_recovery_review(ORIGIN, 1).await.unwrap();
+    b.configure_recovery_review(ORIGIN, 1).await.unwrap();
+    let a = make_app(a);
+    let b = make_app(b);
+    assert_eq!(post_recovery(&a, &path, None, bytes.clone()).await.0, StatusCode::UNAUTHORIZED);
+    let missing = post_recovery(&a, &endpoint(&"a".repeat(64)), Some("alice"), bytes.clone()).await;
+    assert_eq!(missing.0, StatusCode::NOT_FOUND);
+    assert_eq!(post_recovery(&a, &path, Some("bob"), bytes.clone()).await, missing);
+
+    let (first, second) = tokio::join!(post_recovery(&a, &path, Some("alice"), bytes.clone()),
+        post_recovery(&b, &path, Some("alice"), bytes.clone()));
+    assert_eq!(first.0, StatusCode::OK, "{}", first.1);
+    assert_eq!(first, second);
+    let challenge = SignerReportChallenge::parse(first.1.to_string().as_bytes()).unwrap();
+    assert_eq!(challenge.connection(), 1);
+    assert_eq!(challenge.expires_at() - challenge.issued_at(), 30_000);
+    assert_eq!(challenge.origin(), ORIGIN);
+    assert_eq!(challenge.recovery().to_json(), request["recovery"]);
+
+    for bad in ["evidence","head","signer","extra"] {
+        let mut changed = request.clone();
+        match bad {
+            "evidence" => changed["recovery"]["evidence_hash"] = json!("0".repeat(64)),
+            "head" => changed["expected"]["seq"] = json!(999),
+            "signer" => changed["signer"] = json!("service:bot"),
+            _ => changed["nonce"] = json!("caller-chosen"),
+        }
+        assert!(!post_recovery(&a, &path, Some("alice"), changed.to_string().into_bytes()).await.0.is_success());
+    }
+    // Expiry alone never alters the external generation, plan, fence or live root.
+    sqlx::query("UPDATE station_delegated_signer_challenges SET expires_at=0")
+        .execute(&database.pool).await.unwrap();
+    let renewed = post_recovery(&b, &path, Some("alice"), bytes.clone()).await;
+    assert_eq!(renewed.0, StatusCode::OK);
+    let next = SignerReportChallenge::parse(renewed.1.to_string().as_bytes()).unwrap();
+    assert_ne!(challenge.nonce(), next.nonce());
+    assert_eq!(next.connection(), 2);
+    assert_eq!(saved(&database.pool, &genesis).await, before);
+    assert!(!inspect(&database.pool, ORIGIN).await.unwrap().unwrap().ready);
+
+    // Simulate a lost database commit while another slot is being created.
+    sqlx::raw_sql("CREATE FUNCTION reject_mint() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'commit fault'; END $$; \
+        CREATE CONSTRAINT TRIGGER reject_mint AFTER INSERT ON station_delegated_signer_challenges \
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_mint();")
+        .execute(&database.pool).await.unwrap();
+    let mut another = request;
+    another["slot"] = json!("astation-ios");
+    assert_eq!(post_recovery(&a, &path, Some("alice"), another.to_string().into_bytes()).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    let counts: (i64, i64) = sqlx::query_as("SELECT signer_connection,(SELECT count(*) FROM station_delegated_signer_challenges) FROM station_delegated_recovery_plans")
+        .fetch_one(&database.pool).await.unwrap();
+    assert_eq!(counts, (2, 1));
     database.cleanup().await;
 }
