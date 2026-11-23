@@ -88,6 +88,27 @@ final class RemoteControlRecoveryBarrierTests: XCTestCase {
         }
     }
 
+    func testFrozenEvidenceSurvivesLossOfTheOutboxesAcrossOrigins() throws {
+        let f = try ControlPublicationFixture(), host = try f.hostBody(), service = try f.body()
+        let hostDraft = try XCTUnwrap(f.prepare(host).bodyJson)
+        _ = try f.prepare(service)
+        let signed = try f.sign(service)
+        // Model a legacy signed outbox retained from before independent journaling.
+        f.authorBytes.removeAll()
+        let c = try context(f), ch = try challenge(c, now: f.clock.wallMs)
+        _ = try f.readAuthorJournal("manager").holdForReport(context: c, challengeJSON: ch, log: f.log,
+            slot: "astation-macos", nowMs: f.clock.wallMs, outboxes: [f.journal], recoveryCopies: [])
+        let reopened = try f.readAuthorJournal("manager")
+        let here = try reopened.inventory(stationOrigin: f.origin, outboxes: [], recoveryCopies: [])
+        XCTAssertEqual(here.signedRecords, [signed])
+        XCTAssertEqual(here.unsignedDraftBodies, [hostDraft])
+        let elsewhere = try reopened.inventory(stationOrigin: "https://second.example", outboxes: [], recoveryCopies: [])
+        XCTAssertTrue(elsewhere.signedRecords.isEmpty)
+        XCTAssertEqual(elsewhere.unsignedDraftBodies, [hostDraft])
+        _ = try reopened.holdForReport(context: c, challengeJSON: challenge(c, now: f.clock.wallMs + 1),
+            log: f.log, slot: "astation-macos", nowMs: f.clock.wallMs + 1, outboxes: [], recoveryCopies: [])
+    }
+
     func testExposureFailureCannotReturnSignedBytesAndDurableRetryUsesTheExactSignature() throws {
         let f = try ControlPublicationFixture(), c = try context(f), now = f.clock.wallMs
         let j = try f.readAuthorJournal("manager"), ch = try challenge(c, now: now)

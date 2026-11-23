@@ -222,6 +222,19 @@ public final class RemoteControlSigningJournal {
             try result.retain(body: checkedBody(entry.body), json: entry.body, key: key,
                 record: entry.record, possiblySigned: true)
         }
+        for barrier in (saved.barriers ?? [:]).values {
+            for (json, record) in zip(barrier.records, barrier.signedRecords) {
+                try result.retain(body: checkedBody(json), json: json, key: key, record: record, possiblySigned: true)
+            }
+            // A held draft cannot have been cancelled. An ended plan no longer
+            // attests that its unsigned drafts are outstanding.
+            if barrier.supersededBy == nil {
+                for json in barrier.drafts {
+                    try result.retain(body: checkedBody(json), json: json, key: key, record: nil,
+                        possiblySigned: false, unsignedDraft: true)
+                }
+            }
+        }
         for box in outboxes { try box.collectAuthorEvidence(into: &result) }
         for copies in recoveryCopies { try copies.collectAuthorEvidence(into: &result) }
         try checkStorage()
