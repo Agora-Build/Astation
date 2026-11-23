@@ -1,4 +1,5 @@
 import AppKit
+import AtemClient
 import AstationRemote
 import UniformTypeIdentifiers
 
@@ -313,11 +314,15 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
                     status.stringValue = "Resolve the missing signatures on this Mac before sending its report."
                     return
                 }
+                let slot = try access.coordinator.localSignerReportSlot(context)
                 let sheet = NSAlert(); alert = sheet
                 sheet.messageText = "Hold stop signing and report to Station?"
                 sheet.informativeText = """
                     \(stationOrigin)
                     Recovery plan \(context.planID) (generation \(context.generation))
+                    Replacement feed \(context.candidateFeedID)
+                    Reporting slot \(slot)
+                    SDK process \(verifierReportProcess())
                     This Mac will report \(preview.signedRecords.count) signed stops and commit to \(preview.reportDraftCount) draft bodies.
 
                     Continuing places a durable hold before Touch ID or password confirmation. During the hold this Mac cannot sign service stops for this Station or host interrupts at any Station. Closing this window or cancelling authentication keeps the hold.
@@ -332,7 +337,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
                 }
                 alert = nil
                 guard consent, current() else { return }
-                try await access.coordinator.submitSignerReport(context, preview: preview, current: current)
+                try await access.coordinator.submitSignerReport(context, slot: slot, preview: preview, current: current)
                 guard current() else { return }
                 status.stringValue = "Station retained this Mac's signed report. The signing hold remains in place."
             } catch {

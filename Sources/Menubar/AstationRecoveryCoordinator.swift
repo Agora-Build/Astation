@@ -1776,7 +1776,20 @@ extension AstationRecoveryCoordinator {
         return retained
     }
 
-    func submitSignerReport(_ context: RemoteControlRecoveryContext, preview: RemoteControlAuthorInventory,
+    /// A report can retain stop evidence before the operator has a complete process roster.
+    func localSignerReportSlot(_ context: RemoteControlRecoveryContext) throws -> String {
+        try requireDurableRecoveryCheckpoint()
+        guard !uncertain, let log = membershipLog, log.frozen() == nil, context.accountID == accountID,
+              context.stationOrigin == relayURL, context.genesisHash == log.genesisHash(),
+              context.membershipHead == log.head() else { throw RemoteRecoveryError.requiresReview }
+        guard let roster = saved.processRosters?[relayURL]?[managerID],
+              roster.sequence == log.head().seq, roster.headHash == log.head().hash else { return "astation-macos" }
+        let process = verifierReportProcess()
+        let matches = try reviewedProcessSlots(member: managerID, log: log).filter { $0.process == process }
+        return matches.count == 1 ? matches[0].slot : "astation-macos"
+    }
+
+    func submitSignerReport(_ context: RemoteControlRecoveryContext, slot: String, preview: RemoteControlAuthorInventory,
         current: () -> Bool) async throws {
         try begin(); defer { busy = false }
         guard current(), !Task.isCancelled, context.stationOrigin == relayURL, context.accountID == accountID,
@@ -1785,7 +1798,8 @@ extension AstationRecoveryCoordinator {
         let log = try await refreshedLog(genesis: context.genesisHash)
         try requireDelegatedControl(log)
         guard current(), !Task.isCancelled, log.head() == context.membershipHead else { throw RemoteChannelError.staleLink }
-        let issued = try await station.signerChallenge(for: context, memberID: managerID, slot: "astation-macos",
+        guard slot == (try localSignerReportSlot(context)) else { throw RemoteRecoveryError.requiresReview }
+        let issued = try await station.signerChallenge(for: context, memberID: managerID, slot: slot,
             nowMs: { Self.clock().wallMs })
         guard current(), !Task.isCancelled, membershipLog?.head() == context.membershipHead else { throw RemoteChannelError.staleLink }
         try requireDelegatedControl(log)

@@ -2582,8 +2582,14 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [RecoveryReportHTTPStub.self]
         let http = try RemoteRecoveryHTTP(relayURL: context.stationOrigin, configuration: config, accessToken: { "native-test" })
+        let rosterOwner = try h.coordinator(confirmProcessRoster: { true })
+        XCTAssertEqual(try rosterOwner.localSignerReportSlot(context), "astation-macos")
+        let review = try await rosterOwner.prepareProcessReview(member: "manager-a", current: { true })
+        try await rosterOwner.acceptProcessReview(review, lines: ["offline AQEBAQEBAQEBAQEBAQEBAQ",
+            "truck " + verifierReportProcess()], current: { true })
+        XCTAssertEqual(try rosterOwner.localSignerReportSlot(context), "truck")
         let wall = AstationRecoveryCoordinator.clock().wallMs
-        let challenge = try signerReportChallenge(signer: "member:manager-a", slot: "astation-macos", origin: context.stationOrigin,
+        let challenge = try signerReportChallenge(signer: "member:manager-a", slot: "truck", origin: context.stationOrigin,
             connection: 1, issuedAt: wall, expiresAt: wall + 30_000, recovery: context.signerReportRecovery)
         var deliveries: [Data] = []
         RecoveryReportHTTPStub.lock.withLock {
@@ -2594,6 +2600,8 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                     return try JSONSerialization.data(withJSONObject: ["head": ["seq": log.head().seq, "hash": log.head().hash] as [String: Any],
                         "entries": [], "more": false] as [String: Any])
                 case "signer-challenges":
+                    let fields = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+                    XCTAssertEqual(fields["slot"] as? String, "truck")
                     return Data(challenge.utf8)
                 case "signer-reports":
                     deliveries.append(data)
@@ -2605,6 +2613,8 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
                     let checked = try verifySignerReport(log: log, reportJson: json(XCTUnwrap(input["report"])),
                         expectedChallengeJson: challenge, exportedRecordsJson: records, nowMs: wall)
                     XCTAssertTrue(checked.atHead)
+                    XCTAssertEqual(checked.slot, "truck")
+                    XCTAssertEqual(checked.process, verifierReportProcess())
                     XCTAssertEqual(checked.journal.records, 1)
                     if deliveries.count == 1 { throw URLError(.networkConnectionLost) }
                     let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
@@ -2630,8 +2640,13 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
             return h.approve
         }
         defer { h.protectedJournal = nil; h.ownerConfirmation = nil }
+        let prompts = h.ownerRequests.count
+        do { try await coordinator.submitSignerReport(context, slot: "astation-macos", preview: preview, current: { true }); XCTFail() }
+        catch { XCTAssertEqual(error as? RemoteRecoveryError, .requiresReview) }
+        XCTAssertEqual(h.ownerRequests.count, prompts)
+        XCTAssertNoThrow(try coordinator.requireServiceStopChange(origin: context.stationOrigin))
         h.approve = false
-        do { try await coordinator.submitSignerReport(context, preview: preview, current: { true }); XCTFail() }
+        do { try await coordinator.submitSignerReport(context, slot: "truck", preview: preview, current: { true }); XCTFail() }
         catch { XCTAssertEqual(error as? RemoteRecoveryError, .confirmationRequired) }
         XCTAssertEqual(h.ownerRequests.last?.purpose, .signerReport)
         XCTAssertThrowsError(try coordinator.requireServiceStopChange(origin: context.stationOrigin)) {
@@ -2639,7 +2654,7 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         }
         XCTAssertTrue(deliveries.isEmpty)
         h.approve = true
-        do { try await coordinator.submitSignerReport(context, preview: preview, current: { true }); XCTFail() }
+        do { try await coordinator.submitSignerReport(context, slot: "truck", preview: preview, current: { true }); XCTFail() }
         catch { XCTAssertEqual((error as? URLError)?.code, .networkConnectionLost) }
         let count = h.ownerRequests.count
         let reopened = try h.coordinator(transport: http)

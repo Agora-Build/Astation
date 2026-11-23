@@ -190,7 +190,8 @@ pub(super) async fn inspection(
                 let author = authors.get_mut(&verified.signer).ok_or_else(invalid)?;
                 let first = author["first_manage_seq"].as_u64().ok_or_else(invalid)?;
                 author["reports"].as_array_mut().ok_or_else(invalid)?.push(json!({
-                    "connection": verified.connection, "slot": verified.slot, "journal": verified.journal.to_json(),
+                    "connection": verified.connection, "slot": verified.slot,
+                    "process": atem_client::encoding::b64u(&verified.process), "journal": verified.journal.to_json(),
                     "missing_early_range": verified.journal.since > first, "submission_hash": hash,
                 }));
             }

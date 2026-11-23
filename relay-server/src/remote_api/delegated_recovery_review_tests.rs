@@ -504,6 +504,8 @@ async fn postgres_signer_report_is_verified_once_and_receipted_across_replicas()
     let review = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
     let author = &review["known_authors"]["members"]["member:phone"];
     assert_eq!(author["member_status"], "manager");
+    assert_eq!(author["reports"][0]["process"], input["report"]["body"]["process"]);
+    assert!(author["reports"][0]["process"].as_str().is_some_and(|p| p.len() == 22));
     assert_eq!(author["reports"][0]["missing_early_range"], true);
     assert_eq!(author["reports"][0]["journal"]["records"], 1);
     assert_eq!(author["reports"][0]["submission_hash"], one.1["submission_hash"]);
@@ -667,6 +669,8 @@ async fn postgres_delegated_history_retains_signer_exports_after_abandonment() {
     let previous = &later["known_authors"]["prior_plans"][0];
     assert_eq!(previous["plan_id"], first["plan_id"]);
     assert_eq!(previous["members"][signer]["member_status"], "manager");
+    assert_eq!(previous["members"][signer]["reports"][0]["process"],
+        atem_client::encoding::b64u(&atem_client::member_report::process_generation()));
     assert_eq!(previous["members"][signer]["reports"][0]["journal"]["records"], 3);
     assert_eq!(later["known_authors"]["members"][signer]["member_status"], "demoted");
     assert_eq!(later["recovery_ready"], false);
