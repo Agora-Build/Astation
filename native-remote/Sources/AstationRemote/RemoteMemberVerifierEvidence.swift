@@ -151,12 +151,14 @@ public final class RemoteMemberVerifierEvidence {
             state.pending = nil
             state.consumed = pending
             states[challenge.slot] = state
-            guard report.atHead, report.head == self.log.head() else {
-                throw RemoteVerifierGateError.staleMembership
-            }
+            // An authenticated ancestor cannot authorize signing, but its process
+            // mismatch still conflicts with the protected roster in either order.
             guard report.process == challenge.slot.process else {
                 try conflict(challenge.slot)
                 throw RemoteVerifierGateError.staleConnection
+            }
+            guard report.atHead, report.head == self.log.head() else {
+                throw RemoteVerifierGateError.staleMembership
             }
             if let highest = state.highest {
                 guard report.inventory.version >= highest.version,

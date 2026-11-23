@@ -412,6 +412,56 @@ final class RemoteMemberVerifierEvidenceTests: XCTestCase {
     }
 
     @MainActor
+    func testUnexpectedAncestorProcessDurablyConflictsBeforeHeadRejection() throws {
+        let f = try MemberReportFixture(slotNames: ["phone"]), ancestor = f.log.snapshot()
+        try f.append(["action": "set_roles", "device_id": "manager", "roles": ["control", "manage", "view"]])
+        let gate = try RemoteVerifierSigningGate(log: f.log,
+            verifiers: [.member("manager"), .host("host"), .stationReplica("station")], now: { f.time })
+        let evidence = try RemoteMemberVerifierEvidence(gate: gate, log: f.log, origin: f.origin, slots: f.slots,
+            journal: f.makeJournal(), current: { true }, now: { f.time })
+        let challenge = try evidence.begin(f.slots[0], log: f.log, wallMs: f.wall)
+        let report = try f.report(challenge, log: ancestor) {
+            $0["process"] = RemoteRecoveryKit.base64URL(Data(repeating: 4, count: 16))
+        }
+        let proof = try verifyVerifierReport(log: f.log, reportJson: report,
+            expectedChallengeJson: challenge.json, nowMs: f.wall)
+        XCTAssertFalse(proof.atHead)
+        XCTAssertNotEqual(proof.process, f.slots[0].process)
+        XCTAssertThrowsError(try evidence.receive(report, for: challenge, log: f.log, wallMs: f.wall)) {
+            XCTAssertEqual($0 as? RemoteVerifierGateError, .staleConnection)
+        }
+        XCTAssertTrue(f.journal.retained(f.slots[0]).conflicted)
+        XCTAssertThrowsError(try evidence.receive(f.report(challenge), for: challenge, log: f.log, wallMs: f.wall))
+        XCTAssertThrowsError(try evidence.begin(f.slots[0], log: f.log, wallMs: f.wall),
+            "An expected-process retry cannot erase the authenticated conflict")
+        evidence.retire()
+        let restarted = try RemoteMemberVerifierEvidence(gate: gate, log: f.log, origin: f.origin, slots: f.slots,
+            journal: f.makeJournal(), current: { true }, now: { f.time })
+        XCTAssertThrowsError(try restarted.begin(f.slots[0], log: f.log, wallMs: f.wall),
+            "Restart retains the conflict until protected roster review")
+    }
+
+    @MainActor
+    func testWallExpiryRejectsReportWithoutMonotonicAdvancement() throws {
+        let f = try MemberReportFixture(slotNames: ["phone"])
+        let challenge = try f.begin(), report = try f.report(challenge)
+        f.wall += 30_000
+        XCTAssertThrowsError(try f.receive(report, challenge))
+        XCTAssertThrowsError(try f.authorize())
+    }
+
+    @MainActor
+    func testServiceWallExpiryWithdrawsEvidenceWithoutMonotonicAdvancement() throws {
+        let f = try MemberReportFixture(slotNames: ["bot"], service: true)
+        try f.confirmAll()
+        XCTAssertNoThrow(try f.authorize())
+        f.wall += 1_000
+        XCTAssertThrowsError(try f.evidence.refresh(log: f.log, wallMs: f.wall))
+        XCTAssertThrowsError(try f.authorize())
+        XCTAssertThrowsError(try f.begin())
+    }
+
+    @MainActor
     func testExternalServiceProofCannotOutliveItsSignedMembershipExpiry() throws {
         let f = try MemberReportFixture(slotNames: ["bot"], service: true)
         let challenge = try f.begin()
