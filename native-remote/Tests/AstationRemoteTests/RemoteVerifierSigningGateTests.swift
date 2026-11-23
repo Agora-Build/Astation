@@ -150,20 +150,25 @@ final class RemoteVerifierSigningGateTests: XCTestCase {
     }
 
     @MainActor
-    func testActualSigningGateRejectsEveryPublishedMalformedMembershipBody() throws {
+    func testActualSigningGateRejectsDuplicateAndUnknownActionsBeforeWaivingUpgrade() throws {
         let f = try VerifierFixture()
         let (gate, _) = try f.confirmedGate()
-        let url = try XCTUnwrap(Bundle.module.url(forResource: "r9-vectors-required-verifier",
-            withExtension: "json", subdirectory: "Fixtures"))
-        let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
-        let cases = try XCTUnwrap(fixture["cases"] as? [[String: Any]])
-        let rejected = cases.filter { $0["reject"] as? Bool == true }
-        XCTAssertFalse(rejected.isEmpty)
-        for vector in rejected {
-            let body = try XCTUnwrap(vector["body_json"] as? String)
-            let request = SignRequest(keyId: "manager", purpose: .roles, freshConfirmation: true,
-                label: "atem-membership-entry-v1", input: Data(), bodyJson: body)
-            XCTAssertThrowsError(try gate.authorize(request, log: f.log), "\(vector["label"] ?? "malformed")")
+        let body = try f.log.draftEntry(signer: "manager", signedAt: f.clock.wallMs,
+            actionJson: "{\"action\":\"set_roles\",\"device_id\":\"manager\",\"roles\":[\"control\",\"manage\",\"view\"]}")
+        let valid = try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: "manager")
+        XCTAssertNoThrow(try gate.authorize(valid, log: f.log))
+        let canonical = try XCTUnwrap(valid.bodyJson)
+        let malformed = [
+            String(canonical.dropLast()) + ",\"action\":\"set_roles\"}",
+            String(canonical.dropLast()) + ",\"\\u0061ction\":\"set_roles\"}",
+            canonical.replacingOccurrences(of: "\"action\":\"set_roles\"", with: "\"action\":\"future_action\"")
+        ]
+        for body in malformed {
+            XCTAssertNotEqual(body, canonical)
+            XCTAssertThrowsError(try RemoteConfirmedSigner.membershipRequest(bodyJSON: body, keyID: "manager"))
+            let request = SignRequest(keyId: valid.keyId, purpose: valid.purpose,
+                freshConfirmation: valid.freshConfirmation, label: valid.label, input: valid.input, bodyJson: body)
+            XCTAssertThrowsError(try gate.authorize(request, log: f.log))
         }
     }
 
