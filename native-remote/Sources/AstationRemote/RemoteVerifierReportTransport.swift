@@ -51,8 +51,7 @@ public final class RemoteMemberVerifierPoller {
         let id: UUID
         let challenge: RemoteMemberVerifierEvidence.Challenge
         let started: UInt64
-        var seen: Set<String> = []
-        var confirmed = false
+        var acceptedBody: String?
         var inFlight = false
     }
     private let evidence: RemoteMemberVerifierEvidence
@@ -74,12 +73,8 @@ public final class RemoteMemberVerifierPoller {
     @discardableResult
     public func poll(_ slot: RemoteMemberVerifierSlot) async throws -> Bool {
         guard !retired else { throw RemoteVerifierGateError.staleConnection }
-        let log: MembershipLog
-        do {
-            try Task.checkCancellation()
-            log = try membership().snapshot()
-            try evidence.refresh(log: log, wallMs: wall())
-        } catch { retire(); throw error }
+        if Task.isCancelled { retire(); throw CancellationError() }
+        let log = try currentMembership()
         let time = now()
         if rounds[slot]?.inFlight == true { throw RemoteVerifierGateError.staleConnection }
         let creating: Bool
@@ -102,29 +97,47 @@ public final class RemoteMemberVerifierPoller {
             }
             try Task.checkCancellation()
             guard !retired, rounds[slot]?.id == round.id else { throw RemoteVerifierGateError.staleConnection }
-            let current = try membership().snapshot()
-            try evidence.refresh(log: current, wallMs: wall())
-            guard try parseVerifierReportChallenge(challengeJson: mailbox.challengeJSON) ==
-                parseVerifierReportChallenge(challengeJson: round.challenge.json), mailbox.reports.count <= 4 else {
+            let current = try currentMembership()
+            let challenge = try parseVerifierReportChallenge(challengeJson: round.challenge.json)
+            guard try parseVerifierReportChallenge(challengeJson: mailbox.challengeJSON) == challenge,
+                  mailbox.reports.count <= 4 else {
                 throw RemoteRecoveryTransportError.invalidResponse
             }
-            // Authenticate the whole batch before exposing any new evidence.
-            for report in mailbox.reports {
-                _ = try verifyVerifierReport(log: current, reportJson: report,
-                    expectedChallengeJson: round.challenge.json, nowMs: wall())
+            let receivedAt = now()
+            let wallMs = wall()
+            guard receivedAt >= round.started, receivedAt - round.started < challenge.expiresAt - challenge.issuedAt,
+                  wallMs >= challenge.issuedAt, wallMs < challenge.expiresAt else {
+                throw RemoteVerifierGateError.staleConnection
             }
+            // A bad sibling or an ancestor from the expected process must never
+            // hide an authenticated process conflict. Only positive evidence waits.
+            var invalid: Error?
+            var candidate: (body: String, report: String)?
             for report in mailbox.reports {
-                // A signer may produce a different valid signature over the same
-                // immutable body. Such a retry cannot consume or renew proof.
+                let proof: VerifiedReport
+                do {
+                    proof = try verifyVerifierReport(log: current, reportJson: report,
+                        expectedChallengeJson: round.challenge.json, nowMs: wallMs)
+                } catch { invalid = error; continue }
+                if proof.process != slot.process {
+                    try evidence.receive(report, for: round.challenge, log: current, wallMs: wallMs)
+                    throw RemoteVerifierGateError.staleConnection
+                }
                 let body = try signedObjectInfo(json: report).bodyJcs
-                guard !round.seen.contains(body) else { continue }
-                try evidence.receive(report, for: round.challenge, log: current, wallMs: wall())
-                round.seen.insert(body)
-                round.confirmed = true
+                if let candidate, candidate.body != body { invalid = RemoteRecoveryTransportError.invalidResponse }
+                candidate = (body, report)
+            }
+            if let invalid { throw invalid }
+            // The Station retains one immutable body per process until closure.
+            if let accepted = round.acceptedBody {
+                guard accepted == candidate?.body else { throw RemoteRecoveryTransportError.invalidResponse }
+            } else if let candidate {
+                try evidence.receive(candidate.report, for: round.challenge, log: current, wallMs: wallMs)
+                round.acceptedBody = candidate.body
             }
             round.inFlight = false
             rounds[slot] = round
-            return round.confirmed
+            return evidence.confirmed(round.challenge)
         } catch {
             if rounds[slot]?.id == round.id {
                 rounds.removeValue(forKey: slot)
@@ -132,6 +145,14 @@ public final class RemoteMemberVerifierPoller {
             }
             throw error
         }
+    }
+
+    private func currentMembership() throws -> MembershipLog {
+        do {
+            let log = try membership().snapshot()
+            try evidence.refresh(log: log, wallMs: wall())
+            return log
+        } catch { retire(); throw error }
     }
 
     public func retire() {

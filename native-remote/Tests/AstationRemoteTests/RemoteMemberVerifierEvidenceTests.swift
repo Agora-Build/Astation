@@ -34,6 +34,7 @@ private final class MemberReportFixture {
     let key = Curve25519.Signing.PrivateKey()
     let origin = "https://station.example"
     let log: MembershipLog
+    let genesis: MembershipLog
     var time: UInt64 = 100
     var wall = VerifierReportTestSupport.wall
     var current = true
@@ -51,6 +52,7 @@ private final class MemberReportFixture {
         log = try VerifierReportTestSupport.log(account: "account", member: "manager",
             auth: PublicKeyData(alg: .ed25519, raw: key.publicKey.rawRepresentation),
             encryption: PublicKeyData(alg: .x25519, raw: Data(repeating: 7, count: 32)), sign: { try key.signature(for: $0) })
+        genesis = log.snapshot()
         try append(["action": "add_host", "host": ["host_id": "host", "host_trust_gen": 1,
             "host_key": ["alg": "ed25519", "pub": RemoteRecoveryKit.base64URL(key.publicKey.rawRepresentation)]]])
         if service {
@@ -132,8 +134,8 @@ private final class MemberReportFixture {
         for index in slots.indices { let next = try begin(index); try receive(report(next), next) }
     }
 
-    func carriedReport(_ challengeJSON: String, process: UInt8? = nil) throws -> String {
-        let request = try VerifierReportRequest(log: log, challengeJson: challengeJSON,
+    func carriedReport(_ challengeJSON: String, process: UInt8? = nil, log: MembershipLog? = nil) throws -> String {
+        let request = try VerifierReportRequest(log: log ?? self.log, challengeJson: challengeJSON,
             signer: "member:manager", slot: slots[0].slot, origin: origin, keyId: "manager", nowMs: wall)
         let report = try request.finish(signature: key.signature(for: request.signRequest().input))
         guard let process else { return report }
@@ -259,6 +261,60 @@ final class RemoteMemberVerifierEvidenceTests: XCTestCase {
             poller.retire()
             do { _ = try await poller.poll(f.slots[0]); XCTFail("accepted retired poll") } catch {}
         }
+    }
+
+    @MainActor
+    func testAuthenticatedConflictSurvivesRejectedSiblingsInEitherOrder() async throws {
+        for conflictFirst in [false, true] {
+            let f = try MemberReportFixture(slotNames: ["phone"])
+            let transport = MemberReportTransport { _, challenge in
+                let other = try f.carriedReport(challenge, process: 7)
+                let ancestor = try f.carriedReport(challenge, log: f.genesis)
+                let reports = conflictFirst ? [other, ancestor, "{}"] : ["{}", ancestor, other]
+                return try f.mailbox(challenge, reports: reports)
+            }
+            let poller = RemoteMemberVerifierPoller(evidence: f.evidence, transport: transport,
+                membership: { f.log }, wall: { f.wall }, now: { f.time })
+            do { _ = try await poller.poll(f.slots[0]); XCTFail("accepted conflicting batch") } catch {}
+            XCTAssertTrue(try f.makeJournal().retained(f.slots[0]).conflicted)
+            XCTAssertThrowsError(try f.begin())
+            XCTAssertThrowsError(try f.authorize())
+        }
+    }
+
+    @MainActor
+    func testRepeatedReadRequiresRetainedBodyAndOriginalDeadline() async throws {
+        for dropped in [false, true] {
+            let f = try MemberReportFixture(slotNames: ["phone"])
+            let transport = MemberReportTransport { creating, challenge in
+                let reports = !creating && dropped ? [] : [try f.carriedReport(challenge)]
+                if !creating && !dropped { f.time += 30_000 }
+                return try f.mailbox(challenge, reports: reports)
+            }
+            let poller = RemoteMemberVerifierPoller(evidence: f.evidence, transport: transport,
+                membership: { f.log }, wall: { f.wall }, now: { f.time })
+            try await assertPoll(poller, f.slots[0], expected: true)
+            do { _ = try await poller.poll(f.slots[0]); XCTFail("accepted lost or expired evidence") } catch {}
+            XCTAssertThrowsError(try f.authorize())
+        }
+    }
+
+    @MainActor
+    func testMembershipLossDuringTransportRetiresPoller() async throws {
+        let f = try MemberReportFixture(slotNames: ["phone"])
+        var available = true
+        let transport = MemberReportTransport { _, challenge in
+            available = false
+            return try f.mailbox(challenge, reports: [f.carriedReport(challenge)])
+        }
+        let poller = RemoteMemberVerifierPoller(evidence: f.evidence, transport: transport,
+            membership: { guard available else { throw RemoteRecoveryStoreError.changed }; return f.log },
+            wall: { f.wall }, now: { f.time })
+        do { _ = try await poller.poll(f.slots[0]); XCTFail("accepted missing membership") } catch {}
+        available = true
+        transport.handler = { _, _ in XCTFail("retired owner polled again"); throw RemoteRecoveryStoreError.changed }
+        do { _ = try await poller.poll(f.slots[0]); XCTFail("revived retired owner") } catch {}
+        XCTAssertThrowsError(try f.authorize())
     }
 
     @MainActor

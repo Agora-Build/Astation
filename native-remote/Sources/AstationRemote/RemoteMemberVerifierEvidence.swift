@@ -183,6 +183,13 @@ public final class RemoteMemberVerifierEvidence {
         }
     }
 
+    func confirmed(_ challenge: Challenge) -> Bool {
+        guard !retired, let state = states[challenge.slot], !state.conflicted,
+              state.consumed?.challenge == challenge, state.pending == nil,
+              state.inventory != nil, let deadline = state.validBefore else { return false }
+        return now() < deadline
+    }
+
     /// A superseded request's failure cannot clear newer evidence.
     public func failed(_ challenge: Challenge) {
         guard let state = states[challenge.slot], state.pending?.challenge == challenge ||
