@@ -1,8 +1,8 @@
 # Delegated Station implementation (#79)
 
 This is implementation status against the agreed Atem Step 4 contract, pinned
-to `de7ec29882f23508a430436cba34f73f88c15ed1` (published SDK
-`atem-client-sdk-de7ec29882f2`, including #190-#199).
+to `1952ec8ad03fe6c613ce60a8d5b620b93712f8bf` (published SDK
+`atem-client-sdk-1952ec8ad03f`, including the #207 recovery signer report).
 The feature is **not ready for activation**. This change does not enable
 delegated execution or new native membership/control signing.
 
@@ -91,7 +91,7 @@ wiring remain required; the additional-route provider remains unset.
 ## November 23 SDK adoption and review resolutions
 
 Atem's responses crossed the November 22 status update. Its immutable
-`de7ec29882f2` SDK is now the Apple, Android and Station source pin. The release's
+`de7ec29882f2` SDK was the initial Apple, Android and Station verifier-report pin. The release's
 combined manifest was verified before selecting the individual asset hashes;
 the consumers download published release assets, validate every consumed hash
 and source record, and retain an offline bundle option with the same checks.
@@ -114,10 +114,12 @@ and [Atem #120](https://github.com/Agora-Build/Atem/issues/120#issuecomment-7089
   No extra reporter-wall-clock future-`issued_at` bound is requested. Native
   authorization requires its own exact single-use challenge and ContinuousClock
   deadline, captured before token work, with sleep/delay consuming at most 30 s.
-- The exact-plan durable author barrier and typed signer report are agreed
-  for implementation. The journal/locking/publication adapter remains
-  Astation-owned and unimplemented; the signer-report helper is a newly
-  approved Atem build, not part of this SDK.
+- Apple, Android and Station now consume Atem #207 at `1952ec8ad03f`.
+  Its immutable signer-report request binds the confirmed signature to the
+  reviewed recovery plan and journal contents. Its verifier checks the signed
+  report against the challenge and exported records. Astation still owns the
+  protected author journal, the signing barrier and verification of complete
+  history before publication.
 - Valid retained Station-own stops may be carried unchanged, as may a current
   manager's. Covers/holds/releases are new signatures. The shared snapshot
   checker reports consistency only, never complete history or clocks.
@@ -743,7 +745,7 @@ the opt-in flag through LaunchServices. For an already provisioned bundle, use
 after quitting that app. The Station still needs its separate build/runtime
 gates and healthy recovery generation; this native flag changes none of them.
 Station and Apple consume the reviewed shared core at
-`de7ec29882f23508a430436cba34f73f88c15ed1`; native forwards the proof opaquely
+`1952ec8ad03fe6c613ce60a8d5b620b93712f8bf`; native forwards the proof opaquely
 and uses the shared control readers/correlation helper. This
 does not satisfy the separate all-verifier signing compatibility gate.
 
