@@ -100,6 +100,7 @@ pub(super) async fn inspection(
     let mut commitments = Vec::new();
     let mut retained_feed_ids = BTreeSet::new();
     let mut found_current = false;
+    let mut journals = super::author_history::JournalHistory::default();
     let mut current_authors = None;
     let mut prior_authors = Vec::new();
     let mut current_report_hashes = Vec::new();
@@ -187,6 +188,8 @@ pub(super) async fn inspection(
                 add_record(&mut records, record.object().to_json(), stops::review(&record, log, &binding.origin)?)?;
             }
             if let Some(authors) = &mut authors {
+                journals.observe(&verified.signer, verified.journal.id, verified.journal.since,
+                    verified.journal.revision, checkpoint.plan_id == prepared.plan_id);
                 let author = authors.get_mut(&verified.signer).ok_or_else(invalid)?;
                 let first = author["first_manage_seq"].as_u64().ok_or_else(invalid)?;
                 author["reports"].as_array_mut().ok_or_else(invalid)?.push(json!({
@@ -256,7 +259,8 @@ pub(super) async fn inspection(
             .into_iter()
             .map(|(id, (record, _))| (id, record))
             .collect(),
-        authors: json!({"members": current_authors, "prior_plans": prior_authors, "complete_history": false}),
+        authors: json!({"members": current_authors, "prior_plans": prior_authors,
+            "journal_gaps": journals.gaps(), "complete_history": false}),
         current_report_hashes,
     })
 }

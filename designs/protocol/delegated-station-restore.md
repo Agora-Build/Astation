@@ -158,6 +158,14 @@ An empty reports list identifies a known author with no accepted report in this
 plan. `known_authors.prior_plans` lists the authors and reports from each earlier
 retained membership head. An old report describes only its original plan.
 
+The operator review lists `known_authors.journal_gaps` when a previously
+observed member journal has no current report, its highest current revision
+falls below a prior plan's observation, or its signed creation sequence
+changes. A new process can report the same durable journal. A new journal
+cannot account for the missing old one. An empty list describes only the
+journals observed at this Station. Participant coverage still requires the
+independent roster.
+
 Recovery rechecks each retained report with the membership and challenge from
 the plan that accepted it. A signed revoke or interrupt exported only in that
 report appears among the replacement plan's obligations, including after
