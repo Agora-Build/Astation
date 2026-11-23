@@ -27,13 +27,29 @@ verified complete snapshot. The generation is an operational rollback fence;
 it grants no signing or host authority. The UUID alone supplies no such
 protection.
 
-## Agreed author barrier (not yet implemented)
+## Native author signing barrier
 
 The [November 23 review](https://github.com/Agora-Build/Astation/issues/114#issuecomment-7089435073)
 agrees Atem's exact-plan durable barrier B1-B6 and typed signer-report proposal.
-This closes the contract question about a stop signed after an author's report
-but before snapshot publication. It does not implement the barrier or establish
-that existing saved journals are complete.
+The Apple journal implements a local hold for this interval. Its internal
+collector validates the SDK challenge and a plan at the pinned membership head,
+then commits both sets of bodies, the exact signed records and the hold in one
+protected revision. A signed body can also appear in a surviving unsigned
+outbox. The SDK commits that body once in each applicable set. The owner-signing
+adapter can return signed bytes only after their exposure is saved and read
+back. An exact retry uses the retained signature.
+
+Ordinary stops, re-signs and recovery copies check the hold before owner
+confirmation, at draft persistence and at key use. An already signed outbox
+can still deliver its retained bytes. Loading a fresh authenticated Station
+review reconciles a different plan in a higher generation for that origin. The
+Mac retains the original signatures and the successor generation in the same
+commit. A file import, another origin or an unknown outcome keeps the hold.
+
+Station signer-challenge delivery, the native report confirmation and submission
+flow, exact publication and abandonment receipts, historical author coverage and
+joint verification remain open. The production app cannot initiate a hold or
+issue a signer report yet.
 
 Recovery Copies can review this Mac's retained evidence offline. The coordinator
 holds the account checkpoint and the member key's journal lock while reading

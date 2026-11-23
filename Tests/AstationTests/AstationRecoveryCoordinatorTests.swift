@@ -2734,6 +2734,36 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(retried, exported)
         XCTAssertEqual(h.ownerRequests.count, prompts + 1, "Reloading saved signatures must not confirm or sign again")
         XCTAssertEqual(authority.reservations, 1)
+
+        let outboxes = try XCTUnwrap(fields["controlPublications"] as? [String: Data]).map { origin, bytes in
+            try RemoteControlPublication(checkpoint: bytes, accountID: context.accountID, genesisHash: context.genesisHash,
+                stationOrigin: origin, persist: { _ in XCTFail("collecting a report cannot change a stop") })
+        }
+        let copies = try XCTUnwrap(fields["controlRecoveryPublications"] as? [String: Data]).map { origin, bytes in
+            try RemoteControlRecoveryPublication(checkpoint: bytes, accountID: context.accountID, genesisHash: context.genesisHash,
+                stationOrigin: origin, persist: { _ in XCTFail("collecting a report cannot change a copy") })
+        }
+        let challenge = try signerReportChallenge(signer: "member:manager-a", slot: "astation-macos",
+            origin: context.stationOrigin, connection: 1, issuedAt: 100, expiresAt: 30_100,
+            recovery: context.signerReportRecovery)
+        do {
+            let journal = try RemoteControlSigningJournal(log: log, memberID: "manager-a")
+            let request = try journal.holdForReport(context: context, challengeJSON: challenge, log: log,
+                slot: "astation-macos", nowMs: 100, outboxes: outboxes, recoveryCopies: copies)
+            XCTAssertEqual(request.purpose, .signerReport)
+        }
+        // Reopen both protected stores. A saved signature can still be delivered.
+        coordinator = nil
+        store = nil
+        store = try RemoteRecoveryStore(accountID: name)
+        coordinator = try h.coordinator(checkpointStore: store,
+            authorizeDelegatedControl: { _ in }, controlRecoveryAuthority: authority)
+        XCTAssertThrowsError(try coordinator!.requireControlChange(review.request)) {
+            XCTAssertEqual(($0 as? RemoteControlRecoveryHold)?.context, context)
+        }
+        let retained = try await coordinator!.signControlRecoveryCopy(review, current: { true })
+        XCTAssertEqual(retained, exported)
+        XCTAssertEqual(h.ownerRequests.count, prompts + 1)
     }
 
     func testLocalAuthorInventoryReadsAllRetainedOriginsOfflineWithoutChangingIntent() async throws {

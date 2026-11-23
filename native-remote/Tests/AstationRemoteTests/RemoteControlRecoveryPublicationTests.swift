@@ -57,7 +57,7 @@ private final class ControlRecoveryFixture {
         context = try Self.context(source)
         authority = ControlRecoveryAuthority(context: context, original: original, reservedTime: body.issuedAt + 1)
         journal = try RemoteControlRecoveryPublication(accountID: source.log.accountId(), genesisHash: source.log.genesisHash(),
-            stationOrigin: source.origin, persist: { [unowned self] in try self.save($0) })
+            stationOrigin: source.origin, draftJournal: source.authorJournal, persist: { [unowned self] in try self.save($0) })
     }
 
     static func context(_ source: ControlPublicationFixture, evidence: String = String(repeating: "b", count: 64)) throws -> RemoteControlRecoveryContext {
@@ -74,7 +74,7 @@ private final class ControlRecoveryFixture {
     }
     func restore(_ data: Data? = nil) throws {
         journal = try RemoteControlRecoveryPublication(checkpoint: XCTUnwrap(data ?? bytes),
-            accountID: source.log.accountId(), genesisHash: source.log.genesisHash(), stationOrigin: source.origin,
+            accountID: source.log.accountId(), genesisHash: source.log.genesisHash(), stationOrigin: source.origin, draftJournal: source.authorJournal,
             persist: { [unowned self] in try self.save($0) })
     }
     func prepare(manager: String = "manager") throws -> RemoteControlRecoveryReview {
@@ -449,7 +449,7 @@ final class RemoteControlRecoveryPublicationTests: XCTestCase {
         // The 257th entry is valid and unique; only the whole-journal limit should refuse its reload.
         var extra: Data?
         let standalone = try RemoteControlRecoveryPublication(accountID: f.source.log.accountId(),
-            genesisHash: f.source.log.genesisHash(), stationOrigin: f.source.origin, persist: { extra = $0 })
+            genesisHash: f.source.log.genesisHash(), stationOrigin: f.source.origin, draftJournal: f.source.authorJournal, persist: { extra = $0 })
         let extraAuthority = ControlRecoveryAuthority(context: context, original: f.original,
             reservedTime: authority.reservedTime + 1)
         _ = try standalone.prepare(originalRecordJSON: f.original, context: context, managerID: "manager",

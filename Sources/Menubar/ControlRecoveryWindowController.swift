@@ -320,6 +320,7 @@ final class ControlRecoveryWindowController: NSWindowController, NSWindowDelegat
             defer { task = nil; refreshAuthorInventory(access, epoch: epoch); render() }
             do {
                 guard isCurrent(access, epoch: epoch), access.canSign() else { return }
+                try access.coordinator.requireControlChange(review.request)
                 let approved: Bool
                 if let confirm { approved = await confirm(review) }
                 else {

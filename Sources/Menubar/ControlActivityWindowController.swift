@@ -215,6 +215,7 @@ final class ControlActivityWindowController: NSWindowController, NSWindowDelegat
             do {
                 let prepared = try await coordinator.prepareControlResign(recordID: row.body.recordId, current: current)
                 guard current(), !Task.isCancelled else { return }
+                if !prepared.signed { try coordinator.requireControlChange(prepared.request) }
                 let alert = NSAlert()
                 alert.messageText = prepared.signed ? "Retry the saved stop?" : "Confirm this stop with the current manager?"
                 alert.informativeText = Self.explanation(prepared, station: coordinator.relayURL)

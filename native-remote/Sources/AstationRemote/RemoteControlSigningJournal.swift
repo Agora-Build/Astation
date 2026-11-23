@@ -11,8 +11,26 @@ public final class RemoteControlSigningJournal {
         var record: String?
     }
 
+    private struct Barrier: Codable {
+        let context: RemoteControlRecoveryContext
+        let revision: UInt64
+        let records: [String]
+        let drafts: [String]
+        let signedRecords: [String]
+        let challengeJSON: String
+        let slot: String
+        var exposedReport: String?
+        var supersededBy: RemoteControlRecoveryContext?
+
+        func request(log: MembershipLog, id: Data, since: UInt64, member: String, nowMs: UInt64) throws -> SignerReportRequest {
+            try SignerReportRequest(log: log, challengeJson: challengeJSON, signer: "member:" + member,
+                slot: slot, origin: context.stationOrigin, journal: SignerJournalView(id: RemoteRecoveryKit.base64URL(id),
+                    since: since, revision: revision, records: records, drafts: drafts), keyId: member, nowMs: nowMs)
+        }
+    }
+
     private struct Checkpoint: Codable {
-        let version: Int
+        var version: Int
         let account: String
         let genesis: String
         let member: String
@@ -22,6 +40,7 @@ public final class RemoteControlSigningJournal {
         let since: UInt64
         var revision: UInt64
         var entries: [String: Entry]
+        var barriers: [String: Barrier]?
     }
 
     private let read: () throws -> Data?
@@ -73,7 +92,8 @@ public final class RemoteControlSigningJournal {
         if let bytes = expected {
             guard bytes.count <= 8_388_608 else { throw RemoteControlPublicationError.invalidCheckpoint }
             saved = try PropertyListDecoder().decode(Checkpoint.self, from: bytes)
-            guard saved.version == 1, saved.account == log.accountId(), saved.genesis == log.genesisHash(),
+            guard [1, 2].contains(saved.version), saved.version == 1 ? saved.barriers == nil : saved.barriers != nil,
+                  (saved.barriers?.count ?? 0) <= 64, saved.account == log.accountId(), saved.genesis == log.genesisHash(),
                   saved.member == memberID, saved.algorithm == algorithm, saved.key == key.raw,
                   saved.id.count == 16, saved.since > 0, saved.since <= log.head().seq,
                   saved.revision <= 9_007_199_254_740_991, saved.entries.count <= 4096 else {
@@ -87,6 +107,10 @@ public final class RemoteControlSigningJournal {
                     try checkRecord(record, bodyJSON: entry.body)
                     minimumRevision += 1
                 }
+            }
+            for (origin, barrier) in saved.barriers ?? [:] {
+                try validate(barrier, origin: origin)
+                minimumRevision += 1
             }
             guard saved.revision >= minimumRevision else { throw RemoteControlPublicationError.invalidCheckpoint }
         } else {
@@ -105,6 +129,43 @@ public final class RemoteControlSigningJournal {
             throw RemoteControlPublicationError.invalidRecord
         }
         return body
+    }
+
+    private func validate(_ barrier: Barrier, origin: String) throws {
+        let context = barrier.context
+        try context.validate()
+        guard context.stationOrigin == origin, context.accountID == saved.account, context.genesisHash == saved.genesis,
+              barrier.revision > 0, barrier.revision <= saved.revision,
+              barrier.signedRecords.count == barrier.records.count else {
+            throw RemoteControlPublicationError.invalidCheckpoint
+        }
+        if let successor = barrier.supersededBy {
+            try successor.validate()
+            guard successor.accountID == context.accountID, successor.genesisHash == context.genesisHash,
+                  successor.stationOrigin == origin, successor.generation > context.generation,
+                  successor.planID != context.planID else { throw RemoteControlPublicationError.invalidCheckpoint }
+        }
+        let challenge = try parseSignerReportChallenge(challengeJson: barrier.challengeJSON)
+        guard challenge.slot == barrier.slot, challenge.signer == "member:" + saved.member, challenge.origin == origin,
+              challenge.recovery == context.signerReportRecovery else { throw RemoteControlPublicationError.invalidCheckpoint }
+        if let report = barrier.exposedReport {
+            try verifySignedObject(json: report, key: key)
+        }
+        var bodies: [String: String] = [:]
+        for group in [barrier.records, barrier.drafts] {
+            var seen = Set<String>()
+            for json in group {
+                let body = try checkedBody(json)
+                guard body.origin == origin || (body.origin == nil && body.principal.hasPrefix("host:")),
+                      seen.insert(body.recordId).inserted, bodies[body.recordId].map({ $0 == json }) ?? true else {
+                    throw RemoteControlPublicationError.invalidCheckpoint
+                }
+                bodies[body.recordId] = json
+            }
+        }
+        for (body, record) in zip(barrier.records, barrier.signedRecords) {
+            try checkRecord(record, bodyJSON: body)
+        }
     }
 
     private func checkRecord(_ record: String, bodyJSON: String) throws {
@@ -167,6 +228,166 @@ public final class RemoteControlSigningJournal {
         return result
     }
 
+    /// Called under the member-key lock with every outbox from the locked account.
+    /// Only the trusted collector may supply the Station's authenticated review and challenge.
+    /// The hold is durable before the SDK signing request leaves the journal.
+    func holdForReport(context: RemoteControlRecoveryContext, challengeJSON: String, log: MembershipLog,
+                       slot: String, nowMs: UInt64, outboxes: [RemoteControlPublication],
+                       recoveryCopies: [RemoteControlRecoveryPublication]) throws -> SignRequest {
+        try context.validate()
+        let origin = context.stationOrigin
+        guard !operating, context.accountID == saved.account, context.genesisHash == saved.genesis,
+              log.accountId() == saved.account, log.genesisHash() == saved.genesis,
+              log.head() == context.membershipHead, log.member(deviceId: saved.member)?.authKey == key else {
+            throw RemoteControlPublicationError.requiresReview
+        }
+        let challenge = try parseSignerReportChallenge(challengeJson: challengeJSON)
+        guard challenge.recovery == context.signerReportRecovery else { throw RemoteControlPublicationError.requiresReview }
+        let evidence = try inventory(stationOrigin: origin, outboxes: outboxes, recoveryCopies: recoveryCopies)
+        guard evidence.missingSignatureBodies.isEmpty else { throw RemoteControlPublicationError.requiresReview }
+        let records = evidence.reportRecordBodies, drafts = evidence.reportDraftBodies
+        if let prior = saved.barriers?[origin] {
+            // Never replace a different plan using a caller-supplied generation,
+            // or mistake a restored outbox for the disappearance of a frozen draft.
+            if let successor = prior.supersededBy {
+                guard context.generation >= successor.generation,
+                      context.generation != successor.generation ||
+                        (context.planID == successor.planID && context.candidateFeedID == successor.candidateFeedID &&
+                         context.sourceHash == successor.sourceHash) else {
+                    throw RemoteControlPublicationError.requiresReview
+                }
+            } else {
+                guard prior.context.planID == context.planID, prior.context.generation == context.generation,
+                      prior.context.candidateFeedID == context.candidateFeedID, prior.context.sourceHash == context.sourceHash,
+                      prior.records == records, prior.drafts == drafts else { throw RemoteControlPublicationError.requiresReview }
+                if prior.context == context, prior.slot == slot, prior.challengeJSON == challengeJSON {
+                    return try prior.request(log: log, id: id, since: saved.since, member: saved.member, nowMs: nowMs).signRequest()
+                }
+            }
+        }
+        guard saved.revision < 9_007_199_254_740_991,
+              saved.barriers?[origin] != nil || (saved.barriers?.count ?? 0) < 64 else {
+            throw RemoteControlPublicationError.full
+        }
+        let revision = saved.revision + 1
+        let barrier = Barrier(context: context, revision: revision, records: records, drafts: drafts,
+            signedRecords: evidence.signedRecords, challengeJSON: challengeJSON, slot: slot)
+        // Reject malformed, expired or unauthorized requests before acquiring a hold.
+        _ = try barrier.request(log: log, id: id, since: saved.since, member: saved.member, nowMs: nowMs)
+        operating = true
+        defer { operating = false }
+        var next = saved
+        next.version = 2
+        next.revision = revision
+        next.barriers = (next.barriers ?? [:]).merging([origin: barrier]) { _, new in new }
+        try write(next)
+        guard let committed = saved.barriers?[origin] else { throw RemoteControlPublicationError.storageUncertain }
+        return try committed.request(log: log, id: id, since: saved.since, member: saved.member, nowMs: nowMs).signRequest()
+    }
+
+    /// The trusted owner-confirmation adapter supplies a one-shot signature of the
+    /// exact reviewed request. No signed bytes leave before exposure is durable.
+    func finishReport(context: RemoteControlRecoveryContext, reviewed: SignRequest, log: MembershipLog,
+                      nowMs: () -> UInt64, current: () -> Bool,
+                      sign: (SignRequest) throws -> Data) throws -> (report: String, records: [String]) {
+        guard !operating else { throw RemoteControlPublicationError.busy }
+        operating = true
+        defer { operating = false }
+        try checkStorage()
+        guard current(), let barrier = saved.barriers?[context.stationOrigin], barrier.context == context, barrier.supersededBy == nil,
+              context.accountID == log.accountId(), context.genesisHash == log.genesisHash(),
+              context.membershipHead == log.head(), log.member(deviceId: saved.member)?.authKey == key else {
+            throw RemoteControlPublicationError.requiresReview
+        }
+        let request = try barrier.request(log: log, id: id, since: saved.since, member: saved.member, nowMs: nowMs())
+        guard request.signRequest() == reviewed else { throw RemoteControlPublicationError.requiresReview }
+        let report: String
+        if let exposed = barrier.exposedReport { report = exposed }
+        else { report = try request.finish(signature: sign(reviewed)) }
+        let checked = try verifySignerReport(log: log, reportJson: report, expectedChallengeJson: barrier.challengeJSON,
+            exportedRecordsJson: barrier.signedRecords, nowMs: nowMs())
+        guard current(), log.head() == context.membershipHead, checked.journal.revision == barrier.revision,
+              try signedObjectInfo(json: report).bodyJcs == request.bodyJson() else {
+            throw RemoteControlPublicationError.requiresReview
+        }
+        try checkStorage()
+        if barrier.exposedReport == nil {
+            var next = saved
+            guard next.revision < 9_007_199_254_740_991 else { throw RemoteControlPublicationError.full }
+            next.revision += 1
+            next.barriers?[context.stationOrigin]?.exposedReport = report
+            try write(next)
+        }
+        guard current(), log.frozen() == nil, log.head() == context.membershipHead,
+              nowMs() < (try parseSignerReportChallenge(challengeJson: barrier.challengeJSON)).expiresAt else {
+            throw RemoteControlPublicationError.requiresReview
+        }
+        return (report, barrier.signedRecords)
+    }
+
+    /// Only the HTTPS transport can attest the origin of the prepared successor.
+    /// Keep the successor as a generation floor and retain all frozen signatures,
+    /// including those that came only from an outbox at the time of the report.
+    public func reconcileSupersedingPlan(_ review: RemoteControlRecoveryPreparation) throws {
+        guard !operating else { throw RemoteControlPublicationError.busy }
+        try checkStorage()
+        let successor = review.context, origin = successor.stationOrigin
+        guard var barrier = saved.barriers?[origin], barrier.supersededBy == nil else { return }
+        guard review.receivedFromStation, successor.accountID == saved.account, successor.genesisHash == saved.genesis,
+              successor.generation > barrier.context.generation, successor.planID != barrier.context.planID else { return }
+        operating = true
+        defer { operating = false }
+        var next = saved
+        var increments: UInt64 = 1
+        for (json, record) in zip(barrier.records, barrier.signedRecords) {
+            let id = try checkedBody(json).recordId
+            if let prior = next.entries[id] {
+                guard prior.body == json else { throw RemoteControlPublicationError.requiresReview }
+                if prior.record != nil { continue }
+                increments += 1
+            } else { increments += 2 }
+            next.entries[id] = Entry(body: json, record: record)
+        }
+        guard next.entries.count <= 4096, next.revision <= 9_007_199_254_740_991 - increments else {
+            throw RemoteControlPublicationError.full
+        }
+        barrier.supersededBy = successor
+        next.barriers?[origin] = barrier
+        next.revision += increments
+        try write(next)
+    }
+
+    /// Holds the interprocess lock through draft creation or cancellation.
+    /// A service stop names one Station. A host interrupt may reach any of them.
+    func withPermittedStopChange<T>(origin: String?, _ change: () throws -> T) throws -> T {
+        try requireStopChange(origin: origin)
+        operating = true
+        defer { operating = false }
+        return try change()
+    }
+
+    public func requireStopChange(bodyJSON: String) throws {
+        try requireStopChange(origin: checkedBody(bodyJSON).origin)
+    }
+
+    func requireStopChange(origin: String?) throws {
+        guard !operating else { throw RemoteControlPublicationError.busy }
+        try checkStorage()
+        try requirePermitted(origin: origin)
+    }
+
+    private func requirePermitted(origin: String?) throws {
+        guard let barriers = saved.barriers else { return }
+        if let origin {
+            if let barrier = barriers[origin], barrier.supersededBy == nil {
+                throw RemoteControlRecoveryHold(context: barrier.context)
+            }
+        } else if let station = barriers.keys.sorted().first(where: { barriers[$0]?.supersededBy == nil }),
+                  let barrier = barriers[station] {
+            throw RemoteControlRecoveryHold(context: barrier.context)
+        }
+    }
+
     enum SigningEvidence {
         case untouched
         case attempted
@@ -195,6 +416,7 @@ public final class RemoteControlSigningJournal {
             guard entry.body == bodyJSON else { throw RemoteControlPublicationError.requiresReview }
             if let record = entry.record { return record }
         }
+        try requirePermitted(origin: body.origin)
         // Commit each attempt before invoking the key, including an exact retry.
         try append(id: body.recordId, entry: Entry(body: bodyJSON))
         let record = try makeRecord()
