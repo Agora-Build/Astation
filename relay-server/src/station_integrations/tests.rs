@@ -344,6 +344,61 @@ pub(super) async fn signed_action(runtime: &StationIntegrations, f: &Fixture, ac
     append_body(runtime, f, body).await;
 }
 
+#[cfg(feature = "delegated-host-work")]
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_recovery_review_worker_retains_same_cursor_binding_changes_and_shares_poll_budget() {
+    use crate::remote_api::recovery::delegated_recovery::{inspect, Binding};
+
+    let db = crate::test_database::TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 6).await;
+    let mut portal = crate::integration_portal::tests::Fixture::new().await;
+    let origin = "https://station-dev.agora.build";
+    portal.binding.station_origin = origin.into();
+    let mut app = crate::tests::test_state();
+    app.recovery = RecoveryStore::postgres(db.pool.clone());
+    assert!(!app.recovery.collects_portal_checkpoint(origin));
+    Binding::new(origin, 2).unwrap().initialize(&db.pool, true).await.unwrap();
+    app.recovery.configure_recovery_review(origin, 2).await.unwrap();
+    assert!(!app.recovery.collects_portal_checkpoint("https://station.agora.build"));
+    let runtime = StationIntegrations::new(app, portal.binding.clone(),
+        ServiceKeyVault::new(&[42; 32], "operator-test").unwrap(), portal.key.take().unwrap()).unwrap();
+    let mut snapshot = json!({"changes":[], "cursor":0, "checkpoint":{
+        "at":"2026-11-23T00:00:00.000Z", "integrations":[], "accounts":{"complete":true,"disabled":[]},
+        "bindings":[{"account":OWNER,"accountId":"acct","genesisHash":"a".repeat(64),
+            "bindingId":"bind-1","version":1,"bindingState":"bound"}]}});
+    let replica = PolicyStore(db.reconnect(2).await);
+    for version in [1, 2] {
+        snapshot["checkpoint"]["bindings"][0]["version"] = json!(version);
+        *portal.shared.checkpoint.lock().await = Some(snapshot.clone());
+        if version == 2 {
+            // Advance only the shared pacing deadlines, retaining every policy row.
+            sqlx::query("UPDATE station_integration_feed_poll SET not_before=clock_timestamp(),checkpoint_not_before=clock_timestamp()")
+                .execute(&db.pool).await.unwrap();
+        }
+        let worker = tokio::spawn(runtime.clone().run());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = replica.load(&runtime.binding).await.unwrap();
+                if let Some(source) = state.portal_snapshot {
+                    if source.bindings.unwrap()[0].version == version {
+                        assert_eq!(state.cursor, 0);
+                        assert_eq!(state.portal_snapshot_revision, Some(state.revision));
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert!(!replica.claim_checkpoint_poll(&runtime.binding).await.unwrap());
+        worker.abort();
+        let _ = worker.await;
+    }
+    assert!(!runtime.app.recovery.delegated_enabled());
+    assert!(!inspect(&db.pool, origin).await.unwrap().unwrap().ready);
+    replica.0.close().await;
+    db.cleanup().await;
+}
+
 pub(super) async fn append_body(runtime: &StationIntegrations, f: &Fixture, body: Value) {
     use atem_client::{membership::Entry, signed::SignedObject};
     let log = runtime.recovery_log(&f.log.genesis_hash().to_hex(), OWNER).await.unwrap();
