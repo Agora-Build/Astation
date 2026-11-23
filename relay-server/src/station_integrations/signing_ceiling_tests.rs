@@ -284,6 +284,166 @@ async fn postgres_delegated_regressed_signing_store_cannot_hide_retained_service
         review["service_clock_evidence"]["reservations"][0]["highest_ms"],
         0
     );
+    // A different registered key's reservation cannot cover this signature.
+    let store = recovery.signing_ceilings.get().unwrap();
+    let other_key = "f".repeat(64);
+    let service = format!("svc-{ID}");
+    store
+        .register_new_key(fixture.log.account_id(), &genesis, &service, &other_key)
+        .await
+        .unwrap();
+    store
+        .reserve(
+            fixture.log.account_id(),
+            &genesis,
+            &service,
+            &other_key,
+            0,
+            last..=last,
+        )
+        .await
+        .unwrap();
+    let wrong_key = plan::prepare_with_sources(&primary.pool, &fence, &genesis, Some(store), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        wrong_key["service_clock_evidence"]["uncovered_service_signatures"][service],
+        last
+    );
+    drop(runtime);
+    primary.cleanup().await;
+    external.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires two independent local PostgreSQL clusters"]
+async fn postgres_delegated_restore_finds_revoked_service_missing_from_membership() {
+    use crate::integration_checkpoint::PortalCheckpoint;
+
+    let external = TestDatabase::new("SIGNING_TEST_DATABASE_URL", 2).await;
+    sqlx::raw_sql(include_str!("../../signing-store/schema.sql"))
+        .execute(&external.pool)
+        .await
+        .unwrap();
+    let (primary, runtime, fixture) =
+        fixture_with_ceiling_cluster("https://auth.example", Some(&external.pool)).await;
+    let genesis = fixture.log.genesis_hash().to_hex();
+    let account = fixture.log.account_id();
+    let origin = &runtime.binding.station_origin;
+    let recovery = &runtime.app.recovery;
+    recovery.configure_delegated(origin, 1).await.unwrap();
+    assert_eq!(
+        recovery
+            .delegated_operation(&genesis, PRINCIPAL, Command::Ensure)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let backup: Value =
+        sqlx::query_scalar("SELECT state FROM remote_recovery_roots WHERE genesis_hash=$1")
+            .bind(&genesis)
+            .fetch_one(&primary.pool)
+            .await
+            .unwrap();
+    let draft = runtime.prepare(ID, OWNER, request(&fixture)).await.unwrap();
+    append_body(
+        &runtime,
+        &fixture,
+        serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap(),
+    )
+    .await;
+    let fingerprint = draft["fingerprint"].as_str().unwrap();
+    policy(&runtime, "paused", fingerprint, None).await;
+    runtime.reconcile_delegated_service(ID).await.unwrap();
+    let ceiling = feed(&runtime, &genesis).await.last().unwrap()["body"]["issued_at"]
+        .as_u64()
+        .unwrap();
+    let store = recovery.signing_ceilings.get().unwrap();
+    let id = format!("svc-{ID}");
+    let orphan = "f".repeat(64);
+    store
+        .register_new_key(account, &genesis, &id, &orphan)
+        .await
+        .unwrap();
+    store
+        .register_new_key(account, &"0".repeat(64), "other-root", fingerprint)
+        .await
+        .unwrap();
+    store
+        .register_new_key("other-account", &genesis, "foreign", fingerprint)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE remote_recovery_roots SET state=$2 WHERE genesis_hash=$1")
+        .bind(&genesis)
+        .bind(&backup)
+        .execute(&primary.pool)
+        .await
+        .unwrap();
+    let fence = Binding::new(origin, 2).unwrap();
+    fence.initialize(&primary.pool, true).await.unwrap();
+
+    let prev = runtime.policies.load(&runtime.binding).await.unwrap();
+    let other = "i-99999999999999999999999999";
+    store
+        .register_new_key(account, &genesis, &format!("svc-{other}"), fingerprint)
+        .await
+        .unwrap();
+    let source = json!({"changes":[],"cursor":prev.cursor,"checkpoint":{"at":"2026-11-23T10:00:00.000Z","integrations":[{
+        "id":ID,"ownerAccount":OWNER,"state":"revoked","scopes":["agent.view"],"r9Svc":fingerprint,
+        "interruptRunning":true,"revokedAt":null,"expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10
+    },{
+        "id":other,"ownerAccount":"ab00000000000000000000000001","state":"ready","scopes":["agent.view"],
+        "r9Svc":fingerprint,"expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10
+    }]}});
+    let snapshot =
+        PortalCheckpoint::parse(&serde_json::to_vec(&source).unwrap(), &runtime.binding).unwrap();
+    let bound = prev.apply_checkpoint(snapshot, prev.received_at).unwrap();
+    runtime
+        .policies
+        .commit_for_recovery(&prev, &bound, Some(&fence))
+        .await
+        .unwrap();
+    let replica = primary.reconnect(2).await;
+    let review = || {
+        plan::prepare_with_sources(
+            &replica,
+            &fence,
+            &genesis,
+            Some(store),
+            Some(&runtime.binding),
+        )
+    };
+    let prepared = review().await.unwrap();
+    let portal = &prepared["portal_service_evidence"];
+    assert_eq!(portal["services"], json!([]));
+    let keys = portal["registrations_without_membership"]
+        .as_array()
+        .unwrap();
+    assert_eq!(keys.len(), 3);
+    let lost = keys
+        .iter()
+        .find(|k| k["service_id"] == id && k["key_fingerprint"] == fingerprint)
+        .unwrap();
+    assert_eq!(lost["service_id"], id);
+    assert_eq!(lost["highest_reserved_ms"], ceiling);
+    assert_eq!(lost["portal_observation"]["state"], "revoked");
+    assert_eq!(lost["portal_observation"]["interrupt_running"], true);
+    assert!(lost["portal_observation"]["revoked_at"].is_null());
+    let unused = keys
+        .iter()
+        .find(|k| k["key_fingerprint"] == orphan)
+        .unwrap();
+    assert_eq!(unused["highest_reserved_ms"], 0);
+    assert_eq!(unused["portal_observation"], json!({"status":"unresolved"}));
+    let foreign = keys
+        .iter()
+        .find(|k| k["service_id"] == format!("svc-{other}"))
+        .unwrap();
+    assert_eq!(
+        foreign["portal_observation"],
+        json!({"status":"unresolved"})
+    );
+    assert_eq!(prepared["recovery_ready"], false);
     drop(runtime);
     primary.cleanup().await;
     external.cleanup().await;

@@ -764,8 +764,16 @@ the configured issuer's account owner, integration ID and signed service key.
 The projection carries the lifecycle state, interruption choice, expiry and any
 known revocation time. Missing or mismatched rows stay unresolved. The recovery
 plan commits to this observation separately from its native signer reports.
-A missing checkpoint is reported as pending. Publication still needs to reconcile
-services absent from the restored membership and recheck current authority.
+When the independent signing database is configured, the same account and genesis
+reservation rows also drive the Portal comparison. Keys missing from the restored
+list appear in `registrations_without_membership`. Each row carries the highest
+reserved time and the Portal lifecycle observation for its exact owner, integration
+and public key. Zero can identify an unused registration from an interrupted
+enrollment. A key in this list requires membership reconciliation. A missing
+signing database leaves this field null. A retained service signature requires a
+ceiling for its exact key, even if another key registered for the same integration
+has reserved a higher time. A missing checkpoint is reported as pending.
+Publication must recheck current authority.
 
 ### Operator Steps
 

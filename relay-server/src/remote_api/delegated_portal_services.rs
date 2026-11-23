@@ -1,6 +1,7 @@
 //! Per-device-list observations from the report client's recovery-generation checkpoint.
 use super::{invalid, Binding};
 use crate::integration_feed::{FeedBinding, PolicyCheckpoint};
+use crate::service_signing_ceilings::Reservation;
 use atem_client::membership::{service_key_fingerprint, Action, MemberKind, Membership};
 use serde_json::{json, Value};
 use sqlx::PgConnection;
@@ -12,6 +13,7 @@ pub(super) async fn observe(
     portal: &FeedBinding,
     subject: &str,
     log: &Membership,
+    registrations: Option<&[Reservation]>,
 ) -> Result<Value, sqlx::Error> {
     if portal.station_origin != fence.origin {
         return Err(invalid());
@@ -49,6 +51,22 @@ pub(super) async fn observe(
         return Err(invalid());
     }
 
+    let observation = |id: &str, fingerprint: &str| {
+        let policy = id
+            .strip_prefix("svc-")
+            .and_then(|id| snapshot.integrations.get(id))
+            .filter(|row| {
+                row.policy.owner_account == *owner
+                    && row.policy.r9_svc.as_deref() == Some(fingerprint)
+            });
+        match policy {
+            Some(row) => json!({
+                "state":row.policy.state,"interrupt_running":row.policy.interrupt_running,
+                "revoked_at":row.revoked_at,"expires_at":row.policy.expires_at
+            }),
+            None => json!({"status":"unresolved"}),
+        }
+    };
     let mut services = BTreeMap::new();
     for entry in log.entries() {
         let member = match &entry.action {
@@ -59,25 +77,21 @@ pub(super) async fn observe(
             }
             _ => continue,
         };
-        let id = &member.device_id;
-        let observation = id
-            .strip_prefix("svc-")
-            .and_then(|id| snapshot.integrations.get(id))
-            .filter(|row| row.policy.owner_account == *owner);
         let fingerprint = service_key_fingerprint(&member.auth_key).map_err(|_| invalid())?;
-        let observation = match observation {
-            Some(row) if row.policy.r9_svc.as_deref() == Some(&fingerprint) => json!({
-                "state":row.policy.state,"interrupt_running":row.policy.interrupt_running,
-                "revoked_at":row.revoked_at,"expires_at":row.policy.expires_at
-            }),
-            _ => json!({"status":"unresolved"}),
-        };
-        services.insert((id.clone(), fingerprint), observation);
+        let observed = observation(&member.device_id, &fingerprint);
+        services.insert((member.device_id.clone(), fingerprint), observed);
     }
+    // A registration may outlive an enrollment or its failed provisioning transaction.
+    // Keep such keys outside signed membership, including unused registrations.
+    let unmatched = registrations.map(|rows| rows.iter().filter(|row|
+        !services.contains_key(&(row.service_id.clone(), row.key_hash.clone())))
+        .map(|row| json!({"service_id":row.service_id,"key_fingerprint":row.key_hash,
+            "highest_reserved_ms":row.highest_ms,"portal_observation":observation(&row.service_id,&row.key_hash)}))
+        .collect::<Vec<_>>());
     Ok(
         json!({"status":"observed","binding":portal,"cursor":snapshot.cursor,"at":snapshot.at,
         "generation":fence.generation.to_string(),"account_id":log.account_id(),"genesis_hash":log.genesis_hash().to_hex(),
-        "membership_head":log.head().to_json(),
+        "membership_head":log.head().to_json(),"registrations_without_membership":unmatched,
         "services":services.into_iter().map(|((id,key),observation)| json!({
             "service_id":id,"key_fingerprint":key,"observation":observation
         })).collect::<Vec<_>>()}),

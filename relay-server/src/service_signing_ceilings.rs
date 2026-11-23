@@ -124,8 +124,8 @@ impl SigningCeilings {
         Ok(())
     }
 
-    pub(crate) async fn recovery_evidence(
-        &self,
+    pub(crate) fn recovery_evidence(
+        reservations: &[Reservation],
         log: &atem_client::membership::Membership,
         plan: &serde_json::Value,
     ) -> Result<serde_json::Value, ()> {
@@ -134,9 +134,6 @@ impl SigningCeilings {
             membership::{Action, MemberKind},
         };
         use std::collections::BTreeSet;
-        let reservations = self
-            .reservations(log.account_id(), &log.genesis_hash().to_hex())
-            .await?;
         let registered: BTreeSet<_> = reservations
             .iter()
             .map(|row| (row.service_id.as_str(), row.key_hash.as_str()))
@@ -156,28 +153,39 @@ impl SigningCeilings {
                 }
             }
         }
-        let mut observed = std::collections::BTreeMap::<&str, u64>::new();
+        let signed: std::collections::BTreeMap<_, _> = reservations
+            .iter()
+            .filter(|row| row.highest_ms > 0)
+            .map(|row| {
+                (
+                    (row.service_id.as_str(), row.key_hash.as_str()),
+                    row.highest_ms as u64,
+                )
+            })
+            .collect();
+        let mut uncovered = std::collections::BTreeMap::<&str, u64>::new();
         for record in plan["known_history"]["records"].as_array().ok_or(())? {
             let principal = record["principal"].as_str().ok_or(())?;
             if record["signer"] == principal && record["verification"] == "valid" {
                 if let Some(service) = principal.strip_prefix("service:") {
-                    let floor = observed.entry(service).or_default();
-                    *floor = (*floor).max(record["issued_at"].as_u64().ok_or(())?);
+                    let key = record["principal_key"].as_str().ok_or(())?;
+                    let time = record["issued_at"].as_u64().ok_or(())?;
+                    if signed
+                        .get(&(service, key))
+                        .is_none_or(|ceiling| *ceiling < time)
+                    {
+                        let floor = uncovered.entry(service).or_default();
+                        *floor = (*floor).max(time);
+                    }
                 }
             }
         }
-        let signed: std::collections::BTreeMap<_, _> = reservations
-            .iter()
-            .filter(|r| r.highest_ms > 0)
-            .map(|r| (r.service_id.as_str(), r.highest_ms as u64))
-            .collect();
-        observed.retain(|service, time| signed.get(service).is_none_or(|ceiling| ceiling < time));
         // Preserve even registrations absent from restored membership. The
         // publisher must reread these observations under the recovery fence.
         Ok(
             serde_json::json!({"plan_id": plan["plan_id"], "source_hash": plan["source_hash"],
             "reconstruction_hash": plan["reconstruction_hash"], "reservations": reservations,
-            "unregistered_membership_keys": missing, "uncovered_service_signatures": observed}),
+            "unregistered_membership_keys": missing, "uncovered_service_signatures": uncovered}),
         )
     }
 
