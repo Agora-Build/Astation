@@ -831,7 +831,9 @@ When the operator configures the Station service wrapping key, `protected_servic
 reports the public fingerprint derived from each authenticated envelope. A key saved
 before the provisioning fingerprint is `pending`. An established fingerprint can
 be `matched` or `mismatch`. An absent envelope is `missing`, and one the Station
-cannot authenticate is `unreadable`. Preparing a review leaves the provisioning
+cannot authenticate is `unreadable`. With the independent signing database configured,
+each authenticated key carries its exact reservation or a missing-registration
+observation. A registered ceiling of zero records an unused key. Preparing a review leaves the provisioning
 record and enrollment as they were. The protected-key observation is omitted when
 the wrapping key is unconfigured. These entries require reconciliation before
 publication. If the Portal alone identifies a

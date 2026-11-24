@@ -132,6 +132,11 @@ pub(super) async fn observe(
     let mut authenticated_keys = BTreeSet::new();
     let mut protected = Vec::new();
     let mut pending = Vec::new();
+    let ceilings = registrations.map(|rows| {
+        rows.iter()
+            .map(|r| ((r.service_id.as_str(), r.key_hash.as_str()), r.highest_ms))
+            .collect::<BTreeMap<_, _>>()
+    });
     for (id, stored, key, sealed) in provisions {
         let context: ServiceKeyContext = serde_json::from_str(&stored).map_err(|_| invalid())?;
         if !crate::integration_feed::client_id(&id, "i-")
@@ -154,6 +159,13 @@ pub(super) async fn observe(
                     Ok(fingerprint) => {
                         row["key_fingerprint"] = json!(fingerprint);
                         row["portal_observation"] = observation(&context.service_id, &fingerprint);
+                        if let Some(ceilings) = &ceilings {
+                            let identity = (context.service_id.as_str(), fingerprint.as_str());
+                            row["signing_reservation"] = match ceilings.get(&identity) {
+                                Some(ms) => json!({"highest_reserved_ms":ms}),
+                                None => json!({"status":"missing"}),
+                            };
+                        }
                         let status = match &key {
                             None => "pending",
                             Some(expected) if expected == &fingerprint => "matched",

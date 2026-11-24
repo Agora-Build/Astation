@@ -481,6 +481,8 @@ async fn postgres_delegated_restore_finds_revoked_service_missing_from_membershi
     assert_eq!(provisioned[0]["portal_observation"]["interrupt_running"], true);
     assert_eq!(portal["portal_keys_without_attribution"], json!([]));
     assert_eq!(portal["services"], json!([]));
+    assert_eq!(portal["protected_service_keys"][0]["signing_reservation"],
+        json!({"highest_reserved_ms":ceiling}));
     let keys = portal["registrations_without_membership"]
         .as_array()
         .unwrap();
@@ -512,9 +514,11 @@ async fn postgres_delegated_restore_finds_revoked_service_missing_from_membershi
 
     // The Portal may be the only surviving source after both restores. Its
     // owner has multiple R9 lists; the row establishes no signing authority.
-    sqlx::query("DELETE FROM station_service_signing_ceilings WHERE account_id=$1 AND genesis_hash=$2")
-        .bind(account).bind(&genesis).execute(&external.pool).await.unwrap();
+    sqlx::query("DELETE FROM station_service_signing_ceilings WHERE account_id=$1 AND genesis_hash=$2 AND key_hash=$3")
+        .bind(account).bind(&genesis).bind(fingerprint).execute(&external.pool).await.unwrap();
     let saved = review().await.unwrap();
+    assert_eq!(saved["portal_service_evidence"]["protected_service_keys"][0]["signing_reservation"],
+        json!({"status":"missing"}), "the same service's other key cannot supply its reservation");
     assert_eq!(saved["portal_service_evidence"]["provisioned_without_membership"].as_array().unwrap(), provisioned);
     sqlx::query("DELETE FROM station_integration_provisioning WHERE integration_id=$1")
         .bind(ID).execute(&primary.pool).await.unwrap();
