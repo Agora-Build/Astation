@@ -81,6 +81,7 @@ pub(super) fn recovery_record_review(record: &ControlRecord, log: &Membership) -
     serde_json::json!({
         "record_id": record.record_id(),
         "principal": record.principal().name(),
+        "principal_key": record.body().principal_key.map(|key| key.to_hex()),
         "signer": record.signer().name(record.principal()),
         "action": record.action().name(),
         "interrupt_running": matches!(record.action(), ControlAction::Revoke { interrupt_running: true } | ControlAction::InterruptRunning { .. }),

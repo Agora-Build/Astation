@@ -82,14 +82,19 @@ pub(crate) async fn prepare_with_sources(
     let mut tx = pool.begin().await?;
     let (prepared, log, mut report) = checkpoint(&mut tx, binding, genesis, true).await?;
     review_evidence(&mut tx, &prepared, &log, binding, &mut report, true).await?;
-    if let Some(ceilings) = ceilings {
-        let evidence = ceilings.recovery_evidence(&log, &report).await.map_err(|_| invalid())?;
+    let reservations = match ceilings {
+        Some(store) => Some(store.reservations(log.account_id(), genesis).await.map_err(|_| invalid())?),
+        None => None,
+    };
+    if let Some(rows) = reservations.as_deref() {
+        let evidence = crate::service_signing_ceilings::SigningCeilings::recovery_evidence(rows, &log, &report)
+            .map_err(|_| invalid())?;
         report["service_clock_evidence_hash"] = source_hash(&evidence)?.into();
         report["service_clock_evidence"] = evidence;
     }
     if let Some(portal) = portal {
         let subject = prepared.retained["account_subject"].as_str().ok_or_else(invalid)?;
-        let source = portal_services::observe(&mut tx, binding, portal, subject, &log).await?;
+        let source = portal_services::observe(&mut tx, binding, portal, subject, &log, reservations.as_deref()).await?;
         report["portal_service_evidence_hash"] = source_hash(&json!({
             "plan_id": prepared.plan_id, "reconstruction_hash": report["reconstruction_hash"],
             "source": source,
