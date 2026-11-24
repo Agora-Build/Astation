@@ -90,17 +90,28 @@ pub(super) async fn observe(
         });
         services.insert((member.device_id.clone(), key), active);
     }
-    let ids: Vec<_> = services
+    // A restore may predate every membership entry for a service the Portal
+    // still reports. The owner can have more than one R9 genesis.
+    let portal_keys: BTreeSet<_> = snapshot
+        .integrations
+        .iter()
+        .filter(|(_, row)| row.policy.owner_account == *owner)
+        .filter_map(|(id, row)| Some((format!("svc-{id}"), row.policy.r9_svc.clone()?)))
+        .collect();
+    let ids: BTreeSet<_> = services
         .keys()
+        .chain(portal_keys.iter())
         .filter_map(|(id, _)| id.strip_prefix("svc-"))
         .collect();
+    let ids: Vec<_> = ids.into_iter().collect();
     let genesis = log.genesis_hash().to_hex();
     let provisions: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT integration_id,context,fingerprint FROM station_integration_provisioning
-         WHERE binding=$1 AND integration_id=ANY($2) AND fingerprint IS NOT NULL AND octet_length(context)<=4096")
+         WHERE binding=$1 AND integration_id=ANY($2) AND octet_length(fingerprint)=64 AND octet_length(context)<=4096")
         .bind(portal.storage_key().map_err(|_| invalid())?).bind(&ids)
         .fetch_all(&mut *connection).await?;
     let mut managed_keys = BTreeSet::new();
+    let mut attributed_keys: BTreeSet<_> = services.keys().cloned().collect();
     for (id, stored, key) in provisions {
         let Ok(context) = serde_json::from_str::<ServiceKeyContext>(&stored) else {
             continue;
@@ -109,10 +120,13 @@ pub(super) async fn observe(
             && context.station_origin == fence.origin
             && context.owner == *owner
             && context.genesis == genesis
+            && super::super::canonical_genesis(&key)
             && context.integration_id == id
             && context.service_id == format!("svc-{id}")
         {
-            managed_keys.insert((context.service_id, key));
+            let identity = (context.service_id, key);
+            attributed_keys.insert(identity.clone());
+            managed_keys.insert(identity);
         }
     }
     let stops = ServiceStops::from_review(review)?;
@@ -137,6 +151,12 @@ pub(super) async fn observe(
 
     // A registration may outlive an enrollment or its failed provisioning transaction.
     // Keep such keys outside signed membership, including unused registrations.
+    if let Some(rows) = registrations {
+        attributed_keys.extend(
+            rows.iter()
+                .map(|r| (r.service_id.clone(), r.key_hash.clone())),
+        );
+    }
     let unmatched = registrations.map(|rows| rows.iter().filter(|row|
         !services.contains_key(&(row.service_id.clone(), row.key_hash.clone())))
         .map(|row| json!({"service_id":row.service_id,"key_fingerprint":row.key_hash,
@@ -151,16 +171,36 @@ pub(super) async fn observe(
     {
         let id = row["service_id"].as_str().ok_or_else(invalid)?;
         let key = row["key_fingerprint"].as_str().ok_or_else(invalid)?;
-        if !services.contains_key(&(id.to_owned(), key.to_owned())) {
+        let identity = (id.to_owned(), key.to_owned());
+        attributed_keys.insert(identity.clone());
+        if !services.contains_key(&identity) {
             historical.push(json!({"service_id":id,"key_fingerprint":key,
                 "highest_signed_ms":row["highest_signed_ms"],"portal_observation":observation(id,key)}));
         }
     }
+    let provisioned: Vec<_> = managed_keys
+        .iter()
+        .filter(|identity| !services.contains_key(*identity))
+        .map(|(id, key)| {
+            json!({"service_id":id,"key_fingerprint":key,
+            "portal_observation":observation(id,key)})
+        })
+        .collect();
+    // Portal identifies the Agora.Build owner but does not identify an R9
+    // genesis for a service. Keep these out of this list's signing inputs.
+    let unattributed: Vec<_> = portal_keys
+        .difference(&attributed_keys)
+        .map(|(id, key)| {
+            json!({"service_id":id,"key_fingerprint":key,
+            "portal_observation":observation(id,key)})
+        })
+        .collect();
     Ok(
         json!({"status":"observed","binding":portal,"cursor":snapshot.cursor,"at":snapshot.at,
         "generation":fence.generation.to_string(),"account_id":log.account_id(),"genesis_hash":genesis,
         "membership_head":log.head().to_json(),"registrations_without_membership":unmatched,
-        "prior_membership_keys":historical,"services":rows}),
+        "prior_membership_keys":historical,"provisioned_without_membership":provisioned,
+        "portal_keys_without_attribution":unattributed,"services":rows}),
     )
 }
 
@@ -237,7 +277,9 @@ impl ServiceStops {
                 Some(ServiceDesired::Revoked { interrupt_running }) if !self.own_revoke => {
                     json!([{"action":"revoke","interrupt_running":interrupt_running}])
                 }
-                Some(ServiceDesired::Revoked { interrupt_running: true }) if !self.own_interrupt => {
+                Some(ServiceDesired::Revoked {
+                    interrupt_running: true,
+                }) if !self.own_interrupt => {
                     json!([{"action":"interrupt_running"}])
                 }
                 _ => json!([]),

@@ -475,6 +475,11 @@ async fn postgres_delegated_restore_finds_revoked_service_missing_from_membershi
     };
     let prepared = review().await.unwrap();
     let portal = &prepared["portal_service_evidence"];
+    let provisioned = portal["provisioned_without_membership"].as_array().unwrap();
+    assert_eq!(provisioned.len(), 1);
+    assert_eq!(provisioned[0]["key_fingerprint"], fingerprint);
+    assert_eq!(provisioned[0]["portal_observation"]["interrupt_running"], true);
+    assert_eq!(portal["portal_keys_without_attribution"], json!([]));
     assert_eq!(portal["services"], json!([]));
     let keys = portal["registrations_without_membership"]
         .as_array()
@@ -504,6 +509,27 @@ async fn postgres_delegated_restore_finds_revoked_service_missing_from_membershi
         json!({"status":"unresolved"})
     );
     assert_eq!(prepared["recovery_ready"], false);
+
+    // The Portal may be the only surviving source after both restores. Its
+    // owner has multiple R9 lists; the row establishes no signing authority.
+    sqlx::query("DELETE FROM station_service_signing_ceilings WHERE account_id=$1 AND genesis_hash=$2")
+        .bind(account).bind(&genesis).execute(&external.pool).await.unwrap();
+    let saved = review().await.unwrap();
+    assert_eq!(saved["portal_service_evidence"]["provisioned_without_membership"].as_array().unwrap(), provisioned);
+    sqlx::query("DELETE FROM station_integration_provisioning WHERE integration_id=$1")
+        .bind(ID).execute(&primary.pool).await.unwrap();
+    let unassigned = review().await.unwrap();
+    let source = &unassigned["portal_service_evidence"];
+    assert_eq!(source["services"], json!([]));
+    assert_eq!(source["provisioned_without_membership"], json!([]));
+    let keys = source["portal_keys_without_attribution"].as_array().unwrap();
+    assert_eq!(keys.len(), 1, "the other Agora.Build owner's row stays private");
+    assert_eq!(keys[0]["service_id"], id);
+    assert_eq!(keys[0]["portal_observation"]["state"], "revoked");
+    assert_eq!(keys[0]["portal_observation"]["interrupt_running"], true);
+    assert!(keys[0].get("snapshot_review").is_none());
+    assert_ne!(saved["portal_service_evidence_hash"], unassigned["portal_service_evidence_hash"]);
+    assert_eq!(unassigned["recovery_ready"], false);
     drop(runtime);
     primary.cleanup().await;
     external.cleanup().await;
