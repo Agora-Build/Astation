@@ -586,7 +586,7 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
     let other_app = make_app(other_store);
     let base = format!("/api/remote/v1/logs/{genesis}/control/recovery");
     let report_path = format!("{base}/signer-reports");
-    let make_submission = async |signer: &str, key: &str, revision: u64, source: &Value| {
+    let make_submission = async |signer: &str, key: &str, revision: u64, drafts: Vec<String>, source: &Value| {
         let slot = "native";
         let mint = json!({"signer":signer,"slot":slot,"expected":f.log.head().to_json(),
             "recovery":{"generation":"1","plan_id":initial["plan_id"],"candidate_feed_id":initial["candidate_feed_id"],
@@ -595,25 +595,25 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
             mint.to_string().into_bytes()).await;
         assert_eq!(status, StatusCode::OK, "{challenge}");
         let challenge = SignerReportChallenge::parse(challenge.to_string().as_bytes()).unwrap();
-        let journal = JournalView { id: [1; 16], since: 1, revision, records: vec![], drafts: vec![] };
+        let journal = JournalView { id: [1; 16], since: 1, revision, records: vec![], drafts };
         let body = signer_report_body(&f.log, &challenge, signer, slot, ORIGIN, &journal, challenge.issued_at()).unwrap();
         let report = sign_signer_report(&f.keys, &KeyId::new(key), &body).unwrap();
         json!({"report":report.to_json(),"records":[]}).to_string().into_bytes()
     };
     let former = "member:phone";
     let active = "member:replacement-manager";
-    let initial_submission = make_submission(former, "manager", 1, &initial["evidence_hash"]).await;
+    let initial_submission = make_submission(former, "manager", 1, vec![], &initial["evidence_hash"]).await;
     let original_receipt = post_recovery(&app, &report_path, Some("alice"), initial_submission.clone()).await;
     assert_eq!(original_receipt.0, StatusCode::OK);
     let first = plan::prepare(&replica, &binding, &genesis).await.unwrap();
-    let second = make_submission(active, "replacement-manager", 1, &first["evidence_hash"]).await;
+    let second = make_submission(active, "replacement-manager", 1, vec![], &first["evidence_hash"]).await;
     assert_eq!(post_recovery(&app, &report_path, Some("alice"), second).await.0, StatusCode::OK);
 
     let cut = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
     assert_ne!(cut["evidence_hash"], first["evidence_hash"]);
     let hash = &cut["evidence_hash"];
-    let a = make_submission(former, "manager", 1, hash).await;
-    let b = make_submission(active, "replacement-manager", 1, hash).await;
+    let a = make_submission(former, "manager", 1, vec![], hash).await;
+    let b = make_submission(active, "replacement-manager", 1, vec![], hash).await;
     let (a, b) = tokio::join!(post_recovery(&app, &report_path, Some("alice"), a),
         post_recovery(&other_app, &report_path, Some("alice"), b));
     assert_eq!((a.0, b.0), (StatusCode::OK, StatusCode::OK));
@@ -640,7 +640,7 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
     // A new revision represents new evidence. An old receipt cannot confirm it.
     // A fresh challenge is needed even if a previous one is still inside its lease.
     sqlx::query("DELETE FROM station_delegated_signer_challenges").execute(&resumed).await.unwrap();
-    let changed = make_submission(active, "replacement-manager", 2, hash).await;
+    let changed = make_submission(active, "replacement-manager", 2, vec![], hash).await;
     assert_eq!(post_recovery(&app, &report_path, Some("alice"), changed).await.0, StatusCode::OK);
     assert_eq!(post_recovery(&app, &report_path, Some("alice"), initial_submission).await, original_receipt);
     assert!(compare(&roster).await.is_err());
@@ -651,6 +651,24 @@ async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() 
     let result = compare(&roster).await.unwrap();
     assert_eq!(result["matching_evidence_confirmations"], json!([]));
     assert_eq!(result["reviewed_without_current_confirmation"].as_array().unwrap().len(), 2);
+    // A contradictory inventory is retained as evidence even if the process
+    // re-attests it at the latest evidence hash. A replica reconstructs the conflict.
+    let mut draft = root["delegated"][ORIGIN]["records"][1]["body"].clone();
+    draft["signer"] = json!(active);
+    let divergent = make_submission(active, "replacement-manager", 2, vec![draft.to_string()],
+        &latest["evidence_hash"]).await;
+    assert_eq!(post_recovery(&other_app, &report_path, Some("alice"), divergent).await.0, StatusCode::OK);
+    let fork = plan::prepare(&resumed, &binding, &genesis).await.unwrap();
+    let gaps = fork["known_authors"]["journal_gaps"].as_array().unwrap();
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0]["signer"], active);
+    assert_eq!(gaps[0]["reasons"], json!(["conflicting_revision_contents","held_inventory_changed"]));
+    let confirm_fork = make_submission(active, "replacement-manager", 2, vec![draft.to_string()],
+        &fork["evidence_hash"]).await;
+    assert_eq!(post_recovery(&app, &report_path, Some("alice"), confirm_fork).await.0, StatusCode::OK);
+    let after = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
+    assert_eq!(after["evidence_hash"], fork["evidence_hash"]);
+    assert_eq!(after["known_authors"]["journal_gaps"], fork["known_authors"]["journal_gaps"]);
     assert_eq!(saved(&resumed, &genesis).await, root);
     assert!(!inspect(&resumed, ORIGIN).await.unwrap().unwrap().ready);
     database.cleanup().await;
