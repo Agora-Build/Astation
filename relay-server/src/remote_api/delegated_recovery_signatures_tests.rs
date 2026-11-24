@@ -834,3 +834,58 @@ async fn postgres_delegated_snapshot_stops_commit_exact_records_across_retry_and
     drop(store);
     database.cleanup().await;
 }
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_restore_preserves_carried_stops_and_their_old_feed_identity() {
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (store, f, genesis, binding) = retained(&database).await;
+    let value: Value = sqlx::query_scalar("SELECT state FROM remote_recovery_roots WHERE genesis_hash=$1")
+        .bind(&genesis).fetch_one(&database.pool).await.unwrap();
+    let mut root: Root = serde_json::from_value(value).unwrap();
+    let feed = root.delegated.get_mut(ORIGIN).unwrap();
+    let old_id = feed.feed_id.clone();
+    let hold = feed.records[0].clone();
+    let revoke = feed.records[1].clone();
+    let interrupt = record(&f, feed, &uuid::Uuid::new_v4().to_string(),
+        ControlAction::InterruptRunning { revoke_seq: None });
+    feed.publish(ORIGIN, &f.log, &interrupt, f.created, &[], f.created).unwrap();
+
+    // Restore the state a replacement feed keeps: both original signatures
+    // and the ledger survive; the old hold would need a fresh signature.
+    feed.feed_id = uuid::Uuid::new_v4().to_string();
+    feed.records.remove(0);
+    let review = feed.recovery_review(ORIGIN, &f.log).unwrap();
+    assert_eq!(review["records"].as_array().unwrap().len(), 2);
+    assert!(review["records"].as_array().unwrap().iter().all(|r| r["verification"] == "valid"));
+    assert!(feed.publish(ORIGIN, &f.log, &interrupt, f.created, &[], f.created).is_err());
+    feed.records.push(hold);
+    assert!(feed.recovery_review(ORIGIN, &f.log).is_err());
+    feed.records.pop();
+    let mut foreign = interrupt.body().clone();
+    foreign.record_id = uuid::Uuid::new_v4().to_string();
+    foreign.feed.as_mut().unwrap().origin = "https://other.example".into();
+    let signed = build_control(&f.keys, &KeyId::new("service"), &foreign).unwrap();
+    feed.records.push(signed.to_json());
+    assert!(feed.recovery_review(ORIGIN, &f.log).is_err());
+    feed.records.pop();
+
+    sqlx::query("UPDATE remote_recovery_roots SET state=$1 WHERE genesis_hash=$2")
+        .bind(serde_json::to_value(root).unwrap()).bind(&genesis).execute(&database.pool).await.unwrap();
+    binding.initialize(&database.pool, true).await.unwrap();
+    let replica = database.reconnect(2).await;
+    let prepared = prepare(&replica, &binding, &genesis).await.unwrap();
+    stage(&replica, &binding, &genesis, prepared["reconstruction_hash"].as_str().unwrap()).await.unwrap();
+    let actual: Value = sqlx::query_scalar("SELECT records FROM station_delegated_snapshot_stops")
+        .fetch_one(&database.pool).await.unwrap();
+    let records = actual.as_array().unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(records.contains(&revoke) && records.contains(&interrupt.object().to_json()));
+    // The signed records are the only surviving references to this earlier feed.
+    sqlx::query("UPDATE station_delegated_recovery_plans SET candidate_feed_id=$1 WHERE plan_id=$2")
+        .bind(old_id).bind(prepared["plan_id"].as_str().unwrap()).execute(&database.pool).await.unwrap();
+    assert!(prepare(&replica, &binding, &genesis).await.is_err());
+    replica.close().await;
+    drop(store);
+    database.cleanup().await;
+}
