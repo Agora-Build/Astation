@@ -629,6 +629,19 @@ pub(crate) enum ServiceDesired {
     Revoked { interrupt_running: bool },
 }
 
+impl ServiceDesired {
+    pub(crate) fn from_policy(policy: &crate::integration_feed::IntegrationPolicy) -> Option<Self> {
+        match policy.state.as_str() {
+            "provisioning" | "waiting_for_host" | "ready" => Some(Self::Active),
+            "paused" => Some(Self::Held),
+            "revoking" | "revoked" => Some(Self::Revoked {
+                interrupt_running: policy.interrupt_running.unwrap_or(false),
+            }),
+            _ => None,
+        }
+    }
+}
+
 impl super::RecoveryStore {
     pub(crate) async fn reconcile_service_in(
         &self,
