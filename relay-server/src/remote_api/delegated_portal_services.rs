@@ -98,37 +98,43 @@ pub(super) async fn observe(
         .filter(|(_, row)| row.policy.owner_account == *owner)
         .filter_map(|(id, row)| Some((format!("svc-{id}"), row.policy.r9_svc.clone()?)))
         .collect();
-    let ids: BTreeSet<_> = services
-        .keys()
-        .chain(portal_keys.iter())
-        .filter_map(|(id, _)| id.strip_prefix("svc-"))
-        .collect();
-    let ids: Vec<_> = ids.into_iter().collect();
     let genesis = log.genesis_hash().to_hex();
-    let provisions: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT integration_id,context,fingerprint FROM station_integration_provisioning
-         WHERE binding=$1 AND integration_id=ANY($2) AND octet_length(fingerprint)=64 AND octet_length(context)<=4096")
-        .bind(portal.storage_key().map_err(|_| invalid())?).bind(&ids)
-        .fetch_all(&mut *connection).await?;
+    // A key may have been provisioned before either membership or Portal
+    // learned its fingerprint. Enumerate this list independently of both.
+    let scope = json!({"issuer":portal.issuer,"station_origin":fence.origin,"owner":owner,"genesis":genesis});
+    let provisions: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT CASE WHEN octet_length(integration_id)=28 THEN integration_id END,
+                CASE WHEN octet_length(context)<=4096 THEN context END,
+                CASE WHEN octet_length(fingerprint)>64 THEN '' ELSE fingerprint END
+         FROM station_integration_provisioning
+         WHERE binding=$1 AND context::jsonb @> $2 ORDER BY integration_id LIMIT 4097",
+    )
+    .bind(portal.storage_key().map_err(|_| invalid())?)
+    .bind(scope)
+    .fetch_all(&mut *connection)
+    .await?;
+    if provisions.len() > 4096 {
+        return Err(invalid());
+    }
     let mut managed_keys = BTreeSet::new();
-    let mut attributed_keys: BTreeSet<_> = services.keys().cloned().collect();
+    let mut pending = Vec::new();
     for (id, stored, key) in provisions {
-        let Ok(context) = serde_json::from_str::<ServiceKeyContext>(&stored) else {
-            continue;
-        };
-        if context.issuer == portal.issuer
-            && context.station_origin == fence.origin
-            && context.owner == *owner
-            && context.genesis == genesis
-            && super::super::canonical_genesis(&key)
-            && context.integration_id == id
-            && context.service_id == format!("svc-{id}")
+        let context: ServiceKeyContext = serde_json::from_str(&stored).map_err(|_| invalid())?;
+        if !crate::integration_feed::client_id(&id, "i-")
+            || context.integration_id != id
+            || context.service_id != format!("svc-{id}")
         {
-            let identity = (context.service_id, key);
-            attributed_keys.insert(identity.clone());
-            managed_keys.insert(identity);
+            return Err(invalid());
+        }
+        match key {
+            Some(key) if super::super::canonical_genesis(&key) => {
+                managed_keys.insert((context.service_id, key));
+            }
+            None => pending.push(context.service_id),
+            _ => return Err(invalid()),
         }
     }
+    let mut attributed_keys: BTreeSet<_> = services.keys().chain(&managed_keys).cloned().collect();
     let stops = ServiceStops::from_review(review)?;
     let can_release = snapshot
         .accounts
@@ -200,6 +206,7 @@ pub(super) async fn observe(
         "generation":fence.generation.to_string(),"account_id":log.account_id(),"genesis_hash":genesis,
         "membership_head":log.head().to_json(),"registrations_without_membership":unmatched,
         "prior_membership_keys":historical,"provisioned_without_membership":provisioned,
+        "provisioning_without_fingerprint":pending,
         "portal_keys_without_attribution":unattributed,"services":rows}),
     )
 }

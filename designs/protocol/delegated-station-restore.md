@@ -808,8 +808,12 @@ Missing ownership, an unresolved stop, or expiry that hides the previous hold
 keeps the corresponding state unresolved. Earlier membership keys appear in
 `prior_membership_keys` with their matching Portal observations even after both
 the restored membership and the signing database lose the enrollment.
-If provisioning still identifies the service and genesis, the review lists that
-key under `provisioned_without_membership`. If the Portal alone identifies a
+Station also reads provisioning for the exact report binding, issuer, owner and
+genesis. A provisioned key can predate both native enrollment and Portal's
+receipt of its fingerprint. It appears in `provisioned_without_membership`
+even if neither source mentions it. An interrupted provisioning operation
+without a saved fingerprint appears in `provisioning_without_fingerprint`.
+These entries require reconciliation before publication. If the Portal alone identifies a
 key for this Agora.Build owner, `portal_keys_without_attribution` preserves its
 lifecycle observation. The owner can have several R9 lists, so this evidence
 requires reconciliation before the Station can attribute the key to this list.
