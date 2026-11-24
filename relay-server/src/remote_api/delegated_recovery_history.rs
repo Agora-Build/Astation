@@ -28,7 +28,7 @@ struct Retained {
     account_subject: String,
     account_id: String,
     membership: Value,
-    feed: Stored,
+    feed: Option<Stored>,
 }
 
 fn add_record(
@@ -134,20 +134,11 @@ pub(super) async fn inspection(
         }
         // Validate the historical checkpoint, then classify every obligation
         // under current authority. Removed managers never regain authority.
-        let old_review = retained
-            .feed
-            .recovery_review(&binding.origin, &old_log)
-            .map_err(|_| invalid())?;
-        let review = retained
-            .feed
-            .recovery_review(&binding.origin, log)
-            .map_err(|_| invalid())?;
-        retained_feed_ids.insert(
-            review["retained_feed_id"]
-                .as_str()
-                .ok_or_else(invalid)?
-                .to_owned(),
-        );
+        let old_review = super::retained_feed_review(retained.feed.as_ref(), &binding.origin, &old_log)?;
+        let review = super::retained_feed_review(retained.feed.as_ref(), &binding.origin, log)?;
+        if let Some(feed_id) = review["retained_feed_id"].as_str() {
+            retained_feed_ids.insert(feed_id.to_owned());
+        }
         if checkpoint.candidate_feed_id == review["retained_feed_id"] {
             return Err(invalid());
         }
@@ -161,9 +152,7 @@ pub(super) async fn inspection(
             }
             found_current = true;
         }
-        let values = checkpoint.retained["feed"]["records"]
-            .as_array()
-            .ok_or_else(invalid)?;
+        let values = checkpoint.retained_records()?;
         let reviews = review["records"].as_array().ok_or_else(invalid)?;
         let old_reviews = old_review["records"].as_array().ok_or_else(invalid)?;
         if values.len() != reviews.len() || values.len() != old_reviews.len() {

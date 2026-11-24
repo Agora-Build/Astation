@@ -206,6 +206,51 @@ pub(super) fn demote_manager(f: &mut Fixture) -> Membership {
 
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_reviews_a_root_that_predates_its_first_feed() {
+    use super::super::super::delegated_recovery::plan::{review_for_owner, stops};
+
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
+    let (store, f, genesis, first) = retained(&database).await;
+    let original = saved(&database.pool, &genesis).await;
+    let native = original["delegated"][ORIGIN]["records"][1].clone();
+    let mut backup = original.clone();
+    backup.as_object_mut().unwrap().remove("delegated");
+    sqlx::query("UPDATE remote_recovery_roots SET state=$1 WHERE genesis_hash=$2")
+        .bind(&backup).bind(&genesis).execute(&database.pool).await.unwrap();
+    first.initialize(&database.pool, true).await.unwrap();
+    let review = prepare(&database.pool, &first, &genesis).await.unwrap();
+    assert!(review["review"]["retained_feed_id"].is_null());
+    assert!(review["review"]["inspection"].is_null());
+    assert_eq!(review["review"]["status"], "missing_retained_feed");
+    assert_eq!(plans(&database.pool).await[0]["retained"].get("feed"), Some(&Value::Null));
+    assert!(review_for_owner(&database.pool, &first, &genesis, "other").await.is_err());
+    let owner = review_for_owner(&database.pool, &first, &genesis, "alice").await.unwrap();
+    assert_eq!(owner["source_hash"], review["source_hash"]);
+    let input = serde_json::to_vec(&json!({
+        "plan_id":review["plan_id"],"source_hash":review["source_hash"],"records":[native]
+    })).unwrap();
+    let retained = stops::retain(&database.pool, &first, &genesis, &input).await.unwrap();
+    assert_eq!(retained["known_history"]["records"][0]["record_id"], native["body"]["record_id"]);
+    assert_eq!(retained["known_history"]["observed_signing_lower_bounds"]["service:svc-test"], f.created);
+    assert_eq!(retained["recovery_ready"], false);
+    assert_eq!(saved(&database.pool, &genesis).await, backup);
+
+    let next = Binding::new(ORIGIN, 2).unwrap();
+    next.initialize(&database.pool, true).await.unwrap();
+    let replica = database.reconnect(2).await;
+    let after = prepare(&replica, &next, &genesis).await.unwrap();
+    assert_ne!(after["candidate_feed_id"], review["candidate_feed_id"]);
+    assert_eq!(after["known_history"]["records"], retained["known_history"]["records"]);
+    assert_eq!(after["known_history"]["complete_history"], false);
+    assert!(!inspect(&replica, ORIGIN).await.unwrap().unwrap().ready);
+    assert_eq!(saved(&replica, &genesis).await, backup);
+    replica.close().await;
+    drop(store);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
 async fn postgres_delegated_recovery_preserves_prior_checkpoint_stops_and_reserved_clocks() {
     let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 4).await;
     let (store, mut f, genesis, binding) = retained(&database).await;
@@ -217,9 +262,7 @@ async fn postgres_delegated_recovery_preserves_prior_checkpoint_stops_and_reserv
     // The next restored source predates both stops and a reservation that
     // never produced a record. The earlier checkpoint still knows them.
     let mut older_source = original.clone();
-    let mut empty = Stored::new(ORIGIN, &f.log).unwrap();
-    empty.feed_id = original["delegated"][ORIGIN]["feed_id"].as_str().unwrap().into();
-    older_source["delegated"][ORIGIN] = serde_json::to_value(empty).unwrap();
+    older_source["delegated"].as_object_mut().unwrap().remove(ORIGIN);
     let replacement_seq = f.log.head().seq + 1;
     older_source["membership"] = demote_manager(&mut f).to_stored();
     sqlx::query("UPDATE remote_recovery_roots SET state=$1 WHERE genesis_hash=$2")
@@ -462,9 +505,9 @@ async fn postgres_delegated_recovery_preparation_refuses_missing_foreign_and_cor
         .is_none());
     let source = saved(&database.pool, &genesis).await;
     let mut cases = vec![json!({})];
-    let mut missing = source.clone();
-    missing["delegated"] = json!({});
-    cases.push(missing);
+    let mut malformed = source.clone();
+    malformed["delegated"][ORIGIN] = Value::Null;
+    cases.push(malformed);
     let mut missing_clock = source.clone();
     missing_clock["delegated"][ORIGIN]["signing_high_water"] = json!({});
     cases.push(missing_clock);

@@ -42,6 +42,29 @@ pub(super) struct Prepared {
     retained: Value,
 }
 
+impl Prepared {
+    fn retained_records(&self) -> Result<&[Value], sqlx::Error> {
+        match self.retained.get("feed").ok_or_else(invalid)? {
+            Value::Null => Ok(&[]),
+            feed => feed["records"].as_array().map(Vec::as_slice).ok_or_else(invalid),
+        }
+    }
+}
+
+fn retained_feed_review(
+    feed: Option<&super::super::delegated::Stored>,
+    origin: &str,
+    log: &Membership,
+) -> Result<Value, sqlx::Error> {
+    match feed {
+        Some(feed) => feed.recovery_review(origin, log).map_err(|_| invalid()),
+        None => Ok(json!({
+            "status":"missing_retained_feed", "retained_feed_id":null, "inspection":null,
+            "records":[], "retained_signing_watermarks":{}
+        })),
+    }
+}
+
 pub(super) fn invalid() -> sqlx::Error {
     sqlx::Error::Protocol("delegated recovery preparation requires review".into())
 }
@@ -252,10 +275,8 @@ async fn checkpoint_for_owner(
     if log.frozen().is_some() {
         return Err(invalid());
     }
-    let feed = root.delegated.get(&binding.origin).ok_or_else(invalid)?;
-    let review = feed
-        .recovery_review(&binding.origin, &log)
-        .map_err(|_| invalid())?;
+    let feed = root.delegated.get(&binding.origin);
+    let review = retained_feed_review(feed, &binding.origin, &log)?;
     // Exclude mutable routes, pushes and backup blobs. They neither establish
     // control history nor invalidate a prepared source on an ordinary reconnect.
     let retained = json!({
