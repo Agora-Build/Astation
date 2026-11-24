@@ -649,3 +649,98 @@ async fn postgres_delegated_snapshot_actions_follow_current_policy_and_exact_pro
     drop(runtime);
     db.cleanup().await;
 }
+
+#[cfg(feature = "delegated-host-work")]
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_recovery_inventories_provisioning_before_enrollment() {
+    use crate::integration_checkpoint::PortalCheckpoint;
+    use crate::remote_api::recovery::delegated::Command;
+    use crate::remote_api::recovery::delegated_recovery::{plan, Binding};
+
+    let (db, runtime, fixture) = fixture().await;
+    let genesis = fixture.log.genesis_hash().to_hex();
+    let origin = &runtime.binding.station_origin;
+    runtime
+        .app
+        .recovery
+        .configure_delegated(origin, 1)
+        .await
+        .unwrap();
+    let draft = runtime.prepare(ID, OWNER, request(&fixture)).await.unwrap();
+    assert_eq!(
+        runtime
+            .app
+            .recovery
+            .delegated_operation(&genesis, PRINCIPAL, Command::Ensure)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let fence = Binding::new(origin, 2).unwrap();
+    fence.initialize(&db.pool, true).await.unwrap();
+    let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+    // The native manager never enrolled this key. The trusted checkpoint
+    // does not know its fingerprint, and this restore has no signing store.
+    let source = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{
+        "at":"2026-11-24T10:00:00.000Z","integrations":[]}});
+    let snapshot =
+        PortalCheckpoint::parse(&serde_json::to_vec(&source).unwrap(), &runtime.binding).unwrap();
+    let next = previous
+        .apply_checkpoint(snapshot, previous.received_at)
+        .unwrap();
+    runtime
+        .policies
+        .commit_for_recovery(&previous, &next, Some(&fence))
+        .await
+        .unwrap();
+
+    let binding = runtime.binding.storage_key().unwrap();
+    let pending = "i-11111111111111111111111111";
+    for (id, owner, list) in [
+        (pending, OWNER, genesis.clone()),
+        ("i-22222222222222222222222222", OWNER, "a".repeat(64)),
+        (
+            "i-33333333333333333333333333",
+            "ab00000000000000000000000001",
+            genesis.clone(),
+        ),
+    ] {
+        let context = ServiceKeyContext {
+            issuer: runtime.binding.issuer.clone(),
+            station_origin: origin.clone(),
+            owner: owner.into(),
+            integration_id: id.into(),
+            genesis: list,
+            service_id: format!("svc-{id}"),
+        };
+        sqlx::query("INSERT INTO station_integration_provisioning(binding,integration_id,context) VALUES($1,$2,$3)")
+            .bind(&binding).bind(id).bind(serde_json::to_string(&context).unwrap())
+            .execute(&db.pool).await.unwrap();
+    }
+    let replica = db.reconnect(2).await;
+    let review =
+        || plan::prepare_with_sources(&replica, &fence, &genesis, None, Some(&runtime.binding));
+    let prepared = review().await.unwrap();
+    let evidence = &prepared["portal_service_evidence"];
+    assert_eq!(
+        evidence["provisioned_without_membership"],
+        json!([{
+            "service_id":format!("svc-{ID}"), "key_fingerprint":draft["fingerprint"],
+            "portal_observation":{"status":"unresolved"}
+        }])
+    );
+    assert_eq!(
+        evidence["provisioning_without_fingerprint"],
+        json!([format!("svc-{pending}")])
+    );
+    assert_eq!(evidence["services"], json!([]));
+    assert_eq!(prepared["recovery_ready"], false);
+    assert_eq!(
+        review().await.unwrap()["portal_service_evidence_hash"],
+        prepared["portal_service_evidence_hash"]
+    );
+    replica.close().await;
+    drop(runtime);
+    db.cleanup().await;
+}
