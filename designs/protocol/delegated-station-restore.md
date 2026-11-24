@@ -783,7 +783,11 @@ and public key. Zero can identify an unused registration from an interrupted
 enrollment. A key in this list requires membership reconciliation. A missing
 signing database leaves this field null. A retained service signature requires a
 ceiling for its exact key, even if another key registered for the same integration
-has reserved a higher time. A missing checkpoint is reported as pending.
+has reserved a higher time. The comparison includes keys recorded in earlier
+recovery checkpoints. A service signature verified under its earlier membership
+still sets a lower bound for that key if the current restore predates enrollment.
+A missing historical registration appears even when its signatures were never
+published. A missing checkpoint is reported as pending.
 Publication must recheck current authority.
 
 ### Staging revocations and interrupts

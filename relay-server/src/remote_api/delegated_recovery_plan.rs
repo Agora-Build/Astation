@@ -89,7 +89,7 @@ pub(crate) async fn prepare_with_sources(
         None => None,
     };
     if let Some(rows) = reservations.as_deref() {
-        let evidence = crate::service_signing_ceilings::SigningCeilings::recovery_evidence(rows, &log, &report)
+        let evidence = crate::service_signing_ceilings::SigningCeilings::recovery_evidence(rows, &report)
             .map_err(|_| invalid())?;
         report["service_clock_evidence_hash"] = source_hash(&evidence)?.into();
         report["service_clock_evidence"] = evidence;
