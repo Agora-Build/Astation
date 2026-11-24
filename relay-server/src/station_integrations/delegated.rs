@@ -51,16 +51,8 @@ impl StationIntegrations {
             return Err(());
         }
         let policy = checkpoint.owned(id, &context.owner, chrono::Utc::now().timestamp())?;
-        let desired = match policy.state.as_str() {
-            "provisioning" | "waiting_for_host" | "ready" => ServiceDesired::Active,
-            "paused" => ServiceDesired::Held,
-            "revoking" | "revoked" => ServiceDesired::Revoked {
-                interrupt_running: policy.interrupt_running.unwrap_or(false),
-            },
-            // Expiry changes API access only. Preserve any earlier hold and
-            // never manufacture a release, stop, or cover from expiry alone.
-            _ => return Ok(()),
-        };
+        // Expiry changes API access only and cannot release an earlier hold.
+        let Some(desired) = ServiceDesired::from_policy(policy) else { return Ok(()) };
         if desired == ServiceDesired::Active && !checkpoint.allows_delegated_release(&context.owner) {
             return Err(());
         }

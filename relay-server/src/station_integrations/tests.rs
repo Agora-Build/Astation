@@ -554,6 +554,7 @@ async fn postgres_delegated_recovery_requires_a_portal_observation_in_this_close
     let draft = runtime.prepare(ID, OWNER, request(&fixture)).await.unwrap();
     append_body(&runtime, &fixture, serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap()).await;
     assert_eq!(runtime.app.recovery.delegated_operation(&genesis, PRINCIPAL, Command::Ensure).await.0, StatusCode::OK);
+    signed_action(&runtime, &fixture, atem_client::membership::Action::Remove { device_id: format!("svc-{ID}") }).await;
     let source = json!({"changes":[],"cursor":0,"checkpoint":{"at":"2026-11-23T10:00:00.000Z","integrations":[{
         "id":ID,"ownerAccount":OWNER,"state":"revoked","scopes":["agent.view"],"r9Svc":draft["fingerprint"],
         "interruptRunning":true,"revokedAt":null,"expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10
@@ -576,6 +577,8 @@ async fn postgres_delegated_recovery_requires_a_portal_observation_in_this_close
     let action = &evidence["services"][0]["observation"];
     assert_eq!(action["state"], "revoked");
     assert_eq!(action["interrupt_running"], true);
+    assert_eq!(evidence["services"][0]["snapshot_review"],
+        json!({"status":"coverage_unresolved","fresh_stop_actions":[{"action":"revoke","interrupt_running":true}]}));
     assert!(action["revoked_at"].is_null());
     assert_ne!(before["portal_service_evidence_hash"],observed["portal_service_evidence_hash"]);
     assert_eq!(observed["recovery_ready"],false);
@@ -597,6 +600,52 @@ async fn postgres_delegated_recovery_requires_a_portal_observation_in_this_close
     sqlx::query("UPDATE station_integration_policy SET checkpoint=jsonb_set(checkpoint::jsonb,'{revision}',to_jsonb(1000))::text")
         .execute(&db.pool).await.unwrap();
     assert_eq!(review(&newer).await.unwrap()["portal_service_evidence"]["status"],"awaiting_checkpoint");
+    drop(runtime);
+    db.cleanup().await;
+}
+
+#[cfg(feature = "delegated-host-work")]
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_snapshot_actions_follow_current_policy_and_exact_provisioning() {
+    use crate::integration_checkpoint::PortalCheckpoint;
+    use crate::remote_api::recovery::delegated::Command;
+    use crate::remote_api::recovery::delegated_recovery::{plan, Binding};
+    let (db, runtime, fixture) = fixture().await;
+    let genesis = fixture.log.genesis_hash().to_hex();
+    let origin = &runtime.binding.station_origin;
+    let recovery = &runtime.app.recovery;
+    recovery.configure_delegated(origin, 1).await.unwrap();
+    let draft = runtime.prepare(ID, OWNER, request(&fixture)).await.unwrap();
+    append_body(&runtime, &fixture, serde_json::from_str(draft["bodyJSON"].as_str().unwrap()).unwrap()).await;
+    assert_eq!(recovery.delegated_operation(&genesis, PRINCIPAL, Command::Ensure).await.0,StatusCode::OK);
+    let fence = Binding::new(origin,2).unwrap();
+    fence.initialize(&db.pool,true).await.unwrap();
+    let replica = db.reconnect(2).await;
+    let review = || plan::prepare_with_sources(&replica,&fence,&genesis,None,Some(&runtime.binding));
+    for (state, expected) in [
+        ("paused",json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"hold"}]})),
+        ("ready",json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"release"}]})),
+        ("expired",json!({"status":"pre_expiry_state_unresolved"})),
+        ("ready",json!({"status":"reviewed","fresh_actions":[{"action":"cover"},{"action":"release"}]})),
+    ] {
+        let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+        let source = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{"at":"2026-11-23T10:00:00.000Z","integrations":[{
+            "id":ID,"ownerAccount":OWNER,"state":state,"scopes":["agent.view"],"r9Svc":draft["fingerprint"],
+            "expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10
+        }]}});
+        let snapshot = PortalCheckpoint::parse(&serde_json::to_vec(&source).unwrap(),&runtime.binding).unwrap();
+        let next = previous.apply_checkpoint(snapshot, previous.received_at).unwrap();
+        runtime.policies.commit_for_recovery(&previous,&next,Some(&fence)).await.unwrap();
+        let result = review().await.unwrap();
+        assert_eq!(result["portal_service_evidence"]["services"][0]["snapshot_review"],expected);
+        assert_eq!(result["recovery_ready"], false);
+    }
+    sqlx::query("UPDATE station_integration_provisioning SET context=jsonb_set(context::jsonb,'{genesis}',to_jsonb(repeat('a',64)))::text")
+        .execute(&db.pool).await.unwrap();
+    assert_eq!(review().await.unwrap()["portal_service_evidence"]["services"][0]["snapshot_review"],
+        json!({"status":"provisioning_unresolved"}));
+    replica.close().await;
     drop(runtime);
     db.cleanup().await;
 }
