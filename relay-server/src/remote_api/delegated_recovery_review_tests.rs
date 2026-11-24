@@ -565,6 +565,99 @@ async fn postgres_signer_report_is_verified_once_and_receipted_across_replicas()
 
 #[tokio::test]
 #[ignore = "requires isolated Postgres"]
+async fn postgres_delegated_authors_confirm_one_evidence_hash_across_replicas() {
+    use atem_client::member_report::{sign_signer_report, signer_report_body, JournalView, SignerReportChallenge};
+
+    let database = TestDatabase::migrated("RECOVERY_TEST_DATABASE_URL", 5).await;
+    let (_, mut f, genesis, binding) = retained(&database).await;
+    f.log = super::recovery_plan::demote_manager(&mut f);
+    let mut root = saved(&database.pool, &genesis).await;
+    root["membership"] = f.log.to_stored();
+    sqlx::query("UPDATE remote_recovery_roots SET state=$2 WHERE genesis_hash=$1")
+        .bind(&genesis).bind(&root).execute(&database.pool).await.unwrap();
+    binding.initialize(&database.pool, true).await.unwrap();
+    let initial = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
+    let replica = database.reconnect(2).await;
+    let store = RecoveryStore::postgres(replica.clone());
+    store.configure_recovery_review(ORIGIN, 1).await.unwrap();
+    let app = make_app(store);
+    let other_store = RecoveryStore::postgres(database.pool.clone());
+    other_store.configure_recovery_review(ORIGIN, 1).await.unwrap();
+    let other_app = make_app(other_store);
+    let base = format!("/api/remote/v1/logs/{genesis}/control/recovery");
+    let report_path = format!("{base}/signer-reports");
+    let make_submission = async |signer: &str, key: &str, revision: u64, source: &Value| {
+        let slot = "native";
+        let mint = json!({"signer":signer,"slot":slot,"expected":f.log.head().to_json(),
+            "recovery":{"generation":"1","plan_id":initial["plan_id"],"candidate_feed_id":initial["candidate_feed_id"],
+                "source_hash":initial["source_hash"],"evidence_hash":source}});
+        let (status, challenge) = post_recovery(&app, &format!("{base}/signer-challenges"), Some("alice"),
+            mint.to_string().into_bytes()).await;
+        assert_eq!(status, StatusCode::OK, "{challenge}");
+        let challenge = SignerReportChallenge::parse(challenge.to_string().as_bytes()).unwrap();
+        let journal = JournalView { id: [1; 16], since: 1, revision, records: vec![], drafts: vec![] };
+        let body = signer_report_body(&f.log, &challenge, signer, slot, ORIGIN, &journal, challenge.issued_at()).unwrap();
+        let report = sign_signer_report(&f.keys, &KeyId::new(key), &body).unwrap();
+        json!({"report":report.to_json(),"records":[]}).to_string().into_bytes()
+    };
+    let former = "member:phone";
+    let active = "member:replacement-manager";
+    let initial_submission = make_submission(former, "manager", 1, &initial["evidence_hash"]).await;
+    let original_receipt = post_recovery(&app, &report_path, Some("alice"), initial_submission.clone()).await;
+    assert_eq!(original_receipt.0, StatusCode::OK);
+    let first = plan::prepare(&replica, &binding, &genesis).await.unwrap();
+    let second = make_submission(active, "replacement-manager", 1, &first["evidence_hash"]).await;
+    assert_eq!(post_recovery(&app, &report_path, Some("alice"), second).await.0, StatusCode::OK);
+
+    let cut = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
+    assert_ne!(cut["evidence_hash"], first["evidence_hash"]);
+    let hash = &cut["evidence_hash"];
+    let a = make_submission(former, "manager", 1, hash).await;
+    let b = make_submission(active, "replacement-manager", 1, hash).await;
+    let (a, b) = tokio::join!(post_recovery(&app, &report_path, Some("alice"), a),
+        post_recovery(&other_app, &report_path, Some("alice"), b));
+    assert_eq!((a.0, b.0), (StatusCode::OK, StatusCode::OK));
+    let resumed = database.reconnect(2).await;
+    let confirmed = plan::prepare(&resumed, &binding, &genesis).await.unwrap();
+    assert_eq!(&confirmed["evidence_hash"], hash);
+    assert_ne!(confirmed["reconstruction_hash"], cut["reconstruction_hash"]);
+    let mut roster = http(&app, &genesis, Some("alice")).await.1;
+    for flag in ["retained_history_only", "complete_history", "signing_clock_complete", "snapshot_complete", "recovery_ready"] {
+        roster.as_object_mut().unwrap().remove(flag);
+    }
+    roster["slots"] = json!(["phone", "replacement-manager"].map(|member| json!({
+        "member":member,"slot":"native","process":atem_client::encoding::b64u(&atem_client::member_report::process_generation()),
+        "selected":true,"review_head":f.log.head().to_json()})));
+    let compare = async |roster: &Value| {
+        plan::author_roster::compare(&resumed, &binding, &genesis, initial["plan_id"].as_str().unwrap(),
+            roster.to_string().as_bytes()).await
+    };
+    let result = compare(&roster).await.unwrap();
+    assert_eq!(result["matching_evidence_confirmations"].as_array().unwrap().len(), 2);
+    assert_eq!(result["reviewed_without_current_confirmation"], json!([]));
+    assert_eq!(result["complete_history"], false);
+
+    // A new revision represents new evidence. An old receipt cannot confirm it.
+    // A fresh challenge is needed even if a previous one is still inside its lease.
+    sqlx::query("DELETE FROM station_delegated_signer_challenges").execute(&resumed).await.unwrap();
+    let changed = make_submission(active, "replacement-manager", 2, hash).await;
+    assert_eq!(post_recovery(&app, &report_path, Some("alice"), changed).await.0, StatusCode::OK);
+    assert_eq!(post_recovery(&app, &report_path, Some("alice"), initial_submission).await, original_receipt);
+    assert!(compare(&roster).await.is_err());
+    let latest = plan::prepare(&database.pool, &binding, &genesis).await.unwrap();
+    assert_ne!(&latest["evidence_hash"], hash);
+    roster["evidence_hash"] = latest["evidence_hash"].clone();
+    roster["reconstruction_hash"] = latest["reconstruction_hash"].clone();
+    let result = compare(&roster).await.unwrap();
+    assert_eq!(result["matching_evidence_confirmations"], json!([]));
+    assert_eq!(result["reviewed_without_current_confirmation"].as_array().unwrap().len(), 2);
+    assert_eq!(saved(&resumed, &genesis).await, root);
+    assert!(!inspect(&resumed, ORIGIN).await.unwrap().unwrap().ready);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Postgres"]
 async fn postgres_delegated_history_retains_signer_exports_after_abandonment() {
     use atem_client::member_report::{
         sign_signer_report, signer_report_body, JournalView, SignerReportChallenge,

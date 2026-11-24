@@ -74,7 +74,12 @@ pub(crate) async fn compare(
     {
         return Err(invalid());
     }
-    let mut comparison = compare_members(&log, &report["known_authors"], export.slots)?;
+    let mut comparison = compare_members(
+        &log,
+        &report["known_authors"],
+        &export.evidence_hash,
+        export.slots,
+    )?;
     comparison["origin"] = json!(binding.origin);
     comparison["genesis_hash"] = json!(genesis);
     comparison["plan_id"] = json!(plan);
@@ -111,6 +116,7 @@ fn describe((member, slot, process): &Process) -> Value {
 fn compare_members(
     log: &Membership,
     authors: &Value,
+    evidence_hash: &str,
     slots: Vec<Slot>,
 ) -> Result<Value, sqlx::Error> {
     let mut managers = BTreeSet::new();
@@ -172,15 +178,35 @@ fn compare_members(
         }
     }
     let mut missing_early_ranges = Vec::new();
+    let mut latest = BTreeMap::new();
     for (signer, member) in authors["members"].as_object().ok_or_else(invalid)? {
+        let id = signer.strip_prefix("member:").ok_or_else(invalid)?;
         for report in member["reports"].as_array().ok_or_else(invalid)? {
+            // Reports are read in ascending Station connection order within this plan.
+            let process = (
+                id.to_owned(),
+                report["slot"].as_str().ok_or_else(invalid)?.to_owned(),
+                report["process"].as_str().ok_or_else(invalid)?.to_owned(),
+            );
+            latest.insert(
+                process,
+                report["signed_evidence_hash"]
+                    .as_str()
+                    .ok_or_else(invalid)?,
+            );
             if report["missing_early_range"] == true {
                 missing_early_ranges.push(json!({"signer": signer, "slot": report["slot"],
                     "process": report["process"], "submission_hash": report["submission_hash"]}));
             }
         }
     }
+    let confirmed: BTreeSet<_> = latest
+        .into_iter()
+        .filter_map(|(p, hash)| (hash == evidence_hash).then_some(p))
+        .collect();
     Ok(json!({
+        "reviewed_without_current_confirmation": reviewed.difference(&confirmed).map(describe).collect::<Vec<_>>(),
+        "matching_evidence_confirmations": reviewed.intersection(&confirmed).map(describe).collect::<Vec<_>>(),
         "missing_current_roster": managers.difference(&current_rosters).collect::<Vec<_>>(),
         "reviewed_without_current_report": reviewed.difference(&current).map(describe).collect::<Vec<_>>(),
         "reported_outside_review": observed.difference(&reviewed).map(describe).collect::<Vec<_>>(),

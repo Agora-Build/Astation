@@ -57,6 +57,7 @@ pub(super) struct History {
     pub signed: BTreeMap<String, Value>,
     pub authors: Value,
     pub current_report_hashes: Vec<String>,
+    pub confirmation_hashes: Vec<String>,
 }
 
 pub(super) async fn inspection(
@@ -104,6 +105,7 @@ pub(super) async fn inspection(
     let mut current_authors = None;
     let mut prior_authors = Vec::new();
     let mut current_report_hashes = Vec::new();
+    let mut confirmation_hashes = Vec::new();
     for Historical {
         generation,
         plan: checkpoint,
@@ -175,6 +177,8 @@ pub(super) async fn inspection(
         }
         let mut authors = operator_review.then(|| super::author_history::inventory(&old_log));
         let mut hashes = Vec::new();
+        let current_plan = checkpoint.plan_id == prepared.plan_id;
+        let mut latest_journals = BTreeMap::new();
         signer_reports::visit(connection, &checkpoint, &old_log, &binding.origin, generation, |verified, hash| {
             for record in verified.records {
                 // Signing a journal export does not establish authority for its target.
@@ -189,14 +193,26 @@ pub(super) async fn inspection(
             }
             if let Some(authors) = &mut authors {
                 journals.observe(&verified.signer, verified.journal.id, verified.journal.since,
-                    verified.journal.revision, checkpoint.plan_id == prepared.plan_id);
+                    verified.journal.revision, current_plan);
                 let author = authors.get_mut(&verified.signer).ok_or_else(invalid)?;
                 let first = author["first_manage_seq"].as_u64().ok_or_else(invalid)?;
                 author["reports"].as_array_mut().ok_or_else(invalid)?.push(json!({
                     "connection": verified.connection, "slot": verified.slot,
                     "process": atem_client::encoding::b64u(&verified.process), "journal": verified.journal.to_json(),
                     "missing_early_range": verified.journal.since > first, "submission_hash": hash,
+                    "signed_evidence_hash": verified.recovery.evidence_hash().to_hex(),
                 }));
+            }
+            // The first observation of each change commits the exact submission.
+            // Re-attesting a frozen journal must let other authors sign the same
+            // evidence hash. All receipts remain in storage and are reverified.
+            if current_plan {
+                let process = (verified.signer, verified.slot, verified.process);
+                if latest_journals.get(&process) == Some(&verified.journal) {
+                    confirmation_hashes.push(hash);
+                    return Ok(());
+                }
+                latest_journals.insert(process, verified.journal);
             }
             hashes.push(hash);
             Ok(())
@@ -262,5 +278,6 @@ pub(super) async fn inspection(
         authors: json!({"members": current_authors, "prior_plans": prior_authors,
             "journal_gaps": journals.gaps(), "complete_history": false}),
         current_report_hashes,
+        confirmation_hashes,
     })
 }
