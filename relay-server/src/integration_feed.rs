@@ -75,6 +75,18 @@ pub(crate) struct IntegrationPolicy {
 }
 
 impl IntegrationPolicy {
+    fn preserves_observed_lifecycle(&self, prior: &Self) -> bool {
+        if self.owner_account != prior.owner_account {
+            return false;
+        }
+        let stopped = match prior.state.as_str() {
+            "revoked" => self.state == "revoked",
+            "revoking" => matches!(self.state.as_str(), "revoking" | "revoked"),
+            _ => return true,
+        };
+        stopped && (prior.interrupt_running != Some(true) || self.interrupt_running == Some(true))
+    }
+
     pub(crate) fn validate(&self) -> Result<(), ()> {
         if self.owner_account.len() != 28
             || !self.owner_account.starts_with("ab")
@@ -273,14 +285,22 @@ impl PolicyCheckpoint {
         if now < 0 || (snapshot.cursor < self.cursor && !self.denied) {
             return Err(());
         }
-        for (id, row) in &snapshot.integrations {
-            if self.integrations.get(id).is_some_and(|old| old.owner_account != row.policy.owner_account) {
-                return Err(());
+        for (id, old) in &self.integrations {
+            match snapshot.integrations.get(id) {
+                Some(row) if !row.policy.preserves_observed_lifecycle(old) => return Err(()),
+                None if matches!(old.state.as_str(), "revoking" | "revoked") => return Err(()),
+                _ => {}
             }
         }
-        if self.portal_snapshot.as_ref().is_some_and(|old| old.integrations.iter().any(|(id, row)|
-            snapshot.integrations.get(id).is_none_or(|next| next.policy.owner_account != row.policy.owner_account))) {
-            return Err(());
+        if let Some(previous) = &self.portal_snapshot {
+            for (id, old) in &previous.integrations {
+                let next = snapshot.integrations.get(id).ok_or(())?;
+                if !next.policy.preserves_observed_lifecycle(&old.policy)
+                    || old.revoked_at.is_some() && old.revoked_at != next.revoked_at
+                {
+                    return Err(());
+                }
+            }
         }
         if self.portal_snapshot.as_ref().is_some_and(|old| snapshot.cursor < old.cursor) {
             return Err(());
