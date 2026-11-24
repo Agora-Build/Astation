@@ -354,6 +354,21 @@ async fn postgres_delegated_regressed_signing_store_cannot_hide_retained_service
         missing["service_clock_evidence"]["unregistered_membership_keys"],
         json!([[service, fingerprint]])
     );
+    let previous = runtime.policies.load(&runtime.binding).await.unwrap();
+    let source = json!({"changes":[],"cursor":previous.cursor,"checkpoint":{"at":"2026-11-23T10:00:00.000Z","integrations":[{
+        "id":ID,"ownerAccount":OWNER,"state":"revoked","scopes":["agent.view"],"r9Svc":fingerprint,
+        "interruptRunning":true,"revokedAt":null,"expiresAt":"2099-01-01T00:00:00.000Z","quotaPerSecond":10
+    }]}});
+    let snapshot = crate::integration_checkpoint::PortalCheckpoint::parse(&serde_json::to_vec(&source).unwrap(),&runtime.binding).unwrap();
+    let next = previous.apply_checkpoint(snapshot, previous.received_at).unwrap();
+    runtime.policies.commit_for_recovery(&previous,&next,Some(&later)).await.unwrap();
+    let portal = plan::prepare_with_sources(&replica,&later,&genesis,Some(store),Some(&runtime.binding)).await.unwrap();
+    let observed = &portal["portal_service_evidence"]["prior_membership_keys"][0];
+    assert_eq!(observed["service_id"], service);
+    assert_eq!(observed["key_fingerprint"], fingerprint);
+    assert_eq!(observed["highest_signed_ms"], last);
+    assert_eq!(observed["portal_observation"]["interrupt_running"], true);
+    assert_eq!(portal["portal_service_evidence"]["services"],json!([]));
     replica.close().await;
     drop(runtime);
     primary.cleanup().await;

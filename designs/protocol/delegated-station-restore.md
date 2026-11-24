@@ -790,6 +790,28 @@ A missing historical registration appears even when its signatures were never
 published. A missing checkpoint is reported as pending.
 Publication must recheck current authority.
 
+For each service, `snapshot_review` lists the fresh lifecycle actions required
+by the observed checkpoint. Station matches the signed active member and key
+to the stored provisioning context for this issuer, Station, owner, and genesis.
+A paused service needs a new cover followed by a hold. An active service needs
+a new cover followed by a release so a host that kept the old hold can resume.
+A known manager revoke survives a Portal resume. A matching reviewed copy
+preserves the effect of a former manager's revoke. Portal revocation separately
+requires the service's own revoke for reporting, and a later interrupt request
+requires an interrupt if the own-key stop did not already include one. After
+a Portal or native revoke, `fresh_stop_actions` lists only the missing stops,
+even when membership already removed the service. Current coverage stays
+unresolved. If this Station still covers the principal, its replacement feed
+must start that principal's records with a fresh cover.
+
+Missing ownership, an unresolved stop, or expiry that hides the previous hold
+keeps the corresponding state unresolved. Earlier membership keys appear in
+`prior_membership_keys` with their matching Portal observations even after both
+the restored membership and the signing database lose the enrollment.
+These are obligations for review. Signing and publication still require a
+current coverage decision, protected key access, complete participants and
+clock validation.
+
 ### Staging revocations and interrupts
 
 After reviewing `prepare`, run

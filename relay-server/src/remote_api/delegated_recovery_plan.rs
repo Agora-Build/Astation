@@ -96,7 +96,7 @@ pub(crate) async fn prepare_with_sources(
     }
     if let Some(portal) = portal {
         let subject = prepared.retained["account_subject"].as_str().ok_or_else(invalid)?;
-        let source = portal_services::observe(&mut tx, binding, portal, subject, &log, reservations.as_deref()).await?;
+        let source = portal_services::observe(&mut tx, binding, portal, subject, &log, reservations.as_deref(), &report).await?;
         report["portal_service_evidence_hash"] = source_hash(&json!({
             "plan_id": prepared.plan_id, "reconstruction_hash": report["reconstruction_hash"],
             "source": source,
