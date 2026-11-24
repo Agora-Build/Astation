@@ -90,10 +90,7 @@ pub(super) async fn retain_records(
     incoming: Vec<ControlRecord>,
 ) -> Result<(), sqlx::Error> {
     let mut retained = BTreeMap::new();
-    for value in prepared.retained["feed"]["records"]
-        .as_array()
-        .ok_or_else(invalid)?
-    {
+    for value in prepared.retained_records()? {
         let record = ControlRecord::parse(&serde_json::to_vec(value).map_err(|_| invalid())?)
             .map_err(|_| invalid())?;
         retained.insert(record.record_id().to_owned(), value.clone());
@@ -172,10 +169,7 @@ pub(super) async fn inspection(
 ) -> Result<Value, sqlx::Error> {
     let recovered = load(connection, binding, &log.genesis_hash().to_hex()).await?;
     let mut retained = BTreeMap::new();
-    for value in prepared.retained["feed"]["records"]
-        .as_array()
-        .ok_or_else(invalid)?
-    {
+    for value in prepared.retained_records()? {
         let record = ControlRecord::parse(&serde_json::to_vec(value).map_err(|_| invalid())?)
             .map_err(|_| invalid())?;
         retained.insert(record.record_id().to_owned(), value);

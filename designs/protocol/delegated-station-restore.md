@@ -425,8 +425,12 @@ is a recovery checkpoint, not a live replacement feed or an export of private
 keys. The prepared UUID is never advertised in heads or accepted by live sync.
 
 Preparation requires an existing closed fence at exactly the configured
-generation, an owned retained root, an unfrozen shared-verified membership and
-a structurally consistent feed. Missing clocks, duplicate record IDs or another
+generation, an owned retained root and an unfrozen shared-verified membership.
+If the backup predates this origin's first feed, the checkpoint stores an explicit
+null feed. The review reports `missing_retained_feed` with no feed ID or ledger
+inspection. Operators can collect later signed stops and earlier checkpoints
+against that membership. The missing feed supplies no evidence of prior signing
+times or report delivery. For a present feed, missing clocks, duplicate record IDs or another
 account/origin/feed are refused. It never initializes a missing root, feed or
 fence. Concurrent operators/replicas and retry after restart return the same
 durable plan and replacement UUID. A commit failure returns no successful plan.
