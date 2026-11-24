@@ -220,6 +220,44 @@ fn equal_feed_cursor_does_not_hide_binding_changes_or_allow_version_rollback() {
 }
 
 #[test]
+fn checkpoint_preserves_revocation_time_and_interrupt_across_restarts() {
+    let config = binding(false);
+    let mut value = source(false);
+    let row = &mut value["checkpoint"]["integrations"][0];
+    row["state"] = json!("revoking");
+    row["interruptRunning"] = json!(false);
+    row["revokedAt"] = json!("2026-11-22T23:58:00.000Z");
+    let first = PolicyCheckpoint::empty(config.clone()).unwrap()
+        .apply_checkpoint(parse(&value, &config).unwrap(), 100).unwrap();
+    let row = &mut value["checkpoint"]["integrations"][0];
+    row["state"] = json!("revoked");
+    row["interruptRunning"] = json!(true);
+    let final_state = first.apply_checkpoint(parse(&value, &config).unwrap(), 101).unwrap();
+    let reloaded: PolicyCheckpoint = serde_json::from_value(serde_json::to_value(&final_state).unwrap()).unwrap();
+    for (field, regression) in [
+        ("state", json!("revoking")),
+        ("interruptRunning", json!(false)),
+        ("revokedAt", Value::Null),
+        ("revokedAt", json!("2026-11-23T00:00:00.000Z")),
+    ] {
+        let mut changed = value.clone();
+        changed["cursor"] = json!(13);
+        changed["checkpoint"]["integrations"][0][field] = regression;
+        assert!(reloaded.apply_checkpoint(parse(&changed, &config).unwrap(), 102).is_err(), "{field}");
+    }
+    assert!(reloaded.apply_checkpoint(parse(&source(false), &config).unwrap(), 102).is_err());
+    assert!(reloaded.apply_checkpoint(parse(&value, &config).unwrap(), 102).is_ok());
+
+    // The first exact checkpoint must also preserve stops received on the ordinary feed.
+    let mut live_only = PolicyCheckpoint::empty(config.clone()).unwrap();
+    live_only.integrations.insert(ID.into(), reloaded.portal_snapshot.as_ref().unwrap().integrations[ID].policy.clone());
+    let mut missing = source(false);
+    missing["checkpoint"]["integrations"] = json!([]);
+    assert!(live_only.apply_checkpoint(parse(&missing, &config).unwrap(), 103).is_err());
+    assert!(live_only.apply_checkpoint(parse(&source(false), &config).unwrap(), 103).is_err());
+}
+
+#[test]
 fn collecting_a_source_never_refreshes_or_replaces_live_execution_policy() {
     let config = binding(true);
     let raw = source(true);
