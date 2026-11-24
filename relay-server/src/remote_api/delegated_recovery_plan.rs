@@ -94,7 +94,7 @@ pub(crate) async fn prepare(
     binding: &Binding,
     genesis: &str,
 ) -> Result<Value, sqlx::Error> {
-    prepare_with_sources(pool, binding, genesis, None, None).await
+    prepare_with_sources(pool, binding, genesis, None, None, None).await
 }
 
 pub(crate) async fn prepare_with_sources(
@@ -103,6 +103,7 @@ pub(crate) async fn prepare_with_sources(
     genesis: &str,
     ceilings: Option<&crate::service_signing_ceilings::SigningCeilings>,
     portal: Option<&crate::integration_feed::FeedBinding>,
+    vault: Option<&crate::service_keys::ServiceKeyVault>,
 ) -> Result<Value, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let (prepared, log, mut report) = checkpoint(&mut tx, binding, genesis, true).await?;
@@ -119,7 +120,7 @@ pub(crate) async fn prepare_with_sources(
     }
     if let Some(portal) = portal {
         let subject = prepared.retained["account_subject"].as_str().ok_or_else(invalid)?;
-        let source = portal_services::observe(&mut tx, binding, portal, subject, &log, reservations.as_deref(), &report).await?;
+        let source = portal_services::observe(&mut tx, binding, portal, vault, subject, &log, reservations.as_deref(), &report).await?;
         report["portal_service_evidence_hash"] = source_hash(&json!({
             "plan_id": prepared.plan_id, "reconstruction_hash": report["reconstruction_hash"],
             "source": source,

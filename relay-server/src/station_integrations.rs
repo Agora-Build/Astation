@@ -100,6 +100,17 @@ fn protected_file(path: &str, limit: u64) -> Result<Zeroizing<Vec<u8>>, ()> {
     Ok(bytes)
 }
 
+pub(crate) fn configured_service_vault() -> Result<Option<ServiceKeyVault>, ()> {
+    const FILE: &str = "STATION_SERVICE_WRAPPING_KEY_FILE";
+    const ID: &str = "STATION_SERVICE_WRAPPING_KEY_ID";
+    if std::env::var_os(FILE).is_none() && std::env::var_os(ID).is_none() {
+        return Ok(None);
+    }
+    let wrapping = protected_file(&std::env::var(FILE).map_err(|_| ())?, 32)?;
+    let key = wrapping.as_slice().try_into().map_err(|_| ())?;
+    ServiceKeyVault::new(key, &std::env::var(ID).map_err(|_| ())?).map(Some)
+}
+
 impl StationIntegrations {
     pub(crate) async fn owner_principal(&self, owner: &str) -> Result<String, Response> {
         self.app.accounts.principal_for_identity(&self.binding.issuer, owner)
@@ -114,9 +125,7 @@ impl StationIntegrations {
     pub(crate) fn from_env(app: AppState) -> Result<Option<Arc<Self>>, ()> {
         let get = |key| std::env::var(key).map_err(|_| ());
         let Some(binding) = FeedBinding::from_reporting_env()? else { return Ok(None) };
-        let wrapping = protected_file(&get("STATION_SERVICE_WRAPPING_KEY_FILE")?, 32)?;
-        let key: &[u8; 32] = wrapping.as_slice().try_into().map_err(|_| ())?;
-        let vault = ServiceKeyVault::new(key, &get("STATION_SERVICE_WRAPPING_KEY_ID")?)?;
+        let vault = configured_service_vault()?.ok_or(())?;
         let report = protected_file(&get("STATION_REPORT_KEY_FILE")?, 4096)?;
         Self::new(
             app,

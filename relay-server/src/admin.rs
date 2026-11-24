@@ -264,8 +264,17 @@ async fn delegated_recovery(args: &[String]) -> i32 {
                 eprintln!("invalid Portal reporting configuration");
                 return 1;
             };
+            let vault = if portal.is_some() {
+                let Ok(vault) = crate::station_integrations::configured_service_vault() else {
+                    eprintln!("invalid service wrapping key configuration");
+                    return 1;
+                };
+                vault
+            } else {
+                None
+            };
             crate::remote_api::recovery::delegated_recovery::plan::prepare_with_sources(
-                &pool, &binding, genesis, ceilings.as_ref(), portal.as_ref(),
+                &pool, &binding, genesis, ceilings.as_ref(), portal.as_ref(), vault.as_ref(),
             ).await
         } else {
             inspect_root(&pool, &binding, genesis).await

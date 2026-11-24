@@ -3,7 +3,7 @@ use super::super::super::delegated::ServiceDesired;
 use super::{invalid, Binding};
 use crate::integration_checkpoint::CheckpointIntegration;
 use crate::integration_feed::{FeedBinding, PolicyCheckpoint};
-use crate::service_keys::ServiceKeyContext;
+use crate::service_keys::{ServiceKeyContext, ServiceKeyVault, SERVICE_KEY_CONTEXT};
 use crate::service_signing_ceilings::Reservation;
 use atem_client::membership::{
     service_key_fingerprint, Action, MemberKind, MemberStatus, Membership,
@@ -16,6 +16,7 @@ pub(super) async fn observe(
     connection: &mut PgConnection,
     fence: &Binding,
     portal: &FeedBinding,
+    vault: Option<&ServiceKeyVault>,
     subject: &str,
     log: &Membership,
     registrations: Option<&[Reservation]>,
@@ -107,39 +108,90 @@ pub(super) async fn observe(
     // A key may have been provisioned before either membership or Portal
     // learned its fingerprint. Enumerate this list independently of both.
     let scope = json!({"issuer":portal.issuer,"station_origin":fence.origin,"owner":owner,"genesis":genesis});
-    let provisions: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT CASE WHEN octet_length(integration_id)=28 THEN integration_id END,
-                CASE WHEN octet_length(context)<=4096 THEN context END,
-                CASE WHEN octet_length(fingerprint)>64 THEN '' ELSE fingerprint END
-         FROM station_integration_provisioning
-         WHERE binding=$1 AND context::jsonb @> $2 ORDER BY integration_id LIMIT 4097",
+    // Provisioning stores the serialized context; the vault uses the tagged
+    // context as its primary key. Read both in the same statement snapshot.
+    let provisions: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT CASE WHEN octet_length(p.integration_id)=28 THEN p.integration_id END,
+                CASE WHEN octet_length(p.context)<=4096 THEN p.context END,
+                CASE WHEN octet_length(p.fingerprint)>64 THEN '' ELSE p.fingerprint END,
+                k.sealed
+         FROM station_integration_provisioning p LEFT JOIN station_service_keys k
+           ON $3 AND octet_length(p.context)<=4096 AND k.context=($4 || p.context || ']')
+         WHERE p.binding=$1 AND p.context::jsonb @> $2 ORDER BY p.integration_id LIMIT 4097",
     )
     .bind(portal.storage_key().map_err(|_| invalid())?)
     .bind(scope)
+    .bind(vault.is_some())
+    .bind(format!(r#"["{SERVICE_KEY_CONTEXT}","#))
     .fetch_all(&mut *connection)
     .await?;
     if provisions.len() > 4096 {
         return Err(invalid());
     }
     let mut managed_keys = BTreeSet::new();
+    let mut authenticated_keys = BTreeSet::new();
+    let mut protected = Vec::new();
     let mut pending = Vec::new();
-    for (id, stored, key) in provisions {
+    let ceilings = registrations.map(|rows| {
+        rows.iter()
+            .map(|r| ((r.service_id.as_str(), r.key_hash.as_str()), r.highest_ms))
+            .collect::<BTreeMap<_, _>>()
+    });
+    for (id, stored, key, sealed) in provisions {
         let context: ServiceKeyContext = serde_json::from_str(&stored).map_err(|_| invalid())?;
         if !crate::integration_feed::client_id(&id, "i-")
             || context.integration_id != id
             || context.service_id != format!("svc-{id}")
+            || (vault.is_some()
+                && serde_json::to_string(&context).map_err(|_| invalid())? != stored)
+            || key
+                .as_deref()
+                .is_some_and(|key| !super::super::canonical_genesis(key))
         {
             return Err(invalid());
         }
+        if let Some(vault) = vault {
+            let mut row = json!({"service_id":context.service_id,"provisioning_fingerprint":key});
+            let status = match sealed {
+                None => "missing",
+                Some(sealed) => match vault.retained_fingerprint(&context, &sealed) {
+                    Err(()) => "unreadable",
+                    Ok(fingerprint) => {
+                        row["key_fingerprint"] = json!(fingerprint);
+                        row["portal_observation"] = observation(&context.service_id, &fingerprint);
+                        if let Some(ceilings) = &ceilings {
+                            let identity = (context.service_id.as_str(), fingerprint.as_str());
+                            row["signing_reservation"] = match ceilings.get(&identity) {
+                                Some(ms) => json!({"highest_reserved_ms":ms}),
+                                None => json!({"status":"missing"}),
+                            };
+                        }
+                        let status = match &key {
+                            None => "pending",
+                            Some(expected) if expected == &fingerprint => "matched",
+                            Some(_) => "mismatch",
+                        };
+                        authenticated_keys.insert((context.service_id.clone(), fingerprint));
+                        status
+                    }
+                },
+            };
+            row["status"] = status.into();
+            protected.push(row);
+        }
         match key {
-            Some(key) if super::super::canonical_genesis(&key) => {
+            Some(key) => {
                 managed_keys.insert((context.service_id, key));
             }
             None => pending.push(context.service_id),
-            _ => return Err(invalid()),
         }
     }
-    let mut attributed_keys: BTreeSet<_> = services.keys().chain(&managed_keys).cloned().collect();
+    let mut attributed_keys: BTreeSet<_> = services
+        .keys()
+        .chain(&managed_keys)
+        .chain(&authenticated_keys)
+        .cloned()
+        .collect();
     let stops = ServiceStops::from_review(review)?;
     let mut rows = Vec::with_capacity(services.len());
     for (identity @ (id, key), active) in &services {
@@ -208,6 +260,9 @@ pub(super) async fn observe(
         "prior_membership_keys":historical,"provisioned_without_membership":provisioned,
         "provisioning_without_fingerprint":pending,
         "portal_keys_without_attribution":unattributed,"services":rows});
+    if vault.is_some() {
+        evidence["protected_service_keys"] = json!(protected);
+    }
     if let (Some(bindings), Some(accounts)) = (&snapshot.bindings, &snapshot.accounts) {
         // A binding can advance without a feed event. Only commit this
         // owner's record for the exact R9 account and genesis to the review.
