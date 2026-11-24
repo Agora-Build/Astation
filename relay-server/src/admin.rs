@@ -11,7 +11,7 @@ pub const USAGE: &str = "usage: station-relay-server admin forget-key <astation_
        station-relay-server admin delegated-recovery stage-stops <genesis_hash> <reconstruction_hash>\n\
        station-relay-server admin delegated-recovery abandon <genesis_hash> <plan_id>\n\
        station-relay-server admin delegated-recovery inspect|prepare <genesis_hash>\n\
-       station-relay-server admin delegated-recovery compare-authors <genesis_hash> <plan_id> <file>\n\
+       station-relay-server admin delegated-recovery compare-authors <genesis_hash> <plan_id> <file> [file ...]\n\
        station-relay-server admin delegated-recovery retain-stops <genesis_hash> <file>\n\
        station-relay-server admin delegated-recovery retain-native <genesis_hash> <plan_id> <file>\n\
        station-relay-server admin delegated-recovery retain-resigned <genesis_hash> <plan_id> <file>\n\
@@ -152,7 +152,7 @@ async fn read_opened_stop_evidence(input: tokio::fs::File, limit: usize) -> std:
 
 async fn delegated_recovery(args: &[String]) -> i32 {
     use crate::remote_api::recovery::delegated_recovery::{generation, inspect, inspect_root, Binding};
-    let (fence, root, file, plan_or_hash) = match args {
+    let (fence, root, files, plan_or_hash) = match args {
         [command] if command == "status" => (false, None, None, None),
         [command] if command == "fence" => (true, None, None, None),
         [command, genesis]
@@ -177,14 +177,15 @@ async fn delegated_recovery(args: &[String]) -> i32 {
             if command == "retain-stops" && genesis.len() == 64
                 && genesis.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
         {
-            (false, Some((command.as_str(), genesis)), Some(file), None)
+            (false, Some((command.as_str(), genesis)), Some(std::slice::from_ref(file)), None)
         }
-        [command, genesis, plan, file]
-            if matches!(command.as_str(), "retain-native" | "retain-resigned" | "compare-authors") && genesis.len() == 64
+        [command, genesis, plan, files @ ..]
+            if !files.is_empty() && (command == "compare-authors" ||
+                (files.len() == 1 && matches!(command.as_str(), "retain-native" | "retain-resigned"))) && genesis.len() == 64
                 && genesis.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                 && uuid::Uuid::parse_str(plan).is_ok_and(|id| id.get_version_num() == 4 && id.to_string() == *plan) =>
         {
-            (false, Some((command.as_str(), genesis)), Some(file), Some(plan))
+            (false, Some((command.as_str(), genesis)), Some(files), Some(plan))
         }
         _ => {
             eprintln!("{USAGE}");
@@ -216,7 +217,7 @@ async fn delegated_recovery(args: &[String]) -> i32 {
         }
     };
     if let Some((command, genesis)) = root {
-        let report = if let Some(file) = file {
+        let report = if let Some(files) = files {
             use crate::remote_api::recovery::delegated_recovery::plan::{author_roster, native, signatures, stops};
             let limit = match command {
                 "compare-authors" => author_roster::INPUT_LIMIT,
@@ -224,21 +225,28 @@ async fn delegated_recovery(args: &[String]) -> i32 {
                 "retain-resigned" => signatures::INPUT_LIMIT,
                 _ => stops::input_limit(),
             };
-            let bytes = match read_stop_evidence(std::path::Path::new(file), limit).await {
-                Ok(bytes) => bytes,
-                Err(_) => {
+            let mut inputs = Vec::new();
+            let mut remaining = limit;
+            for path in files {
+                let Ok(bytes) = read_stop_evidence(std::path::Path::new(path), remaining).await else {
                     eprintln!("could not read bounded regular recovery evidence");
                     return 1;
+                };
+                if bytes.is_empty() {
+                    eprintln!("empty recovery evidence");
+                    return 1;
                 }
-            };
+                remaining -= bytes.len();
+                inputs.push(bytes);
+            }
             if command == "compare-authors" {
-                author_roster::compare(&pool, &binding, genesis, plan_or_hash.expect("validated plan"), &bytes).await
+                author_roster::compare(&pool, &binding, genesis, plan_or_hash.expect("validated plan"), &inputs).await
             } else if command == "retain-resigned" {
-                signatures::retain(&pool, &binding, genesis, plan_or_hash.expect("validated plan"), &bytes).await
+                signatures::retain(&pool, &binding, genesis, plan_or_hash.expect("validated plan"), &inputs[0]).await
             } else if let Some(plan) = plan_or_hash {
-                native::retain(&pool, &binding, genesis, plan, &bytes).await
+                native::retain(&pool, &binding, genesis, plan, &inputs[0]).await
             } else {
-                stops::retain(&pool, &binding, genesis, &bytes).await
+                stops::retain(&pool, &binding, genesis, &inputs[0]).await
             }
         } else if command == "stage-stops" {
             crate::remote_api::recovery::delegated_recovery::plan::snapshot_stops::stage(
@@ -266,6 +274,10 @@ async fn delegated_recovery(args: &[String]) -> i32 {
             Ok(report) => {
                 println!("{report}");
                 0
+            }
+            Err(_) if command == "compare-authors" => {
+                eprintln!("could not compare process exports; check the recovery review and overlapping member lists");
+                1
             }
             Err(_) => {
                 eprintln!("could not {command} the retained delegated recovery state");

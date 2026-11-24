@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const INPUT_LIMIT: usize = 4 * 1024 * 1024;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Slot {
     member: String,
@@ -23,7 +23,7 @@ struct Slot {
     selected: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Export {
     version: u8,
@@ -40,15 +40,54 @@ struct Export {
     slots: Vec<Slot>,
 }
 
+fn combine(inputs: &[Vec<u8>]) -> Result<Export, sqlx::Error> {
+    let mut remaining = INPUT_LIMIT;
+    let mut scope = None;
+    let mut members = BTreeMap::<String, Vec<Slot>>::new();
+    for bytes in inputs {
+        remaining = remaining.checked_sub(bytes.len()).ok_or_else(invalid)?;
+        let strict = StrictValue::parse(bytes, INPUT_LIMIT).map_err(|_| invalid())?;
+        let mut export: Export =
+            serde_json::from_value(strict.into_value()).map_err(|_| invalid())?;
+        let mut reviewed = BTreeMap::<String, Vec<Slot>>::new();
+        for row in std::mem::take(&mut export.slots) {
+            reviewed.entry(row.member.clone()).or_default().push(row);
+        }
+        if scope.as_ref().is_some_and(|prior| prior != &export) {
+            return Err(invalid());
+        }
+        scope = Some(export);
+        for (member, mut slots) in reviewed {
+            slots.sort_by(|a, b| {
+                (&a.slot, &a.process, a.selected).cmp(&(&b.slot, &b.process, b.selected))
+            });
+            // Two views of one member must agree before either can represent
+            // it in a combined review. Duplicate rows within a file remain
+            // visible to the normal slot validator.
+            if let Some(other) = members.get(&member) {
+                if other != &slots {
+                    return Err(sqlx::Error::Protocol(
+                        "conflicting recovery process lists for the same member".into(),
+                    ));
+                }
+            } else {
+                members.insert(member, slots);
+            }
+        }
+    }
+    let mut export = scope.ok_or_else(invalid)?;
+    export.slots = members.into_values().flatten().collect();
+    Ok(export)
+}
+
 pub(crate) async fn compare(
     pool: &PgPool,
     binding: &Binding,
     genesis: &str,
     plan: &str,
-    bytes: &[u8],
+    inputs: &[Vec<u8>],
 ) -> Result<Value, sqlx::Error> {
-    let strict = StrictValue::parse(bytes, INPUT_LIMIT).map_err(|_| invalid())?;
-    let export: Export = serde_json::from_value(strict.into_value()).map_err(|_| invalid())?;
+    let export = combine(inputs)?;
     if export.version != 1
         || export.origin != binding.origin
         || export.genesis_hash != genesis

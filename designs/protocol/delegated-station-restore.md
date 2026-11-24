@@ -179,7 +179,7 @@ In **Recovery Copies**, load the Station review and choose **Save Reviewed
 Processes**. Give the file to the recovery operator for comparison:
 
 ```sh
-station-relay-server admin delegated-recovery compare-authors <genesis_hash> <plan_id> <file>
+station-relay-server admin delegated-recovery compare-authors <genesis_hash> <plan_id> <file> [file ...]
 ```
 
 The Mac reads its protected native process lists for the selected Station,
@@ -195,8 +195,11 @@ plan, and reported processes absent from the supplied list. A match requires
 the same member, slot and SDK process ID. Early journal gaps and ambiguous
 process identities remain visible even when a tuple matches. The comparison
 also lists which reviewed tuples' latest reports sign the current evidence hash
-and which still need confirmation. A retried receipt retains its original scope. This command reads
-one Mac's export and cannot attest its provenance, establish complete history,
+and which still need confirmation. Several managers can supply separate exports
+for the same review. If two exports describe the same member, their slot lists
+must agree, including prior processes and reviewed heads. A disagreement or a
+stale file refuses the combined comparison. A retried receipt retains its original
+scope. Comparing exported files cannot attest their provenance, establish complete history,
 release a signing hold or reopen a feed.
 
 Recovery rechecks each retained report with the membership and challenge from
