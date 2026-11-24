@@ -366,6 +366,25 @@ impl PolicyCheckpoint {
             || (!self.denied && self.availability.as_ref().is_some_and(|s| s.enabled_at(self.cursor, owner)))
     }
 
+    /// A known release or transfer remains a veto across ordinary feed polls.
+    /// The caller separately verifies the durable root owner for never-bound lists.
+    pub(crate) fn allows_list_release(&self, owner: &str, account_id: &str, genesis: &str) -> bool {
+        if !crate::integration_checkpoint::PortalCheckpoint::built_in(&self.binding) {
+            return true;
+        }
+        if !self.allows_delegated_release(owner) {
+            return false;
+        }
+        let Some(source) = &self.portal_snapshot else { return false };
+        if source.validate_for(&self.binding).is_err() {
+            return false;
+        }
+        let Some(bindings) = &source.bindings else { return false };
+        bindings.iter()
+            .find(|row| row.account_id == account_id && row.genesis_hash == genesis)
+            .is_none_or(|row| row.account == owner && row.binding_state == "bound")
+    }
+
     pub(crate) fn owned(&self, id: &str, owner: &str, now: i64) -> Result<&IntegrationPolicy, ()> {
         if self.denied
             || self.revision == 0

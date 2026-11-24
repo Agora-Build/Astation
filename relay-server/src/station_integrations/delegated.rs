@@ -53,9 +53,6 @@ impl StationIntegrations {
         let policy = checkpoint.owned(id, &context.owner, chrono::Utc::now().timestamp())?;
         // Expiry changes API access only and cannot release an earlier hold.
         let Some(desired) = ServiceDesired::from_policy(policy) else { return Ok(()) };
-        if desired == ServiceDesired::Active && !checkpoint.allows_delegated_release(&context.owner) {
-            return Err(());
-        }
         let signer = crate::service_keys::load_approved_in(
             &mut tx,
             &self.vault,
@@ -65,7 +62,7 @@ impl StationIntegrations {
         .await?;
         let recovery = &self.app.recovery;
         let published = recovery
-            .reconcile_service_in(&mut tx, &principal, &context, &signer, desired)
+            .reconcile_service_in(&mut tx, &principal, &context, &signer, desired, &checkpoint)
             .await?;
         tx.commit().await.map_err(|_| ())?;
         if published {
@@ -470,6 +467,36 @@ mod tests {
         let records = feed(&runtime, &genesis).await;
         assert_eq!(records.iter().map(|r| r["body"]["action"].as_str().unwrap()).collect::<Vec<_>>(),
             ["cover", "hold", "release"]);
+        // A checkpoint can change the owner without advancing the change-feed cursor.
+        policy(&runtime, "paused", fingerprint, None).await;
+        runtime.reconcile_delegated_service(ID).await.unwrap();
+        policy(&runtime, "ready", fingerprint, None).await;
+        let mut current = replica.load(&runtime.binding).await.unwrap();
+        let held = feed(&runtime, &genesis).await;
+        let other = "ab00000000000000000000000001";
+        for (version, state, owner) in [
+            (1, "unbound", OWNER), (2, "released", OWNER), (3, "bound", other), (4, "bound", OWNER),
+        ] {
+            let mut update = value.clone();
+            update["cursor"] = json!(current.cursor);
+            update["checkpoint"]["accounts"]["disabled"] = json!([]);
+            update["checkpoint"]["bindings"] = json!([{"account":owner,"accountId":f.log.account_id(),
+                "genesisHash":genesis,"bindingId":"test-binding","version":version,"bindingState":state}]);
+            let exact = PortalCheckpoint::parse(&serde_json::to_vec(&update).unwrap(), &runtime.binding).unwrap();
+            let next = current.apply_checkpoint(exact, chrono::Utc::now().timestamp()).unwrap();
+            replica.commit(&current, &next).await.unwrap();
+            current = next;
+            let result = runtime.reconcile_delegated_service(ID).await;
+            if version < 4 {
+                assert!(result.is_err());
+                assert_eq!(feed(&runtime, &genesis).await, held);
+            } else {
+                result.unwrap();
+                let resumed = feed(&runtime, &genesis).await;
+                assert_eq!(resumed.len(), held.len() + 1);
+                assert_eq!(resumed.last().unwrap()["body"]["action"], "release");
+            }
+        }
         replica.0.close().await;
         drop(runtime);
         db.cleanup().await;

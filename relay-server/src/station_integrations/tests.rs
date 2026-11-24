@@ -743,16 +743,11 @@ async fn postgres_delegated_recovery_commits_to_this_lists_owner_binding() {
             "unknown"
         };
         assert_eq!(observed["owner_availability"], availability);
-        if version == 1 || version >= 5 {
-            let expected = if version == 1 {
-                "reviewed"
-            } else {
-                "owner_availability_unresolved"
-            };
-            assert_eq!(
-                observed["services"][0]["snapshot_review"]["status"],
-                expected
-            );
+        let review = &observed["services"][0]["snapshot_review"];
+        if version == 1 {
+            assert_eq!(review["status"], "reviewed");
+        } else {
+            assert_eq!(review, &json!({"status":"owner_availability_unresolved"}));
         }
         assert_ne!(prepared["portal_service_evidence_hash"], previous_hash);
         previous_hash = prepared["portal_service_evidence_hash"].clone();

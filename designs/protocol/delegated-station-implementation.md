@@ -189,6 +189,11 @@ transaction as the integration policy. A backlog, reset, malformed account
 change or unavailable baseline blocks new covers for active services and
 blocks releases. Holds and terminal stops can still be signed. The normal
 policy freshness check also applies. Custom Stations use their own policy.
+When a built-in Station has observed a binding for the service's R9 account and
+genesis, an unbound, released or transferred binding prevents a fresh release.
+Both the live signer and the recovery review check the owner. Never-bound lists
+retain the existing root-owner and account-availability checks. Binding changes
+can take effect at the same feed cursor.
 The checkpoint's polling interval sets no ownership freshness guarantee.
 Binding-to-room ownership enforcement,
 account lifecycle closures, history/clock completeness and locked plan-source
