@@ -81,6 +81,8 @@ final class AstationRecoveryCoordinator {
     private let confirmVerifierRoster: ((VerifierRosterReview) async -> Bool)?
     private let confirmProcessRoster: (() async -> Bool)?
     private var processReview: ProcessReview?
+    private var deliveredVerifierChallenges = Set<String>()
+    private var verifierReportGeneration = UUID()
     private let verifierTime: () -> UInt64
     /// The caller authenticates this account's Station roster and scopes each transport's token
     /// to its exact origin. A cached presence list is not a complete roster.
@@ -113,6 +115,7 @@ final class AstationRecoveryCoordinator {
     /// Deliver only durable head changes, after the account operation releases its lock.
     var onMembershipCommit: ((LogHead) -> Void)?
     var onControlCommit: (() -> Void)?
+    var onLocalVerifierSlotChange: (() -> Void)?
     private var pendingMembershipHead: LogHead?
     private var pendingControlCommit = false
     private var busy = false {
@@ -210,7 +213,10 @@ final class AstationRecoveryCoordinator {
         self.now = now
         if let data = try store.read() {
             saved = try PropertyListDecoder().decode(Saved.self, from: data)
-            guard (2...7).contains(saved.version), saved.accountID == accountID, saved.managerID == managerID,
+            guard (2...8).contains(saved.version), saved.accountID == accountID, saved.managerID == managerID,
+                  saved.version >= 8 || !(saved.processRosters ?? [:]).values.contains(where: {
+                      $0.values.contains { $0.localReporterSlot != nil }
+                  }),
                   saved.version >= 7 || !(saved.processRosters ?? [:]).values.contains(where: {
                       $0.values.contains { $0.earlier != nil }
                   }),
@@ -1408,6 +1414,10 @@ extension AstationRecoveryCoordinator {
         var rosters = saved.processRosters ?? [:]
         var candidate = AstationProcessRoster(origin: relayURL, member: review.member,
             genesis: review.genesis, sequence: review.head.seq, headHash: review.head.hash, lines: lines)
+        if review.member == managerID {
+            let local = slots.filter { $0.process == verifierReportProcess() }
+            if local.count == 1 { candidate.localReporterSlot = local[0].slot }
+        }
         if let previous = review.previous { candidate.retainDisplacedSlots(from: previous) }
         rosters[relayURL, default: [:]][review.member] = candidate
         let lists = rosters.values.flatMap(\.values)
@@ -1419,9 +1429,64 @@ extension AstationRecoveryCoordinator {
         let finished = verifierTime()
         guard finished >= confirmedAt, finished - confirmedAt < 30_000 else { throw RemoteRecoveryError.requiresReview }
         try requireDurableRecoveryCheckpoint()
-        try persist { $0.version = 7; $0.processRosters = rosters }
+        try persist { $0.version = candidate.localReporterSlot == nil ? 7 : 8; $0.processRosters = rosters }
+        verifierReportGeneration = UUID()
+        deliveredVerifierChallenges.removeAll()
         do { try requireDurableRecoveryCheckpoint() }
         catch { uncertain = true; throw error }
+        onLocalVerifierSlotChange?()
+    }
+
+    var hasLocalVerifierSlot: Bool {
+        guard !uncertain, let roster = saved.processRosters?[relayURL]?[managerID],
+              let log = membershipLog, log.frozen() == nil else { return false }
+        return roster.localReporterSlot != nil && roster.genesis == log.genesisHash() &&
+            roster.sequence == log.head().seq && roster.headHash == log.head().hash
+    }
+
+    func answerVerifierChallenges(current: @escaping @MainActor @Sendable () -> Bool,
+        transport: (@escaping @MainActor @Sendable () -> Bool) throws -> any RemoteVerifierReportTransport) async throws {
+        guard current(), !Task.isCancelled, !busy, hasLocalVerifierSlot,
+              let roster = saved.processRosters?[relayURL]?[managerID], let slot = roster.localReporterSlot,
+              let log = membershipLog?.snapshot(),
+              try reviewedProcessSlots(member: managerID, log: log).contains(where: { $0.slot == slot })
+        else { return }
+        let anchor = try RemoteVerifierReportAnchor(log: log)
+        let head = log.head(), generation = verifierReportGeneration
+        let active: @MainActor @Sendable () -> Bool = { [weak self] in
+            guard let self else { return false }
+            return current() && !Task.isCancelled && !self.busy && !self.uncertain &&
+                self.verifierReportGeneration == generation && self.membershipLog?.head() == head &&
+                self.membershipLog?.frozen() == nil
+        }
+        let station = try transport(active)
+        let challenges = try await station.verifierChallenges(genesisHash: anchor.genesisHash,
+            signer: "member:" + managerID, slot: slot, expected: head)
+        guard active(), challenges.count <= 16 else { throw RemoteChannelError.staleLink }
+        deliveredVerifierChallenges.formIntersection(challenges)
+        for challenge in challenges where !deliveredVerifierChallenges.contains(challenge) {
+            guard active() else { throw RemoteChannelError.staleLink }
+            try requireDurableRecoveryCheckpoint()
+            // An inbox entry can expire while an earlier entry is being answered.
+            let wall = now().wallMs
+            let parsed = try parseVerifierReportChallenge(challengeJson: challenge)
+            guard wall < parsed.expiresAt else { continue }
+            let report = try identity.verifierReport(log: log, anchor: anchor, memberID: managerID,
+                challengeJSON: challenge, slot: slot, origin: relayURL, wallMs: wall, current: active)
+            let receipt = try await station.publishVerifierReport(genesisHash: anchor.genesisHash,
+                challengeJSON: challenge, expected: head, reportJSON: report)
+            guard active() else { throw RemoteChannelError.staleLink }
+            // Station may have kept an earlier valid signature for this same body.
+            let body = try signedObjectInfo(json: report).bodyJcs
+            let receivedAt = now().wallMs
+            guard receipt.reports.contains(where: { returned in
+                guard let proof = try? verifyVerifierReport(log: log, reportJson: returned,
+                    expectedChallengeJson: challenge, nowMs: receivedAt), proof.atHead else { return false }
+                return (try? signedObjectInfo(json: returned).bodyJcs) == body
+            })
+            else { throw RemoteRecoveryTransportError.invalidResponse }
+            deliveredVerifierChallenges.insert(challenge)
+        }
     }
 
     struct VerifierRosterReview: Equatable {

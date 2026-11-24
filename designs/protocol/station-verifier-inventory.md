@@ -387,7 +387,21 @@ On a later head the previous rows are available for editing, including offline
 slots. A successful save cannot clear the conflict journal or supply live
 evidence. Older app versions refuse a checkpoint containing process rosters.
 
+When the manager reviews this Mac's own member, a single row containing the
+running SDK's process ID assigns that slot to this Mac. The Mac stores the
+assignment in its protected checkpoint. An older review needs a fresh
+confirmation to assign a slot. Removing the local row stops reporting.
+
+The signed-in Mac checks that slot's inbox on the selected Station every four
+seconds. It checks the protected roster and device-list head before signing,
+uses its existing key without an owner prompt, and verifies the signed body
+returned by Station before marking the challenge answered. A lost or invalid
+receipt is retried while the challenge is open. Switching accounts or Stations,
+sleeping, or changing membership invalidates the in-flight work. After a process
+restart the Mac reports its new SDK process ID under the saved slot, allowing a
+consumer to detect the conflict and require a new review.
+
 The review covers one member at one Station. The production provider must
 establish coverage for every active member, host and Station replica, and
 obtain independent evidence from every required process. Third-party service
-carriage, production polling and VII.A are still open.
+carriage, consumer-side scheduling across participants and VII.A are still open.

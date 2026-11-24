@@ -261,7 +261,7 @@ final class HostSenderAccessWindowController: NSWindowController, NSWindowDelega
                 edit.messageText = "Processes for " + member
                 edit.informativeText = "Include every SDK process using this key, even offline ones. Enter its configured slot name and SDK process ID on each line, separated by a space."
                 if member == coordinator.managerID {
-                    edit.informativeText += "\n\nThis Mac's SDK process ID is " + verifierReportProcess()
+                    edit.informativeText += "\n\nTo answer verifier requests on this Mac, include its process ID in one slot. This Mac keeps that slot after restarting. Its current process ID is " + verifierReportProcess()
                 }
                 let (scroll, text) = processEditor(review.previous?.lines.joined(separator: "\n") ?? "", editable: true)
                 edit.accessoryView = scroll

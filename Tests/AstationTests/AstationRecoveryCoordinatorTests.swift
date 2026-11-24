@@ -725,6 +725,113 @@ final class AstationRecoveryCoordinatorTests: XCTestCase {
         XCTAssertEqual(try restarted.reviewedProcessSlots(member: member, log: changed).count, 1)
     }
 
+    func testReviewedMacAnswersStationInboxAndRetriesOnlyUnconfirmedReports() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let coordinator = try h.coordinator(confirmProcessRoster: { true })
+        _ = try await coordinator.setup()
+        let origin = coordinator.relayURL, member = coordinator.managerID
+        let log = try await coordinator.hostSenderMembership()
+        let review = try await coordinator.prepareProcessReview(member: member, current: { true })
+        try await coordinator.acceptProcessReview(review, lines: ["truck " + verifierReportProcess()], current: { true })
+        // Model restarting under a new SDK process. The independently saved slot
+        // still identifies this installation; the old expected process cannot sign.
+        let bytes = try XCTUnwrap(h.store.bytes)
+        var checkpoint = try XCTUnwrap(PropertyListSerialization.propertyList(from: bytes, format: nil) as? [String: Any])
+        var rosters = try XCTUnwrap(checkpoint["processRosters"] as? [String: [String: [String: Any]]])
+        rosters[origin]?[member]?["lines"] = ["truck AQEBAQEBAQEBAQEBAQEBAQ"]
+        checkpoint["processRosters"] = rosters
+        h.store.bytes = try PropertyListSerialization.data(fromPropertyList: checkpoint, format: .binary, options: 0)
+        let restarted = try h.coordinator()
+        XCTAssertTrue(restarted.hasLocalVerifierSlot)
+        XCTAssertFalse(restarted.delegatedControlsAvailable)
+
+        let wall = AstationRecoveryCoordinator.clock().wallMs
+        let challenge = try verifierReportChallenge(signer: "member:" + member, slot: "truck",
+            origin: origin, connection: 1, issuedAt: wall, expiresAt: wall + 30_000)
+        let challengeObject = try JSONSerialization.jsonObject(with: Data(challenge.utf8))
+        let head: [String: Any] = ["seq": log.head().seq, "hash": log.head().hash]
+        var reads = 0, posts = 0
+        RecoveryReportHTTPStub.lock.withLock {
+            RecoveryReportHTTPStub.response = { request, bytes in
+                let input = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
+                XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer verifier-test")
+                if request.url?.lastPathComponent == "verifier-requests" {
+                    reads += 1
+                    XCTAssertEqual(input["signer"] as? String, "member:" + member)
+                    XCTAssertEqual(input["slot"] as? String, "truck")
+                    XCTAssertEqual(input["expected"] as? NSDictionary, head as NSDictionary)
+                    return try JSONSerialization.data(withJSONObject: ["challenges": [challengeObject]])
+                }
+                posts += 1
+                var report = try XCTUnwrap(input["report"] as? [String: Any])
+                let json = String(decoding: try JSONSerialization.data(withJSONObject: report), as: UTF8.self)
+                let checked = try verifyVerifierReport(log: log, reportJson: json, expectedChallengeJson: challenge, nowMs: wall)
+                XCTAssertTrue(checked.atHead)
+                XCTAssertEqual(checked.process, verifierReportProcess())
+                XCTAssertEqual(checked.inventory, verifierInventory())
+                // A real signed body paired with a corrupted signature is not a receipt.
+                if posts == 1 { report["sig"] = "AA" }
+                return try JSONSerialization.data(withJSONObject: ["challenge": challengeObject, "expected": head,
+                    "reports": [report]] as [String: Any])
+            }
+        }
+        defer { RecoveryReportHTTPStub.lock.withLock { RecoveryReportHTTPStub.response = nil } }
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RecoveryReportHTTPStub.self]
+        func poll() async throws {
+            try await restarted.answerVerifierChallenges(current: { true }) { active in
+                try RemoteRecoveryHTTP(relayURL: origin, configuration: config, accessToken: {
+                    guard await active() else { throw AccountLoginError.changed }
+                    return "verifier-test"
+                })
+            }
+        }
+        let prompts = h.ownerRequests.count
+        do { try await poll(); XCTFail("missing retained report") } catch RemoteRecoveryTransportError.invalidResponse {}
+        try await poll()
+        try await poll()
+        XCTAssertEqual(reads, 3)
+        XCTAssertEqual(posts, 2)
+        XCTAssertEqual(h.ownerRequests.count, prompts)
+        XCTAssertEqual(h.identityCryptography.noninteractiveSigningCalls, 2)
+        _ = try await addSecondManager(harness: h)
+        _ = try await restarted.hostSenderMembership()
+        XCTAssertFalse(restarted.hasLocalVerifierSlot)
+        try await restarted.answerVerifierChallenges(current: { true }) { _ in
+            XCTFail("stale roster started a request"); throw AccountLoginError.changed
+        }
+    }
+
+    func testLocalVerifierNeedsAReviewedSlotAndCurrentContextThroughTokenAcquisition() async throws {
+        let h = RecoveryCoordinatorHarness()
+        let coordinator = try h.coordinator(confirmProcessRoster: { true })
+        _ = try await coordinator.setup()
+        XCTAssertFalse(coordinator.hasLocalVerifierSlot)
+        try await coordinator.answerVerifierChallenges(current: { true }) { _ in
+            XCTFail("unreviewed Mac requested a token"); throw AccountLoginError.changed
+        }
+        let review = try await coordinator.prepareProcessReview(member: coordinator.managerID, current: { true })
+        try await coordinator.acceptProcessReview(review, lines: ["truck " + verifierReportProcess()], current: { true })
+        var signedIn = true
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [RecoveryReportHTTPStub.self]
+        RecoveryReportHTTPStub.lock.withLock {
+            RecoveryReportHTTPStub.response = { _, _ in XCTFail("signed-out request reached Station"); throw AccountLoginError.changed }
+        }
+        defer { RecoveryReportHTTPStub.lock.withLock { RecoveryReportHTTPStub.response = nil } }
+        do {
+            try await coordinator.answerVerifierChallenges(current: { signedIn }) { active in
+                try RemoteRecoveryHTTP(relayURL: coordinator.relayURL, configuration: config, accessToken: {
+                    await MainActor.run { signedIn = false }
+                    guard await active() else { throw AccountLoginError.changed }
+                    return "unexpected"
+                })
+            }
+            XCTFail("changed context accepted")
+        } catch AccountLoginError.changed {}
+        XCTAssertEqual(h.identityCryptography.noninteractiveSigningCalls, 0)
+    }
+
     func testProcessReviewRefusesInvalidRowsBeforeConfirmation() async throws {
         let h = RecoveryCoordinatorHarness(), process = verifierReportProcess()
         let coordinator = try h.coordinator(confirmProcessRoster: { XCTFail("confirmed an invalid candidate"); return true })

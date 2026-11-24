@@ -9,6 +9,9 @@ struct AstationProcessRoster: Codable, Equatable {
     let sequence: UInt64
     let headHash: String
     let lines: [String]
+    // Keep this Mac's configured slot across SDK process restarts. The signed
+    // report always contains the running process ID, including after a restart.
+    var localReporterSlot: String?
     // A removed slot can still have authored a stop before it left the list.
     struct EarlierSlot: Codable, Equatable {
         let line: String
